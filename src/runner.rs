@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::Path;
 
 use owo_colors::OwoColorize;
@@ -31,6 +32,7 @@ pub fn run(dir: &Path, engine: &dyn Engine) -> Result<()> {
             total,
             step.name.bold()
         );
+        std::io::stdout().flush().ok();
 
         let result = if let Some(ref sql) = step.sql {
             let sql_path = dir.join(sql);
