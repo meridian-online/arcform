@@ -1,13 +1,41 @@
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::error::{Error, Result};
 
 /// Output captured from a step execution.
+/// Stdout is inherited (streams to terminal in real-time).
+/// Stderr is captured for error reporting but also streamed for SQL steps.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct StepOutput {
-    pub stdout: String,
     pub stderr: String,
+}
+
+/// Read stderr from a child process, streaming it to the terminal in real-time
+/// while capturing the full content for error reporting.
+fn stream_stderr(child: &mut std::process::Child) -> String {
+    let Some(mut stderr) = child.stderr.take() else {
+        return String::new();
+    };
+
+    let mut buf = [0u8; 4096];
+    let mut captured = Vec::new();
+
+    loop {
+        match stderr.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let _ = std::io::Write::write_all(&mut std::io::stderr(), &buf[..n]);
+                captured.extend_from_slice(&buf[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+
+    String::from_utf8_lossy(&captured).to_string()
 }
 
 /// Trait for executing pipeline steps.
@@ -27,46 +55,26 @@ pub struct DuckDbEngine;
 
 impl Engine for DuckDbEngine {
     fn execute_sql(&self, db_path: &Path, sql_path: &Path) -> Result<StepOutput> {
-        let output = Command::new("duckdb")
+        let mut child = Command::new("duckdb")
             .arg(db_path)
             .arg("-f")
             .arg(sql_path)
-            .output()
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| Error::StepExecution {
                 step: sql_path.display().to_string(),
                 source: e,
             })?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stderr = stream_stderr(&mut child);
+        let status = child.wait().map_err(|e| Error::StepExecution {
+            step: sql_path.display().to_string(),
+            source: e,
+        })?;
 
-        if !output.status.success() {
-            let code = output.status.code().unwrap_or(1);
-            return Err(Error::StepFailed {
-                step: String::new(), // Caller will provide the step name.
-                code,
-                stderr,
-            });
-        }
-
-        Ok(StepOutput { stdout, stderr })
-    }
-
-    fn execute_command(&self, command: &str) -> Result<StepOutput> {
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .output()
-            .map_err(|e| Error::StepExecution {
-                step: command.to_string(),
-                source: e,
-            })?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-        if !output.status.success() {
-            let code = output.status.code().unwrap_or(1);
+        if !status.success() {
+            let code = status.code().unwrap_or(1);
             return Err(Error::StepFailed {
                 step: String::new(),
                 code,
@@ -74,7 +82,38 @@ impl Engine for DuckDbEngine {
             });
         }
 
-        Ok(StepOutput { stdout, stderr })
+        Ok(StepOutput { stderr })
+    }
+
+    fn execute_command(&self, command: &str) -> Result<StepOutput> {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| Error::StepExecution {
+                step: command.to_string(),
+                source: e,
+            })?;
+
+        let status = child.wait().map_err(|e| Error::StepExecution {
+            step: command.to_string(),
+            source: e,
+        })?;
+
+        if !status.success() {
+            let code = status.code().unwrap_or(1);
+            return Err(Error::StepFailed {
+                step: String::new(),
+                code,
+                stderr: String::new(),
+            });
+        }
+
+        Ok(StepOutput {
+            stderr: String::new(),
+        })
     }
 
     fn preflight(&self) -> Result<()> {
@@ -178,7 +217,6 @@ pub mod mock {
             }
 
             Ok(StepOutput {
-                stdout: String::new(),
                 stderr: String::new(),
             })
         }
@@ -197,7 +235,6 @@ pub mod mock {
             }
 
             Ok(StepOutput {
-                stdout: String::new(),
                 stderr: String::new(),
             })
         }

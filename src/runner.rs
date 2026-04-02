@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::path::Path;
 
 use owo_colors::OwoColorize;
@@ -26,18 +25,16 @@ pub fn run(dir: &Path, engine: &dyn Engine) -> Result<()> {
     let mut succeeded = 0;
 
     for (i, step) in manifest.steps.iter().enumerate() {
-        print!(
-            "[{}/{}] {} ... ",
+        println!(
+            "[{}/{}] {} ...",
             i + 1,
             total,
             step.name.bold()
         );
-        std::io::stdout().flush().ok();
 
         let result = if let Some(ref sql) = step.sql {
             let sql_path = dir.join(sql);
             if !sql_path.exists() {
-                println!("{}", "failed".red());
                 return Err(Error::SqlFileNotFound {
                     step: step.name.clone(),
                     path: sql_path,
@@ -51,18 +48,10 @@ pub fn run(dir: &Path, engine: &dyn Engine) -> Result<()> {
         };
 
         match result {
-            Ok(output) => {
-                println!("{}", "done".green());
-                if !output.stdout.is_empty() {
-                    print!("{}", output.stdout);
-                }
-                if !output.stderr.is_empty() {
-                    eprint!("{}", output.stderr);
-                }
+            Ok(_output) => {
                 succeeded += 1;
             }
             Err(Error::StepFailed { code, stderr, .. }) => {
-                println!("{}", "failed".red());
                 return Err(Error::StepFailed {
                     step: step.name.clone(),
                     code,
@@ -70,7 +59,6 @@ pub fn run(dir: &Path, engine: &dyn Engine) -> Result<()> {
                 });
             }
             Err(e) => {
-                println!("{}", "failed".red());
                 return Err(e);
             }
         }
