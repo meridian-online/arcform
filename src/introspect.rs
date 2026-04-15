@@ -12,13 +12,17 @@ use sqlparser::ast::{
 use sqlparser::dialect::DuckDbDialect;
 use sqlparser::parser::Parser;
 
-/// Assets discovered from parsing a SQL file.
+/// Assets discovered from parsing a SQL file — four-set model.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SqlAssets {
-    /// Tables/views this SQL creates or writes to.
+    /// Tables/views this SQL creates, writes to, or modifies (ALTER).
     pub outputs: BTreeSet<String>,
-    /// Tables this SQL reads from.
+    /// External tables this SQL reads data from (CTEs excluded).
     pub inputs: BTreeSet<String>,
+    /// CTE names — step-internal assets visible in lineage but not cross-step dependencies.
+    pub internal: BTreeSet<String>,
+    /// Tables/views this SQL drops — destructive operations tracked separately.
+    pub destroys: BTreeSet<String>,
 }
 
 /// Parse a SQL string and extract the assets it produces and consumes.
@@ -36,12 +40,12 @@ pub fn extract_assets(sql: &str) -> Result<SqlAssets, Vec<String>> {
         extract_from_statement(stmt, &mut assets);
     }
 
-    // Remove self-references: if a table appears in both outputs and inputs
-    // within the same file, the input reference is likely to the table being
-    // created (e.g. INSERT INTO t SELECT * FROM t).
-    // However, for CTAS patterns like CREATE TABLE t AS SELECT * FROM s,
-    // 't' is only in outputs and 's' is only in inputs, which is correct.
-    // We keep both sets as-is — the asset graph handles the semantics.
+    // CTE filtering: CTE names were collected in `internal` during parsing.
+    // Remove them from `inputs` — a CTE reference in FROM is step-internal,
+    // not an external dependency.
+    for cte_name in &assets.internal {
+        assets.inputs.remove(cte_name);
+    }
 
     Ok(assets)
 }
@@ -109,6 +113,38 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
             }
         }
 
+        // DROP TABLE/VIEW — destructive operation
+        Statement::Drop {
+            names, ..
+        } => {
+            for name in names {
+                assets.destroys.insert(object_name_to_string(name));
+            }
+        }
+
+        // ALTER TABLE — modifies the asset (output), does not read data from it
+        Statement::AlterTable { name, .. } => {
+            assets.outputs.insert(object_name_to_string(name));
+        }
+
+        // ALTER VIEW — modifies the view (output), new query reads from tables (inputs)
+        Statement::AlterView { name, query, .. } => {
+            assets.outputs.insert(object_name_to_string(name));
+            extract_inputs_from_query(query, assets);
+        }
+
+        // MERGE INTO target USING source — target is written, source is read
+        Statement::Merge {
+            table, source, ..
+        } => {
+            // Target table → outputs
+            if let TableFactor::Table { name, .. } = table {
+                assets.outputs.insert(object_name_to_string(name));
+            }
+            // Source table → inputs
+            extract_inputs_from_table_factor(source, assets);
+        }
+
         // SELECT ... FROM — standalone select, extract inputs
         Statement::Query(query) => {
             extract_inputs_from_query(query, assets);
@@ -120,12 +156,17 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
 }
 
 /// Extract input table names from a query (SELECT ... FROM ... JOIN ...).
+/// Also collects CTE names into `assets.internal`.
 fn extract_inputs_from_query(query: &sqlparser::ast::Query, assets: &mut SqlAssets) {
     extract_inputs_from_set_expr(&query.body, assets);
 
     // Handle CTEs — they define local names, and their queries read from tables.
+    // CTE names are captured in `internal` (step-internal assets).
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
+            // Record the CTE name as an internal asset.
+            assets.internal.insert(cte.alias.name.value.to_lowercase());
+            // The CTE's body reads from tables — those are real inputs.
             extract_inputs_from_query(&cte.query, assets);
         }
     }
@@ -170,7 +211,15 @@ fn extract_inputs_from_table_factor(factor: &TableFactor, assets: &mut SqlAssets
                 extract_inputs_from_table_factor(&join.relation, assets);
             }
         }
-        // TableFactor::TableFunction, Pivot, etc. — skip for now
+        // PIVOT wraps a source table — extract the inner table as an input.
+        TableFactor::Pivot { table, .. } => {
+            extract_inputs_from_table_factor(table, assets);
+        }
+        // UNPIVOT wraps a source table — extract the inner table as an input.
+        TableFactor::Unpivot { table, .. } => {
+            extract_inputs_from_table_factor(table, assets);
+        }
+        // TableFunction, MatchRecognize, etc. — skip
         _ => {}
     }
 }
@@ -305,15 +354,14 @@ mod tests {
         assert!(assets.inputs.contains("blocklist"));
     }
 
-    // Edge case: CTE inputs are discovered.
+    // AC-02: CTE names go to internal, not inputs.
     #[test]
-    fn test_cte_inputs() {
+    fn test_ac02_cte_internal_not_inputs() {
         let sql = "WITH recent AS (SELECT * FROM orders WHERE date > '2026-01-01') SELECT * FROM recent;";
         let assets = extract_assets(sql).unwrap();
-        assert!(assets.inputs.contains("orders"));
-        // 'recent' is a CTE alias, not a real table — it will appear in inputs
-        // from the outer SELECT but that's acceptable; the asset graph can handle it.
-        assert!(assets.inputs.contains("recent"));
+        assert!(assets.inputs.contains("orders"), "real table should be in inputs");
+        assert!(!assets.inputs.contains("recent"), "CTE name should NOT be in inputs");
+        assert!(assets.internal.contains("recent"), "CTE name should be in internal");
     }
 
     // Edge case: Qualified table names use the last component.
@@ -338,5 +386,152 @@ mod tests {
             }
             Err(_) => {} // Also acceptable — treated as opaque
         }
+    }
+
+    // AC-03: Nested CTEs — both captured in internal.
+    #[test]
+    fn test_ac03_nested_ctes_in_internal() {
+        let sql = "WITH a AS (SELECT * FROM raw_data), b AS (SELECT * FROM a) SELECT * FROM b;";
+        let assets = extract_assets(sql).unwrap();
+        assert!(assets.internal.contains("a"), "CTE 'a' should be in internal");
+        assert!(assets.internal.contains("b"), "CTE 'b' should be in internal");
+        assert!(assets.inputs.contains("raw_data"), "real table should be in inputs");
+        assert!(!assets.inputs.contains("a"), "CTE 'a' should NOT be in inputs");
+        assert!(!assets.inputs.contains("b"), "CTE 'b' should NOT be in inputs");
+    }
+
+    // AC-04: CTE name shadowing a real table — CTE goes to internal, real table stays in inputs.
+    #[test]
+    fn test_ac04_cte_shadows_real_table() {
+        let sql = "WITH customers AS (SELECT * FROM raw_customers) SELECT * FROM customers;";
+        let assets = extract_assets(sql).unwrap();
+        assert!(assets.internal.contains("customers"), "CTE 'customers' should be in internal");
+        assert!(assets.inputs.contains("raw_customers"), "real table should be in inputs");
+        assert!(!assets.inputs.contains("customers"), "CTE 'customers' should NOT be in inputs");
+    }
+
+    // AC-05: DROP TABLE populates destroys.
+    #[test]
+    fn test_ac05_drop_table_destroys() {
+        let sql = "DROP TABLE foo;";
+        let assets = extract_assets(sql).unwrap();
+        assert!(assets.destroys.contains("foo"), "dropped table should be in destroys");
+        assert!(assets.outputs.is_empty(), "drop should not add to outputs");
+        assert!(assets.inputs.is_empty(), "drop should not add to inputs");
+    }
+
+    // AC-05: DROP VIEW also populates destroys.
+    #[test]
+    fn test_ac05_drop_view_destroys() {
+        let sql = "DROP VIEW IF EXISTS my_view;";
+        let assets = extract_assets(sql).unwrap();
+        assert!(assets.destroys.contains("my_view"), "dropped view should be in destroys");
+    }
+
+    // AC-06: DROP + CREATE in same file — both destroys and outputs populated.
+    #[test]
+    fn test_ac06_drop_then_create() {
+        let sql = "DROP TABLE IF EXISTS foo; CREATE TABLE foo AS SELECT * FROM bar;";
+        let assets = extract_assets(sql).unwrap();
+        assert!(assets.destroys.contains("foo"), "dropped table should be in destroys");
+        assert!(assets.outputs.contains("foo"), "created table should be in outputs");
+        assert!(assets.inputs.contains("bar"), "source table should be in inputs");
+    }
+
+    // AC-07: ALTER TABLE populates outputs only.
+    #[test]
+    fn test_ac07_alter_table_outputs_only() {
+        let sql = "ALTER TABLE customers ADD COLUMN email TEXT;";
+        let assets = extract_assets(sql).unwrap();
+        assert!(assets.outputs.contains("customers"), "altered table should be in outputs");
+        assert!(assets.inputs.is_empty(), "alter should not add to inputs");
+    }
+
+    // AC-08: MERGE INTO — target in outputs, source in inputs.
+    #[test]
+    fn test_ac08_merge_into() {
+        let sql = "MERGE INTO target USING source ON target.id = source.id WHEN MATCHED THEN UPDATE SET target.name = source.name;";
+        let assets = extract_assets(sql).unwrap();
+        assert!(assets.outputs.contains("target"), "merge target should be in outputs");
+        assert!(assets.inputs.contains("source"), "merge source should be in inputs");
+    }
+
+    // AC-09: CREATE OR REPLACE TABLE is handled as output.
+    #[test]
+    fn test_ac09_create_or_replace() {
+        let sql = "CREATE OR REPLACE TABLE foo AS SELECT * FROM bar;";
+        let assets = extract_assets(sql).unwrap();
+        assert!(assets.outputs.contains("foo"), "replaced table should be in outputs");
+        assert!(assets.inputs.contains("bar"), "source table should be in inputs");
+    }
+
+    // AC-14: PIVOT source table is extracted as input.
+    #[test]
+    fn test_ac14_pivot_source_table() {
+        // sqlparser-rs 0.55 supports PIVOT syntax
+        let sql = "SELECT * FROM monthly_sales PIVOT (SUM(amount) FOR month IN ('Jan', 'Feb', 'Mar'));";
+        let result = extract_assets(sql);
+        match result {
+            Ok(assets) => {
+                assert!(assets.inputs.contains("monthly_sales"), "pivot source should be in inputs");
+            }
+            Err(_) => {
+                // If sqlparser doesn't support this syntax, graceful degradation is acceptable
+            }
+        }
+    }
+
+    // AC-14: UNPIVOT source table is extracted as input.
+    #[test]
+    fn test_ac14_unpivot_source_table() {
+        let sql = "SELECT * FROM quarterly_report UNPIVOT (value FOR quarter IN (q1, q2, q3, q4));";
+        let result = extract_assets(sql);
+        match result {
+            Ok(assets) => {
+                assert!(assets.inputs.contains("quarterly_report"), "unpivot source should be in inputs");
+            }
+            Err(_) => {
+                // If sqlparser doesn't support this syntax, graceful degradation is acceptable
+            }
+        }
+    }
+
+    // Edge case: Recursive CTE — self-reference within CTE body.
+    #[test]
+    fn test_recursive_cte() {
+        let sql = "WITH RECURSIVE tree AS (SELECT id, parent_id FROM nodes WHERE parent_id IS NULL UNION ALL SELECT n.id, n.parent_id FROM nodes n JOIN tree t ON n.parent_id = t.id) SELECT * FROM tree;";
+        let assets = extract_assets(sql).unwrap();
+        assert!(assets.internal.contains("tree"), "recursive CTE should be in internal");
+        assert!(assets.inputs.contains("nodes"), "real table should be in inputs");
+        assert!(!assets.inputs.contains("tree"), "CTE should NOT be in inputs");
+    }
+
+    // Edge case: CTE with subquery — inner subquery tables discovered.
+    #[test]
+    fn test_cte_with_subquery() {
+        let sql = "WITH a AS (SELECT * FROM (SELECT * FROM raw) sub) SELECT * FROM a;";
+        let assets = extract_assets(sql).unwrap();
+        assert!(assets.internal.contains("a"), "CTE should be in internal");
+        assert!(assets.inputs.contains("raw"), "subquery source should be in inputs");
+        assert!(!assets.inputs.contains("a"), "CTE should NOT be in inputs");
+    }
+
+    // Edge case: ALTER VIEW — modifies view (output), reads from tables (inputs).
+    #[test]
+    fn test_alter_view_outputs_and_inputs() {
+        let sql = "ALTER VIEW active_customers AS SELECT * FROM customers WHERE active = true;";
+        let assets = extract_assets(sql).unwrap();
+        assert!(assets.outputs.contains("active_customers"), "altered view should be in outputs");
+        assert!(assets.inputs.contains("customers"), "source table should be in inputs");
+    }
+
+    // Edge case: DROP multiple tables in one statement.
+    #[test]
+    fn test_drop_multiple_tables() {
+        let sql = "DROP TABLE foo, bar, baz;";
+        let assets = extract_assets(sql).unwrap();
+        assert!(assets.destroys.contains("foo"));
+        assert!(assets.destroys.contains("bar"));
+        assert!(assets.destroys.contains("baz"));
     }
 }

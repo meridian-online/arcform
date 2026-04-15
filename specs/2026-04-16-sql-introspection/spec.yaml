@@ -1,0 +1,120 @@
+goal: "Harden SQL introspection: fix CTE false dependencies, add DROP/ALTER/MERGE/DuckDB syntax support, enrich SqlAssets with internal and destroys fields"
+
+constraints:
+  - "SqlAssets grows from 2 to 4 fields: outputs, inputs, internal, destroys"
+  - "CTE names must appear in `internal`, never in `inputs` — filtered at the introspect layer"
+  - "Existing test coverage is preserved — tests are updated for the new four-field SqlAssets and StepAssets shapes, and all updated tests pass"
+  - "AssetGraph::build must filter `internal` assets from cross-step dependency validation"
+  - "StepAssets in asset.rs must expose internal and destroys for downstream lineage (card 0013)"
+  - "Schema-qualified name handling is explicitly deferred — current behavior (last component only) is preserved"
+  - "Destructive ordering validation is deferred — `destroys` is captured for lineage but does not participate in `validate_order` in this drive"
+
+acceptance_criteria:
+  - id: ac-01
+    ac_type: code
+    description: "SqlAssets has four fields: outputs, inputs, internal, destroys (all BTreeSet<String>)"
+    verification: "Struct definition compiles; existing tests updated to use new fields"
+
+  - id: ac-02
+    ac_type: code
+    description: "CTE names are captured in the `internal` set and removed from `inputs`"
+    verification: "Test: WITH recent AS (SELECT * FROM orders) SELECT * FROM recent → internal contains 'recent', inputs contains 'orders' but NOT 'recent'"
+
+  - id: ac-03
+    ac_type: code
+    description: "Nested CTEs (CTE referencing another CTE) are both captured in `internal`"
+    verification: "Test: WITH a AS (...), b AS (SELECT * FROM a) SELECT * FROM b → internal contains both 'a' and 'b'"
+
+  - id: ac-04
+    ac_type: code
+    description: "CTE name shadowing a real table: CTE name goes to `internal`, real table stays in `inputs`"
+    verification: "Test: WITH customers AS (SELECT * FROM raw_customers) SELECT * FROM customers → internal contains 'customers', inputs contains 'raw_customers' but NOT 'customers'"
+
+  - id: ac-05
+    ac_type: code
+    description: "DROP TABLE/VIEW populates the `destroys` set"
+    verification: "Test: DROP TABLE foo → destroys contains 'foo', outputs/inputs empty"
+
+  - id: ac-06
+    ac_type: code
+    description: "DROP + CREATE in the same file: both destroys and outputs are populated"
+    verification: "Test: DROP TABLE IF EXISTS foo; CREATE TABLE foo AS SELECT * FROM bar → destroys contains 'foo', outputs contains 'foo', inputs contains 'bar'"
+
+  - id: ac-07
+    ac_type: code
+    description: "ALTER TABLE populates `outputs` only — it modifies the asset but does not read data from it"
+    verification: "Test: ALTER TABLE customers ADD COLUMN email TEXT → outputs contains 'customers', inputs is empty"
+
+  - id: ac-08
+    ac_type: code
+    description: "MERGE INTO is handled — target in outputs, source table(s) in inputs"
+    verification: "Test: MERGE INTO target USING source ON ... → outputs contains 'target', inputs contains 'source'"
+
+  - id: ac-09
+    ac_type: code
+    description: "CREATE OR REPLACE TABLE/VIEW is handled as an output (same as CREATE)"
+    verification: "Test: CREATE OR REPLACE TABLE foo AS SELECT * FROM bar → outputs contains 'foo', inputs contains 'bar'"
+
+  - id: ac-10
+    ac_type: code
+    description: "StepAssets in asset.rs gains `internal` and `destroys` fields, populated from SqlAssets"
+    verification: "Test in asset.rs: SQL step with CTE → step's internal set contains the CTE name. SQL step with DROP TABLE → step's destroys set contains the table name."
+
+  - id: ac-11
+    ac_type: code
+    description: "AssetGraph::validate_order ignores `internal` assets — CTE names don't cause false dependency violations"
+    verification: "Unit test in asset.rs: step-A creates table `recent`, step-B's SQL uses WITH recent AS (...) SELECT * FROM recent, validate_order succeeds (no false violation on `recent`)"
+
+  - id: ac-12
+    ac_type: code
+    description: "All existing introspect.rs tests pass with the new SqlAssets shape (tests updated for four-field struct)"
+    verification: "cargo test -- introspect passes; test_cte_inputs updated to assert CTE name in internal, not inputs"
+
+  - id: ac-13
+    ac_type: code
+    description: "All existing asset.rs and runner.rs tests pass with the new StepAssets shape"
+    verification: "cargo test -- asset and cargo test -- runner both pass"
+
+  - id: ac-14
+    ac_type: code
+    description: "PIVOT/UNPIVOT in FROM clause: source table is extracted as an input"
+    verification: "Test: SELECT * FROM orders PIVOT (...) → inputs contains 'orders'. If sqlparser-rs does not support the syntax, test that it degrades gracefully (opaque step with warning)."
+
+ontology_schema:
+  name: "SqlAssets"
+  description: "Assets discovered from parsing a SQL file — four-set model"
+  fields:
+    - name: "outputs"
+      type: "BTreeSet<String>"
+      description: "Tables/views this SQL creates, writes to, or modifies (ALTER)"
+    - name: "inputs"
+      type: "BTreeSet<String>"
+      description: "External tables this SQL reads data from (CTEs excluded)"
+    - name: "internal"
+      type: "BTreeSet<String>"
+      description: "CTE names — step-internal assets visible in lineage but not cross-step dependencies"
+    - name: "destroys"
+      type: "BTreeSet<String>"
+      description: "Tables/views this SQL drops — destructive operations tracked separately"
+
+evaluation_principles:
+  - principle: "Correctness — CTE names never leak into cross-step dependency validation"
+    weight: 0.4
+  - principle: "Backwards compatibility — existing test coverage preserved, tests updated for new shapes"
+    weight: 0.3
+  - principle: "Coverage — new SQL patterns have tests that verify both positive and edge cases"
+    weight: 0.2
+  - principle: "Graceful degradation — unsupported syntax warns, doesn't block"
+    weight: 0.1
+
+exit_conditions:
+  - "All 14 ACs verified by tests"
+  - "cargo test passes with zero failures"
+  - "CTE test explicitly asserts: internal contains CTE name, inputs does NOT"
+
+metadata:
+  version: "2.0"
+  timestamp: "2026-04-16T11:00:00Z"
+  ambiguity_score: 0.08
+  interview_ref: "specs/2026-04-16-sql-introspection/interview.md"
+  review_ref: "specs/2026-04-16-sql-introspection/review-spec-2026-04-16.md"

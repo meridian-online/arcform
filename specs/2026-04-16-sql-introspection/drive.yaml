@@ -1,0 +1,8 @@
+card: cards/0009-sql-introspection.yaml
+autonomy: guided
+budget: 3
+iteration: 1
+current_spec: specs/2026-04-16-sql-introspection
+status: review
+history: []
+started: 2026-04-16T10:00:00Z
