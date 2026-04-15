@@ -28,9 +28,10 @@ scenarios:
     then: "CTEs are recognised as internal definitions, not external dependencies"
     source_lines: "decisions/0007: CTE definitions"
 
-goal: "v0.2/v0.3 — zero-boilerplate SQL dependency tracking"
-maturity: "planned"
-specs: []
+goal: "v0.3 — four-set asset model (outputs, inputs, internal, destroys) with CTE filtering, DROP/ALTER/MERGE/PIVOT support"
+maturity: "emerging"
+specs:
+  - specs/2026-04-16-sql-introspection/spec.yaml
 references:
   - "decisions/0007-sql-introspection-core-feature.md"
   - "decisions/0002-rust-implementation.md"
