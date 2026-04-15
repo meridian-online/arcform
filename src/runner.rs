@@ -91,6 +91,7 @@ mod tests {
         }
     }
 
+    // AC-8: Empty steps list exits successfully.
     #[test]
     fn test_run_empty_steps() {
         let dir = tempfile::tempdir().unwrap();
@@ -101,6 +102,7 @@ mod tests {
         assert!(engine.calls.borrow().is_empty());
     }
 
+    // AC-3: Steps execute in declared order against shared database.
     #[test]
     fn test_run_sql_steps_in_order() {
         let dir = tempfile::tempdir().unwrap();
@@ -140,6 +142,7 @@ mod tests {
         );
     }
 
+    // AC-9: Command steps execute via sh -c, preflight skipped for command-only.
     #[test]
     fn test_run_command_step() {
         let dir = tempfile::tempdir().unwrap();
@@ -156,9 +159,9 @@ mod tests {
         assert!(matches!(&calls[0], MockCall::Command { command } if command == "echo hello"));
     }
 
+    // AC-4: Halt on failure — steps after a failed step do not execute.
     #[test]
     fn test_run_halts_on_step2_failure_step3_skipped() {
-        // AC-4: step 1 succeeds, step 2 fails, step 3 never executes.
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n  - name: s2\n    sql: models/s2.sql\n  - name: s3\n    sql: models/s3.sql\n";
         setup_project(
@@ -190,6 +193,7 @@ mod tests {
         assert_eq!(exec_calls.len(), 2, "expected 2 execution calls (s1 + s2), got {}", exec_calls.len());
     }
 
+    // AC-5: Missing SQL file produces a specific error.
     #[test]
     fn test_run_missing_sql_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -201,6 +205,7 @@ mod tests {
         assert!(err.to_string().contains("sql file not found"));
     }
 
+    // AC-7: SQL files passed to engine byte-identical.
     #[test]
     fn test_sql_content_passed_unmodified() {
         let dir = tempfile::tempdir().unwrap();
@@ -217,5 +222,61 @@ mod tests {
             _ => panic!("expected Sql call"),
         };
         assert_eq!(sql_content, original_sql);
+    }
+
+    // AC-6: Preflight failure blocks execution — no steps run.
+    #[test]
+    fn test_ac06_preflight_failure_blocks_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+
+        let engine = MockEngine::new();
+        engine.set_preflight_failure();
+
+        let err = run(dir.path(), &engine).unwrap_err();
+        assert!(
+            err.to_string().contains("not found"),
+            "should report engine not found: {err}"
+        );
+
+        // Only preflight was called — no execution calls.
+        let calls = engine.calls.borrow();
+        assert_eq!(calls.len(), 1, "only preflight should be called");
+        assert!(matches!(calls[0], MockCall::Preflight));
+    }
+
+    // AC-9: Failing command step exits non-zero and halts pipeline.
+    #[test]
+    fn test_ac09_command_step_failure_halts_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: fetch\n    command: curl http://example.com\n  - name: transform\n    command: echo done\n";
+        setup_project(dir.path(), yaml, &[]);
+
+        let engine = MockEngine::new();
+        // Fail on the first command execution.
+        engine.set_fail_on_call(0, 1, "connection refused");
+
+        let result = run(dir.path(), &engine);
+        assert!(result.is_err());
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("fetch"),
+            "error should name step 'fetch': {err_msg}"
+        );
+
+        // Only 1 command call — second step never ran.
+        let calls = engine.calls.borrow();
+        let exec_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| !matches!(c, MockCall::Preflight))
+            .collect();
+        assert_eq!(
+            exec_calls.len(),
+            1,
+            "only first command should run, got {}",
+            exec_calls.len()
+        );
     }
 }

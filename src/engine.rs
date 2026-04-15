@@ -144,6 +144,8 @@ pub mod mock {
         pub fail_on_call: RefCell<Option<usize>>,
         /// Tracks the current execution call index (excludes preflight).
         exec_count: RefCell<usize>,
+        /// If true, preflight returns EngineNotFound.
+        pub preflight_should_fail: RefCell<bool>,
     }
 
     #[derive(Debug, Clone)]
@@ -165,12 +167,18 @@ pub mod mock {
                 should_fail: RefCell::new(None),
                 fail_on_call: RefCell::new(None),
                 exec_count: RefCell::new(0),
+                preflight_should_fail: RefCell::new(false),
             }
         }
 
         /// Fail on every execution call.
         pub fn set_failure(&self, code: i32, stderr: &str) {
             *self.should_fail.borrow_mut() = Some((code, stderr.to_string()));
+        }
+
+        /// Make preflight return EngineNotFound.
+        pub fn set_preflight_failure(&self) {
+            *self.preflight_should_fail.borrow_mut() = true;
         }
 
         /// Fail only on the Nth execution call (0-indexed, excludes preflight).
@@ -241,6 +249,11 @@ pub mod mock {
 
         fn preflight(&self) -> Result<()> {
             self.calls.borrow_mut().push(MockCall::Preflight);
+            if *self.preflight_should_fail.borrow() {
+                return Err(Error::EngineNotFound {
+                    engine: "duckdb".to_string(),
+                });
+            }
             Ok(())
         }
     }

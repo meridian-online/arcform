@@ -24,12 +24,14 @@ constraints:
 
 acceptance_criteria:
   - id: ac-1
+    ac_type: code
     description: >
       `arc init` creates a project directory with: arcform.yaml (valid manifest
       with name, engine, and db fields), models/ directory, and sources/ directory.
     verification: "Run `arc init my-project && ls my-project/` — expect arcform.yaml, models/, sources/"
 
   - id: ac-2
+    ac_type: code
     description: >
       `arc init` generates a valid arcform.yaml with project name derived from
       the argument, engine defaulting to 'duckdb', db defaulting to '<name>.duckdb',
@@ -39,6 +41,7 @@ acceptance_criteria:
       db is '<name>.duckdb', steps is empty list. `arc init ""` fails.
 
   - id: ac-3
+    ac_type: code
     description: >
       `arc run` parses arcform.yaml, reads the steps list, and executes each
       step's SQL file against the DuckDB CLI in declared order. All steps share
@@ -51,6 +54,7 @@ acceptance_criteria:
       via CLI output that step names appear in declaration order.
 
   - id: ac-4
+    ac_type: code
     description: >
       `arc run` exits with a non-zero code and clear error message when a SQL
       step fails (e.g., syntax error, missing table reference). Steps after the
@@ -61,6 +65,7 @@ acceptance_criteria:
       (its table does not exist in the database).
 
   - id: ac-5
+    ac_type: code
     description: >
       `arc run` exits with a clear error when: (a) arcform.yaml is missing
       (run from a directory without one), (b) arcform.yaml is malformed YAML,
@@ -72,6 +77,7 @@ acceptance_criteria:
       test manifests and verify specific error messages.
 
   - id: ac-6
+    ac_type: code
     description: >
       `arc run` verifies that the declared engine CLI (duckdb) is available
       and executable before running any steps, by invoking `duckdb --version`
@@ -81,6 +87,7 @@ acceptance_criteria:
       before any SQL runs. Verify no database file is created.
 
   - id: ac-7
+    ac_type: code
     description: >
       SQL files are passed to the DuckDB CLI unmodified — arc does not template,
       transform, or inject anything into the SQL content.
@@ -90,6 +97,7 @@ acceptance_criteria:
       byte-identical to the source SQL file.
 
   - id: ac-8
+    ac_type: code
     description: >
       `arc run` on a project with an empty steps list (`steps: []`) exits
       successfully (code 0) with a message indicating no steps were defined.
@@ -98,6 +106,7 @@ acceptance_criteria:
       "no steps" or equivalent message.
 
   - id: ac-9
+    ac_type: code
     description: >
       A step with `command:` instead of `sql:` executes the raw command string
       via shell (`sh -c "<command>"`). The command's exit code determines
@@ -109,6 +118,7 @@ acceptance_criteria:
       (`command: exit 1`). `arc run` exits non-zero.
 
   - id: ac-10
+    ac_type: code
     description: >
       A step with both `sql:` and `command:` (or neither) is rejected during
       manifest validation with a clear error message before any steps execute.

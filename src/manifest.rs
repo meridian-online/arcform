@@ -143,6 +143,7 @@ mod tests {
     use super::*;
     use std::fs;
 
+    // AC-2: Manifest::new_project generates correct defaults.
     #[test]
     fn test_new_project_defaults() {
         let m = Manifest::new_project("test-pipeline");
@@ -152,6 +153,7 @@ mod tests {
         assert!(m.steps.is_empty());
     }
 
+    // AC-3: Database path defaults to <name>.duckdb.
     #[test]
     fn test_db_path_default() {
         let m = Manifest {
@@ -164,6 +166,7 @@ mod tests {
         assert_eq!(path, PathBuf::from("/tmp/project/my-proj.duckdb"));
     }
 
+    // AC-3: Explicit db field overrides the default path.
     #[test]
     fn test_db_path_explicit() {
         let m = Manifest {
@@ -176,6 +179,7 @@ mod tests {
         assert_eq!(path, PathBuf::from("/tmp/project/custom.duckdb"));
     }
 
+    // AC-10: Duplicate step names are rejected during validation.
     #[test]
     fn test_validate_duplicate_step_names() {
         let m = Manifest {
@@ -199,6 +203,7 @@ mod tests {
         assert!(err.to_string().contains("duplicate step name"));
     }
 
+    // AC-10: Step with both sql and command is rejected.
     #[test]
     fn test_validate_step_both_fields() {
         let m = Manifest {
@@ -215,6 +220,7 @@ mod tests {
         assert!(err.to_string().contains("not both"));
     }
 
+    // AC-10: Step with neither sql nor command is rejected.
     #[test]
     fn test_validate_step_neither_field() {
         let m = Manifest {
@@ -231,6 +237,7 @@ mod tests {
         assert!(err.to_string().contains("must have either"));
     }
 
+    // AC-5: Missing arcform.yaml produces a clear error.
     #[test]
     fn test_load_missing_manifest() {
         let dir = tempfile::tempdir().unwrap();
@@ -238,6 +245,7 @@ mod tests {
         assert!(err.to_string().contains("not found"));
     }
 
+    // AC-3: Valid manifest loads and parses correctly.
     #[test]
     fn test_load_valid_manifest() {
         let dir = tempfile::tempdir().unwrap();
@@ -248,6 +256,7 @@ mod tests {
         assert_eq!(m.steps.len(), 1);
     }
 
+    // AC-5: Malformed YAML produces a parse error.
     #[test]
     fn test_load_malformed_yaml() {
         let dir = tempfile::tempdir().unwrap();
@@ -256,6 +265,7 @@ mod tests {
         assert!(err.to_string().contains("parse"));
     }
 
+    // AC-6: has_sql_steps gates whether preflight is called.
     #[test]
     fn test_has_sql_steps() {
         let m = Manifest {
@@ -271,9 +281,9 @@ mod tests {
         assert!(!m.has_sql_steps());
     }
 
+    // AC-3: Steps maintain declaration order (Vec, not HashMap).
     #[test]
     fn test_sequential_order_preserved() {
-        // Verify that steps maintain declaration order (Vec, not HashMap).
         let m = Manifest {
             name: "test".to_string(),
             engine: "duckdb".to_string(),
