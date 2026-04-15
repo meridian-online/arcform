@@ -1,0 +1,30 @@
+feature: "Project scaffolding"
+as_a: "data analyst starting a new pipeline"
+i_want: "run `arc init` and get a valid project structure with manifest and directories"
+so_that: "I can start writing SQL steps immediately without manual setup"
+
+scenarios:
+  - name: "Init creates project structure"
+    given: "I'm in an empty directory"
+    when: "I run `arc init my-project`"
+    then: "a directory is created with arcform.yaml, models/, and sources/"
+    source_lines: "spec.yaml: arc init creates a project directory with: arcform.yaml, models/ directory, and sources/ directory"
+
+  - name: "Manifest defaults"
+    given: "a freshly initialised project"
+    when: "I inspect the generated arcform.yaml"
+    then: "name matches the argument, engine defaults to 'duckdb', db defaults to '<name>.duckdb', steps is an empty list"
+    source_lines: "spec.yaml: engine defaulting to 'duckdb', db defaulting to '<name>.duckdb', and steps as an empty list"
+
+  - name: "Empty name rejected"
+    given: "I attempt to init with an empty name"
+    when: "I run `arc init \"\"`"
+    then: "arc exits with an error rejecting the empty project name"
+    source_lines: "spec.yaml: Empty project names are rejected"
+
+goal: "v0.1 — project scaffolding working"
+maturity: "established"
+specs:
+  - "specs/2026-03-30-foundational-decisions/spec.yaml"
+references:
+  - "decisions/0010-v01-scope-step-execution-foundation.md"

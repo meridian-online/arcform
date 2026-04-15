@@ -1,0 +1,37 @@
+feature: "Step execution"
+as_a: "data analyst"
+i_want: "define a sequence of SQL and shell steps in a YAML manifest and have them execute in order against my database"
+so_that: "I can orchestrate multi-stage analytical workflows with a single command"
+
+scenarios:
+  - name: "Sequential SQL execution"
+    given: "a manifest with three SQL steps"
+    when: "I run `arc run`"
+    then: "each step executes in declared order against the shared database file"
+    source_lines: "spec.yaml: arc run parses arcform.yaml, reads the steps list, and executes each step's SQL file against the DuckDB CLI in declared order"
+
+  - name: "Halt on failure"
+    given: "a manifest where step 2 contains invalid SQL"
+    when: "step 2 fails"
+    then: "execution halts immediately, step 3 does not run, and arc exits non-zero with the engine's error visible"
+    source_lines: "spec.yaml: arc run exits with a non-zero code and clear error message when a SQL step fails. Steps after the failure do not execute."
+
+  - name: "Empty pipeline"
+    given: "a manifest with an empty steps list"
+    when: "I run `arc run`"
+    then: "arc exits successfully with a message indicating no steps were defined"
+    source_lines: "spec.yaml: arc run on a project with an empty steps list exits successfully (code 0) with a message indicating no steps were defined"
+
+  - name: "Shared database state"
+    given: "multiple SQL steps writing to the same database"
+    when: "the pipeline completes"
+    then: "all steps see each other's writes because they share the same database file"
+    source_lines: "spec.yaml: All steps share the same database file (specified by the db field)"
+
+goal: "v0.1 — all 10 ACs passing"
+maturity: "established"
+specs:
+  - "specs/2026-03-30-foundational-decisions/spec.yaml"
+references:
+  - "decisions/0010-v01-scope-step-execution-foundation.md"
+  - "decisions/0001-asset-centric-pipeline-engine.md"

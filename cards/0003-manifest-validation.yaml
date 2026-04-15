@@ -1,0 +1,36 @@
+feature: "Manifest validation"
+as_a: "data analyst"
+i_want: "get clear, specific error messages when my manifest is invalid"
+so_that: "I can fix problems before any steps attempt to run"
+
+scenarios:
+  - name: "Missing manifest"
+    given: "I'm in a directory without arcform.yaml"
+    when: "I run `arc run`"
+    then: "arc exits with 'arcform.yaml not found in current directory'"
+    source_lines: "spec.yaml: run arc run from /tmp — expect 'arcform.yaml not found in current directory'"
+
+  - name: "Malformed YAML"
+    given: "arcform.yaml contains invalid YAML syntax"
+    when: "I run `arc run`"
+    then: "arc exits with a parse error before any steps run"
+    source_lines: "spec.yaml: arcform.yaml is malformed YAML"
+
+  - name: "Missing SQL file"
+    given: "a step references a SQL file that doesn't exist"
+    when: "I run `arc run`"
+    then: "arc exits with a specific error naming the missing file"
+    source_lines: "spec.yaml: a step references a SQL file that doesn't exist. Each case produces a specific, distinct error message."
+
+  - name: "Step type conflict"
+    given: "a step has both `sql:` and `command:` fields, or neither"
+    when: "I run `arc run`"
+    then: "arc rejects the manifest with a validation error naming the offending step"
+    source_lines: "spec.yaml: A step with both sql: and command: (or neither) is rejected during manifest validation with a clear error message before any steps execute."
+
+goal: "v0.1 — all error cases handled"
+maturity: "established"
+specs:
+  - "specs/2026-03-30-foundational-decisions/spec.yaml"
+references:
+  - "decisions/0009-hybrid-engine-invocation.md"

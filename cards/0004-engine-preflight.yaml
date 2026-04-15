@@ -1,0 +1,31 @@
+feature: "Engine preflight"
+as_a: "data analyst"
+i_want: "arc to verify the engine CLI is available before running any steps"
+so_that: "I get a clear error upfront instead of a cryptic failure mid-pipeline"
+
+scenarios:
+  - name: "Engine available"
+    given: "duckdb is on PATH"
+    when: "I run `arc run` on a valid pipeline"
+    then: "preflight passes silently and steps execute"
+    source_lines: "spec.yaml: verifies that the declared engine CLI (duckdb) is available and executable before running any steps, by invoking duckdb --version"
+
+  - name: "Engine missing"
+    given: "duckdb is not on PATH"
+    when: "I run `arc run`"
+    then: "arc fails with a clear error before any SQL runs, and no database file is created"
+    source_lines: "spec.yaml: Set PATH to exclude duckdb. arc run fails with a clear error message before any SQL runs. Verify no database file is created."
+
+  - name: "Preflight skipped for command-only"
+    given: "a manifest with only command: steps (no sql: steps)"
+    when: "I run `arc run`"
+    then: "engine preflight is skipped since no SQL engine is needed"
+    source_lines: "spec.yaml: Engine preflight check is skipped for command steps if no sql steps exist in the manifest."
+
+goal: "v0.1 — preflight working"
+maturity: "established"
+specs:
+  - "specs/2026-03-30-foundational-decisions/spec.yaml"
+references:
+  - "decisions/0003-delegate-execution-to-engine-cli.md"
+  - "decisions/0006-local-first-remote-compatible.md"

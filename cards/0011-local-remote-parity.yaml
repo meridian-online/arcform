@@ -1,0 +1,30 @@
+feature: "Local-remote parity"
+as_a: "data analyst deploying pipelines to production"
+i_want: "the same manifest to run identically on my laptop and in a remote environment"
+so_that: "I can develop locally with confidence it works in production"
+
+scenarios:
+  - name: "Same manifest, different environments"
+    given: "a pipeline tested locally against DuckDB"
+    when: "the same arcform.yaml runs in a remote environment"
+    then: "the pipeline produces the same results"
+    source_lines: "decisions/0006: what runs locally also works remotely"
+
+  - name: "Version assertion preflight"
+    given: "a manifest that declares engine version requirements"
+    when: "the remote engine version differs from local"
+    then: "arc catches the mismatch before execution begins"
+    source_lines: "decisions/0006: Preflight version assertions (verify engine version matches before execution)"
+
+  - name: "No local-only features"
+    given: "any feature available in local development"
+    when: "the pipeline is deployed remotely"
+    then: "all manifest features are portable — nothing is local-only"
+    source_lines: "decisions/0006: No local-only features — everything in the manifest is portable"
+
+goal: "future — version assertion mechanism"
+maturity: "planned"
+specs: []
+references:
+  - "decisions/0006-local-first-remote-compatible.md"
+  - "decisions/0003-delegate-execution-to-engine-cli.md"

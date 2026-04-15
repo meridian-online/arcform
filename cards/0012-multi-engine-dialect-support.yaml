@@ -1,0 +1,25 @@
+feature: "Multi-engine dialect support"
+as_a: "data analyst targeting different SQL engines"
+i_want: "arc to support multiple SQL engines so I can use the right engine for each workload"
+so_that: "I'm not locked into DuckDB when my production environment uses Postgres or BigQuery"
+
+scenarios:
+  - name: "Engine-agnostic execution"
+    given: "a manifest targeting a non-DuckDB engine"
+    when: "arc delegates execution to that engine's CLI"
+    then: "the pipeline runs without any arc code changes"
+    source_lines: "decisions/0003: ArcForm is engine-agnostic — the same manifest can target DuckDB locally and Postgres/BigQuery in production"
+
+  - name: "Dialect-aware introspection"
+    given: "a SQL step using Postgres-specific syntax"
+    when: "arc parses the SQL for dependency inference"
+    then: "sqlparser-rs handles the dialect correctly"
+    source_lines: "decisions/0002: direct access to sqlparser-rs (DataFusion's SQL parser) is essential for SQL introspection"
+
+goal: "future — multi-engine support"
+maturity: "planned"
+specs: []
+references:
+  - "decisions/0003-delegate-execution-to-engine-cli.md"
+  - "decisions/0005-duckdb-as-default-engine.md"
+  - "decisions/0002-rust-implementation.md"

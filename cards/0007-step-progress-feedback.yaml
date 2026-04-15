@@ -1,0 +1,32 @@
+feature: "Step progress feedback"
+as_a: "analyst running arcform"
+i_want: "see which step is running and its output as it happens, and know whether steps succeeded or failed without waiting for the end"
+so_that: "I trust the workflow is progressing and can iterate rapidly when something breaks"
+
+scenarios:
+  - name: "Step announces itself"
+    given: "an arcfile with multiple steps"
+    when: "a step begins execution"
+    then: "the step name appears immediately with a running indicator"
+
+  - name: "Live output during execution"
+    given: "a step is running"
+    when: "the step produces stdout or stderr"
+    then: "the step name, a progress bar if available, and a short tail of output are visible"
+
+  - name: "Step completion status"
+    given: "a step finishes execution"
+    when: "the step exits"
+    then: "the running indicator is replaced with a success or failure status and duration"
+
+  - name: "Critical step failure"
+    given: "a step on the critical path fails"
+    when: "the step exits with an error"
+    then: "stderr is shown and dependent steps are skipped"
+
+  - name: "Non-critical step failure"
+    given: "a step not on the critical path fails"
+    when: "the step exits with an error"
+    then: "the failure is noted in the summary, dependent steps are skipped, but independent paths continue"
+
+priority: "now"
