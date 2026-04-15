@@ -2,11 +2,12 @@ use std::path::Path;
 
 use owo_colors::OwoColorize;
 
+use crate::asset::AssetGraph;
 use crate::engine::Engine;
 use crate::error::{Error, Result};
 use crate::manifest::Manifest;
 
-/// Run a pipeline: load manifest, preflight, execute steps sequentially.
+/// Run a pipeline: load manifest, preflight, validate assets, execute steps sequentially.
 pub fn run(dir: &Path, engine: &dyn Engine) -> Result<()> {
     let manifest = Manifest::load(dir)?;
 
@@ -18,6 +19,20 @@ pub fn run(dir: &Path, engine: &dyn Engine) -> Result<()> {
     if manifest.steps.is_empty() {
         println!("{}", "No steps defined.".dimmed());
         return Ok(());
+    }
+
+    // Build the asset graph and validate dependency ordering.
+    let asset_graph = AssetGraph::build(&manifest, dir);
+
+    // Print any warnings from asset discovery (e.g. unparseable SQL).
+    for warning in &asset_graph.warnings {
+        eprintln!("{} {}", "warning:".yellow(), warning);
+    }
+
+    // If the graph has assets, validate step ordering against dependencies.
+    if asset_graph.has_assets() {
+        let step_order: Vec<String> = manifest.steps.iter().map(|s| s.name.clone()).collect();
+        asset_graph.validate_order(&step_order)?;
     }
 
     let db_path = manifest.db_path(dir);
@@ -278,5 +293,112 @@ mod tests {
             "only first command should run, got {}",
             exec_calls.len()
         );
+    }
+
+    // v0.2 AC-06: `arc run` halts with dependency order violation before executing.
+    #[test]
+    fn test_v02_ac06_dependency_order_blocks_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: summary\n    sql: models/summary.sql\n  - name: load\n    sql: models/load.sql\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[
+                (
+                    "models/summary.sql",
+                    "CREATE TABLE summary AS SELECT count(*) FROM customers;",
+                ),
+                ("models/load.sql", "CREATE TABLE customers (id INT);"),
+            ],
+        );
+
+        let engine = MockEngine::new();
+        let result = run(dir.path(), &engine);
+        assert!(result.is_err());
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("summary"),
+            "error should name reader 'summary': {err_msg}"
+        );
+        assert!(
+            err_msg.contains("customers"),
+            "error should name asset 'customers': {err_msg}"
+        );
+        assert!(
+            err_msg.contains("load"),
+            "error should name producer 'load': {err_msg}"
+        );
+
+        // No steps should have executed — validation happens before execution.
+        let calls = engine.calls.borrow();
+        let exec_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| !matches!(c, MockCall::Preflight))
+            .collect();
+        assert_eq!(
+            exec_calls.len(),
+            0,
+            "no steps should execute after dependency validation failure"
+        );
+    }
+
+    // v0.2 AC-08: v0.1-style manifest (no assets) runs identically.
+    #[test]
+    fn test_v02_ac08_v1_manifest_runs_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        // Command-only pipeline — no SQL, no assets, no validation.
+        let yaml = "name: test\nsteps:\n  - name: greet\n    command: echo hello\n  - name: done\n    command: echo done\n";
+        setup_project(dir.path(), yaml, &[]);
+
+        let engine = MockEngine::new();
+        run(dir.path(), &engine).unwrap();
+
+        let calls = engine.calls.borrow();
+        // No preflight (command-only), 2 command executions.
+        assert_eq!(calls.len(), 2);
+    }
+
+    // v0.2 AC-07: Unparseable SQL warns but still executes.
+    #[test]
+    fn test_v02_ac07_unparseable_sql_still_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: weird\n    sql: models/weird.sql\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[("models/weird.sql", "THIS IS NOT VALID SQL %%%")],
+        );
+
+        let engine = MockEngine::new();
+        // Should succeed — unparseable SQL is treated as opaque, not an error.
+        run(dir.path(), &engine).unwrap();
+
+        let calls = engine.calls.borrow();
+        // 1 preflight + 1 SQL execution.
+        assert_eq!(calls.len(), 2);
+    }
+
+    // v0.2 AC-09: Multi-step chain with valid ordering succeeds.
+    #[test]
+    fn test_v02_ac09_valid_chain_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: step-a\n    sql: models/a.sql\n  - name: step-b\n    sql: models/b.sql\n  - name: step-c\n    sql: models/c.sql\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[
+                ("models/a.sql", "CREATE TABLE x (id INT);"),
+                ("models/b.sql", "CREATE TABLE y AS SELECT * FROM x;"),
+                ("models/c.sql", "CREATE TABLE z AS SELECT * FROM y;"),
+            ],
+        );
+
+        let engine = MockEngine::new();
+        run(dir.path(), &engine).unwrap();
+
+        let calls = engine.calls.borrow();
+        // 1 preflight + 3 SQL executions.
+        assert_eq!(calls.len(), 4);
     }
 }

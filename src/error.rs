@@ -39,6 +39,13 @@ pub enum Error {
     #[error("project directory already exists: {0}")]
     ProjectExists(PathBuf),
 
+    #[error("dependency order violation: step '{reader}' reads asset '{asset}' but '{asset}' is produced by step '{producer}' which runs after it")]
+    DependencyOrder {
+        reader: String,
+        asset: String,
+        producer: String,
+    },
+
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }
