@@ -22,9 +22,10 @@ scenarios:
     then: "arc includes those dependencies in the lineage graph"
     source_lines: "decisions/0004: command: steps to declare assets explicitly (since they can't be introspected)"
 
-goal: "v0.2 — asset-centric model"
-maturity: "planned"
-specs: []
+goal: "v0.2 — auto-discover assets from SQL, validate dependency ordering, override for corrections"
+maturity: "emerging"
+specs:
+  - "specs/2026-04-15-asset-registry/spec.yaml"
 references:
   - "decisions/0001-asset-centric-pipeline-engine.md"
   - "decisions/0004-yaml-manifest-with-steps-and-assets.md"
