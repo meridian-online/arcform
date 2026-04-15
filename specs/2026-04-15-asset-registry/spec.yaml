@@ -1,0 +1,215 @@
+goal: >
+  Ship the asset registry layer (v0.2) — auto-discover data assets from SQL
+  via sqlparser-rs, validate dependency ordering before execution, and provide
+  a manifest override mechanism for corrections and command steps. SQL steps
+  should require zero manual asset declarations. This is the semantic layer
+  that makes ArcForm asset-centric rather than just a step runner.
+
+vision: >
+  ArcForm understands the data flowing through a pipeline, not just the commands
+  that run. Steps are the execution layer (how). Assets are the data layer (what).
+  SQL introspection bridges the two — the engine parses SQL to auto-infer which
+  assets a step reads and writes. The asset graph enables dependency validation
+  now, and selective re-materialisation in v0.3.
+
+constraints:
+  - "sqlparser-rs (datafusion-sqlparser-rs) for SQL parsing — not DuckDB's own parser"
+  - "DuckDB SQL dialect for sqlparser configuration"
+  - "Output patterns: CREATE TABLE, CREATE VIEW, CREATE TABLE AS (CTAS), INSERT INTO, COPY TO"
+  - "Input patterns: table names in FROM and JOIN clauses"
+  - "Steps run in declared order — validation only, no topological reordering"
+  - "Dependency validation is pre-execution (preflight-style), not during execution"
+  - "Parse failures degrade gracefully — warn and treat step as opaque, don't block"
+  - "Backwards compatible — manifests without assets/produces/depends_on work as v0.1"
+  - "Lineage visualisation is out of scope (separate card)"
+  - "Single crate — add modules, not workspace members"
+
+acceptance_criteria:
+  - id: ac-01
+    ac_type: code
+    description: >
+      SQL steps auto-discover produced assets. Given a SQL file containing
+      CREATE TABLE, CREATE VIEW, or CREATE TABLE AS SELECT, sqlparser-rs
+      extracts the table/view names as assets produced by that step.
+    verification: >
+      Unit test: parse SQL containing CREATE TABLE foo, CREATE VIEW bar,
+      CREATE TABLE baz AS SELECT. Assert discovered outputs are [foo, bar, baz].
+
+  - id: ac-02
+    ac_type: code
+    description: >
+      SQL steps auto-discover consumed assets. Given a SQL file with FROM
+      and JOIN clauses, sqlparser-rs extracts the referenced table names as
+      assets consumed by that step.
+    verification: >
+      Unit test: parse SQL containing SELECT ... FROM customers JOIN orders.
+      Assert discovered inputs are [customers, orders].
+
+  - id: ac-03
+    ac_type: code
+    description: >
+      DML statements are recognised as output signals. INSERT INTO and
+      COPY ... TO are treated as the step producing/writing to those assets.
+    verification: >
+      Unit test: parse SQL containing INSERT INTO summary SELECT ... and
+      COPY customers TO 'file.csv'. Assert discovered outputs include
+      [summary] and the COPY target is handled (at minimum not erroring).
+
+  - id: ac-04
+    ac_type: code
+    description: >
+      Command steps accept optional `produces` and `depends_on` fields in
+      the manifest. These fields explicitly declare what assets the command
+      step produces and consumes, since shell commands cannot be introspected.
+    verification: >
+      Parse a manifest with a command step having produces: [output_file]
+      and depends_on: [customers]. Assert the step's asset declarations
+      are correctly parsed and included in the dependency graph.
+
+  - id: ac-05
+    ac_type: code
+    description: >
+      A top-level `assets:` section in the manifest allows users to override
+      or augment auto-inferred assets. Each asset entry has a `produced_by`
+      field (step name) and optional `depends_on` (list of asset names).
+      Overrides replace the inferred graph for that asset.
+    verification: >
+      Unit test: create a manifest with a SQL step that sqlparser infers
+      produces [customers], plus an assets: section that overrides customers
+      to add depends_on: [raw_data]. Assert the final graph includes the
+      override dependency, not just the inferred one.
+
+  - id: ac-06
+    ac_type: code
+    description: >
+      `arc run` validates dependency ordering before executing any steps.
+      If a step reads an asset that is produced by a later step in the
+      declared order, arc exits with a non-zero code and a clear error
+      message naming both the reading step and the producing step.
+    verification: >
+      Create a manifest where step 1 reads from a table that step 2 creates.
+      `arc run` exits with an error like "step 'X' reads asset 'Y' but 'Y'
+      is produced by step 'Z' which runs after it." No steps execute.
+
+  - id: ac-07
+    ac_type: code
+    description: >
+      When sqlparser-rs cannot parse a SQL file (unsupported DuckDB syntax,
+      extensions, etc.), arc emits a warning to stderr and treats the step
+      as opaque — no assets are inferred. The step still executes normally.
+      The user can add overrides in the assets: section.
+    verification: >
+      Unit test: feed sqlparser deliberately unparseable SQL. Assert a
+      warning is produced and the step returns empty asset sets (no error).
+      Integration: the step still runs successfully.
+
+  - id: ac-08
+    ac_type: code
+    description: >
+      Manifests without any asset-related fields (no produces, no depends_on,
+      no assets: section) work exactly as v0.1 — no dependency validation,
+      no warnings, identical behaviour. All existing v0.1 tests pass without
+      modification.
+    verification: >
+      Run the full v0.1 test suite. All 24 tests pass. Additionally, run
+      a v0.1-style manifest (steps only, no assets) through the v0.2 code
+      path and verify identical output.
+
+  - id: ac-09
+    ac_type: code
+    description: >
+      The asset dependency graph correctly handles multi-step chains.
+      Given steps A → B → C where A produces table X, B reads X and
+      produces Y, C reads Y — the graph captures the full chain and
+      validates ordering across all links.
+    verification: >
+      Unit test: build a 3-step pipeline with chained dependencies.
+      Assert the graph contains edges X→B, Y→C. Reverse the order of
+      steps B and C — assert validation catches the ordering violation.
+
+  - id: ac-10
+    ac_type: code
+    description: >
+      Command steps without explicit produces/depends_on are treated as
+      opaque — they have no assets in the dependency graph. They execute
+      normally but do not participate in dependency validation.
+    verification: >
+      Create a manifest mixing SQL steps (with discoverable assets) and
+      bare command steps. Assert the command steps appear in the graph
+      with empty asset sets. Dependency validation only applies to steps
+      with known assets.
+
+ontology_schema:
+  name: "AssetGraph"
+  description: "The dependency graph model linking steps to the data assets they produce and consume"
+  fields:
+    - name: "Asset"
+      type: "struct"
+      description: "A named data output (table, view, file) produced by a step"
+    - name: "Asset.name"
+      type: "string"
+      description: "Asset identifier — typically the table/view name extracted from SQL"
+    - name: "Asset.produced_by"
+      type: "string"
+      description: "Name of the step that produces this asset"
+    - name: "Asset.depends_on"
+      type: "Vec<string>"
+      description: "Names of assets this asset depends on (read by the producing step)"
+    - name: "Asset.source"
+      type: "enum"
+      description: "How the asset was discovered: Inferred (sqlparser), Declared (manifest), Override (assets: section)"
+    - name: "StepAssets"
+      type: "struct"
+      description: "The assets associated with a single step — what it produces and what it reads"
+    - name: "StepAssets.produces"
+      type: "Vec<string>"
+      description: "Asset names this step creates/writes"
+    - name: "StepAssets.reads"
+      type: "Vec<string>"
+      description: "Asset names this step reads from"
+
+evaluation_principles:
+  - principle: "Correctness — inferred assets match actual SQL semantics"
+    weight: 0.30
+  - principle: "Backwards compatibility — v0.1 manifests work identically"
+    weight: 0.25
+  - principle: "Graceful degradation — unparseable SQL doesn't block execution"
+    weight: 0.20
+  - principle: "Simplicity — zero-config for the common case (SQL steps just work)"
+    weight: 0.15
+  - principle: "Extensibility — override mechanism handles edge cases cleanly"
+    weight: 0.10
+
+exit_conditions:
+  - "All 10 acceptance criteria pass"
+  - "`cargo test` passes with all v0.1 tests plus new asset registry tests"
+  - "A sample pipeline with 3+ SQL steps auto-discovers correct lineage"
+  - "A misordered pipeline triggers the dependency validation error"
+  - "An unparseable SQL file degrades gracefully with a warning"
+
+implementation_notes:
+  new_modules:
+    - "introspect.rs — SQL parsing via sqlparser-rs, asset extraction from SQL AST"
+    - "asset.rs — AssetGraph struct, dependency validation, graph construction from steps + overrides"
+  modified_modules:
+    - "manifest.rs — add produces/depends_on to Step, add assets: section to Manifest"
+    - "runner.rs — call asset graph construction and validation before step execution"
+    - "error.rs — add DependencyOrder and SqlParseWarning error variants"
+  new_dependencies:
+    - "sqlparser = { version = \"0.55\", features = [\"visitor\"] } — SQL parsing"
+  architecture: >
+    The asset graph is built in three layers:
+    1. Inferred: sqlparser-rs parses each SQL step's file, extracts outputs and inputs
+    2. Declared: command steps' produces/depends_on fields are added
+    3. Overrides: the top-level assets: section replaces/augments inferred entries
+    The merged graph is validated against step declaration order before execution begins.
+
+metadata:
+  version: "1.0"
+  timestamp: "2026-04-15T09:00:00Z"
+  ambiguity_score: 0.10
+  interview_ref: "specs/2026-04-15-asset-registry/interview.md"
+  decisions_ref:
+    - "decisions/0001-asset-centric-pipeline-engine.md"
+    - "decisions/0004-yaml-manifest-with-steps-and-assets.md"
+    - "decisions/0007-sql-introspection-core-feature.md"

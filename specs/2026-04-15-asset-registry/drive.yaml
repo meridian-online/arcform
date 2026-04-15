@@ -1,0 +1,8 @@
+card: cards/0008-asset-registry.yaml
+autonomy: guided
+budget: 3
+iteration: 1
+current_spec: specs/2026-04-15-asset-registry
+status: complete
+history: []
+started: 2026-04-15T09:00:00Z

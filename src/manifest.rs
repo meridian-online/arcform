@@ -22,6 +22,11 @@ pub struct Manifest {
     /// Ordered list of transform steps.
     #[serde(default)]
     pub steps: Vec<Step>,
+
+    /// Optional asset overrides. Keys are asset names; values specify
+    /// which step produces the asset and its dependencies.
+    #[serde(default)]
+    pub assets: std::collections::HashMap<String, AssetOverride>,
 }
 
 fn default_engine() -> String {
@@ -41,6 +46,27 @@ pub struct Step {
     /// Raw shell command string. Mutually exclusive with `sql`.
     #[serde(default)]
     pub command: Option<String>,
+
+    /// Assets this step produces (primarily for command steps).
+    /// SQL steps auto-discover their outputs via sqlparser-rs.
+    #[serde(default)]
+    pub produces: Vec<String>,
+
+    /// Assets this step depends on (primarily for command steps).
+    /// SQL steps auto-discover their inputs via sqlparser-rs.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+}
+
+/// An asset override entry in the top-level `assets:` section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetOverride {
+    /// Name of the step that produces this asset.
+    pub produced_by: String,
+
+    /// Asset names this asset depends on.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
 
 impl Step {
@@ -129,6 +155,7 @@ impl Manifest {
             engine: "duckdb".to_string(),
             db: Some(format!("{}.duckdb", name)),
             steps: Vec::new(),
+            assets: std::collections::HashMap::new(),
         }
     }
 
@@ -143,6 +170,39 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// Helper: create a SQL step with no asset declarations.
+    fn sql_step(name: &str, sql: &str) -> Step {
+        Step {
+            name: name.to_string(),
+            sql: Some(sql.to_string()),
+            command: None,
+            produces: vec![],
+            depends_on: vec![],
+        }
+    }
+
+    /// Helper: create a command step with no asset declarations.
+    fn cmd_step(name: &str, command: &str) -> Step {
+        Step {
+            name: name.to_string(),
+            sql: None,
+            command: Some(command.to_string()),
+            produces: vec![],
+            depends_on: vec![],
+        }
+    }
+
+    /// Helper: create a test manifest with given steps and no asset overrides.
+    fn test_manifest(name: &str, steps: Vec<Step>) -> Manifest {
+        Manifest {
+            name: name.to_string(),
+            engine: "duckdb".to_string(),
+            db: None,
+            steps,
+            assets: std::collections::HashMap::new(),
+        }
+    }
+
     // AC-2: Manifest::new_project generates correct defaults.
     #[test]
     fn test_new_project_defaults() {
@@ -151,17 +211,13 @@ mod tests {
         assert_eq!(m.engine, "duckdb");
         assert_eq!(m.db, Some("test-pipeline.duckdb".to_string()));
         assert!(m.steps.is_empty());
+        assert!(m.assets.is_empty());
     }
 
     // AC-3: Database path defaults to <name>.duckdb.
     #[test]
     fn test_db_path_default() {
-        let m = Manifest {
-            name: "my-proj".to_string(),
-            engine: "duckdb".to_string(),
-            db: None,
-            steps: vec![],
-        };
+        let m = test_manifest("my-proj", vec![]);
         let path = m.db_path(Path::new("/tmp/project"));
         assert_eq!(path, PathBuf::from("/tmp/project/my-proj.duckdb"));
     }
@@ -169,12 +225,8 @@ mod tests {
     // AC-3: Explicit db field overrides the default path.
     #[test]
     fn test_db_path_explicit() {
-        let m = Manifest {
-            name: "my-proj".to_string(),
-            engine: "duckdb".to_string(),
-            db: Some("custom.duckdb".to_string()),
-            steps: vec![],
-        };
+        let mut m = test_manifest("my-proj", vec![]);
+        m.db = Some("custom.duckdb".to_string());
         let path = m.db_path(Path::new("/tmp/project"));
         assert_eq!(path, PathBuf::from("/tmp/project/custom.duckdb"));
     }
@@ -182,23 +234,10 @@ mod tests {
     // AC-10: Duplicate step names are rejected during validation.
     #[test]
     fn test_validate_duplicate_step_names() {
-        let m = Manifest {
-            name: "test".to_string(),
-            engine: "duckdb".to_string(),
-            db: None,
-            steps: vec![
-                Step {
-                    name: "a".to_string(),
-                    sql: Some("a.sql".to_string()),
-                    command: None,
-                },
-                Step {
-                    name: "a".to_string(),
-                    sql: Some("b.sql".to_string()),
-                    command: None,
-                },
-            ],
-        };
+        let m = test_manifest(
+            "test",
+            vec![sql_step("a", "a.sql"), sql_step("a", "b.sql")],
+        );
         let err = m.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate step name"));
     }
@@ -206,16 +245,16 @@ mod tests {
     // AC-10: Step with both sql and command is rejected.
     #[test]
     fn test_validate_step_both_fields() {
-        let m = Manifest {
-            name: "test".to_string(),
-            engine: "duckdb".to_string(),
-            db: None,
-            steps: vec![Step {
+        let m = test_manifest(
+            "test",
+            vec![Step {
                 name: "bad".to_string(),
                 sql: Some("a.sql".to_string()),
                 command: Some("echo hi".to_string()),
+                produces: vec![],
+                depends_on: vec![],
             }],
-        };
+        );
         let err = m.validate().unwrap_err();
         assert!(err.to_string().contains("not both"));
     }
@@ -223,16 +262,16 @@ mod tests {
     // AC-10: Step with neither sql nor command is rejected.
     #[test]
     fn test_validate_step_neither_field() {
-        let m = Manifest {
-            name: "test".to_string(),
-            engine: "duckdb".to_string(),
-            db: None,
-            steps: vec![Step {
+        let m = test_manifest(
+            "test",
+            vec![Step {
                 name: "bad".to_string(),
                 sql: None,
                 command: None,
+                produces: vec![],
+                depends_on: vec![],
             }],
-        };
+        );
         let err = m.validate().unwrap_err();
         assert!(err.to_string().contains("must have either"));
     }
@@ -268,45 +307,77 @@ mod tests {
     // AC-6: has_sql_steps gates whether preflight is called.
     #[test]
     fn test_has_sql_steps() {
-        let m = Manifest {
-            name: "test".to_string(),
-            engine: "duckdb".to_string(),
-            db: None,
-            steps: vec![Step {
-                name: "cmd".to_string(),
-                sql: None,
-                command: Some("echo hi".to_string()),
-            }],
-        };
+        let m = test_manifest("test", vec![cmd_step("cmd", "echo hi")]);
         assert!(!m.has_sql_steps());
     }
 
     // AC-3: Steps maintain declaration order (Vec, not HashMap).
     #[test]
     fn test_sequential_order_preserved() {
-        let m = Manifest {
-            name: "test".to_string(),
-            engine: "duckdb".to_string(),
-            db: None,
-            steps: vec![
-                Step {
-                    name: "c".to_string(),
-                    sql: Some("c.sql".to_string()),
-                    command: None,
-                },
-                Step {
-                    name: "a".to_string(),
-                    sql: Some("a.sql".to_string()),
-                    command: None,
-                },
-                Step {
-                    name: "b".to_string(),
-                    sql: Some("b.sql".to_string()),
-                    command: None,
-                },
+        let m = test_manifest(
+            "test",
+            vec![
+                sql_step("c", "c.sql"),
+                sql_step("a", "a.sql"),
+                sql_step("b", "b.sql"),
             ],
-        };
+        );
         let names: Vec<&str> = m.steps.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["c", "a", "b"]);
+    }
+
+    // v0.2 AC-04: Command steps parse produces and depends_on from YAML.
+    #[test]
+    fn test_ac04_command_step_with_asset_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+steps:
+  - name: export
+    command: "duckdb db.duckdb -c \"COPY customers TO 'out.csv'\""
+    produces:
+      - customers_csv
+    depends_on:
+      - customers
+"#;
+        fs::write(dir.path().join("arcform.yaml"), yaml).unwrap();
+        let m = Manifest::load(dir.path()).unwrap();
+        assert_eq!(m.steps[0].produces, vec!["customers_csv"]);
+        assert_eq!(m.steps[0].depends_on, vec!["customers"]);
+    }
+
+    // v0.2 AC-05: Top-level assets section parses correctly.
+    #[test]
+    fn test_ac05_assets_override_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+steps:
+  - name: load
+    sql: models/load.sql
+assets:
+  customers:
+    produced_by: load
+    depends_on:
+      - raw_data
+      - lookups
+"#;
+        fs::write(dir.path().join("arcform.yaml"), yaml).unwrap();
+        let m = Manifest::load(dir.path()).unwrap();
+        let asset = m.assets.get("customers").expect("asset should exist");
+        assert_eq!(asset.produced_by, "load");
+        assert_eq!(asset.depends_on, vec!["raw_data", "lookups"]);
+    }
+
+    // v0.2 AC-08: Manifest without asset fields works identically to v0.1.
+    #[test]
+    fn test_ac08_v1_manifest_backwards_compatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        fs::write(dir.path().join("arcform.yaml"), yaml).unwrap();
+        let m = Manifest::load(dir.path()).unwrap();
+        assert!(m.steps[0].produces.is_empty());
+        assert!(m.steps[0].depends_on.is_empty());
+        assert!(m.assets.is_empty());
     }
 }

@@ -1,6 +1,8 @@
+mod asset;
 mod cli;
 mod engine;
 mod error;
+mod introspect;
 mod manifest;
 mod runner;
 
