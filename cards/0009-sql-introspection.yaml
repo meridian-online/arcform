@@ -1,0 +1,37 @@
+feature: "SQL introspection"
+as_a: "data analyst writing SQL pipelines"
+i_want: "arc to automatically understand which tables my SQL reads and writes"
+so_that: "I don't have to manually declare dependencies for every SQL step"
+
+scenarios:
+  - name: "Auto-infer table reads"
+    given: "a SQL step with FROM and JOIN clauses"
+    when: "arc parses the SQL via sqlparser-rs"
+    then: "the referenced tables are registered as input dependencies"
+    source_lines: "decisions/0007: parse SQL to extract table references — Tables read (FROM, JOIN clauses)"
+
+  - name: "Auto-infer table writes"
+    given: "a SQL step with CREATE TABLE or INSERT INTO"
+    when: "arc parses the SQL"
+    then: "the target tables are registered as output assets"
+    source_lines: "decisions/0007: Tables written (CREATE TABLE, INSERT INTO, COPY TO)"
+
+  - name: "Explicit override"
+    given: "a SQL step with dynamic SQL that can't be parsed"
+    when: "I add explicit depends_on to the asset declaration"
+    then: "the explicit declaration takes precedence over parsed results"
+    source_lines: "decisions/0007: Users can override with explicit depends_on for edge cases (dynamic SQL, indirect dependencies)"
+
+  - name: "CTE awareness"
+    given: "a SQL step with common table expressions"
+    when: "arc parses the SQL"
+    then: "CTEs are recognised as internal definitions, not external dependencies"
+    source_lines: "decisions/0007: CTE definitions"
+
+goal: "v0.2/v0.3 — zero-boilerplate SQL dependency tracking"
+maturity: "planned"
+specs: []
+references:
+  - "decisions/0007-sql-introspection-core-feature.md"
+  - "decisions/0002-rust-implementation.md"
+  - "README.md"

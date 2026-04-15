@@ -1,0 +1,31 @@
+feature: "Shell command steps"
+as_a: "data analyst"
+i_want: "run arbitrary shell commands as pipeline steps alongside SQL steps"
+so_that: "I can integrate non-SQL tools (curl, jq, rclone) into my data pipeline"
+
+scenarios:
+  - name: "Command execution"
+    given: "a step with `command: echo hello`"
+    when: "arc executes the step"
+    then: "the command runs via `sh -c` and stdout is captured"
+    source_lines: "spec.yaml: A step with command: instead of sql: executes the raw command string via shell (sh -c '<command>')"
+
+  - name: "Command failure halts pipeline"
+    given: "a step with `command: exit 1`"
+    when: "the command exits non-zero"
+    then: "arc treats it as a step failure and halts execution"
+    source_lines: "spec.yaml: The command's exit code determines step success/failure"
+
+  - name: "Escape hatch for any tool"
+    given: "a user needs to run a tool arc doesn't know about"
+    when: "they add a command: step"
+    then: "it works without any code changes to arc"
+    source_lines: "decisions/0009: command: is the generic escape hatch — any CLI tool, no code changes needed"
+
+goal: "v0.1 — command steps working"
+maturity: "established"
+specs:
+  - "specs/2026-03-30-foundational-decisions/spec.yaml"
+references:
+  - "decisions/0009-hybrid-engine-invocation.md"
+  - "README.md"

@@ -1,0 +1,31 @@
+feature: "Asset registry"
+as_a: "data analyst"
+i_want: "declare the data assets my pipeline produces and their dependencies"
+so_that: "arc understands my data lineage, not just my execution order"
+
+scenarios:
+  - name: "Declare asset outputs"
+    given: "a manifest with an assets section"
+    when: "I map a data output to the step that produces it"
+    then: "arc tracks which steps produce which assets"
+    source_lines: "decisions/0004: Assets define WHAT (the data produced, its dependencies)"
+
+  - name: "One step, multiple assets"
+    given: "a SQL step that creates two tables"
+    when: "I declare both as assets produced by that step"
+    then: "both assets are tracked independently"
+    source_lines: "decisions/0004: One step to produce multiple assets"
+
+  - name: "Explicit dependency declaration"
+    given: "a command: step that can't be introspected"
+    when: "I declare its assets with explicit depends_on"
+    then: "arc includes those dependencies in the lineage graph"
+    source_lines: "decisions/0004: command: steps to declare assets explicitly (since they can't be introspected)"
+
+goal: "v0.2 — asset-centric model"
+maturity: "planned"
+specs: []
+references:
+  - "decisions/0001-asset-centric-pipeline-engine.md"
+  - "decisions/0004-yaml-manifest-with-steps-and-assets.md"
+  - "specs/2026-03-30-foundational-decisions/spec.yaml"

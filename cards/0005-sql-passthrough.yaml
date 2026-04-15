@@ -1,0 +1,24 @@
+feature: "SQL passthrough"
+as_a: "data analyst"
+i_want: "my SQL files to be passed to the engine completely unmodified"
+so_that: "I can use any SQL syntax my engine supports without arc interfering"
+
+scenarios:
+  - name: "Byte-identical passthrough"
+    given: "a SQL file with engine-specific syntax"
+    when: "arc executes the step"
+    then: "the SQL content received by the engine is byte-identical to the source file"
+    source_lines: "spec.yaml: SQL files are passed to the DuckDB CLI unmodified — arc does not template, transform, or inject anything into the SQL content."
+
+  - name: "No templating"
+    given: "a SQL file containing Jinja-like syntax (e.g., {{ var }})"
+    when: "arc executes the step"
+    then: "the raw text including {{ var }} is passed through — arc does not interpret it"
+    source_lines: "interview.md: Templating is a minefield — Jinja is intense, SQLMesh steered away from it"
+
+goal: "v0.1 — zero-modification guarantee"
+maturity: "established"
+specs:
+  - "specs/2026-03-30-foundational-decisions/spec.yaml"
+references:
+  - "decisions/0003-delegate-execution-to-engine-cli.md"
