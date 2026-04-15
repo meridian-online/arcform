@@ -3,6 +3,6 @@ autonomy: guided
 budget: 3
 iteration: 1
 current_spec: specs/2026-04-15-asset-registry
-status: review
+status: complete
 history: []
 started: 2026-04-15T09:00:00Z
