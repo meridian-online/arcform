@@ -1,0 +1,37 @@
+feature: "Lineage visualisation"
+as_a: "data analyst"
+i_want: "view my pipeline's data dependency graph from the CLI"
+so_that: "I can understand data flow, spot misordered steps, and feed the DAG to other tools"
+
+scenarios:
+  - name: "Mermaid source output"
+    given: "a pipeline with discovered assets and dependencies"
+    when: "I run `arc lineage` or `arc lineage --format mermaid`"
+    then: "arc outputs Mermaid flowchart markup of the asset DAG to stdout"
+    source_lines: "design session: 'The lineage is the actual DAG — so we want to make this useful, while still being a CLI'"
+
+  - name: "JSON output for tooling"
+    given: "a pipeline with discovered assets and dependencies"
+    when: "I run `arc lineage --format json`"
+    then: "arc outputs a JSON representation of the DAG (nodes, edges, step associations) for consumption by other Meridian tools"
+    source_lines: "design session: considering another app for design across the Meridian ecosystem"
+
+  - name: "Text summary for quick inspection"
+    given: "a pipeline with discovered assets"
+    when: "I run `arc lineage --format text`"
+    then: "arc prints a compact text summary of each step's produced and consumed assets"
+    source_lines: "design session: terminal-friendly output without rendering dependencies"
+
+  - name: "Lineage without executing"
+    given: "a valid arcform.yaml with SQL steps"
+    when: "I run `arc lineage`"
+    then: "arc parses SQL and builds the graph without running any steps or requiring the database to exist"
+    source_lines: "design session: separate from execution — useful for inspecting the graph without running anything"
+
+goal: "CLI command that outputs the asset DAG in mermaid, JSON, and text formats"
+maturity: "planned"
+specs: []
+references:
+  - "https://github.com/1jehuang/mermaid-rs-renderer"
+  - "specs/2026-04-15-asset-registry/interview.md"
+  - "cards/0008-asset-registry.yaml"
