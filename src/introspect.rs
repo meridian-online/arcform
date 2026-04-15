@@ -121,20 +121,37 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
 
 /// Extract input table names from a query (SELECT ... FROM ... JOIN ...).
 fn extract_inputs_from_query(query: &sqlparser::ast::Query, assets: &mut SqlAssets) {
-    if let Some(ref body) = query.body.as_select() {
-        for table in &body.from {
-            extract_inputs_from_table_factor(&table.relation, assets);
-            for join in &table.joins {
-                extract_inputs_from_table_factor(&join.relation, assets);
-            }
-        }
-    }
+    extract_inputs_from_set_expr(&query.body, assets);
 
     // Handle CTEs — they define local names, and their queries read from tables.
-    if let Some(ref with) = query.with {
+    if let Some(with) = &query.with {
         for cte in &with.cte_tables {
             extract_inputs_from_query(&cte.query, assets);
         }
+    }
+}
+
+/// Recursively extract input table names from a set expression.
+/// Handles SELECT, UNION/EXCEPT/INTERSECT, and nested queries.
+fn extract_inputs_from_set_expr(set_expr: &sqlparser::ast::SetExpr, assets: &mut SqlAssets) {
+    match set_expr {
+        sqlparser::ast::SetExpr::Select(select) => {
+            for table in &select.from {
+                extract_inputs_from_table_factor(&table.relation, assets);
+                for join in &table.joins {
+                    extract_inputs_from_table_factor(&join.relation, assets);
+                }
+            }
+        }
+        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+            extract_inputs_from_set_expr(left, assets);
+            extract_inputs_from_set_expr(right, assets);
+        }
+        sqlparser::ast::SetExpr::Query(query) => {
+            extract_inputs_from_query(query, assets);
+        }
+        // Values, Insert, Update, Table — no table references to extract.
+        _ => {}
     }
 }
 
@@ -258,6 +275,34 @@ mod tests {
         let sql = "THIS IS NOT VALID SQL AT ALL %%%";
         let result = extract_assets(sql);
         assert!(result.is_err());
+    }
+
+    // AC-02: UNION ALL discovers inputs from both branches.
+    #[test]
+    fn test_ac02_union_all_inputs() {
+        let sql = "SELECT * FROM customers UNION ALL SELECT * FROM archived_customers;";
+        let assets = extract_assets(sql).unwrap();
+        assert!(assets.inputs.contains("customers"));
+        assert!(assets.inputs.contains("archived_customers"));
+    }
+
+    // AC-02: CTAS with UNION discovers output and all inputs.
+    #[test]
+    fn test_ac02_ctas_union_inputs() {
+        let sql = "CREATE TABLE all_customers AS SELECT * FROM customers UNION ALL SELECT * FROM archived_customers;";
+        let assets = extract_assets(sql).unwrap();
+        assert!(assets.outputs.contains("all_customers"));
+        assert!(assets.inputs.contains("customers"));
+        assert!(assets.inputs.contains("archived_customers"));
+    }
+
+    // AC-02: EXCEPT discovers inputs from both sides.
+    #[test]
+    fn test_ac02_except_inputs() {
+        let sql = "SELECT id FROM customers EXCEPT SELECT id FROM blocklist;";
+        let assets = extract_assets(sql).unwrap();
+        assert!(assets.inputs.contains("customers"));
+        assert!(assets.inputs.contains("blocklist"));
     }
 
     // Edge case: CTE inputs are discovered.
