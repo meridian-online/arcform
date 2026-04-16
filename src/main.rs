@@ -5,6 +5,7 @@ mod error;
 mod introspect;
 mod manifest;
 mod runner;
+mod state;
 
 use clap::Parser;
 

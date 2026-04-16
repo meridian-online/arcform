@@ -184,6 +184,46 @@ impl AssetGraph {
         Ok(())
     }
 
+    /// Compute the transitive set of downstream steps affected when the
+    /// given steps are stale. A step is downstream if it reads an asset
+    /// produced by a stale step (directly or transitively).
+    ///
+    /// Returns step names in arbitrary order (callers should not rely on ordering).
+    pub fn downstream_steps(&self, stale_steps: &[String]) -> Vec<String> {
+        let mut affected: std::collections::HashSet<String> = stale_steps.iter().cloned().collect();
+        let mut changed = true;
+
+        // Iterate until no new steps are added (fixed-point).
+        while changed {
+            changed = false;
+            for (step_name, step_assets) in &self.steps {
+                if affected.contains(step_name) {
+                    continue;
+                }
+                // Check if this step reads any asset produced by an affected step.
+                for read_asset in &step_assets.reads {
+                    let produced_by_affected = affected.iter().any(|s| {
+                        self.steps
+                            .get(s)
+                            .is_some_and(|sa| sa.produces.contains(read_asset))
+                    });
+                    if produced_by_affected {
+                        affected.insert(step_name.clone());
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Remove the original stale steps — return only newly-affected downstream steps.
+        for s in stale_steps {
+            affected.remove(s);
+        }
+
+        affected.into_iter().collect()
+    }
+
     /// Check if this graph has any asset information worth validating.
     /// Returns false if no steps have any known assets (pure v0.1 manifest).
     pub fn has_assets(&self) -> bool {
@@ -551,6 +591,56 @@ mod tests {
         );
 
         assert!(!graph.has_assets(), "bare command step has no assets");
+    }
+
+    // v0.3 AC-07: downstream_steps computes transitive downstream.
+    #[test]
+    fn test_v03_ac07_downstream_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = build_graph(
+            dir.path(),
+            vec![
+                sql_step("step-a", "models/a.sql"),
+                sql_step("step-b", "models/b.sql"),
+                sql_step("step-c", "models/c.sql"),
+            ],
+            HashMap::new(),
+            &[
+                ("models/a.sql", "CREATE TABLE x (id INT);"),
+                ("models/b.sql", "CREATE TABLE y AS SELECT * FROM x;"),
+                ("models/c.sql", "CREATE TABLE z AS SELECT * FROM y;"),
+            ],
+        );
+
+        let downstream = graph.downstream_steps(&["step-a".into()]);
+        assert!(downstream.contains(&"step-b".to_string()), "step-b depends on step-a's output");
+        assert!(downstream.contains(&"step-c".to_string()), "step-c transitively depends on step-a");
+    }
+
+    // v0.3 AC-07: downstream_steps with opaque middle step — chain breaks.
+    #[test]
+    fn test_v03_ac07_downstream_opaque_breaks_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = build_graph(
+            dir.path(),
+            vec![
+                sql_step("step-a", "models/a.sql"),
+                cmd_step("step-b", "echo transform"),
+                sql_step("step-c", "models/c.sql"),
+            ],
+            HashMap::new(),
+            &[
+                ("models/a.sql", "CREATE TABLE x (id INT);"),
+                ("models/c.sql", "CREATE TABLE z AS SELECT * FROM y;"),
+            ],
+        );
+
+        // step-b is opaque (no produces/reads), so step-c doesn't transitively
+        // depend on step-a through step-b.
+        let downstream = graph.downstream_steps(&["step-a".into()]);
+        // step-c reads 'y' which is not produced by step-a (step-a produces 'x'),
+        // so step-c is NOT downstream of step-a in this graph.
+        assert!(!downstream.contains(&"step-c".to_string()), "opaque middle step breaks propagation");
     }
 
     // v0.3 AC-10: StepAssets gains internal and destroys, populated from SqlAssets.

@@ -1,0 +1,37 @@
+feature: "Step preconditions"
+as_a: "data analyst with command steps in my pipeline"
+i_want: "to declare freshness checks on steps so arc can skip them when conditions are met"
+so_that: "command steps participate in selective execution instead of always re-running"
+
+scenarios:
+  - name: "Shell command precondition"
+    given: "a command step with a preconditions field"
+    when: "arc evaluates whether to run the step"
+    then: "the precondition shell command runs; if it succeeds (exit 0), the step is fresh and skipped"
+    source_lines: "design session: 'generalise the stale_if idea using Dagu preconditions'"
+
+  - name: "File freshness check"
+    given: "a command step with a precondition checking file modification time"
+    when: "the output file was modified recently"
+    then: "the step is skipped (file is fresh)"
+    source_lines: "brewtrend.yml: preconditions: test $(find data/cask.json -mtime -1 | wc -l) -ne 1"
+
+  - name: "Multiple preconditions"
+    given: "a step with multiple precondition commands"
+    when: "all preconditions pass"
+    then: "the step is skipped; if any precondition fails, the step runs"
+    source_lines: "dagu control-flow docs: all conditions must pass"
+
+  - name: "SQL steps unaffected"
+    given: "a SQL step with no preconditions field"
+    when: "arc evaluates staleness"
+    then: "SQL steps continue to use content-hash staleness from the state backend"
+    source_lines: "design session: SQL hash is an auto-generated precondition"
+
+goal: "Step-level freshness checks for command steps — Dagu-inspired preconditions"
+maturity: "planned"
+specs: []
+references:
+  - "cards/0010-selective-rematerialisation.yaml"
+  - "/home/hugh/reference/brewtrend/brewtrend.yml"
+  - "/home/hugh/github/dagucloud/docs/writing-workflows/control-flow.md"

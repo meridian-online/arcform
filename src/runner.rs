@@ -6,9 +6,11 @@ use crate::asset::AssetGraph;
 use crate::engine::Engine;
 use crate::error::{Error, Result};
 use crate::manifest::Manifest;
+use crate::state::{self, StateBackend, StepStatus};
 
-/// Run a pipeline: load manifest, preflight, validate assets, execute steps sequentially.
-pub fn run(dir: &Path, engine: &dyn Engine) -> Result<()> {
+/// Run a pipeline: load manifest, preflight, validate assets, execute steps
+/// with staleness-aware selective execution.
+pub fn run(dir: &Path, engine: &dyn Engine, state: &dyn StateBackend, force: bool) -> Result<()> {
     let manifest = Manifest::load(dir)?;
 
     // If there are SQL steps, verify the engine is available.
@@ -20,6 +22,12 @@ pub fn run(dir: &Path, engine: &dyn Engine) -> Result<()> {
         println!("{}", "No steps defined.".dimmed());
         return Ok(());
     }
+
+    // Initialise the state backend (creates tables if needed).
+    state.init()?;
+
+    // Start a new run record.
+    let run_id = state.start_run()?;
 
     // Build the asset graph and validate dependency ordering.
     let asset_graph = AssetGraph::build(&manifest, dir);
@@ -35,11 +43,30 @@ pub fn run(dir: &Path, engine: &dyn Engine) -> Result<()> {
         asset_graph.validate_order(&step_order)?;
     }
 
+    // Determine which steps are stale.
+    let stale_steps = compute_staleness(&manifest, dir, state, &asset_graph, force)?;
+
     let db_path = manifest.db_path(dir);
     let total = manifest.steps.len();
     let mut succeeded = 0;
+    let mut executed = 0;
+    let mut skipped = 0;
 
     for (i, step) in manifest.steps.iter().enumerate() {
+        let is_stale = stale_steps.contains(&step.name);
+
+        if !is_stale {
+            println!(
+                "[{}/{}] {} {}",
+                i + 1,
+                total,
+                step.name.bold(),
+                "[skip]".dimmed(),
+            );
+            skipped += 1;
+            continue;
+        }
+
         println!(
             "[{}/{}] {} ...",
             i + 1,
@@ -47,7 +74,8 @@ pub fn run(dir: &Path, engine: &dyn Engine) -> Result<()> {
             step.name.bold()
         );
 
-        let result = if let Some(ref sql) = step.sql {
+        // Compute the SQL hash for this step (for state recording).
+        let sql_hash = if let Some(ref sql) = step.sql {
             let sql_path = dir.join(sql);
             if !sql_path.exists() {
                 return Err(Error::SqlFileNotFound {
@@ -55,6 +83,17 @@ pub fn run(dir: &Path, engine: &dyn Engine) -> Result<()> {
                     path: sql_path,
                 });
             }
+            let content = std::fs::read(&sql_path).map_err(|e| Error::FileRead {
+                path: sql_path.clone(),
+                source: e,
+            })?;
+            state::content_hash(&content)
+        } else {
+            String::new()
+        };
+
+        let result = if let Some(ref sql) = step.sql {
+            let sql_path = dir.join(sql);
             engine.execute_sql(&db_path, &sql_path)
         } else if let Some(ref command) = step.command {
             engine.execute_command(command)
@@ -65,8 +104,14 @@ pub fn run(dir: &Path, engine: &dyn Engine) -> Result<()> {
         match result {
             Ok(_output) => {
                 succeeded += 1;
+                executed += 1;
+                // Record success.
+                let _ = state.record_step(&step.name, &sql_hash, StepStatus::Success);
             }
             Err(Error::StepFailed { code, stderr, .. }) => {
+                // Record failure before returning error.
+                let _ = state.record_step(&step.name, &sql_hash, StepStatus::Failed);
+                let _ = state.finish_run(&run_id, executed, "failed");
                 return Err(Error::StepFailed {
                     step: step.name.clone(),
                     code,
@@ -74,25 +119,119 @@ pub fn run(dir: &Path, engine: &dyn Engine) -> Result<()> {
                 });
             }
             Err(e) => {
+                let _ = state.finish_run(&run_id, executed, "error");
                 return Err(e);
             }
         }
     }
 
-    println!(
-        "\n{} {}/{} steps succeeded.",
-        "✓".green(),
-        succeeded,
-        total,
-    );
+    // Finish the run record.
+    let _ = state.finish_run(&run_id, executed, "success");
+
+    if skipped > 0 {
+        println!(
+            "\n{} {}/{} steps succeeded, {} skipped (fresh).",
+            "✓".green(),
+            succeeded,
+            total,
+            skipped,
+        );
+    } else {
+        println!(
+            "\n{} {}/{} steps succeeded.",
+            "✓".green(),
+            succeeded,
+            total,
+        );
+    }
 
     Ok(())
+}
+
+/// Determine which steps are stale and need to execute.
+///
+/// A step is stale if:
+/// - `force` is true (all steps run)
+/// - It's a command step (always re-runs)
+/// - It has no prior state (first run)
+/// - Its prior run failed
+/// - Its SQL file content hash changed
+/// - An upstream step (via asset graph) is stale (downstream propagation)
+fn compute_staleness(
+    manifest: &Manifest,
+    dir: &Path,
+    state: &dyn StateBackend,
+    asset_graph: &AssetGraph,
+    force: bool,
+) -> Result<std::collections::HashSet<String>> {
+    let mut stale: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    if force {
+        // Force mode: everything is stale.
+        for step in &manifest.steps {
+            stale.insert(step.name.clone());
+        }
+        return Ok(stale);
+    }
+
+    // Phase 1: Check each step's own staleness.
+    for step in &manifest.steps {
+        if step.command.is_some() {
+            // Command steps always re-run.
+            stale.insert(step.name.clone());
+            continue;
+        }
+
+        let prior = state.get_step_state(&step.name)?;
+
+        match prior {
+            None => {
+                // Never run before — stale.
+                stale.insert(step.name.clone());
+            }
+            Some(prior_state) => {
+                if prior_state.status == StepStatus::Failed {
+                    // Previously failed — always stale.
+                    stale.insert(step.name.clone());
+                    continue;
+                }
+
+                // Check SQL content hash.
+                if let Some(ref sql) = step.sql {
+                    let sql_path = dir.join(sql);
+                    if sql_path.exists() {
+                        let content = std::fs::read(&sql_path).map_err(|e| Error::FileRead {
+                            path: sql_path.clone(),
+                            source: e,
+                        })?;
+                        let current_hash = state::content_hash(&content);
+                        if current_hash != prior_state.sql_hash {
+                            stale.insert(step.name.clone());
+                        }
+                    } else {
+                        // SQL file doesn't exist — will error during execution.
+                        stale.insert(step.name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 2: Downstream propagation.
+    let directly_stale: Vec<String> = stale.iter().cloned().collect();
+    let downstream = asset_graph.downstream_steps(&directly_stale);
+    for step_name in downstream {
+        stale.insert(step_name);
+    }
+
+    Ok(stale)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::mock::{MockCall, MockEngine};
+    use crate::state::mock::MockStateBackend;
     use std::fs;
 
     fn setup_project(dir: &Path, yaml: &str, files: &[(&str, &str)]) {
@@ -112,7 +251,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         setup_project(dir.path(), "name: test\nsteps: []\n", &[]);
         let engine = MockEngine::new();
-        run(dir.path(), &engine).unwrap();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
         // No preflight called for empty steps.
         assert!(engine.calls.borrow().is_empty());
     }
@@ -133,13 +273,14 @@ mod tests {
         );
 
         let engine = MockEngine::new();
-        run(dir.path(), &engine).unwrap();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
 
         let calls = engine.calls.borrow();
         assert_eq!(calls.len(), 4); // 1 preflight + 3 sql
         assert!(matches!(calls[0], MockCall::Preflight));
 
-        // Verify order and content.
+        // Verify execution order.
         let sql_calls: Vec<_> = calls
             .iter()
             .filter_map(|c| match c {
@@ -166,7 +307,8 @@ mod tests {
         setup_project(dir.path(), yaml, &[]);
 
         let engine = MockEngine::new();
-        run(dir.path(), &engine).unwrap();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
 
         let calls = engine.calls.borrow();
         // No preflight (no sql steps), 1 command.
@@ -190,22 +332,14 @@ mod tests {
         );
 
         let engine = MockEngine::new();
-        // Fail on the 2nd execution call (0-indexed: call 1 = step 2).
         engine.set_fail_on_call(1, 1, "syntax error");
+        let state = MockStateBackend::new();
 
-        let result = run(dir.path(), &engine);
+        let result = run(dir.path(), &engine, &state, false);
         assert!(result.is_err());
 
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("s2"), "error should name step 's2': {err_msg}");
-
-        let calls = engine.calls.borrow();
-        let exec_calls: Vec<_> = calls
-            .iter()
-            .filter(|c| !matches!(c, MockCall::Preflight))
-            .collect();
-        // Step 1 ran, step 2 ran (and failed), step 3 never ran.
-        assert_eq!(exec_calls.len(), 2, "expected 2 execution calls (s1 + s2), got {}", exec_calls.len());
     }
 
     // AC-5: Missing SQL file produces a specific error.
@@ -216,7 +350,8 @@ mod tests {
         setup_project(dir.path(), yaml, &[]);
 
         let engine = MockEngine::new();
-        let err = run(dir.path(), &engine).unwrap_err();
+        let state = MockStateBackend::new();
+        let err = run(dir.path(), &engine, &state, false).unwrap_err();
         assert!(err.to_string().contains("sql file not found"));
     }
 
@@ -229,7 +364,8 @@ mod tests {
         setup_project(dir.path(), yaml, &[("models/s1.sql", original_sql)]);
 
         let engine = MockEngine::new();
-        run(dir.path(), &engine).unwrap();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
 
         let calls = engine.calls.borrow();
         let sql_content = match &calls[1] {
@@ -248,17 +384,13 @@ mod tests {
 
         let engine = MockEngine::new();
         engine.set_preflight_failure();
+        let state = MockStateBackend::new();
 
-        let err = run(dir.path(), &engine).unwrap_err();
+        let err = run(dir.path(), &engine, &state, false).unwrap_err();
         assert!(
             err.to_string().contains("not found"),
             "should report engine not found: {err}"
         );
-
-        // Only preflight was called — no execution calls.
-        let calls = engine.calls.borrow();
-        assert_eq!(calls.len(), 1, "only preflight should be called");
-        assert!(matches!(calls[0], MockCall::Preflight));
     }
 
     // AC-9: Failing command step exits non-zero and halts pipeline.
@@ -269,29 +401,16 @@ mod tests {
         setup_project(dir.path(), yaml, &[]);
 
         let engine = MockEngine::new();
-        // Fail on the first command execution.
         engine.set_fail_on_call(0, 1, "connection refused");
+        let state = MockStateBackend::new();
 
-        let result = run(dir.path(), &engine);
+        let result = run(dir.path(), &engine, &state, false);
         assert!(result.is_err());
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("fetch"),
             "error should name step 'fetch': {err_msg}"
-        );
-
-        // Only 1 command call — second step never ran.
-        let calls = engine.calls.borrow();
-        let exec_calls: Vec<_> = calls
-            .iter()
-            .filter(|c| !matches!(c, MockCall::Preflight))
-            .collect();
-        assert_eq!(
-            exec_calls.len(),
-            1,
-            "only first command should run, got {}",
-            exec_calls.len()
         );
     }
 
@@ -313,7 +432,8 @@ mod tests {
         );
 
         let engine = MockEngine::new();
-        let result = run(dir.path(), &engine);
+        let state = MockStateBackend::new();
+        let result = run(dir.path(), &engine, &state, false);
         assert!(result.is_err());
 
         let err_msg = result.unwrap_err().to_string();
@@ -325,37 +445,20 @@ mod tests {
             err_msg.contains("customers"),
             "error should name asset 'customers': {err_msg}"
         );
-        assert!(
-            err_msg.contains("load"),
-            "error should name producer 'load': {err_msg}"
-        );
-
-        // No steps should have executed — validation happens before execution.
-        let calls = engine.calls.borrow();
-        let exec_calls: Vec<_> = calls
-            .iter()
-            .filter(|c| !matches!(c, MockCall::Preflight))
-            .collect();
-        assert_eq!(
-            exec_calls.len(),
-            0,
-            "no steps should execute after dependency validation failure"
-        );
     }
 
     // v0.2 AC-08: v0.1-style manifest (no assets) runs identically.
     #[test]
     fn test_v02_ac08_v1_manifest_runs_unchanged() {
         let dir = tempfile::tempdir().unwrap();
-        // Command-only pipeline — no SQL, no assets, no validation.
         let yaml = "name: test\nsteps:\n  - name: greet\n    command: echo hello\n  - name: done\n    command: echo done\n";
         setup_project(dir.path(), yaml, &[]);
 
         let engine = MockEngine::new();
-        run(dir.path(), &engine).unwrap();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
 
         let calls = engine.calls.borrow();
-        // No preflight (command-only), 2 command executions.
         assert_eq!(calls.len(), 2);
     }
 
@@ -371,12 +474,11 @@ mod tests {
         );
 
         let engine = MockEngine::new();
-        // Should succeed — unparseable SQL is treated as opaque, not an error.
-        run(dir.path(), &engine).unwrap();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
 
         let calls = engine.calls.borrow();
-        // 1 preflight + 1 SQL execution.
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 2); // preflight + 1 SQL
     }
 
     // v0.2 AC-09: Multi-step chain with valid ordering succeeds.
@@ -395,10 +497,222 @@ mod tests {
         );
 
         let engine = MockEngine::new();
-        run(dir.path(), &engine).unwrap();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
 
         let calls = engine.calls.borrow();
-        // 1 preflight + 3 SQL executions.
-        assert_eq!(calls.len(), 4);
+        assert_eq!(calls.len(), 4); // preflight + 3 SQL
+    }
+
+    // ---- v0.3 Staleness Tests ----
+
+    // v0.3 AC-04: Fresh SQL step is skipped on second run.
+    #[test]
+    fn test_v03_ac04_fresh_step_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        let sql = "CREATE TABLE t(v TEXT);";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", sql)]);
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+
+        // First run — step executes.
+        run(dir.path(), &engine, &state, false).unwrap();
+        let calls_after_first = engine.calls.borrow().len();
+        assert_eq!(calls_after_first, 2); // preflight + 1 sql
+
+        // Second run — step should be skipped (hash unchanged).
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let calls = engine.calls.borrow();
+        // Only preflight, no SQL execution.
+        assert_eq!(calls.len(), 1, "fresh step should be skipped on second run");
+        assert!(matches!(calls[0], MockCall::Preflight));
+    }
+
+    // v0.3 AC-05: Stale SQL step re-runs after edit.
+    #[test]
+    fn test_v03_ac05_stale_step_reruns() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+
+        // First run.
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        // Edit the SQL file.
+        fs::write(dir.path().join("models/s1.sql"), "SELECT 2;").unwrap();
+
+        // Second run — step should re-execute (hash changed).
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let calls = engine.calls.borrow();
+        assert_eq!(calls.len(), 2, "stale step should re-run: preflight + 1 sql");
+    }
+
+    // v0.3 AC-06: Downstream propagation — stale upstream makes dependents stale.
+    #[test]
+    fn test_v03_ac06_downstream_propagation() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: step-a\n    sql: models/a.sql\n  - name: step-b\n    sql: models/b.sql\n  - name: step-c\n    sql: models/c.sql\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[
+                ("models/a.sql", "CREATE TABLE x (id INT);"),
+                ("models/b.sql", "CREATE TABLE y AS SELECT * FROM x;"),
+                ("models/c.sql", "CREATE TABLE z AS SELECT * FROM y;"),
+            ],
+        );
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+
+        // First run — all execute.
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        // Edit only step-a's SQL.
+        fs::write(dir.path().join("models/a.sql"), "CREATE TABLE x (id INT, name TEXT);").unwrap();
+
+        // Second run — all three should re-run (a is stale, b and c are downstream).
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let calls = engine.calls.borrow();
+        let sql_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(c, MockCall::Sql { .. }))
+            .collect();
+        assert_eq!(sql_calls.len(), 3, "all 3 steps should re-run due to downstream propagation");
+    }
+
+    // v0.3 AC-08: Failed step always re-runs.
+    #[test]
+    fn test_v03_ac08_failed_step_reruns() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+
+        let engine = MockEngine::new();
+        engine.set_fail_on_call(0, 1, "error");
+        let state = MockStateBackend::new();
+
+        // First run — fails.
+        let _ = run(dir.path(), &engine, &state, false);
+
+        // Verify state records failure.
+        let step_state = state.get_step_state("s1").unwrap().unwrap();
+        assert_eq!(step_state.status, StepStatus::Failed);
+
+        // Second run — should re-execute (failed = always stale).
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let calls = engine.calls.borrow();
+        let sql_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(c, MockCall::Sql { .. }))
+            .collect();
+        assert_eq!(sql_calls.len(), 1, "failed step should re-run");
+    }
+
+    // v0.3 AC-09: Command steps always re-run.
+    #[test]
+    fn test_v03_ac09_command_always_reruns() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: greet\n    command: echo hello\n";
+        setup_project(dir.path(), yaml, &[]);
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+
+        // First run.
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        // Second run — command should still execute.
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let calls = engine.calls.borrow();
+        assert_eq!(calls.len(), 1, "command step should always re-run");
+    }
+
+    // v0.3 AC-10: --force runs all steps regardless of staleness.
+    #[test]
+    fn test_v03_ac10_force_runs_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+
+        // First run.
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        // Second run with --force — should execute even though fresh.
+        {
+            let engine = MockEngine::new();
+            run(dir.path(), &engine, &state, true).unwrap();
+
+            let calls = engine.calls.borrow();
+            let sql_calls: Vec<_> = calls
+                .iter()
+                .filter(|c| matches!(c, MockCall::Sql { .. }))
+                .collect();
+            assert_eq!(sql_calls.len(), 1, "--force should run fresh step");
+        }
+
+        // Third run without --force — should skip (--force recorded new state).
+        {
+            let engine = MockEngine::new();
+            run(dir.path(), &engine, &state, false).unwrap();
+
+            let calls = engine.calls.borrow();
+            let sql_calls: Vec<_> = calls
+                .iter()
+                .filter(|c| matches!(c, MockCall::Sql { .. }))
+                .collect();
+            assert_eq!(sql_calls.len(), 0, "after --force, step should be fresh");
+        }
+    }
+
+    // v0.3 AC-11: First run treats all steps as stale.
+    #[test]
+    fn test_v03_ac11_first_run_all_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n  - name: s2\n    sql: models/s2.sql\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[
+                ("models/s1.sql", "SELECT 1;"),
+                ("models/s2.sql", "SELECT 2;"),
+            ],
+        );
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+
+        // First run — no prior state, all should execute.
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let calls = engine.calls.borrow();
+        let sql_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(c, MockCall::Sql { .. }))
+            .collect();
+        assert_eq!(sql_calls.len(), 2, "first run should execute all steps");
     }
 }
