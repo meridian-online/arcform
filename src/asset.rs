@@ -17,10 +17,14 @@ use crate::manifest::Manifest;
 /// The assets associated with a single step.
 #[derive(Debug, Clone, Default)]
 pub struct StepAssets {
-    /// Asset names this step produces (creates/writes).
+    /// Asset names this step produces (creates/writes/modifies).
     pub produces: BTreeSet<String>,
-    /// Asset names this step reads from.
+    /// Asset names this step reads data from (external dependencies).
     pub reads: BTreeSet<String>,
+    /// CTE names — step-internal assets visible in lineage but not cross-step dependencies.
+    pub internal: BTreeSet<String>,
+    /// Asset names this step destroys (DROP operations).
+    pub destroys: BTreeSet<String>,
 }
 
 /// The complete asset graph for a pipeline.
@@ -60,6 +64,8 @@ impl AssetGraph {
                         Ok(sql_assets) => {
                             step_assets.produces.extend(sql_assets.outputs);
                             step_assets.reads.extend(sql_assets.inputs);
+                            step_assets.internal.extend(sql_assets.internal);
+                            step_assets.destroys.extend(sql_assets.destroys);
                         }
                         Err(warnings) => {
                             // AC-07: Warn on parse failure, treat as opaque.
@@ -176,6 +182,46 @@ impl AssetGraph {
         }
 
         Ok(())
+    }
+
+    /// Compute the transitive set of downstream steps affected when the
+    /// given steps are stale. A step is downstream if it reads an asset
+    /// produced by a stale step (directly or transitively).
+    ///
+    /// Returns step names in arbitrary order (callers should not rely on ordering).
+    pub fn downstream_steps(&self, stale_steps: &[String]) -> Vec<String> {
+        let mut affected: std::collections::HashSet<String> = stale_steps.iter().cloned().collect();
+        let mut changed = true;
+
+        // Iterate until no new steps are added (fixed-point).
+        while changed {
+            changed = false;
+            for (step_name, step_assets) in &self.steps {
+                if affected.contains(step_name) {
+                    continue;
+                }
+                // Check if this step reads any asset produced by an affected step.
+                for read_asset in &step_assets.reads {
+                    let produced_by_affected = affected.iter().any(|s| {
+                        self.steps
+                            .get(s)
+                            .is_some_and(|sa| sa.produces.contains(read_asset))
+                    });
+                    if produced_by_affected {
+                        affected.insert(step_name.clone());
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Remove the original stale steps — return only newly-affected downstream steps.
+        for s in stale_steps {
+            affected.remove(s);
+        }
+
+        affected.into_iter().collect()
     }
 
     /// Check if this graph has any asset information worth validating.
@@ -545,5 +591,118 @@ mod tests {
         );
 
         assert!(!graph.has_assets(), "bare command step has no assets");
+    }
+
+    // v0.3 AC-07: downstream_steps computes transitive downstream.
+    #[test]
+    fn test_v03_ac07_downstream_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = build_graph(
+            dir.path(),
+            vec![
+                sql_step("step-a", "models/a.sql"),
+                sql_step("step-b", "models/b.sql"),
+                sql_step("step-c", "models/c.sql"),
+            ],
+            HashMap::new(),
+            &[
+                ("models/a.sql", "CREATE TABLE x (id INT);"),
+                ("models/b.sql", "CREATE TABLE y AS SELECT * FROM x;"),
+                ("models/c.sql", "CREATE TABLE z AS SELECT * FROM y;"),
+            ],
+        );
+
+        let downstream = graph.downstream_steps(&["step-a".into()]);
+        assert!(downstream.contains(&"step-b".to_string()), "step-b depends on step-a's output");
+        assert!(downstream.contains(&"step-c".to_string()), "step-c transitively depends on step-a");
+    }
+
+    // v0.3 AC-07: downstream_steps with opaque middle step — chain breaks.
+    #[test]
+    fn test_v03_ac07_downstream_opaque_breaks_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = build_graph(
+            dir.path(),
+            vec![
+                sql_step("step-a", "models/a.sql"),
+                cmd_step("step-b", "echo transform"),
+                sql_step("step-c", "models/c.sql"),
+            ],
+            HashMap::new(),
+            &[
+                ("models/a.sql", "CREATE TABLE x (id INT);"),
+                ("models/c.sql", "CREATE TABLE z AS SELECT * FROM y;"),
+            ],
+        );
+
+        // step-b is opaque (no produces/reads), so step-c doesn't transitively
+        // depend on step-a through step-b.
+        let downstream = graph.downstream_steps(&["step-a".into()]);
+        // step-c reads 'y' which is not produced by step-a (step-a produces 'x'),
+        // so step-c is NOT downstream of step-a in this graph.
+        assert!(!downstream.contains(&"step-c".to_string()), "opaque middle step breaks propagation");
+    }
+
+    // v0.3 AC-10: StepAssets gains internal and destroys, populated from SqlAssets.
+    #[test]
+    fn test_v03_ac10_step_assets_internal_from_cte() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = build_graph(
+            dir.path(),
+            vec![sql_step("transform", "models/transform.sql")],
+            HashMap::new(),
+            &[(
+                "models/transform.sql",
+                "WITH recent AS (SELECT * FROM orders WHERE date > '2026-01-01') SELECT * FROM recent;",
+            )],
+        );
+
+        let step = graph.steps.get("transform").unwrap();
+        assert!(step.internal.contains("recent"), "CTE name should be in step's internal set");
+        assert!(step.reads.contains("orders"), "real table should be in reads");
+        assert!(!step.reads.contains("recent"), "CTE name should NOT be in reads");
+    }
+
+    // v0.3 AC-10: StepAssets destroys populated from DROP TABLE.
+    #[test]
+    fn test_v03_ac10_step_assets_destroys_from_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = build_graph(
+            dir.path(),
+            vec![sql_step("cleanup", "models/cleanup.sql")],
+            HashMap::new(),
+            &[("models/cleanup.sql", "DROP TABLE old_data;")],
+        );
+
+        let step = graph.steps.get("cleanup").unwrap();
+        assert!(step.destroys.contains("old_data"), "dropped table should be in step's destroys set");
+    }
+
+    // v0.3 AC-11: validate_order ignores internal — CTE names don't cause false violations.
+    #[test]
+    fn test_v03_ac11_cte_name_no_false_violation() {
+        let dir = tempfile::tempdir().unwrap();
+        // step-A creates table `recent`, step-B uses WITH recent AS (...) which shadows the name.
+        // validate_order should NOT flag this as a dependency violation.
+        let graph = build_graph(
+            dir.path(),
+            vec![
+                sql_step("step-b", "models/b.sql"),
+                sql_step("step-a", "models/a.sql"),
+            ],
+            HashMap::new(),
+            &[
+                (
+                    "models/b.sql",
+                    "WITH recent AS (SELECT * FROM raw_data) CREATE TABLE summary AS SELECT * FROM recent;",
+                ),
+                ("models/a.sql", "CREATE TABLE recent (id INT);"),
+            ],
+        );
+
+        // step-B runs before step-A. step-B's SQL has a CTE named 'recent' —
+        // this should NOT trigger a violation even though step-A creates a table named 'recent'.
+        let order: Vec<String> = vec!["step-b".into(), "step-a".into()];
+        graph.validate_order(&order).unwrap();
     }
 }

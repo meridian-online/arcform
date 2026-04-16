@@ -46,6 +46,9 @@ pub enum Error {
         producer: String,
     },
 
+    #[error("state backend error: {0}")]
+    StateBackend(String),
+
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }

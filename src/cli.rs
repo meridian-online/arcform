@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use crate::engine::DuckDbEngine;
 use crate::error::{Error, Result};
 use crate::manifest::Manifest;
+use crate::state::DuckDbStateBackend;
 
 #[derive(Parser)]
 #[command(name = "arc", version, about = "Local-first data pipeline engine")]
@@ -22,7 +23,11 @@ pub enum Commands {
         name: String,
     },
     /// Run the pipeline defined in arcform.yaml.
-    Run,
+    Run {
+        /// Force re-execution of all steps, ignoring staleness.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// Execute the `arc init` command in the current directory.
@@ -60,17 +65,20 @@ pub fn init_at(name: &str, base: &std::path::Path) -> Result<()> {
 }
 
 /// Execute the `arc run` command.
-pub fn run_pipeline() -> Result<()> {
+pub fn run_pipeline(force: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
+    let manifest = Manifest::load(&cwd)?;
+    let db_path = manifest.db_path(&cwd);
     let engine = DuckDbEngine;
-    crate::runner::run(&cwd, &engine)
+    let state = DuckDbStateBackend::new(&db_path);
+    crate::runner::run(&cwd, &engine, &state, force)
 }
 
 /// Dispatch CLI commands.
 pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Init { name } => init(&name),
-        Commands::Run => run_pipeline(),
+        Commands::Run { force } => run_pipeline(force),
     }
 }
 

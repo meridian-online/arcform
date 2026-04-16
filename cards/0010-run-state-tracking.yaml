@@ -1,0 +1,44 @@
+feature: "Run state tracking"
+as_a: "data analyst iterating on a pipeline"
+i_want: "arc to track execution state so it can skip fresh steps and detect stale assets"
+so_that: "I don't wait for the full pipeline after a small change, and I have a reliable execution history"
+
+scenarios:
+  - name: "Configurable state backend"
+    given: "the StateBackend trait"
+    when: "arc initialises"
+    then: "the backend is selected from config (default: DuckDB metadata table)"
+    source_lines: "design session: 'we need to make it configurable'"
+
+  - name: "SQL content hash staleness"
+    given: "a step whose SQL file was edited"
+    when: "arc evaluates the pipeline"
+    then: "the step is marked stale (hash differs from last successful run)"
+    source_lines: "decisions/0001: the engine understands data lineage, enabling selective re-materialisation"
+
+  - name: "Skip fresh assets"
+    given: "a pipeline where only one step changed"
+    when: "I run `arc run`"
+    then: "unchanged steps are skipped; only the stale step and its dependents re-run"
+    source_lines: "decisions/0001: the engine understands data lineage, enabling selective re-materialisation"
+
+  - name: "Downstream propagation"
+    given: "a stale upstream step"
+    when: "arc evaluates dependencies"
+    then: "all downstream steps are also marked stale, even if their SQL hasn't changed"
+    source_lines: "design session: stale upstream makes dependents stale"
+
+  - name: "Force full rebuild"
+    given: "a pipeline with cached state"
+    when: "I run `arc run --force`"
+    then: "all steps execute regardless of staleness"
+    source_lines: "design session: escape hatch for forcing a full rebuild"
+
+goal: "v0.3 — configurable state backend with content-hash staleness and selective execution"
+maturity: "active"
+specs:
+  - specs/2026-04-16-selective-rematerialisation/spec.yaml
+references:
+  - "decisions/0001-asset-centric-pipeline-engine.md"
+  - "specs/2026-03-30-foundational-decisions/spec.yaml"
+  - "cards/0011-local-remote-parity.yaml"

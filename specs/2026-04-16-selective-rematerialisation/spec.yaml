@@ -1,0 +1,133 @@
+goal: "Configurable state backend with SQL content-hash staleness detection and selective step execution"
+
+constraints:
+  - "StateBackend is a trait — DuckDbStateBackend is the first implementation"
+  - "DuckDbStateBackend uses the `duckdb` crate (duckdb-rs) for in-process access to state tables"
+  - "DuckDB connection is opened/closed around state operations — not held during step execution (avoids file locking with CLI-based step execution)"
+  - "SQL staleness uses SHA-256 content hash of the SQL file contents (raw bytes, no normalisation)"
+  - "Downstream propagation: stale upstream step → all downstream steps are stale (via asset graph)"
+  - "Downstream propagation follows the asset graph only — opaque steps (no declared assets) do not participate in propagation chains"
+  - "Failed steps are always stale — re-run on next invocation"
+  - "Command steps always re-run — no staleness signal without preconditions (deferred to future card)"
+  - "Two DuckDB metadata tables: _arcform_state (per-step state) and _arcform_runs (per-run history)"
+  - "--force flag overrides all staleness — every step executes AND records new state afterward"
+  - "State backend must not block execution on first run (no prior state = all steps stale)"
+  - "Runner signature changes: run(dir, engine, state, force) — state backend and force flag threaded from CLI"
+  - "Steps should be idempotent — crash recovery limitation acknowledged (state recorded after step execution, not atomically)"
+  - "State tables co-located in the project's database file (manifest db_path)"
+  - "New crate dependencies: `duckdb` (state backend), `sha2` (content hashing)"
+
+acceptance_criteria:
+  - id: ac-01
+    ac_type: code
+    description: "StateBackend trait with get_step_state, record_step, start_run, and finish_run methods"
+    verification: "Trait compiles; MockStateBackend used in tests"
+
+  - id: ac-02
+    ac_type: code
+    description: "DuckDbStateBackend creates _arcform_state and _arcform_runs tables on first use (CREATE TABLE IF NOT EXISTS)"
+    verification: "Test: backend initialises against a fresh DuckDB database; tables exist after first call. Calling init twice is idempotent."
+
+  - id: ac-03
+    ac_type: code
+    description: "SQL step content hash: SHA-256 of the SQL file contents, stored in _arcform_state"
+    verification: "Test: run a pipeline, verify _arcform_state contains step name and correct SHA-256 hash"
+
+  - id: ac-04
+    ac_type: code
+    description: "Fresh SQL step is skipped — hash matches last successful run"
+    verification: "Test: run pipeline twice without editing SQL; second run skips the step (mock engine not called)"
+
+  - id: ac-05
+    ac_type: code
+    description: "Stale SQL step re-runs — SQL file was edited (hash differs)"
+    verification: "Test: run pipeline, edit SQL file, run again; step executes on second run"
+
+  - id: ac-06
+    ac_type: code
+    description: "Downstream propagation — stale upstream step makes dependent steps stale even if their own SQL is unchanged"
+    verification: "Test: 3-step chain (A→B→C), edit A's SQL, run; all three re-run. Also test: middle step is opaque — propagation chain breaks at the opaque step."
+
+  - id: ac-07
+    ac_type: code
+    description: "AssetGraph provides a downstream_steps method to compute the transitive set of steps affected by a stale step"
+    verification: "Test: given steps A→B→C in the asset graph, downstream_steps('A') returns ['B', 'C']"
+
+  - id: ac-08
+    ac_type: code
+    description: "Failed step is always stale — re-runs on next invocation"
+    verification: "Test: step fails on first run, second run re-executes it"
+
+  - id: ac-09
+    ac_type: code
+    description: "Command steps always re-run regardless of state"
+    verification: "Test: pipeline with command step; run twice; command executes both times"
+
+  - id: ac-10
+    ac_type: code
+    description: "`arc run --force` flag runs all steps regardless of staleness AND records new state"
+    verification: "Test: run pipeline (all fresh), run with --force; all steps execute. Then run without --force; SQL steps are skipped (state was updated)."
+
+  - id: ac-11
+    ac_type: code
+    description: "First run (no prior state) treats all steps as stale — full execution"
+    verification: "Test: fresh database, arc run executes all steps"
+
+  - id: ac-12
+    ac_type: code
+    description: "Step progress output shows skip/run status for each step"
+    verification: "Test: output includes '[skip]' for fresh steps and step counter for executed steps"
+
+  - id: ac-13
+    ac_type: code
+    description: "_arcform_runs table records run history"
+    verification: "Test: after a run, _arcform_runs has one row with run_id, started_at, finished_at, steps_executed count, and outcome"
+
+  - id: ac-14
+    ac_type: code
+    description: "Runner signature updated: run(dir, engine, state, force) — CLI wires DuckDbStateBackend and --force flag"
+    verification: "Test: CLI dispatch passes state backend and force flag to runner. Existing runner tests updated with MockStateBackend."
+
+  - id: ac-15
+    ac_type: code
+    description: "All existing tests pass — backwards compatible"
+    verification: "cargo test passes with zero failures"
+
+ontology_schema:
+  name: "RunState"
+  description: "Per-step execution state for staleness detection"
+  fields:
+    - name: "step_name"
+      type: "TEXT PRIMARY KEY"
+      description: "Unique step name from the manifest"
+    - name: "sql_hash"
+      type: "TEXT NOT NULL"
+      description: "SHA-256 hex digest of the SQL file contents (empty string for command steps)"
+    - name: "last_run_at"
+      type: "TIMESTAMP NOT NULL"
+      description: "When this step last executed"
+    - name: "status"
+      type: "TEXT NOT NULL"
+      description: "Result of last execution: 'success' or 'failed'"
+
+evaluation_principles:
+  - principle: "Correctness — stale steps always re-run, fresh steps always skip"
+    weight: 0.4
+  - principle: "Backwards compatibility — existing tests and behaviour preserved"
+    weight: 0.3
+  - principle: "Extensibility — trait-based backend enables future implementations"
+    weight: 0.2
+  - principle: "Observability — user can see which steps were skipped and why"
+    weight: 0.1
+
+exit_conditions:
+  - "All 15 ACs verified by tests"
+  - "cargo test passes with zero failures"
+  - "A pipeline run twice without changes skips all SQL steps on second run"
+
+metadata:
+  version: "2.0"
+  timestamp: "2026-04-16T13:00:00Z"
+  ambiguity_score: 0.08
+  interview_ref: "specs/2026-04-16-selective-rematerialisation/interview.md"
+  review_ref: "specs/2026-04-16-selective-rematerialisation/review-spec-2026-04-16.md"
