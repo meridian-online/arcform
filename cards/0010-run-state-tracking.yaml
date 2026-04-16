@@ -35,7 +35,7 @@ scenarios:
     source_lines: "design session: escape hatch for forcing a full rebuild"
 
 goal: "v0.3 — configurable state backend with content-hash staleness and selective execution"
-maturity: "planned"
+maturity: "active"
 specs:
   - specs/2026-04-16-selective-rematerialisation/spec.yaml
 references:

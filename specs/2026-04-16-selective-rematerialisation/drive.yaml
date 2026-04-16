@@ -3,6 +3,6 @@ autonomy: guided
 budget: 3
 iteration: 1
 current_spec: specs/2026-04-16-selective-rematerialisation
-status: review
+status: complete
 history: []
 started: 2026-04-16T11:30:00Z
