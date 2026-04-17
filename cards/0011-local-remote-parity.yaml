@@ -22,9 +22,10 @@ scenarios:
     then: "all manifest features are portable — nothing is local-only"
     source_lines: "decisions/0006: No local-only features — everything in the manifest is portable"
 
-goal: "future — version assertion mechanism"
-maturity: "planned"
-specs: []
+goal: "Engine version assertion catches mismatches before execution; manifest engine_version field uses Cargo-style semver constraints"
+maturity: "active"
+specs:
+  - specs/2026-04-17-local-remote-parity/spec.yaml
 references:
   - "decisions/0006-local-first-remote-compatible.md"
   - "decisions/0003-delegate-execution-to-engine-cli.md"
