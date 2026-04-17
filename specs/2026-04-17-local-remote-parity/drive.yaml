@@ -1,0 +1,8 @@
+card: cards/0011-local-remote-parity.yaml
+autonomy: guided
+budget: 3
+iteration: 1
+current_spec: specs/2026-04-17-local-remote-parity/
+status: complete
+history: []
+started: "2026-04-17T10:00:00Z"

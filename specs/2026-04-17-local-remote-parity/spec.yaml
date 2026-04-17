@@ -1,0 +1,106 @@
+goal: "Engine version assertion: manifest declares engine_version constraint, preflight detects installed version, runner catches mismatches before execution begins"
+
+constraints:
+  - "Use dtolnay's `semver` crate for version parsing and comparison — no custom semver implementation"
+  - "engine_version is optional — omitting it skips the check (backwards compatible with all existing manifests)"
+  - "Engine::preflight() returns EngineInfo (detection) — runner does the comparison (policy). Separation of concerns."
+  - "Parse duckdb --version output format: 'v1.5.2 (Variegata) 8a5851971f' → extract semver '1.5.2'. Graceful degradation if unparseable."
+  - "All existing tests must pass — preflight() return type change touches every caller"
+  - "Portability is a design principle, not a code feature — no local-only features are introduced"
+
+acceptance_criteria:
+  - id: ac-01
+    ac_type: code
+    description: "EngineInfo struct exists with a `version` field of type Option<semver::Version>"
+    verification: "Struct definition compiles; field is public"
+
+  - id: ac-02
+    ac_type: code
+    description: "Engine::preflight() trait method returns Result<EngineInfo> instead of Result<()>"
+    verification: "Trait definition compiles; all implementors updated"
+
+  - id: ac-03
+    ac_type: code
+    description: "DuckDbEngine::preflight() parses `duckdb --version` output and populates EngineInfo.version"
+    verification: "Test: version parsing extracts '1.5.2' from 'v1.5.2 (Variegata) 8a5851971f'. Also tests format without codename: 'v0.10.0 1234abc'."
+
+  - id: ac-04
+    ac_type: code
+    description: "Manifest gains an optional `engine_version` field (String, serde default None)"
+    verification: "Test: manifest with engine_version parses correctly; manifest without it also parses (backwards compatible)"
+
+  - id: ac-05
+    ac_type: code
+    description: "Runner compares EngineInfo.version against manifest's engine_version constraint using semver::VersionReq"
+    verification: "Test: mock engine returns version 1.3.0, manifest requires >=1.5 → run fails before any step executes"
+
+  - id: ac-06
+    ac_type: code
+    description: "Version mismatch produces a rich error: 'engine version mismatch: requires <constraint>, found <detected>'"
+    verification: "Test: error message contains both the constraint string and the detected version"
+
+  - id: ac-07
+    ac_type: code
+    description: "Missing engine_version field skips the version check — only CLI existence is verified"
+    verification: "Test: manifest without engine_version + mock engine → preflight passes (no version comparison)"
+
+  - id: ac-08
+    ac_type: code
+    description: "Invalid engine_version syntax (e.g. 'banana') caught during manifest validation with a clear error"
+    verification: "Test: manifest with engine_version: 'not-semver' fails validation with error containing 'engine_version'"
+
+  - id: ac-09
+    ac_type: code
+    description: "arc init scaffolds engine_version: '>=1.0' as a sensible default in the generated arcform.yaml"
+    verification: "Test: init_at creates a manifest that includes engine_version with a non-empty value"
+
+  - id: ac-10
+    ac_type: code
+    description: "MockEngine::preflight() returns configurable EngineInfo with a settable version"
+    verification: "Test: MockEngine with version set to 2.0.0 → preflight returns EngineInfo { version: 2.0.0 }"
+
+  - id: ac-11
+    ac_type: code
+    description: "All existing tests pass with the new preflight return type (Result<EngineInfo> replaces Result<()>)"
+    verification: "cargo test passes with zero failures; all existing test assertions preserved"
+
+  - id: ac-12
+    ac_type: code
+    description: "If engine version output cannot be parsed, preflight succeeds with a warning and version check is skipped — pipeline still runs"
+    verification: "Test: mock engine returns unparseable version string → preflight returns EngineInfo with version None, runner skips version comparison, pipeline executes"
+
+  - id: ac-13
+    ac_type: doc
+    description: "Portability principle documented: all manifest features are portable between local and remote environments"
+    verification: "Constraint recorded in spec; no local-only features introduced by this change"
+
+ontology_schema:
+  name: "EngineInfo"
+  description: "Information about the detected engine, returned by preflight"
+  fields:
+    - name: "version"
+      type: "Option<semver::Version>"
+      description: "Parsed semantic version of the installed engine CLI, or None if version output was unparseable"
+
+evaluation_principles:
+  - principle: "Correctness — version mismatches are caught before any step executes"
+    weight: 0.4
+  - principle: "Backwards compatibility — existing manifests without engine_version work unchanged"
+    weight: 0.3
+  - principle: "Clarity — error messages are actionable, showing both required and found versions"
+    weight: 0.2
+  - principle: "Simplicity — uses established semver crate, no custom parsing beyond CLI output extraction"
+    weight: 0.1
+
+exit_conditions:
+  - "All 12 code ACs verified by tests"
+  - "cargo test passes with zero failures"
+  - "Version mismatch error contains both constraint and detected version"
+  - "Existing manifests without engine_version continue to work"
+
+metadata:
+  version: "1.0"
+  test_prefix: "lrp"
+  timestamp: "2026-04-17T10:30:00Z"
+  ambiguity_score: 0.07
+  interview_ref: "specs/2026-04-17-local-remote-parity/interview.md"

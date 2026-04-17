@@ -23,6 +23,9 @@ pub enum Error {
     #[error("engine '{engine}' not found on PATH or not executable")]
     EngineNotFound { engine: String },
 
+    #[error("engine version mismatch: requires {required}, found {found}")]
+    VersionMismatch { required: String, found: String },
+
     #[error("step '{step}' failed (exit code {code}):\n{stderr}")]
     StepFailed {
         step: String,

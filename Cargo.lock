@@ -132,6 +132,7 @@ dependencies = [
  "clap",
  "duckdb",
  "owo-colors",
+ "semver",
  "serde",
  "serde_yaml",
  "sha2",
