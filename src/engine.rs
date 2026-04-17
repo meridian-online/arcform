@@ -4,6 +4,14 @@ use std::process::{Command, Stdio};
 
 use crate::error::{Error, Result};
 
+/// Information about the detected engine, returned by preflight.
+#[derive(Debug, Clone)]
+pub struct EngineInfo {
+    /// Parsed semantic version of the installed engine CLI,
+    /// or None if version output was unparseable.
+    pub version: Option<semver::Version>,
+}
+
 /// Output captured from a step execution.
 /// Stdout is inherited (streams to terminal in real-time).
 /// Stderr is captured for error reporting but also streamed for SQL steps.
@@ -46,8 +54,9 @@ pub trait Engine {
     /// Execute a raw shell command.
     fn execute_command(&self, command: &str) -> Result<StepOutput>;
 
-    /// Check that the engine CLI is available and executable.
-    fn preflight(&self) -> Result<()>;
+    /// Check that the engine CLI is available and return information about it.
+    /// Returns EngineInfo with the detected version (or None if unparseable).
+    fn preflight(&self) -> Result<EngineInfo>;
 }
 
 /// DuckDB CLI engine implementation.
@@ -116,16 +125,39 @@ impl Engine for DuckDbEngine {
         })
     }
 
-    fn preflight(&self) -> Result<()> {
+    fn preflight(&self) -> Result<EngineInfo> {
         let output = Command::new("duckdb").arg("--version").output();
 
         match output {
-            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) if o.status.success() => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let version = parse_version_output(&stdout);
+                Ok(EngineInfo { version })
+            }
             _ => Err(Error::EngineNotFound {
                 engine: "duckdb".to_string(),
             }),
         }
     }
+}
+
+/// Parse a version string from engine CLI output.
+///
+/// Handles formats like:
+/// - "v1.5.2 (Variegata) 8a5851971f"
+/// - "v0.10.0 1234abc"
+/// - "1.5.2"
+///
+/// Returns None if the version cannot be parsed.
+pub fn parse_version_output(output: &str) -> Option<semver::Version> {
+    // Find the first token that looks like a version (with or without leading 'v').
+    for token in output.split_whitespace() {
+        let stripped = token.strip_prefix('v').unwrap_or(token);
+        if let Ok(ver) = semver::Version::parse(stripped) {
+            return Some(ver);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -146,6 +178,8 @@ pub mod mock {
         exec_count: RefCell<usize>,
         /// If true, preflight returns EngineNotFound.
         pub preflight_should_fail: RefCell<bool>,
+        /// Version to report from preflight. Defaults to 2.0.0.
+        pub version: RefCell<Option<semver::Version>>,
     }
 
     #[derive(Debug, Clone)]
@@ -168,7 +202,13 @@ pub mod mock {
                 fail_on_call: RefCell::new(None),
                 exec_count: RefCell::new(0),
                 preflight_should_fail: RefCell::new(false),
+                version: RefCell::new(Some(semver::Version::new(2, 0, 0))),
             }
+        }
+
+        /// Set the version that preflight will report.
+        pub fn set_version(&self, version: Option<semver::Version>) {
+            *self.version.borrow_mut() = version;
         }
 
         /// Fail on every execution call.
@@ -247,14 +287,70 @@ pub mod mock {
             })
         }
 
-        fn preflight(&self) -> Result<()> {
+        fn preflight(&self) -> Result<EngineInfo> {
             self.calls.borrow_mut().push(MockCall::Preflight);
             if *self.preflight_should_fail.borrow() {
                 return Err(Error::EngineNotFound {
                     engine: "duckdb".to_string(),
                 });
             }
-            Ok(())
+            Ok(EngineInfo {
+                version: self.version.borrow().clone(),
+            })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // lrp ac-03: Parse version with codename (standard DuckDB format).
+    #[test]
+    fn test_lrp_ac03_parse_version_with_codename() {
+        let version = parse_version_output("v1.5.2 (Variegata) 8a5851971f");
+        assert_eq!(version.unwrap(), semver::Version::new(1, 5, 2));
+    }
+
+    // lrp ac-03: Parse version without codename.
+    #[test]
+    fn test_lrp_ac03_parse_version_without_codename() {
+        let version = parse_version_output("v0.10.0 1234abc");
+        assert_eq!(version.unwrap(), semver::Version::new(0, 10, 0));
+    }
+
+    // lrp ac-03: Parse bare version (no leading 'v').
+    #[test]
+    fn test_lrp_ac03_parse_bare_version() {
+        let version = parse_version_output("1.5.2");
+        assert_eq!(version.unwrap(), semver::Version::new(1, 5, 2));
+    }
+
+    // lrp ac-12: Unparseable output returns None.
+    #[test]
+    fn test_lrp_ac12_unparseable_version_returns_none() {
+        assert!(parse_version_output("not a version").is_none());
+        assert!(parse_version_output("").is_none());
+        assert!(parse_version_output("duckdb").is_none());
+    }
+
+    // lrp ac-10: MockEngine returns configurable version.
+    #[test]
+    fn test_lrp_ac10_mock_engine_configurable_version() {
+        let engine = mock::MockEngine::new();
+
+        // Default is 2.0.0.
+        let info = engine.preflight().unwrap();
+        assert_eq!(info.version.unwrap(), semver::Version::new(2, 0, 0));
+
+        // Set custom version.
+        engine.set_version(Some(semver::Version::new(1, 3, 0)));
+        let info = engine.preflight().unwrap();
+        assert_eq!(info.version.unwrap(), semver::Version::new(1, 3, 0));
+
+        // Set None (unparseable).
+        engine.set_version(None);
+        let info = engine.preflight().unwrap();
+        assert!(info.version.is_none());
     }
 }

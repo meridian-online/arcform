@@ -295,6 +295,7 @@ mod tests {
         let manifest = Manifest {
             name: "test".to_string(),
             engine: "duckdb".to_string(),
+            engine_version: None,
             db: None,
             steps,
             assets,

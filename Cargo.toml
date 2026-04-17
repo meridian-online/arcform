@@ -17,6 +17,7 @@ thiserror = "2"
 owo-colors = "4"
 sqlparser = { version = "0.55", features = ["visitor"] }
 duckdb = "1.2"
+semver = "1"
 sha2 = "0.10"
 
 [dev-dependencies]

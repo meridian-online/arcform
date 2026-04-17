@@ -13,9 +13,34 @@ use crate::state::{self, StateBackend, StepStatus};
 pub fn run(dir: &Path, engine: &dyn Engine, state: &dyn StateBackend, force: bool) -> Result<()> {
     let manifest = Manifest::load(dir)?;
 
-    // If there are SQL steps, verify the engine is available.
+    // If there are SQL steps, verify the engine is available and check version.
     if manifest.has_sql_steps() {
-        engine.preflight()?;
+        let info = engine.preflight()?;
+
+        // Check engine version constraint if specified.
+        if let Some(ref constraint_str) = manifest.engine_version {
+            if let Ok(req) = semver::VersionReq::parse(constraint_str) {
+                match &info.version {
+                    Some(ver) => {
+                        if !req.matches(ver) {
+                            return Err(Error::VersionMismatch {
+                                required: constraint_str.clone(),
+                                found: ver.to_string(),
+                            });
+                        }
+                    }
+                    None => {
+                        // Version unparseable — warn but don't block.
+                        eprintln!(
+                            "{} could not detect engine version — skipping version check (requires {})",
+                            "warning:".yellow(),
+                            constraint_str,
+                        );
+                    }
+                }
+            }
+            // If constraint_str is invalid, manifest validation already caught it.
+        }
     }
 
     if manifest.steps.is_empty() {
@@ -714,5 +739,101 @@ mod tests {
             .filter(|c| matches!(c, MockCall::Sql { .. }))
             .collect();
         assert_eq!(sql_calls.len(), 2, "first run should execute all steps");
+    }
+
+    // ---- Local-Remote Parity Tests ----
+
+    // lrp ac-05: Version mismatch blocks execution before any step runs.
+    #[test]
+    fn test_lrp_ac05_version_mismatch_blocks_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nengine_version: '>=2.0'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+
+        let engine = MockEngine::new();
+        // MockEngine defaults to v2.0.0, set it to 1.3.0 to trigger mismatch.
+        engine.set_version(Some(semver::Version::new(1, 3, 0)));
+        let state = MockStateBackend::new();
+
+        let result = run(dir.path(), &engine, &state, false);
+        assert!(result.is_err(), "should fail due to version mismatch");
+
+        // Verify no steps executed — only preflight was called.
+        let calls = engine.calls.borrow();
+        assert_eq!(calls.len(), 1, "only preflight should be called");
+        assert!(matches!(calls[0], MockCall::Preflight));
+    }
+
+    // lrp ac-06: Version mismatch error contains both required and found versions.
+    #[test]
+    fn test_lrp_ac06_error_contains_both_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nengine_version: '>=2.0'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+
+        let engine = MockEngine::new();
+        engine.set_version(Some(semver::Version::new(1, 3, 0)));
+        let state = MockStateBackend::new();
+
+        let err = run(dir.path(), &engine, &state, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(">=2.0"), "error should contain constraint: {msg}");
+        assert!(msg.contains("1.3.0"), "error should contain detected version: {msg}");
+    }
+
+    // lrp ac-07: No engine_version skips the version check.
+    #[test]
+    fn test_lrp_ac07_no_version_constraint_skips_check() {
+        let dir = tempfile::tempdir().unwrap();
+        // No engine_version in YAML — should skip version check.
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+
+        let engine = MockEngine::new();
+        // Even with a very old version, no constraint means no check.
+        engine.set_version(Some(semver::Version::new(0, 1, 0)));
+        let state = MockStateBackend::new();
+
+        // Should succeed — no version comparison.
+        run(dir.path(), &engine, &state, false).unwrap();
+    }
+
+    // lrp ac-05: Version that satisfies constraint passes.
+    #[test]
+    fn test_lrp_ac05_version_satisfies_constraint() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nengine_version: '>=1.5'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+
+        let engine = MockEngine::new();
+        engine.set_version(Some(semver::Version::new(1, 5, 2)));
+        let state = MockStateBackend::new();
+
+        // Should succeed — 1.5.2 >= 1.5.
+        run(dir.path(), &engine, &state, false).unwrap();
+    }
+
+    // lrp ac-12: Unparseable version warns but pipeline continues.
+    #[test]
+    fn test_lrp_ac12_unparseable_version_warns_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nengine_version: '>=1.5'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+
+        let engine = MockEngine::new();
+        // Set version to None (simulating unparseable output).
+        engine.set_version(None);
+        let state = MockStateBackend::new();
+
+        // Should succeed — unparseable version skips check.
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        // Verify step actually executed.
+        let calls = engine.calls.borrow();
+        let sql_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(c, MockCall::Sql { .. }))
+            .collect();
+        assert_eq!(sql_calls.len(), 1, "step should execute despite unparseable version");
     }
 }

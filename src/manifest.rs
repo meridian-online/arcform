@@ -14,6 +14,11 @@ pub struct Manifest {
     #[serde(default = "default_engine")]
     pub engine: String,
 
+    /// Semver version constraint for the engine CLI (e.g. ">=1.5").
+    /// Optional — omitting skips version check. Uses Cargo-style syntax.
+    #[serde(default)]
+    pub engine_version: Option<String>,
+
     /// Path to the database file, relative to the manifest directory.
     /// Defaults to "<name>.duckdb" if not specified.
     #[serde(default)]
@@ -109,6 +114,16 @@ impl Manifest {
             ));
         }
 
+        // Validate engine_version is parseable semver constraint.
+        if let Some(ref ev) = self.engine_version {
+            if semver::VersionReq::parse(ev).is_err() {
+                return Err(Error::ManifestValidation(format!(
+                    "invalid engine_version '{}': must be a valid semver constraint (e.g. '>=1.5')",
+                    ev
+                )));
+            }
+        }
+
         let mut seen_names = std::collections::HashSet::new();
         for (i, step) in self.steps.iter().enumerate() {
             // Check for empty step names.
@@ -153,6 +168,7 @@ impl Manifest {
         Manifest {
             name: name.to_string(),
             engine: "duckdb".to_string(),
+            engine_version: Some(">=1.0".to_string()),
             db: Some(format!("{}.duckdb", name)),
             steps: Vec::new(),
             assets: std::collections::HashMap::new(),
@@ -197,6 +213,7 @@ mod tests {
         Manifest {
             name: name.to_string(),
             engine: "duckdb".to_string(),
+            engine_version: None,
             db: None,
             steps,
             assets: std::collections::HashMap::new(),
@@ -379,5 +396,52 @@ assets:
         assert!(m.steps[0].produces.is_empty());
         assert!(m.steps[0].depends_on.is_empty());
         assert!(m.assets.is_empty());
+    }
+
+    // lrp ac-04: Manifest with engine_version parses correctly.
+    #[test]
+    fn test_lrp_ac04_manifest_with_engine_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nengine_version: '>=1.5'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        fs::write(dir.path().join("arcform.yaml"), yaml).unwrap();
+        let m = Manifest::load(dir.path()).unwrap();
+        assert_eq!(m.engine_version, Some(">=1.5".to_string()));
+    }
+
+    // lrp ac-04: Manifest without engine_version is backwards compatible.
+    #[test]
+    fn test_lrp_ac04_manifest_without_engine_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        fs::write(dir.path().join("arcform.yaml"), yaml).unwrap();
+        let m = Manifest::load(dir.path()).unwrap();
+        assert!(m.engine_version.is_none());
+    }
+
+    // lrp ac-08: Invalid engine_version syntax is rejected.
+    #[test]
+    fn test_lrp_ac08_invalid_engine_version_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nengine_version: 'banana'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        fs::write(dir.path().join("arcform.yaml"), yaml).unwrap();
+        let err = Manifest::load(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("engine_version"), "error should mention engine_version: {msg}");
+        assert!(msg.contains("banana"), "error should show the invalid value: {msg}");
+    }
+
+    // lrp ac-09: arc init scaffolds engine_version.
+    #[test]
+    fn test_lrp_ac09_init_scaffolds_engine_version() {
+        let m = Manifest::new_project("test-pipeline");
+        assert!(m.engine_version.is_some(), "new_project should include engine_version");
+        let ev = m.engine_version.unwrap();
+        assert!(!ev.is_empty(), "engine_version should not be empty");
+        // Should be a valid semver constraint.
+        assert!(
+            semver::VersionReq::parse(&ev).is_ok(),
+            "engine_version '{}' should be valid semver",
+            ev
+        );
     }
 }
