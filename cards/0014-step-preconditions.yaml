@@ -28,9 +28,10 @@ scenarios:
     then: "SQL steps continue to use content-hash staleness from the state backend"
     source_lines: "design session: SQL hash is an auto-generated precondition"
 
-goal: "Step-level freshness checks for command steps — Dagu-inspired preconditions"
-maturity: "planned"
-specs: []
+goal: "Typed precondition system (modified_after, command) with AND semantics — steps skip when all preconditions and hash agree fresh"
+maturity: "active"
+specs:
+  - specs/2026-04-18-step-preconditions/spec.yaml
 references:
   - "cards/0010-selective-rematerialisation.yaml"
   - "/home/hugh/reference/brewtrend/brewtrend.yml"
