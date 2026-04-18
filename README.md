@@ -80,11 +80,11 @@ Early development. The project is in the discovery and design phase.
 
 ---
 
-## Built With
+## Credits
 
-- [Rust](https://www.rust-lang.org/)
-- [DuckDB](https://duckdb.org/)
-- [DataFusion SQL Parser](https://github.com/apache/arrow-datafusion)
-- [dagu](https://github.com/dagu-org/dagu) *(inspiration)*
-- [Dagster](https://dagster.io/) *(inspiration)*
+Part of the [Meridian](https://meridian.online) project.
+
+Built with [DuckDB](https://duckdb.org), [sqlparser-rs](https://github.com/sqlparser-rs/sqlparser-rs) (SQL introspection), and [Serde](https://serde.rs).
+
+Pipeline model and step execution inspired by [Dagu](https://github.com/dagu-org/dagu). Asset-centric design influenced by [Dagster](https://dagster.io/)'s software-defined asset model. SQL-first approach informed by [SQLMesh](https://sqlmesh.com/) and [dbt](https://www.getdbt.com/). Local-remote parity pattern drawn from [nektos/act](https://github.com/nektos/act).
 
