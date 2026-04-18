@@ -4,6 +4,7 @@ mod engine;
 mod error;
 mod introspect;
 mod manifest;
+mod precondition;
 mod runner;
 mod state;
 

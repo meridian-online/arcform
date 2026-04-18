@@ -19,6 +19,8 @@ sqlparser = { version = "0.55", features = ["visitor"] }
 duckdb = "1.2"
 semver = "1"
 sha2 = "0.10"
+humantime = "2"
 
 [dev-dependencies]
 tempfile = "3"
+filetime = "0.2"
