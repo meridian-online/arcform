@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::precondition::Precondition;
 
 /// The top-level ArcForm project manifest (arcform.yaml).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +62,12 @@ pub struct Step {
     /// SQL steps auto-discover their inputs via sqlparser-rs.
     #[serde(default)]
     pub depends_on: Vec<String>,
+
+    /// Typed preconditions for freshness checks.
+    /// If all preconditions pass, the step is considered fresh and may be skipped.
+    /// Empty = no preconditions (command steps always re-run, SQL steps use hash).
+    #[serde(default)]
+    pub preconditions: Vec<Precondition>,
 }
 
 /// An asset override entry in the top-level `assets:` section.
@@ -142,6 +149,13 @@ impl Manifest {
                 )));
             }
 
+            // Validate preconditions.
+            for precondition in &step.preconditions {
+                precondition.validate().map_err(|e| {
+                    Error::ManifestValidation(format!("step '{}': {}", step.name, e))
+                })?;
+            }
+
             // Each step must have exactly one of sql or command.
             match (&step.sql, &step.command) {
                 (Some(_), Some(_)) => {
@@ -194,6 +208,7 @@ mod tests {
             command: None,
             produces: vec![],
             depends_on: vec![],
+            preconditions: vec![],
         }
     }
 
@@ -205,6 +220,7 @@ mod tests {
             command: Some(command.to_string()),
             produces: vec![],
             depends_on: vec![],
+            preconditions: vec![],
         }
     }
 
@@ -270,6 +286,7 @@ mod tests {
                 command: Some("echo hi".to_string()),
                 produces: vec![],
                 depends_on: vec![],
+                preconditions: vec![],
             }],
         );
         let err = m.validate().unwrap_err();
@@ -287,6 +304,7 @@ mod tests {
                 command: None,
                 produces: vec![],
                 depends_on: vec![],
+                preconditions: vec![],
             }],
         );
         let err = m.validate().unwrap_err();

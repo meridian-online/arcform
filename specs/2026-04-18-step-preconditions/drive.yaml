@@ -1,0 +1,8 @@
+card: cards/0014-step-preconditions.yaml
+autonomy: guided
+budget: 3
+iteration: 1
+current_spec: specs/2026-04-18-step-preconditions/
+status: complete
+history: []
+started: "2026-04-18T10:00:00Z"

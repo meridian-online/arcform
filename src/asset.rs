@@ -247,6 +247,7 @@ mod tests {
             command: None,
             produces: vec![],
             depends_on: vec![],
+            preconditions: vec![],
         }
     }
 
@@ -263,6 +264,7 @@ mod tests {
             command: Some(command.to_string()),
             produces: produces.into_iter().map(String::from).collect(),
             depends_on: depends_on.into_iter().map(String::from).collect(),
+            preconditions: vec![],
         }
     }
 
@@ -274,6 +276,7 @@ mod tests {
             command: Some(command.to_string()),
             produces: vec![],
             depends_on: vec![],
+            preconditions: vec![],
         }
     }
 

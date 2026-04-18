@@ -49,6 +49,13 @@ pub enum Error {
         producer: String,
     },
 
+    #[error("precondition error for step '{step}': command '{command}' failed to execute: {detail}")]
+    PreconditionError {
+        step: String,
+        command: String,
+        detail: String,
+    },
+
     #[error("state backend error: {0}")]
     StateBackend(String),
 

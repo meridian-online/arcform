@@ -6,6 +6,7 @@ use crate::asset::AssetGraph;
 use crate::engine::Engine;
 use crate::error::{Error, Result};
 use crate::manifest::Manifest;
+use crate::precondition;
 use crate::state::{self, StateBackend, StepStatus};
 
 /// Run a pipeline: load manifest, preflight, validate assets, execute steps
@@ -202,42 +203,32 @@ fn compute_staleness(
     // Phase 1: Check each step's own staleness.
     for step in &manifest.steps {
         if step.command.is_some() {
-            // Command steps always re-run.
-            stale.insert(step.name.clone());
+            if step.preconditions.is_empty() {
+                // No preconditions — command steps always re-run (backwards compat).
+                stale.insert(step.name.clone());
+            } else {
+                // Evaluate preconditions — if any says stale, step runs.
+                if !precondition::evaluate_all(&step.preconditions, dir, &step.name)? {
+                    stale.insert(step.name.clone());
+                }
+            }
             continue;
         }
 
-        let prior = state.get_step_state(&step.name)?;
+        // SQL step — check hash staleness.
+        let hash_stale = is_sql_hash_stale(step, dir, state)?;
 
-        match prior {
-            None => {
-                // Never run before — stale.
+        if step.preconditions.is_empty() {
+            // No preconditions — SQL steps use hash only (backwards compat).
+            if hash_stale {
                 stale.insert(step.name.clone());
             }
-            Some(prior_state) => {
-                if prior_state.status == StepStatus::Failed {
-                    // Previously failed — always stale.
-                    stale.insert(step.name.clone());
-                    continue;
-                }
-
-                // Check SQL content hash.
-                if let Some(ref sql) = step.sql {
-                    let sql_path = dir.join(sql);
-                    if sql_path.exists() {
-                        let content = std::fs::read(&sql_path).map_err(|e| Error::FileRead {
-                            path: sql_path.clone(),
-                            source: e,
-                        })?;
-                        let current_hash = state::content_hash(&content);
-                        if current_hash != prior_state.sql_hash {
-                            stale.insert(step.name.clone());
-                        }
-                    } else {
-                        // SQL file doesn't exist — will error during execution.
-                        stale.insert(step.name.clone());
-                    }
-                }
+        } else {
+            // AND: hash AND preconditions must both be fresh to skip.
+            let preconditions_fresh =
+                precondition::evaluate_all(&step.preconditions, dir, &step.name)?;
+            if hash_stale || !preconditions_fresh {
+                stale.insert(step.name.clone());
             }
         }
     }
@@ -250,6 +241,41 @@ fn compute_staleness(
     }
 
     Ok(stale)
+}
+
+/// Check whether a SQL step's content hash has changed since the last run.
+///
+/// Returns true (stale) if: no prior state, prior failure, hash mismatch, or missing file.
+fn is_sql_hash_stale(
+    step: &crate::manifest::Step,
+    dir: &Path,
+    state: &dyn StateBackend,
+) -> Result<bool> {
+    let prior = state.get_step_state(&step.name)?;
+
+    match prior {
+        None => Ok(true), // Never run before.
+        Some(prior_state) => {
+            if prior_state.status == StepStatus::Failed {
+                return Ok(true); // Previously failed.
+            }
+            if let Some(ref sql) = step.sql {
+                let sql_path = dir.join(sql);
+                if sql_path.exists() {
+                    let content = std::fs::read(&sql_path).map_err(|e| Error::FileRead {
+                        path: sql_path.clone(),
+                        source: e,
+                    })?;
+                    let current_hash = state::content_hash(&content);
+                    Ok(current_hash != prior_state.sql_hash)
+                } else {
+                    Ok(true) // File missing — will error during execution.
+                }
+            } else {
+                Ok(false) // No SQL file (shouldn't happen for SQL steps).
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -835,5 +861,288 @@ mod tests {
             .filter(|c| matches!(c, MockCall::Sql { .. }))
             .collect();
         assert_eq!(sql_calls.len(), 1, "step should execute despite unparseable version");
+    }
+
+    // ---- Step Preconditions Tests ----
+
+    // pre ac-02: YAML with preconditions deserialises correctly.
+    #[test]
+    fn test_pre_ac02_preconditions_deserialise() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+steps:
+  - name: fetch
+    command: "curl http://example.com"
+    preconditions:
+      - modified_after:
+          path: data/output.json
+          period: 24h
+      - command: "test -f /tmp/ready"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let manifest = crate::manifest::Manifest::load(dir.path()).unwrap();
+        assert_eq!(manifest.steps[0].preconditions.len(), 2);
+    }
+
+    // pre ac-02: YAML without preconditions still works (backwards compat).
+    #[test]
+    fn test_pre_ac02_no_preconditions_backwards_compat() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: greet\n    command: echo hello\n";
+        setup_project(dir.path(), yaml, &[]);
+        let manifest = crate::manifest::Manifest::load(dir.path()).unwrap();
+        assert!(manifest.steps[0].preconditions.is_empty());
+    }
+
+    // pre ac-07: Command step with passing precondition is skipped.
+    #[test]
+    fn test_pre_ac07_command_with_fresh_precondition_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+steps:
+  - name: fetch
+    command: "echo fetching"
+    preconditions:
+      - command: "true"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        // Precondition "true" exits 0 → fresh → step skipped.
+        let calls = engine.calls.borrow();
+        assert!(
+            calls.is_empty(),
+            "command step with fresh precondition should be skipped, got {} calls",
+            calls.len()
+        );
+    }
+
+    // pre ac-07: Command step with failing precondition runs.
+    #[test]
+    fn test_pre_ac07_command_with_stale_precondition_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+steps:
+  - name: fetch
+    command: "echo fetching"
+    preconditions:
+      - command: "false"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        // Precondition "false" exits non-zero → stale → step runs.
+        let calls = engine.calls.borrow();
+        assert_eq!(calls.len(), 1, "command step with stale precondition should run");
+        assert!(matches!(&calls[0], MockCall::Command { command } if command == "echo fetching"));
+    }
+
+    // pre ac-08: Command steps without preconditions still always re-run.
+    // (Verified by existing test_v03_ac09_command_always_reruns — this is a confirmation.)
+    #[test]
+    fn test_pre_ac08_command_no_preconditions_always_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: greet\n    command: echo hello\n";
+        setup_project(dir.path(), yaml, &[]);
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+
+        // First run.
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        // Second run — command without preconditions should still execute.
+        let engine2 = MockEngine::new();
+        run(dir.path(), &engine2, &state, false).unwrap();
+        let calls = engine2.calls.borrow();
+        assert_eq!(calls.len(), 1, "command step without preconditions should always re-run");
+    }
+
+    // pre ac-09: SQL + preconditions — fresh hash + stale precondition → runs.
+    #[test]
+    fn test_pre_ac09_sql_fresh_hash_stale_precondition_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+steps:
+  - name: transform
+    sql: models/transform.sql
+    preconditions:
+      - command: "false"
+"#;
+        setup_project(dir.path(), yaml, &[("models/transform.sql", "SELECT 1;")]);
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+
+        // First run — establishes hash state.
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        // Second run — hash is fresh but precondition says stale → should run.
+        let engine2 = MockEngine::new();
+        run(dir.path(), &engine2, &state, false).unwrap();
+        let calls = engine2.calls.borrow();
+        let sql_calls: Vec<_> = calls.iter().filter(|c| matches!(c, MockCall::Sql { .. })).collect();
+        assert_eq!(sql_calls.len(), 1, "SQL step should run when precondition is stale");
+    }
+
+    // pre ac-09: SQL + preconditions — stale hash + fresh precondition → runs.
+    #[test]
+    fn test_pre_ac09_sql_stale_hash_fresh_precondition_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+steps:
+  - name: transform
+    sql: models/transform.sql
+    preconditions:
+      - command: "true"
+"#;
+        setup_project(dir.path(), yaml, &[("models/transform.sql", "SELECT 1;")]);
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+
+        // First run — establishes hash state.
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        // Edit SQL to make hash stale.
+        fs::write(dir.path().join("models/transform.sql"), "SELECT 2;").unwrap();
+
+        // Second run — hash is stale even though precondition is fresh → should run (AND).
+        let engine2 = MockEngine::new();
+        run(dir.path(), &engine2, &state, false).unwrap();
+        let calls = engine2.calls.borrow();
+        let sql_calls: Vec<_> = calls.iter().filter(|c| matches!(c, MockCall::Sql { .. })).collect();
+        assert_eq!(sql_calls.len(), 1, "SQL step should run when hash is stale (AND semantics)");
+    }
+
+    // pre ac-09: SQL + preconditions — both fresh → skips.
+    #[test]
+    fn test_pre_ac09_sql_both_fresh_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+steps:
+  - name: transform
+    sql: models/transform.sql
+    preconditions:
+      - command: "true"
+"#;
+        setup_project(dir.path(), yaml, &[("models/transform.sql", "SELECT 1;")]);
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+
+        // First run — establishes hash state.
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        // Second run — hash is fresh AND precondition is fresh → should skip.
+        let engine2 = MockEngine::new();
+        run(dir.path(), &engine2, &state, false).unwrap();
+        let calls = engine2.calls.borrow();
+        let sql_calls: Vec<_> = calls.iter().filter(|c| matches!(c, MockCall::Sql { .. })).collect();
+        assert_eq!(sql_calls.len(), 0, "SQL step should be skipped when both hash and precondition are fresh");
+    }
+
+    // pre ac-09: SQL + preconditions — both stale → runs.
+    #[test]
+    fn test_pre_ac09_sql_both_stale_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+steps:
+  - name: transform
+    sql: models/transform.sql
+    preconditions:
+      - command: "false"
+"#;
+        setup_project(dir.path(), yaml, &[("models/transform.sql", "SELECT 1;")]);
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+
+        // First run.
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        // Edit SQL + precondition is false → both stale → runs.
+        fs::write(dir.path().join("models/transform.sql"), "SELECT 2;").unwrap();
+        let engine2 = MockEngine::new();
+        run(dir.path(), &engine2, &state, false).unwrap();
+        let calls = engine2.calls.borrow();
+        let sql_calls: Vec<_> = calls.iter().filter(|c| matches!(c, MockCall::Sql { .. })).collect();
+        assert_eq!(sql_calls.len(), 1, "SQL step should run when both hash and precondition are stale");
+    }
+
+    // pre ac-10: SQL steps without preconditions use hash staleness unchanged.
+    // (Verified by existing tests test_v03_ac04, ac05, ac06 — this confirms no regression.)
+    #[test]
+    fn test_pre_ac10_sql_no_preconditions_uses_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+
+        // First run.
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        // Second run — hash unchanged, no preconditions → skip.
+        let engine2 = MockEngine::new();
+        run(dir.path(), &engine2, &state, false).unwrap();
+        let calls = engine2.calls.borrow();
+        let sql_calls: Vec<_> = calls.iter().filter(|c| matches!(c, MockCall::Sql { .. })).collect();
+        assert_eq!(sql_calls.len(), 0, "SQL step without preconditions should use hash staleness");
+    }
+
+    // pre ac-11: --force overrides preconditions — step runs regardless.
+    #[test]
+    fn test_pre_ac11_force_overrides_preconditions() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+steps:
+  - name: fetch
+    command: "echo fetching"
+    preconditions:
+      - command: "true"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+
+        // With force=true, preconditions should be ignored.
+        run(dir.path(), &engine, &state, true).unwrap();
+        let calls = engine.calls.borrow();
+        assert_eq!(
+            calls.len(),
+            1,
+            "--force should override fresh precondition and run the step"
+        );
+        assert!(matches!(&calls[0], MockCall::Command { command } if command == "echo fetching"));
+    }
+
+    // pre ac-15: Manifest validation rejects invalid precondition duration.
+    #[test]
+    fn test_pre_ac15_manifest_rejects_invalid_precondition() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+steps:
+  - name: fetch
+    command: "echo fetching"
+    preconditions:
+      - modified_after:
+          path: data/file.json
+          period: "banana"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let err = crate::manifest::Manifest::load(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("banana"), "error should mention the bad duration: {msg}");
     }
 }

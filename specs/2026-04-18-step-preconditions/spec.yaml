@@ -1,0 +1,131 @@
+goal: "Typed precondition system for step-level freshness checks — modified_after (file mtime) and command (shell) types, AND semantics with existing hash staleness"
+
+constraints:
+  - "Field name is `preconditions` (Dagu-compatible)"
+  - "Preconditions are a list of typed entries — extensible for future types"
+  - "Two initial types: `modified_after` (path + period) and `command` (shell)"
+  - "Polarity: all preconditions pass (exit 0 / file fresh) = step is fresh = skip"
+  - "AND semantics: ALL preconditions must pass for step to be fresh"
+  - "For SQL steps with preconditions: AND(hash_fresh, preconditions_fresh) — both must agree"
+  - "For command steps without preconditions: always stale (backwards compatible)"
+  - "`--force` overrides all preconditions (consistent with existing --force behaviour)"
+  - "Precondition execution errors (binary not found, crash) halt the pipeline"
+  - "All 105 existing tests must pass unchanged"
+  - "Use humantime crate for duration parsing (e.g. 24h, 60m, 7d)"
+  - "`modified_after` paths are relative to the manifest directory (same convention as `sql` file paths)"
+  - "Use `filetime` crate in tests to set file mtime explicitly — no sleep-based or wall-clock-dependent tests"
+
+acceptance_criteria:
+  - id: ac-01
+    ac_type: code
+    description: "Precondition enum with ModifiedAfter { path, period } and Command { command } variants"
+    verification: "Compile-check — enum exists in manifest.rs or a new precondition.rs module"
+
+  - id: ac-02
+    ac_type: code
+    description: "Step struct gains optional preconditions field (Vec<Precondition>, defaults to empty)"
+    verification: "Test: YAML with preconditions deserialises correctly; YAML without preconditions still works"
+
+  - id: ac-03
+    ac_type: code
+    description: "modified_after evaluates file mtime — fresh if file was modified within the declared period"
+    verification: "Test: create a file, set precondition period to 1h, verify fresh. Touch file with old mtime, verify stale."
+
+  - id: ac-04
+    ac_type: code
+    description: "modified_after with missing or inaccessible file evaluates as stale (not an error) — missing file and permission errors both treated as stale"
+    verification: "Test: precondition references nonexistent file, step runs (not skipped)"
+
+  - id: ac-05
+    ac_type: code
+    description: "command precondition evaluates shell command — exit 0 = fresh, non-zero = stale"
+    verification: "Test: precondition `true` → step skipped. Precondition `false` → step runs."
+
+  - id: ac-06
+    ac_type: code
+    description: "AND semantics — all preconditions must pass for step to be fresh; any failure makes step stale"
+    verification: "Test: two preconditions, one fresh one stale → step runs"
+
+  - id: ac-07
+    ac_type: code
+    description: "Command steps with preconditions can now be fresh and skipped (not always stale)"
+    verification: "Test: command step with passing precondition is skipped on run"
+
+  - id: ac-08
+    ac_type: code
+    description: "Command steps without preconditions still always re-run (backwards compatible)"
+    verification: "Test: existing test_v03_ac09_command_always_reruns still passes"
+
+  - id: ac-09
+    ac_type: code
+    description: "SQL steps with preconditions use AND(hash_fresh, preconditions_fresh) — both must agree to skip"
+    verification: "Test all four combinations: (1) fresh hash + stale precondition → runs, (2) stale hash + fresh precondition → runs, (3) both fresh → skips, (4) both stale → runs."
+
+  - id: ac-10
+    ac_type: code
+    description: "SQL steps without preconditions use hash staleness unchanged"
+    verification: "Test: existing staleness tests pass unchanged (test_v03_ac04, ac05, ac06, etc.)"
+
+  - id: ac-11
+    ac_type: code
+    description: "--force overrides all preconditions — steps run regardless"
+    verification: "Test: step with passing precondition still runs when force=true"
+
+  - id: ac-12
+    ac_type: code
+    description: "Precondition command execution error (binary not found, crash) halts the pipeline"
+    verification: "Test: precondition with nonexistent binary returns Err, pipeline stops"
+
+  - id: ac-13
+    ac_type: code
+    description: "Duration parsing supports human-readable formats (24h, 60m, 7d, 1h30m)"
+    verification: "Test: parse various duration strings correctly"
+
+  - id: ac-14
+    ac_type: code
+    description: "All 105 existing tests pass unchanged"
+    verification: "cargo test — 105+ tests pass"
+
+  - id: ac-15
+    ac_type: code
+    description: "Manifest validation rejects invalid precondition types and missing required fields"
+    verification: "Test: precondition with unknown type rejected; modified_after without path rejected"
+
+ontology_schema:
+  name: "Precondition"
+  description: "A typed freshness check that determines whether a step should be skipped"
+  fields:
+    - name: "type"
+      type: "enum(modified_after, command)"
+      description: "The kind of freshness check to perform"
+    - name: "path"
+      type: "string (modified_after only)"
+      description: "Relative path to the file whose mtime is checked"
+    - name: "period"
+      type: "duration (modified_after only)"
+      description: "Maximum period since last modification before the step is considered stale (e.g. 24h, 7d)"
+    - name: "command"
+      type: "string (command only)"
+      description: "Shell command to execute; exit 0 = fresh, non-zero = stale"
+
+evaluation_principles:
+  - principle: "Backwards compatibility — no existing behaviour changes"
+    weight: 0.3
+  - principle: "Correctness — precondition evaluation matches declared semantics"
+    weight: 0.3
+  - principle: "Composability — AND semantics and typed model are extensible"
+    weight: 0.2
+  - principle: "Error clarity — precondition failures produce actionable messages"
+    weight: 0.2
+
+exit_conditions:
+  - "All 15 ACs have passing tests"
+  - "All 105+ existing tests pass"
+  - "brewtrend.yml patterns are expressible in the new syntax"
+
+metadata:
+  version: "1.0"
+  test_prefix: "pre"
+  timestamp: "2026-04-18T10:30:00Z"
+  ambiguity_score: 0.07
+  interview_ref: "specs/2026-04-18-step-preconditions/interview.md"
