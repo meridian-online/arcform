@@ -1,0 +1,36 @@
+feature: "Reference pipelines"
+as_a: "data analyst learning arcform, or a contributor validating changes"
+i_want: "realistic example pipelines shipped in the repo that I can run and study"
+so_that: "I learn from working examples, and the test suite exercises real-world patterns — not just unit-test stubs"
+
+scenarios:
+  - name: "Brewtrend pipeline"
+    given: "the examples/brewtrend/ project in the repo"
+    when: "I run arc run in that directory"
+    then: "the pipeline fetches Homebrew analytics, loads into DuckDB, and computes trending packages"
+    source_lines: "/home/hugh/reference/brewtrend/brewtrend.yml: rclone sync, duckdb -bail, preconditions, depends"
+
+  - name: "Mixed step types exercised"
+    given: "a reference pipeline with both SQL and command steps"
+    when: "the test suite runs against it"
+    then: "integration tests validate end-to-end execution with real manifests, not synthetic YAML"
+    source_lines: "/home/hugh/reference/brewtrend/brewtrend.yml: 10 steps mixing rclone, duckdb, preconditions, depends"
+
+  - name: "Feature coverage across examples"
+    given: "the full set of reference pipelines"
+    when: "I look at what features they exercise"
+    then: "each major arcform capability (SQL, commands, preconditions, params, dependencies) has at least one reference pipeline demonstrating it"
+    source_lines: "author-directed during review"
+
+  - name: "Arc init points to examples"
+    given: "a new user who just ran arc init"
+    when: "they look at the generated project"
+    then: "the scaffold references the examples directory for realistic patterns"
+    source_lines: "author-directed during review"
+
+goal: "Ship realistic example pipelines (starting with brewtrend) that serve as both learning material and integration test fixtures"
+maturity: "planned"
+specs: []
+references:
+  - "/home/hugh/reference/brewtrend/brewtrend.yml"
+  - "/home/hugh/reference/brewtrend/models/"

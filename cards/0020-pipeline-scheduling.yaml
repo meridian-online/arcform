@@ -1,0 +1,36 @@
+feature: "Pipeline scheduling"
+as_a: "data analyst deploying pipelines to production"
+i_want: "to declare a schedule in my manifest so the pipeline runs automatically on a cron cadence"
+so_that: "the schedule lives with the pipeline definition — not in a separate system cron entry I'll forget about"
+
+scenarios:
+  - name: "Cron schedule in manifest"
+    given: "a manifest with a schedule field (cron expression)"
+    when: "arc scheduler is running"
+    then: "the pipeline executes at the scheduled times"
+    source_lines: "internal/core/dag.go: Schedule/StopSchedule/RestartSchedule — Cron scheduling"
+
+  - name: "Overlap policy"
+    given: "a scheduled pipeline that is still running when the next interval arrives"
+    when: "the scheduler evaluates the next run"
+    then: "the overlap policy (skip, queue, or replace) determines behaviour"
+    source_lines: "internal/core/dag.go: OverlapPolicy — skip (default), all, latest"
+
+  - name: "Catch-up on missed runs"
+    given: "the scheduler was offline and missed scheduled intervals"
+    when: "the scheduler restarts"
+    then: "missed runs within the catchup window are executed"
+    source_lines: "internal/core/dag.go: CatchupWindow — Lookback period for missed intervals"
+
+  - name: "Manual run still works"
+    given: "a manifest with a schedule"
+    when: "I run arc run manually"
+    then: "the pipeline runs immediately — scheduling is additive, not exclusive"
+    source_lines: "author-directed during review"
+
+goal: "Declarative cron scheduling with overlap policies and catch-up — schedule travels with the manifest"
+maturity: "planned"
+specs: []
+references:
+  - "/home/hugh/github/dagucloud/dagu/internal/core/dag.go"
+  - "/home/hugh/github/dagucloud/docs/writing-workflows/scheduling.md"

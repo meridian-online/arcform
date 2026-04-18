@@ -1,0 +1,50 @@
+feature: "Pipeline parameterisation"
+as_a: "data analyst running the same pipeline for different date ranges, environments, or dynamic inputs"
+i_want: "to pass parameters at runtime and capture step outputs so values flow through the pipeline"
+so_that: "one manifest serves multiple contexts, and shell step results feed downstream steps without hardcoding"
+
+scenarios:
+  - name: "Runtime parameter injection"
+    given: "a manifest with a params section declaring named parameters"
+    when: "I run arc run --param start_date=2026-01-01"
+    then: "the parameter is available as an environment variable in shell steps and via DuckDB getenv() in SQL"
+    source_lines: "internal/core/spec/dag.go: Params any — Parameters/inputs"
+
+  - name: "Default parameter values"
+    given: "a manifest with params that declare defaults"
+    when: "I run arc run without providing the parameter"
+    then: "the default value is used"
+    source_lines: "writing-workflows/parameters.md: defaults applied before template expansion"
+
+  - name: "Dotenv file loading"
+    given: "a manifest with a dotenv field pointing to .env files"
+    when: "arc initialises the pipeline"
+    then: "variables from the dotenv files are loaded into the step environment"
+    source_lines: "internal/core/dag.go: Dotenv — Path(s) to dotenv files for loading env vars"
+
+  - name: "Capture step output to named variable"
+    given: "a command step with an output field"
+    when: "the step completes successfully"
+    then: "its stdout is captured and available as an environment variable in downstream steps"
+    source_lines: "internal/core/spec/step.go: Output any — Output capture and schema validation"
+
+  - name: "SQL accesses parameters and captured output"
+    given: "a SQL step downstream of parameterised or output-producing steps"
+    when: "the SQL step executes"
+    then: "values are accessible via DuckDB getenv() — SQL passthrough preserved"
+    source_lines: "writing-workflows/data-flow.md: Output capture per step, Variable substitution in downstream steps"
+
+  - name: "SQL passthrough preserved"
+    given: "a SQL step in a parameterised pipeline"
+    when: "the step executes"
+    then: "SQL is passed unmodified to the engine — no template substitution in SQL files"
+    source_lines: "cards/0005-sql-passthrough.yaml: Pass SQL to engine completely unmodified"
+
+goal: "Named runtime parameters with defaults, step output capture, dotenv loading — all via environment variables, SQL passthrough preserved"
+maturity: "planned"
+specs: []
+references:
+  - "/home/hugh/github/dagucloud/dagu/internal/core/spec/dag.go"
+  - "/home/hugh/github/dagucloud/docs/writing-workflows/parameters.md"
+  - "/home/hugh/github/dagucloud/docs/writing-workflows/data-flow.md"
+  - "cards/0005-sql-passthrough.yaml"

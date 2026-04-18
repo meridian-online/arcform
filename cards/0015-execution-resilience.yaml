@@ -1,0 +1,49 @@
+feature: "Execution resilience"
+as_a: "data analyst running pipelines against flaky APIs and long-running queries"
+i_want: "steps to retry on transient failure and abort on timeout instead of hanging forever"
+so_that: "a momentary API timeout doesn't restart the whole pipeline, and a stuck query doesn't block indefinitely"
+
+scenarios:
+  - name: "Retry on transient failure"
+    given: "a step with a retry_policy field"
+    when: "the step fails"
+    then: "arc retries the step up to the configured limit before halting the pipeline"
+    source_lines: "internal/core/spec/step.go: RetryPolicy *retryPolicy — Limit, IntervalSec, Backoff"
+
+  - name: "Exponential backoff"
+    given: "a retry policy with backoff enabled"
+    when: "a step fails repeatedly"
+    then: "the wait time between retries increases exponentially"
+    source_lines: "writing-workflows/durable-execution.md: backoff: 2.0 — Exponential backoff"
+
+  - name: "Exit code filtering"
+    given: "a retry policy with specific exit codes"
+    when: "a step fails with an unmatched exit code"
+    then: "the step halts immediately — only matching exit codes trigger retries"
+    source_lines: "internal/core/spec/step.go: ExitCode []int — Retry only on specific exit codes"
+
+  - name: "Step-level timeout"
+    given: "a step with a timeout_sec field"
+    when: "the step exceeds the timeout"
+    then: "arc kills the step process and reports a timeout error"
+    source_lines: "internal/core/dag.go: TimeoutSec — Timing controls"
+
+  - name: "Pipeline-level timeout"
+    given: "a manifest with a timeout_sec field at the top level"
+    when: "total pipeline execution exceeds the timeout"
+    then: "arc halts the pipeline and reports which step was running when the timeout hit"
+    source_lines: "internal/core/spec/dag.go: TimeoutSec int — Max runtime"
+
+  - name: "No timeout by default"
+    given: "a step without a timeout or retry field"
+    when: "the step runs"
+    then: "the step runs to completion with no time limit and no retry (backwards compatible)"
+    source_lines: "author-directed during review"
+
+goal: "Step-level retry with backoff + step/pipeline timeouts — transient failures handled, stuck processes killed"
+maturity: "planned"
+specs: []
+references:
+  - "/home/hugh/github/dagucloud/dagu/internal/core/spec/step.go"
+  - "/home/hugh/github/dagucloud/docs/writing-workflows/durable-execution.md"
+  - "/home/hugh/github/dagucloud/docs/writing-workflows/execution-control.md"

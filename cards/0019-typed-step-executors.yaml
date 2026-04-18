@@ -1,0 +1,36 @@
+feature: "Typed step executors"
+as_a: "data analyst integrating cloud storage, APIs, and data transforms in my pipeline"
+i_want: "first-class step types for common operations (HTTP, S3, jq, rclone) with structured config instead of raw shell commands"
+so_that: "steps are validated before execution, portable across environments, and don't require shell escaping gymnastics"
+
+scenarios:
+  - name: "HTTP request step"
+    given: "a step with type: http and structured fields (url, method, headers, body)"
+    when: "arc runs the step"
+    then: "the request executes with proper error handling and response capture — no curl incantation needed"
+    source_lines: "internal/runtime/builtin/ — 18 built-in executors including http"
+
+  - name: "S3 step"
+    given: "a step with type: s3 and fields (bucket, key, operation)"
+    when: "arc runs the step"
+    then: "the S3 operation executes with structured credentials — no aws cli flags to remember"
+    source_lines: "internal/runtime/builtin/ — s3 executor"
+
+  - name: "jq transform step"
+    given: "a step with type: jq and a filter expression"
+    when: "arc runs the step"
+    then: "the JSON transformation runs with input/output validation"
+    source_lines: "internal/runtime/builtin/ — jq executor"
+
+  - name: "Executor validation at manifest load"
+    given: "a step with an unknown or misconfigured executor type"
+    when: "arc validates the manifest"
+    then: "the error is caught before any steps run — not mid-pipeline"
+    source_lines: "internal/core/spec/step.go: ExecutorConfig — Type-specific configuration object"
+
+goal: "Extensible executor framework with built-in types for common data pipeline operations"
+maturity: "planned"
+specs: []
+references:
+  - "/home/hugh/github/dagucloud/dagu/internal/runtime/builtin/"
+  - "/home/hugh/github/dagucloud/docs/step-types/"

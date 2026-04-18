@@ -1,0 +1,32 @@
+feature: "Parallel step execution"
+as_a: "data analyst with independent transformation steps"
+i_want: "arc to run steps concurrently when their dependencies allow it"
+so_that: "my pipeline finishes faster without me manually splitting work"
+
+scenarios:
+  - name: "Independent steps run concurrently"
+    given: "a pipeline with steps that have no shared dependencies"
+    when: "arc evaluates the asset graph"
+    then: "independent steps are scheduled concurrently"
+    source_lines: "internal/core/dag.go: Type — graph (dependency-based parallel) vs chain (sequential)"
+
+  - name: "Dependency ordering preserved"
+    given: "a step that depends on another step's output"
+    when: "arc schedules execution"
+    then: "the dependent step waits until its upstream step completes successfully"
+    source_lines: "internal/core/spec/step.go: Depends — Dependency list for DAG ordering"
+
+  - name: "Concurrency limit"
+    given: "a manifest with a max_parallel field"
+    when: "many steps are ready to run"
+    then: "arc caps concurrent execution at the configured limit"
+    source_lines: "internal/core/dag.go: MaxActiveSteps — Concurrency limits"
+
+goal: "Leverage the asset dependency graph (cards 0008/0009) to run independent steps concurrently"
+maturity: "planned"
+specs: []
+references:
+  - "/home/hugh/github/dagucloud/dagu/internal/core/dag.go"
+  - "/home/hugh/github/dagucloud/dagu/internal/runtime/plan.go"
+  - "cards/0008-asset-registry.yaml"
+  - "cards/0009-sql-introspection.yaml"

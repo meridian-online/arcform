@@ -1,0 +1,30 @@
+feature: "Lifecycle hooks"
+as_a: "data analyst deploying pipelines that need setup and cleanup"
+i_want: "to declare handlers that run on pipeline success, failure, or exit"
+so_that: "cleanup happens even when the pipeline fails, and I can notify downstream systems on completion"
+
+scenarios:
+  - name: "Failure handler runs on error"
+    given: "a manifest with an on_failure handler step"
+    when: "a step fails and the pipeline halts"
+    then: "the failure handler runs before arc exits"
+    source_lines: "internal/core/dag.go: handlerOn — Lifecycle hooks: init, success, failure, abort, exit"
+
+  - name: "Exit handler always runs"
+    given: "a manifest with an on_exit handler step"
+    when: "the pipeline completes (success or failure)"
+    then: "the exit handler runs regardless of outcome"
+    source_lines: "writing-workflows/lifecycle-handlers.md: exit handler runs regardless of outcome"
+
+  - name: "Init handler runs before steps"
+    given: "a manifest with an on_init handler step"
+    when: "the pipeline starts"
+    then: "the init handler runs before any declared steps; if it fails, no steps execute"
+    source_lines: "writing-workflows/lifecycle-handlers.md: Execution order: init → main steps → status-specific handler → exit"
+
+goal: "Declarative lifecycle hooks (init, success, failure, exit) for pipeline setup, teardown, and notification"
+maturity: "planned"
+specs: []
+references:
+  - "/home/hugh/github/dagucloud/dagu/internal/core/dag.go"
+  - "/home/hugh/github/dagucloud/docs/writing-workflows/lifecycle-handlers.md"
