@@ -5,16 +5,17 @@ started: "2026-04-20T10:00:00+10:00"
 completed: null
 cards:
   - path: orbit/cards/0016-pipeline-parameterisation.yaml
-    status: implementing
+    status: complete
     spec_dir: orbit/specs/2026-04-20-pipeline-parameterisation/
     branch: rally/pipeline-parameterisation
-    worktree: "main"
+    worktree: null
     parked_constraint: null
+    pr: https://github.com/meridian-online/arcform/pull/8
   - path: orbit/cards/0015-execution-resilience.yaml
-    status: designed
+    status: implementing
     spec_dir: orbit/specs/2026-04-20-execution-resilience/
     branch: rally/execution-resilience
-    worktree: null
+    worktree: "main"
     parked_constraint: null
   - path: orbit/cards/0017-lifecycle-hooks.yaml
     status: designed
