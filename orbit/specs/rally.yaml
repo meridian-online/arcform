@@ -1,8 +1,8 @@
 rally: "pipeline runtime essentials — resilience, parameterisation, lifecycle hooks"
 autonomy: guided
-phase: implementing
+phase: complete
 started: "2026-04-20T10:00:00+10:00"
-completed: null
+completed: "2026-04-20T16:00:00+10:00"
 cards:
   - path: orbit/cards/0016-pipeline-parameterisation.yaml
     status: complete
@@ -19,11 +19,12 @@ cards:
     parked_constraint: null
     pr: https://github.com/meridian-online/arcform/pull/9
   - path: orbit/cards/0017-lifecycle-hooks.yaml
-    status: designed
+    status: complete
     spec_dir: orbit/specs/2026-04-20-lifecycle-hooks/
     branch: rally/lifecycle-hooks
-    worktree: null
+    worktree: "main"
     parked_constraint: null
+    pr: https://github.com/meridian-online/arcform/pull/10
 implementation_order:
   - orbit/cards/0016-pipeline-parameterisation.yaml
   - orbit/cards/0015-execution-resilience.yaml
