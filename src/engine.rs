@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -13,12 +14,15 @@ pub struct EngineInfo {
 }
 
 /// Output captured from a step execution.
-/// Stdout is inherited (streams to terminal in real-time).
+/// Stdout is inherited (streams to terminal in real-time) unless output capture is active.
 /// Stderr is captured for error reporting but also streamed for SQL steps.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct StepOutput {
     pub stderr: String,
+    /// Captured stdout from a command step when output capture is active.
+    /// None for SQL steps and command steps without output capture.
+    pub stdout: Option<String>,
 }
 
 /// Read stderr from a child process, streaming it to the terminal in real-time
@@ -49,10 +53,13 @@ fn stream_stderr(child: &mut std::process::Child) -> String {
 /// Trait for executing pipeline steps.
 pub trait Engine {
     /// Execute a SQL file against a database.
-    fn execute_sql(&self, db_path: &Path, sql_path: &Path) -> Result<StepOutput>;
+    /// `env` contains ARC_PARAM_ variables to inject into the child process environment.
+    fn execute_sql(&self, db_path: &Path, sql_path: &Path, env: &HashMap<String, String>) -> Result<StepOutput>;
 
     /// Execute a raw shell command.
-    fn execute_command(&self, command: &str) -> Result<StepOutput>;
+    /// `env` contains ARC_PARAM_ variables to inject into the child process environment.
+    /// If `capture_stdout` is true, stdout is piped and captured instead of inherited.
+    fn execute_command(&self, command: &str, env: &HashMap<String, String>, capture_stdout: bool) -> Result<StepOutput>;
 
     /// Check that the engine CLI is available and return information about it.
     /// Returns EngineInfo with the detected version (or None if unparseable).
@@ -63,11 +70,12 @@ pub trait Engine {
 pub struct DuckDbEngine;
 
 impl Engine for DuckDbEngine {
-    fn execute_sql(&self, db_path: &Path, sql_path: &Path) -> Result<StepOutput> {
+    fn execute_sql(&self, db_path: &Path, sql_path: &Path, env: &HashMap<String, String>) -> Result<StepOutput> {
         let mut child = Command::new("duckdb")
             .arg(db_path)
             .arg("-f")
             .arg(sql_path)
+            .envs(env)
             .stdout(Stdio::inherit())
             .stderr(Stdio::piped())
             .spawn()
@@ -91,20 +99,39 @@ impl Engine for DuckDbEngine {
             });
         }
 
-        Ok(StepOutput { stderr })
+        Ok(StepOutput { stderr, stdout: None })
     }
 
-    fn execute_command(&self, command: &str) -> Result<StepOutput> {
+    fn execute_command(&self, command: &str, env: &HashMap<String, String>, capture_stdout: bool) -> Result<StepOutput> {
+        let stdout_cfg = if capture_stdout { Stdio::piped() } else { Stdio::inherit() };
+        // Stderr: inherited for command steps (streams to terminal).
+        // When capturing stdout, stderr remains inherited so errors are visible.
+        let stderr_cfg = Stdio::inherit();
+
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(command)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+            .envs(env)
+            .stdout(stdout_cfg)
+            .stderr(stderr_cfg)
             .spawn()
             .map_err(|e| Error::StepExecution {
                 step: command.to_string(),
                 source: e,
             })?;
+
+        // If capturing, read stdout before wait() to avoid deadlocks.
+        let captured_stdout = if capture_stdout {
+            let mut stdout_buf = String::new();
+            if let Some(mut stdout) = child.stdout.take() {
+                let _ = stdout.read_to_string(&mut stdout_buf);
+            }
+            // Trim trailing newline (shell commands typically append one).
+            let trimmed = stdout_buf.trim_end_matches('\n').to_string();
+            Some(trimmed)
+        } else {
+            None
+        };
 
         let status = child.wait().map_err(|e| Error::StepExecution {
             step: command.to_string(),
@@ -122,6 +149,7 @@ impl Engine for DuckDbEngine {
 
         Ok(StepOutput {
             stderr: String::new(),
+            stdout: captured_stdout,
         })
     }
 
@@ -180,6 +208,8 @@ pub mod mock {
         pub preflight_should_fail: RefCell<bool>,
         /// Version to report from preflight. Defaults to 2.0.0.
         pub version: RefCell<Option<semver::Version>>,
+        /// Simulated stdout for command steps with capture_stdout=true.
+        pub simulated_stdout: RefCell<Option<String>>,
     }
 
     #[derive(Debug, Clone)]
@@ -187,9 +217,12 @@ pub mod mock {
         Sql {
             db_path: String,
             sql_content: String,
+            env: HashMap<String, String>,
         },
         Command {
             command: String,
+            env: HashMap<String, String>,
+            capture_stdout: bool,
         },
         Preflight,
     }
@@ -203,7 +236,13 @@ pub mod mock {
                 exec_count: RefCell::new(0),
                 preflight_should_fail: RefCell::new(false),
                 version: RefCell::new(Some(semver::Version::new(2, 0, 0))),
+                simulated_stdout: RefCell::new(None),
             }
+        }
+
+        /// Set simulated stdout for command steps with capture_stdout=true.
+        pub fn set_simulated_stdout(&self, stdout: &str) {
+            *self.simulated_stdout.borrow_mut() = Some(stdout.to_string());
         }
 
         /// Set the version that preflight will report.
@@ -245,7 +284,7 @@ pub mod mock {
     }
 
     impl Engine for MockEngine {
-        fn execute_sql(&self, db_path: &Path, sql_path: &Path) -> Result<StepOutput> {
+        fn execute_sql(&self, db_path: &Path, sql_path: &Path, env: &HashMap<String, String>) -> Result<StepOutput> {
             let sql_content = fs::read_to_string(sql_path).map_err(|e| Error::FileRead {
                 path: sql_path.to_path_buf(),
                 source: e,
@@ -254,6 +293,7 @@ pub mod mock {
             self.calls.borrow_mut().push(MockCall::Sql {
                 db_path: db_path.display().to_string(),
                 sql_content,
+                env: env.clone(),
             });
 
             if let Some((code, stderr)) = self.should_fail_now() {
@@ -266,12 +306,15 @@ pub mod mock {
 
             Ok(StepOutput {
                 stderr: String::new(),
+                stdout: None,
             })
         }
 
-        fn execute_command(&self, command: &str) -> Result<StepOutput> {
+        fn execute_command(&self, command: &str, env: &HashMap<String, String>, capture_stdout: bool) -> Result<StepOutput> {
             self.calls.borrow_mut().push(MockCall::Command {
                 command: command.to_string(),
+                env: env.clone(),
+                capture_stdout,
             });
 
             if let Some((code, stderr)) = self.should_fail_now() {
@@ -282,8 +325,15 @@ pub mod mock {
                 });
             }
 
+            let stdout = if capture_stdout {
+                Some(self.simulated_stdout.borrow().clone().unwrap_or_default())
+            } else {
+                None
+            };
+
             Ok(StepOutput {
                 stderr: String::new(),
+                stdout,
             })
         }
 

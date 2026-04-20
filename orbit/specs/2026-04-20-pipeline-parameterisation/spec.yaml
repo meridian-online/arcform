@@ -1,0 +1,97 @@
+goal: "Add named runtime parameters with defaults, dotenv file loading, and step output capture — all flowing as environment variables to preserve SQL passthrough"
+
+constraints:
+  - "SQL passthrough preserved — SQL files are never read, modified, or templated by Arcform (decision 0003)"
+  - "String-only param values — DuckDB getenv() returns VARCHAR; no false type safety"
+  - "ARC_PARAM_ prefix on all injected env vars — prevents collision with system env vars"
+  - "Param values do not affect SQL staleness — runtime context, not pipeline definition"
+  - "Output capture is mutually exclusive with real-time streaming per step"
+  - "SQL steps cannot declare an output field — validated at manifest load"
+  - "Backwards compatible — existing manifests without params/dotenv work identically"
+  - "Child processes inherit parent environment — Command::envs() adds ARC_PARAM_ vars without clearing inherited vars; no env_clear() anywhere in the pipeline"
+  - "Empty captured stdout sets env var to empty string (not omitted) — DuckDB getenv() returns empty string vs NULL for missing vars"
+
+acceptance_criteria:
+  - id: ac-01
+    ac_type: code
+    description: "Manifest params section — Manifest struct gains params: IndexMap<String, Param> and dotenv: Vec<String> fields, both serde(default). Param struct has default: Option<String>. Requires indexmap crate with serde feature as a direct dependency."
+    verification: "Unit test: deserialise a manifest YAML with params and dotenv fields; verify struct fields populated correctly. Deserialise a manifest without params/dotenv; verify empty defaults."
+
+  - id: ac-02
+    ac_type: code
+    description: "CLI --param flag — Commands::Run gains a repeatable --param KEY=VALUE flag. Runner parses on first '=' to split key/value. Invalid format (no '=') produces a clear error."
+    verification: "Unit test: parse valid --param flags into (key, value) pairs. Parse invalid flag (no '=') and assert error."
+
+  - id: ac-03
+    ac_type: code
+    description: "Param resolution with precedence — resolve_params() merges sources in order: dotenv files → manifest defaults (fill gaps only) → CLI params (override all). Missing required params (no default, not in dotenv or CLI) produce Error::MissingParam { name: String } (new error variant in error.rs)."
+    verification: "Unit test: provide overlapping values from dotenv, defaults, and CLI; verify CLI wins, defaults fill gaps, dotenv is baseline. Test missing required param produces MissingParam error with the param name."
+
+  - id: ac-04
+    ac_type: code
+    description: "ARC_PARAM_ prefix and uppercasing — All resolved params are injected as ARC_PARAM_{NAME_UPPERCASED} into the child process environment via Command::envs()."
+    verification: "Unit test: param 'start_date' with value '2026-01-01' produces env var ARC_PARAM_START_DATE=2026-01-01."
+
+  - id: ac-05
+    ac_type: code
+    description: "Engine trait env parameter — Engine trait methods (execute_sql, execute_command) gain an env: &HashMap<String, String> parameter. DuckDbEngine applies via Command::envs(). MockEngine accepts and records the env map. Env propagation failures (e.g. NUL bytes) are caught by the existing StepExecution error variant — no new error variant needed for this path."
+    verification: "Compile-time: trait methods accept env param. Unit test: MockEngine records env map passed to it."
+
+  - id: ac-06
+    ac_type: code
+    description: "Dotenv file loading — dotenvy crate parses dotenv files via from_path_iter() without setting process env. Files load in declared order (later overrides earlier). Missing files silently skipped."
+    verification: "Unit test: create temp .env file with KEY=VALUE; verify resolve_params reads it. Test missing .env.local is silently skipped."
+
+  - id: ac-07
+    ac_type: code
+    description: "Step output capture — Step struct gains output: Option<String>. When set on a command step, stdout is piped (not inherited), captured, trimmed of trailing newline, and injected as ARC_PARAM_{OUTPUT_NAME_UPPERCASED} for downstream steps. Stderr remains inherited (streams to terminal) for output-capturing steps. Empty stdout (after trimming) sets the env var to empty string, not omitted."
+    verification: "Integration test: command step with output field; verify captured value is available as env var in a subsequent step. Test empty stdout produces empty-string env var."
+
+  - id: ac-08
+    ac_type: code
+    description: "SQL steps cannot declare output — Manifest validation rejects a step with both sql and output fields set."
+    verification: "Unit test: manifest with SQL step + output field; assert validation error."
+
+  - id: ac-09
+    ac_type: code
+    description: "Backwards compatibility — Manifests without params, dotenv, or output fields deserialise and execute identically to current behaviour. Engine trait methods receive an empty env map."
+    verification: "Existing test suite passes without modification. Unit test: empty params/dotenv deserialise to empty defaults."
+
+  - id: ac-10
+    ac_type: code
+    description: "Param staleness independence — Changing param values between runs does not affect SQL step staleness. Only SQL file content hash determines freshness."
+    verification: "Unit test: run with param A, then param B (SQL file unchanged); verify the step is skipped on the second run (no engine call). Follows codebase pattern of asserting MockEngine call counts."
+
+ontology_schema:
+  name: "PipelineParameterisation"
+  description: "Runtime parameter system for Arcform pipelines"
+  fields:
+    - name: "Param"
+      type: "struct"
+      description: "A declared pipeline parameter with optional default value"
+    - name: "resolve_params"
+      type: "function"
+      description: "Merges dotenv, manifest defaults, and CLI params into a single env map with ARC_PARAM_ prefix"
+    - name: "StepOutput.stdout"
+      type: "Option<String>"
+      description: "Captured stdout from a command step when output field is set"
+
+evaluation_principles:
+  - principle: "SQL passthrough preservation"
+    weight: 0.4
+  - principle: "Precedence correctness (CLI > dotenv > defaults)"
+    weight: 0.3
+  - principle: "Backwards compatibility"
+    weight: 0.3
+
+exit_conditions:
+  - "All 10 ACs pass verification"
+  - "Existing test suite passes without modification"
+  - "cargo check --all-targets succeeds (no compilation errors in non-test code)"
+
+metadata:
+  version: "1.0"
+  test_prefix: "param"
+  timestamp: "2026-04-20T10:20:00+10:00"
+  ambiguity_score: 0.07
+  interview_ref: "orbit/specs/2026-04-20-pipeline-parameterisation/interview.md"
