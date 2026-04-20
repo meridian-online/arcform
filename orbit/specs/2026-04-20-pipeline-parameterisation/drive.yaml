@@ -3,7 +3,7 @@ autonomy: full
 budget: 3
 iteration: 1
 current_spec: orbit/specs/2026-04-20-pipeline-parameterisation/
-status: review
+status: pr
 history: []
 started: "2026-04-20T10:15:00+10:00"
 review_cycles:
