@@ -5,10 +5,10 @@ started: "2026-04-20T10:00:00+10:00"
 completed: null
 cards:
   - path: orbit/cards/0016-pipeline-parameterisation.yaml
-    status: designed
+    status: implementing
     spec_dir: orbit/specs/2026-04-20-pipeline-parameterisation/
     branch: rally/pipeline-parameterisation
-    worktree: null
+    worktree: "main"
     parked_constraint: null
   - path: orbit/cards/0015-execution-resilience.yaml
     status: designed
