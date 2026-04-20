@@ -12,11 +12,12 @@ cards:
     parked_constraint: null
     pr: https://github.com/meridian-online/arcform/pull/8
   - path: orbit/cards/0015-execution-resilience.yaml
-    status: implementing
+    status: complete
     spec_dir: orbit/specs/2026-04-20-execution-resilience/
     branch: rally/execution-resilience
     worktree: "main"
     parked_constraint: null
+    pr: https://github.com/meridian-online/arcform/pull/9
   - path: orbit/cards/0017-lifecycle-hooks.yaml
     status: designed
     spec_dir: orbit/specs/2026-04-20-lifecycle-hooks/
