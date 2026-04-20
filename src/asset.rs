@@ -249,6 +249,8 @@ mod tests {
             depends_on: vec![],
             preconditions: vec![],
             output: None,
+            retry: None,
+            timeout_sec: None,
         }
     }
 
@@ -267,6 +269,8 @@ mod tests {
             depends_on: depends_on.into_iter().map(String::from).collect(),
             preconditions: vec![],
             output: None,
+            retry: None,
+            timeout_sec: None,
         }
     }
 
@@ -280,6 +284,8 @@ mod tests {
             depends_on: vec![],
             preconditions: vec![],
             output: None,
+            retry: None,
+            timeout_sec: None,
         }
     }
 
@@ -305,6 +311,8 @@ mod tests {
             db: None,
             params: indexmap::IndexMap::new(),
             dotenv: Vec::new(),
+            timeout_sec: None,
+            defaults: None,
             steps,
             assets,
         };

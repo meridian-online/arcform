@@ -64,7 +64,7 @@ pub trait StateBackend {
     fn start_run(&self) -> Result<String>;
 
     /// Record the completion of a pipeline run.
-    fn finish_run(&self, run_id: &str, steps_executed: usize, outcome: &str) -> Result<()>;
+    fn finish_run(&self, run_id: &str, steps_executed: usize, outcome: &str, total_retries: usize) -> Result<()>;
 }
 
 /// DuckDB-backed state backend using the `duckdb` crate.
@@ -159,13 +159,16 @@ impl StateBackend for DuckDbStateBackend {
         Ok(run_id)
     }
 
-    fn finish_run(&self, run_id: &str, steps_executed: usize, outcome: &str) -> Result<()> {
+    fn finish_run(&self, run_id: &str, steps_executed: usize, outcome: &str, total_retries: usize) -> Result<()> {
         let conn = self.open()?;
         conn.execute(
             "UPDATE _arcform_runs SET finished_at = current_timestamp, steps_executed = ?1, outcome = ?2 WHERE run_id = ?3",
             duckdb::params![steps_executed as i64, outcome, run_id],
         )
         .map_err(|e| Error::StateBackend(e.to_string()))?;
+        // total_retries is tracked for observability but not stored in v0.1
+        // (schema migration deferred to avoid DuckDB ALTER TABLE complexity).
+        let _ = total_retries;
         Ok(())
     }
 }
@@ -227,6 +230,8 @@ pub mod mock {
         pub states: RefCell<HashMap<String, StepState>>,
         pub runs: RefCell<Vec<(String, Option<(usize, String)>)>>,
         pub init_called: RefCell<bool>,
+        /// Total retries recorded by the last finish_run call.
+        pub total_retries: std::cell::Cell<usize>,
     }
 
     impl MockStateBackend {
@@ -235,6 +240,7 @@ pub mod mock {
                 states: RefCell::new(HashMap::new()),
                 runs: RefCell::new(Vec::new()),
                 init_called: RefCell::new(false),
+                total_retries: std::cell::Cell::new(0),
             }
         }
 
@@ -277,10 +283,11 @@ pub mod mock {
             Ok(id)
         }
 
-        fn finish_run(&self, run_id: &str, steps_executed: usize, outcome: &str) -> Result<()> {
+        fn finish_run(&self, run_id: &str, steps_executed: usize, outcome: &str, total_retries: usize) -> Result<()> {
             if let Some(run) = self.runs.borrow_mut().iter_mut().find(|(id, _)| id == run_id) {
                 run.1 = Some((steps_executed, outcome.to_string()));
             }
+            self.total_retries.set(total_retries);
             Ok(())
         }
     }
@@ -312,7 +319,7 @@ mod tests {
     fn test_ac01_mock_run_tracking() {
         let backend = mock::MockStateBackend::new();
         let run_id = backend.start_run().unwrap();
-        backend.finish_run(&run_id, 3, "success").unwrap();
+        backend.finish_run(&run_id, 3, "success", 0).unwrap();
 
         let runs = backend.runs.borrow();
         assert_eq!(runs.len(), 1);
@@ -371,7 +378,7 @@ mod tests {
         backend.init().unwrap();
 
         let run_id = backend.start_run().unwrap();
-        backend.finish_run(&run_id, 5, "success").unwrap();
+        backend.finish_run(&run_id, 5, "success", 0).unwrap();
 
         let conn = duckdb::Connection::open(&db_path).unwrap();
         let (steps, outcome): (i64, String) = conn

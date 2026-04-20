@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 
@@ -54,23 +55,62 @@ fn stream_stderr(child: &mut std::process::Child) -> String {
 pub trait Engine {
     /// Execute a SQL file against a database.
     /// `env` contains ARC_PARAM_ variables to inject into the child process environment.
-    fn execute_sql(&self, db_path: &Path, sql_path: &Path, env: &HashMap<String, String>) -> Result<StepOutput>;
+    /// `timeout` is the maximum duration before the step is killed.
+    fn execute_sql(&self, db_path: &Path, sql_path: &Path, env: &HashMap<String, String>, timeout: Option<Duration>) -> Result<StepOutput>;
 
     /// Execute a raw shell command.
     /// `env` contains ARC_PARAM_ variables to inject into the child process environment.
     /// If `capture_stdout` is true, stdout is piped and captured instead of inherited.
-    fn execute_command(&self, command: &str, env: &HashMap<String, String>, capture_stdout: bool) -> Result<StepOutput>;
+    /// `timeout` is the maximum duration before the step is killed.
+    fn execute_command(&self, command: &str, env: &HashMap<String, String>, capture_stdout: bool, timeout: Option<Duration>) -> Result<StepOutput>;
 
     /// Check that the engine CLI is available and return information about it.
     /// Returns EngineInfo with the detected version (or None if unparseable).
     fn preflight(&self) -> Result<EngineInfo>;
 }
 
+/// Wait for a child process with an optional timeout.
+/// Polls try_wait() at ~100ms intervals. On timeout, kills the child.
+fn wait_with_timeout(child: &mut std::process::Child, timeout: Option<Duration>, step_name: &str) -> Result<std::process::ExitStatus> {
+    let Some(deadline_duration) = timeout else {
+        // No timeout — wait normally.
+        return child.wait().map_err(|e| Error::StepExecution {
+            step: step_name.to_string(),
+            source: e,
+        });
+    };
+
+    let deadline = Instant::now() + deadline_duration;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // Reap the killed process.
+                    return Err(Error::StepTimeout {
+                        step: step_name.to_string(),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                return Err(Error::StepExecution {
+                    step: step_name.to_string(),
+                    source: e,
+                });
+            }
+        }
+    }
+}
+
 /// DuckDB CLI engine implementation.
 pub struct DuckDbEngine;
 
 impl Engine for DuckDbEngine {
-    fn execute_sql(&self, db_path: &Path, sql_path: &Path, env: &HashMap<String, String>) -> Result<StepOutput> {
+    fn execute_sql(&self, db_path: &Path, sql_path: &Path, env: &HashMap<String, String>, timeout: Option<Duration>) -> Result<StepOutput> {
+        let step_name = sql_path.display().to_string();
         let mut child = Command::new("duckdb")
             .arg(db_path)
             .arg("-f")
@@ -80,15 +120,12 @@ impl Engine for DuckDbEngine {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| Error::StepExecution {
-                step: sql_path.display().to_string(),
+                step: step_name.clone(),
                 source: e,
             })?;
 
         let stderr = stream_stderr(&mut child);
-        let status = child.wait().map_err(|e| Error::StepExecution {
-            step: sql_path.display().to_string(),
-            source: e,
-        })?;
+        let status = wait_with_timeout(&mut child, timeout, &step_name)?;
 
         if !status.success() {
             let code = status.code().unwrap_or(1);
@@ -102,7 +139,7 @@ impl Engine for DuckDbEngine {
         Ok(StepOutput { stderr, stdout: None })
     }
 
-    fn execute_command(&self, command: &str, env: &HashMap<String, String>, capture_stdout: bool) -> Result<StepOutput> {
+    fn execute_command(&self, command: &str, env: &HashMap<String, String>, capture_stdout: bool, timeout: Option<Duration>) -> Result<StepOutput> {
         let stdout_cfg = if capture_stdout { Stdio::piped() } else { Stdio::inherit() };
         // Stderr: inherited for command steps (streams to terminal).
         // When capturing stdout, stderr remains inherited so errors are visible.
@@ -121,22 +158,19 @@ impl Engine for DuckDbEngine {
             })?;
 
         // If capturing, read stdout before wait() to avoid deadlocks.
+        // Timeout applies to the wait after stdout drain (constraint #10).
         let captured_stdout = if capture_stdout {
             let mut stdout_buf = String::new();
             if let Some(mut stdout) = child.stdout.take() {
                 let _ = stdout.read_to_string(&mut stdout_buf);
             }
-            // Trim trailing newline (shell commands typically append one).
             let trimmed = stdout_buf.trim_end_matches('\n').to_string();
             Some(trimmed)
         } else {
             None
         };
 
-        let status = child.wait().map_err(|e| Error::StepExecution {
-            step: command.to_string(),
-            source: e,
-        })?;
+        let status = wait_with_timeout(&mut child, timeout, command)?;
 
         if !status.success() {
             let code = status.code().unwrap_or(1);
@@ -210,6 +244,8 @@ pub mod mock {
         pub version: RefCell<Option<semver::Version>>,
         /// Simulated stdout for command steps with capture_stdout=true.
         pub simulated_stdout: RefCell<Option<String>>,
+        /// If true, return StepTimeout when timeout is Some(_).
+        pub timeout_should_fire: RefCell<bool>,
     }
 
     #[derive(Debug, Clone)]
@@ -237,12 +273,18 @@ pub mod mock {
                 preflight_should_fail: RefCell::new(false),
                 version: RefCell::new(Some(semver::Version::new(2, 0, 0))),
                 simulated_stdout: RefCell::new(None),
+                timeout_should_fire: RefCell::new(false),
             }
         }
 
         /// Set simulated stdout for command steps with capture_stdout=true.
         pub fn set_simulated_stdout(&self, stdout: &str) {
             *self.simulated_stdout.borrow_mut() = Some(stdout.to_string());
+        }
+
+        /// Make the mock return StepTimeout when a timeout is provided.
+        pub fn set_timeout_fire(&self) {
+            *self.timeout_should_fire.borrow_mut() = true;
         }
 
         /// Set the version that preflight will report.
@@ -284,7 +326,7 @@ pub mod mock {
     }
 
     impl Engine for MockEngine {
-        fn execute_sql(&self, db_path: &Path, sql_path: &Path, env: &HashMap<String, String>) -> Result<StepOutput> {
+        fn execute_sql(&self, db_path: &Path, sql_path: &Path, env: &HashMap<String, String>, timeout: Option<Duration>) -> Result<StepOutput> {
             let sql_content = fs::read_to_string(sql_path).map_err(|e| Error::FileRead {
                 path: sql_path.to_path_buf(),
                 source: e,
@@ -295,6 +337,13 @@ pub mod mock {
                 sql_content,
                 env: env.clone(),
             });
+
+            // Simulate timeout if configured and a timeout was provided.
+            if timeout.is_some() && *self.timeout_should_fire.borrow() {
+                return Err(Error::StepTimeout {
+                    step: sql_path.display().to_string(),
+                });
+            }
 
             if let Some((code, stderr)) = self.should_fail_now() {
                 return Err(Error::StepFailed {
@@ -310,12 +359,19 @@ pub mod mock {
             })
         }
 
-        fn execute_command(&self, command: &str, env: &HashMap<String, String>, capture_stdout: bool) -> Result<StepOutput> {
+        fn execute_command(&self, command: &str, env: &HashMap<String, String>, capture_stdout: bool, timeout: Option<Duration>) -> Result<StepOutput> {
             self.calls.borrow_mut().push(MockCall::Command {
                 command: command.to_string(),
                 env: env.clone(),
                 capture_stdout,
             });
+
+            // Simulate timeout if configured and a timeout was provided.
+            if timeout.is_some() && *self.timeout_should_fire.borrow() {
+                return Err(Error::StepTimeout {
+                    step: command.to_string(),
+                });
+            }
 
             if let Some((code, stderr)) = self.should_fail_now() {
                 return Err(Error::StepFailed {
