@@ -42,9 +42,10 @@ scenarios:
 
 goal: "Named runtime parameters with defaults, step output capture, dotenv loading — all via environment variables, SQL passthrough preserved"
 maturity: "planned"
-specs: []
+specs:
+  - orbit/specs/2026-04-20-pipeline-parameterisation/interview.md
 references:
   - "/home/hugh/github/dagucloud/dagu/internal/core/spec/dag.go"
   - "/home/hugh/github/dagucloud/docs/writing-workflows/parameters.md"
   - "/home/hugh/github/dagucloud/docs/writing-workflows/data-flow.md"
-  - "cards/0005-sql-passthrough.yaml"
+  - "orbit/cards/0005-sql-passthrough.yaml"

@@ -42,7 +42,8 @@ scenarios:
 
 goal: "Step-level retry with backoff + step/pipeline timeouts — transient failures handled, stuck processes killed"
 maturity: "planned"
-specs: []
+specs:
+  - orbit/specs/2026-04-20-execution-resilience/interview.md
 references:
   - "/home/hugh/github/dagucloud/dagu/internal/core/spec/step.go"
   - "/home/hugh/github/dagucloud/docs/writing-workflows/durable-execution.md"

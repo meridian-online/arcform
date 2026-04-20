@@ -22,9 +22,28 @@ scenarios:
     then: "the init handler runs before any declared steps; if it fails, no steps execute"
     source_lines: "writing-workflows/lifecycle-handlers.md: Execution order: init → main steps → status-specific handler → exit"
 
+  - name: "Success handler runs on completion"
+    given: "a manifest with an on_success handler step"
+    when: "all pipeline steps succeed"
+    then: "the success handler runs after the last step"
+    source_lines: "design interview: on_success runs after all steps succeed"
+
+  - name: "Hook failure is non-fatal"
+    given: "a manifest with an on_success handler that fails"
+    when: "all steps succeed but the success hook fails"
+    then: "the pipeline exit code still reflects success — hook failure is reported but non-fatal"
+    source_lines: "design interview: hook failures are reported but non-fatal to exit code"
+
+  - name: "No hooks is backwards compatible"
+    given: "a manifest without a hooks section"
+    when: "the pipeline runs"
+    then: "the pipeline behaves identically to today — no hooks means no lifecycle overhead"
+    source_lines: "author-directed during review"
+
 goal: "Declarative lifecycle hooks (init, success, failure, exit) for pipeline setup, teardown, and notification"
 maturity: "planned"
-specs: []
+specs:
+  - orbit/specs/2026-04-20-lifecycle-hooks/interview.md
 references:
   - "/home/hugh/github/dagucloud/dagu/internal/core/dag.go"
   - "/home/hugh/github/dagucloud/docs/writing-workflows/lifecycle-handlers.md"

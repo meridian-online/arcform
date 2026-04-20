@@ -1,0 +1,29 @@
+rally: "pipeline runtime essentials — resilience, parameterisation, lifecycle hooks"
+autonomy: guided
+phase: implementing
+started: "2026-04-20T10:00:00+10:00"
+completed: null
+cards:
+  - path: orbit/cards/0016-pipeline-parameterisation.yaml
+    status: designed
+    spec_dir: orbit/specs/2026-04-20-pipeline-parameterisation/
+    branch: rally/pipeline-parameterisation
+    worktree: null
+    parked_constraint: null
+  - path: orbit/cards/0015-execution-resilience.yaml
+    status: designed
+    spec_dir: orbit/specs/2026-04-20-execution-resilience/
+    branch: rally/execution-resilience
+    worktree: null
+    parked_constraint: null
+  - path: orbit/cards/0017-lifecycle-hooks.yaml
+    status: designed
+    spec_dir: orbit/specs/2026-04-20-lifecycle-hooks/
+    branch: rally/lifecycle-hooks
+    worktree: null
+    parked_constraint: null
+implementation_order:
+  - orbit/cards/0016-pipeline-parameterisation.yaml
+  - orbit/cards/0015-execution-resilience.yaml
+  - orbit/cards/0017-lifecycle-hooks.yaml
+order_rationale: "Shared Engine trait — 0016 adds env param, 0015 adds timeout param, 0017 consumes 0016's env injection for hook context vars. Serial required."
