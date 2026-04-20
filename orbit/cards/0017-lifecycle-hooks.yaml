@@ -44,6 +44,7 @@ goal: "Declarative lifecycle hooks (init, success, failure, exit) for pipeline s
 maturity: "planned"
 specs:
   - orbit/specs/2026-04-20-lifecycle-hooks/interview.md
+  - orbit/specs/2026-04-20-lifecycle-hooks/spec.yaml
 references:
   - "/home/hugh/github/dagucloud/dagu/internal/core/dag.go"
   - "/home/hugh/github/dagucloud/docs/writing-workflows/lifecycle-handlers.md"

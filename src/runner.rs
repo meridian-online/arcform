@@ -78,6 +78,26 @@ pub fn backoff_duration(policy: &RetryPolicy, attempt: u32) -> Duration {
     Duration::from_secs_f64(secs)
 }
 
+/// Execute a lifecycle hook step.
+///
+/// Hooks use the Engine's execute paths (SQL or command) with the given env vars.
+/// Returns Ok on success, Err on failure.
+fn execute_hook(
+    hook: &crate::manifest::Step,
+    engine: &dyn Engine,
+    db_path: &Path,
+    dir: &Path,
+    env: &HashMap<String, String>,
+) -> Result<()> {
+    if let Some(ref sql) = hook.sql {
+        let sql_path = dir.join(sql);
+        engine.execute_sql(db_path, &sql_path, env, None)?;
+    } else if let Some(ref command) = hook.command {
+        engine.execute_command(command, env, false, None)?;
+    }
+    Ok(())
+}
+
 /// Run a pipeline with no CLI parameter overrides.
 ///
 /// Backwards-compatible entry point — delegates to `run_with_params` with empty params.
@@ -169,177 +189,297 @@ pub fn run_with_params(
     let pipeline_start = Instant::now();
     let pipeline_timeout = manifest.timeout_sec.map(Duration::from_secs_f64);
 
-    for (i, step) in manifest.steps.iter().enumerate() {
-        let is_stale = stale_steps.contains(&step.name);
+    // Track whether on_init was attempted (for on_exit try/finally guarantee).
+    let mut init_attempted = false;
 
-        if !is_stale {
+    // --- on_init hook ---
+    if let Some(ref init_hook) = manifest.hooks.on_init {
+        init_attempted = true;
+        println!("{} {} ...", "[hook]".dimmed(), init_hook.name.bold());
+        if let Err(e) = execute_hook(init_hook, engine, &db_path, dir, &env_map) {
+            // on_init failure is fatal — no steps execute.
+            // But on_exit still runs.
+            eprintln!("{} on_init hook '{}' failed: {}", "error:".red(), init_hook.name, e);
+
+            // Run on_exit with ARC_PIPELINE_STATUS=init_failed.
+            if let Some(ref exit_hook) = manifest.hooks.on_exit {
+                let mut exit_env = env_map.clone();
+                exit_env.insert("ARC_PIPELINE_STATUS".to_string(), "init_failed".to_string());
+                println!("{} {} ...", "[hook]".dimmed(), exit_hook.name.bold());
+                if let Err(exit_err) = execute_hook(exit_hook, engine, &db_path, dir, &exit_env) {
+                    eprintln!("{} on_exit hook '{}' failed: {}", "warning:".yellow(), exit_hook.name, exit_err);
+                }
+            }
+
+            let _ = state.finish_run(&run_id, executed, "init_failed", total_retries);
+            return Err(e);
+        }
+    }
+
+    // --- Step execution loop ---
+    // Run the step loop, capturing the result for hook dispatch.
+    let step_loop_result: std::result::Result<(), Error> = (|| {
+        for (i, step) in manifest.steps.iter().enumerate() {
+            let is_stale = stale_steps.contains(&step.name);
+
+            if !is_stale {
+                println!(
+                    "[{}/{}] {} {}",
+                    i + 1,
+                    total,
+                    step.name.bold(),
+                    "[skip]".dimmed(),
+                );
+                skipped += 1;
+                continue;
+            }
+
+            // Check pipeline timeout before executing.
+            if let Some(pt) = pipeline_timeout {
+                let elapsed = pipeline_start.elapsed();
+                if elapsed >= pt {
+                    let _ = state.finish_run(&run_id, executed, "timeout", total_retries);
+                    return Err(Error::PipelineTimeout {
+                        step: step.name.clone(),
+                        elapsed_sec: elapsed.as_secs_f64(),
+                    });
+                }
+            }
+
             println!(
-                "[{}/{}] {} {}",
+                "[{}/{}] {} ...",
                 i + 1,
                 total,
-                step.name.bold(),
-                "[skip]".dimmed(),
+                step.name.bold()
             );
-            skipped += 1;
-            continue;
-        }
 
-        // Check pipeline timeout before executing.
-        if let Some(pt) = pipeline_timeout {
-            let elapsed = pipeline_start.elapsed();
-            if elapsed >= pt {
-                let _ = state.finish_run(&run_id, executed, "timeout", total_retries);
-                return Err(Error::PipelineTimeout {
-                    step: step.name.clone(),
-                    elapsed_sec: elapsed.as_secs_f64(),
-                });
-            }
-        }
-
-        println!(
-            "[{}/{}] {} ...",
-            i + 1,
-            total,
-            step.name.bold()
-        );
-
-        // Compute the SQL hash for this step (for state recording).
-        let sql_hash = if let Some(ref sql) = step.sql {
-            let sql_path = dir.join(sql);
-            if !sql_path.exists() {
-                return Err(Error::SqlFileNotFound {
-                    step: step.name.clone(),
-                    path: sql_path,
-                });
-            }
-            let content = std::fs::read(&sql_path).map_err(|e| Error::FileRead {
-                path: sql_path.clone(),
-                source: e,
-            })?;
-            state::content_hash(&content)
-        } else {
-            String::new()
-        };
-
-        let capture_stdout = step.output.is_some();
-
-        // Resolve effective retry policy: step-level overrides defaults wholesale.
-        let effective_retry = step.retry.as_ref().or_else(|| {
-            manifest.defaults.as_ref().and_then(|d| d.retry.as_ref())
-        });
-
-        let max_attempts = effective_retry.map_or(1, |r| r.max_attempts);
-
-        let mut last_error = None;
-
-        for attempt in 1..=max_attempts {
-            if attempt > 1 {
-                // Print retry separator.
-                if let Some(policy) = effective_retry {
-                    let delay = backoff_duration(policy, attempt);
-                    eprintln!(
-                        "[retry {}/{}, backoff {:.1}s]",
-                        attempt, max_attempts, delay.as_secs_f64()
-                    );
-                    std::thread::sleep(delay);
-                }
-                total_retries += 1;
-            }
-
-            // Compute step timeout per attempt, clamped to remaining pipeline time.
-            // Recomputed each iteration so backoff sleep + prior attempts are accounted for.
-            let step_timeout = {
-                let step_t = step.timeout_sec.map(Duration::from_secs_f64);
-                if let Some(pt) = pipeline_timeout {
-                    let remaining = pt.saturating_sub(pipeline_start.elapsed());
-                    match step_t {
-                        Some(st) => Some(st.min(remaining)),
-                        None => Some(remaining),
-                    }
-                } else {
-                    step_t
-                }
-            };
-
-            let result = if let Some(ref sql) = step.sql {
+            // Compute the SQL hash for this step (for state recording).
+            let sql_hash = if let Some(ref sql) = step.sql {
                 let sql_path = dir.join(sql);
-                engine.execute_sql(&db_path, &sql_path, &env_map, step_timeout)
-            } else if let Some(ref command) = step.command {
-                engine.execute_command(command, &env_map, capture_stdout, step_timeout)
+                if !sql_path.exists() {
+                    return Err(Error::SqlFileNotFound {
+                        step: step.name.clone(),
+                        path: sql_path,
+                    });
+                }
+                let content = std::fs::read(&sql_path).map_err(|e| Error::FileRead {
+                    path: sql_path.clone(),
+                    source: e,
+                })?;
+                state::content_hash(&content)
             } else {
-                unreachable!("validation ensures sql or command is present")
+                String::new()
             };
 
-            match result {
-                Ok(output) => {
-                    succeeded += 1;
-                    executed += 1;
-                    let _ = state.record_step(&step.name, &sql_hash, StepStatus::Success);
+            let capture_stdout = step.output.is_some();
 
-                    // If this step captures output, inject it as ARC_PARAM_ for downstream steps.
-                    if let Some(ref output_name) = step.output {
-                        let captured = output.stdout.unwrap_or_default();
-                        let env_key = format!("ARC_PARAM_{}", output_name.to_uppercase());
-                        env_map.insert(env_key, captured);
+            // Resolve effective retry policy: step-level overrides defaults wholesale.
+            // Hooks do not inherit manifest defaults — only pipeline steps do.
+            let effective_retry = step.retry.as_ref().or_else(|| {
+                manifest.defaults.as_ref().and_then(|d| d.retry.as_ref())
+            });
+
+            let max_attempts = effective_retry.map_or(1, |r| r.max_attempts);
+
+            let mut last_error = None;
+
+            for attempt in 1..=max_attempts {
+                if attempt > 1 {
+                    // Print retry separator.
+                    if let Some(policy) = effective_retry {
+                        let delay = backoff_duration(policy, attempt);
+                        eprintln!(
+                            "[retry {}/{}, backoff {:.1}s]",
+                            attempt, max_attempts, delay.as_secs_f64()
+                        );
+                        std::thread::sleep(delay);
                     }
+                    total_retries += 1;
+                }
 
-                    last_error = None;
-                    break;
+                // Compute step timeout per attempt, clamped to remaining pipeline time.
+                // Recomputed each iteration so backoff sleep + prior attempts are accounted for.
+                let step_timeout = {
+                    let step_t = step.timeout_sec.map(Duration::from_secs_f64);
+                    if let Some(pt) = pipeline_timeout {
+                        let remaining = pt.saturating_sub(pipeline_start.elapsed());
+                        match step_t {
+                            Some(st) => Some(st.min(remaining)),
+                            None => Some(remaining),
+                        }
+                    } else {
+                        step_t
+                    }
+                };
+
+                let result = if let Some(ref sql) = step.sql {
+                    let sql_path = dir.join(sql);
+                    engine.execute_sql(&db_path, &sql_path, &env_map, step_timeout)
+                } else if let Some(ref command) = step.command {
+                    engine.execute_command(command, &env_map, capture_stdout, step_timeout)
+                } else {
+                    unreachable!("validation ensures sql or command is present")
+                };
+
+                match result {
+                    Ok(output) => {
+                        succeeded += 1;
+                        executed += 1;
+                        let _ = state.record_step(&step.name, &sql_hash, StepStatus::Success);
+
+                        // If this step captures output, inject it as ARC_PARAM_ for downstream steps.
+                        if let Some(ref output_name) = step.output {
+                            let captured = output.stdout.unwrap_or_default();
+                            let env_key = format!("ARC_PARAM_{}", output_name.to_uppercase());
+                            env_map.insert(env_key, captured);
+                        }
+
+                        last_error = None;
+                        break;
+                    }
+                    Err(Error::StepFailed { code, stderr, .. }) => {
+                        last_error = Some(Error::StepFailed {
+                            step: step.name.clone(),
+                            code,
+                            stderr,
+                        });
+                        // Continue to next attempt if retries remain.
+                    }
+                    Err(Error::StepTimeout { step: timed_out_step }) => {
+                        // A timed-out step counts as a failed attempt — retryable.
+                        last_error = Some(Error::StepTimeout {
+                            step: timed_out_step,
+                        });
+                        // Continue to next attempt if retries remain.
+                    }
+                    Err(e) => {
+                        // Non-retryable errors (StepExecution, etc.) — halt immediately.
+                        let _ = state.record_step(&step.name, &sql_hash, StepStatus::Failed);
+                        let _ = state.finish_run(&run_id, executed, "error", total_retries);
+                        return Err(e);
+                    }
                 }
-                Err(Error::StepFailed { code, stderr, .. }) => {
-                    last_error = Some(Error::StepFailed {
-                        step: step.name.clone(),
-                        code,
-                        stderr,
-                    });
-                    // Continue to next attempt if retries remain.
+            }
+
+            // If we exhausted all attempts with an error, record failure and halt.
+            if let Some(err) = last_error {
+                executed += 1;
+                let _ = state.record_step(&step.name, &sql_hash, StepStatus::Failed);
+                let _ = state.finish_run(&run_id, executed, "failed", total_retries);
+                return Err(err);
+            }
+        }
+
+        // All steps succeeded.
+        let _ = state.finish_run(&run_id, executed, "success", total_retries);
+        Ok(())
+    })();
+
+    // --- Lifecycle hooks: on_success / on_failure / on_exit ---
+    // Hooks run outside the pipeline timeout boundary.
+
+    match &step_loop_result {
+        Ok(()) => {
+            // --- on_success hook ---
+            if let Some(ref success_hook) = manifest.hooks.on_success {
+                println!("{} {} ...", "[hook]".dimmed(), success_hook.name.bold());
+                if let Err(e) = execute_hook(success_hook, engine, &db_path, dir, &env_map) {
+                    // Non-fatal: report but keep Ok result.
+                    eprintln!("{} on_success hook '{}' failed: {}", "warning:".yellow(), success_hook.name, e);
                 }
-                Err(Error::StepTimeout { step: timed_out_step }) => {
-                    // A timed-out step counts as a failed attempt — retryable.
-                    last_error = Some(Error::StepTimeout {
-                        step: timed_out_step,
-                    });
-                    // Continue to next attempt if retries remain.
+            }
+        }
+        Err(e) => {
+            // --- on_failure hook ---
+            if let Some(ref failure_hook) = manifest.hooks.on_failure {
+                let mut failure_env = env_map.clone();
+                // Inject failure context env vars.
+                match e {
+                    Error::StepFailed { step, code, .. } => {
+                        failure_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
+                        failure_env.insert("ARC_EXIT_CODE".to_string(), code.to_string());
+                    }
+                    Error::StepTimeout { step } => {
+                        failure_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
+                        failure_env.insert("ARC_EXIT_CODE".to_string(), "timeout".to_string());
+                    }
+                    Error::PipelineTimeout { step, .. } => {
+                        failure_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
+                        failure_env.insert("ARC_EXIT_CODE".to_string(), "timeout".to_string());
+                    }
+                    _ => {}
+                }
+
+                println!("{} {} ...", "[hook]".dimmed(), failure_hook.name.bold());
+                if let Err(hook_err) = execute_hook(failure_hook, engine, &db_path, dir, &failure_env) {
+                    // Non-fatal: report but keep original error.
+                    eprintln!("{} on_failure hook '{}' failed: {}", "warning:".yellow(), failure_hook.name, hook_err);
+                }
+            }
+        }
+    }
+
+    // --- on_exit hook (try/finally) ---
+    // on_exit runs if on_init was attempted OR if any steps ran (even without on_init).
+    let should_run_exit = init_attempted || !manifest.steps.is_empty();
+    if should_run_exit {
+        if let Some(ref exit_hook) = manifest.hooks.on_exit {
+            let mut exit_env = env_map.clone();
+            match &step_loop_result {
+                Ok(()) => {
+                    exit_env.insert("ARC_PIPELINE_STATUS".to_string(), "success".to_string());
                 }
                 Err(e) => {
-                    // Non-retryable errors (StepExecution, etc.) — halt immediately.
-                    let _ = state.record_step(&step.name, &sql_hash, StepStatus::Failed);
-                    let _ = state.finish_run(&run_id, executed, "error", total_retries);
-                    return Err(e);
+                    exit_env.insert("ARC_PIPELINE_STATUS".to_string(), "failed".to_string());
+                    // Inject failure context on failed status.
+                    match e {
+                        Error::StepFailed { step, code, .. } => {
+                            exit_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
+                            exit_env.insert("ARC_EXIT_CODE".to_string(), code.to_string());
+                        }
+                        Error::StepTimeout { step } => {
+                            exit_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
+                            exit_env.insert("ARC_EXIT_CODE".to_string(), "timeout".to_string());
+                        }
+                        Error::PipelineTimeout { step, .. } => {
+                            exit_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
+                            exit_env.insert("ARC_EXIT_CODE".to_string(), "timeout".to_string());
+                        }
+                        _ => {}
+                    }
                 }
             }
-        }
 
-        // If we exhausted all attempts with an error, record failure and halt.
-        if let Some(err) = last_error {
-            executed += 1;
-            let _ = state.record_step(&step.name, &sql_hash, StepStatus::Failed);
-            let _ = state.finish_run(&run_id, executed, "failed", total_retries);
-            return Err(err);
+            println!("{} {} ...", "[hook]".dimmed(), exit_hook.name.bold());
+            if let Err(exit_err) = execute_hook(exit_hook, engine, &db_path, dir, &exit_env) {
+                eprintln!("{} on_exit hook '{}' failed: {}", "warning:".yellow(), exit_hook.name, exit_err);
+            }
         }
     }
 
-    // Finish the run record.
-    let _ = state.finish_run(&run_id, executed, "success", total_retries);
-
-    if skipped > 0 {
-        println!(
-            "\n{} {}/{} steps succeeded, {} skipped (fresh).",
-            "✓".green(),
-            succeeded,
-            total,
-            skipped,
-        );
-    } else {
-        println!(
-            "\n{} {}/{} steps succeeded.",
-            "✓".green(),
-            succeeded,
-            total,
-        );
+    // Print summary and return the pipeline result (not hook result).
+    match step_loop_result {
+        Ok(()) => {
+            if skipped > 0 {
+                println!(
+                    "\n{} {}/{} steps succeeded, {} skipped (fresh).",
+                    "✓".green(),
+                    succeeded,
+                    total,
+                    skipped,
+                );
+            } else {
+                println!(
+                    "\n{} {}/{} steps succeeded.",
+                    "✓".green(),
+                    succeeded,
+                    total,
+                );
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
     }
-
-    Ok(())
 }
 
 /// Determine which steps are stale and need to execute.
@@ -2135,5 +2275,710 @@ steps:
         // Verify the error is StepTimeout (not a non-retryable error).
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("timed out"), "final error should be StepTimeout: {msg}");
+    }
+
+    // ---- Lifecycle Hook Tests ----
+
+    // hook ac-01: Hooks struct deserialises from YAML.
+    #[test]
+    fn test_hook_ac01_hooks_deserialise() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_init:
+    name: setup
+    command: "echo init"
+  on_success:
+    name: notify
+    command: "echo ok"
+  on_failure:
+    name: alert
+    command: "echo fail"
+  on_exit:
+    name: teardown
+    command: "echo exit"
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let manifest = crate::manifest::Manifest::load(dir.path()).unwrap();
+        assert!(manifest.hooks.on_init.is_some());
+        assert!(manifest.hooks.on_success.is_some());
+        assert!(manifest.hooks.on_failure.is_some());
+        assert!(manifest.hooks.on_exit.is_some());
+        assert_eq!(manifest.hooks.on_init.unwrap().name, "setup");
+    }
+
+    // hook ac-01: No hooks section is backwards compatible.
+    #[test]
+    fn test_hook_ac01_no_hooks_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: greet\n    command: echo hello\n";
+        setup_project(dir.path(), yaml, &[]);
+        let manifest = crate::manifest::Manifest::load(dir.path()).unwrap();
+        assert!(manifest.hooks.on_init.is_none());
+        assert!(manifest.hooks.on_success.is_none());
+        assert!(manifest.hooks.on_failure.is_none());
+        assert!(manifest.hooks.on_exit.is_none());
+    }
+
+    // hook ac-02: on_init runs before steps.
+    #[test]
+    fn test_hook_ac02_init_runs_before_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_init:
+    name: setup
+    command: "echo init"
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let calls = engine.calls.borrow();
+        // on_init command, then load command.
+        let cmd_calls: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                MockCall::Command { command, .. } => Some(command.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cmd_calls, vec!["echo init", "echo loading"]);
+    }
+
+    // hook ac-02: on_init failure prevents steps, but on_exit still runs.
+    #[test]
+    fn test_hook_ac02_init_failure_aborts_but_exit_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_init:
+    name: setup
+    command: "echo init"
+  on_exit:
+    name: teardown
+    command: "echo exit"
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let engine = MockEngine::new();
+        // Fail the first command call (on_init).
+        engine.set_fail_on_call(0, 1, "init boom");
+        let state = MockStateBackend::new();
+        let result = run(dir.path(), &engine, &state, false);
+        assert!(result.is_err(), "should fail when on_init fails");
+
+        let calls = engine.calls.borrow();
+        let cmd_calls: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                MockCall::Command { command, .. } => Some(command.as_str()),
+                _ => None,
+            })
+            .collect();
+        // on_init (failed) + on_exit (runs), but NOT the load step.
+        assert_eq!(cmd_calls, vec!["echo init", "echo exit"]);
+    }
+
+    // hook ac-03: on_success runs after all steps succeed.
+    #[test]
+    fn test_hook_ac03_success_hook_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_success:
+    name: notify
+    command: "echo ok"
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let calls = engine.calls.borrow();
+        let cmd_calls: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                MockCall::Command { command, .. } => Some(command.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cmd_calls, vec!["echo loading", "echo ok"]);
+    }
+
+    // hook ac-03: on_success does NOT run when a step fails.
+    #[test]
+    fn test_hook_ac03_success_not_called_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_success:
+    name: notify
+    command: "echo ok"
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let engine = MockEngine::new();
+        engine.set_failure(1, "boom");
+        let state = MockStateBackend::new();
+        let result = run(dir.path(), &engine, &state, false);
+        assert!(result.is_err());
+
+        let calls = engine.calls.borrow();
+        let cmd_calls: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                MockCall::Command { command, .. } => Some(command.as_str()),
+                _ => None,
+            })
+            .collect();
+        // Only the failing step — no on_success.
+        assert_eq!(cmd_calls, vec!["echo loading"]);
+    }
+
+    // hook ac-04: on_failure runs with ARC_FAILED_STEP and ARC_EXIT_CODE.
+    #[test]
+    fn test_hook_ac04_failure_hook_with_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_failure:
+    name: alert
+    command: "echo fail"
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let engine = MockEngine::new();
+        engine.set_failure(1, "step error");
+        let state = MockStateBackend::new();
+        let result = run(dir.path(), &engine, &state, false);
+        assert!(result.is_err());
+
+        let calls = engine.calls.borrow();
+        // Find the on_failure hook call and check env.
+        let failure_call = calls.iter().find(|c| match c {
+            MockCall::Command { command, .. } => command == "echo fail",
+            _ => false,
+        });
+        assert!(failure_call.is_some(), "on_failure hook should have been called");
+        if let MockCall::Command { env, .. } = failure_call.unwrap() {
+            assert_eq!(env.get("ARC_FAILED_STEP"), Some(&"load".to_string()));
+            assert_eq!(env.get("ARC_EXIT_CODE"), Some(&"1".to_string()));
+        }
+    }
+
+    // hook ac-04: on_failure does NOT run when all steps succeed.
+    #[test]
+    fn test_hook_ac04_failure_not_called_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_failure:
+    name: alert
+    command: "echo fail"
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let calls = engine.calls.borrow();
+        let cmd_calls: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                MockCall::Command { command, .. } => Some(command.as_str()),
+                _ => None,
+            })
+            .collect();
+        // Only the pipeline step — no on_failure.
+        assert_eq!(cmd_calls, vec!["echo loading"]);
+    }
+
+    // hook ac-05: on_exit runs on success with ARC_PIPELINE_STATUS=success.
+    #[test]
+    fn test_hook_ac05_exit_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_exit:
+    name: teardown
+    command: "echo exit"
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let calls = engine.calls.borrow();
+        let exit_call = calls.iter().find(|c| match c {
+            MockCall::Command { command, .. } => command == "echo exit",
+            _ => false,
+        });
+        assert!(exit_call.is_some(), "on_exit should run on success");
+        if let MockCall::Command { env, .. } = exit_call.unwrap() {
+            assert_eq!(env.get("ARC_PIPELINE_STATUS"), Some(&"success".to_string()));
+            assert!(env.get("ARC_FAILED_STEP").is_none(), "no ARC_FAILED_STEP on success");
+        }
+    }
+
+    // hook ac-05: on_exit runs on failure with ARC_PIPELINE_STATUS=failed.
+    #[test]
+    fn test_hook_ac05_exit_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_exit:
+    name: teardown
+    command: "echo exit"
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let engine = MockEngine::new();
+        engine.set_failure(1, "step error");
+        let state = MockStateBackend::new();
+        let result = run(dir.path(), &engine, &state, false);
+        assert!(result.is_err());
+
+        let calls = engine.calls.borrow();
+        let exit_call = calls.iter().find(|c| match c {
+            MockCall::Command { command, .. } => command == "echo exit",
+            _ => false,
+        });
+        assert!(exit_call.is_some(), "on_exit should run on failure");
+        if let MockCall::Command { env, .. } = exit_call.unwrap() {
+            assert_eq!(env.get("ARC_PIPELINE_STATUS"), Some(&"failed".to_string()));
+            assert_eq!(env.get("ARC_FAILED_STEP"), Some(&"load".to_string()));
+        }
+    }
+
+    // hook ac-05: on_exit runs on init failure with ARC_PIPELINE_STATUS=init_failed.
+    #[test]
+    fn test_hook_ac05_exit_on_init_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_init:
+    name: setup
+    command: "echo init"
+  on_exit:
+    name: teardown
+    command: "echo exit"
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let engine = MockEngine::new();
+        engine.set_fail_on_call(0, 1, "init error");
+        let state = MockStateBackend::new();
+        let result = run(dir.path(), &engine, &state, false);
+        assert!(result.is_err());
+
+        let calls = engine.calls.borrow();
+        let exit_call = calls.iter().find(|c| match c {
+            MockCall::Command { command, .. } => command == "echo exit",
+            _ => false,
+        });
+        assert!(exit_call.is_some(), "on_exit should run even when on_init fails");
+        if let MockCall::Command { env, .. } = exit_call.unwrap() {
+            assert_eq!(env.get("ARC_PIPELINE_STATUS"), Some(&"init_failed".to_string()));
+            assert!(env.get("ARC_FAILED_STEP").is_none(), "no ARC_FAILED_STEP on init failure");
+        }
+    }
+
+    // hook ac-06: Non-fatal — on_success failure doesn't change pipeline result.
+    #[test]
+    fn test_hook_ac06_success_hook_failure_nonfatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_success:
+    name: notify
+    command: "echo notify"
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let engine = MockEngine::new();
+        // Fail the second call (on_success hook). First call is the step.
+        engine.set_fail_on_call(1, 1, "hook error");
+        let state = MockStateBackend::new();
+        // Pipeline should still succeed — hook failure is non-fatal.
+        let result = run(dir.path(), &engine, &state, false);
+        assert!(result.is_ok(), "pipeline should succeed despite on_success hook failure");
+    }
+
+    // hook ac-06: Non-fatal — on_failure failure doesn't change pipeline error.
+    #[test]
+    fn test_hook_ac06_failure_hook_failure_returns_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_failure:
+    name: alert
+    command: "echo alert"
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let engine = MockEngine::new();
+        // All calls fail (step + hook).
+        engine.set_failure(1, "original error");
+        let state = MockStateBackend::new();
+        let result = run(dir.path(), &engine, &state, false);
+        assert!(result.is_err());
+        // Verify the error is from the step, not the hook.
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("load"), "error should name the failed step: {msg}");
+    }
+
+    // hook ac-07: Hooks with preconditions are rejected.
+    #[test]
+    fn test_hook_ac07_reject_preconditions() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_init:
+    name: setup
+    command: "echo init"
+    preconditions:
+      - command: "true"
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let err = crate::manifest::Manifest::load(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("preconditions"), "should reject preconditions on hooks: {msg}");
+    }
+
+    // hook ac-07: Hooks with retry are rejected.
+    #[test]
+    fn test_hook_ac07_reject_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_init:
+    name: setup
+    command: "echo init"
+    retry:
+      max_attempts: 3
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let err = crate::manifest::Manifest::load(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("retry"), "should reject retry on hooks: {msg}");
+    }
+
+    // hook ac-07: Hooks with timeout_sec are rejected.
+    #[test]
+    fn test_hook_ac07_reject_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_init:
+    name: setup
+    command: "echo init"
+    timeout_sec: 30.0
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let err = crate::manifest::Manifest::load(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("timeout_sec"), "should reject timeout_sec on hooks: {msg}");
+    }
+
+    // hook ac-07: Hooks with produces are rejected.
+    #[test]
+    fn test_hook_ac07_reject_produces() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_init:
+    name: setup
+    command: "echo init"
+    produces:
+      - some_asset
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let err = crate::manifest::Manifest::load(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("produces"), "should reject produces on hooks: {msg}");
+    }
+
+    // hook ac-07: Hooks with depends_on are rejected.
+    #[test]
+    fn test_hook_ac07_reject_depends_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_init:
+    name: setup
+    command: "echo init"
+    depends_on:
+      - some_asset
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let err = crate::manifest::Manifest::load(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("depends_on"), "should reject depends_on on hooks: {msg}");
+    }
+
+    // hook ac-07: Hooks with output are rejected.
+    #[test]
+    fn test_hook_ac07_reject_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_success:
+    name: notify
+    command: "echo ok"
+    output: captured_value
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let err = crate::manifest::Manifest::load(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("output"), "should reject output on hooks: {msg}");
+    }
+
+    // hook ac-07: Hook name collision with step name is rejected.
+    #[test]
+    fn test_hook_ac07_reject_name_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_init:
+    name: load
+    command: "echo init"
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let err = crate::manifest::Manifest::load(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("collides"), "should reject name collision: {msg}");
+    }
+
+    // hook ac-08: Backwards compatibility — no hooks in manifest.
+    #[test]
+    fn test_hook_ac08_backwards_compat() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: greet\n    command: echo hello\n";
+        setup_project(dir.path(), yaml, &[]);
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let calls = engine.calls.borrow();
+        let cmd_calls: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                MockCall::Command { command, .. } => Some(command.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cmd_calls, vec!["echo hello"], "should work identically without hooks");
+    }
+
+    // hook ac-09: SQL hook step calls engine.execute_sql.
+    #[test]
+    fn test_hook_ac09_sql_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_init:
+    name: setup
+    sql: hooks/setup.sql
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[("hooks/setup.sql", "CREATE TABLE staging (id INT);")]);
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let calls = engine.calls.borrow();
+        // First call should be Preflight (since we have a SQL hook), then SQL, then Command.
+        let sql_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(c, MockCall::Sql { .. }))
+            .collect();
+        assert_eq!(sql_calls.len(), 1, "SQL hook should produce one execute_sql call");
+    }
+
+    // hook ac-09: Command hook step calls engine.execute_command.
+    #[test]
+    fn test_hook_ac09_command_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_exit:
+    name: teardown
+    command: "echo cleanup"
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let calls = engine.calls.borrow();
+        let cmd_calls: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                MockCall::Command { command, .. } => Some(command.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(cmd_calls.contains(&"echo cleanup"), "on_exit command hook should run");
+    }
+
+    // hook: Full lifecycle — success path (init → steps → success → exit).
+    #[test]
+    fn test_hook_full_lifecycle_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_init:
+    name: setup
+    command: "echo init"
+  on_success:
+    name: notify
+    command: "echo ok"
+  on_failure:
+    name: alert
+    command: "echo fail"
+  on_exit:
+    name: teardown
+    command: "echo exit"
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let calls = engine.calls.borrow();
+        let cmd_calls: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                MockCall::Command { command, .. } => Some(command.as_str()),
+                _ => None,
+            })
+            .collect();
+        // init → load → success → exit (no failure).
+        assert_eq!(cmd_calls, vec!["echo init", "echo loading", "echo ok", "echo exit"]);
+    }
+
+    // hook: Full lifecycle — failure path (init → steps → failure → exit).
+    #[test]
+    fn test_hook_full_lifecycle_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+hooks:
+  on_init:
+    name: setup
+    command: "echo init"
+  on_success:
+    name: notify
+    command: "echo ok"
+  on_failure:
+    name: alert
+    command: "echo fail"
+  on_exit:
+    name: teardown
+    command: "echo exit"
+steps:
+  - name: load
+    command: "echo loading"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let engine = MockEngine::new();
+        // Fail the step (call index 1 — after on_init at index 0).
+        engine.set_fail_on_call(1, 1, "step error");
+        let state = MockStateBackend::new();
+        let result = run(dir.path(), &engine, &state, false);
+        assert!(result.is_err());
+
+        let calls = engine.calls.borrow();
+        let cmd_calls: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                MockCall::Command { command, .. } => Some(command.as_str()),
+                _ => None,
+            })
+            .collect();
+        // init → load (fail) → failure → exit (no success).
+        assert_eq!(cmd_calls, vec!["echo init", "echo loading", "echo fail", "echo exit"]);
     }
 }

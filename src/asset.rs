@@ -313,6 +313,7 @@ mod tests {
             dotenv: Vec::new(),
             timeout_sec: None,
             defaults: None,
+            hooks: crate::manifest::Hooks::default(),
             steps,
             assets,
         };

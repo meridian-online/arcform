@@ -77,6 +77,10 @@ pub struct Manifest {
     #[serde(default)]
     pub defaults: Option<Defaults>,
 
+    /// Lifecycle hooks (on_init, on_success, on_failure, on_exit).
+    #[serde(default)]
+    pub hooks: Hooks,
+
     /// Ordered list of transform steps.
     #[serde(default)]
     pub steps: Vec<Step>,
@@ -134,6 +138,29 @@ pub struct Step {
     /// Step-level timeout in seconds. Clamped to remaining pipeline time.
     #[serde(default)]
     pub timeout_sec: Option<f64>,
+}
+
+/// Lifecycle hooks for pipeline setup, teardown, and notification.
+///
+/// Each hook is an optional Step. Execution order:
+/// on_init → steps[0..n] → (on_success | on_failure) → on_exit
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Hooks {
+    /// Runs before any pipeline step. Fatal on failure.
+    #[serde(default)]
+    pub on_init: Option<Step>,
+
+    /// Runs after all steps succeed.
+    #[serde(default)]
+    pub on_success: Option<Step>,
+
+    /// Runs when a step fails. Receives ARC_FAILED_STEP, ARC_EXIT_CODE.
+    #[serde(default)]
+    pub on_failure: Option<Step>,
+
+    /// Always runs if on_init was attempted. Receives ARC_PIPELINE_STATUS.
+    #[serde(default)]
+    pub on_exit: Option<Step>,
 }
 
 /// An asset override entry in the top-level `assets:` section.
@@ -277,6 +304,99 @@ impl Manifest {
             }
         }
 
+        // Validate lifecycle hooks.
+        let hook_entries: [(&str, &Option<Step>); 4] = [
+            ("hooks.on_init", &self.hooks.on_init),
+            ("hooks.on_success", &self.hooks.on_success),
+            ("hooks.on_failure", &self.hooks.on_failure),
+            ("hooks.on_exit", &self.hooks.on_exit),
+        ];
+
+        for (label, hook_opt) in &hook_entries {
+            if let Some(hook) = hook_opt {
+                // Hook must have sql xor command.
+                match (&hook.sql, &hook.command) {
+                    (Some(_), Some(_)) => {
+                        return Err(Error::ManifestValidation(format!(
+                            "{}: must have either 'sql' or 'command', not both",
+                            label
+                        )));
+                    }
+                    (None, None) => {
+                        return Err(Error::ManifestValidation(format!(
+                            "{}: must have either 'sql' or 'command'",
+                            label
+                        )));
+                    }
+                    _ => {}
+                }
+
+                // Hook name must not be empty.
+                if hook.name.trim().is_empty() {
+                    return Err(Error::ManifestValidation(format!(
+                        "{}: hook has an empty name",
+                        label
+                    )));
+                }
+
+                // Hook name must not collide with pipeline step names.
+                if seen_names.contains(&hook.name) {
+                    return Err(Error::ManifestValidation(format!(
+                        "{}: hook name '{}' collides with a pipeline step name",
+                        label, hook.name
+                    )));
+                }
+
+                // Hooks must not have preconditions.
+                if !hook.preconditions.is_empty() {
+                    return Err(Error::ManifestValidation(format!(
+                        "{}: hooks cannot have preconditions",
+                        label
+                    )));
+                }
+
+                // Hooks must not have produces.
+                if !hook.produces.is_empty() {
+                    return Err(Error::ManifestValidation(format!(
+                        "{}: hooks cannot have produces",
+                        label
+                    )));
+                }
+
+                // Hooks must not have depends_on.
+                if !hook.depends_on.is_empty() {
+                    return Err(Error::ManifestValidation(format!(
+                        "{}: hooks cannot have depends_on",
+                        label
+                    )));
+                }
+
+                // Hooks must not have retry.
+                if hook.retry.is_some() {
+                    return Err(Error::ManifestValidation(format!(
+                        "{}: hooks cannot have retry",
+                        label
+                    )));
+                }
+
+                // Hooks must not have timeout_sec.
+                if hook.timeout_sec.is_some() {
+                    return Err(Error::ManifestValidation(format!(
+                        "{}: hooks cannot have timeout_sec",
+                        label
+                    )));
+                }
+
+                // Hooks must not have output.
+                if hook.output.is_some() {
+                    return Err(Error::ManifestValidation(format!(
+                        "{}: hooks cannot have output",
+                        label
+                    )));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -291,14 +411,18 @@ impl Manifest {
             dotenv: Vec::new(),
             timeout_sec: None,
             defaults: None,
+            hooks: Hooks::default(),
             steps: Vec::new(),
             assets: std::collections::HashMap::new(),
         }
     }
 
-    /// Check if any steps use the SQL engine.
+    /// Check if any steps or hooks use the SQL engine.
     pub fn has_sql_steps(&self) -> bool {
-        self.steps.iter().any(|s| s.is_sql())
+        let hook_has_sql = [&self.hooks.on_init, &self.hooks.on_success, &self.hooks.on_failure, &self.hooks.on_exit]
+            .iter()
+            .any(|h| h.as_ref().is_some_and(|s| s.is_sql()));
+        self.steps.iter().any(|s| s.is_sql()) || hook_has_sql
     }
 }
 
@@ -348,6 +472,7 @@ mod tests {
             dotenv: Vec::new(),
             timeout_sec: None,
             defaults: None,
+            hooks: Hooks::default(),
             steps,
             assets: std::collections::HashMap::new(),
         }
