@@ -1,0 +1,112 @@
+goal: "Add declarative lifecycle hooks (on_init, on_success, on_failure, on_exit) to Arcform pipelines — hooks are full Step objects reusing existing execution and validation infrastructure"
+
+constraints:
+  - "Hooks are full Step objects — reuse existing Step struct, sql-xor-command validation, Engine execution paths"
+  - "Execution order: on_init → steps[0..n] → (on_success | on_failure) → on_exit"
+  - "on_exit always runs if on_init was attempted (try/finally semantics) — even if on_init, on_failure, or on_success fail"
+  - "on_init failure is fatal — prevents step execution. on_exit still runs. on_failure does NOT run (no step failed)"
+  - "Hook failures (except on_init) are non-fatal — pipeline exit code reflects the original pipeline outcome"
+  - "Hooks do not participate in staleness — always run when their phase triggers"
+  - "Hooks are not recorded in state backend (no record_step for hooks)"
+  - "Hook step names must not collide with pipeline step names"
+  - "Preconditions on hook steps are rejected at manifest validation"
+  - "Backwards compatible — manifests without hooks work identically"
+  - "Failure context env vars: on_failure receives ARC_FAILED_STEP (step name) and ARC_EXIT_CODE (exit code string) but NOT ARC_PIPELINE_STATUS. on_exit receives ARC_PIPELINE_STATUS ('success', 'failed', 'init_failed') plus ARC_FAILED_STEP and ARC_EXIT_CODE when status is 'failed'. on_success receives no extra env vars beyond ARC_PARAM_*."
+  - "retry/timeout_sec on hook steps are rejected at manifest validation (hooks are not retried)"
+  - "Hooks do not have produces/depends_on — rejected at manifest validation"
+  - "Hooks do not inherit manifest.defaults.retry — defaults resolution skips hooks entirely (they are not retried)"
+  - "On init_failed: on_exit receives ARC_PIPELINE_STATUS=init_failed but ARC_FAILED_STEP and ARC_EXIT_CODE are NOT set (init is not a pipeline step — the failure info is in the init hook's stderr, not a step name)"
+  - "Hooks run outside the pipeline timeout boundary — pipeline timeout governs the step loop only. If the pipeline times out, hooks still run (on_failure, on_exit). Hook execution is unbounded in v1."
+
+acceptance_criteria:
+  - id: ac-01
+    ac_type: code
+    description: "Hooks struct — New struct with on_init, on_success, on_failure, on_exit: Option<Step>. Added to Manifest as hooks: Hooks (serde default). Deserialises from YAML hooks: map."
+    verification: "Unit test: deserialise YAML with all four hooks; verify struct fields populated. Deserialise without hooks; verify all None."
+
+  - id: ac-02
+    ac_type: code
+    description: "on_init hook — Runs before any pipeline step. If on_init succeeds, steps execute normally. If on_init fails, no steps execute. on_exit still runs after init failure."
+    verification: "Unit test: MockEngine with on_init step; verify it runs before step calls. Test: on_init fails; verify no pipeline steps execute but on_exit does."
+
+  - id: ac-03
+    ac_type: code
+    description: "on_success hook — Runs after all pipeline steps succeed. Receives the same env vars (ARC_PARAM_*) as steps. Does not run if any step failed."
+    verification: "Unit test: all steps succeed; verify on_success hook is called after last step. Test: a step fails; verify on_success is NOT called."
+
+  - id: ac-04
+    ac_type: code
+    description: "on_failure hook — Runs when a step fails. Receives ARC_FAILED_STEP and ARC_EXIT_CODE env vars alongside ARC_PARAM_* vars. Does not run on init failure or success."
+    verification: "Unit test: step fails; verify on_failure is called with ARC_FAILED_STEP=<name> and ARC_EXIT_CODE=<code> in env. Test: all steps succeed; verify on_failure is NOT called."
+
+  - id: ac-05
+    ac_type: code
+    description: "on_exit hook — Always runs if on_init was attempted. Receives ARC_PIPELINE_STATUS ('success', 'failed', or 'init_failed') env var. On failure, also receives ARC_FAILED_STEP and ARC_EXIT_CODE. Runs after on_success or on_failure."
+    verification: "Unit test: success path; verify on_exit runs with ARC_PIPELINE_STATUS=success and NO ARC_FAILED_STEP. Test: failure path; verify on_exit runs with ARC_PIPELINE_STATUS=failed and ARC_FAILED_STEP=<name>. Test: init failure; verify on_exit runs with ARC_PIPELINE_STATUS=init_failed and NO ARC_FAILED_STEP (init is not a step)."
+
+  - id: ac-06
+    ac_type: code
+    description: "Non-fatal hook failures — If on_success, on_failure, or on_exit fail, the error is reported (eprintln) but the pipeline exit code reflects the original outcome. The original error is returned, not the hook error."
+    verification: "Unit test: all steps succeed but on_success hook fails; verify pipeline returns Ok (not Err). Test: step fails, on_failure hook also fails; verify original StepFailed error is returned."
+
+  - id: ac-07
+    ac_type: code
+    description: "Manifest validation — Hook step names must not collide with pipeline step names. Preconditions, produces, depends_on, retry, timeout_sec, and output on hooks are rejected with ManifestValidation error."
+    verification: "Unit test: hook with preconditions → error. Hook with retry → error. Hook with timeout_sec → error. Hook with produces → error. Hook with depends_on → error. Hook with output → error. Hook name same as step name → error."
+
+  - id: ac-08
+    ac_type: code
+    description: "Backwards compatibility — Manifests without hooks section deserialise correctly. Pipeline behaviour unchanged. Existing tests pass without modification."
+    verification: "Existing test suite passes. Unit test: manifest without hooks → hooks.on_init is None, etc."
+
+  - id: ac-09
+    ac_type: code
+    description: "Hook execution uses Engine trait — Hooks execute via the same engine.execute_sql / engine.execute_command paths as steps. Env vars are passed via the same HashMap mechanism from 0016."
+    verification: "Unit test: SQL hook step; verify MockEngine receives execute_sql call. Command hook step; verify execute_command call."
+
+  - id: ac-10
+    ac_type: code
+    description: "execute_hook helper — New function in runner.rs that takes a Step and env map, executes via the engine, and returns Result<()>. Non-fatal wrapper for success/failure/exit hooks prints error but returns Ok. Init hook returns the engine error directly."
+    verification: "Covered by ac-02 through ac-06 integration tests."
+
+ontology_schema:
+  name: "LifecycleHooks"
+  description: "Declarative lifecycle hook system for Arcform pipelines"
+  fields:
+    - name: "Hooks"
+      type: "struct"
+      description: "Container for four optional lifecycle hook steps (init, success, failure, exit)"
+    - name: "execute_hook"
+      type: "function"
+      description: "Runs a hook step via the Engine; wrapper controls fatality semantics"
+    - name: "ARC_FAILED_STEP"
+      type: "env_var"
+      description: "Name of the failed step, injected into on_failure and on_exit hook env"
+    - name: "ARC_EXIT_CODE"
+      type: "env_var"
+      description: "Exit code of the failed step, injected into on_failure and on_exit hook env"
+    - name: "ARC_PIPELINE_STATUS"
+      type: "env_var"
+      description: "Pipeline outcome (success|failed|init_failed), injected into on_exit hook env"
+
+evaluation_principles:
+  - principle: "try/finally correctness (on_exit always runs)"
+    weight: 0.3
+  - principle: "Non-fatal hook semantics (exit code honesty)"
+    weight: 0.25
+  - principle: "Backwards compatibility"
+    weight: 0.25
+  - principle: "Validation completeness (reject invalid hook fields)"
+    weight: 0.2
+
+exit_conditions:
+  - "All 10 ACs pass verification"
+  - "Existing test suite passes without modification"
+  - "cargo check --all-targets succeeds"
+
+metadata:
+  version: "1.2"
+  test_prefix: "hook"
+  timestamp: "2026-04-20T14:00:00+10:00"
+  ambiguity_score: 0.08
+  interview_ref: "orbit/specs/2026-04-20-lifecycle-hooks/interview.md"

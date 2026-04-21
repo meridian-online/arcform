@@ -1,0 +1,14 @@
+card: orbit/cards/0017-lifecycle-hooks.yaml
+autonomy: full
+budget: 3
+iteration: 1
+current_spec: orbit/specs/2026-04-20-lifecycle-hooks/
+status: review
+history: []
+started: "2026-04-20T14:00:00+10:00"
+review_cycles:
+  review_spec: 2
+  review_pr: 0
+review_cycle_dates:
+  review_spec: "2026-04-20"
+  review_pr: "2026-04-20"
