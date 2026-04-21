@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -52,7 +53,7 @@ impl Precondition {
     ///
     /// For `ModifiedWithin`: file issues return Ok(false) — stale, not error.
     /// For `Command`: execution errors return Err — pipeline halts.
-    pub fn evaluate(&self, manifest_dir: &Path, step_name: &str) -> Result<bool> {
+    pub fn evaluate(&self, manifest_dir: &Path, step_name: &str, env: &HashMap<String, String>) -> Result<bool> {
         match self {
             Precondition::ModifiedAfter { modified_after } => {
                 let period_duration =
@@ -80,6 +81,7 @@ impl Precondition {
                     .arg("-c")
                     .arg(cmd)
                     .current_dir(manifest_dir)
+                    .envs(env)
                     .output();
 
                 match output {
@@ -135,9 +137,10 @@ pub fn evaluate_all(
     preconditions: &[Precondition],
     manifest_dir: &Path,
     step_name: &str,
+    env: &HashMap<String, String>,
 ) -> Result<bool> {
     for p in preconditions {
-        if !p.evaluate(manifest_dir, step_name)? {
+        if !p.evaluate(manifest_dir, step_name, env)? {
             return Ok(false);
         }
     }
@@ -197,12 +200,16 @@ mod tests {
         Precondition::Command { command: command.to_string() }
     }
 
+    fn empty_env() -> HashMap<String, String> {
+        HashMap::new()
+    }
+
     // pre ac-03: modified_after evaluates file mtime — fresh file.
     #[test]
     fn test_pre_ac03_modified_after_fresh() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("data.json"), "{}").unwrap();
-        assert!(ma("data.json", "1h").evaluate(dir.path(), "test-step").unwrap());
+        assert!(ma("data.json", "1h").evaluate(dir.path(), "test-step", &empty_env()).unwrap());
     }
 
     // pre ac-03: modified_after evaluates file mtime — stale file.
@@ -217,28 +224,42 @@ mod tests {
         let ft = filetime::FileTime::from_system_time(old_time);
         filetime::set_file_mtime(&file_path, ft).unwrap();
 
-        assert!(!ma("data.json", "24h").evaluate(dir.path(), "test-step").unwrap());
+        assert!(!ma("data.json", "24h").evaluate(dir.path(), "test-step", &empty_env()).unwrap());
     }
 
     // pre ac-04: modified_after with missing file = stale (not error).
     #[test]
     fn test_pre_ac04_missing_file_is_stale() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!ma("nonexistent.json", "24h").evaluate(dir.path(), "test-step").unwrap());
+        assert!(!ma("nonexistent.json", "24h").evaluate(dir.path(), "test-step", &empty_env()).unwrap());
     }
 
     // pre ac-05: command precondition — exit 0 = fresh.
     #[test]
     fn test_pre_ac05_command_exit_zero_fresh() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(cmd("true").evaluate(dir.path(), "test-step").unwrap());
+        assert!(cmd("true").evaluate(dir.path(), "test-step", &empty_env()).unwrap());
     }
 
     // pre ac-05: command precondition — non-zero = stale.
     #[test]
     fn test_pre_ac05_command_nonzero_stale() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!cmd("false").evaluate(dir.path(), "test-step").unwrap());
+        assert!(!cmd("false").evaluate(dir.path(), "test-step", &empty_env()).unwrap());
+    }
+
+    // Command precondition receives resolved params as env vars.
+    #[test]
+    fn test_command_precondition_receives_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = HashMap::new();
+        env.insert("ARC_PARAM_SEARCH_TERM".to_string(), "hello".to_string());
+
+        // Command checks if the env var is set — should return fresh (exit 0).
+        assert!(cmd("test -n \"$ARC_PARAM_SEARCH_TERM\"").evaluate(dir.path(), "test-step", &env).unwrap());
+
+        // Without the env var, the same command returns stale (exit non-zero).
+        assert!(!cmd("test -n \"$ARC_PARAM_SEARCH_TERM\"").evaluate(dir.path(), "test-step", &empty_env()).unwrap());
     }
 
     // pre ac-06: AND semantics — all must pass.
@@ -249,7 +270,7 @@ mod tests {
         fs::write(dir.path().join("b.json"), "{}").unwrap();
 
         let preconditions = vec![ma("a.json", "1h"), ma("b.json", "1h")];
-        assert!(evaluate_all(&preconditions, dir.path(), "test-step").unwrap());
+        assert!(evaluate_all(&preconditions, dir.path(), "test-step", &empty_env()).unwrap());
     }
 
     // pre ac-06: AND semantics — one stale makes all stale.
@@ -259,14 +280,14 @@ mod tests {
         fs::write(dir.path().join("fresh.json"), "{}").unwrap();
 
         let preconditions = vec![ma("fresh.json", "1h"), ma("stale.json", "1h")];
-        assert!(!evaluate_all(&preconditions, dir.path(), "test-step").unwrap());
+        assert!(!evaluate_all(&preconditions, dir.path(), "test-step", &empty_env()).unwrap());
     }
 
     // pre ac-12: command non-zero exit = stale (not error).
     #[test]
     fn test_pre_ac12_command_nonzero_is_stale() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!cmd("exit 1").evaluate(dir.path(), "test-step").unwrap());
+        assert!(!cmd("exit 1").evaluate(dir.path(), "test-step", &empty_env()).unwrap());
     }
 
     // pre ac-13: duration parsing supports various formats.

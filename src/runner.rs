@@ -176,7 +176,7 @@ pub fn run_with_params(
     }
 
     // Determine which steps are stale.
-    let stale_steps = compute_staleness(&manifest, dir, state, &asset_graph, force)?;
+    let stale_steps = compute_staleness(&manifest, dir, state, &asset_graph, force, &env_map)?;
 
     let db_path = manifest.db_path(dir);
     let total = manifest.steps.len();
@@ -497,6 +497,7 @@ fn compute_staleness(
     state: &dyn StateBackend,
     asset_graph: &AssetGraph,
     force: bool,
+    env: &HashMap<String, String>,
 ) -> Result<std::collections::HashSet<String>> {
     let mut stale: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -516,7 +517,7 @@ fn compute_staleness(
                 stale.insert(step.name.clone());
             } else {
                 // Evaluate preconditions — if any says stale, step runs.
-                if !precondition::evaluate_all(&step.preconditions, dir, &step.name)? {
+                if !precondition::evaluate_all(&step.preconditions, dir, &step.name, env)? {
                     stale.insert(step.name.clone());
                 }
             }
@@ -534,7 +535,7 @@ fn compute_staleness(
         } else {
             // AND: hash AND preconditions must both be fresh to skip.
             let preconditions_fresh =
-                precondition::evaluate_all(&step.preconditions, dir, &step.name)?;
+                precondition::evaluate_all(&step.preconditions, dir, &step.name, env)?;
             if hash_stale || !preconditions_fresh {
                 stale.insert(step.name.clone());
             }
