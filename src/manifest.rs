@@ -14,6 +14,30 @@ pub struct Param {
     pub default: Option<String>,
 }
 
+/// Retry policy for a step — retry on failure with exponential backoff.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    /// Maximum number of attempts (including the first). Must be >= 1.
+    pub max_attempts: u32,
+
+    /// Base backoff in seconds. Actual delay: backoff_sec * 2^(attempt-1).
+    /// Defaults to 1.0.
+    #[serde(default = "default_backoff")]
+    pub backoff_sec: f64,
+}
+
+fn default_backoff() -> f64 {
+    1.0
+}
+
+/// Manifest-level defaults inheritable by steps.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Defaults {
+    /// Default retry policy applied to steps that don't declare their own.
+    #[serde(default)]
+    pub retry: Option<RetryPolicy>,
+}
+
 /// The top-level ArcForm project manifest (arcform.yaml).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -43,6 +67,15 @@ pub struct Manifest {
     /// Missing files are silently skipped.
     #[serde(default)]
     pub dotenv: Vec<String>,
+
+    /// Pipeline-level timeout in seconds. If total execution exceeds this,
+    /// the pipeline halts with a PipelineTimeout error.
+    #[serde(default)]
+    pub timeout_sec: Option<f64>,
+
+    /// Manifest-level defaults inheritable by steps.
+    #[serde(default)]
+    pub defaults: Option<Defaults>,
 
     /// Ordered list of transform steps.
     #[serde(default)]
@@ -93,6 +126,14 @@ pub struct Step {
     /// Mutually exclusive with SQL steps (validated at manifest load).
     #[serde(default)]
     pub output: Option<String>,
+
+    /// Retry policy for this step. Overrides manifest defaults.retry wholesale.
+    #[serde(default)]
+    pub retry: Option<RetryPolicy>,
+
+    /// Step-level timeout in seconds. Clamped to remaining pipeline time.
+    #[serde(default)]
+    pub timeout_sec: Option<f64>,
 }
 
 /// An asset override entry in the top-level `assets:` section.
@@ -111,6 +152,23 @@ impl Step {
     pub fn is_sql(&self) -> bool {
         self.sql.is_some()
     }
+}
+
+/// Validate a retry policy's fields.
+fn validate_retry_policy(policy: &RetryPolicy, context: &str) -> Result<()> {
+    if policy.max_attempts < 1 {
+        return Err(Error::ManifestValidation(format!(
+            "{}: retry max_attempts must be >= 1, got {}",
+            context, policy.max_attempts
+        )));
+    }
+    if policy.backoff_sec < 0.0 {
+        return Err(Error::ManifestValidation(format!(
+            "{}: retry backoff_sec must be >= 0, got {}",
+            context, policy.backoff_sec
+        )));
+    }
+    Ok(())
 }
 
 impl Manifest {
@@ -144,6 +202,13 @@ impl Manifest {
             return Err(Error::ManifestValidation(
                 "project name cannot be empty".to_string(),
             ));
+        }
+
+        // Validate defaults.retry if present.
+        if let Some(ref defaults) = self.defaults {
+            if let Some(ref retry) = defaults.retry {
+                validate_retry_policy(retry, "defaults")?;
+            }
         }
 
         // Validate engine_version is parseable semver constraint.
@@ -205,6 +270,11 @@ impl Manifest {
                     step.name
                 )));
             }
+
+            // Validate step-level retry policy if present.
+            if let Some(ref retry) = step.retry {
+                validate_retry_policy(retry, &format!("step '{}'", step.name))?;
+            }
         }
 
         Ok(())
@@ -219,6 +289,8 @@ impl Manifest {
             db: Some(format!("{}.duckdb", name)),
             params: IndexMap::new(),
             dotenv: Vec::new(),
+            timeout_sec: None,
+            defaults: None,
             steps: Vec::new(),
             assets: std::collections::HashMap::new(),
         }
@@ -245,6 +317,8 @@ mod tests {
             depends_on: vec![],
             preconditions: vec![],
             output: None,
+            retry: None,
+            timeout_sec: None,
         }
     }
 
@@ -258,6 +332,8 @@ mod tests {
             depends_on: vec![],
             preconditions: vec![],
             output: None,
+            retry: None,
+            timeout_sec: None,
         }
     }
 
@@ -270,6 +346,8 @@ mod tests {
             db: None,
             params: IndexMap::new(),
             dotenv: Vec::new(),
+            timeout_sec: None,
+            defaults: None,
             steps,
             assets: std::collections::HashMap::new(),
         }
@@ -327,6 +405,8 @@ mod tests {
                 depends_on: vec![],
                 preconditions: vec![],
                 output: None,
+                retry: None,
+                timeout_sec: None,
             }],
         );
         let err = m.validate().unwrap_err();
@@ -346,6 +426,8 @@ mod tests {
                 depends_on: vec![],
                 preconditions: vec![],
                 output: None,
+                retry: None,
+                timeout_sec: None,
             }],
         );
         let err = m.validate().unwrap_err();

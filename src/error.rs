@@ -59,6 +59,12 @@ pub enum Error {
     #[error("missing required parameter '{name}' (no default, not in dotenv or CLI)")]
     MissingParam { name: String },
 
+    #[error("step '{step}' timed out")]
+    StepTimeout { step: String },
+
+    #[error("pipeline timeout after {elapsed_sec:.1}s — step '{step}' was running")]
+    PipelineTimeout { step: String, elapsed_sec: f64 },
+
     #[error("state backend error: {0}")]
     StateBackend(String),
 

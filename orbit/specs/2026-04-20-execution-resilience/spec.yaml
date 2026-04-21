@@ -1,0 +1,109 @@
+goal: "Add step-level retry with exponential backoff, step/pipeline timeouts, and manifest-level defaults — backwards compatible with existing manifests"
+
+constraints:
+  - "Preconditions evaluate once before the first attempt — freshness gate, not readiness probe"
+  - "Pipeline timeout clamps step timeout — no step can outlive the pipeline"
+  - "State records only final outcome per step, not per-attempt rows"
+  - "No exit code filtering in v1 — retry on any non-zero exit code"
+  - "Retry and timeout interact independently — a timed-out step counts as a failed attempt"
+  - "Backwards compatible — manifests without retry/timeout/defaults work identically"
+  - "Step-level retry overrides defaults wholesale (no field-merging)"
+  - "Pipeline timeout checks fire before step execution, not during skipped steps"
+  - "Backoff formula: backoff_sec * 2^(attempt-1) — no jitter (local-first, no thundering herd)"
+  - "Timeout for capture_stdout steps applies to the wait after stdout drain — no non-blocking I/O in v1. If the child blocks on stdout, the timeout fires after the read completes."
+  - "finish_run trait change is acceptable for v0.1 (no external consumers) — uses usize parameter, not a struct"
+
+acceptance_criteria:
+  - id: ac-01
+    ac_type: code
+    description: "RetryPolicy struct — New struct with max_attempts: u32 and backoff_sec: f64 (default 1.0). Defaults struct with retry: Option<RetryPolicy>. Both serde(default). Added to manifest.rs."
+    verification: "Unit test: deserialise YAML with retry and defaults fields; verify struct fields populated. Deserialise without them; verify empty defaults."
+
+  - id: ac-02
+    ac_type: code
+    description: "Step retry and timeout fields — Step struct gains retry: Option<RetryPolicy> and timeout_sec: Option<f64>. Manifest struct gains defaults: Option<Defaults> and timeout_sec: Option<f64>."
+    verification: "Unit test: deserialise a step with retry and timeout_sec fields; verify parsed correctly. Verify step without retry/timeout defaults to None."
+
+  - id: ac-03
+    ac_type: code
+    description: "Retry execution loop — When a step fails and has an effective retry policy (step-level or defaults), retry up to max_attempts with exponential backoff (backoff_sec * 2^(attempt-1)). Sleep between attempts using std::thread::sleep. Backoff calculation is extracted as fn backoff_duration(policy, attempt) -> Duration for testability."
+    verification: "Unit test: configure MockEngine to fail on first 2 calls, succeed on 3rd. Step with max_attempts=3 should succeed. Verify 3 engine calls. Step with max_attempts=2 should fail (only 2 attempts). Unit test: backoff_duration(backoff_sec=2.0, attempt=1) = 2s, attempt=2 = 4s, attempt=3 = 8s."
+
+  - id: ac-04
+    ac_type: code
+    description: "Defaults resolution — If a step has no retry field but manifest has defaults.retry, the defaults policy applies. Step-level retry overrides defaults wholesale (not field-merged)."
+    verification: "Unit test: manifest with defaults.retry, step without retry → step retries using defaults. Step with its own retry → uses step's policy, ignores defaults."
+
+  - id: ac-05
+    ac_type: code
+    description: "Step timeout — Engine trait methods gain timeout: Option<Duration> as the last parameter on both execute_sql and execute_command. MockEngine: when timeout is Some, returns StepTimeout error (simulates timeout without real process). DuckDbEngine: wait_with_timeout helper polls child.try_wait() in ~100ms intervals against Instant deadline; on timeout, child.kill() + return StepTimeout. For capture_stdout steps, timeout applies to the wait() call after stdout drain (no non-blocking I/O in v1)."
+    verification: "Unit test: MockEngine called with Some(timeout) returns StepTimeout. Unit test: MockEngine called with None returns normally."
+
+  - id: ac-06
+    ac_type: code
+    description: "Pipeline timeout — Manifest struct gains timeout_sec: Option<f64>. Runner tracks Instant at top of run(). Before each step execution, check remaining time. If remaining <= 0, return PipelineTimeout. Step timeout is clamped to min(step_timeout, remaining_pipeline). On pipeline timeout exceeded, return PipelineTimeout error naming the current step."
+    verification: "Unit test: manifest with very small pipeline timeout_sec; MockEngine configured with simulated_duration that exceeds remaining time; verify PipelineTimeout error names the step."
+
+  - id: ac-07
+    ac_type: code
+    description: "Error variants — Add StepTimeout { step: String } and PipelineTimeout { step: String, elapsed_sec: f64 } to Error enum in error.rs."
+    verification: "Compile-time: error variants exist with correct fields. Unit test: format StepTimeout and PipelineTimeout errors; verify messages contain step name."
+
+  - id: ac-08
+    ac_type: code
+    description: "State records final outcome only — After all retry attempts, record_step() is called once with the final status (Success or Failed). Total retry count tracked per-run. StateBackend::finish_run gains total_retries: usize parameter. MockStateBackend records total_retries for assertion."
+    verification: "Unit test: step retries 3 times then succeeds; verify record_step called once with Success. Verify finish_run receives total_retries count."
+
+  - id: ac-09
+    ac_type: code
+    description: "Retry output separators — Before each retry attempt (not the first attempt), print a separator: '[retry N/M, backoff Xs]' where N is the current attempt, M is max_attempts, X is the backoff seconds. Each attempt streams output in real-time (existing Engine behaviour unchanged)."
+    verification: "Unit test: verify MockEngine is called the expected number of times (confirms all attempts execute)."
+
+  - id: ac-10
+    ac_type: code
+    description: "Backwards compatibility — Manifests without retry, timeout_sec, or defaults fields deserialise and execute identically to current behaviour. Engine trait methods receive None for timeout."
+    verification: "Existing test suite passes without modification. Unit test: empty retry/timeout/defaults deserialise to None defaults."
+
+  - id: ac-11
+    ac_type: code
+    description: "Manifest-level defaults.retry validation — max_attempts must be >= 1. backoff_sec must be >= 0. Invalid values produce ManifestValidation error. Step-level retry validated with same rules."
+    verification: "Unit test: max_attempts=0 is rejected. backoff_sec=-1 is rejected."
+
+ontology_schema:
+  name: "ExecutionResilience"
+  description: "Retry and timeout system for Arcform pipeline steps"
+  fields:
+    - name: "RetryPolicy"
+      type: "struct"
+      description: "A retry policy with max attempts and exponential backoff"
+    - name: "Defaults"
+      type: "struct"
+      description: "Manifest-level defaults inheritable by steps"
+    - name: "wait_with_timeout"
+      type: "function"
+      description: "Polls child process with deadline, kills on timeout"
+    - name: "backoff_duration"
+      type: "function"
+      description: "Pure function: computes Duration from RetryPolicy + attempt number"
+
+evaluation_principles:
+  - principle: "Backwards compatibility"
+    weight: 0.3
+  - principle: "Retry correctness (attempt counting, backoff timing)"
+    weight: 0.3
+  - principle: "Timeout reliability (kill on deadline, pipeline clamp)"
+    weight: 0.25
+  - principle: "Clean Engine trait extension (builds on 0016's env param)"
+    weight: 0.15
+
+exit_conditions:
+  - "All 11 ACs pass verification"
+  - "Existing test suite passes without modification"
+  - "cargo check --all-targets succeeds"
+
+metadata:
+  version: "1.1"
+  test_prefix: "res"
+  timestamp: "2026-04-20T12:30:00+10:00"
+  ambiguity_score: 0.08
+  interview_ref: "orbit/specs/2026-04-20-execution-resilience/interview.md"
