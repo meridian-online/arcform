@@ -1,17 +1,91 @@
+use std::collections::HashMap;
 use std::path::Path;
 
+use indexmap::IndexMap;
 use owo_colors::OwoColorize;
 
 use crate::asset::AssetGraph;
 use crate::engine::Engine;
 use crate::error::{Error, Result};
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, Param};
 use crate::precondition;
 use crate::state::{self, StateBackend, StepStatus};
 
-/// Run a pipeline: load manifest, preflight, validate assets, execute steps
-/// with staleness-aware selective execution.
+/// Load dotenv files and return their key-value pairs.
+/// Files are loaded in declared order; later files override earlier ones.
+/// Missing files are silently skipped.
+fn load_dotenv_files(dir: &Path, dotenv_paths: &[String]) -> HashMap<String, String> {
+    let mut vars = HashMap::new();
+    for path_str in dotenv_paths {
+        let path = dir.join(path_str);
+        if let Ok(iter) = dotenvy::from_path_iter(&path) {
+            for item in iter {
+                if let Ok((key, value)) = item {
+                    vars.insert(key, value);
+                }
+            }
+        }
+        // Missing files are silently skipped (from_path_iter returns Err).
+    }
+    vars
+}
+
+/// Resolve parameters from dotenv files, manifest defaults, and CLI overrides.
+///
+/// Precedence (highest wins): CLI params > dotenv files > manifest defaults.
+/// Returns a map of ARC_PARAM_{NAME_UPPERCASED} -> value for all resolved params.
+///
+/// Missing required params (no default, not in dotenv or CLI) produce MissingParam error.
+pub fn resolve_params(
+    manifest_params: &IndexMap<String, Param>,
+    dotenv_vars: &HashMap<String, String>,
+    cli_params: &[(String, String)],
+) -> Result<HashMap<String, String>> {
+    let mut resolved: HashMap<String, String> = HashMap::new();
+
+    // Build a lookup from CLI params.
+    let cli_map: HashMap<&str, &str> = cli_params.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    for (name, param) in manifest_params {
+        // Precedence: CLI > dotenv > default.
+        let value = if let Some(v) = cli_map.get(name.as_str()) {
+            Some(v.to_string())
+        } else if let Some(v) = dotenv_vars.get(name) {
+            Some(v.clone())
+        } else {
+            param.default.clone()
+        };
+
+        match value {
+            Some(v) => {
+                let env_key = format!("ARC_PARAM_{}", name.to_uppercase());
+                resolved.insert(env_key, v);
+            }
+            None => {
+                return Err(Error::MissingParam { name: name.clone() });
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
+/// Run a pipeline with no CLI parameter overrides.
+///
+/// Backwards-compatible entry point — delegates to `run_with_params` with empty params.
+/// Used by tests and call sites that don't need parameterisation.
 pub fn run(dir: &Path, engine: &dyn Engine, state: &dyn StateBackend, force: bool) -> Result<()> {
+    run_with_params(dir, engine, state, force, &[])
+}
+
+/// Run a pipeline with CLI parameter overrides.
+pub fn run_with_params(
+    dir: &Path,
+    engine: &dyn Engine,
+    state: &dyn StateBackend,
+    force: bool,
+    cli_params: &[(String, String)],
+) -> Result<()> {
     let manifest = Manifest::load(dir)?;
 
     // If there are SQL steps, verify the engine is available and check version.
@@ -48,6 +122,10 @@ pub fn run(dir: &Path, engine: &dyn Engine, state: &dyn StateBackend, force: boo
         println!("{}", "No steps defined.".dimmed());
         return Ok(());
     }
+
+    // Resolve parameters: dotenv files → manifest defaults → CLI overrides.
+    let dotenv_vars = load_dotenv_files(dir, &manifest.dotenv);
+    let mut env_map = resolve_params(&manifest.params, &dotenv_vars, cli_params)?;
 
     // Initialise the state backend (creates tables if needed).
     state.init()?;
@@ -118,21 +196,30 @@ pub fn run(dir: &Path, engine: &dyn Engine, state: &dyn StateBackend, force: boo
             String::new()
         };
 
+        let capture_stdout = step.output.is_some();
+
         let result = if let Some(ref sql) = step.sql {
             let sql_path = dir.join(sql);
-            engine.execute_sql(&db_path, &sql_path)
+            engine.execute_sql(&db_path, &sql_path, &env_map)
         } else if let Some(ref command) = step.command {
-            engine.execute_command(command)
+            engine.execute_command(command, &env_map, capture_stdout)
         } else {
             unreachable!("validation ensures sql or command is present")
         };
 
         match result {
-            Ok(_output) => {
+            Ok(output) => {
                 succeeded += 1;
                 executed += 1;
                 // Record success.
                 let _ = state.record_step(&step.name, &sql_hash, StepStatus::Success);
+
+                // If this step captures output, inject it as ARC_PARAM_ for downstream steps.
+                if let Some(ref output_name) = step.output {
+                    let captured = output.stdout.unwrap_or_default();
+                    let env_key = format!("ARC_PARAM_{}", output_name.to_uppercase());
+                    env_map.insert(env_key, captured);
+                }
             }
             Err(Error::StepFailed { code, stderr, .. }) => {
                 // Record failure before returning error.
@@ -364,7 +451,7 @@ mod tests {
         let calls = engine.calls.borrow();
         // No preflight (no sql steps), 1 command.
         assert_eq!(calls.len(), 1);
-        assert!(matches!(&calls[0], MockCall::Command { command } if command == "echo hello"));
+        assert!(matches!(&calls[0], MockCall::Command { command, .. } if command == "echo hello"));
     }
 
     // AC-4: Halt on failure — steps after a failed step do not execute.
@@ -941,7 +1028,7 @@ steps:
         // Precondition "false" exits non-zero → stale → step runs.
         let calls = engine.calls.borrow();
         assert_eq!(calls.len(), 1, "command step with stale precondition should run");
-        assert!(matches!(&calls[0], MockCall::Command { command } if command == "echo fetching"));
+        assert!(matches!(&calls[0], MockCall::Command { command, .. } if command == "echo fetching"));
     }
 
     // pre ac-08: Command steps without preconditions still always re-run.
@@ -1123,7 +1210,7 @@ steps:
             1,
             "--force should override fresh precondition and run the step"
         );
-        assert!(matches!(&calls[0], MockCall::Command { command } if command == "echo fetching"));
+        assert!(matches!(&calls[0], MockCall::Command { command, .. } if command == "echo fetching"));
     }
 
     // pre ac-15: Manifest validation rejects invalid precondition duration.
@@ -1144,5 +1231,395 @@ steps:
         let err = crate::manifest::Manifest::load(dir.path()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("banana"), "error should mention the bad duration: {msg}");
+    }
+
+    // ---- Pipeline Parameterisation Tests ----
+
+    // param ac-01: Manifest with params and dotenv fields deserialises correctly.
+    #[test]
+    fn test_param_ac01_manifest_with_params_deserialises() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+params:
+  start_date:
+    default: "2026-01-01"
+  end_date: {}
+dotenv:
+  - .env
+  - .env.local
+steps:
+  - name: greet
+    command: echo hello
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        let manifest = crate::manifest::Manifest::load(dir.path()).unwrap();
+        assert_eq!(manifest.params.len(), 2);
+        assert_eq!(
+            manifest.params["start_date"].default,
+            Some("2026-01-01".to_string())
+        );
+        assert!(manifest.params["end_date"].default.is_none());
+        assert_eq!(manifest.dotenv, vec![".env", ".env.local"]);
+    }
+
+    // param ac-01: Manifest without params/dotenv deserialises to empty defaults.
+    #[test]
+    fn test_param_ac01_manifest_without_params_empty_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: greet\n    command: echo hello\n";
+        setup_project(dir.path(), yaml, &[]);
+        let manifest = crate::manifest::Manifest::load(dir.path()).unwrap();
+        assert!(manifest.params.is_empty());
+        assert!(manifest.dotenv.is_empty());
+    }
+
+    // param ac-02: parse_params with valid KEY=VALUE pairs.
+    #[test]
+    fn test_param_ac02_parse_valid_params() {
+        let raw = vec![
+            "start_date=2026-01-01".to_string(),
+            "region=us-east-1".to_string(),
+        ];
+        let parsed = crate::cli::parse_params(&raw).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], ("start_date".to_string(), "2026-01-01".to_string()));
+        assert_eq!(parsed[1], ("region".to_string(), "us-east-1".to_string()));
+    }
+
+    // param ac-02: parse_params splits on first '=' only.
+    #[test]
+    fn test_param_ac02_parse_value_with_equals() {
+        let raw = vec!["query=SELECT * FROM t WHERE x=1".to_string()];
+        let parsed = crate::cli::parse_params(&raw).unwrap();
+        assert_eq!(parsed[0].0, "query");
+        assert_eq!(parsed[0].1, "SELECT * FROM t WHERE x=1");
+    }
+
+    // param ac-02: parse_params rejects missing '='.
+    #[test]
+    fn test_param_ac02_parse_invalid_no_equals() {
+        let raw = vec!["no_equals_here".to_string()];
+        let err = crate::cli::parse_params(&raw).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("KEY=VALUE"), "error should mention format: {msg}");
+    }
+
+    // param ac-03: resolve_params merges sources with correct precedence.
+    #[test]
+    fn test_param_ac03_resolve_params_precedence() {
+        use indexmap::IndexMap;
+        use crate::manifest::Param;
+
+        let mut params = IndexMap::new();
+        params.insert("a".to_string(), Param { default: Some("default_a".to_string()) });
+        params.insert("b".to_string(), Param { default: Some("default_b".to_string()) });
+        params.insert("c".to_string(), Param { default: Some("default_c".to_string()) });
+
+        let mut dotenv_vars = std::collections::HashMap::new();
+        dotenv_vars.insert("a".to_string(), "dotenv_a".to_string());
+        dotenv_vars.insert("b".to_string(), "dotenv_b".to_string());
+
+        let cli_params = vec![("a".to_string(), "cli_a".to_string())];
+
+        let resolved = resolve_params(&params, &dotenv_vars, &cli_params).unwrap();
+
+        // CLI wins over dotenv and default.
+        assert_eq!(resolved["ARC_PARAM_A"], "cli_a");
+        // Dotenv wins over default.
+        assert_eq!(resolved["ARC_PARAM_B"], "dotenv_b");
+        // Default fills gap.
+        assert_eq!(resolved["ARC_PARAM_C"], "default_c");
+    }
+
+    // param ac-03: resolve_params errors on missing required param.
+    #[test]
+    fn test_param_ac03_missing_required_param() {
+        use indexmap::IndexMap;
+        use crate::manifest::Param;
+
+        let mut params = IndexMap::new();
+        params.insert("required_param".to_string(), Param { default: None });
+
+        let dotenv_vars = std::collections::HashMap::new();
+        let cli_params: Vec<(String, String)> = vec![];
+
+        let err = resolve_params(&params, &dotenv_vars, &cli_params).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("required_param"), "error should name the param: {msg}");
+        assert!(msg.contains("missing"), "error should say missing: {msg}");
+    }
+
+    // param ac-04: ARC_PARAM_ prefix and uppercasing.
+    #[test]
+    fn test_param_ac04_arc_param_prefix_uppercasing() {
+        use indexmap::IndexMap;
+        use crate::manifest::Param;
+
+        let mut params = IndexMap::new();
+        params.insert("start_date".to_string(), Param { default: None });
+
+        let dotenv_vars = std::collections::HashMap::new();
+        let cli_params = vec![("start_date".to_string(), "2026-01-01".to_string())];
+
+        let resolved = resolve_params(&params, &dotenv_vars, &cli_params).unwrap();
+        assert_eq!(resolved.get("ARC_PARAM_START_DATE").unwrap(), "2026-01-01");
+    }
+
+    // param ac-05: MockEngine records env map passed to it.
+    #[test]
+    fn test_param_ac05_mock_engine_records_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+params:
+  region:
+    default: "us-west-2"
+steps:
+  - name: s1
+    sql: models/s1.sql
+"#;
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let calls = engine.calls.borrow();
+        // Find the SQL call and check env.
+        let sql_call = calls.iter().find(|c| matches!(c, MockCall::Sql { .. }));
+        match sql_call {
+            Some(MockCall::Sql { env, .. }) => {
+                assert_eq!(env.get("ARC_PARAM_REGION").unwrap(), "us-west-2");
+            }
+            _ => panic!("expected SQL call with env"),
+        }
+    }
+
+    // param ac-06: Dotenv file loading.
+    #[test]
+    fn test_param_ac06_dotenv_file_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+params:
+  db_host: {}
+dotenv:
+  - .env
+steps:
+  - name: greet
+    command: echo hello
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        // Create the .env file.
+        fs::write(dir.path().join(".env"), "db_host=localhost\n").unwrap();
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let calls = engine.calls.borrow();
+        let cmd_call = calls.iter().find(|c| matches!(c, MockCall::Command { .. }));
+        match cmd_call {
+            Some(MockCall::Command { env, .. }) => {
+                assert_eq!(env.get("ARC_PARAM_DB_HOST").unwrap(), "localhost");
+            }
+            _ => panic!("expected Command call with env"),
+        }
+    }
+
+    // param ac-06: Missing dotenv file is silently skipped.
+    #[test]
+    fn test_param_ac06_missing_dotenv_silently_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+params:
+  x:
+    default: "fallback"
+dotenv:
+  - .env.local
+steps:
+  - name: greet
+    command: echo hello
+"#;
+        setup_project(dir.path(), yaml, &[]);
+        // Do NOT create .env.local — should be silently skipped.
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let calls = engine.calls.borrow();
+        let cmd_call = calls.iter().find(|c| matches!(c, MockCall::Command { .. }));
+        match cmd_call {
+            Some(MockCall::Command { env, .. }) => {
+                // Should use default since dotenv was missing.
+                assert_eq!(env.get("ARC_PARAM_X").unwrap(), "fallback");
+            }
+            _ => panic!("expected Command call"),
+        }
+    }
+
+    // param ac-07: Step output capture — captured value available downstream.
+    #[test]
+    fn test_param_ac07_output_capture_available_downstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+steps:
+  - name: get_date
+    command: "echo 2026-04-20"
+    output: current_date
+  - name: use_date
+    command: "echo using date"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+
+        let engine = MockEngine::new();
+        engine.set_simulated_stdout("2026-04-20");
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let calls = engine.calls.borrow();
+        // Second call should have ARC_PARAM_CURRENT_DATE in its env.
+        let cmd_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(c, MockCall::Command { .. }))
+            .collect();
+        assert_eq!(cmd_calls.len(), 2, "should have 2 command calls");
+
+        match &cmd_calls[1] {
+            MockCall::Command { env, .. } => {
+                assert_eq!(
+                    env.get("ARC_PARAM_CURRENT_DATE").unwrap(),
+                    "2026-04-20",
+                    "downstream step should see captured output"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // param ac-07: Empty captured stdout sets env var to empty string.
+    #[test]
+    fn test_param_ac07_empty_stdout_sets_empty_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+steps:
+  - name: get_empty
+    command: "true"
+    output: result
+  - name: use_result
+    command: "echo done"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+
+        let engine = MockEngine::new();
+        engine.set_simulated_stdout(""); // Empty stdout.
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let calls = engine.calls.borrow();
+        let cmd_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(c, MockCall::Command { .. }))
+            .collect();
+        assert_eq!(cmd_calls.len(), 2);
+
+        match &cmd_calls[1] {
+            MockCall::Command { env, .. } => {
+                // Empty stdout → env var set to empty string (not omitted).
+                assert!(
+                    env.contains_key("ARC_PARAM_RESULT"),
+                    "env var should exist even for empty stdout"
+                );
+                assert_eq!(env["ARC_PARAM_RESULT"], "", "empty stdout → empty string");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // param ac-08: SQL step with output field is rejected.
+    #[test]
+    fn test_param_ac08_sql_step_output_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+steps:
+  - name: bad
+    sql: models/bad.sql
+    output: result
+"#;
+        setup_project(dir.path(), yaml, &[("models/bad.sql", "SELECT 1;")]);
+        let err = crate::manifest::Manifest::load(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SQL steps cannot declare an output"),
+            "should reject SQL + output: {msg}"
+        );
+    }
+
+    // param ac-09: Backwards compatibility — existing manifests work identically.
+    #[test]
+    fn test_param_ac09_backwards_compat_no_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let calls = engine.calls.borrow();
+        // Verify engine received empty env map.
+        let sql_call = calls.iter().find(|c| matches!(c, MockCall::Sql { .. }));
+        match sql_call {
+            Some(MockCall::Sql { env, .. }) => {
+                assert!(env.is_empty(), "backwards-compat: env map should be empty");
+            }
+            _ => panic!("expected SQL call"),
+        }
+    }
+
+    // param ac-10: Changing param values does not affect SQL staleness.
+    #[test]
+    fn test_param_ac10_param_staleness_independence() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+params:
+  region:
+    default: "us-west-2"
+steps:
+  - name: transform
+    sql: models/transform.sql
+"#;
+        setup_project(dir.path(), yaml, &[("models/transform.sql", "SELECT 1;")]);
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+
+        // First run with default param.
+        run(dir.path(), &engine, &state, false).unwrap();
+        let first_calls = engine.calls.borrow().len();
+        assert_eq!(first_calls, 2, "first run: preflight + 1 SQL");
+
+        // Second run with different param value (via run_with_params).
+        // SQL file unchanged → step should be skipped.
+        let engine2 = MockEngine::new();
+        let cli_params = vec![("region".to_string(), "eu-west-1".to_string())];
+        run_with_params(dir.path(), &engine2, &state, false, &cli_params).unwrap();
+
+        let calls = engine2.calls.borrow();
+        let sql_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(c, MockCall::Sql { .. }))
+            .collect();
+        assert_eq!(
+            sql_calls.len(),
+            0,
+            "changing param value should not make SQL step stale (no engine call)"
+        );
     }
 }

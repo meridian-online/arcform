@@ -56,6 +56,9 @@ pub enum Error {
         detail: String,
     },
 
+    #[error("missing required parameter '{name}' (no default, not in dotenv or CLI)")]
+    MissingParam { name: String },
+
     #[error("state backend error: {0}")]
     StateBackend(String),
 

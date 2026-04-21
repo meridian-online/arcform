@@ -248,6 +248,7 @@ mod tests {
             produces: vec![],
             depends_on: vec![],
             preconditions: vec![],
+            output: None,
         }
     }
 
@@ -265,6 +266,7 @@ mod tests {
             produces: produces.into_iter().map(String::from).collect(),
             depends_on: depends_on.into_iter().map(String::from).collect(),
             preconditions: vec![],
+            output: None,
         }
     }
 
@@ -277,6 +279,7 @@ mod tests {
             produces: vec![],
             depends_on: vec![],
             preconditions: vec![],
+            output: None,
         }
     }
 
@@ -300,6 +303,8 @@ mod tests {
             engine: "duckdb".to_string(),
             engine_version: None,
             db: None,
+            params: indexmap::IndexMap::new(),
+            dotenv: Vec::new(),
             steps,
             assets,
         };

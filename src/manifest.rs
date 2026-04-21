@@ -1,9 +1,18 @@
 use std::path::{Path, PathBuf};
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::precondition::Precondition;
+
+/// A declared pipeline parameter with an optional default value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Param {
+    /// Default value. If None, the parameter is required (must be provided via CLI or dotenv).
+    #[serde(default)]
+    pub default: Option<String>,
+}
 
 /// The top-level ArcForm project manifest (arcform.yaml).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +33,16 @@ pub struct Manifest {
     /// Defaults to "<name>.duckdb" if not specified.
     #[serde(default)]
     pub db: Option<String>,
+
+    /// Named runtime parameters with optional defaults.
+    /// Insertion order is preserved for deterministic merge semantics.
+    #[serde(default)]
+    pub params: IndexMap<String, Param>,
+
+    /// Paths to dotenv files, loaded in declared order (later overrides earlier).
+    /// Missing files are silently skipped.
+    #[serde(default)]
+    pub dotenv: Vec<String>,
 
     /// Ordered list of transform steps.
     #[serde(default)]
@@ -68,6 +87,12 @@ pub struct Step {
     /// Empty = no preconditions (command steps always re-run, SQL steps use hash).
     #[serde(default)]
     pub preconditions: Vec<Precondition>,
+
+    /// Output capture name. When set on a command step, stdout is piped and captured,
+    /// then injected as ARC_PARAM_{OUTPUT_UPPERCASED} for downstream steps.
+    /// Mutually exclusive with SQL steps (validated at manifest load).
+    #[serde(default)]
+    pub output: Option<String>,
 }
 
 /// An asset override entry in the top-level `assets:` section.
@@ -172,6 +197,14 @@ impl Manifest {
                 }
                 _ => {}
             }
+
+            // SQL steps cannot declare an output field.
+            if step.sql.is_some() && step.output.is_some() {
+                return Err(Error::ManifestValidation(format!(
+                    "step '{}': SQL steps cannot declare an output field",
+                    step.name
+                )));
+            }
         }
 
         Ok(())
@@ -184,6 +217,8 @@ impl Manifest {
             engine: "duckdb".to_string(),
             engine_version: Some(">=1.0".to_string()),
             db: Some(format!("{}.duckdb", name)),
+            params: IndexMap::new(),
+            dotenv: Vec::new(),
             steps: Vec::new(),
             assets: std::collections::HashMap::new(),
         }
@@ -209,6 +244,7 @@ mod tests {
             produces: vec![],
             depends_on: vec![],
             preconditions: vec![],
+            output: None,
         }
     }
 
@@ -221,6 +257,7 @@ mod tests {
             produces: vec![],
             depends_on: vec![],
             preconditions: vec![],
+            output: None,
         }
     }
 
@@ -231,6 +268,8 @@ mod tests {
             engine: "duckdb".to_string(),
             engine_version: None,
             db: None,
+            params: IndexMap::new(),
+            dotenv: Vec::new(),
             steps,
             assets: std::collections::HashMap::new(),
         }
@@ -287,6 +326,7 @@ mod tests {
                 produces: vec![],
                 depends_on: vec![],
                 preconditions: vec![],
+                output: None,
             }],
         );
         let err = m.validate().unwrap_err();
@@ -305,6 +345,7 @@ mod tests {
                 produces: vec![],
                 depends_on: vec![],
                 preconditions: vec![],
+                output: None,
             }],
         );
         let err = m.validate().unwrap_err();
