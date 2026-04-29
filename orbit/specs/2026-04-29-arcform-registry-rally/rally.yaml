@@ -1,0 +1,36 @@
+rally: "ArcForm registry capability — assets rename + registry CLI/monorepo/canonical entries"
+autonomy: guided
+phase: design-review
+started: 2026-04-29T00:00:00Z
+completed: null
+cards:
+  - path: orbit/cards/0008-asset-registry.yaml
+    status: designed
+    spec_dir: orbit/specs/2026-04-29-assets-rename/
+    branch: rally/assets-rename
+    worktree: null
+    parked_constraint: null
+  - path: orbit/cards/0022-registry.yaml
+    status: designed
+    spec_dir: orbit/specs/2026-04-29-arcform-registry/
+    branch: rally/arcform-registry
+    worktree: null
+    parked_constraint: null
+implementation_order:
+  - orbit/cards/0008-asset-registry.yaml
+  - orbit/cards/0022-registry.yaml
+order_rationale: |
+  Serial — shared symbols are vocabulary, not source. Card 0008 renames "asset registry" →
+  "asset" across src/, docs, and error messages. Card 0022's new registry CLI surface
+  (cli.rs, registry.rs) and end-user docs reference asset-language; sequencing the rename
+  first lets card 0022 inherit clean terminology and avoid a parallel-merge churn pass.
+  Per design.md Q1 + decision 0011.
+notes: |
+  Designs predate the rally:
+    - Card 0008 design captured in decision 0011 (naming/rename) + design.md notes
+    - Card 0022 design captured in interview.md (discovery, 9 Qs) + design.md (design, 4 Qs)
+  §4 (decision-pack sub-agents) and §5 (consolidated decision gate) skipped — decisions
+  0011–0016 are already accepted and approved in the foundation commit.
+
+  Next: §6a write interview.md for card 0008, §6b consolidated design review, §6c
+  disjointness check (expected outcome: serial — captured above), §7b serial implementation.
