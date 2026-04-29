@@ -1,8 +1,8 @@
 rally: "ArcForm registry capability — assets rename + registry CLI/monorepo/canonical entries"
 autonomy: guided
-phase: implementing
+phase: complete
 started: 2026-04-29T00:00:00Z
-completed: null
+completed: 2026-04-29T00:00:00Z
 cards:
   - path: orbit/cards/0008-asset-registry.yaml
     status: complete
@@ -12,11 +12,12 @@ cards:
     parked_constraint: null
     pr: "https://github.com/meridian-online/arcform/pull/13"
   - path: orbit/cards/0022-registry.yaml
-    status: implementing
+    status: complete
     spec_dir: orbit/specs/2026-04-29-arcform-registry/
     branch: rally/arcform-registry
     worktree: main
     parked_constraint: null
+    pr: "https://github.com/meridian-online/arcform/pull/14"
     scope_note: |
       Per author-confirmed scope (rally checkpoint, 2026-04-29): this drive ships
       arcform-side CLI scaffolding only — `src/registry.rs` (or sub-modules),
