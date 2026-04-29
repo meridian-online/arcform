@@ -12,11 +12,19 @@ cards:
     parked_constraint: null
     pr: "https://github.com/meridian-online/arcform/pull/13"
   - path: orbit/cards/0022-registry.yaml
-    status: designed
+    status: implementing
     spec_dir: orbit/specs/2026-04-29-arcform-registry/
     branch: rally/arcform-registry
-    worktree: null
+    worktree: main
     parked_constraint: null
+    scope_note: |
+      Per author-confirmed scope (rally checkpoint, 2026-04-29): this drive ships
+      arcform-side CLI scaffolding only — `src/registry.rs` (or sub-modules),
+      `src/cli.rs` extension with the `arc registry {list,show,fetch,run}` tree,
+      types, tests with a mocked index. The meridian-online/registry repo
+      (registry.yaml index + brewtrend + gnaf canonical entries + CI smoke-test +
+      per-entry tags) is sister work in a separate repo and a separate effort.
+
 implementation_order:
   - orbit/cards/0008-asset-registry.yaml
   - orbit/cards/0022-registry.yaml
