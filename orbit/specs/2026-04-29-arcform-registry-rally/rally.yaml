@@ -1,14 +1,14 @@
 rally: "ArcForm registry capability — assets rename + registry CLI/monorepo/canonical entries"
 autonomy: guided
-phase: design-review
+phase: implementing
 started: 2026-04-29T00:00:00Z
 completed: null
 cards:
   - path: orbit/cards/0008-asset-registry.yaml
-    status: designed
+    status: implementing
     spec_dir: orbit/specs/2026-04-29-assets-rename/
     branch: rally/assets-rename
-    worktree: null
+    worktree: main
     parked_constraint: null
   - path: orbit/cards/0022-registry.yaml
     status: designed
