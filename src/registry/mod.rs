@@ -80,4 +80,5 @@ pub use run::{handle_fetch, handle_list, handle_run, handle_show, RunOptions};
 #[allow(unused_imports)]
 pub use transport::{GitTarballTransport, Transport, TransportSrc};
 #[cfg(test)]
+#[allow(unused_imports)]
 pub use transport::FixtureTransport;

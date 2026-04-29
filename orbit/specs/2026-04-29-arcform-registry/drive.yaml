@@ -8,10 +8,10 @@ history: []
 started: 2026-04-29T00:00:00Z
 review_cycles:
   review_spec: 1
-  review_pr: 0
+  review_pr: 1
 review_cycle_dates:
   review_spec: 2026-04-29
-  review_pr: null
+  review_pr: 2026-04-29
 notes: |
   Started at status: spec per §11.5 file-presence override — interview.md and
   design.md predate the drive (foundation commit, derived from rally design pack).

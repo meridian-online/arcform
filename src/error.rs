@@ -104,3 +104,99 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod ac11_format_tests {
+    //! ac-11: format each new registry variant; assert single-line default
+    //! and that the message carries the `registry:` prefix so callers can
+    //! distinguish registry surface errors from other arcform error families.
+    //!
+    //! These tests are deliberately narrow — they check Display output, not
+    //! the runtime construction sites (those are exercised by the registry
+    //! module's own unit tests).
+    use super::*;
+    use std::io;
+    use std::path::PathBuf;
+
+    fn assert_single_line_registry(err: &Error) {
+        let s = err.to_string();
+        assert!(!s.contains('\n'), "Display must be single-line: {:?}", s);
+        assert!(
+            s.starts_with("registry:"),
+            "expected `registry:` prefix, got: {:?}",
+            s
+        );
+    }
+
+    #[test]
+    fn ac11_registry_index_fetch() {
+        let e = Error::RegistryIndexFetch {
+            url: "https://example/index.yaml".into(),
+            detail: "boom".into(),
+        };
+        assert_single_line_registry(&e);
+    }
+
+    #[test]
+    fn ac11_registry_index_parse() {
+        let e = Error::RegistryIndexParse {
+            detail: "bad yaml".into(),
+        };
+        assert_single_line_registry(&e);
+    }
+
+    #[test]
+    fn ac11_registry_unknown_entry() {
+        let e = Error::RegistryUnknownEntry {
+            query: "nope".into(),
+        };
+        assert_single_line_registry(&e);
+        assert!(e.to_string().contains("nope"));
+    }
+
+    #[test]
+    fn ac11_registry_ambiguous_query() {
+        let e = Error::RegistryAmbiguousQuery {
+            query: "//bad".into(),
+        };
+        assert_single_line_registry(&e);
+    }
+
+    #[test]
+    fn ac11_registry_transport() {
+        let e = Error::RegistryTransport {
+            detail: "tarball walked outside <dest>".into(),
+        };
+        assert_single_line_registry(&e);
+    }
+
+    #[test]
+    fn ac11_registry_cache_io() {
+        let e = Error::RegistryCacheIo {
+            path: PathBuf::from("/tmp/cache/index.yaml"),
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
+        };
+        assert_single_line_registry(&e);
+    }
+
+    #[test]
+    fn ac11_registry_cache_root_missing() {
+        let e = Error::RegistryCacheRootMissing;
+        assert_single_line_registry(&e);
+        // The remediation hint must surface in the default Display.
+        assert!(
+            e.to_string().contains("ARCFORM_REGISTRY_CACHE"),
+            "remediation env var must appear: {:?}",
+            e.to_string()
+        );
+    }
+
+    #[test]
+    fn ac11_registry_unimplemented() {
+        let e = Error::RegistryUnimplemented {
+            feature: "--latest rolling resolution".into(),
+        };
+        assert_single_line_registry(&e);
+        assert!(e.to_string().contains("--latest rolling resolution"));
+    }
+}

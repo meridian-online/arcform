@@ -192,6 +192,10 @@ impl FixtureTransport {
         self
     }
 
+    /// Number of times `fetch` has been invoked. Reserved for future
+    /// idempotence-and-cache-hit tests; today the test suite asserts
+    /// `index_fetch_count` only.
+    #[allow(dead_code)]
     pub fn fetch_count(&self) -> usize {
         self.fetch_count.load(Ordering::Relaxed)
     }
@@ -569,16 +573,38 @@ mod tests {
         assert_eq!(target, PathBuf::from("/tmp/dest/a/b/c.txt"));
     }
 
+    /// Write `name` into the raw `name` slot of an old-style ustar header,
+    /// bypassing `Header::set_path`'s `..`-rejection. Used only by ac-04b
+    /// hostile-fixture construction below — production code never plants
+    /// names this way.
+    fn poke_raw_name(hdr: &mut Header, name: &str) {
+        let bytes = name.as_bytes();
+        let slot = &mut hdr.as_old_mut().name;
+        // Zero the slot, then copy as much of `name` as fits.
+        for b in slot.iter_mut() {
+            *b = 0;
+        }
+        let n = bytes.len().min(slot.len());
+        slot[..n].copy_from_slice(&bytes[..n]);
+    }
+
     // ac-04b: end-to-end hostile tarball is refused before any file lands.
+    //
+    // The `tar` crate's `Header::set_path` rejects `..` segments at construction
+    // time as a defensive measure. To exercise the EXTRACTOR's defensive
+    // validator (per spec ac-04b — "build a hostile fixture tarball ... assert
+    // each hostile entry is rejected"), we have to plant the hostile name
+    // directly into the raw header bytes via `poke_raw_name`, sidestepping
+    // `set_path`'s pre-flight check. Then `cksum` is recomputed so the bytes
+    // form a valid ustar entry — exactly what a malicious upstream would ship.
     #[test]
     fn test_ac04b_hostile_tarball_extraction_rejected() {
         let mut buf: Vec<u8> = Vec::new();
         {
             let gz = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::fast());
             let mut tar = Builder::new(gz);
-            // Add a hostile entry with parent traversal.
             let mut hdr = Header::new_gnu();
-            hdr.set_path("../hostile.txt").unwrap();
+            poke_raw_name(&mut hdr, "../hostile.txt");
             hdr.set_size(4);
             hdr.set_entry_type(tar::EntryType::Regular);
             hdr.set_cksum();
