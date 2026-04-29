@@ -5,6 +5,7 @@ mod error;
 mod introspect;
 mod manifest;
 mod precondition;
+mod registry;
 mod runner;
 mod state;
 

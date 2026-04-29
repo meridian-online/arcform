@@ -1,0 +1,45 @@
+card: orbit/cards/0022-registry.yaml
+autonomy: full
+budget: 3
+iteration: 1
+current_spec: orbit/specs/2026-04-29-arcform-registry/
+status: review-pr
+history: []
+started: 2026-04-29T00:00:00Z
+review_cycles:
+  review_spec: 1
+  review_pr: 0
+review_cycle_dates:
+  review_spec: 2026-04-29
+  review_pr: null
+notes: |
+  Started at status: spec per §11.5 file-presence override — interview.md and
+  design.md predate the drive (foundation commit, derived from rally design pack).
+  Design stage skipped.
+
+  status transitions:
+    spec → review-spec (cycle 1, 2026-04-29) → REQUEST_CHANGES → spec edits → review-spec (cycle 2)
+
+  cycle 1 findings addressed:
+    HIGH 1 (tarball traversal): new ac-04b + sandbox constraint
+    HIGH 2 (--latest undefined): dropped from v1 — flag parses but resolver errors RegistryUnimplemented
+    MEDIUM (chdir): removed from ac-10 + constraint clarifies pass-as-arg
+    MEDIUM (non-atomic writes): atomic temp-dir + rename constraint, ac-04 + ac-09 + ac-05 verification
+    MEDIUM (min_arcform_version dead): dropped from ac-01 + scope.out; reintroduce in follow-up
+    MEDIUM (--param parsing): ac-10 reuses cli::parse_params with ManifestValidation
+    LOW (concurrent fetches): scope.out — atomic-rename gives loser-takes-correct-value
+    LOW (home_dir None): ac-03 + ac-11 add RegistryCacheRootMissing
+    LOW (.fetched format): constraint + ac-05 specify Unix epoch decimal
+    LOW (ac-12 manual gate): explicit two-track verification (automated anchors + reviewer prose)
+    LOW (Pillar enum forward-compat): ac-01 hard-rejects unknown pillars in v1
+
+  cycle 2 verdict: APPROVE (4 residual LOW findings — none gate implementation):
+    - test-time transport seam: library-level integration tests (no binary-CLI coverage in v1)
+    - cache_root home injection: small HomeProvider trait, default SystemHomeProvider
+    - --refresh + offline-grace: --refresh errors hard on transport failure (TTL-refresh keeps grace)
+    - cache root creation: ensure_cache_root() mkdir-ps the tree before any rename
+
+  Scope clarification (per checkpoint): arcform-side CLI scaffolding ONLY this drive.
+  meridian-online/registry repo + brewtrend + gnaf canonical entries are sister
+  work, deferred to a follow-up effort. The spec must use a mocked/fixture index
+  for tests; no live network, no real entries.

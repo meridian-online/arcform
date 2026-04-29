@@ -68,6 +68,37 @@ pub enum Error {
     #[error("state backend error: {0}")]
     StateBackend(String),
 
+    // Constructed by FixtureTransport (cfg(test)) and by the production transport's
+    // sister-work fetch path. Allowed because non-test builds today only see the
+    // cfg(test) construction site.
+    #[allow(dead_code)]
+    #[error("registry: failed to fetch index from {url}: {detail}")]
+    RegistryIndexFetch { url: String, detail: String },
+
+    #[error("registry: failed to parse index: {detail}")]
+    RegistryIndexParse { detail: String },
+
+    #[error("registry: unknown entry '{query}' (try `arc registry list`)")]
+    RegistryUnknownEntry { query: String },
+
+    #[error("registry: malformed query '{query}' (expected `<name>` or `<owner>/<name>`)")]
+    RegistryAmbiguousQuery { query: String },
+
+    #[error("registry: transport error: {detail}")]
+    RegistryTransport { detail: String },
+
+    #[error("registry: cache I/O at {path}: {source}")]
+    RegistryCacheIo {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[error("registry: cache root unavailable (set ARCFORM_REGISTRY_CACHE to a writable directory)")]
+    RegistryCacheRootMissing,
+
+    #[error("registry: '{feature}' is not implemented in v1")]
+    RegistryUnimplemented { feature: String },
+
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }

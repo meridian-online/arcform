@@ -63,6 +63,7 @@ maturity: "in_design"
 specs:
   - "2026-04-29-arcform-registry/interview.md"
   - "2026-04-29-arcform-registry/design.md"
+  - "orbit/specs/2026-04-29-arcform-registry/spec.yaml"
 references:
   - "/home/hugh/github/meridian-online/arcform/orbit/specs/2026-04-29-arcform-registry/interview.md"
   - "/home/hugh/github/meridian-online/arcform/orbit/decisions/0011-pipeline-registry-naming-and-assets-rename.md"
