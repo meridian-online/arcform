@@ -8,7 +8,9 @@ Local-first data pipeline engine for analytical workflows. Part of the [Meridian
 
 ## Sprint Goal
 
-**Reference pipelines (card 0022):** Ship realistic example pipelines (starting with brewtrend) that serve as both learning material and integration test fixtures. Each major arcform capability (SQL, commands, preconditions, dependencies) should have at least one reference pipeline demonstrating it.
+**Registry (card 0022):** Ship an end-users-first registry of working ArcForm pipelines, organised across three pillars (Practical / Foundational / Investigative). v1 ships two canonical entries — `brewtrend` (Practical) and `gnaf` (Foundational) — fetched on demand via `arc registry list/show/fetch/run` from a hosted index. `fred` (Investigative) deferred to a follow-up spec gated on card 0021 (secrets management); the Investigative pillar exists in the index from v1 but is empty. Distribution: monorepo (`meridian-online/registry`) + git fetch with tarball fallback. Architecture supports two-tier ownership (canonical + contributor) from v1.
+
+Delivery: rally coordinating two cards — card 0008 (assets rename) sequenced first, card 0022 (registry capability) second.
 
 ---
 
@@ -32,7 +34,7 @@ src/
   manifest.rs     # YAML manifest parsing (arcform.yaml)
   runner.rs       # Step execution engine (~1150 lines, largest module)
   engine.rs       # SQL engine invocation (DuckDB CLI delegation)
-  asset.rs        # Asset registry, SQL auto-discovery, dependency validation
+  asset.rs        # Assets, SQL auto-discovery, dependency validation
   introspect.rs   # SQL introspection via sqlparser-rs
   precondition.rs # Typed step preconditions (modified_after, command)
   state.rs        # Run state tracking (step hashes, staleness)
@@ -71,30 +73,38 @@ src/
 
 ## Decision Register
 
-10 decisions in `orbit/decisions/` (MADR format):
+16 decisions in `orbit/decisions/` (MADR format):
 
 | # | Decision |
 |---|---|
 | 0001 | Asset-centric pipeline engine (not step-centric) |
 | 0002 | Implement in Rust |
 | 0003 | Delegate SQL execution to engine CLIs |
-| 0004 | YAML manifest with steps and separate asset registry |
+| 0004 | YAML manifest with steps and separate asset declarations |
 | 0005 | DuckDB as default engine |
 | 0006 | Local-first, remote-compatible design |
 | 0007 | SQL introspection via sqlparser-rs is a core feature |
 | 0008 | CLI binary name is `arc` |
 | 0009 | Hybrid engine invocation (defaults + command override) |
 | 0010 | v0.1 scope: step execution foundation |
+| 0011 | Pipeline catalogue takes "registry"; rename "asset registry" → "assets" |
+| 0012 | Registry is end-users-first |
+| 0013 | Registry uses a hosted index with on-demand fetch |
+| 0014 | Registry distribution via monorepo + git fetch (tarball fallback) |
+| 0015 | Registry organised around three pillars: Practical / Foundational / Investigative |
+| 0016 | Registry supports two-tier ownership (canonical + contributor) |
+
+**Vocabulary note (decision 0011):** forward usage refers to **assets** (not "asset registry") for within-pipeline data declarations, freeing **registry** for the user-facing pipeline catalogue. Historical artefacts (card 0008, spec `2026-04-15-asset-registry/`) keep their original names for traceability.
 
 ---
 
 ## Card Roadmap
 
-22 cards in `orbit/cards/`. Shipped/active through 0014; planned from 0015 onward.
+22 cards in `orbit/cards/`. Shipped/active through 0017; planned from 0018 onward.
 
-**Shipped:** 0001–0011, 0014 (scaffolding, step execution, manifest validation, preflight, SQL passthrough, shell commands, progress feedback, asset registry, SQL introspection, run state, local-remote parity, step preconditions)
-**Sprint focus:** 0022 (reference pipelines)
-**Planned:** 0012–0013, 0015–0021 (multi-engine dialects, lineage visualisation, execution resilience, parameterisation, lifecycle hooks, parallel execution, typed executors, scheduling, secrets, reference pipelines)
+**Shipped:** 0001–0011, 0014–0017 (scaffolding, step execution, manifest validation, preflight, SQL passthrough, shell commands, progress feedback, assets, SQL introspection, run state, local-remote parity, step preconditions, execution resilience, parameterisation, lifecycle hooks)
+**Sprint focus:** 0022 (registry)
+**Planned:** 0012–0013, 0018–0021 (multi-engine dialects, lineage visualisation, parallel execution, typed executors, scheduling, secrets)
 
 ---
 
@@ -126,14 +136,21 @@ This project uses the orbit workflow: Card → Design → Spec → Implement →
 - `/orb:review-spec` — stress-test the spec before implementation
 - `/orb:review-pr` — verify the PR against the spec's acceptance criteria
 
-Artefacts live in `orbit/cards/`, `orbit/specs/`, and `orbit/decisions/`.
+## Orbit vocabulary
+
+- **Card** (`orbit/cards/*.yaml`) — a capability the product provides. User language. Never closed.
+- **Memo** (`orbit/cards/memos/*.md`) — raw idea awaiting distillation.
+- **Interview** (`orbit/specs/<slug>/interview.md`) — Q&A record from `/design` or `/discovery`.
+- **Spec** (`orbit/specs/<slug>/spec.yaml`) — a discrete unit of work with numbered ACs.
+- **Progress** (`orbit/specs/<slug>/progress.md`) — AC tracker during implementation.
+- **Decision** (`orbit/decisions/*.md`) — MADR record of an architectural choice.
+
+Cards describe *what*, specs describe *work*. Follow-up work is a new spec against an existing card — not a new card. New cards are for new capabilities.
 
 ## Current Sprint
 
-goal: "Build reference pipelines — ship realistic example pipelines that exercise all major arcform capabilities"
+goal: "Build the ArcForm registry — end-users-first catalogue of working pipelines across three pillars (Practical / Foundational / Investigative), distributed via hosted monorepo + on-demand fetch"
 
 cards:
-  - 0015: "Execution resilience — retry, backoff, timeouts"
-  - 0016: "Pipeline parameterisation — params, dotenv, output capture"
-  - 0017: "Lifecycle hooks — init, success, failure, exit handlers"
-  - 0022: "Reference pipelines — brewtrend and others"
+  - 0008: "Assets rename — 'asset registry' → 'asset' in forward usage (sequenced first)"
+  - 0022: "Registry — CLI + monorepo + brewtrend (Practical) + gnaf (Foundational); fred deferred"
