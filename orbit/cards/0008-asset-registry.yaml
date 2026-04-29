@@ -1,4 +1,4 @@
-feature: "Asset registry"
+feature: "Assets"
 as_a: "data analyst"
 i_want: "declare the data assets my pipeline produces and their dependencies"
 so_that: "arc understands my data lineage, not just my execution order"
@@ -26,6 +26,7 @@ goal: "v0.2 — auto-discover assets from SQL, validate dependency ordering, ove
 maturity: "emerging"
 specs:
   - "specs/2026-04-15-asset-registry/spec.yaml"
+  - "orbit/specs/2026-04-29-assets-rename/spec.yaml"
 references:
   - "decisions/0001-asset-centric-pipeline-engine.md"
   - "decisions/0004-yaml-manifest-with-steps-and-assets.md"
