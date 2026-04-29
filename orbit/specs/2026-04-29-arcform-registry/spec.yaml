@@ -1,0 +1,337 @@
+goal: |
+  Ship the arcform-side `arc registry` CLI subcommand tree (list/show/fetch/run)
+  with index parsing, two-tier ownership resolution, version-pinned cache, and
+  pluggable transport — all driven by fixture-backed tests with no live network.
+  The meridian-online/registry repo and its canonical entries (brewtrend, gnaf)
+  are sister work, deferred to a follow-up spec on card 0022.
+
+scope:
+  in:
+    - "src/registry.rs (or src/registry/ sub-module tree) — index, resolver, cache, transport, run orchestration"
+    - "src/cli.rs — extend Commands with `Registry { ... }` subcommand tree (list, show, fetch, run)"
+    - "Cargo.toml — add ureq (sync HTTP), tar, flate2, dirs"
+    - "src/error.rs — registry-specific error variants"
+    - "Fixture-backed integration tests using a local on-disk index + cache"
+    - "Module documentation describing architecture, vocabulary, and the sister-work boundary"
+  out:
+    - "meridian-online/registry GitHub repo (sister work)"
+    - "brewtrend / gnaf canonical entries (sister work)"
+    - "Live network smoke tests (sister-work CI)"
+    - "fred (Investigative pillar) — gated on card 0021"
+    - "`arc registry validate <path>` lint subcommand (deferred — design.md open question)"
+    - "`arc registry init` scaffolder (deferred — design.md open question)"
+    - "Concurrent-invocation safety beyond atomic-rename loser-takes-correct-value (single-shell typical use; multi-shell not a v1 goal)"
+    - "Rolling `--latest` resolution (deferred to v1.1 — flag rejected as unimplemented in v1, see ac-02 + ac-06)"
+    - "Engine-version gating on `min_arcform_version` (field deferred from v1 index schema; reintroduce in a follow-up spec once enforcement semantics are decided)"
+
+constraints:
+  - "Single new module: src/registry.rs (or src/registry/ if sub-modules emerge naturally). No edits to runner.rs."
+  - "uv-style CLI aesthetic: quiet by default, signal-dense, terse errors, --verbose opens the firehose."
+  - "Index-pinned default version. --version <ref> overrides explicitly. Cache key is the resolved ref, never the alias. `--latest` is reserved (parses, errors as unimplemented in v1) — rolling resolution is deferred (see scope.out)."
+  - "Two-tier ownership from v1: canonical entries have owner=null and resolve unprefixed; contributor entries have owner=<name> and resolve as <owner>/<name>. Canonical names cannot be shadowed by contributors (validated at index parse)."
+  - "Cache layout — canonical: ~/.arcform/registry/<name>/<resolved-ref>/; contributor: ~/.arcform/registry/<owner>/<name>/<resolved-ref>/. Path resolution via the `dirs` crate; HOME override via $ARCFORM_REGISTRY_CACHE for tests."
+  - "Index URL is configurable via $ARCFORM_REGISTRY_INDEX; default points to the (future) meridian-online/registry raw index URL — but tests never resolve the default."
+  - "Transport is a trait. Real impl uses git shell-out (preferred) with HTTPS tarball fallback when git is missing. Tests use a fixture transport that copies from a fixture directory tree. The trait boundary is the only seam tests cross."
+  - "Index TTL: cached for 1 hour; --refresh forces a fresh fetch on any subcommand. Stale-while-offline is acceptable (carry old index forward if fetch fails)."
+  - "Empty pillars render with a `(no entries yet)` placeholder line under the pillar header — preserves discoverability for the v1 Investigative case."
+  - "`arc registry run <name>` resolves and ensures cache, then hands the local manifest path to the existing `runner::run_with_params` — no parallel run path. The registry path does NOT mutate process cwd; it passes the cache path as the dir argument exactly like `cli::run_pipeline` does."
+  - "Errors surface as single-line messages with a suggested next action. Underlying detail (git stderr, HTTP body, parse offset) hides behind --verbose."
+  - "No async runtime. ureq is synchronous; transports run on the calling thread."
+  - "No tests rely on $HOME, the real network, or a system git binary. The fixture transport satisfies all integration tests."
+  - "Backwards compatibility — existing `arc init` and `arc run` behaviour is unchanged. The Registry subcommand is additive."
+  - "Atomic cache writes: every transport.fetch writes to a sibling temp directory under the cache root and renames atomically into the resolved-ref path on success. On any error during fetch/extract, the temp directory is removed and no `<ref>/` directory exists. The same discipline applies to the production tarball path and the fixture transport. Concurrent invocations may both fetch into separate temp dirs; the rename is racy but loser-takes-correct-value (no corruption, just redundant work)."
+  - "Tarball-extraction sandboxing: the tarball-fallback path rejects entries whose normalised path escapes the destination, rejects absolute paths, and does not follow symlinks during extraction. This protection ships in the production transport regardless of whether v1 wires up contributor entries — the moment a contributor URL is fetched, the extractor must be safe."
+  - "Index timestamp format: `index.yaml.fetched` stores Unix epoch seconds as decimal text on a single line (no trailing newline required). Cross-shell debugging benefits from a stable, timezone-independent format."
+  - "Pillar enum forward-compat: unknown pillar string values fail index parsing in v1 (hard reject). Future versions may relax to skip-unknown if needed."
+
+acceptance_criteria:
+  - id: ac-01
+    ac_type: code
+    description: |
+      Index schema and parser. Add types `RegistryIndex { version: u32, entries: Vec<IndexEntry> }`
+      and `IndexEntry { name, owner: Option<String>, pillar: Pillar, summary, repo_url, repo_path,
+      current_version, sources: Vec<String>, schedule_guidance: Option<String> }`. NOTE — `min_arcform_version`
+      is intentionally NOT included in v1 (deferred per scope.out): we don't ship a parsed-but-unenforced
+      field. Reintroduce in a follow-up spec once enforcement semantics are decided. `Pillar` is an enum with
+      Practical / Foundational / Investigative variants (serde rename_all = "lowercase"). Unknown pillar string
+      values FAIL index parsing in v1 (hard reject — no skip-unknown). Parse from YAML via serde_yaml. Validate
+      at parse time: (a) unknown index version rejects; (b) duplicate (owner, name) rejects; (c) any contributor
+      entry whose `name` collides with a canonical entry rejects; (d) unknown pillar rejects with a clear error
+      naming the offending entry.
+    verification: |
+      Unit tests parse a sample index covering all three pillars + canonical and contributor entries;
+      verify shape and field population. Negative tests: index version=2 rejects, duplicate canonical name
+      rejects, contributor shadowing a canonical name rejects, unknown pillar value (`pillar: educational`)
+      rejects with an error mentioning the entry name.
+
+  - id: ac-02
+    ac_type: code
+    description: |
+      Resolver. `resolve(index: &RegistryIndex, query: &str, version_override: Option<VersionSpec>) -> Result<ResolvedEntry>`
+      where `VersionSpec` is `{ Pinned(String), Latest }` and `ResolvedEntry { name, owner, ref_: String, repo_url,
+      repo_path, pillar }`. Query parsing: a query containing `/` is treated as `<owner>/<name>` (contributor lookup);
+      otherwise it's a canonical lookup against `owner == None`. Without override, resolves to `entry.current_version`
+      (concrete ref). Pinned override returns the pinned ref. `Latest` is reserved-but-unimplemented in v1 — the
+      resolver returns `RegistryUnimplemented { feature: "--latest rolling resolution" }` immediately, before any
+      transport work. Errors: UnknownEntry { query }, AmbiguousQuery { query } (e.g. malformed slash form),
+      RegistryUnimplemented { feature }.
+    verification: |
+      Unit tests: canonical query resolves to the canonical entry's current_version. `<owner>/<name>` query
+      resolves to the contributor entry. Pinned override returns the pinned ref. Latest errors with
+      RegistryUnimplemented (the message names `--latest`). Unknown query errors. Malformed `a/b/c` errors.
+
+  - id: ac-03
+    ac_type: code
+    description: |
+      Cache path computation. `cache_path(root: &Path, resolved: &ResolvedEntry) -> PathBuf`. Canonical:
+      `<root>/<name>/<ref_>/`. Contributor: `<root>/<owner>/<name>/<ref_>/`. Cache root is determined by
+      `cache_root() -> Result<PathBuf>` which reads `$ARCFORM_REGISTRY_CACHE` if set, else uses
+      `dirs::home_dir().join(".arcform/registry")`. If `$ARCFORM_REGISTRY_CACHE` is unset AND `dirs::home_dir()`
+      returns None, `cache_root()` errors with `RegistryCacheRootMissing` (single-line message suggesting
+      `set ARCFORM_REGISTRY_CACHE` as the next action).
+    verification: |
+      Unit tests cover both ownership tiers and the env override. A test sets $ARCFORM_REGISTRY_CACHE to a
+      tempdir and verifies cache_root() returns it. A test simulates the home-dir-None branch (e.g. by clearing
+      both $HOME and $ARCFORM_REGISTRY_CACHE in a child-process invocation, or by injecting a wrapper trait
+      that returns None) and asserts `RegistryCacheRootMissing` surfaces with the suggested next-action text.
+
+  - id: ac-04
+    ac_type: code
+    description: |
+      Transport trait + fixture impl. `trait Transport { fn fetch(&self, src: &TransportSrc, dest: &Path) -> Result<()>;
+      fn fetch_index(&self, url: &str) -> Result<String>; }`. `TransportSrc { repo_url, repo_path, ref_ }`.
+      Real impl `GitTarballTransport` uses `git clone --depth=1 --filter=blob:none --sparse` + sparse-checkout
+      for the `<repo_path>` slice at `<ref_>`, falling back to `https://<repo_url>/archive/<ref_>.tar.gz` extracted
+      via tar+flate2 when git is not on PATH. Index fetch uses ureq HTTPS GET. Fixture impl `FixtureTransport`
+      reads from a local directory tree mirroring the real layout (`<fixture_root>/<repo_path>/<ref_>/`) and
+      copies into the cache target — no shell-out, no HTTP. ALL transports (production AND fixture) MUST honour
+      the atomic-write contract from the constraints: write to a sibling `<dest>.tmp.<rand>` directory, then
+      `std::fs::rename` into `<dest>` on success; on any error path, remove the temp dir and propagate. The
+      target directory MUST NOT exist when fetch is called (caller's responsibility per ac-09 cached-detection).
+    verification: |
+      Unit tests instantiate FixtureTransport against a tempdir tree and verify both `fetch` (copies content
+      under the dest path) and `fetch_index` (returns the fixture index string). Atomic-write test: a wrapper
+      `FailingFixtureTransport` errors after writing one file into the temp dir; assert that no `<dest>/` directory
+      remains and the temp dir was cleaned up. The real GitTarballTransport's git-detection branch is unit-tested
+      by stubbing the `which("git")` lookup behind a small helper; the actual shell-out and HTTP code paths are
+      not exercised by tests (documented as sister-work surface).
+
+  - id: ac-04b
+    ac_type: code
+    description: |
+      Tarball-extraction sandboxing. The tarball-fallback path (used by GitTarballTransport when git is missing)
+      MUST validate every entry before writing to disk: (a) reject entries whose canonical path (after joining
+      with the destination and resolving `.` / `..` components) escapes the destination root; (b) reject entries
+      with absolute paths (`/foo/bar`, `C:\foo` on Windows targets — even though Windows isn't a v1 platform,
+      the check costs nothing); (c) refuse to follow symlinks, both as entry targets and via parent-directory
+      symlinks already on disk. Extraction calls `tar::Archive::set_overwrite(false)` and validates each entry
+      via an explicit per-entry guard before unpacking; do not rely on `tar`'s default behaviour. On any
+      validation failure, the extraction errors with `RegistryTransport { detail: "tarball entry escapes
+      destination: <name>" }` (or analogous) and the atomic-write contract from ac-04 cleans up the temp dir.
+    verification: |
+      Unit test: build a hostile fixture tarball (in-memory, via the `tar` crate) containing entries with
+      `..` segments, an absolute path, and a symlink. Pass it through the extractor's per-entry validator
+      (extracted as a pure function for testability) and assert each hostile entry is rejected with a
+      RegistryTransport error naming the entry. Unit test: a benign tarball extracts cleanly to the
+      destination. The validator function MUST be unit-testable without instantiating GitTarballTransport
+      (i.e. exposed at module-private but accessible via #[cfg(test)] re-export or a free function).
+
+  - id: ac-05
+    ac_type: code
+    description: |
+      Index acquisition with TTL + offline grace. `IndexCache::load(transport, url, ttl, refresh: bool) -> Result<RegistryIndex>`.
+      Reads `<cache_root>/index.yaml` and `<cache_root>/index.yaml.fetched`. The `.fetched` file stores Unix epoch
+      seconds as decimal text on a single line (per constraints). If --refresh OR (now - fetched > ttl): attempt
+      `transport.fetch_index(url)`, write to disk + bump fetched time. On fetch failure with a stale-but-present
+      cache, log to stderr (under --verbose) and carry the cached copy forward. On fetch failure with no cache, error.
+      Index writes ARE atomic via the same temp-file + rename pattern used by ac-04 (write to `index.yaml.tmp`,
+      rename into `index.yaml`).
+    verification: |
+      Unit tests with FixtureTransport: first call fetches; second call within TTL reuses cache; --refresh forces fetch;
+      stale + transport failure but cache present returns cached; no cache + transport failure errors with a clear message.
+      One test asserts the `.fetched` file contents parse as a Unix epoch integer.
+
+  - id: ac-06
+    ac_type: code
+    description: |
+      CLI subcommand tree. Extend `Commands` with `Registry { #[command(subcommand)] cmd: RegistryCmd }`.
+      `RegistryCmd` has variants `List { #[arg(long)] refresh: bool }`, `Show { name: String, #[arg(long)] refresh: bool }`,
+      `Fetch { name: String, #[arg(long)] version: Option<String>, #[arg(long)] latest: bool, #[arg(long)] refresh: bool }`,
+      `Run { name: String, #[arg(long)] version: Option<String>, #[arg(long)] latest: bool, #[arg(long)] refresh: bool,
+      #[arg(long)] force: bool, #[arg(long = "param", value_name = "KEY=VALUE")] params: Vec<String> }`.
+      `--version` and `--latest` are mutually exclusive at the clap level (`conflicts_with`). `--latest` parses
+      successfully but, per constraints + ac-02, the resolver returns `RegistryUnimplemented` immediately at runtime
+      — the flag is reserved for a future spec, not silently dropped. Top-level `--verbose` flag (or
+      $ARCFORM_VERBOSE) toggles firehose output.
+    verification: |
+      Clap-level tests (using `Cli::try_parse_from`) verify each subcommand parses; --version + --latest together
+      errors at parse time; unknown subcommand errors. Run subcommand accepts repeated --param flags. Runtime test:
+      `arc registry fetch foo --latest` errors with `RegistryUnimplemented` whose message names `--latest`.
+
+  - id: ac-07
+    ac_type: code
+    description: |
+      `arc registry list` — uv-style output. Group entries by pillar in a fixed order
+      (Practical → Foundational → Investigative). Each pillar header is uppercase
+      (`PRACTICAL`, etc.) on its own line. Empty pillars render `  (no entries yet)` directly
+      below their header. Entry rows: two-space indent, columns aligned (name | current_version | summary).
+      Contributor entries render as `<owner>/<name>` in the name column.
+    verification: |
+      Integration test loads a fixture index covering all three ownership/pillar combinations (canonical Practical,
+      canonical Foundational, contributor Practical, empty Investigative) and asserts the rendered output line-by-line
+      against an expected golden string.
+
+  - id: ac-08
+    ac_type: code
+    description: |
+      `arc registry show <name>` — terse metadata block + README. Resolves the entry, ensures the cache contains
+      the resolved version (fetches via transport if missing), reads `<cache_path>/README.md` if present, and
+      prints: name (or owner/name), pillar, summary, current_version, repo_url, schedule_guidance, sources list,
+      a blank line, then the README contents inline. Missing README prints the metadata block alone with a single
+      `(no README)` line.
+    verification: |
+      Integration test: fixture index + fixture transport with a sample entry that has a README; capture stdout
+      and assert metadata fields present and README body interleaved. Second test exercises the missing-README path.
+
+  - id: ac-09
+    ac_type: code
+    description: |
+      `arc registry fetch <name>` — resolves, ensures cache, prints a single completion line on success
+      (`➜ <display-name> <ref> (<size> KB)` where size is the on-disk byte count of the cache subtree formatted
+      as KB rounded). On already-cached, prints `✓ <display-name> <ref> (cached)`. Failures print one line:
+      `✗ <display-name> <ref>: <reason>` to stderr. --verbose prepends transport details. Cached-detection is
+      "the resolved-ref directory exists and is non-empty"; the atomic-rename contract from ac-04 guarantees
+      that a directory either contains the full fetched payload or does not exist.
+    verification: |
+      Integration tests cover: cold fetch (➜), already-cached (✓), transport failure (✗ to stderr). Output strings
+      asserted against goldens. One test verifies that a transport which errors mid-fetch (ac-04 atomic-write test)
+      results in NO `<ref>/` directory and a subsequent fetch behaves as cold, not as `(cached)`.
+
+  - id: ac-10
+    ac_type: code
+    description: |
+      `arc registry run <name>` — resolves, ensures cache, then call `runner::run_with_params(&cache_path, &engine,
+      &state, force, &cli_params)` exactly as `cli::run_pipeline` does. The cache path is passed as the first
+      argument; the registry path does NOT mutate process cwd. `--param` raw strings are parsed via the existing
+      `cli::parse_params` helper before invoking the runner — invalid `KEY=VALUE` formats error before any cache
+      or transport work, surfacing as the existing `Error::ManifestValidation` for parity with `arc run --param`.
+      All of `--version`, `--refresh`, `--force`, `--param` flow through; `--latest` errors per ac-02. Errors out
+      of the runner propagate unmodified.
+    verification: |
+      Integration test using a fixture entry whose `arcform.yaml` declares a single command step
+      (`echo registry-run-ok`). Invoke the run path with FixtureTransport; assert step ran and exit was clean.
+      Test: `--version v1.0 --latest` together errors at parse time. Test: `--param BADFORMAT` (no `=`) errors
+      with `ManifestValidation` before any transport call (verified by passing a transport that panics on use
+      and asserting it was not invoked). Test: process cwd is unchanged after `arc registry run` (record cwd
+      before and after; assert equal).
+
+  - id: ac-11
+    ac_type: code
+    description: |
+      Error variants in `error.rs`. Add: RegistryIndexFetch { url: String, detail: String },
+      RegistryIndexParse { detail: String }, RegistryUnknownEntry { query: String },
+      RegistryAmbiguousQuery { query: String }, RegistryTransport { detail: String },
+      RegistryCacheIo { path: PathBuf, source: std::io::Error }, RegistryCacheRootMissing (no fields),
+      RegistryUnimplemented { feature: String }. Each formats to a single line; --verbose mode prints the
+      underlying detail block on a follow-up line. RegistryCacheRootMissing's message includes the suggested
+      next action: "set ARCFORM_REGISTRY_CACHE to a writable directory".
+    verification: |
+      Unit tests format each variant; assert single-line default. Verify the registry module returns the
+      appropriate variant on simulated failure modes (parse failure, unknown query, transport failure,
+      home-dir missing, --latest invocation).
+
+  - id: ac-12
+    ac_type: code
+    description: |
+      Module-level documentation. `src/registry.rs` (or `src/registry/mod.rs`) opens with a doc comment
+      describing: the asset/registry vocabulary boundary (per decision 0011), the two-tier ownership model
+      (per decision 0016), the transport contract, the cache layout, and an explicit note that the
+      `meridian-online/registry` monorepo and canonical entries (brewtrend, gnaf) are delivered via sister
+      work (link to card 0022 follow-up spec).
+    verification: |
+      Automated: a Rust doc test (or a regular #[test] reading the module's `env!`-style file contents) asserts
+      the rendered module doc string contains the four vocabulary anchors as case-insensitive substrings:
+      "asset", "two-tier", "transport", "sister work". `cargo doc --no-deps` runs cleanly on the new module
+      (full-project warnings are out of scope for this AC). Reviewer manual gate is explicit: AC-12's prose
+      quality is checked during PR review, not by the automated test — the test only enforces that the four
+      anchors are present.
+
+  - id: ac-13
+    ac_type: code
+    description: |
+      Cargo.toml additions. Add `ureq = { version = "2", default-features = false, features = ["tls"] }`,
+      `tar = "0.4"`, `flate2 = "1"`, `dirs = "5"` to `[dependencies]`. No new `[dev-dependencies]` (tempfile
+      already present). `cargo check` passes; `cargo build` link state matches the existing CLAUDE.md
+      "Known Issues" entry (DuckDB linker — unrelated to this work).
+    verification: |
+      Inspect Cargo.toml diff; run `cargo check`; confirm clean. Build behaviour identical to pre-change other
+      than the new module's compile.
+
+ontology_schema:
+  name: "ArcformRegistry"
+  description: "CLI-side registry plumbing — index, resolution, cache, transport, run orchestration"
+  fields:
+    - name: "RegistryIndex"
+      type: "struct"
+      description: "Top-level index document (version + entries)"
+    - name: "IndexEntry"
+      type: "struct"
+      description: "Single registry entry — name, owner, pillar, version, repo coordinates"
+    - name: "Pillar"
+      type: "enum"
+      description: "Practical | Foundational | Investigative"
+    - name: "ResolvedEntry"
+      type: "struct"
+      description: "Output of resolver — entry plus the resolved ref"
+    - name: "VersionSpec"
+      type: "enum"
+      description: "Pinned(String) | Latest"
+    - name: "Transport"
+      type: "trait"
+      description: "Fetch transport — git/tarball real impl, fixture test impl"
+    - name: "GitTarballTransport"
+      type: "struct"
+      description: "Production transport: git shell-out preferred, HTTPS tarball fallback"
+    - name: "FixtureTransport"
+      type: "struct"
+      description: "Test transport: copies from a local fixture directory tree"
+    - name: "IndexCache"
+      type: "struct"
+      description: "TTL-aware index cache with offline grace"
+    - name: "cache_root"
+      type: "function"
+      description: "Resolves the cache root from $ARCFORM_REGISTRY_CACHE or ~/.arcform/registry/"
+    - name: "cache_path"
+      type: "function"
+      description: "Computes <root>/<name|owner/name>/<ref>/ for a resolved entry"
+
+evaluation_principles:
+  - principle: "Test isolation (no live network, no system git, fixture-backed everywhere)"
+    weight: 0.25
+  - principle: "Two-tier ownership correctness (canonical/contributor disambiguation, no shadowing)"
+    weight: 0.20
+  - principle: "uv-aesthetic output discipline (quiet, signal-dense, --verbose firehose)"
+    weight: 0.20
+  - principle: "Sister-work boundary kept clean (no monorepo coupling, no entry-specific code)"
+    weight: 0.20
+  - principle: "Backwards compatibility (existing arc init / arc run untouched)"
+    weight: 0.15
+
+exit_conditions:
+  - "All 14 ACs pass verification (ac-01 through ac-13, plus ac-04b)"
+  - "cargo check clean; clippy clean on the new module"
+  - "Existing test suite unchanged"
+  - "Module doc comment surfaces the sister-work boundary"
+  - "Atomic-write contract verified: no test produces a partially-populated cache directory"
+  - "Tarball-sandbox guard verified against a hostile fixture archive"
+
+references:
+  - "orbit/cards/0022-registry.yaml"
+  - "orbit/specs/2026-04-29-arcform-registry/interview.md"
+  - "orbit/specs/2026-04-29-arcform-registry/design.md"
+  - "orbit/decisions/0011-pipeline-registry-naming-and-assets-rename.md"
+  - "orbit/decisions/0012-registry-end-users-first.md"
+  - "orbit/decisions/0013-hosted-index-on-demand-fetch.md"
+  - "orbit/decisions/0014-registry-monorepo-git-fetch.md"
+  - "orbit/decisions/0015-registry-three-pillars.md"
+  - "orbit/decisions/0016-registry-two-tier-ownership.md"
