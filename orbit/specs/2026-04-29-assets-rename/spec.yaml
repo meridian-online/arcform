@@ -1,0 +1,76 @@
+goal: |
+  Land decision 0011's forward-usage rename of "asset registry" → "assets"
+  across active code and docs. Scoping discovery revealed that src/ and
+  README.md already use the correct "asset" / "asset graph" vocabulary,
+  reducing the practical scope to: (1) verify zero forward-usage hits in
+  active code, (2) update card 0008's feature label from "Asset registry"
+  to "Assets", and (3) audit CLAUDE.md's three remaining references to
+  confirm they are quotation-form (referring to the renamed-from term)
+  rather than naked forward usage. Historical artefacts (decisions
+  0001/0004/0010, spec 2026-04-15-asset-registry/, card 0008 file slug)
+  are preserved per decision 0011's traceability rule.
+
+constraints:
+  - "Forward usage only — historical artefacts retained per decision 0011: decisions 0001/0004/0010 mention 'asset registry' as historical context; spec folder 2026-04-15-asset-registry/ keeps its name; card 0008 file slug 0008-asset-registry.yaml is preserved"
+  - "No manifest schema change, no runtime behaviour change, no public Rust type rename"
+  - "Card 0008's existing `goal:` field already uses 'assets' vocabulary correctly; only the `feature:` label changes"
+  - "Sequenced first inside the registry-capability rally (rally branch rally/assets-rename); card 0022's rally branch rebases onto the post-rename main"
+
+acceptance_criteria:
+  - id: ac-01
+    ac_type: code
+    description: "Active code surfaces contain zero forward-usage occurrences of 'asset registry'"
+    verification: "rg -i 'asset registry' src/ README.md Cargo.toml — returns no matches"
+
+  - id: ac-02
+    ac_type: doc
+    description: "Card 0008's `feature:` label updated from 'Asset registry' to 'Assets'; file slug 0008-asset-registry.yaml preserved per traceability rule"
+    verification: "orbit/cards/0008-asset-registry.yaml line 1 reads `feature: \"Assets\"`; file path unchanged"
+
+  - id: ac-03
+    ac_type: doc
+    description: "CLAUDE.md's remaining 'asset registry' mentions are all appropriate quotation-form references to the rename itself (decisions-table row at ~line 90, vocabulary note at ~line 97, sprint-cards entry at ~line 155). No naked forward usage of 'asset registry' as a current capability label exists in CLAUDE.md."
+    verification: "Manual audit of each CLAUDE.md hit confirms it is wrapped in quotes or markdown formatting that clearly identifies the term as the renamed-from form (per decision 0011)"
+
+  - id: ac-04
+    ac_type: gate
+    description: "`cargo build` succeeds on a machine with libduckdb.so available; build does not regress"
+    verification: "cargo build (where linkable). Skip is acceptable on this machine per CLAUDE.md 'Known Issues' (libduckdb.so missing); the rename touches no Rust source so build behaviour is necessarily unchanged"
+
+  - id: ac-05
+    ac_type: doc
+    description: "progress.md captures the scoping discovery — that the active code surfaces had already evolved to use 'asset' / 'asset graph' terminology, making the rename a verification + label tweak rather than a cross-cutting refactor"
+    verification: "orbit/specs/2026-04-29-assets-rename/progress.md exists with a discovery note explaining the small final scope"
+
+  - id: ac-06
+    ac_type: doc
+    description: "Card 0008's `specs:` array appended with 'orbit/specs/2026-04-29-assets-rename/spec.yaml' so the work trail stays complete"
+    verification: "orbit/cards/0008-asset-registry.yaml `specs` list contains the new spec path"
+
+implementation_notes:
+  - "Discovery: rg -i 'asset registry' src/ README.md Cargo.toml returned zero hits. The codebase already uses 'asset' and 'asset graph' as the canonical internal terms. Decision 0011's forward-usage rename was effectively complete before this spec began — only the card label and verification audit remain."
+  - "src/asset.rs's module docstring uses 'Asset graph construction and dependency validation' — already correct vocabulary."
+  - "README.md uses 'asset-aware', 'data assets', 'asset-centric design' — already correct."
+  - "CLAUDE.md hits to audit (not modify): line 90 (decisions table row for 0011), line 97 (vocabulary note explaining the change), line 155 (Current Sprint card label naming the rename work). Each is a quotation-form reference; no naked forward usage of 'asset registry' as the current label."
+  - "The only label edit: orbit/cards/0008-asset-registry.yaml line 1, `feature: \"Asset registry\"` → `feature: \"Assets\"`. File slug preserved."
+  - "Rally context: this card is sequenced first; on merge to main, card 0022's rally/arcform-registry branch rebases onto the new tip and inherits the clean terminology."
+
+evaluation_principles:
+  - principle: "Honesty about scope — the spec reflects what the code actually needs, not what the interview imagined"
+    weight: 0.4
+  - principle: "Decision 0011 compliance — forward usage updated, historical artefacts preserved"
+    weight: 0.4
+  - principle: "Traceability preservation — file paths and slugs unchanged"
+    weight: 0.2
+
+exit_conditions:
+  - "ac-01 through ac-06 verified"
+  - "Rename PR opened against main with discovery note"
+  - "Card 0022's rally branch can rebase onto post-rename main without conflict"
+
+metadata:
+  version: "1.0"
+  test_prefix: "rename"
+  timestamp: "2026-04-29T00:00:00Z"
+  ambiguity_score: 0.10
+  interview_ref: "orbit/specs/2026-04-29-assets-rename/interview.md"
