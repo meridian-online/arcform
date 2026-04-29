@@ -5,11 +5,12 @@ started: 2026-04-29T00:00:00Z
 completed: null
 cards:
   - path: orbit/cards/0008-asset-registry.yaml
-    status: implementing
+    status: complete
     spec_dir: orbit/specs/2026-04-29-assets-rename/
     branch: rally/assets-rename
     worktree: main
     parked_constraint: null
+    pr: "https://github.com/meridian-online/arcform/pull/13"
   - path: orbit/cards/0022-registry.yaml
     status: designed
     spec_dir: orbit/specs/2026-04-29-arcform-registry/
