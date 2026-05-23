@@ -1,0 +1,6 @@
+- path: scenarios[0].source_lines
+  value: 'spec.yaml: A step with command: instead of sql: executes the raw command string via shell (sh -c ''<command>'')'
+- path: scenarios[1].source_lines
+  value: 'spec.yaml: The command''s exit code determines step success/failure'
+- path: scenarios[2].source_lines
+  value: 'decisions/0009: command: is the generic escape hatch — any CLI tool, no code changes needed'

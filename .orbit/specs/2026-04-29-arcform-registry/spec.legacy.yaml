@@ -1,0 +1,108 @@
+- path: scope
+  value:
+    in:
+    - src/registry.rs (or src/registry/ sub-module tree) — index, resolver, cache, transport, run orchestration
+    - src/cli.rs — extend Commands with `Registry { ... }` subcommand tree (list, show, fetch, run)
+    - Cargo.toml — add ureq (sync HTTP), tar, flate2, dirs
+    - src/error.rs — registry-specific error variants
+    - Fixture-backed integration tests using a local on-disk index + cache
+    - Module documentation describing architecture, vocabulary, and the sister-work boundary
+    out:
+    - meridian-online/registry GitHub repo (sister work)
+    - brewtrend / gnaf canonical entries (sister work)
+    - Live network smoke tests (sister-work CI)
+    - fred (Investigative pillar) — gated on card 0021
+    - '`arc registry validate <path>` lint subcommand (deferred — design.md open question)'
+    - '`arc registry init` scaffolder (deferred — design.md open question)'
+    - Concurrent-invocation safety beyond atomic-rename loser-takes-correct-value (single-shell typical use; multi-shell not a v1 goal)
+    - Rolling `--latest` resolution (deferred to v1.1 — flag rejected as unimplemented in v1, see ac-02 + ac-06)
+    - Engine-version gating on `min_arcform_version` (field deferred from v1 index schema; reintroduce in a follow-up spec once enforcement semantics are decided)
+- path: constraints
+  value:
+  - 'Single new module: src/registry.rs (or src/registry/ if sub-modules emerge naturally). No edits to runner.rs.'
+  - 'uv-style CLI aesthetic: quiet by default, signal-dense, terse errors, --verbose opens the firehose.'
+  - Index-pinned default version. --version <ref> overrides explicitly. Cache key is the resolved ref, never the alias. `--latest` is reserved (parses, errors as unimplemented in v1) — rolling resolution is deferred (see scope.out).
+  - 'Two-tier ownership from v1: canonical entries have owner=null and resolve unprefixed; contributor entries have owner=<name> and resolve as <owner>/<name>. Canonical names cannot be shadowed by contributors (validated at index parse).'
+  - 'Cache layout — canonical: ~/.arcform/registry/<name>/<resolved-ref>/; contributor: ~/.arcform/registry/<owner>/<name>/<resolved-ref>/. Path resolution via the `dirs` crate; HOME override via $ARCFORM_REGISTRY_CACHE for tests.'
+  - Index URL is configurable via $ARCFORM_REGISTRY_INDEX; default points to the (future) meridian-online/registry raw index URL — but tests never resolve the default.
+  - Transport is a trait. Real impl uses git shell-out (preferred) with HTTPS tarball fallback when git is missing. Tests use a fixture transport that copies from a fixture directory tree. The trait boundary is the only seam tests cross.
+  - 'Index TTL: cached for 1 hour; --refresh forces a fresh fetch on any subcommand. Stale-while-offline is acceptable (carry old index forward if fetch fails).'
+  - Empty pillars render with a `(no entries yet)` placeholder line under the pillar header — preserves discoverability for the v1 Investigative case.
+  - '`arc registry run <name>` resolves and ensures cache, then hands the local manifest path to the existing `runner::run_with_params` — no parallel run path. The registry path does NOT mutate process cwd; it passes the cache path as the dir argument exactly like `cli::run_pipeline` does.'
+  - Errors surface as single-line messages with a suggested next action. Underlying detail (git stderr, HTTP body, parse offset) hides behind --verbose.
+  - No async runtime. ureq is synchronous; transports run on the calling thread.
+  - No tests rely on $HOME, the real network, or a system git binary. The fixture transport satisfies all integration tests.
+  - Backwards compatibility — existing `arc init` and `arc run` behaviour is unchanged. The Registry subcommand is additive.
+  - 'Atomic cache writes: every transport.fetch writes to a sibling temp directory under the cache root and renames atomically into the resolved-ref path on success. On any error during fetch/extract, the temp directory is removed and no `<ref>/` directory exists. The same discipline applies to the production tarball path and the fixture transport. Concurrent invocations may both fetch into separate temp dirs; the rename is racy but loser-takes-correct-value (no corruption, just redundant work).'
+  - 'Tarball-extraction sandboxing: the tarball-fallback path rejects entries whose normalised path escapes the destination, rejects absolute paths, and does not follow symlinks during extraction. This protection ships in the production transport regardless of whether v1 wires up contributor entries — the moment a contributor URL is fetched, the extractor must be safe.'
+  - 'Index timestamp format: `index.yaml.fetched` stores Unix epoch seconds as decimal text on a single line (no trailing newline required). Cross-shell debugging benefits from a stable, timezone-independent format.'
+  - 'Pillar enum forward-compat: unknown pillar string values fail index parsing in v1 (hard reject). Future versions may relax to skip-unknown if needed.'
+- path: ontology_schema
+  value:
+    name: ArcformRegistry
+    description: CLI-side registry plumbing — index, resolution, cache, transport, run orchestration
+    fields:
+    - name: RegistryIndex
+      type: struct
+      description: Top-level index document (version + entries)
+    - name: IndexEntry
+      type: struct
+      description: Single registry entry — name, owner, pillar, version, repo coordinates
+    - name: Pillar
+      type: enum
+      description: Practical | Foundational | Investigative
+    - name: ResolvedEntry
+      type: struct
+      description: Output of resolver — entry plus the resolved ref
+    - name: VersionSpec
+      type: enum
+      description: Pinned(String) | Latest
+    - name: Transport
+      type: trait
+      description: Fetch transport — git/tarball real impl, fixture test impl
+    - name: GitTarballTransport
+      type: struct
+      description: 'Production transport: git shell-out preferred, HTTPS tarball fallback'
+    - name: FixtureTransport
+      type: struct
+      description: 'Test transport: copies from a local fixture directory tree'
+    - name: IndexCache
+      type: struct
+      description: TTL-aware index cache with offline grace
+    - name: cache_root
+      type: function
+      description: Resolves the cache root from $ARCFORM_REGISTRY_CACHE or ~/.arcform/registry/
+    - name: cache_path
+      type: function
+      description: Computes <root>/<name|owner/name>/<ref>/ for a resolved entry
+- path: evaluation_principles
+  value:
+  - principle: Test isolation (no live network, no system git, fixture-backed everywhere)
+    weight: 0.25
+  - principle: Two-tier ownership correctness (canonical/contributor disambiguation, no shadowing)
+    weight: 0.2
+  - principle: uv-aesthetic output discipline (quiet, signal-dense, --verbose firehose)
+    weight: 0.2
+  - principle: Sister-work boundary kept clean (no monorepo coupling, no entry-specific code)
+    weight: 0.2
+  - principle: Backwards compatibility (existing arc init / arc run untouched)
+    weight: 0.15
+- path: exit_conditions
+  value:
+  - All 14 ACs pass verification (ac-01 through ac-13, plus ac-04b)
+  - cargo check clean; clippy clean on the new module
+  - Existing test suite unchanged
+  - Module doc comment surfaces the sister-work boundary
+  - 'Atomic-write contract verified: no test produces a partially-populated cache directory'
+  - Tarball-sandbox guard verified against a hostile fixture archive
+- path: references
+  value:
+  - orbit/cards/0022-registry.yaml
+  - orbit/specs/2026-04-29-arcform-registry/interview.md
+  - orbit/specs/2026-04-29-arcform-registry/design.md
+  - orbit/decisions/0011-pipeline-registry-naming-and-assets-rename.md
+  - orbit/decisions/0012-registry-end-users-first.md
+  - orbit/decisions/0013-hosted-index-on-demand-fetch.md
+  - orbit/decisions/0014-registry-monorepo-git-fetch.md
+  - orbit/decisions/0015-registry-three-pillars.md
+  - orbit/decisions/0016-registry-two-tier-ownership.md

@@ -1,0 +1,8 @@
+- path: scenarios[0].source_lines
+  value: 'spec.yaml: run arc run from /tmp — expect ''arcform.yaml not found in current directory'''
+- path: scenarios[1].source_lines
+  value: 'spec.yaml: arcform.yaml is malformed YAML'
+- path: scenarios[2].source_lines
+  value: 'spec.yaml: a step references a SQL file that doesn''t exist. Each case produces a specific, distinct error message.'
+- path: scenarios[3].source_lines
+  value: 'spec.yaml: A step with both sql: and command: (or neither) is rejected during manifest validation with a clear error message before any steps execute.'

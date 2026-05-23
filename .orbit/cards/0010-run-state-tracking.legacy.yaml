@@ -1,0 +1,10 @@
+- path: scenarios[0].source_lines
+  value: 'design session: ''we need to make it configurable'''
+- path: scenarios[1].source_lines
+  value: 'decisions/0001: the engine understands data lineage, enabling selective re-materialisation'
+- path: scenarios[2].source_lines
+  value: 'decisions/0001: the engine understands data lineage, enabling selective re-materialisation'
+- path: scenarios[3].source_lines
+  value: 'design session: stale upstream makes dependents stale'
+- path: scenarios[4].source_lines
+  value: 'design session: escape hatch for forcing a full rebuild'

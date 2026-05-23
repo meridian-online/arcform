@@ -1,0 +1,8 @@
+- path: scenarios[0].source_lines
+  value: 'spec.yaml: arc run parses arcform.yaml, reads the steps list, and executes each step''s SQL file against the DuckDB CLI in declared order'
+- path: scenarios[1].source_lines
+  value: 'spec.yaml: arc run exits with a non-zero code and clear error message when a SQL step fails. Steps after the failure do not execute.'
+- path: scenarios[2].source_lines
+  value: 'spec.yaml: arc run on a project with an empty steps list exits successfully (code 0) with a message indicating no steps were defined'
+- path: scenarios[3].source_lines
+  value: 'spec.yaml: All steps share the same database file (specified by the db field)'

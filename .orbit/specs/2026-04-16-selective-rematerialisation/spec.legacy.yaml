@@ -1,0 +1,56 @@
+- path: constraints
+  value:
+  - StateBackend is a trait — DuckDbStateBackend is the first implementation
+  - DuckDbStateBackend uses the `duckdb` crate (duckdb-rs) for in-process access to state tables
+  - DuckDB connection is opened/closed around state operations — not held during step execution (avoids file locking with CLI-based step execution)
+  - SQL staleness uses SHA-256 content hash of the SQL file contents (raw bytes, no normalisation)
+  - 'Downstream propagation: stale upstream step → all downstream steps are stale (via asset graph)'
+  - Downstream propagation follows the asset graph only — opaque steps (no declared assets) do not participate in propagation chains
+  - Failed steps are always stale — re-run on next invocation
+  - Command steps always re-run — no staleness signal without preconditions (deferred to future card)
+  - 'Two DuckDB metadata tables: _arcform_state (per-step state) and _arcform_runs (per-run history)'
+  - --force flag overrides all staleness — every step executes AND records new state afterward
+  - State backend must not block execution on first run (no prior state = all steps stale)
+  - 'Runner signature changes: run(dir, engine, state, force) — state backend and force flag threaded from CLI'
+  - Steps should be idempotent — crash recovery limitation acknowledged (state recorded after step execution, not atomically)
+  - State tables co-located in the project's database file (manifest db_path)
+  - 'New crate dependencies: `duckdb` (state backend), `sha2` (content hashing)'
+- path: ontology_schema
+  value:
+    name: RunState
+    description: Per-step execution state for staleness detection
+    fields:
+    - name: step_name
+      type: TEXT PRIMARY KEY
+      description: Unique step name from the manifest
+    - name: sql_hash
+      type: TEXT NOT NULL
+      description: SHA-256 hex digest of the SQL file contents (empty string for command steps)
+    - name: last_run_at
+      type: TIMESTAMP NOT NULL
+      description: When this step last executed
+    - name: status
+      type: TEXT NOT NULL
+      description: 'Result of last execution: ''success'' or ''failed'''
+- path: evaluation_principles
+  value:
+  - principle: Correctness — stale steps always re-run, fresh steps always skip
+    weight: 0.4
+  - principle: Backwards compatibility — existing tests and behaviour preserved
+    weight: 0.3
+  - principle: Extensibility — trait-based backend enables future implementations
+    weight: 0.2
+  - principle: Observability — user can see which steps were skipped and why
+    weight: 0.1
+- path: exit_conditions
+  value:
+  - All 15 ACs verified by tests
+  - cargo test passes with zero failures
+  - A pipeline run twice without changes skips all SQL steps on second run
+- path: metadata
+  value:
+    version: '2.0'
+    timestamp: 2026-04-16T13:00:00Z
+    ambiguity_score: 0.08
+    interview_ref: specs/2026-04-16-selective-rematerialisation/interview.md
+    review_ref: specs/2026-04-16-selective-rematerialisation/review-spec-2026-04-16.md

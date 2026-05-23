@@ -1,0 +1,45 @@
+- path: constraints
+  value:
+  - SQL passthrough preserved — SQL files are never read, modified, or templated by Arcform (decision 0003)
+  - String-only param values — DuckDB getenv() returns VARCHAR; no false type safety
+  - ARC_PARAM_ prefix on all injected env vars — prevents collision with system env vars
+  - Param values do not affect SQL staleness — runtime context, not pipeline definition
+  - Output capture is mutually exclusive with real-time streaming per step
+  - SQL steps cannot declare an output field — validated at manifest load
+  - Backwards compatible — existing manifests without params/dotenv work identically
+  - Child processes inherit parent environment — Command::envs() adds ARC_PARAM_ vars without clearing inherited vars; no env_clear() anywhere in the pipeline
+  - Empty captured stdout sets env var to empty string (not omitted) — DuckDB getenv() returns empty string vs NULL for missing vars
+- path: ontology_schema
+  value:
+    name: PipelineParameterisation
+    description: Runtime parameter system for Arcform pipelines
+    fields:
+    - name: Param
+      type: struct
+      description: A declared pipeline parameter with optional default value
+    - name: resolve_params
+      type: function
+      description: Merges dotenv, manifest defaults, and CLI params into a single env map with ARC_PARAM_ prefix
+    - name: StepOutput.stdout
+      type: Option<String>
+      description: Captured stdout from a command step when output field is set
+- path: evaluation_principles
+  value:
+  - principle: SQL passthrough preservation
+    weight: 0.4
+  - principle: Precedence correctness (CLI > dotenv > defaults)
+    weight: 0.3
+  - principle: Backwards compatibility
+    weight: 0.3
+- path: exit_conditions
+  value:
+  - All 10 ACs pass verification
+  - Existing test suite passes without modification
+  - cargo check --all-targets succeeds (no compilation errors in non-test code)
+- path: metadata
+  value:
+    version: '1.0'
+    test_prefix: param
+    timestamp: 2026-04-20T10:20:00+10:00
+    ambiguity_score: 0.07
+    interview_ref: orbit/specs/2026-04-20-pipeline-parameterisation/interview.md

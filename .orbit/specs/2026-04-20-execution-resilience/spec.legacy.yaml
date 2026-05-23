@@ -1,0 +1,52 @@
+- path: constraints
+  value:
+  - Preconditions evaluate once before the first attempt — freshness gate, not readiness probe
+  - Pipeline timeout clamps step timeout — no step can outlive the pipeline
+  - State records only final outcome per step, not per-attempt rows
+  - No exit code filtering in v1 — retry on any non-zero exit code
+  - Retry and timeout interact independently — a timed-out step counts as a failed attempt
+  - Backwards compatible — manifests without retry/timeout/defaults work identically
+  - Step-level retry overrides defaults wholesale (no field-merging)
+  - Pipeline timeout checks fire before step execution, not during skipped steps
+  - 'Backoff formula: backoff_sec * 2^(attempt-1) — no jitter (local-first, no thundering herd)'
+  - Timeout for capture_stdout steps applies to the wait after stdout drain — no non-blocking I/O in v1. If the child blocks on stdout, the timeout fires after the read completes.
+  - finish_run trait change is acceptable for v0.1 (no external consumers) — uses usize parameter, not a struct
+- path: ontology_schema
+  value:
+    name: ExecutionResilience
+    description: Retry and timeout system for Arcform pipeline steps
+    fields:
+    - name: RetryPolicy
+      type: struct
+      description: A retry policy with max attempts and exponential backoff
+    - name: Defaults
+      type: struct
+      description: Manifest-level defaults inheritable by steps
+    - name: wait_with_timeout
+      type: function
+      description: Polls child process with deadline, kills on timeout
+    - name: backoff_duration
+      type: function
+      description: 'Pure function: computes Duration from RetryPolicy + attempt number'
+- path: evaluation_principles
+  value:
+  - principle: Backwards compatibility
+    weight: 0.3
+  - principle: Retry correctness (attempt counting, backoff timing)
+    weight: 0.3
+  - principle: Timeout reliability (kill on deadline, pipeline clamp)
+    weight: 0.25
+  - principle: Clean Engine trait extension (builds on 0016's env param)
+    weight: 0.15
+- path: exit_conditions
+  value:
+  - All 11 ACs pass verification
+  - Existing test suite passes without modification
+  - cargo check --all-targets succeeds
+- path: metadata
+  value:
+    version: '1.1'
+    test_prefix: res
+    timestamp: 2026-04-20T12:30:00+10:00
+    ambiguity_score: 0.08
+    interview_ref: orbit/specs/2026-04-20-execution-resilience/interview.md

@@ -1,0 +1,4 @@
+- path: scenarios[0].source_lines
+  value: 'spec.yaml: SQL files are passed to the DuckDB CLI unmodified — arc does not template, transform, or inject anything into the SQL content.'
+- path: scenarios[1].source_lines
+  value: 'interview.md: Templating is a minefield — Jinja is intense, SQLMesh steered away from it'

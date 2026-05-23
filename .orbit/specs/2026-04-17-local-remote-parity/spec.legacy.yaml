@@ -1,0 +1,39 @@
+- path: constraints
+  value:
+  - Use dtolnay's `semver` crate for version parsing and comparison — no custom semver implementation
+  - engine_version is optional — omitting it skips the check (backwards compatible with all existing manifests)
+  - Engine::preflight() returns EngineInfo (detection) — runner does the comparison (policy). Separation of concerns.
+  - 'Parse duckdb --version output format: ''v1.5.2 (Variegata) 8a5851971f'' → extract semver ''1.5.2''. Graceful degradation if unparseable.'
+  - All existing tests must pass — preflight() return type change touches every caller
+  - Portability is a design principle, not a code feature — no local-only features are introduced
+- path: ontology_schema
+  value:
+    name: EngineInfo
+    description: Information about the detected engine, returned by preflight
+    fields:
+    - name: version
+      type: Option<semver::Version>
+      description: Parsed semantic version of the installed engine CLI, or None if version output was unparseable
+- path: evaluation_principles
+  value:
+  - principle: Correctness — version mismatches are caught before any step executes
+    weight: 0.4
+  - principle: Backwards compatibility — existing manifests without engine_version work unchanged
+    weight: 0.3
+  - principle: Clarity — error messages are actionable, showing both required and found versions
+    weight: 0.2
+  - principle: Simplicity — uses established semver crate, no custom parsing beyond CLI output extraction
+    weight: 0.1
+- path: exit_conditions
+  value:
+  - All 12 code ACs verified by tests
+  - cargo test passes with zero failures
+  - Version mismatch error contains both constraint and detected version
+  - Existing manifests without engine_version continue to work
+- path: metadata
+  value:
+    version: '1.0'
+    test_prefix: lrp
+    timestamp: 2026-04-17T10:30:00Z
+    ambiguity_score: 0.07
+    interview_ref: specs/2026-04-17-local-remote-parity/interview.md
