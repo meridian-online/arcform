@@ -19,11 +19,11 @@ Delivery: rally coordinating two cards — card 0008 (assets rename) sequenced f
 
 ## Decision register
 
-16 decisions in `orbit/decisions/` (MADR format). Browse: `ls orbit/decisions/`. Vocabulary note (decision 0011): forward usage refers to **assets** (not "asset registry") for within-pipeline data declarations, freeing **registry** for the user-facing pipeline catalogue.
+16 decisions in `.orbit/decisions/` (MADR format). Browse: `ls .orbit/decisions/`. Vocabulary note (decision 0011): forward usage refers to **assets** (not "asset registry") for within-pipeline data declarations, freeing **registry** for the user-facing pipeline catalogue.
 
 ## Card roadmap
 
-22 cards in `orbit/cards/`. Shipped/active through 0017; planned from 0018 onward.
+22 cards in `.orbit/cards/`. Shipped/active through 0017; planned from 0018 onward.
 
 - **Shipped:** 0001–0011, 0014–0017 (scaffolding, step execution, manifest validation, preflight, SQL passthrough, shell commands, progress feedback, assets, SQL introspection, run state, local-remote parity, step preconditions, execution resilience, parameterisation, lifecycle hooks)
 - **Sprint focus:** 0022 (registry)
@@ -37,3 +37,9 @@ Delivery: rally coordinating two cards — card 0008 (assets rename) sequenced f
 ## Tier-2 references — load on demand
 
 **Before modifying the runner, manifest parser, SQL introspection, or asset dependency graph:** Read `docs/ARCHITECTURE.md`.
+
+
+@.orbit/METHOD.md
+
+
+@.orbit/STYLE.md
