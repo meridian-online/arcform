@@ -1,3 +1,4 @@
+id: 0015-execution-resilience
 feature: Execution resilience
 as_a: data analyst running pipelines against flaky APIs and long-running queries
 i_want: steps to retry on transient failure and abort on timeout instead of hanging forever

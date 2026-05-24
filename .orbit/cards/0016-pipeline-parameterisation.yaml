@@ -1,3 +1,4 @@
+id: 0016-pipeline-parameterisation
 feature: Pipeline parameterisation
 as_a: data analyst running the same pipeline for different date ranges, environments, or dynamic inputs
 i_want: to pass parameters at runtime and capture step outputs so values flow through the pipeline

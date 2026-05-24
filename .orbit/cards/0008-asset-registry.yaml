@@ -1,3 +1,4 @@
+id: 0008-asset-registry
 feature: Assets
 as_a: data analyst
 i_want: declare the data assets my pipeline produces and their dependencies

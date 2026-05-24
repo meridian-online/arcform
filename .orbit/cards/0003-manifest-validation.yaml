@@ -1,3 +1,4 @@
+id: 0003-manifest-validation
 feature: Manifest validation
 as_a: data analyst
 i_want: get clear, specific error messages when my manifest is invalid

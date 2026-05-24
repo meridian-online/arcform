@@ -1,3 +1,4 @@
+id: 0019-typed-step-executors
 feature: Typed step executors
 as_a: data analyst integrating cloud storage, APIs, and data transforms in my pipeline
 i_want: first-class step types for common operations (HTTP, S3, jq, rclone) with structured config instead of raw shell commands

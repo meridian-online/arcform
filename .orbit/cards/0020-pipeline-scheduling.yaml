@@ -1,3 +1,4 @@
+id: 0020-pipeline-scheduling
 feature: Pipeline scheduling
 as_a: data analyst deploying pipelines to production
 i_want: to declare a schedule in my manifest so the pipeline runs automatically on a cron cadence

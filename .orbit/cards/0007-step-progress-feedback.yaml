@@ -1,3 +1,4 @@
+id: 0007-step-progress-feedback
 feature: Step progress feedback
 as_a: analyst running arcform
 i_want: see which step is running and its output as it happens, and know whether steps succeeded or failed without waiting for the end

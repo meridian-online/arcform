@@ -1,3 +1,4 @@
+id: 0006-shell-command-steps
 feature: Shell command steps
 as_a: data analyst
 i_want: run arbitrary shell commands as pipeline steps alongside SQL steps

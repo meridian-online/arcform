@@ -1,3 +1,4 @@
+id: 0017-lifecycle-hooks
 feature: Lifecycle hooks
 as_a: data analyst deploying pipelines that need setup and cleanup
 i_want: to declare handlers that run on pipeline success, failure, or exit

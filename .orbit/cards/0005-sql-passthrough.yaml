@@ -1,3 +1,4 @@
+id: 0005-sql-passthrough
 feature: SQL passthrough
 as_a: data analyst
 i_want: my SQL files to be passed to the engine completely unmodified

@@ -1,3 +1,4 @@
+id: 0001-project-scaffolding
 feature: Project scaffolding
 as_a: data analyst starting a new pipeline
 i_want: run `arc init` and get a valid project structure with manifest and directories

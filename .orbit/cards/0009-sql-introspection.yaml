@@ -1,3 +1,4 @@
+id: 0009-sql-introspection
 feature: SQL introspection
 as_a: data analyst writing SQL pipelines
 i_want: arc to automatically understand which tables my SQL reads and writes

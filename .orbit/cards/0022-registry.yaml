@@ -1,3 +1,4 @@
+id: 0022-registry
 feature: Registry
 as_a: an analyst or operator who wants working ArcForm pipelines that produce real value
 i_want: to discover, fetch, and run curated pipelines from a hosted catalogue without building them from scratch

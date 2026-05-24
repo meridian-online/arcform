@@ -1,3 +1,4 @@
+id: 0004-engine-preflight
 feature: Engine preflight
 as_a: data analyst
 i_want: arc to verify the engine CLI is available before running any steps

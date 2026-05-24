@@ -1,3 +1,4 @@
+id: 0014-step-preconditions
 feature: Step preconditions
 as_a: data analyst with command steps in my pipeline
 i_want: to declare freshness checks on steps so arc can skip them when conditions are met

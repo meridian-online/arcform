@@ -1,3 +1,4 @@
+id: 0011-local-remote-parity
 feature: Local-remote parity
 as_a: data analyst deploying pipelines to production
 i_want: the same manifest to run identically on my laptop and in a remote environment

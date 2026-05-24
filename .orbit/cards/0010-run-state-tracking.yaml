@@ -1,3 +1,4 @@
+id: 0010-run-state-tracking
 feature: Run state tracking
 as_a: data analyst iterating on a pipeline
 i_want: arc to track execution state so it can skip fresh steps and detect stale assets

@@ -1,3 +1,4 @@
+id: 0013-lineage-visualisation
 feature: Lineage visualisation
 as_a: data analyst
 i_want: view my pipeline's data dependency graph from the CLI

@@ -1,3 +1,4 @@
+id: 0002-step-execution
 feature: Step execution
 as_a: data analyst
 i_want: define a sequence of SQL and shell steps in a YAML manifest and have them execute in order against my database
