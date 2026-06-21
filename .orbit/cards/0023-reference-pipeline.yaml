@@ -1,0 +1,50 @@
+id: 0023-reference-pipeline
+feature: Reference pipeline
+as_a: a data analyst evaluating ArcForm, or a contributor validating changes
+i_want: one realistic, hand-built example pipeline shipped in the repo that I can run and study
+so_that: I learn ArcForm from a working example, the test suite exercises a real end-to-end workflow, and the project has its first piece of genuine catalogue-worthy content
+goal: >-
+  Ship brewtrend as a complete, runnable example under examples/ — fetch → load →
+  transform → analyse → export — exercising the major capabilities already built
+  (SQL, command steps, preconditions, params, dependencies, resilience). It ships a
+  datapackage.json describing its outputs (dogfooding decision 0017) and doubles as
+  an integration-test fixture. This is milestone M1: the first real entry, which the
+  catalogue (card 0022) later distributes. Content before distribution.
+maturity: emerging
+scenarios:
+- name: Brewtrend runs end-to-end locally
+  given: the examples/brewtrend/ project in the repo
+  when: I run `arc run` in that directory
+  then: the pipeline fetches Homebrew analytics, loads into DuckDB, computes trending packages, and exports a result — producing real output on a clean machine
+  gate: false
+- name: Exercises multiple capabilities, not stubs
+  given: the brewtrend manifest
+  when: I read it
+  then: it uses both SQL and command steps, declares dependencies, and uses at least one precondition and one runtime parameter — demonstrating shipped features in a realistic combination
+  gate: false
+- name: Ships a Data Package describing its outputs
+  given: a completed brewtrend run
+  when: I look at what it produced
+  then: the entry includes a datapackage.json describing the output table(s) — schema, types, provenance — per decision 0017, so the pipeline is self-describing
+  gate: false
+- name: Doubles as an integration fixture
+  given: the test suite
+  when: it runs against examples/brewtrend (on a host where DuckDB links)
+  then: it validates real end-to-end execution against a real manifest, not synthetic YAML
+  gate: false
+- name: arc init points to the example
+  given: a new user who just ran `arc init`
+  when: they look at the generated project
+  then: the scaffold references examples/ for realistic patterns to learn from
+  gate: false
+specs: []
+relations:
+- 0022-registry
+- 0017-datapackage-data-description-standard
+references:
+- .orbit/decisions/0017-datapackage-data-description-standard.md
+- .orbit/cards/0022-registry.yaml
+- /home/hugh/reference/brewtrend/ — Practical pillar exemplar source
+notes:
+- "Milestone M1 of the catalogue path. M0 = decision 0017 (Data Package as data-description standard). M1 = this card (one real pipeline). M2 = 3-5 pipelines + settled entry convention. M3 = fetch+run distribution (card 0022 scaffolding). M4 = read-only web catalogue. M5 = contribution flywheel (decision 0016)."
+- "Reclaims the original reference-pipelines intent that card 0022 absorbed before it was rescoped to the registry. Distribution and catalogue UI are explicitly out of scope here — this card only ships runnable content."

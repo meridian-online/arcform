@@ -3,7 +3,7 @@ feature: Registry
 as_a: an analyst or operator who wants working ArcForm pipelines that produce real value
 i_want: to discover, fetch, and run curated pipelines from a hosted catalogue without building them from scratch
 so_that: I get immediate analytical value from ArcForm, learn realistic patterns by example, and can demonstrate the local-then-schedule narrative on my own machine
-goal: Ship an end-users-first registry of working ArcForm pipelines, organised across three pillars, distributed via hosted monorepo + on-demand fetch. v1 ships brewtrend (Practical) + gnaf (Foundational); fred (Investigative) deferred to a follow-up spec gated on card 0021 (secrets management). Architecture supports two-tier ownership (canonical + contributor) from day one.
+goal: Ship an end-users-first registry of working ArcForm pipelines, organised across three pillars, distributed via hosted monorepo + on-demand fetch. v1 ships brewtrend (Practical) + gnaf (Foundational); fred (Investigative) deferred to a follow-up spec gated on card 0021 (secrets management). Architecture supports two-tier ownership (canonical + contributor) from day one. RESEQUENCED (2026-06-21) — the CLI/index/transport scaffolding is built (PR #14), but the catalogue is the *distribution* layer and now follows *content*: real entries must exist first (card 0023, milestone M1) and the entry convention must settle (M2) before fetch+run distribution (M3) earns its keep. This card is the M3+ phase; its production transport stays unimplemented until then.
 maturity: emerging
 scenarios:
 - name: Browse the registry
@@ -55,7 +55,9 @@ specs:
 - 2026-04-29-arcform-registry/interview.md
 - 2026-04-29-arcform-registry/design.md
 - orbit/specs/2026-04-29-arcform-registry/spec.yaml
-relations: []
+relations:
+- 0023-reference-pipeline
+- 0017-datapackage-data-description-standard
 references:
 - /home/hugh/github/meridian-online/arcform/orbit/specs/2026-04-29-arcform-registry/interview.md
 - /home/hugh/github/meridian-online/arcform/orbit/decisions/0011-pipeline-registry-naming-and-assets-rename.md
@@ -67,4 +69,7 @@ references:
 - /home/hugh/reference/brewtrend/ — Practical pillar exemplar source
 - /home/hugh/reference/gnaf/ — Foundational pillar exemplar inputs
 - https://fred.stlouisfed.org/ — Investigative pillar exemplar source
-notes: []
+notes:
+- "Catalogue path milestones: M0 = decision 0017 (Data Package as data-description standard); M1 = card 0023 (one real pipeline, brewtrend under examples/); M2 = 3-5 pipelines + settled 'what is an entry' convention; M3 = fetch+run distribution (this card's merged scaffolding, transport finished); M4 = read-only web catalogue (reuse finetype's types-registry pattern); M5 = contribution flywheel (decision 0016)."
+- "Open forks before resuming M3+: (1) does `arc registry` survive as a CLI or does the catalogue go web-first with `arc run <fetched>`? (2) Pillar enum (closed, 3 buckets, decision 0015) vs HuggingFace-style free-form tags once contribution opens. (3) where the catalogue lives and who curates."
+- "A registry entry is a *pipeline* (yaml+sql), not a Data Package. Per decision 0017 an entry MAY ship a datapackage.json describing its IO so the catalogue can render its schema — but the Data Package describes data, it does not execute."
