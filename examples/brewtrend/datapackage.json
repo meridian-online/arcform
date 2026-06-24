@@ -1,0 +1,37 @@
+{
+  "$schema": "https://datapackage.org/profiles/2.0/datapackage.json",
+  "name": "brewtrend",
+  "title": "Homebrew install trends",
+  "description": "Trending Homebrew packages ranked by recent install volume and 30-day-vs-90-day momentum. Produced by the brewtrend arcform pipeline from formulae.brew.sh analytics.",
+  "version": "0.1.0",
+  "licenses": [
+    { "name": "CC-BY-4.0", "title": "Creative Commons Attribution 4.0" }
+  ],
+  "sources": [
+    { "title": "Homebrew Formulae & Cask analytics", "path": "https://formulae.brew.sh/api/" }
+  ],
+  "resources": [
+    {
+      "name": "ranking",
+      "path": "data/ranking.parquet",
+      "type": "table",
+      "format": "parquet",
+      "mediatype": "application/vnd.apache.parquet",
+      "description": "One row per ranked package. Lower rank = stronger combined trend + volume signal.",
+      "schema": {
+        "fields": [
+          { "name": "rank", "type": "integer", "description": "1-based rank; lower is more trending." },
+          { "name": "category", "type": "string", "description": "Package kind: 'cask' or 'formula'.", "constraints": { "enum": ["cask", "formula"] } },
+          { "name": "name", "type": "string", "description": "Package token / formula name." },
+          { "name": "installs_30d", "type": "integer", "description": "Installs in the trailing 30 days." },
+          { "name": "trend_index", "type": "number", "description": "Momentum: mean daily installs over the prior 60 days relative to the last 30 days. 0 below the trend threshold." },
+          { "name": "description", "type": "string", "description": "Upstream package description." },
+          { "name": "homepage", "type": "string", "format": "uri", "description": "Package homepage URL." }
+        ],
+        "primaryKey": ["category", "name"]
+      }
+    }
+  ],
+  "x-arcform-pipeline": "arcform.yaml",
+  "x-arcform-note": "This descriptor describes the pipeline's OUTPUT data (decision 0017). It is not the runnable artifact — `arc run` executes arcform.yaml."
+}

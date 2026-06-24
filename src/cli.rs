@@ -124,6 +124,9 @@ pub fn init_at(name: &str, base: &std::path::Path) -> Result<()> {
     println!("  arcform.yaml");
     println!("  models/");
     println!("  sources/");
+    println!();
+    println!("For a complete, runnable example — SQL + command steps, preconditions,");
+    println!("retries, and parameters — see examples/brewtrend in the arcform repo.");
 
     Ok(())
 }

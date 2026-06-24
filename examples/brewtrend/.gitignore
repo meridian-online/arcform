@@ -1,0 +1,4 @@
+# Fetched inputs, the DuckDB database, and generated outputs are not checked in.
+data/
+trends.db
+trends.db.wal

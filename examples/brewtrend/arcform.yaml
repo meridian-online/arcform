@@ -1,0 +1,75 @@
+name: brewtrend
+engine: duckdb
+engine_version: ">=1.2"
+db: trends.db
+
+# Runtime parameter — override with: arc run --param trend_threshold=25
+# Minimum 30-day installs for a package to be ranked. Read in trending.sql via
+# getenv('ARC_PARAM_TREND_THRESHOLD').
+params:
+  trend_threshold:
+    default: "10"
+
+# Transient API timeouts shouldn't sink the whole run — retry fetches with
+# exponential backoff (1st retry +2s, 2nd +4s). Applied to every step that
+# doesn't override it.
+defaults:
+  retry:
+    max_attempts: 3
+    backoff_sec: 2.0
+
+steps:
+  # --- Fetch: Homebrew analytics + catalogue (cached 24h via preconditions) ---
+  - name: fetch_cask_catalogue
+    command: "mkdir -p data/cask && curl -fsSL https://formulae.brew.sh/api/cask.json -o data/cask/cask.json"
+    produces: [cask_json]
+    preconditions:
+      - modified_after: { path: data/cask/cask.json, period: 24h }
+
+  - name: fetch_formula_catalogue
+    command: "mkdir -p data/formula && curl -fsSL https://formulae.brew.sh/api/formula.json -o data/formula/formula.json"
+    produces: [formula_json]
+    preconditions:
+      - modified_after: { path: data/formula/formula.json, period: 24h }
+
+  - name: fetch_cask_30d
+    command: "mkdir -p data/cask && curl -fsSL https://formulae.brew.sh/api/analytics/cask-install/homebrew-cask/30d.json -o data/cask/30d.json"
+    produces: [cask_30d]
+    preconditions:
+      - modified_after: { path: data/cask/30d.json, period: 24h }
+
+  - name: fetch_cask_90d
+    command: "mkdir -p data/cask && curl -fsSL https://formulae.brew.sh/api/analytics/cask-install/homebrew-cask/90d.json -o data/cask/90d.json"
+    produces: [cask_90d]
+    preconditions:
+      - modified_after: { path: data/cask/90d.json, period: 24h }
+
+  - name: fetch_formula_30d
+    command: "mkdir -p data/formula && curl -fsSL https://formulae.brew.sh/api/analytics/install-on-request/homebrew-core/30d.json -o data/formula/30d.json"
+    produces: [formula_30d]
+    preconditions:
+      - modified_after: { path: data/formula/30d.json, period: 24h }
+
+  - name: fetch_formula_90d
+    command: "mkdir -p data/formula && curl -fsSL https://formulae.brew.sh/api/analytics/install-on-request/homebrew-core/90d.json -o data/formula/90d.json"
+    produces: [formula_90d]
+    preconditions:
+      - modified_after: { path: data/formula/90d.json, period: 24h }
+
+  # --- Load: raw JSON → DuckDB tables (depends on all six fetches) ---
+  - name: load
+    sql: models/load_data.sql
+    depends_on: [cask_json, formula_json, cask_30d, cask_90d, formula_30d, formula_90d]
+
+  # --- Transform: compute trend metrics (reads trend_threshold param) ---
+  - name: trending
+    sql: models/trending.sql
+
+  # --- Analyse + export: final ranking → data/ranking.parquet ---
+  - name: rank
+    sql: models/full_ranking.sql
+
+  # --- Report: print the top 20 to the terminal (depends on the ranking table) ---
+  - name: show_top20
+    command: 'duckdb trends.db -markdown -c "SELECT rank, category, name, installs_30d, ROUND(trend_index, 3) AS trend FROM ranking ORDER BY rank LIMIT 20"'
+    depends_on: [ranking]
