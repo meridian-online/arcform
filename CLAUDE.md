@@ -22,11 +22,11 @@ Catalogue path beyond M1: M2 (3–5 pipelines + settled entry convention) → M3
 
 ## Decision register
 
-17 decisions in `.orbit/decisions/` (MADR format). Browse: `ls .orbit/decisions/`. Vocabulary note (decision 0011): forward usage refers to **assets** (not "asset registry") for within-pipeline data declarations, freeing **registry** for the user-facing pipeline catalogue. Data standard (decision 0017): meridian describes data via Frictionless Data Package — a description format, not an execution format.
+Decisions live in a private planning repo: full MADR decision records plus one-line summaries. Vocabulary note (decision 0011): forward usage refers to **assets** (not "asset registry") for within-pipeline data declarations, freeing **registry** for the user-facing pipeline catalogue. Data standard (decision 0017): meridian describes data via Frictionless Data Package — a description format, not an execution format.
 
 ## Card roadmap
 
-23 cards in `.orbit/cards/`. Shipped/active through 0017; planned from 0018 onward.
+The engine roadmap lives in a private planning repo: arcform's own build track plus a Meridian-wide coordinating view. Shipped/active through 0017; planned from 0018 onward.
 
 - **Shipped:** 0001–0011, 0014–0017 (scaffolding, step execution, manifest validation, preflight, SQL passthrough, shell commands, progress feedback, assets, SQL introspection, run state, local-remote parity, step preconditions, execution resilience, parameterisation, lifecycle hooks)
 - **Sprint focus:** 0023 (reference pipeline — M1) on decision 0017 (M0)
@@ -42,8 +42,6 @@ Catalogue path beyond M1: M2 (3–5 pipelines + settled entry convention) → M3
 
 **Before modifying the runner, manifest parser, SQL introspection, or asset dependency graph:** Read `docs/ARCHITECTURE.md`.
 
+## Prose style — how to talk to the author
 
-@.orbit/METHOD.md
-
-
-@.orbit/STYLE.md
+British English. Direct, warm, never chatty. Lead with the answer or the recommendation — don't restate the question, apologise, or bury the lede behind context. Recommendations are imperative and singular ("Run X on Y"), not a menu; if two paths genuinely matter, lay them out *and* pick one. Keep it short: name any load-bearing assumption inline rather than sanding the call into mush, and keep detail available on request instead of dumping it. Use plain words a peer outside the project would understand; define a term of art the first time you reach for it. No corporate hedging, no stacked qualifiers, no apologetic preambles.

@@ -1,8 +1,0 @@
-- path: scenarios[0].source_lines
-  value: 'decisions/0007: parse SQL to extract table references — Tables read (FROM, JOIN clauses)'
-- path: scenarios[1].source_lines
-  value: 'decisions/0007: Tables written (CREATE TABLE, INSERT INTO, COPY TO)'
-- path: scenarios[2].source_lines
-  value: 'decisions/0007: Users can override with explicit depends_on for edge cases (dynamic SQL, indirect dependencies)'
-- path: scenarios[3].source_lines
-  value: 'decisions/0007: CTE definitions'

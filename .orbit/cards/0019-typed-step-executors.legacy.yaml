@@ -1,8 +1,0 @@
-- path: scenarios[0].source_lines
-  value: internal/runtime/builtin/ — 18 built-in executors including http
-- path: scenarios[1].source_lines
-  value: internal/runtime/builtin/ — s3 executor
-- path: scenarios[2].source_lines
-  value: internal/runtime/builtin/ — jq executor
-- path: scenarios[3].source_lines
-  value: 'internal/core/spec/step.go: ExecutorConfig — Type-specific configuration object'

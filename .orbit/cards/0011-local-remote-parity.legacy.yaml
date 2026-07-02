@@ -1,6 +1,0 @@
-- path: scenarios[0].source_lines
-  value: 'decisions/0006: what runs locally also works remotely'
-- path: scenarios[1].source_lines
-  value: 'decisions/0006: Preflight version assertions (verify engine version matches before execution)'
-- path: scenarios[2].source_lines
-  value: 'decisions/0006: No local-only features — everything in the manifest is portable'

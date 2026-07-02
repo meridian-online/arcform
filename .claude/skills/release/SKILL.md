@@ -2,7 +2,7 @@
 description: >-
   Release arcform — roll the CHANGELOG, bump the crate version, tag, and publish a GitHub
   release. The changelog is the centre of gravity: each release moves `[Unreleased]` into a
-  dated version section compiled from orbit cards/decisions + git log. Network + git push, so
+  dated version section compiled from the conventional-commit git log. Network + git push, so
   run the pre-flight checks first and stop on any failure.
 when_to_use: >-
   User says "release", "ship", "cut a release", "tag a version", or "update the changelog for
@@ -25,9 +25,9 @@ and don't shortcut them.
 Pre-1.0, so the rules are looser than SemVer-proper but still deliberate:
 
 - **patch** (`0.1.x`) — bug fixes, docs, internal changes with no new surface.
-- **minor** (`0.x.0`) — new capabilities: a shipped card, a new CLI command/flag, a new manifest
-  field. This is the common case while the engine is growing. **Default to minor when a card
-  shipped since the last release.**
+- **minor** (`0.x.0`) — new capabilities: a `feat:` commit, a new CLI command/flag, a new manifest
+  field. This is the common case while the engine is growing. **Default to minor when a `feat:`
+  commit landed since the last release.**
 - **major** (`x.0.0`) — reserved. Don't cut a 1.0 without an explicit decision.
 
 If the user passed an argument (`patch` / `minor` / `major` / an explicit `X.Y.Z`), use it.
@@ -37,7 +37,7 @@ summary.
 ## Usage
 
 ```
-/release            # infer the bump from cards/commits since the last tag
+/release            # infer the bump from the commits since the last tag
 /release minor      # force a minor bump
 /release 0.2.0      # set an explicit version
 ```
@@ -85,14 +85,31 @@ arcform follows [Keep a Changelog](https://keepachangelog.com/). The top of the 
 an `[Unreleased]` section; a release converts it into a dated version heading and starts a fresh
 `[Unreleased]`.
 
-**Compile the entries** for everything since the last release from three sources — they
-complement each other:
+**Compile the entries** for everything since the last release from the git log. arcform follows
+[Conventional Commits](https://www.conventionalcommits.org/), so the commit history is the single
+source of truth — the skill needs no external substrate to read.
 
-1. **Commits** — `git log $(git describe --tags --abbrev=0 2>/dev/null || git rev-list --max-parents=0 HEAD)..HEAD --oneline`
-2. **Cards shipped** — scan `.orbit/cards/` for cards whose `maturity` advanced since the last
-   release (these are the user-facing capabilities; one changelog line each, linking the card id).
-3. **Decisions made** — scan `.orbit/decisions/` for MADR files dated since the last release
-   (architectural choices worth a line under `Changed` or a short note).
+1. **List the commits since the last release** (subject lines only):
+   ```bash
+   git log $(git describe --tags --abbrev=0 2>/dev/null || git rev-list --max-parents=0 HEAD)..HEAD \
+     --no-merges --pretty=format:'%s'
+   ```
+   No tags yet on a fresh repo → the `git rev-list --max-parents=0 HEAD` fallback walks from the
+   root commit, so the first release covers the whole history.
+
+2. **Sort each commit by its conventional-commit type** into Keep a Changelog categories:
+
+   | Commit prefix                          | Changelog section        | Notes                                          |
+   |----------------------------------------|--------------------------|------------------------------------------------|
+   | `feat:`                                | **Added**                | New capability, CLI command/flag, or manifest field. |
+   | `fix:`                                 | **Fixed**                | A bug fix the user can feel.                    |
+   | `feat!:` / `BREAKING CHANGE:` footer   | **Changed** or **Removed** | Behaviour change or a removed/renamed surface. |
+   | `refactor:` / `perf:` / `docs:` / `chore:` / `test:` / `build:` / `ci:` | *usually omit* | Internal — fold into one line only if user-visible. |
+
+   Commits already cite the card or decision that drove them in parentheses (e.g. `feat: lifecycle
+   hooks — init, success, failure, exit handlers (card 0017)`) — carry that citation straight into
+   the changelog line. For the fuller rationale behind a change, the roadmap and decision records
+   live in the team's private planning repo (MADR decision records + roadmap).
 
 **Write for users, not for the commit log.** Each entry is a user-visible change — a new
 command/flag, a manifest field, a behaviour change, a fix. Fold internal refactors into one line

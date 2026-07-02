@@ -1,6 +1,0 @@
-- path: scenarios[0].source_lines
-  value: 'spec.yaml: arc init creates a project directory with: arcform.yaml, models/ directory, and sources/ directory'
-- path: scenarios[1].source_lines
-  value: 'spec.yaml: engine defaulting to ''duckdb'', db defaulting to ''<name>.duckdb'', and steps as an empty list'
-- path: scenarios[2].source_lines
-  value: 'spec.yaml: Empty project names are rejected'
