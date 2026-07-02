@@ -1,6 +1,0 @@
-- path: scenarios[0].source_lines
-  value: 'spec.yaml: verifies that the declared engine CLI (duckdb) is available and executable before running any steps, by invoking duckdb --version'
-- path: scenarios[1].source_lines
-  value: 'spec.yaml: Set PATH to exclude duckdb. arc run fails with a clear error message before any SQL runs. Verify no database file is created.'
-- path: scenarios[2].source_lines
-  value: 'spec.yaml: Engine preflight check is skipped for command steps if no sql steps exist in the manifest.'

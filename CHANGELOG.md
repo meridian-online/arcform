@@ -5,8 +5,8 @@ All notable changes to arcform will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-Entries cite the orbit card or decision that drove them — browse `.orbit/cards/`
-and `.orbit/decisions/` for the full rationale.
+Entries cite the card or decision that drove them — see the team's private planning repo
+(MADR decision records + roadmap) for the full rationale.
 
 ## [Unreleased]
 

@@ -1,8 +1,0 @@
-- path: scenarios[0].source_lines
-  value: 'design session: ''generalise the stale_if idea using Dagu preconditions'''
-- path: scenarios[1].source_lines
-  value: 'brewtrend.yml: preconditions: test $(find data/cask.json -mtime -1 | wc -l) -ne 1'
-- path: scenarios[2].source_lines
-  value: 'dagu control-flow docs: all conditions must pass'
-- path: scenarios[3].source_lines
-  value: 'design session: SQL hash is an auto-generated precondition'

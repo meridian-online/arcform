@@ -1,4 +1,0 @@
-- path: scenarios[0].source_lines
-  value: 'decisions/0003: ArcForm is engine-agnostic — the same manifest can target DuckDB locally and Postgres/BigQuery in production'
-- path: scenarios[1].source_lines
-  value: 'decisions/0002: direct access to sqlparser-rs (DataFusion''s SQL parser) is essential for SQL introspection'

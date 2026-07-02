@@ -1,6 +1,0 @@
-- path: scenarios[0].source_lines
-  value: 'internal/core/dag.go: Type — graph (dependency-based parallel) vs chain (sequential)'
-- path: scenarios[1].source_lines
-  value: 'internal/core/spec/step.go: Depends — Dependency list for DAG ordering'
-- path: scenarios[2].source_lines
-  value: 'internal/core/dag.go: MaxActiveSteps — Concurrency limits'

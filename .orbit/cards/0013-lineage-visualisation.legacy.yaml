@@ -1,8 +1,0 @@
-- path: scenarios[0].source_lines
-  value: 'design session: ''The lineage is the actual DAG — so we want to make this useful, while still being a CLI'''
-- path: scenarios[1].source_lines
-  value: 'design session: considering another app for design across the Meridian ecosystem'
-- path: scenarios[2].source_lines
-  value: 'design session: terminal-friendly output without rendering dependencies'
-- path: scenarios[3].source_lines
-  value: 'design session: separate from execution — useful for inspecting the graph without running anything'
