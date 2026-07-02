@@ -1,0 +1,86 @@
+name: code-lists
+engine: duckdb
+engine_version: ">=1.2"
+db: build.duckdb
+
+# Snapshot date stamped onto every output row (the `as_of` column) and echoed in
+# datapackage.json. Override the vintage with: arc run --param as_of=2026-01-01.
+# Read inside the transform SQL via getenv('ARC_PARAM_AS_OF').
+params:
+  as_of:
+    default: "2025-01-01"
+
+# Public code-list servers occasionally hiccup — retry fetches with exponential
+# backoff (1st retry +2s, 2nd +4s). Applied to every step that doesn't override.
+defaults:
+  retry:
+    max_attempts: 3
+    backoff_sec: 2.0
+
+steps:
+  # --- Fetch (Pre-SQL): pull the two public-domain sources, cached 24h ---------
+  # NAICS 2022 structure workbook (US Census Bureau, public domain).
+  - name: fetch_naics
+    command: "mkdir -p data/naics dist && curl -fsSL 'https://www.census.gov/naics/2022NAICS/2022_NAICS_Structure.xlsx' -o data/naics/naics_structure.xlsx"
+    produces: [naics_source]
+    preconditions:
+      - modified_after: { path: data/naics/naics_structure.xlsx, period: 24h }
+
+  # ICD-10-CM FY2025 code descriptions / order file (CMS, public domain). The
+  # download is a zip; keep only the fixed-width order file under a stable name.
+  - name: fetch_icd10cm
+    command: "mkdir -p data/icd10cm dist && curl -fsSL 'https://www.cms.gov/files/zip/2025-code-descriptions-tabular-order.zip' -o data/icd10cm/icd10cm.zip && unzip -o -q data/icd10cm/icd10cm.zip 'icd10cm_order_[0-9][0-9][0-9][0-9].txt' -d data/icd10cm && mv -f data/icd10cm/icd10cm_order_[0-9][0-9][0-9][0-9].txt data/icd10cm/icd10cm_order.txt"
+    produces: [icd_source]
+    preconditions:
+      - modified_after: { path: data/icd10cm/icd10cm_order.txt, period: 24h }
+
+  # --- License gate (Pre-SQL): GREEN-list gate, MUST clear before any transform.
+  # Reads each source's SPDX id + redistribution flag from datapackage.json and
+  # exits non-zero (default RED) unless every source is proven GREEN. Also resets
+  # the local open-zone catalogue so each run yields a single frozen snapshot.
+  - name: license_gate
+    command: "bash scripts/license_gate.sh datapackage.json"
+    depends_on: [naics_source, icd_source]
+    produces: [license_cleared]
+
+  # --- Load (SQL): raw sources -> DuckDB staging tables ------------------------
+  - name: load
+    sql: models/load.sql
+    depends_on: [license_cleared]
+    produces: [raw_tables]
+
+  # --- Transform (SQL): normalise -> code/title/level/parent/as_of -> Parquet ---
+  - name: transform_naics
+    sql: models/transform_naics.sql
+    depends_on: [raw_tables]
+    produces: [naics_parquet]
+
+  - name: transform_icd10cm
+    sql: models/transform_icd10cm.sql
+    depends_on: [raw_tables]
+    produces: [icd_parquet]
+
+  # --- Quality gate: finetype validates the published columns against contract --
+  - name: finetype_gate
+    command: "bash scripts/finetype_gate.sh"
+    depends_on: [naics_parquet, icd_parquet]
+    produces: [columns_validated]
+
+  # --- Catalogue (SQL): frozen open.ducklake registering the Parquet by ref -----
+  - name: catalog
+    sql: models/catalog.sql
+    depends_on: [columns_validated]
+    produces: [open_catalog]
+
+  # --- Self-validate (SQL): row-count deltas + referential integrity + golden ---
+  #     Blocks the pipeline (non-zero exit via error()) on any regression.
+  - name: validate
+    sql: models/validate.sql
+    depends_on: [open_catalog]
+    produces: [validated]
+
+  # --- Publish: upload to the R2 open zone, or stage to ./dist when creds absent.
+  - name: publish
+    command: "bash scripts/publish.sh"
+    depends_on: [validated]
+    produces: [published]
