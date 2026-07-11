@@ -9,15 +9,19 @@ Both sources are open: SEC EDGAR (public domain), GLEIF golden copy (CC0).
 
 ## Status — spike
 
-- **v0 model** = a fully-specified Fellegi-Sunter name comparison with expert m/u priors:
+- **Model (v1)** = a fully-specified Fellegi-Sunter name comparison with expert m/u priors:
   frozen and reproducible (fixed seed, no stochastic EM).
 - **Name-only signal** — EDGAR carries no address/jurisdiction, so the sole comparison is
-  the normalized company name. GLEIF is pre-filtered to `reg_status='ISSUED'`; a
-  US-jurisdiction preference breaks ties, and any row with more than one top candidate is
-  flagged `status='ambiguous'`.
-- **First full run** (GLEIF ISSUED ≈ 1.9M rows): AAPL / COIN / MSFT / NVDA / TSLA all
-  resolve to the correct LEI at p ≈ 0.99; ~2,720 confident (≥ 0.99) matches of 10,433
-  filers, with a clean bimodal separation (exact-norm vs fuzzy).
+  the normalized company name. All real GLEIF registration statuses (ISSUED/LAPSED/RETIRED)
+  are matched and `reg_status` is carried through (a lapsed registration doesn't change the
+  entity's LEI); ties break by ISSUED > LAPSED > RETIRED then a US-jurisdiction preference,
+  and residual ties are flagged `status='ambiguous'`.
+- **Precision-first** — only exact-normalized-name matches auto-confirm (spot-checked
+  ~95% precise). Name-only fuzzy (Jaro-Winkler) matches are only ~55% precise, so they are
+  surfaced as `status='candidate'`, never auto-confirmed.
+- **Full run** (GLEIF ≈ 3.2M rows, ticker grain): AAPL / COIN / MSFT / NVDA / TSLA all
+  resolve to the correct LEI; **4,904 confirmed (47%)** + 186 ambiguous + 1,480 candidate,
+  of 10,433 EDGAR ticker-rows.
 
 ## Run
 
@@ -33,7 +37,8 @@ uv run operators/splink_resolve/resolve.py \
 
 ## Not built yet
 
-- EM / term-frequency tuning so the fuzzy (Jaro-Winkler) tiers contribute beyond
-  exact-normalized-name matches.
+- A **second comparison signal** (address, ISIN, or ticker cross-reference) to promote fuzzy
+  candidates to confirmed — name alone cannot (~55% precise). This is the lever for recall
+  beyond exact-name matching.
 - The declared typed I/O contract + arcform-Rust invocation (Python stays at the edges;
   operators declare input/output columns + semantic types so lineage holds at the boundary).
