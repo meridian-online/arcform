@@ -42,13 +42,63 @@ trim(regexp_replace(regexp_replace(regexp_replace(
     '\s+', ' ', 'g'))
 """
 
+# --- Blocking-key derivation (scaling only — does NOT touch the frozen F-S model) -----
+# Leading "stopword" tokens that would otherwise pool into one giant block. Measured on
+# the 3.36M GLEIF golden copy: first-token "THE" = 66k rows, "STICHTING" = 9.8k, and the
+# "SOCIETE"/"STIFTUNG" prefixes ~8k/3k. They are stripped into a `core` name so that
+# neither the name prefix nor the first token of these rows can form a hotspot block.
+BLOCK_STOPWORDS = (
+    "THE", "STICHTING", "SOCIETE", "STIFTUNG",
+    "FONDATION", "ASSOCIATION", "FUNDACION", "FONDAZIONE",
+)
+
+
+def blocking_select(src: str, country_sql: str) -> str:
+    """SQL that projects a source table down to (uid, nname) + the compound-blocking keys.
+
+    `country_sql` is the per-source domicile expression (a literal for EDGAR, the GLEIF
+    `country` column for GLEIF). All name keys derive from `core` = nname with a single
+    leading stopword token removed, so THE.../STICHTING... rows disperse instead of pooling.
+    Each key is NULL when its guard fails, which drops the row from that block (NULL never
+    equi-joins) — this is how the min-length guard and the short-name routing are enforced.
+    """
+    stop = ", ".join(f"'{w}'" for w in BLOCK_STOPWORDS)
+    core = (f"CASE WHEN split_part(nname, ' ', 1) IN ({stop}) "
+            f"THEN substr(nname, length(split_part(nname, ' ', 1)) + 2) ELSE nname END")
+    return f"""
+        WITH base AS (
+            SELECT uid, nname, {country_sql} AS country, {core} AS core FROM {src}
+        )
+        SELECT uid, nname, country,
+               -- primary US-core key: 6-char prefix of the stopword-stripped name (names >=6)
+               CASE WHEN length(core) >= 6 THEN substr(core, 1, 6) END        AS blk_p6,
+               -- global near-miss key (no country): selective 8-char prefix for longer names
+               CASE WHEN length(core) >= 8 THEN substr(core, 1, 8) END        AS blk_p8,
+               -- significant first token; >=4 chars kills single-letter/short-token megablocks
+               CASE WHEN length(split_part(core, ' ', 1)) >= 4
+                    THEN split_part(core, ' ', 1) END                         AS blk_tok,
+               -- global exact-name key (no country): recovers foreign ADRs of ANY length that
+               -- the country/8-char rules would otherwise miss. Exact full-name collisions are
+               -- rare, so this block stays tiny (worst observed ~40 rows) with no hotspot.
+               CASE WHEN length(core) >= 2 THEN core END                      AS blk_exact
+        FROM base
+    """
+
 
 class SplinkResolveConfig(BaseModel):
     """Hand-authored operator config (typed-operator design: config-not-code)."""
     match_key: str = "nname"
-    blocking_rules: list[str] = Field(default_factory=lambda: [
-        "substr(nname, 1, 6)",          # shared 6-char name prefix (catches exact + near-miss)
-        "split_part(nname, ' ', 1)",    # shared first token
+    # Compound blocking keys (union of rules; each rule is an AND of its columns). Country is
+    # the strong pruning dimension: only ~355k of 3.36M GLEIF are US-domiciled and every SEC
+    # filer is US, so the US<->US rules cut the comparison space ~9.5x. Two country-free rules
+    # (8-char prefix + exact name) keep foreign ADRs reachable by name alone. Keys are built in
+    # build_inputs via blocking_select() (min-length guards + stopword-stripped `core`
+    # neutralise the THE/STICHTING/single-letter-token hotspots).
+    blocking_rules: list[list[str]] = Field(default_factory=lambda: [
+        ["country", "blk_p6"],      # US<->US core: domicile + 6-char stopword-stripped prefix
+        ["blk_p8"],                 # global 8-char prefix — foreign near-miss recall
+        ["country", "blk_tok"],     # US<->US significant first token (>=4 chars)
+        ["blk_exact"],              # global exact name — foreign ADRs of any length
     ])
     # Fellegi-Sunter name-comparison priors: (sql, label, m, u). m = P(level | true match),
     # u = P(level | random pair). Tuned so exact/JW>=0.95 -> confirmed, JW>=0.92 -> candidate.
@@ -59,24 +109,32 @@ class SplinkResolveConfig(BaseModel):
 
 
 def build_inputs(con: duckdb.DuckDBPyConnection, edgar_path: str, gleif_path: str, sample: int) -> None:
-    n = NORM_SQL.format(col="name")
+    n_e = NORM_SQL.format(col="company_name")   # EDGAR published name column
+    n_g = NORM_SQL.format(col="legal_name")     # GLEIF published name column
     con.execute(f"""
         CREATE OR REPLACE TABLE edgar_src AS
         SELECT 'e' || CAST(row_number() OVER () AS VARCHAR) AS uid,
-               cik, ticker, name AS raw_name, {n} AS nname
+               cik, ticker, company_name AS raw_name, {n_e} AS nname
         FROM read_parquet('{edgar_path}')
-        WHERE {n} <> '';
+        WHERE {n_e} <> '';
     """)
     limit = f"USING SAMPLE {sample} ROWS (reservoir, {SEED})" if sample else ""
+    # GLEIF now publishes a domicile `country` column (used for blocking) alongside the
+    # `jurisdiction` used by the frozen US tie-break; carry both. reg_status = registration_status.
     con.execute(f"""
         CREATE OR REPLACE TABLE gleif_src AS
-        SELECT lei AS uid, name AS raw_name, jurisdiction, reg_status, {n} AS nname
+        SELECT lei AS uid, legal_name AS raw_name, jurisdiction, country,
+               registration_status AS reg_status, {n_g} AS nname
         FROM read_parquet('{gleif_path}')
-        WHERE {n} <> '' AND reg_status IN ('ISSUED', 'LAPSED', 'RETIRED')
+        WHERE {n_g} <> '' AND registration_status IN ('ISSUED', 'LAPSED', 'RETIRED')
         {limit};
     """)
-    con.execute("CREATE OR REPLACE TABLE edgar_in AS SELECT uid, nname FROM edgar_src;")
-    con.execute("CREATE OR REPLACE TABLE gleif_in AS SELECT uid, nname FROM gleif_src;")
+    # Blocking inputs: nname + domicile + derived compound-blocking keys. EDGAR filers are all
+    # US-listed, so EDGAR's blocking domicile is the literal 'US' (a proxy — see blocking_select).
+    edgar_in_sql = blocking_select("edgar_src", "'US'")
+    gleif_in_sql = blocking_select("gleif_src", "country")
+    con.execute(f"CREATE OR REPLACE TABLE edgar_in AS {edgar_in_sql};")
+    con.execute(f"CREATE OR REPLACE TABLE gleif_in AS {gleif_in_sql};")
     e = con.sql("SELECT count(*) FROM edgar_in").fetchone()[0]
     g = con.sql("SELECT count(*) FROM gleif_in").fetchone()[0]
     print(f"[inputs] edgar(ticker-grain)={e:,}  gleif(all statuses{'/sampled' if sample else ''})={g:,}")
@@ -116,7 +174,7 @@ def run(edgar_path: str, gleif_path: str, out_path: str, sample: int) -> None:
         unique_id_column_name="uid",
         probability_two_random_records_match=cfg.prob_two_random_match,
         comparisons=[name_cmp],
-        blocking_rules_to_generate_predictions=[block_on(r) for r in cfg.blocking_rules],
+        blocking_rules_to_generate_predictions=[block_on(*r) for r in cfg.blocking_rules],
     )
     db_api = DuckDBAPI(connection=con)
     linker = Linker(["edgar_in", "gleif_in"], settings, db_api, input_table_aliases=["edgar", "gleif"])
