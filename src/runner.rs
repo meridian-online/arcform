@@ -9,6 +9,7 @@ use crate::asset::AssetGraph;
 use crate::engine::Engine;
 use crate::error::{Error, Result};
 use crate::manifest::{Manifest, Param, RetryPolicy};
+use crate::operator;
 use crate::precondition;
 use crate::state::{self, StateBackend, StepStatus};
 
@@ -267,6 +268,8 @@ pub fn run_with_params(
                     source: e,
                 })?;
                 state::content_hash(&content)
+            } else if step.op.is_some() {
+                op_config_hash(step)
             } else {
                 String::new()
             };
@@ -315,10 +318,24 @@ pub fn run_with_params(
                 let result = if let Some(ref sql) = step.sql {
                     let sql_path = dir.join(sql);
                     engine.execute_sql(&db_path, &sql_path, &env_map, step_timeout)
+                } else if let Some(ref op_ref) = step.op {
+                    match operator::resolve(op_ref) {
+                        Ok(op) => {
+                            let ctx = operator::OpContext {
+                                dir,
+                                db_path: db_path.as_path(),
+                                env: &env_map,
+                                timeout: step_timeout,
+                            };
+                            let with = step.with.clone().unwrap_or(serde_yaml::Value::Null);
+                            op.run(&with, &ctx)
+                        }
+                        Err(e) => Err(e),
+                    }
                 } else if let Some(ref command) = step.command {
                     engine.execute_command(command, &env_map, capture_stdout, step_timeout)
                 } else {
-                    unreachable!("validation ensures sql or command is present")
+                    unreachable!("validation ensures sql, command, or op is present")
                 };
 
                 match result {
@@ -524,8 +541,8 @@ fn compute_staleness(
             continue;
         }
 
-        // SQL step — check hash staleness.
-        let hash_stale = is_sql_hash_stale(step, dir, state)?;
+        // SQL/op step — check hash staleness (op steps hash their config).
+        let hash_stale = is_hash_stale(step, dir, state)?;
 
         if step.preconditions.is_empty() {
             // No preconditions — SQL steps use hash only (backwards compat).
@@ -552,10 +569,23 @@ fn compute_staleness(
     Ok(stale)
 }
 
-/// Check whether a SQL step's content hash has changed since the last run.
+/// Staleness hash for an `op:` step: the operator reference plus its serialized `with:`
+/// config. An op step re-runs when either changes and skips when neither does — the same
+/// cache-correctness a SQL step gets from its file hash, stored in the same state column.
+fn op_config_hash(step: &crate::manifest::Step) -> String {
+    let op = step.op.as_deref().unwrap_or_default();
+    let with = step
+        .with
+        .as_ref()
+        .and_then(|v| serde_yaml::to_string(v).ok())
+        .unwrap_or_default();
+    state::content_hash(format!("{}\n{}", op, with).as_bytes())
+}
+
+/// Check whether a SQL or op step's staleness hash has changed since the last run.
 ///
 /// Returns true (stale) if: no prior state, prior failure, hash mismatch, or missing file.
-fn is_sql_hash_stale(
+fn is_hash_stale(
     step: &crate::manifest::Step,
     dir: &Path,
     state: &dyn StateBackend,
@@ -567,6 +597,10 @@ fn is_sql_hash_stale(
         Some(prior_state) => {
             if prior_state.status == StepStatus::Failed {
                 return Ok(true); // Previously failed.
+            }
+            if step.op.is_some() {
+                // Op step — config hash (operator ref + serialized `with:`).
+                return Ok(op_config_hash(step) != prior_state.sql_hash);
             }
             if let Some(ref sql) = step.sql {
                 let sql_path = dir.join(sql);
