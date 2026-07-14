@@ -2,6 +2,7 @@ mod asset;
 mod cli;
 mod engine;
 mod error;
+mod ingress_meta;
 mod introspect;
 mod manifest;
 mod operator;

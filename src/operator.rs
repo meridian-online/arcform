@@ -225,17 +225,24 @@ impl Operator for ParquetExport {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// http_fetch (ingress) — the curl/wget of the catalog: a plain authenticated
-// GET streamed atomically to `out`.
+// http_fetch (ingress) — the curl/wget of the catalog: an authenticated GET
+// streamed atomically to `out`, with a **content-freshness contract**.
 //
 // Built on **ureq** — already an arcform dependency, blocking, ~0 transitive
-// weight, http/https only. The operator is a straight-line GET: resilience
-// (retry + backoff) comes from the ENGINE's step-retry loop, which already
-// wraps every op run via `defaults.retry` — a transient failure returns the
-// retryable `StepFailed` and the runner re-attempts with backoff. A default
-// User-Agent is always set (gov registries — SEC — 403 a missing UA) and any
-// `headers` the Protocol supplies are layered on top. This is the workhorse
-// that retires `fetch_edgar`/`fetch_gleif` and the header-gated SEC fetch.
+// weight, http/https only. Resilience (retry + backoff) comes from the ENGINE's
+// step-retry loop, which already wraps every op run via `defaults.retry`. A
+// default User-Agent is always set (gov registries — SEC — 403 a missing UA) and
+// any `headers` the Protocol supplies are layered on top.
+//
+// The one thing `command: curl` can't give cleanly, and the reason this operator
+// is worth owning: the **freshness contract** ([`crate::ingress_meta`]). Every
+// fetch records the remote identity (ETag / Last-Modified / sha256) in a sidecar
+// `<out>.arcmeta`; the next run replays it as an `If-None-Match` conditional
+// request, so an unchanged 127 MB remote answers `304` and is not re-downloaded.
+// Paired with the `fresh` precondition (which HEAD-probes the same sidecar), a
+// step re-runs — and propagates downstream — only when the remote actually
+// changed: content-addressed ingress, not the clock-based mtime `modified_after`.
+// This is the workhorse that retires `fetch_edgar`/`fetch_gleif` and the SEC fetch.
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct HttpFetch;
@@ -251,9 +258,6 @@ struct HttpFetchConfig {
     #[serde(default)]
     headers: BTreeMap<String, String>,
 }
-
-/// Default UA — an unset User-Agent is a 403 at the SEC and several registries.
-const DEFAULT_UA: &str = "arcform-http_fetch/1 (+https://meridian.online)";
 
 impl HttpFetchConfig {
     fn parse(with: &Value) -> Result<Self> {
@@ -292,6 +296,12 @@ impl Operator for HttpFetch {
     }
 
     fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        use std::io::{Read, Write};
+
+        use sha2::{Digest, Sha256};
+
+        use crate::ingress_meta::{self, FetchMeta, DEFAULT_UA};
+
         let cfg = HttpFetchConfig::parse(with)?;
         let out = ctx.dir.join(&cfg.out);
         if let Some(parent) = out.parent() {
@@ -303,22 +313,78 @@ impl Operator for HttpFetch {
         for (k, v) in &cfg.headers {
             req = req.set(k, v);
         }
-        let resp = req
-            .call()
-            .map_err(|e| fetch_failed(format!("http_fetch: GET {}: {}", cfg.url, e)))?;
+        // The freshness contract: if we've fetched this artifact before and it's
+        // still on disk, replay the stored ETag / Last-Modified as a conditional
+        // request. An unchanged remote answers `304` and we keep the bytes.
+        let prior = ingress_meta::read(&out);
+        if out.exists() {
+            if let Some(ref p) = prior {
+                if let Some(ref etag) = p.etag {
+                    req = req.set("If-None-Match", etag);
+                }
+                if let Some(ref lm) = p.last_modified {
+                    req = req.set("If-Modified-Since", lm);
+                }
+            }
+        }
 
-        // Stream to a sibling `.part` file, then atomically rename into place —
+        let resp = match req.call() {
+            Ok(resp) => resp,
+            // 304 Not Modified — the remote is byte-unchanged. Keep the file + sidecar
+            // untouched (so its content identity, hence downstream staleness, is stable).
+            Err(ureq::Error::Status(304, _)) => {
+                return Ok(StepOutput { stderr: String::new(), stdout: None });
+            }
+            Err(e) => return Err(fetch_failed(format!("http_fetch: GET {}: {}", cfg.url, e))),
+        };
+        if resp.status() == 304 {
+            return Ok(StepOutput { stderr: String::new(), stdout: None });
+        }
+
+        // 200: capture the server's content identity before consuming the body.
+        let etag = resp.header("ETag").map(str::to_string);
+        let last_modified = resp.header("Last-Modified").map(str::to_string);
+
+        // Stream to a sibling `.part` file, hashing as we go, then atomically rename —
         // a killed run never leaves a truncated artifact that looks complete.
         let tmp = out.with_extension("part");
         let mut reader = resp.into_reader();
         let mut file = std::fs::File::create(&tmp)
             .map_err(|e| fetch_failed(format!("http_fetch: create {}: {}", tmp.display(), e)))?;
-        std::io::copy(&mut reader, &mut file)
-            .map_err(|e| fetch_failed(format!("http_fetch: write {}: {}", tmp.display(), e)))?;
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .map_err(|e| fetch_failed(format!("http_fetch: read body {}: {}", cfg.url, e)))?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n])
+                .map_err(|e| fetch_failed(format!("http_fetch: write {}: {}", tmp.display(), e)))?;
+            hasher.update(&buf[..n]);
+        }
         let _ = file.sync_all();
         drop(file);
         std::fs::rename(&tmp, &out)
             .map_err(|e| fetch_failed(format!("http_fetch: rename {}: {}", out.display(), e)))?;
+
+        // Persist the content identity for next run's conditional request + the
+        // `fresh` precondition's HEAD probe. Best-effort: a failed sidecar write
+        // doesn't fail the fetch (it just forfeits the next conditional/skip).
+        let fetched_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs());
+        let meta = FetchMeta {
+            url: cfg.url.clone(),
+            request_headers: cfg.headers.clone(),
+            etag,
+            last_modified,
+            sha256: format!("{:x}", hasher.finalize()),
+            fetched_unix,
+        };
+        let _ = ingress_meta::write(&out, &meta);
 
         Ok(StepOutput {
             stderr: String::new(),
