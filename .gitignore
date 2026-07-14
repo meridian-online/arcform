@@ -1,1 +1,5 @@
 /target
+
+# Python bytecode from py_compile / uv-run script edits
+__pycache__/
+*.pyc
