@@ -125,6 +125,93 @@ pub fn assets_for(op_ref: &str, with: Option<&Value>) -> Result<OpAssets> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Subprocess substrate — the shared spawn/wait/error-map for operators that wrap
+// an external process: a `uv run` Python script (splink_resolve, gleif_ra_fetch)
+// or a CLI (datapackage_describe → finetype). One place for the retry taxonomy so
+// each op doesn't hand-roll a Command block with divergent error handling.
+// (Wired by those operators in later increments — allow(dead_code) until then.)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How a subprocess operator handles its child's output.
+#[allow(dead_code)]
+enum OutputMode {
+    /// Inherit the terminal — stream child stdout/stderr live (e.g. `splink_resolve`'s
+    /// coverage tables). Honours the step timeout via `wait_with_timeout`.
+    Inherit,
+    /// Capture stdout+stderr into `StepOutput` — for ops that parse stdout
+    /// (`datapackage_describe`) or surface child stderr. `output()` drains the pipes
+    /// (no fill-up deadlock); the timeout is not enforced here (parity with the
+    /// capturing command path today).
+    Capture,
+}
+
+/// Spawn `program args…` in `ctx.dir` with `ctx.env`, mapping failures to the engine's
+/// retry taxonomy: a **spawn** failure (missing binary — deterministic) is a
+/// NON-retryable [`Error::StepExecution`] so a bad binary never burns 3 attempts of a
+/// 4 h job; a **non-zero exit** is a retryable [`Error::StepFailed`]; a **deadline** is
+/// [`Error::StepTimeout`] (retryable). `name` labels timeout/exec errors (the runner
+/// rewrites only `StepFailed.step`).
+#[allow(dead_code)]
+fn run_process(
+    program: &str,
+    args: &[String],
+    ctx: &OpContext,
+    mode: OutputMode,
+    name: &str,
+) -> Result<StepOutput> {
+    use std::process::{Command, Stdio};
+
+    let mut cmd = Command::new(program);
+    cmd.args(args).current_dir(ctx.dir).envs(ctx.env);
+
+    match mode {
+        OutputMode::Inherit => {
+            cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+            let mut child = cmd.spawn().map_err(|e| Error::StepExecution {
+                step: name.to_string(),
+                source: e,
+            })?;
+            let status = crate::engine::wait_with_timeout(&mut child, ctx.timeout, name)?;
+            if !status.success() {
+                return Err(Error::StepFailed {
+                    step: String::new(), // runner rewrites with the step name
+                    code: status.code().unwrap_or(1),
+                    stderr: String::new(),
+                });
+            }
+            Ok(StepOutput { stderr: String::new(), stdout: None })
+        }
+        OutputMode::Capture => {
+            let out = cmd.output().map_err(|e| Error::StepExecution {
+                step: name.to_string(),
+                source: e,
+            })?;
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            if !out.status.success() {
+                return Err(Error::StepFailed {
+                    step: String::new(),
+                    code: out.status.code().unwrap_or(1),
+                    stderr,
+                });
+            }
+            Ok(StepOutput {
+                stderr,
+                stdout: Some(String::from_utf8_lossy(&out.stdout).to_string()),
+            })
+        }
+    }
+}
+
+/// `["run", "--script", <script>, <extra…>]` — the shared `uv run --script` invocation
+/// for the uv-backed Python operators. Factored out so its arg order is unit-testable.
+#[allow(dead_code)]
+fn uv_run_args(script: &str, extra: &[String]) -> Vec<String> {
+    let mut a = vec!["run".to_string(), "--script".to_string(), script.to_string()];
+    a.extend_from_slice(extra);
+    a
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // parquet_export (activate) — the terminal Parquet output as a first-class asset.
 //
 // Replaces the opaque `COPY … (COMPRESSION zstd)` step whose SQL the engine can't
@@ -563,6 +650,55 @@ impl Operator for OpendalFetch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_ctx<'a>(dir: &'a Path, env: &'a HashMap<String, String>) -> OpContext<'a> {
+        OpContext { dir, db_path: dir, env, timeout: None }
+    }
+
+    #[test]
+    fn uv_run_args_arg_order_is_stable() {
+        assert_eq!(
+            uv_run_args("scripts/x.py", &["--out".to_string(), "o.parquet".to_string()]),
+            vec!["run", "--script", "scripts/x.py", "--out", "o.parquet"]
+        );
+    }
+
+    #[test]
+    fn run_process_success_and_capture() {
+        let dir = std::env::temp_dir();
+        let env = HashMap::new();
+        let ctx = test_ctx(&dir, &env);
+        // Inherit: `true` exits 0 → Ok.
+        assert!(run_process("true", &[], &ctx, OutputMode::Inherit, "t").is_ok());
+        // Capture: stdout is returned.
+        let out = run_process("echo", &["hi".to_string()], &ctx, OutputMode::Capture, "t").unwrap();
+        assert!(out.stdout.unwrap().contains("hi"));
+    }
+
+    #[test]
+    fn run_process_nonzero_exit_is_retryable_stepfailed() {
+        let dir = std::env::temp_dir();
+        let env = HashMap::new();
+        let ctx = test_ctx(&dir, &env);
+        // `false` exits 1 → retryable StepFailed (the engine step-retry re-attempts).
+        match run_process("false", &[], &ctx, OutputMode::Inherit, "t") {
+            Err(Error::StepFailed { code, .. }) => assert_eq!(code, 1),
+            other => panic!("expected StepFailed, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn run_process_missing_binary_is_nonretryable_stepexecution() {
+        let dir = std::env::temp_dir();
+        let env = HashMap::new();
+        let ctx = test_ctx(&dir, &env);
+        // A missing binary is deterministic → NON-retryable StepExecution, so a 4 h
+        // job is never re-attempted 3× for a typo. This is the load-bearing choice.
+        match run_process("arc-no-such-binary-xyz", &[], &ctx, OutputMode::Inherit, "t") {
+            Err(Error::StepExecution { .. }) => {}
+            other => panic!("expected StepExecution, got {:?}", other.map(|_| ())),
+        }
+    }
 
     #[test]
     fn resolves_by_name_and_semver() {

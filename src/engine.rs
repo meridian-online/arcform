@@ -71,7 +71,9 @@ pub trait Engine {
 
 /// Wait for a child process with an optional timeout.
 /// Polls try_wait() at ~100ms intervals. On timeout, kills the child.
-fn wait_with_timeout(child: &mut std::process::Child, timeout: Option<Duration>, step_name: &str) -> Result<std::process::ExitStatus> {
+/// `pub(crate)` so the operator subprocess substrate shares the identical
+/// kill-on-deadline semantics (the uv-run operators: splink_resolve, gleif).
+pub(crate) fn wait_with_timeout(child: &mut std::process::Child, timeout: Option<Duration>, step_name: &str) -> Result<std::process::ExitStatus> {
     let Some(deadline_duration) = timeout else {
         // No timeout — wait normally.
         return child.wait().map_err(|e| Error::StepExecution {
