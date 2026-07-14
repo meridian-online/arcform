@@ -140,6 +140,7 @@ dependencies = [
  "opendal",
  "opendal-http-transport-reqwest",
  "owo-colors",
+ "regex",
  "reqwest 0.13.4",
  "semver",
  "serde",
@@ -151,6 +152,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "ureq",
+ "zip",
 ]
 
 [[package]]

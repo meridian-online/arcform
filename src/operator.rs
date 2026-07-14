@@ -66,7 +66,10 @@ pub trait Operator: Sync {
 
 static PARQUET_EXPORT: ParquetExport = ParquetExport;
 static HTTP_FETCH: HttpFetch = HttpFetch;
+static HTML_LINK_DISCOVER: HtmlLinkDiscover = HtmlLinkDiscover;
+static ARCHIVE_EXTRACT: ArchiveExtract = ArchiveExtract;
 static DATAPACKAGE_DESCRIBE: DatapackageDescribe = DatapackageDescribe;
+static SPLINK_RESOLVE: SplinkResolve = SplinkResolve;
 #[cfg(feature = "opendal")]
 static OPENDAL_FETCH: OpendalFetch = OpendalFetch;
 
@@ -75,8 +78,14 @@ static OPENDAL_FETCH: OpendalFetch = OpendalFetch;
 /// single binary lean).
 fn catalog() -> Vec<&'static dyn Operator> {
     #[allow(unused_mut)]
-    let mut ops: Vec<&'static dyn Operator> =
-        vec![&PARQUET_EXPORT, &HTTP_FETCH, &DATAPACKAGE_DESCRIBE];
+    let mut ops: Vec<&'static dyn Operator> = vec![
+        &PARQUET_EXPORT,
+        &HTTP_FETCH,
+        &HTML_LINK_DISCOVER,
+        &ARCHIVE_EXTRACT,
+        &DATAPACKAGE_DESCRIBE,
+        &SPLINK_RESOLVE,
+    ];
     #[cfg(feature = "opendal")]
     ops.push(&OPENDAL_FETCH);
     ops
@@ -749,6 +758,543 @@ impl Operator for DatapackageDescribe {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// html_link_discover (ingress) — the "list what's there" primitive: GET an index
+// page, regex-pluck the hrefs matching `pattern`, absolutise them against the page
+// URL, de-dup preserving document order, and emit a newline-delimited URL list as
+// a first-class produced asset.
+//
+// This is the discovery half of the SEC N-CEN pull (scripts/fetch_ncen.sh): the
+// SEC "Form N-CEN Data Sets" page lists each quarter's zip as a root-relative href
+// (`/files/dera/data/…ncen_2024q1.zip`); this op turns that page into the list of
+// absolute zip URLs a downstream fetch fans out over. Same default UA as http_fetch
+// (SEC 403s a missing UA); a Protocol `User-Agent` in `headers` overrides it.
+//
+// NOTE (byte-equivalence): this + archive_extract are unit-verified building blocks;
+// they do NOT by themselves retire fetch_ncen.sh end-to-end, because the engine has
+// no fan-out step that maps over the discovered-quarters URL list yet. That fan-out
+// is separate work; here we produce the complete list.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct HtmlLinkDiscover;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HtmlLinkDiscoverConfig {
+    /// Index page to fetch (http/https).
+    url: String,
+    /// Regex tested (unanchored) against each raw `href` value; matches are kept.
+    pattern: String,
+    /// Destination URL-list path (newline-delimited), relative to the manifest dir.
+    out: String,
+    /// Extra request headers. A default `User-Agent` is set unless overridden here.
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+}
+
+impl HtmlLinkDiscoverConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        serde_yaml::from_value(with.clone()).map_err(|e| {
+            Error::ManifestValidation(format!("html_link_discover: invalid `with:` config: {}", e))
+        })
+    }
+
+    /// Compile `pattern`, mapping a bad regex to a load-time validation error.
+    fn compiled_pattern(&self) -> Result<regex::Regex> {
+        regex::Regex::new(&self.pattern).map_err(|e| {
+            Error::ManifestValidation(format!(
+                "html_link_discover: invalid `pattern` regex '{}': {}",
+                self.pattern, e
+            ))
+        })
+    }
+}
+
+/// The origin (`scheme://authority`) of an absolute URL, or `None` if `url` isn't one.
+fn url_origin(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme.is_empty() {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+    Some(format!("{}://{}", scheme, authority))
+}
+
+/// The RFC-3986 directory base of a page URL — the URL up to and including the last
+/// `/` of its path (query/fragment stripped) — that a bare relative href resolves
+/// against. Falls back to `origin/` when the path has no slash.
+fn url_dir_base(page_url: &str) -> Option<String> {
+    let origin = url_origin(page_url)?;
+    let rest = &page_url[origin.len()..];
+    let path = rest.split(['?', '#']).next().unwrap_or("");
+    match path.rfind('/') {
+        Some(i) => Some(format!("{}{}", origin, &path[..=i])),
+        None => Some(format!("{}/", origin)),
+    }
+}
+
+/// Whether `s` begins with a URL scheme (`http:`, `mailto:`, …) per RFC-3986.
+fn href_has_scheme(s: &str) -> bool {
+    match s.find(':') {
+        None | Some(0) => false,
+        Some(i) => {
+            let scheme = &s[..i];
+            scheme.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        }
+    }
+}
+
+/// Absolutise an `href` against the page URL. Handles absolute URLs (kept verbatim),
+/// protocol-relative (`//host/…`), root-relative (`/path` → page origin), and
+/// path-relative (resolved against the page's directory base). Returns `None` for
+/// empty or fragment-only hrefs.
+fn absolutise(page_url: &str, href: &str) -> Option<String> {
+    let h = href.trim();
+    if h.is_empty() || h.starts_with('#') {
+        return None;
+    }
+    if href_has_scheme(h) {
+        return Some(h.to_string());
+    }
+    if let Some(rest) = h.strip_prefix("//") {
+        let scheme = page_url.split("://").next()?;
+        if scheme.is_empty() || scheme == page_url {
+            return None;
+        }
+        return Some(format!("{}://{}", scheme, rest));
+    }
+    if h.starts_with('/') {
+        return Some(format!("{}{}", url_origin(page_url)?, h));
+    }
+    Some(format!("{}{}", url_dir_base(page_url)?, h))
+}
+
+/// Extract every `href` in `html` whose value matches `pattern`, absolutise it
+/// against `page_url`, and return the list de-duplicated in document order. `limit`
+/// caps the number of distinct URLs returned (the `head -n N` of fetch_ncen.sh).
+fn discover_links(
+    html: &str,
+    page_url: &str,
+    pattern: &regex::Regex,
+    limit: Option<usize>,
+) -> Vec<String> {
+    // Quoted href forms only (`href="…"` / `href='…'`) — unquoted attributes are
+    // rare in the gov index pages this targets.
+    let href_re = regex::Regex::new(r#"(?i)href\s*=\s*["']([^"']*)["']"#)
+        .expect("static href regex is valid");
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for cap in href_re.captures_iter(html) {
+        let href = &cap[1];
+        if !pattern.is_match(href) {
+            continue;
+        }
+        let Some(abs) = absolutise(page_url, href) else {
+            continue;
+        };
+        if seen.insert(abs.clone()) {
+            out.push(abs);
+            if let Some(l) = limit {
+                if out.len() >= l {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+impl Operator for HtmlLinkDiscover {
+    fn name(&self) -> &'static str {
+        "html_link_discover"
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = HtmlLinkDiscoverConfig::parse(with)?;
+        cfg.compiled_pattern()?; // fail fast on a bad regex at manifest load
+        // The network source is not a graph node; only the local URL list is.
+        Ok(OpAssets {
+            reads: vec![],
+            produces: vec![cfg.out.to_lowercase()],
+        })
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        use crate::ingress_meta::DEFAULT_UA;
+
+        let cfg = HtmlLinkDiscoverConfig::parse(with)?;
+        let pattern = cfg.compiled_pattern()?;
+        let out = ctx.dir.join(&cfg.out);
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        // Default UA first, then Protocol overrides (a `User-Agent` key wins).
+        let mut req = ureq::get(&cfg.url).set("User-Agent", DEFAULT_UA);
+        for (k, v) in &cfg.headers {
+            req = req.set(k, v);
+        }
+        let resp = req
+            .call()
+            .map_err(|e| fetch_failed(format!("html_link_discover: GET {}: {}", cfg.url, e)))?;
+        let body = resp
+            .into_string()
+            .map_err(|e| fetch_failed(format!("html_link_discover: read {}: {}", cfg.url, e)))?;
+
+        let links = discover_links(&body, &cfg.url, &pattern, None);
+        let mut payload = String::new();
+        for l in &links {
+            payload.push_str(l);
+            payload.push('\n');
+        }
+
+        // Atomic write: sibling `.part`, then rename — a killed run never leaves a
+        // half-written list that looks complete.
+        let mut tmp_os = out.clone().into_os_string();
+        tmp_os.push(".part");
+        let tmp = PathBuf::from(tmp_os);
+        std::fs::write(&tmp, payload.as_bytes()).map_err(|e| {
+            fetch_failed(format!("html_link_discover: write {}: {}", tmp.display(), e))
+        })?;
+        std::fs::rename(&tmp, &out).map_err(|e| {
+            fetch_failed(format!("html_link_discover: rename {}: {}", out.display(), e))
+        })?;
+
+        Ok(StepOutput {
+            stderr: String::new(),
+            stdout: None,
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// archive_extract (ingress) — pull named / pattern-matched members out of a `.zip`
+// into `dest` as first-class produced assets. The extraction half of the N-CEN
+// pull: each quarter's `ncen_YYYYqN.zip` yields REGISTRANT.tsv and
+// FUND_REPORTED_INFO.tsv (the CIK↔LEI / SERIES_ID↔LEI carriers).
+//
+// Three properties `command: unzip` doesn't give cleanly:
+//   • zip-slip guard — a member named `../…` or an absolute path is rejected, so a
+//     hostile archive can't write outside `dest`.
+//   • atomic per-file write — each member lands via a sibling `.part` + rename, so a
+//     killed run never leaves a half-written TSV that looks complete.
+//   • case-preserving on disk, case-folded in the graph — the file keeps its real
+//     name (`REGISTRANT.tsv`, referenced verbatim by downstream SQL) while the
+//     AssetGraph node name is lowercased, matching every other operator.
+//
+// zip dep: default-features OFF + `deflate-flate2` ONLY. The N-CEN zips are DEFLATE-
+// compressed, and plain `deflate` is a zip base meta-feature with no inflate backend
+// (→ runtime failure); `deflate-flate2` wires flate2 (already an arcform dep).
+// Dropping defaults avoids pulling the bzip2/zstd/aes C backends.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct ArchiveExtract;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchiveExtractConfig {
+    /// Source `.zip`, relative to the manifest dir (a `reads` asset).
+    archive: String,
+    /// Explicit member names to extract (exact match on the zip-internal name).
+    #[serde(default)]
+    members: Vec<String>,
+    /// Regex tested (unanchored) against each member name; matches are extracted.
+    #[serde(default)]
+    pattern: Option<String>,
+    /// Destination directory, relative to the manifest dir. Members are written under
+    /// it preserving their real-case relative path.
+    dest: String,
+}
+
+impl ArchiveExtractConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        let cfg: Self = serde_yaml::from_value(with.clone()).map_err(|e| {
+            Error::ManifestValidation(format!("archive_extract: invalid `with:` config: {}", e))
+        })?;
+        if cfg.members.is_empty() && cfg.pattern.is_none() {
+            return Err(Error::ManifestValidation(
+                "archive_extract: specify at least one of `members` or `pattern`".to_string(),
+            ));
+        }
+        Ok(cfg)
+    }
+
+    /// Compile `pattern` (if any), mapping a bad regex to a load-time validation error.
+    fn compiled_pattern(&self) -> Result<Option<regex::Regex>> {
+        match &self.pattern {
+            None => Ok(None),
+            Some(p) => regex::Regex::new(p).map(Some).map_err(|e| {
+                Error::ManifestValidation(format!(
+                    "archive_extract: invalid `pattern` regex '{}': {}",
+                    p, e
+                ))
+            }),
+        }
+    }
+}
+
+/// Whether a zip member is selected: an exact name in `members`, or a `pattern` hit.
+fn member_selected(name: &str, members: &[String], pattern: Option<&regex::Regex>) -> bool {
+    members.iter().any(|m| m == name) || pattern.map(|re| re.is_match(name)).unwrap_or(false)
+}
+
+/// Resolve a zip member name to a SAFE relative path (case preserved). Returns `None`
+/// for a zip-slip attempt — an absolute path, a Windows drive, or any `..` component —
+/// so nothing can be written outside `dest`.
+fn safe_relative(name: &str) -> Option<PathBuf> {
+    if name.starts_with('/') || name.starts_with('\\') {
+        return None;
+    }
+    let b = name.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return None; // Windows drive-absolute (C:\…)
+    }
+    let mut rel = PathBuf::new();
+    for comp in name.split(['/', '\\']) {
+        match comp {
+            "" | "." => continue,
+            ".." => return None,
+            c => rel.push(c),
+        }
+    }
+    if rel.as_os_str().is_empty() {
+        return None;
+    }
+    Some(rel)
+}
+
+/// Extract the selected members of a zip `reader` into `dest`: case-preserving on
+/// disk, zip-slip guarded, atomic per-file write. Returns the written paths. Factored
+/// out of `run` so the extraction is unit-testable against an in-memory zip.
+fn extract_members<R: std::io::Read + std::io::Seek>(
+    reader: R,
+    dest: &Path,
+    members: &[String],
+    pattern: Option<&regex::Regex>,
+) -> Result<Vec<PathBuf>> {
+    let mut archive = zip::ZipArchive::new(reader)
+        .map_err(|e| fetch_failed(format!("archive_extract: open zip: {}", e)))?;
+    let mut written = Vec::new();
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| fetch_failed(format!("archive_extract: read entry {}: {}", i, e)))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().to_string();
+        if !member_selected(&name, members, pattern) {
+            continue;
+        }
+        let rel = safe_relative(&name).ok_or_else(|| {
+            fetch_failed(format!(
+                "archive_extract: unsafe member path '{}' (zip-slip rejected)",
+                name
+            ))
+        })?;
+        let target = dest.join(&rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                fetch_failed(format!("archive_extract: mkdir {}: {}", parent.display(), e))
+            })?;
+        }
+        // Atomic per-file write: sibling `<target>.part`, then rename.
+        let mut tmp_os = target.clone().into_os_string();
+        tmp_os.push(".part");
+        let tmp = PathBuf::from(tmp_os);
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| fetch_failed(format!("archive_extract: create {}: {}", tmp.display(), e)))?;
+        std::io::copy(&mut entry, &mut f)
+            .map_err(|e| fetch_failed(format!("archive_extract: extract '{}': {}", name, e)))?;
+        let _ = f.sync_all();
+        drop(f);
+        std::fs::rename(&tmp, &target).map_err(|e| {
+            fetch_failed(format!("archive_extract: rename {}: {}", target.display(), e))
+        })?;
+        written.push(target);
+    }
+    Ok(written)
+}
+
+impl Operator for ArchiveExtract {
+    fn name(&self) -> &'static str {
+        "archive_extract"
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = ArchiveExtractConfig::parse(with)?;
+        cfg.compiled_pattern()?; // fail fast on a bad regex at manifest load
+        // Node names are lowercased (graph convention); the on-disk files keep real
+        // case. Explicit `members` give per-file produced nodes; a pattern-only
+        // selection isn't known until the archive is opened, so `dest` stands in as
+        // the coarse produced node.
+        let produces = if cfg.members.is_empty() {
+            vec![cfg.dest.to_lowercase()]
+        } else {
+            let base = cfg.dest.trim_end_matches('/');
+            cfg.members
+                .iter()
+                .map(|m| format!("{}/{}", base, m).to_lowercase())
+                .collect()
+        };
+        Ok(OpAssets {
+            reads: vec![cfg.archive.to_lowercase()],
+            produces,
+        })
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        let cfg = ArchiveExtractConfig::parse(with)?;
+        let pattern = cfg.compiled_pattern()?;
+        let archive_path = ctx.dir.join(&cfg.archive);
+        let dest = ctx.dir.join(&cfg.dest);
+        std::fs::create_dir_all(&dest)
+            .map_err(|e| fetch_failed(format!("archive_extract: mkdir {}: {}", dest.display(), e)))?;
+        let file = std::fs::File::open(&archive_path).map_err(|e| {
+            fetch_failed(format!(
+                "archive_extract: open {}: {}",
+                archive_path.display(),
+                e
+            ))
+        })?;
+        extract_members(file, &dest, &cfg.members, pattern.as_ref())?;
+        Ok(StepOutput {
+            stderr: String::new(),
+            stdout: None,
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// splink_resolve (transform) — the probabilistic EDGAR↔GLEIF name match, promoted
+// from the opaque `command: uv run --script …/resolve.py …` step to a first-class,
+// versioned operator. `op: splink_resolve@1` addresses the EXACT frozen script bytes
+// embedded below (SEED=42 Fellegi-Sunter model; see resolve.py) — the reproducibility
+// contract the "call the script by relative path" step lacked. Its `reads`/`produces`
+// put the resolve *in* the asset graph, so a stale input propagates instead of the
+// graph-island silent-skip the path-based step risked.
+//
+// Wraps the arcform-EMBEDDED resolve.py via the uv-run substrate (materialize_frozen_
+// script → uv_run_args → run_process), NOT a Rust reimplementation of Splink — Python
+// at the edges, same posture as datapackage_describe. Runs in OutputMode::Inherit so
+// resolve.py's `[coverage]` / `[hero tickers]` tables stream live and the step timeout
+// (the manifest's `timeout_sec`) is enforced by wait_with_timeout.
+//
+// SCALE — this is the ~4 h full-corpus job (GLEIF ≈ 3.2M rows). The manifest step MUST
+// pin `retry.max_attempts: 1`: a non-zero exit or timeout is retryable in the substrate,
+// so without a cap the engine would re-attempt a 4 h job up to `defaults.retry`. (A
+// spawn failure — bad `uv`/binary — is already NON-retryable, so a typo never burns
+// attempts; but a mid-run failure is the case the manifest cap guards.) `--sample` is a
+// smoke-test cap on GLEIF rows and is OMITTED for a published run (see the arg builder).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The resolve script, pinned into the binary. `@1` == these exact bytes.
+const RESOLVE_PY: &str = include_str!("../operators/splink_resolve/resolve.py");
+
+struct SplinkResolve;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SplinkResolveConfig {
+    /// EDGAR / SEC-entity Parquet (cik, ticker, company_name) — the crosswalk's left
+    /// side. A `reads` asset, resolved against ctx.dir.
+    edgar: String,
+    /// GLEIF golden-copy Parquet (lei, legal_name, jurisdiction, country, reg_status) —
+    /// the right side. A `reads` asset, resolved against ctx.dir.
+    gleif: String,
+    /// Resolved-crosswalk Parquet to write (the `produces` asset). Resolved against ctx.dir.
+    out: String,
+    /// Optional GLEIF-row cap for a fast smoke test (reservoir sample, SEED=42). OMITTED
+    /// from the argv unless `Some(n)` with `n > 0`; a published run leaves it unset (or 0)
+    /// and resolves the full corpus.
+    #[serde(default)]
+    sample: Option<u64>,
+}
+
+impl SplinkResolveConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        serde_yaml::from_value(with.clone()).map_err(|e| {
+            Error::ManifestValidation(format!("splink_resolve: invalid `with:` config: {}", e))
+        })
+    }
+}
+
+/// Build resolve.py's argv tail (everything after the script path). `--sample` is emitted
+/// ONLY for a positive cap: a published run passes `sample: None` (or `0`) and the full
+/// GLEIF corpus is resolved. Factored out so the omit-on-publish rule is unit-testable
+/// without spawning `uv`.
+fn splink_resolve_args(edgar: &str, gleif: &str, out: &str, sample: Option<u64>) -> Vec<String> {
+    let mut a = vec![
+        "--edgar".to_string(),
+        edgar.to_string(),
+        "--gleif".to_string(),
+        gleif.to_string(),
+        "--out".to_string(),
+        out.to_string(),
+    ];
+    if let Some(n) = sample {
+        if n > 0 {
+            a.push("--sample".to_string());
+            a.push(n.to_string());
+        }
+    }
+    a
+}
+
+impl Operator for SplinkResolve {
+    fn name(&self) -> &'static str {
+        "splink_resolve"
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = SplinkResolveConfig::parse(with)?;
+        Ok(OpAssets {
+            reads: vec![cfg.edgar.to_lowercase(), cfg.gleif.to_lowercase()],
+            produces: vec![cfg.out.to_lowercase()],
+        })
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        let cfg = SplinkResolveConfig::parse(with)?;
+        let edgar = ctx.dir.join(&cfg.edgar);
+        let gleif = ctx.dir.join(&cfg.gleif);
+        let out = ctx.dir.join(&cfg.out);
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let script = materialize_frozen_script("splink_resolve", "1.0.0", RESOLVE_PY)?;
+        let extra = splink_resolve_args(
+            &edgar.display().to_string(),
+            &gleif.display().to_string(),
+            &out.display().to_string(),
+            cfg.sample,
+        );
+        let args = uv_run_args(&script.to_string_lossy(), &extra);
+        // Inherit: stream resolve.py's coverage/hero-ticker tables live and honour the
+        // step timeout (a 4 h job that overruns is killed, not left hanging).
+        run_process("uv", &args, ctx, OutputMode::Inherit, "splink_resolve")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,6 +1390,69 @@ mod tests {
     }
 
     #[test]
+    fn splink_resolve_declares_lineage() {
+        // reads = [edgar, gleif] (order-preserving), produces = [out].
+        let with: Value = serde_yaml::from_str(
+            "edgar: build/sec_entities.parquet\ngleif: build/gleif.parquet\nout: build/resolved.parquet",
+        )
+        .unwrap();
+        let a = assets_for("splink_resolve", Some(&with)).unwrap();
+        assert_eq!(
+            a.reads,
+            vec![
+                "build/sec_entities.parquet".to_string(),
+                "build/gleif.parquet".to_string()
+            ]
+        );
+        assert_eq!(a.produces, vec!["build/resolved.parquet".to_string()]);
+        // `sample` is optional — a published run omits it and still validates.
+        assert!(assets_for("splink_resolve", Some(&with)).is_ok());
+        // unknown field rejected (deny_unknown_fields)
+        let bad: Value =
+            serde_yaml::from_str("edgar: e\ngleif: g\nout: o\nbogus: 1").unwrap();
+        assert!(assets_for("splink_resolve", Some(&bad)).is_err());
+        // missing a required field rejected
+        let miss: Value = serde_yaml::from_str("edgar: e\ngleif: g").unwrap();
+        assert!(assets_for("splink_resolve", Some(&miss)).is_err());
+    }
+
+    #[test]
+    fn splink_resolve_resolves_by_semver() {
+        assert!(resolve("splink_resolve").is_ok());
+        assert!(resolve("splink_resolve@1").is_ok());
+        assert!(resolve("splink_resolve@^1.0").is_ok());
+        assert!(resolve("splink_resolve@2").is_err()); // version not satisfied
+    }
+
+    #[test]
+    fn splink_resolve_sample_omitted_for_published_run() {
+        // Published run: no sample → the full corpus, no `--sample` flag at all
+        // (it MUST be omittable — a `--sample 0` would cap GLEIF to zero rows).
+        let full = splink_resolve_args("e.parquet", "g.parquet", "o.parquet", None);
+        assert_eq!(
+            full,
+            vec!["--edgar", "e.parquet", "--gleif", "g.parquet", "--out", "o.parquet"]
+        );
+        assert!(!full.iter().any(|a| a == "--sample"));
+        // `sample: 0` is treated as "full corpus" too → still omitted.
+        let zero = splink_resolve_args("e.parquet", "g.parquet", "o.parquet", Some(0));
+        assert!(!zero.iter().any(|a| a == "--sample"));
+        // A positive smoke-test cap IS emitted, as the trailing `--sample N` pair.
+        let sampled = splink_resolve_args("e.parquet", "g.parquet", "o.parquet", Some(20_000));
+        assert_eq!(
+            &sampled[sampled.len() - 2..],
+            &["--sample".to_string(), "20000".to_string()]
+        );
+        // Full invocation threads through uv_run_args in the documented order.
+        let script = "/tmp/arcform-op-splink_resolve-1.0.0/splink_resolve.py";
+        let argv = uv_run_args(script, &sampled);
+        assert_eq!(argv[0], "run");
+        assert_eq!(argv[1], "--script");
+        assert_eq!(argv[2], script);
+        assert_eq!(argv[3], "--edgar");
+    }
+
+    #[test]
     fn http_fetch_declares_only_its_output() {
         // Ingress produces the local artifact and reads no graph node (the
         // network source isn't in the AssetGraph).
@@ -851,6 +1460,243 @@ mod tests {
         let a = assets_for("http_fetch", Some(&hf)).unwrap();
         assert_eq!(a.produces, vec!["build/edgar.parquet".to_string()]);
         assert!(a.reads.is_empty());
+    }
+
+    // ── html_link_discover ──────────────────────────────────────────────────
+
+    #[test]
+    fn new_ingress_ops_are_in_catalog() {
+        assert!(resolve("html_link_discover@1").is_ok());
+        assert!(resolve("archive_extract@^1.0").is_ok());
+        assert!(resolve("html_link_discover@2").is_err()); // version not satisfied
+    }
+
+    #[test]
+    fn html_link_discover_declares_only_its_output() {
+        let with: Value = serde_yaml::from_str(
+            "url: https://www.sec.gov/x\npattern: 'ncen.*\\.zip'\nout: build/ncen_urls.txt",
+        )
+        .unwrap();
+        let a = assets_for("html_link_discover", Some(&with)).unwrap();
+        assert_eq!(a.produces, vec!["build/ncen_urls.txt".to_string()]);
+        assert!(a.reads.is_empty());
+    }
+
+    #[test]
+    fn html_link_discover_rejects_bad_config() {
+        // missing required `out`
+        let bad: Value = serde_yaml::from_str("url: https://x\npattern: 'a'").unwrap();
+        assert!(assets_for("html_link_discover", Some(&bad)).is_err());
+        // unknown field (deny_unknown_fields)
+        let bad: Value =
+            serde_yaml::from_str("url: https://x\npattern: 'a'\nout: o\nbogus: 1").unwrap();
+        assert!(assets_for("html_link_discover", Some(&bad)).is_err());
+        // invalid `pattern` regex is a load-time validation error
+        let bad: Value = serde_yaml::from_str("url: https://x\npattern: '('\nout: o").unwrap();
+        assert!(assets_for("html_link_discover", Some(&bad)).is_err());
+    }
+
+    #[test]
+    fn discover_links_extracts_absolutises_dedups_in_order() {
+        let page = "https://www.sec.gov/data-research/sec-markets-data/form-n-cen-data-sets";
+        let html = r#"
+            <a href="/files/dera/data/ncen_2024q4.zip">Q4</a>
+            <a href='/files/dera/data/ncen_2024q3.zip'>Q3</a>
+            <a href="/about">nope</a>
+            <a href="https://cdn.example.com/ncen_2024q2.zip">Q2 abs</a>
+            <a href="/files/dera/data/ncen_2024q4.zip">Q4 dup</a>
+            <a href="/files/dera/data/other_2024q1.zip">other</a>
+        "#;
+        let re = regex::Regex::new(r"ncen.*\.zip").unwrap();
+        let all = discover_links(html, page, &re, None);
+        assert_eq!(
+            all,
+            vec![
+                "https://www.sec.gov/files/dera/data/ncen_2024q4.zip".to_string(),
+                "https://www.sec.gov/files/dera/data/ncen_2024q3.zip".to_string(),
+                "https://cdn.example.com/ncen_2024q2.zip".to_string(),
+            ]
+        );
+        // `/about` and `other_2024q1.zip` don't match `pattern`; the duplicate Q4 is
+        // de-duped, first-seen order preserved.
+
+        // cap: `limit` truncates to the head of the ordered, de-duped list.
+        let capped = discover_links(html, page, &re, Some(2));
+        assert_eq!(
+            capped,
+            vec![
+                "https://www.sec.gov/files/dera/data/ncen_2024q4.zip".to_string(),
+                "https://www.sec.gov/files/dera/data/ncen_2024q3.zip".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn absolutise_handles_relative_forms() {
+        let page = "https://www.sec.gov/a/b/page.html";
+        assert_eq!(
+            absolutise(page, "/files/x.zip").as_deref(),
+            Some("https://www.sec.gov/files/x.zip")
+        );
+        // path-relative resolves against the page's directory base.
+        assert_eq!(
+            absolutise(page, "c.zip").as_deref(),
+            Some("https://www.sec.gov/a/b/c.zip")
+        );
+        // absolute is kept verbatim; protocol-relative borrows the page scheme.
+        assert_eq!(absolutise(page, "https://cdn/x").as_deref(), Some("https://cdn/x"));
+        assert_eq!(
+            absolutise(page, "//cdn.example.com/x").as_deref(),
+            Some("https://cdn.example.com/x")
+        );
+        assert_eq!(absolutise(page, "#frag"), None);
+        assert_eq!(absolutise(page, ""), None);
+    }
+
+    // ── archive_extract ─────────────────────────────────────────────────────
+
+    #[test]
+    fn archive_extract_declares_members_and_reads() {
+        let with: Value = serde_yaml::from_str(
+            "archive: build/ncen/2024q1.zip\nmembers: [REGISTRANT.tsv, FUND_REPORTED_INFO.tsv]\ndest: build/ncen/2024q1",
+        )
+        .unwrap();
+        let a = assets_for("archive_extract", Some(&with)).unwrap();
+        assert_eq!(a.reads, vec!["build/ncen/2024q1.zip".to_string()]);
+        // Node names lowercased (graph convention); on-disk case preserved separately.
+        assert_eq!(
+            a.produces,
+            vec![
+                "build/ncen/2024q1/registrant.tsv".to_string(),
+                "build/ncen/2024q1/fund_reported_info.tsv".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn archive_extract_pattern_only_declares_dest_node() {
+        let with: Value =
+            serde_yaml::from_str("archive: a.zip\npattern: '\\.tsv$'\ndest: build/out").unwrap();
+        let a = assets_for("archive_extract", Some(&with)).unwrap();
+        assert_eq!(a.reads, vec!["a.zip".to_string()]);
+        assert_eq!(a.produces, vec!["build/out".to_string()]);
+    }
+
+    #[test]
+    fn archive_extract_rejects_bad_config() {
+        // neither `members` nor `pattern` — nothing to select
+        let bad: Value = serde_yaml::from_str("archive: a.zip\ndest: out").unwrap();
+        assert!(assets_for("archive_extract", Some(&bad)).is_err());
+        // unknown field (deny_unknown_fields)
+        let bad: Value =
+            serde_yaml::from_str("archive: a.zip\nmembers: [x]\ndest: out\nbogus: 1").unwrap();
+        assert!(assets_for("archive_extract", Some(&bad)).is_err());
+        // invalid `pattern` regex
+        let bad: Value = serde_yaml::from_str("archive: a.zip\npattern: '('\ndest: out").unwrap();
+        assert!(assets_for("archive_extract", Some(&bad)).is_err());
+    }
+
+    #[test]
+    fn safe_relative_guards_zip_slip_and_preserves_case() {
+        // Rejected: traversal, absolute, Windows drive / UNC.
+        assert!(safe_relative("../evil.txt").is_none());
+        assert!(safe_relative("a/../../b").is_none());
+        assert!(safe_relative("/etc/passwd").is_none());
+        assert!(safe_relative("C:\\Windows\\x").is_none());
+        assert!(safe_relative("\\\\server\\share").is_none());
+        // Accepted: real case preserved, `.` components dropped.
+        assert_eq!(
+            safe_relative("REGISTRANT.tsv"),
+            Some(PathBuf::from("REGISTRANT.tsv"))
+        );
+        assert_eq!(
+            safe_relative("Sub/Dir/File.TSV"),
+            Some(PathBuf::from("Sub/Dir/File.TSV"))
+        );
+        assert_eq!(safe_relative("./a/./b"), Some(PathBuf::from("a/b")));
+    }
+
+    /// Build a DEFLATE-compressed in-memory zip of `(name, bytes)` members. Exercises
+    /// the `deflate-flate2` backend end-to-end (the compression the N-CEN zips use).
+    fn build_zip(entries: &[(&str, &[u8])], method: zip::CompressionMethod) -> Vec<u8> {
+        use std::io::{Cursor, Write};
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default().compression_method(method);
+            for (name, bytes) in entries {
+                zw.start_file(*name, opts).unwrap();
+                zw.write_all(bytes).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn extract_members_roundtrip_preserves_case_and_selects() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_bytes = build_zip(
+            &[
+                ("REGISTRANT.tsv", b"cik\tlei\n1\tABC\n"),
+                ("FUND_REPORTED_INFO.tsv", b"series_id\tlei\nS1\tXYZ\n"),
+                ("SUBMISSION.tsv", b"unwanted\n"),
+            ],
+            zip::CompressionMethod::Deflated,
+        );
+        let members = vec![
+            "REGISTRANT.tsv".to_string(),
+            "FUND_REPORTED_INFO.tsv".to_string(),
+        ];
+        let written =
+            extract_members(std::io::Cursor::new(&zip_bytes), dir.path(), &members, None).unwrap();
+        assert_eq!(written.len(), 2);
+
+        // Real (upper) case preserved on disk; content round-trips through DEFLATE.
+        let reg = dir.path().join("REGISTRANT.tsv");
+        assert!(reg.exists(), "REGISTRANT.tsv (real case) should exist on disk");
+        assert_eq!(std::fs::read_to_string(&reg).unwrap(), "cik\tlei\n1\tABC\n");
+        assert!(dir.path().join("FUND_REPORTED_INFO.tsv").exists());
+        // Non-selected member is not extracted; no leftover `.part` temp file.
+        assert!(!dir.path().join("SUBMISSION.tsv").exists());
+        assert!(!dir.path().join("REGISTRANT.tsv.part").exists());
+    }
+
+    #[test]
+    fn extract_members_selects_by_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_bytes = build_zip(
+            &[
+                ("REGISTRANT.tsv", b"a"),
+                ("FUND_REPORTED_INFO.tsv", b"b"),
+                ("readme.txt", b"c"),
+            ],
+            zip::CompressionMethod::Deflated,
+        );
+        let re = regex::Regex::new(r"\.tsv$").unwrap();
+        let written =
+            extract_members(std::io::Cursor::new(&zip_bytes), dir.path(), &[], Some(&re)).unwrap();
+        assert_eq!(written.len(), 2);
+        assert!(dir.path().join("REGISTRANT.tsv").exists());
+        assert!(!dir.path().join("readme.txt").exists());
+    }
+
+    #[test]
+    fn extract_members_blocks_zip_slip_write() {
+        let dir = tempfile::tempdir().unwrap();
+        // A hostile member named `../evil.txt`.
+        let zip_bytes = build_zip(&[("../evil.txt", b"pwned")], zip::CompressionMethod::Stored);
+        let re = regex::Regex::new("evil").unwrap();
+        let res = extract_members(std::io::Cursor::new(&zip_bytes), dir.path(), &[], Some(&re));
+        // Invariant: whether the writer stored `../evil.txt` verbatim (→ guard rejects,
+        // `Err`) or normalised it (→ lands safely inside `dest`), nothing is ever
+        // written to the traversal target outside `dest`.
+        let escaped = dir.path().parent().unwrap().join("evil.txt");
+        assert!(
+            !escaped.exists(),
+            "zip-slip must never write outside dest (res_ok={})",
+            res.is_ok()
+        );
     }
 
     #[cfg(feature = "opendal")]

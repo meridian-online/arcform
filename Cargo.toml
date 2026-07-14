@@ -26,6 +26,13 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 tar = "0.4"
 flate2 = "1"
 dirs = "5"
+# html_link_discover href-plucking + archive_extract member selection.
+regex = "1"
+# archive_extract: unzip the DEFLATE-compressed SEC N-CEN quarter zips. MUST be
+# `deflate-flate2` (wires the flate2 inflate backend — already an arcform dep),
+# NOT plain `deflate` (a base meta-feature with no backend → runtime failure on
+# the compressed members). default-features OFF drops the bzip2/zstd/aes C backends.
+zip = { version = "6", default-features = false, features = ["deflate-flate2"] }
 # opendal_fetch (ingress): one operator, 40+ backends + built-in RetryLayer —
 # the s3://securelake / multi-store lever. HEAVY: +156 crates (tokio, hyper,
 # tower, reqwest, rustls) that the ureq http_fetch path needs none of. Feature-
