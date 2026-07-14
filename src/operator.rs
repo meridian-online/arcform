@@ -70,6 +70,7 @@ static HTML_LINK_DISCOVER: HtmlLinkDiscover = HtmlLinkDiscover;
 static ARCHIVE_EXTRACT: ArchiveExtract = ArchiveExtract;
 static DATAPACKAGE_DESCRIBE: DatapackageDescribe = DatapackageDescribe;
 static SPLINK_RESOLVE: SplinkResolve = SplinkResolve;
+static GLEIF_RA_FETCH: GleifRaFetch = GleifRaFetch;
 #[cfg(feature = "opendal")]
 static OPENDAL_FETCH: OpendalFetch = OpendalFetch;
 
@@ -85,6 +86,7 @@ fn catalog() -> Vec<&'static dyn Operator> {
         &ARCHIVE_EXTRACT,
         &DATAPACKAGE_DESCRIBE,
         &SPLINK_RESOLVE,
+        &GLEIF_RA_FETCH,
     ];
     #[cfg(feature = "opendal")]
     ops.push(&OPENDAL_FETCH);
@@ -1295,6 +1297,102 @@ impl Operator for SplinkResolve {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// gleif_ra_fetch (ingress) — page the public GLEIF v1 API for every entity
+// registered under one registration authority (RA000665 = the SEC) and emit the
+// `lei,registered_as,category` CSV the `load` step consumes.
+//
+// Retires `edgar_gleif/scripts/fetch_gleif_ra.sh`. That script hand-rolled cursor
+// paging in bash (`page[cursor]=*`, follow `.links.next`, terminate on null/empty,
+// with a loop guard) because GLEIF hard-caps OFFSET paging at 10,000 records and
+// RA000665 has ~27k. The embedded `fetch_gleif_ra.py` does the same with dlt's
+// `RESTClient` + `JSONLinkPaginator(next_url_path="links.next")` — STATELESS
+// full-refresh (no incremental cursor persisted) — then writes a DETERMINISTIC
+// SORTED CSV so the row-set parity gate against the retired script is a clean
+// `EXCEPT`. Same uv-run substrate + frozen-script contract as datapackage_describe
+// and splink_resolve: `op@1` addresses these exact script bytes.
+//
+// Ingress, so `reads: []` (the network source is not a graph node) and
+// `produces: [out]` — the CSV sits in the AssetGraph downstream of nothing and
+// upstream of `load`, exactly where the old `command:` step sat but now typed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The GLEIF-fetch script, pinned into the binary. `@1` == these exact bytes.
+const GLEIF_RA_FETCH_PY: &str = include_str!("../operators/gleif_ra_fetch/fetch_gleif_ra.py");
+
+struct GleifRaFetch;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GleifRaFetchConfig {
+    /// GLEIF registration-authority id to page (e.g. `RA000665`, the SEC).
+    ra: String,
+    /// Destination CSV path, relative to the manifest directory (the `produces`
+    /// asset). The script writes it atomically (`.part` + rename).
+    out: String,
+    /// GLEIF `page[size]`. Defaults to the script's 200 when omitted.
+    #[serde(default)]
+    page_size: Option<u64>,
+    /// User-Agent request header. Defaults to the script's Meridian UA when omitted.
+    #[serde(default)]
+    user_agent: Option<String>,
+}
+
+impl GleifRaFetchConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        serde_yaml::from_value(with.clone()).map_err(|e| {
+            Error::ManifestValidation(format!("gleif_ra_fetch: invalid `with:` config: {}", e))
+        })
+    }
+}
+
+impl Operator for GleifRaFetch {
+    fn name(&self) -> &'static str {
+        "gleif_ra_fetch"
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = GleifRaFetchConfig::parse(with)?;
+        // Ingress: the network source is not a graph node; only the local CSV is.
+        Ok(OpAssets {
+            reads: vec![],
+            produces: vec![cfg.out.to_lowercase()],
+        })
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        let cfg = GleifRaFetchConfig::parse(with)?;
+        let out = ctx.dir.join(&cfg.out);
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let script = materialize_frozen_script("gleif_ra_fetch", "1.0.0", GLEIF_RA_FETCH_PY)?;
+        let mut extra = vec![
+            "--ra".to_string(),
+            cfg.ra.clone(),
+            "--out".to_string(),
+            out.display().to_string(),
+        ];
+        // `--max-pages` is intentionally NOT surfaced in config — it is a smoke-test
+        // lever only. Production always does a full, guarded, unbounded pull.
+        if let Some(ps) = cfg.page_size {
+            extra.push("--page-size".to_string());
+            extra.push(ps.to_string());
+        }
+        if let Some(ref ua) = cfg.user_agent {
+            extra.push("--user-agent".to_string());
+            extra.push(ua.clone());
+        }
+        let args = uv_run_args(&script.to_string_lossy(), &extra);
+        run_process("uv", &args, ctx, OutputMode::Capture, "gleif_ra_fetch")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1451,6 +1549,52 @@ mod tests {
         assert_eq!(argv[2], script);
         assert_eq!(argv[3], "--edgar");
     }
+
+    #[test]
+    fn gleif_ra_fetch_is_in_catalog_and_versioned() {
+        assert!(resolve("gleif_ra_fetch").is_ok());
+        assert!(resolve("gleif_ra_fetch@1").is_ok());
+        assert!(resolve("gleif_ra_fetch@^1.0").is_ok());
+        assert!(resolve("gleif_ra_fetch@2").is_err()); // version not satisfied
+    }
+
+    #[test]
+    fn gleif_ra_fetch_declares_only_its_output() {
+        // Ingress: produces the local CSV, reads no graph node (the GLEIF API is not
+        // in the AssetGraph). `out` is lowercased into the produces asset.
+        let with: Value = serde_yaml::from_str("ra: RA000665\nout: build/gleif_ra_sec.csv").unwrap();
+        let a = assets_for("gleif_ra_fetch", Some(&with)).unwrap();
+        assert_eq!(a.produces, vec!["build/gleif_ra_sec.csv".to_string()]);
+        assert!(a.reads.is_empty());
+    }
+
+    #[test]
+    fn gleif_ra_fetch_optional_fields_default() {
+        // page_size / user_agent are optional — a minimal ra+out config validates.
+        let min: Value = serde_yaml::from_str("ra: RA000665\nout: g.csv").unwrap();
+        assert!(assets_for("gleif_ra_fetch", Some(&min)).is_ok());
+        // …and both may be supplied.
+        let full: Value = serde_yaml::from_str(
+            "ra: RA000665\nout: g.csv\npage_size: 50\nuser_agent: 'X (y@z)'",
+        )
+        .unwrap();
+        assert!(assets_for("gleif_ra_fetch", Some(&full)).is_ok());
+    }
+
+    #[test]
+    fn gleif_ra_fetch_rejects_bad_config() {
+        // missing required `out`
+        let no_out: Value = serde_yaml::from_str("ra: RA000665").unwrap();
+        assert!(assets_for("gleif_ra_fetch", Some(&no_out)).is_err());
+        // missing required `ra`
+        let no_ra: Value = serde_yaml::from_str("out: g.csv").unwrap();
+        assert!(assets_for("gleif_ra_fetch", Some(&no_ra)).is_err());
+        // unknown field rejected (deny_unknown_fields) — e.g. a stray `max_pages`,
+        // which is a smoke-test-only CLI flag and deliberately not a config field.
+        let bogus: Value = serde_yaml::from_str("ra: RA000665\nout: g.csv\nmax_pages: 2").unwrap();
+        assert!(assets_for("gleif_ra_fetch", Some(&bogus)).is_err());
+    }
+
 
     #[test]
     fn http_fetch_declares_only_its_output() {
