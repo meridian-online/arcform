@@ -16,7 +16,7 @@
 //! Design spec: `bearing/research/arcform-typed-operators.md`.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -39,11 +39,9 @@ pub struct OpContext<'a> {
     pub dir: &'a Path,
     /// The pipeline's DuckDB file — operators that touch tables open this.
     pub db_path: &'a Path,
-    /// `ARC_PARAM_*` environment for the step. Read by ingress/model operators (B2).
-    #[allow(dead_code)]
+    /// `ARC_PARAM_*` environment for the step, passed through to subprocess operators.
     pub env: &'a HashMap<String, String>,
-    /// Step timeout, if any. Read by ingress/model operators (B2).
-    #[allow(dead_code)]
+    /// Step timeout, if any — enforced by `run_process` (Inherit mode).
     pub timeout: Option<Duration>,
 }
 
@@ -68,6 +66,7 @@ pub trait Operator: Sync {
 
 static PARQUET_EXPORT: ParquetExport = ParquetExport;
 static HTTP_FETCH: HttpFetch = HttpFetch;
+static DATAPACKAGE_DESCRIBE: DatapackageDescribe = DatapackageDescribe;
 #[cfg(feature = "opendal")]
 static OPENDAL_FETCH: OpendalFetch = OpendalFetch;
 
@@ -76,7 +75,8 @@ static OPENDAL_FETCH: OpendalFetch = OpendalFetch;
 /// single binary lean).
 fn catalog() -> Vec<&'static dyn Operator> {
     #[allow(unused_mut)]
-    let mut ops: Vec<&'static dyn Operator> = vec![&PARQUET_EXPORT, &HTTP_FETCH];
+    let mut ops: Vec<&'static dyn Operator> =
+        vec![&PARQUET_EXPORT, &HTTP_FETCH, &DATAPACKAGE_DESCRIBE];
     #[cfg(feature = "opendal")]
     ops.push(&OPENDAL_FETCH);
     ops
@@ -133,7 +133,6 @@ pub fn assets_for(op_ref: &str, with: Option<&Value>) -> Result<OpAssets> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// How a subprocess operator handles its child's output.
-#[allow(dead_code)]
 enum OutputMode {
     /// Inherit the terminal — stream child stdout/stderr live (e.g. `splink_resolve`'s
     /// coverage tables). Honours the step timeout via `wait_with_timeout`.
@@ -151,7 +150,6 @@ enum OutputMode {
 /// 4 h job; a **non-zero exit** is a retryable [`Error::StepFailed`]; a **deadline** is
 /// [`Error::StepTimeout`] (retryable). `name` labels timeout/exec errors (the runner
 /// rewrites only `StepFailed.step`).
-#[allow(dead_code)]
 fn run_process(
     program: &str,
     args: &[String],
@@ -204,11 +202,28 @@ fn run_process(
 
 /// `["run", "--script", <script>, <extra…>]` — the shared `uv run --script` invocation
 /// for the uv-backed Python operators. Factored out so its arg order is unit-testable.
-#[allow(dead_code)]
 fn uv_run_args(script: &str, extra: &[String]) -> Vec<String> {
     let mut a = vec!["run".to_string(), "--script".to_string(), script.to_string()];
     a.extend_from_slice(extra);
     a
+}
+
+/// Materialize an `include_str!`-embedded operator script to a version-stamped cache
+/// under the temp dir (write-if-changed), returning the path to run. Pinning the
+/// script into the binary means `op@<ver>` addresses **exact** bytes — a script change
+/// is a version bump + rebuild, never a silent edit. This is the reproducibility
+/// contract the old "call the script by relative path" step lacked.
+fn materialize_frozen_script(name: &str, version: &str, bytes: &str) -> Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("arcform-op-{}-{}", name, version));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| fetch_failed(format!("{}: cache dir {}: {}", name, dir.display(), e)))?;
+    let path = dir.join(format!("{}.py", name));
+    let needs_write = std::fs::read_to_string(&path).map(|s| s != bytes).unwrap_or(true);
+    if needs_write {
+        std::fs::write(&path, bytes)
+            .map_err(|e| fetch_failed(format!("{}: write {}: {}", name, path.display(), e)))?;
+    }
+    Ok(path)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -647,6 +662,93 @@ impl Operator for OpendalFetch {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// datapackage_describe (activate) — emit the Frictionless datapackage.json from the
+// built Parquet: finetype types every column (the machine half) overlaid with the
+// curated descriptor.overrides.json (the hand half; overrides win, relational keys
+// hard-checked against the Parquet).
+//
+// Wraps an arcform-EMBEDDED copy of describe.py via the uv-run substrate — NOT a
+// Rust reimplementation of the JSON merge. That is deliberate: running the identical
+// script makes the output byte-identical to the retired scripts/describe.py by
+// construction, it needs no serde_json dep (and dodges its float/sort byte-equivalence
+// hazards vs Python's json.dump), and the operator becomes reusable by any dataset.
+// Python at the edges — the same posture as splink_resolve. describe.py itself has
+// no Python deps; it shells the `finetype` CLI (must be on PATH, as today).
+//
+// Verified byte-identical to the retired script on the live build, save the one field
+// `finetype` stamps itself — the per-run `created` timestamp (non-deterministic, and
+// pre-existing; the command step had it too). datapackage.json is metadata, not the
+// data; the parquet (the byte-equivalence target) is untouched by this op.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The describe script, pinned into the binary. `@1` == these exact bytes.
+const DESCRIBE_PY: &str = include_str!("../operators/datapackage_describe/describe.py");
+
+struct DatapackageDescribe;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DatapackageDescribeConfig {
+    /// Built Parquet finetype types (a `reads` asset — keeps `describe` downstream
+    /// of the step that produces it). Resolved against ctx.dir.
+    parquet: String,
+    /// Curated descriptor sidecar (JSON) overlaid onto finetype's base.
+    overrides: String,
+    /// datapackage.json to write (the `produces` asset). Resolved against ctx.dir.
+    out: String,
+}
+
+impl DatapackageDescribeConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        serde_yaml::from_value(with.clone()).map_err(|e| {
+            Error::ManifestValidation(format!("datapackage_describe: invalid `with:` config: {}", e))
+        })
+    }
+}
+
+impl Operator for DatapackageDescribe {
+    fn name(&self) -> &'static str {
+        "datapackage_describe"
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = DatapackageDescribeConfig::parse(with)?;
+        Ok(OpAssets {
+            reads: vec![cfg.parquet.to_lowercase()],
+            produces: vec![cfg.out.to_lowercase()],
+        })
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        let cfg = DatapackageDescribeConfig::parse(with)?;
+        let parquet = ctx.dir.join(&cfg.parquet);
+        let overrides = ctx.dir.join(&cfg.overrides);
+        let out = ctx.dir.join(&cfg.out);
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let script = materialize_frozen_script("datapackage_describe", "1.0.0", DESCRIBE_PY)?;
+        let args = uv_run_args(
+            &script.to_string_lossy(),
+            &[
+                "--parquet".to_string(),
+                parquet.display().to_string(),
+                "--overrides".to_string(),
+                overrides.display().to_string(),
+                "--out".to_string(),
+                out.display().to_string(),
+            ],
+        );
+        run_process("uv", &args, ctx, OutputMode::Capture, "datapackage_describe")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,6 +827,20 @@ mod tests {
         // unknown field
         let with: Value = serde_yaml::from_str("input: t\ndest: o.parquet\nbogus: 1").unwrap();
         assert!(assets_for("parquet_export", Some(&with)).is_err());
+    }
+
+    #[test]
+    fn datapackage_describe_declares_lineage() {
+        let with: Value = serde_yaml::from_str(
+            "parquet: build/edgar_gleif.parquet\noverrides: descriptor.overrides.json\nout: datapackage.json",
+        )
+        .unwrap();
+        let a = assets_for("datapackage_describe", Some(&with)).unwrap();
+        assert_eq!(a.reads, vec!["build/edgar_gleif.parquet".to_string()]);
+        assert_eq!(a.produces, vec!["datapackage.json".to_string()]);
+        // unknown field rejected (deny_unknown_fields)
+        let bad: Value = serde_yaml::from_str("parquet: p\noverrides: o\nout: d\nx: 1").unwrap();
+        assert!(assets_for("datapackage_describe", Some(&bad)).is_err());
     }
 
     #[test]

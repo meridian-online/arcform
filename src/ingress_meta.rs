@@ -63,8 +63,7 @@ pub fn read(out: &Path) -> Option<FetchMeta> {
 
 /// Write the sidecar for `out`.
 pub fn write(out: &Path, meta: &FetchMeta) -> std::io::Result<()> {
-    let s = serde_yaml::to_string(meta)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let s = serde_yaml::to_string(meta).map_err(std::io::Error::other)?;
     std::fs::write(meta_path(out), s)
 }
 
