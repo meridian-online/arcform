@@ -333,15 +333,16 @@ impl Operator for HttpFetch {
 // (http/https, s3, gcs, azblob, …) with a built-in `RetryLayer` (per-request
 // backoff, *on top of* the engine step-retry).
 //
-// MEASURED TRADE-OFF (2026-07-14 spike): OpenDAL's HTTP service exposes only
-// basic-auth / bearer — **no arbitrary request headers**. So it structurally
-// cannot satisfy a User-Agent-gated source (the SEC 403s a missing UA); on the
-// http(s) backend, a non-empty `headers` is a hard config error pointing back
-// to `http_fetch`. OpenDAL also buffers the whole object in memory (blocking
-// `read`) and needs a tokio runtime, where ureq streams with zero runtime.
-// OpenDAL's genuine win is **s3://securelake** and multi-backend portability —
-// one operator, many stores — not the vanilla gov fetches these Protocols run.
-// Feature-gated behind `opendal` (Cargo.toml) so the default binary stays lean.
+// MEASURED TRADE-OFF (2026-07-14 spike): OpenDAL's Http *builder* exposes only
+// basic-auth / bearer — no header setter — but arbitrary request headers (a SEC
+// User-Agent) ARE reachable by injecting a reqwest client (`default_headers`)
+// through a custom `ReqwestTransport` (wired below; proven on the live SEC
+// UA-gated fetch). The cost is +2 deps and ~25 lines of transport plumbing vs
+// ureq's one `.set(k, v)`. OpenDAL also buffers the whole object in memory
+// (blocking `read`) and needs a tokio runtime, where ureq streams with zero
+// runtime. OpenDAL's genuine win is **s3://securelake** and multi-backend
+// portability — one operator, many stores. Feature-gated behind `opendal`
+// (Cargo.toml) so the default binary stays lean.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "opendal")]
@@ -408,17 +409,47 @@ impl Operator for OpendalFetch {
 
         let op = match scheme {
             "http" | "https" => {
-                if !cfg.headers.is_empty() {
-                    return Err(Error::ManifestValidation(format!(
-                        "opendal_fetch: the OpenDAL HTTP service cannot set request headers ({}); \
-                         a header-gated source (e.g. a SEC User-Agent) needs `op: http_fetch`",
-                        cfg.headers.keys().cloned().collect::<Vec<_>>().join(", ")
-                    )));
-                }
                 let endpoint = format!("{}://{}", scheme, authority);
                 let builder = services::Http::default().endpoint(&endpoint);
-                DalOperator::new(builder)
-                    .map_err(|e| fetch_failed(format!("opendal_fetch: http backend: {}", e)))?
+                let mut dal = DalOperator::new(builder)
+                    .map_err(|e| fetch_failed(format!("opendal_fetch: http backend: {}", e)))?;
+                // OpenDAL's Http builder has no header setter (only basic-auth /
+                // bearer). To carry request headers — e.g. the SEC User-Agent —
+                // inject a reqwest client with `default_headers` through a custom
+                // ReqwestTransport. More plumbing (+2 deps) than ureq's `.set()`,
+                // but it works: proven on the live SEC fetch.
+                if !cfg.headers.is_empty() {
+                    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+                    let mut hm = HeaderMap::new();
+                    for (k, v) in &cfg.headers {
+                        let name = HeaderName::from_bytes(k.as_bytes()).map_err(|e| {
+                            Error::ManifestValidation(format!(
+                                "opendal_fetch: bad header name '{}': {}",
+                                k, e
+                            ))
+                        })?;
+                        let val = HeaderValue::from_str(v).map_err(|e| {
+                            Error::ManifestValidation(format!(
+                                "opendal_fetch: bad header value for '{}': {}",
+                                k, e
+                            ))
+                        })?;
+                        hm.insert(name, val);
+                    }
+                    let client = reqwest::Client::builder()
+                        .default_headers(hm)
+                        .build()
+                        .map_err(|e| {
+                            fetch_failed(format!("opendal_fetch: build http client: {}", e))
+                        })?;
+                    let transport =
+                        opendal_http_transport_reqwest::ReqwestTransport::new(client);
+                    dal = dal.with_context(
+                        opendal::OperationContext::new()
+                            .with_http_transport(opendal::HttpTransporter::new(transport)),
+                    );
+                }
+                dal
             }
             "s3" => {
                 // Credentials/region from the standard AWS_* environment — the
@@ -515,24 +546,17 @@ mod tests {
 
     #[cfg(feature = "opendal")]
     #[test]
-    fn opendal_fetch_rejects_header_gated_http() {
-        // The decisive spike finding, pinned in code: OpenDAL's HTTP service has
-        // no request-header knob, so a UA-gated fetch must fail fast and point at
-        // http_fetch — never silently drop the header and 403 at the SEC.
+    fn opendal_fetch_accepts_headers() {
+        // `headers` is a valid config field on opendal_fetch — it is carried to
+        // the http(s) backend via a custom ReqwestTransport (see run()), not
+        // rejected. The live transport wiring is proven by the SEC fetch in the
+        // spike run; here we just assert the config is accepted + lineage holds.
         let with: Value = serde_yaml::from_str(
-            "from: https://www.sec.gov/Archives/edgar/cik-lookup-data.txt\nto: build/cik.txt\nheaders:\n  User-Agent: 'Meridian (research@meridian.online)'",
+            "from: https://www.sec.gov/files/company_tickers.json\nto: build/tickers.json\nheaders:\n  User-Agent: 'Meridian (research@meridian.online)'",
         )
         .unwrap();
-        let dir = std::env::temp_dir();
-        let db = dir.join("_arc_spike_none.db");
-        let env = HashMap::new();
-        let ctx = OpContext { dir: &dir, db_path: &db, env: &env, timeout: None };
-        // Fails on the header check *before* any network/tokio work.
-        match OPENDAL_FETCH.run(&with, &ctx) {
-            Err(Error::ManifestValidation(m)) => {
-                assert!(m.contains("http_fetch"), "should redirect to http_fetch: {}", m)
-            }
-            other => panic!("expected header-rejection, got {:?}", other.map(|_| ())),
-        }
+        let assets = assets_for("opendal_fetch", Some(&with)).unwrap();
+        assert_eq!(assets.produces, vec!["build/tickers.json".to_string()]);
+        assert!(assets.reads.is_empty());
     }
 }

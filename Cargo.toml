@@ -33,12 +33,17 @@ dirs = "5"
 # `--features opendal` to include it. Spike evidence + verdict:
 # bearing/research/arcform-typed-operators.md §ingress-engines.
 opendal = { version = "0.58", features = ["services-http", "services-s3", "blocking"], optional = true }
+# Custom HTTP transport so opendal_fetch can carry request headers (User-Agent) —
+# OpenDAL's Http builder has no header setter; you inject a reqwest client via a
+# ReqwestTransport. reqwest 0.13 is version-matched to OpenDAL's transport.
+opendal-http-transport-reqwest = { version = "0.58", optional = true }
+reqwest = { version = "0.13", default-features = false, optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time"], optional = true }
 
 [features]
 default = []
 # The OpenDAL-backed opendal_fetch operator (multi-backend ingress; securelake s3://).
-opendal = ["dep:opendal", "dep:tokio"]
+opendal = ["dep:opendal", "dep:opendal-http-transport-reqwest", "dep:reqwest", "dep:tokio"]
 
 [dev-dependencies]
 tempfile = "3"
