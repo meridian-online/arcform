@@ -26,6 +26,19 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 tar = "0.4"
 flate2 = "1"
 dirs = "5"
+# opendal_fetch (ingress): one operator, 40+ backends + built-in RetryLayer —
+# the s3://securelake / multi-store lever. HEAVY: +156 crates (tokio, hyper,
+# tower, reqwest, rustls) that the ureq http_fetch path needs none of. Feature-
+# gated OFF by default so the flagship single binary stays lean; build with
+# `--features opendal` to include it. Spike evidence + verdict:
+# bearing/research/arcform-typed-operators.md §ingress-engines.
+opendal = { version = "0.58", features = ["services-http", "services-s3", "blocking"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time"], optional = true }
+
+[features]
+default = []
+# The OpenDAL-backed opendal_fetch operator (multi-backend ingress; securelake s3://).
+opendal = ["dep:opendal", "dep:tokio"]
 
 [dev-dependencies]
 tempfile = "3"

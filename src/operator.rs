@@ -15,7 +15,7 @@
 //!
 //! Design spec: `bearing/research/arcform-typed-operators.md`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::Duration;
 
@@ -67,10 +67,19 @@ pub trait Operator: Sync {
 }
 
 static PARQUET_EXPORT: ParquetExport = ParquetExport;
+static HTTP_FETCH: HttpFetch = HttpFetch;
+#[cfg(feature = "opendal")]
+static OPENDAL_FETCH: OpendalFetch = OpendalFetch;
 
-/// The built-in operator catalog.
+/// The built-in operator catalog. `opendal_fetch` is present only when the
+/// `opendal` feature is enabled (see Cargo.toml — off by default to keep the
+/// single binary lean).
 fn catalog() -> Vec<&'static dyn Operator> {
-    vec![&PARQUET_EXPORT]
+    #[allow(unused_mut)]
+    let mut ops: Vec<&'static dyn Operator> = vec![&PARQUET_EXPORT, &HTTP_FETCH];
+    #[cfg(feature = "opendal")]
+    ops.push(&OPENDAL_FETCH);
+    ops
 }
 
 /// Resolve an `op:` reference (`name` or `name@<semver-req>`) from the catalog,
@@ -215,6 +224,245 @@ impl Operator for ParquetExport {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// http_fetch (ingress) — the curl/wget of the catalog: a plain authenticated
+// GET streamed atomically to `out`.
+//
+// Built on **ureq** — already an arcform dependency, blocking, ~0 transitive
+// weight, http/https only. The operator is a straight-line GET: resilience
+// (retry + backoff) comes from the ENGINE's step-retry loop, which already
+// wraps every op run via `defaults.retry` — a transient failure returns the
+// retryable `StepFailed` and the runner re-attempts with backoff. A default
+// User-Agent is always set (gov registries — SEC — 403 a missing UA) and any
+// `headers` the Protocol supplies are layered on top. This is the workhorse
+// that retires `fetch_edgar`/`fetch_gleif` and the header-gated SEC fetch.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct HttpFetch;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HttpFetchConfig {
+    /// Source URL (http/https).
+    url: String,
+    /// Destination path, relative to the manifest directory. Written atomically.
+    out: String,
+    /// Extra request headers. A default `User-Agent` is set unless overridden here.
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+}
+
+/// Default UA — an unset User-Agent is a 403 at the SEC and several registries.
+const DEFAULT_UA: &str = "arcform-http_fetch/1 (+https://meridian.online)";
+
+impl HttpFetchConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        serde_yaml::from_value(with.clone()).map_err(|e| {
+            Error::ManifestValidation(format!("http_fetch: invalid `with:` config: {}", e))
+        })
+    }
+}
+
+/// Map any fetch/IO failure to the retryable `StepFailed` so the engine's
+/// step-retry loop re-attempts it with backoff.
+fn fetch_failed(msg: String) -> Error {
+    Error::StepFailed {
+        step: String::new(), // runner overwrites with the step name
+        code: 1,
+        stderr: msg,
+    }
+}
+
+impl Operator for HttpFetch {
+    fn name(&self) -> &'static str {
+        "http_fetch"
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = HttpFetchConfig::parse(with)?;
+        // The network source is not a graph node; only the local artifact is.
+        Ok(OpAssets {
+            reads: vec![],
+            produces: vec![cfg.out.to_lowercase()],
+        })
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        let cfg = HttpFetchConfig::parse(with)?;
+        let out = ctx.dir.join(&cfg.out);
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        // Default UA first, then Protocol overrides (a `User-Agent` key wins).
+        let mut req = ureq::get(&cfg.url).set("User-Agent", DEFAULT_UA);
+        for (k, v) in &cfg.headers {
+            req = req.set(k, v);
+        }
+        let resp = req
+            .call()
+            .map_err(|e| fetch_failed(format!("http_fetch: GET {}: {}", cfg.url, e)))?;
+
+        // Stream to a sibling `.part` file, then atomically rename into place —
+        // a killed run never leaves a truncated artifact that looks complete.
+        let tmp = out.with_extension("part");
+        let mut reader = resp.into_reader();
+        let mut file = std::fs::File::create(&tmp)
+            .map_err(|e| fetch_failed(format!("http_fetch: create {}: {}", tmp.display(), e)))?;
+        std::io::copy(&mut reader, &mut file)
+            .map_err(|e| fetch_failed(format!("http_fetch: write {}: {}", tmp.display(), e)))?;
+        let _ = file.sync_all();
+        drop(file);
+        std::fs::rename(&tmp, &out)
+            .map_err(|e| fetch_failed(format!("http_fetch: rename {}: {}", out.display(), e)))?;
+
+        Ok(StepOutput {
+            stderr: String::new(),
+            stdout: None,
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// opendal_fetch (ingress) — the same fetch over **Apache OpenDAL**, a single
+// operator that reads a scheme-dispatched `from` URL across 40+ backends
+// (http/https, s3, gcs, azblob, …) with a built-in `RetryLayer` (per-request
+// backoff, *on top of* the engine step-retry).
+//
+// MEASURED TRADE-OFF (2026-07-14 spike): OpenDAL's HTTP service exposes only
+// basic-auth / bearer — **no arbitrary request headers**. So it structurally
+// cannot satisfy a User-Agent-gated source (the SEC 403s a missing UA); on the
+// http(s) backend, a non-empty `headers` is a hard config error pointing back
+// to `http_fetch`. OpenDAL also buffers the whole object in memory (blocking
+// `read`) and needs a tokio runtime, where ureq streams with zero runtime.
+// OpenDAL's genuine win is **s3://securelake** and multi-backend portability —
+// one operator, many stores — not the vanilla gov fetches these Protocols run.
+// Feature-gated behind `opendal` (Cargo.toml) so the default binary stays lean.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "opendal")]
+struct OpendalFetch;
+
+#[cfg(feature = "opendal")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpendalFetchConfig {
+    /// Scheme-dispatched source: `https://host/key`, `s3://bucket/key`, …
+    from: String,
+    /// Destination path, relative to the manifest directory. Written atomically.
+    to: String,
+    /// Extra request headers. Rejected on the http(s) backend (see above).
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+}
+
+#[cfg(feature = "opendal")]
+impl OpendalFetchConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        serde_yaml::from_value(with.clone()).map_err(|e| {
+            Error::ManifestValidation(format!("opendal_fetch: invalid `with:` config: {}", e))
+        })
+    }
+}
+
+#[cfg(feature = "opendal")]
+impl Operator for OpendalFetch {
+    fn name(&self) -> &'static str {
+        "opendal_fetch"
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = OpendalFetchConfig::parse(with)?;
+        Ok(OpAssets {
+            reads: vec![],
+            produces: vec![cfg.to.to_lowercase()],
+        })
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        use opendal::layers::RetryLayer;
+        use opendal::{services, Operator as DalOperator};
+
+        let cfg = OpendalFetchConfig::parse(with)?;
+        let out = ctx.dir.join(&cfg.to);
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let (scheme, rest) = cfg.from.split_once("://").ok_or_else(|| {
+            Error::ManifestValidation(format!(
+                "opendal_fetch: `from` must be a scheme URL (https://… or s3://…), got '{}'",
+                cfg.from
+            ))
+        })?;
+        // authority = host or bucket; path = the object key relative to backend root.
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+
+        let op = match scheme {
+            "http" | "https" => {
+                if !cfg.headers.is_empty() {
+                    return Err(Error::ManifestValidation(format!(
+                        "opendal_fetch: the OpenDAL HTTP service cannot set request headers ({}); \
+                         a header-gated source (e.g. a SEC User-Agent) needs `op: http_fetch`",
+                        cfg.headers.keys().cloned().collect::<Vec<_>>().join(", ")
+                    )));
+                }
+                let endpoint = format!("{}://{}", scheme, authority);
+                let builder = services::Http::default().endpoint(&endpoint);
+                DalOperator::new(builder)
+                    .map_err(|e| fetch_failed(format!("opendal_fetch: http backend: {}", e)))?
+            }
+            "s3" => {
+                // Credentials/region from the standard AWS_* environment — the
+                // securelake path. Constructed + retry-wrapped here; exercised
+                // when securelake creds are present (not in this spike's run).
+                let builder = services::S3::default().bucket(authority);
+                DalOperator::new(builder)
+                    .map_err(|e| fetch_failed(format!("opendal_fetch: s3 backend: {}", e)))?
+            }
+            other => {
+                return Err(Error::ManifestValidation(format!(
+                    "opendal_fetch: unsupported scheme '{}' (http, https, s3)",
+                    other
+                )));
+            }
+        };
+        let op = op.layer(RetryLayer::new());
+
+        // OpenDAL's blocking bridge requires an entered tokio runtime.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|e| fetch_failed(format!("opendal_fetch: tokio runtime: {}", e)))?;
+        let _guard = rt.enter();
+        let bop = opendal::blocking::Operator::new(op)
+            .map_err(|e| fetch_failed(format!("opendal_fetch: blocking bridge: {}", e)))?;
+        let buf = bop
+            .read(path)
+            .map_err(|e| fetch_failed(format!("opendal_fetch: read {}: {}", cfg.from, e)))?;
+
+        let tmp = out.with_extension("part");
+        std::fs::write(&tmp, buf.to_vec())
+            .map_err(|e| fetch_failed(format!("opendal_fetch: write {}: {}", tmp.display(), e)))?;
+        std::fs::rename(&tmp, &out)
+            .map_err(|e| fetch_failed(format!("opendal_fetch: rename {}: {}", out.display(), e)))?;
+
+        Ok(StepOutput {
+            stderr: String::new(),
+            stdout: None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +492,47 @@ mod tests {
         // unknown field
         let with: Value = serde_yaml::from_str("input: t\ndest: o.parquet\nbogus: 1").unwrap();
         assert!(assets_for("parquet_export", Some(&with)).is_err());
+    }
+
+    #[test]
+    fn http_fetch_declares_only_its_output() {
+        // Ingress produces the local artifact and reads no graph node (the
+        // network source isn't in the AssetGraph).
+        let hf: Value = serde_yaml::from_str("url: https://x/edgar.parquet\nout: build/edgar.parquet").unwrap();
+        let a = assets_for("http_fetch", Some(&hf)).unwrap();
+        assert_eq!(a.produces, vec!["build/edgar.parquet".to_string()]);
+        assert!(a.reads.is_empty());
+    }
+
+    #[cfg(feature = "opendal")]
+    #[test]
+    fn opendal_fetch_declares_only_its_output() {
+        let of: Value = serde_yaml::from_str("from: s3://securelake/edgar.parquet\nto: build/edgar.parquet").unwrap();
+        let a = assets_for("opendal_fetch", Some(&of)).unwrap();
+        assert_eq!(a.produces, vec!["build/edgar.parquet".to_string()]);
+        assert!(a.reads.is_empty());
+    }
+
+    #[cfg(feature = "opendal")]
+    #[test]
+    fn opendal_fetch_rejects_header_gated_http() {
+        // The decisive spike finding, pinned in code: OpenDAL's HTTP service has
+        // no request-header knob, so a UA-gated fetch must fail fast and point at
+        // http_fetch — never silently drop the header and 403 at the SEC.
+        let with: Value = serde_yaml::from_str(
+            "from: https://www.sec.gov/Archives/edgar/cik-lookup-data.txt\nto: build/cik.txt\nheaders:\n  User-Agent: 'Meridian (research@meridian.online)'",
+        )
+        .unwrap();
+        let dir = std::env::temp_dir();
+        let db = dir.join("_arc_spike_none.db");
+        let env = HashMap::new();
+        let ctx = OpContext { dir: &dir, db_path: &db, env: &env, timeout: None };
+        // Fails on the header check *before* any network/tokio work.
+        match OPENDAL_FETCH.run(&with, &ctx) {
+            Err(Error::ManifestValidation(m)) => {
+                assert!(m.contains("http_fetch"), "should redirect to http_fetch: {}", m)
+            }
+            other => panic!("expected header-rejection, got {:?}", other.map(|_| ())),
+        }
     }
 }
