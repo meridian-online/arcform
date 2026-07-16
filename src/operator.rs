@@ -69,6 +69,7 @@ static HTTP_FETCH: HttpFetch = HttpFetch;
 static HTML_LINK_DISCOVER: HtmlLinkDiscover = HtmlLinkDiscover;
 static ARCHIVE_EXTRACT: ArchiveExtract = ArchiveExtract;
 static DATAPACKAGE_DESCRIBE: DatapackageDescribe = DatapackageDescribe;
+static FINETYPE_VALIDATE: FinetypeValidate = FinetypeValidate;
 static SPLINK_RESOLVE: SplinkResolve = SplinkResolve;
 static GLEIF_RA_FETCH: GleifRaFetch = GleifRaFetch;
 #[cfg(feature = "opendal")]
@@ -85,6 +86,7 @@ fn catalog() -> Vec<&'static dyn Operator> {
         &HTML_LINK_DISCOVER,
         &ARCHIVE_EXTRACT,
         &DATAPACKAGE_DESCRIBE,
+        &FINETYPE_VALIDATE,
         &SPLINK_RESOLVE,
         &GLEIF_RA_FETCH,
     ];
@@ -757,6 +759,90 @@ impl Operator for DatapackageDescribe {
             ],
         );
         run_process("uv", &args, ctx, OutputMode::Capture, "datapackage_describe")
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// finetype_validate (gate) — the fail-closed DRIFT GATE that makes finetype's typed
+// schema LOAD-BEARING, not just post-hoc descriptive. Where datapackage_describe
+// *describes* the built Parquet, this *enforces* it: `finetype validate <parquet>
+// <schema>` in CHECK-ONLY mode types every column and checks it against a self-derived
+// JSON-Schema contract.
+//
+// The contract per dataset is derived from that dataset's OWN produced Parquet —
+// `finetype profile -o json-schema --stats` (the observed length/range envelope, the
+// closed enum domains for low-cardinality columns, the per-column x-finetype-label
+// semantic type). Because it is derived from the data, every current row validates:
+// the gate is a PASS-THROUGH today and a TRIPWIRE for future Runs (a value outside a
+// closed enum, a length past the envelope, a range break → finetype exits non-zero →
+// the run fails). See each dataset's schema.finetype.json header for the exact recipe.
+//
+// CHECK-ONLY is load-bearing for byte-equivalence: with no `--db`/`--table`, finetype
+// writes nothing and only sets its exit code (0 = all valid; 1 = rows violate the
+// contract; 2 = finetype error). It never rewrites/reorders/drops rows — this operator
+// READS the terminal Parquet, it does not touch it, so the published bytes are
+// unchanged. Native binary, exactly as datapackage_describe shells `finetype` — no
+// uv-run indirection. (finetype validate itself shells `duckdb` to stream Parquet→CSV,
+// so `duckdb` must be on PATH — it already is, for the SQL steps.)
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct FinetypeValidate;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FinetypeValidateConfig {
+    /// Built Parquet to check (a `reads` asset — orders the gate downstream of the
+    /// step that produces it, so a rebuilt Parquet re-triggers the gate). Resolved
+    /// against ctx.dir.
+    parquet: String,
+    /// Self-derived JSON-Schema contract to check against (a `reads` asset). Resolved
+    /// against ctx.dir.
+    schema: String,
+}
+
+impl FinetypeValidateConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        serde_yaml::from_value(with.clone()).map_err(|e| {
+            Error::ManifestValidation(format!("finetype_validate: invalid `with:` config: {}", e))
+        })
+    }
+}
+
+impl Operator for FinetypeValidate {
+    fn name(&self) -> &'static str {
+        "finetype_validate"
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = FinetypeValidateConfig::parse(with)?;
+        // A gate produces no artifact (check-only). It READS both the Parquet — which
+        // orders it downstream of the export that produces it (so a rebuilt Parquet
+        // re-triggers the gate via stale-propagation) — and the schema contract.
+        Ok(OpAssets {
+            reads: vec![cfg.parquet.to_lowercase(), cfg.schema.to_lowercase()],
+            produces: vec![],
+        })
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        let cfg = FinetypeValidateConfig::parse(with)?;
+        let parquet = ctx.dir.join(&cfg.parquet);
+        let schema = ctx.dir.join(&cfg.schema);
+
+        // `finetype validate <file> <schema>` with NO `--db`/`--table` → check-only.
+        // Inherit mode streams the validation report live so a drift failure shows the
+        // offending column/constraint; a non-zero exit maps to a StepFailed and the run
+        // fails closed (the contract is the gate, not a suggestion).
+        let args = vec![
+            "validate".to_string(),
+            parquet.display().to_string(),
+            schema.display().to_string(),
+        ];
+        run_process("finetype", &args, ctx, OutputMode::Inherit, "finetype_validate")
     }
 }
 
@@ -1595,6 +1681,100 @@ mod tests {
         assert!(assets_for("gleif_ra_fetch", Some(&bogus)).is_err());
     }
 
+
+    // ── finetype_validate ───────────────────────────────────────────────────
+
+    #[test]
+    fn finetype_validate_is_in_catalog_and_versioned() {
+        assert!(resolve("finetype_validate").is_ok());
+        assert!(resolve("finetype_validate@1").is_ok());
+        assert!(resolve("finetype_validate@^1.0").is_ok());
+        assert!(resolve("finetype_validate@2").is_err()); // version not satisfied
+    }
+
+    #[test]
+    fn finetype_validate_declares_reads_and_no_produces() {
+        // Gate: reads [parquet, schema] (parquet first → downstream of its producer),
+        // produces nothing (check-only leaves the terminal Parquet byte-identical).
+        let with: Value = serde_yaml::from_str(
+            "parquet: build/edgar_gleif.parquet\nschema: schema.finetype.json",
+        )
+        .unwrap();
+        let a = assets_for("finetype_validate", Some(&with)).unwrap();
+        assert_eq!(
+            a.reads,
+            vec![
+                "build/edgar_gleif.parquet".to_string(),
+                "schema.finetype.json".to_string(),
+            ]
+        );
+        assert!(a.produces.is_empty());
+    }
+
+    #[test]
+    fn finetype_validate_rejects_bad_config() {
+        // missing required `schema`
+        let no_schema: Value = serde_yaml::from_str("parquet: p.parquet").unwrap();
+        assert!(assets_for("finetype_validate", Some(&no_schema)).is_err());
+        // missing required `parquet`
+        let no_parquet: Value = serde_yaml::from_str("schema: s.json").unwrap();
+        assert!(assets_for("finetype_validate", Some(&no_parquet)).is_err());
+        // unknown field rejected (deny_unknown_fields)
+        let bogus: Value =
+            serde_yaml::from_str("parquet: p\nschema: s\nbogus: 1").unwrap();
+        assert!(assets_for("finetype_validate", Some(&bogus)).is_err());
+    }
+
+    /// A minimal CSV + a JSON Schema it satisfies, then a schema it violates — the two
+    /// halves of the gate. `finetype` and `duckdb` must be on PATH (they are in CI and
+    /// for `arc run`); if `finetype` is absent the run maps to a NON-retryable
+    /// StepExecution (missing binary), which we assert as the skip signal rather than a
+    /// false failure.
+    #[test]
+    fn finetype_validate_passes_clean_and_fails_on_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        // A tiny table: one column `code` with two 2-letter values.
+        std::fs::write(dir.path().join("data.csv"), "code\nUS\nGB\n").unwrap();
+        // PASS schema: `code` is a 2-char string — both rows satisfy it.
+        std::fs::write(
+            dir.path().join("pass.json"),
+            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"code":{"type":"string","minLength":2,"maxLength":2}}}"#,
+        )
+        .unwrap();
+        // DRIFT schema: a closed enum that does NOT contain "GB" — the second row
+        // violates it, so finetype must exit non-zero and the gate must fail.
+        std::fs::write(
+            dir.path().join("drift.json"),
+            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"code":{"type":"string","enum":["US"]}}}"#,
+        )
+        .unwrap();
+
+        let env = HashMap::new();
+        let ctx = test_ctx(dir.path(), &env);
+        let op = resolve("finetype_validate").unwrap();
+
+        let pass_with: Value =
+            serde_yaml::from_str("parquet: data.csv\nschema: pass.json").unwrap();
+        match op.run(&pass_with, &ctx) {
+            Ok(_) => {} // clean → gate passes
+            Err(Error::StepExecution { .. }) => {
+                eprintln!("skipping: `finetype` not on PATH");
+                return;
+            }
+            other => panic!("clean validate should pass, got {:?}", other.map(|_| ())),
+        }
+
+        let drift_with: Value =
+            serde_yaml::from_str("parquet: data.csv\nschema: drift.json").unwrap();
+        match op.run(&drift_with, &ctx) {
+            // Fail-closed: a row violates the contract → finetype exits 1 → StepFailed.
+            Err(Error::StepFailed { .. }) => {}
+            Err(Error::StepExecution { .. }) => {
+                eprintln!("skipping: `finetype` not on PATH");
+            }
+            other => panic!("drift must fail the gate, got {:?}", other.map(|_| ())),
+        }
+    }
 
     #[test]
     fn http_fetch_declares_only_its_output() {
