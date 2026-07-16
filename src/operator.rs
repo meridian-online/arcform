@@ -765,25 +765,34 @@ impl Operator for DatapackageDescribe {
 // ─────────────────────────────────────────────────────────────────────────────
 // finetype_validate (gate) — the fail-closed DRIFT GATE that makes finetype's typed
 // schema LOAD-BEARING, not just post-hoc descriptive. Where datapackage_describe
-// *describes* the built Parquet, this *enforces* it: `finetype validate <parquet>
-// <schema>` in CHECK-ONLY mode types every column and checks it against a self-derived
-// JSON-Schema contract.
+// *describes* the built Parquet, this *enforces* it: it checks every column of the
+// terminal Parquet against a self-derived JSON-Schema contract.
 //
-// The contract per dataset is derived from that dataset's OWN produced Parquet —
-// `finetype profile -o json-schema --stats` (the observed length/range envelope, the
-// closed enum domains for low-cardinality columns, the per-column x-finetype-label
-// semantic type). Because it is derived from the data, every current row validates:
-// the gate is a PASS-THROUGH today and a TRIPWIRE for future Runs (a value outside a
-// closed enum, a length past the envelope, a range break → finetype exits non-zero →
-// the run fails). See each dataset's schema.finetype.json header for the exact recipe.
+// IN-ENGINE (no subprocess). The gate opens a throwaway in-memory DuckDB, LOADs the
+// finetype DuckDB extension, and runs its `ft_validate(table, schema) → TABLE` macro —
+// the model-free (jsonschema-based, no model dir) validator. `ft_validate` melts every
+// column to VARCHAR and checks each against its `$.properties.<col>` subschema,
+// returning a per-column report {column_name, total, rejects, sample_message}. Any
+// rejecting row → the run fails closed, and the offending columns are logged first.
+// Running the extension in-process (vs shelling a `finetype` CLI) means the gate needs
+// no `finetype`/`duckdb` on PATH — only the built extension artifact, located via the
+// `FINETYPE_DUCKDB_EXT` env var (the deployment sets the per-platform build) or a
+// per-step `extension:` override.
 //
-// CHECK-ONLY is load-bearing for byte-equivalence: with no `--db`/`--table`, finetype
-// writes nothing and only sets its exit code (0 = all valid; 1 = rows violate the
-// contract; 2 = finetype error). It never rewrites/reorders/drops rows — this operator
-// READS the terminal Parquet, it does not touch it, so the published bytes are
-// unchanged. Native binary, exactly as datapackage_describe shells `finetype` — no
-// uv-run indirection. (finetype validate itself shells `duckdb` to stream Parquet→CSV,
-// so `duckdb` must be on PATH — it already is, for the SQL steps.)
+// The contract per dataset is derived from that dataset's OWN produced Parquet, relaxed
+// to the string-surviving keywords `ft_validate` enforces once columns are melted to
+// VARCHAR — `enum` (closed categorical domains), `pattern`, `minLength`/`maxLength`,
+// `const`, `type: string`. Because it is derived from the data, every current row
+// validates: the gate is a PASS-THROUGH today and a TRIPWIRE for future Runs (a value
+// outside a closed enum, a length past the envelope, a shape break → rejects → the run
+// fails). See each dataset's schema.finetype.json `$comment` for what is enforced (and
+// what is deliberately NOT: numeric ranges are inert once melted, and NULLs are
+// invisible — no not-null enforcement).
+//
+// CHECK-ONLY is load-bearing for byte-equivalence: the gate READS the Parquet via
+// `read_parquet` and never rewrites/reorders/drops rows, so the published bytes are
+// unchanged. `allow_unsigned_extensions` MUST be an open-time flag (a runtime `SET`
+// fails), so the connection is opened with it via `open_in_memory_with_flags`.
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct FinetypeValidate;
@@ -798,6 +807,13 @@ struct FinetypeValidateConfig {
     /// Self-derived JSON-Schema contract to check against (a `reads` asset). Resolved
     /// against ctx.dir.
     schema: String,
+    /// OPTIONAL per-step override for the finetype DuckDB extension path. Normally the
+    /// path comes from the `FINETYPE_DUCKDB_EXT` env var (the deployment sets the
+    /// per-platform build); this field lets a single Protocol pin a specific artifact.
+    /// NOT a data asset — deliberately excluded from `assets()`, so manifests that omit
+    /// it (all of them) don't churn and lineage is unchanged.
+    #[serde(default)]
+    extension: Option<String>,
 }
 
 impl FinetypeValidateConfig {
@@ -833,17 +849,132 @@ impl Operator for FinetypeValidate {
         let parquet = ctx.dir.join(&cfg.parquet);
         let schema = ctx.dir.join(&cfg.schema);
 
-        // `finetype validate <file> <schema>` with NO `--db`/`--table` → check-only.
-        // Inherit mode streams the validation report live so a drift failure shows the
-        // offending column/constraint; a non-zero exit maps to a StepFailed and the run
-        // fails closed (the contract is the gate, not a suggestion).
-        let args = vec![
-            "validate".to_string(),
-            parquet.display().to_string(),
-            schema.display().to_string(),
-        ];
-        run_process("finetype", &args, ctx, OutputMode::Inherit, "finetype_validate")
+        // Locate the finetype DuckDB extension (per-step override, else env var).
+        // A missing/unset artifact is a deterministic misconfiguration → non-retryable.
+        let ext = finetype_ext_path(cfg.extension.as_deref())?;
+
+        // Open a throwaway in-memory DuckDB with unsigned extensions ALLOWED. This is an
+        // OPEN-TIME flag — a runtime `SET allow_unsigned_extensions` is rejected — so it
+        // goes through `open_in_memory_with_flags`.
+        let config = duckdb::Config::default()
+            .allow_unsigned_extensions()
+            .map_err(|e| gate_failed(format!("configure duckdb: {e}")))?;
+        let conn = duckdb::Connection::open_in_memory_with_flags(config)
+            .map_err(|e| gate_failed(format!("open in-memory duckdb: {e}")))?;
+        conn.execute_batch(&format!("LOAD '{}';", sql_lit(&ext.display().to_string())))
+            .map_err(|e| gate_failed(format!("LOAD finetype extension {}: {e}", ext.display())))?;
+        // View the terminal Parquet — read-only, so the published bytes are untouched.
+        conn.execute_batch(&format!(
+            "CREATE OR REPLACE TEMP VIEW _ftv AS SELECT * FROM read_parquet('{}');",
+            sql_lit(&parquet.display().to_string())
+        ))
+        .map_err(|e| gate_failed(format!("read_parquet {}: {e}", parquet.display())))?;
+
+        // Run the model-free `ft_validate` macro and pull the full per-column report.
+        // It auto-detects the `schema` arg as a file path (it does not start with `{`).
+        // coalesce guards the nested-column skip rows, which carry NULL total/rejects.
+        let report_sql = format!(
+            "SELECT column_name, coalesce(total, 0)::BIGINT, coalesce(rejects, 0)::BIGINT, \
+             coalesce(sample_message, '') FROM ft_validate('_ftv', '{}') \
+             ORDER BY coalesce(rejects, 0) DESC, column_name",
+            sql_lit(&schema.display().to_string())
+        );
+        let mut stmt = conn
+            .prepare(&report_sql)
+            .map_err(|e| gate_failed(format!("prepare ft_validate: {e}")))?;
+        let report = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?, // column_name
+                    row.get::<_, i64>(1)?,    // total
+                    row.get::<_, i64>(2)?,    // rejects
+                    row.get::<_, String>(3)?, // sample_message
+                ))
+            })
+            .map_err(|e| gate_failed(format!("run ft_validate: {e}")))?;
+
+        let mut total_rejects: i64 = 0;
+        let mut offenders: Vec<(String, i64, i64, String)> = Vec::new();
+        for row in report {
+            let (col, total, rejects, msg) =
+                row.map_err(|e| gate_failed(format!("read ft_validate report: {e}")))?;
+            total_rejects += rejects;
+            if rejects > 0 {
+                offenders.push((col, total, rejects, msg));
+            }
+        }
+
+        if total_rejects > 0 {
+            // Fail-report UX: surface the offending {column, rejects, sample_message}
+            // rows before failing closed — a strict upgrade on the old exit-code signal.
+            eprintln!(
+                "finetype_validate: {} contract violation(s) in {} vs {} — DRIFT, failing closed:",
+                total_rejects, cfg.parquet, cfg.schema
+            );
+            for (col, total, rejects, msg) in &offenders {
+                eprintln!("  ✗ {col}: {rejects}/{total} row(s) reject — {msg}");
+            }
+            return Err(Error::StepFailed {
+                step: String::new(), // runner rewrites with the step name
+                code: 1,
+                stderr: format!(
+                    "finetype_validate: {} column(s) drifted from {} ({} rejecting row(s))",
+                    offenders.len(),
+                    cfg.schema,
+                    total_rejects
+                ),
+            });
+        }
+
+        Ok(StepOutput { stderr: String::new(), stdout: None })
     }
+}
+
+/// Resolve the finetype DuckDB extension path for the in-engine gate: a per-step
+/// `extension:` override wins, else the `FINETYPE_DUCKDB_EXT` env var. A missing/unset
+/// path is a deterministic misconfiguration → NON-retryable [`Error::StepExecution`]
+/// (a bad binary must never burn a 4 h job's retries — parity with the old missing
+/// `finetype` CLI case).
+fn finetype_ext_path(config_ext: Option<&str>) -> Result<PathBuf> {
+    let raw = match config_ext {
+        Some(p) if !p.trim().is_empty() => p.to_string(),
+        _ => std::env::var("FINETYPE_DUCKDB_EXT").map_err(|_| Error::StepExecution {
+            step: "finetype_validate".to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "finetype DuckDB extension not configured: set FINETYPE_DUCKDB_EXT to the built \
+                 finetype.duckdb_extension (per-platform), or pass `extension:` in the step",
+            ),
+        })?,
+    };
+    let path = PathBuf::from(raw);
+    if !path.exists() {
+        return Err(Error::StepExecution {
+            step: "finetype_validate".to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("finetype DuckDB extension not found at {}", path.display()),
+            ),
+        });
+    }
+    Ok(path)
+}
+
+/// Map an in-engine gate failure (duckdb open / LOAD / query) to the retryable
+/// [`Error::StepFailed`], matching the old shell-out's "finetype error exit → retryable"
+/// posture (the runner rewrites the empty `step` with the step name).
+fn gate_failed(msg: String) -> Error {
+    Error::StepFailed {
+        step: String::new(),
+        code: 1,
+        stderr: format!("finetype_validate: {msg}"),
+    }
+}
+
+/// Escape single quotes for a SQL string literal — used when interpolating filesystem
+/// paths into `LOAD`/`read_parquet`/`ft_validate`.
+fn sql_lit(s: &str) -> String {
+    s.replace('\'', "''")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1725,53 +1856,67 @@ mod tests {
         assert!(assets_for("finetype_validate", Some(&bogus)).is_err());
     }
 
-    /// A minimal CSV + a JSON Schema it satisfies, then a schema it violates — the two
-    /// halves of the gate. `finetype` and `duckdb` must be on PATH (they are in CI and
-    /// for `arc run`); if `finetype` is absent the run maps to a NON-retryable
-    /// StepExecution (missing binary), which we assert as the skip signal rather than a
-    /// false failure.
+    /// A minimal Parquet + a JSON Schema it satisfies, then a schema it violates — the
+    /// two halves of the in-engine gate. Needs the built finetype DuckDB extension: the
+    /// verify harness exports `FINETYPE_DUCKDB_EXT` to point at it; if it is unset or
+    /// absent (e.g. CI without the extension) the test SKIPS rather than false-fails.
     #[test]
     fn finetype_validate_passes_clean_and_fails_on_drift() {
+        let ext = match std::env::var("FINETYPE_DUCKDB_EXT") {
+            Ok(p) if std::path::Path::new(&p).exists() => p,
+            _ => {
+                eprintln!("skipping finetype_validate: FINETYPE_DUCKDB_EXT unset or missing");
+                return;
+            }
+        };
+
         let dir = tempfile::tempdir().unwrap();
-        // A tiny table: one column `code` with two 2-letter values.
-        std::fs::write(dir.path().join("data.csv"), "code\nUS\nGB\n").unwrap();
-        // PASS schema: `code` is a 2-char string — both rows satisfy it.
+        // Build a tiny Parquet with one column `code` holding two 2-letter values — the
+        // gate reads Parquet via `read_parquet`, so materialise it with DuckDB itself.
+        let parquet = dir.path().join("data.parquet");
+        {
+            let conn = duckdb::Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "COPY (SELECT 'US' AS code UNION ALL SELECT 'GB') TO '{}' (FORMAT parquet);",
+                sql_lit(&parquet.display().to_string())
+            ))
+            .unwrap();
+        }
+        // PASS schema: a closed enum containing BOTH values — 0 rejects.
         std::fs::write(
             dir.path().join("pass.json"),
-            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"code":{"type":"string","minLength":2,"maxLength":2}}}"#,
+            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"code":{"type":"string","minLength":2,"maxLength":2,"enum":["US","GB"]}}}"#,
         )
         .unwrap();
         // DRIFT schema: a closed enum that does NOT contain "GB" — the second row
-        // violates it, so finetype must exit non-zero and the gate must fail.
+        // violates it, so ft_validate reports a reject and the gate must fail closed.
         std::fs::write(
             dir.path().join("drift.json"),
             r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"code":{"type":"string","enum":["US"]}}}"#,
         )
         .unwrap();
 
+        // Wire the extension through the per-step `extension:` config field — the same
+        // resolution path the env var feeds, without mutating process-global env.
+        let ext_yaml = format!("\nextension: {}", ext);
         let env = HashMap::new();
         let ctx = test_ctx(dir.path(), &env);
         let op = resolve("finetype_validate").unwrap();
 
         let pass_with: Value =
-            serde_yaml::from_str("parquet: data.csv\nschema: pass.json").unwrap();
+            serde_yaml::from_str(&format!("parquet: data.parquet\nschema: pass.json{ext_yaml}"))
+                .unwrap();
         match op.run(&pass_with, &ctx) {
             Ok(_) => {} // clean → gate passes
-            Err(Error::StepExecution { .. }) => {
-                eprintln!("skipping: `finetype` not on PATH");
-                return;
-            }
             other => panic!("clean validate should pass, got {:?}", other.map(|_| ())),
         }
 
         let drift_with: Value =
-            serde_yaml::from_str("parquet: data.csv\nschema: drift.json").unwrap();
+            serde_yaml::from_str(&format!("parquet: data.parquet\nschema: drift.json{ext_yaml}"))
+                .unwrap();
         match op.run(&drift_with, &ctx) {
-            // Fail-closed: a row violates the contract → finetype exits 1 → StepFailed.
+            // Fail-closed: a row violates the contract → rejects > 0 → StepFailed.
             Err(Error::StepFailed { .. }) => {}
-            Err(Error::StepExecution { .. }) => {
-                eprintln!("skipping: `finetype` not on PATH");
-            }
             other => panic!("drift must fail the gate, got {:?}", other.map(|_| ())),
         }
     }
