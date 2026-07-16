@@ -84,6 +84,15 @@ impl DuckDbStateBackend {
     }
 
     fn open(&self) -> Result<duckdb::Connection> {
+        // The Protocol declares the db path (e.g. `db: build/edgar.db`); its parent dir
+        // may not exist yet on a fresh checkout (the retired opaque pipelines did
+        // `mkdir -p build` in their first step). Create it so `arc run` is self-
+        // sufficient — otherwise opening the state db fails before any step runs.
+        if let Some(parent) = self.db_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
         duckdb::Connection::open(&self.db_path).map_err(|e| Error::StateBackend(e.to_string()))
     }
 }
@@ -350,6 +359,25 @@ mod tests {
 
         // Idempotent: calling init again should not fail.
         backend.init().unwrap();
+    }
+
+    // The state db's parent dir is created on open — a fresh all-config Protocol
+    // (`db: build/x.db`) has no `build/` yet (the retired opaque pipelines did
+    // `mkdir -p build`), and opening the state db must not fail before any step runs.
+    #[test]
+    fn init_creates_missing_db_parent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // `build/` does NOT exist yet — mirrors a fresh checkout.
+        let db_path = dir.path().join("build").join("x.db");
+        assert!(!db_path.parent().unwrap().exists());
+
+        let backend = DuckDbStateBackend::new(&db_path);
+        backend.init().unwrap(); // must not error on the missing parent
+
+        assert!(db_path.exists(), "state db (and its parent) should be created");
+        // Tables are usable.
+        backend.record_step("s", "h", StepStatus::Success).unwrap();
+        assert_eq!(backend.get_step_state("s").unwrap().unwrap().sql_hash, "h");
     }
 
     // AC-03: SQL content hash stored correctly.
