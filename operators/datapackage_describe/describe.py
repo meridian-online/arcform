@@ -29,6 +29,11 @@ sidecar. finetype's semantic labels are also only as good as the installed
 finetype; a wrong label is corrected by adding the field to the sidecar's
 `fields` map (an override sets any field key, including `x-finetype-label`).
 
+Because we shell out to whatever `finetype` is on PATH, the step first asserts a
+minimum finetype version (`--min-finetype-version`) and fails closed below it — a
+stale binary types columns wrong but still emits valid JSON, so trusting PATH
+once shipped wrong labels downstream with no error.
+
 The step FAILS LOUDLY if a curated primaryKey / foreignKey names a column that
 is not in the built Parquet — that is exactly the descriptor-drift this step
 exists to catch, and a silent mismatch would be worse than a stopped run.
@@ -37,12 +42,50 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 
 # Top-level override keys handled structurally (everything else is copied to the
 # package root as-is, e.g. title / description / homepage / licenses / sources).
 _STRUCTURAL = {"resource", "fields", "primaryKey", "foreignKeys"}
+
+# The floor finetype version whose taxonomy types these datasets correctly. A
+# drifted, older binary on PATH once silently shipped wrong labels — the guard
+# below turns that into a stopped run. Bump this when a newer finetype is needed
+# for correct labels; a Protocol may override it with `--min-finetype-version`.
+MIN_FINETYPE_VERSION = "0.6.52"
+
+
+def _parse_version(text: str) -> tuple[int, ...]:
+    """Pull the first dotted numeric version out of text (e.g. 'finetype 0.6.52')."""
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", text)
+    return tuple(int(g) for g in m.groups()) if m else ()
+
+
+def _require_finetype(min_version: str) -> None:
+    """Fail closed unless the `finetype` on PATH is >= min_version.
+
+    Column typing is only as good as the installed binary, and a stale one is
+    invisible here — its output is still valid JSON. So assert the version before
+    profiling rather than trust whatever PATH resolves to.
+    """
+    try:
+        proc = subprocess.run(["finetype", "--version"], capture_output=True, text=True)
+    except FileNotFoundError:
+        sys.exit("describe: `finetype` is not on PATH — cannot type columns.")
+    if proc.returncode != 0:
+        sys.exit(f"describe: `finetype --version` failed ({proc.returncode})\n{proc.stderr}")
+    got, want = _parse_version(proc.stdout), _parse_version(min_version)
+    if not got:
+        sys.exit(f"describe: could not parse a version from `finetype --version` ({proc.stdout!r}).")
+    if got < want:
+        got_s = ".".join(map(str, got))
+        sys.exit(
+            f"describe: finetype {got_s} on PATH is older than the required {min_version}; "
+            "its labels are not trustworthy for these datasets. Update it "
+            "(e.g. `cargo install --path crates/finetype-cli --force`) and re-run."
+        )
 
 
 def _finetype_datapackage(parquet: str) -> dict:
@@ -125,8 +168,14 @@ def main() -> None:
     ap.add_argument("--parquet", required=True, help="built Parquet (finetype types it)")
     ap.add_argument("--overrides", required=True, help="curated sidecar (JSON)")
     ap.add_argument("--out", required=True, help="datapackage.json to write")
+    ap.add_argument(
+        "--min-finetype-version",
+        default=MIN_FINETYPE_VERSION,
+        help=f"fail if the finetype on PATH is older (default {MIN_FINETYPE_VERSION})",
+    )
     args = ap.parse_args()
 
+    _require_finetype(args.min_finetype_version)
     base = _finetype_datapackage(args.parquet)
     with open(args.overrides, encoding="utf-8") as fh:
         overrides = json.load(fh)
