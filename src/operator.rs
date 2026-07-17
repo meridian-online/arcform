@@ -1,0 +1,1870 @@
+//! First-class typed operators — the `op:` / `with:` third step arm.
+//!
+//! An operator is a *packaged, typed* unit of work configured (not scripted) via a
+//! `with:` block. Unlike an opaque `command:` shell string, an operator declares its
+//! I/O to the **same** [`crate::asset::AssetGraph`] the SQL path uses, so lineage,
+//! ordering, and stale-propagation hold at its boundary — a step that isn't in the
+//! graph can silently ship a stale artifact on a green run (the exact defect the
+//! `edgar_gleif` `package` step patches by hand today).
+//!
+//! Operators are addressed by `op: <name>@<semver-req>` and resolved from a built-in
+//! [`catalog`] — a namespace deliberately *distinct* from the pipeline `registry`
+//! (DECISIONS §G choice 0011). Config is validated by typed deserialization (a `with:`
+//! block that doesn't deserialize into the operator's config is a load-time error);
+//! JSON-Schema emission for Brightfield authoring forms is a later addition.
+//!
+//! Design spec: `bearing/research/arcform-typed-operators.md`.
+
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde::Deserialize;
+use serde_yaml::Value;
+
+use crate::engine::StepOutput;
+use crate::error::{Error, Result};
+
+/// Assets an operator step reads and produces — merged into the [`crate::asset::AssetGraph`]
+/// exactly as SQL introspection and command `produces`/`depends_on` are.
+#[derive(Debug, Clone, Default)]
+pub struct OpAssets {
+    pub produces: Vec<String>,
+    pub reads: Vec<String>,
+}
+
+/// Execution context handed to an operator's [`Operator::run`].
+pub struct OpContext<'a> {
+    /// Manifest directory — resolve relative paths (`dest`, `out`) against this.
+    pub dir: &'a Path,
+    /// The pipeline's DuckDB file — operators that touch tables open this.
+    pub db_path: &'a Path,
+    /// `ARC_PARAM_*` environment for the step, passed through to subprocess operators.
+    pub env: &'a HashMap<String, String>,
+    /// Step timeout, if any — enforced by `run_process` (Inherit mode).
+    pub timeout: Option<Duration>,
+}
+
+/// A first-class typed operator. Registered in the [`catalog`], addressed by
+/// `op: <name>@<semver>`.
+pub trait Operator: Sync {
+    /// Catalog name — the `<name>` in `op: <name>@<ver>`.
+    fn name(&self) -> &'static str;
+
+    /// Operator version. A Protocol pins it with a semver constraint, exactly as
+    /// `engine_version` pins the engine — extending local≡cloud parity to every operator.
+    fn version(&self) -> semver::Version;
+
+    /// Validate the config and declare the assets this step reads/produces, so lineage
+    /// holds at the boundary. Doubles as the config-validation gate (a `with:` that does
+    /// not deserialize is an `Err` here, surfaced at manifest load).
+    fn assets(&self, with: &Value) -> Result<OpAssets>;
+
+    /// Execute the operator.
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput>;
+}
+
+static PARQUET_EXPORT: ParquetExport = ParquetExport;
+static HTTP_FETCH: HttpFetch = HttpFetch;
+static HTML_LINK_DISCOVER: HtmlLinkDiscover = HtmlLinkDiscover;
+static ARCHIVE_EXTRACT: ArchiveExtract = ArchiveExtract;
+static DATAPACKAGE_DESCRIBE: DatapackageDescribe = DatapackageDescribe;
+static SPLINK_RESOLVE: SplinkResolve = SplinkResolve;
+static GLEIF_RA_FETCH: GleifRaFetch = GleifRaFetch;
+#[cfg(feature = "opendal")]
+static OPENDAL_FETCH: OpendalFetch = OpendalFetch;
+
+/// The built-in operator catalog. `opendal_fetch` is present only when the
+/// `opendal` feature is enabled (see Cargo.toml — off by default to keep the
+/// single binary lean).
+fn catalog() -> Vec<&'static dyn Operator> {
+    #[allow(unused_mut)]
+    let mut ops: Vec<&'static dyn Operator> = vec![
+        &PARQUET_EXPORT,
+        &HTTP_FETCH,
+        &HTML_LINK_DISCOVER,
+        &ARCHIVE_EXTRACT,
+        &DATAPACKAGE_DESCRIBE,
+        &SPLINK_RESOLVE,
+        &GLEIF_RA_FETCH,
+    ];
+    #[cfg(feature = "opendal")]
+    ops.push(&OPENDAL_FETCH);
+    ops
+}
+
+/// Resolve an `op:` reference (`name` or `name@<semver-req>`) from the catalog,
+/// checking the version constraint. Returns a validation error if the operator is
+/// unknown or the installed version doesn't satisfy the constraint.
+pub fn resolve(op_ref: &str) -> Result<&'static dyn Operator> {
+    let (name, req) = match op_ref.split_once('@') {
+        Some((n, r)) => (n.trim(), Some(r.trim())),
+        None => (op_ref.trim(), None),
+    };
+    let op = catalog()
+        .into_iter()
+        .find(|o| o.name() == name)
+        .ok_or_else(|| {
+            Error::ManifestValidation(format!(
+                "unknown operator '{}' (not in the operator catalog)",
+                name
+            ))
+        })?;
+    if let Some(req) = req {
+        let vreq = semver::VersionReq::parse(req).map_err(|_| {
+            Error::ManifestValidation(format!(
+                "operator '{}': invalid version constraint '{}' (expected semver, e.g. '1' or '^1.2')",
+                name, req
+            ))
+        })?;
+        if !vreq.matches(&op.version()) {
+            return Err(Error::ManifestValidation(format!(
+                "operator '{}@{}' not satisfied by installed version {}",
+                name,
+                req,
+                op.version()
+            )));
+        }
+    }
+    Ok(op)
+}
+
+/// Resolve and declare an operator step's assets in one call — used by manifest
+/// validation and the asset-graph builder (which have no [`OpContext`]).
+pub fn assets_for(op_ref: &str, with: Option<&Value>) -> Result<OpAssets> {
+    resolve(op_ref)?.assets(with.unwrap_or(&Value::Null))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Subprocess substrate — the shared spawn/wait/error-map for operators that wrap
+// an external process: a `uv run` Python script (splink_resolve, gleif_ra_fetch)
+// or a CLI (datapackage_describe → finetype). One place for the retry taxonomy so
+// each op doesn't hand-roll a Command block with divergent error handling.
+// (Wired by those operators in later increments — allow(dead_code) until then.)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How a subprocess operator handles its child's output.
+enum OutputMode {
+    /// Inherit the terminal — stream child stdout/stderr live (e.g. `splink_resolve`'s
+    /// coverage tables). Honours the step timeout via `wait_with_timeout`.
+    Inherit,
+    /// Capture stdout+stderr into `StepOutput` — for ops that parse stdout
+    /// (`datapackage_describe`) or surface child stderr. `output()` drains the pipes
+    /// (no fill-up deadlock); the timeout is not enforced here (parity with the
+    /// capturing command path today).
+    Capture,
+}
+
+/// Spawn `program args…` in `ctx.dir` with `ctx.env`, mapping failures to the engine's
+/// retry taxonomy: a **spawn** failure (missing binary — deterministic) is a
+/// NON-retryable [`Error::StepExecution`] so a bad binary never burns 3 attempts of a
+/// 4 h job; a **non-zero exit** is a retryable [`Error::StepFailed`]; a **deadline** is
+/// [`Error::StepTimeout`] (retryable). `name` labels timeout/exec errors (the runner
+/// rewrites only `StepFailed.step`).
+fn run_process(
+    program: &str,
+    args: &[String],
+    ctx: &OpContext,
+    mode: OutputMode,
+    name: &str,
+) -> Result<StepOutput> {
+    use std::process::{Command, Stdio};
+
+    let mut cmd = Command::new(program);
+    cmd.args(args).current_dir(ctx.dir).envs(ctx.env);
+
+    match mode {
+        OutputMode::Inherit => {
+            cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+            let mut child = cmd.spawn().map_err(|e| Error::StepExecution {
+                step: name.to_string(),
+                source: e,
+            })?;
+            let status = crate::engine::wait_with_timeout(&mut child, ctx.timeout, name)?;
+            if !status.success() {
+                return Err(Error::StepFailed {
+                    step: String::new(), // runner rewrites with the step name
+                    code: status.code().unwrap_or(1),
+                    stderr: String::new(),
+                });
+            }
+            Ok(StepOutput { stderr: String::new(), stdout: None })
+        }
+        OutputMode::Capture => {
+            let out = cmd.output().map_err(|e| Error::StepExecution {
+                step: name.to_string(),
+                source: e,
+            })?;
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            if !out.status.success() {
+                return Err(Error::StepFailed {
+                    step: String::new(),
+                    code: out.status.code().unwrap_or(1),
+                    stderr,
+                });
+            }
+            Ok(StepOutput {
+                stderr,
+                stdout: Some(String::from_utf8_lossy(&out.stdout).to_string()),
+            })
+        }
+    }
+}
+
+/// `["run", "--script", <script>, <extra…>]` — the shared `uv run --script` invocation
+/// for the uv-backed Python operators. Factored out so its arg order is unit-testable.
+fn uv_run_args(script: &str, extra: &[String]) -> Vec<String> {
+    let mut a = vec!["run".to_string(), "--script".to_string(), script.to_string()];
+    a.extend_from_slice(extra);
+    a
+}
+
+/// Materialize an `include_str!`-embedded operator script to a version-stamped cache
+/// under the temp dir (write-if-changed), returning the path to run. Pinning the
+/// script into the binary means `op@<ver>` addresses **exact** bytes — a script change
+/// is a version bump + rebuild, never a silent edit. This is the reproducibility
+/// contract the old "call the script by relative path" step lacked.
+fn materialize_frozen_script(name: &str, version: &str, bytes: &str) -> Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("arcform-op-{}-{}", name, version));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| fetch_failed(format!("{}: cache dir {}: {}", name, dir.display(), e)))?;
+    let path = dir.join(format!("{}.py", name));
+    let needs_write = std::fs::read_to_string(&path).map(|s| s != bytes).unwrap_or(true);
+    if needs_write {
+        std::fs::write(&path, bytes)
+            .map_err(|e| fetch_failed(format!("{}: write {}: {}", name, path.display(), e)))?;
+    }
+    Ok(path)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// parquet_export (activate) — the terminal Parquet output as a first-class asset.
+//
+// Replaces the opaque `COPY … (COMPRESSION zstd)` step whose SQL the engine can't
+// introspect, so it becomes a graph island that can silently skip and ship a stale
+// artifact. By declaring `reads: [input]`, the export sits *in* the graph downstream
+// of the table it exports — no manual `depends_on`, no silent stale-ship.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct ParquetExport;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParquetExportConfig {
+    /// Source table or view in the pipeline DB to export.
+    input: String,
+    /// Destination Parquet path, relative to the manifest directory.
+    dest: String,
+    /// Parquet codec. Defaults to `zstd`.
+    #[serde(default = "default_zstd")]
+    compression: String,
+    /// Optional Parquet row-group size.
+    #[serde(default)]
+    row_group_size: Option<u64>,
+    /// Optional `ORDER BY` clause applied to the export.
+    #[serde(default)]
+    order_by: Option<String>,
+}
+
+fn default_zstd() -> String {
+    "zstd".to_string()
+}
+
+impl ParquetExportConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        serde_yaml::from_value(with.clone()).map_err(|e| {
+            Error::ManifestValidation(format!("parquet_export: invalid `with:` config: {}", e))
+        })
+    }
+}
+
+impl Operator for ParquetExport {
+    fn name(&self) -> &'static str {
+        "parquet_export"
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = ParquetExportConfig::parse(with)?;
+        Ok(OpAssets {
+            reads: vec![cfg.input.to_lowercase()],
+            produces: vec![cfg.dest.to_lowercase()],
+        })
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        let cfg = ParquetExportConfig::parse(with)?;
+        let dest = ctx.dir.join(&cfg.dest);
+        if let Some(parent) = dest.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let order = cfg
+            .order_by
+            .as_deref()
+            .map(|o| format!(" ORDER BY {}", o))
+            .unwrap_or_default();
+        let mut opts = format!("FORMAT parquet, COMPRESSION {}", cfg.compression);
+        if let Some(rg) = cfg.row_group_size {
+            opts.push_str(&format!(", ROW_GROUP_SIZE {}", rg));
+        }
+        let sql = format!(
+            "COPY (SELECT * FROM {input}{order}) TO '{dest}' ({opts});",
+            input = cfg.input,
+            order = order,
+            dest = dest.display(),
+            opts = opts,
+        );
+
+        let conn = duckdb::Connection::open(ctx.db_path).map_err(|e| Error::StepFailed {
+            step: String::new(),
+            code: 1,
+            stderr: format!("parquet_export: open db {}: {}", ctx.db_path.display(), e),
+        })?;
+        conn.execute_batch(&sql).map_err(|e| Error::StepFailed {
+            step: String::new(),
+            code: 1,
+            stderr: format!("parquet_export: {}", e),
+        })?;
+
+        Ok(StepOutput {
+            stderr: String::new(),
+            stdout: None,
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// http_fetch (ingress) — the curl/wget of the catalog: an authenticated GET
+// streamed atomically to `out`, with a **content-freshness contract**.
+//
+// Built on **ureq** — already an arcform dependency, blocking, ~0 transitive
+// weight, http/https only. Resilience (retry + backoff) comes from the ENGINE's
+// step-retry loop, which already wraps every op run via `defaults.retry`. A
+// default User-Agent is always set (gov registries — SEC — 403 a missing UA) and
+// any `headers` the Protocol supplies are layered on top.
+//
+// The one thing `command: curl` can't give cleanly, and the reason this operator
+// is worth owning: the **freshness contract** ([`crate::ingress_meta`]). Every
+// fetch records the remote identity (ETag / Last-Modified / sha256) in a sidecar
+// `<out>.arcmeta`; the next run replays it as an `If-None-Match` conditional
+// request, so an unchanged 127 MB remote answers `304` and is not re-downloaded.
+// Paired with the `fresh` precondition (which HEAD-probes the same sidecar), a
+// step re-runs — and propagates downstream — only when the remote actually
+// changed: content-addressed ingress, not the clock-based mtime `modified_after`.
+// This is the workhorse that retires `fetch_edgar`/`fetch_gleif` and the SEC fetch.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct HttpFetch;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HttpFetchConfig {
+    /// Source URL (http/https).
+    url: String,
+    /// Destination path, relative to the manifest directory. Written atomically.
+    out: String,
+    /// Extra request headers. A default `User-Agent` is set unless overridden here.
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+}
+
+impl HttpFetchConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        serde_yaml::from_value(with.clone()).map_err(|e| {
+            Error::ManifestValidation(format!("http_fetch: invalid `with:` config: {}", e))
+        })
+    }
+}
+
+/// Map any fetch/IO failure to the retryable `StepFailed` so the engine's
+/// step-retry loop re-attempts it with backoff.
+fn fetch_failed(msg: String) -> Error {
+    Error::StepFailed {
+        step: String::new(), // runner overwrites with the step name
+        code: 1,
+        stderr: msg,
+    }
+}
+
+impl Operator for HttpFetch {
+    fn name(&self) -> &'static str {
+        "http_fetch"
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = HttpFetchConfig::parse(with)?;
+        // The network source is not a graph node; only the local artifact is.
+        Ok(OpAssets {
+            reads: vec![],
+            produces: vec![cfg.out.to_lowercase()],
+        })
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        use std::io::{Read, Write};
+
+        use sha2::{Digest, Sha256};
+
+        use crate::ingress_meta::{self, FetchMeta, DEFAULT_UA};
+
+        let cfg = HttpFetchConfig::parse(with)?;
+        let out = ctx.dir.join(&cfg.out);
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        // Default UA first, then Protocol overrides (a `User-Agent` key wins).
+        let mut req = ureq::get(&cfg.url).set("User-Agent", DEFAULT_UA);
+        for (k, v) in &cfg.headers {
+            req = req.set(k, v);
+        }
+        // The freshness contract: if we've fetched this artifact before and it's
+        // still on disk, replay the stored ETag / Last-Modified as a conditional
+        // request. An unchanged remote answers `304` and we keep the bytes.
+        let prior = ingress_meta::read(&out);
+        if out.exists() {
+            if let Some(ref p) = prior {
+                if let Some(ref etag) = p.etag {
+                    req = req.set("If-None-Match", etag);
+                }
+                if let Some(ref lm) = p.last_modified {
+                    req = req.set("If-Modified-Since", lm);
+                }
+            }
+        }
+
+        let resp = match req.call() {
+            Ok(resp) => resp,
+            // 304 Not Modified — the remote is byte-unchanged. Keep the file + sidecar
+            // untouched (so its content identity, hence downstream staleness, is stable).
+            Err(ureq::Error::Status(304, _)) => {
+                return Ok(StepOutput { stderr: String::new(), stdout: None });
+            }
+            Err(e) => return Err(fetch_failed(format!("http_fetch: GET {}: {}", cfg.url, e))),
+        };
+        if resp.status() == 304 {
+            return Ok(StepOutput { stderr: String::new(), stdout: None });
+        }
+
+        // 200: capture the server's content identity before consuming the body.
+        let etag = resp.header("ETag").map(str::to_string);
+        let last_modified = resp.header("Last-Modified").map(str::to_string);
+
+        // Stream to a sibling `.part` file, hashing as we go, then atomically rename —
+        // a killed run never leaves a truncated artifact that looks complete.
+        let tmp = out.with_extension("part");
+        let mut reader = resp.into_reader();
+        let mut file = std::fs::File::create(&tmp)
+            .map_err(|e| fetch_failed(format!("http_fetch: create {}: {}", tmp.display(), e)))?;
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .map_err(|e| fetch_failed(format!("http_fetch: read body {}: {}", cfg.url, e)))?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n])
+                .map_err(|e| fetch_failed(format!("http_fetch: write {}: {}", tmp.display(), e)))?;
+            hasher.update(&buf[..n]);
+        }
+        let _ = file.sync_all();
+        drop(file);
+        std::fs::rename(&tmp, &out)
+            .map_err(|e| fetch_failed(format!("http_fetch: rename {}: {}", out.display(), e)))?;
+
+        // Persist the content identity for next run's conditional request + the
+        // `fresh` precondition's HEAD probe. Best-effort: a failed sidecar write
+        // doesn't fail the fetch (it just forfeits the next conditional/skip).
+        let fetched_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs());
+        let meta = FetchMeta {
+            url: cfg.url.clone(),
+            request_headers: cfg.headers.clone(),
+            etag,
+            last_modified,
+            sha256: format!("{:x}", hasher.finalize()),
+            fetched_unix,
+        };
+        let _ = ingress_meta::write(&out, &meta);
+
+        Ok(StepOutput {
+            stderr: String::new(),
+            stdout: None,
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// opendal_fetch (ingress) — the same fetch over **Apache OpenDAL**, a single
+// operator that reads a scheme-dispatched `from` URL across 40+ backends
+// (http/https, s3, gcs, azblob, …) with a built-in `RetryLayer` (per-request
+// backoff, *on top of* the engine step-retry).
+//
+// MEASURED TRADE-OFF (2026-07-14 spike): OpenDAL's Http *builder* exposes only
+// basic-auth / bearer — no header setter — but arbitrary request headers (a SEC
+// User-Agent) ARE reachable by injecting a reqwest client (`default_headers`)
+// through a custom `ReqwestTransport` (wired below; proven on the live SEC
+// UA-gated fetch). The cost is +2 deps and ~25 lines of transport plumbing vs
+// ureq's one `.set(k, v)`. OpenDAL also buffers the whole object in memory
+// (blocking `read`) and needs a tokio runtime, where ureq streams with zero
+// runtime. OpenDAL's genuine win is **s3://securelake** and multi-backend
+// portability — one operator, many stores. Feature-gated behind `opendal`
+// (Cargo.toml) so the default binary stays lean.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "opendal")]
+struct OpendalFetch;
+
+#[cfg(feature = "opendal")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpendalFetchConfig {
+    /// Scheme-dispatched source: `https://host/key`, `s3://bucket/key`, …
+    from: String,
+    /// Destination path, relative to the manifest directory. Written atomically.
+    to: String,
+    /// Extra request headers. Rejected on the http(s) backend (see above).
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+}
+
+#[cfg(feature = "opendal")]
+impl OpendalFetchConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        serde_yaml::from_value(with.clone()).map_err(|e| {
+            Error::ManifestValidation(format!("opendal_fetch: invalid `with:` config: {}", e))
+        })
+    }
+}
+
+#[cfg(feature = "opendal")]
+impl Operator for OpendalFetch {
+    fn name(&self) -> &'static str {
+        "opendal_fetch"
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = OpendalFetchConfig::parse(with)?;
+        Ok(OpAssets {
+            reads: vec![],
+            produces: vec![cfg.to.to_lowercase()],
+        })
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        use opendal::layers::RetryLayer;
+        use opendal::{services, Operator as DalOperator};
+
+        let cfg = OpendalFetchConfig::parse(with)?;
+        let out = ctx.dir.join(&cfg.to);
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let (scheme, rest) = cfg.from.split_once("://").ok_or_else(|| {
+            Error::ManifestValidation(format!(
+                "opendal_fetch: `from` must be a scheme URL (https://… or s3://…), got '{}'",
+                cfg.from
+            ))
+        })?;
+        // authority = host or bucket; path = the object key relative to backend root.
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+
+        let op = match scheme {
+            "http" | "https" => {
+                let endpoint = format!("{}://{}", scheme, authority);
+                let builder = services::Http::default().endpoint(&endpoint);
+                let mut dal = DalOperator::new(builder)
+                    .map_err(|e| fetch_failed(format!("opendal_fetch: http backend: {}", e)))?;
+                // OpenDAL's Http builder has no header setter (only basic-auth /
+                // bearer). To carry request headers — e.g. the SEC User-Agent —
+                // inject a reqwest client with `default_headers` through a custom
+                // ReqwestTransport. More plumbing (+2 deps) than ureq's `.set()`,
+                // but it works: proven on the live SEC fetch.
+                if !cfg.headers.is_empty() {
+                    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+                    let mut hm = HeaderMap::new();
+                    for (k, v) in &cfg.headers {
+                        let name = HeaderName::from_bytes(k.as_bytes()).map_err(|e| {
+                            Error::ManifestValidation(format!(
+                                "opendal_fetch: bad header name '{}': {}",
+                                k, e
+                            ))
+                        })?;
+                        let val = HeaderValue::from_str(v).map_err(|e| {
+                            Error::ManifestValidation(format!(
+                                "opendal_fetch: bad header value for '{}': {}",
+                                k, e
+                            ))
+                        })?;
+                        hm.insert(name, val);
+                    }
+                    let client = reqwest::Client::builder()
+                        .default_headers(hm)
+                        .build()
+                        .map_err(|e| {
+                            fetch_failed(format!("opendal_fetch: build http client: {}", e))
+                        })?;
+                    let transport =
+                        opendal_http_transport_reqwest::ReqwestTransport::new(client);
+                    dal = dal.with_context(
+                        opendal::OperationContext::new()
+                            .with_http_transport(opendal::HttpTransporter::new(transport)),
+                    );
+                }
+                dal
+            }
+            "s3" => {
+                // Credentials/region from the standard AWS_* environment — the
+                // securelake path. Constructed + retry-wrapped here; exercised
+                // when securelake creds are present (not in this spike's run).
+                let builder = services::S3::default().bucket(authority);
+                DalOperator::new(builder)
+                    .map_err(|e| fetch_failed(format!("opendal_fetch: s3 backend: {}", e)))?
+            }
+            other => {
+                return Err(Error::ManifestValidation(format!(
+                    "opendal_fetch: unsupported scheme '{}' (http, https, s3)",
+                    other
+                )));
+            }
+        };
+        let op = op.layer(RetryLayer::new());
+
+        // OpenDAL's blocking bridge requires an entered tokio runtime.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|e| fetch_failed(format!("opendal_fetch: tokio runtime: {}", e)))?;
+        let _guard = rt.enter();
+        let bop = opendal::blocking::Operator::new(op)
+            .map_err(|e| fetch_failed(format!("opendal_fetch: blocking bridge: {}", e)))?;
+        let buf = bop
+            .read(path)
+            .map_err(|e| fetch_failed(format!("opendal_fetch: read {}: {}", cfg.from, e)))?;
+
+        let tmp = out.with_extension("part");
+        std::fs::write(&tmp, buf.to_vec())
+            .map_err(|e| fetch_failed(format!("opendal_fetch: write {}: {}", tmp.display(), e)))?;
+        std::fs::rename(&tmp, &out)
+            .map_err(|e| fetch_failed(format!("opendal_fetch: rename {}: {}", out.display(), e)))?;
+
+        Ok(StepOutput {
+            stderr: String::new(),
+            stdout: None,
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// datapackage_describe (activate) — emit the Frictionless datapackage.json from the
+// built Parquet: finetype types every column (the machine half) overlaid with the
+// curated descriptor.overrides.json (the hand half; overrides win, relational keys
+// hard-checked against the Parquet).
+//
+// Wraps an arcform-EMBEDDED copy of describe.py via the uv-run substrate — NOT a
+// Rust reimplementation of the JSON merge. That is deliberate: running the identical
+// script makes the output byte-identical to the retired scripts/describe.py by
+// construction, it needs no serde_json dep (and dodges its float/sort byte-equivalence
+// hazards vs Python's json.dump), and the operator becomes reusable by any dataset.
+// Python at the edges — the same posture as splink_resolve. describe.py itself has
+// no Python deps; it shells the `finetype` CLI (must be on PATH, as today).
+//
+// Verified byte-identical to the retired script on the live build, save the one field
+// `finetype` stamps itself — the per-run `created` timestamp (non-deterministic, and
+// pre-existing; the command step had it too). datapackage.json is metadata, not the
+// data; the parquet (the byte-equivalence target) is untouched by this op.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The describe script, pinned into the binary. `@1` == these exact bytes.
+const DESCRIBE_PY: &str = include_str!("../operators/datapackage_describe/describe.py");
+
+struct DatapackageDescribe;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DatapackageDescribeConfig {
+    /// Built Parquet finetype types (a `reads` asset — keeps `describe` downstream
+    /// of the step that produces it). Resolved against ctx.dir.
+    parquet: String,
+    /// Curated descriptor sidecar (JSON) overlaid onto finetype's base.
+    overrides: String,
+    /// datapackage.json to write (the `produces` asset). Resolved against ctx.dir.
+    out: String,
+}
+
+impl DatapackageDescribeConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        serde_yaml::from_value(with.clone()).map_err(|e| {
+            Error::ManifestValidation(format!("datapackage_describe: invalid `with:` config: {}", e))
+        })
+    }
+}
+
+impl Operator for DatapackageDescribe {
+    fn name(&self) -> &'static str {
+        "datapackage_describe"
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = DatapackageDescribeConfig::parse(with)?;
+        Ok(OpAssets {
+            reads: vec![cfg.parquet.to_lowercase()],
+            produces: vec![cfg.out.to_lowercase()],
+        })
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        let cfg = DatapackageDescribeConfig::parse(with)?;
+        let parquet = ctx.dir.join(&cfg.parquet);
+        let overrides = ctx.dir.join(&cfg.overrides);
+        let out = ctx.dir.join(&cfg.out);
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let script = materialize_frozen_script("datapackage_describe", "1.0.0", DESCRIBE_PY)?;
+        let args = uv_run_args(
+            &script.to_string_lossy(),
+            &[
+                "--parquet".to_string(),
+                parquet.display().to_string(),
+                "--overrides".to_string(),
+                overrides.display().to_string(),
+                "--out".to_string(),
+                out.display().to_string(),
+            ],
+        );
+        run_process("uv", &args, ctx, OutputMode::Capture, "datapackage_describe")
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// html_link_discover (ingress) — the "list what's there" primitive: GET an index
+// page, regex-pluck the hrefs matching `pattern`, absolutise them against the page
+// URL, de-dup preserving document order, and emit a newline-delimited URL list as
+// a first-class produced asset.
+//
+// This is the discovery half of the SEC N-CEN pull (scripts/fetch_ncen.sh): the
+// SEC "Form N-CEN Data Sets" page lists each quarter's zip as a root-relative href
+// (`/files/dera/data/…ncen_2024q1.zip`); this op turns that page into the list of
+// absolute zip URLs a downstream fetch fans out over. Same default UA as http_fetch
+// (SEC 403s a missing UA); a Protocol `User-Agent` in `headers` overrides it.
+//
+// NOTE (byte-equivalence): this + archive_extract are unit-verified building blocks;
+// they do NOT by themselves retire fetch_ncen.sh end-to-end, because the engine has
+// no fan-out step that maps over the discovered-quarters URL list yet. That fan-out
+// is separate work; here we produce the complete list.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct HtmlLinkDiscover;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HtmlLinkDiscoverConfig {
+    /// Index page to fetch (http/https).
+    url: String,
+    /// Regex tested (unanchored) against each raw `href` value; matches are kept.
+    pattern: String,
+    /// Destination URL-list path (newline-delimited), relative to the manifest dir.
+    out: String,
+    /// Extra request headers. A default `User-Agent` is set unless overridden here.
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+}
+
+impl HtmlLinkDiscoverConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        serde_yaml::from_value(with.clone()).map_err(|e| {
+            Error::ManifestValidation(format!("html_link_discover: invalid `with:` config: {}", e))
+        })
+    }
+
+    /// Compile `pattern`, mapping a bad regex to a load-time validation error.
+    fn compiled_pattern(&self) -> Result<regex::Regex> {
+        regex::Regex::new(&self.pattern).map_err(|e| {
+            Error::ManifestValidation(format!(
+                "html_link_discover: invalid `pattern` regex '{}': {}",
+                self.pattern, e
+            ))
+        })
+    }
+}
+
+/// The origin (`scheme://authority`) of an absolute URL, or `None` if `url` isn't one.
+fn url_origin(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme.is_empty() {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+    Some(format!("{}://{}", scheme, authority))
+}
+
+/// The RFC-3986 directory base of a page URL — the URL up to and including the last
+/// `/` of its path (query/fragment stripped) — that a bare relative href resolves
+/// against. Falls back to `origin/` when the path has no slash.
+fn url_dir_base(page_url: &str) -> Option<String> {
+    let origin = url_origin(page_url)?;
+    let rest = &page_url[origin.len()..];
+    let path = rest.split(['?', '#']).next().unwrap_or("");
+    match path.rfind('/') {
+        Some(i) => Some(format!("{}{}", origin, &path[..=i])),
+        None => Some(format!("{}/", origin)),
+    }
+}
+
+/// Whether `s` begins with a URL scheme (`http:`, `mailto:`, …) per RFC-3986.
+fn href_has_scheme(s: &str) -> bool {
+    match s.find(':') {
+        None | Some(0) => false,
+        Some(i) => {
+            let scheme = &s[..i];
+            scheme.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        }
+    }
+}
+
+/// Absolutise an `href` against the page URL. Handles absolute URLs (kept verbatim),
+/// protocol-relative (`//host/…`), root-relative (`/path` → page origin), and
+/// path-relative (resolved against the page's directory base). Returns `None` for
+/// empty or fragment-only hrefs.
+fn absolutise(page_url: &str, href: &str) -> Option<String> {
+    let h = href.trim();
+    if h.is_empty() || h.starts_with('#') {
+        return None;
+    }
+    if href_has_scheme(h) {
+        return Some(h.to_string());
+    }
+    if let Some(rest) = h.strip_prefix("//") {
+        let scheme = page_url.split("://").next()?;
+        if scheme.is_empty() || scheme == page_url {
+            return None;
+        }
+        return Some(format!("{}://{}", scheme, rest));
+    }
+    if h.starts_with('/') {
+        return Some(format!("{}{}", url_origin(page_url)?, h));
+    }
+    Some(format!("{}{}", url_dir_base(page_url)?, h))
+}
+
+/// Extract every `href` in `html` whose value matches `pattern`, absolutise it
+/// against `page_url`, and return the list de-duplicated in document order. `limit`
+/// caps the number of distinct URLs returned (the `head -n N` of fetch_ncen.sh).
+fn discover_links(
+    html: &str,
+    page_url: &str,
+    pattern: &regex::Regex,
+    limit: Option<usize>,
+) -> Vec<String> {
+    // Quoted href forms only (`href="…"` / `href='…'`) — unquoted attributes are
+    // rare in the gov index pages this targets.
+    let href_re = regex::Regex::new(r#"(?i)href\s*=\s*["']([^"']*)["']"#)
+        .expect("static href regex is valid");
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for cap in href_re.captures_iter(html) {
+        let href = &cap[1];
+        if !pattern.is_match(href) {
+            continue;
+        }
+        let Some(abs) = absolutise(page_url, href) else {
+            continue;
+        };
+        if seen.insert(abs.clone()) {
+            out.push(abs);
+            if let Some(l) = limit {
+                if out.len() >= l {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+impl Operator for HtmlLinkDiscover {
+    fn name(&self) -> &'static str {
+        "html_link_discover"
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = HtmlLinkDiscoverConfig::parse(with)?;
+        cfg.compiled_pattern()?; // fail fast on a bad regex at manifest load
+        // The network source is not a graph node; only the local URL list is.
+        Ok(OpAssets {
+            reads: vec![],
+            produces: vec![cfg.out.to_lowercase()],
+        })
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        use crate::ingress_meta::DEFAULT_UA;
+
+        let cfg = HtmlLinkDiscoverConfig::parse(with)?;
+        let pattern = cfg.compiled_pattern()?;
+        let out = ctx.dir.join(&cfg.out);
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        // Default UA first, then Protocol overrides (a `User-Agent` key wins).
+        let mut req = ureq::get(&cfg.url).set("User-Agent", DEFAULT_UA);
+        for (k, v) in &cfg.headers {
+            req = req.set(k, v);
+        }
+        let resp = req
+            .call()
+            .map_err(|e| fetch_failed(format!("html_link_discover: GET {}: {}", cfg.url, e)))?;
+        let body = resp
+            .into_string()
+            .map_err(|e| fetch_failed(format!("html_link_discover: read {}: {}", cfg.url, e)))?;
+
+        let links = discover_links(&body, &cfg.url, &pattern, None);
+        let mut payload = String::new();
+        for l in &links {
+            payload.push_str(l);
+            payload.push('\n');
+        }
+
+        // Atomic write: sibling `.part`, then rename — a killed run never leaves a
+        // half-written list that looks complete.
+        let mut tmp_os = out.clone().into_os_string();
+        tmp_os.push(".part");
+        let tmp = PathBuf::from(tmp_os);
+        std::fs::write(&tmp, payload.as_bytes()).map_err(|e| {
+            fetch_failed(format!("html_link_discover: write {}: {}", tmp.display(), e))
+        })?;
+        std::fs::rename(&tmp, &out).map_err(|e| {
+            fetch_failed(format!("html_link_discover: rename {}: {}", out.display(), e))
+        })?;
+
+        Ok(StepOutput {
+            stderr: String::new(),
+            stdout: None,
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// archive_extract (ingress) — pull named / pattern-matched members out of a `.zip`
+// into `dest` as first-class produced assets. The extraction half of the N-CEN
+// pull: each quarter's `ncen_YYYYqN.zip` yields REGISTRANT.tsv and
+// FUND_REPORTED_INFO.tsv (the CIK↔LEI / SERIES_ID↔LEI carriers).
+//
+// Three properties `command: unzip` doesn't give cleanly:
+//   • zip-slip guard — a member named `../…` or an absolute path is rejected, so a
+//     hostile archive can't write outside `dest`.
+//   • atomic per-file write — each member lands via a sibling `.part` + rename, so a
+//     killed run never leaves a half-written TSV that looks complete.
+//   • case-preserving on disk, case-folded in the graph — the file keeps its real
+//     name (`REGISTRANT.tsv`, referenced verbatim by downstream SQL) while the
+//     AssetGraph node name is lowercased, matching every other operator.
+//
+// zip dep: default-features OFF + `deflate-flate2` ONLY. The N-CEN zips are DEFLATE-
+// compressed, and plain `deflate` is a zip base meta-feature with no inflate backend
+// (→ runtime failure); `deflate-flate2` wires flate2 (already an arcform dep).
+// Dropping defaults avoids pulling the bzip2/zstd/aes C backends.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct ArchiveExtract;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchiveExtractConfig {
+    /// Source `.zip`, relative to the manifest dir (a `reads` asset).
+    archive: String,
+    /// Explicit member names to extract (exact match on the zip-internal name).
+    #[serde(default)]
+    members: Vec<String>,
+    /// Regex tested (unanchored) against each member name; matches are extracted.
+    #[serde(default)]
+    pattern: Option<String>,
+    /// Destination directory, relative to the manifest dir. Members are written under
+    /// it preserving their real-case relative path.
+    dest: String,
+}
+
+impl ArchiveExtractConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        let cfg: Self = serde_yaml::from_value(with.clone()).map_err(|e| {
+            Error::ManifestValidation(format!("archive_extract: invalid `with:` config: {}", e))
+        })?;
+        if cfg.members.is_empty() && cfg.pattern.is_none() {
+            return Err(Error::ManifestValidation(
+                "archive_extract: specify at least one of `members` or `pattern`".to_string(),
+            ));
+        }
+        Ok(cfg)
+    }
+
+    /// Compile `pattern` (if any), mapping a bad regex to a load-time validation error.
+    fn compiled_pattern(&self) -> Result<Option<regex::Regex>> {
+        match &self.pattern {
+            None => Ok(None),
+            Some(p) => regex::Regex::new(p).map(Some).map_err(|e| {
+                Error::ManifestValidation(format!(
+                    "archive_extract: invalid `pattern` regex '{}': {}",
+                    p, e
+                ))
+            }),
+        }
+    }
+}
+
+/// Whether a zip member is selected: an exact name in `members`, or a `pattern` hit.
+fn member_selected(name: &str, members: &[String], pattern: Option<&regex::Regex>) -> bool {
+    members.iter().any(|m| m == name) || pattern.map(|re| re.is_match(name)).unwrap_or(false)
+}
+
+/// Resolve a zip member name to a SAFE relative path (case preserved). Returns `None`
+/// for a zip-slip attempt — an absolute path, a Windows drive, or any `..` component —
+/// so nothing can be written outside `dest`.
+fn safe_relative(name: &str) -> Option<PathBuf> {
+    if name.starts_with('/') || name.starts_with('\\') {
+        return None;
+    }
+    let b = name.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return None; // Windows drive-absolute (C:\…)
+    }
+    let mut rel = PathBuf::new();
+    for comp in name.split(['/', '\\']) {
+        match comp {
+            "" | "." => continue,
+            ".." => return None,
+            c => rel.push(c),
+        }
+    }
+    if rel.as_os_str().is_empty() {
+        return None;
+    }
+    Some(rel)
+}
+
+/// Extract the selected members of a zip `reader` into `dest`: case-preserving on
+/// disk, zip-slip guarded, atomic per-file write. Returns the written paths. Factored
+/// out of `run` so the extraction is unit-testable against an in-memory zip.
+fn extract_members<R: std::io::Read + std::io::Seek>(
+    reader: R,
+    dest: &Path,
+    members: &[String],
+    pattern: Option<&regex::Regex>,
+) -> Result<Vec<PathBuf>> {
+    let mut archive = zip::ZipArchive::new(reader)
+        .map_err(|e| fetch_failed(format!("archive_extract: open zip: {}", e)))?;
+    let mut written = Vec::new();
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| fetch_failed(format!("archive_extract: read entry {}: {}", i, e)))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().to_string();
+        if !member_selected(&name, members, pattern) {
+            continue;
+        }
+        let rel = safe_relative(&name).ok_or_else(|| {
+            fetch_failed(format!(
+                "archive_extract: unsafe member path '{}' (zip-slip rejected)",
+                name
+            ))
+        })?;
+        let target = dest.join(&rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                fetch_failed(format!("archive_extract: mkdir {}: {}", parent.display(), e))
+            })?;
+        }
+        // Atomic per-file write: sibling `<target>.part`, then rename.
+        let mut tmp_os = target.clone().into_os_string();
+        tmp_os.push(".part");
+        let tmp = PathBuf::from(tmp_os);
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| fetch_failed(format!("archive_extract: create {}: {}", tmp.display(), e)))?;
+        std::io::copy(&mut entry, &mut f)
+            .map_err(|e| fetch_failed(format!("archive_extract: extract '{}': {}", name, e)))?;
+        let _ = f.sync_all();
+        drop(f);
+        std::fs::rename(&tmp, &target).map_err(|e| {
+            fetch_failed(format!("archive_extract: rename {}: {}", target.display(), e))
+        })?;
+        written.push(target);
+    }
+    Ok(written)
+}
+
+impl Operator for ArchiveExtract {
+    fn name(&self) -> &'static str {
+        "archive_extract"
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = ArchiveExtractConfig::parse(with)?;
+        cfg.compiled_pattern()?; // fail fast on a bad regex at manifest load
+        // Node names are lowercased (graph convention); the on-disk files keep real
+        // case. Explicit `members` give per-file produced nodes; a pattern-only
+        // selection isn't known until the archive is opened, so `dest` stands in as
+        // the coarse produced node.
+        let produces = if cfg.members.is_empty() {
+            vec![cfg.dest.to_lowercase()]
+        } else {
+            let base = cfg.dest.trim_end_matches('/');
+            cfg.members
+                .iter()
+                .map(|m| format!("{}/{}", base, m).to_lowercase())
+                .collect()
+        };
+        Ok(OpAssets {
+            reads: vec![cfg.archive.to_lowercase()],
+            produces,
+        })
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        let cfg = ArchiveExtractConfig::parse(with)?;
+        let pattern = cfg.compiled_pattern()?;
+        let archive_path = ctx.dir.join(&cfg.archive);
+        let dest = ctx.dir.join(&cfg.dest);
+        std::fs::create_dir_all(&dest)
+            .map_err(|e| fetch_failed(format!("archive_extract: mkdir {}: {}", dest.display(), e)))?;
+        let file = std::fs::File::open(&archive_path).map_err(|e| {
+            fetch_failed(format!(
+                "archive_extract: open {}: {}",
+                archive_path.display(),
+                e
+            ))
+        })?;
+        extract_members(file, &dest, &cfg.members, pattern.as_ref())?;
+        Ok(StepOutput {
+            stderr: String::new(),
+            stdout: None,
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// splink_resolve (transform) — the probabilistic EDGAR↔GLEIF name match, promoted
+// from the opaque `command: uv run --script …/resolve.py …` step to a first-class,
+// versioned operator. `op: splink_resolve@1` addresses the EXACT frozen script bytes
+// embedded below (SEED=42 Fellegi-Sunter model; see resolve.py) — the reproducibility
+// contract the "call the script by relative path" step lacked. Its `reads`/`produces`
+// put the resolve *in* the asset graph, so a stale input propagates instead of the
+// graph-island silent-skip the path-based step risked.
+//
+// Wraps the arcform-EMBEDDED resolve.py via the uv-run substrate (materialize_frozen_
+// script → uv_run_args → run_process), NOT a Rust reimplementation of Splink — Python
+// at the edges, same posture as datapackage_describe. Runs in OutputMode::Inherit so
+// resolve.py's `[coverage]` / `[hero tickers]` tables stream live and the step timeout
+// (the manifest's `timeout_sec`) is enforced by wait_with_timeout.
+//
+// SCALE — this is the ~4 h full-corpus job (GLEIF ≈ 3.2M rows). The manifest step MUST
+// pin `retry.max_attempts: 1`: a non-zero exit or timeout is retryable in the substrate,
+// so without a cap the engine would re-attempt a 4 h job up to `defaults.retry`. (A
+// spawn failure — bad `uv`/binary — is already NON-retryable, so a typo never burns
+// attempts; but a mid-run failure is the case the manifest cap guards.) `--sample` is a
+// smoke-test cap on GLEIF rows and is OMITTED for a published run (see the arg builder).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The resolve script, pinned into the binary. `@1` == these exact bytes.
+const RESOLVE_PY: &str = include_str!("../operators/splink_resolve/resolve.py");
+
+struct SplinkResolve;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SplinkResolveConfig {
+    /// EDGAR / SEC-entity Parquet (cik, ticker, company_name) — the crosswalk's left
+    /// side. A `reads` asset, resolved against ctx.dir.
+    edgar: String,
+    /// GLEIF golden-copy Parquet (lei, legal_name, jurisdiction, country, reg_status) —
+    /// the right side. A `reads` asset, resolved against ctx.dir.
+    gleif: String,
+    /// Resolved-crosswalk Parquet to write (the `produces` asset). Resolved against ctx.dir.
+    out: String,
+    /// Optional GLEIF-row cap for a fast smoke test (reservoir sample, SEED=42). OMITTED
+    /// from the argv unless `Some(n)` with `n > 0`; a published run leaves it unset (or 0)
+    /// and resolves the full corpus.
+    #[serde(default)]
+    sample: Option<u64>,
+}
+
+impl SplinkResolveConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        serde_yaml::from_value(with.clone()).map_err(|e| {
+            Error::ManifestValidation(format!("splink_resolve: invalid `with:` config: {}", e))
+        })
+    }
+}
+
+/// Build resolve.py's argv tail (everything after the script path). `--sample` is emitted
+/// ONLY for a positive cap: a published run passes `sample: None` (or `0`) and the full
+/// GLEIF corpus is resolved. Factored out so the omit-on-publish rule is unit-testable
+/// without spawning `uv`.
+fn splink_resolve_args(edgar: &str, gleif: &str, out: &str, sample: Option<u64>) -> Vec<String> {
+    let mut a = vec![
+        "--edgar".to_string(),
+        edgar.to_string(),
+        "--gleif".to_string(),
+        gleif.to_string(),
+        "--out".to_string(),
+        out.to_string(),
+    ];
+    if let Some(n) = sample {
+        if n > 0 {
+            a.push("--sample".to_string());
+            a.push(n.to_string());
+        }
+    }
+    a
+}
+
+impl Operator for SplinkResolve {
+    fn name(&self) -> &'static str {
+        "splink_resolve"
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = SplinkResolveConfig::parse(with)?;
+        Ok(OpAssets {
+            reads: vec![cfg.edgar.to_lowercase(), cfg.gleif.to_lowercase()],
+            produces: vec![cfg.out.to_lowercase()],
+        })
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        let cfg = SplinkResolveConfig::parse(with)?;
+        let edgar = ctx.dir.join(&cfg.edgar);
+        let gleif = ctx.dir.join(&cfg.gleif);
+        let out = ctx.dir.join(&cfg.out);
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let script = materialize_frozen_script("splink_resolve", "1.0.0", RESOLVE_PY)?;
+        let extra = splink_resolve_args(
+            &edgar.display().to_string(),
+            &gleif.display().to_string(),
+            &out.display().to_string(),
+            cfg.sample,
+        );
+        let args = uv_run_args(&script.to_string_lossy(), &extra);
+        // Inherit: stream resolve.py's coverage/hero-ticker tables live and honour the
+        // step timeout (a 4 h job that overruns is killed, not left hanging).
+        run_process("uv", &args, ctx, OutputMode::Inherit, "splink_resolve")
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// gleif_ra_fetch (ingress) — page the public GLEIF v1 API for every entity
+// registered under one registration authority (RA000665 = the SEC) and emit the
+// `lei,registered_as,category` CSV the `load` step consumes.
+//
+// Retires `edgar_gleif/scripts/fetch_gleif_ra.sh`. That script hand-rolled cursor
+// paging in bash (`page[cursor]=*`, follow `.links.next`, terminate on null/empty,
+// with a loop guard) because GLEIF hard-caps OFFSET paging at 10,000 records and
+// RA000665 has ~27k. The embedded `fetch_gleif_ra.py` does the same with dlt's
+// `RESTClient` + `JSONLinkPaginator(next_url_path="links.next")` — STATELESS
+// full-refresh (no incremental cursor persisted) — then writes a DETERMINISTIC
+// SORTED CSV so the row-set parity gate against the retired script is a clean
+// `EXCEPT`. Same uv-run substrate + frozen-script contract as datapackage_describe
+// and splink_resolve: `op@1` addresses these exact script bytes.
+//
+// Ingress, so `reads: []` (the network source is not a graph node) and
+// `produces: [out]` — the CSV sits in the AssetGraph downstream of nothing and
+// upstream of `load`, exactly where the old `command:` step sat but now typed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The GLEIF-fetch script, pinned into the binary. `@1` == these exact bytes.
+const GLEIF_RA_FETCH_PY: &str = include_str!("../operators/gleif_ra_fetch/fetch_gleif_ra.py");
+
+struct GleifRaFetch;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GleifRaFetchConfig {
+    /// GLEIF registration-authority id to page (e.g. `RA000665`, the SEC).
+    ra: String,
+    /// Destination CSV path, relative to the manifest directory (the `produces`
+    /// asset). The script writes it atomically (`.part` + rename).
+    out: String,
+    /// GLEIF `page[size]`. Defaults to the script's 200 when omitted.
+    #[serde(default)]
+    page_size: Option<u64>,
+    /// User-Agent request header. Defaults to the script's Meridian UA when omitted.
+    #[serde(default)]
+    user_agent: Option<String>,
+}
+
+impl GleifRaFetchConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        serde_yaml::from_value(with.clone()).map_err(|e| {
+            Error::ManifestValidation(format!("gleif_ra_fetch: invalid `with:` config: {}", e))
+        })
+    }
+}
+
+impl Operator for GleifRaFetch {
+    fn name(&self) -> &'static str {
+        "gleif_ra_fetch"
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = GleifRaFetchConfig::parse(with)?;
+        // Ingress: the network source is not a graph node; only the local CSV is.
+        Ok(OpAssets {
+            reads: vec![],
+            produces: vec![cfg.out.to_lowercase()],
+        })
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        let cfg = GleifRaFetchConfig::parse(with)?;
+        let out = ctx.dir.join(&cfg.out);
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let script = materialize_frozen_script("gleif_ra_fetch", "1.0.0", GLEIF_RA_FETCH_PY)?;
+        let mut extra = vec![
+            "--ra".to_string(),
+            cfg.ra.clone(),
+            "--out".to_string(),
+            out.display().to_string(),
+        ];
+        // `--max-pages` is intentionally NOT surfaced in config — it is a smoke-test
+        // lever only. Production always does a full, guarded, unbounded pull.
+        if let Some(ps) = cfg.page_size {
+            extra.push("--page-size".to_string());
+            extra.push(ps.to_string());
+        }
+        if let Some(ref ua) = cfg.user_agent {
+            extra.push("--user-agent".to_string());
+            extra.push(ua.clone());
+        }
+        let args = uv_run_args(&script.to_string_lossy(), &extra);
+        run_process("uv", &args, ctx, OutputMode::Capture, "gleif_ra_fetch")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_ctx<'a>(dir: &'a Path, env: &'a HashMap<String, String>) -> OpContext<'a> {
+        OpContext { dir, db_path: dir, env, timeout: None }
+    }
+
+    #[test]
+    fn uv_run_args_arg_order_is_stable() {
+        assert_eq!(
+            uv_run_args("scripts/x.py", &["--out".to_string(), "o.parquet".to_string()]),
+            vec!["run", "--script", "scripts/x.py", "--out", "o.parquet"]
+        );
+    }
+
+    #[test]
+    fn run_process_success_and_capture() {
+        let dir = std::env::temp_dir();
+        let env = HashMap::new();
+        let ctx = test_ctx(&dir, &env);
+        // Inherit: `true` exits 0 → Ok.
+        assert!(run_process("true", &[], &ctx, OutputMode::Inherit, "t").is_ok());
+        // Capture: stdout is returned.
+        let out = run_process("echo", &["hi".to_string()], &ctx, OutputMode::Capture, "t").unwrap();
+        assert!(out.stdout.unwrap().contains("hi"));
+    }
+
+    #[test]
+    fn run_process_nonzero_exit_is_retryable_stepfailed() {
+        let dir = std::env::temp_dir();
+        let env = HashMap::new();
+        let ctx = test_ctx(&dir, &env);
+        // `false` exits 1 → retryable StepFailed (the engine step-retry re-attempts).
+        match run_process("false", &[], &ctx, OutputMode::Inherit, "t") {
+            Err(Error::StepFailed { code, .. }) => assert_eq!(code, 1),
+            other => panic!("expected StepFailed, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn run_process_missing_binary_is_nonretryable_stepexecution() {
+        let dir = std::env::temp_dir();
+        let env = HashMap::new();
+        let ctx = test_ctx(&dir, &env);
+        // A missing binary is deterministic → NON-retryable StepExecution, so a 4 h
+        // job is never re-attempted 3× for a typo. This is the load-bearing choice.
+        match run_process("arc-no-such-binary-xyz", &[], &ctx, OutputMode::Inherit, "t") {
+            Err(Error::StepExecution { .. }) => {}
+            other => panic!("expected StepExecution, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn resolves_by_name_and_semver() {
+        assert!(resolve("parquet_export").is_ok());
+        assert!(resolve("parquet_export@1").is_ok());
+        assert!(resolve("parquet_export@^1.0").is_ok());
+        assert!(resolve("parquet_export@2").is_err()); // version not satisfied
+        assert!(resolve("no_such_op").is_err()); // unknown
+    }
+
+    #[test]
+    fn parquet_export_declares_lineage() {
+        let with: Value = serde_yaml::from_str("input: crosswalk_edges\ndest: build/out.parquet").unwrap();
+        let assets = assets_for("parquet_export", Some(&with)).unwrap();
+        assert_eq!(assets.reads, vec!["crosswalk_edges".to_string()]);
+        assert_eq!(assets.produces, vec!["build/out.parquet".to_string()]);
+    }
+
+    #[test]
+    fn parquet_export_rejects_bad_config() {
+        // missing required `dest`
+        let with: Value = serde_yaml::from_str("input: t").unwrap();
+        assert!(assets_for("parquet_export", Some(&with)).is_err());
+        // unknown field
+        let with: Value = serde_yaml::from_str("input: t\ndest: o.parquet\nbogus: 1").unwrap();
+        assert!(assets_for("parquet_export", Some(&with)).is_err());
+    }
+
+    #[test]
+    fn datapackage_describe_declares_lineage() {
+        let with: Value = serde_yaml::from_str(
+            "parquet: build/edgar_gleif.parquet\noverrides: descriptor.overrides.json\nout: datapackage.json",
+        )
+        .unwrap();
+        let a = assets_for("datapackage_describe", Some(&with)).unwrap();
+        assert_eq!(a.reads, vec!["build/edgar_gleif.parquet".to_string()]);
+        assert_eq!(a.produces, vec!["datapackage.json".to_string()]);
+        // unknown field rejected (deny_unknown_fields)
+        let bad: Value = serde_yaml::from_str("parquet: p\noverrides: o\nout: d\nx: 1").unwrap();
+        assert!(assets_for("datapackage_describe", Some(&bad)).is_err());
+    }
+
+    #[test]
+    fn splink_resolve_declares_lineage() {
+        // reads = [edgar, gleif] (order-preserving), produces = [out].
+        let with: Value = serde_yaml::from_str(
+            "edgar: build/sec_entities.parquet\ngleif: build/gleif.parquet\nout: build/resolved.parquet",
+        )
+        .unwrap();
+        let a = assets_for("splink_resolve", Some(&with)).unwrap();
+        assert_eq!(
+            a.reads,
+            vec![
+                "build/sec_entities.parquet".to_string(),
+                "build/gleif.parquet".to_string()
+            ]
+        );
+        assert_eq!(a.produces, vec!["build/resolved.parquet".to_string()]);
+        // `sample` is optional — a published run omits it and still validates.
+        assert!(assets_for("splink_resolve", Some(&with)).is_ok());
+        // unknown field rejected (deny_unknown_fields)
+        let bad: Value =
+            serde_yaml::from_str("edgar: e\ngleif: g\nout: o\nbogus: 1").unwrap();
+        assert!(assets_for("splink_resolve", Some(&bad)).is_err());
+        // missing a required field rejected
+        let miss: Value = serde_yaml::from_str("edgar: e\ngleif: g").unwrap();
+        assert!(assets_for("splink_resolve", Some(&miss)).is_err());
+    }
+
+    #[test]
+    fn splink_resolve_resolves_by_semver() {
+        assert!(resolve("splink_resolve").is_ok());
+        assert!(resolve("splink_resolve@1").is_ok());
+        assert!(resolve("splink_resolve@^1.0").is_ok());
+        assert!(resolve("splink_resolve@2").is_err()); // version not satisfied
+    }
+
+    #[test]
+    fn splink_resolve_sample_omitted_for_published_run() {
+        // Published run: no sample → the full corpus, no `--sample` flag at all
+        // (it MUST be omittable — a `--sample 0` would cap GLEIF to zero rows).
+        let full = splink_resolve_args("e.parquet", "g.parquet", "o.parquet", None);
+        assert_eq!(
+            full,
+            vec!["--edgar", "e.parquet", "--gleif", "g.parquet", "--out", "o.parquet"]
+        );
+        assert!(!full.iter().any(|a| a == "--sample"));
+        // `sample: 0` is treated as "full corpus" too → still omitted.
+        let zero = splink_resolve_args("e.parquet", "g.parquet", "o.parquet", Some(0));
+        assert!(!zero.iter().any(|a| a == "--sample"));
+        // A positive smoke-test cap IS emitted, as the trailing `--sample N` pair.
+        let sampled = splink_resolve_args("e.parquet", "g.parquet", "o.parquet", Some(20_000));
+        assert_eq!(
+            &sampled[sampled.len() - 2..],
+            &["--sample".to_string(), "20000".to_string()]
+        );
+        // Full invocation threads through uv_run_args in the documented order.
+        let script = "/tmp/arcform-op-splink_resolve-1.0.0/splink_resolve.py";
+        let argv = uv_run_args(script, &sampled);
+        assert_eq!(argv[0], "run");
+        assert_eq!(argv[1], "--script");
+        assert_eq!(argv[2], script);
+        assert_eq!(argv[3], "--edgar");
+    }
+
+    #[test]
+    fn gleif_ra_fetch_is_in_catalog_and_versioned() {
+        assert!(resolve("gleif_ra_fetch").is_ok());
+        assert!(resolve("gleif_ra_fetch@1").is_ok());
+        assert!(resolve("gleif_ra_fetch@^1.0").is_ok());
+        assert!(resolve("gleif_ra_fetch@2").is_err()); // version not satisfied
+    }
+
+    #[test]
+    fn gleif_ra_fetch_declares_only_its_output() {
+        // Ingress: produces the local CSV, reads no graph node (the GLEIF API is not
+        // in the AssetGraph). `out` is lowercased into the produces asset.
+        let with: Value = serde_yaml::from_str("ra: RA000665\nout: build/gleif_ra_sec.csv").unwrap();
+        let a = assets_for("gleif_ra_fetch", Some(&with)).unwrap();
+        assert_eq!(a.produces, vec!["build/gleif_ra_sec.csv".to_string()]);
+        assert!(a.reads.is_empty());
+    }
+
+    #[test]
+    fn gleif_ra_fetch_optional_fields_default() {
+        // page_size / user_agent are optional — a minimal ra+out config validates.
+        let min: Value = serde_yaml::from_str("ra: RA000665\nout: g.csv").unwrap();
+        assert!(assets_for("gleif_ra_fetch", Some(&min)).is_ok());
+        // …and both may be supplied.
+        let full: Value = serde_yaml::from_str(
+            "ra: RA000665\nout: g.csv\npage_size: 50\nuser_agent: 'X (y@z)'",
+        )
+        .unwrap();
+        assert!(assets_for("gleif_ra_fetch", Some(&full)).is_ok());
+    }
+
+    #[test]
+    fn gleif_ra_fetch_rejects_bad_config() {
+        // missing required `out`
+        let no_out: Value = serde_yaml::from_str("ra: RA000665").unwrap();
+        assert!(assets_for("gleif_ra_fetch", Some(&no_out)).is_err());
+        // missing required `ra`
+        let no_ra: Value = serde_yaml::from_str("out: g.csv").unwrap();
+        assert!(assets_for("gleif_ra_fetch", Some(&no_ra)).is_err());
+        // unknown field rejected (deny_unknown_fields) — e.g. a stray `max_pages`,
+        // which is a smoke-test-only CLI flag and deliberately not a config field.
+        let bogus: Value = serde_yaml::from_str("ra: RA000665\nout: g.csv\nmax_pages: 2").unwrap();
+        assert!(assets_for("gleif_ra_fetch", Some(&bogus)).is_err());
+    }
+
+
+    #[test]
+    fn http_fetch_declares_only_its_output() {
+        // Ingress produces the local artifact and reads no graph node (the
+        // network source isn't in the AssetGraph).
+        let hf: Value = serde_yaml::from_str("url: https://x/edgar.parquet\nout: build/edgar.parquet").unwrap();
+        let a = assets_for("http_fetch", Some(&hf)).unwrap();
+        assert_eq!(a.produces, vec!["build/edgar.parquet".to_string()]);
+        assert!(a.reads.is_empty());
+    }
+
+    // ── html_link_discover ──────────────────────────────────────────────────
+
+    #[test]
+    fn new_ingress_ops_are_in_catalog() {
+        assert!(resolve("html_link_discover@1").is_ok());
+        assert!(resolve("archive_extract@^1.0").is_ok());
+        assert!(resolve("html_link_discover@2").is_err()); // version not satisfied
+    }
+
+    #[test]
+    fn html_link_discover_declares_only_its_output() {
+        let with: Value = serde_yaml::from_str(
+            "url: https://www.sec.gov/x\npattern: 'ncen.*\\.zip'\nout: build/ncen_urls.txt",
+        )
+        .unwrap();
+        let a = assets_for("html_link_discover", Some(&with)).unwrap();
+        assert_eq!(a.produces, vec!["build/ncen_urls.txt".to_string()]);
+        assert!(a.reads.is_empty());
+    }
+
+    #[test]
+    fn html_link_discover_rejects_bad_config() {
+        // missing required `out`
+        let bad: Value = serde_yaml::from_str("url: https://x\npattern: 'a'").unwrap();
+        assert!(assets_for("html_link_discover", Some(&bad)).is_err());
+        // unknown field (deny_unknown_fields)
+        let bad: Value =
+            serde_yaml::from_str("url: https://x\npattern: 'a'\nout: o\nbogus: 1").unwrap();
+        assert!(assets_for("html_link_discover", Some(&bad)).is_err());
+        // invalid `pattern` regex is a load-time validation error
+        let bad: Value = serde_yaml::from_str("url: https://x\npattern: '('\nout: o").unwrap();
+        assert!(assets_for("html_link_discover", Some(&bad)).is_err());
+    }
+
+    #[test]
+    fn discover_links_extracts_absolutises_dedups_in_order() {
+        let page = "https://www.sec.gov/data-research/sec-markets-data/form-n-cen-data-sets";
+        let html = r#"
+            <a href="/files/dera/data/ncen_2024q4.zip">Q4</a>
+            <a href='/files/dera/data/ncen_2024q3.zip'>Q3</a>
+            <a href="/about">nope</a>
+            <a href="https://cdn.example.com/ncen_2024q2.zip">Q2 abs</a>
+            <a href="/files/dera/data/ncen_2024q4.zip">Q4 dup</a>
+            <a href="/files/dera/data/other_2024q1.zip">other</a>
+        "#;
+        let re = regex::Regex::new(r"ncen.*\.zip").unwrap();
+        let all = discover_links(html, page, &re, None);
+        assert_eq!(
+            all,
+            vec![
+                "https://www.sec.gov/files/dera/data/ncen_2024q4.zip".to_string(),
+                "https://www.sec.gov/files/dera/data/ncen_2024q3.zip".to_string(),
+                "https://cdn.example.com/ncen_2024q2.zip".to_string(),
+            ]
+        );
+        // `/about` and `other_2024q1.zip` don't match `pattern`; the duplicate Q4 is
+        // de-duped, first-seen order preserved.
+
+        // cap: `limit` truncates to the head of the ordered, de-duped list.
+        let capped = discover_links(html, page, &re, Some(2));
+        assert_eq!(
+            capped,
+            vec![
+                "https://www.sec.gov/files/dera/data/ncen_2024q4.zip".to_string(),
+                "https://www.sec.gov/files/dera/data/ncen_2024q3.zip".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn absolutise_handles_relative_forms() {
+        let page = "https://www.sec.gov/a/b/page.html";
+        assert_eq!(
+            absolutise(page, "/files/x.zip").as_deref(),
+            Some("https://www.sec.gov/files/x.zip")
+        );
+        // path-relative resolves against the page's directory base.
+        assert_eq!(
+            absolutise(page, "c.zip").as_deref(),
+            Some("https://www.sec.gov/a/b/c.zip")
+        );
+        // absolute is kept verbatim; protocol-relative borrows the page scheme.
+        assert_eq!(absolutise(page, "https://cdn/x").as_deref(), Some("https://cdn/x"));
+        assert_eq!(
+            absolutise(page, "//cdn.example.com/x").as_deref(),
+            Some("https://cdn.example.com/x")
+        );
+        assert_eq!(absolutise(page, "#frag"), None);
+        assert_eq!(absolutise(page, ""), None);
+    }
+
+    // ── archive_extract ─────────────────────────────────────────────────────
+
+    #[test]
+    fn archive_extract_declares_members_and_reads() {
+        let with: Value = serde_yaml::from_str(
+            "archive: build/ncen/2024q1.zip\nmembers: [REGISTRANT.tsv, FUND_REPORTED_INFO.tsv]\ndest: build/ncen/2024q1",
+        )
+        .unwrap();
+        let a = assets_for("archive_extract", Some(&with)).unwrap();
+        assert_eq!(a.reads, vec!["build/ncen/2024q1.zip".to_string()]);
+        // Node names lowercased (graph convention); on-disk case preserved separately.
+        assert_eq!(
+            a.produces,
+            vec![
+                "build/ncen/2024q1/registrant.tsv".to_string(),
+                "build/ncen/2024q1/fund_reported_info.tsv".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn archive_extract_pattern_only_declares_dest_node() {
+        let with: Value =
+            serde_yaml::from_str("archive: a.zip\npattern: '\\.tsv$'\ndest: build/out").unwrap();
+        let a = assets_for("archive_extract", Some(&with)).unwrap();
+        assert_eq!(a.reads, vec!["a.zip".to_string()]);
+        assert_eq!(a.produces, vec!["build/out".to_string()]);
+    }
+
+    #[test]
+    fn archive_extract_rejects_bad_config() {
+        // neither `members` nor `pattern` — nothing to select
+        let bad: Value = serde_yaml::from_str("archive: a.zip\ndest: out").unwrap();
+        assert!(assets_for("archive_extract", Some(&bad)).is_err());
+        // unknown field (deny_unknown_fields)
+        let bad: Value =
+            serde_yaml::from_str("archive: a.zip\nmembers: [x]\ndest: out\nbogus: 1").unwrap();
+        assert!(assets_for("archive_extract", Some(&bad)).is_err());
+        // invalid `pattern` regex
+        let bad: Value = serde_yaml::from_str("archive: a.zip\npattern: '('\ndest: out").unwrap();
+        assert!(assets_for("archive_extract", Some(&bad)).is_err());
+    }
+
+    #[test]
+    fn safe_relative_guards_zip_slip_and_preserves_case() {
+        // Rejected: traversal, absolute, Windows drive / UNC.
+        assert!(safe_relative("../evil.txt").is_none());
+        assert!(safe_relative("a/../../b").is_none());
+        assert!(safe_relative("/etc/passwd").is_none());
+        assert!(safe_relative("C:\\Windows\\x").is_none());
+        assert!(safe_relative("\\\\server\\share").is_none());
+        // Accepted: real case preserved, `.` components dropped.
+        assert_eq!(
+            safe_relative("REGISTRANT.tsv"),
+            Some(PathBuf::from("REGISTRANT.tsv"))
+        );
+        assert_eq!(
+            safe_relative("Sub/Dir/File.TSV"),
+            Some(PathBuf::from("Sub/Dir/File.TSV"))
+        );
+        assert_eq!(safe_relative("./a/./b"), Some(PathBuf::from("a/b")));
+    }
+
+    /// Build a DEFLATE-compressed in-memory zip of `(name, bytes)` members. Exercises
+    /// the `deflate-flate2` backend end-to-end (the compression the N-CEN zips use).
+    fn build_zip(entries: &[(&str, &[u8])], method: zip::CompressionMethod) -> Vec<u8> {
+        use std::io::{Cursor, Write};
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default().compression_method(method);
+            for (name, bytes) in entries {
+                zw.start_file(*name, opts).unwrap();
+                zw.write_all(bytes).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn extract_members_roundtrip_preserves_case_and_selects() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_bytes = build_zip(
+            &[
+                ("REGISTRANT.tsv", b"cik\tlei\n1\tABC\n"),
+                ("FUND_REPORTED_INFO.tsv", b"series_id\tlei\nS1\tXYZ\n"),
+                ("SUBMISSION.tsv", b"unwanted\n"),
+            ],
+            zip::CompressionMethod::Deflated,
+        );
+        let members = vec![
+            "REGISTRANT.tsv".to_string(),
+            "FUND_REPORTED_INFO.tsv".to_string(),
+        ];
+        let written =
+            extract_members(std::io::Cursor::new(&zip_bytes), dir.path(), &members, None).unwrap();
+        assert_eq!(written.len(), 2);
+
+        // Real (upper) case preserved on disk; content round-trips through DEFLATE.
+        let reg = dir.path().join("REGISTRANT.tsv");
+        assert!(reg.exists(), "REGISTRANT.tsv (real case) should exist on disk");
+        assert_eq!(std::fs::read_to_string(&reg).unwrap(), "cik\tlei\n1\tABC\n");
+        assert!(dir.path().join("FUND_REPORTED_INFO.tsv").exists());
+        // Non-selected member is not extracted; no leftover `.part` temp file.
+        assert!(!dir.path().join("SUBMISSION.tsv").exists());
+        assert!(!dir.path().join("REGISTRANT.tsv.part").exists());
+    }
+
+    #[test]
+    fn extract_members_selects_by_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_bytes = build_zip(
+            &[
+                ("REGISTRANT.tsv", b"a"),
+                ("FUND_REPORTED_INFO.tsv", b"b"),
+                ("readme.txt", b"c"),
+            ],
+            zip::CompressionMethod::Deflated,
+        );
+        let re = regex::Regex::new(r"\.tsv$").unwrap();
+        let written =
+            extract_members(std::io::Cursor::new(&zip_bytes), dir.path(), &[], Some(&re)).unwrap();
+        assert_eq!(written.len(), 2);
+        assert!(dir.path().join("REGISTRANT.tsv").exists());
+        assert!(!dir.path().join("readme.txt").exists());
+    }
+
+    #[test]
+    fn extract_members_blocks_zip_slip_write() {
+        let dir = tempfile::tempdir().unwrap();
+        // A hostile member named `../evil.txt`.
+        let zip_bytes = build_zip(&[("../evil.txt", b"pwned")], zip::CompressionMethod::Stored);
+        let re = regex::Regex::new("evil").unwrap();
+        let res = extract_members(std::io::Cursor::new(&zip_bytes), dir.path(), &[], Some(&re));
+        // Invariant: whether the writer stored `../evil.txt` verbatim (→ guard rejects,
+        // `Err`) or normalised it (→ lands safely inside `dest`), nothing is ever
+        // written to the traversal target outside `dest`.
+        let escaped = dir.path().parent().unwrap().join("evil.txt");
+        assert!(
+            !escaped.exists(),
+            "zip-slip must never write outside dest (res_ok={})",
+            res.is_ok()
+        );
+    }
+
+    #[cfg(feature = "opendal")]
+    #[test]
+    fn opendal_fetch_declares_only_its_output() {
+        let of: Value = serde_yaml::from_str("from: s3://securelake/edgar.parquet\nto: build/edgar.parquet").unwrap();
+        let a = assets_for("opendal_fetch", Some(&of)).unwrap();
+        assert_eq!(a.produces, vec!["build/edgar.parquet".to_string()]);
+        assert!(a.reads.is_empty());
+    }
+
+    #[cfg(feature = "opendal")]
+    #[test]
+    fn opendal_fetch_accepts_headers() {
+        // `headers` is a valid config field on opendal_fetch — it is carried to
+        // the http(s) backend via a custom ReqwestTransport (see run()), not
+        // rejected. The live transport wiring is proven by the SEC fetch in the
+        // spike run; here we just assert the config is accepted + lineage holds.
+        let with: Value = serde_yaml::from_str(
+            "from: https://www.sec.gov/files/company_tickers.json\nto: build/tickers.json\nheaders:\n  User-Agent: 'Meridian (research@meridian.online)'",
+        )
+        .unwrap();
+        let assets = assets_for("opendal_fetch", Some(&with)).unwrap();
+        assert_eq!(assets.produces, vec!["build/tickers.json".to_string()]);
+        assert!(assets.reads.is_empty());
+    }
+}

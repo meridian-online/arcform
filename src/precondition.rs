@@ -20,6 +20,16 @@ pub struct ModifiedAfterConfig {
     pub period: String,
 }
 
+/// Configuration for the `fresh` precondition — content-aware ingress freshness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FreshConfig {
+    /// Relative path to a fetched artifact whose `<path>.arcmeta` sidecar records
+    /// its remote identity (written by `http_fetch`). The precondition HEAD-probes
+    /// that identity to decide freshness — the content-addressed replacement for
+    /// `modified_after`'s clock check.
+    pub path: String,
+}
+
 /// YAML format:
 /// ```yaml
 /// preconditions:
@@ -38,6 +48,15 @@ pub enum Precondition {
     /// If the file is missing or inaccessible, evaluates as stale (not an error).
     ModifiedAfter {
         modified_after: ModifiedAfterConfig,
+    },
+
+    /// Content-aware ingress freshness. HEAD-probes the remote recorded in a
+    /// fetched artifact's `<path>.arcmeta` sidecar and compares `ETag` /
+    /// `Last-Modified`: unchanged remote = fresh (skip the fetch and everything
+    /// downstream), changed or unprobeable = stale (re-fetch). Replaces the
+    /// clock-based `modified_after` for `http_fetch` outputs.
+    Fresh {
+        fresh: FreshConfig,
     },
 
     /// Run a shell command. Exit 0 = fresh (skip), non-zero = stale (run).
@@ -75,6 +94,52 @@ impl Precondition {
                 })();
 
                 Ok(fresh.unwrap_or(false))
+            }
+            Precondition::Fresh { fresh } => {
+                let file_path = manifest_dir.join(&fresh.path);
+                // No artifact or no sidecar → stale: the fetch must run. (A probe
+                // failure below is likewise stale — safe, and cheap: the operator's
+                // own conditional GET then 304s rather than re-downloading.)
+                if !file_path.exists() {
+                    return Ok(false);
+                }
+                let Some(meta) = crate::ingress_meta::read(&file_path) else {
+                    return Ok(false);
+                };
+
+                let mut req = ureq::head(&meta.url)
+                    .set("User-Agent", crate::ingress_meta::DEFAULT_UA);
+                for (k, v) in &meta.request_headers {
+                    req = req.set(k, v);
+                }
+                if let Some(ref etag) = meta.etag {
+                    req = req.set("If-None-Match", etag);
+                }
+                if let Some(ref lm) = meta.last_modified {
+                    req = req.set("If-Modified-Since", lm);
+                }
+
+                let fresh = match req.call() {
+                    // Server confirms unchanged.
+                    Ok(resp) if resp.status() == 304 => true,
+                    Ok(resp) => {
+                        // No 304 (e.g. server ignores conditionals) — compare identity
+                        // ourselves: ETag first, then Last-Modified.
+                        let etag_match = matches!(
+                            (&meta.etag, resp.header("ETag")),
+                            (Some(a), Some(b)) if a == b
+                        );
+                        let lm_match = matches!(
+                            (&meta.last_modified, resp.header("Last-Modified")),
+                            (Some(a), Some(b)) if a == b
+                        );
+                        etag_match || lm_match
+                    }
+                    Err(ureq::Error::Status(304, _)) => true,
+                    // Unreachable/errored probe → stale.
+                    Err(_) => false,
+                };
+                Ok(fresh)
             }
             Precondition::Command { command: cmd } => {
                 let output = std::process::Command::new("sh")
@@ -116,6 +181,14 @@ impl Precondition {
                         modified_after.period, e
                     ))
                 })?;
+                Ok(())
+            }
+            Precondition::Fresh { fresh } => {
+                if fresh.path.is_empty() {
+                    return Err(Error::ManifestValidation(
+                        "fresh precondition: 'path' cannot be empty".to_string(),
+                    ));
+                }
                 Ok(())
             }
             Precondition::Command { command: cmd } => {
@@ -327,5 +400,38 @@ mod tests {
     fn test_pre_ac15_validate_valid() {
         assert!(ma("data.json", "24h").validate().is_ok());
         assert!(cmd("test -f output.csv").validate().is_ok());
+    }
+
+    fn fresh(path: &str) -> Precondition {
+        Precondition::Fresh { fresh: FreshConfig { path: path.to_string() } }
+    }
+
+    // fresh: no artifact on disk → stale (must fetch), never a network probe.
+    #[test]
+    fn test_fresh_missing_artifact_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!fresh("build/edgar.parquet")
+            .evaluate(dir.path(), "test-step", &empty_env())
+            .unwrap());
+    }
+
+    // fresh: artifact present but no `.arcmeta` sidecar → stale (nothing to probe).
+    #[test]
+    fn test_fresh_missing_sidecar_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("data.parquet"), b"bytes").unwrap();
+        assert!(!fresh("data.parquet")
+            .evaluate(dir.path(), "test-step", &empty_env())
+            .unwrap());
+    }
+
+    // fresh: validation + serde round-trip.
+    #[test]
+    fn test_fresh_validate_and_roundtrip() {
+        assert!(fresh("build/x.parquet").validate().is_ok());
+        assert!(fresh("").validate().is_err());
+        let yaml = serde_yaml::to_string(&vec![fresh("build/x.parquet")]).unwrap();
+        let parsed: Vec<Precondition> = serde_yaml::from_str(&yaml).unwrap();
+        assert!(matches!(parsed[0], Precondition::Fresh { .. }));
     }
 }

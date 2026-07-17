@@ -88,6 +88,30 @@ impl AssetGraph {
                 }
             }
 
+            // Phase 1b: Operator asset declaration. An `op:` step declares its
+            // reads/produces from its typed config, so lineage + stale-propagation hold
+            // at its boundary exactly as SQL introspection does — no manual depends_on.
+            if let Some(ref op_ref) = step.op {
+                match crate::operator::assets_for(op_ref, step.with.as_ref()) {
+                    Ok(op_assets) => {
+                        for asset in op_assets.produces {
+                            step_assets.produces.insert(asset.to_lowercase());
+                        }
+                        for asset in op_assets.reads {
+                            step_assets.reads.insert(asset.to_lowercase());
+                        }
+                    }
+                    Err(e) => {
+                        // Manifest validation already rejects bad op steps; this is
+                        // defensive (treat as opaque rather than panic).
+                        graph.warnings.push(format!(
+                            "operator step '{}': {} — treating as opaque",
+                            step.name, e
+                        ));
+                    }
+                }
+            }
+
             // Phase 2: Explicit declarations (primarily for command steps).
             for asset in &step.produces {
                 step_assets.produces.insert(asset.to_lowercase());
@@ -248,6 +272,8 @@ mod tests {
             produces: vec![],
             depends_on: vec![],
             preconditions: vec![],
+            op: None,
+            with: None,
             output: None,
             retry: None,
             timeout_sec: None,
@@ -268,6 +294,8 @@ mod tests {
             produces: produces.into_iter().map(String::from).collect(),
             depends_on: depends_on.into_iter().map(String::from).collect(),
             preconditions: vec![],
+            op: None,
+            with: None,
             output: None,
             retry: None,
             timeout_sec: None,
@@ -283,6 +311,8 @@ mod tests {
             produces: vec![],
             depends_on: vec![],
             preconditions: vec![],
+            op: None,
+            with: None,
             output: None,
             retry: None,
             timeout_sec: None,

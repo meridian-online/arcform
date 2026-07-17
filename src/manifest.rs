@@ -105,9 +105,19 @@ pub struct Step {
     #[serde(default)]
     pub sql: Option<String>,
 
-    /// Raw shell command string. Mutually exclusive with `sql`.
+    /// Raw shell command string. Mutually exclusive with `sql`/`op`.
     #[serde(default)]
     pub command: Option<String>,
+
+    /// First-class operator reference: `op: <name>@<semver>`. Mutually exclusive with
+    /// `sql`/`command`. Configured via the typed `with:` block; resolved from the
+    /// operator catalog. `command:` is the flagged escape hatch — prefer `op:`.
+    #[serde(default)]
+    pub op: Option<String>,
+
+    /// Typed config for an `op:` step, validated against the operator's schema at load.
+    #[serde(default)]
+    pub with: Option<serde_yaml::Value>,
 
     /// Assets this step produces (primarily for command steps).
     /// SQL steps auto-discover their outputs via sqlparser-rs.
@@ -273,21 +283,34 @@ impl Manifest {
                 })?;
             }
 
-            // Each step must have exactly one of sql or command.
-            match (&step.sql, &step.command) {
-                (Some(_), Some(_)) => {
+            // Each step must have exactly one of sql, command, or op.
+            let arms = [
+                step.sql.is_some(),
+                step.command.is_some(),
+                step.op.is_some(),
+            ];
+            match arms.iter().filter(|present| **present).count() {
+                0 => {
                     return Err(Error::ManifestValidation(format!(
-                        "step '{}': must have either 'sql' or 'command', not both",
+                        "step '{}': must have one of 'sql', 'command', or 'op'",
                         step.name
                     )));
                 }
-                (None, None) => {
+                1 => {}
+                _ => {
                     return Err(Error::ManifestValidation(format!(
-                        "step '{}': must have either 'sql' or 'command'",
+                        "step '{}': must have exactly one of 'sql', 'command', or 'op', not several",
                         step.name
                     )));
                 }
-                _ => {}
+            }
+
+            // Validate op steps at load: the operator must exist, its version must be
+            // satisfied, and its `with:` config must deserialize (fail fast, not at run).
+            if let Some(ref op_ref) = step.op {
+                crate::operator::assets_for(op_ref, step.with.as_ref()).map_err(|e| {
+                    Error::ManifestValidation(format!("step '{}': {}", step.name, e))
+                })?;
             }
 
             // SQL steps cannot declare an output field.
@@ -440,6 +463,8 @@ mod tests {
             produces: vec![],
             depends_on: vec![],
             preconditions: vec![],
+            op: None,
+            with: None,
             output: None,
             retry: None,
             timeout_sec: None,
@@ -455,6 +480,8 @@ mod tests {
             produces: vec![],
             depends_on: vec![],
             preconditions: vec![],
+            op: None,
+            with: None,
             output: None,
             retry: None,
             timeout_sec: None,
@@ -529,13 +556,15 @@ mod tests {
                 produces: vec![],
                 depends_on: vec![],
                 preconditions: vec![],
+                op: None,
+                with: None,
                 output: None,
                 retry: None,
                 timeout_sec: None,
             }],
         );
         let err = m.validate().unwrap_err();
-        assert!(err.to_string().contains("not both"));
+        assert!(err.to_string().contains("not several"));
     }
 
     // AC-10: Step with neither sql nor command is rejected.
@@ -550,13 +579,15 @@ mod tests {
                 produces: vec![],
                 depends_on: vec![],
                 preconditions: vec![],
+                op: None,
+                with: None,
                 output: None,
                 retry: None,
                 timeout_sec: None,
             }],
         );
         let err = m.validate().unwrap_err();
-        assert!(err.to_string().contains("must have either"));
+        assert!(err.to_string().contains("must have one of"));
     }
 
     // AC-5: Missing arcform.yaml produces a clear error.

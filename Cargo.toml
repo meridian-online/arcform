@@ -26,6 +26,31 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 tar = "0.4"
 flate2 = "1"
 dirs = "5"
+# html_link_discover href-plucking + archive_extract member selection.
+regex = "1"
+# archive_extract: unzip the DEFLATE-compressed SEC N-CEN quarter zips. MUST be
+# `deflate-flate2` (wires the flate2 inflate backend — already an arcform dep),
+# NOT plain `deflate` (a base meta-feature with no backend → runtime failure on
+# the compressed members). default-features OFF drops the bzip2/zstd/aes C backends.
+zip = { version = "6", default-features = false, features = ["deflate-flate2"] }
+# opendal_fetch (ingress): one operator, 40+ backends + built-in RetryLayer —
+# the s3://securelake / multi-store lever. HEAVY: +156 crates (tokio, hyper,
+# tower, reqwest, rustls) that the ureq http_fetch path needs none of. Feature-
+# gated OFF by default so the flagship single binary stays lean; build with
+# `--features opendal` to include it. Spike evidence + verdict:
+# bearing/research/arcform-typed-operators.md §ingress-engines.
+opendal = { version = "0.58", features = ["services-http", "services-s3", "blocking"], optional = true }
+# Custom HTTP transport so opendal_fetch can carry request headers (User-Agent) —
+# OpenDAL's Http builder has no header setter; you inject a reqwest client via a
+# ReqwestTransport. reqwest 0.13 is version-matched to OpenDAL's transport.
+opendal-http-transport-reqwest = { version = "0.58", optional = true }
+reqwest = { version = "0.13", default-features = false, optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time"], optional = true }
+
+[features]
+default = []
+# The OpenDAL-backed opendal_fetch operator (multi-backend ingress; securelake s3://).
+opendal = ["dep:opendal", "dep:opendal-http-transport-reqwest", "dep:reqwest", "dep:tokio"]
 
 [dev-dependencies]
 tempfile = "3"
