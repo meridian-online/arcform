@@ -15,6 +15,7 @@ dotenvy = "0.15"
 indexmap = { version = "2", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+serde_json = "1"
 thiserror = "2"
 owo-colors = "4"
 sqlparser = { version = "0.55", features = ["visitor"] }

@@ -6,6 +6,7 @@ use indexmap::IndexMap;
 use owo_colors::OwoColorize;
 
 use crate::asset::AssetGraph;
+use crate::contract;
 use crate::engine::Engine;
 use crate::error::{Error, Result};
 use crate::manifest::{Manifest, Param, RetryPolicy};
@@ -186,6 +187,19 @@ pub fn run_with_params(
     let mut skipped = 0;
     let mut total_retries: usize = 0;
 
+    // --- Live Protocol+Run contract ---
+    // Persist the asset graph + a per-step status stream instead of discarding the
+    // graph when the run returns. `runs_dir` and its parents are created up front;
+    // `stream` appends one JSONL line per step as it finishes (and a terminal
+    // `run_complete` line at the end). `step_outcomes` records each step's terminal
+    // state + attempt count for the final JSON contract.
+    let started_at = contract::now_iso();
+    let runs_dir = contract::runs_dir(dir);
+    let _ = std::fs::create_dir_all(&runs_dir);
+    let mut stream = contract::RunStream::create(&runs_dir, &run_id);
+    let mut step_outcomes: HashMap<String, (String, u32)> = HashMap::new();
+    let contract_params = contract::param_entries(&manifest.params, &dotenv_vars, cli_params);
+
     // Pipeline-level timeout tracking.
     let pipeline_start = Instant::now();
     let pipeline_timeout = manifest.timeout_sec.map(Duration::from_secs_f64);
@@ -232,6 +246,8 @@ pub fn run_with_params(
                     "[skip]".dimmed(),
                 );
                 skipped += 1;
+                stream.step(&step.name, "skipped");
+                step_outcomes.insert(step.name.clone(), ("skipped".to_string(), 0));
                 continue;
             }
 
@@ -352,6 +368,8 @@ pub fn run_with_params(
                         }
 
                         last_error = None;
+                        stream.step(&step.name, "success");
+                        step_outcomes.insert(step.name.clone(), ("success".to_string(), attempt));
                         break;
                     }
                     Err(Error::StepFailed { code, stderr, .. }) => {
@@ -373,6 +391,8 @@ pub fn run_with_params(
                         // Non-retryable errors (StepExecution, etc.) — halt immediately.
                         let _ = state.record_step(&step.name, &sql_hash, StepStatus::Failed);
                         let _ = state.finish_run(&run_id, executed, "error", total_retries);
+                        stream.step(&step.name, "failed");
+                        step_outcomes.insert(step.name.clone(), ("failed".to_string(), attempt));
                         return Err(e);
                     }
                 }
@@ -383,6 +403,8 @@ pub fn run_with_params(
                 executed += 1;
                 let _ = state.record_step(&step.name, &sql_hash, StepStatus::Failed);
                 let _ = state.finish_run(&run_id, executed, "failed", total_retries);
+                stream.step(&step.name, "failed");
+                step_outcomes.insert(step.name.clone(), ("failed".to_string(), max_attempts));
                 return Err(err);
             }
         }
@@ -473,6 +495,35 @@ pub fn run_with_params(
             }
         }
     }
+
+    // --- Finalize the live Protocol+Run contract ---
+    // Assemble the full contract (assets, per-table row counts, steps), write it to
+    // `<run_id>.json`, mark the status stream complete, and render the asset DAG to
+    // the terminal. Best-effort: a contract-write failure warns but never fails the
+    // run itself.
+    let finished_at = contract::now_iso();
+    let outcome = match &step_loop_result {
+        Ok(()) => "success",
+        Err(_) if succeeded > 0 => "partial",
+        Err(_) => "error",
+    };
+    let run_contract = contract::build_contract(contract::ContractInputs {
+        manifest: &manifest,
+        dir,
+        db_path: &db_path,
+        graph: &asset_graph,
+        run_id: &run_id,
+        started_at: &started_at,
+        finished_at: &finished_at,
+        outcome,
+        params: contract_params,
+        step_outcomes: &step_outcomes,
+    });
+    if let Err(e) = contract::write_contract(&runs_dir, &run_id, &run_contract) {
+        eprintln!("{} could not write run contract: {}", "warning:".yellow(), e);
+    }
+    stream.complete(outcome);
+    print!("{}", contract::render_dag(&run_contract));
 
     // Print summary and return the pipeline result (not hook result).
     match step_loop_result {
@@ -3015,5 +3066,153 @@ steps:
             .collect();
         // init → load (fail) → failure → exit (no success).
         assert_eq!(cmd_calls, vec!["echo init", "echo loading", "echo fail", "echo exit"]);
+    }
+
+    // ---- Live Protocol+Run contract ----
+
+    // A successful run persists a deserializable JSON contract with a measured
+    // row-count, per-statement SQL lineage, and a per-step + run_complete status
+    // stream. Row-count is measured against a real DuckDB table pre-seeded into the
+    // run database (the mock engine records but doesn't materialize tables).
+    #[test]
+    fn test_contract_persisted_with_row_count_and_stream() {
+        use crate::contract::{Contract, StepKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: widgets\ndb: pipeline.duckdb\nsteps:\n  - name: load\n    sql: models/load.sql\n  - name: tally\n    sql: models/tally.sql\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[
+                ("models/load.sql", "CREATE TABLE widgets (id INTEGER, name TEXT);\n"),
+                (
+                    "models/tally.sql",
+                    "CREATE TABLE widget_tally AS SELECT count(*) AS n FROM widgets;\n",
+                ),
+            ],
+        );
+
+        // Pre-seed the run database with a real `widgets` table so the contract's
+        // live row-count measure has something to count. Scoped so the connection
+        // closes before the run opens the same file.
+        {
+            let conn = duckdb::Connection::open(dir.path().join("pipeline.duckdb")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE widgets (id INTEGER, name TEXT); \
+                 INSERT INTO widgets VALUES (1,'a'),(2,'b'),(3,'c');",
+            )
+            .unwrap();
+        }
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        // (a) The per-run JSON exists and deserializes.
+        let json_path = dir.path().join("build/.arcform/runs/run-1.json");
+        assert!(json_path.exists(), "contract JSON should exist at {json_path:?}");
+        let raw = std::fs::read_to_string(&json_path).unwrap();
+        let contract: Contract = serde_json::from_str(&raw).expect("contract JSON deserializes");
+
+        assert_eq!(contract.contract_version, "b4/1");
+        assert_eq!(contract.run.outcome, "success");
+        assert_eq!(contract.run.run_id, "run-1");
+        assert_eq!(contract.run.attempt_id, "run-1");
+        assert_eq!(contract.run.engine.arc, env!("CARGO_PKG_VERSION"));
+        assert!(contract.run.protocol.manifest_sha256.is_some());
+
+        // (b) At least one asset with a dotted id + kind + a populated row_count.
+        let widgets = contract
+            .assets
+            .iter()
+            .find(|a| a.name == "widgets")
+            .expect("widgets asset present");
+        assert_eq!(widgets.id, "table:widgets");
+        assert_eq!(widgets.kind, "table");
+        assert_eq!(widgets.row_count, Some(3), "row_count measured from the run db");
+        assert_eq!(widgets.produced_by.as_deref(), Some("load"));
+        assert!(widgets.consumed_by.contains(&"tally".to_string()));
+
+        // (c) A sql step carries non-empty sql_text + sql_hash + per-statement lineage.
+        let load = contract.steps.iter().find(|s| s.name == "load").unwrap();
+        assert_eq!(load.kind, StepKind::Sql);
+        let sql = load.sql.as_ref().expect("sql detail present");
+        assert!(!sql.sql_text.is_empty(), "sql_text captured");
+        assert!(!sql.sql_hash.is_empty(), "sql_hash captured");
+        assert!(
+            sql.statements
+                .iter()
+                .any(|st| st.produces.contains(&"widgets".to_string())),
+            "per-statement lineage records the produced table"
+        );
+        // Deferred fields stay null in this phase.
+        assert!(widgets.bytes.is_none() && widgets.content_hash.is_none());
+        assert!(load.duration_sec.is_none());
+
+        // (d) The JSONL stream exists with a line per step + a run_complete line.
+        let jsonl_path = dir.path().join("build/.arcform/runs/run-1.jsonl");
+        assert!(jsonl_path.exists(), "status stream should exist");
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&jsonl_path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(
+            lines.iter().any(|l| l["step"] == "load" && l["state"] == "success"),
+            "stream has load success line"
+        );
+        assert!(
+            lines.iter().any(|l| l["step"] == "tally" && l["state"] == "success"),
+            "stream has tally success line"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l["event"] == "run_complete" && l["outcome"] == "success"),
+            "stream has terminal run_complete line"
+        );
+    }
+
+    // A run that fails partway records the failed step's state, a "partial" outcome
+    // (some steps succeeded), and a `failed` line in the status stream.
+    #[test]
+    fn test_contract_records_failed_step_and_partial_outcome() {
+        use crate::contract::Contract;
+
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n  - name: s2\n    sql: models/s2.sql\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[
+                ("models/s1.sql", "CREATE TABLE t (id INT);"),
+                ("models/s2.sql", "CREATE TABLE u AS SELECT * FROM t;"),
+            ],
+        );
+
+        let engine = MockEngine::new();
+        // Fail the 2nd execution call (s2); s1 succeeds first.
+        engine.set_fail_on_call(1, 1, "boom");
+        let state = MockStateBackend::new();
+        let result = run(dir.path(), &engine, &state, false);
+        assert!(result.is_err(), "run should fail on s2");
+
+        let json_path = dir.path().join("build/.arcform/runs/run-1.json");
+        let raw = std::fs::read_to_string(&json_path).unwrap();
+        let contract: Contract = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(contract.run.outcome, "partial", "s1 succeeded, s2 failed");
+        let s1 = contract.steps.iter().find(|s| s.name == "s1").unwrap();
+        let s2 = contract.steps.iter().find(|s| s.name == "s2").unwrap();
+        assert_eq!(s1.status.state, "success");
+        assert_eq!(s2.status.state, "failed");
+
+        let jsonl = std::fs::read_to_string(dir.path().join("build/.arcform/runs/run-1.jsonl")).unwrap();
+        let lines: Vec<serde_json::Value> =
+            jsonl.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert!(lines.iter().any(|l| l["step"] == "s2" && l["state"] == "failed"));
+        assert!(lines
+            .iter()
+            .any(|l| l["event"] == "run_complete" && l["outcome"] == "partial"));
     }
 }

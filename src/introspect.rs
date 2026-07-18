@@ -50,6 +50,33 @@ pub fn extract_assets(sql: &str) -> Result<SqlAssets, Vec<String>> {
     Ok(assets)
 }
 
+/// Parse a SQL string and extract assets **per statement**, in source order.
+///
+/// Like [`extract_assets`] but returns one [`SqlAssets`] per top-level statement
+/// instead of a single merged set — so a contract can record which tables each
+/// statement produces/reads. CTE names are filtered out of `inputs` per statement,
+/// exactly as the merged path does.
+///
+/// Returns `Ok(Vec<SqlAssets>)` on success, or `Err(warnings)` if the SQL cannot be
+/// parsed (caller treats a parse failure as an opaque step).
+pub fn extract_per_statement(sql: &str) -> Result<Vec<SqlAssets>, Vec<String>> {
+    let dialect = DuckDbDialect {};
+    let statements = Parser::parse_sql(&dialect, sql).map_err(|e| vec![e.to_string()])?;
+
+    let mut per_statement = Vec::with_capacity(statements.len());
+    for stmt in &statements {
+        let mut assets = SqlAssets::default();
+        extract_from_statement(stmt, &mut assets);
+        // Per-statement CTE filtering: a CTE reference is step-internal, not an input.
+        let internal: Vec<String> = assets.internal.iter().cloned().collect();
+        for cte_name in internal {
+            assets.inputs.remove(&cte_name);
+        }
+        per_statement.push(assets);
+    }
+    Ok(per_statement)
+}
+
 /// Extract table names from a single SQL statement.
 fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
     match stmt {
