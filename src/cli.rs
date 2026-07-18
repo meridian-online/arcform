@@ -35,6 +35,12 @@ pub enum Commands {
     Init {
         /// Project name (used as directory name).
         name: String,
+
+        /// Generate a runnable Protocol from a Frictionless Data Package
+        /// descriptor (semantic-typed fields + discovered foreignKeys) instead
+        /// of an empty scaffold. `arc run` then runs the GENERATED manifest.
+        #[arg(long = "from-descriptor", value_name = "DATAPACKAGE_JSON")]
+        from_descriptor: Option<PathBuf>,
     },
     /// Run the pipeline defined in arcform.yaml.
     Run {
@@ -171,7 +177,10 @@ pub fn run_pipeline(force: bool, raw_params: &[String]) -> Result<()> {
 pub fn dispatch(cli: Cli) -> Result<()> {
     let verbose = cli.verbose || std::env::var_os(VERBOSE_ENV).is_some();
     match cli.command {
-        Commands::Init { name } => init(&name),
+        Commands::Init { name, from_descriptor } => match from_descriptor {
+            Some(path) => crate::bridge::init_from_descriptor(&name, &path),
+            None => init(&name),
+        },
         Commands::Run { force, params } => run_pipeline(force, &params),
         Commands::Registry { cmd } => dispatch_registry(cmd, verbose),
     }

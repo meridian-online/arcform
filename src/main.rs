@@ -1,4 +1,5 @@
 mod asset;
+mod bridge;
 mod cli;
 mod contract;
 mod engine;

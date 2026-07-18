@@ -185,6 +185,25 @@ pub struct AssetOverride {
 }
 
 impl Step {
+    /// A bare step with just a name — every other field at its empty default.
+    /// Callers set `sql`/`command`/`op` and any deps they need. Used by the
+    /// descriptor bridge to build generated steps.
+    pub fn new(name: &str) -> Self {
+        Step {
+            name: name.to_string(),
+            sql: None,
+            command: None,
+            op: None,
+            with: None,
+            produces: Vec::new(),
+            depends_on: Vec::new(),
+            preconditions: Vec::new(),
+            output: None,
+            retry: None,
+            timeout_sec: None,
+        }
+    }
+
     /// Returns true if this step uses the engine (sql field).
     pub fn is_sql(&self) -> bool {
         self.sql.is_some()
