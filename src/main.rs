@@ -1,5 +1,6 @@
 mod asset;
 mod cli;
+mod contract;
 mod engine;
 mod error;
 mod ingress_meta;
