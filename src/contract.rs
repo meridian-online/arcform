@@ -141,7 +141,8 @@ pub struct StepEntry {
     pub status: StatusInfo,
     /// Actual attempt count (1 on first-try success, more if retried; 0 if skipped/not reached).
     pub attempts: u32,
-    /// Wall-clock duration — deferred (`null`) in this phase.
+    /// Wall-clock duration of the step (all attempts + backoff). `null` when the step was
+    /// skipped or never reached.
     pub duration_sec: Option<f64>,
     /// Effective retry policy (step override or manifest default), if any.
     pub retry: Option<RetryInfo>,
@@ -176,6 +177,10 @@ pub struct SqlInfo {
 pub struct StatementInfo {
     pub produces: Vec<String>,
     pub reads: Vec<String>,
+    /// `[start, end)` byte offsets into the step's `sql_text` — the exact source slice for
+    /// this statement, so a viewer can render statements individually. `null` if the
+    /// lexical split didn't line up with the parsed statements.
+    pub byte_range: Option<[usize; 2]>,
 }
 
 /// A step's terminal status.
@@ -183,8 +188,8 @@ pub struct StatementInfo {
 pub struct StatusInfo {
     /// `"success"`, `"failed"`, or `"skipped"`.
     pub state: String,
-    /// Why a step was skipped — deferred (`null`) in this phase.
-    pub skip_reason: Option<String>,
+    /// For a skipped step, the typed reason it was fresh; `null` for steps that executed.
+    pub skip_reason: Option<crate::state::SkipReason>,
 }
 
 /// The effective retry policy for a step.
@@ -268,6 +273,19 @@ pub fn runs_dir(dir: &Path) -> PathBuf {
     dir.join("build").join(".arcform").join("runs")
 }
 
+/// How a single step fared, captured by the run loop for the contract.
+#[derive(Debug, Clone)]
+pub struct StepOutcome {
+    /// Terminal state: `"success"`, `"failed"`, or `"skipped"`.
+    pub state: String,
+    /// Attempts made (1 on first-try success, more if retried; 0 if skipped/not reached).
+    pub attempts: u32,
+    /// For a skipped step, why it was fresh; `None` for steps that executed.
+    pub skip_reason: Option<crate::state::SkipReason>,
+    /// Wall-clock duration of the step; `None` when skipped or never reached.
+    pub duration_sec: Option<f64>,
+}
+
 /// Inputs to [`build_contract`] — grouped to keep the call site readable.
 pub struct ContractInputs<'a> {
     pub manifest: &'a Manifest,
@@ -279,8 +297,8 @@ pub struct ContractInputs<'a> {
     pub finished_at: &'a str,
     pub outcome: &'a str,
     pub params: Vec<ParamEntry>,
-    /// Per-step terminal `(state, attempts)`, keyed by step name.
-    pub step_outcomes: &'a HashMap<String, (String, u32)>,
+    /// Per-step terminal outcome, keyed by step name.
+    pub step_outcomes: &'a HashMap<String, StepOutcome>,
 }
 
 /// Assemble the full contract from the run's manifest, asset graph, and outcomes.
@@ -452,7 +470,7 @@ fn build_step(
     dir: &Path,
     graph: &AssetGraph,
     manifest: &Manifest,
-    outcomes: &HashMap<String, (String, u32)>,
+    outcomes: &HashMap<String, StepOutcome>,
 ) -> StepEntry {
     let kind = if step.sql.is_some() {
         StepKind::Sql
@@ -497,13 +515,24 @@ fn build_step(
                 let text = String::from_utf8_lossy(&bytes).to_string();
                 let hash = crate::state::content_hash(&bytes);
                 let statements = match crate::introspect::extract_per_statement(&text) {
-                    Ok(list) => list
-                        .into_iter()
-                        .map(|a| StatementInfo {
-                            produces: a.outputs.into_iter().collect(),
-                            reads: a.inputs.into_iter().collect(),
-                        })
-                        .collect(),
+                    Ok(list) => {
+                        // Attach each statement's source byte range. The lexical splitter
+                        // and the parser agree on count for well-formed SQL; if they ever
+                        // diverge, emit no ranges rather than misalign them.
+                        let ranges = crate::introspect::statement_byte_ranges(&text);
+                        let aligned = ranges.len() == list.len();
+                        list.into_iter()
+                            .enumerate()
+                            .map(|(i, a)| StatementInfo {
+                                produces: a.outputs.into_iter().collect(),
+                                reads: a.inputs.into_iter().collect(),
+                                byte_range: aligned.then(|| {
+                                    let (s, e) = ranges[i];
+                                    [s, e]
+                                }),
+                            })
+                            .collect()
+                    }
                     Err(_) => Vec::new(),
                 };
                 (text, hash, statements)
@@ -513,10 +542,12 @@ fn build_step(
         SqlInfo { model_path: model_path.clone(), sql_text, sql_hash, statements }
     });
 
-    let (state, attempts) = outcomes
-        .get(&step.name)
-        .cloned()
-        .unwrap_or_else(|| ("skipped".to_string(), 0));
+    let outcome = outcomes.get(&step.name).cloned().unwrap_or(StepOutcome {
+        state: "skipped".to_string(),
+        attempts: 0,
+        skip_reason: None,
+        duration_sec: None,
+    });
 
     // Effective retry policy: a step override wins, else the manifest default.
     let effective_retry = step
@@ -541,9 +572,12 @@ fn build_step(
         op_ref,
         resolved_with,
         sql,
-        status: StatusInfo { state, skip_reason: None },
-        attempts,
-        duration_sec: None,
+        status: StatusInfo {
+            state: outcome.state,
+            skip_reason: outcome.skip_reason,
+        },
+        attempts: outcome.attempts,
+        duration_sec: outcome.duration_sec,
         retry,
         timeout_sec: step.timeout_sec,
         io: IoInfo::default(),
