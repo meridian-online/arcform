@@ -77,6 +77,149 @@ pub fn extract_per_statement(sql: &str) -> Result<Vec<SqlAssets>, Vec<String>> {
     Ok(per_statement)
 }
 
+/// The `[start, end)` byte offset of each top-level statement in `sql`, in source order.
+///
+/// A lexical splitter (not the AST) that walks the raw bytes so a renderer can slice
+/// `sql` and show the exact source of each statement. It splits on top-level `;`,
+/// skipping over single-quoted strings, double-quoted identifiers, `--` line comments,
+/// `/* … */` block comments, and `$tag$ … $tag$` dollar-quoted bodies so a `;` inside
+/// any of those never splits. Comment-only / whitespace-only segments are dropped, so
+/// on well-formed SQL the count matches [`extract_per_statement`]; the caller zips the
+/// two and falls back to no ranges if they ever disagree. Ranges are trimmed of leading
+/// whitespace/comments and trailing whitespace.
+pub fn statement_byte_ranges(sql: &str) -> Vec<(usize, usize)> {
+    let bytes = sql.as_bytes();
+    let n = bytes.len();
+    let mut ranges = Vec::new();
+    let mut seg_start = 0usize;
+    let mut i = 0usize;
+
+    while i < n {
+        match bytes[i] {
+            b'\'' => i = skip_string(bytes, i, b'\''),
+            b'"' => i = skip_string(bytes, i, b'"'),
+            b'-' if i + 1 < n && bytes[i + 1] == b'-' => i = skip_line_comment(bytes, i),
+            b'/' if i + 1 < n && bytes[i + 1] == b'*' => i = skip_block_comment(bytes, i),
+            b'$' => match skip_dollar_quote(bytes, i) {
+                Some(j) => i = j,
+                None => i += 1,
+            },
+            b';' => {
+                // Include the terminating `;` in the range so a rendered slice reads as a
+                // complete statement.
+                if let Some(r) = trim_code_span(sql, seg_start, i + 1) {
+                    ranges.push(r);
+                }
+                i += 1;
+                seg_start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    // The tail after the last `;` (a file need not terminate its final statement).
+    if let Some(r) = trim_code_span(sql, seg_start, n) {
+        ranges.push(r);
+    }
+    ranges
+}
+
+/// Advance past a quoted string/identifier opened by `quote` at `open`. Handles the
+/// doubled-delimiter escape (`''` / `""`). Returns the index just past the closing quote
+/// (or the input end if unterminated).
+fn skip_string(bytes: &[u8], open: usize, quote: u8) -> usize {
+    let n = bytes.len();
+    let mut i = open + 1;
+    while i < n {
+        if bytes[i] == quote {
+            if i + 1 < n && bytes[i + 1] == quote {
+                i += 2; // Escaped delimiter — stay inside the string.
+            } else {
+                return i + 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    n
+}
+
+/// Advance past a `-- …` line comment. Returns the index just past the newline (or end).
+fn skip_line_comment(bytes: &[u8], open: usize) -> usize {
+    let n = bytes.len();
+    let mut i = open + 2;
+    while i < n && bytes[i] != b'\n' {
+        i += 1;
+    }
+    if i < n { i + 1 } else { n }
+}
+
+/// Advance past a `/* … */` block comment. Returns the index just past `*/` (or end).
+fn skip_block_comment(bytes: &[u8], open: usize) -> usize {
+    let n = bytes.len();
+    let mut i = open + 2;
+    while i + 1 < n {
+        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+            return i + 2;
+        }
+        i += 1;
+    }
+    n
+}
+
+/// If a `$tag$` dollar-quote opens at `open`, return the index just past the matching
+/// `$tag$` close (or the input end if unterminated). Returns `None` if `open` is not a
+/// valid dollar-quote opener, so the caller treats `$` as an ordinary byte.
+fn skip_dollar_quote(bytes: &[u8], open: usize) -> Option<usize> {
+    let n = bytes.len();
+    // Tag runs from just after the opening `$` to the next `$`; tags are [A-Za-z0-9_]*.
+    let mut j = open + 1;
+    while j < n && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+        j += 1;
+    }
+    if j >= n || bytes[j] != b'$' {
+        return None; // Not a `$…$`-delimited opener.
+    }
+    let tag = &bytes[open..=j]; // The full `$tag$` delimiter, reused to find the close.
+    let mut i = j + 1;
+    while i < n {
+        if bytes[i] == b'$' && bytes[i..].starts_with(tag) {
+            return Some(i + tag.len());
+        }
+        i += 1;
+    }
+    Some(n)
+}
+
+/// Trim `[start, end)` to the code it contains: skip leading whitespace and comments,
+/// then drop trailing ASCII whitespace. Returns `None` if the span is empty or made up
+/// entirely of whitespace/comments (so blank or comment-only segments are not counted).
+fn trim_code_span(sql: &str, start: usize, end: usize) -> Option<(usize, usize)> {
+    let bytes = sql.as_bytes();
+    let mut i = start;
+    loop {
+        while i < end && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i + 1 < end && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            i = skip_line_comment(bytes, i).min(end);
+            continue;
+        }
+        if i + 1 < end && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i = skip_block_comment(bytes, i).min(end);
+            continue;
+        }
+        break;
+    }
+    if i >= end {
+        return None; // Nothing but whitespace/comments.
+    }
+    let mut j = end;
+    while j > i && bytes[j - 1].is_ascii_whitespace() {
+        j -= 1;
+    }
+    Some((i, j))
+}
+
 /// Extract table names from a single SQL statement.
 fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
     match stmt {
@@ -560,5 +703,54 @@ mod tests {
         assert!(assets.destroys.contains("foo"));
         assert!(assets.destroys.contains("bar"));
         assert!(assets.destroys.contains("baz"));
+    }
+
+    // Byte ranges: one range per top-level statement, each slicing its own source.
+    #[test]
+    fn byte_ranges_split_top_level_statements() {
+        let sql = "CREATE TABLE foo (id INT);\nSELECT * FROM foo;";
+        let ranges = statement_byte_ranges(sql);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(&sql[ranges[0].0..ranges[0].1], "CREATE TABLE foo (id INT);");
+        assert_eq!(&sql[ranges[1].0..ranges[1].1], "SELECT * FROM foo;");
+        // Ranges align 1:1 with the parsed statements.
+        assert_eq!(ranges.len(), extract_per_statement(sql).unwrap().len());
+    }
+
+    // Byte ranges: a `;` inside a string literal must not split the statement.
+    #[test]
+    fn byte_ranges_ignore_semicolons_in_strings() {
+        let sql = "INSERT INTO t VALUES ('a;b;c');";
+        let ranges = statement_byte_ranges(sql);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&sql[ranges[0].0..ranges[0].1], "INSERT INTO t VALUES ('a;b;c');");
+    }
+
+    // Byte ranges: comment-only and blank segments are dropped, not counted.
+    #[test]
+    fn byte_ranges_drop_comment_and_blank_segments() {
+        let sql = "-- header comment\nSELECT 1; /* trailing */ \n\n";
+        let ranges = statement_byte_ranges(sql);
+        assert_eq!(ranges.len(), 1);
+        // Range starts at the code, past the leading comment, and trims trailing space.
+        assert_eq!(&sql[ranges[0].0..ranges[0].1], "SELECT 1;");
+    }
+
+    // Byte ranges: a `;` inside a `--` line comment does not split.
+    #[test]
+    fn byte_ranges_ignore_semicolons_in_line_comments() {
+        let sql = "SELECT 1 -- a; b; c\nFROM t;";
+        let ranges = statement_byte_ranges(sql);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&sql[ranges[0].0..ranges[0].1], sql.trim_end_matches('\n'));
+    }
+
+    // Byte ranges: a `;` inside a dollar-quoted body does not split.
+    #[test]
+    fn byte_ranges_ignore_semicolons_in_dollar_quotes() {
+        let sql = "SELECT $$a; b; c$$ AS s;";
+        let ranges = statement_byte_ranges(sql);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&sql[ranges[0].0..ranges[0].1], "SELECT $$a; b; c$$ AS s;");
     }
 }
