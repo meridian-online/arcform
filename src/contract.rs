@@ -100,13 +100,17 @@ pub struct AssetEntry {
     /// `"table"`, `"source"` (read but never produced here), or `"file"`.
     pub kind: String,
     pub name: String,
-    /// Filesystem path — deferred (`null`) in this phase.
+    /// Filesystem path for a `file` asset (relative to the protocol dir); `null` for
+    /// relational (`table`/`source`) assets, whose `name` is the relation.
     pub path: Option<String>,
-    /// Byte size — deferred (`null`) in this phase.
+    /// Measured byte size: on-disk length for `file` assets, DuckDB `estimated_size` for
+    /// relational assets. `null` when the artifact can't be measured (missing/unqueryable).
     pub bytes: Option<u64>,
     /// Live measure: row count for table/source assets, if queryable.
     pub row_count: Option<i64>,
-    /// Content hash — deferred (`null`) in this phase.
+    /// Content hash (sha256 hex — one representation across kinds): the `.arcmeta` fetch
+    /// sidecar's sha256 for a fetched file, else the file's bytes hashed; for a relational
+    /// asset, a deterministic hash of its rows. `null` when unmeasurable.
     pub content_hash: Option<String>,
     /// The step whose produced-set contains this asset, or `null` for external reads.
     pub produced_by: Option<String>,
@@ -137,7 +141,8 @@ pub struct StepEntry {
     pub status: StatusInfo,
     /// Actual attempt count (1 on first-try success, more if retried; 0 if skipped/not reached).
     pub attempts: u32,
-    /// Wall-clock duration — deferred (`null`) in this phase.
+    /// Wall-clock duration of the step (all attempts + backoff). `null` when the step was
+    /// skipped or never reached.
     pub duration_sec: Option<f64>,
     /// Effective retry policy (step override or manifest default), if any.
     pub retry: Option<RetryInfo>,
@@ -172,6 +177,10 @@ pub struct SqlInfo {
 pub struct StatementInfo {
     pub produces: Vec<String>,
     pub reads: Vec<String>,
+    /// `[start, end)` byte offsets into the step's `sql_text` — the exact source slice for
+    /// this statement, so a viewer can render statements individually. `null` if the
+    /// lexical split didn't line up with the parsed statements.
+    pub byte_range: Option<[usize; 2]>,
 }
 
 /// A step's terminal status.
@@ -179,8 +188,8 @@ pub struct StatementInfo {
 pub struct StatusInfo {
     /// `"success"`, `"failed"`, or `"skipped"`.
     pub state: String,
-    /// Why a step was skipped — deferred (`null`) in this phase.
-    pub skip_reason: Option<String>,
+    /// For a skipped step, the typed reason it was fresh; `null` for steps that executed.
+    pub skip_reason: Option<crate::state::SkipReason>,
 }
 
 /// The effective retry policy for a step.
@@ -264,6 +273,19 @@ pub fn runs_dir(dir: &Path) -> PathBuf {
     dir.join("build").join(".arcform").join("runs")
 }
 
+/// How a single step fared, captured by the run loop for the contract.
+#[derive(Debug, Clone)]
+pub struct StepOutcome {
+    /// Terminal state: `"success"`, `"failed"`, or `"skipped"`.
+    pub state: String,
+    /// Attempts made (1 on first-try success, more if retried; 0 if skipped/not reached).
+    pub attempts: u32,
+    /// For a skipped step, why it was fresh; `None` for steps that executed.
+    pub skip_reason: Option<crate::state::SkipReason>,
+    /// Wall-clock duration of the step; `None` when skipped or never reached.
+    pub duration_sec: Option<f64>,
+}
+
 /// Inputs to [`build_contract`] — grouped to keep the call site readable.
 pub struct ContractInputs<'a> {
     pub manifest: &'a Manifest,
@@ -275,8 +297,8 @@ pub struct ContractInputs<'a> {
     pub finished_at: &'a str,
     pub outcome: &'a str,
     pub params: Vec<ParamEntry>,
-    /// Per-step terminal `(state, attempts)`, keyed by step name.
-    pub step_outcomes: &'a HashMap<String, (String, u32)>,
+    /// Per-step terminal outcome, keyed by step name.
+    pub step_outcomes: &'a HashMap<String, StepOutcome>,
 }
 
 /// Assemble the full contract from the run's manifest, asset graph, and outcomes.
@@ -290,7 +312,7 @@ pub fn build_contract(inp: ContractInputs) -> Contract {
         c.query_row("SELECT version()", [], |r| r.get::<_, String>(0)).ok()
     });
 
-    let assets = build_assets(inp.manifest, inp.graph, conn.as_ref());
+    let assets = build_assets(inp.manifest, inp.dir, inp.graph, conn.as_ref());
     let steps = inp
         .manifest
         .steps
@@ -329,9 +351,15 @@ pub fn write_contract(runs_dir: &Path, run_id: &str, contract: &Contract) -> std
     std::fs::write(path, json)
 }
 
-/// Build the deduplicated asset list from the graph, measuring row counts where possible.
+/// Build the deduplicated asset list from the graph, measuring each asset where possible.
+///
+/// Each asset is measured net-new at run end: `file` assets are stat'd + hashed on disk
+/// (reusing the `.arcmeta` sha256 when a fetch left one), relational assets get their
+/// DuckDB `estimated_size` + row count + a deterministic row hash. `dir` resolves the
+/// relative file paths lineage lifted from the SQL (see [`crate::introspect`]).
 fn build_assets(
     manifest: &Manifest,
+    dir: &Path,
     graph: &AssetGraph,
     conn: Option<&duckdb::Connection>,
 ) -> Vec<AssetEntry> {
@@ -366,25 +394,74 @@ fn build_assets(
             } else {
                 "table"
             };
-            // Live measure: count rows for relational assets (not files).
-            let row_count = if kind == "file" {
-                None
+            // Measure the asset net-new. Files are measured on disk; relational assets
+            // (table/source) are measured through the engine.
+            let (path, bytes, row_count, content_hash) = if kind == "file" {
+                let full = dir.join(name);
+                let (bytes, content_hash) = measure_file(&full);
+                (Some(name.clone()), bytes, None, content_hash)
             } else {
-                conn.and_then(|c| table_row_count(c, name))
+                let (bytes, content_hash) = conn
+                    .map(|c| measure_table(c, name))
+                    .unwrap_or((None, None));
+                let row_count = conn.and_then(|c| table_row_count(c, name));
+                (None, bytes, row_count, content_hash)
             };
             AssetEntry {
                 id: format!("{kind}:{name}"),
                 kind: kind.to_string(),
                 name: name.clone(),
-                path: None,
-                bytes: None,
+                path,
+                bytes,
                 row_count,
-                content_hash: None,
+                content_hash,
                 produced_by,
                 consumed_by,
             }
         })
         .collect()
+}
+
+/// On-disk measure for a `file` asset: byte length + content hash. The hash **reuses the
+/// fetch sidecar's sha256** (`<file>.arcmeta`, see [`crate::ingress_meta`]) when present, so
+/// a fetched artifact is never re-hashed under a second scheme; otherwise the file's bytes
+/// are hashed directly. Both are sha256 hex — the single representation shared with tables.
+/// Best-effort: an absent/unreadable file yields `(None, None)`.
+fn measure_file(full: &Path) -> (Option<u64>, Option<String>) {
+    let bytes = std::fs::metadata(full).ok().map(|m| m.len());
+    let content_hash = crate::ingress_meta::read(full)
+        .map(|m| m.sha256)
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::fs::read(full).ok().map(|b| crate::state::content_hash(&b)));
+    (bytes, content_hash)
+}
+
+/// Engine-side measure for a relational asset: DuckDB `estimated_size` bytes + a
+/// deterministic content hash. The hash is `sha256` over the relation's rows rendered as
+/// text and **ordered**, so it is independent of physical row order and shares the sha256-hex
+/// representation used for files. Best-effort: a non-identifier name or any query failure
+/// (missing/unqueryable relation) degrades to `None`, exactly like [`table_row_count`].
+fn measure_table(conn: &duckdb::Connection, name: &str) -> (Option<u64>, Option<String>) {
+    if !is_simple_ident(name) {
+        return (None, None);
+    }
+    let bytes = conn
+        .query_row(
+            "SELECT estimated_size FROM duckdb_tables() WHERE table_name = ?",
+            [name],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok()
+        .filter(|n| *n >= 0)
+        .map(|n| n as u64);
+    // `CAST(<rel> AS VARCHAR)` renders each row as a struct literal; string_agg with an
+    // ORDER BY makes the digest order-independent. sha256() returns lowercase hex.
+    let hash_sql = format!(
+        "SELECT sha256(coalesce(string_agg(r, '\n' ORDER BY r), '')) \
+         FROM (SELECT CAST({name} AS VARCHAR) AS r FROM {name})"
+    );
+    let content_hash = conn.query_row(&hash_sql, [], |r| r.get::<_, String>(0)).ok();
+    (bytes, content_hash)
 }
 
 /// Build a single step entry.
@@ -393,7 +470,7 @@ fn build_step(
     dir: &Path,
     graph: &AssetGraph,
     manifest: &Manifest,
-    outcomes: &HashMap<String, (String, u32)>,
+    outcomes: &HashMap<String, StepOutcome>,
 ) -> StepEntry {
     let kind = if step.sql.is_some() {
         StepKind::Sql
@@ -438,13 +515,24 @@ fn build_step(
                 let text = String::from_utf8_lossy(&bytes).to_string();
                 let hash = crate::state::content_hash(&bytes);
                 let statements = match crate::introspect::extract_per_statement(&text) {
-                    Ok(list) => list
-                        .into_iter()
-                        .map(|a| StatementInfo {
-                            produces: a.outputs.into_iter().collect(),
-                            reads: a.inputs.into_iter().collect(),
-                        })
-                        .collect(),
+                    Ok(list) => {
+                        // Attach each statement's source byte range. The lexical splitter
+                        // and the parser agree on count for well-formed SQL; if they ever
+                        // diverge, emit no ranges rather than misalign them.
+                        let ranges = crate::introspect::statement_byte_ranges(&text);
+                        let aligned = ranges.len() == list.len();
+                        list.into_iter()
+                            .enumerate()
+                            .map(|(i, a)| StatementInfo {
+                                produces: a.outputs.into_iter().collect(),
+                                reads: a.inputs.into_iter().collect(),
+                                byte_range: aligned.then(|| {
+                                    let (s, e) = ranges[i];
+                                    [s, e]
+                                }),
+                            })
+                            .collect()
+                    }
                     Err(_) => Vec::new(),
                 };
                 (text, hash, statements)
@@ -454,10 +542,12 @@ fn build_step(
         SqlInfo { model_path: model_path.clone(), sql_text, sql_hash, statements }
     });
 
-    let (state, attempts) = outcomes
-        .get(&step.name)
-        .cloned()
-        .unwrap_or_else(|| ("skipped".to_string(), 0));
+    let outcome = outcomes.get(&step.name).cloned().unwrap_or(StepOutcome {
+        state: "skipped".to_string(),
+        attempts: 0,
+        skip_reason: None,
+        duration_sec: None,
+    });
 
     // Effective retry policy: a step override wins, else the manifest default.
     let effective_retry = step
@@ -482,9 +572,12 @@ fn build_step(
         op_ref,
         resolved_with,
         sql,
-        status: StatusInfo { state, skip_reason: None },
-        attempts,
-        duration_sec: None,
+        status: StatusInfo {
+            state: outcome.state,
+            skip_reason: outcome.skip_reason,
+        },
+        attempts: outcome.attempts,
+        duration_sec: outcome.duration_sec,
         retry,
         timeout_sec: step.timeout_sec,
         io: IoInfo::default(),
@@ -699,6 +792,45 @@ mod tests {
         assert_eq!(json["url"], serde_json::json!("https://example.com"));
         assert_eq!(json["api_token"], serde_json::json!(REDACTED));
         assert_eq!(json["headers"]["Authorization"], serde_json::json!(REDACTED));
+    }
+
+    #[test]
+    fn measure_file_hashes_bytes_when_no_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("out.parquet");
+        std::fs::write(&f, b"hello world").unwrap();
+        let (bytes, hash) = measure_file(&f);
+        assert_eq!(bytes, Some(11), "byte length measured on disk");
+        // sha256("hello world") — the file-bytes hash when there is no .arcmeta sidecar.
+        assert_eq!(
+            hash.as_deref(),
+            Some("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"),
+        );
+    }
+
+    #[test]
+    fn measure_file_reuses_arcmeta_sha256() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("edgar.parquet");
+        std::fs::write(&f, b"the actual downloaded bytes").unwrap();
+        // A fetch left a sidecar recording the remote content identity — reuse it
+        // verbatim rather than re-hashing the file under a second scheme.
+        let meta = FetchMeta {
+            url: "https://openlake.meridian.online/edgar.parquet".to_string(),
+            sha256: "feedface00000000000000000000000000000000000000000000000000000000".to_string(),
+            ..Default::default()
+        };
+        crate::ingress_meta::write(&f, &meta).unwrap();
+        let (bytes, hash) = measure_file(&f);
+        assert!(bytes.is_some(), "byte length still measured on disk");
+        assert_eq!(hash.as_deref(), Some(meta.sha256.as_str()), "sidecar sha256 reused");
+    }
+
+    #[test]
+    fn measure_file_absent_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bytes, hash) = measure_file(&dir.path().join("nope.parquet"));
+        assert!(bytes.is_none() && hash.is_none());
     }
 
     #[test]

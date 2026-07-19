@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
@@ -38,6 +39,31 @@ impl StepStatus {
         match s {
             "success" => StepStatus::Success,
             _ => StepStatus::Failed,
+        }
+    }
+}
+
+/// Why a step was skipped as fresh — the typed reason threaded out of staleness
+/// computation and recorded per step in the run contract. It distinguishes the three
+/// freshness mechanisms so history selectors (`state:modified+`, diff mode) can tell a
+/// hash-clean skip from a precondition-driven one, rather than seeing a bare `[skip]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// SQL/op content hash unchanged and no preconditions gated the step.
+    HashClean,
+    /// The step's preconditions all evaluated fresh (`fresh`/`command` kinds).
+    PreconditionFresh,
+    /// A `modified_after` clock precondition judged the file still within its period.
+    PreconditionModifiedAfter,
+}
+
+impl SkipReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SkipReason::HashClean => "hash_clean",
+            SkipReason::PreconditionFresh => "precondition_fresh",
+            SkipReason::PreconditionModifiedAfter => "precondition_modified_after",
         }
     }
 }
@@ -175,8 +201,9 @@ impl StateBackend for DuckDbStateBackend {
             duckdb::params![steps_executed as i64, outcome, run_id],
         )
         .map_err(|e| Error::StateBackend(e.to_string()))?;
-        // total_retries is tracked for observability but not stored in v0.1
-        // (schema migration deferred to avoid DuckDB ALTER TABLE complexity).
+        // total_retries is the pipeline-wide roll-up; the durable per-step breakdown
+        // (attempts + duration_sec per step) now lives in the run contract JSON, so this
+        // aggregate is not persisted to the state table.
         let _ = total_retries;
         Ok(())
     }

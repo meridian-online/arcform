@@ -12,7 +12,8 @@ use crate::error::{Error, Result};
 use crate::manifest::{Manifest, Param, RetryPolicy};
 use crate::operator;
 use crate::precondition;
-use crate::state::{self, StateBackend, StepStatus};
+use crate::precondition::Precondition;
+use crate::state::{self, SkipReason, StateBackend, StepStatus};
 
 /// Load dotenv files and return their key-value pairs.
 /// Files are loaded in declared order; later files override earlier ones.
@@ -177,8 +178,9 @@ pub fn run_with_params(
         asset_graph.validate_order(&step_order)?;
     }
 
-    // Determine which steps are stale.
-    let stale_steps = compute_staleness(&manifest, dir, state, &asset_graph, force, &env_map)?;
+    // Determine which steps are stale, and — for the fresh ones — the typed reason
+    // they can be skipped (recorded per step in the contract).
+    let staleness = compute_staleness(&manifest, dir, state, &asset_graph, force, &env_map)?;
 
     let db_path = manifest.db_path(dir);
     let total = manifest.steps.len();
@@ -197,7 +199,7 @@ pub fn run_with_params(
     let runs_dir = contract::runs_dir(dir);
     let _ = std::fs::create_dir_all(&runs_dir);
     let mut stream = contract::RunStream::create(&runs_dir, &run_id);
-    let mut step_outcomes: HashMap<String, (String, u32)> = HashMap::new();
+    let mut step_outcomes: HashMap<String, contract::StepOutcome> = HashMap::new();
     let contract_params = contract::param_entries(&manifest.params, &dotenv_vars, cli_params);
 
     // Pipeline-level timeout tracking.
@@ -235,19 +237,33 @@ pub fn run_with_params(
     // Run the step loop, capturing the result for hook dispatch.
     let step_loop_result: std::result::Result<(), Error> = (|| {
         for (i, step) in manifest.steps.iter().enumerate() {
-            let is_stale = stale_steps.contains(&step.name);
+            let is_stale = staleness.stale.contains(&step.name);
 
             if !is_stale {
+                // Fresh: report the typed reason (hash_clean / precondition_*) rather than
+                // a bare `[skip]`, and record it so history selectors can read it back.
+                let skip_reason = staleness.skip_reasons.get(&step.name).copied();
+                let reason_tag = skip_reason
+                    .map(|r| format!("[skip: {}]", r.as_str()))
+                    .unwrap_or_else(|| "[skip]".to_string());
                 println!(
                     "[{}/{}] {} {}",
                     i + 1,
                     total,
                     step.name.bold(),
-                    "[skip]".dimmed(),
+                    reason_tag.dimmed(),
                 );
                 skipped += 1;
                 stream.step(&step.name, "skipped");
-                step_outcomes.insert(step.name.clone(), ("skipped".to_string(), 0));
+                step_outcomes.insert(
+                    step.name.clone(),
+                    contract::StepOutcome {
+                        state: "skipped".to_string(),
+                        attempts: 0,
+                        skip_reason,
+                        duration_sec: None,
+                    },
+                );
                 continue;
             }
 
@@ -301,6 +317,11 @@ pub fn run_with_params(
             let max_attempts = effective_retry.map_or(1, |r| r.max_attempts);
 
             let mut last_error = None;
+
+            // Wall-clock timer for this step — spans every attempt and its backoff sleep,
+            // captured into the contract as `duration_sec` (per-step timing, replacing the
+            // discarded pipeline-wide retry count).
+            let step_start = Instant::now();
 
             for attempt in 1..=max_attempts {
                 if attempt > 1 {
@@ -369,7 +390,15 @@ pub fn run_with_params(
 
                         last_error = None;
                         stream.step(&step.name, "success");
-                        step_outcomes.insert(step.name.clone(), ("success".to_string(), attempt));
+                        step_outcomes.insert(
+                            step.name.clone(),
+                            contract::StepOutcome {
+                                state: "success".to_string(),
+                                attempts: attempt,
+                                skip_reason: None,
+                                duration_sec: Some(step_start.elapsed().as_secs_f64()),
+                            },
+                        );
                         break;
                     }
                     Err(Error::StepFailed { code, stderr, .. }) => {
@@ -392,7 +421,15 @@ pub fn run_with_params(
                         let _ = state.record_step(&step.name, &sql_hash, StepStatus::Failed);
                         let _ = state.finish_run(&run_id, executed, "error", total_retries);
                         stream.step(&step.name, "failed");
-                        step_outcomes.insert(step.name.clone(), ("failed".to_string(), attempt));
+                        step_outcomes.insert(
+                            step.name.clone(),
+                            contract::StepOutcome {
+                                state: "failed".to_string(),
+                                attempts: attempt,
+                                skip_reason: None,
+                                duration_sec: Some(step_start.elapsed().as_secs_f64()),
+                            },
+                        );
                         return Err(e);
                     }
                 }
@@ -404,7 +441,15 @@ pub fn run_with_params(
                 let _ = state.record_step(&step.name, &sql_hash, StepStatus::Failed);
                 let _ = state.finish_run(&run_id, executed, "failed", total_retries);
                 stream.step(&step.name, "failed");
-                step_outcomes.insert(step.name.clone(), ("failed".to_string(), max_attempts));
+                step_outcomes.insert(
+                    step.name.clone(),
+                    contract::StepOutcome {
+                        state: "failed".to_string(),
+                        attempts: max_attempts,
+                        skip_reason: None,
+                        duration_sec: Some(step_start.elapsed().as_secs_f64()),
+                    },
+                );
                 return Err(err);
             }
         }
@@ -550,6 +595,28 @@ pub fn run_with_params(
     }
 }
 
+/// The staleness verdict for a run: which steps must execute, and — for each step that
+/// ends up fresh — the typed reason it can be skipped. A fresh step forced to run by
+/// downstream propagation has no entry in `skip_reasons` (it executed).
+struct Staleness {
+    stale: std::collections::HashSet<String>,
+    skip_reasons: HashMap<String, SkipReason>,
+}
+
+/// Pick the typed skip reason for a step whose preconditions all evaluated fresh: a
+/// `modified_after` clock precondition is called out distinctly from generic ones so the
+/// contract records *which* freshness mechanism decided the skip.
+fn precondition_skip_reason(preconditions: &[Precondition]) -> SkipReason {
+    if preconditions
+        .iter()
+        .any(|p| matches!(p, Precondition::ModifiedAfter { .. }))
+    {
+        SkipReason::PreconditionModifiedAfter
+    } else {
+        SkipReason::PreconditionFresh
+    }
+}
+
 /// Determine which steps are stale and need to execute.
 ///
 /// A step is stale if:
@@ -559,6 +626,9 @@ pub fn run_with_params(
 /// - Its prior run failed
 /// - Its SQL file content hash changed
 /// - An upstream step (via asset graph) is stale (downstream propagation)
+///
+/// For every step that stays fresh, a typed [`SkipReason`] is recorded so the run
+/// contract can distinguish a hash-clean skip from a precondition-driven one.
 fn compute_staleness(
     manifest: &Manifest,
     dir: &Path,
@@ -566,28 +636,30 @@ fn compute_staleness(
     asset_graph: &AssetGraph,
     force: bool,
     env: &HashMap<String, String>,
-) -> Result<std::collections::HashSet<String>> {
+) -> Result<Staleness> {
     let mut stale: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     if force {
-        // Force mode: everything is stale.
+        // Force mode: everything is stale — nothing is skipped, so no reasons.
         for step in &manifest.steps {
             stale.insert(step.name.clone());
         }
-        return Ok(stale);
+        return Ok(Staleness { stale, skip_reasons: HashMap::new() });
     }
 
-    // Phase 1: Check each step's own staleness.
+    // Phase 1: Check each step's own staleness, and note why a fresh step is skippable.
+    // Reasons are provisional until downstream propagation settles (Phase 3).
+    let mut reasons: HashMap<String, SkipReason> = HashMap::new();
     for step in &manifest.steps {
         if step.command.is_some() {
             if step.preconditions.is_empty() {
                 // No preconditions — command steps always re-run (backwards compat).
                 stale.insert(step.name.clone());
+            } else if precondition::evaluate_all(&step.preconditions, dir, &step.name, env)? {
+                // All preconditions fresh — skippable via the precondition mechanism.
+                reasons.insert(step.name.clone(), precondition_skip_reason(&step.preconditions));
             } else {
-                // Evaluate preconditions — if any says stale, step runs.
-                if !precondition::evaluate_all(&step.preconditions, dir, &step.name, env)? {
-                    stale.insert(step.name.clone());
-                }
+                stale.insert(step.name.clone());
             }
             continue;
         }
@@ -599,6 +671,8 @@ fn compute_staleness(
             // No preconditions — SQL steps use hash only (backwards compat).
             if hash_stale {
                 stale.insert(step.name.clone());
+            } else {
+                reasons.insert(step.name.clone(), SkipReason::HashClean);
             }
         } else {
             // AND: hash AND preconditions must both be fresh to skip.
@@ -606,6 +680,9 @@ fn compute_staleness(
                 precondition::evaluate_all(&step.preconditions, dir, &step.name, env)?;
             if hash_stale || !preconditions_fresh {
                 stale.insert(step.name.clone());
+            } else {
+                // Both clean — the precondition kind is the more specific signal.
+                reasons.insert(step.name.clone(), precondition_skip_reason(&step.preconditions));
             }
         }
     }
@@ -617,7 +694,11 @@ fn compute_staleness(
         stale.insert(step_name);
     }
 
-    Ok(stale)
+    // Phase 3: A fresh step dragged stale by an upstream change actually executes, so it
+    // is no longer skipped — drop its provisional reason.
+    reasons.retain(|name, _| !stale.contains(name));
+
+    Ok(Staleness { stale, skip_reasons: reasons })
 }
 
 /// Staleness hash for an `op:` step: the operator reference plus its serialized `with:`
@@ -3139,15 +3220,27 @@ steps:
         let sql = load.sql.as_ref().expect("sql detail present");
         assert!(!sql.sql_text.is_empty(), "sql_text captured");
         assert!(!sql.sql_hash.is_empty(), "sql_hash captured");
-        assert!(
-            sql.statements
-                .iter()
-                .any(|st| st.produces.contains(&"widgets".to_string())),
-            "per-statement lineage records the produced table"
-        );
-        // Deferred fields stay null in this phase.
-        assert!(widgets.bytes.is_none() && widgets.content_hash.is_none());
-        assert!(load.duration_sec.is_none());
+        // Per-statement lineage records the produced table (T42 keeps the statement handle
+        // to check its byte range).
+        let widget_stmt = sql
+            .statements
+            .iter()
+            .find(|st| st.produces.contains(&"widgets".to_string()))
+            .expect("per-statement lineage records the produced table");
+        // Measured asset fields (T41): a relational asset carries a DuckDB `estimated_size`
+        // and a deterministic sha256-hex content hash of its rows.
+        assert!(widgets.bytes.is_some(), "table bytes measured via estimated_size");
+        let hash = widgets.content_hash.as_ref().expect("table content_hash computed");
+        assert_eq!(hash.len(), 64, "content_hash is sha256 hex: {hash}");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "content_hash is hex: {hash}");
+        // (c2) Phase 3 (T42): the producing statement carries a byte range that slices its
+        // own source out of sql_text.
+        let [lo, hi] = widget_stmt.byte_range.expect("statement carries a byte range");
+        assert!(sql.sql_text[lo..hi].to_lowercase().contains("widgets"));
+        // (c3) Phase 3 (T42): an executed step records ≥1 attempt and a wall-clock duration.
+        assert!(load.attempts >= 1, "executed step records its attempt count");
+        assert!(load.duration_sec.is_some(), "executed step records its duration");
+        assert!(load.status.skip_reason.is_none(), "an executed step has no skip reason");
 
         // (d) The JSONL stream exists with a line per step + a run_complete line.
         let jsonl_path = dir.path().join("build/.arcform/runs/run-1.jsonl");
