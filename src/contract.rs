@@ -100,13 +100,17 @@ pub struct AssetEntry {
     /// `"table"`, `"source"` (read but never produced here), or `"file"`.
     pub kind: String,
     pub name: String,
-    /// Filesystem path — deferred (`null`) in this phase.
+    /// Filesystem path for a `file` asset (relative to the protocol dir); `null` for
+    /// relational (`table`/`source`) assets, whose `name` is the relation.
     pub path: Option<String>,
-    /// Byte size — deferred (`null`) in this phase.
+    /// Measured byte size: on-disk length for `file` assets, DuckDB `estimated_size` for
+    /// relational assets. `null` when the artifact can't be measured (missing/unqueryable).
     pub bytes: Option<u64>,
     /// Live measure: row count for table/source assets, if queryable.
     pub row_count: Option<i64>,
-    /// Content hash — deferred (`null`) in this phase.
+    /// Content hash (sha256 hex — one representation across kinds): the `.arcmeta` fetch
+    /// sidecar's sha256 for a fetched file, else the file's bytes hashed; for a relational
+    /// asset, a deterministic hash of its rows. `null` when unmeasurable.
     pub content_hash: Option<String>,
     /// The step whose produced-set contains this asset, or `null` for external reads.
     pub produced_by: Option<String>,
@@ -290,7 +294,7 @@ pub fn build_contract(inp: ContractInputs) -> Contract {
         c.query_row("SELECT version()", [], |r| r.get::<_, String>(0)).ok()
     });
 
-    let assets = build_assets(inp.manifest, inp.graph, conn.as_ref());
+    let assets = build_assets(inp.manifest, inp.dir, inp.graph, conn.as_ref());
     let steps = inp
         .manifest
         .steps
@@ -329,9 +333,15 @@ pub fn write_contract(runs_dir: &Path, run_id: &str, contract: &Contract) -> std
     std::fs::write(path, json)
 }
 
-/// Build the deduplicated asset list from the graph, measuring row counts where possible.
+/// Build the deduplicated asset list from the graph, measuring each asset where possible.
+///
+/// Each asset is measured net-new at run end: `file` assets are stat'd + hashed on disk
+/// (reusing the `.arcmeta` sha256 when a fetch left one), relational assets get their
+/// DuckDB `estimated_size` + row count + a deterministic row hash. `dir` resolves the
+/// relative file paths lineage lifted from the SQL (see [`crate::introspect`]).
 fn build_assets(
     manifest: &Manifest,
+    dir: &Path,
     graph: &AssetGraph,
     conn: Option<&duckdb::Connection>,
 ) -> Vec<AssetEntry> {
@@ -366,25 +376,74 @@ fn build_assets(
             } else {
                 "table"
             };
-            // Live measure: count rows for relational assets (not files).
-            let row_count = if kind == "file" {
-                None
+            // Measure the asset net-new. Files are measured on disk; relational assets
+            // (table/source) are measured through the engine.
+            let (path, bytes, row_count, content_hash) = if kind == "file" {
+                let full = dir.join(name);
+                let (bytes, content_hash) = measure_file(&full);
+                (Some(name.clone()), bytes, None, content_hash)
             } else {
-                conn.and_then(|c| table_row_count(c, name))
+                let (bytes, content_hash) = conn
+                    .map(|c| measure_table(c, name))
+                    .unwrap_or((None, None));
+                let row_count = conn.and_then(|c| table_row_count(c, name));
+                (None, bytes, row_count, content_hash)
             };
             AssetEntry {
                 id: format!("{kind}:{name}"),
                 kind: kind.to_string(),
                 name: name.clone(),
-                path: None,
-                bytes: None,
+                path,
+                bytes,
                 row_count,
-                content_hash: None,
+                content_hash,
                 produced_by,
                 consumed_by,
             }
         })
         .collect()
+}
+
+/// On-disk measure for a `file` asset: byte length + content hash. The hash **reuses the
+/// fetch sidecar's sha256** (`<file>.arcmeta`, see [`crate::ingress_meta`]) when present, so
+/// a fetched artifact is never re-hashed under a second scheme; otherwise the file's bytes
+/// are hashed directly. Both are sha256 hex — the single representation shared with tables.
+/// Best-effort: an absent/unreadable file yields `(None, None)`.
+fn measure_file(full: &Path) -> (Option<u64>, Option<String>) {
+    let bytes = std::fs::metadata(full).ok().map(|m| m.len());
+    let content_hash = crate::ingress_meta::read(full)
+        .map(|m| m.sha256)
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::fs::read(full).ok().map(|b| crate::state::content_hash(&b)));
+    (bytes, content_hash)
+}
+
+/// Engine-side measure for a relational asset: DuckDB `estimated_size` bytes + a
+/// deterministic content hash. The hash is `sha256` over the relation's rows rendered as
+/// text and **ordered**, so it is independent of physical row order and shares the sha256-hex
+/// representation used for files. Best-effort: a non-identifier name or any query failure
+/// (missing/unqueryable relation) degrades to `None`, exactly like [`table_row_count`].
+fn measure_table(conn: &duckdb::Connection, name: &str) -> (Option<u64>, Option<String>) {
+    if !is_simple_ident(name) {
+        return (None, None);
+    }
+    let bytes = conn
+        .query_row(
+            "SELECT estimated_size FROM duckdb_tables() WHERE table_name = ?",
+            [name],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok()
+        .filter(|n| *n >= 0)
+        .map(|n| n as u64);
+    // `CAST(<rel> AS VARCHAR)` renders each row as a struct literal; string_agg with an
+    // ORDER BY makes the digest order-independent. sha256() returns lowercase hex.
+    let hash_sql = format!(
+        "SELECT sha256(coalesce(string_agg(r, '\n' ORDER BY r), '')) \
+         FROM (SELECT CAST({name} AS VARCHAR) AS r FROM {name})"
+    );
+    let content_hash = conn.query_row(&hash_sql, [], |r| r.get::<_, String>(0)).ok();
+    (bytes, content_hash)
 }
 
 /// Build a single step entry.
@@ -699,6 +758,45 @@ mod tests {
         assert_eq!(json["url"], serde_json::json!("https://example.com"));
         assert_eq!(json["api_token"], serde_json::json!(REDACTED));
         assert_eq!(json["headers"]["Authorization"], serde_json::json!(REDACTED));
+    }
+
+    #[test]
+    fn measure_file_hashes_bytes_when_no_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("out.parquet");
+        std::fs::write(&f, b"hello world").unwrap();
+        let (bytes, hash) = measure_file(&f);
+        assert_eq!(bytes, Some(11), "byte length measured on disk");
+        // sha256("hello world") — the file-bytes hash when there is no .arcmeta sidecar.
+        assert_eq!(
+            hash.as_deref(),
+            Some("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"),
+        );
+    }
+
+    #[test]
+    fn measure_file_reuses_arcmeta_sha256() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("edgar.parquet");
+        std::fs::write(&f, b"the actual downloaded bytes").unwrap();
+        // A fetch left a sidecar recording the remote content identity — reuse it
+        // verbatim rather than re-hashing the file under a second scheme.
+        let meta = FetchMeta {
+            url: "https://openlake.meridian.online/edgar.parquet".to_string(),
+            sha256: "feedface00000000000000000000000000000000000000000000000000000000".to_string(),
+            ..Default::default()
+        };
+        crate::ingress_meta::write(&f, &meta).unwrap();
+        let (bytes, hash) = measure_file(&f);
+        assert!(bytes.is_some(), "byte length still measured on disk");
+        assert_eq!(hash.as_deref(), Some(meta.sha256.as_str()), "sidecar sha256 reused");
+    }
+
+    #[test]
+    fn measure_file_absent_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bytes, hash) = measure_file(&dir.path().join("nope.parquet"));
+        assert!(bytes.is_none() && hash.is_none());
     }
 
     #[test]
