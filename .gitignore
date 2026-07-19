@@ -1,4 +1,6 @@
 /target
+# Build output of the vendored sqlparser fork if it is ever built standalone.
+vendor/**/target/
 
 # Python bytecode from py_compile / uv-run script edits
 __pycache__/

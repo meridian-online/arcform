@@ -375,6 +375,16 @@ fn extract_inputs_from_set_expr(set_expr: &sqlparser::ast::SetExpr, assets: &mut
         sqlparser::ast::SetExpr::Query(query) => {
             extract_inputs_from_query(query, assets);
         }
+        // DuckDB statement-form PIVOT/UNPIVOT (`PIVOT t ON … USING …`): the source
+        // relation being (un)pivoted is a real input, exactly as a FROM table is.
+        // (Needs the vendored sqlparser fork; the SQL-standard `FROM t PIVOT (…)`
+        // table-factor form is handled in `extract_inputs_from_table_factor`.)
+        sqlparser::ast::SetExpr::Pivot(pivot) => {
+            extract_inputs_from_table_factor(&pivot.source, assets);
+        }
+        sqlparser::ast::SetExpr::Unpivot(unpivot) => {
+            extract_inputs_from_table_factor(&unpivot.source, assets);
+        }
         // Values, Insert, Update, Table — no table references to extract.
         _ => {}
     }
@@ -874,5 +884,100 @@ mod tests {
         let ranges = statement_byte_ranges(sql);
         assert_eq!(ranges.len(), 1);
         assert_eq!(&sql[ranges[0].0..ranges[0].1], "SELECT $$a; b; c$$ AS s;");
+    }
+
+    // ---- DuckDB statement-form PIVOT/UNPIVOT + multi-option COPY. ----
+    // These forms need the vendored sqlparser fork; without it the parse fails and the
+    // whole step degrades to an opaque node (see AssetGraph::build), defeating the
+    // structural-transparency principle (decision 0007).
+
+    // Statement-form PIVOT over a real table lifts the source as an input, not an
+    // opaque step.
+    #[test]
+    fn test_pivot_statement_lifts_source() {
+        let sql = "PIVOT monthly_sales ON month USING SUM(amount) GROUP BY country;";
+        let assets = extract_assets(sql).expect("statement-form PIVOT must parse");
+        assert!(
+            assets.inputs.contains("monthly_sales"),
+            "pivot source should be an input, got {:?}",
+            assets.inputs
+        );
+    }
+
+    // PIVOT as a CTAS body — output AND source input are both discovered.
+    #[test]
+    fn test_pivot_statement_as_ctas_body() {
+        let sql = "CREATE OR REPLACE TABLE installs AS PIVOT wide_sales ON days USING SUM(installs);";
+        let assets = extract_assets(sql).expect("CTAS over a PIVOT must parse");
+        assert!(assets.outputs.contains("installs"), "CTAS output discovered");
+        assert!(
+            assets.inputs.contains("wide_sales"),
+            "pivot source lifted as input, got {:?}",
+            assets.inputs
+        );
+    }
+
+    // The brewtrend shape — CTAS + WITH + PIVOT over the CTE. The CTE name is filtered
+    // out of inputs; the CTE's own source table is the real input.
+    #[test]
+    fn test_pivot_ctas_with_cte_shape() {
+        let sql = "CREATE OR REPLACE TABLE installs AS \
+                   WITH install_counts AS (SELECT category, name, days, installs FROM categories) \
+                   PIVOT install_counts ON days USING SUM(installs);";
+        let assets = extract_assets(sql).expect("brewtrend-shape PIVOT must parse");
+        assert!(assets.outputs.contains("installs"), "output discovered");
+        assert!(
+            assets.inputs.contains("categories"),
+            "real underlying table is the input, got {:?}",
+            assets.inputs
+        );
+        assert!(
+            !assets.inputs.contains("install_counts"),
+            "the pivoted CTE name is internal, not an external input"
+        );
+        assert!(assets.internal.contains("install_counts"), "CTE tracked as internal");
+    }
+
+    // Statement-form UNPIVOT lifts the source as an input.
+    #[test]
+    fn test_unpivot_statement_lifts_source() {
+        let sql = "UNPIVOT quarterly_report ON q1, q2, q3, q4 INTO NAME quarter VALUE amount;";
+        let assets = extract_assets(sql).expect("statement-form UNPIVOT must parse");
+        assert!(
+            assets.inputs.contains("quarterly_report"),
+            "unpivot source should be an input, got {:?}",
+            assets.inputs
+        );
+    }
+
+    // UNPIVOT with the shorthand (no INTO clause) still parses + lifts source.
+    #[test]
+    fn test_unpivot_statement_shorthand() {
+        let sql = "UNPIVOT sensor_readings ON temp, humidity, pressure;";
+        let assets = extract_assets(sql).expect("shorthand UNPIVOT must parse");
+        assert!(assets.inputs.contains("sensor_readings"), "source lifted");
+    }
+
+    // Multi-option COPY parses; the table is read and the file is produced, and the
+    // extra DuckDB options (COMPRESSION) do not break introspection.
+    #[test]
+    fn test_multi_option_copy() {
+        let sql = "COPY ranking TO 'data/ranking.parquet' (FORMAT parquet, COMPRESSION zstd);";
+        let assets = extract_assets(sql).expect("multi-option COPY must parse");
+        assert!(assets.inputs.contains("ranking"), "table is read");
+        assert!(
+            assets.outputs.contains("data/ranking.parquet"),
+            "file is produced (file-path lineage), got {:?}",
+            assets.outputs
+        );
+    }
+
+    // COPY with a parenthesized PARTITION_BY value list also parses.
+    #[test]
+    fn test_copy_partition_by() {
+        let sql = "COPY orders TO 'out/orders' (FORMAT parquet, PARTITION_BY (year, month), OVERWRITE_OR_IGNORE);";
+        let assets = extract_assets(sql).expect("COPY with PARTITION_BY must parse");
+        assert!(assets.inputs.contains("orders"), "table is read");
+        assert!(assets.outputs.contains("out/orders"), "output path produced");
     }
 }
