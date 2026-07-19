@@ -3145,8 +3145,13 @@ steps:
                 .any(|st| st.produces.contains(&"widgets".to_string())),
             "per-statement lineage records the produced table"
         );
-        // Deferred fields stay null in this phase.
-        assert!(widgets.bytes.is_none() && widgets.content_hash.is_none());
+        // Measured asset fields (T41): a relational asset carries a DuckDB `estimated_size`
+        // and a deterministic sha256-hex content hash of its rows.
+        assert!(widgets.bytes.is_some(), "table bytes measured via estimated_size");
+        let hash = widgets.content_hash.as_ref().expect("table content_hash computed");
+        assert_eq!(hash.len(), 64, "content_hash is sha256 hex: {hash}");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "content_hash is hex: {hash}");
+        // duration_sec is still deferred to a later phase.
         assert!(load.duration_sec.is_none());
 
         // (d) The JSONL stream exists with a line per step + a run_complete line.

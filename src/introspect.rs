@@ -3,11 +3,19 @@
 //! Parses SQL files using the DuckDB dialect to extract:
 //! - **Outputs**: tables/views created or written to (CREATE TABLE, CREATE VIEW, CTAS, INSERT INTO, COPY TO)
 //! - **Inputs**: tables read from (FROM, JOIN clauses)
+//!
+//! **File-path lineage.** A DuckDB file-reader in a FROM clause — `read_parquet('x.parquet')`,
+//! `read_csv(...)`, `read_json(['a.json','b.json'])` — is a table-valued function whose *first
+//! argument is a filesystem path*. Rather than record the opaque function name (`read_parquet`)
+//! as the input, we lift the path literal(s) it reads and a `COPY … TO 'file'` writes: those
+//! path-shaped names become file-kind assets downstream (see [`crate::contract`]). Lineage into
+//! and out of files is thus *discovered from the SQL*, never hand-declared via `depends_on:`.
 
 use std::collections::BTreeSet;
 
 use sqlparser::ast::{
-    CopySource, CopyTarget, Insert, ObjectName, Statement, TableFactor, TableObject,
+    CopySource, CopyTarget, Expr, FunctionArg, FunctionArgExpr, Insert, ObjectName, Statement,
+    TableFactor, TableObject, Value,
 };
 use sqlparser::dialect::DuckDbDialect;
 use sqlparser::parser::Parser;
@@ -123,8 +131,14 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
                 } => {
                     // COPY <table> ... — table is the source being read/written
                     match target {
-                        CopyTarget::File { .. } | CopyTarget::Stdout => {
-                            // COPY table TO file — reading from the table
+                        CopyTarget::File { filename } => {
+                            // COPY table TO 'file' — reading the table, producing the file.
+                            // The file path is a first-class produced asset (file-path lineage).
+                            assets.inputs.insert(object_name_to_string(table_name));
+                            assets.outputs.insert(filename.clone());
+                        }
+                        CopyTarget::Stdout => {
+                            // COPY table TO STDOUT — reading from the table
                             assets.inputs.insert(object_name_to_string(table_name));
                         }
                         CopyTarget::Stdin => {
@@ -226,8 +240,24 @@ fn extract_inputs_from_set_expr(set_expr: &sqlparser::ast::SetExpr, assets: &mut
 /// Extract a table name from a table factor (FROM clause item).
 fn extract_inputs_from_table_factor(factor: &TableFactor, assets: &mut SqlAssets) {
     match factor {
-        TableFactor::Table { name, .. } => {
-            assets.inputs.insert(object_name_to_string(name));
+        // A bare table reference, or a table-valued function call (`args: Some`).
+        TableFactor::Table { name, args, .. } => {
+            match args {
+                // `read_parquet('x.parquet')` / `read_csv([...])` etc: the function reads
+                // files — lift its path literal(s) as file inputs, not the opaque fn name.
+                Some(table_args) if is_file_reader(&object_name_to_string(name)) => {
+                    for arg in &table_args.args {
+                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg {
+                            extract_path_literals(expr, &mut assets.inputs);
+                        }
+                    }
+                }
+                // Any other table-valued function (`range(…)`, `generate_series(…)`) or a
+                // plain table name: record the name itself as the input, as before.
+                _ => {
+                    assets.inputs.insert(object_name_to_string(name));
+                }
+            }
         }
         TableFactor::Derived { subquery, .. } => {
             extract_inputs_from_query(subquery, assets);
@@ -260,6 +290,50 @@ fn object_name_to_string(name: &ObjectName) -> String {
         .and_then(|part| part.as_ident())
         .map(|ident| ident.value.to_lowercase())
         .unwrap_or_default()
+}
+
+/// Whether a table-valued function name is a DuckDB file reader whose first argument
+/// is a path (or list of paths). Matched case-insensitively against the fn name that
+/// [`object_name_to_string`] already lowercased.
+fn is_file_reader(fn_name: &str) -> bool {
+    const READERS: [&str; 12] = [
+        "read_parquet",
+        "parquet_scan",
+        "read_csv",
+        "read_csv_auto",
+        "read_json",
+        "read_json_auto",
+        "read_json_objects",
+        "read_ndjson",
+        "read_ndjson_auto",
+        "read_ndjson_objects",
+        "read_text",
+        "read_blob",
+    ];
+    READERS.contains(&fn_name)
+}
+
+/// Lift filesystem-path string literals out of a file-reader argument expression.
+///
+/// Handles a single quoted path (`'x.parquet'`) and a bracketed/`ARRAY` list of them
+/// (`['a.json', 'b.json']`) — DuckDB's multi-file glob form. Paths keep their original
+/// case (filesystems are case-sensitive); everything else is ignored, so reader options
+/// like `format => 'array'` never masquerade as inputs (they arrive as named args, which
+/// the caller already skips, but a stray literal is harmless).
+fn extract_path_literals(expr: &Expr, out: &mut BTreeSet<String>) {
+    match expr {
+        Expr::Value(v) => {
+            if let Value::SingleQuotedString(path) = &v.value {
+                out.insert(path.clone());
+            }
+        }
+        Expr::Array(array) => {
+            for elem in &array.elem {
+                extract_path_literals(elem, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -560,5 +634,53 @@ mod tests {
         assert!(assets.destroys.contains("foo"));
         assert!(assets.destroys.contains("bar"));
         assert!(assets.destroys.contains("baz"));
+    }
+
+    // T41 AC#2: read_parquet('path') contributes the *file path* as input, not the fn name.
+    #[test]
+    fn test_read_parquet_lifts_path() {
+        let sql = "CREATE TABLE t AS SELECT * FROM read_parquet('build/edgar.parquet');";
+        let assets = extract_assets(sql).unwrap();
+        assert!(assets.inputs.contains("build/edgar.parquet"), "path is the input");
+        assert!(!assets.inputs.contains("read_parquet"), "fn name is not an input");
+        assert!(assets.outputs.contains("t"));
+    }
+
+    // T41 AC#2: read_csv keeps original case in the path (filesystems are case-sensitive).
+    #[test]
+    fn test_read_csv_preserves_case() {
+        let sql = "SELECT * FROM read_csv('Data/Raw/GLEIF.csv');";
+        let assets = extract_assets(sql).unwrap();
+        assert!(assets.inputs.contains("Data/Raw/GLEIF.csv"), "path case preserved");
+        assert!(!assets.inputs.contains("read_csv"));
+    }
+
+    // T41 AC#2: read_json over a list of files lifts every path; named options are ignored.
+    #[test]
+    fn test_read_json_list_and_options() {
+        let sql = "CREATE TABLE brew AS SELECT * FROM read_json(['a/30d.json', 'a/90d.json'], format = 'array');";
+        let assets = extract_assets(sql).unwrap();
+        assert!(assets.inputs.contains("a/30d.json"), "first path lifted");
+        assert!(assets.inputs.contains("a/90d.json"), "second path lifted");
+        assert!(!assets.inputs.contains("read_json"), "fn name is not an input");
+        assert!(!assets.inputs.contains("array"), "option value is not an input");
+        assert!(assets.outputs.contains("brew"));
+    }
+
+    // T41 AC#2: COPY <table> TO 'file' produces the file path as an output (file-path lineage).
+    #[test]
+    fn test_copy_to_produces_file() {
+        let sql = "COPY ranking TO 'data/ranking.parquet';";
+        let assets = extract_assets(sql).unwrap();
+        assert!(assets.inputs.contains("ranking"), "table is read");
+        assert!(assets.outputs.contains("data/ranking.parquet"), "file is produced");
+    }
+
+    // T41 AC#2: a non-file table function keeps recording its name (unchanged behaviour).
+    #[test]
+    fn test_non_file_table_function_unchanged() {
+        let sql = "SELECT * FROM generate_series(1, 10);";
+        let assets = extract_assets(sql).unwrap();
+        assert!(assets.inputs.contains("generate_series"), "non-file TVF name still recorded");
     }
 }
