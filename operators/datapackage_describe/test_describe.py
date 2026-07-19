@@ -32,8 +32,8 @@ from pathlib import Path
 # so importing only pulls in the definitions we want to test.
 _DESCRIBE_PATH = Path(__file__).with_name("describe.py")
 _spec = importlib.util.spec_from_file_location("describe_under_test", _DESCRIBE_PATH)
+assert _spec is not None and _spec.loader is not None
 describe = importlib.util.module_from_spec(_spec)
-assert _spec and _spec.loader
 _spec.loader.exec_module(describe)
 
 
