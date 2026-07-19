@@ -3220,24 +3220,24 @@ steps:
         let sql = load.sql.as_ref().expect("sql detail present");
         assert!(!sql.sql_text.is_empty(), "sql_text captured");
         assert!(!sql.sql_hash.is_empty(), "sql_hash captured");
-        // Per-statement lineage records the produced table (T42 keeps the statement handle
+        // Per-statement lineage records the produced table (keeps the statement handle
         // to check its byte range).
         let widget_stmt = sql
             .statements
             .iter()
             .find(|st| st.produces.contains(&"widgets".to_string()))
             .expect("per-statement lineage records the produced table");
-        // Measured asset fields (T41): a relational asset carries a DuckDB `estimated_size`
+        // Measured asset fields: a relational asset carries a DuckDB `estimated_size`
         // and a deterministic sha256-hex content hash of its rows.
         assert!(widgets.bytes.is_some(), "table bytes measured via estimated_size");
         let hash = widgets.content_hash.as_ref().expect("table content_hash computed");
         assert_eq!(hash.len(), 64, "content_hash is sha256 hex: {hash}");
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "content_hash is hex: {hash}");
-        // (c2) Phase 3 (T42): the producing statement carries a byte range that slices its
+        // (c2) the producing statement carries a byte range that slices its
         // own source out of sql_text.
         let [lo, hi] = widget_stmt.byte_range.expect("statement carries a byte range");
         assert!(sql.sql_text[lo..hi].to_lowercase().contains("widgets"));
-        // (c3) Phase 3 (T42): an executed step records ≥1 attempt and a wall-clock duration.
+        // (c3) an executed step records ≥1 attempt and a wall-clock duration.
         assert!(load.attempts >= 1, "executed step records its attempt count");
         assert!(load.duration_sec.is_some(), "executed step records its duration");
         assert!(load.status.skip_reason.is_none(), "an executed step has no skip reason");

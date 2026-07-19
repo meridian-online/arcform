@@ -789,7 +789,7 @@ mod tests {
         assert!(assets.destroys.contains("baz"));
     }
 
-    // T41 AC#2: read_parquet('path') contributes the *file path* as input, not the fn name.
+    // read_parquet('path') contributes the *file path* as input, not the fn name.
     #[test]
     fn test_read_parquet_lifts_path() {
         let sql = "CREATE TABLE t AS SELECT * FROM read_parquet('build/edgar.parquet');";
@@ -799,7 +799,7 @@ mod tests {
         assert!(assets.outputs.contains("t"));
     }
 
-    // T41 AC#2: read_csv keeps original case in the path (filesystems are case-sensitive).
+    // read_csv keeps original case in the path (filesystems are case-sensitive).
     #[test]
     fn test_read_csv_preserves_case() {
         let sql = "SELECT * FROM read_csv('Data/Raw/GLEIF.csv');";
@@ -808,7 +808,7 @@ mod tests {
         assert!(!assets.inputs.contains("read_csv"));
     }
 
-    // T41 AC#2: read_json over a list of files lifts every path; named options are ignored.
+    // read_json over a list of files lifts every path; named options are ignored.
     #[test]
     fn test_read_json_list_and_options() {
         let sql = "CREATE TABLE brew AS SELECT * FROM read_json(['a/30d.json', 'a/90d.json'], format = 'array');";
@@ -820,7 +820,7 @@ mod tests {
         assert!(assets.outputs.contains("brew"));
     }
 
-    // T41 AC#2: COPY <table> TO 'file' produces the file path as an output (file-path lineage).
+    // COPY <table> TO 'file' produces the file path as an output (file-path lineage).
     #[test]
     fn test_copy_to_produces_file() {
         let sql = "COPY ranking TO 'data/ranking.parquet';";
@@ -829,7 +829,7 @@ mod tests {
         assert!(assets.outputs.contains("data/ranking.parquet"), "file is produced");
     }
 
-    // T41 AC#2: a non-file table function keeps recording its name (unchanged behaviour).
+    // a non-file table function keeps recording its name (unchanged behaviour).
     #[test]
     fn test_non_file_table_function_unchanged() {
         let sql = "SELECT * FROM generate_series(1, 10);";
