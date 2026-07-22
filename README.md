@@ -90,28 +90,37 @@ the *calling* process's `argv` and can exit it. With the feature off the crate r
 `spec` and nothing else, and `clap` leaves the dependency graph.
 
 ```rust
-use arc::spec::{Manifest, Result};
+use arc::spec::{Manifest, Result, SpecEdit, edit_spec};
 
-fn example(edited: &str) -> Result<()> {
+fn example() -> Result<()> {
     // A spec on disk.
-    let manifest = Manifest::load(std::path::Path::new("examples/brewtrend"))?;
+    let dir = std::path::Path::new("examples/brewtrend");
+    let manifest = Manifest::load(dir)?;
     println!("{} — {} steps", manifest.name, manifest.steps.len());
 
-    // Or candidate bytes that are not a file yet — validate before you write.
-    Manifest::from_yaml_str(edited)?;
+    // Edit it through the write path: applied to the original bytes, validated
+    // by the same loader, written atomically — or refused with a reason.
+    let edit = SpecEdit::Replace {
+        path: vec!["params".into(), "trend_threshold".into(), "default".into()],
+        value: "\"25\"".into(),
+    };
+    edit_spec(dir, &[edit])?;
     Ok(())
 }
 ```
 
-`arc::spec` is the entire public surface: the spec schema types, two entry points, and the
-error type. Validation is a **gate, not a transform** — it parses raw YAML to reach a verdict
-and hands nothing back to write, so an editor passes its own bytes through and then writes
-those same bytes. That is the only way comments, key order and formatting survive. The schema
-types do currently derive `serde::Serialize` (used by `arc init` to emit a *generated*
-manifest into an empty directory), but that derive is **out of contract**: serialising a
-loaded spec and writing it back destroys the author's bytes, and a later release is expected
-to withdraw the impl. Everything else — the runner, the engine, SQL introspection, the
-operator catalog, the registry — is private and moves without notice.
+`arc::spec` is the entire public surface: the spec schema types, the loading entry points,
+the write path, and the error type. Validation is a **gate, not a transform** — it parses
+raw YAML to reach a verdict and hands nothing back to write. The write path is built on
+that: a `SpecEdit` is a plain value, applied to the **original bytes** by splicing at
+tree-sitter node spans, so every byte an edit does not target — comments, blank lines, key
+order, quote style — survives verbatim, and a result that will not load is refused with the
+loader's reason, leaving the file untouched. Writes are atomic (temp file + rename).
+`create_spec` serialises a brand-new manifest directly — a spec with no prior authorship
+has nothing to preserve — through the same gate. Serialising an *existing* spec yourself
+remains out of contract: load-serialise-write-back destroys the author's bytes, which is
+the whole reason the write path exists. Everything else — the runner, the engine, SQL
+introspection, the operator catalog, the registry — is private and moves without notice.
 
 The surface is documented as a contract in `src/spec.rs` and enumerated by
 `tests/public_surface.rs`, which fails the build if it widens. Arcform is pre-1.0: **pin an

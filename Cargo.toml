@@ -59,6 +59,12 @@ opendal = { version = "0.58", features = ["services-http", "services-s3", "block
 opendal-http-transport-reqwest = { version = "0.58", optional = true }
 reqwest = { version = "0.13", default-features = false, optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time"], optional = true }
+# The spec write path's span source: format-preserving YAML feature extraction on
+# tree-sitter node byte-spans (`src/edit.rs` splices raw bytes at those spans and
+# never re-serialises, which is how a hand-authored spec survives a machine edit).
+# Pinned exact: 1.28.0 pulls a transitive dep whose MSRV (1.97) is above the CI
+# toolchain pin — bump both together, deliberately.
+yamlpath = "=1.27.0"
 
 [features]
 default = ["cli"]

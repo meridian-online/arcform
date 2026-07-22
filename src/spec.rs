@@ -14,21 +14,30 @@
 //! edit the original bytes, pass them through this gate, and — if the gate passes —
 //! write the bytes it already had.
 //!
-//! **Do not round-trip a spec through `serde`.** The exported types currently derive
-//! `serde::Serialize` because `arc`'s own `arc init` scaffolding uses it to emit a
-//! *generated* manifest into a directory that has no manifest yet — the one case
-//! where there are no author bytes to lose. That derive is **not part of this
-//! contract**: load-serialise-write-back destroys the author's comments, key order
-//! and blank lines, and [`Manifest::from_yaml_str`] would bless the result, because
-//! the mangled bytes are still a valid spec. A later release is expected to withdraw
-//! the impl once spec emission moves to a preservation-aware writer; a consumer that
-//! serialises these types is building on sand.
+//! That discipline is packaged as **the write path**: [`SpecEdit`] describes a
+//! change as a plain value, [`apply_edits`] splices it into the original bytes and
+//! gates the result (in memory — inspectable and refusable before any file is
+//! touched), and [`edit_spec`] is the whole apply → validate → atomic-write
+//! operation against a protocol directory. Every byte an edit does not target is
+//! preserved verbatim; a result that will not load is refused with the loader's
+//! reason, never written. [`create_spec`] is the other mode: a spec authored from
+//! scratch has no prior authorship to protect, so it serialises a [`Manifest`]
+//! directly — through the same gate and the same atomic write.
+//!
+//! **Do not round-trip a spec through `serde` yourself.** The exported types derive
+//! `serde::Serialize` because generated-manifest emission ([`create_spec`], and
+//! `arc`'s own `arc init` scaffolding) serialises into a place that has no manifest
+//! yet — the one case where there are no author bytes to lose. That derive is **not
+//! part of this contract** for any other purpose: load-serialise-write-back destroys
+//! the author's comments, key order and blank lines, and [`Manifest::from_yaml_str`]
+//! would bless the result, because the mangled bytes are still a valid spec. Editing
+//! an existing spec goes through [`edit_spec`], which exists so that no consumer
+//! ever has a reason to re-serialise one.
 //!
 //! What you *can* do is build a [`Manifest`] in memory: every field is `pub`, because
 //! the exported types are the schema and a consumer has to be able to read all of it.
-//! Nothing stops you assembling one with a struct literal. If a tool wants to write
-//! a spec, the bytes are its own to produce, and this surface will tell it whether
-//! they parse.
+//! Nothing stops you assembling one with a struct literal — [`create_spec`] takes
+//! exactly that and turns it into a validated file.
 //!
 //! # The contract
 //!
@@ -50,6 +59,14 @@
 //! - [`Precondition::validate`] — the well-formedness check `load` applies per step
 //! - [`MANIFEST_FILENAME`] — the filename [`Manifest::load`] looks for
 //!
+//! The write path (see the discussion above):
+//!
+//! - [`SpecEdit`], [`PathPart`] — an edit as an inspectable value, and its address
+//! - [`apply_edits`] — apply + validate in memory; returns a [`ValidatedSpec`]
+//! - [`ValidatedSpec`] — gated candidate bytes; [`ValidatedSpec::write_to`] is atomic
+//! - [`edit_spec`] — the one-shot apply → validate → atomic-write against a directory
+//! - [`create_spec`] — direct serialisation for a brand-new spec, same gate
+//!
 //! Exported error types:
 //!
 //! - [`Error`] — `#[non_exhaustive]`; new variants are not a breaking change
@@ -63,7 +80,6 @@
 //! connection, resolve a database path, introspect SQL, evaluate a precondition,
 //! build an asset graph, reach the operator catalog, read the run contract, or touch
 //! the registry. Those are the engine's business and they move; the spec does not.
-//! Spec *emission* is not offered either — see the `Serialize` note above.
 //!
 //! The crate root carries one further item, `cli_main`, the `arc` binary's entry
 //! point. It is `#[doc(hidden)]` and gated behind the default `cli` feature, and it
@@ -109,21 +125,27 @@
 //! # Example
 //!
 //! ```no_run
-//! use arc::spec::{Manifest, Result};
+//! use arc::spec::{Manifest, Result, SpecEdit, edit_spec};
 //!
 //! # fn main() -> Result<()> {
 //! // Load and validate a spec that is on disk.
-//! let manifest = Manifest::load(std::path::Path::new("examples/brewtrend"))?;
+//! let dir = std::path::Path::new("examples/brewtrend");
+//! let manifest = Manifest::load(dir)?;
 //! println!("{} — {} steps", manifest.name, manifest.steps.len());
 //!
-//! // Gate an edit: validate the candidate bytes, then write the bytes you already had.
-//! let edited: String = std::fs::read_to_string("examples/brewtrend/arcform.yaml")?;
-//! Manifest::from_yaml_str(&edited)?; // parse only to check — the value is discarded
-//! std::fs::write("examples/brewtrend/arcform.yaml", edited.as_bytes())?;
+//! // Edit it through the write path: the change is applied to the original
+//! // bytes, validated by the same loader, and written atomically — or refused
+//! // with a reason, leaving the file untouched.
+//! let edit = SpecEdit::Replace {
+//!     path: vec!["params".into(), "trend_threshold".into(), "default".into()],
+//!     value: "\"25\"".into(),
+//! };
+//! edit_spec(dir, &[edit])?;
 //! # Ok(())
 //! # }
 //! ```
 
+pub use crate::edit::{PathPart, SpecEdit, ValidatedSpec, apply_edits, create_spec, edit_spec};
 pub use crate::error::{Error, Result};
 pub use crate::manifest::{
     AssetOverride, Defaults, Hooks, MANIFEST_FILENAME, Manifest, Param, RetryPolicy, Step,
