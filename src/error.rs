@@ -1,6 +1,14 @@
 use std::path::PathBuf;
 
+/// Every failure `arc` reports, from spec loading through to the registry client.
+///
+/// Published as part of the spec contract, so it is `#[non_exhaustive]`: a caller
+/// matching on it must carry a `_` arm, and adding a variant is therefore not a
+/// breaking change for them. Only the manifest variants can be raised by the loading
+/// and validation surface — the rest belong to the private engine and are reachable
+/// through this type only because they share it.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("arcform.yaml not found in current directory")]
     ManifestNotFound,

@@ -6,6 +6,12 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::precondition::Precondition;
 
+/// The manifest filename `arc` looks for in a protocol directory.
+///
+/// Published so a tool that writes a spec addresses the same file the loader reads,
+/// rather than hardcoding the string a second time.
+pub const MANIFEST_FILENAME: &str = "arcform.yaml";
+
 /// A declared pipeline parameter with an optional default value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Param {
@@ -54,7 +60,7 @@ pub struct Manifest {
     pub engine_version: Option<String>,
 
     /// Path to the database file, relative to the manifest directory.
-    /// Defaults to "<name>.duckdb" if not specified.
+    /// Defaults to `<name>.duckdb` if not specified.
     #[serde(default)]
     pub db: Option<String>,
 
@@ -188,7 +194,7 @@ impl Step {
     /// A bare step with just a name — every other field at its empty default.
     /// Callers set `sql`/`command`/`op` and any deps they need. Used by the
     /// descriptor bridge to build generated steps.
-    pub fn new(name: &str) -> Self {
+    pub(crate) fn new(name: &str) -> Self {
         Step {
             name: name.to_string(),
             sql: None,
@@ -205,7 +211,7 @@ impl Step {
     }
 
     /// Returns true if this step uses the engine (sql field).
-    pub fn is_sql(&self) -> bool {
+    pub(crate) fn is_sql(&self) -> bool {
         self.sql.is_some()
     }
 }
@@ -228,9 +234,14 @@ fn validate_retry_policy(policy: &RetryPolicy, context: &str) -> Result<()> {
 }
 
 impl Manifest {
-    /// Load and validate a manifest from the given directory.
+    /// Load and validate `arcform.yaml` from the given directory.
+    ///
+    /// Errors: [`Error::ManifestNotFound`] if the file is absent, [`Error::FileRead`]
+    /// if it cannot be read, [`Error::ManifestParse`] if it is not YAML in the shape of
+    /// a manifest, [`Error::ManifestValidation`] if the shape is right but the content
+    /// is not — see [`Manifest::from_yaml_str`] for what that covers.
     pub fn load(dir: &Path) -> Result<Self> {
-        let path = dir.join("arcform.yaml");
+        let path = dir.join(MANIFEST_FILENAME);
         if !path.exists() {
             return Err(Error::ManifestNotFound);
         }
@@ -238,13 +249,32 @@ impl Manifest {
             path: path.clone(),
             source: e,
         })?;
-        let manifest: Manifest = serde_yaml::from_str(&contents)?;
+        Self::from_yaml_str(&contents)
+    }
+
+    /// Parse and validate manifest YAML that is not (yet) on disk.
+    ///
+    /// The same parse and the same checks [`Manifest::load`] performs, minus the file
+    /// read — so a caller holding candidate bytes can ask whether `arc` would accept
+    /// them before those bytes become a file. Parsing here is a gate: the returned
+    /// [`Manifest`] is a by-product, and a caller that only wants the verdict should
+    /// discard it and write the bytes it already has. Nothing here re-serialises, so
+    /// the comments, key order and formatting in those bytes survive untouched.
+    ///
+    /// Checks the manifest in isolation: names non-empty and unique, exactly one of
+    /// `sql`/`command`/`op` per step, `op:` steps resolvable against the operator
+    /// catalog with a `with:` block that deserialises, well-formed preconditions,
+    /// retry policies and `engine_version` constraint, and the hook restrictions. It
+    /// does not touch the filesystem — referenced SQL files, dotenv files and fetched
+    /// artifacts are the runner's preflight, not this.
+    pub fn from_yaml_str(yaml: &str) -> Result<Self> {
+        let manifest: Manifest = serde_yaml::from_str(yaml)?;
         manifest.validate()?;
         Ok(manifest)
     }
 
     /// Resolve the database file path relative to the manifest directory.
-    pub fn db_path(&self, manifest_dir: &Path) -> PathBuf {
+    pub(crate) fn db_path(&self, manifest_dir: &Path) -> PathBuf {
         let db = self
             .db
             .clone()
@@ -443,7 +473,7 @@ impl Manifest {
     }
 
     /// Generate a default manifest for a new project.
-    pub fn new_project(name: &str) -> Self {
+    pub(crate) fn new_project(name: &str) -> Self {
         Manifest {
             name: name.to_string(),
             engine: "duckdb".to_string(),
@@ -460,7 +490,7 @@ impl Manifest {
     }
 
     /// Check if any steps or hooks use the SQL engine.
-    pub fn has_sql_steps(&self) -> bool {
+    pub(crate) fn has_sql_steps(&self) -> bool {
         let hook_has_sql = [
             &self.hooks.on_init,
             &self.hooks.on_success,

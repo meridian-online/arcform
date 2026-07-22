@@ -259,7 +259,7 @@ pub fn render_fetch_failure<W: Write>(
 /// `arc registry run <name>` — resolves, ensures cache, hands off to runner.
 ///
 /// Does NOT mutate process cwd. `--param` raw strings are parsed via the existing
-/// [`crate::cli::parse_params`] helper before any cache or transport work.
+/// [`crate::runner::parse_params`] helper before any cache or transport work.
 pub fn handle_run(
     opts: &RunOptions<'_>,
     query: &str,
@@ -269,7 +269,7 @@ pub fn handle_run(
     raw_params: &[String],
 ) -> Result<()> {
     // Validate --param FIRST so a bad value does not even consult the transport.
-    let cli_params = crate::cli::parse_params(raw_params)?;
+    let cli_params = crate::runner::parse_params(raw_params)?;
 
     let index = opts.index()?;
     let spec = version_spec_from_flags(version, latest);

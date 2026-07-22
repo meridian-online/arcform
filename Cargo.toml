@@ -5,12 +5,24 @@ edition = "2024"
 description = "Local-first data pipeline engine for analytical workflows"
 license = "MIT"
 
+# The library target. `arc` is a binary first, but the spec it runs is now also
+# consumed by sibling Rust tools that must not reimplement the schema — they link
+# this crate and call the real loader. With `default-features = false` the crate
+# root exports `spec` and nothing else; the default `cli` feature adds one further
+# root item, the doc-hidden `cli_main` the binary shim calls. Both shapes are
+# enumerated by `tests/public_surface.rs`, which fails the build if either widens.
+[lib]
+name = "arc"
+path = "src/lib.rs"
+
+# Needs `cli`, so `--no-default-features` builds the library alone.
 [[bin]]
 name = "arc"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 dotenvy = "0.15"
 indexmap = { version = "2", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
@@ -49,7 +61,13 @@ reqwest = { version = "0.13", default-features = false, optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time"], optional = true }
 
 [features]
-default = []
+default = ["cli"]
+# The `arc` command line: the clap parser, the command dispatch, and the `cli_main`
+# entry point the binary shim calls. On by default so `cargo build` still produces
+# the binary. A library consumer turns it off — `cli_main` reads the *caller's* argv
+# and can exit the caller's process, so it has no business being reachable from a
+# crate that only wants the spec loader.
+cli = ["dep:clap"]
 # The OpenDAL-backed opendal_fetch operator (multi-backend ingress; securelake s3://).
 opendal = ["dep:opendal", "dep:opendal-http-transport-reqwest", "dep:reqwest", "dep:tokio"]
 

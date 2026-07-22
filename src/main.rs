@@ -1,25 +1,7 @@
-mod asset;
-mod bridge;
-mod cli;
-mod contract;
-mod engine;
-mod error;
-mod ingress_meta;
-mod introspect;
-mod manifest;
-mod operator;
-mod precondition;
-mod registry;
-mod runner;
-mod state;
-
-use clap::Parser;
+//! The `arc` binary. All of it lives in the library target — this is a shim so the
+//! engine is compiled once and the CLI and the published spec loader can never be
+//! built from different code.
 
 fn main() {
-    let cli = cli::Cli::parse();
-
-    if let Err(e) = cli::dispatch(cli) {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    }
+    arc::cli_main();
 }

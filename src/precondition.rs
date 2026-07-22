@@ -66,7 +66,7 @@ impl Precondition {
     ///
     /// For `ModifiedWithin`: file issues return Ok(false) — stale, not error.
     /// For `Command`: execution errors return Err — pipeline halts.
-    pub fn evaluate(
+    pub(crate) fn evaluate(
         &self,
         manifest_dir: &Path,
         step_name: &str,
@@ -205,7 +205,7 @@ impl Precondition {
 /// Evaluate all preconditions for a step. Returns Ok(true) if ALL pass (step is fresh).
 /// Returns Ok(false) if any precondition says stale.
 /// Returns Err if a command precondition fails to execute.
-pub fn evaluate_all(
+pub(crate) fn evaluate_all(
     preconditions: &[Precondition],
     manifest_dir: &Path,
     step_name: &str,

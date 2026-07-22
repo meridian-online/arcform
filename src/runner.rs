@@ -754,6 +754,35 @@ fn op_config_hash(step: &crate::manifest::Step) -> String {
     state::content_hash(format!("{}\n{}", op, with).as_bytes())
 }
 
+/// Parse `--param KEY=VALUE` flags into (key, value) pairs.
+///
+/// Lives here rather than in the CLI module because it is part of running a
+/// pipeline, not part of the command line: the registry run path calls it too,
+/// and the CLI can be compiled out.
+/// Splits on the first '=' — keys cannot contain '=', values can.
+pub(crate) fn parse_params(raw: &[String]) -> Result<Vec<(String, String)>> {
+    let mut parsed = Vec::new();
+    for param in raw {
+        if let Some(pos) = param.find('=') {
+            let key = param[..pos].to_string();
+            let value = param[pos + 1..].to_string();
+            if key.is_empty() {
+                return Err(Error::ManifestValidation(format!(
+                    "invalid --param '{}': key cannot be empty",
+                    param
+                )));
+            }
+            parsed.push((key, value));
+        } else {
+            return Err(Error::ManifestValidation(format!(
+                "invalid --param '{}': expected KEY=VALUE format",
+                param
+            )));
+        }
+    }
+    Ok(parsed)
+}
+
 /// Check whether a SQL or op step's staleness hash has changed since the last run.
 ///
 /// Returns true (stale) if: no prior state, prior failure, hash mismatch, or missing file.
@@ -1787,7 +1816,7 @@ steps:
             "start_date=2026-01-01".to_string(),
             "region=us-east-1".to_string(),
         ];
-        let parsed = crate::cli::parse_params(&raw).unwrap();
+        let parsed = parse_params(&raw).unwrap();
         assert_eq!(parsed.len(), 2);
         assert_eq!(
             parsed[0],
@@ -1800,7 +1829,7 @@ steps:
     #[test]
     fn test_param_parse_value_with_equals() {
         let raw = vec!["query=SELECT * FROM t WHERE x=1".to_string()];
-        let parsed = crate::cli::parse_params(&raw).unwrap();
+        let parsed = parse_params(&raw).unwrap();
         assert_eq!(parsed[0].0, "query");
         assert_eq!(parsed[0].1, "SELECT * FROM t WHERE x=1");
     }
@@ -1809,7 +1838,7 @@ steps:
     #[test]
     fn test_param_parse_invalid_no_equals() {
         let raw = vec!["no_equals_here".to_string()];
-        let err = crate::cli::parse_params(&raw).unwrap_err();
+        let err = parse_params(&raw).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("KEY=VALUE"),
