@@ -103,9 +103,9 @@ duckdb -c "INSTALL ducklake; LOAD ducklake;
 ## Publishing (open zone)
 
 `scripts/publish.sh` uploads the artifacts to the **R2 open zone**, but is guarded:
-when R2 credentials are absent it **stages locally and does not fail**. The real R2
-write token is pending (Track B), so out of the box the step stages the open-zone
-layout under `dist/open-zone/code-lists/` and writes a `_publish_receipt.json`
+when R2 credentials are absent it **stages locally and does not fail**. Out of the
+box the step stages the open-zone layout under `dist/open-zone/code-lists/` and
+writes a `_publish_receipt.json`
 (sha256 + as_of + target key prefix). Provide `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
 `R2_SECRET_ACCESS_KEY`, `R2_BUCKET` (and `rclone`) to switch to a real upload.
 
@@ -117,7 +117,7 @@ layout under `dist/open-zone/code-lists/` and writes a `_publish_receipt.json`
 - `dist/open-zone/code-lists/` — the staged open zone (+ publish receipt).
 - `datapackage.json` — the [Frictionless Data Package](https://datapackage.org)
   descriptor: SPDX, attribution, and `as_of` per source, plus the green-list policy
-  the license gate reads. Per decision 0017 this *describes* the data; it is **not**
+  the license gate reads. This descriptor *describes* the data; it is **not**
   the runnable artifact (`arc run` executes `arcform.yaml`).
 
 ## Requirements

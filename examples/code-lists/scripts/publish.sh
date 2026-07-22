@@ -4,9 +4,9 @@
 #
 # Uploads the published artifacts (both Parquet, the frozen open.ducklake
 # catalogue, and datapackage.json) to the R2 open zone. GUARDED: when R2
-# credentials are absent — the real write token is pending (Track B) — it does
-# NOT fail. Instead it stages the same artifact set into a local ./dist mirror of
-# the open-zone layout and writes a publish receipt, then exits 0.
+# credentials are absent it does NOT fail. Instead it stages the same artifact
+# set into a local ./dist mirror of the open-zone layout and writes a publish
+# receipt, then exits 0.
 #
 # Real upload requires: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
 # R2_BUCKET, and rclone on PATH. Any missing piece falls back to local staging.
@@ -73,5 +73,5 @@ if [ -n "${R2_ACCOUNT_ID:-}" ] && [ -n "${R2_ACCESS_KEY_ID:-}" ] \
     exit 0
 fi
 
-# Track B: R2 write token pending — never fail, stage locally.
-stage_local "r2-credentials-absent (Track B pending)"
+# No R2 credentials configured — never fail, stage locally.
+stage_local "r2-credentials-absent"

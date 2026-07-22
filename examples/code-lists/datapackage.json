@@ -86,5 +86,5 @@
     }
   ],
   "x-arcform-pipeline": "arcform.yaml",
-  "x-arcform-note": "This descriptor describes the pipeline's OUTPUT data (decision 0017) and is read by the license gate (x-meridian-license-gate). It is not the runnable artifact — `arc run` executes arcform.yaml."
+  "x-arcform-note": "This descriptor describes the pipeline's OUTPUT data and is read by the license gate (x-meridian-license-gate). It is not the runnable artifact — `arc run` executes arcform.yaml."
 }
