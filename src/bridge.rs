@@ -169,13 +169,22 @@ fn generate(name: &str, descriptor: &Descriptor, descriptor_dir: &Path) -> Resul
             let child = res.name.as_str();
             let parent = fk.reference.resource.as_str();
             let child_field = fk.fields.first().map(String::as_str).unwrap_or("");
-            let parent_field = fk.reference.fields.first().map(String::as_str).unwrap_or("");
+            let parent_field = fk
+                .reference
+                .fields
+                .first()
+                .map(String::as_str)
+                .unwrap_or("");
             let edge = format!("{child}.{child_field} -> {parent}.{parent_field}");
 
             if !fk.status.eq_ignore_ascii_case(ACCEPTED) {
                 review_comments.push(format!(
                     "# foreign key surfaced for review (x-dovetailStatus: {}{}): {} — not executed",
-                    if fk.status.is_empty() { "unset" } else { &fk.status },
+                    if fk.status.is_empty() {
+                        "unset"
+                    } else {
+                        &fk.status
+                    },
                     fk.confidence
                         .map(|c| format!(", confidence {c:.2}"))
                         .unwrap_or_default(),
@@ -334,8 +343,14 @@ pub fn init_from_descriptor_at(name: &str, descriptor_path: &Path, base: &Path) 
         .filter(|s| s.name.starts_with("load_"))
         .count();
     let n_fk = generated.manifest.steps.len() - n_load;
-    println!("Generated Protocol '{name}' from {}:", descriptor_path.display());
-    println!("  arcform.yaml   ({} steps: {n_load} load, {n_fk} foreign-key check(s))", generated.manifest.steps.len());
+    println!(
+        "Generated Protocol '{name}' from {}:",
+        descriptor_path.display()
+    );
+    println!(
+        "  arcform.yaml   ({} steps: {n_load} load, {n_fk} foreign-key check(s))",
+        generated.manifest.steps.len()
+    );
     println!("  models/        ({} SQL file(s))", generated.models.len());
     for (_, dest) in &generated.db_sources {
         println!("  {dest}   (copied in)");
@@ -373,8 +388,7 @@ mod tests {
     use super::*;
 
     /// The real descriptor `dovetail relate` produced for the committed fixture.
-    const SIGNUPS_DESCRIPTOR: &str =
-        include_str!("../tests/fixtures/signups.datapackage.json");
+    const SIGNUPS_DESCRIPTOR: &str = include_str!("../tests/fixtures/signups.datapackage.json");
 
     fn parse(json: &str) -> Descriptor {
         serde_json::from_str(json).expect("descriptor parses")
@@ -387,8 +401,14 @@ mod tests {
         let d = parse(SIGNUPS_DESCRIPTOR);
         let g = generate("assemble_demo", &d, Path::new("tests/fixtures")).unwrap();
         let names: Vec<&str> = g.manifest.steps.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["load_accounts", "load_logins", "fk_logins_accounts"]);
-        assert!(g.review_comments.is_empty(), "no non-accepted FKs in the fixture");
+        assert_eq!(
+            names,
+            ["load_accounts", "load_logins", "fk_logins_accounts"]
+        );
+        assert!(
+            g.review_comments.is_empty(),
+            "no non-accepted FKs in the fixture"
+        );
     }
 
     // The fk step fans in from both tables and joins account_id -> id.
@@ -411,7 +431,10 @@ mod tests {
             .expect("fk model present")
             .1;
         assert!(sql.contains("LEFT JOIN accounts p"), "joins parent: {sql}");
-        assert!(sql.contains(r#"c."account_id" = p."id""#), "joins account_id -> id: {sql}");
+        assert!(
+            sql.contains(r#"c."account_id" = p."id""#),
+            "joins account_id -> id: {sql}"
+        );
         assert!(sql.contains("orphans"), "counts orphans: {sql}");
     }
 
@@ -422,7 +445,10 @@ mod tests {
     fn load_sql_registers_the_table_as_a_produced_asset() {
         let sql = load_sql("accounts", "signups.duckdb", "accounts");
         let assets = crate::introspect::extract_assets(&sql).expect("load SQL parses");
-        assert!(assets.outputs.contains("accounts"), "produces accounts: {assets:?}");
+        assert!(
+            assets.outputs.contains("accounts"),
+            "produces accounts: {assets:?}"
+        );
     }
 
     // GATING: the fk step appears ONLY because the FK is accepted. Flip the same
@@ -468,7 +494,12 @@ mod tests {
         }"#;
         let d = parse(json);
         let g = generate("demo", &d, Path::new("tests/fixtures")).unwrap();
-        assert!(g.manifest.steps.iter().any(|s| s.name == "fk_logins_accounts"));
+        assert!(
+            g.manifest
+                .steps
+                .iter()
+                .any(|s| s.name == "fk_logins_accounts")
+        );
         assert!(g.review_comments.is_empty());
     }
 
@@ -485,7 +516,10 @@ mod tests {
 
     #[test]
     fn split_duckdb_path_parses_and_rejects() {
-        assert_eq!(split_duckdb_path("signups.duckdb#accounts"), Some(("signups.duckdb", "accounts")));
+        assert_eq!(
+            split_duckdb_path("signups.duckdb#accounts"),
+            Some(("signups.duckdb", "accounts"))
+        );
         assert_eq!(split_duckdb_path("no-fragment.duckdb"), None);
         assert_eq!(split_duckdb_path("#accounts"), None);
         assert_eq!(split_duckdb_path("db#"), None);

@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 
 use crate::engine::DuckDbEngine;
 use crate::error::{Error, Result};
-use crate::registry::cache::{cache_path, ensure_cache_root, IndexCache};
+use crate::registry::cache::{IndexCache, cache_path, ensure_cache_root};
 use crate::registry::index::{Pillar, RegistryIndex};
-use crate::registry::resolve::{resolve, ResolvedEntry, VersionSpec};
+use crate::registry::resolve::{ResolvedEntry, VersionSpec, resolve};
 use crate::registry::transport::{Transport, TransportSrc};
 use crate::state::DuckDbStateBackend;
 
@@ -30,8 +30,12 @@ pub struct RunOptions<'a> {
 
 impl<'a> RunOptions<'a> {
     fn index(&self) -> Result<RegistryIndex> {
-        IndexCache::new(self.transport, self.cache_root.clone(), self.index_url.clone())
-            .load(self.refresh)
+        IndexCache::new(
+            self.transport,
+            self.cache_root.clone(),
+            self.index_url.clone(),
+        )
+        .load(self.refresh)
     }
 }
 
@@ -50,7 +54,12 @@ fn ensure_cached(
     resolved: &ResolvedEntry,
 ) -> Result<PathBuf> {
     let dest = cache_path(cache_root, resolved);
-    if dest.is_dir() && dest.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false) {
+    if dest.is_dir()
+        && dest
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
+    {
         return Ok(dest);
     }
     ensure_cache_root(&dest)?;
@@ -71,10 +80,10 @@ fn dir_size_bytes(path: &Path) -> u64 {
                 if let Ok(ft) = entry.file_type() {
                     if ft.is_dir() {
                         walk(&path, total);
-                    } else if ft.is_file() {
-                        if let Ok(meta) = entry.metadata() {
-                            *total += meta.len();
-                        }
+                    } else if ft.is_file()
+                        && let Ok(meta) = entry.metadata()
+                    {
+                        *total += meta.len();
                     }
                 }
             }
@@ -90,7 +99,7 @@ fn format_kb(bytes: u64) -> String {
     format!("{} KB", kb)
 }
 
-// -- handle_list (ac-07) ---------------------------------------------------
+// -- handle_list ---------------------------------------------------
 
 /// `arc registry list` — uv-style grouped output.
 pub fn handle_list<W: Write>(opts: &RunOptions<'_>, out: &mut W) -> Result<()> {
@@ -112,7 +121,11 @@ pub fn render_list<W: Write>(index: &RegistryIndex, out: &mut W) -> Result<()> {
             writeln!(out)?;
         }
         writeln!(out, "{}", pillar.header())?;
-        let entries: Vec<_> = index.entries.iter().filter(|e| e.pillar == *pillar).collect();
+        let entries: Vec<_> = index
+            .entries
+            .iter()
+            .filter(|e| e.pillar == *pillar)
+            .collect();
         if entries.is_empty() {
             writeln!(out, "  (no entries yet)")?;
             continue;
@@ -133,7 +146,7 @@ pub fn render_list<W: Write>(index: &RegistryIndex, out: &mut W) -> Result<()> {
     Ok(())
 }
 
-// -- handle_show (ac-08) ---------------------------------------------------
+// -- handle_show ---------------------------------------------------
 
 /// `arc registry show <name>` — terse metadata block + README inline.
 pub fn handle_show<W: Write>(opts: &RunOptions<'_>, query: &str, out: &mut W) -> Result<()> {
@@ -187,7 +200,7 @@ fn render_show<W: Write>(
     Ok(())
 }
 
-// -- handle_fetch (ac-09) --------------------------------------------------
+// -- handle_fetch --------------------------------------------------
 
 /// `arc registry fetch <name>` — single completion line on success.
 pub fn handle_fetch<W: Write, E: Write>(
@@ -204,7 +217,10 @@ pub fn handle_fetch<W: Write, E: Write>(
     let resolved = resolve(&index, query, spec)?;
     let dest = cache_path(&opts.cache_root, &resolved);
     let already = dest.is_dir()
-        && dest.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false);
+        && dest
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
     if already {
         writeln!(
             out,
@@ -238,7 +254,7 @@ pub fn render_fetch_failure<W: Write>(
     writeln!(err_stream, "✗ {} {}: {}", display_name, ref_, err)
 }
 
-// -- handle_run (ac-10) ----------------------------------------------------
+// -- handle_run ----------------------------------------------------
 
 /// `arc registry run <name>` — resolves, ensures cache, hands off to runner.
 ///
@@ -303,9 +319,9 @@ entries:
         .to_string()
     }
 
-    // ac-07: list output — golden assertion across all three pillars + empty Investigative.
+    // list output — golden assertion across all three pillars + empty Investigative.
     #[test]
-    fn test_ac07_list_groups_by_pillar_with_empty_placeholder() {
+    fn test_list_groups_by_pillar_with_empty_placeholder() {
         let idx = RegistryIndex::parse(&fixture_index_yaml()).unwrap();
         let mut buf = Vec::new();
         render_list(&idx, &mut buf).unwrap();
@@ -331,20 +347,22 @@ entries:
         );
     }
 
-    // ac-08: show prints metadata block + README contents inline.
+    // show prints metadata block + README contents inline.
     #[test]
-    fn test_ac08_show_renders_metadata_and_readme() {
+    fn test_show_renders_metadata_and_readme() {
         let fixture_root = TempDir::new().unwrap();
         let cache_root = TempDir::new().unwrap();
 
         let src = fixture_root.path().join("practical/brewtrend/v1.0");
         std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("README.md"), "# brewtrend\n\nDaily homebrew signal.\n").unwrap();
+        std::fs::write(
+            src.join("README.md"),
+            "# brewtrend\n\nDaily homebrew signal.\n",
+        )
+        .unwrap();
 
-        let transport = FixtureTransport::with_tree(
-            fixture_root.path().to_path_buf(),
-            fixture_index_yaml(),
-        );
+        let transport =
+            FixtureTransport::with_tree(fixture_root.path().to_path_buf(), fixture_index_yaml());
         let opts = RunOptions {
             transport: &transport,
             cache_root: cache_root.path().to_path_buf(),
@@ -363,9 +381,9 @@ entries:
         assert!(s.contains("Daily homebrew signal"));
     }
 
-    // ac-08: missing README path renders the (no README) line.
+    // missing README path renders the (no README) line.
     #[test]
-    fn test_ac08_show_no_readme_renders_placeholder() {
+    fn test_show_no_readme_renders_placeholder() {
         let fixture_root = TempDir::new().unwrap();
         let cache_root = TempDir::new().unwrap();
 
@@ -373,10 +391,8 @@ entries:
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("arcform.yaml"), "name: brewtrend\n").unwrap();
 
-        let transport = FixtureTransport::with_tree(
-            fixture_root.path().to_path_buf(),
-            fixture_index_yaml(),
-        );
+        let transport =
+            FixtureTransport::with_tree(fixture_root.path().to_path_buf(), fixture_index_yaml());
         let opts = RunOptions {
             transport: &transport,
             cache_root: cache_root.path().to_path_buf(),
@@ -391,19 +407,17 @@ entries:
         assert!(s.contains("(no README)"));
     }
 
-    // ac-09: cold fetch prints ➜ line.
+    // cold fetch prints ➜ line.
     #[test]
-    fn test_ac09_cold_fetch_prints_arrow_line() {
+    fn test_cold_fetch_prints_arrow_line() {
         let fixture_root = TempDir::new().unwrap();
         let cache_root = TempDir::new().unwrap();
         let src = fixture_root.path().join("practical/brewtrend/v1.0");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("a.txt"), "hi").unwrap();
 
-        let transport = FixtureTransport::with_tree(
-            fixture_root.path().to_path_buf(),
-            fixture_index_yaml(),
-        );
+        let transport =
+            FixtureTransport::with_tree(fixture_root.path().to_path_buf(), fixture_index_yaml());
         let opts = RunOptions {
             transport: &transport,
             cache_root: cache_root.path().to_path_buf(),
@@ -419,19 +433,17 @@ entries:
         assert!(s.contains("KB"));
     }
 
-    // ac-09: already-cached prints ✓ line.
+    // already-cached prints ✓ line.
     #[test]
-    fn test_ac09_already_cached_prints_check_line() {
+    fn test_already_cached_prints_check_line() {
         let fixture_root = TempDir::new().unwrap();
         let cache_root = TempDir::new().unwrap();
         let src = fixture_root.path().join("practical/brewtrend/v1.0");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("a.txt"), "hi").unwrap();
 
-        let transport = FixtureTransport::with_tree(
-            fixture_root.path().to_path_buf(),
-            fixture_index_yaml(),
-        );
+        let transport =
+            FixtureTransport::with_tree(fixture_root.path().to_path_buf(), fixture_index_yaml());
         let opts = RunOptions {
             transport: &transport,
             cache_root: cache_root.path().to_path_buf(),
@@ -448,20 +460,18 @@ entries:
         assert!(s.starts_with("✓ brewtrend v1.0 (cached)"), "{s}");
     }
 
-    // ac-09: failed fetch leaves no <ref>/ directory and a subsequent fetch is cold, not cached.
+    // failed fetch leaves no <ref>/ directory and a subsequent fetch is cold, not cached.
     #[test]
-    fn test_ac09_partial_fetch_does_not_appear_cached() {
+    fn test_partial_fetch_does_not_appear_cached() {
         let fixture_root = TempDir::new().unwrap();
         let cache_root = TempDir::new().unwrap();
         let src = fixture_root.path().join("practical/brewtrend/v1.0");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("a.txt"), "hi").unwrap();
 
-        let bad_transport = FixtureTransport::with_tree(
-            fixture_root.path().to_path_buf(),
-            fixture_index_yaml(),
-        )
-        .with_fail_mid_fetch();
+        let bad_transport =
+            FixtureTransport::with_tree(fixture_root.path().to_path_buf(), fixture_index_yaml())
+                .with_fail_mid_fetch();
         let opts_bad = RunOptions {
             transport: &bad_transport,
             cache_root: cache_root.path().to_path_buf(),
@@ -473,13 +483,14 @@ entries:
         let mut err = Vec::new();
         let _ = handle_fetch(&opts_bad, "brewtrend", None, false, &mut out, &mut err).unwrap_err();
         let dest = cache_root.path().join("brewtrend/v1.0");
-        assert!(!dest.exists(), "no <ref> dir should remain after failed fetch");
+        assert!(
+            !dest.exists(),
+            "no <ref> dir should remain after failed fetch"
+        );
 
         // Subsequent fetch with a good transport is cold (➜) not cached (✓).
-        let good_transport = FixtureTransport::with_tree(
-            fixture_root.path().to_path_buf(),
-            fixture_index_yaml(),
-        );
+        let good_transport =
+            FixtureTransport::with_tree(fixture_root.path().to_path_buf(), fixture_index_yaml());
         let opts_good = RunOptions {
             transport: &good_transport,
             cache_root: cache_root.path().to_path_buf(),
@@ -490,18 +501,19 @@ entries:
         out.clear();
         handle_fetch(&opts_good, "brewtrend", None, false, &mut out, &mut err).unwrap();
         let s = String::from_utf8(out).unwrap();
-        assert!(s.starts_with("➜ brewtrend v1.0"), "expected cold-fetch arrow: {s}");
+        assert!(
+            s.starts_with("➜ brewtrend v1.0"),
+            "expected cold-fetch arrow: {s}"
+        );
     }
 
-    // ac-09 + ac-02: --latest errors with RegistryUnimplemented.
+    // --latest errors with RegistryUnimplemented.
     #[test]
-    fn test_ac09_latest_errors_unimplemented() {
+    fn test_latest_errors_unimplemented() {
         let fixture_root = TempDir::new().unwrap();
         let cache_root = TempDir::new().unwrap();
-        let transport = FixtureTransport::with_tree(
-            fixture_root.path().to_path_buf(),
-            fixture_index_yaml(),
-        );
+        let transport =
+            FixtureTransport::with_tree(fixture_root.path().to_path_buf(), fixture_index_yaml());
         let opts = RunOptions {
             transport: &transport,
             cache_root: cache_root.path().to_path_buf(),
@@ -515,9 +527,9 @@ entries:
         assert!(matches!(r, Error::RegistryUnimplemented { .. }));
     }
 
-    // ac-10: bad --param surfaces ManifestValidation BEFORE transport invocation.
+    // bad --param surfaces ManifestValidation BEFORE transport invocation.
     #[test]
-    fn test_ac10_bad_param_errors_before_transport_use() {
+    fn test_bad_param_errors_before_transport_use() {
         // A transport that panics on use ensures we assert "no fetch happened".
         struct PanicTransport;
         impl Transport for PanicTransport {
@@ -541,9 +553,9 @@ entries:
         assert!(matches!(err, Error::ManifestValidation(_)));
     }
 
-    // ac-10: cwd is unchanged after a registry run.
+    // cwd is unchanged after a registry run.
     #[test]
-    fn test_ac10_run_does_not_mutate_cwd() {
+    fn test_run_does_not_mutate_cwd() {
         let fixture_root = TempDir::new().unwrap();
         let cache_root = TempDir::new().unwrap();
         let src = fixture_root.path().join("practical/brewtrend/v1.0");
@@ -560,10 +572,8 @@ steps:
         )
         .unwrap();
 
-        let transport = FixtureTransport::with_tree(
-            fixture_root.path().to_path_buf(),
-            fixture_index_yaml(),
-        );
+        let transport =
+            FixtureTransport::with_tree(fixture_root.path().to_path_buf(), fixture_index_yaml());
         let opts = RunOptions {
             transport: &transport,
             cache_root: cache_root.path().to_path_buf(),

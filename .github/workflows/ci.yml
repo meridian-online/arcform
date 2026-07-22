@@ -1,0 +1,70 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref — the newest push is the one that matters.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # arcform links a SYSTEM DuckDB — `libduckdb-sys` ships no `bundled` feature, so
+  # every job that compiles the crate must provide the C library and its headers.
+  # Pinned to the version the crate is developed against; bump in lockstep with the
+  # `duckdb` dependency. The install step below writes the *_DIR / LD_LIBRARY_PATH
+  # env vars that libduckdb-sys and the test runtime read.
+  DUCKDB_VERSION: v1.5.4
+
+jobs:
+  # Formatting is build-free, so it reports in seconds and never waits on the
+  # DuckDB download or a compile.
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned toolchain: clippy's lint set moves between releases, so an
+      # unpinned rustc could turn the gate red on a commit that changed nothing.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # Clippy and the test suite both compile the crate against system DuckDB, so
+  # they share a job that provisions the library once.
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # Fetch the official DuckDB C library (libduckdb.so + duckdb.h/.hpp) and
+      # point the linker, the bindings build script, and the test runtime at it.
+      - name: Install DuckDB C library
+        run: |
+          set -euo pipefail
+          url="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/libduckdb-linux-amd64.zip"
+          curl -fsSL -o /tmp/libduckdb.zip "$url"
+          mkdir -p "$HOME/duckdb"
+          unzip -o /tmp/libduckdb.zip -d "$HOME/duckdb"
+          {
+            echo "DUCKDB_LIB_DIR=$HOME/duckdb"
+            echo "DUCKDB_INCLUDE_DIR=$HOME/duckdb"
+            echo "LD_LIBRARY_PATH=$HOME/duckdb${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          } >> "$GITHUB_ENV"
+
+      # `--all-targets` so the test modules are linted too, not just the binary.
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace

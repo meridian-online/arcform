@@ -229,17 +229,20 @@ mod tests {
         }
     }
 
-    // ac-03: cache_path canonical layout.
+    // cache_path canonical layout.
     #[test]
-    fn test_ac03_cache_path_canonical() {
+    fn test_cache_path_canonical() {
         let root = PathBuf::from("/tmp/r");
         let r = resolved("brewtrend", None, "v1.0");
-        assert_eq!(cache_path(&root, &r), PathBuf::from("/tmp/r/brewtrend/v1.0"));
+        assert_eq!(
+            cache_path(&root, &r),
+            PathBuf::from("/tmp/r/brewtrend/v1.0")
+        );
     }
 
-    // ac-03: cache_path contributor layout.
+    // cache_path contributor layout.
     #[test]
-    fn test_ac03_cache_path_contributor() {
+    fn test_cache_path_contributor() {
         let root = PathBuf::from("/tmp/r");
         let r = resolved("myproject", Some("someone"), "v0.3");
         assert_eq!(
@@ -248,9 +251,9 @@ mod tests {
         );
     }
 
-    // ac-03: $ARCFORM_REGISTRY_CACHE override is honoured.
+    // $ARCFORM_REGISTRY_CACHE override is honoured.
     #[test]
-    fn test_ac03_env_override_honoured() {
+    fn test_env_override_honoured() {
         let _g = ENV_LOCK.lock().unwrap();
         let dir = TempDir::new().unwrap();
         // Safe: mutex above prevents racing with other env-mutating tests in this module.
@@ -264,9 +267,9 @@ mod tests {
         assert_eq!(root, dir.path());
     }
 
-    // ac-03: home_dir() == None branch surfaces RegistryCacheRootMissing.
+    // home_dir() == None branch surfaces RegistryCacheRootMissing.
     #[test]
-    fn test_ac03_home_missing_errors() {
+    fn test_home_missing_errors() {
         let _g = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::remove_var(CACHE_ENV);
@@ -280,9 +283,9 @@ mod tests {
         );
     }
 
-    // ac-05: first call fetches; second within TTL reuses cache.
+    // first call fetches; second within TTL reuses cache.
     #[test]
-    fn test_ac05_first_fetches_then_caches() {
+    fn test_first_fetches_then_caches() {
         let dir = TempDir::new().unwrap();
         let body = r#"version: 1
 entries: []
@@ -300,9 +303,9 @@ entries: []
         );
     }
 
-    // ac-05: --refresh forces fetch even when fresh.
+    // --refresh forces fetch even when fresh.
     #[test]
-    fn test_ac05_refresh_forces_fetch() {
+    fn test_refresh_forces_fetch() {
         let dir = TempDir::new().unwrap();
         let body = "version: 1\nentries: []\n".to_string();
         let transport = FixtureTransport::with_index(body);
@@ -313,9 +316,9 @@ entries: []
         assert_eq!(transport.index_fetch_count(), 2);
     }
 
-    // ac-05: stale + transport failure with cache present returns cached (offline grace).
+    // stale + transport failure with cache present returns cached (offline grace).
     #[test]
-    fn test_ac05_offline_grace_on_ttl_refresh() {
+    fn test_offline_grace_on_ttl_refresh() {
         let dir = TempDir::new().unwrap();
         let good = FixtureTransport::with_index("version: 1\nentries: []\n".to_string());
         let cache = IndexCache::new(&good, dir.path().to_path_buf(), "u".to_string()).with_ttl(0);
@@ -327,12 +330,14 @@ entries: []
         let bad = FixtureTransport::failing();
         let cache = IndexCache::new(&bad, dir.path().to_path_buf(), "u".to_string()).with_ttl(0);
         // refresh=false → falls back to cached copy.
-        cache.load(false).expect("should serve cached copy on ttl-refresh failure");
+        cache
+            .load(false)
+            .expect("should serve cached copy on ttl-refresh failure");
     }
 
-    // ac-05: --refresh + transport failure errors hard (no offline grace under explicit refresh).
+    // --refresh + transport failure errors hard (no offline grace under explicit refresh).
     #[test]
-    fn test_ac05_refresh_failure_errors_hard() {
+    fn test_refresh_failure_errors_hard() {
         let dir = TempDir::new().unwrap();
         let good = FixtureTransport::with_index("version: 1\nentries: []\n".to_string());
         IndexCache::new(&good, dir.path().to_path_buf(), "u".to_string())
@@ -345,9 +350,9 @@ entries: []
         assert!(matches!(err, Error::RegistryIndexFetch { .. }));
     }
 
-    // ac-05: no cache + transport failure errors with a clear message.
+    // no cache + transport failure errors with a clear message.
     #[test]
-    fn test_ac05_no_cache_failure_errors() {
+    fn test_no_cache_failure_errors() {
         let dir = TempDir::new().unwrap();
         let bad = FixtureTransport::failing();
         let cache = IndexCache::new(&bad, dir.path().to_path_buf(), "u".to_string());
@@ -355,16 +360,19 @@ entries: []
         assert!(matches!(err, Error::RegistryIndexFetch { .. }));
     }
 
-    // ac-05: .fetched file contains a Unix epoch integer.
+    // .fetched file contains a Unix epoch integer.
     #[test]
-    fn test_ac05_fetched_file_format_is_epoch_integer() {
+    fn test_fetched_file_format_is_epoch_integer() {
         let dir = TempDir::new().unwrap();
         let body = "version: 1\nentries: []\n".to_string();
         let transport = FixtureTransport::with_index(body);
         let cache = IndexCache::new(&transport, dir.path().to_path_buf(), "u".to_string());
         cache.load(false).unwrap();
         let raw = std::fs::read_to_string(dir.path().join("index.yaml.fetched")).unwrap();
-        let parsed: u64 = raw.trim().parse().expect("fetched file should parse as u64");
+        let parsed: u64 = raw
+            .trim()
+            .parse()
+            .expect("fetched file should parse as u64");
         assert!(parsed > 0, "epoch should be positive, got {parsed}");
     }
 }

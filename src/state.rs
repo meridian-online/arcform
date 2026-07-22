@@ -90,7 +90,13 @@ pub trait StateBackend {
     fn start_run(&self) -> Result<String>;
 
     /// Record the completion of a pipeline run.
-    fn finish_run(&self, run_id: &str, steps_executed: usize, outcome: &str, total_retries: usize) -> Result<()>;
+    fn finish_run(
+        &self,
+        run_id: &str,
+        steps_executed: usize,
+        outcome: &str,
+        total_retries: usize,
+    ) -> Result<()>;
 }
 
 /// DuckDB-backed state backend using the `duckdb` crate.
@@ -114,10 +120,10 @@ impl DuckDbStateBackend {
         // may not exist yet on a fresh checkout (the retired opaque pipelines did
         // `mkdir -p build` in their first step). Create it so `arc run` is self-
         // sufficient — otherwise opening the state db fails before any step runs.
-        if let Some(parent) = self.db_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = std::fs::create_dir_all(parent);
-            }
+        if let Some(parent) = self.db_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let _ = std::fs::create_dir_all(parent);
         }
         duckdb::Connection::open(&self.db_path).map_err(|e| Error::StateBackend(e.to_string()))
     }
@@ -151,15 +157,14 @@ impl StateBackend for DuckDbStateBackend {
             .prepare("SELECT sql_hash, status FROM _arcform_state WHERE step_name = ?1")
             .map_err(|e| Error::StateBackend(e.to_string()))?;
 
-        let result = stmt
-            .query_row([step_name], |row| {
-                let hash: String = row.get(0)?;
-                let status: String = row.get(1)?;
-                Ok(StepState {
-                    sql_hash: hash,
-                    status: StepStatus::from_str(&status),
-                })
-            });
+        let result = stmt.query_row([step_name], |row| {
+            let hash: String = row.get(0)?;
+            let status: String = row.get(1)?;
+            Ok(StepState {
+                sql_hash: hash,
+                status: StepStatus::from_str(&status),
+            })
+        });
 
         match result {
             Ok(state) => Ok(Some(state)),
@@ -180,11 +185,7 @@ impl StateBackend for DuckDbStateBackend {
     }
 
     fn start_run(&self) -> Result<String> {
-        let run_id = format!(
-            "{}-{}",
-            timestamp_id(),
-            &uuid_simple()
-        );
+        let run_id = format!("{}-{}", timestamp_id(), &uuid_simple());
         let conn = self.open()?;
         conn.execute(
             "INSERT INTO _arcform_runs (run_id, started_at) VALUES (?1, current_timestamp)",
@@ -194,7 +195,13 @@ impl StateBackend for DuckDbStateBackend {
         Ok(run_id)
     }
 
-    fn finish_run(&self, run_id: &str, steps_executed: usize, outcome: &str, total_retries: usize) -> Result<()> {
+    fn finish_run(
+        &self,
+        run_id: &str,
+        steps_executed: usize,
+        outcome: &str,
+        total_retries: usize,
+    ) -> Result<()> {
         let conn = self.open()?;
         conn.execute(
             "UPDATE _arcform_runs SET finished_at = current_timestamp, steps_executed = ?1, outcome = ?2 WHERE run_id = ?3",
@@ -261,10 +268,13 @@ pub mod mock {
     use std::cell::RefCell;
     use std::collections::HashMap;
 
+    /// A recorded run: `(run_id, Option<(steps_executed, outcome)>)`.
+    type MockRun = (String, Option<(usize, String)>);
+
     /// Mock state backend for testing.
     pub struct MockStateBackend {
         pub states: RefCell<HashMap<String, StepState>>,
-        pub runs: RefCell<Vec<(String, Option<(usize, String)>)>>,
+        pub runs: RefCell<Vec<MockRun>>,
         pub init_called: RefCell<bool>,
         /// Total retries recorded by the last finish_run call.
         pub total_retries: std::cell::Cell<usize>,
@@ -278,17 +288,6 @@ pub mod mock {
                 init_called: RefCell::new(false),
                 total_retries: std::cell::Cell::new(0),
             }
-        }
-
-        /// Pre-populate a step's state (for testing "second run" scenarios).
-        pub fn set_step_state(&self, step_name: &str, sql_hash: &str, status: StepStatus) {
-            self.states.borrow_mut().insert(
-                step_name.to_string(),
-                StepState {
-                    sql_hash: sql_hash.to_string(),
-                    status,
-                },
-            );
         }
     }
 
@@ -319,8 +318,19 @@ pub mod mock {
             Ok(id)
         }
 
-        fn finish_run(&self, run_id: &str, steps_executed: usize, outcome: &str, total_retries: usize) -> Result<()> {
-            if let Some(run) = self.runs.borrow_mut().iter_mut().find(|(id, _)| id == run_id) {
+        fn finish_run(
+            &self,
+            run_id: &str,
+            steps_executed: usize,
+            outcome: &str,
+            total_retries: usize,
+        ) -> Result<()> {
+            if let Some(run) = self
+                .runs
+                .borrow_mut()
+                .iter_mut()
+                .find(|(id, _)| id == run_id)
+            {
                 run.1 = Some((steps_executed, outcome.to_string()));
             }
             self.total_retries.set(total_retries);
@@ -333,9 +343,9 @@ pub mod mock {
 mod tests {
     use super::*;
 
-    // AC-01: StateBackend trait compiles and MockStateBackend works.
+    // StateBackend trait compiles and MockStateBackend works.
     #[test]
-    fn test_ac01_mock_state_backend() {
+    fn test_mock_state_backend() {
         let backend = mock::MockStateBackend::new();
         backend.init().unwrap();
         assert!(*backend.init_called.borrow());
@@ -344,15 +354,17 @@ mod tests {
         assert!(backend.get_step_state("foo").unwrap().is_none());
 
         // Record and retrieve.
-        backend.record_step("foo", "abc123", StepStatus::Success).unwrap();
+        backend
+            .record_step("foo", "abc123", StepStatus::Success)
+            .unwrap();
         let state = backend.get_step_state("foo").unwrap().unwrap();
         assert_eq!(state.sql_hash, "abc123");
         assert_eq!(state.status, StepStatus::Success);
     }
 
-    // AC-01: Run tracking in mock.
+    // Run tracking in mock.
     #[test]
-    fn test_ac01_mock_run_tracking() {
+    fn test_mock_run_tracking() {
         let backend = mock::MockStateBackend::new();
         let run_id = backend.start_run().unwrap();
         backend.finish_run(&run_id, 3, "success", 0).unwrap();
@@ -363,9 +375,9 @@ mod tests {
         assert_eq!(runs[0].1.as_ref().unwrap().1, "success");
     }
 
-    // AC-02: DuckDbStateBackend creates tables on first use.
+    // DuckDbStateBackend creates tables on first use.
     #[test]
-    fn test_ac02_duckdb_backend_init() {
+    fn test_duckdb_backend_init() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.duckdb");
         let backend = DuckDbStateBackend::new(&db_path);
@@ -401,15 +413,18 @@ mod tests {
         let backend = DuckDbStateBackend::new(&db_path);
         backend.init().unwrap(); // must not error on the missing parent
 
-        assert!(db_path.exists(), "state db (and its parent) should be created");
+        assert!(
+            db_path.exists(),
+            "state db (and its parent) should be created"
+        );
         // Tables are usable.
         backend.record_step("s", "h", StepStatus::Success).unwrap();
         assert_eq!(backend.get_step_state("s").unwrap().unwrap().sql_hash, "h");
     }
 
-    // AC-03: SQL content hash stored correctly.
+    // SQL content hash stored correctly.
     #[test]
-    fn test_ac03_content_hash_stored() {
+    fn test_content_hash_stored() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.duckdb");
         let backend = DuckDbStateBackend::new(&db_path);
@@ -417,16 +432,18 @@ mod tests {
 
         let sql = "CREATE TABLE foo (id INT);";
         let hash = content_hash(sql.as_bytes());
-        backend.record_step("load", &hash, StepStatus::Success).unwrap();
+        backend
+            .record_step("load", &hash, StepStatus::Success)
+            .unwrap();
 
         let state = backend.get_step_state("load").unwrap().unwrap();
         assert_eq!(state.sql_hash, hash);
         assert_eq!(state.status, StepStatus::Success);
     }
 
-    // AC-13: Run history recorded.
+    // Run history recorded.
     #[test]
-    fn test_ac13_run_history() {
+    fn test_run_history() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.duckdb");
         let backend = DuckDbStateBackend::new(&db_path);

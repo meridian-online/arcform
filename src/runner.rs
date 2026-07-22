@@ -23,10 +23,8 @@ fn load_dotenv_files(dir: &Path, dotenv_paths: &[String]) -> HashMap<String, Str
     for path_str in dotenv_paths {
         let path = dir.join(path_str);
         if let Ok(iter) = dotenvy::from_path_iter(&path) {
-            for item in iter {
-                if let Ok((key, value)) = item {
-                    vars.insert(key, value);
-                }
+            for (key, value) in iter.flatten() {
+                vars.insert(key, value);
             }
         }
         // Missing files are silently skipped (from_path_iter returns Err).
@@ -48,7 +46,10 @@ pub fn resolve_params(
     let mut resolved: HashMap<String, String> = HashMap::new();
 
     // Build a lookup from CLI params.
-    let cli_map: HashMap<&str, &str> = cli_params.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let cli_map: HashMap<&str, &str> = cli_params
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
 
     for (name, param) in manifest_params {
         // Precedence: CLI > dotenv > default.
@@ -103,8 +104,11 @@ fn execute_hook(
 
 /// Run a pipeline with no CLI parameter overrides.
 ///
-/// Backwards-compatible entry point — delegates to `run_with_params` with empty params.
-/// Used by tests and call sites that don't need parameterisation.
+/// Convenience wrapper that delegates to `run_with_params` with empty params.
+/// Only the tests need the parameterless form today; production call sites pass
+/// params explicitly, so it is scoped to test builds until a public API surface
+/// (the planned `[lib]` target) exports it deliberately.
+#[cfg(test)]
 pub fn run(dir: &Path, engine: &dyn Engine, state: &dyn StateBackend, force: bool) -> Result<()> {
     run_with_params(dir, engine, state, force, &[])
 }
@@ -124,29 +128,29 @@ pub fn run_with_params(
         let info = engine.preflight()?;
 
         // Check engine version constraint if specified.
-        if let Some(ref constraint_str) = manifest.engine_version {
-            if let Ok(req) = semver::VersionReq::parse(constraint_str) {
-                match &info.version {
-                    Some(ver) => {
-                        if !req.matches(ver) {
-                            return Err(Error::VersionMismatch {
-                                required: constraint_str.clone(),
-                                found: ver.to_string(),
-                            });
-                        }
-                    }
-                    None => {
-                        // Version unparseable — warn but don't block.
-                        eprintln!(
-                            "{} could not detect engine version — skipping version check (requires {})",
-                            "warning:".yellow(),
-                            constraint_str,
-                        );
+        if let Some(ref constraint_str) = manifest.engine_version
+            && let Ok(req) = semver::VersionReq::parse(constraint_str)
+        {
+            match &info.version {
+                Some(ver) => {
+                    if !req.matches(ver) {
+                        return Err(Error::VersionMismatch {
+                            required: constraint_str.clone(),
+                            found: ver.to_string(),
+                        });
                     }
                 }
+                None => {
+                    // Version unparseable — warn but don't block.
+                    eprintln!(
+                        "{} could not detect engine version — skipping version check (requires {})",
+                        "warning:".yellow(),
+                        constraint_str,
+                    );
+                }
             }
-            // If constraint_str is invalid, manifest validation already caught it.
         }
+        // If constraint_str is invalid, manifest validation already caught it.
     }
 
     if manifest.steps.is_empty() {
@@ -216,7 +220,12 @@ pub fn run_with_params(
         if let Err(e) = execute_hook(init_hook, engine, &db_path, dir, &env_map) {
             // on_init failure is fatal — no steps execute.
             // But on_exit still runs.
-            eprintln!("{} on_init hook '{}' failed: {}", "error:".red(), init_hook.name, e);
+            eprintln!(
+                "{} on_init hook '{}' failed: {}",
+                "error:".red(),
+                init_hook.name,
+                e
+            );
 
             // Run on_exit with ARC_PIPELINE_STATUS=init_failed.
             if let Some(ref exit_hook) = manifest.hooks.on_exit {
@@ -224,7 +233,12 @@ pub fn run_with_params(
                 exit_env.insert("ARC_PIPELINE_STATUS".to_string(), "init_failed".to_string());
                 println!("{} {} ...", "[hook]".dimmed(), exit_hook.name.bold());
                 if let Err(exit_err) = execute_hook(exit_hook, engine, &db_path, dir, &exit_env) {
-                    eprintln!("{} on_exit hook '{}' failed: {}", "warning:".yellow(), exit_hook.name, exit_err);
+                    eprintln!(
+                        "{} on_exit hook '{}' failed: {}",
+                        "warning:".yellow(),
+                        exit_hook.name,
+                        exit_err
+                    );
                 }
             }
 
@@ -279,12 +293,7 @@ pub fn run_with_params(
                 }
             }
 
-            println!(
-                "[{}/{}] {} ...",
-                i + 1,
-                total,
-                step.name.bold()
-            );
+            println!("[{}/{}] {} ...", i + 1, total, step.name.bold());
 
             // Compute the SQL hash for this step (for state recording).
             let sql_hash = if let Some(ref sql) = step.sql {
@@ -310,9 +319,10 @@ pub fn run_with_params(
 
             // Resolve effective retry policy: step-level overrides defaults wholesale.
             // Hooks do not inherit manifest defaults — only pipeline steps do.
-            let effective_retry = step.retry.as_ref().or_else(|| {
-                manifest.defaults.as_ref().and_then(|d| d.retry.as_ref())
-            });
+            let effective_retry = step
+                .retry
+                .as_ref()
+                .or_else(|| manifest.defaults.as_ref().and_then(|d| d.retry.as_ref()));
 
             let max_attempts = effective_retry.map_or(1, |r| r.max_attempts);
 
@@ -330,7 +340,9 @@ pub fn run_with_params(
                         let delay = backoff_duration(policy, attempt);
                         eprintln!(
                             "[retry {}/{}, backoff {:.1}s]",
-                            attempt, max_attempts, delay.as_secs_f64()
+                            attempt,
+                            max_attempts,
+                            delay.as_secs_f64()
                         );
                         std::thread::sleep(delay);
                     }
@@ -409,7 +421,9 @@ pub fn run_with_params(
                         });
                         // Continue to next attempt if retries remain.
                     }
-                    Err(Error::StepTimeout { step: timed_out_step }) => {
+                    Err(Error::StepTimeout {
+                        step: timed_out_step,
+                    }) => {
                         // A timed-out step counts as a failed attempt — retryable.
                         last_error = Some(Error::StepTimeout {
                             step: timed_out_step,
@@ -469,7 +483,12 @@ pub fn run_with_params(
                 println!("{} {} ...", "[hook]".dimmed(), success_hook.name.bold());
                 if let Err(e) = execute_hook(success_hook, engine, &db_path, dir, &env_map) {
                     // Non-fatal: report but keep Ok result.
-                    eprintln!("{} on_success hook '{}' failed: {}", "warning:".yellow(), success_hook.name, e);
+                    eprintln!(
+                        "{} on_success hook '{}' failed: {}",
+                        "warning:".yellow(),
+                        success_hook.name,
+                        e
+                    );
                 }
             }
         }
@@ -495,9 +514,16 @@ pub fn run_with_params(
                 }
 
                 println!("{} {} ...", "[hook]".dimmed(), failure_hook.name.bold());
-                if let Err(hook_err) = execute_hook(failure_hook, engine, &db_path, dir, &failure_env) {
+                if let Err(hook_err) =
+                    execute_hook(failure_hook, engine, &db_path, dir, &failure_env)
+                {
                     // Non-fatal: report but keep original error.
-                    eprintln!("{} on_failure hook '{}' failed: {}", "warning:".yellow(), failure_hook.name, hook_err);
+                    eprintln!(
+                        "{} on_failure hook '{}' failed: {}",
+                        "warning:".yellow(),
+                        failure_hook.name,
+                        hook_err
+                    );
                 }
             }
         }
@@ -506,38 +532,41 @@ pub fn run_with_params(
     // --- on_exit hook (try/finally) ---
     // on_exit runs if on_init was attempted OR if any steps ran (even without on_init).
     let should_run_exit = init_attempted || !manifest.steps.is_empty();
-    if should_run_exit {
-        if let Some(ref exit_hook) = manifest.hooks.on_exit {
-            let mut exit_env = env_map.clone();
-            match &step_loop_result {
-                Ok(()) => {
-                    exit_env.insert("ARC_PIPELINE_STATUS".to_string(), "success".to_string());
-                }
-                Err(e) => {
-                    exit_env.insert("ARC_PIPELINE_STATUS".to_string(), "failed".to_string());
-                    // Inject failure context on failed status.
-                    match e {
-                        Error::StepFailed { step, code, .. } => {
-                            exit_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
-                            exit_env.insert("ARC_EXIT_CODE".to_string(), code.to_string());
-                        }
-                        Error::StepTimeout { step } => {
-                            exit_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
-                            exit_env.insert("ARC_EXIT_CODE".to_string(), "timeout".to_string());
-                        }
-                        Error::PipelineTimeout { step, .. } => {
-                            exit_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
-                            exit_env.insert("ARC_EXIT_CODE".to_string(), "timeout".to_string());
-                        }
-                        _ => {}
+    if should_run_exit && let Some(ref exit_hook) = manifest.hooks.on_exit {
+        let mut exit_env = env_map.clone();
+        match &step_loop_result {
+            Ok(()) => {
+                exit_env.insert("ARC_PIPELINE_STATUS".to_string(), "success".to_string());
+            }
+            Err(e) => {
+                exit_env.insert("ARC_PIPELINE_STATUS".to_string(), "failed".to_string());
+                // Inject failure context on failed status.
+                match e {
+                    Error::StepFailed { step, code, .. } => {
+                        exit_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
+                        exit_env.insert("ARC_EXIT_CODE".to_string(), code.to_string());
                     }
+                    Error::StepTimeout { step } => {
+                        exit_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
+                        exit_env.insert("ARC_EXIT_CODE".to_string(), "timeout".to_string());
+                    }
+                    Error::PipelineTimeout { step, .. } => {
+                        exit_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
+                        exit_env.insert("ARC_EXIT_CODE".to_string(), "timeout".to_string());
+                    }
+                    _ => {}
                 }
             }
+        }
 
-            println!("{} {} ...", "[hook]".dimmed(), exit_hook.name.bold());
-            if let Err(exit_err) = execute_hook(exit_hook, engine, &db_path, dir, &exit_env) {
-                eprintln!("{} on_exit hook '{}' failed: {}", "warning:".yellow(), exit_hook.name, exit_err);
-            }
+        println!("{} {} ...", "[hook]".dimmed(), exit_hook.name.bold());
+        if let Err(exit_err) = execute_hook(exit_hook, engine, &db_path, dir, &exit_env) {
+            eprintln!(
+                "{} on_exit hook '{}' failed: {}",
+                "warning:".yellow(),
+                exit_hook.name,
+                exit_err
+            );
         }
     }
 
@@ -565,7 +594,11 @@ pub fn run_with_params(
         step_outcomes: &step_outcomes,
     });
     if let Err(e) = contract::write_contract(&runs_dir, &run_id, &run_contract) {
-        eprintln!("{} could not write run contract: {}", "warning:".yellow(), e);
+        eprintln!(
+            "{} could not write run contract: {}",
+            "warning:".yellow(),
+            e
+        );
     }
     stream.complete(outcome);
     print!("{}", contract::render_dag(&run_contract));
@@ -582,12 +615,7 @@ pub fn run_with_params(
                     skipped,
                 );
             } else {
-                println!(
-                    "\n{} {}/{} steps succeeded.",
-                    "✓".green(),
-                    succeeded,
-                    total,
-                );
+                println!("\n{} {}/{} steps succeeded.", "✓".green(), succeeded, total,);
             }
             Ok(())
         }
@@ -644,7 +672,10 @@ fn compute_staleness(
         for step in &manifest.steps {
             stale.insert(step.name.clone());
         }
-        return Ok(Staleness { stale, skip_reasons: HashMap::new() });
+        return Ok(Staleness {
+            stale,
+            skip_reasons: HashMap::new(),
+        });
     }
 
     // Phase 1: Check each step's own staleness, and note why a fresh step is skippable.
@@ -657,7 +688,10 @@ fn compute_staleness(
                 stale.insert(step.name.clone());
             } else if precondition::evaluate_all(&step.preconditions, dir, &step.name, env)? {
                 // All preconditions fresh — skippable via the precondition mechanism.
-                reasons.insert(step.name.clone(), precondition_skip_reason(&step.preconditions));
+                reasons.insert(
+                    step.name.clone(),
+                    precondition_skip_reason(&step.preconditions),
+                );
             } else {
                 stale.insert(step.name.clone());
             }
@@ -682,7 +716,10 @@ fn compute_staleness(
                 stale.insert(step.name.clone());
             } else {
                 // Both clean — the precondition kind is the more specific signal.
-                reasons.insert(step.name.clone(), precondition_skip_reason(&step.preconditions));
+                reasons.insert(
+                    step.name.clone(),
+                    precondition_skip_reason(&step.preconditions),
+                );
             }
         }
     }
@@ -698,7 +735,10 @@ fn compute_staleness(
     // is no longer skipped — drop its provisional reason.
     reasons.retain(|name, _| !stale.contains(name));
 
-    Ok(Staleness { stale, skip_reasons: reasons })
+    Ok(Staleness {
+        stale,
+        skip_reasons: reasons,
+    })
 }
 
 /// Staleness hash for an `op:` step: the operator reference plus its serialized `with:`
@@ -771,7 +811,7 @@ mod tests {
         }
     }
 
-    // AC-8: Empty steps list exits successfully.
+    // Empty steps list exits successfully.
     #[test]
     fn test_run_empty_steps() {
         let dir = tempfile::tempdir().unwrap();
@@ -783,7 +823,7 @@ mod tests {
         assert!(engine.calls.borrow().is_empty());
     }
 
-    // AC-3: Steps execute in declared order against shared database.
+    // Steps execute in declared order against shared database.
     #[test]
     fn test_run_sql_steps_in_order() {
         let dir = tempfile::tempdir().unwrap();
@@ -824,12 +864,11 @@ mod tests {
         );
     }
 
-    // AC-9: Command steps execute via sh -c, preflight skipped for command-only.
+    // Command steps execute via sh -c, preflight skipped for command-only.
     #[test]
     fn test_run_command_step() {
         let dir = tempfile::tempdir().unwrap();
-        let yaml =
-            "name: test\nsteps:\n  - name: greet\n    command: echo hello\n";
+        let yaml = "name: test\nsteps:\n  - name: greet\n    command: echo hello\n";
         setup_project(dir.path(), yaml, &[]);
 
         let engine = MockEngine::new();
@@ -842,7 +881,7 @@ mod tests {
         assert!(matches!(&calls[0], MockCall::Command { command, .. } if command == "echo hello"));
     }
 
-    // AC-4: Halt on failure — steps after a failed step do not execute.
+    // Halt on failure — steps after a failed step do not execute.
     #[test]
     fn test_run_halts_on_step2_failure_step3_skipped() {
         let dir = tempfile::tempdir().unwrap();
@@ -865,10 +904,13 @@ mod tests {
         assert!(result.is_err());
 
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("s2"), "error should name step 's2': {err_msg}");
+        assert!(
+            err_msg.contains("s2"),
+            "error should name step 's2': {err_msg}"
+        );
     }
 
-    // AC-5: Missing SQL file produces a specific error.
+    // Missing SQL file produces a specific error.
     #[test]
     fn test_run_missing_sql_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -881,7 +923,7 @@ mod tests {
         assert!(err.to_string().contains("sql file not found"));
     }
 
-    // AC-7: SQL files passed to engine byte-identical.
+    // SQL files passed to engine byte-identical.
     #[test]
     fn test_sql_content_passed_unmodified() {
         let dir = tempfile::tempdir().unwrap();
@@ -901,9 +943,9 @@ mod tests {
         assert_eq!(sql_content, original_sql);
     }
 
-    // AC-6: Preflight failure blocks execution — no steps run.
+    // Preflight failure blocks execution — no steps run.
     #[test]
-    fn test_ac06_preflight_failure_blocks_execution() {
+    fn test_preflight_failure_blocks_execution() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
@@ -919,9 +961,9 @@ mod tests {
         );
     }
 
-    // AC-9: Failing command step exits non-zero and halts pipeline.
+    // Failing command step exits non-zero and halts pipeline.
     #[test]
-    fn test_ac09_command_step_failure_halts_pipeline() {
+    fn test_command_step_failure_halts_pipeline() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: fetch\n    command: curl http://example.com\n  - name: transform\n    command: echo done\n";
         setup_project(dir.path(), yaml, &[]);
@@ -940,9 +982,9 @@ mod tests {
         );
     }
 
-    // v0.2 AC-06: `arc run` halts with dependency order violation before executing.
+    // `arc run` halts with dependency order violation before executing.
     #[test]
-    fn test_v02_ac06_dependency_order_blocks_execution() {
+    fn test_v02_dependency_order_blocks_execution() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: summary\n    sql: models/summary.sql\n  - name: load\n    sql: models/load.sql\n";
         setup_project(
@@ -973,9 +1015,9 @@ mod tests {
         );
     }
 
-    // v0.2 AC-08: v0.1-style manifest (no assets) runs identically.
+    // v0.1-style manifest (no assets) runs identically.
     #[test]
-    fn test_v02_ac08_v1_manifest_runs_unchanged() {
+    fn test_v02_v1_manifest_runs_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: greet\n    command: echo hello\n  - name: done\n    command: echo done\n";
         setup_project(dir.path(), yaml, &[]);
@@ -988,9 +1030,9 @@ mod tests {
         assert_eq!(calls.len(), 2);
     }
 
-    // v0.2 AC-07: Unparseable SQL warns but still executes.
+    // Unparseable SQL warns but still executes.
     #[test]
-    fn test_v02_ac07_unparseable_sql_still_runs() {
+    fn test_v02_unparseable_sql_still_runs() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: weird\n    sql: models/weird.sql\n";
         setup_project(
@@ -1007,9 +1049,9 @@ mod tests {
         assert_eq!(calls.len(), 2); // preflight + 1 SQL
     }
 
-    // v0.2 AC-09: Multi-step chain with valid ordering succeeds.
+    // Multi-step chain with valid ordering succeeds.
     #[test]
-    fn test_v02_ac09_valid_chain_succeeds() {
+    fn test_v02_valid_chain_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: step-a\n    sql: models/a.sql\n  - name: step-b\n    sql: models/b.sql\n  - name: step-c\n    sql: models/c.sql\n";
         setup_project(
@@ -1032,9 +1074,9 @@ mod tests {
 
     // ---- v0.3 Staleness Tests ----
 
-    // v0.3 AC-04: Fresh SQL step is skipped on second run.
+    // Fresh SQL step is skipped on second run.
     #[test]
-    fn test_v03_ac04_fresh_step_skipped() {
+    fn test_v03_fresh_step_skipped() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
         let sql = "CREATE TABLE t(v TEXT);";
@@ -1059,9 +1101,9 @@ mod tests {
         assert!(matches!(calls[0], MockCall::Preflight));
     }
 
-    // v0.3 AC-05: Stale SQL step re-runs after edit.
+    // Stale SQL step re-runs after edit.
     #[test]
-    fn test_v03_ac05_stale_step_reruns() {
+    fn test_v03_stale_step_reruns() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
@@ -1081,12 +1123,16 @@ mod tests {
         run(dir.path(), &engine, &state, false).unwrap();
 
         let calls = engine.calls.borrow();
-        assert_eq!(calls.len(), 2, "stale step should re-run: preflight + 1 sql");
+        assert_eq!(
+            calls.len(),
+            2,
+            "stale step should re-run: preflight + 1 sql"
+        );
     }
 
-    // v0.3 AC-06: Downstream propagation — stale upstream makes dependents stale.
+    // Downstream propagation — stale upstream makes dependents stale.
     #[test]
-    fn test_v03_ac06_downstream_propagation() {
+    fn test_v03_downstream_propagation() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: step-a\n    sql: models/a.sql\n  - name: step-b\n    sql: models/b.sql\n  - name: step-c\n    sql: models/c.sql\n";
         setup_project(
@@ -1106,7 +1152,11 @@ mod tests {
         run(dir.path(), &engine, &state, false).unwrap();
 
         // Edit only step-a's SQL.
-        fs::write(dir.path().join("models/a.sql"), "CREATE TABLE x (id INT, name TEXT);").unwrap();
+        fs::write(
+            dir.path().join("models/a.sql"),
+            "CREATE TABLE x (id INT, name TEXT);",
+        )
+        .unwrap();
 
         // Second run — all three should re-run (a is stale, b and c are downstream).
         drop(engine);
@@ -1118,12 +1168,16 @@ mod tests {
             .iter()
             .filter(|c| matches!(c, MockCall::Sql { .. }))
             .collect();
-        assert_eq!(sql_calls.len(), 3, "all 3 steps should re-run due to downstream propagation");
+        assert_eq!(
+            sql_calls.len(),
+            3,
+            "all 3 steps should re-run due to downstream propagation"
+        );
     }
 
-    // v0.3 AC-08: Failed step always re-runs.
+    // Failed step always re-runs.
     #[test]
-    fn test_v03_ac08_failed_step_reruns() {
+    fn test_v03_failed_step_reruns() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
@@ -1152,9 +1206,9 @@ mod tests {
         assert_eq!(sql_calls.len(), 1, "failed step should re-run");
     }
 
-    // v0.3 AC-09: Command steps always re-run.
+    // Command steps always re-run.
     #[test]
-    fn test_v03_ac09_command_always_reruns() {
+    fn test_v03_command_always_reruns() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: greet\n    command: echo hello\n";
         setup_project(dir.path(), yaml, &[]);
@@ -1174,9 +1228,9 @@ mod tests {
         assert_eq!(calls.len(), 1, "command step should always re-run");
     }
 
-    // v0.3 AC-10: --force runs all steps regardless of staleness.
+    // --force runs all steps regardless of staleness.
     #[test]
-    fn test_v03_ac10_force_runs_all() {
+    fn test_v03_force_runs_all() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
@@ -1214,9 +1268,9 @@ mod tests {
         }
     }
 
-    // v0.3 AC-11: First run treats all steps as stale.
+    // First run treats all steps as stale.
     #[test]
-    fn test_v03_ac11_first_run_all_stale() {
+    fn test_v03_first_run_all_stale() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n  - name: s2\n    sql: models/s2.sql\n";
         setup_project(
@@ -1244,11 +1298,12 @@ mod tests {
 
     // ---- Local-Remote Parity Tests ----
 
-    // lrp ac-05: Version mismatch blocks execution before any step runs.
+    // Version mismatch blocks execution before any step runs.
     #[test]
-    fn test_lrp_ac05_version_mismatch_blocks_execution() {
+    fn test_lrp_version_mismatch_blocks_execution() {
         let dir = tempfile::tempdir().unwrap();
-        let yaml = "name: test\nengine_version: '>=2.0'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        let yaml =
+            "name: test\nengine_version: '>=2.0'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
 
         let engine = MockEngine::new();
@@ -1265,11 +1320,12 @@ mod tests {
         assert!(matches!(calls[0], MockCall::Preflight));
     }
 
-    // lrp ac-06: Version mismatch error contains both required and found versions.
+    // Version mismatch error contains both required and found versions.
     #[test]
-    fn test_lrp_ac06_error_contains_both_versions() {
+    fn test_lrp_error_contains_both_versions() {
         let dir = tempfile::tempdir().unwrap();
-        let yaml = "name: test\nengine_version: '>=2.0'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        let yaml =
+            "name: test\nengine_version: '>=2.0'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
 
         let engine = MockEngine::new();
@@ -1278,13 +1334,19 @@ mod tests {
 
         let err = run(dir.path(), &engine, &state, false).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains(">=2.0"), "error should contain constraint: {msg}");
-        assert!(msg.contains("1.3.0"), "error should contain detected version: {msg}");
+        assert!(
+            msg.contains(">=2.0"),
+            "error should contain constraint: {msg}"
+        );
+        assert!(
+            msg.contains("1.3.0"),
+            "error should contain detected version: {msg}"
+        );
     }
 
-    // lrp ac-07: No engine_version skips the version check.
+    // No engine_version skips the version check.
     #[test]
-    fn test_lrp_ac07_no_version_constraint_skips_check() {
+    fn test_lrp_no_version_constraint_skips_check() {
         let dir = tempfile::tempdir().unwrap();
         // No engine_version in YAML — should skip version check.
         let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
@@ -1299,11 +1361,12 @@ mod tests {
         run(dir.path(), &engine, &state, false).unwrap();
     }
 
-    // lrp ac-05: Version that satisfies constraint passes.
+    // Version that satisfies constraint passes.
     #[test]
-    fn test_lrp_ac05_version_satisfies_constraint() {
+    fn test_lrp_version_satisfies_constraint() {
         let dir = tempfile::tempdir().unwrap();
-        let yaml = "name: test\nengine_version: '>=1.5'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        let yaml =
+            "name: test\nengine_version: '>=1.5'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
 
         let engine = MockEngine::new();
@@ -1314,11 +1377,12 @@ mod tests {
         run(dir.path(), &engine, &state, false).unwrap();
     }
 
-    // lrp ac-12: Unparseable version warns but pipeline continues.
+    // Unparseable version warns but pipeline continues.
     #[test]
-    fn test_lrp_ac12_unparseable_version_warns_continues() {
+    fn test_lrp_unparseable_version_warns_continues() {
         let dir = tempfile::tempdir().unwrap();
-        let yaml = "name: test\nengine_version: '>=1.5'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        let yaml =
+            "name: test\nengine_version: '>=1.5'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
 
         let engine = MockEngine::new();
@@ -1335,14 +1399,18 @@ mod tests {
             .iter()
             .filter(|c| matches!(c, MockCall::Sql { .. }))
             .collect();
-        assert_eq!(sql_calls.len(), 1, "step should execute despite unparseable version");
+        assert_eq!(
+            sql_calls.len(),
+            1,
+            "step should execute despite unparseable version"
+        );
     }
 
     // ---- Step Preconditions Tests ----
 
-    // pre ac-02: YAML with preconditions deserialises correctly.
+    // YAML with preconditions deserialises correctly.
     #[test]
-    fn test_pre_ac02_preconditions_deserialise() {
+    fn test_pre_preconditions_deserialise() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -1360,9 +1428,9 @@ steps:
         assert_eq!(manifest.steps[0].preconditions.len(), 2);
     }
 
-    // pre ac-02: YAML without preconditions still works (backwards compat).
+    // YAML without preconditions still works (backwards compat).
     #[test]
-    fn test_pre_ac02_no_preconditions_backwards_compat() {
+    fn test_pre_no_preconditions_backwards_compat() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: greet\n    command: echo hello\n";
         setup_project(dir.path(), yaml, &[]);
@@ -1370,9 +1438,9 @@ steps:
         assert!(manifest.steps[0].preconditions.is_empty());
     }
 
-    // pre ac-07: Command step with passing precondition is skipped.
+    // Command step with passing precondition is skipped.
     #[test]
-    fn test_pre_ac07_command_with_fresh_precondition_skipped() {
+    fn test_pre_command_with_fresh_precondition_skipped() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -1396,9 +1464,9 @@ steps:
         );
     }
 
-    // pre ac-07: Command step with failing precondition runs.
+    // Command step with failing precondition runs.
     #[test]
-    fn test_pre_ac07_command_with_stale_precondition_runs() {
+    fn test_pre_command_with_stale_precondition_runs() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -1415,14 +1483,20 @@ steps:
 
         // Precondition "false" exits non-zero → stale → step runs.
         let calls = engine.calls.borrow();
-        assert_eq!(calls.len(), 1, "command step with stale precondition should run");
-        assert!(matches!(&calls[0], MockCall::Command { command, .. } if command == "echo fetching"));
+        assert_eq!(
+            calls.len(),
+            1,
+            "command step with stale precondition should run"
+        );
+        assert!(
+            matches!(&calls[0], MockCall::Command { command, .. } if command == "echo fetching")
+        );
     }
 
-    // pre ac-08: Command steps without preconditions still always re-run.
-    // (Verified by existing test_v03_ac09_command_always_reruns — this is a confirmation.)
+    // Command steps without preconditions still always re-run.
+    // (Verified by existing test_v03_command_always_reruns — this is a confirmation.)
     #[test]
-    fn test_pre_ac08_command_no_preconditions_always_runs() {
+    fn test_pre_command_no_preconditions_always_runs() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: greet\n    command: echo hello\n";
         setup_project(dir.path(), yaml, &[]);
@@ -1437,12 +1511,16 @@ steps:
         let engine2 = MockEngine::new();
         run(dir.path(), &engine2, &state, false).unwrap();
         let calls = engine2.calls.borrow();
-        assert_eq!(calls.len(), 1, "command step without preconditions should always re-run");
+        assert_eq!(
+            calls.len(),
+            1,
+            "command step without preconditions should always re-run"
+        );
     }
 
-    // pre ac-09: SQL + preconditions — fresh hash + stale precondition → runs.
+    // SQL + preconditions — fresh hash + stale precondition → runs.
     #[test]
-    fn test_pre_ac09_sql_fresh_hash_stale_precondition_runs() {
+    fn test_pre_sql_fresh_hash_stale_precondition_runs() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -1463,13 +1541,20 @@ steps:
         let engine2 = MockEngine::new();
         run(dir.path(), &engine2, &state, false).unwrap();
         let calls = engine2.calls.borrow();
-        let sql_calls: Vec<_> = calls.iter().filter(|c| matches!(c, MockCall::Sql { .. })).collect();
-        assert_eq!(sql_calls.len(), 1, "SQL step should run when precondition is stale");
+        let sql_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(c, MockCall::Sql { .. }))
+            .collect();
+        assert_eq!(
+            sql_calls.len(),
+            1,
+            "SQL step should run when precondition is stale"
+        );
     }
 
-    // pre ac-09: SQL + preconditions — stale hash + fresh precondition → runs.
+    // SQL + preconditions — stale hash + fresh precondition → runs.
     #[test]
-    fn test_pre_ac09_sql_stale_hash_fresh_precondition_runs() {
+    fn test_pre_sql_stale_hash_fresh_precondition_runs() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -1493,13 +1578,20 @@ steps:
         let engine2 = MockEngine::new();
         run(dir.path(), &engine2, &state, false).unwrap();
         let calls = engine2.calls.borrow();
-        let sql_calls: Vec<_> = calls.iter().filter(|c| matches!(c, MockCall::Sql { .. })).collect();
-        assert_eq!(sql_calls.len(), 1, "SQL step should run when hash is stale (AND semantics)");
+        let sql_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(c, MockCall::Sql { .. }))
+            .collect();
+        assert_eq!(
+            sql_calls.len(),
+            1,
+            "SQL step should run when hash is stale (AND semantics)"
+        );
     }
 
-    // pre ac-09: SQL + preconditions — both fresh → skips.
+    // SQL + preconditions — both fresh → skips.
     #[test]
-    fn test_pre_ac09_sql_both_fresh_skips() {
+    fn test_pre_sql_both_fresh_skips() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -1520,13 +1612,20 @@ steps:
         let engine2 = MockEngine::new();
         run(dir.path(), &engine2, &state, false).unwrap();
         let calls = engine2.calls.borrow();
-        let sql_calls: Vec<_> = calls.iter().filter(|c| matches!(c, MockCall::Sql { .. })).collect();
-        assert_eq!(sql_calls.len(), 0, "SQL step should be skipped when both hash and precondition are fresh");
+        let sql_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(c, MockCall::Sql { .. }))
+            .collect();
+        assert_eq!(
+            sql_calls.len(),
+            0,
+            "SQL step should be skipped when both hash and precondition are fresh"
+        );
     }
 
-    // pre ac-09: SQL + preconditions — both stale → runs.
+    // SQL + preconditions — both stale → runs.
     #[test]
-    fn test_pre_ac09_sql_both_stale_runs() {
+    fn test_pre_sql_both_stale_runs() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -1548,14 +1647,21 @@ steps:
         let engine2 = MockEngine::new();
         run(dir.path(), &engine2, &state, false).unwrap();
         let calls = engine2.calls.borrow();
-        let sql_calls: Vec<_> = calls.iter().filter(|c| matches!(c, MockCall::Sql { .. })).collect();
-        assert_eq!(sql_calls.len(), 1, "SQL step should run when both hash and precondition are stale");
+        let sql_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(c, MockCall::Sql { .. }))
+            .collect();
+        assert_eq!(
+            sql_calls.len(),
+            1,
+            "SQL step should run when both hash and precondition are stale"
+        );
     }
 
-    // pre ac-10: SQL steps without preconditions use hash staleness unchanged.
-    // (Verified by existing tests test_v03_ac04, ac05, ac06 — this confirms no regression.)
+    // SQL steps without preconditions use hash staleness unchanged.
+    // (Verified by the existing v0.3 asset-graph tests — this confirms no regression.)
     #[test]
-    fn test_pre_ac10_sql_no_preconditions_uses_hash() {
+    fn test_pre_sql_no_preconditions_uses_hash() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
@@ -1570,13 +1676,20 @@ steps:
         let engine2 = MockEngine::new();
         run(dir.path(), &engine2, &state, false).unwrap();
         let calls = engine2.calls.borrow();
-        let sql_calls: Vec<_> = calls.iter().filter(|c| matches!(c, MockCall::Sql { .. })).collect();
-        assert_eq!(sql_calls.len(), 0, "SQL step without preconditions should use hash staleness");
+        let sql_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(c, MockCall::Sql { .. }))
+            .collect();
+        assert_eq!(
+            sql_calls.len(),
+            0,
+            "SQL step without preconditions should use hash staleness"
+        );
     }
 
-    // pre ac-11: --force overrides preconditions — step runs regardless.
+    // --force overrides preconditions — step runs regardless.
     #[test]
-    fn test_pre_ac11_force_overrides_preconditions() {
+    fn test_pre_force_overrides_preconditions() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -1598,12 +1711,14 @@ steps:
             1,
             "--force should override fresh precondition and run the step"
         );
-        assert!(matches!(&calls[0], MockCall::Command { command, .. } if command == "echo fetching"));
+        assert!(
+            matches!(&calls[0], MockCall::Command { command, .. } if command == "echo fetching")
+        );
     }
 
-    // pre ac-15: Manifest validation rejects invalid precondition duration.
+    // Manifest validation rejects invalid precondition duration.
     #[test]
-    fn test_pre_ac15_manifest_rejects_invalid_precondition() {
+    fn test_pre_manifest_rejects_invalid_precondition() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -1618,14 +1733,17 @@ steps:
         setup_project(dir.path(), yaml, &[]);
         let err = crate::manifest::Manifest::load(dir.path()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("banana"), "error should mention the bad duration: {msg}");
+        assert!(
+            msg.contains("banana"),
+            "error should mention the bad duration: {msg}"
+        );
     }
 
     // ---- Pipeline Parameterisation Tests ----
 
-    // param ac-01: Manifest with params and dotenv fields deserialises correctly.
+    // Manifest with params and dotenv fields deserialises correctly.
     #[test]
-    fn test_param_ac01_manifest_with_params_deserialises() {
+    fn test_param_manifest_with_params_deserialises() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -1651,9 +1769,9 @@ steps:
         assert_eq!(manifest.dotenv, vec![".env", ".env.local"]);
     }
 
-    // param ac-01: Manifest without params/dotenv deserialises to empty defaults.
+    // Manifest without params/dotenv deserialises to empty defaults.
     #[test]
-    fn test_param_ac01_manifest_without_params_empty_defaults() {
+    fn test_param_manifest_without_params_empty_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: greet\n    command: echo hello\n";
         setup_project(dir.path(), yaml, &[]);
@@ -1662,47 +1780,68 @@ steps:
         assert!(manifest.dotenv.is_empty());
     }
 
-    // param ac-02: parse_params with valid KEY=VALUE pairs.
+    // parse_params with valid KEY=VALUE pairs.
     #[test]
-    fn test_param_ac02_parse_valid_params() {
+    fn test_param_parse_valid_params() {
         let raw = vec![
             "start_date=2026-01-01".to_string(),
             "region=us-east-1".to_string(),
         ];
         let parsed = crate::cli::parse_params(&raw).unwrap();
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0], ("start_date".to_string(), "2026-01-01".to_string()));
+        assert_eq!(
+            parsed[0],
+            ("start_date".to_string(), "2026-01-01".to_string())
+        );
         assert_eq!(parsed[1], ("region".to_string(), "us-east-1".to_string()));
     }
 
-    // param ac-02: parse_params splits on first '=' only.
+    // parse_params splits on first '=' only.
     #[test]
-    fn test_param_ac02_parse_value_with_equals() {
+    fn test_param_parse_value_with_equals() {
         let raw = vec!["query=SELECT * FROM t WHERE x=1".to_string()];
         let parsed = crate::cli::parse_params(&raw).unwrap();
         assert_eq!(parsed[0].0, "query");
         assert_eq!(parsed[0].1, "SELECT * FROM t WHERE x=1");
     }
 
-    // param ac-02: parse_params rejects missing '='.
+    // parse_params rejects missing '='.
     #[test]
-    fn test_param_ac02_parse_invalid_no_equals() {
+    fn test_param_parse_invalid_no_equals() {
         let raw = vec!["no_equals_here".to_string()];
         let err = crate::cli::parse_params(&raw).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("KEY=VALUE"), "error should mention format: {msg}");
+        assert!(
+            msg.contains("KEY=VALUE"),
+            "error should mention format: {msg}"
+        );
     }
 
-    // param ac-03: resolve_params merges sources with correct precedence.
+    // resolve_params merges sources with correct precedence.
     #[test]
-    fn test_param_ac03_resolve_params_precedence() {
-        use indexmap::IndexMap;
+    fn test_param_resolve_params_precedence() {
         use crate::manifest::Param;
+        use indexmap::IndexMap;
 
         let mut params = IndexMap::new();
-        params.insert("a".to_string(), Param { default: Some("default_a".to_string()) });
-        params.insert("b".to_string(), Param { default: Some("default_b".to_string()) });
-        params.insert("c".to_string(), Param { default: Some("default_c".to_string()) });
+        params.insert(
+            "a".to_string(),
+            Param {
+                default: Some("default_a".to_string()),
+            },
+        );
+        params.insert(
+            "b".to_string(),
+            Param {
+                default: Some("default_b".to_string()),
+            },
+        );
+        params.insert(
+            "c".to_string(),
+            Param {
+                default: Some("default_c".to_string()),
+            },
+        );
 
         let mut dotenv_vars = std::collections::HashMap::new();
         dotenv_vars.insert("a".to_string(), "dotenv_a".to_string());
@@ -1720,11 +1859,11 @@ steps:
         assert_eq!(resolved["ARC_PARAM_C"], "default_c");
     }
 
-    // param ac-03: resolve_params errors on missing required param.
+    // resolve_params errors on missing required param.
     #[test]
-    fn test_param_ac03_missing_required_param() {
-        use indexmap::IndexMap;
+    fn test_param_missing_required_param() {
         use crate::manifest::Param;
+        use indexmap::IndexMap;
 
         let mut params = IndexMap::new();
         params.insert("required_param".to_string(), Param { default: None });
@@ -1734,15 +1873,18 @@ steps:
 
         let err = resolve_params(&params, &dotenv_vars, &cli_params).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("required_param"), "error should name the param: {msg}");
+        assert!(
+            msg.contains("required_param"),
+            "error should name the param: {msg}"
+        );
         assert!(msg.contains("missing"), "error should say missing: {msg}");
     }
 
-    // param ac-04: ARC_PARAM_ prefix and uppercasing.
+    // ARC_PARAM_ prefix and uppercasing.
     #[test]
-    fn test_param_ac04_arc_param_prefix_uppercasing() {
-        use indexmap::IndexMap;
+    fn test_param_arc_param_prefix_uppercasing() {
         use crate::manifest::Param;
+        use indexmap::IndexMap;
 
         let mut params = IndexMap::new();
         params.insert("start_date".to_string(), Param { default: None });
@@ -1754,9 +1896,9 @@ steps:
         assert_eq!(resolved.get("ARC_PARAM_START_DATE").unwrap(), "2026-01-01");
     }
 
-    // param ac-05: MockEngine records env map passed to it.
+    // MockEngine records env map passed to it.
     #[test]
-    fn test_param_ac05_mock_engine_records_env() {
+    fn test_param_mock_engine_records_env() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -1783,9 +1925,9 @@ steps:
         }
     }
 
-    // param ac-06: Dotenv file loading.
+    // Dotenv file loading.
     #[test]
-    fn test_param_ac06_dotenv_file_loading() {
+    fn test_param_dotenv_file_loading() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -1815,9 +1957,9 @@ steps:
         }
     }
 
-    // param ac-06: Missing dotenv file is silently skipped.
+    // Missing dotenv file is silently skipped.
     #[test]
-    fn test_param_ac06_missing_dotenv_silently_skipped() {
+    fn test_param_missing_dotenv_silently_skipped() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -1848,9 +1990,9 @@ steps:
         }
     }
 
-    // param ac-07: Step output capture — captured value available downstream.
+    // Step output capture — captured value available downstream.
     #[test]
-    fn test_param_ac07_output_capture_available_downstream() {
+    fn test_param_output_capture_available_downstream() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -1888,9 +2030,9 @@ steps:
         }
     }
 
-    // param ac-07: Empty captured stdout sets env var to empty string.
+    // Empty captured stdout sets env var to empty string.
     #[test]
-    fn test_param_ac07_empty_stdout_sets_empty_string() {
+    fn test_param_empty_stdout_sets_empty_string() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -1928,9 +2070,9 @@ steps:
         }
     }
 
-    // param ac-08: SQL step with output field is rejected.
+    // SQL step with output field is rejected.
     #[test]
-    fn test_param_ac08_sql_step_output_rejected() {
+    fn test_param_sql_step_output_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -1948,9 +2090,9 @@ steps:
         );
     }
 
-    // param ac-09: Backwards compatibility — existing manifests work identically.
+    // Backwards compatibility — existing manifests work identically.
     #[test]
-    fn test_param_ac09_backwards_compat_no_params() {
+    fn test_param_backwards_compat_no_params() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
@@ -1970,9 +2112,9 @@ steps:
         }
     }
 
-    // param ac-10: Changing param values does not affect SQL staleness.
+    // Changing param values does not affect SQL staleness.
     #[test]
-    fn test_param_ac10_param_staleness_independence() {
+    fn test_param_param_staleness_independence() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2013,9 +2155,9 @@ steps:
 
     // ---- Execution Resilience Tests ----
 
-    // res ac-01: RetryPolicy and Defaults structs deserialise from YAML.
+    // RetryPolicy and Defaults structs deserialise from YAML.
     #[test]
-    fn test_res_ac01_retry_policy_deserialises() {
+    fn test_res_retry_policy_deserialises() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2035,9 +2177,9 @@ steps:
         assert_eq!(retry.backoff_sec, 2.0);
     }
 
-    // res ac-01: Manifest without defaults deserialises to None.
+    // Manifest without defaults deserialises to None.
     #[test]
-    fn test_res_ac01_no_defaults_is_none() {
+    fn test_res_no_defaults_is_none() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: greet\n    command: echo hello\n";
         setup_project(dir.path(), yaml, &[]);
@@ -2045,9 +2187,9 @@ steps:
         assert!(manifest.defaults.is_none());
     }
 
-    // res ac-02: Step with retry and timeout_sec fields.
+    // Step with retry and timeout_sec fields.
     #[test]
-    fn test_res_ac02_step_retry_and_timeout() {
+    fn test_res_step_retry_and_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2068,9 +2210,9 @@ steps:
         assert_eq!(step.timeout_sec, Some(30.0));
     }
 
-    // res ac-03: Retry exhaustion — always-fail with max_attempts=2 makes 2 attempts then fails.
+    // Retry exhaustion — always-fail with max_attempts=2 makes 2 attempts then fails.
     #[test]
-    fn test_res_ac03_retry_exhaustion() {
+    fn test_res_retry_exhaustion() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2089,13 +2231,16 @@ steps:
         assert!(result.is_err(), "should fail after exhausting retries");
         // Verify 2 engine calls (2 attempts).
         let calls = engine.calls.borrow();
-        let cmd_calls: Vec<_> = calls.iter().filter(|c| matches!(c, MockCall::Command { .. })).collect();
+        let cmd_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(c, MockCall::Command { .. }))
+            .collect();
         assert_eq!(cmd_calls.len(), 2, "should have made 2 attempts");
     }
 
-    // res ac-03: Retry with fail_on_call — fail first, succeed second.
+    // Retry with fail_on_call — fail first, succeed second.
     #[test]
-    fn test_res_ac03_retry_succeeds_on_second_attempt() {
+    fn test_res_retry_succeeds_on_second_attempt() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2113,23 +2258,38 @@ steps:
         run(dir.path(), &engine, &state, false).unwrap();
 
         let calls = engine.calls.borrow();
-        let cmd_calls: Vec<_> = calls.iter().filter(|c| matches!(c, MockCall::Command { .. })).collect();
+        let cmd_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(c, MockCall::Command { .. }))
+            .collect();
         assert_eq!(cmd_calls.len(), 2, "should have retried once and succeeded");
     }
 
-    // res ac-03: backoff_duration pure function.
+    // backoff_duration pure function.
     #[test]
-    fn test_res_ac03_backoff_duration() {
+    fn test_res_backoff_duration() {
         use crate::manifest::RetryPolicy;
-        let policy = RetryPolicy { max_attempts: 5, backoff_sec: 2.0 };
-        assert_eq!(backoff_duration(&policy, 1), std::time::Duration::from_secs(2));
-        assert_eq!(backoff_duration(&policy, 2), std::time::Duration::from_secs(4));
-        assert_eq!(backoff_duration(&policy, 3), std::time::Duration::from_secs(8));
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            backoff_sec: 2.0,
+        };
+        assert_eq!(
+            backoff_duration(&policy, 1),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            backoff_duration(&policy, 2),
+            std::time::Duration::from_secs(4)
+        );
+        assert_eq!(
+            backoff_duration(&policy, 3),
+            std::time::Duration::from_secs(8)
+        );
     }
 
-    // res ac-04: Defaults resolution — step inherits from defaults.
+    // Defaults resolution — step inherits from defaults.
     #[test]
-    fn test_res_ac04_defaults_resolution() {
+    fn test_res_defaults_resolution() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2149,13 +2309,20 @@ steps:
 
         // Should have retried using defaults (2 calls = 1 fail + 1 success).
         let calls = engine.calls.borrow();
-        let cmd_calls: Vec<_> = calls.iter().filter(|c| matches!(c, MockCall::Command { .. })).collect();
-        assert_eq!(cmd_calls.len(), 2, "defaults.retry should apply when step has no retry");
+        let cmd_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(c, MockCall::Command { .. }))
+            .collect();
+        assert_eq!(
+            cmd_calls.len(),
+            2,
+            "defaults.retry should apply when step has no retry"
+        );
     }
 
-    // res ac-04: Step-level retry overrides defaults.
+    // Step-level retry overrides defaults.
     #[test]
-    fn test_res_ac04_step_overrides_defaults() {
+    fn test_res_step_overrides_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2175,15 +2342,25 @@ steps:
         engine.set_failure(1, "always fail");
         let state = MockStateBackend::new();
         let result = run(dir.path(), &engine, &state, false);
-        assert!(result.is_err(), "step max_attempts=1 should override defaults");
+        assert!(
+            result.is_err(),
+            "step max_attempts=1 should override defaults"
+        );
         let calls = engine.calls.borrow();
-        let cmd_calls: Vec<_> = calls.iter().filter(|c| matches!(c, MockCall::Command { .. })).collect();
-        assert_eq!(cmd_calls.len(), 1, "step override to 1 attempt should mean only 1 call");
+        let cmd_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(c, MockCall::Command { .. }))
+            .collect();
+        assert_eq!(
+            cmd_calls.len(),
+            1,
+            "step override to 1 attempt should mean only 1 call"
+        );
     }
 
-    // res ac-05: MockEngine returns StepTimeout when timeout is Some.
+    // MockEngine returns StepTimeout when timeout is Some.
     #[test]
-    fn test_res_ac05_mock_timeout_fires() {
+    fn test_res_mock_timeout_fires() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2198,12 +2375,15 @@ steps:
         let state = MockStateBackend::new();
         let err = run(dir.path(), &engine, &state, false).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("timed out"), "should be a timeout error: {msg}");
+        assert!(
+            msg.contains("timed out"),
+            "should be a timeout error: {msg}"
+        );
     }
 
-    // res ac-05: No timeout → no StepTimeout.
+    // No timeout → no StepTimeout.
     #[test]
-    fn test_res_ac05_no_timeout_no_error() {
+    fn test_res_no_timeout_no_error() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: fast\n    command: echo hi\n";
         setup_project(dir.path(), yaml, &[]);
@@ -2213,10 +2393,12 @@ steps:
         run(dir.path(), &engine, &state, false).unwrap();
     }
 
-    // res ac-07: StepTimeout and PipelineTimeout error messages.
+    // StepTimeout and PipelineTimeout error messages.
     #[test]
-    fn test_res_ac07_error_messages() {
-        let timeout_err = crate::error::Error::StepTimeout { step: "fetch".to_string() };
+    fn test_res_error_messages() {
+        let timeout_err = crate::error::Error::StepTimeout {
+            step: "fetch".to_string(),
+        };
         assert!(timeout_err.to_string().contains("fetch"));
         assert!(timeout_err.to_string().contains("timed out"));
 
@@ -2229,9 +2411,9 @@ steps:
         assert!(msg.contains("30.5"));
     }
 
-    // res ac-08: State records final outcome only; total_retries tracked.
+    // State records final outcome only; total_retries tracked.
     #[test]
-    fn test_res_ac08_state_final_outcome_and_retries() {
+    fn test_res_state_final_outcome_and_retries() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2251,15 +2433,19 @@ steps:
         // record_step should be called once with Success.
         let states = state.states.borrow();
         let step_state = states.get("flaky").unwrap();
-        assert_eq!(step_state.status, StepStatus::Success, "final outcome should be Success");
+        assert_eq!(
+            step_state.status,
+            StepStatus::Success,
+            "final outcome should be Success"
+        );
 
         // total_retries should be 1 (1 retry after the first failure).
         assert_eq!(state.total_retries.get(), 1, "should record 1 retry");
     }
 
-    // res ac-10: Backwards compat — manifests without retry/timeout work unchanged.
+    // Backwards compat — manifests without retry/timeout work unchanged.
     #[test]
-    fn test_res_ac10_backwards_compat() {
+    fn test_res_backwards_compat() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
@@ -2271,9 +2457,9 @@ steps:
         assert_eq!(calls.len(), 2);
     }
 
-    // res ac-11: Validation rejects max_attempts=0.
+    // Validation rejects max_attempts=0.
     #[test]
-    fn test_res_ac11_reject_max_attempts_zero() {
+    fn test_res_reject_max_attempts_zero() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2286,12 +2472,15 @@ steps:
         setup_project(dir.path(), yaml, &[]);
         let err = crate::manifest::Manifest::load(dir.path()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("max_attempts"), "should reject max_attempts=0: {msg}");
+        assert!(
+            msg.contains("max_attempts"),
+            "should reject max_attempts=0: {msg}"
+        );
     }
 
-    // res ac-11: Validation rejects negative backoff_sec.
+    // Validation rejects negative backoff_sec.
     #[test]
-    fn test_res_ac11_reject_negative_backoff() {
+    fn test_res_reject_negative_backoff() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2305,12 +2494,15 @@ steps:
         setup_project(dir.path(), yaml, &[]);
         let err = crate::manifest::Manifest::load(dir.path()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("backoff_sec"), "should reject negative backoff: {msg}");
+        assert!(
+            msg.contains("backoff_sec"),
+            "should reject negative backoff: {msg}"
+        );
     }
 
-    // res ac-06: Pipeline timeout fires before a step starts.
+    // Pipeline timeout fires before a step starts.
     #[test]
-    fn test_res_ac06_pipeline_timeout() {
+    fn test_res_pipeline_timeout() {
         let dir = tempfile::tempdir().unwrap();
         // Pipeline timeout of 0.001s — effectively already expired by the time step 2 starts.
         // Step 1 consumes the budget; step 2 should trigger PipelineTimeout.
@@ -2350,9 +2542,9 @@ steps:
         // If it succeeded, the mock was too fast — acceptable for CI.
     }
 
-    // res ac-06: Pipeline timeout (deterministic) — MockEngine timeout simulation.
+    // Pipeline timeout (deterministic) — MockEngine timeout simulation.
     #[test]
-    fn test_res_ac06_pipeline_timeout_deterministic() {
+    fn test_res_pipeline_timeout_deterministic() {
         let dir = tempfile::tempdir().unwrap();
         // Use step timeout to trigger StepTimeout, which with pipeline timeout
         // ensures the pipeline-level tracking is active.
@@ -2376,9 +2568,9 @@ steps:
         assert!(result.is_err());
     }
 
-    // res ac-09: Retry output separators — verify correct number of engine calls.
+    // Retry output separators — verify correct number of engine calls.
     #[test]
-    fn test_res_ac09_retry_call_count() {
+    fn test_res_retry_call_count() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2403,15 +2595,19 @@ steps:
             .filter(|c| matches!(c, MockCall::Command { .. }))
             .collect();
         // max_attempts=3 with always-fail → 3 command calls (1 initial + 2 retries).
-        assert_eq!(cmd_calls.len(), 3, "should have made 3 attempts (with retry separators between)");
+        assert_eq!(
+            cmd_calls.len(),
+            3,
+            "should have made 3 attempts (with retry separators between)"
+        );
 
         // total_retries should be 2 (attempts 2 and 3 counted).
         assert_eq!(state.total_retries.get(), 2, "should record 2 retries");
     }
 
-    // res ac-03/05: StepTimeout is retryable — a timed-out step counts as a failed attempt.
+    // StepTimeout is retryable — a timed-out step counts as a failed attempt.
     #[test]
-    fn test_res_ac03_timeout_is_retryable() {
+    fn test_res_timeout_is_retryable() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2437,18 +2633,25 @@ steps:
             .filter(|c| matches!(c, MockCall::Command { .. }))
             .collect();
         // StepTimeout is retryable — should have made 3 attempts, not just 1.
-        assert_eq!(cmd_calls.len(), 3, "StepTimeout should be retried (3 attempts)");
+        assert_eq!(
+            cmd_calls.len(),
+            3,
+            "StepTimeout should be retried (3 attempts)"
+        );
 
         // Verify the error is StepTimeout (not a non-retryable error).
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("timed out"), "final error should be StepTimeout: {msg}");
+        assert!(
+            msg.contains("timed out"),
+            "final error should be StepTimeout: {msg}"
+        );
     }
 
     // ---- Lifecycle Hook Tests ----
 
-    // hook ac-01: Hooks struct deserialises from YAML.
+    // Hooks struct deserialises from YAML.
     #[test]
-    fn test_hook_ac01_hooks_deserialise() {
+    fn test_hook_hooks_deserialise() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2478,9 +2681,9 @@ steps:
         assert_eq!(manifest.hooks.on_init.unwrap().name, "setup");
     }
 
-    // hook ac-01: No hooks section is backwards compatible.
+    // No hooks section is backwards compatible.
     #[test]
-    fn test_hook_ac01_no_hooks_is_none() {
+    fn test_hook_no_hooks_is_none() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: greet\n    command: echo hello\n";
         setup_project(dir.path(), yaml, &[]);
@@ -2491,9 +2694,9 @@ steps:
         assert!(manifest.hooks.on_exit.is_none());
     }
 
-    // hook ac-02: on_init runs before steps.
+    // on_init runs before steps.
     #[test]
-    fn test_hook_ac02_init_runs_before_steps() {
+    fn test_hook_init_runs_before_steps() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2522,9 +2725,9 @@ steps:
         assert_eq!(cmd_calls, vec!["echo init", "echo loading"]);
     }
 
-    // hook ac-02: on_init failure prevents steps, but on_exit still runs.
+    // on_init failure prevents steps, but on_exit still runs.
     #[test]
-    fn test_hook_ac02_init_failure_aborts_but_exit_runs() {
+    fn test_hook_init_failure_aborts_but_exit_runs() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2559,9 +2762,9 @@ steps:
         assert_eq!(cmd_calls, vec!["echo init", "echo exit"]);
     }
 
-    // hook ac-03: on_success runs after all steps succeed.
+    // on_success runs after all steps succeed.
     #[test]
-    fn test_hook_ac03_success_hook_runs() {
+    fn test_hook_success_hook_runs() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2589,9 +2792,9 @@ steps:
         assert_eq!(cmd_calls, vec!["echo loading", "echo ok"]);
     }
 
-    // hook ac-03: on_success does NOT run when a step fails.
+    // on_success does NOT run when a step fails.
     #[test]
-    fn test_hook_ac03_success_not_called_on_failure() {
+    fn test_hook_success_not_called_on_failure() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2622,9 +2825,9 @@ steps:
         assert_eq!(cmd_calls, vec!["echo loading"]);
     }
 
-    // hook ac-04: on_failure runs with ARC_FAILED_STEP and ARC_EXIT_CODE.
+    // on_failure runs with ARC_FAILED_STEP and ARC_EXIT_CODE.
     #[test]
-    fn test_hook_ac04_failure_hook_with_env() {
+    fn test_hook_failure_hook_with_env() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2649,16 +2852,19 @@ steps:
             MockCall::Command { command, .. } => command == "echo fail",
             _ => false,
         });
-        assert!(failure_call.is_some(), "on_failure hook should have been called");
+        assert!(
+            failure_call.is_some(),
+            "on_failure hook should have been called"
+        );
         if let MockCall::Command { env, .. } = failure_call.unwrap() {
             assert_eq!(env.get("ARC_FAILED_STEP"), Some(&"load".to_string()));
             assert_eq!(env.get("ARC_EXIT_CODE"), Some(&"1".to_string()));
         }
     }
 
-    // hook ac-04: on_failure does NOT run when all steps succeed.
+    // on_failure does NOT run when all steps succeed.
     #[test]
-    fn test_hook_ac04_failure_not_called_on_success() {
+    fn test_hook_failure_not_called_on_success() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2687,9 +2893,9 @@ steps:
         assert_eq!(cmd_calls, vec!["echo loading"]);
     }
 
-    // hook ac-05: on_exit runs on success with ARC_PIPELINE_STATUS=success.
+    // on_exit runs on success with ARC_PIPELINE_STATUS=success.
     #[test]
-    fn test_hook_ac05_exit_on_success() {
+    fn test_hook_exit_on_success() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2714,13 +2920,16 @@ steps:
         assert!(exit_call.is_some(), "on_exit should run on success");
         if let MockCall::Command { env, .. } = exit_call.unwrap() {
             assert_eq!(env.get("ARC_PIPELINE_STATUS"), Some(&"success".to_string()));
-            assert!(env.get("ARC_FAILED_STEP").is_none(), "no ARC_FAILED_STEP on success");
+            assert!(
+                env.get("ARC_FAILED_STEP").is_none(),
+                "no ARC_FAILED_STEP on success"
+            );
         }
     }
 
-    // hook ac-05: on_exit runs on failure with ARC_PIPELINE_STATUS=failed.
+    // on_exit runs on failure with ARC_PIPELINE_STATUS=failed.
     #[test]
-    fn test_hook_ac05_exit_on_failure() {
+    fn test_hook_exit_on_failure() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2751,9 +2960,9 @@ steps:
         }
     }
 
-    // hook ac-05: on_exit runs on init failure with ARC_PIPELINE_STATUS=init_failed.
+    // on_exit runs on init failure with ARC_PIPELINE_STATUS=init_failed.
     #[test]
-    fn test_hook_ac05_exit_on_init_failure() {
+    fn test_hook_exit_on_init_failure() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2780,16 +2989,25 @@ steps:
             MockCall::Command { command, .. } => command == "echo exit",
             _ => false,
         });
-        assert!(exit_call.is_some(), "on_exit should run even when on_init fails");
+        assert!(
+            exit_call.is_some(),
+            "on_exit should run even when on_init fails"
+        );
         if let MockCall::Command { env, .. } = exit_call.unwrap() {
-            assert_eq!(env.get("ARC_PIPELINE_STATUS"), Some(&"init_failed".to_string()));
-            assert!(env.get("ARC_FAILED_STEP").is_none(), "no ARC_FAILED_STEP on init failure");
+            assert_eq!(
+                env.get("ARC_PIPELINE_STATUS"),
+                Some(&"init_failed".to_string())
+            );
+            assert!(
+                env.get("ARC_FAILED_STEP").is_none(),
+                "no ARC_FAILED_STEP on init failure"
+            );
         }
     }
 
-    // hook ac-06: Non-fatal — on_success failure doesn't change pipeline result.
+    // Non-fatal — on_success failure doesn't change pipeline result.
     #[test]
-    fn test_hook_ac06_success_hook_failure_nonfatal() {
+    fn test_hook_success_hook_failure_nonfatal() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2808,12 +3026,15 @@ steps:
         let state = MockStateBackend::new();
         // Pipeline should still succeed — hook failure is non-fatal.
         let result = run(dir.path(), &engine, &state, false);
-        assert!(result.is_ok(), "pipeline should succeed despite on_success hook failure");
+        assert!(
+            result.is_ok(),
+            "pipeline should succeed despite on_success hook failure"
+        );
     }
 
-    // hook ac-06: Non-fatal — on_failure failure doesn't change pipeline error.
+    // Non-fatal — on_failure failure doesn't change pipeline error.
     #[test]
-    fn test_hook_ac06_failure_hook_failure_returns_original() {
+    fn test_hook_failure_hook_failure_returns_original() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2834,12 +3055,15 @@ steps:
         assert!(result.is_err());
         // Verify the error is from the step, not the hook.
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("load"), "error should name the failed step: {msg}");
+        assert!(
+            msg.contains("load"),
+            "error should name the failed step: {msg}"
+        );
     }
 
-    // hook ac-07: Hooks with preconditions are rejected.
+    // Hooks with preconditions are rejected.
     #[test]
-    fn test_hook_ac07_reject_preconditions() {
+    fn test_hook_reject_preconditions() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2856,12 +3080,15 @@ steps:
         setup_project(dir.path(), yaml, &[]);
         let err = crate::manifest::Manifest::load(dir.path()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("preconditions"), "should reject preconditions on hooks: {msg}");
+        assert!(
+            msg.contains("preconditions"),
+            "should reject preconditions on hooks: {msg}"
+        );
     }
 
-    // hook ac-07: Hooks with retry are rejected.
+    // Hooks with retry are rejected.
     #[test]
-    fn test_hook_ac07_reject_retry() {
+    fn test_hook_reject_retry() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2881,9 +3108,9 @@ steps:
         assert!(msg.contains("retry"), "should reject retry on hooks: {msg}");
     }
 
-    // hook ac-07: Hooks with timeout_sec are rejected.
+    // Hooks with timeout_sec are rejected.
     #[test]
-    fn test_hook_ac07_reject_timeout() {
+    fn test_hook_reject_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2899,12 +3126,15 @@ steps:
         setup_project(dir.path(), yaml, &[]);
         let err = crate::manifest::Manifest::load(dir.path()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("timeout_sec"), "should reject timeout_sec on hooks: {msg}");
+        assert!(
+            msg.contains("timeout_sec"),
+            "should reject timeout_sec on hooks: {msg}"
+        );
     }
 
-    // hook ac-07: Hooks with produces are rejected.
+    // Hooks with produces are rejected.
     #[test]
-    fn test_hook_ac07_reject_produces() {
+    fn test_hook_reject_produces() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2921,12 +3151,15 @@ steps:
         setup_project(dir.path(), yaml, &[]);
         let err = crate::manifest::Manifest::load(dir.path()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("produces"), "should reject produces on hooks: {msg}");
+        assert!(
+            msg.contains("produces"),
+            "should reject produces on hooks: {msg}"
+        );
     }
 
-    // hook ac-07: Hooks with depends_on are rejected.
+    // Hooks with depends_on are rejected.
     #[test]
-    fn test_hook_ac07_reject_depends_on() {
+    fn test_hook_reject_depends_on() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2943,12 +3176,15 @@ steps:
         setup_project(dir.path(), yaml, &[]);
         let err = crate::manifest::Manifest::load(dir.path()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("depends_on"), "should reject depends_on on hooks: {msg}");
+        assert!(
+            msg.contains("depends_on"),
+            "should reject depends_on on hooks: {msg}"
+        );
     }
 
-    // hook ac-07: Hooks with output are rejected.
+    // Hooks with output are rejected.
     #[test]
-    fn test_hook_ac07_reject_output() {
+    fn test_hook_reject_output() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2964,12 +3200,15 @@ steps:
         setup_project(dir.path(), yaml, &[]);
         let err = crate::manifest::Manifest::load(dir.path()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("output"), "should reject output on hooks: {msg}");
+        assert!(
+            msg.contains("output"),
+            "should reject output on hooks: {msg}"
+        );
     }
 
-    // hook ac-07: Hook name collision with step name is rejected.
+    // Hook name collision with step name is rejected.
     #[test]
-    fn test_hook_ac07_reject_name_collision() {
+    fn test_hook_reject_name_collision() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -2984,12 +3223,15 @@ steps:
         setup_project(dir.path(), yaml, &[]);
         let err = crate::manifest::Manifest::load(dir.path()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("collides"), "should reject name collision: {msg}");
+        assert!(
+            msg.contains("collides"),
+            "should reject name collision: {msg}"
+        );
     }
 
-    // hook ac-08: Backwards compatibility — no hooks in manifest.
+    // Backwards compatibility — no hooks in manifest.
     #[test]
-    fn test_hook_ac08_backwards_compat() {
+    fn test_hook_backwards_compat() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: greet\n    command: echo hello\n";
         setup_project(dir.path(), yaml, &[]);
@@ -3005,12 +3247,16 @@ steps:
                 _ => None,
             })
             .collect();
-        assert_eq!(cmd_calls, vec!["echo hello"], "should work identically without hooks");
+        assert_eq!(
+            cmd_calls,
+            vec!["echo hello"],
+            "should work identically without hooks"
+        );
     }
 
-    // hook ac-09: SQL hook step calls engine.execute_sql.
+    // SQL hook step calls engine.execute_sql.
     #[test]
-    fn test_hook_ac09_sql_hook() {
+    fn test_hook_sql_hook() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -3022,7 +3268,11 @@ steps:
   - name: load
     command: "echo loading"
 "#;
-        setup_project(dir.path(), yaml, &[("hooks/setup.sql", "CREATE TABLE staging (id INT);")]);
+        setup_project(
+            dir.path(),
+            yaml,
+            &[("hooks/setup.sql", "CREATE TABLE staging (id INT);")],
+        );
         let engine = MockEngine::new();
         let state = MockStateBackend::new();
         run(dir.path(), &engine, &state, false).unwrap();
@@ -3033,12 +3283,16 @@ steps:
             .iter()
             .filter(|c| matches!(c, MockCall::Sql { .. }))
             .collect();
-        assert_eq!(sql_calls.len(), 1, "SQL hook should produce one execute_sql call");
+        assert_eq!(
+            sql_calls.len(),
+            1,
+            "SQL hook should produce one execute_sql call"
+        );
     }
 
-    // hook ac-09: Command hook step calls engine.execute_command.
+    // Command hook step calls engine.execute_command.
     #[test]
-    fn test_hook_ac09_command_hook() {
+    fn test_hook_command_hook() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = r#"
 name: test
@@ -3063,7 +3317,10 @@ steps:
                 _ => None,
             })
             .collect();
-        assert!(cmd_calls.contains(&"echo cleanup"), "on_exit command hook should run");
+        assert!(
+            cmd_calls.contains(&"echo cleanup"),
+            "on_exit command hook should run"
+        );
     }
 
     // hook: Full lifecycle — success path (init → steps → success → exit).
@@ -3103,7 +3360,10 @@ steps:
             })
             .collect();
         // init → load → success → exit (no failure).
-        assert_eq!(cmd_calls, vec!["echo init", "echo loading", "echo ok", "echo exit"]);
+        assert_eq!(
+            cmd_calls,
+            vec!["echo init", "echo loading", "echo ok", "echo exit"]
+        );
     }
 
     // hook: Full lifecycle — failure path (init → steps → failure → exit).
@@ -3146,7 +3406,10 @@ steps:
             })
             .collect();
         // init → load (fail) → failure → exit (no success).
-        assert_eq!(cmd_calls, vec!["echo init", "echo loading", "echo fail", "echo exit"]);
+        assert_eq!(
+            cmd_calls,
+            vec!["echo init", "echo loading", "echo fail", "echo exit"]
+        );
     }
 
     // ---- Live Protocol+Run contract ----
@@ -3165,7 +3428,10 @@ steps:
             dir.path(),
             yaml,
             &[
-                ("models/load.sql", "CREATE TABLE widgets (id INTEGER, name TEXT);\n"),
+                (
+                    "models/load.sql",
+                    "CREATE TABLE widgets (id INTEGER, name TEXT);\n",
+                ),
                 (
                     "models/tally.sql",
                     "CREATE TABLE widget_tally AS SELECT count(*) AS n FROM widgets;\n",
@@ -3191,7 +3457,10 @@ steps:
 
         // (a) The per-run JSON exists and deserializes.
         let json_path = dir.path().join("build/.arcform/runs/run-1.json");
-        assert!(json_path.exists(), "contract JSON should exist at {json_path:?}");
+        assert!(
+            json_path.exists(),
+            "contract JSON should exist at {json_path:?}"
+        );
         let raw = std::fs::read_to_string(&json_path).unwrap();
         let contract: Contract = serde_json::from_str(&raw).expect("contract JSON deserializes");
 
@@ -3210,7 +3479,11 @@ steps:
             .expect("widgets asset present");
         assert_eq!(widgets.id, "table:widgets");
         assert_eq!(widgets.kind, "table");
-        assert_eq!(widgets.row_count, Some(3), "row_count measured from the run db");
+        assert_eq!(
+            widgets.row_count,
+            Some(3),
+            "row_count measured from the run db"
+        );
         assert_eq!(widgets.produced_by.as_deref(), Some("load"));
         assert!(widgets.consumed_by.contains(&"tally".to_string()));
 
@@ -3229,18 +3502,38 @@ steps:
             .expect("per-statement lineage records the produced table");
         // Measured asset fields: a relational asset carries a DuckDB `estimated_size`
         // and a deterministic sha256-hex content hash of its rows.
-        assert!(widgets.bytes.is_some(), "table bytes measured via estimated_size");
-        let hash = widgets.content_hash.as_ref().expect("table content_hash computed");
+        assert!(
+            widgets.bytes.is_some(),
+            "table bytes measured via estimated_size"
+        );
+        let hash = widgets
+            .content_hash
+            .as_ref()
+            .expect("table content_hash computed");
         assert_eq!(hash.len(), 64, "content_hash is sha256 hex: {hash}");
-        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "content_hash is hex: {hash}");
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "content_hash is hex: {hash}"
+        );
         // (c2) the producing statement carries a byte range that slices its
         // own source out of sql_text.
-        let [lo, hi] = widget_stmt.byte_range.expect("statement carries a byte range");
+        let [lo, hi] = widget_stmt
+            .byte_range
+            .expect("statement carries a byte range");
         assert!(sql.sql_text[lo..hi].to_lowercase().contains("widgets"));
         // (c3) an executed step records ≥1 attempt and a wall-clock duration.
-        assert!(load.attempts >= 1, "executed step records its attempt count");
-        assert!(load.duration_sec.is_some(), "executed step records its duration");
-        assert!(load.status.skip_reason.is_none(), "an executed step has no skip reason");
+        assert!(
+            load.attempts >= 1,
+            "executed step records its attempt count"
+        );
+        assert!(
+            load.duration_sec.is_some(),
+            "executed step records its duration"
+        );
+        assert!(
+            load.status.skip_reason.is_none(),
+            "an executed step has no skip reason"
+        );
 
         // (d) The JSONL stream exists with a line per step + a run_complete line.
         let jsonl_path = dir.path().join("build/.arcform/runs/run-1.jsonl");
@@ -3251,11 +3544,15 @@ steps:
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
         assert!(
-            lines.iter().any(|l| l["step"] == "load" && l["state"] == "success"),
+            lines
+                .iter()
+                .any(|l| l["step"] == "load" && l["state"] == "success"),
             "stream has load success line"
         );
         assert!(
-            lines.iter().any(|l| l["step"] == "tally" && l["state"] == "success"),
+            lines
+                .iter()
+                .any(|l| l["step"] == "tally" && l["state"] == "success"),
             "stream has tally success line"
         );
         assert!(
@@ -3300,12 +3597,21 @@ steps:
         assert_eq!(s1.status.state, "success");
         assert_eq!(s2.status.state, "failed");
 
-        let jsonl = std::fs::read_to_string(dir.path().join("build/.arcform/runs/run-1.jsonl")).unwrap();
-        let lines: Vec<serde_json::Value> =
-            jsonl.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-        assert!(lines.iter().any(|l| l["step"] == "s2" && l["state"] == "failed"));
-        assert!(lines
-            .iter()
-            .any(|l| l["event"] == "run_complete" && l["outcome"] == "partial"));
+        let jsonl =
+            std::fs::read_to_string(dir.path().join("build/.arcform/runs/run-1.jsonl")).unwrap();
+        let lines: Vec<serde_json::Value> = jsonl
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l["step"] == "s2" && l["state"] == "failed")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l["event"] == "run_complete" && l["outcome"] == "partial")
+        );
     }
 }

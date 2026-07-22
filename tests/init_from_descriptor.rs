@@ -21,7 +21,11 @@ fn read_contract(project: &Path) -> serde_json::Value {
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
         .collect();
-    assert_eq!(json_files.len(), 1, "expected exactly one contract, got {json_files:?}");
+    assert_eq!(
+        json_files.len(),
+        1,
+        "expected exactly one contract, got {json_files:?}"
+    );
     let bytes = std::fs::read(json_files.remove(0)).unwrap();
     serde_json::from_slice(&bytes).expect("contract is valid JSON")
 }
@@ -47,8 +51,14 @@ fn generates_and_runs_a_protocol_from_a_descriptor() {
 
     let project = workspace.path().join("assemble_demo");
     assert!(project.join("arcform.yaml").is_file());
-    assert!(project.join("signups.duckdb").is_file(), "database copied in");
-    assert!(project.join("datapackage.json").is_file(), "companion descriptor written");
+    assert!(
+        project.join("signups.duckdb").is_file(),
+        "database copied in"
+    );
+    assert!(
+        project.join("datapackage.json").is_file(),
+        "companion descriptor written"
+    );
 
     // --- generated arcform.yaml: exactly three steps, in order --------------
     let yaml = std::fs::read_to_string(project.join("arcform.yaml")).unwrap();
@@ -62,13 +72,27 @@ fn generates_and_runs_a_protocol_from_a_descriptor() {
     );
 
     // The fk step fans in from both tables.
-    let fk = steps.iter().find(|s| s["name"] == "fk_logins_accounts").unwrap();
-    let deps: Vec<&str> = fk["depends_on"].as_sequence().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-    assert!(deps.contains(&"logins") && deps.contains(&"accounts"), "fk depends_on both tables: {deps:?}");
+    let fk = steps
+        .iter()
+        .find(|s| s["name"] == "fk_logins_accounts")
+        .unwrap();
+    let deps: Vec<&str> = fk["depends_on"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        deps.contains(&"logins") && deps.contains(&"accounts"),
+        "fk depends_on both tables: {deps:?}"
+    );
 
     // The fk model joins account_id -> id.
     let fk_sql = std::fs::read_to_string(project.join("models/fk_logins_accounts.sql")).unwrap();
-    assert!(fk_sql.contains(r#"c."account_id" = p."id""#), "fk joins account_id -> id: {fk_sql}");
+    assert!(
+        fk_sql.contains(r#"c."account_id" = p."id""#),
+        "fk joins account_id -> id: {fk_sql}"
+    );
 
     // --- arc run on the GENERATED project -----------------------------------
     let run = Command::new(arc)
@@ -104,8 +128,19 @@ fn generates_and_runs_a_protocol_from_a_descriptor() {
     // The fk asset consumes BOTH tables: accounts and logins are each consumed by
     // the fk step.
     let consumed_by = |a: &serde_json::Value| -> Vec<String> {
-        a["consumed_by"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect()
+        a["consumed_by"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
     };
-    assert!(consumed_by(accounts).contains(&"fk_logins_accounts".to_string()), "accounts consumed by fk");
-    assert!(consumed_by(logins).contains(&"fk_logins_accounts".to_string()), "logins consumed by fk");
+    assert!(
+        consumed_by(accounts).contains(&"fk_logins_accounts".to_string()),
+        "accounts consumed by fk"
+    );
+    assert!(
+        consumed_by(logins).contains(&"fk_logins_accounts".to_string()),
+        "logins consumed by fk"
+    );
 }

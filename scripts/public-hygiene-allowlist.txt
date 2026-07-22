@@ -1,0 +1,24 @@
+# Allowlist for scripts/check-public-hygiene.sh.
+#
+# Empty on purpose, and it should stay that way. If the gate fires, the fix is
+# to delete the private planning identifier — not to record it here.
+#
+# Format, one entry per line, THREE pipe-separated fields:
+#
+#     path/to/file | <exact matched text> | why this one is legitimate
+#
+# `|` is the separator because no rule pattern can ever match a `|`, so the
+# matched text — which routinely contains `#`, `-` and `_` — can never collide
+# with it. All three fields are required; an entry that does not parse, or whose
+# explanation is empty, fails the check with exit 2, so nothing is waved through
+# silently.
+#
+# Line numbers are not part of an entry — they drift. Instead, every entry must
+# match something: an entry that suppresses nothing is exit 2 too, so a stale
+# allowlist cannot rot into fake coverage.
+#
+# Before adding anything here, try to make the pattern in
+# scripts/check-public-hygiene.sh more precise instead, and add the innocent
+# string to scripts/public-hygiene-innocent-strings.txt so the tightening stays
+# fixed. The allowlist is for genuine content that must stay, never for papering
+# over a bad regex.

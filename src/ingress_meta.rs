@@ -100,7 +100,10 @@ mod tests {
         assert_eq!(back.etag, meta.etag);
         assert_eq!(back.last_modified, meta.last_modified);
         assert_eq!(back.sha256, meta.sha256);
-        assert_eq!(back.request_headers.get("User-Agent").map(String::as_str), Some("meridian"));
+        assert_eq!(
+            back.request_headers.get("User-Agent").map(String::as_str),
+            Some("meridian")
+        );
     }
 
     #[test]

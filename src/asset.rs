@@ -68,7 +68,7 @@ impl AssetGraph {
                             step_assets.destroys.extend(sql_assets.destroys);
                         }
                         Err(warnings) => {
-                            // AC-07: Warn on parse failure, treat as opaque.
+                            // Warn on parse failure, treat as opaque.
                             for w in warnings {
                                 graph.warnings.push(format!(
                                     "could not parse {}: {} — treating as opaque step",
@@ -351,15 +351,18 @@ mod tests {
         AssetGraph::build(&manifest, dir)
     }
 
-    // AC-01: SQL steps auto-discover produced assets.
+    // SQL steps auto-discover produced assets.
     #[test]
-    fn test_ac01_sql_discovers_outputs() {
+    fn test_sql_discovers_outputs() {
         let dir = tempfile::tempdir().unwrap();
         let graph = build_graph(
             dir.path(),
             vec![sql_step("load", "models/load.sql")],
             HashMap::new(),
-            &[("models/load.sql", "CREATE TABLE customers (id INT, name TEXT);")],
+            &[(
+                "models/load.sql",
+                "CREATE TABLE customers (id INT, name TEXT);",
+            )],
         );
 
         let step = graph.steps.get("load").unwrap();
@@ -367,9 +370,9 @@ mod tests {
         assert!(graph.warnings.is_empty());
     }
 
-    // AC-02: SQL steps auto-discover consumed assets.
+    // SQL steps auto-discover consumed assets.
     #[test]
-    fn test_ac02_sql_discovers_inputs() {
+    fn test_sql_discovers_inputs() {
         let dir = tempfile::tempdir().unwrap();
         let graph = build_graph(
             dir.path(),
@@ -387,9 +390,9 @@ mod tests {
         assert!(step.reads.contains("orders"));
     }
 
-    // AC-03: INSERT INTO is recognised as an output.
+    // INSERT INTO is recognised as an output.
     #[test]
-    fn test_ac03_insert_into_output() {
+    fn test_insert_into_output() {
         let dir = tempfile::tempdir().unwrap();
         let graph = build_graph(
             dir.path(),
@@ -406,9 +409,9 @@ mod tests {
         assert!(step.reads.contains("customers"));
     }
 
-    // AC-04: Command steps with produces/depends_on are included in graph.
+    // Command steps with produces/depends_on are included in graph.
     #[test]
-    fn test_ac04_command_step_declared_assets() {
+    fn test_command_step_declared_assets() {
         let dir = tempfile::tempdir().unwrap();
         let graph = build_graph(
             dir.path(),
@@ -427,9 +430,9 @@ mod tests {
         assert!(step.reads.contains("customers"));
     }
 
-    // AC-05: Top-level assets: section overrides inferred graph.
+    // Top-level assets: section overrides inferred graph.
     #[test]
-    fn test_ac05_override_adds_dependency() {
+    fn test_override_adds_dependency() {
         let dir = tempfile::tempdir().unwrap();
         let mut assets = HashMap::new();
         assets.insert(
@@ -454,9 +457,9 @@ mod tests {
         assert!(step.reads.contains("lookups"));
     }
 
-    // AC-06: Dependency order violation is detected.
+    // Dependency order violation is detected.
     #[test]
-    fn test_ac06_dependency_order_violation() {
+    fn test_dependency_order_violation() {
         let dir = tempfile::tempdir().unwrap();
         // Step order: summary runs BEFORE load-customers.
         // summary reads from customers, which load-customers creates.
@@ -484,12 +487,15 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("summary"), "should name reader: {msg}");
         assert!(msg.contains("customers"), "should name asset: {msg}");
-        assert!(msg.contains("load-customers"), "should name producer: {msg}");
+        assert!(
+            msg.contains("load-customers"),
+            "should name producer: {msg}"
+        );
     }
 
-    // AC-06: Valid order passes validation.
+    // Valid order passes validation.
     #[test]
-    fn test_ac06_valid_order_passes() {
+    fn test_valid_order_passes() {
         let dir = tempfile::tempdir().unwrap();
         let graph = build_graph(
             dir.path(),
@@ -514,9 +520,9 @@ mod tests {
         graph.validate_order(&step_order).unwrap();
     }
 
-    // AC-07: Unparseable SQL produces a warning, step is opaque.
+    // Unparseable SQL produces a warning, step is opaque.
     #[test]
-    fn test_ac07_unparseable_sql_warns() {
+    fn test_unparseable_sql_warns() {
         let dir = tempfile::tempdir().unwrap();
         let graph = build_graph(
             dir.path(),
@@ -536,9 +542,9 @@ mod tests {
         );
     }
 
-    // AC-09: Multi-step chain validates correctly.
+    // Multi-step chain validates correctly.
     #[test]
-    fn test_ac09_multi_step_chain() {
+    fn test_multi_step_chain() {
         let dir = tempfile::tempdir().unwrap();
         let graph = build_graph(
             dir.path(),
@@ -550,14 +556,8 @@ mod tests {
             HashMap::new(),
             &[
                 ("models/a.sql", "CREATE TABLE x (id INT);"),
-                (
-                    "models/b.sql",
-                    "CREATE TABLE y AS SELECT * FROM x;",
-                ),
-                (
-                    "models/c.sql",
-                    "CREATE TABLE z AS SELECT * FROM y;",
-                ),
+                ("models/b.sql", "CREATE TABLE y AS SELECT * FROM x;"),
+                ("models/c.sql", "CREATE TABLE z AS SELECT * FROM y;"),
             ],
         );
 
@@ -573,9 +573,9 @@ mod tests {
         assert!(msg.contains("y"), "should name asset: {msg}");
     }
 
-    // AC-10: Bare command steps are opaque in the graph.
+    // Bare command steps are opaque in the graph.
     #[test]
-    fn test_ac10_opaque_command_step() {
+    fn test_opaque_command_step() {
         let dir = tempfile::tempdir().unwrap();
         let graph = build_graph(
             dir.path(),
@@ -627,9 +627,9 @@ mod tests {
         graph.validate_order(&order).unwrap();
     }
 
-    // AC-08: Empty graph (no assets at all) has_assets returns false.
+    // Empty graph (no assets at all) has_assets returns false.
     #[test]
-    fn test_ac08_no_assets_graph() {
+    fn test_no_assets_graph() {
         let dir = tempfile::tempdir().unwrap();
         let graph = build_graph(
             dir.path(),
@@ -641,9 +641,9 @@ mod tests {
         assert!(!graph.has_assets(), "bare command step has no assets");
     }
 
-    // v0.3 AC-07: downstream_steps computes transitive downstream.
+    // downstream_steps computes transitive downstream.
     #[test]
-    fn test_v03_ac07_downstream_steps() {
+    fn test_v03_downstream_steps() {
         let dir = tempfile::tempdir().unwrap();
         let graph = build_graph(
             dir.path(),
@@ -661,13 +661,19 @@ mod tests {
         );
 
         let downstream = graph.downstream_steps(&["step-a".into()]);
-        assert!(downstream.contains(&"step-b".to_string()), "step-b depends on step-a's output");
-        assert!(downstream.contains(&"step-c".to_string()), "step-c transitively depends on step-a");
+        assert!(
+            downstream.contains(&"step-b".to_string()),
+            "step-b depends on step-a's output"
+        );
+        assert!(
+            downstream.contains(&"step-c".to_string()),
+            "step-c transitively depends on step-a"
+        );
     }
 
-    // v0.3 AC-07: downstream_steps with opaque middle step — chain breaks.
+    // downstream_steps with opaque middle step — chain breaks.
     #[test]
-    fn test_v03_ac07_downstream_opaque_breaks_chain() {
+    fn test_v03_downstream_opaque_breaks_chain() {
         let dir = tempfile::tempdir().unwrap();
         let graph = build_graph(
             dir.path(),
@@ -688,12 +694,15 @@ mod tests {
         let downstream = graph.downstream_steps(&["step-a".into()]);
         // step-c reads 'y' which is not produced by step-a (step-a produces 'x'),
         // so step-c is NOT downstream of step-a in this graph.
-        assert!(!downstream.contains(&"step-c".to_string()), "opaque middle step breaks propagation");
+        assert!(
+            !downstream.contains(&"step-c".to_string()),
+            "opaque middle step breaks propagation"
+        );
     }
 
-    // v0.3 AC-10: StepAssets gains internal and destroys, populated from SqlAssets.
+    // StepAssets gains internal and destroys, populated from SqlAssets.
     #[test]
-    fn test_v03_ac10_step_assets_internal_from_cte() {
+    fn test_v03_step_assets_internal_from_cte() {
         let dir = tempfile::tempdir().unwrap();
         let graph = build_graph(
             dir.path(),
@@ -706,14 +715,23 @@ mod tests {
         );
 
         let step = graph.steps.get("transform").unwrap();
-        assert!(step.internal.contains("recent"), "CTE name should be in step's internal set");
-        assert!(step.reads.contains("orders"), "real table should be in reads");
-        assert!(!step.reads.contains("recent"), "CTE name should NOT be in reads");
+        assert!(
+            step.internal.contains("recent"),
+            "CTE name should be in step's internal set"
+        );
+        assert!(
+            step.reads.contains("orders"),
+            "real table should be in reads"
+        );
+        assert!(
+            !step.reads.contains("recent"),
+            "CTE name should NOT be in reads"
+        );
     }
 
-    // v0.3 AC-10: StepAssets destroys populated from DROP TABLE.
+    // StepAssets destroys populated from DROP TABLE.
     #[test]
-    fn test_v03_ac10_step_assets_destroys_from_drop() {
+    fn test_v03_step_assets_destroys_from_drop() {
         let dir = tempfile::tempdir().unwrap();
         let graph = build_graph(
             dir.path(),
@@ -723,12 +741,15 @@ mod tests {
         );
 
         let step = graph.steps.get("cleanup").unwrap();
-        assert!(step.destroys.contains("old_data"), "dropped table should be in step's destroys set");
+        assert!(
+            step.destroys.contains("old_data"),
+            "dropped table should be in step's destroys set"
+        );
     }
 
-    // v0.3 AC-11: validate_order ignores internal — CTE names don't cause false violations.
+    // validate_order ignores internal — CTE names don't cause false violations.
     #[test]
-    fn test_v03_ac11_cte_name_no_false_violation() {
+    fn test_v03_cte_name_no_false_violation() {
         let dir = tempfile::tempdir().unwrap();
         // step-A creates table `recent`, step-B uses WITH recent AS (...) which shadows the name.
         // validate_order should NOT flag this as a dependency violation.

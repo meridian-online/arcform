@@ -8,8 +8,8 @@
 //! `edgar_gleif` `package` step patches by hand today).
 //!
 //! Operators are addressed by `op: <name>@<semver-req>` and resolved from a built-in
-//! [`catalog`] — a namespace deliberately *distinct* from the pipeline `registry`
-//! (DECISIONS §G choice 0011). Config is validated by typed deserialization (a `with:`
+//! [`catalog`] — a namespace deliberately *distinct* from the pipeline `registry`.
+//! Config is validated by typed deserialization (a `with:`
 //! block that doesn't deserialize into the operator's config is a load-time error);
 //! JSON-Schema emission for Brightfield authoring forms is a later addition.
 //!
@@ -190,7 +190,10 @@ fn run_process(
                     stderr: String::new(),
                 });
             }
-            Ok(StepOutput { stderr: String::new(), stdout: None })
+            Ok(StepOutput {
+                stderr: String::new(),
+                stdout: None,
+            })
         }
         OutputMode::Capture => {
             let out = cmd.output().map_err(|e| Error::StepExecution {
@@ -216,7 +219,11 @@ fn run_process(
 /// `["run", "--script", <script>, <extra…>]` — the shared `uv run --script` invocation
 /// for the uv-backed Python operators. Factored out so its arg order is unit-testable.
 fn uv_run_args(script: &str, extra: &[String]) -> Vec<String> {
-    let mut a = vec!["run".to_string(), "--script".to_string(), script.to_string()];
+    let mut a = vec![
+        "run".to_string(),
+        "--script".to_string(),
+        script.to_string(),
+    ];
     a.extend_from_slice(extra);
     a
 }
@@ -231,7 +238,9 @@ fn materialize_frozen_script(name: &str, version: &str, bytes: &str) -> Result<P
     std::fs::create_dir_all(&dir)
         .map_err(|e| fetch_failed(format!("{}: cache dir {}: {}", name, dir.display(), e)))?;
     let path = dir.join(format!("{}.py", name));
-    let needs_write = std::fs::read_to_string(&path).map(|s| s != bytes).unwrap_or(true);
+    let needs_write = std::fs::read_to_string(&path)
+        .map(|s| s != bytes)
+        .unwrap_or(true);
     if needs_write {
         std::fs::write(&path, bytes)
             .map_err(|e| fetch_failed(format!("{}: write {}: {}", name, path.display(), e)))?;
@@ -415,7 +424,7 @@ impl Operator for HttpFetch {
 
         use sha2::{Digest, Sha256};
 
-        use crate::ingress_meta::{self, FetchMeta, DEFAULT_UA};
+        use crate::ingress_meta::{self, DEFAULT_UA, FetchMeta};
 
         let cfg = HttpFetchConfig::parse(with)?;
         let out = ctx.dir.join(&cfg.out);
@@ -432,14 +441,14 @@ impl Operator for HttpFetch {
         // still on disk, replay the stored ETag / Last-Modified as a conditional
         // request. An unchanged remote answers `304` and we keep the bytes.
         let prior = ingress_meta::read(&out);
-        if out.exists() {
-            if let Some(ref p) = prior {
-                if let Some(ref etag) = p.etag {
-                    req = req.set("If-None-Match", etag);
-                }
-                if let Some(ref lm) = p.last_modified {
-                    req = req.set("If-Modified-Since", lm);
-                }
+        if out.exists()
+            && let Some(ref p) = prior
+        {
+            if let Some(ref etag) = p.etag {
+                req = req.set("If-None-Match", etag);
+            }
+            if let Some(ref lm) = p.last_modified {
+                req = req.set("If-Modified-Since", lm);
             }
         }
 
@@ -448,12 +457,18 @@ impl Operator for HttpFetch {
             // 304 Not Modified — the remote is byte-unchanged. Keep the file + sidecar
             // untouched (so its content identity, hence downstream staleness, is stable).
             Err(ureq::Error::Status(304, _)) => {
-                return Ok(StepOutput { stderr: String::new(), stdout: None });
+                return Ok(StepOutput {
+                    stderr: String::new(),
+                    stdout: None,
+                });
             }
             Err(e) => return Err(fetch_failed(format!("http_fetch: GET {}: {}", cfg.url, e))),
         };
         if resp.status() == 304 {
-            return Ok(StepOutput { stderr: String::new(), stdout: None });
+            return Ok(StepOutput {
+                stderr: String::new(),
+                stdout: None,
+            });
         }
 
         // 200: capture the server's content identity before consuming the body.
@@ -571,7 +586,7 @@ impl Operator for OpendalFetch {
 
     fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
         use opendal::layers::RetryLayer;
-        use opendal::{services, Operator as DalOperator};
+        use opendal::{Operator as DalOperator, services};
 
         let cfg = OpendalFetchConfig::parse(with)?;
         let out = ctx.dir.join(&cfg.to);
@@ -623,8 +638,7 @@ impl Operator for OpendalFetch {
                         .map_err(|e| {
                             fetch_failed(format!("opendal_fetch: build http client: {}", e))
                         })?;
-                    let transport =
-                        opendal_http_transport_reqwest::ReqwestTransport::new(client);
+                    let transport = opendal_http_transport_reqwest::ReqwestTransport::new(client);
                     dal = dal.with_context(
                         opendal::OperationContext::new()
                             .with_http_transport(opendal::HttpTransporter::new(transport)),
@@ -715,7 +729,10 @@ struct DatapackageDescribeConfig {
 impl DatapackageDescribeConfig {
     fn parse(with: &Value) -> Result<Self> {
         serde_yaml::from_value(with.clone()).map_err(|e| {
-            Error::ManifestValidation(format!("datapackage_describe: invalid `with:` config: {}", e))
+            Error::ManifestValidation(format!(
+                "datapackage_describe: invalid `with:` config: {}",
+                e
+            ))
         })
     }
 }
@@ -758,7 +775,13 @@ impl Operator for DatapackageDescribe {
                 out.display().to_string(),
             ],
         );
-        run_process("uv", &args, ctx, OutputMode::Capture, "datapackage_describe")
+        run_process(
+            "uv",
+            &args,
+            ctx,
+            OutputMode::Capture,
+            "datapackage_describe",
+        )
     }
 }
 
@@ -926,7 +949,10 @@ impl Operator for FinetypeValidate {
             });
         }
 
-        Ok(StepOutput { stderr: String::new(), stdout: None })
+        Ok(StepOutput {
+            stderr: String::new(),
+            stdout: None,
+        })
     }
 }
 
@@ -1061,7 +1087,11 @@ fn href_has_scheme(s: &str) -> bool {
         None | Some(0) => false,
         Some(i) => {
             let scheme = &s[..i];
-            scheme.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
+            scheme
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_alphabetic())
+                .unwrap_or(false)
                 && scheme
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
@@ -1119,10 +1149,10 @@ fn discover_links(
         };
         if seen.insert(abs.clone()) {
             out.push(abs);
-            if let Some(l) = limit {
-                if out.len() >= l {
-                    break;
-                }
+            if let Some(l) = limit
+                && out.len() >= l
+            {
+                break;
             }
         }
     }
@@ -1183,10 +1213,18 @@ impl Operator for HtmlLinkDiscover {
         tmp_os.push(".part");
         let tmp = PathBuf::from(tmp_os);
         std::fs::write(&tmp, payload.as_bytes()).map_err(|e| {
-            fetch_failed(format!("html_link_discover: write {}: {}", tmp.display(), e))
+            fetch_failed(format!(
+                "html_link_discover: write {}: {}",
+                tmp.display(),
+                e
+            ))
         })?;
         std::fs::rename(&tmp, &out).map_err(|e| {
-            fetch_failed(format!("html_link_discover: rename {}: {}", out.display(), e))
+            fetch_failed(format!(
+                "html_link_discover: rename {}: {}",
+                out.display(),
+                e
+            ))
         })?;
 
         Ok(StepOutput {
@@ -1324,21 +1362,30 @@ fn extract_members<R: std::io::Read + std::io::Seek>(
         let target = dest.join(&rel);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                fetch_failed(format!("archive_extract: mkdir {}: {}", parent.display(), e))
+                fetch_failed(format!(
+                    "archive_extract: mkdir {}: {}",
+                    parent.display(),
+                    e
+                ))
             })?;
         }
         // Atomic per-file write: sibling `<target>.part`, then rename.
         let mut tmp_os = target.clone().into_os_string();
         tmp_os.push(".part");
         let tmp = PathBuf::from(tmp_os);
-        let mut f = std::fs::File::create(&tmp)
-            .map_err(|e| fetch_failed(format!("archive_extract: create {}: {}", tmp.display(), e)))?;
+        let mut f = std::fs::File::create(&tmp).map_err(|e| {
+            fetch_failed(format!("archive_extract: create {}: {}", tmp.display(), e))
+        })?;
         std::io::copy(&mut entry, &mut f)
             .map_err(|e| fetch_failed(format!("archive_extract: extract '{}': {}", name, e)))?;
         let _ = f.sync_all();
         drop(f);
         std::fs::rename(&tmp, &target).map_err(|e| {
-            fetch_failed(format!("archive_extract: rename {}: {}", target.display(), e))
+            fetch_failed(format!(
+                "archive_extract: rename {}: {}",
+                target.display(),
+                e
+            ))
         })?;
         written.push(target);
     }
@@ -1381,8 +1428,9 @@ impl Operator for ArchiveExtract {
         let pattern = cfg.compiled_pattern()?;
         let archive_path = ctx.dir.join(&cfg.archive);
         let dest = ctx.dir.join(&cfg.dest);
-        std::fs::create_dir_all(&dest)
-            .map_err(|e| fetch_failed(format!("archive_extract: mkdir {}: {}", dest.display(), e)))?;
+        std::fs::create_dir_all(&dest).map_err(|e| {
+            fetch_failed(format!("archive_extract: mkdir {}: {}", dest.display(), e))
+        })?;
         let file = std::fs::File::open(&archive_path).map_err(|e| {
             fetch_failed(format!(
                 "archive_extract: open {}: {}",
@@ -1465,11 +1513,11 @@ fn splink_resolve_args(edgar: &str, gleif: &str, out: &str, sample: Option<u64>)
         "--out".to_string(),
         out.to_string(),
     ];
-    if let Some(n) = sample {
-        if n > 0 {
-            a.push("--sample".to_string());
-            a.push(n.to_string());
-        }
+    if let Some(n) = sample
+        && n > 0
+    {
+        a.push("--sample".to_string());
+        a.push(n.to_string());
     }
     a
 }
@@ -1615,13 +1663,21 @@ mod tests {
     use super::*;
 
     fn test_ctx<'a>(dir: &'a Path, env: &'a HashMap<String, String>) -> OpContext<'a> {
-        OpContext { dir, db_path: dir, env, timeout: None }
+        OpContext {
+            dir,
+            db_path: dir,
+            env,
+            timeout: None,
+        }
     }
 
     #[test]
     fn uv_run_args_arg_order_is_stable() {
         assert_eq!(
-            uv_run_args("scripts/x.py", &["--out".to_string(), "o.parquet".to_string()]),
+            uv_run_args(
+                "scripts/x.py",
+                &["--out".to_string(), "o.parquet".to_string()]
+            ),
             vec!["run", "--script", "scripts/x.py", "--out", "o.parquet"]
         );
     }
@@ -1657,7 +1713,13 @@ mod tests {
         let ctx = test_ctx(&dir, &env);
         // A missing binary is deterministic → NON-retryable StepExecution, so a 4 h
         // job is never re-attempted 3× for a typo. This is the load-bearing choice.
-        match run_process("arc-no-such-binary-xyz", &[], &ctx, OutputMode::Inherit, "t") {
+        match run_process(
+            "arc-no-such-binary-xyz",
+            &[],
+            &ctx,
+            OutputMode::Inherit,
+            "t",
+        ) {
             Err(Error::StepExecution { .. }) => {}
             other => panic!("expected StepExecution, got {:?}", other.map(|_| ())),
         }
@@ -1674,7 +1736,8 @@ mod tests {
 
     #[test]
     fn parquet_export_declares_lineage() {
-        let with: Value = serde_yaml::from_str("input: crosswalk_edges\ndest: build/out.parquet").unwrap();
+        let with: Value =
+            serde_yaml::from_str("input: crosswalk_edges\ndest: build/out.parquet").unwrap();
         let assets = assets_for("parquet_export", Some(&with)).unwrap();
         assert_eq!(assets.reads, vec!["crosswalk_edges".to_string()]);
         assert_eq!(assets.produces, vec!["build/out.parquet".to_string()]);
@@ -1723,8 +1786,7 @@ mod tests {
         // `sample` is optional — a published run omits it and still validates.
         assert!(assets_for("splink_resolve", Some(&with)).is_ok());
         // unknown field rejected (deny_unknown_fields)
-        let bad: Value =
-            serde_yaml::from_str("edgar: e\ngleif: g\nout: o\nbogus: 1").unwrap();
+        let bad: Value = serde_yaml::from_str("edgar: e\ngleif: g\nout: o\nbogus: 1").unwrap();
         assert!(assets_for("splink_resolve", Some(&bad)).is_err());
         // missing a required field rejected
         let miss: Value = serde_yaml::from_str("edgar: e\ngleif: g").unwrap();
@@ -1746,7 +1808,14 @@ mod tests {
         let full = splink_resolve_args("e.parquet", "g.parquet", "o.parquet", None);
         assert_eq!(
             full,
-            vec!["--edgar", "e.parquet", "--gleif", "g.parquet", "--out", "o.parquet"]
+            vec![
+                "--edgar",
+                "e.parquet",
+                "--gleif",
+                "g.parquet",
+                "--out",
+                "o.parquet"
+            ]
         );
         assert!(!full.iter().any(|a| a == "--sample"));
         // `sample: 0` is treated as "full corpus" too → still omitted.
@@ -1779,7 +1848,8 @@ mod tests {
     fn gleif_ra_fetch_declares_only_its_output() {
         // Ingress: produces the local CSV, reads no graph node (the GLEIF API is not
         // in the AssetGraph). `out` is lowercased into the produces asset.
-        let with: Value = serde_yaml::from_str("ra: RA000665\nout: build/gleif_ra_sec.csv").unwrap();
+        let with: Value =
+            serde_yaml::from_str("ra: RA000665\nout: build/gleif_ra_sec.csv").unwrap();
         let a = assets_for("gleif_ra_fetch", Some(&with)).unwrap();
         assert_eq!(a.produces, vec!["build/gleif_ra_sec.csv".to_string()]);
         assert!(a.reads.is_empty());
@@ -1791,10 +1861,9 @@ mod tests {
         let min: Value = serde_yaml::from_str("ra: RA000665\nout: g.csv").unwrap();
         assert!(assets_for("gleif_ra_fetch", Some(&min)).is_ok());
         // …and both may be supplied.
-        let full: Value = serde_yaml::from_str(
-            "ra: RA000665\nout: g.csv\npage_size: 50\nuser_agent: 'X (y@z)'",
-        )
-        .unwrap();
+        let full: Value =
+            serde_yaml::from_str("ra: RA000665\nout: g.csv\npage_size: 50\nuser_agent: 'X (y@z)'")
+                .unwrap();
         assert!(assets_for("gleif_ra_fetch", Some(&full)).is_ok());
     }
 
@@ -1811,7 +1880,6 @@ mod tests {
         let bogus: Value = serde_yaml::from_str("ra: RA000665\nout: g.csv\nmax_pages: 2").unwrap();
         assert!(assets_for("gleif_ra_fetch", Some(&bogus)).is_err());
     }
-
 
     // ── finetype_validate ───────────────────────────────────────────────────
 
@@ -1851,8 +1919,7 @@ mod tests {
         let no_parquet: Value = serde_yaml::from_str("schema: s.json").unwrap();
         assert!(assets_for("finetype_validate", Some(&no_parquet)).is_err());
         // unknown field rejected (deny_unknown_fields)
-        let bogus: Value =
-            serde_yaml::from_str("parquet: p\nschema: s\nbogus: 1").unwrap();
+        let bogus: Value = serde_yaml::from_str("parquet: p\nschema: s\nbogus: 1").unwrap();
         assert!(assets_for("finetype_validate", Some(&bogus)).is_err());
     }
 
@@ -1903,17 +1970,19 @@ mod tests {
         let ctx = test_ctx(dir.path(), &env);
         let op = resolve("finetype_validate").unwrap();
 
-        let pass_with: Value =
-            serde_yaml::from_str(&format!("parquet: data.parquet\nschema: pass.json{ext_yaml}"))
-                .unwrap();
+        let pass_with: Value = serde_yaml::from_str(&format!(
+            "parquet: data.parquet\nschema: pass.json{ext_yaml}"
+        ))
+        .unwrap();
         match op.run(&pass_with, &ctx) {
             Ok(_) => {} // clean → gate passes
             other => panic!("clean validate should pass, got {:?}", other.map(|_| ())),
         }
 
-        let drift_with: Value =
-            serde_yaml::from_str(&format!("parquet: data.parquet\nschema: drift.json{ext_yaml}"))
-                .unwrap();
+        let drift_with: Value = serde_yaml::from_str(&format!(
+            "parquet: data.parquet\nschema: drift.json{ext_yaml}"
+        ))
+        .unwrap();
         match op.run(&drift_with, &ctx) {
             // Fail-closed: a row violates the contract → rejects > 0 → StepFailed.
             Err(Error::StepFailed { .. }) => {}
@@ -1925,7 +1994,8 @@ mod tests {
     fn http_fetch_declares_only_its_output() {
         // Ingress produces the local artifact and reads no graph node (the
         // network source isn't in the AssetGraph).
-        let hf: Value = serde_yaml::from_str("url: https://x/edgar.parquet\nout: build/edgar.parquet").unwrap();
+        let hf: Value =
+            serde_yaml::from_str("url: https://x/edgar.parquet\nout: build/edgar.parquet").unwrap();
         let a = assets_for("http_fetch", Some(&hf)).unwrap();
         assert_eq!(a.produces, vec!["build/edgar.parquet".to_string()]);
         assert!(a.reads.is_empty());
@@ -2013,7 +2083,10 @@ mod tests {
             Some("https://www.sec.gov/a/b/c.zip")
         );
         // absolute is kept verbatim; protocol-relative borrows the page scheme.
-        assert_eq!(absolutise(page, "https://cdn/x").as_deref(), Some("https://cdn/x"));
+        assert_eq!(
+            absolutise(page, "https://cdn/x").as_deref(),
+            Some("https://cdn/x")
+        );
         assert_eq!(
             absolutise(page, "//cdn.example.com/x").as_deref(),
             Some("https://cdn.example.com/x")
@@ -2123,7 +2196,10 @@ mod tests {
 
         // Real (upper) case preserved on disk; content round-trips through DEFLATE.
         let reg = dir.path().join("REGISTRANT.tsv");
-        assert!(reg.exists(), "REGISTRANT.tsv (real case) should exist on disk");
+        assert!(
+            reg.exists(),
+            "REGISTRANT.tsv (real case) should exist on disk"
+        );
         assert_eq!(std::fs::read_to_string(&reg).unwrap(), "cik\tlei\n1\tABC\n");
         assert!(dir.path().join("FUND_REPORTED_INFO.tsv").exists());
         // Non-selected member is not extracted; no leftover `.part` temp file.
@@ -2171,7 +2247,9 @@ mod tests {
     #[cfg(feature = "opendal")]
     #[test]
     fn opendal_fetch_declares_only_its_output() {
-        let of: Value = serde_yaml::from_str("from: s3://securelake/edgar.parquet\nto: build/edgar.parquet").unwrap();
+        let of: Value =
+            serde_yaml::from_str("from: s3://securelake/edgar.parquet\nto: build/edgar.parquet")
+                .unwrap();
         let a = assets_for("opendal_fetch", Some(&of)).unwrap();
         assert_eq!(a.produces, vec!["build/edgar.parquet".to_string()]);
         assert!(a.reads.is_empty());
