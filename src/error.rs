@@ -25,6 +25,17 @@ pub enum Error {
     #[error("invalid manifest: {0}")]
     ManifestValidation(String),
 
+    // The spec write path's refusal for an edit that cannot be applied: the
+    // route did not resolve, the fragment was missing or ambiguous, or the op
+    // does not fit the shape it found. Distinct from `ManifestValidation`,
+    // which is the refusal for an edit that applied but produced a spec that
+    // will not load.
+    #[error("edit: {path}: {detail}")]
+    EditTarget { path: String, detail: String },
+
+    #[error("a spec already exists at {0} — edit it rather than re-creating it")]
+    SpecExists(PathBuf),
+
     #[error("step '{step}': sql file not found: {path}")]
     SqlFileNotFound { step: String, path: PathBuf },
 

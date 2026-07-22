@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 
 /// Every type, constant and function `arc::spec` re-exports, and the module that
 /// owns it. An `impl` on any of these names may only appear in its owning file.
-const EXPORTED: [(&str, &str); 13] = [
+const EXPORTED: [(&str, &str); 19] = [
     ("Manifest", "manifest.rs"),
     ("Step", "manifest.rs"),
     ("Param", "manifest.rs"),
@@ -61,17 +61,25 @@ const EXPORTED: [(&str, &str); 13] = [
     ("Precondition", "precondition.rs"),
     ("ModifiedAfterConfig", "precondition.rs"),
     ("FreshConfig", "precondition.rs"),
+    // The write path: an edit as a value, its application, and the gated result.
+    ("PathPart", "edit.rs"),
+    ("SpecEdit", "edit.rs"),
+    ("ValidatedSpec", "edit.rs"),
+    ("apply_edits", "edit.rs"),
+    ("create_spec", "edit.rs"),
+    ("edit_spec", "edit.rs"),
     ("Error", "error.rs"),
     ("Result", "error.rs"),
 ];
 
 /// Every module file in the crate. Frozen so a new one cannot be added without
 /// passing under the checks below.
-const MODULE_FILES: [&str; 22] = [
+const MODULE_FILES: [&str; 23] = [
     "asset.rs",
     "bridge.rs",
     "cli.rs",
     "contract.rs",
+    "edit.rs",
     "engine.rs",
     "error.rs",
     "ingress_meta.rs",
@@ -97,13 +105,14 @@ const MODULE_FILES: [&str; 22] = [
 /// comparison contract — so growing or shrinking a list here is a version-visible
 /// change to the crate, reviewed like one.
 ///
-/// `Serialize` is on the lists today because `arc`'s own `arc init` scaffolding
-/// serialises a *generated* manifest into a directory that has no manifest yet. It is
-/// explicitly **out of contract** for consumers — see the round-trip warning in
-/// `src/spec.rs` — and it is expected to be withdrawn once spec emission moves to a
-/// preservation-aware writer. This freeze is what turns that withdrawal into a
-/// deliberate, version-visible act instead of a silent drift in either direction.
-const FROZEN_DERIVES: [(&str, &str, &[&str]); 11] = [
+/// `Serialize` is on the lists because *generated*-manifest emission — `create_spec`
+/// in the write path, and `arc`'s own `arc init` scaffolding — serialises into a
+/// place that has no manifest yet, the one case with no author bytes to lose. It is
+/// explicitly **out of contract** for any other use — see the round-trip warning in
+/// `src/spec.rs`: editing an existing spec goes through the write path, which splices
+/// original bytes and never re-serialises. This freeze keeps any change to that
+/// arrangement a deliberate, version-visible act instead of a silent drift.
+const FROZEN_DERIVES: [(&str, &str, &[&str]); 14] = [
     (
         "manifest.rs",
         "Param",
@@ -154,6 +163,21 @@ const FROZEN_DERIVES: [(&str, &str, &[&str]); 11] = [
         "Precondition",
         &["Debug", "Clone", "Serialize", "Deserialize"],
     ),
+    // The edit values are plain data — comparable and cloneable so a caller can
+    // build, inspect and log a proposed edit. Deliberately NOT serde types: an
+    // edit travels inside a process, not over a wire, and keeping serde off the
+    // list means no one can mistake it for a persistence format.
+    (
+        "edit.rs",
+        "PathPart",
+        &["Debug", "Clone", "PartialEq", "Eq"],
+    ),
+    (
+        "edit.rs",
+        "SpecEdit",
+        &["Debug", "Clone", "PartialEq", "Eq"],
+    ),
+    ("edit.rs", "ValidatedSpec", &["Debug", "Clone"]),
     ("error.rs", "Error", &["Debug", "thiserror::Error"]),
 ];
 
@@ -862,6 +886,28 @@ fn exported_modules_declare_only_contracted_items() {
         frozen(&["Error", "Result"]),
         "`error.rs` contributes exactly the error type and its alias"
     );
+
+    assert_eq!(
+        pub_items(&src("edit.rs")),
+        frozen(&[
+            // Re-exported types.
+            "PathPart",
+            "SpecEdit",
+            "ValidatedSpec",
+            // Re-exported entry points.
+            "apply_edits",
+            "create_spec",
+            "edit_spec",
+            // `ValidatedSpec`'s accessors and its atomic write. The splicing
+            // internals — span resolution, extent derivation, the temp-file
+            // dance — are private: the contract is the ops, not the mechanism.
+            "text",
+            "manifest",
+            "write_to",
+        ]),
+        "a `pub` item in `edit.rs` is public API once its types are re-exported; \
+         use `pub(crate)` unless you mean to promise it"
+    );
 }
 
 /// A derive on an exported type is part of the surface. Freeze the lists so neither
@@ -870,7 +916,7 @@ fn exported_modules_declare_only_contracted_items() {
 /// health warning — see `FROZEN_DERIVES` and the round-trip note in `src/spec.rs`.
 #[test]
 fn the_schema_types_derive_exactly_what_is_recorded() {
-    for owner in ["manifest.rs", "precondition.rs", "error.rs"] {
+    for owner in ["manifest.rs", "precondition.rs", "edit.rs", "error.rs"] {
         let found = pub_type_derives(&src(owner));
         let expected: Vec<(String, Vec<String>)> = FROZEN_DERIVES
             .iter()

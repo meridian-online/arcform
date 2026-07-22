@@ -11,6 +11,21 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Added
 
+- **The spec write path** — `arc::spec` now edits specs as well as loading them:
+  `SpecEdit` describes a change as an inspectable value (`Replace`, `RewriteFragment`,
+  `Add`, `Append`, `Delete`, `Reorder`), `apply_edits` applies it to the original bytes
+  and gates the result through the real loader in memory, and `edit_spec` is the
+  one-shot apply → validate → atomic-write against a protocol directory. Edits splice
+  raw bytes at tree-sitter node spans (via `yamlpath`), so every byte an edit does not
+  target — comments, blank lines, key order, quote style — survives verbatim; the only
+  normalisation is a final newline. A result that will not load is refused with the
+  loader's reason and the file on disk is untouched; writes go through a temp file +
+  rename, so an interrupt can never leave a truncated spec. Delete/reorder follow a
+  documented comment-ownership convention (a `#` block flush against an item is that
+  item's header and travels with it). `create_spec` covers the other mode: a brand-new
+  spec serialises directly — no preservation machinery — through the same gate and the
+  same atomic write. New corpus example `examples/almanac` exercises inline
+  `command: |` block scalars, which the rest of the corpus lacked.
 - **Execution resilience** — step `retry` with exponential backoff, plus step- and
   pipeline-level `timeout_sec`. Transient API failures retry; stuck processes are killed.
 - **Pipeline parameterisation** — runtime `arc run --param KEY=VALUE` with manifest defaults,

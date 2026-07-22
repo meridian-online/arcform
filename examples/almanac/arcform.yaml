@@ -1,0 +1,55 @@
+name: almanac
+engine: duckdb
+
+# Runtime parameter — override with: arc run --param port=hobart
+# The port whose tide table the report covers. Commands read it via
+# $ARC_PARAM_PORT.
+params:
+  port:
+    default: "dover"   # try hobart for the southern table
+
+# Flaky-shell insurance: one retry, short backoff, applied to every step
+# that doesn't override it.
+defaults:
+  retry:
+    max_attempts: 2
+    backoff_sec: 1.0
+
+steps:
+  # ── Collect: build the raw tables by hand ──────────────────────────────────
+  - name: tide_table
+    command: |
+      mkdir -p data
+      printf 'day,port,tide_m\n' > data/tides.csv
+      printf '1,dover,5.1\n2,dover,5.4\n3,dover,5.9\n' >> data/tides.csv
+
+      printf '1,hobart,1.1\n2,hobart,1.4\n3,hobart,0.9\n' >> data/tides.csv
+    produces: [tides_csv]
+    preconditions:
+      - modified_after: { path: data/tides.csv, period: 24h }
+
+  # The lunar table pairs each day with its phase; regenerating it is cheap,
+  # so no precondition guards it.
+  - name: moon_phases
+    command: |
+      mkdir -p data
+      printf 'day,phase\n1,new\n2,waxing\n3,full\n' > data/moons.csv
+    produces: [moons_csv]
+
+  # ── Report: keep the chosen port and count what survived ───────────────────
+
+  - name: join_report
+    command: |
+      awk -F, 'NR > 1 && $2 == port { print $1 "," $3 }' port="$ARC_PARAM_PORT" \
+        data/tides.csv > data/report.csv
+      wc -l < data/report.csv | tr -d ' ' > data/rows.txt
+    depends_on: [tides_csv, moons_csv]
+    produces: [report_csv]
+    timeout_sec: 30   # generous; awk is instant
+
+  # Console tail: the demo ends by printing the table it built.
+  - name: show
+    command: "cat data/report.csv"
+    depends_on: [report_csv]
+
+# fin — the report lands in data/report.csv; run `arc run` from this directory.

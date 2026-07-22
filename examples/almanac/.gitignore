@@ -1,0 +1,5 @@
+# Everything the steps generate.
+data/
+build/
+*.duckdb
+*.db
