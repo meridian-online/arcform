@@ -50,8 +50,7 @@ zip = { version = "6", default-features = false, features = ["deflate-flate2"] }
 # the s3://securelake / multi-store lever. HEAVY: +156 crates (tokio, hyper,
 # tower, reqwest, rustls) that the ureq http_fetch path needs none of. Feature-
 # gated OFF by default so the flagship single binary stays lean; build with
-# `--features opendal` to include it. Spike evidence + verdict:
-# bearing/research/arcform-typed-operators.md §ingress-engines.
+# `--features opendal` to include it.
 opendal = { version = "0.58", features = ["services-http", "services-s3", "blocking"], optional = true }
 # Custom HTTP transport so opendal_fetch can carry request headers (User-Agent) —
 # OpenDAL's Http builder has no header setter; you inject a reqwest client via a
