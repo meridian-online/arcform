@@ -11,6 +11,14 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Added
 
+- **CLI authoring verbs** — `arc create-protocol` writes a fresh `arcform.yaml` from
+  scratch and `arc edit-protocol` amends an existing one (`replace`, `rewrite`, `add`,
+  `append`, `delete`, `reorder`, addressed as `steps[2].command`-style paths). Both are
+  argument surface over the spec write path — the same splice, the same validation gate,
+  the same atomic write the library gives every caller, so an agent can author and amend
+  a runnable protocol with nothing but the binary in the loop. An edit that cannot apply,
+  or whose result would not load, is refused with the reason before the file is touched;
+  every untargeted byte is preserved verbatim, and no verb reformats as a side effect.
 - **The spec write path** — `arc::spec` now edits specs as well as loading them:
   `SpecEdit` describes a change as an inspectable value (`Replace`, `RewriteFragment`,
   `Add`, `Append`, `Delete`, `Reorder`), `apply_edits` applies it to the original bytes
