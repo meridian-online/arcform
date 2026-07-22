@@ -92,6 +92,20 @@
 //! replacing it is a change to how specs parse, not a change to this surface, so it
 //! is recorded here rather than papered over.
 //!
+//! Two build-time facts a consumer inherits, recorded here because they bite at
+//! resolve or link time rather than in this API:
+//!
+//! - `arc` parses SQL with its **vendored `sqlparser` fork** (see `vendor/`), wired
+//!   in with a `[patch.crates-io]` entry — and Cargo patch tables do not propagate
+//!   through dependencies. The workspace that links this crate must carry the same
+//!   patch entry, pointing at the `vendor/sqlparser-0.55.0` package inside the same
+//!   pinned `arc` source; without it the build fails on missing
+//!   `SetExpr::Pivot`/`SetExpr::Unpivot` variants.
+//! - The private engine still compiles into the library, so the **DuckDB C library**
+//!   must be present to build (`DUCKDB_LIB_DIR`/`DUCKDB_INCLUDE_DIR`, or a system
+//!   install the linker finds), even for a consumer that only loads specs.
+//!   `default-features = false` drops `clap`, not the engine's dependency graph.
+//!
 //! # Example
 //!
 //! ```no_run

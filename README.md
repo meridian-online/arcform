@@ -117,6 +117,14 @@ The surface is documented as a contract in `src/spec.rs` and enumerated by
 `tests/public_surface.rs`, which fails the build if it widens. Arcform is pre-1.0: **pin an
 exact version** (or, inside the same organisation, a git revision).
 
+Two build-time facts come with the dependency. Arcform parses SQL with its vendored
+`sqlparser` fork (`vendor/sqlparser-0.55.0`), wired in via `[patch.crates-io]` — and Cargo
+patch tables do not propagate through dependencies, so the consuming workspace must carry the
+same patch entry pointing at that vendored package in the same pinned Arcform source (without
+it, the build fails on missing `SetExpr::Pivot`/`Unpivot` variants). And the private engine
+still compiles into the library, so the DuckDB C library must be available to the build
+(`DUCKDB_LIB_DIR`/`DUCKDB_INCLUDE_DIR`) even for a consumer that only loads specs.
+
 ---
 
 ## Status
