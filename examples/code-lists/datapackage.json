@@ -1,0 +1,90 @@
+{
+  "$schema": "https://datapackage.org/profiles/2.0/datapackage.json",
+  "name": "code-lists",
+  "title": "Public-domain reference code lists (NAICS + ICD-10-CM)",
+  "description": "Two normalised, public-domain classification systems — NAICS 2022 (industry) and ICD-10-CM FY2025 (diagnosis) — flattened to a shared code/title/level/parent/as_of shape. Produced by the code-lists arcform pipeline and published to the open zone.",
+  "version": "0.1.0",
+  "created": "2025-01-01",
+  "licenses": [
+    {
+      "name": "CC0-1.0",
+      "path": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "title": "Creative Commons Zero v1.0 Universal (public domain dedication of this compilation)"
+    }
+  ],
+  "sources": [
+    {
+      "title": "NAICS 2022 — North American Industry Classification System (Structure)",
+      "path": "https://www.census.gov/naics/2022NAICS/2022_NAICS_Structure.xlsx",
+      "author": "U.S. Census Bureau",
+      "x-spdx-license": "LicenseRef-USGov-PublicDomain",
+      "x-redistribution": "allow",
+      "x-attribution": "North American Industry Classification System (NAICS), U.S. Census Bureau. A work of the U.S. federal government; public domain (17 U.S.C. § 105).",
+      "x-as-of": "2022-01-01"
+    },
+    {
+      "title": "ICD-10-CM FY2025 — Code Descriptions (Tabular Order File)",
+      "path": "https://www.cms.gov/files/zip/2025-code-descriptions-tabular-order.zip",
+      "author": "U.S. Centers for Medicare & Medicaid Services (CMS) / CDC NCHS",
+      "x-spdx-license": "LicenseRef-USGov-PublicDomain",
+      "x-redistribution": "allow",
+      "x-attribution": "ICD-10-CM, U.S. Centers for Medicare & Medicaid Services and CDC/NCHS. A work of the U.S. federal government; public domain.",
+      "x-as-of": "2025-01-01"
+    }
+  ],
+  "x-meridian-license-gate": {
+    "policy": "green-list",
+    "default": "red",
+    "description": "scripts/license_gate.sh clears a source only if its x-spdx-license AND x-redistribution are both on the green-list below. Anything else is RED and blocks the run.",
+    "green": {
+      "spdx": ["CC0-1.0", "LicenseRef-USGov-PublicDomain", "CC-PDDC", "Unlicense"],
+      "redistribution": ["allow"]
+    }
+  },
+  "resources": [
+    {
+      "name": "naics",
+      "path": "dist/naics.parquet",
+      "type": "table",
+      "format": "parquet",
+      "mediatype": "application/vnd.apache.parquet",
+      "description": "NAICS 2022 hierarchy: one row per code, sector (level 1) down to national industry (level 5).",
+      "schema": {
+        "fields": [
+          { "name": "code", "type": "string", "description": "2–6 digit NAICS code, or a sector range like 31-33." },
+          { "name": "title", "type": "string", "description": "Official NAICS title (change/trilateral markers stripped)." },
+          { "name": "level", "type": "integer", "description": "1 sector … 5 national industry." },
+          { "name": "parent", "type": "string", "description": "Parent code; null for sectors (roots)." },
+          { "name": "as_of", "type": "date", "description": "Snapshot date." }
+        ],
+        "primaryKey": ["code"],
+        "foreignKeys": [
+          { "fields": ["parent"], "reference": { "resource": "naics", "fields": ["code"] } }
+        ]
+      }
+    },
+    {
+      "name": "icd10cm",
+      "path": "dist/icd10cm.parquet",
+      "type": "table",
+      "format": "parquet",
+      "mediatype": "application/vnd.apache.parquet",
+      "description": "ICD-10-CM FY2025 hierarchy: one row per code, 3-char category (level 1) down to full 7-char code (level 5).",
+      "schema": {
+        "fields": [
+          { "name": "code", "type": "string", "description": "3–7 char ICD-10-CM code (no dot)." },
+          { "name": "title", "type": "string", "description": "Long description." },
+          { "name": "level", "type": "integer", "description": "1 category … 5 full code." },
+          { "name": "parent", "type": "string", "description": "Parent code; null for 3-char categories (roots)." },
+          { "name": "as_of", "type": "date", "description": "Snapshot date." }
+        ],
+        "primaryKey": ["code"],
+        "foreignKeys": [
+          { "fields": ["parent"], "reference": { "resource": "icd10cm", "fields": ["code"] } }
+        ]
+      }
+    }
+  ],
+  "x-arcform-pipeline": "arcform.yaml",
+  "x-arcform-note": "This descriptor describes the pipeline's OUTPUT data and is read by the license gate (x-meridian-license-gate). It is not the runnable artifact — `arc run` executes arcform.yaml."
+}

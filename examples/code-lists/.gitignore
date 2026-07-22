@@ -1,0 +1,8 @@
+# Fetched source inputs, the working DuckDB database, generated outputs, the
+# frozen catalogue, and per-run contracts are not checked in — `arc run`
+# regenerates them.
+data/
+dist/
+build/
+build.duckdb
+build.duckdb.wal
