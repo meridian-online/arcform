@@ -309,7 +309,8 @@ pub fn build_contract(inp: ContractInputs) -> Contract {
     // One connection for both the engine version and every row-count measure.
     let conn = duckdb::Connection::open(inp.db_path).ok();
     let duckdb_version = conn.as_ref().and_then(|c| {
-        c.query_row("SELECT version()", [], |r| r.get::<_, String>(0)).ok()
+        c.query_row("SELECT version()", [], |r| r.get::<_, String>(0))
+            .ok()
     });
 
     let assets = build_assets(inp.manifest, inp.dir, inp.graph, conn.as_ref());
@@ -374,11 +375,16 @@ fn build_assets(
         };
         for produced in &sa.produces {
             universe.insert(produced.clone());
-            producer.entry(produced.clone()).or_insert_with(|| step.name.clone());
+            producer
+                .entry(produced.clone())
+                .or_insert_with(|| step.name.clone());
         }
         for read in &sa.reads {
             universe.insert(read.clone());
-            consumers.entry(read.clone()).or_default().push(step.name.clone());
+            consumers
+                .entry(read.clone())
+                .or_default()
+                .push(step.name.clone());
         }
     }
 
@@ -401,9 +407,8 @@ fn build_assets(
                 let (bytes, content_hash) = measure_file(&full);
                 (Some(name.clone()), bytes, None, content_hash)
             } else {
-                let (bytes, content_hash) = conn
-                    .map(|c| measure_table(c, name))
-                    .unwrap_or((None, None));
+                let (bytes, content_hash) =
+                    conn.map(|c| measure_table(c, name)).unwrap_or((None, None));
                 let row_count = conn.and_then(|c| table_row_count(c, name));
                 (None, bytes, row_count, content_hash)
             };
@@ -432,7 +437,11 @@ fn measure_file(full: &Path) -> (Option<u64>, Option<String>) {
     let content_hash = crate::ingress_meta::read(full)
         .map(|m| m.sha256)
         .filter(|s| !s.is_empty())
-        .or_else(|| std::fs::read(full).ok().map(|b| crate::state::content_hash(&b)));
+        .or_else(|| {
+            std::fs::read(full)
+                .ok()
+                .map(|b| crate::state::content_hash(&b))
+        });
     (bytes, content_hash)
 }
 
@@ -460,7 +469,9 @@ fn measure_table(conn: &duckdb::Connection, name: &str) -> (Option<u64>, Option<
         "SELECT sha256(coalesce(string_agg(r, '\n' ORDER BY r), '')) \
          FROM (SELECT CAST({name} AS VARCHAR) AS r FROM {name})"
     );
-    let content_hash = conn.query_row(&hash_sql, [], |r| r.get::<_, String>(0)).ok();
+    let content_hash = conn
+        .query_row(&hash_sql, [], |r| r.get::<_, String>(0))
+        .ok();
     (bytes, content_hash)
 }
 
@@ -489,18 +500,20 @@ fn build_step(
         let version_resolved = crate::operator::resolve(reference)
             .map(|op| op.version().to_string())
             .unwrap_or_default();
-        OpRef { name, constraint, version_resolved }
+        OpRef {
+            name,
+            constraint,
+            version_resolved,
+        }
     });
 
     // resolved_with: the op's typed config, secret-looking values redacted.
     let resolved_with = if step.op.is_some() {
         match &step.with {
-            Some(with) if !with.is_null() => {
-                serde_json::to_value(with).ok().map(|mut json| {
-                    redact_json(&mut json);
-                    json
-                })
-            }
+            Some(with) if !with.is_null() => serde_json::to_value(with).ok().map(|mut json| {
+                redact_json(&mut json);
+                json
+            }),
             _ => None,
         }
     } else {
@@ -539,7 +552,12 @@ fn build_step(
             }
             Err(_) => (String::new(), String::new(), Vec::new()),
         };
-        SqlInfo { model_path: model_path.clone(), sql_text, sql_hash, statements }
+        SqlInfo {
+            model_path: model_path.clone(),
+            sql_text,
+            sql_hash,
+            statements,
+        }
     });
 
     let outcome = outcomes.get(&step.name).cloned().unwrap_or(StepOutcome {
@@ -593,8 +611,10 @@ pub fn param_entries(
     dotenv_vars: &HashMap<String, String>,
     cli_params: &[(String, String)],
 ) -> Vec<ParamEntry> {
-    let cli: HashMap<&str, &str> =
-        cli_params.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let cli: HashMap<&str, &str> = cli_params
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
 
     let mut out = Vec::new();
     for (name, param) in manifest_params {
@@ -609,7 +629,11 @@ pub fn param_entries(
             // point; skip defensively.
             continue;
         };
-        let value = if is_secret_key(name) { REDACTED.to_string() } else { value };
+        let value = if is_secret_key(name) {
+            REDACTED.to_string()
+        } else {
+            value
+        };
         out.push(ParamEntry {
             key: name.clone(),
             value,
@@ -649,7 +673,10 @@ pub fn render_dag(contract: &Contract) -> String {
             None => out.push_str("      produced by  (external source)\n"),
         }
         if !asset.consumed_by.is_empty() {
-            out.push_str(&format!("      feeds        {}\n", asset.consumed_by.join(", ")));
+            out.push_str(&format!(
+                "      feeds        {}\n",
+                asset.consumed_by.join(", ")
+            ));
         }
     }
     out
@@ -665,8 +692,15 @@ const REDACTED: &str = "***REDACTED***";
 fn is_secret_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     [
-        "secret", "token", "password", "passwd", "credential", "api_key", "apikey",
-        "access_key", "auth",
+        "secret",
+        "token",
+        "password",
+        "passwd",
+        "credential",
+        "api_key",
+        "apikey",
+        "access_key",
+        "auth",
     ]
     .iter()
     .any(|needle| key.contains(needle))
@@ -695,8 +729,8 @@ fn looks_like_file(name: &str) -> bool {
         return true;
     }
     const EXTS: [&str; 13] = [
-        ".parquet", ".csv", ".tsv", ".json", ".ndjson", ".jsonl", ".txt", ".zip",
-        ".gz", ".arrow", ".xlsx", ".db", ".duckdb",
+        ".parquet", ".csv", ".tsv", ".json", ".ndjson", ".jsonl", ".txt", ".zip", ".gz", ".arrow",
+        ".xlsx", ".db", ".duckdb",
     ];
     EXTS.iter().any(|ext| name.ends_with(ext))
 }
@@ -791,7 +825,10 @@ mod tests {
         redact_json(&mut json);
         assert_eq!(json["url"], serde_json::json!("https://example.com"));
         assert_eq!(json["api_token"], serde_json::json!(REDACTED));
-        assert_eq!(json["headers"]["Authorization"], serde_json::json!(REDACTED));
+        assert_eq!(
+            json["headers"]["Authorization"],
+            serde_json::json!(REDACTED)
+        );
     }
 
     #[test]
@@ -823,7 +860,11 @@ mod tests {
         crate::ingress_meta::write(&f, &meta).unwrap();
         let (bytes, hash) = measure_file(&f);
         assert!(bytes.is_some(), "byte length still measured on disk");
-        assert_eq!(hash.as_deref(), Some(meta.sha256.as_str()), "sidecar sha256 reused");
+        assert_eq!(
+            hash.as_deref(),
+            Some(meta.sha256.as_str()),
+            "sidecar sha256 reused"
+        );
     }
 
     #[test]
@@ -846,9 +887,24 @@ mod tests {
     #[test]
     fn param_entries_track_source_and_redact_secrets() {
         let mut params: IndexMap<String, Param> = IndexMap::new();
-        params.insert("date".to_string(), Param { default: Some("2026-01-01".to_string()) });
-        params.insert("mode".to_string(), Param { default: Some("local".to_string()) });
-        params.insert("api_token".to_string(), Param { default: Some("sekret".to_string()) });
+        params.insert(
+            "date".to_string(),
+            Param {
+                default: Some("2026-01-01".to_string()),
+            },
+        );
+        params.insert(
+            "mode".to_string(),
+            Param {
+                default: Some("local".to_string()),
+            },
+        );
+        params.insert(
+            "api_token".to_string(),
+            Param {
+                default: Some("sekret".to_string()),
+            },
+        );
 
         let mut dotenv = HashMap::new();
         dotenv.insert("mode".to_string(), "dotenv-mode".to_string());

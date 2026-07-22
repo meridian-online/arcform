@@ -1,0 +1,35 @@
+name: public-hygiene
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Deliberately a workflow of its own rather than a job inside `ci`:
+#
+# * `ci` builds the crate, which links a system DuckDB and takes minutes. This
+#   gate needs no toolchain, no cache and no build — it is `git grep` over
+#   tracked files and finishes in seconds. It should be the first thing to go
+#   red, and it should still report when the Rust suite is queued or cancelled.
+# * A leaked private planning identifier must be reported on every pushed commit,
+#   independent of whether the build succeeds.
+jobs:
+  planning-identifiers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # fetch-depth 1 is enough: the gate reads the tracked files of this one
+      # commit, never history.
+      - uses: actions/checkout@v4
+
+      # The gate's own regression test runs FIRST. A hygiene gate fails silently
+      # in both directions — it can stop matching, or start matching honest
+      # prose — so "the gate still works" has to be checked before "the tree is
+      # clean" means anything.
+      - name: hygiene gate self-test
+        run: ./scripts/check-public-hygiene-selftest.sh
+
+      # No `working-directory`. The gate cd's to the repo root itself and scans
+      # every tracked file in the repository.
+      - name: private planning identifiers
+        run: ./scripts/check-public-hygiene.sh

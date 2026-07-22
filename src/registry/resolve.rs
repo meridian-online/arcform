@@ -79,7 +79,7 @@ fn lookup<'a>(index: &'a RegistryIndex, query: &str) -> Result<&'a IndexEntry> {
 
 /// Resolve a (query, version-override) pair to a concrete `ResolvedEntry`.
 ///
-/// `Latest` is reserved in v1 — see ac-02 + spec scope.out — and errors with
+/// `Latest` is reserved in v1 — out of the v1 spec scope — and errors with
 /// `RegistryUnimplemented` before any transport work.
 pub fn resolve(
     index: &RegistryIndex,
@@ -133,9 +133,9 @@ entries:
         RegistryIndex::parse(yaml).unwrap()
     }
 
-    // ac-02: canonical query resolves to current_version.
+    // canonical query resolves to current_version.
     #[test]
-    fn test_ac02_canonical_default() {
+    fn test_canonical_default() {
         let r = resolve(&idx(), "brewtrend", None).unwrap();
         assert_eq!(r.name, "brewtrend");
         assert_eq!(r.owner, None);
@@ -143,18 +143,18 @@ entries:
         assert_eq!(r.display_name(), "brewtrend");
     }
 
-    // ac-02: contributor query resolves correctly.
+    // contributor query resolves correctly.
     #[test]
-    fn test_ac02_contributor_query() {
+    fn test_contributor_query() {
         let r = resolve(&idx(), "someone/myproject", None).unwrap();
         assert_eq!(r.owner.as_deref(), Some("someone"));
         assert_eq!(r.ref_, "v0.3");
         assert_eq!(r.display_name(), "someone/myproject");
     }
 
-    // ac-02: pinned override returns the pinned ref.
+    // pinned override returns the pinned ref.
     #[test]
-    fn test_ac02_pinned_override() {
+    fn test_pinned_override() {
         let r = resolve(
             &idx(),
             "brewtrend",
@@ -164,38 +164,38 @@ entries:
         assert_eq!(r.ref_, "v0.5");
     }
 
-    // ac-02: --latest errors with RegistryUnimplemented naming --latest.
+    // --latest errors with RegistryUnimplemented naming --latest.
     #[test]
-    fn test_ac02_latest_errors_unimplemented() {
+    fn test_latest_errors_unimplemented() {
         let err = resolve(&idx(), "brewtrend", Some(VersionSpec::Latest)).unwrap_err();
         let msg = err.to_string();
         assert!(matches!(err, Error::RegistryUnimplemented { .. }));
         assert!(msg.contains("--latest"), "{msg}");
     }
 
-    // ac-02: unknown query errors.
+    // unknown query errors.
     #[test]
-    fn test_ac02_unknown_query_errors() {
+    fn test_unknown_query_errors() {
         let err = resolve(&idx(), "ghost", None).unwrap_err();
         assert!(matches!(err, Error::RegistryUnknownEntry { .. }));
     }
 
-    // ac-02: malformed `a/b/c` errors.
+    // malformed `a/b/c` errors.
     #[test]
-    fn test_ac02_malformed_three_slash_errors() {
+    fn test_malformed_three_slash_errors() {
         let err = resolve(&idx(), "a/b/c", None).unwrap_err();
         assert!(matches!(err, Error::RegistryAmbiguousQuery { .. }));
     }
 
-    // ac-02: empty halves of slash form error.
+    // empty halves of slash form error.
     #[test]
-    fn test_ac02_malformed_empty_owner_errors() {
+    fn test_malformed_empty_owner_errors() {
         let err = resolve(&idx(), "/foo", None).unwrap_err();
         assert!(matches!(err, Error::RegistryAmbiguousQuery { .. }));
     }
 
     #[test]
-    fn test_ac02_malformed_empty_name_errors() {
+    fn test_malformed_empty_name_errors() {
         let err = resolve(&idx(), "owner/", None).unwrap_err();
         assert!(matches!(err, Error::RegistryAmbiguousQuery { .. }));
     }

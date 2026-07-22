@@ -250,11 +250,7 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
         }
 
         // INSERT INTO foo SELECT ...
-        Statement::Insert(Insert {
-            table,
-            source,
-            ..
-        }) => {
+        Statement::Insert(Insert { table, source, .. }) => {
             if let TableObject::TableName(name) = table {
                 assets.outputs.insert(object_name_to_string(name));
             }
@@ -265,13 +261,9 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
 
         // COPY foo TO 'file.csv'
         // COPY foo FROM 'file.csv'
-        Statement::Copy {
-            source, target, ..
-        } => {
+        Statement::Copy { source, target, .. } => {
             match source {
-                CopySource::Table {
-                    table_name, ..
-                } => {
+                CopySource::Table { table_name, .. } => {
                     // COPY <table> ... — table is the source being read/written
                     match target {
                         CopyTarget::File { filename } => {
@@ -298,9 +290,7 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
         }
 
         // DROP TABLE/VIEW — destructive operation
-        Statement::Drop {
-            names, ..
-        } => {
+        Statement::Drop { names, .. } => {
             for name in names {
                 assets.destroys.insert(object_name_to_string(name));
             }
@@ -318,9 +308,7 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
         }
 
         // MERGE INTO target USING source — target is written, source is read
-        Statement::Merge {
-            table, source, ..
-        } => {
+        Statement::Merge { table, source, .. } => {
             // Target table → outputs
             if let TableFactor::Table { name, .. } = table {
                 assets.outputs.insert(object_name_to_string(name));
@@ -415,7 +403,9 @@ fn extract_inputs_from_table_factor(factor: &TableFactor, assets: &mut SqlAssets
         TableFactor::Derived { subquery, .. } => {
             extract_inputs_from_query(subquery, assets);
         }
-        TableFactor::NestedJoin { table_with_joins, .. } => {
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
             extract_inputs_from_table_factor(&table_with_joins.relation, assets);
             for join in &table_with_joins.joins {
                 extract_inputs_from_table_factor(&join.relation, assets);
@@ -493,105 +483,108 @@ fn extract_path_literals(expr: &Expr, out: &mut BTreeSet<String>) {
 mod tests {
     use super::*;
 
-    // AC-01: CREATE TABLE is discovered as an output.
+    // CREATE TABLE is discovered as an output.
     #[test]
-    fn test_ac01_create_table_output() {
+    fn test_create_table_output() {
         let sql = "CREATE TABLE customers (id INT, name TEXT);";
         let assets = extract_assets(sql).unwrap();
         assert!(assets.outputs.contains("customers"));
         assert!(assets.inputs.is_empty());
     }
 
-    // AC-01: CREATE VIEW is discovered as an output.
+    // CREATE VIEW is discovered as an output.
     #[test]
-    fn test_ac01_create_view_output() {
+    fn test_create_view_output() {
         let sql = "CREATE VIEW active_customers AS SELECT * FROM customers WHERE active = true;";
         let assets = extract_assets(sql).unwrap();
         assert!(assets.outputs.contains("active_customers"));
         assert!(assets.inputs.contains("customers"));
     }
 
-    // AC-01: CREATE TABLE AS SELECT (CTAS) discovers both output and inputs.
+    // CREATE TABLE AS SELECT (CTAS) discovers both output and inputs.
     #[test]
-    fn test_ac01_ctas_output_and_inputs() {
+    fn test_ctas_output_and_inputs() {
         let sql = "CREATE TABLE summary AS SELECT count(*) AS total FROM orders;";
         let assets = extract_assets(sql).unwrap();
         assert!(assets.outputs.contains("summary"));
         assert!(assets.inputs.contains("orders"));
     }
 
-    // AC-01: Multiple DDL statements in one file.
+    // Multiple DDL statements in one file.
     #[test]
-    fn test_ac01_multiple_creates() {
+    fn test_multiple_creates() {
         let sql = "CREATE TABLE foo (id INT);\nCREATE TABLE bar (id INT);\nCREATE VIEW baz AS SELECT * FROM foo;";
         let assets = extract_assets(sql).unwrap();
-        assert_eq!(assets.outputs, BTreeSet::from(["foo".into(), "bar".into(), "baz".into()]));
+        assert_eq!(
+            assets.outputs,
+            BTreeSet::from(["foo".into(), "bar".into(), "baz".into()])
+        );
         assert!(assets.inputs.contains("foo"));
     }
 
-    // AC-02: FROM clause tables are discovered as inputs.
+    // FROM clause tables are discovered as inputs.
     #[test]
-    fn test_ac02_from_clause_inputs() {
+    fn test_from_clause_inputs() {
         let sql = "SELECT * FROM customers;";
         let assets = extract_assets(sql).unwrap();
         assert!(assets.inputs.contains("customers"));
         assert!(assets.outputs.is_empty());
     }
 
-    // AC-02: JOIN tables are discovered as inputs.
+    // JOIN tables are discovered as inputs.
     #[test]
-    fn test_ac02_join_inputs() {
+    fn test_join_inputs() {
         let sql = "SELECT c.name, o.total FROM customers c JOIN orders o ON c.id = o.customer_id;";
         let assets = extract_assets(sql).unwrap();
         assert!(assets.inputs.contains("customers"));
         assert!(assets.inputs.contains("orders"));
     }
 
-    // AC-02: Subqueries in FROM clause.
+    // Subqueries in FROM clause.
     #[test]
-    fn test_ac02_subquery_inputs() {
+    fn test_subquery_inputs() {
         let sql = "SELECT * FROM (SELECT * FROM raw_data) sub;";
         let assets = extract_assets(sql).unwrap();
         assert!(assets.inputs.contains("raw_data"));
     }
 
-    // AC-03: INSERT INTO is discovered as an output.
+    // INSERT INTO is discovered as an output.
     #[test]
-    fn test_ac03_insert_into_output() {
+    fn test_insert_into_output() {
         let sql = "INSERT INTO summary SELECT count(*) FROM customers;";
         let assets = extract_assets(sql).unwrap();
         assert!(assets.outputs.contains("summary"));
         assert!(assets.inputs.contains("customers"));
     }
 
-    // AC-03: COPY TO reads from a table (input).
+    // COPY TO reads from a table (input).
     #[test]
-    fn test_ac03_copy_to_file() {
+    fn test_copy_to_file() {
         let sql = "COPY customers TO 'customers.csv';";
         let assets = extract_assets(sql).unwrap();
         assert!(assets.inputs.contains("customers"));
     }
 
-    // AC-07: Unparseable SQL returns an error (caller treats as opaque).
+    // Unparseable SQL returns an error (caller treats as opaque).
     #[test]
-    fn test_ac07_unparseable_sql() {
+    fn test_unparseable_sql() {
         let sql = "THIS IS NOT VALID SQL AT ALL %%%";
         let result = extract_assets(sql);
         assert!(result.is_err());
     }
 
-    // AC-02: UNION ALL discovers inputs from both branches.
+    // UNION ALL discovers inputs from both branches.
     #[test]
-    fn test_ac02_union_all_inputs() {
+    fn test_union_all_inputs() {
         let sql = "SELECT * FROM customers UNION ALL SELECT * FROM archived_customers;";
         let assets = extract_assets(sql).unwrap();
         assert!(assets.inputs.contains("customers"));
         assert!(assets.inputs.contains("archived_customers"));
     }
 
-    // AC-02: CTAS with UNION discovers output and all inputs.
+    // CTAS with UNION discovers output and all inputs.
     #[test]
-    fn test_ac02_ctas_union_inputs() {
+    fn test_ctas_union_inputs() {
         let sql = "CREATE TABLE all_customers AS SELECT * FROM customers UNION ALL SELECT * FROM archived_customers;";
         let assets = extract_assets(sql).unwrap();
         assert!(assets.outputs.contains("all_customers"));
@@ -599,23 +592,33 @@ mod tests {
         assert!(assets.inputs.contains("archived_customers"));
     }
 
-    // AC-02: EXCEPT discovers inputs from both sides.
+    // EXCEPT discovers inputs from both sides.
     #[test]
-    fn test_ac02_except_inputs() {
+    fn test_except_inputs() {
         let sql = "SELECT id FROM customers EXCEPT SELECT id FROM blocklist;";
         let assets = extract_assets(sql).unwrap();
         assert!(assets.inputs.contains("customers"));
         assert!(assets.inputs.contains("blocklist"));
     }
 
-    // AC-02: CTE names go to internal, not inputs.
+    // CTE names go to internal, not inputs.
     #[test]
-    fn test_ac02_cte_internal_not_inputs() {
-        let sql = "WITH recent AS (SELECT * FROM orders WHERE date > '2026-01-01') SELECT * FROM recent;";
+    fn test_cte_internal_not_inputs() {
+        let sql =
+            "WITH recent AS (SELECT * FROM orders WHERE date > '2026-01-01') SELECT * FROM recent;";
         let assets = extract_assets(sql).unwrap();
-        assert!(assets.inputs.contains("orders"), "real table should be in inputs");
-        assert!(!assets.inputs.contains("recent"), "CTE name should NOT be in inputs");
-        assert!(assets.internal.contains("recent"), "CTE name should be in internal");
+        assert!(
+            assets.inputs.contains("orders"),
+            "real table should be in inputs"
+        );
+        assert!(
+            !assets.inputs.contains("recent"),
+            "CTE name should NOT be in inputs"
+        );
+        assert!(
+            assets.internal.contains("recent"),
+            "CTE name should be in internal"
+        );
     }
 
     // Edge case: Qualified table names use the last component.
@@ -633,101 +636,157 @@ mod tests {
         let sql = "-- just a comment";
         // This may either parse as empty or error — both are acceptable
         let result = extract_assets(sql);
-        match result {
-            Ok(assets) => {
-                assert!(assets.outputs.is_empty());
-                assert!(assets.inputs.is_empty());
-            }
-            Err(_) => {} // Also acceptable — treated as opaque
+        // An Err is also acceptable — comment-only input is treated as opaque.
+        if let Ok(assets) = result {
+            assert!(assets.outputs.is_empty());
+            assert!(assets.inputs.is_empty());
         }
     }
 
-    // AC-03: Nested CTEs — both captured in internal.
+    // Nested CTEs — both captured in internal.
     #[test]
-    fn test_ac03_nested_ctes_in_internal() {
+    fn test_nested_ctes_in_internal() {
         let sql = "WITH a AS (SELECT * FROM raw_data), b AS (SELECT * FROM a) SELECT * FROM b;";
         let assets = extract_assets(sql).unwrap();
-        assert!(assets.internal.contains("a"), "CTE 'a' should be in internal");
-        assert!(assets.internal.contains("b"), "CTE 'b' should be in internal");
-        assert!(assets.inputs.contains("raw_data"), "real table should be in inputs");
-        assert!(!assets.inputs.contains("a"), "CTE 'a' should NOT be in inputs");
-        assert!(!assets.inputs.contains("b"), "CTE 'b' should NOT be in inputs");
+        assert!(
+            assets.internal.contains("a"),
+            "CTE 'a' should be in internal"
+        );
+        assert!(
+            assets.internal.contains("b"),
+            "CTE 'b' should be in internal"
+        );
+        assert!(
+            assets.inputs.contains("raw_data"),
+            "real table should be in inputs"
+        );
+        assert!(
+            !assets.inputs.contains("a"),
+            "CTE 'a' should NOT be in inputs"
+        );
+        assert!(
+            !assets.inputs.contains("b"),
+            "CTE 'b' should NOT be in inputs"
+        );
     }
 
-    // AC-04: CTE name shadowing a real table — CTE goes to internal, real table stays in inputs.
+    // CTE name shadowing a real table — CTE goes to internal, real table stays in inputs.
     #[test]
-    fn test_ac04_cte_shadows_real_table() {
+    fn test_cte_shadows_real_table() {
         let sql = "WITH customers AS (SELECT * FROM raw_customers) SELECT * FROM customers;";
         let assets = extract_assets(sql).unwrap();
-        assert!(assets.internal.contains("customers"), "CTE 'customers' should be in internal");
-        assert!(assets.inputs.contains("raw_customers"), "real table should be in inputs");
-        assert!(!assets.inputs.contains("customers"), "CTE 'customers' should NOT be in inputs");
+        assert!(
+            assets.internal.contains("customers"),
+            "CTE 'customers' should be in internal"
+        );
+        assert!(
+            assets.inputs.contains("raw_customers"),
+            "real table should be in inputs"
+        );
+        assert!(
+            !assets.inputs.contains("customers"),
+            "CTE 'customers' should NOT be in inputs"
+        );
     }
 
-    // AC-05: DROP TABLE populates destroys.
+    // DROP TABLE populates destroys.
     #[test]
-    fn test_ac05_drop_table_destroys() {
+    fn test_drop_table_destroys() {
         let sql = "DROP TABLE foo;";
         let assets = extract_assets(sql).unwrap();
-        assert!(assets.destroys.contains("foo"), "dropped table should be in destroys");
+        assert!(
+            assets.destroys.contains("foo"),
+            "dropped table should be in destroys"
+        );
         assert!(assets.outputs.is_empty(), "drop should not add to outputs");
         assert!(assets.inputs.is_empty(), "drop should not add to inputs");
     }
 
-    // AC-05: DROP VIEW also populates destroys.
+    // DROP VIEW also populates destroys.
     #[test]
-    fn test_ac05_drop_view_destroys() {
+    fn test_drop_view_destroys() {
         let sql = "DROP VIEW IF EXISTS my_view;";
         let assets = extract_assets(sql).unwrap();
-        assert!(assets.destroys.contains("my_view"), "dropped view should be in destroys");
+        assert!(
+            assets.destroys.contains("my_view"),
+            "dropped view should be in destroys"
+        );
     }
 
-    // AC-06: DROP + CREATE in same file — both destroys and outputs populated.
+    // DROP + CREATE in same file — both destroys and outputs populated.
     #[test]
-    fn test_ac06_drop_then_create() {
+    fn test_drop_then_create() {
         let sql = "DROP TABLE IF EXISTS foo; CREATE TABLE foo AS SELECT * FROM bar;";
         let assets = extract_assets(sql).unwrap();
-        assert!(assets.destroys.contains("foo"), "dropped table should be in destroys");
-        assert!(assets.outputs.contains("foo"), "created table should be in outputs");
-        assert!(assets.inputs.contains("bar"), "source table should be in inputs");
+        assert!(
+            assets.destroys.contains("foo"),
+            "dropped table should be in destroys"
+        );
+        assert!(
+            assets.outputs.contains("foo"),
+            "created table should be in outputs"
+        );
+        assert!(
+            assets.inputs.contains("bar"),
+            "source table should be in inputs"
+        );
     }
 
-    // AC-07: ALTER TABLE populates outputs only.
+    // ALTER TABLE populates outputs only.
     #[test]
-    fn test_ac07_alter_table_outputs_only() {
+    fn test_alter_table_outputs_only() {
         let sql = "ALTER TABLE customers ADD COLUMN email TEXT;";
         let assets = extract_assets(sql).unwrap();
-        assert!(assets.outputs.contains("customers"), "altered table should be in outputs");
+        assert!(
+            assets.outputs.contains("customers"),
+            "altered table should be in outputs"
+        );
         assert!(assets.inputs.is_empty(), "alter should not add to inputs");
     }
 
-    // AC-08: MERGE INTO — target in outputs, source in inputs.
+    // MERGE INTO — target in outputs, source in inputs.
     #[test]
-    fn test_ac08_merge_into() {
+    fn test_merge_into() {
         let sql = "MERGE INTO target USING source ON target.id = source.id WHEN MATCHED THEN UPDATE SET target.name = source.name;";
         let assets = extract_assets(sql).unwrap();
-        assert!(assets.outputs.contains("target"), "merge target should be in outputs");
-        assert!(assets.inputs.contains("source"), "merge source should be in inputs");
+        assert!(
+            assets.outputs.contains("target"),
+            "merge target should be in outputs"
+        );
+        assert!(
+            assets.inputs.contains("source"),
+            "merge source should be in inputs"
+        );
     }
 
-    // AC-09: CREATE OR REPLACE TABLE is handled as output.
+    // CREATE OR REPLACE TABLE is handled as output.
     #[test]
-    fn test_ac09_create_or_replace() {
+    fn test_create_or_replace() {
         let sql = "CREATE OR REPLACE TABLE foo AS SELECT * FROM bar;";
         let assets = extract_assets(sql).unwrap();
-        assert!(assets.outputs.contains("foo"), "replaced table should be in outputs");
-        assert!(assets.inputs.contains("bar"), "source table should be in inputs");
+        assert!(
+            assets.outputs.contains("foo"),
+            "replaced table should be in outputs"
+        );
+        assert!(
+            assets.inputs.contains("bar"),
+            "source table should be in inputs"
+        );
     }
 
-    // AC-14: PIVOT source table is extracted as input.
+    // PIVOT source table is extracted as input.
     #[test]
-    fn test_ac14_pivot_source_table() {
+    fn test_pivot_source_table() {
         // sqlparser-rs 0.55 supports PIVOT syntax
-        let sql = "SELECT * FROM monthly_sales PIVOT (SUM(amount) FOR month IN ('Jan', 'Feb', 'Mar'));";
+        let sql =
+            "SELECT * FROM monthly_sales PIVOT (SUM(amount) FOR month IN ('Jan', 'Feb', 'Mar'));";
         let result = extract_assets(sql);
         match result {
             Ok(assets) => {
-                assert!(assets.inputs.contains("monthly_sales"), "pivot source should be in inputs");
+                assert!(
+                    assets.inputs.contains("monthly_sales"),
+                    "pivot source should be in inputs"
+                );
             }
             Err(_) => {
                 // If sqlparser doesn't support this syntax, graceful degradation is acceptable
@@ -735,14 +794,17 @@ mod tests {
         }
     }
 
-    // AC-14: UNPIVOT source table is extracted as input.
+    // UNPIVOT source table is extracted as input.
     #[test]
-    fn test_ac14_unpivot_source_table() {
+    fn test_unpivot_source_table() {
         let sql = "SELECT * FROM quarterly_report UNPIVOT (value FOR quarter IN (q1, q2, q3, q4));";
         let result = extract_assets(sql);
         match result {
             Ok(assets) => {
-                assert!(assets.inputs.contains("quarterly_report"), "unpivot source should be in inputs");
+                assert!(
+                    assets.inputs.contains("quarterly_report"),
+                    "unpivot source should be in inputs"
+                );
             }
             Err(_) => {
                 // If sqlparser doesn't support this syntax, graceful degradation is acceptable
@@ -755,9 +817,18 @@ mod tests {
     fn test_recursive_cte() {
         let sql = "WITH RECURSIVE tree AS (SELECT id, parent_id FROM nodes WHERE parent_id IS NULL UNION ALL SELECT n.id, n.parent_id FROM nodes n JOIN tree t ON n.parent_id = t.id) SELECT * FROM tree;";
         let assets = extract_assets(sql).unwrap();
-        assert!(assets.internal.contains("tree"), "recursive CTE should be in internal");
-        assert!(assets.inputs.contains("nodes"), "real table should be in inputs");
-        assert!(!assets.inputs.contains("tree"), "CTE should NOT be in inputs");
+        assert!(
+            assets.internal.contains("tree"),
+            "recursive CTE should be in internal"
+        );
+        assert!(
+            assets.inputs.contains("nodes"),
+            "real table should be in inputs"
+        );
+        assert!(
+            !assets.inputs.contains("tree"),
+            "CTE should NOT be in inputs"
+        );
     }
 
     // Edge case: CTE with subquery — inner subquery tables discovered.
@@ -766,7 +837,10 @@ mod tests {
         let sql = "WITH a AS (SELECT * FROM (SELECT * FROM raw) sub) SELECT * FROM a;";
         let assets = extract_assets(sql).unwrap();
         assert!(assets.internal.contains("a"), "CTE should be in internal");
-        assert!(assets.inputs.contains("raw"), "subquery source should be in inputs");
+        assert!(
+            assets.inputs.contains("raw"),
+            "subquery source should be in inputs"
+        );
         assert!(!assets.inputs.contains("a"), "CTE should NOT be in inputs");
     }
 
@@ -775,8 +849,14 @@ mod tests {
     fn test_alter_view_outputs_and_inputs() {
         let sql = "ALTER VIEW active_customers AS SELECT * FROM customers WHERE active = true;";
         let assets = extract_assets(sql).unwrap();
-        assert!(assets.outputs.contains("active_customers"), "altered view should be in outputs");
-        assert!(assets.inputs.contains("customers"), "source table should be in inputs");
+        assert!(
+            assets.outputs.contains("active_customers"),
+            "altered view should be in outputs"
+        );
+        assert!(
+            assets.inputs.contains("customers"),
+            "source table should be in inputs"
+        );
     }
 
     // Edge case: DROP multiple tables in one statement.
@@ -794,8 +874,14 @@ mod tests {
     fn test_read_parquet_lifts_path() {
         let sql = "CREATE TABLE t AS SELECT * FROM read_parquet('build/edgar.parquet');";
         let assets = extract_assets(sql).unwrap();
-        assert!(assets.inputs.contains("build/edgar.parquet"), "path is the input");
-        assert!(!assets.inputs.contains("read_parquet"), "fn name is not an input");
+        assert!(
+            assets.inputs.contains("build/edgar.parquet"),
+            "path is the input"
+        );
+        assert!(
+            !assets.inputs.contains("read_parquet"),
+            "fn name is not an input"
+        );
         assert!(assets.outputs.contains("t"));
     }
 
@@ -804,7 +890,10 @@ mod tests {
     fn test_read_csv_preserves_case() {
         let sql = "SELECT * FROM read_csv('Data/Raw/GLEIF.csv');";
         let assets = extract_assets(sql).unwrap();
-        assert!(assets.inputs.contains("Data/Raw/GLEIF.csv"), "path case preserved");
+        assert!(
+            assets.inputs.contains("Data/Raw/GLEIF.csv"),
+            "path case preserved"
+        );
         assert!(!assets.inputs.contains("read_csv"));
     }
 
@@ -815,8 +904,14 @@ mod tests {
         let assets = extract_assets(sql).unwrap();
         assert!(assets.inputs.contains("a/30d.json"), "first path lifted");
         assert!(assets.inputs.contains("a/90d.json"), "second path lifted");
-        assert!(!assets.inputs.contains("read_json"), "fn name is not an input");
-        assert!(!assets.inputs.contains("array"), "option value is not an input");
+        assert!(
+            !assets.inputs.contains("read_json"),
+            "fn name is not an input"
+        );
+        assert!(
+            !assets.inputs.contains("array"),
+            "option value is not an input"
+        );
         assert!(assets.outputs.contains("brew"));
     }
 
@@ -826,7 +921,10 @@ mod tests {
         let sql = "COPY ranking TO 'data/ranking.parquet';";
         let assets = extract_assets(sql).unwrap();
         assert!(assets.inputs.contains("ranking"), "table is read");
-        assert!(assets.outputs.contains("data/ranking.parquet"), "file is produced");
+        assert!(
+            assets.outputs.contains("data/ranking.parquet"),
+            "file is produced"
+        );
     }
 
     // a non-file table function keeps recording its name (unchanged behaviour).
@@ -834,7 +932,10 @@ mod tests {
     fn test_non_file_table_function_unchanged() {
         let sql = "SELECT * FROM generate_series(1, 10);";
         let assets = extract_assets(sql).unwrap();
-        assert!(assets.inputs.contains("generate_series"), "non-file TVF name still recorded");
+        assert!(
+            assets.inputs.contains("generate_series"),
+            "non-file TVF name still recorded"
+        );
     }
 
     // Byte ranges: one range per top-level statement, each slicing its own source.
@@ -855,7 +956,10 @@ mod tests {
         let sql = "INSERT INTO t VALUES ('a;b;c');";
         let ranges = statement_byte_ranges(sql);
         assert_eq!(ranges.len(), 1);
-        assert_eq!(&sql[ranges[0].0..ranges[0].1], "INSERT INTO t VALUES ('a;b;c');");
+        assert_eq!(
+            &sql[ranges[0].0..ranges[0].1],
+            "INSERT INTO t VALUES ('a;b;c');"
+        );
     }
 
     // Byte ranges: comment-only and blank segments are dropped, not counted.
@@ -889,7 +993,7 @@ mod tests {
     // ---- DuckDB statement-form PIVOT/UNPIVOT + multi-option COPY. ----
     // These forms need the vendored sqlparser fork; without it the parse fails and the
     // whole step degrades to an opaque node (see AssetGraph::build), defeating the
-    // structural-transparency principle (decision 0007).
+    // structural-transparency principle.
 
     // Statement-form PIVOT over a real table lifts the source as an input, not an
     // opaque step.
@@ -907,9 +1011,13 @@ mod tests {
     // PIVOT as a CTAS body — output AND source input are both discovered.
     #[test]
     fn test_pivot_statement_as_ctas_body() {
-        let sql = "CREATE OR REPLACE TABLE installs AS PIVOT wide_sales ON days USING SUM(installs);";
+        let sql =
+            "CREATE OR REPLACE TABLE installs AS PIVOT wide_sales ON days USING SUM(installs);";
         let assets = extract_assets(sql).expect("CTAS over a PIVOT must parse");
-        assert!(assets.outputs.contains("installs"), "CTAS output discovered");
+        assert!(
+            assets.outputs.contains("installs"),
+            "CTAS output discovered"
+        );
         assert!(
             assets.inputs.contains("wide_sales"),
             "pivot source lifted as input, got {:?}",
@@ -935,7 +1043,10 @@ mod tests {
             !assets.inputs.contains("install_counts"),
             "the pivoted CTE name is internal, not an external input"
         );
-        assert!(assets.internal.contains("install_counts"), "CTE tracked as internal");
+        assert!(
+            assets.internal.contains("install_counts"),
+            "CTE tracked as internal"
+        );
     }
 
     // Statement-form UNPIVOT lifts the source as an input.
@@ -978,6 +1089,9 @@ mod tests {
         let sql = "COPY orders TO 'out/orders' (FORMAT parquet, PARTITION_BY (year, month), OVERWRITE_OR_IGNORE);";
         let assets = extract_assets(sql).expect("COPY with PARTITION_BY must parse");
         assert!(assets.inputs.contains("orders"), "table is read");
-        assert!(assets.outputs.contains("out/orders"), "output path produced");
+        assert!(
+            assets.outputs.contains("out/orders"),
+            "output path produced"
+        );
     }
 }

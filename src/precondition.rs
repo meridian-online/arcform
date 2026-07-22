@@ -46,24 +46,18 @@ pub enum Precondition {
     /// Check that a file was modified after a given period ago.
     /// Path is relative to the manifest directory.
     /// If the file is missing or inaccessible, evaluates as stale (not an error).
-    ModifiedAfter {
-        modified_after: ModifiedAfterConfig,
-    },
+    ModifiedAfter { modified_after: ModifiedAfterConfig },
 
     /// Content-aware ingress freshness. HEAD-probes the remote recorded in a
     /// fetched artifact's `<path>.arcmeta` sidecar and compares `ETag` /
     /// `Last-Modified`: unchanged remote = fresh (skip the fetch and everything
     /// downstream), changed or unprobeable = stale (re-fetch). Replaces the
     /// clock-based `modified_after` for `http_fetch` outputs.
-    Fresh {
-        fresh: FreshConfig,
-    },
+    Fresh { fresh: FreshConfig },
 
     /// Run a shell command. Exit 0 = fresh (skip), non-zero = stale (run).
     /// Execution errors (binary not found, crash) halt the pipeline.
-    Command {
-        command: String,
-    },
+    Command { command: String },
 }
 
 impl Precondition {
@@ -72,7 +66,12 @@ impl Precondition {
     ///
     /// For `ModifiedWithin`: file issues return Ok(false) — stale, not error.
     /// For `Command`: execution errors return Err — pipeline halts.
-    pub fn evaluate(&self, manifest_dir: &Path, step_name: &str, env: &HashMap<String, String>) -> Result<bool> {
+    pub fn evaluate(
+        &self,
+        manifest_dir: &Path,
+        step_name: &str,
+        env: &HashMap<String, String>,
+    ) -> Result<bool> {
         match self {
             Precondition::ModifiedAfter { modified_after } => {
                 let period_duration =
@@ -107,8 +106,8 @@ impl Precondition {
                     return Ok(false);
                 };
 
-                let mut req = ureq::head(&meta.url)
-                    .set("User-Agent", crate::ingress_meta::DEFAULT_UA);
+                let mut req =
+                    ureq::head(&meta.url).set("User-Agent", crate::ingress_meta::DEFAULT_UA);
                 for (k, v) in &meta.request_headers {
                     req = req.set(k, v);
                 }
@@ -151,7 +150,7 @@ impl Precondition {
 
                 match output {
                     Ok(o) => Ok(o.status.success()),
-                    Err(e) => Err(Error::PreconditionError {
+                    Err(e) => Err(Error::Precondition {
                         step: step_name.to_string(),
                         command: cmd.clone(),
                         detail: e.to_string(),
@@ -226,24 +225,26 @@ mod tests {
     use std::fs;
     use std::time::{Duration, SystemTime};
 
-    // pre ac-01: Precondition enum exists with both variants.
+    // Precondition enum exists with both variants.
     #[test]
-    fn test_pre_ac01_enum_variants() {
+    fn test_pre_enum_variants() {
         let ma = Precondition::ModifiedAfter {
             modified_after: ModifiedAfterConfig {
                 path: "data/file.json".to_string(),
                 period: "24h".to_string(),
             },
         };
-        let cmd = Precondition::Command { command: "true".to_string() };
+        let cmd = Precondition::Command {
+            command: "true".to_string(),
+        };
         // Both variants compile and construct.
         assert!(matches!(ma, Precondition::ModifiedAfter { .. }));
         assert!(matches!(cmd, Precondition::Command { .. }));
     }
 
-    // pre ac-01: Serde round-trip for both variants.
+    // Serde round-trip for both variants.
     #[test]
-    fn test_pre_ac01_serde_roundtrip() {
+    fn test_pre_serde_roundtrip() {
         let preconditions = vec![
             Precondition::ModifiedAfter {
                 modified_after: ModifiedAfterConfig {
@@ -251,7 +252,9 @@ mod tests {
                     period: "24h".to_string(),
                 },
             },
-            Precondition::Command { command: "test $SKIP".to_string() },
+            Precondition::Command {
+                command: "test $SKIP".to_string(),
+            },
         ];
         let yaml = serde_yaml::to_string(&preconditions).unwrap();
         let parsed: Vec<Precondition> = serde_yaml::from_str(&yaml).unwrap();
@@ -270,24 +273,30 @@ mod tests {
     }
 
     fn cmd(command: &str) -> Precondition {
-        Precondition::Command { command: command.to_string() }
+        Precondition::Command {
+            command: command.to_string(),
+        }
     }
 
     fn empty_env() -> HashMap<String, String> {
         HashMap::new()
     }
 
-    // pre ac-03: modified_after evaluates file mtime — fresh file.
+    // modified_after evaluates file mtime — fresh file.
     #[test]
-    fn test_pre_ac03_modified_after_fresh() {
+    fn test_pre_modified_after_fresh() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("data.json"), "{}").unwrap();
-        assert!(ma("data.json", "1h").evaluate(dir.path(), "test-step", &empty_env()).unwrap());
+        assert!(
+            ma("data.json", "1h")
+                .evaluate(dir.path(), "test-step", &empty_env())
+                .unwrap()
+        );
     }
 
-    // pre ac-03: modified_after evaluates file mtime — stale file.
+    // modified_after evaluates file mtime — stale file.
     #[test]
-    fn test_pre_ac03_modified_after_stale() {
+    fn test_pre_modified_after_stale() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("data.json");
         fs::write(&file_path, "{}").unwrap();
@@ -297,28 +306,44 @@ mod tests {
         let ft = filetime::FileTime::from_system_time(old_time);
         filetime::set_file_mtime(&file_path, ft).unwrap();
 
-        assert!(!ma("data.json", "24h").evaluate(dir.path(), "test-step", &empty_env()).unwrap());
+        assert!(
+            !ma("data.json", "24h")
+                .evaluate(dir.path(), "test-step", &empty_env())
+                .unwrap()
+        );
     }
 
-    // pre ac-04: modified_after with missing file = stale (not error).
+    // modified_after with missing file = stale (not error).
     #[test]
-    fn test_pre_ac04_missing_file_is_stale() {
+    fn test_pre_missing_file_is_stale() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!ma("nonexistent.json", "24h").evaluate(dir.path(), "test-step", &empty_env()).unwrap());
+        assert!(
+            !ma("nonexistent.json", "24h")
+                .evaluate(dir.path(), "test-step", &empty_env())
+                .unwrap()
+        );
     }
 
-    // pre ac-05: command precondition — exit 0 = fresh.
+    // command precondition — exit 0 = fresh.
     #[test]
-    fn test_pre_ac05_command_exit_zero_fresh() {
+    fn test_pre_command_exit_zero_fresh() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(cmd("true").evaluate(dir.path(), "test-step", &empty_env()).unwrap());
+        assert!(
+            cmd("true")
+                .evaluate(dir.path(), "test-step", &empty_env())
+                .unwrap()
+        );
     }
 
-    // pre ac-05: command precondition — non-zero = stale.
+    // command precondition — non-zero = stale.
     #[test]
-    fn test_pre_ac05_command_nonzero_stale() {
+    fn test_pre_command_nonzero_stale() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!cmd("false").evaluate(dir.path(), "test-step", &empty_env()).unwrap());
+        assert!(
+            !cmd("false")
+                .evaluate(dir.path(), "test-step", &empty_env())
+                .unwrap()
+        );
     }
 
     // Command precondition receives resolved params as env vars.
@@ -329,15 +354,23 @@ mod tests {
         env.insert("ARC_PARAM_SEARCH_TERM".to_string(), "hello".to_string());
 
         // Command checks if the env var is set — should return fresh (exit 0).
-        assert!(cmd("test -n \"$ARC_PARAM_SEARCH_TERM\"").evaluate(dir.path(), "test-step", &env).unwrap());
+        assert!(
+            cmd("test -n \"$ARC_PARAM_SEARCH_TERM\"")
+                .evaluate(dir.path(), "test-step", &env)
+                .unwrap()
+        );
 
         // Without the env var, the same command returns stale (exit non-zero).
-        assert!(!cmd("test -n \"$ARC_PARAM_SEARCH_TERM\"").evaluate(dir.path(), "test-step", &empty_env()).unwrap());
+        assert!(
+            !cmd("test -n \"$ARC_PARAM_SEARCH_TERM\"")
+                .evaluate(dir.path(), "test-step", &empty_env())
+                .unwrap()
+        );
     }
 
-    // pre ac-06: AND semantics — all must pass.
+    // AND semantics — all must pass.
     #[test]
-    fn test_pre_ac06_and_semantics_all_fresh() {
+    fn test_pre_and_semantics_all_fresh() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.json"), "{}").unwrap();
         fs::write(dir.path().join("b.json"), "{}").unwrap();
@@ -346,9 +379,9 @@ mod tests {
         assert!(evaluate_all(&preconditions, dir.path(), "test-step", &empty_env()).unwrap());
     }
 
-    // pre ac-06: AND semantics — one stale makes all stale.
+    // AND semantics — one stale makes all stale.
     #[test]
-    fn test_pre_ac06_and_semantics_one_stale() {
+    fn test_pre_and_semantics_one_stale() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("fresh.json"), "{}").unwrap();
 
@@ -356,63 +389,77 @@ mod tests {
         assert!(!evaluate_all(&preconditions, dir.path(), "test-step", &empty_env()).unwrap());
     }
 
-    // pre ac-12: command non-zero exit = stale (not error).
+    // command non-zero exit = stale (not error).
     #[test]
-    fn test_pre_ac12_command_nonzero_is_stale() {
+    fn test_pre_command_nonzero_is_stale() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!cmd("exit 1").evaluate(dir.path(), "test-step", &empty_env()).unwrap());
+        assert!(
+            !cmd("exit 1")
+                .evaluate(dir.path(), "test-step", &empty_env())
+                .unwrap()
+        );
     }
 
-    // pre ac-13: duration parsing supports various formats.
+    // duration parsing supports various formats.
     #[test]
-    fn test_pre_ac13_duration_parsing() {
+    fn test_pre_duration_parsing() {
         for duration_str in &["24h", "60m", "7d", "1h30m", "30s", "2d12h"] {
-            assert!(humantime::parse_duration(duration_str).is_ok(), "Failed: {}", duration_str);
+            assert!(
+                humantime::parse_duration(duration_str).is_ok(),
+                "Failed: {}",
+                duration_str
+            );
         }
     }
 
-    // pre ac-15: validation rejects empty path.
+    // validation rejects empty path.
     #[test]
-    fn test_pre_ac15_validate_empty_path() {
+    fn test_pre_validate_empty_path() {
         assert!(ma("", "24h").validate().is_err());
     }
 
-    // pre ac-15: validation rejects empty period.
+    // validation rejects empty period.
     #[test]
-    fn test_pre_ac15_validate_empty_period() {
+    fn test_pre_validate_empty_period() {
         assert!(ma("file.json", "").validate().is_err());
     }
 
-    // pre ac-15: validation rejects invalid duration.
+    // validation rejects invalid duration.
     #[test]
-    fn test_pre_ac15_validate_invalid_duration() {
+    fn test_pre_validate_invalid_duration() {
         assert!(ma("file.json", "banana").validate().is_err());
     }
 
-    // pre ac-15: validation rejects empty command.
+    // validation rejects empty command.
     #[test]
-    fn test_pre_ac15_validate_empty_command() {
+    fn test_pre_validate_empty_command() {
         assert!(cmd("").validate().is_err());
     }
 
-    // pre ac-15: validation passes for valid preconditions.
+    // validation passes for valid preconditions.
     #[test]
-    fn test_pre_ac15_validate_valid() {
+    fn test_pre_validate_valid() {
         assert!(ma("data.json", "24h").validate().is_ok());
         assert!(cmd("test -f output.csv").validate().is_ok());
     }
 
     fn fresh(path: &str) -> Precondition {
-        Precondition::Fresh { fresh: FreshConfig { path: path.to_string() } }
+        Precondition::Fresh {
+            fresh: FreshConfig {
+                path: path.to_string(),
+            },
+        }
     }
 
     // fresh: no artifact on disk → stale (must fetch), never a network probe.
     #[test]
     fn test_fresh_missing_artifact_is_stale() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!fresh("build/edgar.parquet")
-            .evaluate(dir.path(), "test-step", &empty_env())
-            .unwrap());
+        assert!(
+            !fresh("build/edgar.parquet")
+                .evaluate(dir.path(), "test-step", &empty_env())
+                .unwrap()
+        );
     }
 
     // fresh: artifact present but no `.arcmeta` sidecar → stale (nothing to probe).
@@ -420,9 +467,11 @@ mod tests {
     fn test_fresh_missing_sidecar_is_stale() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("data.parquet"), b"bytes").unwrap();
-        assert!(!fresh("data.parquet")
-            .evaluate(dir.path(), "test-step", &empty_env())
-            .unwrap());
+        assert!(
+            !fresh("data.parquet")
+                .evaluate(dir.path(), "test-step", &empty_env())
+                .unwrap()
+        );
     }
 
     // fresh: validation + serde round-trip.

@@ -1,0 +1,71 @@
+Innocent strings the public-hygiene gate must stay silent on.
+=============================================================
+
+This file is tracked, so scripts/check-public-hygiene.sh scans it like any other
+file in the tree. That is the whole point: every line below looks enough like a
+private planning identifier to be a plausible false positive, and if a pattern
+is ever loosened until it bites one of them, the gate goes red on its own
+fixture instead of on somebody's honest prose six months later.
+
+Add a line here whenever a pattern is tightened, so the tightening stays fixed.
+Never add a line that is a genuine violation — this file is not an allowlist.
+The allowlist is scripts/public-hygiene-allowlist.txt and it is exempt from the
+scan; this file deliberately is not.
+
+Rust generics that look like ticket refs
+----------------------------------------
+    fn pair<T1, T22>(a: T22, b: T22) -> T22 { b }
+    fn convert<T22, T23>(v: Vec<T22>) -> Vec<T23> { todo!() }
+    impl<T1: Clone, T22: Clone> Merge for Pair<T1, T22> {}
+    let seen: HashMap<T22, T23> = HashMap::new();
+    let boxed: Box<dyn Fn(T22) -> T23> = Box::new(f);
+    let owned = T22::default();
+    where T22: Into<T23>,
+    fn borrow(v: &T22) -> &T22 { v }
+    type Alias = PhantomData<T22>;
+
+Timestamps that end in a capital T plus digits
+----------------------------------------------
+    2026-07-20T10:30:00Z
+    2026-01-02T09:05:59+00:00
+    started_at = "2025-12-31T23:59:60Z"
+
+URL path segments and CSS custom properties that look like milestone ids
+------------------------------------------------------------------------
+    https://example.com/m-2/spec
+    https://example.com/m-14/spec
+    --m-accent-bg: #4b7a9b;
+    --m-2: 8px;
+    --m-14: 96px;
+    Matrix cell m-1 holds the residual.
+    Row m-1 by column n-3 in the transform.
+
+Hex digests that contain the letters "ac"
+------------------------------------------
+    rev = "4afea48"
+    rev = "cfbac37c"
+    sha = "dedcac1"
+    sha = "fbac503"
+    blob = "eabac5b"
+    short = "bac10"
+    lock = "?rev=4afea48#4afea48"
+    dep = "git+https://example.com/x?rev=v1-ac#4afea48"
+    dep = "git+https://example.com/x?rev=hvac#4afea48"
+
+Words that merely start with a covered prefix
+----------------------------------------------
+    decision-making is not a decision record
+    documentation-2026 is a folder name
+    multitask-42 is one word
+    a mac-01 network label, and a mac_02 variable
+    the doc-comment convention
+    docs-2026 is a directory
+    cardinality-1000 is a metric name
+    a card in the deck, and the cards it sits with
+
+Prose that mentions the vocabulary without an identifier
+---------------------------------------------------------
+    The acceptance criteria are listed in the spec.
+    The milestone slipped a week.
+    See the decision record for the rationale.
+    The task list is in the tracker.

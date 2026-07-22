@@ -106,14 +106,13 @@ source of truth — the skill needs no external substrate to read.
    | `feat!:` / `BREAKING CHANGE:` footer   | **Changed** or **Removed** | Behaviour change or a removed/renamed surface. |
    | `refactor:` / `perf:` / `docs:` / `chore:` / `test:` / `build:` / `ci:` | *usually omit* | Internal — fold into one line only if user-visible. |
 
-   Commits already cite the card or decision that drove them in parentheses (e.g. `feat: lifecycle
-   hooks — init, success, failure, exit handlers (card 0017)`) — carry that citation straight into
-   the changelog line. For the fuller rationale behind a change, the roadmap and decision records
-   live in the team's private planning repo (MADR decision records + roadmap).
+   Commits may cite a private planning id in parentheses (e.g. a `(card NNNN)` suffix). **This
+   repo is public — never carry that citation into the changelog.** Strip it and describe the
+   user-visible change in plain English; the fuller rationale lives in the private planning repo.
 
 **Write for users, not for the commit log.** Each entry is a user-visible change — a new
 command/flag, a manifest field, a behaviour change, a fix. Fold internal refactors into one line
-or omit them. Lead with the capability, cite the card/decision in parentheses.
+or omit them. Lead with the capability; do not cite private card or decision ids.
 
 Use these categories (omit any that are empty):
 
@@ -122,7 +121,7 @@ Use these categories (omit any that are empty):
 
 ### Added
 - **Lifecycle hooks** — `on_init` / `on_success` / `on_failure` / `on_exit` handlers in the
-  manifest (card 0017).
+  manifest.
 
 ### Changed
 - ...

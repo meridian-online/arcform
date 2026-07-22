@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-/// The three pillars from **decision 0015**. Unknown pillar values fail parsing in v1
-/// (hard reject — see ac-01); future versions may relax to skip-unknown.
+/// The three pillars. Unknown pillar values fail parsing in v1
+/// (hard reject); future versions may relax to skip-unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase", deny_unknown_fields)]
 pub enum Pillar {
@@ -37,7 +37,7 @@ impl Pillar {
 }
 
 /// One registry entry. `min_arcform_version` is intentionally NOT included in v1 —
-/// see scope.out + ac-01 in the spec; reintroduce in a follow-up once enforcement
+/// out of the v1 spec scope; reintroduce in a follow-up once enforcement
 /// semantics are decided.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexEntry {
@@ -83,8 +83,10 @@ const SUPPORTED_INDEX_VERSION: u32 = 1;
 impl RegistryIndex {
     /// Parse + validate from a YAML string.
     pub fn parse(yaml: &str) -> Result<Self> {
-        let raw: RegistryIndex = serde_yaml::from_str(yaml)
-            .map_err(|e| Error::RegistryIndexParse { detail: e.to_string() })?;
+        let raw: RegistryIndex =
+            serde_yaml::from_str(yaml).map_err(|e| Error::RegistryIndexParse {
+                detail: e.to_string(),
+            })?;
         raw.validate()?;
         Ok(raw)
     }
@@ -183,9 +185,9 @@ entries:
 "#
     }
 
-    // ac-01: parses sample index covering all three pillars + canonical and contributor.
+    // parses sample index covering all three pillars + canonical and contributor.
     #[test]
-    fn test_ac01_parse_valid_index() {
+    fn test_parse_valid_index() {
         let idx = RegistryIndex::parse(fixture_index()).expect("parse should succeed");
         assert_eq!(idx.version, 1);
         assert_eq!(idx.entries.len(), 3);
@@ -202,27 +204,27 @@ entries:
         assert_eq!(mp.display_name(), "someone/myproject");
     }
 
-    // ac-01: covers Foundational pillar specifically.
+    // covers Foundational pillar specifically.
     #[test]
-    fn test_ac01_parses_all_pillars() {
+    fn test_parses_all_pillars() {
         let idx = RegistryIndex::parse(fixture_index()).unwrap();
         let pillars: Vec<Pillar> = idx.entries.iter().map(|e| e.pillar).collect();
         assert!(pillars.contains(&Pillar::Practical));
         assert!(pillars.contains(&Pillar::Foundational));
     }
 
-    // ac-01: index version=2 rejects.
+    // index version=2 rejects.
     #[test]
-    fn test_ac01_unsupported_version_rejects() {
+    fn test_unsupported_version_rejects() {
         let yaml = "version: 2\nentries: []\n";
         let err = RegistryIndex::parse(yaml).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("version"), "should mention version: {msg}");
     }
 
-    // ac-01: duplicate (owner, name) rejects.
+    // duplicate (owner, name) rejects.
     #[test]
-    fn test_ac01_duplicate_rejects() {
+    fn test_duplicate_rejects() {
         let yaml = r#"
 version: 1
 entries:
@@ -245,9 +247,9 @@ entries:
         assert!(err.to_string().contains("duplicate"), "{err}");
     }
 
-    // ac-01: contributor shadowing canonical name rejects.
+    // contributor shadowing canonical name rejects.
     #[test]
-    fn test_ac01_contributor_shadows_canonical_rejects() {
+    fn test_contributor_shadows_canonical_rejects() {
         let yaml = r#"
 version: 1
 entries:
@@ -273,9 +275,9 @@ entries:
         assert!(msg.contains("brewtrend"), "{msg}");
     }
 
-    // ac-01: unknown pillar value rejects with the entry name in the message.
+    // unknown pillar value rejects with the entry name in the message.
     #[test]
-    fn test_ac01_unknown_pillar_rejects() {
+    fn test_unknown_pillar_rejects() {
         let yaml = r#"
 version: 1
 entries:

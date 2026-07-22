@@ -56,13 +56,25 @@ pub trait Engine {
     /// Execute a SQL file against a database.
     /// `env` contains ARC_PARAM_ variables to inject into the child process environment.
     /// `timeout` is the maximum duration before the step is killed.
-    fn execute_sql(&self, db_path: &Path, sql_path: &Path, env: &HashMap<String, String>, timeout: Option<Duration>) -> Result<StepOutput>;
+    fn execute_sql(
+        &self,
+        db_path: &Path,
+        sql_path: &Path,
+        env: &HashMap<String, String>,
+        timeout: Option<Duration>,
+    ) -> Result<StepOutput>;
 
     /// Execute a raw shell command.
     /// `env` contains ARC_PARAM_ variables to inject into the child process environment.
     /// If `capture_stdout` is true, stdout is piped and captured instead of inherited.
     /// `timeout` is the maximum duration before the step is killed.
-    fn execute_command(&self, command: &str, env: &HashMap<String, String>, capture_stdout: bool, timeout: Option<Duration>) -> Result<StepOutput>;
+    fn execute_command(
+        &self,
+        command: &str,
+        env: &HashMap<String, String>,
+        capture_stdout: bool,
+        timeout: Option<Duration>,
+    ) -> Result<StepOutput>;
 
     /// Check that the engine CLI is available and return information about it.
     /// Returns EngineInfo with the detected version (or None if unparseable).
@@ -73,7 +85,11 @@ pub trait Engine {
 /// Polls try_wait() at ~100ms intervals. On timeout, kills the child.
 /// `pub(crate)` so the operator subprocess substrate shares the identical
 /// kill-on-deadline semantics (the uv-run operators: splink_resolve, gleif).
-pub(crate) fn wait_with_timeout(child: &mut std::process::Child, timeout: Option<Duration>, step_name: &str) -> Result<std::process::ExitStatus> {
+pub(crate) fn wait_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Option<Duration>,
+    step_name: &str,
+) -> Result<std::process::ExitStatus> {
     let Some(deadline_duration) = timeout else {
         // No timeout — wait normally.
         return child.wait().map_err(|e| Error::StepExecution {
@@ -111,7 +127,13 @@ pub(crate) fn wait_with_timeout(child: &mut std::process::Child, timeout: Option
 pub struct DuckDbEngine;
 
 impl Engine for DuckDbEngine {
-    fn execute_sql(&self, db_path: &Path, sql_path: &Path, env: &HashMap<String, String>, timeout: Option<Duration>) -> Result<StepOutput> {
+    fn execute_sql(
+        &self,
+        db_path: &Path,
+        sql_path: &Path,
+        env: &HashMap<String, String>,
+        timeout: Option<Duration>,
+    ) -> Result<StepOutput> {
         let step_name = sql_path.display().to_string();
         let mut child = Command::new("duckdb")
             .arg(db_path)
@@ -138,11 +160,24 @@ impl Engine for DuckDbEngine {
             });
         }
 
-        Ok(StepOutput { stderr, stdout: None })
+        Ok(StepOutput {
+            stderr,
+            stdout: None,
+        })
     }
 
-    fn execute_command(&self, command: &str, env: &HashMap<String, String>, capture_stdout: bool, timeout: Option<Duration>) -> Result<StepOutput> {
-        let stdout_cfg = if capture_stdout { Stdio::piped() } else { Stdio::inherit() };
+    fn execute_command(
+        &self,
+        command: &str,
+        env: &HashMap<String, String>,
+        capture_stdout: bool,
+        timeout: Option<Duration>,
+    ) -> Result<StepOutput> {
+        let stdout_cfg = if capture_stdout {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        };
         // Stderr: inherited for command steps (streams to terminal).
         // When capturing stdout, stderr remains inherited so errors are visible.
         let stderr_cfg = Stdio::inherit();
@@ -328,7 +363,13 @@ pub mod mock {
     }
 
     impl Engine for MockEngine {
-        fn execute_sql(&self, db_path: &Path, sql_path: &Path, env: &HashMap<String, String>, timeout: Option<Duration>) -> Result<StepOutput> {
+        fn execute_sql(
+            &self,
+            db_path: &Path,
+            sql_path: &Path,
+            env: &HashMap<String, String>,
+            timeout: Option<Duration>,
+        ) -> Result<StepOutput> {
             let sql_content = fs::read_to_string(sql_path).map_err(|e| Error::FileRead {
                 path: sql_path.to_path_buf(),
                 source: e,
@@ -361,7 +402,13 @@ pub mod mock {
             })
         }
 
-        fn execute_command(&self, command: &str, env: &HashMap<String, String>, capture_stdout: bool, timeout: Option<Duration>) -> Result<StepOutput> {
+        fn execute_command(
+            &self,
+            command: &str,
+            env: &HashMap<String, String>,
+            capture_stdout: bool,
+            timeout: Option<Duration>,
+        ) -> Result<StepOutput> {
             self.calls.borrow_mut().push(MockCall::Command {
                 command: command.to_string(),
                 env: env.clone(),
@@ -413,38 +460,38 @@ pub mod mock {
 mod tests {
     use super::*;
 
-    // lrp ac-03: Parse version with codename (standard DuckDB format).
+    // Parse version with codename (standard DuckDB format).
     #[test]
-    fn test_lrp_ac03_parse_version_with_codename() {
+    fn test_lrp_parse_version_with_codename() {
         let version = parse_version_output("v1.5.2 (Variegata) 8a5851971f");
         assert_eq!(version.unwrap(), semver::Version::new(1, 5, 2));
     }
 
-    // lrp ac-03: Parse version without codename.
+    // Parse version without codename.
     #[test]
-    fn test_lrp_ac03_parse_version_without_codename() {
+    fn test_lrp_parse_version_without_codename() {
         let version = parse_version_output("v0.10.0 1234abc");
         assert_eq!(version.unwrap(), semver::Version::new(0, 10, 0));
     }
 
-    // lrp ac-03: Parse bare version (no leading 'v').
+    // Parse bare version (no leading 'v').
     #[test]
-    fn test_lrp_ac03_parse_bare_version() {
+    fn test_lrp_parse_bare_version() {
         let version = parse_version_output("1.5.2");
         assert_eq!(version.unwrap(), semver::Version::new(1, 5, 2));
     }
 
-    // lrp ac-12: Unparseable output returns None.
+    // Unparseable output returns None.
     #[test]
-    fn test_lrp_ac12_unparseable_version_returns_none() {
+    fn test_lrp_unparseable_version_returns_none() {
         assert!(parse_version_output("not a version").is_none());
         assert!(parse_version_output("").is_none());
         assert!(parse_version_output("duckdb").is_none());
     }
 
-    // lrp ac-10: MockEngine returns configurable version.
+    // MockEngine returns configurable version.
     #[test]
-    fn test_lrp_ac10_mock_engine_configurable_version() {
+    fn test_lrp_mock_engine_configurable_version() {
         let engine = mock::MockEngine::new();
 
         // Default is 2.0.0.

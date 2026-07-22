@@ -7,7 +7,7 @@ use crate::engine::DuckDbEngine;
 use crate::error::{Error, Result};
 use crate::manifest::Manifest;
 use crate::registry::transport::GitTarballTransport;
-use crate::registry::{cache_root, RunOptions};
+use crate::registry::{RunOptions, cache_root};
 use crate::state::DuckDbStateBackend;
 
 /// Default index URL — points to the (future) meridian-online/registry repo.
@@ -177,7 +177,10 @@ pub fn run_pipeline(force: bool, raw_params: &[String]) -> Result<()> {
 pub fn dispatch(cli: Cli) -> Result<()> {
     let verbose = cli.verbose || std::env::var_os(VERBOSE_ENV).is_some();
     match cli.command {
-        Commands::Init { name, from_descriptor } => match from_descriptor {
+        Commands::Init {
+            name,
+            from_descriptor,
+        } => match from_descriptor {
             Some(path) => crate::bridge::init_from_descriptor(&name, &path),
             None => init(&name),
         },
@@ -233,14 +236,7 @@ fn dispatch_registry(cmd: RegistryCmd, verbose: bool) -> Result<()> {
             };
             let mut stdout = std::io::stdout();
             let mut stderr = std::io::stderr();
-            crate::registry::handle_fetch(
-                &opts,
-                &name,
-                version,
-                latest,
-                &mut stdout,
-                &mut stderr,
-            )
+            crate::registry::handle_fetch(&opts, &name, version, latest, &mut stdout, &mut stderr)
         }
         RegistryCmd::Run {
             name,
@@ -266,21 +262,24 @@ fn dispatch_registry(cmd: RegistryCmd, verbose: bool) -> Result<()> {
 mod tests {
     use super::*;
 
-    // AC-1: `arc init` creates arcform.yaml, models/, sources/.
+    // `arc init` creates arcform.yaml, models/, sources/.
     #[test]
-    fn test_ac01_init_creates_project_structure() {
+    fn test_init_creates_project_structure() {
         let base = tempfile::tempdir().unwrap();
         init_at("my-project", base.path()).unwrap();
 
         let project = base.path().join("my-project");
-        assert!(project.join("arcform.yaml").is_file(), "arcform.yaml should exist");
+        assert!(
+            project.join("arcform.yaml").is_file(),
+            "arcform.yaml should exist"
+        );
         assert!(project.join("models").is_dir(), "models/ should exist");
         assert!(project.join("sources").is_dir(), "sources/ should exist");
     }
 
-    // AC-2: Generated manifest has correct defaults.
+    // Generated manifest has correct defaults.
     #[test]
-    fn test_ac02_init_manifest_defaults() {
+    fn test_init_manifest_defaults() {
         let base = tempfile::tempdir().unwrap();
         init_at("analytics", base.path()).unwrap();
 
@@ -294,36 +293,45 @@ mod tests {
         assert!(manifest.steps.is_empty());
     }
 
-    // AC-2: Empty project name is rejected.
+    // Empty project name is rejected.
     #[test]
-    fn test_ac02_init_empty_name_rejected() {
+    fn test_init_empty_name_rejected() {
         let base = tempfile::tempdir().unwrap();
         let err = init_at("", base.path()).unwrap_err();
-        assert!(err.to_string().contains("empty"), "should reject empty name: {err}");
+        assert!(
+            err.to_string().contains("empty"),
+            "should reject empty name: {err}"
+        );
     }
 
-    // AC-2: Whitespace-only project name is rejected.
+    // Whitespace-only project name is rejected.
     #[test]
-    fn test_ac02_init_whitespace_name_rejected() {
+    fn test_init_whitespace_name_rejected() {
         let base = tempfile::tempdir().unwrap();
         let err = init_at("   ", base.path()).unwrap_err();
-        assert!(err.to_string().contains("empty"), "should reject whitespace name: {err}");
+        assert!(
+            err.to_string().contains("empty"),
+            "should reject whitespace name: {err}"
+        );
     }
 
-    // AC-1: Init fails if project directory already exists.
+    // Init fails if project directory already exists.
     #[test]
-    fn test_ac01_init_project_already_exists() {
+    fn test_init_project_already_exists() {
         let base = tempfile::tempdir().unwrap();
         init_at("my-project", base.path()).unwrap();
         let err = init_at("my-project", base.path()).unwrap_err();
-        assert!(err.to_string().contains("already exists"), "should reject existing project: {err}");
+        assert!(
+            err.to_string().contains("already exists"),
+            "should reject existing project: {err}"
+        );
     }
 
     use clap::Parser;
 
-    // ac-06: `arc registry list` parses.
+    // `arc registry list` parses.
     #[test]
-    fn test_ac06_registry_list_parses() {
+    fn test_registry_list_parses() {
         let cli = Cli::try_parse_from(["arc", "registry", "list"]).unwrap();
         assert!(matches!(
             cli.command,
@@ -333,9 +341,9 @@ mod tests {
         ));
     }
 
-    // ac-06: `arc registry list --refresh` parses.
+    // `arc registry list --refresh` parses.
     #[test]
-    fn test_ac06_registry_list_refresh_parses() {
+    fn test_registry_list_refresh_parses() {
         let cli = Cli::try_parse_from(["arc", "registry", "list", "--refresh"]).unwrap();
         assert!(matches!(
             cli.command,
@@ -345,9 +353,9 @@ mod tests {
         ));
     }
 
-    // ac-06: `arc registry show <name>` parses.
+    // `arc registry show <name>` parses.
     #[test]
-    fn test_ac06_registry_show_parses() {
+    fn test_registry_show_parses() {
         let cli = Cli::try_parse_from(["arc", "registry", "show", "brewtrend"]).unwrap();
         match cli.command {
             Commands::Registry {
@@ -360,11 +368,12 @@ mod tests {
         }
     }
 
-    // ac-06: `arc registry fetch <name> --version <ref>` parses.
+    // `arc registry fetch <name> --version <ref>` parses.
     #[test]
-    fn test_ac06_registry_fetch_with_version_parses() {
-        let cli = Cli::try_parse_from(["arc", "registry", "fetch", "brewtrend", "--version", "v1.2"])
-            .unwrap();
+    fn test_registry_fetch_with_version_parses() {
+        let cli =
+            Cli::try_parse_from(["arc", "registry", "fetch", "brewtrend", "--version", "v1.2"])
+                .unwrap();
         match cli.command {
             Commands::Registry {
                 cmd:
@@ -383,9 +392,9 @@ mod tests {
         }
     }
 
-    // ac-06: `--version` and `--latest` together are mutually exclusive at parse time.
+    // `--version` and `--latest` together are mutually exclusive at parse time.
     #[test]
-    fn test_ac06_version_latest_mutually_exclusive() {
+    fn test_version_latest_mutually_exclusive() {
         let r = Cli::try_parse_from([
             "arc",
             "registry",
@@ -395,12 +404,15 @@ mod tests {
             "v1.0",
             "--latest",
         ]);
-        assert!(r.is_err(), "version + latest together should error at parse time");
+        assert!(
+            r.is_err(),
+            "version + latest together should error at parse time"
+        );
     }
 
-    // ac-06: `arc registry run <name>` accepts repeated --param.
+    // `arc registry run <name>` accepts repeated --param.
     #[test]
-    fn test_ac06_registry_run_accepts_repeated_params() {
+    fn test_registry_run_accepts_repeated_params() {
         let cli = Cli::try_parse_from([
             "arc",
             "registry",
@@ -422,23 +434,23 @@ mod tests {
         }
     }
 
-    // ac-06: top-level --verbose flag is global.
+    // top-level --verbose flag is global.
     #[test]
-    fn test_ac06_verbose_flag_is_global() {
+    fn test_verbose_flag_is_global() {
         let cli = Cli::try_parse_from(["arc", "--verbose", "registry", "list"]).unwrap();
         assert!(cli.verbose);
     }
 
-    // ac-06: unknown subcommand errors.
+    // unknown subcommand errors.
     #[test]
-    fn test_ac06_unknown_subcommand_errors() {
+    fn test_unknown_subcommand_errors() {
         let r = Cli::try_parse_from(["arc", "registry", "drop"]);
         assert!(r.is_err());
     }
 
-    // ac-12: module documentation contains the four vocabulary anchors.
+    // module documentation contains the four vocabulary anchors.
     #[test]
-    fn test_ac12_registry_module_doc_contains_anchors() {
+    fn test_registry_module_doc_contains_anchors() {
         let body = include_str!("registry/mod.rs");
         let lower = body.to_lowercase();
         for anchor in ["asset", "two-tier", "transport", "sister work"] {

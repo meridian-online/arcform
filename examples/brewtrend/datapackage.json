@@ -33,5 +33,5 @@
     }
   ],
   "x-arcform-pipeline": "arcform.yaml",
-  "x-arcform-note": "This descriptor describes the pipeline's OUTPUT data (decision 0017). It is not the runnable artifact — `arc run` executes arcform.yaml."
+  "x-arcform-note": "This descriptor describes the pipeline's OUTPUT data. It is not the runnable artifact — `arc run` executes arcform.yaml."
 }

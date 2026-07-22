@@ -42,15 +42,19 @@ pub enum Error {
     #[error("project directory already exists: {0}")]
     ProjectExists(PathBuf),
 
-    #[error("dependency order violation: step '{reader}' reads asset '{asset}' but '{asset}' is produced by step '{producer}' which runs after it")]
+    #[error(
+        "dependency order violation: step '{reader}' reads asset '{asset}' but '{asset}' is produced by step '{producer}' which runs after it"
+    )]
     DependencyOrder {
         reader: String,
         asset: String,
         producer: String,
     },
 
-    #[error("precondition error for step '{step}': command '{command}' failed to execute: {detail}")]
-    PreconditionError {
+    #[error(
+        "precondition error for step '{step}': command '{command}' failed to execute: {detail}"
+    )]
+    Precondition {
         step: String,
         command: String,
         detail: String,
@@ -93,7 +97,9 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    #[error("registry: cache root unavailable (set ARCFORM_REGISTRY_CACHE to a writable directory)")]
+    #[error(
+        "registry: cache root unavailable (set ARCFORM_REGISTRY_CACHE to a writable directory)"
+    )]
     RegistryCacheRootMissing,
 
     #[error("registry: '{feature}' is not implemented in v1")]
@@ -106,8 +112,8 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
-mod ac11_format_tests {
-    //! ac-11: format each new registry variant; assert single-line default
+mod format_tests {
+    //! format each new registry variant; assert single-line default
     //! and that the message carries the `registry:` prefix so callers can
     //! distinguish registry surface errors from other arcform error families.
     //!
@@ -129,7 +135,7 @@ mod ac11_format_tests {
     }
 
     #[test]
-    fn ac11_registry_index_fetch() {
+    fn registry_index_fetch() {
         let e = Error::RegistryIndexFetch {
             url: "https://example/index.yaml".into(),
             detail: "boom".into(),
@@ -138,7 +144,7 @@ mod ac11_format_tests {
     }
 
     #[test]
-    fn ac11_registry_index_parse() {
+    fn registry_index_parse() {
         let e = Error::RegistryIndexParse {
             detail: "bad yaml".into(),
         };
@@ -146,7 +152,7 @@ mod ac11_format_tests {
     }
 
     #[test]
-    fn ac11_registry_unknown_entry() {
+    fn registry_unknown_entry() {
         let e = Error::RegistryUnknownEntry {
             query: "nope".into(),
         };
@@ -155,7 +161,7 @@ mod ac11_format_tests {
     }
 
     #[test]
-    fn ac11_registry_ambiguous_query() {
+    fn registry_ambiguous_query() {
         let e = Error::RegistryAmbiguousQuery {
             query: "//bad".into(),
         };
@@ -163,7 +169,7 @@ mod ac11_format_tests {
     }
 
     #[test]
-    fn ac11_registry_transport() {
+    fn registry_transport() {
         let e = Error::RegistryTransport {
             detail: "tarball walked outside <dest>".into(),
         };
@@ -171,7 +177,7 @@ mod ac11_format_tests {
     }
 
     #[test]
-    fn ac11_registry_cache_io() {
+    fn registry_cache_io() {
         let e = Error::RegistryCacheIo {
             path: PathBuf::from("/tmp/cache/index.yaml"),
             source: io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
@@ -180,7 +186,7 @@ mod ac11_format_tests {
     }
 
     #[test]
-    fn ac11_registry_cache_root_missing() {
+    fn registry_cache_root_missing() {
         let e = Error::RegistryCacheRootMissing;
         assert_single_line_registry(&e);
         // The remediation hint must surface in the default Display.
@@ -192,7 +198,7 @@ mod ac11_format_tests {
     }
 
     #[test]
-    fn ac11_registry_unimplemented() {
+    fn registry_unimplemented() {
         let e = Error::RegistryUnimplemented {
             feature: "--latest rolling resolution".into(),
         };

@@ -75,7 +75,7 @@ fn cleanup_temp(tmp: &Path) {
     }
 }
 
-// -- Tarball sandbox validator (ac-04b) ------------------------------------
+// -- Tarball sandbox validator ------------------------------------
 
 /// Validate a tarball entry path is safe to extract under `dest`.
 ///
@@ -87,11 +87,7 @@ fn cleanup_temp(tmp: &Path) {
 ///   (a) entries whose normalised path escapes the destination (parent-traversal),
 ///   (b) entries with absolute paths,
 ///   (c) symlinks (caller passes the entry kind separately).
-pub fn validate_tarball_entry(
-    dest: &Path,
-    entry_path: &Path,
-    is_symlink: bool,
-) -> Result<PathBuf> {
+pub fn validate_tarball_entry(dest: &Path, entry_path: &Path, is_symlink: bool) -> Result<PathBuf> {
     if is_symlink {
         return Err(Error::RegistryTransport {
             detail: format!(
@@ -241,9 +237,12 @@ impl FixtureTransport {
 impl Transport for FixtureTransport {
     fn fetch(&self, src: &TransportSrc, dest: &Path) -> Result<()> {
         self.fetch_count.fetch_add(1, Ordering::Relaxed);
-        let tree_root = self.tree_root.as_ref().ok_or_else(|| Error::RegistryTransport {
-            detail: "fixture transport not configured for fetch".to_string(),
-        })?;
+        let tree_root = self
+            .tree_root
+            .as_ref()
+            .ok_or_else(|| Error::RegistryTransport {
+                detail: "fixture transport not configured for fetch".to_string(),
+            })?;
 
         let tmp = temp_sibling(dest);
         cleanup_temp(&tmp); // defensive — clear residue from a prior crashed run
@@ -256,10 +255,7 @@ impl Transport for FixtureTransport {
         if !source_dir.is_dir() {
             cleanup_temp(&tmp);
             return Err(Error::RegistryTransport {
-                detail: format!(
-                    "fixture path missing: {}",
-                    source_dir.display()
-                ),
+                detail: format!("fixture path missing: {}", source_dir.display()),
             });
         }
 
@@ -396,14 +392,14 @@ impl GitTarballTransport {
                     });
                 }
             } else if entry.header().entry_type().is_file() {
-                if let Some(parent) = target.parent() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        cleanup_temp(&tmp);
-                        return Err(Error::RegistryCacheIo {
-                            path: parent.to_path_buf(),
-                            source: e,
-                        });
-                    }
+                if let Some(parent) = target.parent()
+                    && let Err(e) = std::fs::create_dir_all(parent)
+                {
+                    cleanup_temp(&tmp);
+                    return Err(Error::RegistryCacheIo {
+                        path: parent.to_path_buf(),
+                        source: e,
+                    });
                 }
                 if let Err(e) = entry.unpack(&target) {
                     cleanup_temp(&tmp);
@@ -451,9 +447,9 @@ mod tests {
     use tar::{Builder, Header};
     use tempfile::TempDir;
 
-    // ac-04: FixtureTransport copies content under dest.
+    // FixtureTransport copies content under dest.
     #[test]
-    fn test_ac04_fixture_fetch_copies_tree() {
+    fn test_fixture_fetch_copies_tree() {
         let fixture_root = TempDir::new().unwrap();
         let cache_root = TempDir::new().unwrap();
 
@@ -475,17 +471,17 @@ mod tests {
         assert!(dest.join("README.md").is_file());
     }
 
-    // ac-04: fetch_index returns the configured fixture string.
+    // fetch_index returns the configured fixture string.
     #[test]
-    fn test_ac04_fixture_fetch_index() {
+    fn test_fixture_fetch_index() {
         let body = "version: 1\nentries: []\n".to_string();
         let t = FixtureTransport::with_index(body.clone());
         assert_eq!(t.fetch_index("u").unwrap(), body);
     }
 
-    // ac-04: atomic-write — failing transport leaves no <dest> directory.
+    // atomic-write — failing transport leaves no <dest> directory.
     #[test]
-    fn test_ac04_atomic_write_no_partial_dest() {
+    fn test_atomic_write_no_partial_dest() {
         let fixture_root = TempDir::new().unwrap();
         let cache_root = TempDir::new().unwrap();
         let src = fixture_root.path().join("p/r/v");
@@ -509,9 +505,9 @@ mod tests {
         );
     }
 
-    // ac-04: which_git detection branch — exercises the seam without shelling out.
+    // which_git detection branch — exercises the seam without shelling out.
     #[test]
-    fn test_ac04_which_git_uses_path() {
+    fn test_which_git_uses_path() {
         // Force PATH to a tempdir that has no `git`.
         let dir = TempDir::new().unwrap();
         let prev = std::env::var_os("PATH");
@@ -529,52 +525,55 @@ mod tests {
         }
     }
 
-    // ac-04b: parent-traversal entry rejected.
+    // parent-traversal entry rejected.
     #[test]
-    fn test_ac04b_parent_traversal_rejected() {
+    fn test_parent_traversal_rejected() {
         let dest = Path::new("/tmp/dest");
         let err = validate_tarball_entry(dest, Path::new("../escape.txt"), false).unwrap_err();
         assert!(matches!(err, Error::RegistryTransport { .. }));
         let msg = err.to_string();
-        assert!(msg.contains("escape") || msg.contains("destination"), "{msg}");
+        assert!(
+            msg.contains("escape") || msg.contains("destination"),
+            "{msg}"
+        );
     }
 
-    // ac-04b: deeper parent-traversal still rejected.
+    // deeper parent-traversal still rejected.
     #[test]
-    fn test_ac04b_deep_traversal_rejected() {
+    fn test_deep_traversal_rejected() {
         let dest = Path::new("/tmp/dest");
         let err =
             validate_tarball_entry(dest, Path::new("a/b/../../../escape.txt"), false).unwrap_err();
         assert!(matches!(err, Error::RegistryTransport { .. }));
     }
 
-    // ac-04b: absolute path rejected.
+    // absolute path rejected.
     #[test]
-    fn test_ac04b_absolute_rejected() {
+    fn test_absolute_rejected() {
         let dest = Path::new("/tmp/dest");
         let err = validate_tarball_entry(dest, Path::new("/etc/passwd"), false).unwrap_err();
         assert!(matches!(err, Error::RegistryTransport { .. }));
     }
 
-    // ac-04b: symlink rejected.
+    // symlink rejected.
     #[test]
-    fn test_ac04b_symlink_rejected() {
+    fn test_symlink_rejected() {
         let dest = Path::new("/tmp/dest");
         let err = validate_tarball_entry(dest, Path::new("link"), true).unwrap_err();
         assert!(matches!(err, Error::RegistryTransport { .. }));
         assert!(err.to_string().contains("symlink"));
     }
 
-    // ac-04b: benign relative path accepted.
+    // benign relative path accepted.
     #[test]
-    fn test_ac04b_benign_path_accepted() {
+    fn test_benign_path_accepted() {
         let dest = Path::new("/tmp/dest");
         let target = validate_tarball_entry(dest, Path::new("a/b/c.txt"), false).unwrap();
         assert_eq!(target, PathBuf::from("/tmp/dest/a/b/c.txt"));
     }
 
     /// Write `name` into the raw `name` slot of an old-style ustar header,
-    /// bypassing `Header::set_path`'s `..`-rejection. Used only by ac-04b
+    /// bypassing `Header::set_path`'s `..`-rejection. Used only by the
     /// hostile-fixture construction below — production code never plants
     /// names this way.
     fn poke_raw_name(hdr: &mut Header, name: &str) {
@@ -588,17 +587,17 @@ mod tests {
         slot[..n].copy_from_slice(&bytes[..n]);
     }
 
-    // ac-04b: end-to-end hostile tarball is refused before any file lands.
+    // end-to-end hostile tarball is refused before any file lands.
     //
     // The `tar` crate's `Header::set_path` rejects `..` segments at construction
     // time as a defensive measure. To exercise the EXTRACTOR's defensive
-    // validator (per spec ac-04b — "build a hostile fixture tarball ... assert
+    // validator (per spec — "build a hostile fixture tarball ... assert
     // each hostile entry is rejected"), we have to plant the hostile name
     // directly into the raw header bytes via `poke_raw_name`, sidestepping
     // `set_path`'s pre-flight check. Then `cksum` is recomputed so the bytes
     // form a valid ustar entry — exactly what a malicious upstream would ship.
     #[test]
-    fn test_ac04b_hostile_tarball_extraction_rejected() {
+    fn test_hostile_tarball_extraction_rejected() {
         let mut buf: Vec<u8> = Vec::new();
         {
             let gz = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::fast());
@@ -621,9 +620,9 @@ mod tests {
         assert!(!dest.path().join("hostile.txt").exists());
     }
 
-    // ac-04b: benign tarball extracts cleanly.
+    // benign tarball extracts cleanly.
     #[test]
-    fn test_ac04b_benign_tarball_extracts() {
+    fn test_benign_tarball_extracts() {
         let mut buf: Vec<u8> = Vec::new();
         {
             let gz = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::fast());
@@ -644,9 +643,9 @@ mod tests {
         assert_eq!(body, "hello");
     }
 
-    // ac-04: production transport reports unimplemented (sister-work surface).
+    // production transport reports unimplemented (sister-work surface).
     #[test]
-    fn test_ac04_production_fetch_is_unimplemented() {
+    fn test_production_fetch_is_unimplemented() {
         let t = GitTarballTransport;
         let err = t
             .fetch(
