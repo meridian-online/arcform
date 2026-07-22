@@ -74,6 +74,51 @@ The two libraries are designed to complement each other. FineType's JSON Schema 
 
 ---
 
+## Using Arcform as a library
+
+`arc` ships a library target alongside the binary, for one purpose: a tool that edits an
+`arcform.yaml` should not carry its own copy of the schema. Two schemas drift; one cannot.
+
+```toml
+[dependencies]
+arc = { version = "=0.1.0", default-features = false }
+```
+
+`default-features = false` turns off the `cli` feature. That feature exists for the `arc`
+binary; it also compiles a doc-hidden `cli_main` into the crate root, and `cli_main` parses
+the *calling* process's `argv` and can exit it. With the feature off the crate root is
+`spec` and nothing else, and `clap` leaves the dependency graph.
+
+```rust
+use arc::spec::{Manifest, Result};
+
+fn example(edited: &str) -> Result<()> {
+    // A spec on disk.
+    let manifest = Manifest::load(std::path::Path::new("examples/brewtrend"))?;
+    println!("{} — {} steps", manifest.name, manifest.steps.len());
+
+    // Or candidate bytes that are not a file yet — validate before you write.
+    Manifest::from_yaml_str(edited)?;
+    Ok(())
+}
+```
+
+`arc::spec` is the entire public surface: the spec schema types, two entry points, and the
+error type. Validation is a **gate, not a transform** — it parses raw YAML to reach a verdict
+and hands nothing back to write, so an editor passes its own bytes through and then writes
+those same bytes. That is the only way comments, key order and formatting survive. The schema
+types do currently derive `serde::Serialize` (used by `arc init` to emit a *generated*
+manifest into an empty directory), but that derive is **out of contract**: serialising a
+loaded spec and writing it back destroys the author's bytes, and a later release is expected
+to withdraw the impl. Everything else — the runner, the engine, SQL introspection, the
+operator catalog, the registry — is private and moves without notice.
+
+The surface is documented as a contract in `src/spec.rs` and enumerated by
+`tests/public_surface.rs`, which fails the build if it widens. Arcform is pre-1.0: **pin an
+exact version** (or, inside the same organisation, a git revision).
+
+---
+
 ## Status
 
 Early development. The project is in the discovery and design phase.
