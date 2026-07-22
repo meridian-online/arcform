@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use crate::manifest::Manifest;
 use crate::registry::transport::GitTarballTransport;
 use crate::registry::{RunOptions, cache_root};
+use crate::spec::{PathPart, SpecEdit};
 use crate::state::DuckDbStateBackend;
 
 /// Default index URL — points to the (future) meridian-online/registry repo.
@@ -42,6 +43,43 @@ pub enum Commands {
         #[arg(long = "from-descriptor", value_name = "DATAPACKAGE_JSON")]
         from_descriptor: Option<PathBuf>,
     },
+    /// Create a new protocol: write `<DIR>/arcform.yaml` from scratch,
+    /// through the same validation gate `arc run` loads with. Refuses if a
+    /// spec already exists there — an existing spec may be hand-authored,
+    /// and changes to it go through `edit-protocol`.
+    CreateProtocol {
+        /// Directory the protocol lives in (created if absent).
+        dir: PathBuf,
+
+        /// Protocol name. Defaults to the directory's file name.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Engine CLI identifier (default: duckdb).
+        #[arg(long)]
+        engine: Option<String>,
+
+        /// Database file path, relative to the protocol directory
+        /// (default: `<name>.duckdb`).
+        #[arg(long)]
+        db: Option<String>,
+    },
+
+    /// Edit an existing protocol's arcform.yaml in place. The edit is applied
+    /// to the original bytes, validated by the same loader `arc run` uses,
+    /// and written atomically — or refused with the reason, leaving the file
+    /// untouched. Every byte the edit does not target is preserved verbatim:
+    /// comments, key order, blank lines and quote style all survive, and no
+    /// verb reformats the document as a side effect.
+    EditProtocol {
+        /// Protocol directory (where arcform.yaml lives).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+
+        #[command(subcommand)]
+        op: EditOp,
+    },
+
     /// Run the pipeline defined in arcform.yaml.
     Run {
         /// Force re-execution of all steps, ignoring staleness.
@@ -98,6 +136,190 @@ pub enum RegistryCmd {
         #[arg(long = "param", value_name = "KEY=VALUE")]
         params: Vec<String>,
     },
+}
+
+/// One edit to a protocol spec, addressed by PATH: dot-separated mapping keys
+/// with zero-based `[N]` sequence indices — `steps[2].command`,
+/// `params.port.default` — and `.` alone for the manifest root.
+///
+/// Replacement text is spliced verbatim, exactly as the library's write path
+/// takes it: multi-line values must arrive already indented for the position
+/// they land in, and a sequence item carries its own `- ` line(s). Nothing
+/// here reformats on the caller's behalf — that is what keeps the rest of the
+/// document byte-identical.
+#[derive(Subcommand)]
+pub enum EditOp {
+    /// Replace the value at PATH with VALUE. For `key: value` pairs the key,
+    /// separator and any trailing same-line comment are untouched.
+    Replace {
+        path: String,
+        #[arg(allow_hyphen_values = true)]
+        value: String,
+    },
+    /// Rewrite one occurrence of FROM to TO inside the value at PATH — the
+    /// way to touch three characters of a 20-line `command: |` block without
+    /// owning the other lines. Refused unless FROM occurs exactly once there.
+    Rewrite {
+        path: String,
+        #[arg(allow_hyphen_values = true)]
+        from: String,
+        #[arg(allow_hyphen_values = true)]
+        to: String,
+    },
+    /// Add `KEY: VALUE` to the mapping at PATH (`.` for the manifest root).
+    Add {
+        path: String,
+        key: String,
+        #[arg(allow_hyphen_values = true)]
+        value: String,
+    },
+    /// Append ITEM to the sequence at PATH. For a block sequence the item
+    /// text carries its own pre-indented `- ` line(s).
+    Append {
+        path: String,
+        #[arg(allow_hyphen_values = true)]
+        item: String,
+    },
+    /// Delete the element at PATH, along with its flush comment header.
+    Delete { path: String },
+    /// Move the item at index FROM of the block sequence at PATH so it ends
+    /// up at index TO.
+    Reorder {
+        path: String,
+        from: usize,
+        to: usize,
+    },
+}
+
+/// Execute the `arc create-protocol` command: assemble the manifest value the
+/// arguments describe and hand it to the library's creation path — the same
+/// gate and the same atomic write every other caller gets. Nothing is written
+/// unless the result loads; an existing spec is refused, never overwritten.
+pub fn create_protocol(
+    dir: &Path,
+    name: Option<String>,
+    engine: Option<String>,
+    db: Option<String>,
+) -> Result<()> {
+    let name = match name {
+        Some(name) => name,
+        None => dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                Error::ManifestValidation(
+                    "cannot derive a protocol name from that directory; pass --name".to_string(),
+                )
+            })?,
+    };
+
+    let mut manifest = Manifest::new_project(&name);
+    if let Some(engine) = engine {
+        manifest.engine = engine;
+    }
+    if let Some(db) = db {
+        manifest.db = Some(db);
+    }
+    crate::spec::create_spec(dir, &manifest)?;
+
+    println!(
+        "created {} — author steps with `arc edit-protocol`",
+        dir.join(crate::spec::MANIFEST_FILENAME).display()
+    );
+    Ok(())
+}
+
+/// Execute the `arc edit-protocol` command: turn the op into the library's
+/// edit value and hand it to the whole write path — apply, validate, write
+/// atomically. The CLI's job ends at argument parsing; a refusal (an edit
+/// that does not apply, or a result the loader rejects) surfaces here as the
+/// error, before the file is touched.
+pub fn edit_protocol(dir: &Path, op: EditOp) -> Result<()> {
+    let edit = spec_edit_of(op)?;
+    crate::spec::edit_spec(dir, &[edit])?;
+    println!(
+        "edited {}",
+        dir.join(crate::spec::MANIFEST_FILENAME).display()
+    );
+    Ok(())
+}
+
+/// The op as the library's edit value. Pure argument handling: PATH parsing
+/// plus a field-for-field mapping — no edit logic lives on this side.
+fn spec_edit_of(op: EditOp) -> Result<SpecEdit> {
+    Ok(match op {
+        EditOp::Replace { path, value } => SpecEdit::Replace {
+            path: parse_path(&path)?,
+            value,
+        },
+        EditOp::Rewrite { path, from, to } => SpecEdit::RewriteFragment {
+            path: parse_path(&path)?,
+            from,
+            to,
+        },
+        EditOp::Add { path, key, value } => SpecEdit::Add {
+            path: parse_path(&path)?,
+            key,
+            value,
+        },
+        EditOp::Append { path, item } => SpecEdit::Append {
+            path: parse_path(&path)?,
+            item,
+        },
+        EditOp::Delete { path } => SpecEdit::Delete {
+            path: parse_path(&path)?,
+        },
+        EditOp::Reorder { path, from, to } => SpecEdit::Reorder {
+            path: parse_path(&path)?,
+            from,
+            to,
+        },
+    })
+}
+
+/// `steps[2].command` → the write path's address parts; `.` alone is the
+/// manifest root (an empty path — only `add` accepts one). A path whose
+/// syntax does not parse is refused here, before any file is read.
+fn parse_path(raw: &str) -> Result<Vec<PathPart>> {
+    let syntax = |detail: String| Error::EditTarget {
+        path: raw.to_string(),
+        detail,
+    };
+    if raw == "." {
+        return Ok(Vec::new());
+    }
+    if raw.is_empty() {
+        return Err(syntax(
+            "empty path (use `.` for the manifest root)".to_string(),
+        ));
+    }
+    let mut parts = Vec::new();
+    for segment in raw.split('.') {
+        if segment.is_empty() {
+            return Err(syntax("empty path segment".to_string()));
+        }
+        let (key, mut rest) = match segment.find('[') {
+            Some(0) => (None, segment),
+            Some(at) => (Some(&segment[..at]), &segment[at..]),
+            None => (Some(segment), ""),
+        };
+        if let Some(key) = key {
+            parts.push(PathPart::Key(key.to_string()));
+        }
+        while !rest.is_empty() {
+            let (digits, tail) = rest
+                .strip_prefix('[')
+                .and_then(|r| r.split_once(']'))
+                .ok_or_else(|| syntax(format!("malformed index in segment {segment:?}")))?;
+            let index: usize = digits
+                .parse()
+                .map_err(|_| syntax(format!("index {digits:?} is not a number")))?;
+            parts.push(PathPart::Index(index));
+            rest = tail;
+        }
+    }
+    Ok(parts)
 }
 
 /// Execute the `arc init` command in the current directory.
@@ -159,6 +381,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             Some(path) => crate::bridge::init_from_descriptor(&name, &path),
             None => init(&name),
         },
+        Commands::CreateProtocol {
+            dir,
+            name,
+            engine,
+            db,
+        } => create_protocol(&dir, name, engine, db),
+        Commands::EditProtocol { dir, op } => edit_protocol(&dir, op),
         Commands::Run { force, params } => run_pipeline(force, &params),
         Commands::Registry { cmd } => dispatch_registry(cmd, verbose),
     }
@@ -421,6 +650,227 @@ mod tests {
     fn test_unknown_subcommand_errors() {
         let r = Cli::try_parse_from(["arc", "registry", "drop"]);
         assert!(r.is_err());
+    }
+
+    // `arc create-protocol <dir>` parses, with every option defaulted.
+    #[test]
+    fn test_create_protocol_parses() {
+        let cli = Cli::try_parse_from(["arc", "create-protocol", "fieldbook"]).unwrap();
+        match cli.command {
+            Commands::CreateProtocol {
+                dir,
+                name,
+                engine,
+                db,
+            } => {
+                assert_eq!(dir, PathBuf::from("fieldbook"));
+                assert!(name.is_none() && engine.is_none() && db.is_none());
+            }
+            _ => panic!("expected CreateProtocol"),
+        }
+    }
+
+    // `arc edit-protocol --dir <d> replace <path> <value>` parses.
+    #[test]
+    fn test_edit_protocol_replace_parses() {
+        let cli = Cli::try_parse_from([
+            "arc",
+            "edit-protocol",
+            "--dir",
+            "proto",
+            "replace",
+            "steps[0].command",
+            "\"true\"",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::EditProtocol { dir, op } => {
+                assert_eq!(dir, PathBuf::from("proto"));
+                assert!(matches!(op, EditOp::Replace { .. }));
+            }
+            _ => panic!("expected EditProtocol"),
+        }
+    }
+
+    // The edit-protocol directory defaults to the current directory.
+    #[test]
+    fn test_edit_protocol_dir_defaults_to_cwd() {
+        let cli = Cli::try_parse_from(["arc", "edit-protocol", "delete", "steps[0]"]).unwrap();
+        match cli.command {
+            Commands::EditProtocol { dir, .. } => assert_eq!(dir, PathBuf::from(".")),
+            _ => panic!("expected EditProtocol"),
+        }
+    }
+
+    // The path grammar: keys, indices, the root — and the refusals.
+    #[test]
+    fn test_parse_path_grammar() {
+        use PathPart::{Index, Key};
+        assert_eq!(
+            parse_path("steps[2].command").unwrap(),
+            vec![Key("steps".into()), Index(2), Key("command".into())]
+        );
+        assert_eq!(
+            parse_path("params.port.default").unwrap(),
+            vec![
+                Key("params".into()),
+                Key("port".into()),
+                Key("default".into())
+            ]
+        );
+        assert_eq!(parse_path(".").unwrap(), vec![]);
+
+        for bad in [
+            "",
+            "steps..command",
+            "steps.",
+            "steps[x]",
+            "steps[0",
+            "steps[0]tail",
+            "steps[]",
+        ] {
+            let err = parse_path(bad).unwrap_err();
+            assert!(
+                matches!(err, Error::EditTarget { .. }),
+                "{bad:?} must be refused as an edit-target error, got {err}"
+            );
+        }
+    }
+
+    // Each verb maps field-for-field onto the library's edit value — the CLI
+    // adds argument surface, not semantics.
+    #[test]
+    fn test_ops_map_onto_the_library_edit_values() {
+        let steps_cmd = || vec!["steps".into(), 0.into(), "command".into()];
+        assert_eq!(
+            spec_edit_of(EditOp::Replace {
+                path: "steps[0].command".into(),
+                value: "v".into()
+            })
+            .unwrap(),
+            SpecEdit::Replace {
+                path: steps_cmd(),
+                value: "v".into()
+            }
+        );
+        assert_eq!(
+            spec_edit_of(EditOp::Rewrite {
+                path: "steps[0].command".into(),
+                from: "a".into(),
+                to: "b".into()
+            })
+            .unwrap(),
+            SpecEdit::RewriteFragment {
+                path: steps_cmd(),
+                from: "a".into(),
+                to: "b".into()
+            }
+        );
+        assert_eq!(
+            spec_edit_of(EditOp::Add {
+                path: ".".into(),
+                key: "engine".into(),
+                value: "duckdb".into()
+            })
+            .unwrap(),
+            SpecEdit::Add {
+                path: vec![],
+                key: "engine".into(),
+                value: "duckdb".into()
+            }
+        );
+        assert_eq!(
+            spec_edit_of(EditOp::Append {
+                path: "steps".into(),
+                item: "  - name: x\n".into()
+            })
+            .unwrap(),
+            SpecEdit::Append {
+                path: vec!["steps".into()],
+                item: "  - name: x\n".into()
+            }
+        );
+        assert_eq!(
+            spec_edit_of(EditOp::Delete {
+                path: "steps[1]".into()
+            })
+            .unwrap(),
+            SpecEdit::Delete {
+                path: vec!["steps".into(), 1.into()]
+            }
+        );
+        assert_eq!(
+            spec_edit_of(EditOp::Reorder {
+                path: "steps".into(),
+                from: 1,
+                to: 0
+            })
+            .unwrap(),
+            SpecEdit::Reorder {
+                path: vec!["steps".into()],
+                from: 1,
+                to: 0
+            }
+        );
+    }
+
+    // create-protocol writes a loadable spec through the gate, derives the
+    // name from the directory, and refuses a second create.
+    #[test]
+    fn test_create_protocol_writes_once_through_the_gate() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("notes");
+        create_protocol(&dir, None, None, None).unwrap();
+
+        let m = Manifest::load(&dir).unwrap();
+        assert_eq!(m.name, "notes");
+        assert!(m.steps.is_empty());
+
+        let err = create_protocol(&dir, None, None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("already exists"),
+            "an existing spec must be refused, never overwritten: {err}"
+        );
+    }
+
+    // --name / --engine / --db override the derived defaults.
+    #[test]
+    fn test_create_protocol_applies_overrides() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("anything");
+        create_protocol(
+            &dir,
+            Some("tides".to_string()),
+            Some("sqlite3".to_string()),
+            Some("state/tides.db".to_string()),
+        )
+        .unwrap();
+
+        let m = Manifest::load(&dir).unwrap();
+        assert_eq!(m.name, "tides");
+        assert_eq!(m.engine, "sqlite3");
+        assert_eq!(m.db.as_deref(), Some("state/tides.db"));
+    }
+
+    // A directory with no usable file name needs --name.
+    #[test]
+    fn test_create_protocol_requires_a_derivable_name() {
+        let err = create_protocol(Path::new("."), None, None, None).unwrap_err();
+        assert!(err.to_string().contains("--name"), "{err}");
+    }
+
+    // edit-protocol refuses when there is no spec to edit.
+    #[test]
+    fn test_edit_protocol_requires_a_spec() {
+        let base = tempfile::tempdir().unwrap();
+        let err = edit_protocol(
+            base.path(),
+            EditOp::Delete {
+                path: "steps[0]".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ManifestNotFound), "{err}");
     }
 
     // module documentation contains the four vocabulary anchors.
