@@ -1,0 +1,117 @@
+//! The published spec contract — the whole public surface of the `arc` library.
+//!
+//! # What this is for
+//!
+//! An `arcform.yaml` is hand-authored, hand-edited, and machine-edited. A tool that
+//! edits one has to know whether the result is still a valid spec, and the only
+//! answer that means anything is the one `arc` itself would give. Reimplementing the
+//! schema in the editor produces two schemas that agree until the day they don't.
+//! So the loader is published, and callers link it.
+//!
+//! Validation here is a **gate, not a transform**. [`Manifest::from_yaml_str`] parses
+//! raw YAML solely to decide whether it is valid; it never gives you bytes back to
+//! write. An editor that wants to preserve comments, key order and formatting should
+//! edit the original bytes, pass them through this gate, and — if the gate passes —
+//! write the bytes it already had.
+//!
+//! **Do not round-trip a spec through `serde`.** The exported types currently derive
+//! `serde::Serialize` because `arc`'s own `arc init` scaffolding uses it to emit a
+//! *generated* manifest into a directory that has no manifest yet — the one case
+//! where there are no author bytes to lose. That derive is **not part of this
+//! contract**: load-serialise-write-back destroys the author's comments, key order
+//! and blank lines, and [`Manifest::from_yaml_str`] would bless the result, because
+//! the mangled bytes are still a valid spec. A later release is expected to withdraw
+//! the impl once spec emission moves to a preservation-aware writer; a consumer that
+//! serialises these types is building on sand.
+//!
+//! What you *can* do is build a [`Manifest`] in memory: every field is `pub`, because
+//! the exported types are the schema and a consumer has to be able to read all of it.
+//! Nothing stops you assembling one with a struct literal. If a tool wants to write
+//! a spec, the bytes are its own to produce, and this surface will tell it whether
+//! they parse.
+//!
+//! # The contract
+//!
+//! Exported types (the spec schema, exactly as `arc` parses it):
+//!
+//! - [`Manifest`] — the top-level `arcform.yaml`
+//! - [`Step`] — one pipeline step
+//! - [`Param`] — a declared runtime parameter
+//! - [`Defaults`] — manifest-level step defaults
+//! - [`RetryPolicy`] — retry/backoff configuration
+//! - [`Hooks`] — the lifecycle hook block
+//! - [`AssetOverride`] — an entry in the top-level `assets:` block
+//! - [`Precondition`], [`ModifiedAfterConfig`], [`FreshConfig`] — step freshness checks
+//!
+//! Exported entry points:
+//!
+//! - [`Manifest::load`] — read and validate `arcform.yaml` from a directory
+//! - [`Manifest::from_yaml_str`] — validate YAML text that is not (yet) on disk
+//! - [`Precondition::validate`] — the well-formedness check `load` applies per step
+//! - [`MANIFEST_FILENAME`] — the filename [`Manifest::load`] looks for
+//!
+//! Exported error types:
+//!
+//! - [`Error`] — `#[non_exhaustive]`; new variants are not a breaking change
+//! - [`Result`] — `std::result::Result<T, Error>`
+//!
+//! That is the list. `tests/public_surface.rs` enumerates it and fails if it grows.
+//!
+//! # What is deliberately not here
+//!
+//! Execution. There is no way through this surface to run a pipeline, open a DuckDB
+//! connection, resolve a database path, introspect SQL, evaluate a precondition,
+//! build an asset graph, reach the operator catalog, read the run contract, or touch
+//! the registry. Those are the engine's business and they move; the spec does not.
+//! Spec *emission* is not offered either — see the `Serialize` note above.
+//!
+//! The crate root carries one further item, `cli_main`, the `arc` binary's entry
+//! point. It is `#[doc(hidden)]` and gated behind the default `cli` feature, and it
+//! is not a library function: it parses the **calling process's** `argv` and can end
+//! the calling process. Depend on `arc` with `default-features = false` and it does
+//! not exist at all — which also drops `clap` and the command dispatch from the
+//! build:
+//!
+//! ```toml
+//! [dependencies]
+//! arc = { version = "=0.1.0", default-features = false }
+//! ```
+//!
+//! # Stability
+//!
+//! **Pin an exact version.** `arc` is pre-1.0 and the spec schema is still growing;
+//! treat every version bump as potentially breaking and move deliberately. A
+//! consumer inside the same organisation should pin a git revision; one outside
+//! should pin `version = "=x.y.z"`. The guarantee offered is narrow and real:
+//! within a version, what is listed above is what exists, it behaves as `arc`
+//! itself behaves, and nothing else is reachable.
+//!
+//! One wart to know about: [`Step::with`] — the typed config block of an `op:` step —
+//! is a `serde_yaml::Value`, so inspecting it means depending on `serde_yaml` 0.9.
+//! That crate is unmaintained. It is load-bearing for `arc`'s own parsing today, and
+//! replacing it is a change to how specs parse, not a change to this surface, so it
+//! is recorded here rather than papered over.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use arc::spec::{Manifest, Result};
+//!
+//! # fn main() -> Result<()> {
+//! // Load and validate a spec that is on disk.
+//! let manifest = Manifest::load(std::path::Path::new("examples/brewtrend"))?;
+//! println!("{} — {} steps", manifest.name, manifest.steps.len());
+//!
+//! // Gate an edit: validate the candidate bytes, then write the bytes you already had.
+//! let edited: String = std::fs::read_to_string("examples/brewtrend/arcform.yaml")?;
+//! Manifest::from_yaml_str(&edited)?; // parse only to check — the value is discarded
+//! std::fs::write("examples/brewtrend/arcform.yaml", edited.as_bytes())?;
+//! # Ok(())
+//! # }
+//! ```
+
+pub use crate::error::{Error, Result};
+pub use crate::manifest::{
+    AssetOverride, Defaults, Hooks, MANIFEST_FILENAME, Manifest, Param, RetryPolicy, Step,
+};
+pub use crate::precondition::{FreshConfig, ModifiedAfterConfig, Precondition};

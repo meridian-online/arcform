@@ -137,34 +137,9 @@ pub fn init_at(name: &str, base: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Parse --param KEY=VALUE flags into (key, value) pairs.
-/// Splits on the first '=' — keys cannot contain '=', values can.
-pub fn parse_params(raw: &[String]) -> Result<Vec<(String, String)>> {
-    let mut parsed = Vec::new();
-    for param in raw {
-        if let Some(pos) = param.find('=') {
-            let key = param[..pos].to_string();
-            let value = param[pos + 1..].to_string();
-            if key.is_empty() {
-                return Err(Error::ManifestValidation(format!(
-                    "invalid --param '{}': key cannot be empty",
-                    param
-                )));
-            }
-            parsed.push((key, value));
-        } else {
-            return Err(Error::ManifestValidation(format!(
-                "invalid --param '{}': expected KEY=VALUE format",
-                param
-            )));
-        }
-    }
-    Ok(parsed)
-}
-
 /// Execute the `arc run` command.
 pub fn run_pipeline(force: bool, raw_params: &[String]) -> Result<()> {
-    let cli_params = parse_params(raw_params)?;
+    let cli_params = crate::runner::parse_params(raw_params)?;
     let cwd = std::env::current_dir()?;
     let manifest = Manifest::load(&cwd)?;
     let db_path = manifest.db_path(&cwd);
