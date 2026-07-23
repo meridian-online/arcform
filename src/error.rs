@@ -36,6 +36,22 @@ pub enum Error {
     #[error("a spec already exists at {0} — edit it rather than re-creating it")]
     SpecExists(PathBuf),
 
+    // The record path's create-mode collision: a generated SQL file is only
+    // ever written where no file exists, because an existing file may carry
+    // authorship this tool must not destroy.
+    #[error("a sql file already exists at {0} — a recorded step never overwrites a model")]
+    GeneratedSqlExists(PathBuf),
+
+    // The record path's ownership refusal: the file lacks the generated
+    // marker, so its bytes were not machine-authored and are never machine-
+    // rewritten. The remedy is offered in the message because the caller is
+    // expected to surface it to a person.
+    #[error(
+        "step '{step}': {path} is hand-authored (no generated marker) and will not be \
+         rewritten — record a new step downstream of it instead"
+    )]
+    HandAuthoredSql { step: String, path: PathBuf },
+
     #[error("step '{step}': sql file not found: {path}")]
     SqlFileNotFound { step: String, path: PathBuf },
 

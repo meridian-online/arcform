@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 
 /// Every type, constant and function `arc::spec` re-exports, and the module that
 /// owns it. An `impl` on any of these names may only appear in its owning file.
-const EXPORTED: [(&str, &str); 19] = [
+const EXPORTED: [(&str, &str); 24] = [
     ("Manifest", "manifest.rs"),
     ("Step", "manifest.rs"),
     ("Param", "manifest.rs"),
@@ -68,13 +68,20 @@ const EXPORTED: [(&str, &str); 19] = [
     ("apply_edits", "edit.rs"),
     ("create_spec", "edit.rs"),
     ("edit_spec", "edit.rs"),
+    // The record path: an exploration promoted into a step, and the ownership
+    // marker that licenses regeneration of what the machine wrote.
+    ("RecordedStep", "record.rs"),
+    ("record_step", "record.rs"),
+    ("amend_step_sql", "record.rs"),
+    ("GENERATED_MARKER", "record.rs"),
+    ("sql_is_generated", "record.rs"),
     ("Error", "error.rs"),
     ("Result", "error.rs"),
 ];
 
 /// Every module file in the crate. Frozen so a new one cannot be added without
 /// passing under the checks below.
-const MODULE_FILES: [&str; 23] = [
+const MODULE_FILES: [&str; 24] = [
     "asset.rs",
     "bridge.rs",
     "cli.rs",
@@ -89,6 +96,7 @@ const MODULE_FILES: [&str; 23] = [
     "manifest.rs",
     "operator.rs",
     "precondition.rs",
+    "record.rs",
     "registry/cache.rs",
     "registry/index.rs",
     "registry/mod.rs",
@@ -112,7 +120,7 @@ const MODULE_FILES: [&str; 23] = [
 /// `src/spec.rs`: editing an existing spec goes through the write path, which splices
 /// original bytes and never re-serialises. This freeze keeps any change to that
 /// arrangement a deliberate, version-visible act instead of a silent drift.
-const FROZEN_DERIVES: [(&str, &str, &[&str]); 14] = [
+const FROZEN_DERIVES: [(&str, &str, &[&str]); 15] = [
     (
         "manifest.rs",
         "Param",
@@ -178,6 +186,13 @@ const FROZEN_DERIVES: [(&str, &str, &[&str]); 14] = [
         &["Debug", "Clone", "PartialEq", "Eq"],
     ),
     ("edit.rs", "ValidatedSpec", &["Debug", "Clone"]),
+    // Plain data like the edit values, and NOT serde types for the same
+    // reason: a promotion travels inside a process, not over a wire.
+    (
+        "record.rs",
+        "RecordedStep",
+        &["Debug", "Clone", "PartialEq", "Eq"],
+    ),
     ("error.rs", "Error", &["Debug", "thiserror::Error"]),
 ];
 
@@ -908,6 +923,23 @@ fn exported_modules_declare_only_contracted_items() {
         "a `pub` item in `edit.rs` is public API once its types are re-exported; \
          use `pub(crate)` unless you mean to promise it"
     );
+
+    assert_eq!(
+        pub_items(&src("record.rs")),
+        frozen(&[
+            // Re-exported types and the ownership marker.
+            "RecordedStep",
+            "GENERATED_MARKER",
+            // Re-exported entry points. The internals — the slug, the model
+            // numbering, the checkpoint seam — are private: the contract is
+            // the promotion and the ownership rule, not the mechanism.
+            "record_step",
+            "amend_step_sql",
+            "sql_is_generated",
+        ]),
+        "a `pub` item in `record.rs` is public API once its type is re-exported; \
+         use `pub(crate)` unless you mean to promise it"
+    );
 }
 
 /// A derive on an exported type is part of the surface. Freeze the lists so neither
@@ -916,7 +948,13 @@ fn exported_modules_declare_only_contracted_items() {
 /// health warning — see `FROZEN_DERIVES` and the round-trip note in `src/spec.rs`.
 #[test]
 fn the_schema_types_derive_exactly_what_is_recorded() {
-    for owner in ["manifest.rs", "precondition.rs", "edit.rs", "error.rs"] {
+    for owner in [
+        "manifest.rs",
+        "precondition.rs",
+        "edit.rs",
+        "record.rs",
+        "error.rs",
+    ] {
         let found = pub_type_derives(&src(owner));
         let expected: Vec<(String, Vec<String>)> = FROZEN_DERIVES
             .iter()
