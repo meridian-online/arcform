@@ -75,6 +75,19 @@
 //! - [`amend_step_sql`] — rewrite a *generated* model; hand-authored files are refused
 //! - [`GENERATED_MARKER`], [`sql_is_generated`] — the ownership line, readable by anyone
 //!
+//! Local history (the [`history`](crate::history) module's docs carry the full
+//! discussion — the middle tier between editor undo and version control, stored
+//! outside the project; machine edits checkpoint the state they replace before
+//! writing, and nothing is ever promoted to git):
+//!
+//! - [`LocalHistory`] — the store handle; conventional root or an explicit one
+//! - [`HistoryEntry`], [`HistoryKind`] — one recorded state; save vs checkpoint
+//! - [`edit_spec_with_history`] — [`edit_spec`] on the checkpointed road: the
+//!   replaced bytes are snapshotted first, and no checkpoint means no write
+//! - [`record_step_with_history`] — [`record_step`], same discipline
+//! - [`HISTORY_MAX_ENTRIES`], [`HISTORY_MERGE_WINDOW`] — the retention policy,
+//!   as constants a surface can print beside the entries it governs
+//!
 //! Exported error types:
 //!
 //! - [`Error`] — `#[non_exhaustive]`; new variants are not a breaking change
@@ -155,6 +168,10 @@
 
 pub use crate::edit::{PathPart, SpecEdit, ValidatedSpec, apply_edits, create_spec, edit_spec};
 pub use crate::error::{Error, Result};
+pub use crate::history::{
+    HISTORY_MAX_ENTRIES, HISTORY_MERGE_WINDOW, HistoryEntry, HistoryKind, LocalHistory,
+    edit_spec_with_history, record_step_with_history,
+};
 pub use crate::manifest::{
     AssetOverride, Defaults, Hooks, MANIFEST_FILENAME, Manifest, Param, RetryPolicy, Step,
 };

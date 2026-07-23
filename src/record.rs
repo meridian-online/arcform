@@ -270,11 +270,16 @@ pub fn amend_step_sql(dir: &Path, step_name: &str, sql: &str, provenance: &str) 
 
 // ------------------------------------------------------------------ internals
 
-/// The seam every durable write passes through first. A no-op today, on
-/// purpose: a local-history store that snapshots the bytes about to change
-/// plugs in here, so every machine edit gains a restore point without any
-/// caller having to remember to ask for one. Until that store exists, the
-/// guarantee is only ordering — the hook fires before the first byte moves.
+/// The seam every durable write passes through first. The local-history
+/// store now exists, and it plugs in **above** this line, not inside it:
+/// [`record_step_with_history`](crate::history::record_step_with_history)
+/// snapshots the manifest before calling in here, refusing the write when
+/// the snapshot cannot land. The bare road keeps this no-op so the ordering
+/// stays visible — the hook fires before the first byte moves — and stays
+/// history-free on purpose for callers that bring their own net. (The
+/// model rewrite in [`amend_step_sql`] passes here too; snapshotting
+/// *generated* SQL, which the marker already licenses this tool to
+/// regenerate, is a deliberate non-goal for now.)
 fn checkpoint(_dir: &Path) {}
 
 /// Marker line plus body, with the single permitted normalisation: a missing

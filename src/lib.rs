@@ -41,6 +41,7 @@ mod contract;
 mod edit;
 mod engine;
 mod error;
+mod history;
 mod ingress_meta;
 mod introspect;
 mod manifest;

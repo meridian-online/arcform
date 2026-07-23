@@ -20,10 +20,17 @@ use std::process::{Command, Output};
 
 use arc::spec::{MANIFEST_FILENAME, SpecEdit, apply_edits};
 
-/// Run the real `arc` binary with `args` in `dir`.
+/// Run the real `arc` binary with `args` in `dir`. The spawned binary gets a
+/// test-scoped local-history root: authoring commands record history as they
+/// do in production, but a test run must never write into the developer's
+/// real `~/.arcform`.
 fn arc_cmd(dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_arc"))
         .current_dir(dir)
+        .env(
+            "ARCFORM_HISTORY_DIR",
+            std::env::temp_dir().join("arc-cli-authoring-history"),
+        )
         .args(args)
         .output()
         .expect("spawn arc")

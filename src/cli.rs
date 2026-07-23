@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
@@ -8,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::manifest::Manifest;
 use crate::registry::transport::GitTarballTransport;
 use crate::registry::{RunOptions, cache_root};
-use crate::spec::{PathPart, SpecEdit};
+use crate::spec::{HistoryKind, LocalHistory, PathPart, SpecEdit};
 use crate::state::DuckDbStateBackend;
 
 /// Default index URL — points to the (future) meridian-online/registry repo.
@@ -78,6 +79,22 @@ pub enum Commands {
 
         #[command(subcommand)]
         op: EditOp,
+    },
+
+    /// Local history for a protocol's spec: list, inspect and restore
+    /// earlier states of `arcform.yaml` — no git repository or account
+    /// required.
+    ///
+    /// The middle tier between editor undo and version control: saving
+    /// records an entry and every machine edit checkpoints the state it is
+    /// about to replace, into `$ARCFORM_HISTORY_DIR` (default
+    /// `~/.arcform/history`) — outside the protocol directory, invisible to
+    /// `git status`. At most 50 entries are kept per spec, oldest pruned
+    /// first, and saves within 10 seconds of the newest save merge into it.
+    /// Nothing is ever promoted to git.
+    History {
+        #[command(subcommand)]
+        cmd: HistoryCmd,
     },
 
     /// Run the pipeline defined in arcform.yaml.
@@ -191,6 +208,37 @@ pub enum EditOp {
     },
 }
 
+/// The local-history verbs. Entry ids come from `arc history list`.
+#[derive(Subcommand)]
+pub enum HistoryCmd {
+    /// List the recorded states of the protocol's spec, oldest first, with
+    /// the retention policy that governs them.
+    List {
+        /// Protocol directory (where arcform.yaml lives).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+    /// Print the exact bytes an entry recorded, to stdout.
+    Show {
+        /// The entry id, as listed by `arc history list`.
+        id: String,
+
+        /// Protocol directory (where arcform.yaml lives).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+    /// Roll the spec back to the state an entry recorded. The state being
+    /// replaced is checkpointed first, so a restore can itself be undone.
+    Restore {
+        /// The entry id, as listed by `arc history list`.
+        id: String,
+
+        /// Protocol directory (where arcform.yaml lives).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+}
+
 /// Execute the `arc create-protocol` command: assemble the manifest value the
 /// arguments describe and hand it to the library's creation path — the same
 /// gate and the same atomic write every other caller gets. Nothing is written
@@ -200,6 +248,7 @@ pub fn create_protocol(
     name: Option<String>,
     engine: Option<String>,
     db: Option<String>,
+    history: &LocalHistory,
 ) -> Result<()> {
     let name = match name {
         Some(name) => name,
@@ -221,7 +270,13 @@ pub fn create_protocol(
     if let Some(db) = db {
         manifest.db = Some(db);
     }
-    crate::spec::create_spec(dir, &manifest)?;
+    let validated = crate::spec::create_spec(dir, &manifest)?;
+
+    // The new spec's first durable state enters local history at its save
+    // boundary. Best-effort by design: the state is also the file itself, so
+    // a store that cannot record costs nothing here — and creation, which
+    // replaces nothing, must not fail on the safety net's account.
+    let _ = history.record_save(dir, validated.text());
 
     println!(
         "created {} — author steps with `arc edit-protocol`",
@@ -231,13 +286,14 @@ pub fn create_protocol(
 }
 
 /// Execute the `arc edit-protocol` command: turn the op into the library's
-/// edit value and hand it to the whole write path — apply, validate, write
-/// atomically. The CLI's job ends at argument parsing; a refusal (an edit
-/// that does not apply, or a result the loader rejects) surfaces here as the
-/// error, before the file is touched.
-pub fn edit_protocol(dir: &Path, op: EditOp) -> Result<()> {
+/// edit value and hand it to the whole write path on its checkpointed road —
+/// apply, validate, checkpoint the state being replaced, write atomically.
+/// The CLI's job ends at argument parsing; a refusal (an edit that does not
+/// apply, a result the loader rejects, or a checkpoint that cannot land)
+/// surfaces here as the error, before the file is touched.
+pub fn edit_protocol(dir: &Path, op: EditOp, history: &LocalHistory) -> Result<()> {
     let edit = spec_edit_of(op)?;
-    crate::spec::edit_spec(dir, &[edit])?;
+    crate::spec::edit_spec_with_history(dir, &[edit], history)?;
     println!(
         "edited {}",
         dir.join(crate::spec::MANIFEST_FILENAME).display()
@@ -322,6 +378,83 @@ fn parse_path(raw: &str) -> Result<Vec<PathPart>> {
     Ok(parts)
 }
 
+/// Execute `arc history list`: the recorded states of the spec in `dir`,
+/// oldest first (the newest lands beside the prompt), with the retention
+/// policy printed under the entries it governs — a user should never have to
+/// hunt for the rules deciding what this command shows.
+pub fn history_list(dir: &Path, history: &LocalHistory, out: &mut impl Write) -> Result<()> {
+    let spec = dir.join(crate::spec::MANIFEST_FILENAME);
+    let entries = history.entries(dir)?;
+    if entries.is_empty() {
+        writeln!(
+            out,
+            "no local history for {} yet — entries are recorded as the spec is saved or machine-edited",
+            spec.display()
+        )?;
+    } else {
+        for entry in &entries {
+            writeln!(
+                out,
+                "{}  {:<10}  {}  {:>7} bytes",
+                entry.id,
+                kind_word(entry.kind),
+                humantime::format_rfc3339_seconds(entry.at),
+                entry.bytes,
+            )?;
+        }
+        writeln!(
+            out,
+            "({} recorded state(s), newest last — `arc history restore <id>` rolls back)",
+            entries.len()
+        )?;
+    }
+    writeln!(out, "{}", crate::history::policy_line(history.root()))?;
+    Ok(())
+}
+
+/// Execute `arc history show`: the exact recorded bytes and nothing else —
+/// the output is the historical spec, fit for a diff or a redirect.
+pub fn history_show(
+    dir: &Path,
+    id: &str,
+    history: &LocalHistory,
+    out: &mut impl Write,
+) -> Result<()> {
+    write!(out, "{}", history.read(dir, id)?)?;
+    Ok(())
+}
+
+/// Execute `arc history restore`: roll the spec back to a recorded state.
+/// The library checkpoints the state being replaced first — a restore is a
+/// machine write like any other — and recovery is byte-faithful rather than
+/// gated, so the one thing left to check is whether the restored state still
+/// loads; when it does not, that is said out loud instead of silently
+/// handing back a spec `arc run` will refuse.
+pub fn history_restore(
+    dir: &Path,
+    id: &str,
+    history: &LocalHistory,
+    out: &mut impl Write,
+) -> Result<()> {
+    let text = history.restore(dir, id)?;
+    writeln!(
+        out,
+        "restored {} to {id} — the replaced state was checkpointed first",
+        dir.join(crate::spec::MANIFEST_FILENAME).display()
+    )?;
+    if let Err(e) = Manifest::from_yaml_str(&text) {
+        writeln!(out, "note: the restored state does not load as a spec: {e}")?;
+    }
+    Ok(())
+}
+
+fn kind_word(kind: HistoryKind) -> &'static str {
+    match kind {
+        HistoryKind::Save => "save",
+        HistoryKind::Checkpoint => "checkpoint",
+    }
+}
+
 /// Execute the `arc init` command in the current directory.
 pub fn init(name: &str) -> Result<()> {
     init_at(name, &PathBuf::from("."))
@@ -386,10 +519,23 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             name,
             engine,
             db,
-        } => create_protocol(&dir, name, engine, db),
-        Commands::EditProtocol { dir, op } => edit_protocol(&dir, op),
+        } => create_protocol(&dir, name, engine, db, &LocalHistory::open_default()?),
+        Commands::EditProtocol { dir, op } => {
+            edit_protocol(&dir, op, &LocalHistory::open_default()?)
+        }
+        Commands::History { cmd } => dispatch_history(cmd),
         Commands::Run { force, params } => run_pipeline(force, &params),
         Commands::Registry { cmd } => dispatch_registry(cmd, verbose),
+    }
+}
+
+fn dispatch_history(cmd: HistoryCmd) -> Result<()> {
+    let history = LocalHistory::open_default()?;
+    let mut stdout = std::io::stdout();
+    match cmd {
+        HistoryCmd::List { dir } => history_list(&dir, &history, &mut stdout),
+        HistoryCmd::Show { id, dir } => history_show(&dir, &id, &history, &mut stdout),
+        HistoryCmd::Restore { id, dir } => history_restore(&dir, &id, &history, &mut stdout),
     }
 }
 
@@ -819,14 +965,15 @@ mod tests {
     #[test]
     fn test_create_protocol_writes_once_through_the_gate() {
         let base = tempfile::tempdir().unwrap();
+        let history = LocalHistory::at_root(base.path().join("history"));
         let dir = base.path().join("notes");
-        create_protocol(&dir, None, None, None).unwrap();
+        create_protocol(&dir, None, None, None, &history).unwrap();
 
         let m = Manifest::load(&dir).unwrap();
         assert_eq!(m.name, "notes");
         assert!(m.steps.is_empty());
 
-        let err = create_protocol(&dir, None, None, None).unwrap_err();
+        let err = create_protocol(&dir, None, None, None, &history).unwrap_err();
         assert!(
             err.to_string().contains("already exists"),
             "an existing spec must be refused, never overwritten: {err}"
@@ -843,6 +990,7 @@ mod tests {
             Some("tides".to_string()),
             Some("sqlite3".to_string()),
             Some("state/tides.db".to_string()),
+            &LocalHistory::at_root(base.path().join("history")),
         )
         .unwrap();
 
@@ -855,7 +1003,9 @@ mod tests {
     // A directory with no usable file name needs --name.
     #[test]
     fn test_create_protocol_requires_a_derivable_name() {
-        let err = create_protocol(Path::new("."), None, None, None).unwrap_err();
+        let base = tempfile::tempdir().unwrap();
+        let history = LocalHistory::at_root(base.path().join("history"));
+        let err = create_protocol(Path::new("."), None, None, None, &history).unwrap_err();
         assert!(err.to_string().contains("--name"), "{err}");
     }
 
@@ -868,9 +1018,128 @@ mod tests {
             EditOp::Delete {
                 path: "steps[0]".into(),
             },
+            &LocalHistory::at_root(base.path().join("history")),
         )
         .unwrap_err();
         assert!(matches!(err, Error::ManifestNotFound), "{err}");
+    }
+
+    // `arc history list` / `show <id>` / `restore <id>` parse, with the
+    // directory defaulting to the cwd.
+    #[test]
+    fn test_history_subcommands_parse() {
+        let cli = Cli::try_parse_from(["arc", "history", "list"]).unwrap();
+        match cli.command {
+            Commands::History {
+                cmd: HistoryCmd::List { dir },
+            } => assert_eq!(dir, PathBuf::from(".")),
+            _ => panic!("expected History/List"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "arc",
+            "history",
+            "restore",
+            "1700000000000-000-save",
+            "--dir",
+            "notes",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::History {
+                cmd: HistoryCmd::Restore { id, dir },
+            } => {
+                assert_eq!(id, "1700000000000-000-save");
+                assert_eq!(dir, PathBuf::from("notes"));
+            }
+            _ => panic!("expected History/Restore"),
+        }
+    }
+
+    // The numbers a user reads in `arc history --help` must be the numbers
+    // the store enforces. This fails when the policy constants move without
+    // the stated policy moving with them.
+    #[test]
+    fn test_the_stated_policy_matches_the_enforced_policy() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let about = cmd
+            .find_subcommand("history")
+            .expect("history subcommand exists")
+            .get_long_about()
+            .expect("history carries a long about")
+            .to_string();
+        assert!(
+            about.contains(&format!("{} entries", crate::spec::HISTORY_MAX_ENTRIES)),
+            "the stated bound drifted from HISTORY_MAX_ENTRIES:
+{about}"
+        );
+        assert!(
+            about.contains(&format!(
+                "{} seconds",
+                crate::spec::HISTORY_MERGE_WINDOW.as_secs()
+            )),
+            "the stated merge window drifted from HISTORY_MERGE_WINDOW:
+{about}"
+        );
+    }
+
+    // The CLI surface end to end: create records the first save, an edit
+    // checkpoints the state it replaces, list prints the policy beside the
+    // entries, show hands back exact bytes, restore rolls back and reports.
+    #[test]
+    fn test_history_cli_round_trip() {
+        let base = tempfile::tempdir().unwrap();
+        let history = LocalHistory::at_root(base.path().join("history"));
+        let dir = base.path().join("notes");
+        create_protocol(&dir, None, None, None, &history).unwrap();
+        let created = fs::read_to_string(dir.join("arcform.yaml")).unwrap();
+
+        edit_protocol(
+            &dir,
+            EditOp::Replace {
+                path: "name".into(),
+                value: "renamed".into(),
+            },
+            &history,
+        )
+        .unwrap();
+        let edited = fs::read_to_string(dir.join("arcform.yaml")).unwrap();
+        assert_ne!(created, edited);
+
+        let mut listed = Vec::new();
+        history_list(&dir, &history, &mut listed).unwrap();
+        let listed = String::from_utf8(listed).unwrap();
+        assert!(listed.contains("save"), "{listed}");
+        assert!(
+            listed.contains("policy:"),
+            "the policy prints under the listing: {listed}"
+        );
+
+        // The pre-edit state is recorded; show returns its exact bytes.
+        let entries = history.entries(&dir).unwrap();
+        let pre_edit = entries
+            .iter()
+            .find(|e| history.read(&dir, &e.id).unwrap() == created)
+            .expect("the created state is recorded");
+        let mut shown = Vec::new();
+        history_show(&dir, &pre_edit.id, &history, &mut shown).unwrap();
+        assert_eq!(String::from_utf8(shown).unwrap(), created);
+
+        // Restore rolls the file back and says so.
+        let mut out = Vec::new();
+        history_restore(&dir, &pre_edit.id.clone(), &history, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("restored"), "{out}");
+        assert_eq!(
+            fs::read_to_string(dir.join("arcform.yaml")).unwrap(),
+            created
+        );
+
+        // An unknown id is refused by name.
+        let mut sink = Vec::new();
+        let err = history_restore(&dir, "not-an-id", &history, &mut sink).unwrap_err();
+        assert!(matches!(err, Error::HistoryEntryNotFound { .. }), "{err}");
     }
 
     // module documentation contains the four vocabulary anchors.
