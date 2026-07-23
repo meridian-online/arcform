@@ -16,6 +16,10 @@ Rationale for each change is recorded in the project's design notes and commit h
   mode, opened by a one-line `-- generated:` provenance marker) and splices a
   `name:` + `sql:` step onto the manifest through the same gated, byte-preserving write
   path — refusal-first, so a promotion that cannot apply leaves the directory untouched.
+  The step name must record faithfully: it is spliced as a plain YAML scalar, so a name
+  that would not read back as itself (newlines or other control characters, `#`, `:`,
+  surrounding whitespace, a leading YAML indicator) is refused up front, and the
+  reloaded document is checked to carry exactly the step that was asked for.
   `amend_step_sql` regenerates a model only when it carries the marker: the marker is
   the license to regenerate, and a hand-authored model is refused with the remedy in
   the reason (record a new step downstream instead). Recording never runs anything —
