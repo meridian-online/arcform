@@ -55,6 +55,17 @@ pub enum Error {
     #[error("step '{step}': sql file not found: {path}")]
     SqlFileNotFound { step: String, path: PathBuf },
 
+    // Local history cannot resolve a store root: no $ARCFORM_HISTORY_DIR and
+    // no home directory. The remedy is the env var, so the message names it.
+    #[error(
+        "history: no store root (set ARCFORM_HISTORY_DIR to a writable directory, \
+         or ensure a home directory exists)"
+    )]
+    HistoryRootMissing,
+
+    #[error("history: no entry '{id}' for this spec (see `arc history list`)")]
+    HistoryEntryNotFound { id: String },
+
     #[error("engine '{engine}' not found on PATH or not executable")]
     EngineNotFound { engine: String },
 
@@ -230,6 +241,33 @@ mod format_tests {
             "remediation env var must appear: {:?}",
             e.to_string()
         );
+    }
+
+    // The history variants follow the same discipline: single-line Display,
+    // a `history:` family prefix, and the remediation in the message.
+    #[test]
+    fn history_root_missing_names_the_env_var() {
+        let e = Error::HistoryRootMissing;
+        let s = e.to_string();
+        assert!(!s.contains('\n'), "Display must be single-line: {:?}", s);
+        assert!(s.starts_with("history:"), "family prefix: {:?}", s);
+        assert!(
+            s.contains("ARCFORM_HISTORY_DIR"),
+            "remediation env var must appear: {:?}",
+            s
+        );
+    }
+
+    #[test]
+    fn history_entry_not_found_names_the_entry_and_the_listing() {
+        let e = Error::HistoryEntryNotFound {
+            id: "1700000000000-000-save".into(),
+        };
+        let s = e.to_string();
+        assert!(!s.contains('\n'), "Display must be single-line: {:?}", s);
+        assert!(s.starts_with("history:"), "family prefix: {:?}", s);
+        assert!(s.contains("1700000000000-000-save"));
+        assert!(s.contains("arc history list"));
     }
 
     #[test]

@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 
 /// Every type, constant and function `arc::spec` re-exports, and the module that
 /// owns it. An `impl` on any of these names may only appear in its owning file.
-const EXPORTED: [(&str, &str); 24] = [
+const EXPORTED: [(&str, &str); 31] = [
     ("Manifest", "manifest.rs"),
     ("Step", "manifest.rs"),
     ("Param", "manifest.rs"),
@@ -75,13 +75,22 @@ const EXPORTED: [(&str, &str); 24] = [
     ("amend_step_sql", "record.rs"),
     ("GENERATED_MARKER", "record.rs"),
     ("sql_is_generated", "record.rs"),
+    // Local history: the middle tier between undo and version control, and
+    // the checkpointed roads machine edits take through it.
+    ("LocalHistory", "history.rs"),
+    ("HistoryEntry", "history.rs"),
+    ("HistoryKind", "history.rs"),
+    ("HISTORY_MAX_ENTRIES", "history.rs"),
+    ("HISTORY_MERGE_WINDOW", "history.rs"),
+    ("edit_spec_with_history", "history.rs"),
+    ("record_step_with_history", "history.rs"),
     ("Error", "error.rs"),
     ("Result", "error.rs"),
 ];
 
 /// Every module file in the crate. Frozen so a new one cannot be added without
 /// passing under the checks below.
-const MODULE_FILES: [&str; 24] = [
+const MODULE_FILES: [&str; 25] = [
     "asset.rs",
     "bridge.rs",
     "cli.rs",
@@ -89,6 +98,7 @@ const MODULE_FILES: [&str; 24] = [
     "edit.rs",
     "engine.rs",
     "error.rs",
+    "history.rs",
     "ingress_meta.rs",
     "introspect.rs",
     "lib.rs",
@@ -120,7 +130,7 @@ const MODULE_FILES: [&str; 24] = [
 /// `src/spec.rs`: editing an existing spec goes through the write path, which splices
 /// original bytes and never re-serialises. This freeze keeps any change to that
 /// arrangement a deliberate, version-visible act instead of a silent drift.
-const FROZEN_DERIVES: [(&str, &str, &[&str]); 15] = [
+const FROZEN_DERIVES: [(&str, &str, &[&str]); 18] = [
     (
         "manifest.rs",
         "Param",
@@ -193,6 +203,20 @@ const FROZEN_DERIVES: [(&str, &str, &[&str]); 15] = [
         "RecordedStep",
         &["Debug", "Clone", "PartialEq", "Eq"],
     ),
+    // The history values are plain data like the edit values, and NOT serde
+    // types for the same reason; the store handle is a root path, cloneable
+    // so a tool can hold one per surface.
+    (
+        "history.rs",
+        "HistoryKind",
+        &["Debug", "Clone", "Copy", "PartialEq", "Eq"],
+    ),
+    (
+        "history.rs",
+        "HistoryEntry",
+        &["Debug", "Clone", "PartialEq", "Eq"],
+    ),
+    ("history.rs", "LocalHistory", &["Debug", "Clone"]),
     ("error.rs", "Error", &["Debug", "thiserror::Error"]),
 ];
 
@@ -925,6 +949,34 @@ fn exported_modules_declare_only_contracted_items() {
     );
 
     assert_eq!(
+        pub_items(&src("history.rs")),
+        frozen(&[
+            // Re-exported types and the policy constants.
+            "LocalHistory",
+            "HistoryEntry",
+            "HistoryKind",
+            "HISTORY_MAX_ENTRIES",
+            "HISTORY_MERGE_WINDOW",
+            // Re-exported entry points: the store handle's surface and the
+            // checkpointed roads. The internals — the key hash, the entry
+            // naming, the debounce mechanics — are private: the contract is
+            // the tiers and the ordering, not the store format.
+            "open_default",
+            "at_root",
+            "root",
+            "record_save",
+            "record_checkpoint",
+            "entries",
+            "read",
+            "restore",
+            "edit_spec_with_history",
+            "record_step_with_history",
+        ]),
+        "a `pub` item in `history.rs` is public API once its types are re-exported; \
+         use `pub(crate)` unless you mean to promise it"
+    );
+
+    assert_eq!(
         pub_items(&src("record.rs")),
         frozen(&[
             // Re-exported types and the ownership marker.
@@ -953,6 +1005,7 @@ fn the_schema_types_derive_exactly_what_is_recorded() {
         "precondition.rs",
         "edit.rs",
         "record.rs",
+        "history.rs",
         "error.rs",
     ] {
         let found = pub_type_derives(&src(owner));

@@ -11,6 +11,21 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Added
 
+- **Local history + machine-edit checkpoints** — the middle tier between editor undo
+  and version control, and the tier that makes machine edits safe to accept. Saves
+  record debounced, bounded snapshots of `arcform.yaml` under `~/.arcform/history`
+  (override: `$ARCFORM_HISTORY_DIR`) — outside the protocol directory, so nothing
+  appears in `git status` or a diff; at most 50 entries are kept per spec (oldest
+  pruned first) and saves within 10 seconds of the newest save merge into it. Machine
+  edits go through checkpointed roads — `edit_spec_with_history`,
+  `record_step_with_history`, now used by `arc create-protocol` / `arc edit-protocol` —
+  that snapshot the state being replaced *before* writing: no checkpoint, no write.
+  New `arc history list|show|restore` verbs list the recorded states (with the
+  retention policy printed under them), print an entry's exact bytes, and roll a spec
+  back — restore checkpoints the state it replaces, so a rollback is itself
+  reversible, and none of it needs a git repository or an account. Nothing is ever
+  promoted to git: the only automatic promotion is undo → local history at the save
+  boundary.
 - **The record path** — `arc::spec` can now promote an exploration into a step:
   `record_step` writes the captured SQL as a new numbered model under `models/` (create
   mode, opened by a one-line `-- generated:` provenance marker) and splices a
