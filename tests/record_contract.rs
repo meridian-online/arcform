@@ -4,8 +4,9 @@
 //!      commented spec changes exactly the appended lines and nothing else,
 //!      proven against an independently constructed oracle;
 //!   2. **refusal leaves no trace** — a refused promotion (duplicate name,
-//!      occupied model path) leaves the manifest byte-identical AND writes no
-//!      model file, in either order of failure;
+//!      hostile name, occupied model path, failed manifest write) leaves the
+//!      manifest byte-identical AND writes no model file, in either order of
+//!      failure;
 //!   3. **ownership** — the marker is the license to regenerate: amending a
 //!      generated model rewrites it, amending a hand-authored one is refused
 //!      with the file untouched and the downstream-step remedy in the reason;
@@ -238,6 +239,92 @@ fn a_multi_line_provenance_is_refused_before_anything_happens() {
         Err(Error::EditTarget { path, .. }) => assert_eq!(path, "(provenance)"),
         other => panic!("expected EditTarget, got {other:?}"),
     }
+}
+
+/// The step name is spliced into the manifest verbatim, so a name YAML would
+/// read as anything other than itself is refused with the name called out and
+/// nothing written. The corpus here is the smuggling constructions themselves:
+/// a name that injects a manifest field, one that injects wiring, one that
+/// injects a whole second step (citing a model that does not exist), one a
+/// comment marker would silently truncate, and one that opens a mapping.
+#[test]
+fn a_hostile_step_name_is_refused_with_nothing_written() {
+    for hostile in [
+        "x\n    timeout_sec: 1",                               // injects a field
+        "x\n    depends_on: [tide_table]",                     // injects wiring
+        "x\n    sql: models/09_ghost.sql\n  - name: injected", // injects a second step
+        "top10 # draft",                                       // truncates to 'top10'
+        "a: b",                                                // opens a mapping
+        " dover",                                              // YAML drops the pad
+        "- dover",                                             // leading indicator
+    ] {
+        let dir = corpus_copy();
+        let before = std::fs::read(dir.path().join(MANIFEST_FILENAME)).unwrap();
+
+        let mut capture = tide_capture();
+        capture.name = hostile.to_string();
+        match record_step(dir.path(), &capture) {
+            Err(Error::EditTarget { path, .. }) => assert_eq!(path, "(name)", "{hostile:?}"),
+            other => panic!("expected {hostile:?} refused, got {other:?}"),
+        }
+
+        assert_eq!(
+            std::fs::read(dir.path().join(MANIFEST_FILENAME)).unwrap(),
+            before,
+            "the manifest is untouched after refusing {hostile:?}"
+        );
+        assert!(
+            !dir.path().join("models").exists(),
+            "no model file survives the refusal of {hostile:?}"
+        );
+    }
+}
+
+/// Force the last write of a promotion — the manifest — to fail, and demand a
+/// full retreat: the protocol directory is made read-only while a pre-existing
+/// `models/` stays writable, so the model lands and the manifest cannot. The
+/// rollback must take the model back out and leave `models/` (which the
+/// promotion did not create) standing.
+#[cfg(unix)]
+#[test]
+fn a_failed_manifest_write_takes_the_model_back_out() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = corpus_copy();
+    let models = dir.path().join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    let before = std::fs::read(dir.path().join(MANIFEST_FILENAME)).unwrap();
+
+    // Reads stay allowed; creating the manifest's temp file does not.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    // Root ignores permission bits, so the failure cannot be staged there —
+    // probe, and stand down rather than mis-assert.
+    let probe = dir.path().join(".probe");
+    if std::fs::write(&probe, b"x").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let result = record_step(dir.path(), &tide_capture());
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(result.is_err(), "the promotion must fail, got {result:?}");
+    assert_eq!(
+        std::fs::read(dir.path().join(MANIFEST_FILENAME)).unwrap(),
+        before,
+        "the manifest is untouched, byte for byte"
+    );
+    assert_eq!(
+        std::fs::read_dir(&models).unwrap().count(),
+        0,
+        "no orphan model survives the failed promotion"
+    );
+    assert!(
+        models.exists(),
+        "the pre-existing models/ dir is not the rollback's to remove"
+    );
 }
 
 // -------------------------------------------------------------------- ownership

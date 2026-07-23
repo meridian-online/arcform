@@ -34,10 +34,15 @@
 //! # Refusal discipline
 //!
 //! Every refusal leaves the protocol directory untouched, byte for byte. The
-//! manifest splice is applied and gated **in memory first**; the generated
+//! step name and provenance note are gated first — both are spliced into
+//! durable text verbatim, so a value that would not read back as itself
+//! (a newline, a `#`, a `:`) is refused before anything else happens, and the
+//! reloaded document is checked to carry exactly the step that was asked for.
+//! The manifest splice is applied and gated **in memory first**; the generated
 //! model is written only where no file exists; the manifest write is atomic;
-//! and if that final write fails, the just-written model is removed so no
-//! orphan survives a failed promotion.
+//! and if a write fails partway, the just-written model — and `models/`
+//! itself, when this promotion created it — is removed so no orphan survives
+//! a failed promotion.
 
 use std::path::{Path, PathBuf};
 
@@ -69,7 +74,11 @@ pub fn sql_is_generated(sql: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedStep {
     /// The step's name in the manifest. Must be unique among the steps; the
-    /// spec gate refuses a duplicate before anything is written.
+    /// spec gate refuses a duplicate before anything is written. It is spliced
+    /// into the manifest as a plain, unquoted YAML scalar, so it must read
+    /// back as exactly itself: names carrying newlines or other control
+    /// characters, `#`, `:`, surrounding whitespace, or a leading YAML
+    /// indicator are refused up front — see [`record_step`].
     pub name: String,
 
     /// The SQL body the exploration compiled to. Written verbatim under the
@@ -104,12 +113,17 @@ pub struct RecordedStep {
 /// # Errors
 ///
 /// [`Error::ManifestNotFound`] when `dir` has no spec;
-/// [`Error::EditTarget`] when `steps` is missing or empty (an empty protocol
-/// has nothing to explore, so it has nothing to record against) or the
-/// provenance note spans lines; [`Error::GeneratedSqlExists`] when the model
-/// path is already occupied; the loader's own error when the spliced result
-/// would not load — a duplicate step name, most commonly.
+/// [`Error::EditTarget`] when the step name would not splice faithfully
+/// (empty, control characters, `#`, `:`, surrounding whitespace, a leading
+/// YAML indicator — or, as the structural backstop, any name the reloaded
+/// document does not read back verbatim), when `steps` is missing or empty
+/// (an empty protocol has nothing to explore, so it has nothing to record
+/// against), or when the provenance note spans lines;
+/// [`Error::GeneratedSqlExists`] when the model path is already occupied; the
+/// loader's own error when the spliced result would not load — a duplicate
+/// step name, most commonly.
 pub fn record_step(dir: &Path, step: &RecordedStep) -> Result<(PathBuf, ValidatedSpec)> {
+    valid_step_name(&step.name)?;
     one_line(&step.provenance)?;
 
     let manifest_path = dir.join(MANIFEST_FILENAME);
@@ -120,16 +134,19 @@ pub fn record_step(dir: &Path, step: &RecordedStep) -> Result<(PathBuf, Validate
         path: manifest_path.clone(),
         source: e,
     })?;
+    let steps_before = Manifest::from_yaml_str(&original)?.steps.len();
 
     // Where the model will land. Create mode: an occupied path is refused,
     // never overwritten — an existing file may carry authorship.
+    let models_abs = dir.join("models");
     let filename = format!(
         "{:02}_{}.sql",
-        next_model_number(&dir.join("models")),
+        next_model_number(&models_abs),
         filename_slug(&step.name)
     );
+    let sql_cited = format!("models/{filename}");
     let sql_rel = Path::new("models").join(&filename);
-    let sql_abs = dir.join(&sql_rel);
+    let sql_abs = models_abs.join(&filename);
     if sql_abs.exists() {
         return Err(Error::GeneratedSqlExists(sql_abs));
     }
@@ -141,7 +158,7 @@ pub fn record_step(dir: &Path, step: &RecordedStep) -> Result<(PathBuf, Validate
     let steps_path = vec![PathPart::Key("steps".to_string())];
     let indent = sequence_item_indent(&original, &steps_path)?;
     let item = format!(
-        "{indent}- name: {}\n{indent}  sql: models/{filename}\n",
+        "{indent}- name: {}\n{indent}  sql: {sql_cited}\n",
         step.name
     );
     let validated = apply_edits(
@@ -152,21 +169,43 @@ pub fn record_step(dir: &Path, step: &RecordedStep) -> Result<(PathBuf, Validate
         }],
     )?;
 
+    // The reloaded document is the arbiter: the splice must read back as
+    // exactly one new step carrying exactly the asked-for name and file. The
+    // name gate above refuses the smuggling constructions it can name; this
+    // equality check refuses the ones it cannot — any name that parses but
+    // records something other than itself.
+    let faithful = validated.manifest().steps.len() == steps_before + 1
+        && validated.manifest().steps.last().is_some_and(|last| {
+            last.name == step.name && last.sql.as_deref() == Some(sql_cited.as_str())
+        });
+    if !faithful {
+        return Err(Error::EditTarget {
+            path: "(name)".to_string(),
+            detail: format!(
+                "the step name {:?} does not record faithfully — spliced into the manifest \
+                 it reads back as something other than itself; use a plain single-line name",
+                step.name
+            ),
+        });
+    }
+
     // Both writes are now committed to. The checkpoint seam fires before the
     // first byte changes on disk.
     checkpoint(dir);
 
-    if let Some(parent) = sql_abs.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    write_atomic(
+    let models_dir_created = !models_abs.exists();
+    std::fs::create_dir_all(&models_abs)?;
+    if let Err(e) = write_atomic(
         &sql_abs,
         model_contents(&step.provenance, &step.sql).as_bytes(),
-    )?;
+    ) {
+        remove_orphan_model(&sql_abs, &models_abs, models_dir_created);
+        return Err(e);
+    }
 
     if let Err(e) = validated.write_to(dir) {
         // Take the model back out: a failed promotion leaves no orphan.
-        let _ = std::fs::remove_file(&sql_abs);
+        remove_orphan_model(&sql_abs, &models_abs, models_dir_created);
         return Err(e);
     }
     Ok((sql_rel, validated))
@@ -246,6 +285,71 @@ fn model_contents(provenance: &str, sql: &str) -> String {
         contents.push('\n');
     }
     contents
+}
+
+/// Characters YAML reserves as indicators: a plain scalar cannot open with
+/// one, so a name that does would not read back as itself.
+const YAML_INDICATORS: &str = "-?:,[]{}#&*!|>'\"%@`";
+
+/// The step name is spliced into the manifest as a plain, unquoted YAML
+/// scalar, so only a name YAML reads back exactly as written may pass —
+/// anything else could smuggle structure into the durable document: a newline
+/// injects manifest fields or whole steps, a `#` silently truncates the name
+/// into a comment, a `:` opens a mapping. The refusals here are the clear,
+/// named ones; the faithfulness check after the splice is the structural
+/// backstop for anything not enumerated.
+fn valid_step_name(name: &str) -> Result<()> {
+    let refuse = |detail: String| {
+        Err(Error::EditTarget {
+            path: "(name)".to_string(),
+            detail,
+        })
+    };
+    if name.is_empty() {
+        return refuse("the step name is empty".to_string());
+    }
+    if name.chars().any(char::is_control) {
+        return refuse(format!(
+            "the step name {name:?} contains a control character — a newline here would \
+             inject fields or steps into the manifest"
+        ));
+    }
+    if name != name.trim() {
+        return refuse(format!(
+            "the step name {name:?} has leading or trailing whitespace, which YAML would \
+             silently drop"
+        ));
+    }
+    if name.contains('#') {
+        return refuse(format!(
+            "the step name {name:?} contains '#', which YAML reads as a comment — the \
+             recorded name would be silently truncated"
+        ));
+    }
+    if name.contains(':') {
+        return refuse(format!(
+            "the step name {name:?} contains ':', which YAML reads as a mapping"
+        ));
+    }
+    if name.starts_with(|c: char| YAML_INDICATORS.contains(c)) {
+        return refuse(format!(
+            "the step name {name:?} opens with a YAML indicator character, so it would \
+             not read back as itself"
+        ));
+    }
+    Ok(())
+}
+
+/// Take back the model-side writes of a promotion whose later write failed:
+/// the just-written model is removed, and `models/` itself is removed when
+/// this promotion created it — but only when nothing else has since landed in
+/// it (removing a non-empty directory fails, and that failure is deliberately
+/// ignored). A failed promotion thereby leaves the directory as it found it.
+fn remove_orphan_model(sql_abs: &Path, models_abs: &Path, models_dir_created: bool) {
+    let _ = std::fs::remove_file(sql_abs);
+    if models_dir_created {
+        let _ = std::fs::remove_dir(models_abs);
+    }
 }
 
 /// The provenance note becomes the marker line, and the marker line is one
@@ -373,5 +477,82 @@ mod tests {
             Err(Error::EditTarget { path, .. }) => assert_eq!(path, "(provenance)"),
             other => panic!("expected EditTarget, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn names_that_would_not_read_back_as_themselves_are_refused() {
+        for hostile in [
+            "",                      // nothing to record
+            "x\n    timeout_sec: 1", // field injection
+            "x\n  - name: injected", // step injection
+            "x\ry",                  // carriage return is a break too
+            "x\ty",                  // tab is a control character
+            "top10 # draft",         // '#' silently truncates
+            "a: b",                  // ':' opens a mapping
+            " padded",               // YAML drops the padding
+            "padded ",               // ... on either side
+            "- item",                // leading indicator
+            "[list]",                // leading indicator
+            "*anchor",               // leading indicator
+        ] {
+            match valid_step_name(hostile) {
+                Err(Error::EditTarget { path, .. }) => assert_eq!(path, "(name)", "{hostile:?}"),
+                other => panic!("expected {hostile:?} refused, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn plain_names_pass_the_gate() {
+        for plain in ["filter_tides", "top-10 ports", "dover", "Reprise 2", "café"] {
+            assert!(valid_step_name(plain).is_ok(), "{plain:?} should pass");
+        }
+    }
+
+    #[test]
+    fn rollback_removes_the_model_and_a_directory_this_promotion_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let model = models.join("01_x.sql");
+        std::fs::write(&model, "SELECT 1;").unwrap();
+
+        remove_orphan_model(&model, &models, true);
+        assert!(
+            !models.exists(),
+            "a created dir is taken back out with the model"
+        );
+    }
+
+    #[test]
+    fn rollback_leaves_a_pre_existing_models_directory_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let model = models.join("01_x.sql");
+        std::fs::write(&model, "SELECT 1;").unwrap();
+
+        remove_orphan_model(&model, &models, false);
+        assert!(!model.exists(), "the orphan model is removed");
+        assert!(
+            models.exists(),
+            "a directory the promotion found is not its to remove"
+        );
+    }
+
+    #[test]
+    fn rollback_never_takes_out_a_directory_something_else_now_occupies() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let model = models.join("01_x.sql");
+        std::fs::write(&model, "SELECT 1;").unwrap();
+        let bystander = models.join("theirs.sql");
+        std::fs::write(&bystander, "SELECT 2;").unwrap();
+
+        remove_orphan_model(&model, &models, true);
+        assert!(!model.exists(), "the orphan model is removed");
+        assert!(bystander.exists(), "the bystander survives");
+        assert!(models.exists(), "a non-empty directory is left standing");
     }
 }
