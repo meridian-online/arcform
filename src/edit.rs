@@ -683,6 +683,27 @@ fn item_count(doc: &yamlpath::Document, path: &[PathPart]) -> Result<usize> {
     Ok(n)
 }
 
+/// The exact leading-space prefix of the last item of the block sequence at
+/// `path` — what a new sibling item must be indented with to join it. Reads
+/// the text the way the other extent helpers do, so an appended item matches
+/// the document's own convention instead of imposing one. Refused when the
+/// sequence has no items (there is no convention to read) or the path does
+/// not resolve.
+pub(crate) fn sequence_item_indent(text: &str, path: &[PathPart]) -> Result<String> {
+    let doc = parse(text)?;
+    let last = item_count(&doc, path)? - 1;
+    let mut item_path = path.to_vec();
+    item_path.push(PathPart::Index(last));
+    let anchor = doc
+        .query_pretty(&route_of(&item_path))
+        .map_err(|e| target_err(&item_path, e))?
+        .location
+        .byte_span
+        .0;
+    let ls = line_start(text, anchor);
+    Ok(" ".repeat(indent_of(text, ls)))
+}
+
 /// The indentation for a new key in the block mapping spanning
 /// `[start, end)`: the indent of its first existing child line, or two deeper
 /// than the anchor line when no child line exists to read.
@@ -708,7 +729,7 @@ fn block_child_indent(text: &str, start: usize, end: usize) -> usize {
 /// interrupt at any point leaves either the old file or the new one — never a
 /// truncation. (Same-directory placement is what makes the rename atomic: a
 /// rename across filesystems degrades to copy-and-delete.)
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
 
     static SEQ: AtomicU64 = AtomicU64::new(0);

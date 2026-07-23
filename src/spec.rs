@@ -67,6 +67,14 @@
 //! - [`edit_spec`] — the one-shot apply → validate → atomic-write against a directory
 //! - [`create_spec`] — direct serialisation for a brand-new spec, same gate
 //!
+//! The record path (the [`record`](crate::record) module's docs carry the full
+//! discussion — recording never runs; the marker is the license to regenerate):
+//!
+//! - [`RecordedStep`] — an exploration ready to become a step, as a plain value
+//! - [`record_step`] — new numbered model under `models/` + step splice, refusal-first
+//! - [`amend_step_sql`] — rewrite a *generated* model; hand-authored files are refused
+//! - [`GENERATED_MARKER`], [`sql_is_generated`] — the ownership line, readable by anyone
+//!
 //! Exported error types:
 //!
 //! - [`Error`] — `#[non_exhaustive]`; new variants are not a breaking change
@@ -151,3 +159,6 @@ pub use crate::manifest::{
     AssetOverride, Defaults, Hooks, MANIFEST_FILENAME, Manifest, Param, RetryPolicy, Step,
 };
 pub use crate::precondition::{FreshConfig, ModifiedAfterConfig, Precondition};
+pub use crate::record::{
+    GENERATED_MARKER, RecordedStep, amend_step_sql, record_step, sql_is_generated,
+};

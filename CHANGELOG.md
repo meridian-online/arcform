@@ -11,6 +11,20 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Added
 
+- **The record path** — `arc::spec` can now promote an exploration into a step:
+  `record_step` writes the captured SQL as a new numbered model under `models/` (create
+  mode, opened by a one-line `-- generated:` provenance marker) and splices a
+  `name:` + `sql:` step onto the manifest through the same gated, byte-preserving write
+  path — refusal-first, so a promotion that cannot apply leaves the directory untouched.
+  The step name must record faithfully: it is spliced as a plain YAML scalar, so a name
+  that would not read back as itself (newlines or other control characters, `#`, `:`,
+  surrounding whitespace, a leading YAML indicator) is refused up front, and the
+  reloaded document is checked to carry exactly the step that was asked for.
+  `amend_step_sql` regenerates a model only when it carries the marker: the marker is
+  the license to regenerate, and a hand-authored model is refused with the remedy in
+  the reason (record a new step downstream instead). Recording never runs anything —
+  a recorded step's outputs exist only after `arc run` says so, proven by a parity test
+  that grows a spec purely by recording and executes it under the bare binary.
 - **CLI authoring verbs** — `arc create-protocol` writes a fresh `arcform.yaml` from
   scratch and `arc edit-protocol` amends an existing one (`replace`, `rewrite`, `add`,
   `append`, `delete`, `reorder`, addressed as `steps[2].command`-style paths). Both are

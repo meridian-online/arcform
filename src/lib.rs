@@ -46,6 +46,7 @@ mod introspect;
 mod manifest;
 mod operator;
 mod precondition;
+mod record;
 mod registry;
 mod runner;
 mod state;
