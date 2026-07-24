@@ -24,7 +24,7 @@
 //! Fetches go through the [`transport::Transport`] trait. The production implementation
 //! [`transport::GitTarballTransport`] prefers `git clone --depth=1 --filter=blob:none --sparse`
 //! and falls back to a sandboxed HTTPS tarball extractor when git is unavailable. Tests
-//! use [`transport::FixtureTransport`] which copies from a local directory tree — no
+//! use `transport::FixtureTransport` which copies from a local directory tree — no
 //! shell-out, no network. **All transports honour an atomic-rename contract**: writes go
 //! to a sibling temp directory and rename into the resolved-ref path on success; partial
 //! writes leave no `<ref>/` directory.
