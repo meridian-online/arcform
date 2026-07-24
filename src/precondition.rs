@@ -106,39 +106,55 @@ impl Precondition {
                     return Ok(false);
                 };
 
-                let mut req =
-                    ureq::head(&meta.url).set("User-Agent", crate::ingress_meta::DEFAULT_UA);
-                for (k, v) in &meta.request_headers {
-                    req = req.set(k, v);
-                }
-                if let Some(ref etag) = meta.etag {
-                    req = req.set("If-None-Match", etag);
-                }
-                if let Some(ref lm) = meta.last_modified {
-                    req = req.set("If-Modified-Since", lm);
-                }
-
-                let fresh = match req.call() {
-                    // Server confirms unchanged.
-                    Ok(resp) if resp.status() == 304 => true,
-                    Ok(resp) => {
-                        // No 304 (e.g. server ignores conditionals) — compare identity
-                        // ourselves: ETag first, then Last-Modified.
-                        let etag_match = matches!(
-                            (&meta.etag, resp.header("ETag")),
-                            (Some(a), Some(b)) if a == b
-                        );
-                        let lm_match = matches!(
-                            (&meta.last_modified, resp.header("Last-Modified")),
-                            (Some(a), Some(b)) if a == b
-                        );
-                        etag_match || lm_match
+                // The remote HEAD probe is the ureq path; it rides with the
+                // `http_fetch` operator behind the `http-fetch` feature (see
+                // src/operator.rs for the reachability note). Without that feature
+                // there is no HTTP client to probe with, so fall back to "stale" —
+                // identical to how an unreachable probe is treated below, and safe:
+                // the fetch, if it then runs, 304s rather than re-downloading. This
+                // fallback is dead in practice — preconditions are evaluated only by
+                // the runner, which is CLI-only, and `cli` enables `http-fetch`.
+                #[cfg(feature = "http-fetch")]
+                {
+                    let mut req =
+                        ureq::head(&meta.url).set("User-Agent", crate::ingress_meta::DEFAULT_UA);
+                    for (k, v) in &meta.request_headers {
+                        req = req.set(k, v);
                     }
-                    Err(ureq::Error::Status(304, _)) => true,
-                    // Unreachable/errored probe → stale.
-                    Err(_) => false,
-                };
-                Ok(fresh)
+                    if let Some(ref etag) = meta.etag {
+                        req = req.set("If-None-Match", etag);
+                    }
+                    if let Some(ref lm) = meta.last_modified {
+                        req = req.set("If-Modified-Since", lm);
+                    }
+
+                    let fresh = match req.call() {
+                        // Server confirms unchanged.
+                        Ok(resp) if resp.status() == 304 => true,
+                        Ok(resp) => {
+                            // No 304 (e.g. server ignores conditionals) — compare identity
+                            // ourselves: ETag first, then Last-Modified.
+                            let etag_match = matches!(
+                                (&meta.etag, resp.header("ETag")),
+                                (Some(a), Some(b)) if a == b
+                            );
+                            let lm_match = matches!(
+                                (&meta.last_modified, resp.header("Last-Modified")),
+                                (Some(a), Some(b)) if a == b
+                            );
+                            etag_match || lm_match
+                        }
+                        Err(ureq::Error::Status(304, _)) => true,
+                        // Unreachable/errored probe → stale.
+                        Err(_) => false,
+                    };
+                    Ok(fresh)
+                }
+                #[cfg(not(feature = "http-fetch"))]
+                {
+                    let _ = meta;
+                    Ok(false)
+                }
             }
             Precondition::Command { command: cmd } => {
                 let output = std::process::Command::new("sh")
