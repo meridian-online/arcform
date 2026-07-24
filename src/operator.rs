@@ -137,6 +137,181 @@ pub fn assets_for(op_ref: &str, with: Option<&Value>) -> Result<OpAssets> {
     resolve(op_ref)?.assets(with.unwrap_or(&Value::Null))
 }
 
+/// Every operator in the built-in [`catalog`], by name, in catalog order.
+///
+/// `opendal_fetch` appears only when the `opendal` feature is on (it is only in the
+/// catalog then). Used by the `arc mcp` `operator_describe` tool to enumerate the
+/// operators an authoring UI can pick from.
+#[cfg(feature = "mcp")]
+pub(crate) fn catalog_names() -> Vec<&'static str> {
+    catalog().into_iter().map(|o| o.name()).collect()
+}
+
+/// The JSON Schema (Draft 2020-12) for an operator's `with:` block, or `None` for a
+/// name not in the catalog.
+///
+/// This is the authoring-form emission the module doc anticipates: it describes the
+/// shape a `with:` block must take so an editor or the `arc mcp` `operator_describe`
+/// tool can build a form or validate a draft. It is a *description*, not the gate —
+/// each operator's typed `serde` deserialize (see its `…Config::parse`) remains the
+/// load-time validator, and this schema is hand-kept in step with it (the
+/// `every_catalog_operator_has_a_with_schema` test fails if a new operator is added
+/// without one).
+#[cfg(feature = "mcp")]
+pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
+    use serde_json::json;
+
+    // A `with:` schema: an object of the operator's typed fields, closed to unknown
+    // keys (every config is `#[serde(deny_unknown_fields)]`).
+    fn object(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": properties,
+            "required": required,
+        })
+    }
+    let str_headers = json!({
+        "type": "object",
+        "description": "Extra request headers (a default User-Agent is set unless overridden).",
+        "additionalProperties": { "type": "string" }
+    });
+
+    let schema = match op_name {
+        "parquet_export" => object(
+            json!({
+                "input": { "type": "string", "description": "Source table or view in the pipeline DB to export." },
+                "dest": { "type": "string", "description": "Destination Parquet path, relative to the protocol directory." },
+                "compression": { "type": "string", "description": "Parquet codec.", "default": "zstd" },
+                "row_group_size": { "type": "integer", "minimum": 0, "description": "Optional Parquet row-group size." },
+                "order_by": { "type": "string", "description": "Optional ORDER BY clause applied to the export." }
+            }),
+            &["input", "dest"],
+        ),
+        "http_fetch" => object(
+            json!({
+                "url": { "type": "string", "description": "Source URL (http/https)." },
+                "out": { "type": "string", "description": "Destination path, relative to the protocol directory. Written atomically." },
+                "headers": str_headers
+            }),
+            &["url", "out"],
+        ),
+        "opendal_fetch" => object(
+            json!({
+                "from": { "type": "string", "description": "Scheme-dispatched source: https://host/key, s3://bucket/key, …" },
+                "to": { "type": "string", "description": "Destination path, relative to the protocol directory. Written atomically." },
+                "headers": str_headers
+            }),
+            &["from", "to"],
+        ),
+        "html_link_discover" => object(
+            json!({
+                "url": { "type": "string", "description": "Index page to fetch (http/https)." },
+                "pattern": { "type": "string", "description": "Regex tested (unanchored) against each raw href; matches are kept." },
+                "out": { "type": "string", "description": "Destination URL-list path (newline-delimited), relative to the protocol dir." },
+                "headers": str_headers
+            }),
+            &["url", "pattern", "out"],
+        ),
+        "archive_extract" => object(
+            json!({
+                "archive": { "type": "string", "description": "Source .zip, relative to the protocol dir." },
+                "members": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Explicit member names to extract (exact match). Supply this or `pattern`."
+                },
+                "pattern": { "type": "string", "description": "Regex tested (unanchored) against each member name; matches are extracted. Supply this or `members`." },
+                "dest": { "type": "string", "description": "Destination directory, relative to the protocol dir." }
+            }),
+            &["archive", "dest"],
+        ),
+        "datapackage_describe" => object(
+            json!({
+                "parquet": { "type": "string", "description": "Built Parquet whose columns FineType types." },
+                "overrides": { "type": "string", "description": "Curated descriptor sidecar (JSON) overlaid onto FineType's base." },
+                "out": { "type": "string", "description": "datapackage.json to write." }
+            }),
+            &["parquet", "overrides", "out"],
+        ),
+        "finetype_validate" => object(
+            json!({
+                "parquet": { "type": "string", "description": "Built Parquet to check." },
+                "schema": { "type": "string", "description": "Self-derived JSON-Schema contract to check against." },
+                "extension": { "type": "string", "description": "Optional per-step override for the FineType DuckDB extension path (else FINETYPE_DUCKDB_EXT)." }
+            }),
+            &["parquet", "schema"],
+        ),
+        "splink_resolve" => object(
+            json!({
+                "edgar": { "type": "string", "description": "EDGAR/SEC-entity Parquet (the crosswalk's left side)." },
+                "gleif": { "type": "string", "description": "GLEIF golden-copy Parquet (the right side)." },
+                "out": { "type": "string", "description": "Resolved-crosswalk Parquet to write." },
+                "sample": { "type": "integer", "minimum": 0, "description": "Optional GLEIF-row cap for a fast smoke test (omit/0 resolves the full corpus)." }
+            }),
+            &["edgar", "gleif", "out"],
+        ),
+        "gleif_ra_fetch" => object(
+            json!({
+                "ra": { "type": "string", "description": "GLEIF registration-authority id to page (e.g. RA000665)." },
+                "out": { "type": "string", "description": "Destination CSV path, relative to the protocol directory." },
+                "page_size": { "type": "integer", "minimum": 1, "description": "GLEIF page[size]. Defaults to the script's 200 when omitted." },
+                "user_agent": { "type": "string", "description": "User-Agent request header. Defaults to the script's Meridian UA when omitted." }
+            }),
+            &["ra", "out"],
+        ),
+        _ => return None,
+    };
+    // Name the schema after the operator so an authoring form can title it.
+    let mut schema = schema;
+    if let Some(map) = schema.as_object_mut() {
+        map.insert("title".to_string(), json!(op_name));
+    }
+    Some(schema)
+}
+
+#[cfg(all(test, feature = "mcp"))]
+mod with_schema_tests {
+    use super::*;
+
+    #[test]
+    fn every_catalog_operator_has_a_with_schema() {
+        for name in catalog_names() {
+            let schema = with_schema(name)
+                .unwrap_or_else(|| panic!("operator `{name}` is in the catalog but has no `with:` schema — add one in `with_schema`"));
+            assert_eq!(
+                schema["type"], "object",
+                "`{name}` schema must be an object"
+            );
+            assert!(
+                schema["properties"].is_object(),
+                "`{name}` schema must carry `properties`"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_operator_has_no_schema() {
+        assert!(with_schema("does_not_exist").is_none());
+    }
+
+    #[test]
+    fn parquet_export_schema_shape() {
+        let schema = with_schema("parquet_export").expect("parquet_export has a schema");
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["input"].is_object());
+        assert!(schema["properties"]["dest"].is_object());
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(required.contains(&"input") && required.contains(&"dest"));
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Subprocess substrate — the shared spawn/wait/error-map for operators that wrap
 // an external process: a `uv run` Python script (splink_resolve, gleif_ra_fetch)

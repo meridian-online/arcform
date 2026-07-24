@@ -75,6 +75,13 @@ default = ["cli"]
 cli = ["dep:clap"]
 # The OpenDAL-backed opendal_fetch operator (multi-backend ingress; securelake s3://).
 opendal = ["dep:opendal", "dep:opendal-http-transport-reqwest", "dep:reqwest", "dep:tokio"]
+# The `arc mcp` entry point: a Model Context Protocol server over stdio that
+# federates the `finetype` CLI as tools and exposes protocol-run + operator-describe.
+# Gated OFF by default (like `opendal`) so the flagship binary stays lean and pulls
+# no MCP/agent machinery unless asked; enable with `--features mcp`. Pulls in `cli`
+# because the entry point is an `arc mcp` subcommand. Deliberately dependency-free —
+# it speaks JSON-RPC 2.0 over stdio with the `serde_json` already in the graph.
+mcp = ["cli"]
 
 [dev-dependencies]
 tempfile = "3"

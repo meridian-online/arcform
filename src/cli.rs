@@ -113,6 +113,13 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: RegistryCmd,
     },
+
+    /// Serve a Model Context Protocol server over stdio, for AI-agent and editor
+    /// integration. Federates the `finetype` CLI as tools (infer / profile / taxonomy
+    /// / validate / generate) and adds `protocol_run` (run a Protocol, return its
+    /// Protocol+Run contract) and `operator_describe` (an operator's `with:` schema).
+    #[cfg(feature = "mcp")]
+    Mcp,
 }
 
 #[derive(Subcommand)]
@@ -526,6 +533,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Commands::History { cmd } => dispatch_history(cmd),
         Commands::Run { force, params } => run_pipeline(force, &params),
         Commands::Registry { cmd } => dispatch_registry(cmd, verbose),
+        #[cfg(feature = "mcp")]
+        Commands::Mcp => crate::mcp::serve(),
     }
 }
 

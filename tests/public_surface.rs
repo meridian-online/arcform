@@ -90,7 +90,7 @@ const EXPORTED: [(&str, &str); 31] = [
 
 /// Every module file in the crate. Frozen so a new one cannot be added without
 /// passing under the checks below.
-const MODULE_FILES: [&str; 25] = [
+const MODULE_FILES: [&str; 28] = [
     "asset.rs",
     "bridge.rs",
     "cli.rs",
@@ -104,6 +104,12 @@ const MODULE_FILES: [&str; 25] = [
     "lib.rs",
     "main.rs",
     "manifest.rs",
+    // The `arc mcp` server (behind the `mcp` feature): a stdio JSON-RPC MCP
+    // entry point that federates the FineType CLI and exposes protocol-run +
+    // operator-describe. Private to the crate — it exports nothing at the root.
+    "mcp/finetype.rs",
+    "mcp/hero.rs",
+    "mcp/mod.rs",
     "operator.rs",
     "precondition.rs",
     "record.rs",
