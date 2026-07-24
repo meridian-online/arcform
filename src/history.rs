@@ -50,6 +50,15 @@
 //! spec is small, and a restore that needs no reconstruction is a restore
 //! that cannot compound errors.
 //!
+//! **The snapshot is the spec file, and only the spec file.** A protocol's
+//! generated SQL under `models/` is not snapshotted here, and that is a
+//! recorded non-goal rather than a missing feature: a generated model is a
+//! derivative of the manifest step that names it, machine-authored under the
+//! marker that licenses its regeneration (see
+//! [`amend_step_sql`](crate::record::amend_step_sql)), so the manifest — the
+//! authored artifact — is what the net keeps. Versioning the whole working
+//! tree is the third tier's job, not this one's.
+//!
 //! # Retention policy
 //!
 //! - At most [`HISTORY_MAX_ENTRIES`] entries per spec; the oldest are pruned

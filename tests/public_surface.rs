@@ -961,6 +961,14 @@ fn exported_modules_declare_only_contracted_items() {
             // checkpointed roads. The internals — the key hash, the entry
             // naming, the debounce mechanics — are private: the contract is
             // the tiers and the ordering, not the store format.
+            //
+            // Exactly two checkpointed roads, and no third for the model
+            // rewrite: regenerating a marker-carrying model under `models/`
+            // is a recorded non-goal for local history (a generated model is
+            // a derivative of the manifest the net already snapshots — see
+            // the `checkpoint` seam in `record.rs`). This frozen list is what
+            // keeps that decision honest: an `amend_step_sql_with_history`
+            // added on a whim would fail here.
             "open_default",
             "at_root",
             "root",
