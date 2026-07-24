@@ -31,6 +31,17 @@
 //! manifest edits go through the splice path, which never rewrites untargeted
 //! bytes in the first place.
 //!
+//! That same line settles what local history owes a regenerated model:
+//! nothing, and permanently nothing. The marker marks the *absence* of
+//! authorship, so the bytes an amend replaces carry none to lose, and they
+//! are recoverable without a snapshot — a generated model is a function of
+//! the manifest step that names it and the exploration it was recorded from.
+//! Local history therefore snapshots the authored artifact, the manifest; a
+//! generated model under `models/` is a recorded non-goal for that store, not
+//! a gap in it. Whole-tree history is version control's tier, which the
+//! [`history`](crate::history) store deliberately does not duplicate — the
+//! internal `checkpoint` seam carries the full rationale.
+//!
 //! # Refusal discipline
 //!
 //! Every refusal leaves the protocol directory untouched, byte for byte. The
@@ -271,15 +282,38 @@ pub fn amend_step_sql(dir: &Path, step_name: &str, sql: &str, provenance: &str) 
 // ------------------------------------------------------------------ internals
 
 /// The seam every durable write passes through first. The local-history
-/// store now exists, and it plugs in **above** this line, not inside it:
+/// store plugs in **above** this line, not inside it:
 /// [`record_step_with_history`](crate::history::record_step_with_history)
 /// snapshots the manifest before calling in here, refusing the write when
-/// the snapshot cannot land. The bare road keeps this no-op so the ordering
-/// stays visible — the hook fires before the first byte moves — and stays
-/// history-free on purpose for callers that bring their own net. (The
-/// model rewrite in [`amend_step_sql`] passes here too; snapshotting
-/// *generated* SQL, which the marker already licenses this tool to
-/// regenerate, is a deliberate non-goal for now.)
+/// the snapshot cannot land. The bare road keeps this a no-op so the
+/// ordering stays visible — the hook fires before the first byte moves —
+/// and stays history-free on purpose for callers that bring their own net.
+///
+/// **Regenerating a model is outside that net, and permanently so.** The
+/// rewrite in [`amend_step_sql`] passes through here too and takes no
+/// snapshot of the bytes it replaces — by decision, not by omission. Three
+/// facts settle it as a non-goal rather than a gap:
+///
+/// - Amend only ever rewrites a file carrying the [`GENERATED_MARKER`]; a
+///   hand-authored model is refused with [`Error::HandAuthoredSql`]. So the
+///   bytes it replaces hold no human authorship — no comments, reasoning or
+///   formatting — and there is nothing irreplaceable for a snapshot to keep.
+/// - A generated model is a *derivative*: it is a function of the manifest
+///   step that names it and the exploration it was recorded from. The net
+///   already snapshots the authored artifact — the manifest — and a manifest
+///   restore brings the step back; the model regenerates from there. A model
+///   snapshot would be a second copy of what the first already determines.
+/// - Whole-tree history — every `models/*.sql` beside the spec — is version
+///   control's tier, the one the local-history store deliberately does not
+///   duplicate or automate (see the tiers in [`history`](crate::history)).
+///   Bending a single-spec store into a working-tree mirror would erase the
+///   line those tiers are drawn along.
+///
+/// Amend also leaves the manifest untouched — the step still names the same
+/// file — so there is no manifest state for it to checkpoint either. Hence
+/// `amend_step_sql` takes no history handle and there is no
+/// `amend_step_sql_with_history` road; the frozen public surface in
+/// `tests/public_surface.rs` is what holds it that way.
 fn checkpoint(_dir: &Path) {}
 
 /// Marker line plus body, with the single permitted normalisation: a missing
