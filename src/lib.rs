@@ -45,6 +45,8 @@ mod history;
 mod ingress_meta;
 mod introspect;
 mod manifest;
+#[cfg(feature = "mcp")]
+mod mcp;
 mod operator;
 mod precondition;
 mod record;
