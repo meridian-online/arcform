@@ -67,7 +67,7 @@
 //! - [`edit_spec`] — the one-shot apply → validate → atomic-write against a directory
 //! - [`create_spec`] — direct serialisation for a brand-new spec, same gate
 //!
-//! The record path (the [`record`](crate::record) module's docs carry the full
+//! The record path (the `record` module's docs carry the full
 //! discussion — recording never runs; the marker is the license to regenerate):
 //!
 //! - [`RecordedStep`] — an exploration ready to become a step, as a plain value
@@ -75,7 +75,7 @@
 //! - [`amend_step_sql`] — rewrite a *generated* model; hand-authored files are refused
 //! - [`GENERATED_MARKER`], [`sql_is_generated`] — the ownership line, readable by anyone
 //!
-//! Local history (the [`history`](crate::history) module's docs carry the full
+//! Local history (the `history` module's docs carry the full
 //! discussion — the middle tier between editor undo and version control, stored
 //! outside the project; machine edits checkpoint the state they replace before
 //! writing, and nothing is ever promoted to git):

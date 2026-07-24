@@ -35,7 +35,17 @@ duckdb = "1.2"
 semver = "1"
 sha2 = "0.10"
 humantime = "2"
-ureq = { version = "2", default-features = false, features = ["tls"] }
+# The ureq-backed HTTP ingress path: the `http_fetch` + `html_link_discover`
+# operators and the `fresh` precondition's remote HEAD probe (blocking, http/https,
+# rustls TLS). It is reachable ONLY while a pipeline runs, and a pipeline runs ONLY
+# through the `arc` CLI — the published library surface is `spec` alone (src/lib.rs),
+# so a crate that links arc with `default-features = false` (e.g. brightfield's
+# desktop shell, which wants only the spec loader) can neither reach nor needs it.
+# Optional + gated behind `http-fetch` (pulled in by `cli`), so a no-CLI consumer
+# drops ureq — and, being ureq's sole runtime consumer, its whole rustls/ring TLS
+# stack — out of the binary. Reachability note lives beside the operator in
+# src/operator.rs.
+ureq = { version = "2", default-features = false, features = ["tls"], optional = true }
 tar = "0.4"
 flate2 = "1"
 dirs = "5"
@@ -71,8 +81,18 @@ default = ["cli"]
 # entry point the binary shim calls. On by default so `cargo build` still produces
 # the binary. A library consumer turns it off — `cli_main` reads the *caller's* argv
 # and can exit the caller's process, so it has no business being reachable from a
-# crate that only wants the spec loader.
-cli = ["dep:clap"]
+# crate that only wants the spec loader. Pulls in `http-fetch`: the engine only ever
+# runs a pipeline via the CLI, so the ingress operators ride with it and the shipped
+# binary is always whole.
+cli = ["dep:clap", "http-fetch"]
+# The ureq-backed HTTP ingress path — the `http_fetch` + `html_link_discover`
+# operators and the `fresh` precondition's HEAD probe. Enabled via `cli` (never
+# reachable without a running pipeline, which is a CLI-only operation), so a
+# `default-features = false` library consumer builds without ureq and its
+# rustls/ring TLS stack. Kept a *named* feature distinct from `cli` so a future
+# engine-as-library consumer could opt the fetch path back in without the clap
+# argv parser.
+http-fetch = ["dep:ureq"]
 # The OpenDAL-backed opendal_fetch operator (multi-backend ingress; securelake s3://).
 opendal = ["dep:opendal", "dep:opendal-http-transport-reqwest", "dep:reqwest", "dep:tokio"]
 

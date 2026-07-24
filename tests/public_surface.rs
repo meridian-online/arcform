@@ -783,7 +783,10 @@ fn the_crate_root_exports_only_spec_and_the_gated_binary_entry_point() {
 }
 
 /// The feature that gates the binary entry point has to exist, be on by default (so
-/// `cargo build` still produces `arc`) and be required by the binary target.
+/// `cargo build` still produces `arc`) and be required by the binary target. `cli`
+/// also pulls in `http-fetch` — the ureq-backed HTTP ingress path — so a
+/// `default-features = false` library consumer sheds both the argv parser and the
+/// HTTP client (with its rustls/ring TLS stack) from its dependency graph.
 #[test]
 fn cargo_toml_gates_the_binary_entry_point() {
     let manifest =
@@ -795,13 +798,30 @@ fn cargo_toml_gates_the_binary_entry_point() {
         "`cli` must be a default feature or `cargo build` stops producing the binary"
     );
     assert!(
-        manifest.contains("\ncli = [\"dep:clap\"]"),
-        "the `cli` feature must be declared, and must own `clap`: with the feature off \
-         the argv parser has no reason to be in a library consumer's dependency graph"
+        manifest.contains("\ncli = [\"dep:clap\", \"http-fetch\"]"),
+        "the `cli` feature must be declared and own `clap`; it also pulls in \
+         `http-fetch` so the CLI-driven engine always ships the ingress operators. With \
+         the feature off, neither the argv parser nor ureq is in a library consumer's \
+         dependency graph"
     );
     assert!(
         manifest.contains("clap = { version = \"4\", features = [\"derive\"], optional = true }"),
         "`clap` must be optional, or turning `cli` off still builds it"
+    );
+    // The ureq-backed HTTP ingress path (`http_fetch` + `html_link_discover` operators
+    // and the `fresh` precondition's HEAD probe) is gated so a no-CLI consumer drops
+    // ureq and, as its sole runtime consumer, the whole rustls/ring TLS stack. See
+    // src/operator.rs (http_fetch) for the reachability rationale.
+    assert!(
+        manifest.contains("\nhttp-fetch = [\"dep:ureq\"]"),
+        "`http-fetch` must be declared and own `ureq`, so turning it off (which \
+         `default-features = false` does) drops the HTTP client and its TLS stack"
+    );
+    assert!(
+        manifest.contains(
+            "ureq = { version = \"2\", default-features = false, features = [\"tls\"], optional = true }"
+        ),
+        "`ureq` must be optional, or turning `http-fetch` off still builds it"
     );
     assert!(
         manifest.contains("required-features = [\"cli\"]"),

@@ -86,6 +86,16 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Changed
 
+- **Feature-gated the HTTP ingress path behind `http-fetch`.** The ureq-backed
+  `http_fetch` and `html_link_discover` operators, and the `fresh` precondition's remote
+  HEAD probe, now compile only under the new `http-fetch` feature, which `cli` pulls in.
+  A pipeline is only ever run through the `arc` CLI and the published library surface is
+  `spec` alone, so a crate that links arc with `default-features = false` cannot reach
+  this path — yet it previously still compiled `ureq` (and, as ureq's only runtime
+  consumer, the whole rustls/ring TLS stack) into its binary as dead weight. With the
+  gate, such a consumer drops `ureq` and its TLS stack from the dependency graph
+  entirely; `ureq` is now an optional dependency. The default build and the `arc` binary
+  are unchanged.
 - **Adopted Frictionless Data Package as the data-description standard.** A Data Package
   *describes* data (Table Schema, `foreignKeys`, provenance); it does not execute — the runnable
   artifact stays the arcform manifest. Pipelines may ship a `datapackage.json` describing their

@@ -15,7 +15,10 @@
 //!
 //! Design spec: `bearing/research/arcform-typed-operators.md`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
+// Only the fetch operators' `headers` maps use `BTreeMap`, and each is feature-gated.
+#[cfg(any(feature = "http-fetch", feature = "opendal"))]
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -65,7 +68,9 @@ pub trait Operator: Sync {
 }
 
 static PARQUET_EXPORT: ParquetExport = ParquetExport;
+#[cfg(feature = "http-fetch")]
 static HTTP_FETCH: HttpFetch = HttpFetch;
+#[cfg(feature = "http-fetch")]
 static HTML_LINK_DISCOVER: HtmlLinkDiscover = HtmlLinkDiscover;
 static ARCHIVE_EXTRACT: ArchiveExtract = ArchiveExtract;
 static DATAPACKAGE_DESCRIBE: DatapackageDescribe = DatapackageDescribe;
@@ -75,21 +80,26 @@ static GLEIF_RA_FETCH: GleifRaFetch = GleifRaFetch;
 #[cfg(feature = "opendal")]
 static OPENDAL_FETCH: OpendalFetch = OpendalFetch;
 
-/// The built-in operator catalog. `opendal_fetch` is present only when the
-/// `opendal` feature is enabled (see Cargo.toml — off by default to keep the
-/// single binary lean).
+/// The built-in operator catalog. Two entries are feature-gated: the ureq-backed
+/// ingress ops (`http_fetch`, `html_link_discover`) appear only under `http-fetch`
+/// (enabled via `cli`; a `default-features = false` library consumer builds without
+/// them and without ureq — see Cargo.toml), and `opendal_fetch` only under `opendal`
+/// (off by default to keep the single binary lean).
 fn catalog() -> Vec<&'static dyn Operator> {
     #[allow(unused_mut)]
     let mut ops: Vec<&'static dyn Operator> = vec![
         &PARQUET_EXPORT,
-        &HTTP_FETCH,
-        &HTML_LINK_DISCOVER,
         &ARCHIVE_EXTRACT,
         &DATAPACKAGE_DESCRIBE,
         &FINETYPE_VALIDATE,
         &SPLINK_RESOLVE,
         &GLEIF_RA_FETCH,
     ];
+    #[cfg(feature = "http-fetch")]
+    ops.extend([
+        &HTTP_FETCH as &'static dyn Operator,
+        &HTML_LINK_DISCOVER as &'static dyn Operator,
+    ]);
     #[cfg(feature = "opendal")]
     ops.push(&OPENDAL_FETCH);
     ops
@@ -367,10 +377,25 @@ impl Operator for ParquetExport {
 // step re-runs — and propagates downstream — only when the remote actually
 // changed: content-addressed ingress, not the clock-based mtime `modified_after`.
 // This is the workhorse that retires `fetch_edgar`/`fetch_gleif` and the SEC fetch.
+//
+// REACHABILITY (2026-07-24). This operator, `html_link_discover`, and the `fresh`
+// precondition are the crate's only ureq users, and ureq is the only runtime-linked
+// consumer of the rustls/ring TLS stack. None of them is reachable through the
+// published library surface — `arc::spec` exports the spec loader alone (src/lib.rs);
+// the engine, the operator catalog, and this operator are all private. A pipeline is
+// only ever run through the `arc` CLI. So a crate linking arc with
+// `default-features = false` — brightfield's desktop shell, which wants only the spec
+// loader — cannot call this path, yet before this gating still compiled ureq (and
+// rustls + ring) into its binary as dead weight. The path is therefore gated behind
+// `http-fetch` (Cargo.toml), which `cli` pulls in; a no-CLI consumer drops ureq and
+// its whole TLS stack from the build. (DuckDB still links in via the private engine,
+// which is a separate, larger surface — out of scope here.)
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "http-fetch")]
 struct HttpFetch;
 
+#[cfg(feature = "http-fetch")]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HttpFetchConfig {
@@ -383,6 +408,7 @@ struct HttpFetchConfig {
     headers: BTreeMap<String, String>,
 }
 
+#[cfg(feature = "http-fetch")]
 impl HttpFetchConfig {
     fn parse(with: &Value) -> Result<Self> {
         serde_yaml::from_value(with.clone()).map_err(|e| {
@@ -401,6 +427,7 @@ fn fetch_failed(msg: String) -> Error {
     }
 }
 
+#[cfg(feature = "http-fetch")]
 impl Operator for HttpFetch {
     fn name(&self) -> &'static str {
         "http_fetch"
@@ -1021,8 +1048,14 @@ fn sql_lit(s: &str) -> String {
 // is separate work; here we produce the complete list.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Gated with `http_fetch` (both are ureq-backed ingress ops); see the reachability
+// note beside `http_fetch` above. The pure URL helpers below (`url_origin`,
+// `absolutise`, `discover_links`, …) are ungated — they carry no ureq and their
+// unit tests run in every build.
+#[cfg(feature = "http-fetch")]
 struct HtmlLinkDiscover;
 
+#[cfg(feature = "http-fetch")]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HtmlLinkDiscoverConfig {
@@ -1037,6 +1070,7 @@ struct HtmlLinkDiscoverConfig {
     headers: BTreeMap<String, String>,
 }
 
+#[cfg(feature = "http-fetch")]
 impl HtmlLinkDiscoverConfig {
     fn parse(with: &Value) -> Result<Self> {
         serde_yaml::from_value(with.clone()).map_err(|e| {
@@ -1159,6 +1193,7 @@ fn discover_links(
     out
 }
 
+#[cfg(feature = "http-fetch")]
 impl Operator for HtmlLinkDiscover {
     fn name(&self) -> &'static str {
         "html_link_discover"
@@ -1990,6 +2025,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "http-fetch")]
     #[test]
     fn http_fetch_declares_only_its_output() {
         // Ingress produces the local artifact and reads no graph node (the
@@ -2004,12 +2040,18 @@ mod tests {
     // ── html_link_discover ──────────────────────────────────────────────────
 
     #[test]
-    fn new_ingress_ops_are_in_catalog() {
-        assert!(resolve("html_link_discover@1").is_ok());
+    fn archive_extract_is_in_catalog() {
         assert!(resolve("archive_extract@^1.0").is_ok());
+    }
+
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn html_link_discover_is_in_catalog() {
+        assert!(resolve("html_link_discover@1").is_ok());
         assert!(resolve("html_link_discover@2").is_err()); // version not satisfied
     }
 
+    #[cfg(feature = "http-fetch")]
     #[test]
     fn html_link_discover_declares_only_its_output() {
         let with: Value = serde_yaml::from_str(
@@ -2021,6 +2063,7 @@ mod tests {
         assert!(a.reads.is_empty());
     }
 
+    #[cfg(feature = "http-fetch")]
     #[test]
     fn html_link_discover_rejects_bad_config() {
         // missing required `out`
