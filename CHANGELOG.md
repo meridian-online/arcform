@@ -86,6 +86,19 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Changed
 
+- **Raised the minimum `finetype` to 0.6.53 in both places that gate it.** The
+  `datapackage_describe` operator and the `arc mcp` finetype proxies each shell out to
+  whatever `finetype` is on PATH, and each asserted 0.6.52. But 0.6.53 is the release
+  that corrected three labels the published datasets depend on — the ticker column, the
+  industry-code level column, and the resolved legal-name column — and the consuming
+  website has stopped suppressing the older, wrong labels at display time. An 0.6.52
+  binary therefore passed the gate, re-emitted superseded labels, and nothing downstream
+  caught it: precisely the stale-binary-on-PATH failure the gate exists to stop, which
+  has silently mis-described a published dataset once already. The operator's tests now
+  read `MIN_FINETYPE_VERSION` instead of restating a literal, and a new case in each
+  language refuses an 0.6.52 fixture outright and asserts the floor sits above it, so
+  the constant cannot drift back unnoticed. CI now runs the operator's Python tests —
+  `cargo test` never executed them, so the gate had been shipping untested.
 - **Feature-gated the HTTP ingress path behind `http-fetch`.** The ureq-backed
   `http_fetch` and `html_link_discover` operators, and the `fresh` precondition's remote
   HEAD probe, now compile only under the new `http-fetch` feature, which `cli` pulls in.

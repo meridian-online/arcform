@@ -34,6 +34,21 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  # The Python operator scripts are shelled out to at run time, so `cargo test`
+  # never executes a line of them — their own tests have to be run explicitly or
+  # they are dead weight. Build-free like `fmt`, and stdlib-only (each script
+  # declares `dependencies = []`), so the runner's own Python is enough: no
+  # setup-python, no uv, no install step, seconds to report.
+  operators:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # The finetype version gate — the guard that stops a stale binary on PATH
+      # typing published columns wrong while still emitting valid JSON.
+      - name: datapackage_describe tests
+        run: python3 operators/datapackage_describe/test_describe.py
+
   # Clippy and the test suite both compile the crate against system DuckDB, so
   # they share a job that provisions the library once.
   build:
@@ -77,3 +92,11 @@ jobs:
 
       - name: test
         run: cargo test --workspace
+
+      # `mcp` is off by default, so the run above compiles none of the MCP module —
+      # including the tests that pin the finetype min-version gate. A gate whose test
+      # never executes is not a gate, so run the suite once more with the feature on.
+      # It is `cli` plus a stdio JSON-RPC loop and adds no dependencies, so this
+      # recompiles one module rather than resolving a second dependency graph.
+      - name: test (mcp feature)
+        run: cargo test --workspace --features mcp

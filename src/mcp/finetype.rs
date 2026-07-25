@@ -15,11 +15,17 @@ use serde_json::{Value, json};
 
 use super::{ToolDef, ToolOutput, ToolResult};
 
-/// The minimum `finetype` version these proxies target. Chosen at the release that
-/// established the CLI surface they rely on (JSON-Schema `profile`/`taxonomy` output,
-/// Parquet `validate`, batch `infer`); older binaries are refused because their output
-/// can silently mistype columns.
-const MIN_VERSION: (u64, u64, u64) = (0, 6, 52);
+/// The minimum `finetype` version these proxies target. The CLI surface they rely on
+/// (JSON-Schema `profile`/`taxonomy` output, Parquet `validate`, batch `infer`) landed
+/// earlier, but the floor tracks *label correctness*, not just surface: 0.6.53 is the
+/// release that corrected three labels the published datasets depend on — the ticker
+/// column, the industry-code level column, and the resolved legal-name column. Older
+/// binaries are refused because their output can silently mistype columns, and the
+/// display-side suppression that used to mask those three labels is gone.
+///
+/// Kept in lockstep with `MIN_FINETYPE_VERSION` in
+/// `operators/datapackage_describe/describe.py` — both gate the same binary on PATH.
+const MIN_VERSION: (u64, u64, u64) = (0, 6, 53);
 
 /// The `finetype` binary to run: `$FINETYPE_BIN` if set, else `finetype` on PATH.
 fn finetype_bin() -> String {
@@ -437,7 +443,11 @@ mod tests {
 
     #[test]
     fn min_version_constant_is_the_documented_floor() {
-        assert_eq!(min_version(), semver::Version::new(0, 6, 52));
+        assert_eq!(min_version(), semver::Version::new(0, 6, 53));
+        // The floor must sit ABOVE the release whose labels are wrong for the
+        // published datasets — pin that relation, not just the literal, so a
+        // careless edit to the constant cannot quietly re-admit that binary.
+        assert!(min_version() > semver::Version::new(0, 6, 52));
     }
 
     #[test]
@@ -449,27 +459,61 @@ mod tests {
         );
     }
 
+    /// Write an executable `finetype` into `dir` that answers `--version` with the
+    /// baked-in string and otherwise echoes its argv. Lets the gate be exercised
+    /// through the same subprocess call production uses, with no real binary.
+    #[cfg(unix)]
+    fn fake_finetype(dir: &std::path::Path, version: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("finetype");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"finetype {version}\"; exit 0; fi\necho \"ARGS: $@\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// The exact binary the floor exists to keep out. 0.6.52 emits the superseded
+    /// labels for the ticker / industry-level / legal-name columns, and nothing
+    /// downstream masks them any more — so the gate is the last line of defence.
+    #[cfg(unix)]
+    #[test]
+    fn the_superseded_release_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_finetype(dir.path(), "0.6.52");
+
+        let err = ensure_min_version(bin.to_str().unwrap())
+            .expect_err("the gate must refuse the superseded release");
+        assert!(
+            err.contains("older than the minimum"),
+            "gate message: {err}"
+        );
+
+        // …and the refusal must happen before any subcommand runs, on the tool path.
+        let err = taxonomy_with(bin.to_str().unwrap(), &json!({ "format": "json" }))
+            .expect_err("the tool path must refuse it too");
+        assert!(
+            err.contains("0.6.52"),
+            "gate message names the version: {err}"
+        );
+
+        // The first release with the corrected labels passes.
+        let ok_dir = tempfile::tempdir().unwrap();
+        let ok_bin = fake_finetype(ok_dir.path(), "0.6.53");
+        ensure_min_version(ok_bin.to_str().unwrap()).expect("the floor itself must pass");
+    }
+
     /// The subprocess federation + min-version gate, exercised against a fixture
     /// `finetype` so it runs without the real binary. The fixture echoes its argv, and
     /// reports whatever version we bake into it.
     #[cfg(unix)]
     #[test]
     fn proxy_over_subprocess_gates_on_version_and_forwards_args() {
-        use std::os::unix::fs::PermissionsExt;
-
-        fn fake_finetype(dir: &std::path::Path, version: &str) -> std::path::PathBuf {
-            let path = dir.join("finetype");
-            std::fs::write(
-                &path,
-                format!(
-                    "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"finetype {version}\"; exit 0; fi\necho \"ARGS: $@\"\n"
-                ),
-            )
-            .unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            path
-        }
-
         let new_dir = tempfile::tempdir().unwrap();
         let old_dir = tempfile::tempdir().unwrap();
 
