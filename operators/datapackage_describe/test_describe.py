@@ -10,6 +10,14 @@ a minimum finetype version and fails closed below it (see the module docstring
 and `_require_finetype`). This test pins that guard: a current-enough finetype
 passes; a stale / missing / broken / unparseable one stops the run.
 
+The cases read `describe.MIN_FINETYPE_VERSION` rather than restating a literal,
+so they follow the constant instead of quietly testing a floor the operator no
+longer uses. One case does name a version outright — 0.6.52, the superseded
+release whose labels for the ticker / industry-level / legal-name columns are
+wrong for the published datasets. That one must stay rejected whatever the
+constant says, so it is asserted directly *and* the constant is asserted to sit
+above it.
+
 Stdlib-only (unittest), matching describe.py's `dependencies = []` posture — no
 real finetype is needed. Each case drops a fake `finetype` executable onto a
 temp PATH so the gate is exercised through the same `subprocess` call the
@@ -26,6 +34,10 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+
+# The release whose labels the current floor exists to keep out. Named as a
+# literal on purpose: it is a fact about that binary, not about the constant.
+SUPERSEDED_RELEASE = "0.6.52"
 
 # Import the operator script by path — it is a uv-run script, not an installed
 # module, and its side-effecting work lives under `if __name__ == "__main__"`,
@@ -53,6 +65,12 @@ def _fake_finetype(dir_path: Path, *, version_line: str | None, exit_code: int =
     script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
+def _one_patch_above(version: str) -> str:
+    """The next patch release above `version` — a binary newer than the floor."""
+    major, minor, patch = (int(part) for part in version.split(".")[:3])
+    return f"{major}.{minor}.{patch + 1}"
+
+
 class VersionGateTest(unittest.TestCase):
     def setUp(self) -> None:
         self._orig_path = os.environ.get("PATH", "")
@@ -76,20 +94,42 @@ class VersionGateTest(unittest.TestCase):
 
     # --- the gate passes for a current-enough finetype -------------------
     def test_current_version_passes(self) -> None:
-        _fake_finetype(self.bindir, version_line="finetype 0.6.53")
-        # At or above the floor must NOT raise.
-        describe._require_finetype("0.6.52")
+        newer = _one_patch_above(describe.MIN_FINETYPE_VERSION)
+        _fake_finetype(self.bindir, version_line=f"finetype {newer}")
+        # Above the floor must NOT raise.
+        describe._require_finetype(describe.MIN_FINETYPE_VERSION)
 
     def test_exact_floor_passes(self) -> None:
-        _fake_finetype(self.bindir, version_line="finetype 0.6.52")
-        describe._require_finetype("0.6.52")
+        _fake_finetype(
+            self.bindir, version_line=f"finetype {describe.MIN_FINETYPE_VERSION}"
+        )
+        describe._require_finetype(describe.MIN_FINETYPE_VERSION)
 
     # --- the gate fails closed below the floor ---------------------------
+    def test_superseded_release_fails_closed(self) -> None:
+        """The operator's OWN floor must reject 0.6.52 — the criterion's teeth.
+
+        Every other case would still pass if the constant slipped back a release,
+        because they read the constant. This one names the binary that must stay
+        out and checks the constant sits above it.
+        """
+        self.assertGreater(
+            describe._parse_version(describe.MIN_FINETYPE_VERSION),
+            describe._parse_version(SUPERSEDED_RELEASE),
+            "the floor must sit above the release with the superseded labels",
+        )
+        _fake_finetype(self.bindir, version_line=f"finetype {SUPERSEDED_RELEASE}")
+        with self.assertRaises(SystemExit) as ctx:
+            describe._require_finetype(describe.MIN_FINETYPE_VERSION)
+        msg = str(ctx.exception)
+        self.assertIn(SUPERSEDED_RELEASE, msg)
+        self.assertIn("older", msg)
+
     def test_stale_version_fails_closed(self) -> None:
         # 0.6.41 is the real stale-engine version that shipped wrong labels.
         _fake_finetype(self.bindir, version_line="finetype 0.6.41")
         with self.assertRaises(SystemExit) as ctx:
-            describe._require_finetype("0.6.52")
+            describe._require_finetype(describe.MIN_FINETYPE_VERSION)
         msg = str(ctx.exception)
         self.assertIn("0.6.41", msg)
         self.assertIn("older", msg)
@@ -97,19 +137,19 @@ class VersionGateTest(unittest.TestCase):
     def test_missing_finetype_fails_closed(self) -> None:
         # Empty bindir → nothing named `finetype` resolves on PATH.
         with self.assertRaises(SystemExit) as ctx:
-            describe._require_finetype("0.6.52")
+            describe._require_finetype(describe.MIN_FINETYPE_VERSION)
         self.assertIn("not on PATH", str(ctx.exception))
 
     def test_version_command_failure_fails_closed(self) -> None:
         _fake_finetype(self.bindir, version_line="broken", exit_code=3)
         with self.assertRaises(SystemExit) as ctx:
-            describe._require_finetype("0.6.52")
+            describe._require_finetype(describe.MIN_FINETYPE_VERSION)
         self.assertIn("failed", str(ctx.exception))
 
     def test_unparseable_version_fails_closed(self) -> None:
         _fake_finetype(self.bindir, version_line="finetype (unknown build)")
         with self.assertRaises(SystemExit) as ctx:
-            describe._require_finetype("0.6.52")
+            describe._require_finetype(describe.MIN_FINETYPE_VERSION)
         self.assertIn("could not parse", str(ctx.exception))
 
 
