@@ -12,11 +12,10 @@ passes; a stale / missing / broken / unparseable one stops the run.
 
 The cases read `describe.MIN_FINETYPE_VERSION` rather than restating a literal,
 so they follow the constant instead of quietly testing a floor the operator no
-longer uses. One case does name a version outright — 0.6.52, the superseded
-release whose labels for the ticker / industry-level / legal-name columns are
-wrong for the published datasets. That one must stay rejected whatever the
-constant says, so it is asserted directly *and* the constant is asserted to sit
-above it.
+longer uses. One case does name versions outright — the superseded releases in
+`SUPERSEDED_RELEASES`, each of which mistypes columns the published datasets
+depend on. Those must stay rejected whatever the constant says, so each is
+asserted directly *and* the constant is asserted to sit above it.
 
 Stdlib-only (unittest), matching describe.py's `dependencies = []` posture — no
 real finetype is needed. Each case drops a fake `finetype` executable onto a
@@ -35,9 +34,19 @@ import tempfile
 import unittest
 from pathlib import Path
 
-# The release whose labels the current floor exists to keep out. Named as a
-# literal on purpose: it is a fact about that binary, not about the constant.
-SUPERSEDED_RELEASE = "0.6.52"
+# The releases the floor exists to keep out, each with the defect that put it
+# there. Named as literals on purpose: these are facts about those binaries, not
+# about the constant, so they must stay rejected however the constant is edited.
+SUPERSEDED_RELEASES = {
+    # Wrong labels for the ticker, industry-code level and resolved legal-name
+    # columns; the website no longer suppresses them at display time.
+    "0.6.52": "wrong ticker / industry-level / legal-name labels",
+    # Both the year-first and day-first compact date leaves validated on
+    # `^\d{8}$`, so any eight-digit token — a financial figure, a surrogate key —
+    # came back a confident date WITH a `strptime` transform attached. A consumer
+    # that follows the transform gets a corrupted column, not just a wrong label.
+    "0.6.53": "eight-digit figures typed as confident dates, with a transform",
+}
 
 # Import the operator script by path — it is a uv-run script, not an installed
 # module, and its side-effecting work lives under `if __name__ == "__main__"`,
@@ -106,24 +115,27 @@ class VersionGateTest(unittest.TestCase):
         describe._require_finetype(describe.MIN_FINETYPE_VERSION)
 
     # --- the gate fails closed below the floor ---------------------------
-    def test_superseded_release_fails_closed(self) -> None:
-        """The operator's OWN floor must reject 0.6.52 — the criterion's teeth.
+    def test_superseded_releases_fail_closed(self) -> None:
+        """The operator's OWN floor must reject every superseded release.
 
         Every other case would still pass if the constant slipped back a release,
-        because they read the constant. This one names the binary that must stay
-        out and checks the constant sits above it.
+        because they read the constant. This one names the binaries that must
+        stay out and checks the constant sits above each — so dropping the floor
+        to re-admit one of them fails here rather than downstream.
         """
-        self.assertGreater(
-            describe._parse_version(describe.MIN_FINETYPE_VERSION),
-            describe._parse_version(SUPERSEDED_RELEASE),
-            "the floor must sit above the release with the superseded labels",
-        )
-        _fake_finetype(self.bindir, version_line=f"finetype {SUPERSEDED_RELEASE}")
-        with self.assertRaises(SystemExit) as ctx:
-            describe._require_finetype(describe.MIN_FINETYPE_VERSION)
-        msg = str(ctx.exception)
-        self.assertIn(SUPERSEDED_RELEASE, msg)
-        self.assertIn("older", msg)
+        for release, defect in SUPERSEDED_RELEASES.items():
+            with self.subTest(release=release, defect=defect):
+                self.assertGreater(
+                    describe._parse_version(describe.MIN_FINETYPE_VERSION),
+                    describe._parse_version(release),
+                    f"the floor must sit above {release} — {defect}",
+                )
+                _fake_finetype(self.bindir, version_line=f"finetype {release}")
+                with self.assertRaises(SystemExit) as ctx:
+                    describe._require_finetype(describe.MIN_FINETYPE_VERSION)
+                msg = str(ctx.exception)
+                self.assertIn(release, msg)
+                self.assertIn("older", msg)
 
     def test_stale_version_fails_closed(self) -> None:
         # 0.6.41 is the real stale-engine version that shipped wrong labels.

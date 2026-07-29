@@ -86,6 +86,20 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Changed
 
+- **Raised the minimum `finetype` to 0.6.54 in both places that gate it.** finetype
+  0.6.54 stopped eight-digit numbers typing as confident dates. Up to and including
+  0.6.53, the year-first and day-first compact date leaves both validated on `^\d{8}$`,
+  so any eight-digit token — a financial figure, a surrogate key — came back a
+  high-confidence date *with a `strptime` transform attached*. That is a worse failure
+  than the mislabelling the previous bump addressed: a consumer that follows the
+  transform does not get a wrong name for a correct column, it gets a corrupted one. So
+  0.6.53 is now refused as firmly as 0.6.52 was. Both gates name the superseded releases
+  in one place — `SUPERSEDED_RELEASES` in the operator's tests and in the `arc mcp`
+  module — and each is asserted refused *and* asserted to sit below the floor, so the
+  constant cannot drift back onto either one unnoticed. Verified against the real 0.6.53
+  binary, not only fixtures: the operator exits non-zero on it, and the `taxonomy` tool
+  returns `isError` naming both versions, while the same binary reporting 0.6.54 passes
+  and serves the call.
 - **Raised the minimum `finetype` to 0.6.53 in both places that gate it.** The
   `datapackage_describe` operator and the `arc mcp` finetype proxies each shell out to
   whatever `finetype` is on PATH, and each asserted 0.6.52. But 0.6.53 is the release
