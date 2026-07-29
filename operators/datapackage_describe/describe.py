@@ -55,13 +55,14 @@ _STRUCTURAL = {"resource", "fields", "primaryKey", "foreignKeys"}
 # below turns that into a stopped run. Bump this when a newer finetype is needed
 # for correct labels; a Protocol may override it with `--min-finetype-version`.
 #
-# 0.6.53 is the release that corrected three labels these datasets depend on —
-# the ticker column, the industry-code level column, and the resolved legal-name
-# column. The consuming website no longer suppresses the older, wrong labels at
-# display time, so an 0.6.52 binary would re-emit them with nothing downstream to
-# catch it. The gate is the only thing standing between a stale PATH and a
-# mis-described published dataset.
-MIN_FINETYPE_VERSION = "0.6.53"
+# 0.6.54 is the release that stopped eight-digit numbers typing as confident
+# dates. Up to and including 0.6.53 the year-first and day-first compact date
+# leaves both validated on `^\d{8}$`, so any eight-digit token — a financial
+# figure, a surrogate key — came back as a high-confidence date WITH A `strptime`
+# TRANSFORM ATTACHED. That is worse than a wrong label: a consumer that follows
+# the transform gets a corrupted column, not a mislabelled one. 0.6.53 therefore
+# has to be refused as firmly as 0.6.52 was.
+MIN_FINETYPE_VERSION = "0.6.54"
 
 
 def _parse_version(text: str) -> tuple[int, ...]:

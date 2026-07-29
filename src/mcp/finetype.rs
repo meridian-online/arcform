@@ -17,15 +17,17 @@ use super::{ToolDef, ToolOutput, ToolResult};
 
 /// The minimum `finetype` version these proxies target. The CLI surface they rely on
 /// (JSON-Schema `profile`/`taxonomy` output, Parquet `validate`, batch `infer`) landed
-/// earlier, but the floor tracks *label correctness*, not just surface: 0.6.53 is the
-/// release that corrected three labels the published datasets depend on — the ticker
-/// column, the industry-code level column, and the resolved legal-name column. Older
-/// binaries are refused because their output can silently mistype columns, and the
-/// display-side suppression that used to mask those three labels is gone.
+/// earlier, but the floor tracks *label correctness*, not just surface: 0.6.54 is the
+/// release that stopped eight-digit numbers typing as confident dates. Up to and
+/// including 0.6.53 the year-first and day-first compact date leaves both validated on
+/// `^\d{8}$`, so any eight-digit token — a financial figure, a surrogate key — came back
+/// a high-confidence date *with a `strptime` transform attached*. That is worse than the
+/// mislabelling 0.6.53 itself fixed: a consumer that follows the transform gets a
+/// corrupted column rather than a wrong name for a correct one.
 ///
 /// Kept in lockstep with `MIN_FINETYPE_VERSION` in
 /// `operators/datapackage_describe/describe.py` — both gate the same binary on PATH.
-const MIN_VERSION: (u64, u64, u64) = (0, 6, 53);
+const MIN_VERSION: (u64, u64, u64) = (0, 6, 54);
 
 /// The `finetype` binary to run: `$FINETYPE_BIN` if set, else `finetype` on PATH.
 fn finetype_bin() -> String {
@@ -441,13 +443,32 @@ mod tests {
         assert_eq!(parse_version(""), None);
     }
 
+    /// Every release the floor exists to keep out, with the defect that put it there.
+    /// Facts about those binaries, not about the constant — so they stay rejected
+    /// however the constant is edited.
+    const SUPERSEDED_RELEASES: &[(semver::Version, &str)] = &[
+        (
+            semver::Version::new(0, 6, 52),
+            "wrong ticker / industry-level / legal-name labels",
+        ),
+        (
+            semver::Version::new(0, 6, 53),
+            "eight-digit figures typed as confident dates, with a transform",
+        ),
+    ];
+
     #[test]
     fn min_version_constant_is_the_documented_floor() {
-        assert_eq!(min_version(), semver::Version::new(0, 6, 53));
-        // The floor must sit ABOVE the release whose labels are wrong for the
-        // published datasets — pin that relation, not just the literal, so a
-        // careless edit to the constant cannot quietly re-admit that binary.
-        assert!(min_version() > semver::Version::new(0, 6, 52));
+        assert_eq!(min_version(), semver::Version::new(0, 6, 54));
+        // The floor must sit ABOVE every superseded release — pin that relation, not
+        // just the literal, so a careless edit to the constant cannot quietly re-admit
+        // one of those binaries.
+        for (release, defect) in SUPERSEDED_RELEASES {
+            assert!(
+                min_version() > *release,
+                "the floor must sit above {release} — {defect}"
+            );
+        }
     }
 
     #[test]
@@ -478,33 +499,37 @@ mod tests {
         path
     }
 
-    /// The exact binary the floor exists to keep out. 0.6.52 emits the superseded
-    /// labels for the ticker / industry-level / legal-name columns, and nothing
-    /// downstream masks them any more — so the gate is the last line of defence.
+    /// The exact binaries the floor exists to keep out. Nothing downstream masks
+    /// their output any more — 0.6.52 emits superseded labels, and 0.6.53 attaches a
+    /// `strptime` transform to eight-digit figures — so the gate is the last line of
+    /// defence for both.
     #[cfg(unix)]
     #[test]
-    fn the_superseded_release_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = fake_finetype(dir.path(), "0.6.52");
+    fn every_superseded_release_is_refused() {
+        for (release, defect) in SUPERSEDED_RELEASES {
+            let version = release.to_string();
+            let dir = tempfile::tempdir().unwrap();
+            let bin = fake_finetype(dir.path(), &version);
 
-        let err = ensure_min_version(bin.to_str().unwrap())
-            .expect_err("the gate must refuse the superseded release");
-        assert!(
-            err.contains("older than the minimum"),
-            "gate message: {err}"
-        );
+            let err = ensure_min_version(bin.to_str().unwrap())
+                .expect_err(&format!("the gate must refuse {version} — {defect}"));
+            assert!(
+                err.contains("older than the minimum"),
+                "gate message for {version}: {err}"
+            );
 
-        // …and the refusal must happen before any subcommand runs, on the tool path.
-        let err = taxonomy_with(bin.to_str().unwrap(), &json!({ "format": "json" }))
-            .expect_err("the tool path must refuse it too");
-        assert!(
-            err.contains("0.6.52"),
-            "gate message names the version: {err}"
-        );
+            // …and the refusal must happen before any subcommand runs, on the tool path.
+            let err = taxonomy_with(bin.to_str().unwrap(), &json!({ "format": "json" }))
+                .expect_err("the tool path must refuse it too");
+            assert!(
+                err.contains(&version),
+                "gate message names the version: {err}"
+            );
+        }
 
-        // The first release with the corrected labels passes.
+        // The floor itself passes — the gate refuses what is BELOW it, not everything.
         let ok_dir = tempfile::tempdir().unwrap();
-        let ok_bin = fake_finetype(ok_dir.path(), "0.6.53");
+        let ok_bin = fake_finetype(ok_dir.path(), "0.6.54");
         ensure_min_version(ok_bin.to_str().unwrap()).expect("the floor itself must pass");
     }
 
