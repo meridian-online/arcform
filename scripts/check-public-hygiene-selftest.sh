@@ -168,6 +168,19 @@ else
 	printf '%s\n' "$out" | sed 's/^/        /'
 fi
 
+# 4b. Parses, but the explanation is empty.
+d="$(new_repo)"
+printf '%s\n' "$ac_line" >"$d/subject.txt"
+printf 'subject.txt | %s |\n' "$ac_text" >"$d/scripts/public-hygiene-allowlist.txt"
+out="$(run_gate "$d")"
+rc=$?
+if [[ $rc -eq 2 ]] && printf '%s\n' "$out" | grep -q "all required"; then
+	ok "an entry with no written reason is a hard error"
+else
+	bad "a reasonless allowlist entry was not rejected (exit $rc)"
+	printf '%s\n' "$out" | sed 's/^/        /'
+fi
+
 # 5. Stale entry — well formed, matches nothing.
 d="$(new_repo)"
 printf '%s\n' "$ac_line" >"$d/subject.txt"

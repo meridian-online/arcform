@@ -185,18 +185,24 @@ if [[ -f "$ALLOWLIST" ]]; then
 		[[ -z "$trimmed" ]] && continue
 		[[ "$trimmed" == \#* ]] && continue
 
-		# Split on `|` into exactly three fields.
-		IFS='|' read -r -a fields <<<"$line"
-		if [[ ${#fields[@]} -ne 3 ]]; then
-			echo "check-public-hygiene: $ALLOWLIST:$lineno: expected 3 '|'-separated fields, got ${#fields[@]}" >&2
+		# Split on `|` into exactly three fields, counting the separators
+		# rather than reading into an array: `read -r -a` DISCARDS a trailing
+		# empty field, so `path | text |` — an entry whose author could not
+		# think of a reason, which is precisely the shape the next check
+		# exists to refuse — arrived as two fields and was reported as a
+		# malformed line instead of a reasonless one.
+		seps="${line//[^|]/}"
+		if [[ ${#seps} -ne 2 ]]; then
+			echo "check-public-hygiene: $ALLOWLIST:$lineno: expected 3 '|'-separated fields, got $((${#seps} + 1))" >&2
 			echo "    $line" >&2
 			echo "    format: <tracked/file/path> | <exact offending text> | <why this is legitimate>" >&2
 			bad_allow=1
 			continue
 		fi
-		a_path="$(trim "${fields[0]}")"
-		a_text="$(trim "${fields[1]}")"
-		a_reason="$(trim "${fields[2]}")"
+		rest="${line#*|}"
+		a_path="$(trim "${line%%|*}")"
+		a_text="$(trim "${rest%%|*}")"
+		a_reason="$(trim "${rest#*|}")"
 		if [[ -z "$a_path" || -z "$a_text" || -z "$a_reason" ]]; then
 			echo "check-public-hygiene: $ALLOWLIST:$lineno: path, text and explanation are all required" >&2
 			echo "    $line" >&2
