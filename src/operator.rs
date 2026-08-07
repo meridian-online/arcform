@@ -2599,4 +2599,304 @@ mod tests {
         assert_eq!(assets.produces, vec!["build/tickers.json".to_string()]);
         assert!(assets.reads.is_empty());
     }
+
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn sha256_validator_accepts_only_a_bare_64_hex_digest() {
+        let digest = "6b552ea48424648dc86d00df276f93fdfc55e9ad342ce3e4affc23a3a370792b";
+        assert_eq!(
+            sha256_validator(&format!("\"{}\"", digest)),
+            Some(digest.to_string())
+        );
+        assert_eq!(
+            sha256_validator(&format!("W/\"{}\"", digest.to_ascii_uppercase())),
+            Some(digest.to_string())
+        );
+        // A git blob sha1 (40 hex), an opaque storage id, and an md5 are not it.
+        assert_eq!(
+            sha256_validator("\"9bb295ddab0e05d785b879661af7260fed5140fc\""),
+            None
+        );
+        assert_eq!(sha256_validator("\"storage-object-id\""), None);
+        assert_eq!(
+            sha256_validator("\"5d41402abc4b2a76b9719d911017c592\""),
+            None
+        );
+    }
+
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn join_location_resolves_absolute_and_relative_targets() {
+        let base = "https://example.test/datasets/x/resolve/main/a.parquet";
+        assert_eq!(
+            join_location(base, "https://cdn.example.test/blob?sig=1").as_deref(),
+            Some("https://cdn.example.test/blob?sig=1")
+        );
+        assert_eq!(
+            join_location(base, "/blob").as_deref(),
+            Some("https://example.test/blob")
+        );
+        assert_eq!(
+            join_location(base, "b.parquet").as_deref(),
+            Some("https://example.test/datasets/x/resolve/main/b.parquet")
+        );
+        assert_eq!(join_location("not a url", "/blob"), None);
+    }
+
+    // ── the redirect fixture ────────────────────────────────────────────────
+    //
+    // A loopback origin with a dataset host's shape: `/file` answers `302` with a
+    // RELATIVE `Location` and carries the content validator in `X-Linked-ETag`,
+    // and the redirect target `/blob` answers `200` under a validator of its own.
+    // It records every request head it receives and every payload byte it writes,
+    // which is what the assertions below read.
+    #[cfg(feature = "http-fetch")]
+    mod origin {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::{Arc, Mutex};
+
+        pub const PAYLOAD: &[u8] = b"the artifact bytes, transferred at most once";
+        pub const STORAGE_VALIDATOR: &str = "\"storage-object-id\"";
+
+        #[derive(Default)]
+        pub struct Log {
+            /// Request-target of each request, in arrival order.
+            pub paths: Vec<String>,
+            /// Full request head of each request, in arrival order.
+            pub heads: Vec<String>,
+            /// Payload bytes written to clients.
+            pub bytes_served: usize,
+        }
+
+        pub struct Origin {
+            port: u16,
+            log: Arc<Mutex<Log>>,
+        }
+
+        impl Origin {
+            /// `linked` is served as `X-Linked-ETag` on the redirect. With
+            /// `honour_conditional`, `/file` answers `304` to a matching
+            /// `If-None-Match`; without it, `/file` always redirects.
+            pub fn start(linked: &str, honour_conditional: bool) -> Self {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let log = Arc::new(Mutex::new(Log::default()));
+                let served = Arc::clone(&log);
+                let linked = linked.to_string();
+                std::thread::spawn(move || {
+                    for stream in listener.incoming().flatten() {
+                        serve(stream, &served, &linked, honour_conditional);
+                    }
+                });
+                Self { port, log }
+            }
+
+            pub fn url(&self, path: &str) -> String {
+                format!("http://127.0.0.1:{}{}", self.port, path)
+            }
+
+            pub fn hits(&self, path: &str) -> usize {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .paths
+                    .iter()
+                    .filter(|p| *p == path)
+                    .count()
+            }
+
+            pub fn bytes_served(&self) -> usize {
+                self.log.lock().unwrap().bytes_served
+            }
+
+            pub fn heads(&self) -> Vec<String> {
+                self.log.lock().unwrap().heads.clone()
+            }
+        }
+
+        fn serve(mut stream: TcpStream, log: &Arc<Mutex<Log>>, linked: &str, conditional: bool) {
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(1) => head.push(byte[0]),
+                    _ => return,
+                }
+            }
+            let head = String::from_utf8_lossy(&head).into_owned();
+            let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+            let matched = conditional
+                && head
+                    .to_ascii_lowercase()
+                    .contains(&format!("if-none-match: {}", linked.to_ascii_lowercase()));
+
+            let mut l = log.lock().unwrap();
+            l.paths.push(path.clone());
+            l.heads.push(head);
+            let response = if path == "/blob" {
+                l.bytes_served += PAYLOAD.len();
+                format!(
+                    "HTTP/1.1 200 OK\r\nETag: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    STORAGE_VALIDATOR,
+                    PAYLOAD.len()
+                )
+            } else if matched {
+                "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".to_string()
+            } else {
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: /blob\r\nX-Linked-ETag: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    linked
+                )
+            };
+            drop(l);
+            let _ = stream.write_all(response.as_bytes());
+            if path == "/blob" {
+                let _ = stream.write_all(PAYLOAD);
+            }
+            let _ = stream.flush();
+        }
+    }
+
+    #[cfg(feature = "http-fetch")]
+    fn payload_digest() -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(origin::PAYLOAD))
+    }
+
+    #[cfg(feature = "http-fetch")]
+    fn fetch(dir: &Path, url: &str) -> Result<StepOutput> {
+        let env = HashMap::new();
+        let with: Value =
+            serde_yaml::from_str(&format!("url: {}\nout: build/artifact.bin", url)).unwrap();
+        HttpFetch.run(&with, &test_ctx(dir, &env))
+    }
+
+    // AC1/AC4: the sidecar records the validator the REDIRECT offered, not the one
+    // the redirect target answered under. Reverting to the final hop's `ETag` puts
+    // `STORAGE_VALIDATOR` in the sidecar and reddens this.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn fetch_records_the_redirects_validator_not_the_final_hops() {
+        let digest = payload_digest();
+        let linked = format!("\"{}\"", digest);
+        let server = origin::Origin::start(&linked, true);
+        let dir = tempfile::tempdir().unwrap();
+
+        fetch(dir.path(), &server.url("/file")).unwrap();
+
+        let out = dir.path().join("build/artifact.bin");
+        assert_eq!(std::fs::read(&out).unwrap(), origin::PAYLOAD);
+        let meta = crate::ingress_meta::read(&out).expect("sidecar written");
+        assert_eq!(meta.etag.as_deref(), Some(linked.as_str()));
+        assert_ne!(meta.etag.as_deref(), Some(origin::STORAGE_VALIDATOR));
+        assert_eq!(meta.content_sha256.as_deref(), Some(digest.as_str()));
+    }
+
+    // AC2: a second run against an unchanged remote transfers no payload — the
+    // origin's byte counter does not move, and the redirect target is not asked
+    // for at all.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn second_fetch_against_an_unchanged_remote_transfers_no_payload() {
+        let digest = payload_digest();
+        let linked = format!("\"{}\"", digest);
+        let server = origin::Origin::start(&linked, true);
+        let dir = tempfile::tempdir().unwrap();
+        let url = server.url("/file");
+
+        fetch(dir.path(), &url).unwrap();
+        let after_first = server.bytes_served();
+        assert_eq!(after_first, origin::PAYLOAD.len());
+
+        fetch(dir.path(), &url).unwrap();
+        assert_eq!(server.bytes_served(), after_first, "second run transferred");
+        assert_eq!(server.hits("/blob"), 1, "redirect target re-requested");
+
+        let sent = server.heads();
+        let conditional = sent.last().expect("a second request was made");
+        assert!(
+            conditional
+                .to_ascii_lowercase()
+                .contains(&format!("if-none-match: {}", linked.to_ascii_lowercase())),
+            "{}",
+            conditional
+        );
+    }
+
+    // AC3: where the origin declares a content hash on the redirect, the sidecar
+    // records it with no body transferred — here on a sidecar that predates the
+    // field, against an origin that ignores conditional requests entirely.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn declared_content_hash_is_recorded_without_downloading_the_body() {
+        let digest = payload_digest();
+        let server = origin::Origin::start(&format!("\"{}\"", digest), false);
+        let dir = tempfile::tempdir().unwrap();
+        let url = server.url("/file");
+        let out = dir.path().join("build/artifact.bin");
+
+        fetch(dir.path(), &url).unwrap();
+        let after_first = server.bytes_served();
+
+        // Roll the sidecar back to the shape a fetch wrote before `content_sha256`
+        // existed: the bytes' own hash, and no declaration.
+        let mut aged = crate::ingress_meta::read(&out).unwrap();
+        aged.content_sha256 = None;
+        crate::ingress_meta::write(&out, &aged).unwrap();
+
+        fetch(dir.path(), &url).unwrap();
+
+        assert_eq!(server.bytes_served(), after_first, "second run transferred");
+        assert_eq!(server.hits("/blob"), 1, "redirect target re-requested");
+        assert_eq!(std::fs::read(&out).unwrap(), origin::PAYLOAD);
+        let meta = crate::ingress_meta::read(&out).unwrap();
+        assert_eq!(meta.content_sha256.as_deref(), Some(digest.as_str()));
+    }
+
+    // The declared hash is a match test, not a blanket skip: a different one is
+    // fetched.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn a_changed_declared_content_hash_transfers_again() {
+        let digest = payload_digest();
+        let server = origin::Origin::start(&format!("\"{}\"", digest), false);
+        let dir = tempfile::tempdir().unwrap();
+        let url = server.url("/file");
+        let out = dir.path().join("build/artifact.bin");
+
+        fetch(dir.path(), &url).unwrap();
+        let mut moved = crate::ingress_meta::read(&out).unwrap();
+        moved.sha256 = "0".repeat(64);
+        moved.content_sha256 = Some("1".repeat(64));
+        crate::ingress_meta::write(&out, &moved).unwrap();
+
+        fetch(dir.path(), &url).unwrap();
+        assert_eq!(server.hits("/blob"), 2);
+        assert_eq!(server.bytes_served(), origin::PAYLOAD.len() * 2);
+    }
+
+    // A credential the Protocol set reaches the origin and stops there — the
+    // policy ureq applies when it follows a redirect itself.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn credentials_are_not_forwarded_to_the_redirect_target() {
+        let server = origin::Origin::start("\"opaque\"", false);
+        let dir = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+        let with: Value = serde_yaml::from_str(&format!(
+            "url: {}\nout: build/artifact.bin\nheaders:\n  Authorization: 'Bearer hunter2'\n  Cookie: 'session=abc'",
+            server.url("/file")
+        ))
+        .unwrap();
+        HttpFetch.run(&with, &test_ctx(dir.path(), &env)).unwrap();
+
+        let heads = server.heads();
+        let to_origin = heads.first().unwrap().to_ascii_lowercase();
+        let to_target = heads.last().unwrap().to_ascii_lowercase();
+        assert!(to_origin.contains("authorization: bearer hunter2"));
+        assert!(to_origin.contains("cookie: session=abc"));
+        assert!(!to_target.contains("authorization"), "{}", to_target);
+        assert!(!to_target.contains("cookie:"), "{}", to_target);
+    }
 }
