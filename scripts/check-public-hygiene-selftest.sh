@@ -11,17 +11,27 @@
 # real checker into it, and asserts on exit codes and output:
 #
 #   1. every covered shape is caught, named, and located;
-#   2. the tracked innocent-strings fixture produces silence;
-#   3. a rule that cannot run is FATAL and names itself, never "clean";
-#   4. an allowlist entry that does not parse is fatal;
-#   5. an allowlist entry that suppresses nothing is fatal;
-#   6. a well-formed allowlist entry actually suppresses its match — including
+#   2. the path rule fires on a document path rooted outside the repository AND
+#      stays silent on one rooted inside it. Both directions, and the silent one
+#      is not optional: a rule only ever tested red can be loosened until it
+#      matches everything and still look tested;
+#   3. the tracked innocent-strings fixture produces silence;
+#   4. a rule that cannot run is FATAL and names itself, never "clean" — proved
+#      separately for the pattern rules and for the path rule, because they run
+#      in two loops and so have two copies of that guard;
+#   5. an allowlist entry that does not parse is fatal;
+#   6. an allowlist entry that suppresses nothing is fatal;
+#   7. a well-formed allowlist entry actually suppresses its match — including
 #      match text containing a `#`, which the first cut of the format could not
 #      express.
 #
 # Every violating string below is assembled at runtime from harmless pieces
 # (`printf '%s-%s' decision 69`), never written as a literal. This file is
 # tracked, so a literal here would be a violation of the very rule it tests.
+# For the path rule that constraint binds hardest: the path that prompted it is
+# private, so it is not written here in any form, whole or in pieces. The cases
+# below are fictional paths, which is all the rule reads — it matches a shape
+# against this repository's own contents, never a name.
 #
 # Usage:  ./scripts/check-public-hygiene-selftest.sh
 # Exit:   0 all assertions passed, 1 otherwise.
@@ -90,6 +100,21 @@ check_violation() {
 	ok "$desc"
 }
 
+# The mirror of check_violation: the gate must have nothing at all to say.
+check_clean() {
+	local desc="$1" line="$2" d out rc
+	d="$(new_repo)"
+	printf '%s\n' "$line" >"$d/subject.txt"
+	out="$(run_gate "$d")"
+	rc=$?
+	if [[ $rc -ne 0 ]]; then
+		bad "$desc — expected exit 0, got $rc"
+		printf '%s\n' "$out" | sed 's/^/        /'
+		return
+	fi
+	ok "$desc"
+}
+
 check_violation "decision record"           private-decision-record "$(printf 'as recorded in %s-%s.' decision 69)"
 check_violation "task id"                   planning-task-id        "$(printf 'tracked as %s-%s.' task 42)"
 check_violation "bare ticket ref"           bare-ticket-ref         "$(printf 'shipped under %s%s last week.' T 48)"
@@ -110,7 +135,81 @@ check_violation "spec AC id in a fn name"   spec-ac-id              "$(printf 'f
 check_violation "spec AC id in a literal"   spec-ac-id              "$(printf 'let dir = "bf-%s-%s%s-1234";' clg ac 09)"
 
 # ---------------------------------------------------------------------------
-# 2. The innocent-strings fixture stays silent.
+# 2. The path rule, both directions.
+#
+# A throwaway repo's only top-level entries are `scripts` and `subject.txt`, so
+# any other leading segment is foreign to it — the same relation the gate applies
+# to the real tree, at a size small enough to state in one sentence.
+# ---------------------------------------------------------------------------
+echo "document paths rooted outside the repository:"
+
+check_violation "foreign path, backticked" cross-repo-doc-path \
+	"$(printf 'Design spec: `%s/%s/%s.md`.' elsewhere notes typed-things)"
+check_violation "foreign path, bare prose" cross-repo-doc-path \
+	"$(printf 'see %s/%s.md for the rationale' otherproject rationale)"
+check_violation "foreign path, climbing out of the root" cross-repo-doc-path \
+	"$(printf 'see %s/%s/%s.md' '..' sibling design)"
+
+# The header commits every rule but `bare-ticket-ref` to case-insensitivity and
+# calls a case-sensitive rule "a hole by default". Before `(?i)` was added to
+# PATH_PATTERN these three exited 0 while the lowercase spelling was caught, so
+# they pin the promise the file makes about itself rather than a preference.
+check_violation "foreign path, uppercase extension" cross-repo-doc-path \
+	"$(printf 'see %s/%s.MD for the rationale' otherproject rationale)"
+check_violation "foreign path, title-case extension" cross-repo-doc-path \
+	"$(printf 'see %s/%s.Md for the rationale' otherproject rationale)"
+check_violation "foreign path, mixed-case extension" cross-repo-doc-path \
+	"$(printf 'see %s/%s.mD for the rationale' otherproject rationale)"
+
+echo "document paths rooted inside the repository:"
+
+check_clean "a path under a directory this repo has" \
+	"$(printf 'see %s/%s.md' scripts guide)"
+check_clean "a deeper path under one of ours" \
+	"$(printf 'see %s/%s/%s.md' scripts inner guide)"
+check_clean "a documentation URL is not a repository path" \
+	"$(printf 'see https://example.com/%s/%s.md' docs guide)"
+check_clean "a bare filename is not a path" \
+	"$(printf 'see %s.md at the root' README)"
+
+# A relative link written from inside a subdirectory at a file that is really
+# there. This is the case the leading-segment reading alone gets wrong: read from
+# the repository root the path climbs out of the repository entirely, and only
+# resolving it against the citing file's own directory shows it landing on a
+# tracked file. Delete that second reading and this case goes red.
+d="$(new_repo)"
+mkdir -p "$d/scripts/inner"
+: >"$d/scripts/guide.md"
+: >"$d/subject.txt"
+printf 'see %s\n' "$(printf '%s/%s/%s.md' '../..' scripts guide)" >"$d/scripts/inner/ref.txt"
+out="$(run_gate "$d")"
+rc=$?
+if [[ $rc -eq 0 ]]; then
+	ok "a relative link resolving to a tracked file stays silent"
+else
+	bad "a valid relative link tripped the gate (exit $rc)"
+	printf '%s\n' "$out" | sed 's/^/        /'
+fi
+
+# The same shape pointing at a file that is NOT there resolves to nothing under
+# either reading, which is what a path into another checkout looks like from
+# here. Without this the case above could be passing because the rule stopped
+# matching rather than because the link is good.
+d="$(new_repo)"
+mkdir -p "$d/scripts/inner"
+: >"$d/subject.txt"
+printf 'see %s\n' "$(printf '%s/%s/%s.md' '../..' scripts guide)" >"$d/scripts/inner/ref.txt"
+out="$(run_gate "$d")"
+rc=$?
+if [[ $rc -eq 1 ]] && printf '%s\n' "$out" | grep -q "^scripts/inner/ref.txt:1: cross-repo-doc-path: "; then
+	ok "the same relative link with no file behind it is a violation"
+else
+	bad "a relative link resolving to nothing was not caught (exit $rc)"
+	printf '%s\n' "$out" | sed 's/^/        /'
+fi
+
+# ---------------------------------------------------------------------------
+# 3. The innocent-strings fixture stays silent.
 # ---------------------------------------------------------------------------
 echo "innocent strings:"
 d="$(new_repo)"
@@ -125,7 +224,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. A rule that cannot run is fatal and names itself.
+# 4. A rule that cannot run is fatal and names itself.
 # ---------------------------------------------------------------------------
 echo "broken rule:"
 d="$(new_repo)"
@@ -144,8 +243,25 @@ else
 	printf '%s\n' "$out" | sed 's/^/        /'
 fi
 
+# The path rule scans in a loop of its own, so the guard above is duplicated
+# code and gets its own proof. Corrupt the tail of its pattern into an unclosed
+# group: git grep then exits 128 having printed nothing, and a gate that reads
+# the output before the exit code calls that clean.
+d="$(new_repo)"
+printf '%s\n' "$(printf 'see %s/%s/%s.md' elsewhere notes design)" >"$d/subject.txt"
+perl -0pi -e 's/\Q\.md(?![A-Za-z0-9])\E/\\.md(/' "$d/scripts/check-public-hygiene.sh"
+out="$(run_gate "$d")"
+rc=$?
+if [[ $rc -eq 2 ]] && printf '%s\n' "$out" | grep -q "RULE FAILED TO RUN" &&
+	printf '%s\n' "$out" | grep -q "cross-repo-doc-path"; then
+	ok "a broken path pattern is fatal and names the rule"
+else
+	bad "a broken path pattern did not fail loudly (exit $rc)"
+	printf '%s\n' "$out" | sed 's/^/        /'
+fi
+
 # ---------------------------------------------------------------------------
-# 4-6. Allowlist behaviour.
+# 5-7. Allowlist behaviour.
 # ---------------------------------------------------------------------------
 echo "allowlist:"
 
@@ -155,7 +271,7 @@ echo "allowlist:"
 ac_text="$(printf '%s%s%s' AC '#' 2)"
 ac_line="$(printf 'satisfies %s.' "$ac_text")"
 
-# 4. Unparseable entry.
+# 5. Unparseable entry.
 d="$(new_repo)"
 printf '%s\n' "$ac_line" >"$d/subject.txt"
 printf 'subject.txt | %s\n' "$ac_text" >"$d/scripts/public-hygiene-allowlist.txt"
@@ -168,7 +284,7 @@ else
 	printf '%s\n' "$out" | sed 's/^/        /'
 fi
 
-# 4b. Parses, but the explanation is empty.
+# 5b. Parses, but the explanation is empty.
 d="$(new_repo)"
 printf '%s\n' "$ac_line" >"$d/subject.txt"
 printf 'subject.txt | %s |\n' "$ac_text" >"$d/scripts/public-hygiene-allowlist.txt"
@@ -181,7 +297,7 @@ else
 	printf '%s\n' "$out" | sed 's/^/        /'
 fi
 
-# 5. Stale entry — well formed, matches nothing.
+# 6. Stale entry — well formed, matches nothing.
 d="$(new_repo)"
 printf '%s\n' "$ac_line" >"$d/subject.txt"
 printf 'subject.txt | %s | quoted from a spec that has since moved\n' \
@@ -195,7 +311,7 @@ else
 	printf '%s\n' "$out" | sed 's/^/        /'
 fi
 
-# 6. Legitimate entry — must actually suppress, including the `#` in the text.
+# 7. Legitimate entry — must actually suppress, including the `#` in the text.
 d="$(new_repo)"
 printf '%s\n' "$ac_line" >"$d/subject.txt"
 printf 'subject.txt | %s | quoted verbatim from a public upstream issue\n' \
