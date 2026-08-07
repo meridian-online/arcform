@@ -12,8 +12,6 @@
 //! Config is validated by typed deserialization (a `with:`
 //! block that doesn't deserialize into the operator's config is a load-time error);
 //! JSON-Schema emission for Brightfield authoring forms is a later addition.
-//!
-//! Design spec: `bearing/research/arcform-typed-operators.md`.
 
 use std::collections::HashMap;
 // Only the fetch operators' `headers` maps use `BTreeMap`, and each is feature-gated.

@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
-# Public-hygiene gate: stop private planning identifiers reaching this public repo.
+# Public-hygiene gate: stop private planning references reaching this public repo.
 #
-# This repository is public. The planning that drives it is not. Identifiers that
-# only resolve inside the private planning tracker — decision records, task ids,
-# milestone ids, acceptance-criterion shorthand, document ids, card ids, spec AC
-# ids — are meaningless to anyone reading this repo and leak the shape of private
-# work. They have reached main repeatedly under a convention-only rule. This is
-# the enforcement: it runs in CI, and it is meant to be the first job to go red.
+# This repository is public. The planning that drives it is not. Two shapes leak.
+#
+# Identifiers that only resolve inside the private planning tracker — decision
+# records, task ids, milestone ids, acceptance-criterion shorthand, document ids,
+# card ids, spec AC ids — are meaningless to anyone reading this repo and leak the
+# shape of private work. They have reached main repeatedly under a convention-only
+# rule.
+#
+# Document paths rooted in another checkout are the second shape, and every rule
+# for the first shape misses them because they carry no number. See the
+# cross-repo-doc-path rule below for what it matches and what it cost.
+#
+# This is the enforcement: it runs in CI, and it is meant to be the first job to
+# go red.
 #
 # Usage (no arguments, from anywhere inside the repo):
 #
@@ -144,6 +152,56 @@ RULES=(
 )
 
 # ---------------------------------------------------------------------------
+# The path rule: a document path rooted in another checkout.
+#
+# Every rule above matches a NUMBERED planning identifier. A path into a sibling
+# repository carries no number, so all eleven of them exit 0 on it — which is how
+# a module doc-comment on main came to point at a markdown file inside the
+# project's private planning repo, and stayed there. The deletion was one line;
+# without this rule the next doc-comment reopens the hole.
+#
+# WHAT IT MATCHES, stated without naming anything: a relative path to a `.md`
+# document that does not belong to this repository. Such a path resolves on the
+# author's disk and nowhere else. It is a dead pointer for every reader of a
+# public crate, and when the checkout it names is private it discloses that
+# repository's internal layout on top of being useless.
+#
+# "Does not belong to this repository" is decided by two readings, because prose
+# uses both and either one landing inside the repo means the pointer is about
+# this repo:
+#
+#   * ROOT-RELATIVE — read from the repository root, is the leading segment a
+#     top-level entry of this repository? The whole path is deliberately NOT
+#     required to resolve. Requiring that would redden on `vendor/`, where a
+#     partial upstream copy keeps a README linking to documentation that was
+#     never vendored (measured 2026-08-07: one such link), and on any doc that
+#     has been renamed since it was cited. Neither is a leak, and a gate that
+#     cries wolf is off within the week. The root segment is the part that
+#     distinguishes "another checkout" from "a file that moved".
+#
+#   * FILE-RELATIVE — read from the directory of the file that wrote it, does it
+#     resolve to a TRACKED file? This is the reading a genuine relative markdown
+#     link needs, and it must be exact: without the tracked-file test, any path
+#     written from inside `src/` would appear to live under `src/` and pass.
+#     That hole is the leak this rule exists for.
+#
+# WHY ONLY `.md`. Dropping the extension makes the pattern collide with MIME
+# types — `application/vnd.apache.parquet` and its kin, 5 of them in this tree —
+# and with every `crate/module` path written in prose. A document pointer is the
+# shape that leaked and the shape that has no business being cross-repo.
+#
+# WHAT THE LOOKBEHIND IS FOR. `$`, `{` and `}` join the usual path characters
+# there because an INTERPOLATED path has a variable name where its root segment
+# should be, and no rule can say whether `$d/scripts/guide.md` or
+# `format!("{dir}/notes.md")` points inside this repo. The first draft of this
+# rule went red on this repository's own self-test for exactly that reason.
+#
+# Measured on the tree of 2026-08-07: 4 matches, 3 of them resolving in-repo.
+# ---------------------------------------------------------------------------
+PATH_LABEL='cross-repo-doc-path'
+PATH_PATTERN='(?<![-_A-Za-z0-9/.:${}])(?:\.{1,2}/)*[A-Za-z0-9_.][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_.-]+)+\.md(?![A-Za-z0-9])'
+
+# ---------------------------------------------------------------------------
 # Allowlist.
 #
 # Format, one entry per line, THREE pipe-separated fields:
@@ -233,6 +291,38 @@ is_allowed() {
 	return 1
 }
 
+# Normalise "<base>/<ref>" into a repository-relative path, collapsing `.` and
+# `..` textually — no filesystem access, so it is identical on CI and on a
+# developer's machine, and a path that does not exist still normalises.
+#
+# Returns 1, printing nothing, when the reference climbs above the repository
+# root: that is outside this repository by definition and there is nothing left
+# to compare.
+resolve_rel() {
+	local rest="${1:+$1/}$2" seg stack=""
+	while [[ -n "$rest" ]]; do
+		seg="${rest%%/*}"
+		if [[ "$seg" == "$rest" ]]; then
+			rest=""
+		else
+			rest="${rest#*/}"
+		fi
+		case "$seg" in
+		'' | '.') continue ;;
+		'..')
+			[[ -z "$stack" ]] && return 1
+			if [[ "$stack" == */* ]]; then
+				stack="${stack%/*}"
+			else
+				stack=""
+			fi
+			;;
+		*) stack="${stack:+$stack/}$seg" ;;
+		esac
+	done
+	printf '%s' "$stack"
+}
+
 # ---------------------------------------------------------------------------
 # Scan.
 # ---------------------------------------------------------------------------
@@ -246,35 +336,65 @@ seen_keys=""
 
 hits="$(mktemp)" || exit 2
 errs="$(mktemp)" || exit 2
-trap 'rm -f "$hits" "$errs"' EXIT
+tracked="$(mktemp)" || exit 2
+toplevel="$(mktemp)" || exit 2
+trap 'rm -f "$hits" "$errs" "$tracked" "$toplevel"' EXIT
+
+# The two membership tests the path rule needs, taken once from the index so the
+# rule sees exactly the files `git grep` scans.
+git ls-files >"$tracked" || exit 2
+sed 's|/.*||' "$tracked" | sort -u >"$toplevel" || exit 2
+
+# Run one pattern over the tree into "$hits", or die naming the rule.
+#
+# -I skips binary files, -n gives line numbers, -o prints just the match.
+#
+# The allowlist is excluded from the scan: by construction it quotes the exact
+# text it is waving through, so scanning it would make every entry
+# self-violating. It is the one file with that property — the checker script
+# itself is scanned (its patterns contain no literal ids).
+#
+# The exit code is checked BEFORE the output is read, and it is checked per rule.
+# git grep exits 0 on a match, 1 on no match, and >1 on an error — a broken
+# pattern exits 128 and prints nothing to stdout, which without this check reads
+# exactly like "no violations" and lets the gate report clean while blind.
+# Anything above 1 is fatal and names the rule.
+scan_or_die() {
+	local label="$1" pattern="$2" rc errline
+	git grep -PIn -o -e "$pattern" -- . ":(exclude)$ALLOWLIST" >"$hits" 2>"$errs"
+	rc=$?
+	[[ $rc -le 1 ]] && return 0
+	echo "check-public-hygiene: RULE FAILED TO RUN — '$label' (git grep exited $rc)" >&2
+	echo "    pattern: $pattern" >&2
+	while IFS= read -r errline; do
+		[[ -n "$errline" ]] && echo "    $errline" >&2
+	done <"$errs"
+	echo "    the gate cannot report clean while a rule is broken — fix the pattern" >&2
+	exit 2
+}
+
+# Report one violation, at most once per (rule, file, line).
+report() {
+	local label="$1" file="$2" line="$3" text="$4" key src
+	key="$label:$file:$line"
+	case $'\n'"$seen_keys" in
+	*$'\n'"$key"$'\n'*) return 0 ;;
+	esac
+	seen_keys="$seen_keys$key"$'\n'
+
+	violations=$((violations + 1))
+	printf '%s:%s: %s: %s\n' "$file" "$line" "$label" "$text"
+	# Show the offending source line so the fix is obvious without opening the
+	# file. `sed -n Np` is cheap and the file is tracked, so it exists.
+	src="$(sed -n "${line}p" -- "$file" 2>/dev/null)"
+	[[ -n "$src" ]] && printf '    | %s\n' "$src"
+	return 0
+}
 
 for rule in "${RULES[@]}"; do
 	label="${rule%%|*}"
 	pattern="${rule#*|}"
-
-	# -I skips binary files, -n gives line numbers, -o prints just the match.
-	#
-	# The allowlist is excluded from the scan: by construction it quotes the
-	# exact text it is waving through, so scanning it would make every entry
-	# self-violating. It is the one file with that property — the checker script
-	# itself is scanned (its patterns contain no literal ids).
-	#
-	# The exit code is checked BEFORE the output is read, and it is checked per
-	# rule. git grep exits 0 on a match, 1 on no match, and >1 on an error — a
-	# broken pattern exits 128 and prints nothing to stdout, which without this
-	# check reads exactly like "no violations" and lets the gate report clean
-	# while blind. Anything above 1 is fatal and names the rule.
-	git grep -PIn -o -e "$pattern" -- . ":(exclude)$ALLOWLIST" >"$hits" 2>"$errs"
-	grep_rc=$?
-	if [[ $grep_rc -gt 1 ]]; then
-		echo "check-public-hygiene: RULE FAILED TO RUN — '$label' (git grep exited $grep_rc)" >&2
-		echo "    pattern: $pattern" >&2
-		while IFS= read -r errline; do
-			[[ -n "$errline" ]] && echo "    $errline" >&2
-		done <"$errs"
-		echo "    the gate cannot report clean while a rule is broken — fix the pattern" >&2
-		exit 2
-	fi
+	scan_or_die "$label" "$pattern"
 
 	while IFS= read -r hit; do
 		[[ -z "$hit" ]] && continue
@@ -288,20 +408,44 @@ for rule in "${RULES[@]}"; do
 			continue
 		fi
 
-		key="$label:$file:$line"
-		case $'\n'"$seen_keys" in
-		*$'\n'"$key"$'\n'*) continue ;;
-		esac
-		seen_keys="$seen_keys$key"$'\n'
-
-		violations=$((violations + 1))
-		printf '%s:%s: %s: %s\n' "$file" "$line" "$label" "$text"
-		# Show the offending source line so the fix is obvious without opening
-		# the file. `sed -n Np` is cheap and the file is tracked, so it exists.
-		src="$(sed -n "${line}p" -- "$file" 2>/dev/null)"
-		[[ -n "$src" ]] && printf '    | %s\n' "$src"
+		report "$label" "$file" "$line" "$text"
 	done <"$hits"
 done
+
+# The path rule. Same reporting and the same allowlist as the patterns above; it
+# needs its own loop because whether a match is a violation depends on the tree,
+# not on the text, and no PCRE can ask that question.
+scan_or_die "$PATH_LABEL" "$PATH_PATTERN"
+
+while IFS= read -r hit; do
+	[[ -z "$hit" ]] && continue
+	file="${hit%%:*}"
+	rest="${hit#*:}"
+	line="${rest%%:*}"
+	text="${rest#*:}"
+
+	# Read from the repository root: is the leading segment one of ours?
+	root_rel="$(resolve_rel "" "$text")" || root_rel=""
+	lead="${root_rel%%/*}"
+	if [[ -n "$lead" ]] && grep -Fxq -- "$lead" "$toplevel"; then
+		continue
+	fi
+
+	# Read from the directory of the citing file: does it hit a tracked file?
+	dir="${file%/*}"
+	[[ "$dir" == "$file" ]] && dir=""
+	here_rel="$(resolve_rel "$dir" "$text")" || here_rel=""
+	if [[ -n "$here_rel" ]] && grep -Fxq -- "$here_rel" "$tracked"; then
+		continue
+	fi
+
+	if is_allowed "$file" "$text"; then
+		allowed=$((allowed + 1))
+		continue
+	fi
+
+	report "$PATH_LABEL" "$file" "$line" "$text"
+done <"$hits"
 
 # A stale allowlist entry is a hole nobody is watching: it says "this exact text
 # in this exact file is fine", and once the text has moved or gone it suppresses
@@ -321,11 +465,13 @@ fi
 
 if [[ $violations -gt 0 ]]; then
 	echo
-	echo "check-public-hygiene: FAILED — $violations private planning identifier(s) in tracked files."
+	echo "check-public-hygiene: FAILED — $violations private planning reference(s) in tracked files."
 	echo
-	echo "These identifiers only resolve inside the private planning tracker and must not"
-	echo "appear in a public repo. Delete the pointer and, if it carried meaning, replace it"
-	echo "with the actual rationale in plain English."
+	echo "A planning identifier resolves only inside the private tracker; a document path"
+	echo "rooted in another checkout resolves only on the author's disk. Neither means"
+	echo "anything to a reader of this repo, and both must not appear in a public one."
+	echo "Delete the pointer and, if it carried meaning, replace it with the actual"
+	echo "rationale in plain English."
 	echo
 	echo "If a match is genuinely legitimate, first try to make the pattern more precise in"
 	echo "scripts/check-public-hygiene.sh, adding the innocent string to"

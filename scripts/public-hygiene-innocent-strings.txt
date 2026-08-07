@@ -69,3 +69,39 @@ Prose that mentions the vocabulary without an identifier
     The milestone slipped a week.
     See the decision record for the rationale.
     The task list is in the tracker.
+
+Strings the path rule must never read as a repository path
+------------------------------------------------------------
+One caveat before the list. Every other section here is true anywhere, but the
+cross-repo-doc-path rule asks whether a `.md` path is rooted in THIS repository,
+so whether a path is innocent depends on the repository around it — and this file
+is scanned twice, once in the real tree and once inside the synthetic repo the
+self-test builds, where none of our directories exist. Only tree-INDEPENDENT
+cases belong here. The tree-dependent ones live in
+scripts/check-public-hygiene-selftest.sh, which states the repository it builds
+and so can say what "inside" means.
+
+A URL is tree-independent: every position a match could start at is preceded by
+`/`, `.` or `:`, all of which the pattern refuses.
+
+    https://example.com/docs/guide.md
+    https://raw.githubusercontent.com/example/repo/main/README.md
+    see [the guide](https://example.com/handbook/getting-started.md)
+
+MIME types and module paths are what the rule would swallow if the `.md`
+requirement were ever dropped as "too narrow". It is not too narrow; it is the
+only thing standing between this rule and every slash in the tree.
+
+    application/vnd.apache.parquet
+    text/csv, application/json, image/svg+xml
+    the std::collections module path, and serde/serde_json in prose
+
+An interpolated path has a variable name where its root segment should be, so
+nothing can be decided about where it points. These were not hypothetical: the
+first draft of the rule turned red on this repository's own self-test.
+
+    : >"$d/scripts/guide.md"
+    cp "$src/docs/guide.md" "${dest}/docs/guide.md"
+    let p = format!("{dir}/notes.md");
+    let q = format!("{}/notes.md", dir);
+    path = os.path.join(base, "notes.md")
