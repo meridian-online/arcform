@@ -705,6 +705,64 @@ mod tests {
         assert_eq!(probe_hits(&hits), 0, "the remote must not be consulted");
     }
 
+    // The refusal reaches stderr. `evaluate` prints it with `eprintln!`, which libtest
+    // swallows in-process, so the test re-executes its own binary with `--nocapture` and
+    // reads the child's stderr: the assertions below are on bytes the operator would see.
+    // The child arm is this same test, told by the env var to build the fixture and
+    // evaluate rather than to spawn.
+    #[test]
+    fn test_fresh_refusal_is_printed_to_stderr() {
+        const CHILD: &str = "ARC_TEST_FRESH_REFUSAL_CHILD";
+
+        if std::env::var_os(CHILD).is_some() {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("edgar.parquet");
+            fs::write(&out, b"cik,lei\n0000320193,HWU").unwrap();
+            crate::ingress_meta::write(
+                &out,
+                &crate::ingress_meta::FetchMeta {
+                    // Port 1 on the loopback: were the probe ever reached, it would
+                    // refuse the connection rather than answer.
+                    url: "http://127.0.0.1:1/never-probed".to_string(),
+                    sha256: crate::state::content_hash(
+                        b"cik,lei\n0000320193,HWUPKR0MPOU8FGXBT394\n",
+                    ),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(
+                !fresh("edgar.parquet")
+                    .evaluate(dir.path(), "test-step", &empty_env())
+                    .unwrap()
+            );
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "precondition::tests::test_fresh_refusal_is_printed_to_stderr",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("re-execute the test binary");
+        assert!(output.status.success(), "child run: {:?}", output.status);
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("warning:"), "warns: {stderr}");
+        assert!(stderr.contains("edgar.parquet"), "names the file: {stderr}");
+        assert!(
+            stderr.contains("local copy"),
+            "names the local copy: {stderr}"
+        );
+        assert!(
+            stderr.contains("the remote was not consulted"),
+            "clears the remote: {stderr}"
+        );
+    }
+
     // The refusal names the file that failed and attributes the failure to the local
     // copy. This string is what `evaluate` prints to stderr before returning stale.
     #[test]
