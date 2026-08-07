@@ -819,15 +819,21 @@ fn cargo_toml_gates_the_binary_entry_point() {
     // ureq and, as its sole runtime consumer, the whole rustls/ring TLS stack. See
     // src/operator.rs (http_fetch) for the reachability rationale.
     assert!(
-        manifest.contains("\nhttp-fetch = [\"dep:ureq\"]"),
+        manifest.contains("\nhttp-fetch = [\"dep:ureq\", \"dep:url\"]"),
         "`http-fetch` must be declared and own `ureq`, so turning it off (which \
-         `default-features = false` does) drops the HTTP client and its TLS stack"
+         `default-features = false` does) drops the HTTP client and its TLS stack. \
+         It also owns `url`, which `http_fetch` uses to resolve a relative redirect \
+         `Location` while following redirects itself"
     );
     assert!(
         manifest.contains(
             "ureq = { version = \"2\", default-features = false, features = [\"tls\"], optional = true }"
         ),
         "`ureq` must be optional, or turning `http-fetch` off still builds it"
+    );
+    assert!(
+        manifest.contains("url = { version = \"2\", optional = true }"),
+        "`url` must be optional, or turning `http-fetch` off still builds it"
     );
     assert!(
         manifest.contains("required-features = [\"cli\"]"),
