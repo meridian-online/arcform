@@ -196,10 +196,13 @@ RULES=(
 # `format!("{dir}/notes.md")` points inside this repo. The first draft of this
 # rule went red on this repository's own self-test for exactly that reason.
 #
-# Measured on the tree of 2026-08-07: 4 matches, 3 of them resolving in-repo.
+# `(?i)` because the header above commits every rule but `bare-ticket-ref` to
+# being case-insensitive, and `.MD` is as valid an extension as `.md`. Without
+# it a foreign doc path spelled `.MD`, `.Md` or `.mD` passed the gate — measured
+# on 2026-08-07, all three exited 0 against a path `.md` caught.
 # ---------------------------------------------------------------------------
 PATH_LABEL='cross-repo-doc-path'
-PATH_PATTERN='(?<![-_A-Za-z0-9/.:${}])(?:\.{1,2}/)*[A-Za-z0-9_.][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_.-]+)+\.md(?![A-Za-z0-9])'
+PATH_PATTERN='(?i)(?<![-_A-Za-z0-9/.:${}])(?:\.{1,2}/)*[A-Za-z0-9_.][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_.-]+)+\.md(?![A-Za-z0-9])'
 
 # ---------------------------------------------------------------------------
 # Allowlist.

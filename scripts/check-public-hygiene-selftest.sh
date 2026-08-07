@@ -150,6 +150,17 @@ check_violation "foreign path, bare prose" cross-repo-doc-path \
 check_violation "foreign path, climbing out of the root" cross-repo-doc-path \
 	"$(printf 'see %s/%s/%s.md' '..' sibling design)"
 
+# The header commits every rule but `bare-ticket-ref` to case-insensitivity and
+# calls a case-sensitive rule "a hole by default". Before `(?i)` was added to
+# PATH_PATTERN these three exited 0 while the lowercase spelling was caught, so
+# they pin the promise the file makes about itself rather than a preference.
+check_violation "foreign path, uppercase extension" cross-repo-doc-path \
+	"$(printf 'see %s/%s.MD for the rationale' otherproject rationale)"
+check_violation "foreign path, title-case extension" cross-repo-doc-path \
+	"$(printf 'see %s/%s.Md for the rationale' otherproject rationale)"
+check_violation "foreign path, mixed-case extension" cross-repo-doc-path \
+	"$(printf 'see %s/%s.mD for the rationale' otherproject rationale)"
+
 echo "document paths rooted inside the repository:"
 
 check_clean "a path under a directory this repo has" \

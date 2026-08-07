@@ -76,8 +76,8 @@ One caveat before the list. Every other section here is true anywhere, but the
 cross-repo-doc-path rule asks whether a `.md` path is rooted in THIS repository,
 so whether a path is innocent depends on the repository around it — and this file
 is scanned twice, once in the real tree and once inside the synthetic repo the
-self-test builds, where none of our directories exist. Only tree-INDEPENDENT
-cases belong here. The tree-dependent ones live in
+self-test builds, and the two have different directories at their roots. Only
+tree-INDEPENDENT cases belong here. The tree-dependent ones live in
 scripts/check-public-hygiene-selftest.sh, which states the repository it builds
 and so can say what "inside" means.
 
