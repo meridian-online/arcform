@@ -546,6 +546,7 @@ impl Operator for ParquetExport {
 // fetch records the remote identity (ETag / Last-Modified / sha256) in a sidecar
 // `<out>.arcmeta`; the next run replays it as an `If-None-Match` conditional
 // request, so an unchanged 127 MB remote answers `304` and is not re-downloaded.
+// The validators recorded are the FIRST hop's — see the redirect loop in `run`.
 // Paired with the `fresh` precondition (which HEAD-probes the same sidecar), a
 // step re-runs — and propagates downstream — only when the remote actually
 // changed: content-addressed ingress, not the clock-based mtime `modified_after`.
@@ -587,6 +588,68 @@ impl HttpFetchConfig {
         serde_yaml::from_value(with.clone()).map_err(|e| {
             Error::ManifestValidation(format!("http_fetch: invalid `with:` config: {}", e))
         })
+    }
+}
+
+/// Header carrying the validator of the content a redirect points at, as opposed to
+/// the validator of the redirect response itself.
+#[cfg(feature = "http-fetch")]
+const LINKED_ETAG: &str = "X-Linked-ETag";
+
+/// Redirect hops followed before the fetch gives up. Matches ureq's own default.
+#[cfg(feature = "http-fetch")]
+const MAX_REDIRECTS: u32 = 5;
+
+/// What the origin said about the artifact, read from the **first** response in the
+/// chain — the hop `url` addresses, and the only hop a later conditional request
+/// reaches.
+#[cfg(feature = "http-fetch")]
+#[derive(Default)]
+struct RemoteIdentity {
+    etag: Option<String>,
+    last_modified: Option<String>,
+    content_sha256: Option<String>,
+}
+
+#[cfg(feature = "http-fetch")]
+impl RemoteIdentity {
+    fn read(resp: &ureq::Response) -> Self {
+        let linked = resp.header(LINKED_ETAG).map(str::to_string);
+        Self {
+            content_sha256: linked.as_deref().and_then(sha256_validator),
+            // `ETag` is the response's own validator and is preferred where the
+            // origin sends one; a redirect that sends only `LINKED_ETAG` has that
+            // header as its sole offered validator.
+            etag: resp
+                .header("ETag")
+                .map(str::to_string)
+                .or_else(|| linked.clone()),
+            last_modified: resp.header("Last-Modified").map(str::to_string),
+        }
+    }
+}
+
+/// The digest inside a validator that is a bare 64-character hex string, unquoted
+/// and lowercased. `None` for any other shape.
+#[cfg(feature = "http-fetch")]
+fn sha256_validator(validator: &str) -> Option<String> {
+    let v = validator.trim().trim_start_matches("W/").trim_matches('"');
+    (v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit())).then(|| v.to_ascii_lowercase())
+}
+
+/// Resolve a `Location` against the URL that issued it, so a relative redirect
+/// target is followed the way ureq would have followed it.
+#[cfg(feature = "http-fetch")]
+fn join_location(base: &str, location: &str) -> Option<String> {
+    Some(url::Url::parse(base).ok()?.join(location).ok()?.to_string())
+}
+
+/// The remote is unchanged: the artifact and its sidecar stay as they are.
+#[cfg(feature = "http-fetch")]
+fn unchanged() -> StepOutput {
+    StepOutput {
+        stderr: String::new(),
+        stdout: None,
     }
 }
 
@@ -632,48 +695,97 @@ impl Operator for HttpFetch {
             let _ = std::fs::create_dir_all(parent);
         }
 
-        // Default UA first, then Protocol overrides (a `User-Agent` key wins).
-        let mut req = ureq::get(&cfg.url).set("User-Agent", DEFAULT_UA);
-        for (k, v) in &cfg.headers {
-            req = req.set(k, v);
-        }
-        // The freshness contract: if we've fetched this artifact before and it's
-        // still on disk, replay the stored ETag / Last-Modified as a conditional
-        // request. An unchanged remote answers `304` and we keep the bytes.
-        let prior = ingress_meta::read(&out);
-        if out.exists()
-            && let Some(ref p) = prior
-        {
-            if let Some(ref etag) = p.etag {
-                req = req.set("If-None-Match", etag);
-            }
-            if let Some(ref lm) = p.last_modified {
-                req = req.set("If-Modified-Since", lm);
-            }
-        }
+        let prior = ingress_meta::read(&out).filter(|_| out.exists());
 
-        let resp = match req.call() {
-            Ok(resp) => resp,
-            // 304 Not Modified — the remote is byte-unchanged. Keep the file + sidecar
-            // untouched (so its content identity, hence downstream staleness, is stable).
-            Err(ureq::Error::Status(304, _)) => {
-                return Ok(StepOutput {
-                    stderr: String::new(),
-                    stdout: None,
-                });
+        // Redirects are followed here rather than by ureq. ureq follows them itself by
+        // default, and by the time it returns, the only headers left on the `Response`
+        // are the last hop's — for a resolve URL that redirects to a signed, expiring
+        // storage URL, that is the storage object's validator, which the origin does
+        // not accept in a later `If-None-Match`.
+        let agent = ureq::builder().redirects(0).build();
+        let mut url = cfg.url.clone();
+        let mut hop = 0u32;
+        let mut identity = RemoteIdentity::default();
+
+        let resp = loop {
+            // Default UA first, then Protocol overrides (a `User-Agent` key wins).
+            let mut req = agent.get(&url).set("User-Agent", DEFAULT_UA);
+            for (k, v) in &cfg.headers {
+                // ureq drops `Authorization` and `Cookie` when it follows a redirect;
+                // following by hand has to drop them too, or a Protocol's credential
+                // reaches whichever host the origin points at.
+                if hop > 0
+                    && (k.eq_ignore_ascii_case("authorization") || k.eq_ignore_ascii_case("cookie"))
+                {
+                    continue;
+                }
+                req = req.set(k, v);
             }
-            Err(e) => return Err(fetch_failed(format!("http_fetch: GET {}: {}", cfg.url, e))),
+            // The freshness contract: if we've fetched this artifact before and it's
+            // still on disk, replay the stored ETag / Last-Modified as a conditional
+            // request against the hop that issued them. An unchanged remote answers
+            // `304` and we keep the bytes.
+            if hop == 0
+                && let Some(ref p) = prior
+            {
+                if let Some(ref etag) = p.etag {
+                    req = req.set("If-None-Match", etag);
+                }
+                if let Some(ref lm) = p.last_modified {
+                    req = req.set("If-Modified-Since", lm);
+                }
+            }
+
+            let resp = match req.call() {
+                Ok(resp) => resp,
+                // 304 Not Modified — the remote is byte-unchanged. Keep the file + sidecar
+                // untouched (so its content identity, hence downstream staleness, is stable).
+                Err(ureq::Error::Status(304, _)) => return Ok(unchanged()),
+                Err(e) => return Err(fetch_failed(format!("http_fetch: GET {}: {}", cfg.url, e))),
+            };
+            if resp.status() == 304 {
+                return Ok(unchanged());
+            }
+
+            if hop == 0 {
+                identity = RemoteIdentity::read(&resp);
+                // The origin declared the artifact's content hash in the response head.
+                // Where it is a hash we already hold, the body is not read at all —
+                // and the declaration is recorded even if the sidecar predates the
+                // field, which costs no transfer.
+                if let Some(declared) = identity.content_sha256.as_deref()
+                    && let Some(p) = prior.as_ref()
+                    && (p.sha256 == declared || p.content_sha256.as_deref() == Some(declared))
+                {
+                    if p.content_sha256.as_deref() != Some(declared) {
+                        let mut refreshed = p.clone();
+                        refreshed.content_sha256 = Some(declared.to_string());
+                        let _ = ingress_meta::write(&out, &refreshed);
+                    }
+                    return Ok(unchanged());
+                }
+            }
+
+            let location = resp.header("Location").map(str::to_string);
+            match location {
+                Some(loc) if (300..400).contains(&resp.status()) => {
+                    hop += 1;
+                    if hop > MAX_REDIRECTS {
+                        return Err(fetch_failed(format!(
+                            "http_fetch: GET {}: more than {} redirects",
+                            cfg.url, MAX_REDIRECTS
+                        )));
+                    }
+                    url = join_location(&url, &loc).ok_or_else(|| {
+                        fetch_failed(format!(
+                            "http_fetch: GET {}: unresolvable redirect to {}",
+                            cfg.url, loc
+                        ))
+                    })?;
+                }
+                _ => break resp,
+            }
         };
-        if resp.status() == 304 {
-            return Ok(StepOutput {
-                stderr: String::new(),
-                stdout: None,
-            });
-        }
-
-        // 200: capture the server's content identity before consuming the body.
-        let etag = resp.header("ETag").map(str::to_string);
-        let last_modified = resp.header("Last-Modified").map(str::to_string);
 
         // Stream to a sibling `.part` file, hashing as we go, then atomically rename —
         // a killed run never leaves a truncated artifact that looks complete.
@@ -709,9 +821,10 @@ impl Operator for HttpFetch {
         let meta = FetchMeta {
             url: cfg.url.clone(),
             request_headers: cfg.headers.clone(),
-            etag,
-            last_modified,
+            etag: identity.etag,
+            last_modified: identity.last_modified,
             sha256: format!("{:x}", hasher.finalize()),
+            content_sha256: identity.content_sha256,
             fetched_unix,
         };
         let _ = ingress_meta::write(&out, &meta);

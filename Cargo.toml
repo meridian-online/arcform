@@ -46,6 +46,11 @@ humantime = "2"
 # stack — out of the binary. Reachability note lives beside the operator in
 # src/operator.rs.
 ureq = { version = "2", default-features = false, features = ["tls"], optional = true }
+# `http_fetch` follows redirects itself (ureq discards every hop's headers but the
+# last), so it needs ureq's own `Url::join` to resolve a relative `Location`.
+# ureq depends on this crate unconditionally, so the gated dep adds nothing to the
+# graph that `http-fetch` does not already pull in.
+url = { version = "2", optional = true }
 tar = "0.4"
 flate2 = "1"
 dirs = "5"
@@ -92,7 +97,7 @@ cli = ["dep:clap", "http-fetch"]
 # rustls/ring TLS stack. Kept a *named* feature distinct from `cli` so a future
 # engine-as-library consumer could opt the fetch path back in without the clap
 # argv parser.
-http-fetch = ["dep:ureq"]
+http-fetch = ["dep:ureq", "dep:url"]
 # The OpenDAL-backed opendal_fetch operator (multi-backend ingress; securelake s3://).
 opendal = ["dep:opendal", "dep:opendal-http-transport-reqwest", "dep:reqwest", "dep:tokio"]
 # The `arc mcp` entry point: a Model Context Protocol server over stdio that
