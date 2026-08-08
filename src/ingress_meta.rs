@@ -9,8 +9,8 @@
 //!   - the operator replays the stored `ETag`/`Last-Modified` as an `If-None-Match`
 //!     / `If-Modified-Since` conditional request, so an unchanged remote returns
 //!     `304` and the bytes are **not** re-downloaded. The stored validators are the
-//!     ones the **first** hop sent, which is the hop `url` addresses and the only hop
-//!     a later conditional request reaches;
+//!     **first** hop's where that hop sends one — the hop `url` addresses — and the
+//!     last hop's otherwise, with the conditional forwarded down the chain;
 //!   - the [`crate::precondition`] `fresh` gate HEAD-probes the same identity, so a
 //!     step (and everything downstream) re-runs **only when the remote changed** —
 //!     the content-addressed replacement for the mtime `modified_after` gate.

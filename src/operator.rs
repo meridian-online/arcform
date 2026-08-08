@@ -546,7 +546,8 @@ impl Operator for ParquetExport {
 // fetch records the remote identity (ETag / Last-Modified / sha256) in a sidecar
 // `<out>.arcmeta`; the next run replays it as an `If-None-Match` conditional
 // request, so an unchanged 127 MB remote answers `304` and is not re-downloaded.
-// The validators recorded are the FIRST hop's — see the redirect loop in `run`.
+// The validator recorded is the first hop's where that hop offers one, and the
+// last hop's otherwise — see the redirect loop in `run`.
 // Paired with the `fresh` precondition (which HEAD-probes the same sidecar), a
 // step re-runs — and propagates downstream — only when the remote actually
 // changed: content-addressed ingress, not the clock-based mtime `modified_after`.
@@ -600,9 +601,10 @@ const LINKED_ETAG: &str = "X-Linked-ETag";
 #[cfg(feature = "http-fetch")]
 const MAX_REDIRECTS: u32 = 5;
 
-/// What the origin said about the artifact, read from the **first** response in the
-/// chain — the hop `url` addresses, and the only hop a later conditional request
-/// reaches.
+/// What a hop of the redirect chain said about the artifact. The fetch keeps the
+/// first hop's where that hop offers a validator, because that is the hop `url`
+/// addresses; where it offers none, the last hop's, and the conditional request is
+/// forwarded down the chain to reach it.
 #[cfg(feature = "http-fetch")]
 #[derive(Default)]
 struct RemoteIdentity {
@@ -613,6 +615,11 @@ struct RemoteIdentity {
 
 #[cfg(feature = "http-fetch")]
 impl RemoteIdentity {
+    /// True when the hop offered nothing a conditional request could be built from.
+    fn offers_nothing(&self) -> bool {
+        self.etag.is_none() && self.last_modified.is_none() && self.content_sha256.is_none()
+    }
+
     fn read(resp: &ureq::Response) -> Self {
         let linked = resp.header(LINKED_ETAG).map(str::to_string);
         Self {
@@ -723,11 +730,12 @@ impl Operator for HttpFetch {
             }
             // The freshness contract: if we've fetched this artifact before and it's
             // still on disk, replay the stored ETag / Last-Modified as a conditional
-            // request against the hop that issued them. An unchanged remote answers
-            // `304` and we keep the bytes.
-            if hop == 0
-                && let Some(ref p) = prior
-            {
+            // request. Sent on every hop, because the stored validator belongs to
+            // whichever hop offered one — for a redirect that carries no validator
+            // of its own that is the redirect target, which is only asked if the
+            // header travels with the fetch. An unchanged remote answers `304` and
+            // we keep the bytes.
+            if let Some(ref p) = prior {
                 if let Some(ref etag) = p.etag {
                     req = req.set("If-None-Match", etag);
                 }
@@ -786,6 +794,15 @@ impl Operator for HttpFetch {
                 _ => break resp,
             }
         };
+
+        // An origin whose 3xx carries no `ETag`, `Last-Modified` or `X-Linked-ETag` —
+        // the shape of an http→https upgrade or a release redirect — leaves nothing to
+        // record, and a sidecar with no validator forfeits the next `304`. Take the
+        // final hop's instead; the conditional above is sent to every hop, so it
+        // reaches the hop that issued it.
+        if identity.offers_nothing() {
+            identity = RemoteIdentity::read(&resp);
+        }
 
         // Stream to a sibling `.part` file, hashing as we go, then atomically rename —
         // a killed run never leaves a truncated artifact that looks complete.
@@ -2646,8 +2663,9 @@ mod tests {
     // ── the redirect fixture ────────────────────────────────────────────────
     //
     // A loopback origin with a dataset host's shape: `/file` answers `302` with a
-    // RELATIVE `Location` and carries the content validator in `X-Linked-ETag`,
-    // and the redirect target `/blob` answers `200` under a validator of its own.
+    // RELATIVE `Location`, and the redirect target `/blob` answers `200` under
+    // `STORAGE_VALIDATOR` and `304` to a conditional request carrying it. What the
+    // `302` itself carries is per-test, which is the axis the fetch has to get right.
     // It records every request head it receives and every payload byte it writes,
     // which is what the assertions below read.
     #[cfg(feature = "http-fetch")]
@@ -2658,6 +2676,39 @@ mod tests {
 
         pub const PAYLOAD: &[u8] = b"the artifact bytes, transferred at most once";
         pub const STORAGE_VALIDATOR: &str = "\"storage-object-id\"";
+
+        /// The headers the `302` from `/file` carries, and whether `/file` itself
+        /// honours a conditional request.
+        #[derive(Default)]
+        pub struct Spec {
+            /// Served as `X-Linked-ETag` on the redirect when set.
+            pub linked: Option<String>,
+            /// Served as `Last-Modified` on the redirect when set.
+            pub redirect_last_modified: Option<String>,
+            /// When true, `/file` answers `304` to an `If-None-Match` matching
+            /// `linked`; when false it always redirects.
+            pub honour_conditional: bool,
+        }
+
+        impl Spec {
+            /// The dataset-host shape: a `302` carrying `linked`, answering `304` to
+            /// a conditional request that replays it.
+            pub fn linked(validator: &str) -> Self {
+                Self {
+                    linked: Some(validator.to_string()),
+                    honour_conditional: true,
+                    ..Self::default()
+                }
+            }
+
+            /// The same `302`, from an origin that ignores conditional requests.
+            pub fn linked_unconditional(validator: &str) -> Self {
+                Self {
+                    linked: Some(validator.to_string()),
+                    ..Self::default()
+                }
+            }
+        }
 
         #[derive(Default)]
         pub struct Log {
@@ -2675,18 +2726,14 @@ mod tests {
         }
 
         impl Origin {
-            /// `linked` is served as `X-Linked-ETag` on the redirect. With
-            /// `honour_conditional`, `/file` answers `304` to a matching
-            /// `If-None-Match`; without it, `/file` always redirects.
-            pub fn start(linked: &str, honour_conditional: bool) -> Self {
+            pub fn start(spec: Spec) -> Self {
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 let port = listener.local_addr().unwrap().port();
                 let log = Arc::new(Mutex::new(Log::default()));
                 let served = Arc::clone(&log);
-                let linked = linked.to_string();
                 std::thread::spawn(move || {
                     for stream in listener.incoming().flatten() {
-                        serve(stream, &served, &linked, honour_conditional);
+                        serve(stream, &served, &spec);
                     }
                 });
                 Self { port, log }
@@ -2715,7 +2762,15 @@ mod tests {
             }
         }
 
-        fn serve(mut stream: TcpStream, log: &Arc<Mutex<Log>>, linked: &str, conditional: bool) {
+        /// True when the request head replays `validator` in `If-None-Match`.
+        fn replays(head: &str, validator: &str) -> bool {
+            head.to_ascii_lowercase().contains(&format!(
+                "if-none-match: {}",
+                validator.to_ascii_lowercase()
+            ))
+        }
+
+        fn serve(mut stream: TcpStream, log: &Arc<Mutex<Log>>, spec: &Spec) {
             let mut head = Vec::new();
             let mut byte = [0u8; 1];
             while !head.ends_with(b"\r\n\r\n") {
@@ -2726,32 +2781,41 @@ mod tests {
             }
             let head = String::from_utf8_lossy(&head).into_owned();
             let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
-            let matched = conditional
-                && head
-                    .to_ascii_lowercase()
-                    .contains(&format!("if-none-match: {}", linked.to_ascii_lowercase()));
+            let origin_304 = spec.honour_conditional
+                && spec.linked.as_deref().is_some_and(|v| replays(&head, v));
+            let target_304 = replays(&head, STORAGE_VALIDATOR);
 
             let mut l = log.lock().unwrap();
             l.paths.push(path.clone());
             l.heads.push(head);
+            let serve_body = path == "/blob" && !target_304;
             let response = if path == "/blob" {
-                l.bytes_served += PAYLOAD.len();
-                format!(
-                    "HTTP/1.1 200 OK\r\nETag: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    STORAGE_VALIDATOR,
-                    PAYLOAD.len()
-                )
-            } else if matched {
+                if target_304 {
+                    "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    l.bytes_served += PAYLOAD.len();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nETag: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        STORAGE_VALIDATOR,
+                        PAYLOAD.len()
+                    )
+                }
+            } else if origin_304 {
                 "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".to_string()
             } else {
-                format!(
-                    "HTTP/1.1 302 Found\r\nLocation: /blob\r\nX-Linked-ETag: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    linked
-                )
+                let mut r = "HTTP/1.1 302 Found\r\nLocation: /blob\r\n".to_string();
+                if let Some(ref v) = spec.linked {
+                    r.push_str(&format!("X-Linked-ETag: {}\r\n", v));
+                }
+                if let Some(ref lm) = spec.redirect_last_modified {
+                    r.push_str(&format!("Last-Modified: {}\r\n", lm));
+                }
+                r.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
+                r
             };
             drop(l);
             let _ = stream.write_all(response.as_bytes());
-            if path == "/blob" {
+            if serve_body {
                 let _ = stream.write_all(PAYLOAD);
             }
             let _ = stream.flush();
@@ -2780,7 +2844,7 @@ mod tests {
     fn fetch_records_the_redirects_validator_not_the_final_hops() {
         let digest = payload_digest();
         let linked = format!("\"{}\"", digest);
-        let server = origin::Origin::start(&linked, true);
+        let server = origin::Origin::start(origin::Spec::linked(&linked));
         let dir = tempfile::tempdir().unwrap();
 
         fetch(dir.path(), &server.url("/file")).unwrap();
@@ -2801,7 +2865,7 @@ mod tests {
     fn second_fetch_against_an_unchanged_remote_transfers_no_payload() {
         let digest = payload_digest();
         let linked = format!("\"{}\"", digest);
-        let server = origin::Origin::start(&linked, true);
+        let server = origin::Origin::start(origin::Spec::linked(&linked));
         let dir = tempfile::tempdir().unwrap();
         let url = server.url("/file");
 
@@ -2824,6 +2888,65 @@ mod tests {
         );
     }
 
+    // AC2 for the other redirect shape — a `302` carrying no `ETag`, no
+    // `Last-Modified` and no `X-Linked-ETag`, which is what an http→https upgrade or
+    // a release redirect sends. Nothing on the first hop is storable, so the second
+    // run's `304` can only come from the target's validator, reached by forwarding
+    // the conditional. Recording the first hop's alone re-transfers PAYLOAD.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn a_redirect_carrying_no_validator_records_the_targets() {
+        let server = origin::Origin::start(origin::Spec::default());
+        let dir = tempfile::tempdir().unwrap();
+        let url = server.url("/file");
+        let out = dir.path().join("build/artifact.bin");
+
+        fetch(dir.path(), &url).unwrap();
+        let after_first = server.bytes_served();
+        assert_eq!(after_first, origin::PAYLOAD.len());
+        let meta = crate::ingress_meta::read(&out).expect("sidecar written");
+        assert_eq!(meta.etag.as_deref(), Some(origin::STORAGE_VALIDATOR));
+
+        fetch(dir.path(), &url).unwrap();
+        assert_eq!(server.bytes_served(), after_first, "second run transferred");
+        assert_eq!(std::fs::read(&out).unwrap(), origin::PAYLOAD);
+
+        let sent = server.heads();
+        let to_target = sent
+            .last()
+            .expect("the target was asked")
+            .to_ascii_lowercase();
+        assert!(
+            to_target.contains(&format!(
+                "if-none-match: {}",
+                origin::STORAGE_VALIDATOR.to_ascii_lowercase()
+            )),
+            "{}",
+            to_target
+        );
+    }
+
+    // The fallback is reached only where the first hop offers nothing: a `302` with a
+    // `Last-Modified` and no `ETag` keeps that, and `STORAGE_VALIDATOR` — which the
+    // origin would not recognise — stays out of the sidecar.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn a_redirect_offering_only_last_modified_keeps_it() {
+        const WHEN: &str = "Wed, 21 Oct 2026 07:28:00 GMT";
+        let server = origin::Origin::start(origin::Spec {
+            redirect_last_modified: Some(WHEN.to_string()),
+            ..Default::default()
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("build/artifact.bin");
+
+        fetch(dir.path(), &server.url("/file")).unwrap();
+
+        let meta = crate::ingress_meta::read(&out).expect("sidecar written");
+        assert_eq!(meta.last_modified.as_deref(), Some(WHEN));
+        assert!(meta.etag.is_none(), "{:?}", meta.etag);
+    }
+
     // AC3: where the origin declares a content hash on the redirect, the sidecar
     // records it with no body transferred — here on a sidecar that predates the
     // field, against an origin that ignores conditional requests entirely.
@@ -2831,7 +2954,10 @@ mod tests {
     #[test]
     fn declared_content_hash_is_recorded_without_downloading_the_body() {
         let digest = payload_digest();
-        let server = origin::Origin::start(&format!("\"{}\"", digest), false);
+        let server = origin::Origin::start(origin::Spec::linked_unconditional(&format!(
+            "\"{}\"",
+            digest
+        )));
         let dir = tempfile::tempdir().unwrap();
         let url = server.url("/file");
         let out = dir.path().join("build/artifact.bin");
@@ -2860,7 +2986,10 @@ mod tests {
     #[test]
     fn a_changed_declared_content_hash_transfers_again() {
         let digest = payload_digest();
-        let server = origin::Origin::start(&format!("\"{}\"", digest), false);
+        let server = origin::Origin::start(origin::Spec::linked_unconditional(&format!(
+            "\"{}\"",
+            digest
+        )));
         let dir = tempfile::tempdir().unwrap();
         let url = server.url("/file");
         let out = dir.path().join("build/artifact.bin");
@@ -2881,7 +3010,7 @@ mod tests {
     #[cfg(feature = "http-fetch")]
     #[test]
     fn credentials_are_not_forwarded_to_the_redirect_target() {
-        let server = origin::Origin::start("\"opaque\"", false);
+        let server = origin::Origin::start(origin::Spec::linked_unconditional("\"opaque\""));
         let dir = tempfile::tempdir().unwrap();
         let env = HashMap::new();
         let with: Value = serde_yaml::from_str(&format!(
