@@ -2,12 +2,15 @@
 //! fetched artifact.
 //!
 //! An `http_fetch` writes a sidecar (`<out>.arcmeta`, YAML) recording the remote
-//! identity of what it pulled: the `ETag`/`Last-Modified` the server returned and
-//! the `sha256` of the bytes. That sidecar is what makes a fetch *content-aware*
+//! identity of what it pulled: the `ETag`/`Last-Modified` the server returned, the
+//! `sha256` of the bytes, and — where the origin publishes one ahead of the transfer
+//! — the content hash it declared. That sidecar is what makes a fetch *content-aware*
 //! rather than clock-based:
 //!   - the operator replays the stored `ETag`/`Last-Modified` as an `If-None-Match`
 //!     / `If-Modified-Since` conditional request, so an unchanged remote returns
-//!     `304` and the bytes are **not** re-downloaded;
+//!     `304` and the bytes are **not** re-downloaded. The stored validators are the
+//!     **first** hop's where that hop sends one — the hop `url` addresses — and the
+//!     last hop's otherwise, with the conditional forwarded down the chain;
 //!   - the [`crate::precondition`] `fresh` gate hashes the artifact against the
 //!     recorded `sha256` and, when that agrees, HEAD-probes the same identity — so a
 //!     step (and everything downstream) re-runs when the local bytes or the remote
@@ -48,6 +51,12 @@ pub struct FetchMeta {
     /// SHA-256 of the fetched bytes — the content identity (audit + reproducibility).
     #[serde(default)]
     pub sha256: String,
+    /// The content hash the origin declared for the artifact, taken from the response
+    /// head rather than from the body. Skipped on write when absent, so a sidecar for
+    /// an origin that declares none is byte-identical to one written before this
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
     /// Best-effort fetch time (unix seconds) — audit only.
     #[serde(default)]
     pub fetched_unix: Option<u64>,
@@ -111,6 +120,7 @@ mod tests {
             etag: Some("\"abc123\"".to_string()),
             last_modified: Some("Sat, 04 Jul 2026 06:31:19 GMT".to_string()),
             sha256: "deadbeef".to_string(),
+            content_sha256: Some("c0ffee".to_string()),
             fetched_unix: Some(1_784_000_000),
         };
         write(&out, &meta).unwrap();
@@ -119,10 +129,29 @@ mod tests {
         assert_eq!(back.etag, meta.etag);
         assert_eq!(back.last_modified, meta.last_modified);
         assert_eq!(back.sha256, meta.sha256);
+        assert_eq!(back.content_sha256, meta.content_sha256);
         assert_eq!(
             back.request_headers.get("User-Agent").map(String::as_str),
             Some("meridian")
         );
+    }
+
+    // An origin that declares no content hash writes the same bytes it wrote before
+    // the field existed, so an existing sidecar is not rewritten by upgrading.
+    #[test]
+    fn absent_content_hash_is_not_serialised() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("edgar.parquet");
+        let meta = FetchMeta {
+            url: "https://openlake.meridian.online/edgar.parquet".to_string(),
+            etag: Some("\"abc123\"".to_string()),
+            sha256: "deadbeef".to_string(),
+            ..Default::default()
+        };
+        write(&out, &meta).unwrap();
+        let on_disk = std::fs::read_to_string(meta_path(&out)).unwrap();
+        assert!(!on_disk.contains("content_sha256"), "{}", on_disk);
+        assert!(read(&out).unwrap().content_sha256.is_none());
     }
 
     #[test]
