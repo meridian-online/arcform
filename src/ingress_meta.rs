@@ -11,9 +11,15 @@
 //!     `304` and the bytes are **not** re-downloaded. The stored validators are the
 //!     **first** hop's where that hop sends one — the hop `url` addresses — and the
 //!     last hop's otherwise, with the conditional forwarded down the chain;
-//!   - the [`crate::precondition`] `fresh` gate HEAD-probes the same identity, so a
-//!     step (and everything downstream) re-runs **only when the remote changed** —
-//!     the content-addressed replacement for the mtime `modified_after` gate.
+//!   - the [`crate::precondition`] `fresh` gate hashes the artifact against the
+//!     recorded `sha256` and, when that agrees, HEAD-probes the same identity — so a
+//!     step (and everything downstream) re-runs when the local bytes or the remote
+//!     moved, the content-addressed replacement for the mtime `modified_after` gate.
+//!
+//! Because the stored validators are what make the next request conditional, the
+//! sidecar is also the lever for *forcing* a full re-download: [`remove`] it and the
+//! operator has nothing to replay, so the server answers with bytes rather than a
+//! `304`. The `fresh` gate does exactly that when the artifact fails its hash.
 //!
 //! Written by `http_fetch`, read by the `fresh` precondition — hence its own module.
 
@@ -74,6 +80,19 @@ pub fn read(out: &Path) -> Option<FetchMeta> {
 pub fn write(out: &Path, meta: &FetchMeta) -> std::io::Result<()> {
     let s = serde_yaml::to_string(meta).map_err(std::io::Error::other)?;
     std::fs::write(meta_path(out), s)
+}
+
+/// Delete the sidecar for `out`, leaving the artifact itself alone. An already-absent
+/// sidecar is `Ok(())`, so calling this on an artifact that was never fetched is not an
+/// error.
+///
+/// The next `http_fetch` of `out` then finds no `ETag`/`Last-Modified` to replay and
+/// issues an unconditional `GET`.
+pub fn remove(out: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(meta_path(out)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -139,5 +158,24 @@ mod tests {
     fn read_absent_sidecar_is_none() {
         let dir = tempfile::tempdir().unwrap();
         assert!(read(&dir.path().join("nope.parquet")).is_none());
+    }
+
+    #[test]
+    fn remove_deletes_the_sidecar_and_leaves_the_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("edgar.parquet");
+        std::fs::write(&out, b"bytes").unwrap();
+        write(&out, &FetchMeta::default()).unwrap();
+
+        remove(&out).unwrap();
+        assert!(!meta_path(&out).exists(), "sidecar gone");
+        assert!(out.is_file(), "artifact kept");
+        assert!(read(&out).is_none());
+    }
+
+    #[test]
+    fn remove_absent_sidecar_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        remove(&dir.path().join("never-fetched.parquet")).unwrap();
     }
 }

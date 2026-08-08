@@ -1,10 +1,14 @@
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
 use std::time::SystemTime;
 
+use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
+use crate::ingress_meta::FetchMeta;
 
 /// A typed precondition that determines whether a step is fresh.
 ///
@@ -24,8 +28,9 @@ pub struct ModifiedAfterConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FreshConfig {
     /// Relative path to a fetched artifact whose `<path>.arcmeta` sidecar records
-    /// its remote identity (written by `http_fetch`). The precondition HEAD-probes
-    /// that identity to decide freshness — the content-addressed replacement for
+    /// its remote identity and content hash (written by `http_fetch`). The
+    /// precondition checks the file on disk against the recorded `sha256`, then
+    /// HEAD-probes the recorded remote — the content-addressed replacement for
     /// `modified_after`'s clock check.
     pub path: String,
 }
@@ -48,9 +53,12 @@ pub enum Precondition {
     /// If the file is missing or inaccessible, evaluates as stale (not an error).
     ModifiedAfter { modified_after: ModifiedAfterConfig },
 
-    /// Content-aware ingress freshness. HEAD-probes the remote recorded in a
-    /// fetched artifact's `<path>.arcmeta` sidecar and compares `ETag` /
-    /// `Last-Modified`: unchanged remote = fresh (skip the fetch and everything
+    /// Content-aware ingress freshness, in two hops against a fetched artifact's
+    /// `<path>.arcmeta` sidecar. First the bytes on disk are hashed and compared
+    /// with the `sha256` the fetch recorded; a mismatch is stale, the remote is not
+    /// contacted, and the sidecar is discarded so the re-fetch is unconditional.
+    /// Then the recorded remote is HEAD-probed and its `ETag` / `Last-Modified`
+    /// compared: unchanged remote = fresh (skip the fetch and everything
     /// downstream), changed or unprobeable = stale (re-fetch). Replaces the
     /// clock-based `modified_after` for `http_fetch` outputs.
     Fresh { fresh: FreshConfig },
@@ -106,6 +114,17 @@ impl Precondition {
                     return Ok(false);
                 };
 
+                // The local copy is checked against the hash the fetch recorded before
+                // the remote is asked anything. A file that is not the bytes its sidecar
+                // describes is stale whatever the remote answers, and refusing here costs
+                // no round trip. The sidecar goes with it, so the re-run's fetch has no
+                // validator to replay and downloads rather than 304s.
+                if let Some(refusal) = local_copy_refusal(&file_path, &meta) {
+                    let remedy = discard_sidecar(&file_path);
+                    eprintln!("{} {}{}", "warning:".yellow(), refusal, remedy);
+                    return Ok(false);
+                }
+
                 // The remote HEAD probe is the ureq path; it rides with the
                 // `http_fetch` operator behind the `http-fetch` feature (see
                 // src/operator.rs for the reachability note). Without that feature
@@ -152,7 +171,6 @@ impl Precondition {
                 }
                 #[cfg(not(feature = "http-fetch"))]
                 {
-                    let _ = meta;
                     Ok(false)
                 }
             }
@@ -216,6 +234,84 @@ impl Precondition {
             }
         }
     }
+}
+
+/// Check a fetched artifact's bytes against the `sha256` its `<path>.arcmeta` sidecar
+/// recorded at fetch time.
+///
+/// `None` means the file on disk hashes to the value the fetch wrote. `Some` is the
+/// refusal text, which names the file and attributes the failure to the local copy —
+/// the remote has not been contacted when this runs.
+///
+/// A sidecar carrying no `sha256` is refused rather than waved through: the field is
+/// `#[serde(default)]`, so an empty value is what a hand-edited or pre-field sidecar
+/// deserialises to, and an unverifiable artifact is not a verified one.
+///
+/// This decides only the verdict. [`discard_sidecar`] is what makes the re-run replace
+/// the bytes.
+fn local_copy_refusal(file_path: &Path, meta: &FetchMeta) -> Option<String> {
+    let recorded = meta.sha256.trim();
+    if recorded.is_empty() {
+        return Some(format!(
+            "fresh: local copy {} cannot be verified: its .arcmeta records no sha256 \
+             — the remote was not consulted",
+            file_path.display()
+        ));
+    }
+    let on_disk = match hash_file(file_path) {
+        Ok(hex) => hex,
+        Err(e) => {
+            return Some(format!(
+                "fresh: local copy {} could not be read to verify it ({e}) \
+                 — the remote was not consulted",
+                file_path.display()
+            ));
+        }
+    };
+    if on_disk.eq_ignore_ascii_case(recorded) {
+        return None;
+    }
+    Some(format!(
+        "fresh: local copy {} does not match the sha256 its fetch recorded \
+         (recorded {recorded}, on disk {on_disk}) — the remote was not consulted",
+        file_path.display()
+    ))
+}
+
+/// Delete the sidecar of an artifact [`local_copy_refusal`] has just refused, and
+/// return the clause describing what that leaves the re-run to do.
+///
+/// Returning stale only un-skips the step; it does not decide what the step's fetch
+/// sends. With the sidecar still in place `http_fetch` replays its `ETag` as an
+/// `If-None-Match`, a byte-identical remote answers `304`, and the operator keeps the
+/// file it already has — the file this gate just refused. Removing the sidecar removes
+/// the validator, so the `GET` is unconditional and the bytes on disk are replaced.
+fn discard_sidecar(file_path: &Path) -> String {
+    match crate::ingress_meta::remove(file_path) {
+        Ok(()) => "; its .arcmeta is discarded, so the re-fetch is unconditional".to_string(),
+        Err(e) => format!(
+            "; its .arcmeta could not be discarded ({e}), \
+             so the re-fetch may be answered with a 304 and leave these bytes in place"
+        ),
+    }
+}
+
+/// SHA-256 hex digest of a file's bytes, read in fixed-size chunks so peak memory does
+/// not scale with the artifact. Same digest and same hex representation as
+/// [`crate::state::content_hash`] over the whole byte slice — pinned by
+/// `test_fresh_hash_file_matches_content_hash`.
+fn hash_file(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Evaluate all preconditions for a step. Returns Ok(true) if ALL pass (step is fresh).
@@ -487,6 +583,435 @@ mod tests {
             !fresh("data.parquet")
                 .evaluate(dir.path(), "test-step", &empty_env())
                 .unwrap()
+        );
+    }
+
+    // A 127.0.0.1 listener that answers every request `304 Not Modified` and counts the
+    // connections it accepted. The `fresh` probe reads a 304 as fresh, so a gate that
+    // reaches this server declares the artifact fresh; the counter is how a test asserts
+    // the gate did not reach it.
+    #[cfg(feature = "http-fetch")]
+    fn probe_server_304() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n");
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}/artifact"), hits)
+    }
+
+    #[cfg(feature = "http-fetch")]
+    fn probe_hits(hits: &std::sync::atomic::AtomicUsize) -> usize {
+        hits.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    // Write `fetched` to `<dir>/data.parquet` and the sidecar `http_fetch` would have
+    // written for it, then leave `on_disk` in the file's place.
+    fn fetched_then_replaced(dir: &Path, url: &str, fetched: &[u8], on_disk: &[u8]) {
+        let out = dir.join("data.parquet");
+        fs::write(&out, fetched).unwrap();
+        crate::ingress_meta::write(
+            &out,
+            &crate::ingress_meta::FetchMeta {
+                url: url.to_string(),
+                etag: Some("\"v1\"".to_string()),
+                sha256: crate::state::content_hash(fetched),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fs::write(&out, on_disk).unwrap();
+    }
+
+    // fresh: the artifact the fetch left in place is fresh, and the verdict comes from
+    // the remote probe — the control for the two corruption tests below, which point at
+    // the same 304 server and must reach a different verdict.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn test_fresh_intact_artifact_is_fresh_via_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let (url, hits) = probe_server_304();
+        let bytes = b"cik,lei\n0000320193,HWUPKR0MPOU8FGXBT394\n";
+        fetched_then_replaced(dir.path(), &url, bytes, bytes);
+
+        assert!(
+            fresh("data.parquet")
+                .evaluate(dir.path(), "test-step", &empty_env())
+                .unwrap()
+        );
+        assert_eq!(probe_hits(&hits), 1, "the remote was probed");
+    }
+
+    // fresh: one byte flipped, length unchanged — stale, and the remote is never asked.
+    // A size check would not see this mutation; the sidecar's sha256 does.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn test_fresh_corrupted_artifact_is_stale_without_probing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (url, hits) = probe_server_304();
+        fetched_then_replaced(
+            dir.path(),
+            &url,
+            b"cik,lei\n0000320193,HWUPKR0MPOU8FGXBT394\n",
+            b"cik,lei\n0000320193,HWUPKR0MPOU8FGXBT395\n",
+        );
+
+        assert!(
+            !fresh("data.parquet")
+                .evaluate(dir.path(), "test-step", &empty_env())
+                .unwrap(),
+            "a corrupted artifact must not pass the gate"
+        );
+        assert_eq!(probe_hits(&hits), 0, "the remote must not be consulted");
+    }
+
+    // fresh: the artifact truncated mid-record — stale, and the remote is never asked.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn test_fresh_truncated_artifact_is_stale_without_probing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (url, hits) = probe_server_304();
+        fetched_then_replaced(
+            dir.path(),
+            &url,
+            b"cik,lei\n0000320193,HWUPKR0MPOU8FGXBT394\n",
+            b"cik,lei\n0000320193,HWU",
+        );
+
+        assert!(
+            !fresh("data.parquet")
+                .evaluate(dir.path(), "test-step", &empty_env())
+                .unwrap(),
+            "a truncated artifact must not pass the gate"
+        );
+        assert_eq!(probe_hits(&hits), 0, "the remote must not be consulted");
+    }
+
+    // fresh: a sidecar with no recorded sha256 leaves the artifact unverifiable → stale.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn test_fresh_sidecar_without_sha256_is_stale_without_probing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (url, hits) = probe_server_304();
+        let out = dir.path().join("data.parquet");
+        fs::write(&out, b"bytes").unwrap();
+        crate::ingress_meta::write(
+            &out,
+            &crate::ingress_meta::FetchMeta {
+                url,
+                etag: Some("\"v1\"".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !fresh("data.parquet")
+                .evaluate(dir.path(), "test-step", &empty_env())
+                .unwrap()
+        );
+        assert_eq!(probe_hits(&hits), 0, "the remote must not be consulted");
+    }
+
+    // A 127.0.0.1 listener that serves `body` with `ETag: "v1"`, answering `304` to any
+    // request that carries a validator. It records one bool per request — whether that
+    // request was conditional — which is how the tests below read what the operator sent.
+    #[cfg(feature = "http-fetch")]
+    fn etag_server(body: &'static [u8]) -> (String, std::sync::Arc<std::sync::Mutex<Vec<bool>>>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                let conditional =
+                    head.contains("if-none-match") || head.contains("if-modified-since");
+                log.lock().unwrap().push(conditional);
+                if conditional {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n",
+                    );
+                } else {
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nContent-Length: {}\r\n\
+                             Connection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                    let _ = stream.write_all(body);
+                }
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}/artifact"), requests)
+    }
+
+    // Run the catalog's real `http_fetch` against `url`, writing `data.parquet` into `dir`
+    // — the same operator the runner invokes for the step the gate has just un-skipped.
+    #[cfg(feature = "http-fetch")]
+    fn http_fetch_into(dir: &Path, url: &str) {
+        use crate::operator::OpContext;
+
+        let with: serde_yaml::Value =
+            serde_yaml::from_str(&format!("url: {url}\nout: data.parquet\n")).unwrap();
+        let env = empty_env();
+        let db = dir.join("pipeline.duckdb");
+        crate::operator::resolve("http_fetch")
+            .expect("http_fetch is in the catalog")
+            .run(
+                &with,
+                &OpContext {
+                    dir,
+                    db_path: &db,
+                    env: &env,
+                    timeout: None,
+                },
+            )
+            .expect("the fetch succeeds");
+    }
+
+    // The control: a sidecar the gate has NOT refused still makes the next fetch
+    // conditional, so a byte-identical remote answers `304` and nothing is downloaded.
+    // This is the behaviour the refusal path has to defeat.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn test_fresh_intact_sidecar_keeps_the_refetch_conditional() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"cik,lei\n0000320193,HWUPKR0MPOU8FGXBT394\n";
+        let (url, requests) = etag_server(bytes);
+        fetched_then_replaced(dir.path(), &url, bytes, bytes);
+
+        http_fetch_into(dir.path(), &url);
+
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![true],
+            "the stored ETag was replayed"
+        );
+    }
+
+    // The refusal is a repair, not a warning: the gate deletes the sidecar it just found
+    // lying, so the step's re-fetch has no validator to replay, the server sends bytes
+    // instead of a `304`, and the corrupted artifact on disk is replaced. Then the
+    // rewritten sidecar matches the new bytes, so the next run passes the gate — the cost
+    // is one full download, not one refusal per run for ever.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn test_fresh_refusal_forces_an_unconditional_refetch_that_replaces_the_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = b"cik,lei\n0000320193,HWUPKR0MPOU8FGXBT394\n";
+        let corrupt = b"cik,lei\n0000320193,HWUPKR0MPOU8FGXBT395\n";
+        let (url, requests) = etag_server(good);
+        fetched_then_replaced(dir.path(), &url, good, corrupt);
+        let out = dir.path().join("data.parquet");
+
+        assert!(
+            !fresh("data.parquet")
+                .evaluate(dir.path(), "test-step", &empty_env())
+                .unwrap(),
+            "a corrupted artifact must not pass the gate"
+        );
+        assert!(
+            !crate::ingress_meta::meta_path(&out).exists(),
+            "the refusal discards the sidecar"
+        );
+
+        http_fetch_into(dir.path(), &url);
+
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![false],
+            "the re-fetch carried no validator"
+        );
+        assert_eq!(
+            fs::read(&out).unwrap(),
+            good,
+            "the corrupted bytes are replaced by the remote's"
+        );
+
+        let rewritten = crate::ingress_meta::read(&out).expect("the fetch rewrote the sidecar");
+        assert_eq!(rewritten.sha256, crate::state::content_hash(good));
+        assert!(
+            local_copy_refusal(&out, &rewritten).is_none(),
+            "the repaired artifact passes the gate"
+        );
+    }
+
+    // A sidecar with no `sha256` is the pre-field case, and it is repaired the same way:
+    // discarded, so one unconditional fetch writes a sidecar that does carry the hash.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn test_fresh_sidecar_without_sha256_is_repaired_by_one_unconditional_refetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = b"cik,lei\n0000320193,HWUPKR0MPOU8FGXBT394\n";
+        let (url, requests) = etag_server(good);
+        let out = dir.path().join("data.parquet");
+        fs::write(&out, good).unwrap();
+        crate::ingress_meta::write(
+            &out,
+            &crate::ingress_meta::FetchMeta {
+                url: url.clone(),
+                etag: Some("\"v1\"".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !fresh("data.parquet")
+                .evaluate(dir.path(), "test-step", &empty_env())
+                .unwrap()
+        );
+        http_fetch_into(dir.path(), &url);
+
+        assert_eq!(*requests.lock().unwrap(), vec![false]);
+        assert_eq!(
+            crate::ingress_meta::read(&out)
+                .expect("sidecar rewritten")
+                .sha256,
+            crate::state::content_hash(good),
+            "the sidecar now carries the hash it lacked"
+        );
+    }
+
+    // The refusal reaches stderr. `evaluate` prints it with `eprintln!`, which libtest
+    // swallows in-process, so the test re-executes its own binary with `--nocapture` and
+    // reads the child's stderr: the assertions below are on bytes the operator would see.
+    // The child arm is this same test, told by the env var to build the fixture and
+    // evaluate rather than to spawn.
+    #[test]
+    fn test_fresh_refusal_is_printed_to_stderr() {
+        const CHILD: &str = "ARC_TEST_FRESH_REFUSAL_CHILD";
+
+        if std::env::var_os(CHILD).is_some() {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("edgar.parquet");
+            fs::write(&out, b"cik,lei\n0000320193,HWU").unwrap();
+            crate::ingress_meta::write(
+                &out,
+                &crate::ingress_meta::FetchMeta {
+                    // Port 1 on the loopback: were the probe ever reached, it would
+                    // refuse the connection rather than answer.
+                    url: "http://127.0.0.1:1/never-probed".to_string(),
+                    sha256: crate::state::content_hash(
+                        b"cik,lei\n0000320193,HWUPKR0MPOU8FGXBT394\n",
+                    ),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(
+                !fresh("edgar.parquet")
+                    .evaluate(dir.path(), "test-step", &empty_env())
+                    .unwrap()
+            );
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "precondition::tests::test_fresh_refusal_is_printed_to_stderr",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("re-execute the test binary");
+        assert!(output.status.success(), "child run: {:?}", output.status);
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("warning:"), "warns: {stderr}");
+        assert!(stderr.contains("edgar.parquet"), "names the file: {stderr}");
+        assert!(
+            stderr.contains("local copy"),
+            "names the local copy: {stderr}"
+        );
+        assert!(
+            stderr.contains("the remote was not consulted"),
+            "clears the remote: {stderr}"
+        );
+        assert!(
+            stderr.contains(".arcmeta is discarded, so the re-fetch is unconditional"),
+            "states the repair it performed: {stderr}"
+        );
+    }
+
+    // The refusal names the file that failed and attributes the failure to the local
+    // copy. This string is what `evaluate` prints to stderr before returning stale.
+    #[test]
+    fn test_fresh_refusal_names_the_file_and_the_local_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("edgar.parquet");
+        fs::write(&out, b"cik,lei\n0000320193,HWU").unwrap();
+        let meta = crate::ingress_meta::FetchMeta {
+            sha256: crate::state::content_hash(b"cik,lei\n0000320193,HWUPKR0MPOU8FGXBT394\n"),
+            ..Default::default()
+        };
+
+        let msg = local_copy_refusal(&out, &meta).expect("a mismatch is refused");
+        assert!(msg.contains("edgar.parquet"), "names the file: {msg}");
+        assert!(msg.contains("local copy"), "names the local copy: {msg}");
+        assert!(
+            msg.contains("the remote was not consulted"),
+            "clears the remote: {msg}"
+        );
+        assert!(!msg.contains('\n'), "single line: {msg}");
+    }
+
+    // The refusal for a sidecar with no hash carries the same attribution.
+    #[test]
+    fn test_fresh_refusal_for_missing_hash_names_the_local_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("edgar.parquet");
+        fs::write(&out, b"bytes").unwrap();
+
+        let msg = local_copy_refusal(&out, &crate::ingress_meta::FetchMeta::default())
+            .expect("an unverifiable artifact is refused");
+        assert!(msg.contains("edgar.parquet"), "names the file: {msg}");
+        assert!(msg.contains("local copy"), "names the local copy: {msg}");
+        assert!(
+            msg.contains("the remote was not consulted"),
+            "clears the remote: {msg}"
+        );
+    }
+
+    // The chunked file hash and the whole-slice hash agree, so the gate compares like
+    // with like against a sidecar written by the fetch.
+    #[test]
+    fn test_fresh_hash_file_matches_content_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        // Longer than the 64 KiB read buffer, so more than one chunk is fed to the hasher.
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let out = dir.path().join("big.bin");
+        fs::write(&out, &bytes).unwrap();
+        assert_eq!(
+            hash_file(&out).unwrap(),
+            crate::state::content_hash(&bytes),
+            "chunked and whole-slice digests agree"
         );
     }
 
