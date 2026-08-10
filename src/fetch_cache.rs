@@ -32,6 +32,11 @@
 //!   compares it with the key before returning it — so a corrupt entry is evicted
 //!   rather than served to a second consumer. That costs one local read of a file we
 //!   were about to copy anyway, against a transfer it saves;
+//! * a **key is not trusted**. It arrives in a `.arcmeta` — plain YAML inside a
+//!   Protocol directory, which anything that can write a file can author — and it
+//!   names a path under `<root>/objects`. So only a 64-character hex digest addresses
+//!   an object here: a locator carrying anything else is refused rather than acted on,
+//!   and `<root>/objects` is as unescapable as `<root>/urls` below;
 //! * a **credentialed** fetch is never shared. Bytes behind an `Authorization` or
 //!   `Cookie` header belong to the credential, not to the URL, and a store keyed by
 //!   URL cannot tell two credentials apart.
@@ -100,9 +105,16 @@ impl FetchCache {
         home.map(|home| home.join(".arcform").join(DEFAULT_SUBDIR))
     }
 
-    /// Where the bytes with digest `sha256` live.
-    fn object_path(&self, sha256: &str) -> PathBuf {
-        self.root.join("objects").join(sha256)
+    /// Where the bytes with digest `sha256` live, or `None` when `sha256` is not a
+    /// digest.
+    ///
+    /// The key is the one part of an entry that comes out of a file inside a Protocol,
+    /// so it is the one part an untrusted tree chooses, and joining it onto the root
+    /// unchecked makes it a path rather than a name. Returning an `Option` puts that
+    /// decision at every call site instead: a value that is not a digest is not a key
+    /// this store can hold, and there is no file for it to open or unlink.
+    fn object_path(&self, sha256: &str) -> Option<PathBuf> {
+        parse_digest(sha256).map(|digest| self.root.join("objects").join(digest))
     }
 
     /// Where the locator for `url` lives. The file name is the digest of the URL, so
@@ -127,14 +139,14 @@ impl FetchCache {
     /// What the cache holds for `url`, **verified**: the object named by the locator
     /// exists and hashes to the key it is filed under.
     ///
-    /// A locator with no object, an object that fails its hash, and an unreadable
-    /// record are all `None`, and all evict — an entry that cannot be trusted is not
-    /// an entry, and leaving it in place would make every later run pay the same
-    /// verification for the same answer.
+    /// A locator with no object, a key that is not a digest, an object that fails its
+    /// hash, and an unreadable record are all `None`, and all evict — an entry that
+    /// cannot be trusted is not an entry, and leaving it in place would make every
+    /// later run pay the same verification for the same answer.
     pub fn lookup(&self, url: &str) -> Option<FetchMeta> {
         let record = std::fs::read_to_string(self.locator_path(url)).ok()?;
         let meta: FetchMeta = serde_yaml::from_str(&record).ok()?;
-        if meta.sha256.trim().is_empty() || !self.object_is_intact(&meta.sha256) {
+        if self.verified_object(&meta.sha256).is_none() {
             self.evict(url, Some(&meta.sha256));
             return None;
         }
@@ -145,8 +157,7 @@ impl FetchCache {
     /// fetch makes: the manifest named the bytes, so the URL is only where they would
     /// have come from.
     pub fn pinned_object(&self, sha256: &str) -> Option<PathBuf> {
-        self.object_is_intact(sha256)
-            .then(|| self.object_path(sha256))
+        self.verified_object(sha256)
     }
 
     /// Copy a verified object into `out`, atomically: the bytes land in a sibling
@@ -160,7 +171,9 @@ impl FetchCache {
     /// the engine's step-retry is what re-runs it — against a cache that no longer
     /// holds the bad object.
     pub fn materialise(&self, meta: &FetchMeta, out: &Path) -> std::io::Result<()> {
-        let object = self.object_path(meta.sha256.trim());
+        let object = self
+            .object_path(&meta.sha256)
+            .ok_or_else(|| not_a_digest(&meta.sha256))?;
         let tmp = out.with_extension("part");
         let copied = copy_hashing(&object, &tmp)?;
         if !copied.eq_ignore_ascii_case(meta.sha256.trim()) {
@@ -177,28 +190,40 @@ impl FetchCache {
 
     /// File `source`'s bytes under `meta.sha256` and point `meta.url` at them.
     ///
-    /// The copy hashes as it reads and **refuses bytes that do not match the key**,
-    /// which costs nothing over a copy that does not: the store has to read the file
-    /// either way. Nothing enters this cache unverified and nothing leaves it
-    /// unverified, so a caller with a corrupt artifact cannot make it a second
-    /// consumer's problem.
+    /// Two refusals, and a locator is written only past both. The key has to be a
+    /// SHA-256, because a key is a file name in this store and a caller does not get to
+    /// choose a path; and `source` has to hash to it, so a caller with a corrupt
+    /// artifact cannot make it a second consumer's problem.
     ///
-    /// The object is written once — a digest already on disk is the same bytes by
-    /// construction — and the locator is rewritten every time, because the validators
-    /// a URL answers with move even when its content does not.
+    /// The bytes are read once on either branch of the write: hashed as they are copied
+    /// when the object is new, hashed in place when the object is already filed. The
+    /// second branch skips the copy — a digest already on disk is the same bytes by
+    /// construction — and does not skip the check, because the locator it goes on to
+    /// write is a promise about `source`.
+    ///
+    /// The locator is rewritten every time, because the validators a URL answers with
+    /// move even when its content does not.
     ///
     /// Errors are returned for a test to assert on; every caller in the fetch path
     /// discards them. A cache that will not take a write costs a future transfer, not
     /// this one.
     pub fn store(&self, meta: &FetchMeta, source: &Path) -> std::io::Result<()> {
+        let object = self
+            .object_path(&meta.sha256)
+            .ok_or_else(|| not_a_digest(&meta.sha256))?;
         let sha = meta.sha256.trim();
-        if sha.is_empty() {
-            return Err(std::io::Error::other(
-                "refusing to file an artifact whose content hash is unknown",
-            ));
-        }
-        let object = self.object_path(sha);
-        if !object.exists() {
+        let refuse = |hashed: String| {
+            std::io::Error::other(format!(
+                "refusing to file {} under {sha}: its bytes hash to {hashed}",
+                source.display()
+            ))
+        };
+        if object.exists() {
+            let on_disk = hash_file(source)?;
+            if !on_disk.eq_ignore_ascii_case(sha) {
+                return Err(refuse(on_disk));
+            }
+        } else {
             if let Some(parent) = object.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -206,10 +231,7 @@ impl FetchCache {
             let copied = copy_hashing(source, &tmp)?;
             if !copied.eq_ignore_ascii_case(sha) {
                 let _ = std::fs::remove_file(&tmp);
-                return Err(std::io::Error::other(format!(
-                    "refusing to file {} under {sha}: its bytes hash to {copied}",
-                    source.display()
-                )));
+                return Err(refuse(copied));
             }
             std::fs::rename(&tmp, &object)?;
         }
@@ -223,7 +245,10 @@ impl FetchCache {
         std::fs::rename(&tmp, &locator)
     }
 
-    /// Drop a URL's locator and, when one is named, the object it points at.
+    /// Drop a URL's locator and, when the locator named a digest, the object filed
+    /// under it in `<root>/objects`. A key that is not a digest names no object this
+    /// store holds, so the locator goes and nothing is unlinked: eviction is the wrong
+    /// end of a bad entry to trust with a path.
     ///
     /// The object goes even though another URL's locator could name the same bytes.
     /// That costs the other URL one transfer and keeps the rule simple: an object
@@ -232,18 +257,29 @@ impl FetchCache {
     /// re-fetches — which is the same path any cold cache takes.
     fn evict(&self, url: &str, sha256: Option<&str>) {
         let _ = std::fs::remove_file(self.locator_path(url));
-        if let Some(sha) = sha256.map(str::trim).filter(|s| !s.is_empty()) {
-            let _ = std::fs::remove_file(self.object_path(sha));
+        if let Some(object) = sha256.and_then(|sha| self.object_path(sha)) {
+            let _ = std::fs::remove_file(object);
         }
     }
 
-    /// Whether the object filed under `sha256` is present and hashes to it.
-    fn object_is_intact(&self, sha256: &str) -> bool {
-        let sha = sha256.trim();
-        !sha.is_empty()
-            && hash_file(&self.object_path(sha))
-                .is_ok_and(|on_disk| on_disk.eq_ignore_ascii_case(sha))
+    /// The object filed under `sha256`, when `sha256` is a digest and the bytes on disk
+    /// hash to it. `None` covers every other case, so a caller that gets a path has a
+    /// path inside `<root>/objects` holding the bytes the key names.
+    fn verified_object(&self, sha256: &str) -> Option<PathBuf> {
+        let object = self.object_path(sha256)?;
+        hash_file(&object)
+            .is_ok_and(|on_disk| on_disk.eq_ignore_ascii_case(sha256.trim()))
+            .then_some(object)
     }
+}
+
+/// The refusal every entry point gives a key that is not a SHA-256. The key names a
+/// file under `<root>/objects`, so a value that is not a digest is not a key this
+/// store can hold — and acting on it would reach outside the store.
+fn not_a_digest(key: &str) -> std::io::Error {
+    std::io::Error::other(format!(
+        "refusing `{key}` as a cache key: it is not a SHA-256 (expected 64 hex characters)"
+    ))
 }
 
 /// Copy `from` to `to`, returning the SHA-256 hex digest of what was copied. One
@@ -364,7 +400,7 @@ mod tests {
         cache.store(&m, &source).unwrap();
 
         // One byte flipped, length unchanged — the mutation a size check would miss.
-        let object = cache.object_path(&m.sha256);
+        let object = cache.object_path(&m.sha256).expect("the key is a digest");
         std::fs::write(&object, b"cik,lei\n0000320193,HWUPKR0MPOU8FGXBT395\n").unwrap();
 
         assert!(
@@ -391,10 +427,7 @@ mod tests {
         let m = meta("https://example.invalid/edgar.parquet", bytes);
         cache.store(&m, &source).unwrap();
 
-        assert_eq!(
-            cache.pinned_object(&m.sha256),
-            Some(cache.object_path(&m.sha256))
-        );
+        assert_eq!(cache.pinned_object(&m.sha256), cache.object_path(&m.sha256));
         assert!(
             cache
                 .pinned_object(&crate::state::content_hash(b"other bytes"))
@@ -416,6 +449,115 @@ mod tests {
         m.sha256 = String::new();
         assert!(cache.store(&m, &source).is_err());
         assert!(!cache.holds(&m.url));
+    }
+
+    // A key is a file name in this store, and it arrives from a `.arcmeta` inside a
+    // Protocol — plain YAML, which anything that can write a file can author. A key
+    // that is not a digest is therefore a path, and every entry point that would open
+    // or unlink the file it names has to refuse it instead: `store` before it points a
+    // URL at it, `lookup`/`evict` before they remove it, `materialise` before it reads
+    // it, `pinned_object` before it hands the path back to a caller that will.
+    #[test]
+    fn a_key_that_is_not_a_digest_is_refused_by_every_entry_point() {
+        let home = tempfile::tempdir().unwrap();
+        let cache = FetchCache::at(home.path().join("cache"));
+        let elsewhere = tempfile::tempdir().unwrap();
+        let victim = elsewhere.path().join("important.txt");
+        let contents = b"someone else's work";
+        std::fs::write(&victim, contents).unwrap();
+        let source = elsewhere.path().join("source.bin");
+        std::fs::write(&source, b"bytes").unwrap();
+
+        // `Path::join` REPLACES the path when the argument is absolute, so an absolute
+        // key needs no traversal at all; the relative form walks out of
+        // `<root>/objects` to the sibling temp directory. Both tempdirs are children of
+        // `std::env::temp_dir()`, which is what makes the `../../..` count exact.
+        let url = "https://example.invalid/edgar.parquet";
+        let keys = [
+            victim.to_string_lossy().into_owned(),
+            format!(
+                "../../../{}/important.txt",
+                elsewhere.path().file_name().unwrap().to_string_lossy()
+            ),
+            "deadbeef".to_string(),
+            String::new(),
+        ];
+
+        for key in keys {
+            let mut m = meta(url, b"bytes");
+            m.sha256 = key.clone();
+
+            assert!(cache.store(&m, &source).is_err(), "store took `{key}`");
+            assert!(!cache.holds(url), "store filed a locator under `{key}`");
+
+            let out = elsewhere.path().join("materialised.bin");
+            assert!(
+                cache.materialise(&m, &out).is_err(),
+                "materialise took `{key}`"
+            );
+            assert!(!out.exists(), "materialise wrote from `{key}`");
+            assert!(victim.exists(), "materialise unlinked `{key}`");
+
+            // The locator a poisoned `.arcmeta` produces, written by hand because the
+            // store will no longer write one — this is the shape already on disk in a
+            // cache filled before the key was gated.
+            let locator = cache.locator_path(url);
+            std::fs::create_dir_all(locator.parent().unwrap()).unwrap();
+            std::fs::write(&locator, serde_yaml::to_string(&m).unwrap()).unwrap();
+            assert!(cache.lookup(url).is_none(), "lookup served `{key}`");
+            assert!(victim.exists(), "evicting `{key}` unlinked it");
+            assert!(!locator.exists(), "the unusable locator was left in place");
+
+            assert!(
+                cache.pinned_object(&key).is_none(),
+                "pinned_object served `{key}`"
+            );
+            assert!(victim.exists(), "pinned_object's read unlinked `{key}`");
+        }
+
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            contents,
+            "the file outside the store is untouched, byte for byte"
+        );
+    }
+
+    // The store reads `source` on both branches of the write. The branch that skips the
+    // copy — the digest is already on disk — used to skip the check with it, so a
+    // caller could point a URL at bytes it had not shown anyone.
+    #[test]
+    fn store_verifies_the_bytes_even_when_the_object_is_already_filed() {
+        let home = tempfile::tempdir().unwrap();
+        let cache = FetchCache::at(home.path().join("cache"));
+        let dir = tempfile::tempdir().unwrap();
+
+        let real = b"cik,lei\n0000320193,HWUPKR0MPOU8FGXBT394\n";
+        let source = dir.path().join("edgar.parquet");
+        std::fs::write(&source, real).unwrap();
+        let honest = meta("https://a.invalid/edgar.parquet", real);
+        cache.store(&honest, &source).unwrap();
+
+        // A second URL claims the same key for a different file. The object for that
+        // key is already on disk, which is the branch that used to wave the caller
+        // through.
+        let other = dir.path().join("other.parquet");
+        std::fs::write(&other, b"not those bytes at all\n").unwrap();
+        let liar = FetchMeta {
+            url: "https://b.invalid/edgar.parquet".to_string(),
+            ..honest.clone()
+        };
+        assert!(
+            cache.store(&liar, &other).is_err(),
+            "bytes that are not the key's bytes were filed under it"
+        );
+        assert!(
+            !cache.holds(&liar.url),
+            "and a locator was pointed at them anyway"
+        );
+        assert!(
+            cache.lookup(&honest.url).is_some(),
+            "the entry that was filed honestly is untouched"
+        );
     }
 
     // Two URLs, same bytes: one object, two locators. The object is written once.

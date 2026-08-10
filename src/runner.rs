@@ -3649,4 +3649,68 @@ steps:
                 .any(|l| l["event"] == "run_complete" && l["outcome"] == "partial")
         );
     }
+
+    // The runner is the only place the shared fetch cache is resolved and the only
+    // place it is handed to an operator, so nothing else can pin that wiring. A
+    // **pinned** fetch whose bytes the store already holds is the one route that never
+    // reaches the network: with the cache wired, this Protocol runs against a host that
+    // does not resolve; with `cache: None` in the `OpContext` the runner builds, it
+    // cannot, and the step fails.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn a_run_hands_the_shared_fetch_cache_to_its_operators() {
+        // `$ARCFORM_FETCH_CACHE` is process-wide, and a run that resolved the real
+        // default would write into the developer's home.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        const CACHE_ENV: &str = "ARCFORM_FETCH_CACHE";
+        const URL: &str = "http://no-origin-is-reachable.invalid/artifact.bin";
+
+        let bytes = b"the artifact the shared store already holds";
+        let digest = crate::state::content_hash(bytes);
+
+        let store = tempfile::tempdir().unwrap();
+        let root = store.path().join("cache");
+        let seed = tempfile::tempdir().unwrap();
+        let source = seed.path().join("artifact.bin");
+        fs::write(&source, bytes).unwrap();
+        crate::fetch_cache::FetchCache::at(root.clone())
+            .store(
+                &crate::ingress_meta::FetchMeta {
+                    url: URL.to_string(),
+                    sha256: digest.clone(),
+                    ..Default::default()
+                },
+                &source,
+            )
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(
+            dir.path(),
+            &format!(
+                "name: test\nsteps:\n  - name: fetch\n    op: http_fetch\n    with:\n      url: {URL}\n      out: build/artifact.bin\n      sha256: {digest}\n"
+            ),
+            &[],
+        );
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the guard above serialises this crate's own writers of this variable,
+        // and it is restored before the assertions so a failure cannot leak it into a
+        // later test.
+        unsafe { std::env::set_var(CACHE_ENV, &root) };
+        let outcome = run(
+            dir.path(),
+            &MockEngine::new(),
+            &MockStateBackend::new(),
+            false,
+        );
+        unsafe { std::env::remove_var(CACHE_ENV) };
+
+        outcome.expect("a pinned artifact the store holds needs no origin");
+        assert_eq!(
+            fs::read(dir.path().join("build/artifact.bin")).unwrap(),
+            bytes,
+            "the bytes came off the shared store"
+        );
+    }
 }

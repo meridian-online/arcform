@@ -3547,6 +3547,65 @@ mod tests {
         );
     }
 
+    // A `.arcmeta` is a file inside a Protocol, so its `sha256` is chosen by whoever
+    // authored the tree — and that field becomes the shared store's key, which is a
+    // path. Run one Protocol holding a poisoned sidecar, then a second naming the same
+    // URL, and the second used to unlink whatever the first pointed at: a fetch-only
+    // Protocol, exit 0, no message. Nothing outside the store may be touched.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn a_poisoned_sidecar_cannot_make_a_second_protocol_delete_a_file() {
+        let server = origin::Origin::start(origin::Spec::linked(OPAQUE));
+        let url = server.url("/file");
+        let (_store, cache) = shared_cache();
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        let victim = elsewhere.path().join("important.txt");
+        let contents = b"someone else's work";
+        std::fs::write(&victim, contents).unwrap();
+
+        // The first Protocol holds the artifact and a sidecar whose `sha256` is that
+        // file's path rather than a digest. `Path::join` replaces the path it is given
+        // when the argument is absolute, so this key escapes `<root>/objects` outright.
+        let first = tempfile::tempdir().unwrap();
+        let out = artifact(first.path());
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        std::fs::write(&out, origin::PAYLOAD).unwrap();
+        crate::ingress_meta::write(
+            &out,
+            &crate::ingress_meta::FetchMeta {
+                url: url.clone(),
+                etag: Some(OPAQUE.to_string()),
+                sha256: victim.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Its next run revalidates, gets a `304`, keeps its bytes — and offers the
+        // sidecar to the shared store, which is where the key gets in.
+        fetch_with(first.path(), &url, Some(&cache), "").unwrap();
+        assert!(
+            !cache.holds(&url),
+            "a locator was filed under a key that is not a digest"
+        );
+
+        // A second Protocol names the same URL. Its lookup is what used to evict.
+        let second = tempfile::tempdir().unwrap();
+        fetch_with(second.path(), &url, Some(&cache), "").unwrap();
+
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            contents,
+            "a fetch deleted a file outside the cache root"
+        );
+        assert_eq!(
+            std::fs::read(artifact(second.path())).unwrap(),
+            origin::PAYLOAD,
+            "and the second Protocol still got its artifact"
+        );
+    }
+
     // A transfer that does not match the pin is refused before it lands: the manifest
     // said which artifact it wanted, and this is not it.
     #[cfg(feature = "http-fetch")]
