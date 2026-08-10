@@ -3668,10 +3668,10 @@ steps:
         /// Points `$ARCFORM_FETCH_CACHE` at a root for as long as this value is alive,
         /// and clears it in `Drop`.
         ///
-        /// `Drop` rather than a `remove_var` after the call under test, because that
-        /// line does not run when the call panics — and `run` panicking is exactly the
-        /// failure this test is here to catch, so the version that leaks the variable
-        /// into whatever the harness schedules next is the version that fails.
+        /// `Drop` rather than a `remove_var` after the call under test: any unwind past
+        /// that line skips it — a panic inside `run`, or the `expect` on its result —
+        /// and leaves the variable naming a `TempDir` that is about to be deleted, for
+        /// whatever the harness schedules next.
         struct CacheRoot {
             _lock: std::sync::MutexGuard<'static, ()>,
         }
