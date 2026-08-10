@@ -3832,9 +3832,9 @@ mod tests {
     // step named; the next Protocol to name that URL is handed the same match and
     // served the substituted bytes.
     //
-    // Neither half needs a `304` or a live validator — the sidecar's `ETag` is
-    // worthless and this origin ignores conditional requests — which is what separates
-    // this route from the one the parity card owns.
+    // Neither half needs a `304` or a live validator: the sidecar's `ETag` here is
+    // worthless and this origin ignores conditional requests, so the shortcut is the
+    // whole of what decides.
     #[cfg(feature = "http-fetch")]
     #[test]
     fn a_declared_content_hash_is_matched_against_verified_bytes_only() {
