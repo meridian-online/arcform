@@ -3665,6 +3665,38 @@ steps:
         const CACHE_ENV: &str = "ARCFORM_FETCH_CACHE";
         const URL: &str = "http://no-origin-is-reachable.invalid/artifact.bin";
 
+        /// Points `$ARCFORM_FETCH_CACHE` at a root for as long as this value is alive,
+        /// and clears it in `Drop`.
+        ///
+        /// `Drop` rather than a `remove_var` after the call under test, because that
+        /// line does not run when the call panics — and `run` panicking is exactly the
+        /// failure this test is here to catch, so the version that leaks the variable
+        /// into whatever the harness schedules next is the version that fails.
+        struct CacheRoot {
+            _lock: std::sync::MutexGuard<'static, ()>,
+        }
+
+        impl CacheRoot {
+            fn set(root: &std::path::Path) -> Self {
+                let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                // SAFETY: `set_var` is unsound against a concurrent `getenv`, and the
+                // lock does not reach one — it serialises this crate's own *writers* of
+                // the variable and nothing else. A `run` in a test the harness schedules
+                // alongside this one still reads it, and resolves its shared cache from
+                // this root; that changes what such a run does only where it fetches.
+                unsafe { std::env::set_var(CACHE_ENV, root) };
+                Self { _lock }
+            }
+        }
+
+        impl Drop for CacheRoot {
+            fn drop(&mut self) {
+                // SAFETY: the same window as the write above, under the same lock —
+                // which is released with this value, after the variable is cleared.
+                unsafe { std::env::remove_var(CACHE_ENV) };
+            }
+        }
+
         let bytes = b"the artifact the shared store already holds";
         let digest = crate::state::content_hash(bytes);
 
@@ -3693,20 +3725,14 @@ steps:
             &[],
         );
 
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: the guard above serialises this crate's own writers of this variable,
-        // and it is restored before the assertions so a failure cannot leak it into a
-        // later test.
-        unsafe { std::env::set_var(CACHE_ENV, &root) };
-        let outcome = run(
+        let _cache_root = CacheRoot::set(&root);
+        run(
             dir.path(),
             &MockEngine::new(),
             &MockStateBackend::new(),
             false,
-        );
-        unsafe { std::env::remove_var(CACHE_ENV) };
-
-        outcome.expect("a pinned artifact the store holds needs no origin");
+        )
+        .expect("a pinned artifact the store holds needs no origin");
         assert_eq!(
             fs::read(dir.path().join("build/artifact.bin")).unwrap(),
             bytes,
