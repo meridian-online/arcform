@@ -162,7 +162,10 @@ impl FetchCache {
 
     /// Copy a verified object into `out`, atomically: the bytes land in a sibling
     /// temp file and are renamed over `out`, so an interrupted materialisation never
-    /// leaves a Protocol holding half an artifact.
+    /// leaves a Protocol holding half an artifact. A failed copy and a digest mismatch
+    /// each unlink the temp file on the way out; the rename is what leaves it, under
+    /// its final name. A Protocol directory is a working tree, and a `.part` left in
+    /// one is a file `git status` reports and no later run clears.
     ///
     /// The copy re-hashes as it reads, which closes the window between
     /// [`lookup`](Self::lookup) verifying the object and this reading it. A mismatch
@@ -175,7 +178,9 @@ impl FetchCache {
             .object_path(&meta.sha256)
             .ok_or_else(|| not_a_digest(&meta.sha256))?;
         let tmp = out.with_extension("part");
-        let copied = copy_hashing(&object, &tmp)?;
+        let copied = copy_hashing(&object, &tmp).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
         if !copied.eq_ignore_ascii_case(meta.sha256.trim()) {
             let _ = std::fs::remove_file(&tmp);
             self.evict(&meta.url, Some(&meta.sha256));
@@ -412,6 +417,40 @@ mod tests {
             "and must not be left for the next consumer"
         );
         assert!(!cache.holds(&m.url), "its locator goes with it");
+    }
+
+    // The copy runs inside the Protocol's own directory, so what it leaves behind on a
+    // failure is a file in a working tree. A read that dies part-way through — the
+    // object replaced by something that opens and will not read — has to take its temp
+    // file with it, the way the digest-mismatch exit does.
+    #[test]
+    fn a_failed_materialise_leaves_no_partial_file_in_the_protocol() {
+        let home = tempfile::tempdir().unwrap();
+        let cache = FetchCache::at(home.path().join("cache"));
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"cik,lei\n0000320193,HWUPKR0MPOU8FGXBT394\n";
+        let source = dir.path().join("edgar.parquet");
+        std::fs::write(&source, bytes).unwrap();
+        let m = meta("https://example.invalid/edgar.parquet", bytes);
+        cache.store(&m, &source).unwrap();
+
+        // A directory opens and then fails on the first read, which is the window the
+        // temp file is alive in — `EISDIR` on macOS and on Linux.
+        let object = cache.object_path(&m.sha256).expect("the key is a digest");
+        std::fs::remove_file(&object).unwrap();
+        std::fs::create_dir(&object).unwrap();
+
+        let out = dir.path().join("build/artifact.bin");
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        assert!(cache.materialise(&m, &out).is_err());
+        assert!(
+            !out.exists(),
+            "a half-copied artifact was renamed into place"
+        );
+        assert!(
+            !out.with_extension("part").exists(),
+            "the partial copy was left in the Protocol directory"
+        );
     }
 
     // The pinned path looks the object up by hash, and gets nothing when the hash is

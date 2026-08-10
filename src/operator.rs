@@ -980,13 +980,22 @@ impl Operator for HttpFetch {
             if hop == 0 {
                 identity = RemoteIdentity::read(&resp);
                 // The origin declared the artifact's content hash in the response head.
-                // Where it is a hash we already hold — in this Protocol or in the
-                // shared cache — the body is not read at all, and the declaration is
-                // recorded even if the sidecar predates the field, which costs no
-                // transfer.
+                // Where it is the hash of bytes we already hold — in this Protocol or
+                // in the shared cache — the body is not read at all, and the
+                // declaration is recorded even if the sidecar predates the field, which
+                // costs no transfer.
+                //
+                // The comparison is against `sha256` and nothing else, because `sha256`
+                // is the one field of a record that has been hashed against the bytes
+                // it describes: `FetchCache::store` refuses bytes that do not match it
+                // and `FetchCache::lookup` re-hashes the object before returning it.
+                // `content_sha256` is the origin's word carried verbatim from a response
+                // head into the record, so a declaration matched against *it* is a
+                // record confirming itself — and the case it would decide is the one
+                // where the verified hash says these are other bytes.
                 if let Some(declared) = identity.content_sha256.as_deref()
                     && let Some(p) = known
-                    && (p.sha256 == declared || p.content_sha256.as_deref() == Some(declared))
+                    && p.sha256 == declared
                 {
                     if prior.is_some() && p.content_sha256.as_deref() != Some(declared) {
                         let mut refreshed = p.clone();
@@ -3807,6 +3816,77 @@ mod tests {
         );
         let uncached = tempfile::tempdir().unwrap();
         fetch_with(uncached.path(), &genuine_url, None, "").unwrap();
+        assert_same_result(served.path(), uncached.path());
+    }
+
+    // The declared-content-hash shortcut decides on `sha256`, which the store has
+    // hashed against the object's bytes, and not on `content_sha256` — a value copied
+    // from a response head into a `.arcmeta`, which is plain YAML inside a Protocol
+    // directory that anything able to write a file can author.
+    //
+    // The two differ when the verified hash says the bytes are not the declared
+    // artifact, so a shortcut that accepts the claim keeps bytes it has just been told
+    // are the wrong ones — here in both directions. A Protocol holding substituted
+    // bytes answers the origin's declaration with a copy of the declaration, skips the
+    // transfer, keeps the substitution and files it in the shared store for the URL its
+    // step named; the next Protocol to name that URL is handed the same match and
+    // served the substituted bytes.
+    //
+    // Neither half needs a `304` or a live validator — the sidecar's `ETag` is
+    // worthless and this origin ignores conditional requests — which is what separates
+    // this route from the one the parity card owns.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn a_declared_content_hash_is_matched_against_verified_bytes_only() {
+        const SUBSTITUTED: &[u8] = b"bytes the genuine origin never served";
+
+        let digest = payload_digest();
+        let server =
+            origin::Origin::start(origin::Spec::linked_unconditional(&format!("\"{digest}\"")));
+        let url = server.url("/file");
+        let (_store, cache) = shared_cache();
+
+        // A Protocol whose artifact is not what the origin serves, beside a sidecar
+        // declaring the origin's own published content hash for it.
+        let seeding = tempfile::tempdir().unwrap();
+        let out = artifact(seeding.path());
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        std::fs::write(&out, SUBSTITUTED).unwrap();
+        crate::ingress_meta::write(
+            &out,
+            &crate::ingress_meta::FetchMeta {
+                url: url.clone(),
+                etag: Some("\"stale-and-worthless\"".to_string()),
+                sha256: crate::state::content_hash(SUBSTITUTED),
+                content_sha256: Some(digest.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        fetch_with(seeding.path(), &url, Some(&cache), "").unwrap();
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            origin::PAYLOAD,
+            "the transfer was skipped on a claim the sidecar made about itself"
+        );
+        assert_eq!(
+            cache.lookup(&url).map(|e| e.sha256),
+            Some(digest.clone()),
+            "and the shared store was seeded with bytes the origin never served"
+        );
+
+        // What a second Protocol naming the same URL is served, against what it gets
+        // with no store at all.
+        let served = tempfile::tempdir().unwrap();
+        fetch_with(served.path(), &url, Some(&cache), "").unwrap();
+        assert_eq!(
+            std::fs::read(artifact(served.path())).unwrap(),
+            origin::PAYLOAD,
+            "a second Protocol was served the substituted bytes"
+        );
+        let uncached = tempfile::tempdir().unwrap();
+        fetch_with(uncached.path(), &url, None, "").unwrap();
         assert_same_result(served.path(), uncached.path());
     }
 
