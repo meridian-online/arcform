@@ -999,7 +999,7 @@ mod tests {
             "clears the remote: {stderr}"
         );
         assert!(
-            stderr.contains(".arcmeta is discarded, so the re-fetch is unconditional"),
+            stderr.contains(".arcmeta is discarded, so the re-fetch replaces these bytes"),
             "states the repair it performed: {stderr}"
         );
     }

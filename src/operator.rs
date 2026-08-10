@@ -3538,9 +3538,12 @@ mod tests {
             origin::PAYLOAD.len() * 2,
             "which cost a transfer, as it must"
         );
-        assert!(
-            !object.exists(),
-            "and the entry that failed its hash does not survive to be offered again"
+        // The rot is gone: refused, evicted, and replaced by what the transfer
+        // brought back — so the store heals rather than staying poisoned.
+        assert_eq!(
+            std::fs::read(sole_object(&root)).unwrap(),
+            origin::PAYLOAD,
+            "the object filed under the key is not the bytes that failed it"
         );
     }
 
