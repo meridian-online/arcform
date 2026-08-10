@@ -3350,8 +3350,8 @@ mod tests {
         assert!(ma.fetched_unix.is_some() && mb.fetched_unix.is_some());
     }
 
-    // The card, in one test: two Protocols name the same URL and the payload crosses
-    // the wire once. The second still asks the origin — it asks with a validator, so
+    // The whole point, in one test: two Protocols name the same URL and the payload
+    // crosses the wire once. The second still asks the origin — it asks with a validator, so
     // the answer is `304` and the bytes come off the shared store.
     #[cfg(feature = "http-fetch")]
     #[test]

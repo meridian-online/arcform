@@ -305,7 +305,7 @@ mod tests {
     }
 
     // Store a fetched artifact and read it back, then materialise it somewhere else —
-    // the two Protocols of the card, minus the network.
+    // two Protocols over one artifact, minus the network.
     #[test]
     fn a_stored_artifact_is_found_by_url_and_materialises_byte_identically() {
         let home = tempfile::tempdir().unwrap();
@@ -349,9 +349,9 @@ mod tests {
         );
     }
 
-    // AC4, at the store's own boundary: an object whose bytes no longer hash to the
-    // key they are filed under is not returned to the next consumer, and does not
-    // survive to be offered again.
+    // Verification on read, at the store's own boundary: an object whose bytes no
+    // longer hash to the key they are filed under is not returned to the next
+    // consumer, and does not survive to be offered again.
     #[test]
     fn a_corrupt_object_is_refused_and_evicted() {
         let home = tempfile::tempdir().unwrap();
