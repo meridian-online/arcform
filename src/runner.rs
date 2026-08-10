@@ -187,6 +187,11 @@ pub fn run_with_params(
     let staleness = compute_staleness(&manifest, dir, state, &asset_graph, force, &env_map)?;
 
     let db_path = manifest.db_path(dir);
+    // The shared fetch cache, resolved once for the run and handed to every operator
+    // step. `None` when `$ARCFORM_FETCH_CACHE` says `off` or there is no home
+    // directory to put it in — a run without one behaves as every run did before the
+    // cache existed, which is the comparison the cache is held to.
+    let fetch_cache = crate::fetch_cache::FetchCache::from_env();
     let total = manifest.steps.len();
     let mut succeeded = 0;
     let mut executed = 0;
@@ -375,6 +380,7 @@ pub fn run_with_params(
                                 db_path: db_path.as_path(),
                                 env: &env_map,
                                 timeout: step_timeout,
+                                cache: fetch_cache.as_ref(),
                             };
                             let with = step.with.clone().unwrap_or(serde_yaml::Value::Null);
                             op.run(&with, &ctx)
@@ -3641,6 +3647,96 @@ steps:
             lines
                 .iter()
                 .any(|l| l["event"] == "run_complete" && l["outcome"] == "partial")
+        );
+    }
+
+    // The runner is the only place the shared fetch cache is resolved and the only
+    // place it is handed to an operator, so nothing else can pin that wiring. A
+    // **pinned** fetch whose bytes the store already holds is the one route that never
+    // reaches the network: with the cache wired, this Protocol runs against a host that
+    // does not resolve; with `cache: None` in the `OpContext` the runner builds, it
+    // cannot, and the step fails.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn a_run_hands_the_shared_fetch_cache_to_its_operators() {
+        // `$ARCFORM_FETCH_CACHE` is process-wide, and a run that resolved the real
+        // default would write into the developer's home.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        const CACHE_ENV: &str = "ARCFORM_FETCH_CACHE";
+        const URL: &str = "http://no-origin-is-reachable.invalid/artifact.bin";
+
+        /// Points `$ARCFORM_FETCH_CACHE` at a root for as long as this value is alive,
+        /// and clears it in `Drop`.
+        ///
+        /// `Drop` rather than a `remove_var` after the call under test: any unwind past
+        /// that line skips it — a panic inside `run`, or the `expect` on its result —
+        /// and leaves the variable naming a `TempDir` that is about to be deleted, for
+        /// whatever the harness schedules next.
+        struct CacheRoot {
+            _lock: std::sync::MutexGuard<'static, ()>,
+        }
+
+        impl CacheRoot {
+            fn set(root: &std::path::Path) -> Self {
+                let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                // SAFETY: `set_var` is unsound against a concurrent `getenv`, and the
+                // lock does not reach one — it serialises this crate's own *writers* of
+                // the variable and nothing else. A `run` in a test the harness schedules
+                // alongside this one still reads it, and resolves its shared cache from
+                // this root; that changes what such a run does only where it fetches.
+                unsafe { std::env::set_var(CACHE_ENV, root) };
+                Self { _lock }
+            }
+        }
+
+        impl Drop for CacheRoot {
+            fn drop(&mut self) {
+                // SAFETY: the same window as the write above, under the same lock —
+                // which is released with this value, after the variable is cleared.
+                unsafe { std::env::remove_var(CACHE_ENV) };
+            }
+        }
+
+        let bytes = b"the artifact the shared store already holds";
+        let digest = crate::state::content_hash(bytes);
+
+        let store = tempfile::tempdir().unwrap();
+        let root = store.path().join("cache");
+        let seed = tempfile::tempdir().unwrap();
+        let source = seed.path().join("artifact.bin");
+        fs::write(&source, bytes).unwrap();
+        crate::fetch_cache::FetchCache::at(root.clone())
+            .store(
+                &crate::ingress_meta::FetchMeta {
+                    url: URL.to_string(),
+                    sha256: digest.clone(),
+                    ..Default::default()
+                },
+                &source,
+            )
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(
+            dir.path(),
+            &format!(
+                "name: test\nsteps:\n  - name: fetch\n    op: http_fetch\n    with:\n      url: {URL}\n      out: build/artifact.bin\n      sha256: {digest}\n"
+            ),
+            &[],
+        );
+
+        let _cache_root = CacheRoot::set(&root);
+        run(
+            dir.path(),
+            &MockEngine::new(),
+            &MockStateBackend::new(),
+            false,
+        )
+        .expect("a pinned artifact the store holds needs no origin");
+        assert_eq!(
+            fs::read(dir.path().join("build/artifact.bin")).unwrap(),
+            bytes,
+            "the bytes came off the shared store"
         );
     }
 }

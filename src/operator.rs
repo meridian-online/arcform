@@ -44,6 +44,11 @@ pub struct OpContext<'a> {
     pub env: &'a HashMap<String, String>,
     /// Step timeout, if any — enforced by `run_process` (Inherit mode).
     pub timeout: Option<Duration>,
+    /// The shared fetch cache, when the environment gives the run one. Ingress
+    /// operators consult it so the same URL is transferred once however many
+    /// Protocols want it; `None` is a run with no cache, which every other operator
+    /// is anyway.
+    pub cache: Option<&'a crate::fetch_cache::FetchCache>,
 }
 
 /// A first-class typed operator. Registered in the [`catalog`], addressed by
@@ -201,7 +206,8 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
             json!({
                 "url": { "type": "string", "description": "Source URL (http/https)." },
                 "out": { "type": "string", "description": "Destination path, relative to the protocol directory. Written atomically." },
-                "headers": str_headers
+                "headers": str_headers,
+                "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$", "description": "Pin the artifact's SHA-256. Pinned bytes are taken from the shared fetch cache without asking the origin, and a transfer that does not match is refused." }
             }),
             &["url", "out"],
         ),
@@ -581,6 +587,11 @@ struct HttpFetchConfig {
     /// Extra request headers. A default `User-Agent` is set unless overridden here.
     #[serde(default)]
     headers: BTreeMap<String, String>,
+    /// The artifact's SHA-256, pinned by the Protocol. Naming the bytes is the one
+    /// thing that lets the fetch skip revalidation: a run cannot disagree with an
+    /// origin it never asks, and the manifest has said which bytes it wants.
+    #[serde(default)]
+    sha256: Option<String>,
 }
 
 #[cfg(feature = "http-fetch")]
@@ -589,6 +600,32 @@ impl HttpFetchConfig {
         serde_yaml::from_value(with.clone()).map_err(|e| {
             Error::ManifestValidation(format!("http_fetch: invalid `with:` config: {}", e))
         })
+    }
+
+    /// The pinned digest, normalised, or a manifest error naming the bad value — a
+    /// pin that cannot match anything is a typo, and a typo that reads as "always
+    /// re-download" would be the worst of both.
+    fn pinned_digest(&self) -> Result<Option<String>> {
+        match self.sha256.as_deref() {
+            None => Ok(None),
+            Some(raw) => crate::fetch_cache::parse_digest(raw)
+                .map(Some)
+                .ok_or_else(|| {
+                    Error::ManifestValidation(format!(
+                        "http_fetch: `sha256: {raw}` is not a SHA-256 (expected 64 hex characters)"
+                    ))
+                }),
+        }
+    }
+
+    /// Whether the request carries a credential. The shared cache is keyed by URL, so
+    /// it cannot tell one credential's bytes from another's — a credentialed fetch
+    /// therefore neither reads from it nor writes to it. Same two headers ureq drops
+    /// across a redirect, and for the same reason.
+    fn is_credentialed(&self) -> bool {
+        self.headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("authorization") || k.eq_ignore_ascii_case("cookie"))
     }
 }
 
@@ -670,6 +707,133 @@ fn fetch_failed(msg: String) -> Error {
     }
 }
 
+/// Best-effort wall-clock stamp on a sidecar — audit only, and the one field a
+/// cached run cannot reproduce from an uncached one.
+#[cfg(feature = "http-fetch")]
+fn now_unix() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// A record pairing **this step's** addressing — its `url`, its request headers — with
+/// `entry`'s content identity, which is the half that was verified against bytes.
+///
+/// It is what crosses the boundary in each direction, and the direction is why the
+/// split matters.
+///
+/// Reading, it is the sidecar this Protocol writes for bytes the shared cache
+/// supplied, and the equality is the whole of local≡cached parity: the record a cached
+/// run leaves behind is the record the transfer would have left, field for field, down
+/// to `fetched_unix`, which is a clock and differs between any two runs.
+///
+/// Writing, `entry` is a `<out>.arcmeta` — plain YAML inside a Protocol directory,
+/// which anything that can write a file can author, and `url` is as authored as
+/// `sha256` is. Re-addressing it here is what stops a Protocol seeding the shared store
+/// for a URL its step never named.
+#[cfg(feature = "http-fetch")]
+fn adopt(
+    cfg: &HttpFetchConfig,
+    entry: &crate::ingress_meta::FetchMeta,
+) -> crate::ingress_meta::FetchMeta {
+    crate::ingress_meta::FetchMeta {
+        url: cfg.url.clone(),
+        request_headers: cfg.headers.clone(),
+        etag: entry.etag.clone(),
+        last_modified: entry.last_modified.clone(),
+        sha256: entry.sha256.clone(),
+        content_sha256: entry.content_sha256.clone(),
+        fetched_unix: now_unix(),
+    }
+}
+
+/// The sidecar for a **pinned** artifact the fetch did not transfer. Where the shared
+/// entry is the pinned bytes it also carries the validators, so a later run of the
+/// same Protocol *without* the pin still has something to revalidate with; where it
+/// is not, the digest is all that is known and the sidecar says so.
+#[cfg(feature = "http-fetch")]
+fn pinned_meta(
+    cfg: &HttpFetchConfig,
+    digest: &str,
+    entry: Option<&crate::ingress_meta::FetchMeta>,
+) -> crate::ingress_meta::FetchMeta {
+    match entry.filter(|e| e.sha256.eq_ignore_ascii_case(digest)) {
+        Some(e) => adopt(cfg, e),
+        None => crate::ingress_meta::FetchMeta {
+            url: cfg.url.clone(),
+            request_headers: cfg.headers.clone(),
+            sha256: digest.to_string(),
+            fetched_unix: now_unix(),
+            ..Default::default()
+        },
+    }
+}
+
+/// Copy a cache entry into the Protocol and leave the sidecar an uncached fetch would
+/// have left. The one line of output is the point of the feature being visible: a run
+/// that says nothing is indistinguishable from one that downloaded 127 MB again.
+#[cfg(feature = "http-fetch")]
+fn serve_from_cache(
+    cache: &crate::fetch_cache::FetchCache,
+    cfg: &HttpFetchConfig,
+    meta: &crate::ingress_meta::FetchMeta,
+    out: &Path,
+) -> Result<StepOutput> {
+    cache.materialise(meta, out).map_err(|e| {
+        fetch_failed(format!(
+            "http_fetch: {} from the shared cache: {}",
+            cfg.url, e
+        ))
+    })?;
+    let _ = crate::ingress_meta::write(out, meta);
+    {
+        use owo_colors::OwoColorize;
+        eprintln!(
+            "{} {} from the shared fetch cache — no transfer",
+            "cached:".dimmed(),
+            cfg.out
+        );
+    }
+    Ok(unchanged())
+}
+
+/// The remote is unchanged. Either the Protocol already holds the bytes, in which
+/// case the shared cache is seeded from them the first time so the *next* Protocol
+/// naming this URL transfers nothing — or the cache holds them and the Protocol does
+/// not, in which case they are copied in.
+///
+/// A `304` with neither is a remote answering "unchanged" about bytes nobody has:
+/// nothing was downloaded, so nothing changes here either.
+#[cfg(feature = "http-fetch")]
+fn keep_or_materialise(
+    cfg: &HttpFetchConfig,
+    out: &Path,
+    prior: Option<&crate::ingress_meta::FetchMeta>,
+    shared: Option<&crate::ingress_meta::FetchMeta>,
+    cache: Option<&crate::fetch_cache::FetchCache>,
+) -> Result<StepOutput> {
+    if let Some(p) = prior {
+        if let Some(c) = cache
+            && !c.holds(&cfg.url)
+        {
+            // The store files a locator under the record's own `url`, and `p` is this
+            // Protocol's `<out>.arcmeta`. `adopt` re-addresses it to the URL the step
+            // named, so what a Protocol can seed is bounded by what it fetched — and
+            // the guard above then asks about the URL the write targets, so an entry
+            // that is already there is not refiled on every run. `store` hashes what it
+            // is given and refuses bytes that do not match the key, so a Protocol whose
+            // copy has rotted cannot seed the cache with it.
+            let _ = c.store(&adopt(cfg, p), out);
+        }
+        return Ok(unchanged());
+    }
+    match (cache, shared) {
+        (Some(c), Some(entry)) => serve_from_cache(c, cfg, &adopt(cfg, entry), out),
+        _ => Ok(unchanged()),
+    }
+}
+
 #[cfg(feature = "http-fetch")]
 impl Operator for HttpFetch {
     fn name(&self) -> &'static str {
@@ -682,6 +846,10 @@ impl Operator for HttpFetch {
 
     fn assets(&self, with: &Value) -> Result<OpAssets> {
         let cfg = HttpFetchConfig::parse(with)?;
+        // A pin that cannot be a digest is a manifest error, and this is the
+        // load-time gate — refusing it here means a run never starts on a pin that
+        // could not have matched.
+        cfg.pinned_digest()?;
         // The network source is not a graph node; only the local artifact is.
         Ok(OpAssets {
             reads: vec![],
@@ -697,12 +865,62 @@ impl Operator for HttpFetch {
         use crate::ingress_meta::{self, DEFAULT_UA, FetchMeta};
 
         let cfg = HttpFetchConfig::parse(with)?;
+        let pin = cfg.pinned_digest()?;
         let out = ctx.dir.join(&cfg.out);
         if let Some(parent) = out.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
 
+        // The shared cache, unless this fetch carries a credential — see
+        // `is_credentialed`. Every use below is `Option`-guarded, so a run without one
+        // takes exactly the path this operator took before the cache existed.
+        let cache = ctx.cache.filter(|_| !cfg.is_credentialed());
+
         let prior = ingress_meta::read(&out).filter(|_| out.exists());
+
+        // ── Pinned ───────────────────────────────────────────────────────────────
+        // A pinned digest names the bytes, and bytes that are already named have
+        // nothing to revalidate: the origin cannot tell this Protocol anything it did
+        // not already say it wanted. This is the ONLY route that skips the origin, and
+        // it is the reason the default route can afford not to.
+        if let Some(ref want) = pin {
+            if out.exists()
+                && crate::fetch_cache::hash_file(&out).is_ok_and(|on_disk| on_disk == *want)
+            {
+                if let Some(c) = cache
+                    && !c.holds(&cfg.url)
+                {
+                    let _ = c.store(&pinned_meta(&cfg, want, prior.as_ref()), &out);
+                }
+                return Ok(unchanged());
+            }
+            if let Some(c) = cache {
+                // The URL first, then the digest on its own: an object filed by
+                // another URL is still the artifact this manifest asked for, because
+                // the manifest asked for it by hash.
+                let entry = c.lookup(&cfg.url);
+                let hit = entry
+                    .as_ref()
+                    .is_some_and(|e| e.sha256.eq_ignore_ascii_case(want))
+                    || c.pinned_object(want).is_some();
+                if hit {
+                    let meta = pinned_meta(&cfg, want, entry.as_ref());
+                    return serve_from_cache(c, &cfg, &meta, &out);
+                }
+            }
+        }
+
+        // ── Revalidated ──────────────────────────────────────────────────────────
+        // What is known about these bytes already: the Protocol's own sidecar, which
+        // describes the copy in `out`, or — when it has none — the shared cache's
+        // entry for the same URL, verified on the way out of the store. Either way the
+        // request below carries a validator, so an unchanged remote answers `304` and
+        // the payload is not transferred a second time.
+        let shared = match (&prior, cache) {
+            (None, Some(c)) => c.lookup(&cfg.url),
+            _ => None,
+        };
+        let known = prior.as_ref().or(shared.as_ref());
 
         // Redirects are followed here rather than by ureq. ureq follows them itself by
         // default, and by the time it returns, the only headers left on the `Response`
@@ -728,14 +946,14 @@ impl Operator for HttpFetch {
                 }
                 req = req.set(k, v);
             }
-            // The freshness contract: if we've fetched this artifact before and it's
-            // still on disk, replay the stored ETag / Last-Modified as a conditional
-            // request. Sent on every hop, because the stored validator belongs to
-            // whichever hop offered one — for a redirect that carries no validator
-            // of its own that is the redirect target, which is only asked if the
-            // header travels with the fetch. An unchanged remote answers `304` and
-            // we keep the bytes.
-            if let Some(ref p) = prior {
+            // The freshness contract: where this artifact has been fetched before —
+            // by this Protocol, or by any Protocol, into the shared cache — replay the
+            // stored ETag / Last-Modified as a conditional request. Sent on every hop,
+            // because the stored validator belongs to whichever hop offered one — for
+            // a redirect that carries no validator of its own that is the redirect
+            // target, which is only asked if the header travels with the fetch. An
+            // unchanged remote answers `304` and we keep the bytes.
+            if let Some(p) = known {
                 if let Some(ref etag) = p.etag {
                     req = req.set("If-None-Match", etag);
                 }
@@ -746,31 +964,45 @@ impl Operator for HttpFetch {
 
             let resp = match req.call() {
                 Ok(resp) => resp,
-                // 304 Not Modified — the remote is byte-unchanged. Keep the file + sidecar
-                // untouched (so its content identity, hence downstream staleness, is stable).
-                Err(ureq::Error::Status(304, _)) => return Ok(unchanged()),
+                // 304 Not Modified — the remote is byte-unchanged. The Protocol's own
+                // copy (and its sidecar) stay as they are, so its content identity —
+                // hence downstream staleness — is stable; a Protocol with no copy of
+                // its own takes the confirmed bytes from the shared cache.
+                Err(ureq::Error::Status(304, _)) => {
+                    return keep_or_materialise(&cfg, &out, prior.as_ref(), shared.as_ref(), cache);
+                }
                 Err(e) => return Err(fetch_failed(format!("http_fetch: GET {}: {}", cfg.url, e))),
             };
             if resp.status() == 304 {
-                return Ok(unchanged());
+                return keep_or_materialise(&cfg, &out, prior.as_ref(), shared.as_ref(), cache);
             }
 
             if hop == 0 {
                 identity = RemoteIdentity::read(&resp);
                 // The origin declared the artifact's content hash in the response head.
-                // Where it is a hash we already hold, the body is not read at all —
-                // and the declaration is recorded even if the sidecar predates the
-                // field, which costs no transfer.
+                // Where it is the hash of bytes we already hold — in this Protocol or
+                // in the shared cache — the body is not read at all, and the
+                // declaration is recorded even if the sidecar predates the field, which
+                // costs no transfer.
+                //
+                // The comparison is against `sha256` and nothing else, because `sha256`
+                // is the one field of a record that has been hashed against the bytes
+                // it describes: `FetchCache::store` refuses bytes that do not match it
+                // and `FetchCache::lookup` re-hashes the object before returning it.
+                // `content_sha256` is the origin's word carried verbatim from a response
+                // head into the record, so a declaration matched against *it* is a
+                // record confirming itself — and the case it would decide is the one
+                // where the verified hash says these are other bytes.
                 if let Some(declared) = identity.content_sha256.as_deref()
-                    && let Some(p) = prior.as_ref()
-                    && (p.sha256 == declared || p.content_sha256.as_deref() == Some(declared))
+                    && let Some(p) = known
+                    && p.sha256 == declared
                 {
-                    if p.content_sha256.as_deref() != Some(declared) {
+                    if prior.is_some() && p.content_sha256.as_deref() != Some(declared) {
                         let mut refreshed = p.clone();
                         refreshed.content_sha256 = Some(declared.to_string());
                         let _ = ingress_meta::write(&out, &refreshed);
                     }
-                    return Ok(unchanged());
+                    return keep_or_materialise(&cfg, &out, prior.as_ref(), shared.as_ref(), cache);
                 }
             }
 
@@ -825,26 +1057,47 @@ impl Operator for HttpFetch {
         }
         let _ = file.sync_all();
         drop(file);
+        let digest = format!("{:x}", hasher.finalize());
+
+        // A pin the transfer does not satisfy is refused before the bytes land: the
+        // manifest said which artifact it wanted and this is not it. Non-retryable —
+        // the same URL will serve the same bytes on the next attempt — and the partial
+        // file goes, so nothing downstream can read what was rejected.
+        if let Some(ref want) = pin
+            && !digest.eq_ignore_ascii_case(want)
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::StepExecution {
+                step: "http_fetch".to_string(),
+                source: std::io::Error::other(format!(
+                    "{} served bytes hashing to {digest}, but the Protocol pinned {want}",
+                    cfg.url
+                )),
+            });
+        }
+
         std::fs::rename(&tmp, &out)
             .map_err(|e| fetch_failed(format!("http_fetch: rename {}: {}", out.display(), e)))?;
 
         // Persist the content identity for next run's conditional request + the
         // `fresh` precondition's HEAD probe. Best-effort: a failed sidecar write
         // doesn't fail the fetch (it just forfeits the next conditional/skip).
-        let fetched_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|d| d.as_secs());
         let meta = FetchMeta {
             url: cfg.url.clone(),
             request_headers: cfg.headers.clone(),
             etag: identity.etag,
             last_modified: identity.last_modified,
-            sha256: format!("{:x}", hasher.finalize()),
+            sha256: digest,
             content_sha256: identity.content_sha256,
-            fetched_unix,
+            fetched_unix: now_unix(),
         };
         let _ = ingress_meta::write(&out, &meta);
+        // And file the bytes so the next Protocol to name this URL revalidates rather
+        // than transfers. Best-effort for the same reason: a cache that will not take
+        // a write costs a future transfer, not this one.
+        if let Some(c) = cache {
+            let _ = c.store(&meta, &out);
+        }
 
         Ok(StepOutput {
             stderr: String::new(),
@@ -2006,6 +2259,7 @@ mod tests {
             db_path: dir,
             env,
             timeout: None,
+            cache: None,
         }
     }
 
@@ -3027,5 +3281,647 @@ mod tests {
         assert!(to_origin.contains("cookie: session=abc"));
         assert!(!to_target.contains("authorization"), "{}", to_target);
         assert!(!to_target.contains("cookie:"), "{}", to_target);
+    }
+
+    // ── the shared fetch cache ──────────────────────────────────────────────
+    //
+    // The fixture above is a whole origin, so these read the same counters the
+    // freshness tests do: `bytes_served` is the number that has to stop growing when a
+    // second Protocol wants bytes a first one already has.
+
+    /// An opaque validator — no content hash inside it, so a `304` is the only way the
+    /// origin can decline to re-send the payload. That isolates the conditional
+    /// request; the declared-hash shortcut has its own test below.
+    #[cfg(feature = "http-fetch")]
+    const OPAQUE: &str = "\"opaque-v1\"";
+
+    /// A cache under a directory of its own, returned with the directory so the
+    /// caller keeps it alive.
+    #[cfg(feature = "http-fetch")]
+    fn shared_cache() -> (tempfile::TempDir, crate::fetch_cache::FetchCache) {
+        let store = tempfile::tempdir().unwrap();
+        let cache = crate::fetch_cache::FetchCache::at(store.path().join("cache"));
+        (store, cache)
+    }
+
+    /// One Protocol's fetch of `url`, with whatever cache the run has and any extra
+    /// `with:` lines the test needs.
+    #[cfg(feature = "http-fetch")]
+    fn fetch_with(
+        dir: &Path,
+        url: &str,
+        cache: Option<&crate::fetch_cache::FetchCache>,
+        extra: &str,
+    ) -> Result<StepOutput> {
+        let env = HashMap::new();
+        let with: Value =
+            serde_yaml::from_str(&format!("url: {url}\nout: build/artifact.bin\n{extra}")).unwrap();
+        HttpFetch.run(
+            &with,
+            &OpContext {
+                dir,
+                db_path: dir,
+                env: &env,
+                timeout: None,
+                cache,
+            },
+        )
+    }
+
+    #[cfg(feature = "http-fetch")]
+    fn artifact(dir: &Path) -> PathBuf {
+        dir.join("build/artifact.bin")
+    }
+
+    /// The single object a cache rooted at `root` holds. Reached through the
+    /// filesystem rather than through the cache's own accessors, because a test that
+    /// corrupts an entry has to reach it the way rot would.
+    #[cfg(feature = "http-fetch")]
+    fn sole_object(root: &Path) -> PathBuf {
+        let mut objects: Vec<_> = std::fs::read_dir(root.join("objects"))
+            .expect("the cache filed an object")
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(objects.len(), 1, "{:?}", objects);
+        objects.pop().unwrap()
+    }
+
+    /// The single locator a cache rooted at `root` holds, and the record inside it.
+    /// Read through the filesystem rather than through [`FetchCache::lookup`], because
+    /// the question is which URL the store was filed under — not whether a URL the test
+    /// already has in hand is present.
+    #[cfg(feature = "http-fetch")]
+    fn sole_locator(root: &Path) -> (PathBuf, crate::ingress_meta::FetchMeta) {
+        let mut locators: Vec<_> = std::fs::read_dir(root.join("urls"))
+            .expect("the cache filed a locator")
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(locators.len(), 1, "{:?}", locators);
+        let path = locators.pop().unwrap();
+        let record = std::fs::read_to_string(&path).unwrap();
+        (path, serde_yaml::from_str(&record).unwrap())
+    }
+
+    /// A Protocol already holding `bytes`, beside a sidecar describing them as what
+    /// `url` served. Every field of a `<out>.arcmeta` is a field of a file inside the
+    /// Protocol, so `url` is as authored as `sha256` is.
+    #[cfg(feature = "http-fetch")]
+    fn protocol_claiming(dir: &Path, url: &str, bytes: &[u8]) {
+        let out = artifact(dir);
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        std::fs::write(&out, bytes).unwrap();
+        crate::ingress_meta::write(
+            &out,
+            &crate::ingress_meta::FetchMeta {
+                url: url.to_string(),
+                etag: Some(OPAQUE.to_string()),
+                sha256: crate::state::content_hash(bytes),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    /// Two Protocols agree: same artifact bytes, and the same content identity beside
+    /// them. `fetched_unix` is a wall clock — no two runs share one — so it is
+    /// compared for presence, and every other field for value.
+    #[cfg(feature = "http-fetch")]
+    fn assert_same_result(left: &Path, right: &Path) {
+        let (a, b) = (artifact(left), artifact(right));
+        assert_eq!(
+            std::fs::read(&a).unwrap(),
+            std::fs::read(&b).unwrap(),
+            "artifact bytes differ between {} and {}",
+            left.display(),
+            right.display()
+        );
+        let (ma, mb) = (
+            crate::ingress_meta::read(&a).expect("sidecar written"),
+            crate::ingress_meta::read(&b).expect("sidecar written"),
+        );
+        assert_eq!(ma.url, mb.url);
+        assert_eq!(ma.request_headers, mb.request_headers);
+        assert_eq!(ma.etag, mb.etag);
+        assert_eq!(ma.last_modified, mb.last_modified);
+        assert_eq!(ma.sha256, mb.sha256);
+        assert_eq!(ma.content_sha256, mb.content_sha256);
+        assert!(ma.fetched_unix.is_some() && mb.fetched_unix.is_some());
+    }
+
+    // The whole point, in one test: two Protocols name the same URL and the payload
+    // crosses the wire once. The second still asks the origin — it asks with a validator, so
+    // the answer is `304` and the bytes come off the shared store.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn two_protocols_fetching_the_same_url_transfer_it_once() {
+        let server = origin::Origin::start(origin::Spec::linked(OPAQUE));
+        let url = server.url("/file");
+        let (_store, cache) = shared_cache();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+
+        fetch_with(first.path(), &url, Some(&cache), "").unwrap();
+        assert_eq!(
+            server.bytes_served(),
+            origin::PAYLOAD.len(),
+            "the first Protocol transfers the artifact"
+        );
+
+        fetch_with(second.path(), &url, Some(&cache), "").unwrap();
+        assert_eq!(
+            server.bytes_served(),
+            origin::PAYLOAD.len(),
+            "the second Protocol transferred it again"
+        );
+        assert_eq!(
+            std::fs::read(artifact(second.path())).unwrap(),
+            origin::PAYLOAD
+        );
+        assert_same_result(first.path(), second.path());
+    }
+
+    // The same, through the origin that declares a content hash and ignores
+    // conditional requests: the declaration is checked against what the shared store
+    // holds, so the body is never read even though the response is a `200`.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn a_declared_content_hash_the_cache_already_holds_transfers_nothing() {
+        let digest = payload_digest();
+        let server =
+            origin::Origin::start(origin::Spec::linked_unconditional(&format!("\"{digest}\"")));
+        let url = server.url("/file");
+        let (_store, cache) = shared_cache();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+
+        fetch_with(first.path(), &url, Some(&cache), "").unwrap();
+        fetch_with(second.path(), &url, Some(&cache), "").unwrap();
+
+        assert_eq!(server.bytes_served(), origin::PAYLOAD.len());
+        assert_eq!(server.hits("/blob"), 1, "the payload host was asked twice");
+        assert_same_result(first.path(), second.path());
+    }
+
+    // Parity, demonstrated: the same two Protocols against the same origin, once with
+    // no cache and once with one. The cached pair transfers the payload once and the
+    // uncached pair twice — and all four Protocols end holding the same artifact and
+    // the same content identity.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn a_cached_run_and_an_uncached_run_agree() {
+        let server = origin::Origin::start(origin::Spec::linked(OPAQUE));
+        let url = server.url("/file");
+        let uncached = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        for dir in &uncached {
+            fetch_with(dir.path(), &url, None, "").unwrap();
+        }
+        let without = server.bytes_served();
+        assert_eq!(
+            without,
+            origin::PAYLOAD.len() * 2,
+            "without a cache each Protocol transfers the artifact"
+        );
+
+        let (_store, cache) = shared_cache();
+        let cached = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        for dir in &cached {
+            fetch_with(dir.path(), &url, Some(&cache), "").unwrap();
+        }
+        assert_eq!(
+            server.bytes_served() - without,
+            origin::PAYLOAD.len(),
+            "with one, the pair transfers it once"
+        );
+
+        for dir in [&uncached[1], &cached[0], &cached[1]] {
+            assert_same_result(uncached[0].path(), dir.path());
+        }
+    }
+
+    // The cache does not decide freshness. A hit is put to the origin, which is what
+    // keeps a cached run agreeing with an uncached one when the remote has moved —
+    // and the exception is a manifest that pinned the hash, which named the bytes and
+    // leaves the origin nothing to add.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn a_cache_hit_is_revalidated_unless_the_manifest_pinned_the_hash() {
+        let server = origin::Origin::start(origin::Spec::linked(OPAQUE));
+        let url = server.url("/file");
+        let (_store, cache) = shared_cache();
+        let first = tempfile::tempdir().unwrap();
+        fetch_with(first.path(), &url, Some(&cache), "").unwrap();
+        let asked = server.hits("/file");
+
+        let second = tempfile::tempdir().unwrap();
+        fetch_with(second.path(), &url, Some(&cache), "").unwrap();
+        assert_eq!(
+            server.hits("/file"),
+            asked + 1,
+            "an unpinned hit must still be revalidated"
+        );
+
+        let third = tempfile::tempdir().unwrap();
+        fetch_with(
+            third.path(),
+            &url,
+            Some(&cache),
+            &format!("sha256: {}", payload_digest()),
+        )
+        .unwrap();
+        assert_eq!(
+            server.hits("/file"),
+            asked + 1,
+            "a pinned hit must not ask the origin"
+        );
+        assert_eq!(
+            std::fs::read(artifact(third.path())).unwrap(),
+            origin::PAYLOAD
+        );
+        assert_same_result(second.path(), third.path());
+    }
+
+    // Revalidation is not a formality: against an origin that ignores conditional
+    // requests, the cached run downloads exactly as the uncached run does. The store
+    // never answers on behalf of an origin that did not confirm it.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn an_origin_that_ignores_conditionals_is_still_the_authority() {
+        let server = origin::Origin::start(origin::Spec::linked_unconditional(OPAQUE));
+        let url = server.url("/file");
+        let (_store, cache) = shared_cache();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+
+        fetch_with(first.path(), &url, Some(&cache), "").unwrap();
+        fetch_with(second.path(), &url, Some(&cache), "").unwrap();
+
+        assert_eq!(
+            server.bytes_served(),
+            origin::PAYLOAD.len() * 2,
+            "the origin's answer, not the cache's, decides"
+        );
+        assert_same_result(first.path(), second.path());
+    }
+
+    // An entry is verified on the way out, so bytes that have rotted in the store are
+    // refused rather than handed to the next Protocol — which costs that Protocol a
+    // transfer, and is the only acceptable price.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn a_corrupt_entry_is_not_served_to_a_second_consumer() {
+        let store = tempfile::tempdir().unwrap();
+        let root = store.path().join("cache");
+        let cache = crate::fetch_cache::FetchCache::at(root.clone());
+        let server = origin::Origin::start(origin::Spec::linked(OPAQUE));
+        let url = server.url("/file");
+        let first = tempfile::tempdir().unwrap();
+        fetch_with(first.path(), &url, Some(&cache), "").unwrap();
+
+        // One byte flipped, length unchanged — the mutation a size check would miss.
+        let object = sole_object(&root);
+        let mut rotted = std::fs::read(&object).unwrap();
+        *rotted.last_mut().unwrap() ^= 0b0000_0001;
+        std::fs::write(&object, &rotted).unwrap();
+
+        let second = tempfile::tempdir().unwrap();
+        fetch_with(second.path(), &url, Some(&cache), "").unwrap();
+
+        assert_eq!(
+            std::fs::read(artifact(second.path())).unwrap(),
+            origin::PAYLOAD,
+            "the second Protocol got the artifact, not the rot"
+        );
+        assert_eq!(
+            server.bytes_served(),
+            origin::PAYLOAD.len() * 2,
+            "which cost a transfer, as it must"
+        );
+        // The rot is gone: refused, evicted, and replaced by what the transfer
+        // brought back — so the store heals rather than staying poisoned.
+        assert_eq!(
+            std::fs::read(sole_object(&root)).unwrap(),
+            origin::PAYLOAD,
+            "the object filed under the key is not the bytes that failed it"
+        );
+    }
+
+    // A `.arcmeta` is a file inside a Protocol, so its `sha256` is chosen by whoever
+    // authored the tree — and that field becomes the shared store's key, which is a
+    // path. Run one Protocol holding a poisoned sidecar, then a second naming the same
+    // URL, and the second used to unlink whatever the first pointed at: a fetch-only
+    // Protocol, exit 0, no message. Nothing outside the store may be touched.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn a_poisoned_sidecar_cannot_make_a_second_protocol_delete_a_file() {
+        let server = origin::Origin::start(origin::Spec::linked(OPAQUE));
+        let url = server.url("/file");
+        let (_store, cache) = shared_cache();
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        let victim = elsewhere.path().join("important.txt");
+        let contents = b"someone else's work";
+        std::fs::write(&victim, contents).unwrap();
+
+        // The first Protocol holds the artifact and a sidecar whose `sha256` is that
+        // file's path rather than a digest. `Path::join` replaces the path it is given
+        // when the argument is absolute, so this key escapes `<root>/objects` outright.
+        let first = tempfile::tempdir().unwrap();
+        let out = artifact(first.path());
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        std::fs::write(&out, origin::PAYLOAD).unwrap();
+        crate::ingress_meta::write(
+            &out,
+            &crate::ingress_meta::FetchMeta {
+                url: url.clone(),
+                etag: Some(OPAQUE.to_string()),
+                sha256: victim.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Its next run revalidates, gets a `304`, keeps its bytes — and offers the
+        // sidecar to the shared store, which is where the key gets in.
+        fetch_with(first.path(), &url, Some(&cache), "").unwrap();
+        assert!(
+            !cache.holds(&url),
+            "a locator was filed under a key that is not a digest"
+        );
+
+        // A second Protocol names the same URL. Its lookup is what used to evict.
+        let second = tempfile::tempdir().unwrap();
+        fetch_with(second.path(), &url, Some(&cache), "").unwrap();
+
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            contents,
+            "a fetch deleted a file outside the cache root"
+        );
+        assert_eq!(
+            std::fs::read(artifact(second.path())).unwrap(),
+            origin::PAYLOAD,
+            "and the second Protocol still got its artifact"
+        );
+    }
+
+    // A transfer that does not match the pin is refused before it lands: the manifest
+    // said which artifact it wanted, and this is not it.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn a_transfer_that_misses_the_pin_is_refused() {
+        let server = origin::Origin::start(origin::Spec::linked(OPAQUE));
+        let dir = tempfile::tempdir().unwrap();
+        let wrong = crate::state::content_hash(b"some other artifact entirely");
+
+        let err = fetch_with(
+            dir.path(),
+            &server.url("/file"),
+            None,
+            &format!("sha256: {wrong}"),
+        )
+        .expect_err("a pin the bytes miss must fail the step");
+        assert!(
+            matches!(err, Error::StepExecution { .. }),
+            "and must not be retried: {err:?}"
+        );
+        assert!(!artifact(dir.path()).exists(), "nothing lands");
+        assert!(
+            !dir.path().join("build/artifact.part").exists(),
+            "and no partial file is left to be read"
+        );
+    }
+
+    // A pin that cannot be a SHA-256 is a manifest error, caught where every other
+    // `with:` mistake is — at load, by `assets`, before a run starts.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn a_malformed_pin_is_a_load_time_manifest_error() {
+        let with: Value = serde_yaml::from_str(
+            "url: https://x.invalid/a.parquet\nout: build/a.parquet\nsha256: deadbeef",
+        )
+        .unwrap();
+        let err = assets_for("http_fetch", Some(&with)).expect_err("a bad pin is refused");
+        assert!(matches!(err, Error::ManifestValidation(_)), "{err:?}");
+        assert!(err.to_string().contains("64 hex characters"), "{err}");
+    }
+
+    // Bytes behind a credential belong to the credential, not to the URL, and this
+    // store is keyed by URL. So a credentialed fetch neither fills it nor reads it.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn a_credentialed_fetch_is_not_shared() {
+        let server = origin::Origin::start(origin::Spec::linked(OPAQUE));
+        let url = server.url("/file");
+        let (_store, cache) = shared_cache();
+        let dir = tempfile::tempdir().unwrap();
+
+        fetch_with(
+            dir.path(),
+            &url,
+            Some(&cache),
+            "headers:\n  Authorization: 'Bearer hunter2'\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(artifact(dir.path())).unwrap(),
+            origin::PAYLOAD
+        );
+        assert!(
+            !cache.holds(&url),
+            "a credentialed fetch must not seed the store"
+        );
+    }
+
+    // A Protocol that already holds the artifact seeds the store from it, so the cache
+    // arriving mid-corpus does not cost a re-download of what is already on disk.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn an_existing_artifact_seeds_the_store_on_the_next_run() {
+        let server = origin::Origin::start(origin::Spec::linked(OPAQUE));
+        let url = server.url("/file");
+        let first = tempfile::tempdir().unwrap();
+
+        // Fetched before there was a cache to file it in.
+        fetch_with(first.path(), &url, None, "").unwrap();
+        let (_store, cache) = shared_cache();
+        assert!(!cache.holds(&url));
+
+        // The next run of the same Protocol revalidates, keeps its bytes, and files
+        // them.
+        fetch_with(first.path(), &url, Some(&cache), "").unwrap();
+        assert!(
+            cache.holds(&url),
+            "the store is seeded from what was already there"
+        );
+
+        let second = tempfile::tempdir().unwrap();
+        fetch_with(second.path(), &url, Some(&cache), "").unwrap();
+        assert_eq!(
+            server.bytes_served(),
+            origin::PAYLOAD.len(),
+            "so a second Protocol transfers nothing"
+        );
+        assert_same_result(first.path(), second.path());
+    }
+
+    // The store files a locator under the record's own `url`, and the record a keeping
+    // Protocol offers it is `<out>.arcmeta` — a file inside that Protocol. So a
+    // Protocol whose only step fetches its OWN origin could name a third party's URL in
+    // the sidecar and have the store file that URL against bytes nobody fetched from
+    // it. Exit 0, no warning, and the next Protocol to name the URL for real is served
+    // them under a sidecar carrying the genuine URL and the genuine validator.
+    //
+    // Two loopback origins, because the whole defect is the gap between the URL the
+    // step names and the URL the sidecar does.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn a_sidecar_cannot_seed_the_store_for_a_url_the_step_did_not_name() {
+        const SUBSTITUTED: &[u8] = b"bytes the genuine origin never served";
+
+        let hostile_origin = origin::Origin::start(origin::Spec::linked(OPAQUE));
+        let genuine_origin = origin::Origin::start(origin::Spec::linked(OPAQUE));
+        let hostile_url = hostile_origin.url("/file");
+        let genuine_url = genuine_origin.url("/file");
+
+        let store = tempfile::tempdir().unwrap();
+        let root = store.path().join("cache");
+        let cache = crate::fetch_cache::FetchCache::at(root.clone());
+
+        // One `http_fetch`, of its own origin. It holds its own bytes already, so the
+        // conditional request is answered `304` and the keep-and-seed path runs.
+        let hostile = tempfile::tempdir().unwrap();
+        protocol_claiming(hostile.path(), &genuine_url, SUBSTITUTED);
+        fetch_with(hostile.path(), &hostile_url, Some(&cache), "").unwrap();
+
+        assert!(
+            !cache.holds(&genuine_url),
+            "a Protocol that never fetched that URL filed the store's locator for it"
+        );
+        assert_eq!(
+            sole_locator(&root).1.url,
+            hostile_url,
+            "the store may only be told about the URL the step named"
+        );
+
+        // What a later Protocol gets for the genuine URL, against what it gets with no
+        // store at all — the parity a cached run owes an uncached one, which is the
+        // acceptance this defect fails as well as the substitution itself.
+        let served = tempfile::tempdir().unwrap();
+        fetch_with(served.path(), &genuine_url, Some(&cache), "").unwrap();
+        assert_eq!(
+            std::fs::read(artifact(served.path())).unwrap(),
+            origin::PAYLOAD,
+            "a later Protocol was served the substituted bytes"
+        );
+        let uncached = tempfile::tempdir().unwrap();
+        fetch_with(uncached.path(), &genuine_url, None, "").unwrap();
+        assert_same_result(served.path(), uncached.path());
+    }
+
+    // The declared-content-hash shortcut decides on `sha256`, which the store has
+    // hashed against the object's bytes, and not on `content_sha256` — a value copied
+    // from a response head into a `.arcmeta`, which is plain YAML inside a Protocol
+    // directory that anything able to write a file can author.
+    //
+    // The two differ when the verified hash says the bytes are not the declared
+    // artifact, so a shortcut that accepts the claim keeps bytes it has just been told
+    // are the wrong ones — here in both directions. A Protocol holding substituted
+    // bytes answers the origin's declaration with a copy of the declaration, skips the
+    // transfer, keeps the substitution and files it in the shared store for the URL its
+    // step named; the next Protocol to name that URL is handed the same match and
+    // served the substituted bytes.
+    //
+    // Neither half needs a `304` or a live validator: the sidecar's `ETag` here is
+    // worthless and this origin ignores conditional requests, so the shortcut is the
+    // whole of what decides.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn a_declared_content_hash_is_matched_against_verified_bytes_only() {
+        const SUBSTITUTED: &[u8] = b"bytes the genuine origin never served";
+
+        let digest = payload_digest();
+        let server =
+            origin::Origin::start(origin::Spec::linked_unconditional(&format!("\"{digest}\"")));
+        let url = server.url("/file");
+        let (_store, cache) = shared_cache();
+
+        // A Protocol whose artifact is not what the origin serves, beside a sidecar
+        // declaring the origin's own published content hash for it.
+        let seeding = tempfile::tempdir().unwrap();
+        let out = artifact(seeding.path());
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        std::fs::write(&out, SUBSTITUTED).unwrap();
+        crate::ingress_meta::write(
+            &out,
+            &crate::ingress_meta::FetchMeta {
+                url: url.clone(),
+                etag: Some("\"stale-and-worthless\"".to_string()),
+                sha256: crate::state::content_hash(SUBSTITUTED),
+                content_sha256: Some(digest.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        fetch_with(seeding.path(), &url, Some(&cache), "").unwrap();
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            origin::PAYLOAD,
+            "the transfer was skipped on a claim the sidecar made about itself"
+        );
+        assert_eq!(
+            cache.lookup(&url).map(|e| e.sha256),
+            Some(digest.clone()),
+            "and the shared store was seeded with bytes the origin never served"
+        );
+
+        // What a second Protocol naming the same URL is served, against what it gets
+        // with no store at all.
+        let served = tempfile::tempdir().unwrap();
+        fetch_with(served.path(), &url, Some(&cache), "").unwrap();
+        assert_eq!(
+            std::fs::read(artifact(served.path())).unwrap(),
+            origin::PAYLOAD,
+            "a second Protocol was served the substituted bytes"
+        );
+        let uncached = tempfile::tempdir().unwrap();
+        fetch_with(uncached.path(), &url, None, "").unwrap();
+        assert_same_result(served.path(), uncached.path());
+    }
+
+    // The guard that decides whether to seed and the write it guards have to ask about
+    // the same URL. While the write took the sidecar's `url` and the guard asked about
+    // the step's, the guard's answer could never become true — so a Protocol that keeps
+    // its bytes re-filed the store on every single run.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn a_seeded_store_is_not_re_filed_on_every_run() {
+        const KEPT: &[u8] = b"bytes this Protocol already had";
+
+        let hostile_origin = origin::Origin::start(origin::Spec::linked(OPAQUE));
+        let genuine_origin = origin::Origin::start(origin::Spec::linked(OPAQUE));
+        let hostile_url = hostile_origin.url("/file");
+
+        let store = tempfile::tempdir().unwrap();
+        let root = store.path().join("cache");
+        let cache = crate::fetch_cache::FetchCache::at(root.clone());
+
+        let dir = tempfile::tempdir().unwrap();
+        protocol_claiming(dir.path(), &genuine_origin.url("/file"), KEPT);
+        fetch_with(dir.path(), &hostile_url, Some(&cache), "").unwrap();
+
+        // Stamp the entry the first run filed. A second write rewrites the record
+        // wholesale, so the stamp surviving is the proof the store was left alone.
+        let (locator, mut filed) = sole_locator(&root);
+        filed.etag = Some("\"filed-once\"".to_string());
+        std::fs::write(&locator, serde_yaml::to_string(&filed).unwrap()).unwrap();
+
+        fetch_with(dir.path(), &hostile_url, Some(&cache), "").unwrap();
+        assert_eq!(
+            sole_locator(&root).1.etag,
+            filed.etag,
+            "the store was filed again by a run that had nothing new to tell it"
+        );
     }
 }
