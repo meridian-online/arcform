@@ -187,6 +187,11 @@ pub fn run_with_params(
     let staleness = compute_staleness(&manifest, dir, state, &asset_graph, force, &env_map)?;
 
     let db_path = manifest.db_path(dir);
+    // The shared fetch cache, resolved once for the run and handed to every operator
+    // step. `None` when `$ARCFORM_FETCH_CACHE` says `off` or there is no home
+    // directory to put it in — a run without one behaves as every run did before the
+    // cache existed, which is the comparison the cache is held to.
+    let fetch_cache = crate::fetch_cache::FetchCache::from_env();
     let total = manifest.steps.len();
     let mut succeeded = 0;
     let mut executed = 0;
@@ -375,6 +380,7 @@ pub fn run_with_params(
                                 db_path: db_path.as_path(),
                                 env: &env_map,
                                 timeout: step_timeout,
+                                cache: fetch_cache.as_ref(),
                             };
                             let with = step.with.clone().unwrap_or(serde_yaml::Value::Null);
                             op.run(&with, &ctx)

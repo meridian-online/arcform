@@ -90,7 +90,7 @@ const EXPORTED: [(&str, &str); 31] = [
 
 /// Every module file in the crate. Frozen so a new one cannot be added without
 /// passing under the checks below.
-const MODULE_FILES: [&str; 28] = [
+const MODULE_FILES: [&str; 29] = [
     "asset.rs",
     "bridge.rs",
     "cli.rs",
@@ -98,6 +98,9 @@ const MODULE_FILES: [&str; 28] = [
     "edit.rs",
     "engine.rs",
     "error.rs",
+    // The shared fetch cache: one transfer per URL however many Protocols want it.
+    // Private to the crate — a store is a run-time facility, not a schema.
+    "fetch_cache.rs",
     "history.rs",
     "ingress_meta.rs",
     "introspect.rs",

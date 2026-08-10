@@ -1,11 +1,9 @@
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::Path;
 use std::time::SystemTime;
 
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 use crate::ingress_meta::FetchMeta;
@@ -258,7 +256,7 @@ fn local_copy_refusal(file_path: &Path, meta: &FetchMeta) -> Option<String> {
             file_path.display()
         ));
     }
-    let on_disk = match hash_file(file_path) {
+    let on_disk = match crate::fetch_cache::hash_file(file_path) {
         Ok(hex) => hex,
         Err(e) => {
             return Some(format!(
@@ -285,33 +283,17 @@ fn local_copy_refusal(file_path: &Path, meta: &FetchMeta) -> Option<String> {
 /// sends. With the sidecar still in place `http_fetch` replays its `ETag` as an
 /// `If-None-Match`, a byte-identical remote answers `304`, and the operator keeps the
 /// file it already has — the file this gate just refused. Removing the sidecar removes
-/// the validator, so the `GET` is unconditional and the bytes on disk are replaced.
+/// the *local* validator, and the refused bytes are then replaced by whichever source
+/// still has them: the shared fetch cache, whose copy is verified against its content
+/// hash on the way out, or — where nothing is cached — an unconditional `GET`.
 fn discard_sidecar(file_path: &Path) -> String {
     match crate::ingress_meta::remove(file_path) {
-        Ok(()) => "; its .arcmeta is discarded, so the re-fetch is unconditional".to_string(),
+        Ok(()) => "; its .arcmeta is discarded, so the re-fetch replaces these bytes".to_string(),
         Err(e) => format!(
             "; its .arcmeta could not be discarded ({e}), \
              so the re-fetch may be answered with a 304 and leave these bytes in place"
         ),
     }
-}
-
-/// SHA-256 hex digest of a file's bytes, read in fixed-size chunks so peak memory does
-/// not scale with the artifact. Same digest and same hex representation as
-/// [`crate::state::content_hash`] over the whole byte slice — pinned by
-/// `test_fresh_hash_file_matches_content_hash`.
-fn hash_file(path: &Path) -> std::io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Evaluate all preconditions for a step. Returns Ok(true) if ALL pass (step is fresh).
@@ -774,6 +756,17 @@ mod tests {
     // — the same operator the runner invokes for the step the gate has just un-skipped.
     #[cfg(feature = "http-fetch")]
     fn http_fetch_into(dir: &Path, url: &str) {
+        http_fetch_into_with_cache(dir, url, None);
+    }
+
+    // The same fetch, with a shared cache in the context — the runner's arrangement
+    // when `$ARCFORM_FETCH_CACHE` is not `off`.
+    #[cfg(feature = "http-fetch")]
+    fn http_fetch_into_with_cache(
+        dir: &Path,
+        url: &str,
+        cache: Option<&crate::fetch_cache::FetchCache>,
+    ) {
         use crate::operator::OpContext;
 
         let with: serde_yaml::Value =
@@ -789,6 +782,7 @@ mod tests {
                     db_path: &db,
                     env: &env,
                     timeout: None,
+                    cache,
                 },
             )
             .expect("the fetch succeeds");
@@ -818,7 +812,9 @@ mod tests {
     // lying, so the step's re-fetch has no validator to replay, the server sends bytes
     // instead of a `304`, and the corrupted artifact on disk is replaced. Then the
     // rewritten sidecar matches the new bytes, so the next run passes the gate — the cost
-    // is one full download, not one refusal per run for ever.
+    // is one full download, not one refusal per run for ever. This run has no shared
+    // fetch cache; where one holds the same URL the repair costs no download at all,
+    // which is the test below.
     #[cfg(feature = "http-fetch")]
     #[test]
     fn test_fresh_refusal_forces_an_unconditional_refetch_that_replaces_the_bytes() {
@@ -859,6 +855,54 @@ mod tests {
             local_copy_refusal(&out, &rewritten).is_none(),
             "the repaired artifact passes the gate"
         );
+    }
+
+    // The same repair with a shared fetch cache holding the URL: the sidecar still
+    // goes, but the validator the re-fetch replays is the store's, so the origin
+    // answers `304` and the refused bytes are replaced from a copy verified against
+    // its content hash. The gate's message says "replaces these bytes" rather than
+    // "downloads" because of this route.
+    #[cfg(feature = "http-fetch")]
+    #[test]
+    fn test_fresh_refusal_is_repaired_from_the_shared_cache_without_a_download() {
+        let good = b"cik,lei\n0000320193,HWUPKR0MPOU8FGXBT394\n";
+        let corrupt = b"cik,lei\n0000320193,HWUPKR0MPOU8FGXBT395\n";
+        let (url, requests) = etag_server(good);
+        let store = tempfile::tempdir().unwrap();
+        let cache = crate::fetch_cache::FetchCache::at(store.path().join("cache"));
+
+        // Another Protocol fetched these bytes, so the store holds them.
+        let seeded = tempfile::tempdir().unwrap();
+        http_fetch_into_with_cache(seeded.path(), &url, Some(&cache));
+        assert!(cache.holds(&url));
+
+        // This Protocol's copy has rotted.
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("data.parquet");
+        fetched_then_replaced(dir.path(), &url, good, corrupt);
+        assert!(
+            !fresh("data.parquet")
+                .evaluate(dir.path(), "test-step", &empty_env())
+                .unwrap(),
+            "a corrupted artifact must not pass the gate"
+        );
+
+        requests.lock().unwrap().clear();
+        http_fetch_into_with_cache(dir.path(), &url, Some(&cache));
+
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![true],
+            "the re-fetch was conditional, so the server answered 304 and sent no body"
+        );
+        assert_eq!(
+            fs::read(&out).unwrap(),
+            good,
+            "and the rotted bytes are replaced from the store"
+        );
+        let rewritten = crate::ingress_meta::read(&out).expect("the sidecar is rewritten");
+        assert_eq!(rewritten.sha256, crate::state::content_hash(good));
+        assert!(local_copy_refusal(&out, &rewritten).is_none());
     }
 
     // A sidecar with no `sha256` is the pre-field case, and it is repaired the same way:
@@ -996,22 +1040,6 @@ mod tests {
         assert!(
             msg.contains("the remote was not consulted"),
             "clears the remote: {msg}"
-        );
-    }
-
-    // The chunked file hash and the whole-slice hash agree, so the gate compares like
-    // with like against a sidecar written by the fetch.
-    #[test]
-    fn test_fresh_hash_file_matches_content_hash() {
-        let dir = tempfile::tempdir().unwrap();
-        // Longer than the 64 KiB read buffer, so more than one chunk is fed to the hasher.
-        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
-        let out = dir.path().join("big.bin");
-        fs::write(&out, &bytes).unwrap();
-        assert_eq!(
-            hash_file(&out).unwrap(),
-            crate::state::content_hash(&bytes),
-            "chunked and whole-slice digests agree"
         );
     }
 
