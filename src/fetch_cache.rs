@@ -163,8 +163,8 @@ impl FetchCache {
     /// Copy a verified object into `out`, atomically: the bytes land in a sibling
     /// temp file and are renamed over `out`, so an interrupted materialisation never
     /// leaves a Protocol holding half an artifact. A failed copy and a digest mismatch
-    /// each unlink the temp file on the way out; the rename is what leaves it, under
-    /// its final name. A Protocol directory is a working tree, and a `.part` left in
+    /// each unlink the temp file on the way out. A failed rename does not, and leaves
+    /// it as `.part`. A Protocol directory is a working tree, and a `.part` left in
     /// one is a file `git status` reports and no later run clears.
     ///
     /// The copy re-hashes as it reads, which closes the window between
