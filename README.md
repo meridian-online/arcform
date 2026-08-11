@@ -8,13 +8,29 @@ Arcform is a Rust-based workflow engine built for data analysts who want the pow
 
 ## Design Principles
 
-**Local-first.** Arcform runs on your machine with no external dependencies. No managed services, no cloud accounts, no ops overhead. Suitable for air-gapped environments and reproducible local development.
+**Local-first.** Arcform runs on your machine: no managed services, no cloud accounts, no ops overhead. What it does need is the `duckdb` CLI on `PATH`, and whatever binaries your steps invoke.
 
 **Asset-aware.** Inspired by Dagster's software-defined asset model, Arcform treats data outputs — not tasks — as the primary unit of work. The pipeline graph reflects data dependencies, not just execution order.
 
 **Structurally transparent.** A SQL step is not a black box. Using the DataFusion SQL parser, Arcform can inspect and decompose queries into their constituent parts — load operations, CTE dependencies, and export targets — enabling fine-grained lineage and partial re-execution.
 
 **Composable by design.** Pipelines are defined in YAML and composed from discrete, reusable steps. Each stage has a clear input contract and output contract.
+
+---
+
+## Execution model
+
+Arcform runs your steps on your machine, as you. There is no sandbox, no container and no allowlist — **running a Protocol you did not write is running a shell script you did not read.** This is deliberate; the table names the fields it covers.
+
+| Field | How Arcform runs it |
+| --- | --- |
+| `command:` on a step | `sh -c <command>` |
+| `command:` on a precondition | `sh -c <command>`, evaluated while Arcform works out what is stale — so it runs even when the step it guards is then skipped |
+| `command:` on a hook (`on_init`, `on_success`, `on_failure`, `on_exit`) | `sh -c <command>`, the same path as a step |
+| `sql:` on a step or hook | passed to the `duckdb` CLI, which reads and writes whatever the SQL directs |
+| `op:` on a step | a catalog operator: in this process, or `uv run --script` on a script embedded in the `arc` binary — which may spawn tools of its own (`datapackage_describe` runs `finetype`). No shell, and no confinement either |
+
+Each of those inherits the environment Arcform assembled, including the `ARC_PARAM_*` values from `params:`, your dotenv files and `--param` — and the stdout of any earlier step that declared `output:`, which is captured into `ARC_PARAM_<OUTPUT>` for everything that runs after it. `arc registry run` fetches a Protocol and runs it through the same path, so read one before you run it.
 
 ---
 
