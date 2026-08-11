@@ -11,6 +11,29 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Added
 
+- **`parquet_export` can stamp key-value metadata into the Parquet footer** — a new
+  optional `metadata:` mapping on the operator's `with:` block, written through
+  DuckDB's `KV_METADATA` copy option, so a dataset arcform writes can carry a
+  description inside the file rather than only in a sidecar. Keys and values are
+  strings written as their UTF-8 bytes; Parquet's footer map is untyped, so DuckDB
+  reads them back as `BLOB` and `decode(key)` / `decode(value)` over
+  `parquet_kv_metadata()` recovers the text — a `::VARCHAR` cast does not, it yields
+  DuckDB's escaped rendering. The operator takes no view on what the keys mean.
+  Entries are emitted in sorted key order (the config is a `BTreeMap`), because
+  DuckDB writes the map into the footer in the order given and an unordered map
+  would move the output bytes between runs.
+
+  **Effect on output bytes, measured rather than assumed.** An export declaring no
+  `metadata:` — or an empty map — emits no `KV_METADATA` option at all and is
+  byte-identical to what the operator produced before, so no existing output moves.
+  An export that does declare metadata necessarily changes the file and therefore
+  its hash, but the change is confined to the footer: every data page is
+  byte-identical, and the same stamp twice is the same file, so the `order_by`
+  clause still buys the reproducibility it was added for. A publish step that pins
+  the hash of a file that starts being stamped re-pins it once, not on every run.
+  An empty map has to take the no-metadata path in any case: DuckDB rejects
+  `KV_METADATA {}` as a syntax error.
+
 - **Local history + machine-edit checkpoints** — the middle tier between editor undo
   and version control, and the tier that makes machine edits safe to accept. Saves
   record debounced, bounded snapshots of `arcform.yaml` under `~/.arcform/history`
