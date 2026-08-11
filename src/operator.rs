@@ -14,8 +14,9 @@
 //! JSON-Schema emission for Brightfield authoring forms is a later addition.
 
 use std::collections::HashMap;
-// Only the fetch operators' `headers` maps use `BTreeMap`, and each is feature-gated.
-#[cfg(any(feature = "http-fetch", feature = "opendal"))]
+// `BTreeMap` — not `HashMap` — wherever the map's iteration order reaches an output:
+// the fetch operators' `headers`, and `parquet_export`'s `metadata`, whose order is
+// written verbatim into the Parquet footer and so into the file's hash.
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -198,7 +199,12 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
                 "dest": { "type": "string", "description": "Destination Parquet path, relative to the protocol directory." },
                 "compression": { "type": "string", "description": "Parquet codec.", "default": "zstd" },
                 "row_group_size": { "type": "integer", "minimum": 0, "description": "Optional Parquet row-group size." },
-                "order_by": { "type": "string", "description": "Optional ORDER BY clause applied to the export." }
+                "order_by": { "type": "string", "description": "Optional ORDER BY clause applied to the export." },
+                "metadata": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "Key-value metadata stamped into the Parquet footer. Keys and values are strings, written as UTF-8 bytes; read them back with decode(key)/decode(value) over parquet_kv_metadata(), since Parquet stores them untyped and DuckDB returns BLOB. Entries are emitted in sorted key order. Declaring any metadata changes the file's bytes and so its hash; declaring none leaves the output unchanged."
+                }
             }),
             &["input", "dest"],
         ),
@@ -323,6 +329,21 @@ mod with_schema_tests {
             .filter_map(|v| v.as_str())
             .collect();
         assert!(required.contains(&"input") && required.contains(&"dest"));
+
+        // `metadata` is optional, and an authoring form has to know it is a
+        // string→string mapping: the config is `BTreeMap<String, String>`, so a
+        // form offering any other value type builds a `with:` block that will not
+        // deserialize.
+        let metadata = &schema["properties"]["metadata"];
+        assert_eq!(metadata["type"], "object", "`metadata` must be an object");
+        assert_eq!(
+            metadata["additionalProperties"]["type"], "string",
+            "`metadata` values must be declared as strings"
+        );
+        assert!(
+            !required.contains(&"metadata"),
+            "`metadata` must stay optional — an export declaring none must remain valid"
+        );
     }
 }
 
@@ -464,6 +485,24 @@ struct ParquetExportConfig {
     /// Optional `ORDER BY` clause applied to the export.
     #[serde(default)]
     order_by: Option<String>,
+    /// Optional Parquet **key-value metadata**, written into the file's footer.
+    ///
+    /// Keys and values are both strings and are written as their **UTF-8 bytes**.
+    /// Parquet's footer map is untyped bytes, so DuckDB reads them back as `BLOB`:
+    /// `SELECT decode(key), decode(value) FROM parquet_kv_metadata('f.parquet')`
+    /// recovers the strings. **`value::VARCHAR` does not** — casting a `BLOB` to
+    /// `VARCHAR` yields DuckDB's escaped rendering (`"` becomes `\x22`), not the
+    /// text that was written. `decode()` is the read-back.
+    ///
+    /// Deliberately untyped: this operator carries whatever a protocol wants
+    /// stamped and takes no view on what the keys mean.
+    ///
+    /// A `BTreeMap`, so the entries are emitted in sorted key order however the
+    /// `with:` block lists them. Parquet stores the map as an ordered list and
+    /// DuckDB writes it in the order given, so an unordered map here would move
+    /// the output bytes between runs. See [`parquet_export_sql`].
+    #[serde(default)]
+    metadata: BTreeMap<String, String>,
 }
 
 fn default_zstd() -> String {
@@ -476,6 +515,56 @@ impl ParquetExportConfig {
             Error::ManifestValidation(format!("parquet_export: invalid `with:` config: {}", e))
         })
     }
+}
+
+/// A DuckDB single-quoted string literal: wrap in `'` and double any interior `'`.
+///
+/// That is the whole escape — a plain `'…'` literal in DuckDB processes no backslash
+/// escapes (unlike `E'…'`), so a backslash, a newline and a `"` all pass through as
+/// themselves. Verified against DuckDB 1.5.4 for `\`, LF and `"`.
+fn sql_string_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Build the `COPY … TO … (…)` statement a `parquet_export` step executes.
+///
+/// Split out of [`Operator::run`] so the statement — and above all its option list,
+/// which is where the output bytes are decided — is testable without a DuckDB
+/// connection or a written file.
+///
+/// **Byte-reproducibility.** An export declaring no `metadata` emits no
+/// `KV_METADATA` option at all, so its statement is character-identical to the one
+/// this operator built before key-value metadata existed and its output bytes do not
+/// move. An export that does declare metadata necessarily changes the footer and so
+/// the file's hash; the `order_by` clause that makes an export reproducible still
+/// does, because the entries are emitted in sorted key order. An empty map takes the
+/// no-metadata path for the same reason it must: DuckDB rejects `KV_METADATA {}` as a
+/// syntax error.
+fn parquet_export_sql(cfg: &ParquetExportConfig, dest: &Path) -> String {
+    let order = cfg
+        .order_by
+        .as_deref()
+        .map(|o| format!(" ORDER BY {}", o))
+        .unwrap_or_default();
+    let mut opts = format!("FORMAT parquet, COMPRESSION {}", cfg.compression);
+    if let Some(rg) = cfg.row_group_size {
+        opts.push_str(&format!(", ROW_GROUP_SIZE {}", rg));
+    }
+    if !cfg.metadata.is_empty() {
+        let entries: Vec<String> = cfg
+            .metadata
+            .iter()
+            .map(|(k, v)| format!("{}: {}", sql_string_literal(k), sql_string_literal(v)))
+            .collect();
+        opts.push_str(&format!(", KV_METADATA {{{}}}", entries.join(", ")));
+    }
+    format!(
+        "COPY (SELECT * FROM {input}{order}) TO '{dest}' ({opts});",
+        input = cfg.input,
+        order = order,
+        dest = dest.display(),
+        opts = opts,
+    )
 }
 
 impl Operator for ParquetExport {
@@ -502,22 +591,7 @@ impl Operator for ParquetExport {
             let _ = std::fs::create_dir_all(parent);
         }
 
-        let order = cfg
-            .order_by
-            .as_deref()
-            .map(|o| format!(" ORDER BY {}", o))
-            .unwrap_or_default();
-        let mut opts = format!("FORMAT parquet, COMPRESSION {}", cfg.compression);
-        if let Some(rg) = cfg.row_group_size {
-            opts.push_str(&format!(", ROW_GROUP_SIZE {}", rg));
-        }
-        let sql = format!(
-            "COPY (SELECT * FROM {input}{order}) TO '{dest}' ({opts});",
-            input = cfg.input,
-            order = order,
-            dest = dest.display(),
-            opts = opts,
-        );
+        let sql = parquet_export_sql(&cfg, &dest);
 
         let conn = duckdb::Connection::open(ctx.db_path).map_err(|e| Error::StepFailed {
             step: String::new(),
@@ -2343,6 +2417,317 @@ mod tests {
         // unknown field
         let with: Value = serde_yaml::from_str("input: t\ndest: o.parquet\nbogus: 1").unwrap();
         assert!(assets_for("parquet_export", Some(&with)).is_err());
+    }
+
+    // ── parquet_export key-value metadata ────────────────────────────────────
+    //
+    // The statement tests below build the SQL and never touch a file; the three
+    // that follow them write real Parquet and compare bytes. Both halves are
+    // needed: the statement tests say what was asked for, and only the byte tests
+    // say what landed in the footer.
+
+    /// Config helper — parse a `with:` block into the typed config.
+    fn pq_cfg(yaml: &str) -> ParquetExportConfig {
+        ParquetExportConfig::parse(&serde_yaml::from_str::<Value>(yaml).unwrap()).unwrap()
+    }
+
+    /// An export declaring no metadata emits the statement this operator
+    /// built before key-value metadata existed, character for character. Pinned as
+    /// a literal rather than rebuilt from the config, so a change to the option
+    /// list cannot quietly agree with itself.
+    #[test]
+    fn parquet_export_sql_without_metadata_is_unchanged() {
+        const UNSTAMPED: &str = "COPY (SELECT * FROM t ORDER BY id) TO '/tmp/o.parquet' \
+             (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 122880);";
+
+        // `metadata:` absent entirely.
+        let absent = pq_cfg(
+            "input: t\ndest: o.parquet\ncompression: zstd\nrow_group_size: 122880\norder_by: id",
+        );
+        assert_eq!(
+            parquet_export_sql(&absent, Path::new("/tmp/o.parquet")),
+            UNSTAMPED,
+            "an export with no `metadata:` must emit the pre-change statement"
+        );
+
+        // `metadata: {}` declared but empty takes the same path — and must, since
+        // DuckDB rejects `KV_METADATA {}` as a syntax error.
+        let empty = pq_cfg(
+            "input: t\ndest: o.parquet\ncompression: zstd\nrow_group_size: 122880\norder_by: id\nmetadata: {}",
+        );
+        assert_eq!(
+            parquet_export_sql(&empty, Path::new("/tmp/o.parquet")),
+            UNSTAMPED,
+            "an empty `metadata:` map must not emit a KV_METADATA option"
+        );
+    }
+
+    /// Declared metadata reaches the statement. This is the test that
+    /// reddens on a version that accepts the config and drops it.
+    #[test]
+    fn parquet_export_sql_stamps_declared_metadata() {
+        let cfg = pq_cfg("input: t\ndest: o.parquet\nmetadata:\n  descriptor: '{\"name\":\"x\"}'");
+        let sql = parquet_export_sql(&cfg, Path::new("/tmp/o.parquet"));
+        assert_eq!(
+            sql,
+            "COPY (SELECT * FROM t) TO '/tmp/o.parquet' \
+             (FORMAT parquet, COMPRESSION zstd, KV_METADATA {'descriptor': '{\"name\":\"x\"}'});",
+            "declared metadata must reach the COPY option list"
+        );
+    }
+
+    /// A value carrying an apostrophe must be escaped by doubling, or the statement
+    /// is a syntax error at best and an injection at worst.
+    #[test]
+    fn parquet_export_sql_escapes_quotes_in_keys_and_values() {
+        assert_eq!(sql_string_literal("it's"), "'it''s'");
+        // Backslash and double-quote are NOT escapes in a DuckDB `'…'` literal, so
+        // they must pass through untouched — escaping them would corrupt JSON.
+        assert_eq!(sql_string_literal(r#"{"a":"b\c"}"#), r#"'{"a":"b\c"}'"#);
+
+        let cfg = pq_cfg("input: t\ndest: o.parquet\nmetadata:\n  \"it's\": \"o'clock\"");
+        let sql = parquet_export_sql(&cfg, Path::new("/tmp/o.parquet"));
+        assert!(
+            sql.contains("KV_METADATA {'it''s': 'o''clock'}"),
+            "quotes must be doubled in both key and value; got: {sql}"
+        );
+    }
+
+    /// The entries are emitted in sorted key order however the `with:` block
+    /// lists them. DuckDB writes the map into the footer in the order given, so an
+    /// unordered map would move the file's bytes between runs and destroy the
+    /// reproducibility `order_by` exists to provide.
+    #[test]
+    fn parquet_export_metadata_emits_in_sorted_key_order() {
+        let declared_forwards =
+            pq_cfg("input: t\ndest: o.parquet\nmetadata:\n  aaa: '1'\n  zzz: '2'");
+        let declared_backwards =
+            pq_cfg("input: t\ndest: o.parquet\nmetadata:\n  zzz: '2'\n  aaa: '1'");
+        let forwards = parquet_export_sql(&declared_forwards, Path::new("/tmp/o.parquet"));
+        let backwards = parquet_export_sql(&declared_backwards, Path::new("/tmp/o.parquet"));
+        assert_eq!(
+            forwards, backwards,
+            "declaration order must not reach the statement"
+        );
+        assert!(
+            forwards.contains("KV_METADATA {'aaa': '1', 'zzz': '2'}"),
+            "entries must be sorted by key; got: {forwards}"
+        );
+    }
+
+    /// The generated statement stays legible to SQL introspection: the vendored
+    /// sqlparser fork parses the open-ended `KV_METADATA` option and its struct
+    /// literal under the DuckDB dialect. Upstream 0.55.0 rejects the option list
+    /// outright, so this pins the fork's reach over the new syntax.
+    #[test]
+    fn parquet_export_sql_parses_under_the_duckdb_dialect() {
+        let cfg = pq_cfg(
+            "input: t\ndest: o.parquet\nrow_group_size: 122880\norder_by: id\nmetadata:\n  descriptor: '{\"name\":\"x\"}'",
+        );
+        let sql = parquet_export_sql(&cfg, Path::new("/tmp/o.parquet"));
+        let parsed =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::DuckDbDialect {}, &sql);
+        assert!(
+            parsed.is_ok(),
+            "the stamped COPY must parse under the DuckDB dialect, else introspection \
+             degrades the step to an opaque node; got: {parsed:?}\nsql: {sql}"
+        );
+    }
+
+    /// A pipeline DB with a two-column table, for the byte-level tests below.
+    ///
+    /// The rows are **stored out of key order** — `(i * 7919) % 1000` is a
+    /// permutation of `0..1000`, chosen over `hash(i)` so the scramble is fixed by
+    /// arithmetic rather than by a DuckDB internal. That is load-bearing, not
+    /// decoration: a fixture written in key order makes `order_by: id` a no-op, and
+    /// every claim below about the interaction between stamping and `order_by`
+    /// would hold vacuously. `parquet_export_stamping_moves_the_hash_but_only_the_footer`
+    /// asserts the scramble is real before it relies on it.
+    fn pq_fixture(dir: &Path) -> PathBuf {
+        let db = dir.join("pipeline.duckdb");
+        let conn = duckdb::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t AS SELECT i AS id, 'name' || i AS name \
+             FROM range(1000) AS r(i) ORDER BY (i * 7919) % 1000;",
+        )
+        .unwrap();
+        drop(conn);
+        db
+    }
+
+    /// Run `parquet_export` with the given `with:` block against `db`, returning the
+    /// written file's bytes.
+    fn pq_run(dir: &Path, db: &Path, with_yaml: &str) -> Vec<u8> {
+        let with: Value = serde_yaml::from_str(with_yaml).unwrap();
+        let env = HashMap::new();
+        let ctx = OpContext {
+            dir,
+            db_path: db,
+            env: &env,
+            timeout: None,
+            cache: None,
+        };
+        ParquetExport.run(&with, &ctx).unwrap();
+        let dest: String = serde_yaml::from_value::<ParquetExportConfig>(with)
+            .unwrap()
+            .dest;
+        std::fs::read(dir.join(dest)).unwrap()
+    }
+
+    /// The metadata is in the written file's footer, and comes back as the
+    /// UTF-8 it went in as. `decode()` is the read-back, not a `VARCHAR` cast: the
+    /// footer map is untyped bytes, so DuckDB hands it over as `BLOB` and casting
+    /// that to `VARCHAR` yields an escaped rendering rather than the text.
+    #[test]
+    fn parquet_export_writes_metadata_readable_off_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let db = pq_fixture(dir);
+
+        // A value with a quote, a brace and a non-ASCII character — the shapes a
+        // real descriptor carries.
+        let descriptor = r#"{"name":"café","note":"it's fine"}"#;
+        pq_run(
+            dir,
+            &db,
+            &format!(
+                "input: t\ndest: out/stamped.parquet\norder_by: id\nmetadata:\n  descriptor: '{}'\n  licence: CC-BY-4.0",
+                descriptor.replace('\'', "''")
+            ),
+        );
+
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let path = dir.join("out/stamped.parquet");
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT decode(key), decode(value) FROM parquet_kv_metadata('{}') ORDER BY 1",
+                path.display()
+            ))
+            .unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(
+            rows,
+            vec![
+                ("descriptor".to_string(), descriptor.to_string()),
+                ("licence".to_string(), "CC-BY-4.0".to_string()),
+            ],
+            "both entries must be readable off the footer as the UTF-8 that was written"
+        );
+    }
+
+    /// At the byte level — an export declaring no metadata produces the same
+    /// bytes as the statement this operator issued before the change. The reference
+    /// is not a checked-in golden but a COPY run through the same library in the
+    /// same process: the Parquet footer records the writing DuckDB's version
+    /// string, so a golden would pin the library, not this operator.
+    #[test]
+    fn parquet_export_without_metadata_is_byte_identical_to_the_prior_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let db = pq_fixture(dir);
+
+        // The reference: the exact statement `run` built before `metadata` existed.
+        let reference_path = dir.join("reference.parquet");
+        let conn = duckdb::Connection::open(&db).unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT * FROM t ORDER BY id) TO '{}' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 122880);",
+            reference_path.display()
+        ))
+        .unwrap();
+        drop(conn);
+        let reference = std::fs::read(&reference_path).unwrap();
+
+        let through_operator = pq_run(
+            dir,
+            &db,
+            "input: t\ndest: unstamped.parquet\ncompression: zstd\nrow_group_size: 122880\norder_by: id",
+        );
+        assert_eq!(
+            through_operator, reference,
+            "an unstamped export must be byte-identical to the pre-change COPY"
+        );
+
+        // And an explicitly empty map is the same file again.
+        let empty_map = pq_run(
+            dir,
+            &db,
+            "input: t\ndest: empty.parquet\ncompression: zstd\nrow_group_size: 122880\norder_by: id\nmetadata: {}",
+        );
+        assert_eq!(
+            empty_map, reference,
+            "an empty `metadata:` map must not move the output bytes"
+        );
+    }
+
+    /// What stamping costs, measured rather than assumed.
+    ///
+    /// Three claims, each checked: a stamped export is reproducible (same config,
+    /// same bytes), stamping changes the file and so its hash, and the change is
+    /// confined to the footer — every data page is byte-identical, so `order_by`
+    /// still buys exactly what it bought before. Any publish step that pins the
+    /// hash of a stamped file has to re-pin it once, not on every run.
+    #[test]
+    fn parquet_export_stamping_moves_the_hash_but_only_the_footer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let db = pq_fixture(dir);
+
+        let unstamped = "input: t\ndest: u.parquet\norder_by: id\nrow_group_size: 122880";
+        let stamped = "input: t\ndest: s.parquet\norder_by: id\nrow_group_size: 122880\nmetadata:\n  descriptor: DESCRIPTOR";
+        let stamped_again = "input: t\ndest: s2.parquet\norder_by: id\nrow_group_size: 122880\nmetadata:\n  descriptor: DESCRIPTOR";
+
+        let u = pq_run(dir, &db, unstamped);
+        let s = pq_run(dir, &db, stamped);
+        let s2 = pq_run(dir, &db, stamped_again);
+
+        // First: `order_by` is load-bearing on this fixture. The rows are stored
+        // out of key order, so the same export without the clause is a different
+        // file. Without this the footer-confinement assertion below would pass on a
+        // fixture where ORDER BY does nothing, and would be measuring nothing.
+        let unordered = pq_run(
+            dir,
+            &db,
+            "input: t\ndest: unordered.parquet\nrow_group_size: 122880",
+        );
+        assert_ne!(
+            unordered, u,
+            "the fixture must be stored out of key order, or `order_by` proves nothing here"
+        );
+
+        // Reproducible: the same stamp twice is the same file.
+        assert_eq!(
+            s, s2,
+            "a stamped export must be reproducible — same config, same bytes"
+        );
+        // But not the same file as the unstamped one: the hash moves.
+        assert_ne!(
+            u, s,
+            "stamping must change the file, or nothing was written to the footer"
+        );
+
+        // And the change is confined to the footer. Every byte up to the first
+        // difference is shared, and the difference lands past the last data page —
+        // located here as the start of the Parquet footer, which is the final
+        // 8 bytes (4-byte footer length + the `PAR1` magic) plus that length.
+        let footer_len = u32::from_le_bytes(u[u.len() - 8..u.len() - 4].try_into().unwrap());
+        let footer_start = u.len() - 8 - footer_len as usize;
+        let common = u.iter().zip(s.iter()).take_while(|(a, b)| a == b).count();
+        assert!(
+            common >= footer_start,
+            "stamping must not touch the data pages: files diverge at byte {common}, \
+             but the unstamped footer starts at {footer_start}"
+        );
+        assert!(
+            s.len() > u.len(),
+            "the stamped file must be the larger one: {} vs {}",
+            s.len(),
+            u.len()
+        );
     }
 
     #[test]
