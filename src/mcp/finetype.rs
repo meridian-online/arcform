@@ -480,22 +480,49 @@ mod tests {
         );
     }
 
-    /// Write an executable `finetype` into `dir` that answers `--version` with the
-    /// baked-in string and otherwise echoes its argv. Lets the gate be exercised
+    /// Point `dir/finetype` at the checked-in `finetype` stand-in
+    /// (`tests/fixtures/fake_finetype_dispatcher.sh`) so the gate can be exercised
     /// through the same subprocess call production uses, with no real binary.
+    ///
+    /// REMEDY TAKEN (of the available ones) and why, so nobody rediscovers the
+    /// race this replaced: the previous version wrote a fresh `#!/bin/sh` script
+    /// straight into `dir` with `std::fs::write` (open, write, implicit close)
+    /// and then exec'd that same path. `std::fs::write` closes its own handle
+    /// before returning, so nothing about THIS thread was unsound — but `cargo
+    /// test` runs hundreds of tests across parallel threads, and `fork()`
+    /// duplicates a process's *entire* file-descriptor table, from every thread,
+    /// at the instant it is called. If any OTHER thread called `fork()` (e.g. via
+    /// `Command::spawn` for a wholly unrelated subprocess — this crate has half a
+    /// dozen call sites) while this thread's write-handle on the fixture was
+    /// still open, the forked child inherited a duplicate of that writable
+    /// descriptor and held it open until ITS OWN exec completed. If this thread's
+    /// exec of the same fixture path landed inside that window, the kernel's
+    /// execve() refused with ETXTBSY ("Text file busy") — CI run 31676889338,
+    /// `src/mcp/finetype.rs:516`. The failing thread was never the one at fault,
+    /// which is why the failure moved around and why a bare re-run cleared it.
+    ///
+    /// A retry loop around the exec would have "fixed" the symptom without
+    /// touching the mechanism — it removes the signal (a real, rare failure
+    /// mode) rather than the flake, so it was rejected. The alternative taken
+    /// here removes the mechanism instead: `dir/finetype` is now a *symlink* to a fixture file
+    /// this process never writes at all. `symlink()` is a directory-entry
+    /// operation — it never opens its target for writing, so creating it can
+    /// never race anyone's fork. And the checked-in dispatcher it points at
+    /// exists on disk from the git checkout, before this test binary — let alone
+    /// its thread pool — is even loaded, so there is no window, ever, in which
+    /// any thread could hold it open for writing. The one thing still written
+    /// per call, the sidecar `version` file, is only ever *read* (by the
+    /// dispatcher, via `dirname "$0"`) — never exec'd — and ETXTBSY guards only
+    /// exec targets, so a concurrent fork racing that write is harmless.
     #[cfg(unix)]
     fn fake_finetype(dir: &std::path::Path, version: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
+        let dispatcher = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_finetype_dispatcher.sh"
+        ));
+        std::fs::write(dir.join("version"), version).unwrap();
         let path = dir.join("finetype");
-        std::fs::write(
-            &path,
-            format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"finetype {version}\"; exit 0; fi\necho \"ARGS: $@\"\n"
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(dispatcher, &path).unwrap();
         path
     }
 
