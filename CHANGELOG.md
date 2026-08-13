@@ -11,6 +11,20 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Added
 
+- **`datapackage_describe` stamps `x-finetype-version` into every descriptor it
+  writes** — the dotted version reported by the SAME `finetype` binary the step
+  already resolves and runs to type the columns, so a descriptor names the engine
+  that produced it and a stale one is visible by reading the file rather than by
+  trusting whatever produced it. The stamp is written after the curated
+  `descriptor.overrides.json` sidecar is merged in, so a sidecar cannot supply or
+  overwrite it — the field is machine-derived, not hand-curated. A new optional
+  `expect_finetype_version` on the operator's `with:` block (piped to describe.py's
+  `--expect-finetype-version`) pins a run to one exact release: unlike the existing
+  `--min-finetype-version` floor, which passes anything at or above it, a pin
+  refuses a NEWER binary too if it is not the one asked for, naming both versions
+  in the refusal. This replaces the shape of a per-dataset `stamp_finetype_version.py`
+  script that recorded the same fact after the fact, outside the step that ran
+  finetype — one change here now covers every descriptor the operator produces.
 - **A `tool:` precondition declares the external binary or artifact a step depends on**
   — a fourth precondition kind, beside `modified_after`, `fresh` and `command`. A
   step's staleness hash covers what the manifest says and nothing about the machine it

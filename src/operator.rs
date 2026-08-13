@@ -251,7 +251,8 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
             json!({
                 "parquet": { "type": "string", "description": "Built Parquet whose columns FineType types." },
                 "overrides": { "type": "string", "description": "Curated descriptor sidecar (JSON) overlaid onto FineType's base." },
-                "out": { "type": "string", "description": "datapackage.json to write." }
+                "out": { "type": "string", "description": "datapackage.json to write." },
+                "expect_finetype_version": { "type": "string", "description": "Pin the run to one exact finetype release. Refuses, naming both versions, unless the resolved `finetype` on PATH reports exactly this version." }
             }),
             &["parquet", "overrides", "out"],
         ),
@@ -1360,10 +1361,23 @@ impl Operator for OpendalFetch {
 // Python at the edges — the same posture as splink_resolve. describe.py itself has
 // no Python deps; it shells the `finetype` CLI (must be on PATH, as today).
 //
-// Verified byte-identical to the retired script on the live build, save the one field
-// `finetype` stamps itself — the per-run `created` timestamp (non-deterministic, and
-// pre-existing; the command step had it too). datapackage.json is metadata, not the
-// data; the parquet (the byte-equivalence target) is untouched by this op.
+// Verified byte-identical to the retired script on the live build, save two fields
+// `finetype` and this operator stamp themselves: the per-run `created` timestamp
+// (non-deterministic, and pre-existing; the command step had it too) and the new
+// `x-finetype-version` (deliberate — see below; it did not exist in the retired
+// script's output at all). datapackage.json is metadata, not the data; the parquet
+// (the byte-equivalence target) is untouched by this op.
+//
+// The version stamp is produced in describe.py, not here, even though the Rust side
+// is the one that decided to add it. describe.py is what already talks to `finetype`
+// — it resolves the binary on PATH to check the `--min-finetype-version` floor before
+// this operator existed — so the stamp reuses THAT SAME resolved version rather than
+// this operator shelling `finetype --version` a second, independent time (which could
+// in principle race a PATH change between the two calls, or between the operator's
+// check and the version finetype used to type the columns). The Rust side's job is
+// only to plumb the manifest's declared `expect_finetype_version` (see AC2 below)
+// through to describe.py's `--expect-finetype-version` flag; it forms no opinion about
+// what the resolved version IS.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The describe script, pinned into the binary. `@1` == these exact bytes.
@@ -1381,6 +1395,15 @@ struct DatapackageDescribeConfig {
     overrides: String,
     /// datapackage.json to write (the `produces` asset). Resolved against ctx.dir.
     out: String,
+    /// Pin the run to one exact finetype release. When set, the step refuses —
+    /// naming both versions — unless the resolved `finetype` on PATH reports
+    /// exactly this version, so a pinned pipeline cannot silently describe with a
+    /// different engine than the one it asked for. Independent of the operator's
+    /// own `--min-finetype-version` floor (unconfigurable here; describe.py's
+    /// `MIN_FINETYPE_VERSION` covers taxonomy correctness for every caller), which
+    /// stays a "no older than" check even when this is also set.
+    #[serde(default)]
+    expect_finetype_version: Option<String>,
 }
 
 impl DatapackageDescribeConfig {
@@ -1421,17 +1444,13 @@ impl Operator for DatapackageDescribe {
         }
 
         let script = materialize_frozen_script("datapackage_describe", "1.0.0", DESCRIBE_PY)?;
-        let args = uv_run_args(
-            &script.to_string_lossy(),
-            &[
-                "--parquet".to_string(),
-                parquet.display().to_string(),
-                "--overrides".to_string(),
-                overrides.display().to_string(),
-                "--out".to_string(),
-                out.display().to_string(),
-            ],
+        let extra = datapackage_describe_extra_args(
+            &parquet.display().to_string(),
+            &overrides.display().to_string(),
+            &out.display().to_string(),
+            cfg.expect_finetype_version.as_deref(),
         );
+        let args = uv_run_args(&script.to_string_lossy(), &extra);
         run_process(
             "uv",
             &args,
@@ -1440,6 +1459,36 @@ impl Operator for DatapackageDescribe {
             "datapackage_describe",
         )
     }
+}
+
+/// Build the extra (post `run --script <path>`) argv for `describe.py`. Split out of
+/// [`Operator::run`] so the flag order — and above all whether `--expect-finetype-version`
+/// is even emitted — is unit-testable without a `uv` binary or a filesystem.
+///
+/// `--expect-finetype-version` is omitted entirely when the manifest does not set
+/// `expect_finetype_version`, rather than passed empty: describe.py's own argparse
+/// treats a present-but-falsy value as "not pinned" too, but omitting it keeps the
+/// invocation identical to what a manifest without the field produced before this
+/// field existed.
+fn datapackage_describe_extra_args(
+    parquet: &str,
+    overrides: &str,
+    out: &str,
+    expect_finetype_version: Option<&str>,
+) -> Vec<String> {
+    let mut extra = vec![
+        "--parquet".to_string(),
+        parquet.to_string(),
+        "--overrides".to_string(),
+        overrides.to_string(),
+        "--out".to_string(),
+        out.to_string(),
+    ];
+    if let Some(expect) = expect_finetype_version {
+        extra.push("--expect-finetype-version".to_string());
+        extra.push(expect.to_string());
+    }
+    extra
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2345,6 +2394,41 @@ mod tests {
                 &["--out".to_string(), "o.parquet".to_string()]
             ),
             vec!["run", "--script", "scripts/x.py", "--out", "o.parquet"]
+        );
+    }
+
+    #[test]
+    fn datapackage_describe_extra_args_omits_expect_when_unset() {
+        // No `expect_finetype_version` in the manifest → no `--expect-finetype-version`
+        // flag at all, so a manifest predating the field invokes describe.py exactly
+        // as it did before this field existed.
+        assert_eq!(
+            datapackage_describe_extra_args("p.parquet", "o.json", "d.json", None),
+            vec![
+                "--parquet",
+                "p.parquet",
+                "--overrides",
+                "o.json",
+                "--out",
+                "d.json"
+            ],
+        );
+    }
+
+    #[test]
+    fn datapackage_describe_extra_args_passes_expect_through() {
+        assert_eq!(
+            datapackage_describe_extra_args("p.parquet", "o.json", "d.json", Some("0.6.60")),
+            vec![
+                "--parquet",
+                "p.parquet",
+                "--overrides",
+                "o.json",
+                "--out",
+                "d.json",
+                "--expect-finetype-version",
+                "0.6.60",
+            ],
         );
     }
 
