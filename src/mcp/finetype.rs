@@ -502,9 +502,9 @@ mod tests {
     /// which is why the failure moved around and why a bare re-run cleared it.
     ///
     /// A retry loop around the exec would have "fixed" the symptom without
-    /// touching the mechanism (and AC4 rules it out for exactly that reason:
-    /// it removes the signal, not the flake). The alternative taken here removes
-    /// the mechanism instead: `dir/finetype` is now a *symlink* to a fixture file
+    /// touching the mechanism — it removes the signal (a real, rare failure
+    /// mode) rather than the flake, so it was rejected. The alternative taken
+    /// here removes the mechanism instead: `dir/finetype` is now a *symlink* to a fixture file
     /// this process never writes at all. `symlink()` is a directory-entry
     /// operation — it never opens its target for writing, so creating it can
     /// never race anyone's fork. And the checked-in dispatcher it points at
