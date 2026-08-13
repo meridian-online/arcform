@@ -1611,8 +1611,9 @@ mod tests {
 
     // The three resolutions reach the same file: a name on PATH, an absolute path, and
     // an environment variable holding one. All three are fresh against the identity the
-    // step last ran with, which is what makes the env-var case usable at all — the
-    // finetype DuckDB extension is named nowhere but `FINETYPE_DUCKDB_EXT`.
+    // step last ran with, which is what makes the env-var case usable at all —
+    // `finetype_validate` takes its DuckDB extension from a per-step `extension:` or
+    // else from `FINETYPE_DUCKDB_EXT`, and no manifest in this repo sets the former.
     #[test]
     fn test_tool_resolves_from_path_from_a_file_path_and_from_an_env_var() {
         let dir = tempfile::tempdir().unwrap();
@@ -1697,10 +1698,11 @@ mod tests {
         assert!(p.evaluate(dir.path(), "describe", &empty_env()).unwrap());
     }
 
-    // A tool rebuilt in place: same path, same length, same reported version, different
-    // bytes. This is `finetype_validate`'s dependency — a DuckDB extension resolved from
-    // an env var — and nothing but a content hash moves for it. The banner is identical
-    // across the rebuild on purpose: a version comparison would call this fresh.
+    // A tool rebuilt in place: same path, same length, different bytes. This is the shape
+    // of `finetype_validate`'s dependency — a DuckDB extension resolved from an env var,
+    // identified by `contents:` because it answers no version command — and nothing but a
+    // content hash moves for it. The length is held equal across the rebuild on purpose:
+    // identifying the artifact by path or by size would call this fresh.
     #[test]
     fn test_tool_contents_redden_when_the_artifact_is_rebuilt_in_place() {
         let dir = tempfile::tempdir().unwrap();
