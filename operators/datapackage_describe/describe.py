@@ -32,7 +32,14 @@ finetype; a wrong label is corrected by adding the field to the sidecar's
 Because we shell out to whatever `finetype` is on PATH, the step first asserts a
 minimum finetype version (`--min-finetype-version`) and fails closed below it — a
 stale binary types columns wrong but still emits valid JSON, so trusting PATH
-once shipped wrong labels downstream with no error.
+once shipped wrong labels downstream with no error. The SAME resolved binary is
+then recorded: the step stamps the package-level `x-finetype-version` with the
+dotted version that binary reported, so a descriptor carries the identity of the
+engine that produced it and a stale one is visible by reading the file rather
+than by trusting whatever produced it. A caller that wants to pin a run to one
+exact release (not just "at least the floor") passes `--expect-finetype-version`;
+a resolved binary that does not match it exactly refuses the run, naming both
+versions, before finetype is ever invoked to profile the Parquet.
 
 The step FAILS LOUDLY if a curated primaryKey / foreignKey names a column that
 is not in the built Parquet — that is exactly the descriptor-drift this step
@@ -71,12 +78,19 @@ def _parse_version(text: str) -> tuple[int, ...]:
     return tuple(int(g) for g in m.groups()) if m else ()
 
 
-def _require_finetype(min_version: str) -> None:
+def _require_finetype(min_version: str) -> str:
     """Fail closed unless the `finetype` on PATH is >= min_version.
 
     Column typing is only as good as the installed binary, and a stale one is
     invisible here — its output is still valid JSON. So assert the version before
     profiling rather than trust whatever PATH resolves to.
+
+    Returns the resolved dotted version string (e.g. "0.6.60") on success — the
+    SAME string this call already parsed to check the floor, reused by the
+    caller both to stamp `x-finetype-version` and to check `--expect-finetype-version`.
+    Resolving the version once and threading it through means the stamp can only
+    ever name the binary this run actually asserted and ran, never a second,
+    independent lookup that could in principle disagree with the first.
     """
     try:
         proc = subprocess.run(["finetype", "--version"], capture_output=True, text=True)
@@ -93,6 +107,29 @@ def _require_finetype(min_version: str) -> None:
             f"describe: finetype {got_s} on PATH is older than the required {min_version}; "
             "its labels are not trustworthy for these datasets. Update it "
             "(e.g. `cargo install --path crates/finetype-cli --force`) and re-run."
+        )
+    return ".".join(map(str, got))
+
+
+def _require_exact_version(resolved: str, expect: str) -> None:
+    """Fail closed unless the already-resolved `resolved` version equals `expect`.
+
+    `--min-finetype-version` is a floor: anything newer passes, because a newer
+    finetype only ever has a taxonomy at least as good. `--expect-finetype-version`
+    is a pin: a caller that wants THIS EXACT release run (reproducing a prior
+    descriptor, or holding a pipeline to a release under evaluation) asks for that
+    directly, since "newer is fine" is not always true for a pinned pipeline — the
+    engine that describes a dataset changing out from under it, silently, is
+    exactly the failure `x-finetype-version` exists to make visible, and refusing
+    up front is cheaper than discovering it by reading the stamp after the fact.
+    """
+    if resolved != expect:
+        sys.exit(
+            f"describe: finetype on PATH reports {resolved}, but "
+            f"--expect-finetype-version {expect} was requested. Resolve which "
+            "binary should produce this descriptor before running (e.g. `cargo "
+            "install --path crates/finetype-cli --force` for a specific tag, or "
+            "adjust --expect-finetype-version if a newer release is intended)."
         )
 
 
@@ -181,14 +218,28 @@ def main() -> None:
         default=MIN_FINETYPE_VERSION,
         help=f"fail if the finetype on PATH is older (default {MIN_FINETYPE_VERSION})",
     )
+    ap.add_argument(
+        "--expect-finetype-version",
+        help="fail unless the resolved finetype reports exactly this version; "
+        "pins a run to a known release instead of accepting any release at or "
+        "above --min-finetype-version",
+    )
     args = ap.parse_args()
 
-    _require_finetype(args.min_finetype_version)
+    version = _require_finetype(args.min_finetype_version)
+    if args.expect_finetype_version:
+        _require_exact_version(version, args.expect_finetype_version)
     base = _finetype_datapackage(args.parquet)
     with open(args.overrides, encoding="utf-8") as fh:
         overrides = json.load(fh)
 
     descriptor = _merge(base, overrides)
+    # Stamped AFTER the merge, so a sidecar override cannot supply (or clobber)
+    # the identity of the engine that actually ran — this field is machine-derived
+    # like the rest of finetype's half of the descriptor, not hand-curated, and it
+    # is what makes a descriptor produced by a superseded finetype distinguishable
+    # from a current one just by reading the file.
+    descriptor["x-finetype-version"] = version
 
     with open(args.out, "w", encoding="utf-8") as fh:
         json.dump(descriptor, fh, indent=2, sort_keys=True, ensure_ascii=False)
