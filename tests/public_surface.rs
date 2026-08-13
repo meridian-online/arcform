@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 
 /// Every type, constant and function `arc::spec` re-exports, and the module that
 /// owns it. An `impl` on any of these names may only appear in its owning file.
-const EXPORTED: [(&str, &str); 31] = [
+const EXPORTED: [(&str, &str); 32] = [
     ("Manifest", "manifest.rs"),
     ("Step", "manifest.rs"),
     ("Param", "manifest.rs"),
@@ -61,6 +61,7 @@ const EXPORTED: [(&str, &str); 31] = [
     ("Precondition", "precondition.rs"),
     ("ModifiedAfterConfig", "precondition.rs"),
     ("FreshConfig", "precondition.rs"),
+    ("ToolConfig", "precondition.rs"),
     // The write path: an edit as a value, its application, and the gated result.
     ("PathPart", "edit.rs"),
     ("SpecEdit", "edit.rs"),
@@ -139,7 +140,7 @@ const MODULE_FILES: [&str; 29] = [
 /// `src/spec.rs`: editing an existing spec goes through the write path, which splices
 /// original bytes and never re-serialises. This freeze keeps any change to that
 /// arrangement a deliberate, version-visible act instead of a silent drift.
-const FROZEN_DERIVES: [(&str, &str, &[&str]); 18] = [
+const FROZEN_DERIVES: [(&str, &str, &[&str]); 19] = [
     (
         "manifest.rs",
         "Param",
@@ -184,6 +185,14 @@ const FROZEN_DERIVES: [(&str, &str, &[&str]); 18] = [
         "precondition.rs",
         "FreshConfig",
         &["Debug", "Clone", "Serialize", "Deserialize"],
+    ),
+    // `Default` is on the list because a tool declaration has five fields of which a
+    // caller sets two: it exists so the other three can be named once, as
+    // `..Default::default()`, and the empty default is a shape `validate` refuses.
+    (
+        "precondition.rs",
+        "ToolConfig",
+        &["Debug", "Clone", "Default", "Serialize", "Deserialize"],
     ),
     (
         "precondition.rs",
@@ -948,6 +957,7 @@ fn exported_modules_declare_only_contracted_items() {
             "Precondition",
             "ModifiedAfterConfig",
             "FreshConfig",
+            "ToolConfig",
             // `validate` is validation; `evaluate` and `evaluate_all` run commands and
             // stat files, so they are `pub(crate)` — this surface does not execute.
             "validate",
