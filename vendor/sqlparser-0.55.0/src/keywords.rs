@@ -470,6 +470,7 @@ define_keywords!(
     KEYS,
     KILL,
     LAG,
+    LAMBDA,
     LANGUAGE,
     LARGE,
     LAST,

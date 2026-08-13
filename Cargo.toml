@@ -113,10 +113,11 @@ tempfile = "3"
 filetime = "0.2"
 
 # Vendored sqlparser: a local fork of sqlparser 0.55.0 that teaches the DuckDB
-# dialect two grammars the published crate rejects — statement-form PIVOT/UNPIVOT
-# (`PIVOT t ON … USING …`) and multi-option COPY (`COPY … TO 'f' (FORMAT parquet,
-# COMPRESSION zstd)`). Without these, SQL introspection degrades those steps to
-# opaque nodes (the opposite of structural transparency). The fork is
+# dialect three grammars the published crate rejects — statement-form PIVOT/UNPIVOT
+# (`PIVOT t ON … USING …`), multi-option COPY (`COPY … TO 'f' (FORMAT parquet,
+# COMPRESSION zstd)`), and the `lambda x: expr` colon-form lambda DuckDB is
+# replacing its single-arrow lambda with. Without these, SQL introspection degrades
+# those steps to opaque nodes (the opposite of structural transparency). The fork is
 # minimal and version-pinned to 0.55.0 so the patch applies cleanly and the dep graph
 # is unchanged. Upstreaming is the maintenance path — see
 # vendor/sqlparser-0.55.0/MERIDIAN_PATCH.md for the diff summary + draft PR text.

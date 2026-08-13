@@ -70,6 +70,13 @@ impl Dialect for DuckDbDialect {
         true
     }
 
+    /// DuckDB's Python-style `lambda x: expr` / `lambda x, y: expr` syntax — the
+    /// form it is moving users to as it retires the single-arrow lambda.
+    /// See <https://duckdb.org/docs/stable/sql/functions/lambda.html>
+    fn supports_lambda_colon_syntax(&self) -> bool {
+        true
+    }
+
     // DuckDB is compatible with PostgreSQL syntax for this statement,
     // although not all features may be implemented.
     fn supports_explain_with_utility_options(&self) -> bool {
