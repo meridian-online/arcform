@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use owo_colors::OwoColorize;
@@ -33,6 +33,57 @@ pub struct FreshConfig {
     pub path: String,
 }
 
+/// Configuration for the `tool` precondition — the identity of an external binary or
+/// artifact a step depends on and did not produce.
+///
+/// A step's staleness hash covers what the manifest says (a SQL file's bytes, an
+/// operator ref and its `with:` block) and nothing about the environment it runs in, so
+/// a step whose output is decided by a binary somewhere on the machine is clean for ever
+/// while that binary moves underneath it. This kind is how the manifest says which thing
+/// that is. The engine does not guess: it resolves exactly what it was told to resolve.
+///
+/// Two halves, each declared rather than inferred:
+///
+/// * **Where the tool is** — exactly one of `name` (an executable to find on `PATH`),
+///   `path` (a filesystem path, absolute or relative to the manifest directory), or
+///   `env` (the name of an environment variable holding that path). A tool found on
+///   `PATH` and one a deployment points at through an env var are the same dependency
+///   in different clothes, and both have to be expressible.
+/// * **What identifies it** — exactly one of `version` (a shell command whose output is
+///   the tool's reported identity) or `contents: true` (the SHA-256 of the resolved
+///   file's bytes). A released binary announces a version; an artifact rebuilt in place
+///   keeps its path *and* its version and changes only its bytes, so contents is the
+///   only term that moves for it.
+///
+/// The `version` command runs under `sh -c` in the manifest directory with the step's
+/// resolved parameters in its environment, plus `ARC_TOOL` bound to the path that was
+/// resolved. Writing `version: "$ARC_TOOL --version"` is what ties the reported identity
+/// to the file this precondition resolved; a command naming the binary again is free to
+/// interrogate a different one, and the precondition cannot tell.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolConfig {
+    /// Name of an executable to find on `PATH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Path to the tool — absolute, or relative to the manifest directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Name of an environment variable whose value is the path to the tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    /// Shell command that reports the tool's version. `$ARC_TOOL` is the resolved path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Identify the resolved file by the SHA-256 of its bytes instead of by a reported
+    /// version.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub contents: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// YAML format:
 /// ```yaml
 /// preconditions:
@@ -40,6 +91,12 @@ pub struct FreshConfig {
 ///       path: data/cask.json
 ///       period: 24h
 ///   - command: "test $SKIP_FETCH"
+///   - tool:
+///       name: finetype
+///       version: "$ARC_TOOL --version"
+///   - tool:
+///       env: FINETYPE_DUCKDB_EXT
+///       contents: true
 /// ```
 ///
 /// Uses `#[serde(untagged)]` — each variant is identified by its unique key.
@@ -64,6 +121,31 @@ pub enum Precondition {
     /// Run a shell command. Exit 0 = fresh (skip), non-zero = stale (run).
     /// Execution errors (binary not found, crash) halt the pipeline.
     Command { command: String },
+
+    /// The identity of an external binary or artifact the step depends on and did not
+    /// produce: same identity as the step's last successful run = fresh (skip), any
+    /// difference = stale (run). No prior identity — a first run, or a build directory
+    /// that has been cleaned — is stale, like every other kind's missing-state case.
+    ///
+    /// The identity is observed at plan time and recorded after the step succeeds, which
+    /// is [`Precondition::Fresh`]'s shape rather than a hash term: the artifact records
+    /// what it was, and the next run compares that against what it is. Evaluation writes
+    /// nothing, so asking "is this stale?" cannot change the answer.
+    ///
+    /// **A tool that cannot be identified is an error, not "stale", and never "fresh".**
+    /// The two existing kinds disagree about a missing thing —
+    /// [`Precondition::ModifiedAfter`] calls it stale, [`Precondition::Command`] halts —
+    /// and this kind follows `Command`, because the reason `ModifiedAfter` can afford to
+    /// be lenient does not hold here. A missing file there is a file the step itself
+    /// produces, so running the step is the remedy. Nothing a step does creates the tool
+    /// it was told to depend on: "stale" would re-run it for ever against an environment
+    /// that cannot satisfy it, and the failure would then surface from whichever
+    /// operator tripped over the absence rather than from the declaration that named it.
+    /// So the run stops, at plan time, with the step name and the path the lookup
+    /// reached. The one verdict this must never reach is "fresh": a binary that has
+    /// disappeared silently turning a step permanently clean is precisely the failure
+    /// this kind exists to remove.
+    Tool { tool: ToolConfig },
 }
 
 impl Precondition {
@@ -189,6 +271,14 @@ impl Precondition {
                     }),
                 }
             }
+            Precondition::Tool { tool } => {
+                // Observe first: an unidentifiable tool is an error whatever is on
+                // record, so a stamped step cannot outlive the thing it was stamped
+                // against.
+                let observed = tool.observe(manifest_dir, step_name, env)?;
+                let recorded = recorded_identity(manifest_dir, step_name, &tool.stamp_key());
+                Ok(recorded.as_deref() == Some(observed.as_str()))
+            }
         }
     }
 
@@ -230,7 +320,355 @@ impl Precondition {
                 }
                 Ok(())
             }
+            Precondition::Tool { tool } => tool.validate(),
         }
+    }
+}
+
+impl ToolConfig {
+    /// Reject at manifest load anything that cannot be evaluated: a declaration with no
+    /// tool to resolve, or one that never says what identifies it. Both halves are
+    /// required, and each is exactly one choice — a tool named two ways, or identified
+    /// two ways, is an ambiguity the engine would have to break silently.
+    fn validate(&self) -> Result<()> {
+        let mut resolvers: Vec<&str> = Vec::new();
+        if non_empty(&self.name).is_some() {
+            resolvers.push("name");
+        }
+        if non_empty(&self.path).is_some() {
+            resolvers.push("path");
+        }
+        if non_empty(&self.env).is_some() {
+            resolvers.push("env");
+        }
+        match resolvers.len() {
+            0 => {
+                return Err(Error::ManifestValidation(
+                    "tool precondition: names no tool — give exactly one of `name:` (an \
+                     executable on PATH), `path:` (a file) or `env:` (an environment \
+                     variable holding a path)"
+                        .to_string(),
+                ));
+            }
+            1 => {}
+            _ => {
+                return Err(Error::ManifestValidation(format!(
+                    "tool precondition: names the tool {} ways ({}) — give exactly one of \
+                     `name:`, `path:` or `env:`",
+                    resolvers.len(),
+                    resolvers.join(", ")
+                )));
+            }
+        }
+
+        let has_version = non_empty(&self.version).is_some();
+        match (has_version, self.contents) {
+            (false, false) => Err(Error::ManifestValidation(
+                "tool precondition: says nothing about what identifies the tool — give \
+                 `version:` (a shell command that reports it, with `$ARC_TOOL` bound to the \
+                 resolved path) or `contents: true` (the sha256 of the resolved file)"
+                    .to_string(),
+            )),
+            (true, true) => Err(Error::ManifestValidation(
+                "tool precondition: `version:` and `contents: true` are two identities for \
+                 one tool — give one"
+                    .to_string(),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// The declaration as written, for a refusal message and for the stamp key.
+    fn declared(&self) -> String {
+        if let Some(name) = non_empty(&self.name) {
+            format!("`{name}` on PATH")
+        } else if let Some(path) = non_empty(&self.path) {
+            format!("path `{path}`")
+        } else if let Some(var) = non_empty(&self.env) {
+            format!("${var}")
+        } else {
+            // Unreachable through a loaded manifest — `validate` refuses this shape.
+            "(no tool named)".to_string()
+        }
+    }
+
+    /// The key this declaration's identity is recorded under, within its step. It
+    /// carries the identity mode as well as the tool, so editing the manifest from a
+    /// reported version to a content hash — or repointing the tool — leaves no prior
+    /// identity to match and the step runs.
+    fn stamp_key(&self) -> String {
+        let identity = if self.contents {
+            "contents".to_string()
+        } else {
+            format!("version:{}", non_empty(&self.version).unwrap_or_default())
+        };
+        format!("{}|{}", self.declared(), identity)
+    }
+
+    /// Resolve the declaration to the file it names. `Err` carries the detail for the
+    /// refusal: the resolved path when the lookup got that far, otherwise what was
+    /// searched and came up empty.
+    fn resolve(
+        &self,
+        manifest_dir: &Path,
+        env: &HashMap<String, String>,
+    ) -> std::result::Result<PathBuf, String> {
+        if let Some(name) = non_empty(&self.name) {
+            // A bare name means "the executable a shell would find", so the search is
+            // PATH and the test is the executable bit — a readable file of that name in
+            // a PATH directory is not the tool.
+            let path_var = env
+                .get("PATH")
+                .cloned()
+                .or_else(|| std::env::var("PATH").ok())
+                .unwrap_or_default();
+            for entry in std::env::split_paths(&path_var) {
+                let candidate = entry.join(name);
+                if is_executable_file(&candidate) {
+                    return Ok(candidate);
+                }
+            }
+            return Err(format!(
+                "no executable `{name}` on PATH ({})",
+                if path_var.is_empty() {
+                    "PATH is unset".to_string()
+                } else {
+                    path_var
+                }
+            ));
+        }
+
+        // `path:` and `env:` differ only in where the string comes from; an absolute one
+        // stands, a relative one is read against the manifest directory like every other
+        // path in a manifest.
+        let (declared_path, provenance) = if let Some(path) = non_empty(&self.path) {
+            (path.to_string(), String::new())
+        } else if let Some(var) = non_empty(&self.env) {
+            let raw = env
+                .get(var)
+                .cloned()
+                .or_else(|| std::env::var(var).ok())
+                .unwrap_or_default();
+            if raw.trim().is_empty() {
+                return Err(format!(
+                    "environment variable {var} is unset or empty, so there is no path to \
+                     identify"
+                ));
+            }
+            (raw.trim().to_string(), format!("{var}="))
+        } else {
+            return Err("no tool named".to_string());
+        };
+
+        let resolved = manifest_dir.join(&declared_path);
+        if !resolved.exists() {
+            return Err(format!(
+                "{provenance}{declared_path} resolves to {}, which does not exist",
+                resolved.display()
+            ));
+        }
+        Ok(resolved)
+    }
+
+    /// What this declaration identifies right now: `sha256:<hex>` of the resolved file's
+    /// bytes, or `version:<what the command reported>`.
+    ///
+    /// Every failure is an [`Error::ToolPrecondition`] carrying the step and the
+    /// declaration — see [`Precondition::Tool`] for why this halts rather than returning
+    /// a verdict.
+    fn observe(
+        &self,
+        manifest_dir: &Path,
+        step_name: &str,
+        env: &HashMap<String, String>,
+    ) -> Result<String> {
+        let resolved = self
+            .resolve(manifest_dir, env)
+            .map_err(|detail| self.refusal(step_name, detail))?;
+
+        if self.contents {
+            let hex = crate::fetch_cache::hash_file(&resolved).map_err(|e| {
+                self.refusal(
+                    step_name,
+                    format!("{} could not be read to hash it: {e}", resolved.display()),
+                )
+            })?;
+            return Ok(format!("sha256:{hex}"));
+        }
+
+        let command = non_empty(&self.version).unwrap_or_default();
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(manifest_dir)
+            .envs(env)
+            .env("ARC_TOOL", &resolved)
+            .output()
+            .map_err(|e| {
+                self.refusal(
+                    step_name,
+                    format!(
+                        "`{command}` (ARC_TOOL={}) failed to execute: {e}",
+                        resolved.display()
+                    ),
+                )
+            })?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if !output.status.success() {
+            return Err(self.refusal(
+                step_name,
+                format!(
+                    "`{command}` (ARC_TOOL={}) exited {}: {}",
+                    resolved.display(),
+                    output
+                        .status
+                        .code()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "on a signal".to_string()),
+                    if stderr.is_empty() { &stdout } else { &stderr }
+                ),
+            ));
+        }
+        // Version banners land on stderr about as often as stdout, so both are read —
+        // but silence is not an identity, and treating it as one would make every such
+        // tool equal to every other.
+        let reported = if stdout.is_empty() { stderr } else { stdout };
+        if reported.is_empty() {
+            return Err(self.refusal(
+                step_name,
+                format!(
+                    "`{command}` (ARC_TOOL={}) reported no version on stdout or stderr",
+                    resolved.display()
+                ),
+            ));
+        }
+        Ok(format!("version:{reported}"))
+    }
+
+    fn refusal(&self, step_name: &str, detail: String) -> Error {
+        Error::ToolPrecondition {
+            step: step_name.to_string(),
+            tool: self.declared(),
+            detail,
+        }
+    }
+}
+
+/// `Some(trimmed)` for a field that carries something, `None` for absent-or-blank — the
+/// two are the same declaration as far as validation is concerned.
+fn non_empty(field: &Option<String>) -> Option<&str> {
+    field.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// Where the identities observed at each step's last successful run are recorded.
+///
+/// Beside the run records — [`crate::contract::runs_dir`] is `build/.arcform/runs` —
+/// because it is run state rather than something a human maintains, and because
+/// deleting `build/` should forget it: a forgotten identity makes the step stale, which
+/// is the safe direction.
+fn stamp_store_path(manifest_dir: &Path) -> PathBuf {
+    manifest_dir
+        .join("build")
+        .join(".arcform")
+        .join("tools.json")
+}
+
+/// step name → stamp key → identity.
+type ToolStamps = BTreeMap<String, BTreeMap<String, String>>;
+
+/// The recorded identities, or an empty set if the file is absent or unreadable. An
+/// unreadable store means nothing matches, which makes every tool-gated step stale.
+fn read_stamps(manifest_dir: &Path) -> ToolStamps {
+    std::fs::read_to_string(stamp_store_path(manifest_dir))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn recorded_identity(manifest_dir: &Path, step_name: &str, key: &str) -> Option<String> {
+    read_stamps(manifest_dir)
+        .get(step_name)
+        .and_then(|step| step.get(key))
+        .cloned()
+}
+
+/// Record what each of a step's `tool` preconditions identifies, after that step has
+/// executed successfully.
+///
+/// Called from the runner at the success point rather than from `evaluate`, so the
+/// recorded identity means "what was in place when this step last ran" rather than "what
+/// was in place when someone last asked". A step un-skipped by this gate and then never
+/// reached — an earlier step failed, the run was interrupted — leaves the old identity
+/// standing and runs again next time.
+///
+/// Nothing here can fail the run: the step has already succeeded. A tool that cannot be
+/// identified now drops its entry instead, so the next run is stale and says why.
+pub(crate) fn record_all(
+    preconditions: &[Precondition],
+    manifest_dir: &Path,
+    step_name: &str,
+    env: &HashMap<String, String>,
+) {
+    let tools: Vec<&ToolConfig> = preconditions
+        .iter()
+        .filter_map(|p| match p {
+            Precondition::Tool { tool } => Some(tool),
+            _ => None,
+        })
+        .collect();
+    if tools.is_empty() {
+        return;
+    }
+
+    let mut stamps = read_stamps(manifest_dir);
+    {
+        let step_stamps = stamps.entry(step_name.to_string()).or_default();
+        for tool in tools {
+            match tool.observe(manifest_dir, step_name, env) {
+                Ok(identity) => {
+                    step_stamps.insert(tool.stamp_key(), identity);
+                }
+                Err(e) => {
+                    step_stamps.remove(&tool.stamp_key());
+                    eprintln!(
+                        "{} {e} — the step ran, but its tool identity was not recorded, so it \
+                         will run again",
+                        "warning:".yellow()
+                    );
+                }
+            }
+        }
+    }
+
+    let path = stamp_store_path(manifest_dir);
+    let written = path
+        .parent()
+        .map(std::fs::create_dir_all)
+        .unwrap_or(Ok(()))
+        .and_then(|()| serde_json::to_string_pretty(&stamps).map_err(std::io::Error::other))
+        .and_then(|json| std::fs::write(&path, json + "\n"));
+    if let Err(e) = written {
+        eprintln!(
+            "{} could not record tool identities for step '{step_name}' at {} ({e}) — the \
+             step will run again",
+            "warning:".yellow(),
+            path.display()
+        );
     }
 }
 

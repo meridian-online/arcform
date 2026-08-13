@@ -398,6 +398,11 @@ pub fn run_with_params(
                         succeeded += 1;
                         executed += 1;
                         let _ = state.record_step(&step.name, &sql_hash, StepStatus::Success);
+                        // What the step's declared tools were at the moment it ran — the
+                        // identity the next run compares against. Recorded here rather
+                        // than at plan time so a step that was un-skipped and then never
+                        // reached keeps its old identity and runs again.
+                        precondition::record_all(&step.preconditions, dir, &step.name, &env_map);
 
                         // If this step captures output, inject it as ARC_PARAM_ for downstream steps.
                         if let Some(ref output_name) = step.output {
@@ -638,10 +643,20 @@ struct Staleness {
 }
 
 /// Pick the typed skip reason for a step whose preconditions all evaluated fresh: a
-/// `modified_after` clock precondition is called out distinctly from generic ones so the
-/// contract records *which* freshness mechanism decided the skip.
+/// `tool` identity check and a `modified_after` clock check are each called out
+/// distinctly from generic ones so the contract records *which* freshness mechanism
+/// decided the skip.
+///
+/// A step carrying both is reported as `tool`: it is the more specific claim — this
+/// named binary is the one it last ran against — and it is the claim a reader is
+/// checking when a tool moves.
 fn precondition_skip_reason(preconditions: &[Precondition]) -> SkipReason {
     if preconditions
+        .iter()
+        .any(|p| matches!(p, Precondition::Tool { .. }))
+    {
+        SkipReason::PreconditionTool
+    } else if preconditions
         .iter()
         .any(|p| matches!(p, Precondition::ModifiedAfter { .. }))
     {
