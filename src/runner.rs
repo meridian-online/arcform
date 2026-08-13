@@ -3681,10 +3681,7 @@ steps:
         run(dir.path(), &engine, &state, false).unwrap();
         assert_eq!(
             outcome("run-2", "describe"),
-            (
-                "skipped".to_string(),
-                Some("precondition_tool".to_string())
-            ),
+            ("skipped".to_string(), Some("precondition_tool".to_string())),
             "an unchanged tool skips the step, and the contract says which mechanism \
              decided it"
         );
@@ -3719,10 +3716,7 @@ steps:
         run(dir.path(), &engine, &state, false).unwrap();
         assert_eq!(
             outcome("run-4", "describe"),
-            (
-                "skipped".to_string(),
-                Some("precondition_tool".to_string())
-            ),
+            ("skipped".to_string(), Some("precondition_tool".to_string())),
         );
     }
 

@@ -50,7 +50,8 @@
 //! - [`RetryPolicy`] — retry/backoff configuration
 //! - [`Hooks`] — the lifecycle hook block
 //! - [`AssetOverride`] — an entry in the top-level `assets:` block
-//! - [`Precondition`], [`ModifiedAfterConfig`], [`FreshConfig`] — step freshness checks
+//! - [`Precondition`], [`ModifiedAfterConfig`], [`FreshConfig`], [`ToolConfig`] — step
+//!   freshness checks
 //!
 //! Exported entry points:
 //!
@@ -175,7 +176,7 @@ pub use crate::history::{
 pub use crate::manifest::{
     AssetOverride, Defaults, Hooks, MANIFEST_FILENAME, Manifest, Param, RetryPolicy, Step,
 };
-pub use crate::precondition::{FreshConfig, ModifiedAfterConfig, Precondition};
+pub use crate::precondition::{FreshConfig, ModifiedAfterConfig, Precondition, ToolConfig};
 pub use crate::record::{
     GENERATED_MARKER, RecordedStep, amend_step_sql, record_step, sql_is_generated,
 };

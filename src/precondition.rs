@@ -60,7 +60,10 @@ pub struct FreshConfig {
 /// resolved. Writing `version: "$ARC_TOOL --version"` is what ties the reported identity
 /// to the file this precondition resolved; a command naming the binary again is free to
 /// interrogate a different one, and the precondition cannot tell.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// [`Default`] is every field unset, which `validate` refuses — it exists so a caller
+/// building one names the two fields it means and no others.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolConfig {
     /// Name of an executable to find on `PATH`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1483,16 +1486,6 @@ mod tests {
 
     // ─── tool: an external binary or artifact the step did not produce ───────────
 
-    fn tool_cfg() -> ToolConfig {
-        ToolConfig {
-            name: None,
-            path: None,
-            env: None,
-            version: None,
-            contents: false,
-        }
-    }
-
     fn tool(cfg: ToolConfig) -> Precondition {
         Precondition::Tool { tool: cfg }
     }
@@ -1502,7 +1495,7 @@ mod tests {
         tool(ToolConfig {
             path: Some(path.to_string()),
             version: Some("$ARC_TOOL".to_string()),
-            ..tool_cfg()
+            ..ToolConfig::default()
         })
     }
 
@@ -1511,7 +1504,7 @@ mod tests {
         tool(ToolConfig {
             env: Some(var.to_string()),
             contents: true,
-            ..tool_cfg()
+            ..ToolConfig::default()
         })
     }
 
@@ -1592,7 +1585,7 @@ mod tests {
             name: Some("faketool".to_string()),
             path: Some("bin/faketool".to_string()),
             version: Some("$ARC_TOOL".to_string()),
-            ..tool_cfg()
+            ..ToolConfig::default()
         });
         let err = two_tools.validate().unwrap_err().to_string();
         assert!(err.contains("names the tool 2 ways"), "{err}");
@@ -1602,7 +1595,7 @@ mod tests {
             name: Some("faketool".to_string()),
             version: Some("$ARC_TOOL".to_string()),
             contents: true,
-            ..tool_cfg()
+            ..ToolConfig::default()
         });
         let err = two_identities.validate().unwrap_err().to_string();
         assert!(err.contains("two identities for one tool"), "{err}");
@@ -1611,7 +1604,7 @@ mod tests {
         let blank = tool(ToolConfig {
             name: Some("   ".to_string()),
             version: Some("$ARC_TOOL".to_string()),
-            ..tool_cfg()
+            ..ToolConfig::default()
         });
         assert!(blank.validate().is_err(), "a blank name names no tool");
     }
@@ -1642,17 +1635,17 @@ mod tests {
         let on_path = tool(ToolConfig {
             name: Some("faketool".to_string()),
             version: Some("$ARC_TOOL".to_string()),
-            ..tool_cfg()
+            ..ToolConfig::default()
         });
         let at_path = tool(ToolConfig {
             path: Some(bin.join("faketool").display().to_string()),
             version: Some("$ARC_TOOL".to_string()),
-            ..tool_cfg()
+            ..ToolConfig::default()
         });
         let from_env = tool(ToolConfig {
             env: Some("FAKETOOL_BIN".to_string()),
             version: Some("$ARC_TOOL".to_string()),
-            ..tool_cfg()
+            ..ToolConfig::default()
         });
 
         for (label, p) in [
@@ -1769,18 +1762,18 @@ mod tests {
             tool(ToolConfig {
                 name: Some(name.to_string()),
                 version: Some("$ARC_TOOL".to_string()),
-                ..tool_cfg()
+                ..ToolConfig::default()
             })
         };
         let from_env = tool(ToolConfig {
             env: Some("FAKETOOL_BIN".to_string()),
             version: Some("$ARC_TOOL".to_string()),
-            ..tool_cfg()
+            ..ToolConfig::default()
         });
         let unset_var = tool(ToolConfig {
             env: Some("ARC_TEST_NEVER_SET_VAR".to_string()),
             contents: true,
-            ..tool_cfg()
+            ..ToolConfig::default()
         });
 
         let cases: [(&str, &Precondition, &HashMap<String, String>, &str); 6] = [
@@ -1825,7 +1818,10 @@ mod tests {
             };
             let msg = err.to_string();
             assert!(msg.contains("describe"), "{label}: names the step: {msg}");
-            assert!(msg.contains(expected), "{label}: says where it got to: {msg}");
+            assert!(
+                msg.contains(expected),
+                "{label}: says where it got to: {msg}"
+            );
         }
     }
 
@@ -1890,7 +1886,9 @@ mod tests {
             "one moved tool is enough to make the step stale"
         );
         assert!(
-            alpha.evaluate(dir.path(), "describe", &empty_env()).unwrap(),
+            alpha
+                .evaluate(dir.path(), "describe", &empty_env())
+                .unwrap(),
             "and the tool that did not move is still fresh"
         );
     }
