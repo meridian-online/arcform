@@ -1094,4 +1094,36 @@ mod tests {
             "output path produced"
         );
     }
+
+    // ---- DuckDB's Python-style `lambda x: expr` lambda syntax. ----
+    // DuckDB is retiring the single-arrow lambda; without this the fork, a model
+    // using the new form fails to parse and the whole step degrades to an opaque
+    // node (see AssetGraph::build), contributing no assets to the lineage graph.
+
+    // A CTAS whose SELECT list uses `lambda c: ...` still parses and still
+    // discovers both the output and the FROM-clause input — the lambda sits in
+    // an expression that asset extraction never inspects, so the only way it
+    // can affect `assets` at all is by breaking the parse.
+    #[test]
+    fn test_lambda_colon_single_param_does_not_block_introspection() {
+        let sql = "CREATE TABLE bumped AS \
+                   SELECT list_transform([x], lambda c: c + 1) AS y FROM source_table;";
+        let assets = extract_assets(sql).expect("lambda colon syntax must parse");
+        assert!(assets.outputs.contains("bumped"), "CTAS output discovered");
+        assert!(
+            assets.inputs.contains("source_table"),
+            "FROM table still discovered as input, got {:?}",
+            assets.inputs
+        );
+    }
+
+    // The multi-param colon form (`lambda acc, v: ...`, no parens) parses too.
+    #[test]
+    fn test_lambda_colon_multi_param_does_not_block_introspection() {
+        let sql = "CREATE TABLE totals AS \
+                   SELECT list_reduce(xs, lambda acc, v: acc + v) AS total FROM source_table;";
+        let assets = extract_assets(sql).expect("multi-param lambda colon syntax must parse");
+        assert!(assets.outputs.contains("totals"));
+        assert!(assets.inputs.contains("source_table"));
+    }
 }

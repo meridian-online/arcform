@@ -2,7 +2,7 @@
 
 This is a **vendored, minimal fork** of [`sqlparser`](https://crates.io/crates/sqlparser)
 `0.55.0`, wired into `arc` via `[patch.crates-io]` in the top-level `Cargo.toml`.
-It teaches the **DuckDB dialect** two grammars the published crate rejects, both of
+It teaches the **DuckDB dialect** three grammars the published crate rejects, all of
 which otherwise make `arc`'s SQL introspection degrade a whole SQL step to an *opaque*
 node (undercutting the "0 opaque steps" legibility story).
 
@@ -56,13 +56,53 @@ COPY tbl TO 'out'       (FORMAT parquet, PARTITION_BY (year, month));
   dialect is `DuckDbDialect | GenericDialect`, capture the option generically as
   `name [value]` (`value` parsed as an `Expr`, so `(a, b)` becomes an `Expr::Tuple`).
 
+### 3. DuckDB's `lambda x: expr` / `lambda x, y: expr` colon syntax
+
+DuckDB is retiring its single-arrow lambda (`x -> x + 1`) in favour of a Python-style
+colon form, and upstream only parses the arrow forms:
+
+```sql
+SELECT list_transform([1, 2, 3], lambda x: x + 1);      -- one param, no parens
+SELECT list_reduce(xs, lambda acc, v: acc + v);          -- several params, no parens
+```
+
+Both existing arrow forms (`x -> …` and `(acc, v) -> …`) keep parsing unchanged —
+this is additive, not a replacement.
+
+- `keywords.rs`: new non-reserved `LAMBDA` keyword. Not added to any
+  `RESERVED_FOR_*` list, so `SELECT lambda FROM t` (a column literally named
+  `lambda`) still parses as an identifier — same fallback the existing `CASE`,
+  `MAP`, `STRUCT` keyword-prefixed expressions already rely on.
+- `dialect/mod.rs`: new `Dialect::supports_lambda_colon_syntax()` method
+  (default `false`), kept **separate from** `supports_lambda_functions()`
+  deliberately: that flag is also `true` for ClickHouse and Databricks, whose
+  arrow-only lambdas have no colon form, so folding the new syntax into it
+  would have made both dialects silently start accepting SQL neither engine
+  runs.
+- `dialect/duckdb.rs`: `supports_lambda_colon_syntax()` → `true`.
+- `parser/mod.rs`:
+  - `parse_expr_prefix_by_reserved_word`: a leading `LAMBDA` keyword, gated on
+    `supports_lambda_colon_syntax()`, dispatches to `parse_lambda_colon_expr`.
+  - new `parse_lambda_colon_expr`: parses a comma-separated identifier list,
+    `:`, then the body expression. Produces the **existing** `Expr::Lambda(LambdaFunction)`
+    node — `params: OneOrManyWithParens::One` for one identifier,
+    `::Many` for several — rather than a new AST variant, since the two syntaxes
+    describe the same function. `LambdaFunction`'s `Display` was already
+    hardcoded to the arrow form (`{params} -> {body}`) before this change, so a
+    colon-form parse canonicalizes to the arrow form on round-trip; there is no
+    field recording which syntax the source used.
+
 ## Fidelity
 
 All added forms round-trip: parse → `Display` → re-parse yields a structurally-equal
-AST (verified against the DuckDB dialect). Existing behaviour for all other dialects
-is untouched (both grammars are gated behind `DuckDbDialect | GenericDialect`), and the
-crate's inline unit tests pass (the pre-existing `ast::visitor::tests::overflow` test
-overflows the stack in a standalone debug build on upstream `0.55.0` too — unrelated).
+AST (verified against the DuckDB dialect). The lambda colon form round-trips to the
+arrow form specifically (see above) rather than to itself — still structurally equal,
+since the AST is the same either way. Existing behaviour for all other dialects is
+untouched (the PIVOT/UNPIVOT and COPY grammars are gated behind
+`DuckDbDialect | GenericDialect`; the lambda colon syntax behind `DuckDbDialect` alone —
+see the gating rationale above), and the crate's inline unit tests pass (the
+pre-existing `ast::visitor::tests::overflow` test overflows the stack in a standalone
+debug build on upstream `0.55.0` too — unrelated).
 
 ## Maintenance path — upstream this fork
 
@@ -113,3 +153,44 @@ including CTAS-body and `WITH … PIVOT …`, and round-trip (`verified_stmt`) c
 
 **Compatibility:** additive; other dialects are unchanged. New public enum variants
 are a semver-minor API addition.
+
+---
+
+### Second draft upstream PR (do not submit without sign-off)
+
+A separate PR from the one above — different feature, same "**Do not open the PR
+without an explicit go-ahead**" rule.
+
+**Title:** Support DuckDB's `lambda x: expr` colon syntax
+
+**Summary**
+
+DuckDB is retiring its single-arrow lambda (`x -> x + 1`) in favour of a Python-style
+`lambda x: expr` / `lambda x, y: expr` form. Upstream currently only parses the arrow
+forms (`x -> …`, `(acc, v) -> …`), so a model written in the syntax DuckDB is moving
+users to fails to parse:
+
+```sql
+SELECT list_transform([1, 2, 3], lambda x: x + 1);
+SELECT list_reduce(xs, lambda acc, v: acc + v);
+```
+
+Refs: <https://duckdb.org/docs/stable/sql/functions/lambda.html>.
+
+**Changes**
+
+- Add a non-reserved `LAMBDA` keyword.
+- Add `Dialect::supports_lambda_colon_syntax()` (default `false`), separate from
+  `supports_lambda_functions()` so ClickHouse and Databricks — which have arrow-only
+  lambdas — are unaffected; enable it for `DuckDbDialect`.
+- Parse `lambda <ident>[, <ident>]*: <expr>` into the **existing** `Expr::Lambda(LambdaFunction)`
+  node (no new AST variant): one identifier → `OneOrManyWithParens::One`, several →
+  `::Many` — the same shape the arrow forms already produce.
+
+**Tests** (to add before submission): `sqlparser_duckdb.rs` cases for the one- and
+multi-param colon forms, a dialect-gating case (ClickHouse/Databricks/Generic reject
+it), and round-trip coverage noting the colon form canonicalizes to the arrow form on
+`Display` (there is no AST field for which syntax the source used).
+
+**Compatibility:** additive; other dialects are unchanged. New `Dialect` trait method
+with a default impl is a semver-minor addition.

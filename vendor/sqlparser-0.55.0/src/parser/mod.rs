@@ -1229,6 +1229,13 @@ impl<'a> Parser<'a> {
             Keyword::MAP if *self.peek_token_ref() == Token::LBrace && self.dialect.support_map_literal_syntax() => {
                 Ok(Some(self.parse_duckdb_map_literal()?))
             }
+            // DuckDB's Python-style `lambda x: expr` / `lambda x, y: expr`. On a
+            // parse failure below (e.g. `SELECT lambda FROM t` where `lambda` is a
+            // column name) the caller falls back to treating the word as a plain
+            // identifier — see the `try_parse`/`maybe_parse` dance in `parse_prefix`.
+            Keyword::LAMBDA if self.dialect.supports_lambda_colon_syntax() => {
+                Ok(Some(self.parse_lambda_colon_expr()?))
+            }
             _ if self.dialect.supports_geometric_types() => match w.keyword {
                 Keyword::CIRCLE => Ok(Some(self.parse_geometric_type(GeometricTypeKind::Circle)?)),
                 Keyword::BOX => Ok(Some(self.parse_geometric_type(GeometricTypeKind::GeometricBox)?)),
@@ -1802,6 +1809,25 @@ impl<'a> Parser<'a> {
                 body: Box::new(expr),
             }))
         })
+    }
+
+    /// Parses DuckDB's Python-style lambda syntax, with the leading `LAMBDA`
+    /// keyword already consumed: `x: expr` (one param) or `x, y: expr` (several),
+    /// neither form parenthesized. Produces the same `Expr::Lambda(LambdaFunction)`
+    /// node the arrow forms do (`params: OneOrManyWithParens::One` for a single
+    /// param, `::Many` for several) — there is no dedicated AST node for "was
+    /// written with a colon", so `Display` always renders the arrow form and a
+    /// colon-form parse canonicalizes to it on round-trip.
+    fn parse_lambda_colon_expr(&mut self) -> Result<Expr, ParserError> {
+        let mut params = self.parse_comma_separated(|p| p.parse_identifier())?;
+        self.expect_token(&Token::Colon)?;
+        let body = Box::new(self.parse_expr()?);
+        let params = if params.len() == 1 {
+            OneOrManyWithParens::One(params.remove(0))
+        } else {
+            OneOrManyWithParens::Many(params)
+        };
+        Ok(Expr::Lambda(LambdaFunction { params, body }))
     }
 
     /// Tries to parse the body of an [ODBC function] call.
@@ -15514,5 +15540,87 @@ mod tests {
         let sql = r#"REPLACE"#;
 
         assert!(Parser::parse_sql(&MySqlDialect {}, sql).is_err());
+    }
+
+    // ---- DuckDB's Python-style `lambda x: expr` lambda syntax. ----
+    // DuckDB is retiring the single-arrow lambda in favour of this form; both
+    // must keep parsing so a model written in either survives introspection
+    // (see MERIDIAN_PATCH.md #3).
+
+    // `lambda c: expr` (one param, no parens) parses to the same
+    // `Expr::Lambda` node the one-param arrow form does, and `Display`
+    // canonicalizes to that arrow form on round-trip.
+    #[test]
+    fn test_duckdb_lambda_colon_single_param() {
+        let duckdb = TestedDialects::new(vec![Box::new(DuckDbDialect {})]);
+        let expr = duckdb.expr_parses_to("lambda c: c + 1", "c -> c + 1");
+        match expr {
+            Expr::Lambda(LambdaFunction { params, .. }) => {
+                assert_eq!(params, OneOrManyWithParens::One(Ident::new("c")));
+            }
+            other => panic!("expected Expr::Lambda, got {other:?}"),
+        }
+    }
+
+    // `lambda acc, v: expr` (several params, no parens) parses to the same
+    // `Expr::Lambda` node the parenthesized arrow form does.
+    #[test]
+    fn test_duckdb_lambda_colon_multi_param() {
+        let duckdb = TestedDialects::new(vec![Box::new(DuckDbDialect {})]);
+        let expr = duckdb.expr_parses_to("lambda acc, v: acc + v", "(acc, v) -> acc + v");
+        match expr {
+            Expr::Lambda(LambdaFunction { params, .. }) => {
+                assert_eq!(
+                    params,
+                    OneOrManyWithParens::Many(vec![Ident::new("acc"), Ident::new("v")])
+                );
+            }
+            other => panic!("expected Expr::Lambda, got {other:?}"),
+        }
+    }
+
+    // Both pre-existing arrow forms still parse under DuckDB — the colon
+    // syntax is additive, not a replacement.
+    #[test]
+    fn test_duckdb_lambda_arrow_forms_still_parse() {
+        let duckdb = TestedDialects::new(vec![Box::new(DuckDbDialect {})]);
+        duckdb.verified_expr("c -> c + 1");
+        duckdb.verified_expr("(acc, v) -> acc + v");
+    }
+
+    // The colon syntax is gated to DuckDB: ClickHouse and Databricks both set
+    // `supports_lambda_functions` (their own arrow-only lambdas) but have no
+    // `lambda x:` form, and a dialect that did not accept it before must still
+    // reject it. Full-statement parsing (rather than a bare `parse_expr`) so a
+    // stray `lambda` falling back to a plain identifier can't hide a pass —
+    // the trailing `c: c + 1` has to fail to parse as anything for this to
+    // count as rejection.
+    #[test]
+    fn test_lambda_colon_syntax_rejected_outside_duckdb() {
+        let sql = "SELECT list_transform([1, 2, 3], lambda c: c + 1)";
+        for dialect in [
+            Box::new(ClickHouseDialect {}) as Box<dyn Dialect>,
+            Box::new(DatabricksDialect {}) as Box<dyn Dialect>,
+            Box::new(GenericDialect {}) as Box<dyn Dialect>,
+        ] {
+            let dialects = TestedDialects::new(vec![dialect]);
+            assert!(
+                dialects.parse_sql_statements(sql).is_err(),
+                "colon-lambda syntax must be rejected outside DuckDB"
+            );
+        }
+        // DuckDB itself accepts the same statement.
+        let duckdb = TestedDialects::new(vec![Box::new(DuckDbDialect {})]);
+        assert!(duckdb.parse_sql_statements(sql).is_ok());
+    }
+
+    // ClickHouse's and Databricks' own arrow-form lambdas are untouched by
+    // adding the DuckDB-only colon syntax.
+    #[test]
+    fn test_other_lambda_dialects_arrow_form_unaffected() {
+        let clickhouse = TestedDialects::new(vec![Box::new(ClickHouseDialect {})]);
+        clickhouse.verified_expr("x -> x + 1");
+        let databricks = TestedDialects::new(vec![Box::new(DatabricksDialect {})]);
+        databricks.verified_expr("x -> x + 1");
     }
 }

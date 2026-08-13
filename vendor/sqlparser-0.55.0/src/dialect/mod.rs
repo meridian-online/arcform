@@ -362,6 +362,25 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Returns true if the dialect supports the Python-style `lambda x: expr` /
+    /// `lambda x, y: expr` lambda syntax, for example:
+    ///
+    /// ```sql
+    /// SELECT list_transform([1, 2, 3], lambda x: x + 1); -- returns [2, 3, 4]
+    /// ```
+    ///
+    /// DuckDB added this as an alternative to its arrow-form lambdas
+    /// (`supports_lambda_functions`) and is retiring the single-arrow form, so a
+    /// dialect that has arrow lambdas does not necessarily have this: a separate
+    /// method rather than folding it into `supports_lambda_functions` so ClickHouse
+    /// and Databricks — which set that flag for their own arrow-only lambdas — do
+    /// not silently start accepting a syntax neither engine has.
+    ///
+    /// <https://duckdb.org/docs/stable/sql/functions/lambda.html>
+    fn supports_lambda_colon_syntax(&self) -> bool {
+        false
+    }
+
     /// Returns true if the dialect supports multiple variable assignment
     /// using parentheses in a `SET` variable declaration.
     ///
