@@ -1481,6 +1481,462 @@ mod tests {
         );
     }
 
+    // ─── tool: an external binary or artifact the step did not produce ───────────
+
+    fn tool_cfg() -> ToolConfig {
+        ToolConfig {
+            name: None,
+            path: None,
+            env: None,
+            version: None,
+            contents: false,
+        }
+    }
+
+    fn tool(cfg: ToolConfig) -> Precondition {
+        Precondition::Tool { tool: cfg }
+    }
+
+    // A tool identified by what it reports, resolved by `path:` relative to the manifest.
+    fn versioned(path: &str) -> Precondition {
+        tool(ToolConfig {
+            path: Some(path.to_string()),
+            version: Some("$ARC_TOOL".to_string()),
+            ..tool_cfg()
+        })
+    }
+
+    // A tool identified by its bytes, resolved through an environment variable.
+    fn by_contents_from_env(var: &str) -> Precondition {
+        tool(ToolConfig {
+            env: Some(var.to_string()),
+            contents: true,
+            ..tool_cfg()
+        })
+    }
+
+    // Write an executable script — the stand-in for a released binary. `body` is the
+    // whole script, so a test controls exactly what the version command reports.
+    fn write_tool(path: &Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    fn banner(version: &str) -> String {
+        format!("#!/bin/sh\necho 'faketool {version}'\n")
+    }
+
+    // Stand in for the runner: the step ran and succeeded, so its tool identities are
+    // recorded. Every fresh verdict in the tests below is reached through this.
+    fn step_ran(p: &Precondition, dir: &Path, step: &str, env: &HashMap<String, String>) {
+        record_all(std::slice::from_ref(p), dir, step, env);
+    }
+
+    // A manifest step accepts the kind, and both halves of the declaration are required
+    // at load: a `tool:` naming no tool, and one naming no way to identify it, are each
+    // refused by the same parse that accepts the well-formed pair.
+    #[test]
+    fn test_tool_manifest_load_requires_a_tool_and_an_identity() {
+        let manifest = |precondition: &str| {
+            format!(
+                "name: test\nsteps:\n  - name: describe\n    command: \"echo hi\"\n    \
+                 preconditions:\n      - tool:\n{precondition}"
+            )
+        };
+
+        let accepted = crate::manifest::Manifest::from_yaml_str(&manifest(
+            "          name: faketool\n          version: \"$ARC_TOOL --version\"\n",
+        ))
+        .expect("a well-formed tool precondition loads");
+        assert!(matches!(
+            accepted.steps[0].preconditions[0],
+            Precondition::Tool { .. }
+        ));
+
+        let no_tool = crate::manifest::Manifest::from_yaml_str(&manifest(
+            "          version: \"faketool --version\"\n",
+        ))
+        .expect_err("a tool precondition naming no tool is refused at load");
+        assert!(
+            no_tool.to_string().contains("names no tool"),
+            "says which half is missing: {no_tool}"
+        );
+        assert!(
+            no_tool.to_string().contains("describe"),
+            "names the step: {no_tool}"
+        );
+
+        let no_identity =
+            crate::manifest::Manifest::from_yaml_str(&manifest("          name: faketool\n"))
+                .expect_err("a tool precondition with no identity is refused at load");
+        assert!(
+            no_identity
+                .to_string()
+                .contains("says nothing about what identifies the tool"),
+            "says which half is missing: {no_identity}"
+        );
+    }
+
+    // Ambiguity is refused too: a tool named two ways, or identified two ways, would
+    // have to be broken silently by whichever branch the engine happened to test first.
+    #[test]
+    fn test_tool_validate_refuses_ambiguous_declarations() {
+        let two_tools = tool(ToolConfig {
+            name: Some("faketool".to_string()),
+            path: Some("bin/faketool".to_string()),
+            version: Some("$ARC_TOOL".to_string()),
+            ..tool_cfg()
+        });
+        let err = two_tools.validate().unwrap_err().to_string();
+        assert!(err.contains("names the tool 2 ways"), "{err}");
+        assert!(err.contains("name, path"), "names which two: {err}");
+
+        let two_identities = tool(ToolConfig {
+            name: Some("faketool".to_string()),
+            version: Some("$ARC_TOOL".to_string()),
+            contents: true,
+            ..tool_cfg()
+        });
+        let err = two_identities.validate().unwrap_err().to_string();
+        assert!(err.contains("two identities for one tool"), "{err}");
+
+        // A blank string is the same declaration as an absent one.
+        let blank = tool(ToolConfig {
+            name: Some("   ".to_string()),
+            version: Some("$ARC_TOOL".to_string()),
+            ..tool_cfg()
+        });
+        assert!(blank.validate().is_err(), "a blank name names no tool");
+    }
+
+    // The three resolutions reach the same file: a name on PATH, an absolute path, and
+    // an environment variable holding one. All three are fresh against the identity the
+    // step last ran with, which is what makes the env-var case usable at all — the
+    // finetype DuckDB extension is named nowhere but `FINETYPE_DUCKDB_EXT`.
+    #[test]
+    fn test_tool_resolves_from_path_from_a_file_path_and_from_an_env_var() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        write_tool(&bin.join("faketool"), &banner("1.0.0"));
+
+        let mut env = empty_env();
+        // The fake comes first, and the system directories stay on the end: a step's
+        // PATH is what the version command is run with, so a PATH holding nothing but
+        // the tool has no shell to run it.
+        env.insert(
+            "PATH".to_string(),
+            format!("{}:/usr/bin:/bin", bin.display()),
+        );
+        env.insert(
+            "FAKETOOL_BIN".to_string(),
+            bin.join("faketool").display().to_string(),
+        );
+
+        let on_path = tool(ToolConfig {
+            name: Some("faketool".to_string()),
+            version: Some("$ARC_TOOL".to_string()),
+            ..tool_cfg()
+        });
+        let at_path = tool(ToolConfig {
+            path: Some(bin.join("faketool").display().to_string()),
+            version: Some("$ARC_TOOL".to_string()),
+            ..tool_cfg()
+        });
+        let from_env = tool(ToolConfig {
+            env: Some("FAKETOOL_BIN".to_string()),
+            version: Some("$ARC_TOOL".to_string()),
+            ..tool_cfg()
+        });
+
+        for (label, p) in [
+            ("PATH", &on_path),
+            ("absolute path", &at_path),
+            ("env var", &from_env),
+        ] {
+            let step = format!("step-via-{label}");
+            assert!(
+                !p.evaluate(dir.path(), &step, &env).unwrap(),
+                "{label}: with nothing recorded the step is stale"
+            );
+            step_ran(p, dir.path(), &step, &env);
+            assert!(
+                p.evaluate(dir.path(), &step, &env).unwrap(),
+                "{label}: the same tool as the last run is fresh"
+            );
+        }
+    }
+
+    // The behaviour the kind exists for: same reported version = skip, different
+    // reported version = run, with nothing else about the step touched. The tool here
+    // is one file whose bytes change; only what it reports decides the verdict.
+    #[test]
+    fn test_tool_version_decides_the_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin/faketool");
+        write_tool(&bin, &banner("1.0.0"));
+        let p = versioned("bin/faketool");
+
+        assert!(
+            !p.evaluate(dir.path(), "describe", &empty_env()).unwrap(),
+            "a step that has never run against this tool is stale"
+        );
+        step_ran(&p, dir.path(), "describe", &empty_env());
+        assert!(
+            p.evaluate(dir.path(), "describe", &empty_env()).unwrap(),
+            "an unchanged tool is fresh"
+        );
+
+        write_tool(&bin, &banner("1.0.1"));
+        assert!(
+            !p.evaluate(dir.path(), "describe", &empty_env()).unwrap(),
+            "a tool reporting a different version is stale"
+        );
+
+        // And the new identity is what the next run is measured against.
+        step_ran(&p, dir.path(), "describe", &empty_env());
+        assert!(p.evaluate(dir.path(), "describe", &empty_env()).unwrap());
+    }
+
+    // A tool rebuilt in place: same path, same length, same reported version, different
+    // bytes. This is `finetype_validate`'s dependency — a DuckDB extension resolved from
+    // an env var — and nothing but a content hash moves for it. The banner is identical
+    // across the rebuild on purpose: a version comparison would call this fresh.
+    #[test]
+    fn test_tool_contents_redden_when_the_artifact_is_rebuilt_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = dir.path().join("build/finetype.duckdb_extension");
+        fs::create_dir_all(ext.parent().unwrap()).unwrap();
+        fs::write(&ext, b"EXTENSION-BUILD-AAAA").unwrap();
+
+        let mut env = empty_env();
+        env.insert("FINETYPE_EXT".to_string(), ext.display().to_string());
+        let p = by_contents_from_env("FINETYPE_EXT");
+
+        step_ran(&p, dir.path(), "gate", &env);
+        assert!(
+            p.evaluate(dir.path(), "gate", &env).unwrap(),
+            "the artifact the step last ran against is fresh"
+        );
+
+        // Rebuilt in place — the path in the env var has not moved and the file is the
+        // same size.
+        fs::write(&ext, b"EXTENSION-BUILD-BBBB").unwrap();
+        assert_eq!(
+            fs::metadata(&ext).unwrap().len(),
+            "EXTENSION-BUILD-AAAA".len() as u64,
+            "the rebuild changed no size, so only the bytes can carry the difference"
+        );
+        assert!(
+            !p.evaluate(dir.path(), "gate", &env).unwrap(),
+            "a rebuilt artifact at an unchanged path is stale"
+        );
+    }
+
+    // A missing tool is an error naming the step and where the lookup got to — never a
+    // fresh verdict, which would leave the step permanently clean against a tool that is
+    // not there. One case per way of naming a tool, plus a version command that fails.
+    #[test]
+    fn test_tool_that_cannot_be_identified_halts_and_names_the_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty_path_dir = dir.path().join("empty");
+        fs::create_dir_all(&empty_path_dir).unwrap();
+        let mut path_env = empty_env();
+        path_env.insert("PATH".to_string(), empty_path_dir.display().to_string());
+
+        // A readable file that is not executable is not a tool a shell would find.
+        let unreadable_dir = dir.path().join("notexec");
+        fs::create_dir_all(&unreadable_dir).unwrap();
+        fs::write(unreadable_dir.join("faketool"), "not executable").unwrap();
+        let mut notexec_env = empty_env();
+        notexec_env.insert("PATH".to_string(), unreadable_dir.display().to_string());
+
+        let mut pointing_nowhere = empty_env();
+        pointing_nowhere.insert(
+            "FAKETOOL_BIN".to_string(),
+            dir.path().join("gone/faketool").display().to_string(),
+        );
+
+        write_tool(&dir.path().join("bin/broken"), "#!/bin/sh\nexit 3\n");
+
+        let named = |name: &str| {
+            tool(ToolConfig {
+                name: Some(name.to_string()),
+                version: Some("$ARC_TOOL".to_string()),
+                ..tool_cfg()
+            })
+        };
+        let from_env = tool(ToolConfig {
+            env: Some("FAKETOOL_BIN".to_string()),
+            version: Some("$ARC_TOOL".to_string()),
+            ..tool_cfg()
+        });
+        let unset_var = tool(ToolConfig {
+            env: Some("ARC_TEST_NEVER_SET_VAR".to_string()),
+            contents: true,
+            ..tool_cfg()
+        });
+
+        let cases: [(&str, &Precondition, &HashMap<String, String>, &str); 6] = [
+            ("not on PATH", &named("faketool"), &path_env, "on PATH"),
+            (
+                "on PATH but not executable",
+                &named("faketool"),
+                &notexec_env,
+                "on PATH",
+            ),
+            (
+                "env var points at nothing",
+                &from_env,
+                &pointing_nowhere,
+                "does not exist",
+            ),
+            (
+                "env var unset",
+                &unset_var,
+                &empty_env(),
+                "ARC_TEST_NEVER_SET_VAR",
+            ),
+            (
+                "the file is missing",
+                &versioned("bin/absent"),
+                &empty_env(),
+                "does not exist",
+            ),
+            (
+                "the version command fails",
+                &versioned("bin/broken"),
+                &empty_env(),
+                "exited 3",
+            ),
+        ];
+
+        for (label, p, env, expected) in cases {
+            let result = p.evaluate(dir.path(), "describe", env);
+            let err = match result {
+                Err(e) => e,
+                Ok(verdict) => panic!("{label}: evaluated as {verdict} instead of halting"),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("describe"), "{label}: names the step: {msg}");
+            assert!(msg.contains(expected), "{label}: says where it got to: {msg}");
+        }
+    }
+
+    // The identity of a tool that has vanished is not recorded, and any identity already
+    // on record for it is dropped — so a tool removed after a successful run leaves a
+    // stale step and a refusal, not a clean one.
+    #[test]
+    fn test_tool_identity_is_dropped_when_the_tool_goes_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin/faketool");
+        write_tool(&bin, &banner("1.0.0"));
+        let p = versioned("bin/faketool");
+
+        step_ran(&p, dir.path(), "describe", &empty_env());
+        assert!(p.evaluate(dir.path(), "describe", &empty_env()).unwrap());
+
+        fs::remove_file(&bin).unwrap();
+        step_ran(&p, dir.path(), "describe", &empty_env());
+        write_tool(&bin, &banner("1.0.0"));
+        assert!(
+            !p.evaluate(dir.path(), "describe", &empty_env()).unwrap(),
+            "the identity dropped when the tool vanished is not silently restored"
+        );
+    }
+
+    // Evaluation is a question, not a write: asking whether a step is stale records
+    // nothing, so `arc` cannot make a step fresh by looking at it twice.
+    #[test]
+    fn test_tool_evaluation_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tool(&dir.path().join("bin/faketool"), &banner("1.0.0"));
+        let p = versioned("bin/faketool");
+
+        assert!(!p.evaluate(dir.path(), "describe", &empty_env()).unwrap());
+        assert!(
+            !stamp_store_path(dir.path()).exists(),
+            "evaluate wrote a stamp store"
+        );
+        assert!(
+            !p.evaluate(dir.path(), "describe", &empty_env()).unwrap(),
+            "a second look reaches the same verdict"
+        );
+    }
+
+    // Two tools on one step are two independent identities: whichever moves makes the
+    // step stale, and the one that did not move is not what decided it.
+    #[test]
+    fn test_tool_two_declarations_on_one_step_are_tracked_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tool(&dir.path().join("bin/alpha"), &banner("1.0.0"));
+        write_tool(&dir.path().join("bin/beta"), &banner("2.0.0"));
+        let alpha = versioned("bin/alpha");
+        let beta = versioned("bin/beta");
+        let both = vec![alpha.clone(), beta.clone()];
+
+        record_all(&both, dir.path(), "describe", &empty_env());
+        assert!(evaluate_all(&both, dir.path(), "describe", &empty_env()).unwrap());
+
+        write_tool(&dir.path().join("bin/beta"), &banner("2.0.1"));
+        assert!(
+            !evaluate_all(&both, dir.path(), "describe", &empty_env()).unwrap(),
+            "one moved tool is enough to make the step stale"
+        );
+        assert!(
+            alpha.evaluate(dir.path(), "describe", &empty_env()).unwrap(),
+            "and the tool that did not move is still fresh"
+        );
+    }
+
+    // An identity recorded for one step is not an identity for another: two steps
+    // declaring the same tool each answer for their own last run.
+    #[test]
+    fn test_tool_identities_are_per_step() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tool(&dir.path().join("bin/faketool"), &banner("1.0.0"));
+        let p = versioned("bin/faketool");
+
+        step_ran(&p, dir.path(), "describe", &empty_env());
+        assert!(p.evaluate(dir.path(), "describe", &empty_env()).unwrap());
+        assert!(
+            !p.evaluate(dir.path(), "validate", &empty_env()).unwrap(),
+            "a step that has not run is stale whatever its sibling recorded"
+        );
+    }
+
+    // Serde round-trip: the untagged enum reads a `tool:` map back as this variant and
+    // writes only the fields the declaration set.
+    #[test]
+    fn test_tool_serde_roundtrip() {
+        let yaml = serde_yaml::to_string(&vec![
+            versioned("bin/faketool"),
+            by_contents_from_env("FINETYPE_EXT"),
+        ])
+        .unwrap();
+        assert!(
+            !yaml.contains("null"),
+            "an unset resolver is omitted rather than serialised as null: {yaml}"
+        );
+        let parsed: Vec<Precondition> = serde_yaml::from_str(&yaml).unwrap();
+        assert!(matches!(parsed[0], Precondition::Tool { .. }));
+        assert!(matches!(parsed[1], Precondition::Tool { .. }));
+        match &parsed[1] {
+            Precondition::Tool { tool } => {
+                assert_eq!(tool.env.as_deref(), Some("FINETYPE_EXT"));
+                assert!(tool.contents);
+                assert!(tool.version.is_none());
+            }
+            other => panic!("expected a tool precondition: {other:?}"),
+        }
+    }
+
     // fresh: validation + serde round-trip.
     #[test]
     fn test_fresh_validate_and_roundtrip() {
