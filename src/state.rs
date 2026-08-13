@@ -56,6 +56,10 @@ pub enum SkipReason {
     PreconditionFresh,
     /// A `modified_after` clock precondition judged the file still within its period.
     PreconditionModifiedAfter,
+    /// A `tool` precondition found every external binary or artifact the step declares
+    /// still identical to what it was when the step last ran. Distinct from
+    /// `hash_clean`, which is silent about anything the step did not produce.
+    PreconditionTool,
 }
 
 impl SkipReason {
@@ -64,6 +68,7 @@ impl SkipReason {
             SkipReason::HashClean => "hash_clean",
             SkipReason::PreconditionFresh => "precondition_fresh",
             SkipReason::PreconditionModifiedAfter => "precondition_modified_after",
+            SkipReason::PreconditionTool => "precondition_tool",
         }
     }
 }

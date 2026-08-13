@@ -11,6 +11,35 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Added
 
+- **A `tool:` precondition declares the external binary or artifact a step depends on**
+  — a fourth precondition kind, beside `modified_after`, `fresh` and `command`. A
+  step's staleness hash covers what the manifest says and nothing about the machine it
+  runs on, so a step whose output is decided by a binary somewhere on that machine is
+  clean for ever while the binary moves underneath it. The declaration has two halves,
+  each explicit: where the tool is (exactly one of `name:` on `PATH`, `path:`, or
+  `env:` naming a variable that holds the path) and what identifies it (exactly one of
+  `version:`, a shell command with `$ARC_TOOL` bound to the resolved path, or
+  `contents: true`, the sha256 of the resolved file's bytes). Both shapes are needed:
+  a released binary announces a version, while an artifact rebuilt in place keeps its
+  path and its version and changes only its bytes. `arc` refuses at manifest load when
+  either half is missing or given two ways.
+
+  Same identity as the step's last successful run = skip, any difference = run, no
+  prior identity = run. The identity is observed at plan time and recorded after the
+  step succeeds — `evaluate` writes nothing, so asking whether a step is stale cannot
+  change the answer, and a step un-skipped by this gate and then never reached runs
+  again. Identities live in `build/.arcform/tools.json` beside the run records, so
+  deleting `build/` forgets them and the step goes stale. A skip yields the new
+  `precondition_tool` reason in the run contract, distinct from `hash_clean` and from
+  `precondition_fresh`.
+
+  **A tool that cannot be identified halts the run** — it is never "fresh", and not
+  "stale" either. `modified_after` calls a missing file stale because the step itself
+  produces that file, so running it is the remedy; nothing a step does creates the tool
+  it was told to depend on. The run stops at plan time naming the step and the path the
+  lookup reached, rather than surfacing later from whichever operator tripped over the
+  absence.
+
 - **`parquet_export` can stamp key-value metadata into the Parquet footer** — a new
   optional `metadata:` mapping on the operator's `with:` block, written through
   DuckDB's `KV_METADATA` copy option, so a dataset arcform writes can carry a

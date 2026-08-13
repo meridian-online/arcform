@@ -398,6 +398,11 @@ pub fn run_with_params(
                         succeeded += 1;
                         executed += 1;
                         let _ = state.record_step(&step.name, &sql_hash, StepStatus::Success);
+                        // What the step's declared tools were at the moment it ran — the
+                        // identity the next run compares against. Recorded here rather
+                        // than at plan time so a step that was un-skipped and then never
+                        // reached keeps its old identity and runs again.
+                        precondition::record_all(&step.preconditions, dir, &step.name, &env_map);
 
                         // If this step captures output, inject it as ARC_PARAM_ for downstream steps.
                         if let Some(ref output_name) = step.output {
@@ -638,10 +643,20 @@ struct Staleness {
 }
 
 /// Pick the typed skip reason for a step whose preconditions all evaluated fresh: a
-/// `modified_after` clock precondition is called out distinctly from generic ones so the
-/// contract records *which* freshness mechanism decided the skip.
+/// `tool` identity check and a `modified_after` clock check are each called out
+/// distinctly from generic ones so the contract records *which* freshness mechanism
+/// decided the skip.
+///
+/// A step carrying both is reported as `tool`: it is the more specific claim — this
+/// named binary is the one it last ran against — and it is the claim a reader is
+/// checking when a tool moves.
 fn precondition_skip_reason(preconditions: &[Precondition]) -> SkipReason {
     if preconditions
+        .iter()
+        .any(|p| matches!(p, Precondition::Tool { .. }))
+    {
+        SkipReason::PreconditionTool
+    } else if preconditions
         .iter()
         .any(|p| matches!(p, Precondition::ModifiedAfter { .. }))
     {
@@ -3595,6 +3610,113 @@ steps:
                 .iter()
                 .any(|l| l["event"] == "run_complete" && l["outcome"] == "success"),
             "stream has terminal run_complete line"
+        );
+    }
+
+    // Three runs of one unchanged manifest over a tool that moves between the second
+    // and the third: the step runs, is skipped as `precondition_tool` — a reason
+    // distinct from both `hash_clean` and `precondition_fresh` — and then runs again
+    // because the tool reports a different version. Nothing about the manifest, the
+    // command or the step's `with:` block differs across the three.
+    #[test]
+    fn a_step_reruns_when_its_declared_tool_changes_and_says_so_in_the_contract() {
+        use crate::contract::Contract;
+
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+name: test
+steps:
+  - name: describe
+    command: "echo describing"
+    preconditions:
+      - tool:
+          path: bin/faketool
+          version: "$ARC_TOOL --version"
+  - name: unrelated
+    command: "echo unrelated"
+    preconditions:
+      - command: "true"
+"#;
+        setup_project(dir.path(), yaml, &[]);
+
+        let tool = dir.path().join("bin/faketool");
+        let install = |version: &str| {
+            fs::create_dir_all(tool.parent().unwrap()).unwrap();
+            fs::write(&tool, format!("#!/bin/sh\necho 'faketool {version}'\n")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        };
+        let outcome = |run_id: &str, step: &str| {
+            let raw = fs::read_to_string(
+                dir.path()
+                    .join(format!("build/.arcform/runs/{run_id}.json")),
+            )
+            .unwrap();
+            let contract: Contract = serde_json::from_str(&raw).unwrap();
+            let s = contract
+                .steps
+                .iter()
+                .find(|s| s.name == step)
+                .unwrap_or_else(|| panic!("{step} present in {run_id}"));
+            (
+                s.status.state.clone(),
+                s.status.skip_reason.map(|r| r.as_str().to_string()),
+            )
+        };
+
+        install("1.0.0");
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            outcome("run-1", "describe"),
+            ("success".to_string(), None),
+            "a step that has never run against this tool runs"
+        );
+
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            outcome("run-2", "describe"),
+            ("skipped".to_string(), Some("precondition_tool".to_string())),
+            "an unchanged tool skips the step, and the contract says which mechanism \
+             decided it"
+        );
+        // The distinction is the point: a sibling step gated by a `command:`
+        // precondition is skipped in the same run under the generic reason.
+        assert_eq!(
+            outcome("run-2", "unrelated"),
+            (
+                "skipped".to_string(),
+                Some("precondition_fresh".to_string())
+            ),
+        );
+
+        install("1.0.1");
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            outcome("run-3", "describe"),
+            ("success".to_string(), None),
+            "a tool reporting a different version re-runs the step"
+        );
+        assert_eq!(
+            outcome("run-3", "unrelated"),
+            (
+                "skipped".to_string(),
+                Some("precondition_fresh".to_string())
+            ),
+            "and the step that does not declare the tool is untouched by its move"
+        );
+
+        // A fourth run against the bumped tool settles back to skipped, so the re-run is
+        // a consequence of the change rather than of the gate never being satisfiable.
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            outcome("run-4", "describe"),
+            ("skipped".to_string(), Some("precondition_tool".to_string())),
         );
     }
 

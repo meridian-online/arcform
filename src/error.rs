@@ -106,6 +106,16 @@ pub enum Error {
         detail: String,
     },
 
+    /// A `tool:` precondition could not establish what the tool it names currently is.
+    /// Carries the step, the declaration as written, and where the lookup got to — the
+    /// resolved path when there was one, otherwise what was searched.
+    #[error("precondition error for step '{step}': tool {tool} could not be identified: {detail}")]
+    ToolPrecondition {
+        step: String,
+        tool: String,
+        detail: String,
+    },
+
     #[error("missing required parameter '{name}' (no default, not in dotenv or CLI)")]
     MissingParam { name: String },
 

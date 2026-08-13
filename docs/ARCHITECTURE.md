@@ -13,7 +13,7 @@ src/
   engine.rs       # SQL engine invocation (DuckDB CLI delegation)
   asset.rs        # Assets, SQL auto-discovery, dependency validation
   introspect.rs   # SQL introspection via sqlparser-rs
-  precondition.rs # Typed step preconditions (modified_after, command)
+  precondition.rs # Typed step preconditions (modified_after, fresh, command, tool)
   state.rs        # Run state tracking (step hashes, staleness)
   error.rs        # Error types
 ```
@@ -22,7 +22,7 @@ src/
 
 - **`Manifest`** — top-level project config loaded from `arcform.yaml`. Contains `name`, `engine`, `engine_version`, `db`, `steps`, `assets`.
 - **`Step`** — a pipeline step. Either `sql` (path to .sql file) or `command` (shell string). Has `produces`, `depends_on`, `preconditions`.
-- **`Precondition`** — typed freshness check. Variants: `modified_after` (file age), `command` (shell exit code). AND semantics — all must pass to skip.
+- **`Precondition`** — typed freshness check. Variants: `modified_after` (file age), `fresh` (a fetched artifact's recorded identity vs. the remote), `command` (shell exit code), `tool` (the identity of an external binary or artifact the step did not produce — a reported version or a content hash). AND semantics — all must pass to skip.
 - **`AssetOverride`** — manual asset dependency declaration (for command steps; SQL steps auto-discover).
 
 ## Execution model
