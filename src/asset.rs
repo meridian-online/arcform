@@ -220,31 +220,43 @@ impl AssetGraph {
         graph
     }
 
-    /// Refuse a manifest where two declarations — a `produces:`, a `depends_on:`, an
-    /// `assets:` override, anywhere, within one step or across different steps —
-    /// collapse onto the same graph node purely because they differ only by case.
-    /// `asset.rs`'s lowercasing is what makes that collapse happen at all (needed so
-    /// a case-insensitive DuckDB table lands on one node); left silent, the collapsed
-    /// node's `declared_case` holds more than one raw spelling and there is no way to
-    /// say which one names the real file. Covers `reads:` as well as `produces:` —
-    /// two `depends_on:` entries differing only by case are the same defect
-    /// (`declared_case` cannot tell which is real either way) and were reachable
-    /// without ever tripping a `produces:`-only version of this check: nothing about
-    /// reading two distinct, real, differently-cased files is by itself invalid, so
-    /// `produced_artifact_hash` was left to pick one by `BTreeSet` iteration order —
-    /// silently, and the loser was never hashed, never tracked, at all.
+    /// Refuse a manifest where two declarations collapse onto the same graph node
+    /// purely because they differ only by case, **and there is no single producer to
+    /// arbitrate between them**. `asset.rs`'s lowercasing is what makes that collapse
+    /// happen at all (needed so a case-insensitive DuckDB table lands on one node).
     ///
-    /// This is a manifest defect independent of anything happening on disk —
-    /// `build/Report.csv` and `build/report.csv` collide whether or not either file
-    /// exists yet, so it is caught here, at load, rather than left for a staleness
-    /// check to discover only once both are already written. It is a complement to,
-    /// not a replacement for, `produced_artifact_hash`'s own read-time refusal to
-    /// pick a raw spelling by iteration order — that refusal is the backstop for a
-    /// `declared_case` entry this gate did not (or could not yet) inspect; it is not
-    /// covering a *different kind* of collision. Nothing here inspects the
-    /// filesystem, so a coincidental, undeclared file sharing a case-folded name with
-    /// something real is not this gate's concern — no declaration collides with it,
-    /// and `produced_artifact_hash` never looks it up at all.
+    /// **Exempt: a step's `produces:` and another step's `depends_on:` naming the
+    /// same asset with different case.** That is the ordinary shape of a
+    /// producer→consumer edge, not a collision — the real edgar_gleif manifest has
+    /// exactly this, eight times over (`archive_extract` preserves `REGISTRANT.tsv`'s
+    /// real case in each quarter's `produces:`; `load`'s hand-written `depends_on:`
+    /// spells all eight lowercase), and refusing it would make the gate reject the
+    /// flagship manifest it exists to protect. The exemption is keyed on the ASSET,
+    /// not the step: any number of readers, in any steps, may spell it however they
+    /// like as long as exactly one producer spelling exists, because
+    /// `produced_artifact_hash` never consults a reader's own spelling for an asset
+    /// something else produces in the first place (`all_produced` filters it out
+    /// before `declared_case` is ever reached for it; propagation carries the
+    /// staleness instead) — so a reader's case variance was never going to be read
+    /// from disk under its own name regardless of what this gate decided.
+    ///
+    /// **Refused: two or more DISTINCT producer spellings** (`build/Report.csv` and
+    /// `build/report.csv` each declared as `produces:` — probe2's shape) — **or two
+    /// or more distinct spellings with no producer at all** (two `depends_on:`
+    /// entries and nothing that creates either file — an external input's declared
+    /// case is the only identity it has, so disagreement there is exactly as real as
+    /// disagreement between producers). This is a manifest defect independent of
+    /// anything happening on disk, caught here at load rather than left for a
+    /// staleness check to discover only once both files are already written.
+    ///
+    /// It is a complement to, not a replacement for, `produced_artifact_hash`'s own
+    /// read-time refusal to pick a raw spelling by iteration order — that refusal is
+    /// the backstop for a `declared_case` entry this gate did not (or could not yet)
+    /// inspect; it is not covering a *different kind* of collision. Nothing here
+    /// inspects the filesystem, so a coincidental, undeclared file sharing a
+    /// case-folded name with something real is not this gate's concern — no
+    /// declaration collides with it, and `produced_artifact_hash` never looks it up
+    /// at all.
     pub fn validate_no_case_collisions(&self) -> Result<()> {
         // (kind, step, raw), grouped by lowered name — kind labels the error with the
         // manifest key a reader would actually go fix, since a `produces:` and a
@@ -271,6 +283,34 @@ impl AssetGraph {
         }
 
         for (lowered, entries) in &by_lowered {
+            // A SINGLE producer spelling makes any number of differently-cased
+            // READERS harmless, regardless of which step reads them — this is not a
+            // narrower "same step" exemption, because the shape it exists for is
+            // cross-step: the real edgar_gleif manifest has `archive_extract`
+            // preserve `REGISTRANT.tsv`'s real case in `extract_ncen_2025q3`'s
+            // `produces:`, while `load`'s hand-written `depends_on:` spells the same
+            // file lowercase eight times over (four quarters × two members). That is
+            // one asset referenced twice, not two assets colliding — and
+            // `produced_artifact_hash` already treats it that way structurally: a
+            // reader's own `reads` entry for an asset something else produces is
+            // filtered out by `all_produced` before `declared_case` is ever
+            // consulted for it (propagation carries the staleness instead), so the
+            // reader's spelling was never going to be read from disk under its own
+            // name regardless of what this gate decided.
+            let produces_raw: BTreeSet<&str> = entries
+                .iter()
+                .filter(|(kind, _, _)| *kind == "produces:")
+                .map(|(_, _, raw)| *raw)
+                .collect();
+            if produces_raw.len() == 1 {
+                continue;
+            }
+
+            // Otherwise: two or more PRODUCER spellings disagree (the genuine
+            // collision this gate exists for), or nothing produces this asset at all
+            // and two or more READERS disagree with no producer to arbitrate between
+            // them — an external input's own case is then the only identity it has,
+            // so ambiguity there is exactly as real as ambiguity between producers.
             let distinct_raw: BTreeSet<&str> = entries.iter().map(|(_, _, raw)| *raw).collect();
             if distinct_raw.len() > 1 {
                 let detail: Vec<String> = entries
@@ -916,5 +956,118 @@ mod tests {
         // this should NOT trigger a violation even though step-A creates a table named 'recent'.
         let order: Vec<String> = vec!["step-b".into(), "step-a".into()];
         graph.validate_order(&order).unwrap();
+    }
+
+    // Round 6, ground 1's second requirement: no test anywhere in this repo loaded a
+    // real shipping manifest through the case-collision gate before this one, which
+    // is exactly why the gate could refuse one (the real edgar_gleif manifest — see
+    // `validate_no_case_collisions`'s doc for the eight-collision shape it used to
+    // trip) and nothing here would have gone red. Byte-identical copies of all four
+    // manifests `open-analytics` ships, vendored under `tests/fixtures/
+    // open_analytics/` (both repos are public) so this is self-contained on CI, which
+    // checks out only this repo. A future manifest edit — or a future narrowing of
+    // this gate — that starts refusing a shape one of these four actually uses
+    // reddens here.
+    #[test]
+    fn all_open_analytics_manifests_load_and_pass_the_case_collision_gate() {
+        // (dataset name, arcform.yaml content, [(relative sql path, sql content)])
+        type Fixture<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+        let fixtures: &[Fixture] = &[
+            (
+                "gleif",
+                include_str!("../tests/fixtures/open_analytics/gleif/arcform.yaml"),
+                &[
+                    (
+                        "models/load.sql",
+                        include_str!("../tests/fixtures/open_analytics/gleif/models/load.sql"),
+                    ),
+                    (
+                        "models/package.sql",
+                        include_str!("../tests/fixtures/open_analytics/gleif/models/package.sql"),
+                    ),
+                ],
+            ),
+            (
+                "naics",
+                include_str!("../tests/fixtures/open_analytics/naics/arcform.yaml"),
+                &[
+                    (
+                        "models/load.sql",
+                        include_str!("../tests/fixtures/open_analytics/naics/models/load.sql"),
+                    ),
+                    (
+                        "models/package.sql",
+                        include_str!("../tests/fixtures/open_analytics/naics/models/package.sql"),
+                    ),
+                ],
+            ),
+            (
+                "edgar",
+                include_str!("../tests/fixtures/open_analytics/edgar/arcform.yaml"),
+                &[
+                    (
+                        "models/load.sql",
+                        include_str!("../tests/fixtures/open_analytics/edgar/models/load.sql"),
+                    ),
+                    (
+                        "models/package.sql",
+                        include_str!("../tests/fixtures/open_analytics/edgar/models/package.sql"),
+                    ),
+                ],
+            ),
+            (
+                "edgar_gleif",
+                include_str!("../tests/fixtures/open_analytics/edgar_gleif/arcform.yaml"),
+                &[
+                    (
+                        "models/sec_entities.sql",
+                        include_str!(
+                            "../tests/fixtures/open_analytics/edgar_gleif/models/sec_entities.sql"
+                        ),
+                    ),
+                    (
+                        "models/load.sql",
+                        include_str!(
+                            "../tests/fixtures/open_analytics/edgar_gleif/models/load.sql"
+                        ),
+                    ),
+                    (
+                        "models/tier.sql",
+                        include_str!(
+                            "../tests/fixtures/open_analytics/edgar_gleif/models/tier.sql"
+                        ),
+                    ),
+                    (
+                        "models/package.sql",
+                        include_str!(
+                            "../tests/fixtures/open_analytics/edgar_gleif/models/package.sql"
+                        ),
+                    ),
+                ],
+            ),
+        ];
+
+        for (name, yaml, sql_files) in fixtures {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("arcform.yaml"), yaml).unwrap();
+            for (path, content) in *sql_files {
+                let full = dir.path().join(path);
+                fs::create_dir_all(full.parent().unwrap()).unwrap();
+                fs::write(full, content).unwrap();
+            }
+
+            let manifest = Manifest::load(dir.path())
+                .unwrap_or_else(|e| panic!("{name}: manifest failed to load: {e}"));
+            let graph = AssetGraph::build(&manifest, dir.path());
+            assert!(
+                graph.warnings.is_empty(),
+                "{name}: unexpected asset-graph warnings (a step likely became opaque \
+                 because a referenced SQL file did not vendor cleanly): {:?}",
+                graph.warnings
+            );
+            graph.validate_no_case_collisions().unwrap_or_else(|e| {
+                panic!("{name}: case-collision gate refused a real shipping manifest: {e}")
+            });
+        }
     }
 }

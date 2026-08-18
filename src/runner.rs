@@ -417,18 +417,41 @@ pub fn run_with_params(
                         executed += 1;
                         // Hashed AFTER execution, so it reflects what the step just
                         // wrote — the baseline the *next* run's staleness check
-                        // compares against. Command steps always re-run regardless
-                        // (never consult this), so there is nothing to hash for them.
-                        // `None` (a relevant file still unreadable right after
-                        // "success," or an ambiguous declared spelling) records a
-                        // fixed, human-legible placeholder — its value is moot, since
-                        // `is_hash_stale` short-circuits to unconditional staleness on
-                        // the same condition before this string is ever compared.
+                        // compares against. `is_hash_stale` never calls
+                        // `produced_artifact_hash` for a `command:` step regardless of
+                        // whether it ran or was skipped via preconditions (command
+                        // steps are always stale on hash alone — see
+                        // `compute_staleness`), so there is nothing to hash for them
+                        // here either. `None` (a relevant file still unreadable right
+                        // after "success," or an ambiguous declared spelling) records
+                        // a fixed, human-legible placeholder — its value is moot,
+                        // since `is_hash_stale` short-circuits to unconditional
+                        // staleness on the same condition before this string is ever
+                        // compared.
                         let artifact_hash = if step.command.is_some() {
                             String::new()
                         } else {
-                            produced_artifact_hash(step, dir, &asset_graph, &all_produced)
-                                .unwrap_or_else(|| "MISSING".to_string())
+                            let hash =
+                                produced_artifact_hash(step, dir, &asset_graph, &all_produced);
+                            if hash.is_none() {
+                                // The step just "succeeded," and the run is about to
+                                // report success, while its own declared produces:
+                                // still cannot be read. Re-running (forced by `None`
+                                // above) is the safe outcome; it is not a legible one
+                                // on its own — say so, since exit 0 will not.
+                                let missing = missing_declared_produces(step, dir, &asset_graph);
+                                if !missing.is_empty() {
+                                    eprintln!(
+                                        "{} step '{}' succeeded but does not appear to have produced: {} — arc will \
+                                         keep re-running this step until its own work (or the manifest's \
+                                         produces:) matches",
+                                        "warning:".yellow(),
+                                        step.name,
+                                        missing.join(", ")
+                                    );
+                                }
+                            }
+                            hash.unwrap_or_else(|| "MISSING".to_string())
                         };
                         let _ = state.record_step(
                             &step.name,
@@ -903,8 +926,11 @@ fn is_hash_stale(
             //
             // `None` means at least one asset this step is answerable for could not
             // be confidently hashed right now — it is currently unreadable (missing,
-            // truncated mid-write, a directory, permission-denied), or its declared
-            // spelling is itself ambiguous (see `produced_artifact_hash`). Either way
+            // permission-denied — NOT truncated: `fs::read` succeeds on an empty
+            // file and yields `Some(hash_of_empty)`, a real digest that compares
+            // correctly against a non-empty prior hash; NOT a directory or a glob —
+            // `looks_like_file` excludes both before this is ever reached), or its
+            // declared spelling is itself ambiguous (see `produced_artifact_hash`). Either way
             // this forces staleness unconditionally rather than comparing against
             // `prior_state.artifact_hash` — an absence must never be allowed to read
             // as "unchanged" against a PRIOR absence. Two runs of a step whose
@@ -936,6 +962,39 @@ fn all_produced_assets(asset_graph: &AssetGraph) -> std::collections::HashSet<St
         .collect()
 }
 
+/// Every `produces:` name (raw, case-preserved) this step declares that cannot
+/// currently be read as a file. Checked right after the step "succeeds," so this
+/// names a real gap between the manifest's claim and what the step's own work
+/// (SQL/op/command) actually did — probe6's shape: `produces: [build/REGISTRANT.tsv]`
+/// declared, the step's SQL writes `build/registrant.tsv` instead, and
+/// `is_hash_stale` now correctly forces this step to keep re-running rather than
+/// silently certifying success (see `produced_artifact_hash`) — but re-running
+/// forever is a safe outcome, not a legible one. A run that exits 0 while the asset
+/// graph asserts a file is produced and nothing is on disk needs to say so.
+fn missing_declared_produces(
+    step: &crate::manifest::Step,
+    dir: &Path,
+    asset_graph: &AssetGraph,
+) -> Vec<String> {
+    let Some(assets) = asset_graph.steps.get(&step.name) else {
+        return Vec::new();
+    };
+    assets
+        .produces
+        .iter()
+        .filter(|n| contract::looks_like_file(n))
+        .filter_map(|lowered| {
+            let raw = match assets.declared_case.get(lowered) {
+                Some(raws) if raws.len() == 1 => raws.iter().next().unwrap().as_str(),
+                _ => lowered.as_str(),
+            };
+            std::fs::read(dir.join(raw))
+                .is_err()
+                .then(|| raw.to_string())
+        })
+        .collect()
+}
+
 /// A combined content hash over every FILE asset a step is answerable for: what it
 /// produces, plus what it reads directly that nothing in the manifest produces (an
 /// external input — the shape of `build/gleif_ra_sec.csv` before `gleif_ra_fetch`
@@ -959,7 +1018,10 @@ fn all_produced_assets(asset_graph: &AssetGraph) -> std::collections::HashSet<St
 /// (`is_hash_stale`) to unconditional staleness rather than a string comparison:
 ///
 /// - **A relevant file cannot be read right now**, under its declared spelling —
-///   missing, truncated mid-write, a directory, permission-denied. Earlier designs
+///   missing or permission-denied (not truncated: `fs::read` succeeds on an empty
+///   file, yielding `Some(hash_of_empty)`; not a directory or a glob, both excluded
+///   by `looks_like_file` before either ever reaches this function at all — see its
+///   doc in `contract.rs`). Earlier designs
 ///   folded this into a stable `"MISSING"` sentinel *string* and compared it like any
 ///   other digest, which reads as "unchanged" the moment a step's declared artifact
 ///   has never once existed under its declared name (its SQL wrote a differently-cased
@@ -1819,25 +1881,14 @@ mod tests {
         );
     }
 
-    // "For the board": an earlier version of this test asserted `TMPDIR` must be
-    // case-sensitive, unconditionally — true on `ubuntu-latest`, false on the default
-    // macOS temp dir, which turned `cargo test --workspace` into a hard failure at
-    // the lib target on every routine local run. Cargo stops at the first failing
-    // target, so the ten OTHER test binaries (`public_surface`, `record_contract`,
-    // `cli_authoring`, …) never even ran — one `test result:` line instead of eleven,
-    // which is exactly the shape of a check nobody reads and eventually gets
-    // `--skip`ped. Its intent was still right: nothing else in this family proves the
-    // environment it runs in can actually distinguish case — every other test here
-    // self-skips (with an explanation) on a filesystem that folds it, and reports
-    // `ok` either way, so a green run alone carries zero information about that.
-    //
-    // This is the corrected form: a biconditional, computed once, that is true on
-    // BOTH kinds of filesystem under correct code, and false only on the one state
-    // worth catching. It measures case-sensitivity directly (the same two-entry
-    // probe as before) and SEPARATELY measures whether the runner's own behaviour
-    // implies it — does a step correctly go on ignoring a decoy's mutation, which is
-    // only possible when the decoy and the declared file are actually two different
-    // on-disk entries — then asserts the two agree:
+    // Proves the habitat this whole case-collision test family depends on, rather
+    // than assuming it: a biconditional, computed once, true on BOTH a case-sensitive
+    // and a folding filesystem under correct code, false only on the one state worth
+    // catching. It measures case-sensitivity directly (write AAA/aaa, count entries)
+    // and SEPARATELY measures whether the runner's own behaviour implies it — does a
+    // step correctly go on ignoring a decoy's mutation, which is only possible when
+    // the decoy and the declared file are actually two different on-disk entries —
+    // then asserts the two agree:
     //
     //   case-sensitive  ⟺  a decoy's mutation is NOT detected
     //
@@ -1848,9 +1899,13 @@ mod tests {
     // detected, regardless of whether this fix is present or reverted; both sides
     // read false/detected. It reddens only when they disagree: either the probe is
     // wrong about the filesystem, or (on a genuinely case-sensitive habitat) the
-    // runner is substituting a decoy for a declared artifact again — this is,
-    // concretely, the same regression `test_declared_case_that_never_existed_ignores…`
-    // would have caught, folded into a form that cannot itself become vacuous.
+    // runner is substituting a decoy for a declared artifact again.
+    //
+    // Narrower than "case-sensitive ⟺ the whole family executed" would be: the other
+    // case-family tests still self-skip on a folding filesystem, satisfying this
+    // biconditional there without proving any of THEM ran — so this catches the
+    // runner regressing, but would not by itself catch a CI habitat that started
+    // folding case while everything else in the family quietly went back to skipping.
     #[test]
     fn test_case_sensitivity_probe_agrees_with_observed_runner_behavior() {
         let dir = tempfile::tempdir().unwrap();
@@ -4705,6 +4760,61 @@ steps:
             fs::read(dir.path().join("build/artifact.bin")).unwrap(),
             bytes,
             "the bytes came off the shared store"
+        );
+    }
+
+    // Round 6, ground 2: the real edgar_gleif shape — `models/load.sql` reads
+    // `read_csv('build/ncen/*/REGISTRANT.tsv', …)`, and SQL introspection captures
+    // that glob verbatim as a `reads` entry. Nothing produces the literal string
+    // `build/ncen/*/REGISTRANT.tsv` (only concrete per-quarter files do), so it took
+    // the external-read branch of `produced_artifact_hash`, and `looks_like_file`
+    // said yes (it contains `/`) — `fs::read` on a literal `*` always fails, so this
+    // step was `None` (forced stale) on every single run, forever, silently, no
+    // `--force` in sight. Confirmed against the real manifest: `load` re-ran on runs
+    // 2 through 5 with nothing else touched.
+    //
+    // `looks_like_file` now excludes glob metacharacters, so the glob is never added
+    // to this step's hashed-names list at all — proven here by the ordinary
+    // "unchanged, stays skipped" assertion, which a step with a permanently-`None`
+    // artifact hash could never reach.
+    #[test]
+    fn test_sql_introspected_glob_does_not_force_perpetual_staleness() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: load\n    sql: models/load.sql\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[(
+                "models/load.sql",
+                "CREATE TABLE ncen_registrant AS SELECT * FROM read_csv('build/ncen/*/REGISTRANT.tsv');",
+            )],
+        );
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(engine.calls.borrow().len(), 2, "run 1: preflight + 1 sql");
+
+        // Run 2, 3: nothing touched. A step whose staleness check was still trying
+        // (and always failing) to hash the literal glob string would re-run every
+        // time; this must settle into skip instead.
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "run 2: unchanged SQL (including its glob) must skip, not re-run forever \
+             because a glob was mistaken for a hashable file"
+        );
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "run 3: same again — must stay skipped, not resume re-running"
         );
     }
 }
