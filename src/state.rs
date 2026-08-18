@@ -14,8 +14,15 @@ use crate::error::{Error, Result};
 /// Record of a step's last execution state.
 #[derive(Debug, Clone)]
 pub struct StepState {
-    /// SHA-256 hex digest of the SQL file contents at last run.
+    /// SHA-256 hex digest of the SQL file contents (or, for an `op:` step, its
+    /// operator ref + `with:` config) at last run.
     pub sql_hash: String,
+    /// SHA-256 hex digest over every FILE asset this step produced, plus every file it
+    /// reads that nothing in the manifest produces, as those files stood on disk right
+    /// after the step's last success. Empty string for a row written before this field
+    /// existed, or for a step with no file-typed produced/external-read assets — see
+    /// [`crate::runner`]'s `produced_artifact_hash`, the only writer.
+    pub artifact_hash: String,
     /// Result of last execution.
     pub status: StepStatus,
 }
@@ -88,8 +95,15 @@ pub trait StateBackend {
     /// Get the last recorded state for a step, or None if never run.
     fn get_step_state(&self, step_name: &str) -> Result<Option<StepState>>;
 
-    /// Record a step's execution result.
-    fn record_step(&self, step_name: &str, sql_hash: &str, status: StepStatus) -> Result<()>;
+    /// Record a step's execution result: its config hash, its combined produced/
+    /// external-read artifact hash (see [`StepState::artifact_hash`]), and status.
+    fn record_step(
+        &self,
+        step_name: &str,
+        sql_hash: &str,
+        artifact_hash: &str,
+        status: StepStatus,
+    ) -> Result<()>;
 
     /// Record the start of a pipeline run. Returns a run ID.
     fn start_run(&self) -> Result<String>;
@@ -150,7 +164,14 @@ impl StateBackend for DuckDbStateBackend {
                 finished_at TIMESTAMP,
                 steps_executed INTEGER,
                 outcome TEXT
-            );",
+            );
+            -- Migration: a state db created before artifact hashing existed has no
+            -- such column. Idempotent, so every `init()` can run it unconditionally.
+            -- The empty-string default never matches a freshly computed hash (see
+            -- `produced_artifact_hash`), so the first post-upgrade run treats every
+            -- step as artifact-stale exactly once and reseeds it — safe because it
+            -- fails toward re-running, never toward skipping.
+            ALTER TABLE _arcform_state ADD COLUMN IF NOT EXISTS artifact_hash TEXT DEFAULT '';",
         )
         .map_err(|e| Error::StateBackend(e.to_string()))?;
         Ok(())
@@ -159,14 +180,18 @@ impl StateBackend for DuckDbStateBackend {
     fn get_step_state(&self, step_name: &str) -> Result<Option<StepState>> {
         let conn = self.open()?;
         let mut stmt = conn
-            .prepare("SELECT sql_hash, status FROM _arcform_state WHERE step_name = ?1")
+            .prepare(
+                "SELECT sql_hash, artifact_hash, status FROM _arcform_state WHERE step_name = ?1",
+            )
             .map_err(|e| Error::StateBackend(e.to_string()))?;
 
         let result = stmt.query_row([step_name], |row| {
             let hash: String = row.get(0)?;
-            let status: String = row.get(1)?;
+            let artifact_hash: String = row.get(1)?;
+            let status: String = row.get(2)?;
             Ok(StepState {
                 sql_hash: hash,
+                artifact_hash,
                 status: StepStatus::from_str(&status),
             })
         });
@@ -178,12 +203,18 @@ impl StateBackend for DuckDbStateBackend {
         }
     }
 
-    fn record_step(&self, step_name: &str, sql_hash: &str, status: StepStatus) -> Result<()> {
+    fn record_step(
+        &self,
+        step_name: &str,
+        sql_hash: &str,
+        artifact_hash: &str,
+        status: StepStatus,
+    ) -> Result<()> {
         let conn = self.open()?;
         conn.execute(
-            "INSERT OR REPLACE INTO _arcform_state (step_name, sql_hash, last_run_at, status)
-             VALUES (?1, ?2, current_timestamp, ?3)",
-            duckdb::params![step_name, sql_hash, status.as_str()],
+            "INSERT OR REPLACE INTO _arcform_state (step_name, sql_hash, artifact_hash, last_run_at, status)
+             VALUES (?1, ?2, ?3, current_timestamp, ?4)",
+            duckdb::params![step_name, sql_hash, artifact_hash, status.as_str()],
         )
         .map_err(|e| Error::StateBackend(e.to_string()))?;
         Ok(())
@@ -306,11 +337,18 @@ pub mod mock {
             Ok(self.states.borrow().get(step_name).cloned())
         }
 
-        fn record_step(&self, step_name: &str, sql_hash: &str, status: StepStatus) -> Result<()> {
+        fn record_step(
+            &self,
+            step_name: &str,
+            sql_hash: &str,
+            artifact_hash: &str,
+            status: StepStatus,
+        ) -> Result<()> {
             self.states.borrow_mut().insert(
                 step_name.to_string(),
                 StepState {
                     sql_hash: sql_hash.to_string(),
+                    artifact_hash: artifact_hash.to_string(),
                     status,
                 },
             );
@@ -360,7 +398,7 @@ mod tests {
 
         // Record and retrieve.
         backend
-            .record_step("foo", "abc123", StepStatus::Success)
+            .record_step("foo", "abc123", "", StepStatus::Success)
             .unwrap();
         let state = backend.get_step_state("foo").unwrap().unwrap();
         assert_eq!(state.sql_hash, "abc123");
@@ -423,7 +461,9 @@ mod tests {
             "state db (and its parent) should be created"
         );
         // Tables are usable.
-        backend.record_step("s", "h", StepStatus::Success).unwrap();
+        backend
+            .record_step("s", "h", "", StepStatus::Success)
+            .unwrap();
         assert_eq!(backend.get_step_state("s").unwrap().unwrap().sql_hash, "h");
     }
 
@@ -438,7 +478,7 @@ mod tests {
         let sql = "CREATE TABLE foo (id INT);";
         let hash = content_hash(sql.as_bytes());
         backend
-            .record_step("load", &hash, StepStatus::Success)
+            .record_step("load", &hash, "", StepStatus::Success)
             .unwrap();
 
         let state = backend.get_step_state("load").unwrap().unwrap();

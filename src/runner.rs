@@ -170,6 +170,9 @@ pub fn run_with_params(
 
     // Build the asset graph and validate dependency ordering.
     let asset_graph = AssetGraph::build(&manifest, dir);
+    // Who produces what — computed once, consulted both by staleness detection and by
+    // the artifact hash each successful step records for the *next* run to compare.
+    let all_produced = all_produced_assets(&asset_graph);
 
     // Print any warnings from asset discovery (e.g. unparseable SQL).
     for warning in &asset_graph.warnings {
@@ -184,7 +187,15 @@ pub fn run_with_params(
 
     // Determine which steps are stale, and — for the fresh ones — the typed reason
     // they can be skipped (recorded per step in the contract).
-    let staleness = compute_staleness(&manifest, dir, state, &asset_graph, force, &env_map)?;
+    let staleness = compute_staleness(
+        &manifest,
+        dir,
+        state,
+        &asset_graph,
+        &all_produced,
+        force,
+        &env_map,
+    )?;
 
     let db_path = manifest.db_path(dir);
     // The shared fetch cache, resolved once for the run and handed to every operator
@@ -397,7 +408,21 @@ pub fn run_with_params(
                     Ok(output) => {
                         succeeded += 1;
                         executed += 1;
-                        let _ = state.record_step(&step.name, &sql_hash, StepStatus::Success);
+                        // Hashed AFTER execution, so it reflects what the step just
+                        // wrote — the baseline the *next* run's staleness check
+                        // compares against. Command steps always re-run regardless
+                        // (never consult this), so there is nothing to hash for them.
+                        let artifact_hash = if step.command.is_some() {
+                            String::new()
+                        } else {
+                            produced_artifact_hash(step, dir, &asset_graph, &all_produced)
+                        };
+                        let _ = state.record_step(
+                            &step.name,
+                            &sql_hash,
+                            &artifact_hash,
+                            StepStatus::Success,
+                        );
                         // What the step's declared tools were at the moment it ran — the
                         // identity the next run compares against. Recorded here rather
                         // than at plan time so a step that was un-skipped and then never
@@ -443,7 +468,7 @@ pub fn run_with_params(
                     }
                     Err(e) => {
                         // Non-retryable errors (StepExecution, etc.) — halt immediately.
-                        let _ = state.record_step(&step.name, &sql_hash, StepStatus::Failed);
+                        let _ = state.record_step(&step.name, &sql_hash, "", StepStatus::Failed);
                         let _ = state.finish_run(&run_id, executed, "error", total_retries);
                         stream.step(&step.name, "failed");
                         step_outcomes.insert(
@@ -463,7 +488,7 @@ pub fn run_with_params(
             // If we exhausted all attempts with an error, record failure and halt.
             if let Some(err) = last_error {
                 executed += 1;
-                let _ = state.record_step(&step.name, &sql_hash, StepStatus::Failed);
+                let _ = state.record_step(&step.name, &sql_hash, "", StepStatus::Failed);
                 let _ = state.finish_run(&run_id, executed, "failed", total_retries);
                 stream.step(&step.name, "failed");
                 step_outcomes.insert(
@@ -674,6 +699,9 @@ fn precondition_skip_reason(preconditions: &[Precondition]) -> SkipReason {
 /// - It has no prior state (first run)
 /// - Its prior run failed
 /// - Its SQL file content hash changed
+/// - Any FILE asset it produced, or any file it reads that nothing in the manifest
+///   produces, no longer hashes to what it did after the step's last success —
+///   changed, truncated or deleted all count (see [`produced_artifact_hash`])
 /// - An upstream step (via asset graph) is stale (downstream propagation)
 ///
 /// For every step that stays fresh, a typed [`SkipReason`] is recorded so the run
@@ -683,6 +711,7 @@ fn compute_staleness(
     dir: &Path,
     state: &dyn StateBackend,
     asset_graph: &AssetGraph,
+    all_produced: &std::collections::HashSet<String>,
     force: bool,
     env: &HashMap<String, String>,
 ) -> Result<Staleness> {
@@ -719,8 +748,9 @@ fn compute_staleness(
             continue;
         }
 
-        // SQL/op step — check hash staleness (op steps hash their config).
-        let hash_stale = is_hash_stale(step, dir, state)?;
+        // SQL/op step — check hash staleness (op steps hash their config) AND
+        // artifact staleness (did the bytes this step is answerable for change).
+        let hash_stale = is_hash_stale(step, dir, state, asset_graph, all_produced)?;
 
         if step.preconditions.is_empty() {
             // No preconditions — SQL steps use hash only (backwards compat).
@@ -806,11 +836,21 @@ pub(crate) fn parse_params(raw: &[String]) -> Result<Vec<(String, String)>> {
 
 /// Check whether a SQL or op step's staleness hash has changed since the last run.
 ///
-/// Returns true (stale) if: no prior state, prior failure, hash mismatch, or missing file.
+/// Returns true (stale) if: no prior state, prior failure, config hash mismatch, a
+/// missing SQL file, **or the step's [`produced_artifact_hash`] no longer matches what
+/// was recorded at its last success** — i.e. a file it produced, or a file it reads
+/// that nothing in the manifest produces, was changed, truncated or deleted since.
+///
+/// The config-hash checks alone can only answer "would the same inputs produce the
+/// same outputs" — never "do the outputs still hold." An asset-centric engine has to
+/// ask the second question too, from the assets themselves, or a corrupted artifact
+/// with an unchanged SQL/op config looks identical to a genuinely fresh one.
 fn is_hash_stale(
     step: &crate::manifest::Step,
     dir: &Path,
     state: &dyn StateBackend,
+    asset_graph: &AssetGraph,
+    all_produced: &std::collections::HashSet<String>,
 ) -> Result<bool> {
     let prior = state.get_step_state(&step.name)?;
 
@@ -820,27 +860,105 @@ fn is_hash_stale(
             if prior_state.status == StepStatus::Failed {
                 return Ok(true); // Previously failed.
             }
-            if step.op.is_some() {
+
+            let config_stale = if step.op.is_some() {
                 // Op step — config hash (operator ref + serialized `with:`).
-                return Ok(op_config_hash(step) != prior_state.sql_hash);
-            }
-            if let Some(ref sql) = step.sql {
+                op_config_hash(step) != prior_state.sql_hash
+            } else if let Some(ref sql) = step.sql {
                 let sql_path = dir.join(sql);
                 if sql_path.exists() {
                     let content = std::fs::read(&sql_path).map_err(|e| Error::FileRead {
                         path: sql_path.clone(),
                         source: e,
                     })?;
-                    let current_hash = state::content_hash(&content);
-                    Ok(current_hash != prior_state.sql_hash)
+                    state::content_hash(&content) != prior_state.sql_hash
                 } else {
-                    Ok(true) // File missing — will error during execution.
+                    true // File missing — will error during execution.
                 }
             } else {
-                Ok(false) // No SQL file (shouldn't happen for SQL steps).
+                false // No SQL file (shouldn't happen for SQL steps).
+            };
+
+            if config_stale {
+                return Ok(true);
             }
+
+            // Config is unchanged — now ask whether the assets this step is
+            // answerable for still hold. This is the check that catches a produced
+            // file being edited, truncated or deleted underneath an unchanged
+            // manifest, which config hashing alone structurally cannot see.
+            let current_artifact_hash =
+                produced_artifact_hash(step, dir, asset_graph, all_produced);
+            Ok(current_artifact_hash != prior_state.artifact_hash)
         }
     }
+}
+
+/// Every asset name produced by any step in the manifest — the global "who owns this"
+/// set `produced_artifact_hash` consults to tell a file a step reads directly with no
+/// producer (an external input) apart from one produced upstream (already covered by
+/// that producer's own staleness plus downstream propagation).
+fn all_produced_assets(asset_graph: &AssetGraph) -> std::collections::HashSet<String> {
+    asset_graph
+        .steps
+        .values()
+        .flat_map(|sa| sa.produces.iter().cloned())
+        .collect()
+}
+
+/// A combined content hash over every FILE asset a step is answerable for: what it
+/// produces, plus what it reads directly that nothing in the manifest produces (an
+/// external input — the shape of `build/gleif_ra_sec.csv` before `gleif_ra_fetch`
+/// existed to own it). Table/source assets are left to the existing config-hash and
+/// downstream-propagation machinery; this only ever adds file-backed bytes to the
+/// staleness question, never subtracts from it.
+///
+/// Hashes the actual on-disk bytes directly — **never** a fetch sidecar's recorded
+/// digest (`crate::ingress_meta`, which [`crate::contract::measure_file`] prefers for
+/// reporting). Trusting a sidecar here would be exactly the failure this guards
+/// against: a truncated artifact whose stale `.arcmeta` sidecar still claims to be
+/// what the step wrote. A file that cannot be read — missing, truncated mid-write,
+/// permission-denied — hashes to the sentinel `"MISSING"`, which cannot collide with a
+/// real digest (fixed-width hex) and so always registers as a change.
+///
+/// A step with no file-typed produced or external-read assets hashes the empty
+/// input deterministically — stable across runs, so it never falsely reads as changed.
+fn produced_artifact_hash(
+    step: &crate::manifest::Step,
+    dir: &Path,
+    asset_graph: &AssetGraph,
+    all_produced: &std::collections::HashSet<String>,
+) -> String {
+    let mut names: Vec<&String> = Vec::new();
+    if let Some(assets) = asset_graph.steps.get(&step.name) {
+        names.extend(
+            assets
+                .produces
+                .iter()
+                .filter(|n| contract::looks_like_file(n)),
+        );
+        names.extend(
+            assets
+                .reads
+                .iter()
+                .filter(|n| contract::looks_like_file(n) && !all_produced.contains(n.as_str())),
+        );
+    }
+    names.sort();
+    names.dedup();
+
+    let mut buf = String::new();
+    for name in names {
+        let full = dir.join(name);
+        let digest = std::fs::read(&full)
+            .map(|bytes| state::content_hash(&bytes))
+            .unwrap_or_else(|_| "MISSING".to_string());
+        buf.push_str(name);
+        buf.push('\u{1f}'); // unit separator — cheap guard against name/hash collision
+        buf.push_str(&digest);
+        buf.push('\n');
+    }
+    state::content_hash(buf.as_bytes())
 }
 
 #[cfg(test)]
@@ -1177,6 +1295,162 @@ mod tests {
             calls.len(),
             2,
             "stale step should re-run: preflight + 1 sql"
+        );
+    }
+
+    // Card `changing-an-input-file-arcform-did-not-produce-marks-nothing-stale`, AC1 +
+    // AC4: a step's own SQL/config hash is unchanged, but the FILE it declares as
+    // `produces:` was edited directly on disk — arc must not skip it. Mutation proof:
+    // reverting `is_hash_stale`'s artifact-hash check (folding `config_stale` straight
+    // into the returned `Ok(...)` it replaced, dropping the `produced_artifact_hash`
+    // comparison) turns this red — the third run stays at 1 call (preflight only)
+    // instead of 2, because the edited file goes undetected and the step is skipped
+    // `hash_clean` with the edited bytes left in place.
+    #[test]
+    fn test_produced_file_change_forces_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/out.csv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/out.csv"), "a,b\n1,2\n").unwrap();
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+
+        // First run — always stale (no prior state).
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "first run: preflight + 1 sql"
+        );
+
+        // Second run, nothing touched — the positive control. Config unchanged AND the
+        // produced file unchanged must still skip, or the fix has regressed the warm
+        // path this defect was supposed to leave alone.
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "unchanged produced file should stay skipped (preflight only)"
+        );
+
+        // Edit the produced file directly — the manifest and its SQL never change.
+        fs::write(dir.path().join("build/out.csv"), "a,b\n1,2\n3,4\n").unwrap();
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "edited produced file must force a re-run: preflight + 1 sql"
+        );
+    }
+
+    // Same defect, truncation — AC1's second failure mode.
+    #[test]
+    fn test_produced_file_truncated_forces_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/out.csv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/out.csv"), "a,b\n1,2\n").unwrap();
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        // Truncate to 0 bytes — content_hash of empty input differs from the recorded
+        // hash of the non-empty original, so this must not be mistaken for "unchanged".
+        fs::write(dir.path().join("build/out.csv"), "").unwrap();
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "truncated produced file must force a re-run: preflight + 1 sql"
+        );
+    }
+
+    // Same defect, deletion — AC1's third failure mode. The file is gone outright, not
+    // just changed, so `produced_artifact_hash` has to treat "cannot read" as a change
+    // rather than silently degrading to "nothing to compare."
+    #[test]
+    fn test_produced_file_deleted_forces_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/out.csv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/out.csv"), "a,b\n1,2\n").unwrap();
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        fs::remove_file(dir.path().join("build/out.csv")).unwrap();
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "deleted produced file must force a re-run: preflight + 1 sql"
+        );
+    }
+
+    // The "(external source)" shape from the card's original 2026-08-12 evidence: a
+    // file a step *reads* (`depends_on:`) that nothing in the manifest produces. No
+    // step owns marking itself stale for this file via `produces:`, so
+    // `produced_artifact_hash` has to fold a step's *unproduced* direct reads in too,
+    // not just what it produces — otherwise this exact shape stays unfixed.
+    #[test]
+    fn test_external_unproduced_file_change_forces_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    depends_on: [external.csv]\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[
+                ("models/s1.sql", "SELECT 1;"),
+                ("external.csv", "a,b\n1,2\n"),
+            ],
+        );
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "first run: preflight + 1 sql"
+        );
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "unchanged external input should stay skipped (preflight only)"
+        );
+
+        // Nothing produces external.csv — it is edited directly, the only way an input
+        // like this ever changes.
+        fs::write(dir.path().join("external.csv"), "a,b\n1,2\n3,4\n").unwrap();
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "changed external input must force a re-run: preflight + 1 sql"
         );
     }
 

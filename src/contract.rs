@@ -724,7 +724,11 @@ fn redact_json(value: &mut serde_json::Value) {
 }
 
 /// Whether an asset name denotes a file (path-shaped) rather than a table identifier.
-fn looks_like_file(name: &str) -> bool {
+///
+/// `pub(crate)`: the runner's staleness path (`is_hash_stale`) needs the identical
+/// file/table split the contract uses, so a produced table is never mistaken for a
+/// produced file and hashed against a path that was never written.
+pub(crate) fn looks_like_file(name: &str) -> bool {
     if name.contains('/') {
         return true;
     }
