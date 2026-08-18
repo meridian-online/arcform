@@ -723,46 +723,47 @@ fn redact_json(value: &mut serde_json::Value) {
     }
 }
 
-/// Whether an asset name denotes a **single, literal, readable regular file** —
-/// never a table identifier, a directory, or a glob pattern. `fs::read` fails on all
-/// three of the latter, but for a different reason each time, and only the first
-/// (table) was ever excluded before this: a directory reads as a permission/type
-/// error, a glob reads as not-found because no file is literally named with a `*` in
-/// it — either way `runner.rs`'s `produced_artifact_hash` saw an unreadable path and
-/// (correctly, since round 5) refused to trust the absence, which for the real
-/// edgar_gleif manifest meant `load` re-running on every single invocation forever:
-/// its SQL reads `build/ncen/*/REGISTRANT.tsv`, a glob captured verbatim by SQL
-/// introspection, never a file no matter what is on disk.
+/// Whether an asset name is **syntactically path-shaped** — a candidate to resolve
+/// against disk at all, as opposed to a table identifier or a glob pattern. This is
+/// declaration-time and deliberately coarse: it does **not** decide whether the
+/// path, once resolved, turns out to be a directory rather than a regular file —
+/// that question depends on what is actually on disk, not on how the name is
+/// spelled, and round 6 tried to answer it here anyway by requiring a recognized
+/// file extension even when `/` was present. That was wrong, not just imprecise: a
+/// real, shipping operator (`parquet_export`, whose `dest:` is an unconstrained
+/// string — nothing in its schema limits it to these thirteen extensions) can write
+/// to any destination a manifest names, and 21 of 22 real files written to
+/// non-listed extensions in one run went untracked — `.avro`, `.orc`, `.feather`,
+/// `.tar`, `.zst`, `.sqlite`, `.html`, even no extension at all, each silently
+/// stopped being staleness-tracked while still being reported `[table]`. A truncated
+/// or deleted `build/x.avro` read as unchanged forever. Extension is not evidence of
+/// file-ness for a shipped, unconstrained operator; only asking the filesystem is —
+/// see `runner.rs`'s `produced_artifact_hash`, which does exactly that with
+/// `fs::metadata(..).is_dir()` on the resolved path, once, at the point it is about
+/// to read bytes, rather than guessing from the name here.
 ///
-/// The distinguishing question — could this name ever be a readable regular file —
-/// is answerable from the string alone, at declaration time, without touching the
-/// filesystem:
-///
-/// - **A glob is syntactically never one file.** Any of the shell/glob
-///   metacharacters `*`, `?`, `[` rules a name out, regardless of extension (a glob
-///   built from a `.tsv` read is still a glob, still ends in `.tsv`, and would
-///   otherwise pass the extension check below unchanged).
-/// - **A directory has no reason to carry a file extension, and every real file
-///   asset in this codebase does** — `archive_extract`'s coarse, pattern-only
-///   `produces:` node (`cfg.dest`, a directory `std::fs::create_dir_all`'d before
-///   anything is extracted into it) is exactly this shape, and no operator or SQL
-///   model declares a genuine file without one of the extensions below. Requiring an
-///   extension even for a path containing `/` (previously *any* slash was enough) is
-///   the whole fix: it costs nothing for a real file, and it is the one thing a bare
-///   directory path structurally cannot have.
+/// A glob is the one case this function *can* rule out from the string alone,
+/// unconditionally: `build/ncen/*/REGISTRANT.tsv` is syntactically never one file no
+/// matter what is on disk, regardless of extension (SQL introspection captures it
+/// verbatim — this is the real edgar_gleif `load` step, and getting it wrong here is
+/// what made `load` re-run on every single invocation forever; see the commit that
+/// added this check).
 ///
 /// `pub(crate)`: the runner's staleness path (`is_hash_stale`) needs the identical
-/// file/table/directory/glob split the contract uses, so a produced table, directory
-/// or glob is never mistaken for a produced file and hashed (or refused as missing)
-/// against a path that could never have held file bytes in the first place.
+/// file/table/glob split the contract uses, so a produced table or glob is never
+/// mistaken for a produced file.
 pub(crate) fn looks_like_file(name: &str) -> bool {
     if name.contains(['*', '?', '[']) {
         return false; // A glob pattern — syntactically never one file.
     }
-    // Requiring an extension applies uniformly whether or not `name` contains `/` —
-    // a directory (e.g. archive_extract's coarse pattern-only produces: node) looks
-    // path-shaped too, but never carries one of these, which is the deciding fact
-    // rather than a heuristic guess (see the doc above).
+    if name.contains('/') {
+        return true;
+    }
+    // No `/`: still ambiguous between a bare-filename produces: entry and a table
+    // identifier, so an extension is the only signal available — unlike the `/`
+    // case above, there is no operator that writes an extensionless destination
+    // under a bare (no-directory) name today, so this narrower heuristic is not
+    // known to be wrong the way the broader one was.
     const EXTS: [&str; 13] = [
         ".parquet", ".csv", ".tsv", ".json", ".ndjson", ".jsonl", ".txt", ".zip", ".gz", ".arrow",
         ".xlsx", ".db", ".duckdb",
@@ -855,16 +856,23 @@ mod tests {
         assert!(looks_like_file("build/ncen/2026q2/REGISTRANT.tsv"));
     }
 
-    // A directory looks path-shaped (it contains `/`) but never carries one of the
-    // recognized extensions the way every real file asset in this codebase does —
-    // archive_extract's coarse, pattern-only `produces:` node (its destination
-    // directory, `std::fs::create_dir_all`'d before extraction) is exactly this
-    // shape. Requiring an extension even when `/` is present is the fix.
+    // Round 7's regression, corrected: round 6 required a recognized extension even
+    // for a path containing `/`, meant to exclude a directory but actually excluding
+    // any real file `parquet_export` (whose `dest:` is an unconstrained string) or
+    // any other operator writes under an extension not on the thirteen-item list.
+    // These must all be treated as files regardless of extension — the directory
+    // question is answered elsewhere, by asking the filesystem, not by guessing here.
     #[test]
-    fn looks_like_file_excludes_directories() {
-        assert!(!looks_like_file("build/ncen/2026q2"));
-        assert!(!looks_like_file("build/ncen"));
-        assert!(!looks_like_file("build"));
+    fn looks_like_file_does_not_require_a_recognized_extension() {
+        assert!(looks_like_file("build/f1.avro"));
+        assert!(looks_like_file("build/f2.orc"));
+        assert!(looks_like_file("build/f3.feather"));
+        assert!(looks_like_file("build/f7.tar"));
+        assert!(looks_like_file("build/f8.zst"));
+        assert!(looks_like_file("build/f11.sqlite"));
+        assert!(looks_like_file("build/f14.html"));
+        assert!(looks_like_file("build/f20.parquet.crc"));
+        assert!(looks_like_file("build/f21")); // no extension at all
     }
 
     #[test]

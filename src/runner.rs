@@ -988,9 +988,20 @@ fn missing_declared_produces(
                 Some(raws) if raws.len() == 1 => raws.iter().next().unwrap().as_str(),
                 _ => lowered.as_str(),
             };
-            std::fs::read(dir.join(raw))
-                .is_err()
-                .then(|| raw.to_string())
+            let full = dir.join(raw);
+            // A directory that exists is not "missing" — `fs::read` errors on it too
+            // (a real directory is not a file), which would otherwise misreport a
+            // correctly-created destination as an unproduced artifact. Asked once,
+            // here, the same way `produced_artifact_hash` asks it — see that
+            // function's doc for why this is answered at the resolved path rather
+            // than guessed from the name.
+            if std::fs::metadata(&full)
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            std::fs::read(&full).is_err().then(|| raw.to_string())
         })
         .collect()
 }
@@ -1014,14 +1025,24 @@ fn missing_declared_produces(
 /// spelling is the one thing scanning can never recover once it has been thrown away,
 /// so it is carried from the manifest instead of reconstructed from the filesystem.
 ///
-/// Returns `None` — never a hash — in two cases, both forcing the caller
+/// A name that resolves to an on-disk **directory** is skipped entirely — added to
+/// neither the hash buffer nor treated as missing — the same non-participation a
+/// glob already gets from `looks_like_file`. Checked here, at the resolved path,
+/// via `fs::metadata(..).is_dir()`, never by guessing from the declared name's
+/// extension: round 6 tried the latter (require a recognized extension even when
+/// `/` is present) and it silently stopped tracking every real file written under
+/// an extension not on that list — `parquet_export`'s `dest:` is an unconstrained
+/// string, so this is not a hypothetical. Asking the filesystem is exact; guessing
+/// from spelling was not.
+///
+/// Returns `None` — never a hash — in two OTHER cases, both forcing the caller
 /// (`is_hash_stale`) to unconditional staleness rather than a string comparison:
 ///
 /// - **A relevant file cannot be read right now**, under its declared spelling —
 ///   missing or permission-denied (not truncated: `fs::read` succeeds on an empty
-///   file, yielding `Some(hash_of_empty)`; not a directory or a glob, both excluded
-///   by `looks_like_file` before either ever reaches this function at all — see its
-///   doc in `contract.rs`). Earlier designs
+///   file, yielding `Some(hash_of_empty)`; not a directory, handled above before
+///   this is ever reached; not a glob, excluded by `looks_like_file` — see its doc
+///   in `contract.rs`). Earlier designs
 ///   folded this into a stable `"MISSING"` sentinel *string* and compared it like any
 ///   other digest, which reads as "unchanged" the moment a step's declared artifact
 ///   has never once existed under its declared name (its SQL wrote a differently-cased
@@ -1085,6 +1106,20 @@ fn produced_artifact_hash(
             _ => name,
         };
         let full = dir.join(raw);
+        // A directory is not a file to hash, and its presence or absence must never
+        // affect this step's staleness either way — the same treatment a glob
+        // already gets from `looks_like_file`, extended here to the one case that
+        // can only be told apart from a real file by asking the filesystem: an
+        // extension (round 6's mistake) is not evidence either way, since a shipped,
+        // unconstrained operator (`parquet_export`'s `dest:`) can write a real file
+        // under any extension at all. Checked once, at the resolved, exact-declared-
+        // case path, so it can never be fooled the way a name-only guess was.
+        if std::fs::metadata(&full)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            continue;
+        }
         let bytes = std::fs::read(&full).ok()?;
         let digest = state::content_hash(&bytes);
         buf.push_str(name);
@@ -4815,6 +4850,104 @@ steps:
             engine.calls.borrow().len(),
             1,
             "run 3: same again — must stay skipped, not resume re-running"
+        );
+    }
+
+    // Round 7 pin #1: `missing_declared_produces` had zero regression protection —
+    // returning `Vec::new()` unconditionally would have reddened nothing, and it is
+    // the only legibility this whole card adds for a step that certifies success
+    // over work it did not do (probe6's shape). Calls it directly rather than
+    // capturing stderr, since the warning text is downstream of this and testing
+    // the source of the claim is the more direct pin.
+    #[test]
+    fn test_missing_declared_produces_names_the_gap_and_closes_when_fixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/REGISTRANT.tsv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        // build/REGISTRANT.tsv is never written.
+
+        let manifest = crate::manifest::Manifest::load(dir.path()).unwrap();
+        let asset_graph = AssetGraph::build(&manifest, dir.path());
+        let step = manifest.steps.iter().find(|s| s.name == "s1").unwrap();
+
+        let missing = missing_declared_produces(step, dir.path(), &asset_graph);
+        assert_eq!(
+            missing,
+            vec!["build/REGISTRANT.tsv".to_string()],
+            "a declared produces: file that was never written must be named"
+        );
+
+        // Write it — the gap must close, not stay reported forever.
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/REGISTRANT.tsv"), "now it exists\n").unwrap();
+        let missing = missing_declared_produces(step, dir.path(), &asset_graph);
+        assert!(
+            missing.is_empty(),
+            "declared file now exists — must not still be reported missing: {missing:?}"
+        );
+    }
+
+    // Round 7 pin #2: the gate exemption's soundness rests on one unpinned line —
+    // `produced_artifact_hash`'s own `!all_produced.contains(..)` filter over its
+    // `reads`. Dropping it is exactly round 5's perpetual re-execution returning: a
+    // reader (`consume`, mirroring `load`'s hand-written depends_on:) would try to
+    // hash ITS OWN, differently-cased spelling of an asset a producer already owns —
+    // a path that does not exist on a case-sensitive filesystem — and never settle
+    // into skip. The gate's exemption argument depends on this filter meaning the
+    // reader's spelling is never consulted at all; this proves that half.
+    //
+    // Case-sensitivity dependent — self-skips on a filesystem that folds
+    // build/REGISTRANT.tsv and build/registrant.tsv into one entry, since then there
+    // is nothing to distinguish.
+    #[test]
+    fn test_reader_case_mismatch_settles_to_skip_not_perpetual_staleness() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: produce\n    sql: models/produce.sql\n    produces: [build/REGISTRANT.tsv]\n  - name: consume\n    sql: models/consume.sql\n    depends_on: [build/registrant.tsv]\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[
+                ("models/produce.sql", "SELECT 1;"),
+                ("models/consume.sql", "SELECT 2;"),
+            ],
+        );
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/REGISTRANT.tsv"), "real content\n").unwrap();
+
+        if dir.path().join("build/registrant.tsv").exists() {
+            eprintln!(
+                "skipping test_reader_case_mismatch_settles_to_skip_not_perpetual_staleness: \
+                 {} does not distinguish case, so build/registrant.tsv already exists via \
+                 folding",
+                dir.path().display()
+            );
+            return;
+        }
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(engine.calls.borrow().len(), 3, "run 1: preflight + 2 sql");
+
+        // Run 2, 3: nothing touched. "consume" must settle to skip — a reader still
+        // hashing its own case-mismatched spelling directly would find that path
+        // missing every time and never stop re-running.
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "run 2: both steps unchanged, must settle to preflight only"
+        );
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "run 3: same again — must stay settled, not resume re-running"
         );
     }
 }

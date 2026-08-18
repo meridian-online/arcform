@@ -1070,4 +1070,104 @@ mod tests {
             });
         }
     }
+
+    // Round 7: the vendored fixtures above have no drift check. They are
+    // byte-identical to the four live manifests today, but that is a fact about
+    // today — the first `open-analytics` edit to any of them makes the test above
+    // stop testing the manifest it names, silently, since nothing here can see the
+    // other repo (CI checks out this one only). This does not close that gap — it
+    // cannot, without cross-repo CI this lane has no standing to add — but it closes
+    // the adjacent one: an accidental edit to the VENDORED COPY itself (as opposed
+    // to a deliberate, documented re-sync) fails loudly rather than silently
+    // changing what "the real shipping manifest" means in this test suite. See
+    // `tests/fixtures/open_analytics/SOURCE.md` for the re-sync procedure and the
+    // `open-analytics` commit these were last synced from.
+    #[test]
+    fn all_open_analytics_manifests_have_not_drifted_from_their_vendored_checksums() {
+        let fixtures: &[(&str, &str, &str)] = &[
+            (
+                "gleif/arcform.yaml",
+                include_str!("../tests/fixtures/open_analytics/gleif/arcform.yaml"),
+                "b9560912b49511e0f5d113406acf8e298811200ee6f55536149cfd90dfbbdbeb",
+            ),
+            (
+                "gleif/models/load.sql",
+                include_str!("../tests/fixtures/open_analytics/gleif/models/load.sql"),
+                "2f454ada74311a92c430c0bc355d0db79ff8b62b3bd3af51b8b294757b4450a6",
+            ),
+            (
+                "gleif/models/package.sql",
+                include_str!("../tests/fixtures/open_analytics/gleif/models/package.sql"),
+                "359276a8bb87c39636ae74703815b00b28e7da2be506c9da1526379beabef4f4",
+            ),
+            (
+                "naics/arcform.yaml",
+                include_str!("../tests/fixtures/open_analytics/naics/arcform.yaml"),
+                "3a9a3c870ce7e485ecb0d6d94c80e16bb33bc71bfcbeabe78677b34f55caceba",
+            ),
+            (
+                "naics/models/load.sql",
+                include_str!("../tests/fixtures/open_analytics/naics/models/load.sql"),
+                "a1b258a5d58739d609a871b09eae6d341ba71ae8a40fc370e7df6db7805d6019",
+            ),
+            (
+                "naics/models/package.sql",
+                include_str!("../tests/fixtures/open_analytics/naics/models/package.sql"),
+                "24181e6342dcd3c571756faad6245953dc3bf47fa644735f981267f480ab987e",
+            ),
+            (
+                "edgar/arcform.yaml",
+                include_str!("../tests/fixtures/open_analytics/edgar/arcform.yaml"),
+                "3dc51d55313c71df8562808eede1bbc65556b1c88be4a9159f050d02a6411439",
+            ),
+            (
+                "edgar/models/load.sql",
+                include_str!("../tests/fixtures/open_analytics/edgar/models/load.sql"),
+                "f472f769efb93e815020eb4062f283bb3aaf2f1680d4493c29ff1885f8999fe7",
+            ),
+            (
+                "edgar/models/package.sql",
+                include_str!("../tests/fixtures/open_analytics/edgar/models/package.sql"),
+                "b5fff7c311ac52e5c74d4602ae230af79c37f15f7d1e6925efac143070069975",
+            ),
+            (
+                "edgar_gleif/arcform.yaml",
+                include_str!("../tests/fixtures/open_analytics/edgar_gleif/arcform.yaml"),
+                "934e691a91868aad6ced19a66dd66b868fec7cd9759fc51c437f7adde5614c00",
+            ),
+            (
+                "edgar_gleif/models/sec_entities.sql",
+                include_str!(
+                    "../tests/fixtures/open_analytics/edgar_gleif/models/sec_entities.sql"
+                ),
+                "296223049072b164383aa6aa8278b1adfb98cb3ac63b178eaf9a5b4fe1f39efe",
+            ),
+            (
+                "edgar_gleif/models/load.sql",
+                include_str!("../tests/fixtures/open_analytics/edgar_gleif/models/load.sql"),
+                "f7a7281129a753919c64d443dafd95140e98fa34fe2f297b5c090b451ccf1240",
+            ),
+            (
+                "edgar_gleif/models/tier.sql",
+                include_str!("../tests/fixtures/open_analytics/edgar_gleif/models/tier.sql"),
+                "155534dbe397777c58caef91992dc6aeb0d244d56a37bab9bdea907010db7dda",
+            ),
+            (
+                "edgar_gleif/models/package.sql",
+                include_str!("../tests/fixtures/open_analytics/edgar_gleif/models/package.sql"),
+                "1806cbe9d1a0af36376b98d599cc73b2fa5008e467a90ee0ea6df18d75143097",
+            ),
+        ];
+
+        for (path, content, expected_sha256) in fixtures {
+            let actual = crate::state::content_hash(content.as_bytes());
+            assert_eq!(
+                &actual, expected_sha256,
+                "{path}: vendored fixture content does not match its recorded SHA-256 — \
+                 either the copy was edited directly (revert it and re-sync from \
+                 open-analytics deliberately) or this assertion needs updating as part \
+                 of a documented re-sync (see SOURCE.md)"
+            );
+        }
+    }
 }
