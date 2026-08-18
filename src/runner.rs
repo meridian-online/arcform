@@ -949,7 +949,7 @@ fn produced_artifact_hash(
 
     let mut buf = String::new();
     for name in names {
-        let full = dir.join(name);
+        let full = resolve_on_disk_case(dir, name);
         let digest = std::fs::read(&full)
             .map(|bytes| state::content_hash(&bytes))
             .unwrap_or_else(|_| "MISSING".to_string());
@@ -959,6 +959,48 @@ fn produced_artifact_hash(
         buf.push('\n');
     }
     state::content_hash(buf.as_bytes())
+}
+
+/// Resolve a graph-declared asset name (case-normalized to lowercase — every call site
+/// in `asset.rs` and every operator's `assets()` in `operator.rs` does this uniformly,
+/// because a DuckDB *table* identifier is case-insensitive and two spellings of the
+/// same table must land on one graph node) against the case a *file* actually has on
+/// disk. `archive_extract` writes zip members case-preserved on purpose
+/// (`extract_members`/`safe_relative`) — `REGISTRANT.tsv` on disk, `.../registrant.tsv`
+/// in the graph — so on a case-sensitive filesystem (Linux, which CI and the publish
+/// runner both use) `dir.join(name)` silently misses a real, case-differing file.
+/// `std::fs::read` then fails not-found for BOTH the untouched and the tampered file,
+/// `produced_artifact_hash` hashes both to the same `MISSING` sentinel, and the
+/// comparison in `is_hash_stale` can never fire — a truncated or deleted artifact reads
+/// as unchanged, which is the exact defect this file exists to close.
+///
+/// Deliberately does not touch the lowercasing itself: that would desync same-named
+/// table nodes declared or read with inconsistent case across steps, which is a much
+/// larger and unrelated blast radius than a file's on-disk case. Instead this resolves
+/// each path *component* case-sensitively first (free, and correct, on the common case
+/// including a case-insensitive filesystem), and only falls back to a case-insensitive
+/// directory scan for a component that does not match verbatim. Returns a path either
+/// way — a component with no case-insensitive match either resolves to the literal
+/// (still-missing) join, so a genuinely absent file still reads MISSING rather than
+/// this function silently returning a different answer than a present one.
+fn resolve_on_disk_case(dir: &Path, relative: &str) -> std::path::PathBuf {
+    let mut current = dir.to_path_buf();
+    for component in Path::new(relative).components() {
+        let next = current.join(component);
+        if next.exists() {
+            current = next;
+            continue;
+        }
+        let want = component.as_os_str().to_string_lossy().to_lowercase();
+        let found = std::fs::read_dir(&current).ok().and_then(|entries| {
+            entries
+                .flatten()
+                .find(|e| e.file_name().to_string_lossy().to_lowercase() == want)
+                .map(|e| e.path())
+        });
+        current = found.unwrap_or(next);
+    }
+    current
 }
 
 #[cfg(test)]
@@ -1401,6 +1443,119 @@ mod tests {
             engine.calls.borrow().len(),
             2,
             "deleted produced file must force a re-run: preflight + 1 sql"
+        );
+    }
+
+    // Regression: an independent verifier reproduced this live against `dd1ea78` on a
+    // real case-sensitive APFS volume (`hdiutil create -fs "Case-sensitive APFS"`),
+    // mirroring exactly what the real `extract_ncen_*` steps do —
+    // `archive_extract@1` with `members: [REGISTRANT.tsv, ...]` writes that case
+    // preserved to disk, while every lowercasing call site in `asset.rs` and every
+    // operator's `assets()` in `operator.rs` normalizes the graph's produces node to
+    // `.../registrant.tsv` (needed so two differently-cased spellings of the same
+    // case-insensitive DuckDB *table* land on one graph node — see
+    // `resolve_on_disk_case`'s doc for why that stays). On a case-SENSITIVE filesystem
+    // (`ubuntu-latest`, which both `ci.yml` and the publish runner use) the pre-fix
+    // `dir.join(lowercased_name)` never finds the real, mixed-case file — not on the
+    // baseline run, not after a mutation — so it hashes to the same `MISSING` sentinel
+    // both times and `is_hash_stale`'s comparison can never fire. That is the original
+    // defect, reachable through the one shape the real manifest actually uses.
+    //
+    // These three only exercise the bug on a filesystem that distinguishes case — the
+    // default macOS temp dir does not (case-preserving but case-INsensitive), so both
+    // the broken and fixed code resolve the same bytes there regardless of which name
+    // is queried. They reliably redden on `ubuntu-latest`; verified locally against a
+    // `hdiutil create -fs "Case-sensitive APFS"` volume mounted and used as `$TMPDIR`.
+    #[test]
+    fn test_case_mismatched_produced_file_change_forces_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        // Declared with the real member's case, matching `members: [REGISTRANT.tsv]`;
+        // the graph node the manifest's `produces:` list feeds is lowercased.
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/REGISTRANT.tsv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        // Written case-preserved, exactly as archive_extract's extract_members does.
+        fs::write(dir.path().join("build/REGISTRANT.tsv"), "cik\tlei\n1\tX\n").unwrap();
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "first run: preflight + 1 sql"
+        );
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "unchanged case-mismatched file should stay skipped (preflight only)"
+        );
+
+        fs::write(
+            dir.path().join("build/REGISTRANT.tsv"),
+            "cik\tlei\n1\tX\n2\tY\n",
+        )
+        .unwrap();
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "edited case-mismatched produced file must force a re-run: preflight + 1 sql"
+        );
+    }
+
+    #[test]
+    fn test_case_mismatched_produced_file_truncated_forces_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/REGISTRANT.tsv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/REGISTRANT.tsv"), "cik\tlei\n1\tX\n").unwrap();
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        fs::write(dir.path().join("build/REGISTRANT.tsv"), "").unwrap();
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "truncated case-mismatched produced file must force a re-run: preflight + 1 sql"
+        );
+    }
+
+    #[test]
+    fn test_case_mismatched_produced_file_deleted_forces_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/REGISTRANT.tsv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/REGISTRANT.tsv"), "cik\tlei\n1\tX\n").unwrap();
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        fs::remove_file(dir.path().join("build/REGISTRANT.tsv")).unwrap();
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "deleted case-mismatched produced file must force a re-run: preflight + 1 sql"
         );
     }
 
