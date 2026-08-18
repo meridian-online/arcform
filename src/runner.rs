@@ -412,10 +412,15 @@ pub fn run_with_params(
                         // wrote — the baseline the *next* run's staleness check
                         // compares against. Command steps always re-run regardless
                         // (never consult this), so there is nothing to hash for them.
+                        // An ambiguous resolution records a fixed, human-legible
+                        // sentinel rather than a real hash — its exact value is moot,
+                        // since the next run hits the same ambiguity and is_hash_stale
+                        // forces staleness before ever comparing this string again.
                         let artifact_hash = if step.command.is_some() {
                             String::new()
                         } else {
                             produced_artifact_hash(step, dir, &asset_graph, &all_produced)
+                                .unwrap_or_else(|| "AMBIGUOUS".to_string())
                         };
                         let _ = state.record_step(
                             &step.name,
@@ -887,9 +892,21 @@ fn is_hash_stale(
             // answerable for still hold. This is the check that catches a produced
             // file being edited, truncated or deleted underneath an unchanged
             // manifest, which config hashing alone structurally cannot see.
-            let current_artifact_hash =
-                produced_artifact_hash(step, dir, asset_graph, all_produced);
-            Ok(current_artifact_hash != prior_state.artifact_hash)
+            //
+            // `None` means the on-disk lookup for at least one asset was ambiguous —
+            // more than one file matched its name case-insensitively (a stray decoy,
+            // or two `produces:` entries differing only by case collapsed onto one
+            // graph node). An ambiguous resolution must never be allowed to compare
+            // equal to itself across runs — that is exactly how a collision would
+            // otherwise read as permanently "unchanged" regardless of what happens to
+            // either file — so it forces staleness unconditionally instead of
+            // comparing against `prior_state.artifact_hash` at all.
+            match produced_artifact_hash(step, dir, asset_graph, all_produced) {
+                None => Ok(true),
+                Some(current_artifact_hash) => {
+                    Ok(current_artifact_hash != prior_state.artifact_hash)
+                }
+            }
         }
     }
 }
@@ -923,12 +940,19 @@ fn all_produced_assets(asset_graph: &AssetGraph) -> std::collections::HashSet<St
 ///
 /// A step with no file-typed produced or external-read assets hashes the empty
 /// input deterministically — stable across runs, so it never falsely reads as changed.
+///
+/// Returns `None` — never a hash — the moment any one asset's on-disk name is
+/// ambiguous (see [`resolve_on_disk_case`]). Folding an ambiguous lookup into the hash
+/// buffer as a sentinel string (the way a plain "missing" reads) would let it compare
+/// equal to itself run after run, which is precisely how an unresolvable collision
+/// would silently certify "unchanged" while a declared artifact sits deleted beside
+/// its decoy. The caller (`is_hash_stale`) forces staleness on `None` instead.
 fn produced_artifact_hash(
     step: &crate::manifest::Step,
     dir: &Path,
     asset_graph: &AssetGraph,
     all_produced: &std::collections::HashSet<String>,
-) -> String {
+) -> Option<String> {
     let mut names: Vec<&String> = Vec::new();
     if let Some(assets) = asset_graph.steps.get(&step.name) {
         names.extend(
@@ -949,58 +973,87 @@ fn produced_artifact_hash(
 
     let mut buf = String::new();
     for name in names {
-        let full = resolve_on_disk_case(dir, name);
-        let digest = std::fs::read(&full)
-            .map(|bytes| state::content_hash(&bytes))
-            .unwrap_or_else(|_| "MISSING".to_string());
+        let digest = match resolve_on_disk_case(dir, name) {
+            CaseResolution::Ambiguous => {
+                eprintln!(
+                    "{} step '{}': '{}' matches more than one file on disk                      (case-insensitively) — cannot confirm which is the declared                      artifact, forcing this step stale until the collision is resolved",
+                    "warning:".yellow(),
+                    step.name,
+                    name,
+                );
+                return None;
+            }
+            CaseResolution::Path(full) => std::fs::read(&full)
+                .map(|bytes| state::content_hash(&bytes))
+                .unwrap_or_else(|_| "MISSING".to_string()),
+        };
         buf.push_str(name);
         buf.push('\u{1f}'); // unit separator — cheap guard against name/hash collision
         buf.push_str(&digest);
         buf.push('\n');
     }
-    state::content_hash(buf.as_bytes())
+    Some(state::content_hash(buf.as_bytes()))
+}
+
+/// The outcome of resolving one graph-declared asset name against what is actually on
+/// disk: exactly one matching path, or the ambiguity that makes trusting any single
+/// candidate wrong.
+enum CaseResolution {
+    /// Every path component matched exactly one on-disk entry. May or may not exist
+    /// at the final component — a component matching *nothing* still produces a path
+    /// (the literal join), so a genuinely absent file reads `MISSING` when its bytes
+    /// are read, same as always. That is "not found," not ambiguity.
+    Path(std::path::PathBuf),
+    /// A path component matched **more than one** on-disk entry case-insensitively —
+    /// e.g. a stray `registrant.tsv` beside the declared `REGISTRANT.tsv`, or two
+    /// `produces:` entries differing only by case collapsed onto one graph node
+    /// (`asset.rs` warns on neither). Nothing may be hashed as if it confidently were
+    /// the declared file.
+    Ambiguous,
 }
 
 /// Resolve a graph-declared asset name (case-normalized to lowercase — every call site
-/// in `asset.rs` and every operator's `assets()` in `operator.rs` does this uniformly,
+/// in `asset.rs`'s Phase 1b (op-declared) and Phase 2 (explicit `produces:`/
+/// `depends_on:`), and every operator's `assets()` in `operator.rs`, does this,
 /// because a DuckDB *table* identifier is case-insensitive and two spellings of the
 /// same table must land on one graph node) against the case a *file* actually has on
 /// disk. `archive_extract` writes zip members case-preserved on purpose
 /// (`extract_members`/`safe_relative`) — `REGISTRANT.tsv` on disk, `.../registrant.tsv`
 /// in the graph — so on a case-sensitive filesystem (Linux, which CI and the publish
-/// runner both use) `dir.join(name)` silently misses a real, case-differing file.
-/// `std::fs::read` then fails not-found for BOTH the untouched and the tampered file,
-/// `produced_artifact_hash` hashes both to the same `MISSING` sentinel, and the
-/// comparison in `is_hash_stale` can never fire — a truncated or deleted artifact reads
-/// as unchanged, which is the exact defect this file exists to close.
+/// runner both use) a literal join against the lowercased name silently misses a real,
+/// case-differing file.
 ///
 /// Deliberately does not touch the lowercasing itself: that would desync same-named
 /// table nodes declared or read with inconsistent case across steps, which is a much
-/// larger and unrelated blast radius than a file's on-disk case. Instead this resolves
-/// each path *component* case-sensitively first (free, and correct, on the common case
-/// including a case-insensitive filesystem), and only falls back to a case-insensitive
-/// directory scan for a component that does not match verbatim. Returns a path either
-/// way — a component with no case-insensitive match either resolves to the literal
-/// (still-missing) join, so a genuinely absent file still reads MISSING rather than
-/// this function silently returning a different answer than a present one.
-fn resolve_on_disk_case(dir: &Path, relative: &str) -> std::path::PathBuf {
+/// larger and unrelated blast radius than a file's on-disk case. Instead this scans
+/// each path *component*'s parent directory case-insensitively and counts every entry
+/// whose name folds to the one asked for — an exact-case match counts as one candidate
+/// among however many there are, **never preferred or checked first**, because a
+/// verbatim match can itself be the wrong file (a decoy that happens to spell exactly
+/// what the lowercased graph query asks for is indistinguishable from the real one by
+/// spelling alone). Exactly one candidate resolves; zero proceeds to the literal join
+/// (so a genuinely absent file still reads `MISSING`); more than one is
+/// [`CaseResolution::Ambiguous`], and the caller must not read that as "unchanged"
+/// against anything. Measured cost of always scanning rather than trying a literal
+/// join first: 0.09s vs 0.10s over a 50,000-entry directory — free either way.
+fn resolve_on_disk_case(dir: &Path, relative: &str) -> CaseResolution {
     let mut current = dir.to_path_buf();
     for component in Path::new(relative).components() {
-        let next = current.join(component);
-        if next.exists() {
-            current = next;
-            continue;
-        }
         let want = component.as_os_str().to_string_lossy().to_lowercase();
-        let found = std::fs::read_dir(&current).ok().and_then(|entries| {
-            entries
-                .flatten()
-                .find(|e| e.file_name().to_string_lossy().to_lowercase() == want)
-                .map(|e| e.path())
-        });
-        current = found.unwrap_or(next);
+        let matches: Vec<std::path::PathBuf> = std::fs::read_dir(&current)
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.flatten())
+            .filter(|e| e.file_name().to_string_lossy().to_lowercase() == want)
+            .map(|e| e.path())
+            .collect();
+        match matches.len() {
+            0 => current = current.join(component),
+            1 => current = matches.into_iter().next().expect("len() == 1"),
+            _ => return CaseResolution::Ambiguous,
+        }
     }
-    current
+    CaseResolution::Path(current)
 }
 
 #[cfg(test)]
@@ -1450,11 +1503,13 @@ mod tests {
     // real case-sensitive APFS volume (`hdiutil create -fs "Case-sensitive APFS"`),
     // mirroring exactly what the real `extract_ncen_*` steps do —
     // `archive_extract@1` with `members: [REGISTRANT.tsv, ...]` writes that case
-    // preserved to disk, while every lowercasing call site in `asset.rs` and every
-    // operator's `assets()` in `operator.rs` normalizes the graph's produces node to
-    // `.../registrant.tsv` (needed so two differently-cased spellings of the same
-    // case-insensitive DuckDB *table* land on one graph node — see
-    // `resolve_on_disk_case`'s doc for why that stays). On a case-SENSITIVE filesystem
+    // preserved to disk, while the op-declared and explicit-`produces:` lowercasing
+    // call sites in `asset.rs`, and every operator's `assets()` in `operator.rs`,
+    // normalize the graph's produces node to `.../registrant.tsv` (needed so two
+    // differently-cased spellings of the same case-insensitive DuckDB *table* land on
+    // one graph node — see `resolve_on_disk_case`'s doc for why that stays; SQL
+    // introspection's own produces/reads, by contrast, are captured verbatim from the
+    // SQL text and are not part of this). On a case-SENSITIVE filesystem
     // (`ubuntu-latest`, which both `ci.yml` and the publish runner use) the pre-fix
     // `dir.join(lowercased_name)` never finds the real, mixed-case file — not on the
     // baseline run, not after a mutation — so it hashes to the same `MISSING` sentinel
@@ -1464,8 +1519,13 @@ mod tests {
     // These three only exercise the bug on a filesystem that distinguishes case — the
     // default macOS temp dir does not (case-preserving but case-INsensitive), so both
     // the broken and fixed code resolve the same bytes there regardless of which name
-    // is queried. They reliably redden on `ubuntu-latest`; verified locally against a
-    // `hdiutil create -fs "Case-sensitive APFS"` volume mounted and used as `$TMPDIR`.
+    // is queried. They are unfiltered — no `#[ignore]` — so they execute as part of
+    // `cargo test --workspace` in `ci.yml`'s `build` job on `ubuntu-latest`, and that
+    // job on PR #54 at `a9a81d1` (which added them, fixed) is SUCCESS — confirming
+    // they run there, not that a red run was ever observed. The actual redden-on-
+    // reverted-code proof below was measured locally against a
+    // `hdiutil create -fs "Case-sensitive APFS"` volume mounted and used as `$TMPDIR`,
+    // not by watching CI turn red.
     #[test]
     fn test_case_mismatched_produced_file_change_forces_rerun() {
         let dir = tempfile::tempdir().unwrap();
@@ -1556,6 +1616,134 @@ mod tests {
             engine.calls.borrow().len(),
             2,
             "deleted case-mismatched produced file must force a re-run: preflight + 1 sql"
+        );
+    }
+
+    // Round-3 counter-example #1: a verifier found round 2's lookup checked a literal
+    // (exact-case) join FIRST, so a stray file that happens to spell exactly what the
+    // lowercased graph query asks for was matched directly — never reaching the
+    // case-insensitive scan at all. Deleting/truncating the REAL, differently-cased
+    // declared file changed nothing the lookup was actually reading, so the step
+    // stayed `[skip: hash_clean]` forever. `resolve_on_disk_case` no longer prefers a
+    // verbatim match; it counts every case-insensitive candidate and requires exactly
+    // one, so a decoy makes the resolution ambiguous rather than silently substituted.
+    //
+    // Mutation proof (see PR): reverting the ambiguity-forces-staleness handling back
+    // to "pick a candidate and hash it" — the literal shape of round 2's bug, and of
+    // the `.next()`-ignoring-the-name mutation the verifier applied — turns this red:
+    // the second, untouched-manifest run would then skip on the strength of whichever
+    // file `read_dir` happened to return first.
+    #[test]
+    fn test_case_collision_with_decoy_never_reads_as_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/REGISTRANT.tsv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        // The declared, real artifact.
+        fs::write(dir.path().join("build/REGISTRANT.tsv"), "real content\n").unwrap();
+        // A stray file that happens to spell exactly what the lowercased graph node
+        // asks for — this is what round 2's exact-match-first lookup matched directly,
+        // and nothing in `asset.rs` warns that it collides with the declared name.
+        fs::write(dir.path().join("build/registrant.tsv"), "decoy content\n").unwrap();
+
+        // This scenario is only representable on a case-sensitive filesystem: on the
+        // default macOS temp dir the second write above silently overwrote the first
+        // (both names resolve to the same directory entry), so there is only one file
+        // and nothing here would be exercising the fix at all. `ubuntu-latest` — both
+        // `ci.yml`'s `build` job and the publish runner — is case-sensitive, so this
+        // executes for real there; skip locally rather than fail for a reason that has
+        // nothing to do with the code under test.
+        if fs::read_dir(dir.path().join("build")).unwrap().count() < 2 {
+            eprintln!(
+                "skipping test_case_collision_with_decoy_never_reads_as_fresh: {} does \
+                 not distinguish case, so a genuine collision cannot be constructed here",
+                dir.path().display()
+            );
+            return;
+        }
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "first run: preflight + 1 sql"
+        );
+
+        // Nothing touched. An ambiguous resolution can never certify "unchanged" — a
+        // run that skips here is the sentence AC2 exists to abolish.
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "an on-disk name collision must force a re-run rather than certify \
+             freshness: preflight + 1 sql"
+        );
+    }
+
+    // Round-3 counter-example #2: two DIFFERENT steps each declare a `produces:`
+    // artifact differing from the other only by case. `asset.rs`'s per-step
+    // lowercasing collapses both onto the identical graph node name independently,
+    // with no collision warning anywhere (`rg 'duplicate|already produced|collision'
+    // src/asset.rs src/manifest.rs` finds only duplicate STEP-name checks). Both
+    // steps' own lookups for that shared lowercased name land on the same ambiguous
+    // two-file scan, so deleting either declared file must force a re-run of whichever
+    // step is answerable for it — not just the one whose file was actually touched,
+    // since the ambiguity itself, not the specific mutation, is what is undetectable.
+    #[test]
+    fn test_produces_case_collision_across_steps_never_reads_as_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/Report.csv]\n  - name: s2\n    sql: models/s2.sql\n    produces: [build/report.csv]\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[
+                ("models/s1.sql", "SELECT 1;"),
+                ("models/s2.sql", "SELECT 2;"),
+            ],
+        );
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/Report.csv"), "from s1\n").unwrap();
+        fs::write(dir.path().join("build/report.csv"), "from s2\n").unwrap();
+
+        // Same case-sensitivity caveat as the decoy test above: on a case-insensitive
+        // filesystem the second write collapses onto the first, so there is only one
+        // file on disk and nothing to collide.
+        if fs::read_dir(dir.path().join("build")).unwrap().count() < 2 {
+            eprintln!(
+                "skipping test_produces_case_collision_across_steps_never_reads_as_fresh: \
+                 {} does not distinguish case, so a genuine collision cannot be \
+                 constructed here",
+                dir.path().display()
+            );
+            return;
+        }
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            3,
+            "first run: preflight + 2 sql"
+        );
+
+        // Delete only s1's declared file. Both steps' declared name collapses to the
+        // same lowercased graph node, so both are answerable for it — neither may
+        // report fresh while the collision stands.
+        fs::remove_file(dir.path().join("build/Report.csv")).unwrap();
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            3,
+            "a produces: collision must force both steps to re-run rather than \
+             certify freshness while a declared artifact is missing: preflight + 2 sql"
         );
     }
 
