@@ -11,10 +11,10 @@ src/
   manifest.rs     # YAML manifest parsing (arcform.yaml)
   runner.rs       # Step execution engine (~1150 lines, largest module)
   engine.rs       # SQL engine invocation (DuckDB CLI delegation)
-  asset.rs        # Assets, SQL auto-discovery, dependency validation
+  asset.rs        # Assets, SQL auto-discovery, dependency validation, case-collision gate
   introspect.rs   # SQL introspection via sqlparser-rs
   precondition.rs # Typed step preconditions (modified_after, fresh, command, tool)
-  state.rs        # Run state tracking (step hashes, staleness)
+  state.rs        # Run state tracking (step config hash, artifact hash, staleness)
   error.rs        # Error types
 ```
 
@@ -28,9 +28,9 @@ src/
 ## Execution model
 
 1. Load `arcform.yaml` manifest
-2. Build asset dependency graph (SQL introspection + manual overrides)
+2. Build asset dependency graph (SQL introspection + manual overrides); refuse the manifest if two produces:/depends_on: declarations collapse onto one asset by case alone
 3. For each step in order:
-   - Evaluate preconditions (if any) + SQL hash staleness
+   - Evaluate preconditions (if any) + SQL/op config hash staleness + produced/read artifact hash staleness
    - Skip if fresh; execute if stale
    - SQL steps: delegate to engine CLI (`duckdb -bail`)
    - Command steps: shell execution with real-time stdout streaming
@@ -43,7 +43,7 @@ src/
 - **sqlparser** — SQL introspection (CTE/table extraction)
 - **duckdb** — DuckDB Rust bindings (state backend)
 - **semver** — engine version constraint checking
-- **sha2** — SQL content hashing for staleness detection
+- **sha2** — SQL/op config hashing AND produced/read artifact content hashing, both for staleness detection
 - **humantime** — duration parsing for preconditions
 
 ## Conventions

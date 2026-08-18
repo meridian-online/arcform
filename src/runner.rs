@@ -179,11 +179,12 @@ pub fn run_with_params(
         eprintln!("{} {}", "warning:".yellow(), warning);
     }
 
-    // A `produces:` collision (two declarations differing only by case) is a manifest
-    // defect independent of anything on disk — refused before anything runs, not
-    // tolerated with a warning. Unconditional: the collision exists in the manifest
-    // whether or not `has_assets()` would otherwise gate the rest of this section.
-    asset_graph.validate_no_produces_case_collisions()?;
+    // A case collision (two produces:/depends_on: declarations differing only by
+    // case) is a manifest defect independent of anything on disk — refused before
+    // anything runs, not tolerated with a warning. Unconditional: the collision
+    // exists in the manifest whether or not `has_assets()` would otherwise gate the
+    // rest of this section.
+    asset_graph.validate_no_case_collisions()?;
 
     // If the graph has assets, validate step ordering against dependencies.
     if asset_graph.has_assets() {
@@ -418,10 +419,16 @@ pub fn run_with_params(
                         // wrote — the baseline the *next* run's staleness check
                         // compares against. Command steps always re-run regardless
                         // (never consult this), so there is nothing to hash for them.
+                        // `None` (a relevant file still unreadable right after
+                        // "success," or an ambiguous declared spelling) records a
+                        // fixed, human-legible placeholder — its value is moot, since
+                        // `is_hash_stale` short-circuits to unconditional staleness on
+                        // the same condition before this string is ever compared.
                         let artifact_hash = if step.command.is_some() {
                             String::new()
                         } else {
                             produced_artifact_hash(step, dir, &asset_graph, &all_produced)
+                                .unwrap_or_else(|| "MISSING".to_string())
                         };
                         let _ = state.record_step(
                             &step.name,
@@ -893,9 +900,26 @@ fn is_hash_stale(
             // answerable for still hold. This is the check that catches a produced
             // file being edited, truncated or deleted underneath an unchanged
             // manifest, which config hashing alone structurally cannot see.
-            let current_artifact_hash =
-                produced_artifact_hash(step, dir, asset_graph, all_produced);
-            Ok(current_artifact_hash != prior_state.artifact_hash)
+            //
+            // `None` means at least one asset this step is answerable for could not
+            // be confidently hashed right now — it is currently unreadable (missing,
+            // truncated mid-write, a directory, permission-denied), or its declared
+            // spelling is itself ambiguous (see `produced_artifact_hash`). Either way
+            // this forces staleness unconditionally rather than comparing against
+            // `prior_state.artifact_hash` — an absence must never be allowed to read
+            // as "unchanged" against a PRIOR absence. Two runs of a step whose
+            // declared artifact was never actually written under its declared name
+            // would otherwise both hash to the same `MISSING` sentinel and compare
+            // equal forever, which is the graph asserting a file is produced while
+            // nothing is on disk and the run reporting success — the defect this
+            // whole mechanism exists to close, reached through the one case a plain
+            // sentinel string cannot distinguish from genuine freshness.
+            match produced_artifact_hash(step, dir, asset_graph, all_produced) {
+                None => Ok(true),
+                Some(current_artifact_hash) => {
+                    Ok(current_artifact_hash != prior_state.artifact_hash)
+                }
+            }
         }
     }
 }
@@ -929,22 +953,34 @@ fn all_produced_assets(asset_graph: &AssetGraph) -> std::collections::HashSet<St
 /// declared file is deleted and only a decoy remains — at that point exactly one
 /// candidate exists, and a scan finds it confidently, and wrongly. The declared
 /// spelling is the one thing scanning can never recover once it has been thrown away,
-/// so it is carried from the manifest instead of reconstructed from the filesystem. A
-/// `produces:` collision — two declarations differing only by case — is refused at
-/// load by `AssetGraph::validate_no_produces_case_collisions`, so a validated graph
-/// never asks this function to choose between two raw spellings for one lowered name.
+/// so it is carried from the manifest instead of reconstructed from the filesystem.
+///
+/// Returns `None` — never a hash — in two cases, both forcing the caller
+/// (`is_hash_stale`) to unconditional staleness rather than a string comparison:
+///
+/// - **A relevant file cannot be read right now**, under its declared spelling —
+///   missing, truncated mid-write, a directory, permission-denied. Earlier designs
+///   folded this into a stable `"MISSING"` sentinel *string* and compared it like any
+///   other digest, which reads as "unchanged" the moment a step's declared artifact
+///   has never once existed under its declared name (its SQL wrote a differently-cased
+///   file, say): the baseline recorded right after the step's own "success" is already
+///   `MISSING`, so every later run compares `MISSING` to `MISSING` and skips forever —
+///   the graph asserting a file is produced while nothing is on disk, and the run
+///   reporting success. An absence can never be evidence of sameness, so it is never
+///   folded into the comparable string at all.
+/// - **A declared name resolves to more than one raw spelling** —
+///   `declared_case`'s entry for it has 2+ elements. `AssetGraph::
+///   validate_no_case_collisions` refuses this for both `produces:` and
+///   `depends_on:` at load, so a validated graph should never reach this branch; it
+///   exists as the read-time backstop precisely because *"the gate already checked
+///   it"* must not be the only thing standing between an ambiguous declaration and a
+///   silent, iteration-order-dependent pick of one spelling over the other.
 ///
 /// Hashes the actual on-disk bytes directly — **never** a fetch sidecar's recorded
 /// digest (`crate::ingress_meta`, which [`crate::contract::measure_file`] prefers for
 /// reporting). Trusting a sidecar here would be exactly the failure this guards
 /// against: a truncated artifact whose stale `.arcmeta` sidecar still claims to be
-/// what the step wrote. A file that cannot be read — missing, truncated mid-write,
-/// permission-denied, or simply never written under its declared name — hashes to the
-/// sentinel `"MISSING"`, which cannot collide with a real digest (fixed-width hex) and
-/// so always registers as a change against a real prior hash. A declared name that
-/// stays `MISSING` run after run (nothing has ever written it, under any case) is
-/// stably, correctly "unchanged" — there is no artifact to have drifted — and it never
-/// gets there by way of a same-named, differently-cased file being substituted for it.
+/// what the step wrote.
 ///
 /// A step with no file-typed produced or external-read assets hashes the empty
 /// input deterministically — stable across runs, so it never falsely reads as changed.
@@ -953,7 +989,7 @@ fn produced_artifact_hash(
     dir: &Path,
     asset_graph: &AssetGraph,
     all_produced: &std::collections::HashSet<String>,
-) -> String {
+) -> Option<String> {
     let mut names: Vec<&String> = Vec::new();
     if let Some(assets) = asset_graph.steps.get(&step.name) {
         names.extend(
@@ -977,24 +1013,24 @@ fn produced_artifact_hash(
     let mut buf = String::new();
     for name in names {
         // The declared, case-preserved spelling — never the lowercased graph node,
-        // which is identity, not a path. Falls back to the lowered name only if
-        // `declared_case` somehow lacks an entry (defensive; every insertion site in
-        // `asset.rs` populates it), so a missing entry still resolves to *some* path
-        // rather than panicking.
-        let raw = declared_case
-            .and_then(|dc| dc.get(name))
-            .and_then(|raws| raws.iter().next())
-            .unwrap_or(name);
+        // which is identity, not a path. `raws.len() > 1` is the ambiguous-spelling
+        // backstop described above; `None` (no entry at all) falls back to the
+        // lowered name itself, defensive against a future insertion site that forgets
+        // to populate `declared_case` — every current one does.
+        let raw = match declared_case.and_then(|dc| dc.get(name)) {
+            Some(raws) if raws.len() == 1 => raws.iter().next().unwrap(),
+            Some(raws) if raws.len() > 1 => return None,
+            _ => name,
+        };
         let full = dir.join(raw);
-        let digest = std::fs::read(&full)
-            .map(|bytes| state::content_hash(&bytes))
-            .unwrap_or_else(|_| "MISSING".to_string());
+        let bytes = std::fs::read(&full).ok()?;
+        let digest = state::content_hash(&bytes);
         buf.push_str(name);
         buf.push('\u{1f}'); // unit separator — cheap guard against name/hash collision
         buf.push_str(&digest);
         buf.push('\n');
     }
-    state::content_hash(buf.as_bytes())
+    Some(state::content_hash(buf.as_bytes()))
 }
 
 #[cfg(test)]
@@ -1573,8 +1609,8 @@ mod tests {
     // Two `produces:` declarations differing only by case is now refused when the
     // manifest loads — a manifest defect independent of anything on disk, closed at
     // the source rather than tolerated at runtime. Proof: reverting
-    // `AssetGraph::validate_no_produces_case_collisions` to `Ok(())` unconditionally
-    // turns this red — `run(...)` then succeeds instead of returning
+    // `AssetGraph::validate_no_case_collisions` to `Ok(())` unconditionally turns
+    // this red — `run(...)` then succeeds instead of returning
     // `Err(ManifestValidation)`.
     #[test]
     fn test_produces_case_collision_refused_at_load() {
@@ -1612,8 +1648,12 @@ mod tests {
     // even though only the decoy remains afterward — the shape round 3 missed by
     // stopping its own test one run short of exactly this state. Carries probe1's full
     // sequence through: baseline with a decoy present, an unchanged warm run, deletion
-    // of the declared file (decoy still there), and the run *after* that one, which is
-    // where round 3's fix (and round 2's) silently resumed skipping.
+    // of the declared file (decoy still there), and TWO runs after that — round 4's
+    // own regression was at the second of those: it correctly reran once (run 3) but
+    // then let the resulting `MISSING` baseline compare equal to itself forever
+    // (run 4 onward), which is the graph asserting a file is produced while nothing
+    // is on disk and the run reporting success. Both post-deletion runs must
+    // therefore re-run, not just the first.
     //
     // This scenario is only representable on a case-sensitive filesystem — the default
     // macOS temp dir folds the two writes into one file, so it self-skips there with an
@@ -1675,34 +1715,51 @@ mod tests {
              differently-cased file survives it: preflight + 1 sql"
         );
 
-        // Run 4: the mock step's own execution never recreates build/REGISTRANT.tsv (it
-        // does not touch the filesystem), so the declared file is genuinely, stably
-        // absent from here on — MISSING compares equal to the MISSING baseline run 3
-        // just recorded, and this settles into skip. That is a different, correctly
-        // reached state from run 2's "declared file present and unchanged" skip, not a
-        // relapse into round 3's bug: nothing here was ever resolved from the decoy.
+        // Run 4: the mock step's own execution never recreates build/REGISTRANT.tsv
+        // (it does not touch the filesystem), so the declared file is genuinely,
+        // stably absent from here on. This must KEEP re-running, not settle into a
+        // skip — round 4's own regression: "MISSING compares equal to a prior
+        // MISSING" is exactly probe6's shape (a declared artifact that is never
+        // actually produced reads as permanently unchanged). An absence can never be
+        // evidence of sameness, run 3's or run 4's or any other run's.
         drop(engine);
         let engine = MockEngine::new();
         run(dir.path(), &engine, &state, false).unwrap();
         assert_eq!(
             engine.calls.borrow().len(),
-            1,
-            "run 4: a declared file absent on both sides of the comparison is stably \
-             skippable, and it must have gotten there without ever reading the decoy"
+            2,
+            "run 4: a declared file that is STILL absent must force another re-run, \
+             not certify itself unchanged against its own prior absence: \
+             preflight + 1 sql"
         );
     }
 
     // Probe6's shape, pinned on its own: a declared name that never existed on disk —
     // not even for one run — while a differently-cased leftover (a stale file from
-    // before a fix landed, or a hand-authored copy under the wrong case) sits where the
-    // graph's lowercased query would have looked. Round 3's candidate-counting scan
-    // finds exactly one match here and is confident; carrying the declared spelling
-    // means the lookup only ever asks for build/REGISTRANT.tsv, which is never there,
-    // so the leftover is never read, never hashed, and never mistaken for the declared
-    // artifact. Proven by the one place that distinction is observable: mutating the
-    // leftover must not affect this step's staleness at all.
+    // before a fix landed, or a hand-authored copy under the wrong case) sits where
+    // the graph's lowercased query would have looked. This is round 4's own
+    // regression, reported independently of the decoy test above: `MISSING` (the
+    // baseline recorded after this step's first "success," since nothing — not the
+    // mock, not the leftover — ever writes build/REGISTRANT.tsv) compared equal to
+    // `MISSING` (every later run, for the same reason) forever. The graph asserts a
+    // file is produced by s1 while nothing is on disk, and the run reports success —
+    // the card's headline sentence. A declared artifact that has never once existed
+    // must force a re-run on every single invocation, not settle into a skip after
+    // the first: rerunning cannot itself fix anything here (the mock never writes
+    // the file either way), so the only honest signal is that the run keeps trying,
+    // visibly, rather than reporting quiet, permanent success.
+    //
+    // Also proves the leftover is genuinely never substituted for the declared
+    // file: mutating it changes nothing about *why* s1 reruns (still `None` —
+    // "absent," not "changed") or how often (every time, regardless).
+    //
+    // Representable on any filesystem in principle, but the declared name and the
+    // leftover fold to the same entry on one that does not distinguish case, which
+    // would make the leftover BE build/REGISTRANT.tsv rather than a decoy beside it —
+    // self-skips there rather than asserting something the setup cannot construct.
+    // `ubuntu-latest` is case-sensitive, so this executes for real there.
     #[test]
-    fn test_declared_case_that_never_existed_ignores_a_differently_cased_leftover() {
+    fn test_declared_case_that_never_existed_forces_perpetual_staleness() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/REGISTRANT.tsv]\n";
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
@@ -1715,13 +1772,9 @@ mod tests {
         )
         .unwrap();
 
-        // On a case-insensitive filesystem the declared name and the leftover ARE the
-        // same directory entry, so this scenario cannot be constructed — self-skip
-        // rather than fail for a reason unconnected to the code under test.
-        // `ubuntu-latest` is case-sensitive, so this executes for real there.
         if dir.path().join("build/REGISTRANT.tsv").exists() {
             eprintln!(
-                "skipping test_declared_case_that_never_existed_ignores_a_differently_cased_leftover: \
+                "skipping test_declared_case_that_never_existed_forces_perpetual_staleness: \
                  {} does not distinguish case, so the declared name and the leftover are the same file",
                 dir.path().display()
             );
@@ -1730,58 +1783,196 @@ mod tests {
 
         let engine = MockEngine::new();
         let state = MockStateBackend::new();
-        run(dir.path(), &engine, &state, false).unwrap();
+        run(dir.path(), &engine, &state, false).unwrap(); // run 1: first run, always stale
 
+        // Run 2: declared file still absent (the mock never writes it). Must re-run —
+        // a step whose declared artifact has never existed cannot certify "unchanged."
         drop(engine);
         let engine = MockEngine::new();
         run(dir.path(), &engine, &state, false).unwrap();
         assert_eq!(
             engine.calls.borrow().len(),
-            1,
-            "declared file absent on both runs: stays skipped, not because a leftover \
-             was substituted for it"
+            2,
+            "run 2: declared file still absent, must force a re-run rather than \
+             certify unchanged: preflight + 1 sql"
         );
 
-        // Mutate the leftover. If it were being tracked as if it were the declared
-        // artifact (round 3's flaw), this would now register as a change.
+        // Mutate the leftover — must not change WHY s1 reruns, only confirm it still
+        // does, for the same reason.
         fs::write(
             dir.path().join("build/registrant.tsv"),
             "mutated leftover\n",
         )
         .unwrap();
 
+        // Run 3: same again. This must never settle into a skip while the declared
+        // artifact stays absent, no matter how many times it is asked, and regardless
+        // of what happens to an irrelevant, differently-cased leftover.
         drop(engine);
         let engine = MockEngine::new();
         run(dir.path(), &engine, &state, false).unwrap();
         assert_eq!(
             engine.calls.borrow().len(),
-            1,
-            "a differently-cased leftover must never be tracked as the declared \
-             artifact: changing it must not affect this step's staleness"
+            2,
+            "run 3: still absent, still must force a re-run — an artifact that has \
+             never existed cannot become 'stably unchanged'"
         );
     }
 
-    // "For the board": nothing else in this family proves the environment it runs in
-    // can actually distinguish case — every one of the tests above self-skips with an
-    // explanation on a filesystem that folds it, and reports `ok` either way, so a
-    // green CI run carries zero information about whether `TMPDIR` there is genuinely
-    // case-sensitive. This one test has no self-skip: it creates two files differing
-    // only by case and asserts both exist. If a runner image's temp filesystem ever
-    // folded case, this reddens on that day, rather than the whole family quietly
-    // testing nothing while staying green.
+    // "For the board": an earlier version of this test asserted `TMPDIR` must be
+    // case-sensitive, unconditionally — true on `ubuntu-latest`, false on the default
+    // macOS temp dir, which turned `cargo test --workspace` into a hard failure at
+    // the lib target on every routine local run. Cargo stops at the first failing
+    // target, so the ten OTHER test binaries (`public_surface`, `record_contract`,
+    // `cli_authoring`, …) never even ran — one `test result:` line instead of eleven,
+    // which is exactly the shape of a check nobody reads and eventually gets
+    // `--skip`ped. Its intent was still right: nothing else in this family proves the
+    // environment it runs in can actually distinguish case — every other test here
+    // self-skips (with an explanation) on a filesystem that folds it, and reports
+    // `ok` either way, so a green run alone carries zero information about that.
+    //
+    // This is the corrected form: a biconditional, computed once, that is true on
+    // BOTH kinds of filesystem under correct code, and false only on the one state
+    // worth catching. It measures case-sensitivity directly (the same two-entry
+    // probe as before) and SEPARATELY measures whether the runner's own behaviour
+    // implies it — does a step correctly go on ignoring a decoy's mutation, which is
+    // only possible when the decoy and the declared file are actually two different
+    // on-disk entries — then asserts the two agree:
+    //
+    //   case-sensitive  ⟺  a decoy's mutation is NOT detected
+    //
+    // On a real case-sensitive habitat, correct code ignores the decoy (it is never
+    // looked up at all), so both sides read true/not-detected. On a filesystem that
+    // folds case, "the decoy" IS build/REGISTRANT.tsv — there is no separate file to
+    // ignore — so mutating it necessarily changes the one real file's bytes and gets
+    // detected, regardless of whether this fix is present or reverted; both sides
+    // read false/detected. It reddens only when they disagree: either the probe is
+    // wrong about the filesystem, or (on a genuinely case-sensitive habitat) the
+    // runner is substituting a decoy for a declared artifact again — this is,
+    // concretely, the same regression `test_declared_case_that_never_existed_ignores…`
+    // would have caught, folded into a form that cannot itself become vacuous.
     #[test]
-    fn test_habitat_tmpdir_is_case_sensitive() {
+    fn test_case_sensitivity_probe_agrees_with_observed_runner_behavior() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("AAA"), "upper").unwrap();
-        fs::write(dir.path().join("aaa"), "lower").unwrap();
-        let count = fs::read_dir(dir.path()).unwrap().count();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/REGISTRANT.tsv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/REGISTRANT.tsv"), "declared\n").unwrap();
+        fs::write(dir.path().join("build/registrant.tsv"), "decoy\n").unwrap();
+
+        // Measured directly, once, before anything else touches the directory.
+        let case_sensitive = fs::read_dir(dir.path().join("build")).unwrap().count() == 2;
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap(); // run 1: baseline
+
+        // Mutate ONLY the decoy's name — on a folding filesystem this IS the
+        // declared file; on a case-sensitive one it is a different, untracked entry.
+        fs::write(dir.path().join("build/registrant.tsv"), "mutated decoy\n").unwrap();
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        let mutation_detected = engine.calls.borrow().len() > 1;
+
         assert_eq!(
-            count,
-            2,
-            "tempdir() must be case-sensitive for the case-collision test family above \
-             to mean anything — got {count} entr{} in {}",
-            if count == 1 { "y" } else { "ies" },
+            case_sensitive,
+            !mutation_detected,
+            "incoherent habitat: case_sensitive={case_sensitive}, \
+             mutation_detected={mutation_detected} in {} — a case-sensitive habitat \
+             must ignore a decoy's mutation, and a folding one cannot have a separate \
+             decoy to ignore at all",
             dir.path().display()
+        );
+    }
+
+    // Round 5, regression 2: the collision gate checked `produces:` only, so two
+    // `depends_on:` entries differing only by case never reached it — one graph node,
+    // no warning, `declared_case` silently holding both raw spellings. With
+    // build/DATA.csv and build/data.csv both real and distinct, `produced_artifact_hash`
+    // picked one by `BTreeSet` iteration order (`DATA.csv`, 0x44, before `data.csv`,
+    // 0x64) — deterministic, but arbitrary with respect to which file is the real
+    // dependency, and the loser was never hashed, never tracked, at all. `s1` here
+    // does not even declare a `sql:` file that touches either name; it is the
+    // `depends_on:` declaration alone that must be enough to make the collision
+    // reachable — this is a manifest-shape defect, not a read-behaviour one.
+    //
+    // Proof (see PR for the mutation report): reverting `validate_no_case_collisions`
+    // to only inspect `produces:` again turns this red — `run(...)` then succeeds
+    // instead of returning `Err(ManifestValidation)`.
+    //
+    // Representable on any filesystem; the gate is a static check over declared
+    // strings and never touches disk, so unlike the read-time tests above this one
+    // does not need — and does not get — a case-sensitivity guard.
+    #[test]
+    fn test_depends_on_case_collision_refused_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    depends_on: [build/DATA.csv, build/data.csv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        let err = run(dir.path(), &engine, &state, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("collision") && msg.contains("depends_on:"),
+            "expected a depends_on: case-collision refusal naming the manifest key, \
+             got: {msg}"
+        );
+        assert!(
+            matches!(engine.calls.borrow().as_slice(), [MockCall::Preflight]),
+            "a refused manifest must not execute any step: {:?}",
+            engine.calls.borrow()
+        );
+    }
+
+    // The other half of regression 2's fix: even with the gate above, a
+    // `declared_case` entry holding more than one raw spelling must never be resolved
+    // by picking one — that IS the exact ambiguity the gate exists to abolish, and
+    // "the gate already checked it" must not be the only thing standing between an
+    // ambiguous declaration and a silent, iteration-order-dependent choice. The gate
+    // refuses this shape before a real `run()` ever reaches `produced_artifact_hash`,
+    // so this bypasses `run()` and the gate entirely, hand-injecting the ambiguous
+    // graph state the gate exists to prevent, to prove the read-time refusal holds
+    // on its own rather than depending on the gate never having a gap.
+    #[test]
+    fn test_ambiguous_declared_case_forces_staleness_not_iteration_order_pick() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    depends_on: [build/data.csv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/DATA.csv"), "from DATA.csv\n").unwrap();
+        fs::write(dir.path().join("build/data.csv"), "from data.csv\n").unwrap();
+
+        if fs::read_dir(dir.path().join("build")).unwrap().count() < 2 {
+            eprintln!(
+                "skipping test_ambiguous_declared_case_forces_staleness_not_iteration_order_pick: \
+                 {} does not distinguish case, so a genuine collision cannot be constructed here",
+                dir.path().display()
+            );
+            return;
+        }
+
+        let manifest = crate::manifest::Manifest::load(dir.path()).unwrap();
+        let mut asset_graph = AssetGraph::build(&manifest, dir.path());
+        asset_graph
+            .steps
+            .get_mut("s1")
+            .unwrap()
+            .declared_case
+            .get_mut("build/data.csv")
+            .unwrap()
+            .insert("build/DATA.csv".to_string());
+
+        let step = manifest.steps.iter().find(|s| s.name == "s1").unwrap();
+        let all_produced = all_produced_assets(&asset_graph);
+        let result = produced_artifact_hash(step, dir.path(), &asset_graph, &all_produced);
+        assert_eq!(
+            result, None,
+            "an ambiguous declared_case entry (2+ raw spellings) must never be \
+             resolved by picking one — it must force staleness (None), not silently \
+             choose build/DATA.csv over build/data.csv by BTreeSet iteration order"
         );
     }
 

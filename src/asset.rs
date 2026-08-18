@@ -32,12 +32,17 @@ pub struct StepAssets {
     /// For every lowercased name in `produces` or `reads`, every RAW (case-preserved,
     /// exactly as declared) spelling that lowercased to it — almost always exactly
     /// one. More than one means two declarations collapsed onto the same graph node
-    /// purely by case, which `AssetGraph::validate_no_produces_case_collisions`
-    /// refuses at load for `produces:`, so a validated graph's entries here are
-    /// singletons in practice. This is what `produced_artifact_hash` reads bytes
-    /// from — the lowercased name is graph identity, never a filesystem path; no
-    /// amount of scanning a directory recovers a real file's case once this is
-    /// thrown away, so it has to be carried, not reconstructed.
+    /// purely by case, which `AssetGraph::validate_no_case_collisions` refuses at
+    /// load for BOTH `produces:` and `depends_on:`. That gate is what a manifest
+    /// author sees; it does not make this field a singleton by construction — a
+    /// caller reaching this map without having gone through `AssetGraph::build` plus
+    /// that validation (or a future insertion site the gate does not yet cover) can
+    /// still see 2+ entries here, so `produced_artifact_hash` treats that count, not
+    /// this doc comment, as the source of truth and refuses to pick one by iteration
+    /// order. This is what `produced_artifact_hash` reads bytes from — the lowercased
+    /// name is graph identity, never a filesystem path; no amount of scanning a
+    /// directory recovers a real file's case once this is thrown away, so it has to
+    /// be carried, not reconstructed.
     pub declared_case: BTreeMap<String, BTreeSet<String>>,
 }
 
@@ -215,45 +220,65 @@ impl AssetGraph {
         graph
     }
 
-    /// Refuse a manifest where two `produces:` declarations — anywhere, within one
-    /// step or across different steps — collapse onto the same graph node purely
-    /// because they differ only by case. `asset.rs`'s lowercasing is what makes that
-    /// collapse happen at all (needed so a case-insensitive DuckDB table lands on one
-    /// node); left silent, the collapsed node's `declared_case` would hold more than
-    /// one raw spelling and there would be no way to say which step's file the
-    /// combined identity actually names. This is a manifest defect independent of
-    /// anything happening on disk — `build/Report.csv` and `build/report.csv` collide
-    /// whether or not either file exists yet, so it is caught here, at load, rather
-    /// than left for a staleness check to discover only once both are already
-    /// written. Fail-closed at read time (see `crate::runner::produced_artifact_hash`)
-    /// still matters for a collision this gate cannot see — a stray file coinciding
-    /// with a declared name, which is not a manifest defect and has nothing here to
-    /// refuse — so the two are complements, not alternatives.
-    pub fn validate_no_produces_case_collisions(&self) -> Result<()> {
-        let mut by_lowered: BTreeMap<&str, BTreeSet<(&str, &str)>> = BTreeMap::new();
+    /// Refuse a manifest where two declarations — a `produces:`, a `depends_on:`, an
+    /// `assets:` override, anywhere, within one step or across different steps —
+    /// collapse onto the same graph node purely because they differ only by case.
+    /// `asset.rs`'s lowercasing is what makes that collapse happen at all (needed so
+    /// a case-insensitive DuckDB table lands on one node); left silent, the collapsed
+    /// node's `declared_case` holds more than one raw spelling and there is no way to
+    /// say which one names the real file. Covers `reads:` as well as `produces:` —
+    /// two `depends_on:` entries differing only by case are the same defect
+    /// (`declared_case` cannot tell which is real either way) and were reachable
+    /// without ever tripping a `produces:`-only version of this check: nothing about
+    /// reading two distinct, real, differently-cased files is by itself invalid, so
+    /// `produced_artifact_hash` was left to pick one by `BTreeSet` iteration order —
+    /// silently, and the loser was never hashed, never tracked, at all.
+    ///
+    /// This is a manifest defect independent of anything happening on disk —
+    /// `build/Report.csv` and `build/report.csv` collide whether or not either file
+    /// exists yet, so it is caught here, at load, rather than left for a staleness
+    /// check to discover only once both are already written. It is a complement to,
+    /// not a replacement for, `produced_artifact_hash`'s own read-time refusal to
+    /// pick a raw spelling by iteration order — that refusal is the backstop for a
+    /// `declared_case` entry this gate did not (or could not yet) inspect; it is not
+    /// covering a *different kind* of collision. Nothing here inspects the
+    /// filesystem, so a coincidental, undeclared file sharing a case-folded name with
+    /// something real is not this gate's concern — no declaration collides with it,
+    /// and `produced_artifact_hash` never looks it up at all.
+    pub fn validate_no_case_collisions(&self) -> Result<()> {
+        // (kind, step, raw), grouped by lowered name — kind labels the error with the
+        // manifest key a reader would actually go fix, since a `produces:` and a
+        // `depends_on:` entry can collide with each other, not just with their own kind.
+        let mut by_lowered: BTreeMap<&str, BTreeSet<(&str, &str, &str)>> = BTreeMap::new();
         for (step_name, assets) in &self.steps {
-            for lowered in &assets.produces {
-                let Some(raws) = assets.declared_case.get(lowered) else {
-                    continue;
-                };
-                for raw in raws {
-                    by_lowered
-                        .entry(lowered.as_str())
-                        .or_default()
-                        .insert((step_name.as_str(), raw.as_str()));
+            for (kind, names) in [
+                ("produces:", &assets.produces),
+                ("depends_on:", &assets.reads),
+            ] {
+                for lowered in names {
+                    let Some(raws) = assets.declared_case.get(lowered) else {
+                        continue;
+                    };
+                    for raw in raws {
+                        by_lowered.entry(lowered.as_str()).or_default().insert((
+                            kind,
+                            step_name.as_str(),
+                            raw.as_str(),
+                        ));
+                    }
                 }
             }
         }
 
         for (lowered, entries) in &by_lowered {
-            let distinct_raw: BTreeSet<&str> = entries.iter().map(|(_, raw)| *raw).collect();
+            let distinct_raw: BTreeSet<&str> = entries.iter().map(|(_, _, raw)| *raw).collect();
             if distinct_raw.len() > 1 {
                 let detail: Vec<String> = entries
                     .iter()
-                    .map(|(step, raw)| format!("'{raw}' (step '{step}')"))
+                    .map(|(kind, step, raw)| format!("'{raw}' ({kind} step '{step}')"))
                     .collect();
                 return Err(Error::ManifestValidation(format!(
-                    "produces: collision — {} all collapse to the same asset '{}' by case alone; rename one so the spellings are genuinely distinct, or declare it once",
+                    "case collision — {} all collapse to the same asset '{}' by case alone; rename one so the spellings are genuinely distinct, or declare it once",
                     detail.join(", "),
                     lowered
                 )));
