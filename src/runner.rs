@@ -179,6 +179,12 @@ pub fn run_with_params(
         eprintln!("{} {}", "warning:".yellow(), warning);
     }
 
+    // A `produces:` collision (two declarations differing only by case) is a manifest
+    // defect independent of anything on disk — refused before anything runs, not
+    // tolerated with a warning. Unconditional: the collision exists in the manifest
+    // whether or not `has_assets()` would otherwise gate the rest of this section.
+    asset_graph.validate_no_produces_case_collisions()?;
+
     // If the graph has assets, validate step ordering against dependencies.
     if asset_graph.has_assets() {
         let step_order: Vec<String> = manifest.steps.iter().map(|s| s.name.clone()).collect();
@@ -412,15 +418,10 @@ pub fn run_with_params(
                         // wrote — the baseline the *next* run's staleness check
                         // compares against. Command steps always re-run regardless
                         // (never consult this), so there is nothing to hash for them.
-                        // An ambiguous resolution records a fixed, human-legible
-                        // sentinel rather than a real hash — its exact value is moot,
-                        // since the next run hits the same ambiguity and is_hash_stale
-                        // forces staleness before ever comparing this string again.
                         let artifact_hash = if step.command.is_some() {
                             String::new()
                         } else {
                             produced_artifact_hash(step, dir, &asset_graph, &all_produced)
-                                .unwrap_or_else(|| "AMBIGUOUS".to_string())
                         };
                         let _ = state.record_step(
                             &step.name,
@@ -892,21 +893,9 @@ fn is_hash_stale(
             // answerable for still hold. This is the check that catches a produced
             // file being edited, truncated or deleted underneath an unchanged
             // manifest, which config hashing alone structurally cannot see.
-            //
-            // `None` means the on-disk lookup for at least one asset was ambiguous —
-            // more than one file matched its name case-insensitively (a stray decoy,
-            // or two `produces:` entries differing only by case collapsed onto one
-            // graph node). An ambiguous resolution must never be allowed to compare
-            // equal to itself across runs — that is exactly how a collision would
-            // otherwise read as permanently "unchanged" regardless of what happens to
-            // either file — so it forces staleness unconditionally instead of
-            // comparing against `prior_state.artifact_hash` at all.
-            match produced_artifact_hash(step, dir, asset_graph, all_produced) {
-                None => Ok(true),
-                Some(current_artifact_hash) => {
-                    Ok(current_artifact_hash != prior_state.artifact_hash)
-                }
-            }
+            let current_artifact_hash =
+                produced_artifact_hash(step, dir, asset_graph, all_produced);
+            Ok(current_artifact_hash != prior_state.artifact_hash)
         }
     }
 }
@@ -930,29 +919,41 @@ fn all_produced_assets(asset_graph: &AssetGraph) -> std::collections::HashSet<St
 /// downstream-propagation machinery; this only ever adds file-backed bytes to the
 /// staleness question, never subtracts from it.
 ///
+/// Resolves each name through [`crate::asset::StepAssets::declared_case`] — the RAW,
+/// exactly-as-declared spelling carried alongside the lowercased graph node — and
+/// joins that directly onto `dir`. **No scanning, no candidate-counting.** Two earlier
+/// designs here (a literal join with a lowercased fallback; a case-insensitive scan
+/// requiring exactly one match) were both unsound the same way: however many files
+/// happen to share a name case-insensitively on disk *right now* is not evidence about
+/// which one is the declared artifact, and stops being evidence at all the moment the
+/// declared file is deleted and only a decoy remains — at that point exactly one
+/// candidate exists, and a scan finds it confidently, and wrongly. The declared
+/// spelling is the one thing scanning can never recover once it has been thrown away,
+/// so it is carried from the manifest instead of reconstructed from the filesystem. A
+/// `produces:` collision — two declarations differing only by case — is refused at
+/// load by `AssetGraph::validate_no_produces_case_collisions`, so a validated graph
+/// never asks this function to choose between two raw spellings for one lowered name.
+///
 /// Hashes the actual on-disk bytes directly — **never** a fetch sidecar's recorded
 /// digest (`crate::ingress_meta`, which [`crate::contract::measure_file`] prefers for
 /// reporting). Trusting a sidecar here would be exactly the failure this guards
 /// against: a truncated artifact whose stale `.arcmeta` sidecar still claims to be
 /// what the step wrote. A file that cannot be read — missing, truncated mid-write,
-/// permission-denied — hashes to the sentinel `"MISSING"`, which cannot collide with a
-/// real digest (fixed-width hex) and so always registers as a change.
+/// permission-denied, or simply never written under its declared name — hashes to the
+/// sentinel `"MISSING"`, which cannot collide with a real digest (fixed-width hex) and
+/// so always registers as a change against a real prior hash. A declared name that
+/// stays `MISSING` run after run (nothing has ever written it, under any case) is
+/// stably, correctly "unchanged" — there is no artifact to have drifted — and it never
+/// gets there by way of a same-named, differently-cased file being substituted for it.
 ///
 /// A step with no file-typed produced or external-read assets hashes the empty
 /// input deterministically — stable across runs, so it never falsely reads as changed.
-///
-/// Returns `None` — never a hash — the moment any one asset's on-disk name is
-/// ambiguous (see [`resolve_on_disk_case`]). Folding an ambiguous lookup into the hash
-/// buffer as a sentinel string (the way a plain "missing" reads) would let it compare
-/// equal to itself run after run, which is precisely how an unresolvable collision
-/// would silently certify "unchanged" while a declared artifact sits deleted beside
-/// its decoy. The caller (`is_hash_stale`) forces staleness on `None` instead.
 fn produced_artifact_hash(
     step: &crate::manifest::Step,
     dir: &Path,
     asset_graph: &AssetGraph,
     all_produced: &std::collections::HashSet<String>,
-) -> Option<String> {
+) -> String {
     let mut names: Vec<&String> = Vec::new();
     if let Some(assets) = asset_graph.steps.get(&step.name) {
         names.extend(
@@ -971,89 +972,29 @@ fn produced_artifact_hash(
     names.sort();
     names.dedup();
 
+    let declared_case = asset_graph.steps.get(&step.name).map(|a| &a.declared_case);
+
     let mut buf = String::new();
     for name in names {
-        let digest = match resolve_on_disk_case(dir, name) {
-            CaseResolution::Ambiguous => {
-                eprintln!(
-                    "{} step '{}': '{}' matches more than one file on disk                      (case-insensitively) — cannot confirm which is the declared                      artifact, forcing this step stale until the collision is resolved",
-                    "warning:".yellow(),
-                    step.name,
-                    name,
-                );
-                return None;
-            }
-            CaseResolution::Path(full) => std::fs::read(&full)
-                .map(|bytes| state::content_hash(&bytes))
-                .unwrap_or_else(|_| "MISSING".to_string()),
-        };
+        // The declared, case-preserved spelling — never the lowercased graph node,
+        // which is identity, not a path. Falls back to the lowered name only if
+        // `declared_case` somehow lacks an entry (defensive; every insertion site in
+        // `asset.rs` populates it), so a missing entry still resolves to *some* path
+        // rather than panicking.
+        let raw = declared_case
+            .and_then(|dc| dc.get(name))
+            .and_then(|raws| raws.iter().next())
+            .unwrap_or(name);
+        let full = dir.join(raw);
+        let digest = std::fs::read(&full)
+            .map(|bytes| state::content_hash(&bytes))
+            .unwrap_or_else(|_| "MISSING".to_string());
         buf.push_str(name);
         buf.push('\u{1f}'); // unit separator — cheap guard against name/hash collision
         buf.push_str(&digest);
         buf.push('\n');
     }
-    Some(state::content_hash(buf.as_bytes()))
-}
-
-/// The outcome of resolving one graph-declared asset name against what is actually on
-/// disk: exactly one matching path, or the ambiguity that makes trusting any single
-/// candidate wrong.
-enum CaseResolution {
-    /// Every path component matched exactly one on-disk entry. May or may not exist
-    /// at the final component — a component matching *nothing* still produces a path
-    /// (the literal join), so a genuinely absent file reads `MISSING` when its bytes
-    /// are read, same as always. That is "not found," not ambiguity.
-    Path(std::path::PathBuf),
-    /// A path component matched **more than one** on-disk entry case-insensitively —
-    /// e.g. a stray `registrant.tsv` beside the declared `REGISTRANT.tsv`, or two
-    /// `produces:` entries differing only by case collapsed onto one graph node
-    /// (`asset.rs` warns on neither). Nothing may be hashed as if it confidently were
-    /// the declared file.
-    Ambiguous,
-}
-
-/// Resolve a graph-declared asset name (case-normalized to lowercase — every call site
-/// in `asset.rs`'s Phase 1b (op-declared) and Phase 2 (explicit `produces:`/
-/// `depends_on:`), and every operator's `assets()` in `operator.rs`, does this,
-/// because a DuckDB *table* identifier is case-insensitive and two spellings of the
-/// same table must land on one graph node) against the case a *file* actually has on
-/// disk. `archive_extract` writes zip members case-preserved on purpose
-/// (`extract_members`/`safe_relative`) — `REGISTRANT.tsv` on disk, `.../registrant.tsv`
-/// in the graph — so on a case-sensitive filesystem (Linux, which CI and the publish
-/// runner both use) a literal join against the lowercased name silently misses a real,
-/// case-differing file.
-///
-/// Deliberately does not touch the lowercasing itself: that would desync same-named
-/// table nodes declared or read with inconsistent case across steps, which is a much
-/// larger and unrelated blast radius than a file's on-disk case. Instead this scans
-/// each path *component*'s parent directory case-insensitively and counts every entry
-/// whose name folds to the one asked for — an exact-case match counts as one candidate
-/// among however many there are, **never preferred or checked first**, because a
-/// verbatim match can itself be the wrong file (a decoy that happens to spell exactly
-/// what the lowercased graph query asks for is indistinguishable from the real one by
-/// spelling alone). Exactly one candidate resolves; zero proceeds to the literal join
-/// (so a genuinely absent file still reads `MISSING`); more than one is
-/// [`CaseResolution::Ambiguous`], and the caller must not read that as "unchanged"
-/// against anything. Measured cost of always scanning rather than trying a literal
-/// join first: 0.09s vs 0.10s over a 50,000-entry directory — free either way.
-fn resolve_on_disk_case(dir: &Path, relative: &str) -> CaseResolution {
-    let mut current = dir.to_path_buf();
-    for component in Path::new(relative).components() {
-        let want = component.as_os_str().to_string_lossy().to_lowercase();
-        let matches: Vec<std::path::PathBuf> = std::fs::read_dir(&current)
-            .ok()
-            .into_iter()
-            .flat_map(|entries| entries.flatten())
-            .filter(|e| e.file_name().to_string_lossy().to_lowercase() == want)
-            .map(|e| e.path())
-            .collect();
-        match matches.len() {
-            0 => current = current.join(component),
-            1 => current = matches.into_iter().next().expect("len() == 1"),
-            _ => return CaseResolution::Ambiguous,
-        }
-    }
-    CaseResolution::Path(current)
+    state::content_hash(buf.as_bytes())
 }
 
 #[cfg(test)]
@@ -1619,82 +1560,24 @@ mod tests {
         );
     }
 
-    // Round-3 counter-example #1: a verifier found round 2's lookup checked a literal
-    // (exact-case) join FIRST, so a stray file that happens to spell exactly what the
-    // lowercased graph query asks for was matched directly — never reaching the
-    // case-insensitive scan at all. Deleting/truncating the REAL, differently-cased
-    // declared file changed nothing the lookup was actually reading, so the step
-    // stayed `[skip: hash_clean]` forever. `resolve_on_disk_case` no longer prefers a
-    // verbatim match; it counts every case-insensitive candidate and requires exactly
-    // one, so a decoy makes the resolution ambiguous rather than silently substituted.
+    // Round 4, the actual fix Hugh chose: carry the declared, case-preserved spelling
+    // alongside the lowercased graph node, and resolve a produced/read file against
+    // THAT — never by counting how many files happen to share a name
+    // case-insensitively on disk right now. Round 3's "exactly one candidate, so the
+    // code is confident" heuristic was unsound with no collision ever required:
+    // deleting the declared artifact resolves the ambiguity by removing one of the
+    // two candidates, and the guess resumes — silently, no warning — on exactly the
+    // state that matters. A verifier drove this end to end against `14050f2`
+    // (probe2/probe6) and reproduced precisely that.
     //
-    // Mutation proof (see PR): reverting the ambiguity-forces-staleness handling back
-    // to "pick a candidate and hash it" — the literal shape of round 2's bug, and of
-    // the `.next()`-ignoring-the-name mutation the verifier applied — turns this red:
-    // the second, untouched-manifest run would then skip on the strength of whichever
-    // file `read_dir` happened to return first.
+    // Two `produces:` declarations differing only by case is now refused when the
+    // manifest loads — a manifest defect independent of anything on disk, closed at
+    // the source rather than tolerated at runtime. Proof: reverting
+    // `AssetGraph::validate_no_produces_case_collisions` to `Ok(())` unconditionally
+    // turns this red — `run(...)` then succeeds instead of returning
+    // `Err(ManifestValidation)`.
     #[test]
-    fn test_case_collision_with_decoy_never_reads_as_fresh() {
-        let dir = tempfile::tempdir().unwrap();
-        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/REGISTRANT.tsv]\n";
-        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
-        fs::create_dir_all(dir.path().join("build")).unwrap();
-        // The declared, real artifact.
-        fs::write(dir.path().join("build/REGISTRANT.tsv"), "real content\n").unwrap();
-        // A stray file that happens to spell exactly what the lowercased graph node
-        // asks for — this is what round 2's exact-match-first lookup matched directly,
-        // and nothing in `asset.rs` warns that it collides with the declared name.
-        fs::write(dir.path().join("build/registrant.tsv"), "decoy content\n").unwrap();
-
-        // This scenario is only representable on a case-sensitive filesystem: on the
-        // default macOS temp dir the second write above silently overwrote the first
-        // (both names resolve to the same directory entry), so there is only one file
-        // and nothing here would be exercising the fix at all. `ubuntu-latest` — both
-        // `ci.yml`'s `build` job and the publish runner — is case-sensitive, so this
-        // executes for real there; skip locally rather than fail for a reason that has
-        // nothing to do with the code under test.
-        if fs::read_dir(dir.path().join("build")).unwrap().count() < 2 {
-            eprintln!(
-                "skipping test_case_collision_with_decoy_never_reads_as_fresh: {} does \
-                 not distinguish case, so a genuine collision cannot be constructed here",
-                dir.path().display()
-            );
-            return;
-        }
-
-        let engine = MockEngine::new();
-        let state = MockStateBackend::new();
-        run(dir.path(), &engine, &state, false).unwrap();
-        assert_eq!(
-            engine.calls.borrow().len(),
-            2,
-            "first run: preflight + 1 sql"
-        );
-
-        // Nothing touched. An ambiguous resolution can never certify "unchanged" — a
-        // run that skips here is the sentence AC2 exists to abolish.
-        drop(engine);
-        let engine = MockEngine::new();
-        run(dir.path(), &engine, &state, false).unwrap();
-        assert_eq!(
-            engine.calls.borrow().len(),
-            2,
-            "an on-disk name collision must force a re-run rather than certify \
-             freshness: preflight + 1 sql"
-        );
-    }
-
-    // Round-3 counter-example #2: two DIFFERENT steps each declare a `produces:`
-    // artifact differing from the other only by case. `asset.rs`'s per-step
-    // lowercasing collapses both onto the identical graph node name independently,
-    // with no collision warning anywhere (`rg 'duplicate|already produced|collision'
-    // src/asset.rs src/manifest.rs` finds only duplicate STEP-name checks). Both
-    // steps' own lookups for that shared lowercased name land on the same ambiguous
-    // two-file scan, so deleting either declared file must force a re-run of whichever
-    // step is answerable for it — not just the one whose file was actually touched,
-    // since the ambiguity itself, not the specific mutation, is what is undetectable.
-    #[test]
-    fn test_produces_case_collision_across_steps_never_reads_as_fresh() {
+    fn test_produces_case_collision_refused_at_load() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/Report.csv]\n  - name: s2\n    sql: models/s2.sql\n    produces: [build/report.csv]\n";
         setup_project(
@@ -1705,18 +1588,141 @@ mod tests {
                 ("models/s2.sql", "SELECT 2;"),
             ],
         );
-        fs::create_dir_all(dir.path().join("build")).unwrap();
-        fs::write(dir.path().join("build/Report.csv"), "from s1\n").unwrap();
-        fs::write(dir.path().join("build/report.csv"), "from s2\n").unwrap();
 
-        // Same case-sensitivity caveat as the decoy test above: on a case-insensitive
-        // filesystem the second write collapses onto the first, so there is only one
-        // file on disk and nothing to collide.
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        let err = run(dir.path(), &engine, &state, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("collision") && msg.contains("case"),
+            "expected a case-collision refusal, got: {msg}"
+        );
+        // preflight (an engine-availability check, unrelated to manifest validity)
+        // runs before the asset graph is even built, so it is the one call this
+        // refusal cannot pre-empt — no step executes.
+        assert!(
+            matches!(engine.calls.borrow().as_slice(), [MockCall::Preflight]),
+            "a refused manifest must not execute any step: {:?}",
+            engine.calls.borrow()
+        );
+    }
+
+    // A stray, differently-cased file coexisting with the REAL declared artifact must
+    // never be substituted for it, and deleting the declared artifact must be caught
+    // even though only the decoy remains afterward — the shape round 3 missed by
+    // stopping its own test one run short of exactly this state. Carries probe1's full
+    // sequence through: baseline with a decoy present, an unchanged warm run, deletion
+    // of the declared file (decoy still there), and the run *after* that one, which is
+    // where round 3's fix (and round 2's) silently resumed skipping.
+    //
+    // This scenario is only representable on a case-sensitive filesystem — the default
+    // macOS temp dir folds the two writes into one file, so it self-skips there with an
+    // explanation rather than failing for a reason unconnected to the code under test.
+    // `ubuntu-latest` (`ci.yml`'s `build` job and the publish runner) is case-sensitive,
+    // so this executes for real there.
+    #[test]
+    fn test_declared_artifact_deletion_is_caught_even_with_a_surviving_decoy() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/REGISTRANT.tsv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/REGISTRANT.tsv"), "real content\n").unwrap();
+        fs::write(dir.path().join("build/registrant.tsv"), "decoy content\n").unwrap();
+
         if fs::read_dir(dir.path().join("build")).unwrap().count() < 2 {
             eprintln!(
-                "skipping test_produces_case_collision_across_steps_never_reads_as_fresh: \
-                 {} does not distinguish case, so a genuine collision cannot be \
-                 constructed here",
+                "skipping test_declared_artifact_deletion_is_caught_even_with_a_surviving_decoy: \
+                 {} does not distinguish case, so a genuine collision cannot be constructed here",
+                dir.path().display()
+            );
+            return;
+        }
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+
+        // Run 1: first run, always stale.
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(engine.calls.borrow().len(), 2, "run 1: preflight + 1 sql");
+
+        // Run 2: nothing touched, decoy still sitting there. The declared file is
+        // unchanged and the decoy is irrelevant — this must skip, not be treated as
+        // ambiguous forever (round 3's over-caution, which this design does not need).
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "run 2: unchanged declared file must stay skipped despite the decoy"
+        );
+
+        // Delete the DECLARED file. The decoy — never tracked, never hashed — is left
+        // exactly as it was.
+        fs::remove_file(dir.path().join("build/REGISTRANT.tsv")).unwrap();
+
+        // Run 3: this is the run round 3's own test stopped one short of. Round 3's
+        // scan would now find exactly one candidate (the decoy) and confidently, wrongly
+        // treat it as unchanged. Carrying the declared case means the lookup asks for
+        // build/REGISTRANT.tsv specifically, finds it gone, and must re-run.
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "run 3: deleting the declared artifact must force a re-run even though a \
+             differently-cased file survives it: preflight + 1 sql"
+        );
+
+        // Run 4: the mock step's own execution never recreates build/REGISTRANT.tsv (it
+        // does not touch the filesystem), so the declared file is genuinely, stably
+        // absent from here on — MISSING compares equal to the MISSING baseline run 3
+        // just recorded, and this settles into skip. That is a different, correctly
+        // reached state from run 2's "declared file present and unchanged" skip, not a
+        // relapse into round 3's bug: nothing here was ever resolved from the decoy.
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "run 4: a declared file absent on both sides of the comparison is stably \
+             skippable, and it must have gotten there without ever reading the decoy"
+        );
+    }
+
+    // Probe6's shape, pinned on its own: a declared name that never existed on disk —
+    // not even for one run — while a differently-cased leftover (a stale file from
+    // before a fix landed, or a hand-authored copy under the wrong case) sits where the
+    // graph's lowercased query would have looked. Round 3's candidate-counting scan
+    // finds exactly one match here and is confident; carrying the declared spelling
+    // means the lookup only ever asks for build/REGISTRANT.tsv, which is never there,
+    // so the leftover is never read, never hashed, and never mistaken for the declared
+    // artifact. Proven by the one place that distinction is observable: mutating the
+    // leftover must not affect this step's staleness at all.
+    #[test]
+    fn test_declared_case_that_never_existed_ignores_a_differently_cased_leftover() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/REGISTRANT.tsv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        // A leftover under a case nothing declares. build/REGISTRANT.tsv never exists
+        // anywhere in this test.
+        fs::write(
+            dir.path().join("build/registrant.tsv"),
+            "leftover content\n",
+        )
+        .unwrap();
+
+        // On a case-insensitive filesystem the declared name and the leftover ARE the
+        // same directory entry, so this scenario cannot be constructed — self-skip
+        // rather than fail for a reason unconnected to the code under test.
+        // `ubuntu-latest` is case-sensitive, so this executes for real there.
+        if dir.path().join("build/REGISTRANT.tsv").exists() {
+            eprintln!(
+                "skipping test_declared_case_that_never_existed_ignores_a_differently_cased_leftover: \
+                 {} does not distinguish case, so the declared name and the leftover are the same file",
                 dir.path().display()
             );
             return;
@@ -1725,25 +1731,57 @@ mod tests {
         let engine = MockEngine::new();
         let state = MockStateBackend::new();
         run(dir.path(), &engine, &state, false).unwrap();
-        assert_eq!(
-            engine.calls.borrow().len(),
-            3,
-            "first run: preflight + 2 sql"
-        );
-
-        // Delete only s1's declared file. Both steps' declared name collapses to the
-        // same lowercased graph node, so both are answerable for it — neither may
-        // report fresh while the collision stands.
-        fs::remove_file(dir.path().join("build/Report.csv")).unwrap();
 
         drop(engine);
         let engine = MockEngine::new();
         run(dir.path(), &engine, &state, false).unwrap();
         assert_eq!(
             engine.calls.borrow().len(),
-            3,
-            "a produces: collision must force both steps to re-run rather than \
-             certify freshness while a declared artifact is missing: preflight + 2 sql"
+            1,
+            "declared file absent on both runs: stays skipped, not because a leftover \
+             was substituted for it"
+        );
+
+        // Mutate the leftover. If it were being tracked as if it were the declared
+        // artifact (round 3's flaw), this would now register as a change.
+        fs::write(
+            dir.path().join("build/registrant.tsv"),
+            "mutated leftover\n",
+        )
+        .unwrap();
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "a differently-cased leftover must never be tracked as the declared \
+             artifact: changing it must not affect this step's staleness"
+        );
+    }
+
+    // "For the board": nothing else in this family proves the environment it runs in
+    // can actually distinguish case — every one of the tests above self-skips with an
+    // explanation on a filesystem that folds it, and reports `ok` either way, so a
+    // green CI run carries zero information about whether `TMPDIR` there is genuinely
+    // case-sensitive. This one test has no self-skip: it creates two files differing
+    // only by case and asserts both exist. If a runner image's temp filesystem ever
+    // folded case, this reddens on that day, rather than the whole family quietly
+    // testing nothing while staying green.
+    #[test]
+    fn test_habitat_tmpdir_is_case_sensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("AAA"), "upper").unwrap();
+        fs::write(dir.path().join("aaa"), "lower").unwrap();
+        let count = fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(
+            count,
+            2,
+            "tempdir() must be case-sensitive for the case-collision test family above \
+             to mean anything — got {count} entr{} in {}",
+            if count == 1 { "y" } else { "ies" },
+            dir.path().display()
         );
     }
 

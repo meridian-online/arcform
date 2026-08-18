@@ -17,14 +17,49 @@ use crate::manifest::Manifest;
 /// The assets associated with a single step.
 #[derive(Debug, Clone, Default)]
 pub struct StepAssets {
-    /// Asset names this step produces (creates/writes/modifies).
+    /// Asset names this step produces (creates/writes/modifies) — lowercased. A
+    /// DuckDB table identifier is case-insensitive, so two spellings of the same
+    /// table have to land on one graph node; this is the identity every other
+    /// consumer (propagation, `all_produced`, the printed graph) matches on.
     pub produces: BTreeSet<String>,
-    /// Asset names this step reads data from (external dependencies).
+    /// Asset names this step reads data from (external dependencies) — lowercased,
+    /// same reasoning as `produces`.
     pub reads: BTreeSet<String>,
     /// CTE names — step-internal assets visible in lineage but not cross-step dependencies.
     pub internal: BTreeSet<String>,
     /// Asset names this step destroys (DROP operations).
     pub destroys: BTreeSet<String>,
+    /// For every lowercased name in `produces` or `reads`, every RAW (case-preserved,
+    /// exactly as declared) spelling that lowercased to it — almost always exactly
+    /// one. More than one means two declarations collapsed onto the same graph node
+    /// purely by case, which `AssetGraph::validate_no_produces_case_collisions`
+    /// refuses at load for `produces:`, so a validated graph's entries here are
+    /// singletons in practice. This is what `produced_artifact_hash` reads bytes
+    /// from — the lowercased name is graph identity, never a filesystem path; no
+    /// amount of scanning a directory recovers a real file's case once this is
+    /// thrown away, so it has to be carried, not reconstructed.
+    pub declared_case: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl StepAssets {
+    /// Insert `raw` (a name exactly as declared — a SQL-introspected path, an
+    /// operator's config value, an explicit `produces:`/`depends_on:` entry, or an
+    /// `assets:` override) into `set`, lowercased for graph identity, while recording
+    /// `raw` itself in `declared_case` under that same lowercased key. The one path
+    /// every insertion into `produces`/`reads` goes through, so the two can never
+    /// drift apart.
+    fn record(
+        set: &mut BTreeSet<String>,
+        declared_case: &mut BTreeMap<String, BTreeSet<String>>,
+        raw: &str,
+    ) {
+        let lowered = raw.to_lowercase();
+        declared_case
+            .entry(lowered.clone())
+            .or_default()
+            .insert(raw.to_string());
+        set.insert(lowered);
+    }
 }
 
 /// The complete asset graph for a pipeline.
@@ -56,14 +91,30 @@ impl AssetGraph {
         for step in &manifest.steps {
             let mut step_assets = StepAssets::default();
 
-            // Phase 1: SQL introspection.
+            // Phase 1: SQL introspection. Already case-preserved — a path embedded
+            // in SQL text (e.g. `read_csv('build/ncen/2026q2/REGISTRANT.tsv')`) is
+            // captured verbatim by the parser, never lowercased here, so its graph
+            // node IS its real on-disk spelling; `record` still runs so
+            // `declared_case` holds a uniform entry regardless of provenance.
             if let Some(ref sql_path) = step.sql {
                 let full_path = manifest_dir.join(sql_path);
                 match std::fs::read_to_string(&full_path) {
                     Ok(sql_content) => match introspect::extract_assets(&sql_content) {
                         Ok(sql_assets) => {
-                            step_assets.produces.extend(sql_assets.outputs);
-                            step_assets.reads.extend(sql_assets.inputs);
+                            for asset in &sql_assets.outputs {
+                                StepAssets::record(
+                                    &mut step_assets.produces,
+                                    &mut step_assets.declared_case,
+                                    asset,
+                                );
+                            }
+                            for asset in &sql_assets.inputs {
+                                StepAssets::record(
+                                    &mut step_assets.reads,
+                                    &mut step_assets.declared_case,
+                                    asset,
+                                );
+                            }
                             step_assets.internal.extend(sql_assets.internal);
                             step_assets.destroys.extend(sql_assets.destroys);
                         }
@@ -94,11 +145,19 @@ impl AssetGraph {
             if let Some(ref op_ref) = step.op {
                 match crate::operator::assets_for(op_ref, step.with.as_ref()) {
                     Ok(op_assets) => {
-                        for asset in op_assets.produces {
-                            step_assets.produces.insert(asset.to_lowercase());
+                        for asset in &op_assets.produces {
+                            StepAssets::record(
+                                &mut step_assets.produces,
+                                &mut step_assets.declared_case,
+                                asset,
+                            );
                         }
-                        for asset in op_assets.reads {
-                            step_assets.reads.insert(asset.to_lowercase());
+                        for asset in &op_assets.reads {
+                            StepAssets::record(
+                                &mut step_assets.reads,
+                                &mut step_assets.declared_case,
+                                asset,
+                            );
                         }
                     }
                     Err(e) => {
@@ -114,10 +173,18 @@ impl AssetGraph {
 
             // Phase 2: Explicit declarations (primarily for command steps).
             for asset in &step.produces {
-                step_assets.produces.insert(asset.to_lowercase());
+                StepAssets::record(
+                    &mut step_assets.produces,
+                    &mut step_assets.declared_case,
+                    asset,
+                );
             }
             for asset in &step.depends_on {
-                step_assets.reads.insert(asset.to_lowercase());
+                StepAssets::record(
+                    &mut step_assets.reads,
+                    &mut step_assets.declared_case,
+                    asset,
+                );
             }
 
             graph.steps.insert(step.name.clone(), step_assets);
@@ -125,14 +192,17 @@ impl AssetGraph {
 
         // Phase 3: Apply overrides from the top-level assets: section.
         for (asset_name, override_entry) in &manifest.assets {
-            let name = asset_name.to_lowercase();
             if let Some(step_assets) = graph.steps.get_mut(&override_entry.produced_by) {
                 // Override: ensure this step produces the asset.
-                step_assets.produces.insert(name.clone());
+                StepAssets::record(
+                    &mut step_assets.produces,
+                    &mut step_assets.declared_case,
+                    asset_name,
+                );
 
                 // Add override dependencies as reads for the producing step.
                 for dep in &override_entry.depends_on {
-                    step_assets.reads.insert(dep.to_lowercase());
+                    StepAssets::record(&mut step_assets.reads, &mut step_assets.declared_case, dep);
                 }
             } else {
                 graph.warnings.push(format!(
@@ -143,6 +213,54 @@ impl AssetGraph {
         }
 
         graph
+    }
+
+    /// Refuse a manifest where two `produces:` declarations — anywhere, within one
+    /// step or across different steps — collapse onto the same graph node purely
+    /// because they differ only by case. `asset.rs`'s lowercasing is what makes that
+    /// collapse happen at all (needed so a case-insensitive DuckDB table lands on one
+    /// node); left silent, the collapsed node's `declared_case` would hold more than
+    /// one raw spelling and there would be no way to say which step's file the
+    /// combined identity actually names. This is a manifest defect independent of
+    /// anything happening on disk — `build/Report.csv` and `build/report.csv` collide
+    /// whether or not either file exists yet, so it is caught here, at load, rather
+    /// than left for a staleness check to discover only once both are already
+    /// written. Fail-closed at read time (see `crate::runner::produced_artifact_hash`)
+    /// still matters for a collision this gate cannot see — a stray file coinciding
+    /// with a declared name, which is not a manifest defect and has nothing here to
+    /// refuse — so the two are complements, not alternatives.
+    pub fn validate_no_produces_case_collisions(&self) -> Result<()> {
+        let mut by_lowered: BTreeMap<&str, BTreeSet<(&str, &str)>> = BTreeMap::new();
+        for (step_name, assets) in &self.steps {
+            for lowered in &assets.produces {
+                let Some(raws) = assets.declared_case.get(lowered) else {
+                    continue;
+                };
+                for raw in raws {
+                    by_lowered
+                        .entry(lowered.as_str())
+                        .or_default()
+                        .insert((step_name.as_str(), raw.as_str()));
+                }
+            }
+        }
+
+        for (lowered, entries) in &by_lowered {
+            let distinct_raw: BTreeSet<&str> = entries.iter().map(|(_, raw)| *raw).collect();
+            if distinct_raw.len() > 1 {
+                let detail: Vec<String> = entries
+                    .iter()
+                    .map(|(step, raw)| format!("'{raw}' (step '{step}')"))
+                    .collect();
+                return Err(Error::ManifestValidation(format!(
+                    "produces: collision — {} all collapse to the same asset '{}' by case alone; rename one so the spellings are genuinely distinct, or declare it once",
+                    detail.join(", "),
+                    lowered
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     /// Validate that the declared step order is consistent with the

@@ -29,6 +29,13 @@ use crate::error::{Error, Result};
 
 /// Assets an operator step reads and produces — merged into the [`crate::asset::AssetGraph`]
 /// exactly as SQL introspection and command `produces`/`depends_on` are.
+///
+/// **Declared case, not lowercased.** `asset.rs` is the one place that normalizes a
+/// name for graph identity (a DuckDB table identifier is case-insensitive, so two
+/// spellings of the same table have to land on one node) — an operator returning an
+/// already-lowercased name here would throw away the real, possibly mixed on-disk case
+/// before anything downstream ever saw it, which is exactly how a produced FILE's true
+/// spelling used to go missing. Return exactly what the config said.
 #[derive(Debug, Clone, Default)]
 pub struct OpAssets {
     pub produces: Vec<String>,
@@ -580,8 +587,8 @@ impl Operator for ParquetExport {
     fn assets(&self, with: &Value) -> Result<OpAssets> {
         let cfg = ParquetExportConfig::parse(with)?;
         Ok(OpAssets {
-            reads: vec![cfg.input.to_lowercase()],
-            produces: vec![cfg.dest.to_lowercase()],
+            reads: vec![cfg.input.clone()],
+            produces: vec![cfg.dest.clone()],
         })
     }
 
@@ -928,7 +935,7 @@ impl Operator for HttpFetch {
         // The network source is not a graph node; only the local artifact is.
         Ok(OpAssets {
             reads: vec![],
-            produces: vec![cfg.out.to_lowercase()],
+            produces: vec![cfg.out.clone()],
         })
     }
 
@@ -1238,7 +1245,7 @@ impl Operator for OpendalFetch {
         let cfg = OpendalFetchConfig::parse(with)?;
         Ok(OpAssets {
             reads: vec![],
-            produces: vec![cfg.to.to_lowercase()],
+            produces: vec![cfg.to.clone()],
         })
     }
 
@@ -1429,8 +1436,8 @@ impl Operator for DatapackageDescribe {
     fn assets(&self, with: &Value) -> Result<OpAssets> {
         let cfg = DatapackageDescribeConfig::parse(with)?;
         Ok(OpAssets {
-            reads: vec![cfg.parquet.to_lowercase()],
-            produces: vec![cfg.out.to_lowercase()],
+            reads: vec![cfg.parquet.clone()],
+            produces: vec![cfg.out.clone()],
         })
     }
 
@@ -1568,7 +1575,7 @@ impl Operator for FinetypeValidate {
         // orders it downstream of the export that produces it (so a rebuilt Parquet
         // re-triggers the gate via stale-propagation) — and the schema contract.
         Ok(OpAssets {
-            reads: vec![cfg.parquet.to_lowercase(), cfg.schema.to_lowercase()],
+            reads: vec![cfg.parquet.clone(), cfg.schema.clone()],
             produces: vec![],
         })
     }
@@ -1888,7 +1895,7 @@ impl Operator for HtmlLinkDiscover {
         // The network source is not a graph node; only the local URL list is.
         Ok(OpAssets {
             reads: vec![],
-            produces: vec![cfg.out.to_lowercase()],
+            produces: vec![cfg.out.clone()],
         })
     }
 
@@ -2118,21 +2125,24 @@ impl Operator for ArchiveExtract {
     fn assets(&self, with: &Value) -> Result<OpAssets> {
         let cfg = ArchiveExtractConfig::parse(with)?;
         cfg.compiled_pattern()?; // fail fast on a bad regex at manifest load
-        // Node names are lowercased (graph convention); the on-disk files keep real
-        // case. Explicit `members` give per-file produced nodes; a pattern-only
-        // selection isn't known until the archive is opened, so `dest` stands in as
-        // the coarse produced node.
+        // Returned case-preserved, exactly as `members` names them — this is the one
+        // place a zip member's real, possibly mixed case is known before extraction
+        // ever runs. `asset.rs` lowercases for graph identity and keeps this raw
+        // spelling alongside it for on-disk resolution (see its `declared_case`).
+        // Explicit `members` give per-file produced nodes; a pattern-only selection
+        // isn't known until the archive is opened, so `dest` stands in as the coarse
+        // produced node.
         let produces = if cfg.members.is_empty() {
-            vec![cfg.dest.to_lowercase()]
+            vec![cfg.dest.clone()]
         } else {
             let base = cfg.dest.trim_end_matches('/');
             cfg.members
                 .iter()
-                .map(|m| format!("{}/{}", base, m).to_lowercase())
+                .map(|m| format!("{}/{}", base, m))
                 .collect()
         };
         Ok(OpAssets {
-            reads: vec![cfg.archive.to_lowercase()],
+            reads: vec![cfg.archive.clone()],
             produces,
         })
     }
@@ -2248,8 +2258,8 @@ impl Operator for SplinkResolve {
     fn assets(&self, with: &Value) -> Result<OpAssets> {
         let cfg = SplinkResolveConfig::parse(with)?;
         Ok(OpAssets {
-            reads: vec![cfg.edgar.to_lowercase(), cfg.gleif.to_lowercase()],
-            produces: vec![cfg.out.to_lowercase()],
+            reads: vec![cfg.edgar.clone(), cfg.gleif.clone()],
+            produces: vec![cfg.out.clone()],
         })
     }
 
@@ -2339,7 +2349,7 @@ impl Operator for GleifRaFetch {
         // Ingress: the network source is not a graph node; only the local CSV is.
         Ok(OpAssets {
             reads: vec![],
-            produces: vec![cfg.out.to_lowercase()],
+            produces: vec![cfg.out.clone()],
         })
     }
 
@@ -3174,12 +3184,14 @@ mod tests {
         .unwrap();
         let a = assets_for("archive_extract", Some(&with)).unwrap();
         assert_eq!(a.reads, vec!["build/ncen/2024q1.zip".to_string()]);
-        // Node names lowercased (graph convention); on-disk case preserved separately.
+        // Case-preserved, exactly as `members` declares it — `asset.rs` is the one
+        // place that lowercases for graph identity; this layer must not do it first,
+        // or the real on-disk spelling is gone before anything downstream sees it.
         assert_eq!(
             a.produces,
             vec![
-                "build/ncen/2024q1/registrant.tsv".to_string(),
-                "build/ncen/2024q1/fund_reported_info.tsv".to_string(),
+                "build/ncen/2024q1/REGISTRANT.tsv".to_string(),
+                "build/ncen/2024q1/FUND_REPORTED_INFO.tsv".to_string(),
             ]
         );
     }
