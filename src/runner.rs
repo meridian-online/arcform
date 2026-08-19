@@ -5304,18 +5304,22 @@ steps:
         );
     }
 
-    // Round 9, C2 — a hand-declared `produces:` name the step's own SQL never
-    // mentions is an ordering token, not a file. Classified `File` it is looked for
-    // at `<dir>/raw_tables`, never found, and the step re-runs on every run —
-    // measured 4 of 4 — with its consumer dragged along by propagation so that
-    // never settles either.
+    // A hand-declared `produces:` name the step's own SQL never mentions is still a
+    // path, and the step therefore re-runs on every run: `<dir>/raw_tables` cannot be
+    // read, `produced_artifact_hash` returns `None`, staleness is forced, and
+    // propagation drags the consumer along. That cost is the trade taken over the
+    // alternative measured in round 9 — classifying such a name `Table`, which drops
+    // it out of the staleness path and lets a step that really did write bytes under
+    // that name skip over a truncated or deleted artifact at exit 0.
     //
-    // Runs 2 and 3 of `load`, and runs 2 and 3 of `consume`, are what redden on the
-    // parent behaviour. `test_external_unproduced_file_change_forces_rerun` is the
-    // guard on the other side: a bare `depends_on:` name that nothing produces is
-    // still a real file and is still hashed.
+    // Runs 2, 3 and 4 are what redden if that alternative comes back: each would
+    // report 1 (preflight only). `tests/bare_produces_ordering_token.rs` pins the
+    // other half of "loud" — the warning on stderr — which no engine-call count can
+    // see. `test_external_unproduced_file_change_forces_rerun` is the guard on the
+    // reads side: a bare `depends_on:` name that nothing produces is a real file and
+    // is really hashed.
     #[test]
-    fn test_bare_produces_sentinel_settles_and_so_does_its_consumer() {
+    fn test_bare_produces_ordering_token_reruns_rather_than_settling() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: test\nsteps:\n  - name: load\n    sql: models/load.sql\n    produces: [raw_tables]\n  - name: consume\n    sql: models/consume.sql\n    depends_on: [raw_tables]\n";
         setup_project(
@@ -5336,34 +5340,108 @@ steps:
         );
         let state = MockStateBackend::new();
 
-        assert_eq!(
-            engine_calls_for_one_run(dir.path(), &state),
-            3,
-            "run 1: preflight + 2 sql"
+        for run in 1..=4 {
+            assert_eq!(
+                engine_calls_for_one_run(dir.path(), &state),
+                3,
+                "run {run}: `raw_tables` is a declared path with nothing at it, so the \
+                 producer must stay stale and drag its consumer with it — preflight \
+                 plus both sql steps, every run"
+            );
+        }
+
+        // The control: a `produces:` name the step's work DOES write settles, so the
+        // re-running above is this configuration and not every configuration.
+        let settling = tempfile::tempdir().unwrap();
+        let settling_yaml = "name: test\nsteps:\n  - name: load\n    sql: models/load.sql\n    produces: [build/loaded.txt]\n";
+        setup_project(
+            settling.path(),
+            settling_yaml,
+            &[(
+                "models/load.sql",
+                "CREATE OR REPLACE TABLE naics_raw AS SELECT 1;",
+            )],
         );
+        fs::create_dir_all(settling.path().join("build")).unwrap();
+        fs::write(settling.path().join("build/loaded.txt"), b"written").unwrap();
+        let settling_state = MockStateBackend::new();
+        assert_eq!(
+            engine_calls_for_one_run(settling.path(), &settling_state),
+            2,
+            "control run 1"
+        );
+        assert_eq!(
+            engine_calls_for_one_run(settling.path(), &settling_state),
+            1,
+            "control run 2: a declared produces: name that IS on disk settles"
+        );
+    }
+
+    // An `assets:` override is by definition the escape hatch for an asset arcform
+    // cannot discover — no SQL introspection, no operator config, nothing but the
+    // string. So the default decides every one of them, which makes this the path
+    // most likely to be re-guessed. It must hash the file's BYTES.
+    //
+    // Runs 3 and 6 are what redden if the override's default stops being a path:
+    // both would report 1 (preflight only), certifying an artifact that is deleted
+    // and then one whose contents changed underneath.
+    #[test]
+    fn test_assets_override_naming_a_real_file_is_hashed_and_notices_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: export\n    sql: models/export.sql\nassets:\n  build/side.csv:\n    produced_by: export\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            // The SQL creates a table and never mentions build/side.csv — the
+            // discovery gap the `assets:` block exists to close.
+            &[(
+                "models/export.sql",
+                "CREATE OR REPLACE TABLE orders AS SELECT 1;",
+            )],
+        );
+        let side = dir.path().join("build/side.csv");
+        fs::create_dir_all(side.parent().unwrap()).unwrap();
+        fs::write(&side, b"id\n1\n").unwrap();
+        let state = MockStateBackend::new();
+
+        assert_eq!(engine_calls_for_one_run(dir.path(), &state), 2, "run 1");
         assert_eq!(
             engine_calls_for_one_run(dir.path(), &state),
             1,
-            "run 2: an ordering token is not a file — both steps must settle to \
-             preflight only"
-        );
-        assert_eq!(
-            engine_calls_for_one_run(dir.path(), &state),
-            1,
-            "run 3: and stay settled, rather than re-running forever"
+            "run 2: nothing changed, so the step settles"
         );
 
-        // The control: editing the producer's SQL must still re-run both, so the
-        // settling above is a real staleness answer and not a dead graph.
-        fs::write(
-            dir.path().join("models/load.sql"),
-            "CREATE OR REPLACE TABLE naics_raw AS SELECT 99;",
-        )
-        .unwrap();
+        fs::remove_file(&side).unwrap();
         assert_eq!(
             engine_calls_for_one_run(dir.path(), &state),
-            3,
-            "run 4: changed SQL must re-run the producer and propagate to its consumer"
+            2,
+            "run 3: the overridden asset was DELETED — a run that skips here reports \
+             success over an artifact that is gone"
+        );
+
+        fs::write(&side, b"id\n1\n").unwrap();
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 4: restored after an unreadable run, so still stale"
+        );
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 5: settles again on the restored bytes"
+        );
+
+        // Same path, same length, different bytes — presence is not enough.
+        fs::write(&side, b"id\n9\n").unwrap();
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 6: the overridden asset's BYTES changed under an unchanged path"
+        );
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 7: settles on the new contents"
         );
     }
 

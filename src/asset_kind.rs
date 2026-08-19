@@ -12,10 +12,9 @@
 ///
 /// One declaration site has no parser and no operator to consult: a `produces:`,
 /// `depends_on:` or `assets:` string a human wrote. [`default_kind_for_declared_name`]
-/// and [`default_kind_for_declared_produces`] are that site, and they read only what
-/// such a string carries syntactically — a glob metacharacter, a path separator, and
-/// which of the two lists it was written in — rather than enumerating extensions or
-/// asking the filesystem.
+/// is that site, and it reads only what such a string carries syntactically — a glob
+/// metacharacter — rather than enumerating extensions, splitting on a path separator,
+/// or asking the filesystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AssetKind {
     /// A single, literal, readable regular file. Staleness hashes its bytes.
@@ -30,33 +29,48 @@ pub enum AssetKind {
     /// path. Never hashed directly — staleness comes from whatever step produces
     /// the files it matches, through the asset graph, not from the pattern string.
     Pattern,
-    /// Not a filesystem path at all: a relational table or view identifier, or a
-    /// hand-declared `produces:` name that addresses no path (see
-    /// [`default_kind_for_declared_produces`]). Never hashed — staleness comes from
-    /// the producing step's own config hash and downstream propagation.
+    /// Not a filesystem path at all: a relational table or view identifier, the way
+    /// SQL introspection reads a bare `CREATE OR REPLACE TABLE` target. Never hashed
+    /// — staleness comes from the producing step's own config hash and downstream
+    /// propagation.
     Table,
 }
 
-/// The default for a name in `depends_on:` (or an `assets:` dependency) with no
-/// operator or SQL parser behind it to consult — a plain manifest string a human
-/// wrote, with no type syntax available.
+/// The default for a `produces:`, `depends_on:` or `assets:` name with no operator
+/// or SQL parser behind it to consult — a plain manifest string a human wrote, with
+/// no type syntax available.
 ///
 /// Decided on the one thing such a string carries syntactically: a glob metacharacter
-/// means it can never resolve to one path. Everything else is a path. **A bare name
-/// on this side is a path too**, and that is not symmetric with
-/// [`default_kind_for_declared_produces`] by accident. Two places read `declared_kind`
-/// for a name on the reads side — `runner::produced_artifact_hash`, which drops any
-/// read that appears in `all_produced`, and `contract::build_assets`, which prefers a
-/// producer's kind and consults a reader's when there is no producer. Both consult a
-/// reader's kind for exactly the names nothing in the manifest produces, and an input
-/// the pipeline does not produce comes from outside the pipeline — which is the
-/// filesystem.
+/// means it can never resolve to one path. Everything else is a path — the same
+/// answer on both sides, with no second rule keyed on a path separator and no
+/// enumeration of extensions.
+///
+/// **A separator-free `produces:` token is a path too, and for the ordering-edge
+/// shape `examples/code-lists/arcform.yaml` writes as `produces: [raw_tables]` that
+/// is a deliberate, loud cost.** There is no file at `<protocol dir>/raw_tables`, so
+/// `fs::read` fails, `runner::produced_artifact_hash` returns `None`, the step is
+/// stale on every run, and `runner::missing_declared_produces` names it on stderr
+/// each time.
+///
+/// The alternative — reading a separator-free `produces:` name as [`AssetKind::Table`]
+/// and dropping it out of the staleness path entirely — was built, driven and
+/// withdrawn. It fabricates a false "unchanged": what the code can test is whether
+/// arcform's introspection recorded the name, not whether the step's own work wrote
+/// bytes under it, and those differ wherever a step writes through a path
+/// introspection does not model — `ATTACH 'side.db'` inside a `sql:` step, or an
+/// `assets:` override, which exists precisely for an asset arcform cannot discover.
+/// A `side.db` declared that way could be truncated or deleted and the step still
+/// reported `[skip: hash_clean]` at exit 0. A step that re-runs forever is expensive
+/// and visible; a step certifying an artifact it can no longer read is neither.
+/// `runner::tests::test_bare_produces_ordering_token_reruns_rather_than_settling`
+/// and `tests/bare_produces_ordering_token.rs` pin that trade from both ends.
 ///
 /// The failure mode when this lands on a name that is really a directory: `fs::read`
 /// on a directory errors, which forces staleness exactly as a missing file does, so it
 /// does not fabricate a false "unchanged" — the step re-runs on every run instead.
-/// That is safe and it is expensive, and on this side it is also **silent**: nothing
-/// prints, because `missing_declared_produces` reports the `produces:` side only.
+/// That is safe and it is expensive, and on the `depends_on:` side it is also
+/// **silent**: nothing prints, because `missing_declared_produces` reports the
+/// `produces:` side only.
 pub fn default_kind_for_declared_name(raw: &str) -> AssetKind {
     if raw.contains(['*', '?', '[']) {
         AssetKind::Pattern
@@ -65,97 +79,38 @@ pub fn default_kind_for_declared_name(raw: &str) -> AssetKind {
     }
 }
 
-/// The default for a name in `produces:` (or an `assets:` output) with no operator or
-/// SQL parser behind it to consult.
-///
-/// Same glob rule, plus one more syntactic fact: a path separator. A `produces:` name
-/// without one is not a filesystem address — it is the manifest's own vocabulary for
-/// an ordering edge, the shape `examples/code-lists/arcform.yaml` writes as
-/// `produces: [raw_tables]` and `produces: [license_cleared]`, against
-/// `tests/fixtures/open_analytics/edgar_gleif/arcform.yaml`'s
-/// `depends_on: [build/resolved.parquet]` for a real file. So it is classified the way
-/// the one classifier in this crate with real syntax to read already classifies a bare
-/// identifier: `Table` — not hashed, its staleness left to the config hash and the
-/// downstream propagation the relational machinery has always applied to it.
-///
-/// **This is safe on the `produces:` side specifically, and the argument is why the
-/// two sides differ.** A step that really writes bytes at a bare root name says so
-/// where it says everything else: a `sql:` step's `COPY … TO 'out.parquet'` is read by
-/// SQL introspection, an `op:` step's `dest:` by the operator's own config, and both
-/// run before this default and win under `StepAssets::record`'s `or_insert`. A
-/// `command:` step's produced bytes are not hashed at all, whatever kind they carry.
-/// What is left for this default is a name the step's own work never mentions — which
-/// is what an ordering token is.
-///
-/// **To declare a file or a directory in the protocol root, write a separator:**
-/// `./output.parquet`, not `output.parquet`. That is the whole interface, and it is
-/// the reason this is a rule rather than a guess — nothing here inspects an extension,
-/// scans a directory or asks the filesystem, which is what each of the four earlier
-/// attempts did before it got a different case wrong.
-pub fn default_kind_for_declared_produces(raw: &str) -> AssetKind {
-    match default_kind_for_declared_name(raw) {
-        AssetKind::File if !raw.contains('/') && !raw.contains(std::path::MAIN_SEPARATOR) => {
-            AssetKind::Table
-        }
-        other => other,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // The ordering-token shape this repo's own examples ship, and the file-shaped
+    // spellings an extension allowlist walked into from the other side (`tides_csv`
+    // and `report_csv` in `examples/almanac`, `cask_json` in `examples/brewtrend`).
+    // Each is a path here; beyond a glob metacharacter the spelling is not read.
     #[test]
-    fn a_bare_produces_name_is_not_a_filesystem_path() {
-        for name in ["raw_tables", "license_cleared", "open_catalog", "validated"] {
+    fn every_non_glob_name_is_a_path_on_both_sides() {
+        for name in [
+            "raw_tables",
+            "license_cleared",
+            "tides_csv",
+            "cask_json",
+            "output.parquet",
+            "build/resolved.parquet",
+            "./output.parquet",
+            "external.csv",
+        ] {
             assert_eq!(
-                default_kind_for_declared_produces(name),
-                AssetKind::Table,
-                "{name} has no path separator"
-            );
-        }
-    }
-
-    // The trap an extension allowlist walked into from the other side: these names end
-    // in something file-shaped and are ordering tokens in this repo's own examples
-    // (`tides_csv` and `report_csv` in `examples/almanac`, `cask_json` in
-    // `examples/brewtrend`). Spelling is not the signal; the separator is.
-    #[test]
-    fn a_file_shaped_bare_produces_name_is_still_not_a_path() {
-        for name in ["tides_csv", "report_csv", "cask_json", "output.parquet"] {
-            assert_eq!(
-                default_kind_for_declared_produces(name),
-                AssetKind::Table,
-                "{name} has no path separator"
-            );
-        }
-    }
-
-    #[test]
-    fn a_separator_makes_a_produces_name_a_path() {
-        for name in ["build/resolved.parquet", "./output.parquet", "/tmp/x"] {
-            assert_eq!(
-                default_kind_for_declared_produces(name),
+                default_kind_for_declared_name(name),
                 AssetKind::File,
-                "{name} carries a path separator"
+                "{name} carries no glob metacharacter"
             );
         }
     }
 
-    // The reads side keeps every non-glob name a path, separator or not — an input
-    // nothing produces has to come off the filesystem.
     #[test]
-    fn a_bare_depends_on_name_stays_a_path() {
-        for name in ["external.csv", "raw_tables", "build/edgar.parquet"] {
-            assert_eq!(default_kind_for_declared_name(name), AssetKind::File);
-        }
-    }
-
-    #[test]
-    fn a_glob_is_a_pattern_on_both_sides() {
+    fn a_glob_is_a_pattern() {
         for name in ["build/ncen/*/REGISTRANT.tsv", "*.parquet", "x?.csv"] {
             assert_eq!(default_kind_for_declared_name(name), AssetKind::Pattern);
-            assert_eq!(default_kind_for_declared_produces(name), AssetKind::Pattern);
         }
     }
 }
