@@ -97,10 +97,13 @@ pub fn content_hash(content: &[u8]) -> String {
 /// hashes each one's bytes, then hashes the sorted `(relative_path, file_hash)`
 /// pairs together. Sorted so the combined digest is independent of readdir order;
 /// keyed on relative path so a file moving to a different name inside the tree
-/// changes the digest even if no byte anywhere changed. `None` when the directory
-/// cannot be read at all (missing, or a permissions failure) — the same
-/// unconditional-staleness signal an unreadable file already produces, so an
-/// absent directory forces a re-run exactly as a deleted file does.
+/// changes the digest even if no byte anywhere changed. `None` when any part of the
+/// walk fails to read: the directory itself missing or permission-denied, a
+/// subdirectory that cannot be listed, or a single child file whose bytes cannot be
+/// read — each of those is an `.ok()?` in the walk below. That is the same
+/// unconditional-staleness signal an
+/// unreadable file already produces, so an absent or damaged tree forces a re-run
+/// exactly as a deleted file does.
 pub fn hash_directory_contents(dir: &Path) -> Option<String> {
     let mut entries: Vec<(String, String)> = Vec::new();
     let mut stack = vec![dir.to_path_buf()];

@@ -995,8 +995,9 @@ fn missing_declared_produces(
             };
             let full = dir.join(raw);
             // Dispatch on the declared kind, not on what happens to be on disk: a
-            // Directory-kind entry is "missing" only when the directory itself
-            // cannot be read at all (`hash_directory_contents` returns `None`) — an
+            // Directory-kind entry is "missing" when `hash_directory_contents`
+            // returns `None`, which covers the directory itself being absent or
+            // unlistable AND a child anywhere in the tree that cannot be read. An
             // EMPTY-but-present directory is not reported here (that gap is
             // `is_hash_stale`'s job, via the content hash changing), because this
             // function names things the step's own work never created, not things
@@ -1070,8 +1071,8 @@ fn declared_kind_of(assets: &StepAssets, name: &str) -> AssetKind {
 /// survived. `Pattern` and `Table` are filtered out before this loop is ever
 /// reached (see `is_hashable_kind`), so this function has no name-based or
 /// extension-based guessing left in it at all — that was round 6 and round 7's
-/// mistake (an extension allowlist left 21 of 22 real files untracked; an
-/// unconditional directory skip re-opened the exact hole a content hash closes).
+/// mistake (an extension allowlist left real files untracked; an unconditional
+/// directory skip re-opened the exact hole a content hash closes).
 ///
 /// Returns `None` — never a hash — in two OTHER cases, both forcing the caller
 /// (`is_hash_stale`) to unconditional staleness rather than a string comparison:
@@ -5190,6 +5191,390 @@ steps:
         assert!(
             dest.exists(),
             "deleted file must be really rewritten, not just reported fixed"
+        );
+    }
+
+    // ---- Round 9 ----------------------------------------------------------
+    // Round 8's design is unchanged. What follows pins the parts of it that a
+    // mutation could delete with the suite staying green, plus the two places it
+    // was still inferring rather than carrying.
+
+    /// Drive `run()` once and report how many engine calls it made. Every pin below
+    /// asserts on this across a sequence of runs rather than on a predicate's return
+    /// value: 2 is preflight plus one executed `sql:` step, 1 is preflight alone,
+    /// which is what a skip looks like from outside.
+    fn engine_calls_for_one_run(dir: &Path, state: &MockStateBackend) -> usize {
+        let engine = MockEngine::new();
+        run(dir, &engine, state, false).unwrap();
+        let n = engine.calls.borrow().len();
+        drop(engine);
+        n
+    }
+
+    /// A one-step project whose SQL is `sql`, with `build/<dir_name>` pre-created and
+    /// seeded, standing in for what a real DuckDB COPY would have written (MockEngine
+    /// executes no SQL). Returns the temp dir.
+    fn project_with_seeded_directory(sql: &str, files: &[(&str, &[u8])]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: export\n    sql: models/export.sql\n";
+        setup_project(dir.path(), yaml, &[("models/export.sql", sql)]);
+        for (rel, bytes) in files {
+            let full = dir.path().join(rel);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(&full, bytes).unwrap();
+        }
+        dir
+    }
+
+    // Round 9, C1 — `PARTITION_BY` is not the whole set of COPY options that make
+    // DuckDB write a directory, and the three that were missing all failed the same
+    // way: classified `File`, `fs::read` on a directory errors, the hash is `None`,
+    // and the step re-runs on every run at exit 0 while warning that it produced
+    // nothing — with the files on disk.
+    //
+    // Run 2 of each of these is the assertion that reddens on the parent behaviour.
+    // `PARTITION_BY` is in the loop as the control: it settled before this change and
+    // must still settle.
+    #[test]
+    fn test_every_directory_writing_copy_option_settles_and_then_notices_a_change() {
+        for option in [
+            "PARTITION_BY (year)",
+            "PER_THREAD_OUTPUT true",
+            "FILE_SIZE_BYTES '1MB'",
+            "ROW_GROUPS_PER_FILE 1",
+        ] {
+            let sql = format!("COPY orders TO 'build/out' (FORMAT parquet, {option});");
+            let dir = project_with_seeded_directory(
+                &sql,
+                &[("build/out/data_0.parquet", b"first slice")],
+            );
+            let state = MockStateBackend::new();
+
+            assert_eq!(
+                engine_calls_for_one_run(dir.path(), &state),
+                2,
+                "{option}: run 1 has no prior state and must execute"
+            );
+            assert_eq!(
+                engine_calls_for_one_run(dir.path(), &state),
+                1,
+                "{option}: run 2 must settle to skip — a directory-writing COPY \
+                 classified as a File cannot be read and never settles"
+            );
+
+            fs::write(dir.path().join("build/out/data_1.parquet"), b"second slice").unwrap();
+            assert_eq!(
+                engine_calls_for_one_run(dir.path(), &state),
+                2,
+                "{option}: run 3 must notice a file added to the produced directory"
+            );
+            assert_eq!(
+                engine_calls_for_one_run(dir.path(), &state),
+                1,
+                "{option}: run 4 must settle again"
+            );
+        }
+    }
+
+    // Round 9, C1's other half — an option that is NOT in the directory-writing set
+    // must leave the target a single file, or the perpetual re-run simply arrives
+    // from the other side (`hash_directory_contents` on a regular file cannot
+    // `read_dir` it, returns `None`, and the step never settles).
+    #[test]
+    fn test_per_thread_output_false_is_hashed_as_one_file_and_settles() {
+        let dir = project_with_seeded_directory(
+            "COPY orders TO 'build/one.parquet' (FORMAT parquet, PER_THREAD_OUTPUT false);",
+            &[("build/one.parquet", b"one file, not a directory")],
+        );
+        let state = MockStateBackend::new();
+
+        assert_eq!(engine_calls_for_one_run(dir.path(), &state), 2, "run 1");
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 2 must settle — an explicit `false` writes one file, and treating it \
+             as a directory would make the step re-run forever"
+        );
+
+        fs::write(dir.path().join("build/one.parquet"), b"different bytes").unwrap();
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 3: the file's bytes changed and it is really being hashed"
+        );
+    }
+
+    // Round 9, C2 — a hand-declared `produces:` name the step's own SQL never
+    // mentions is an ordering token, not a file. Classified `File` it is looked for
+    // at `<dir>/raw_tables`, never found, and the step re-runs on every run —
+    // measured 4 of 4 — with its consumer dragged along by propagation so that
+    // never settles either.
+    //
+    // Runs 2 and 3 of `load`, and runs 2 and 3 of `consume`, are what redden on the
+    // parent behaviour. `test_external_unproduced_file_change_forces_rerun` is the
+    // guard on the other side: a bare `depends_on:` name that nothing produces is
+    // still a real file and is still hashed.
+    #[test]
+    fn test_bare_produces_sentinel_settles_and_so_does_its_consumer() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: load\n    sql: models/load.sql\n    produces: [raw_tables]\n  - name: consume\n    sql: models/consume.sql\n    depends_on: [raw_tables]\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[
+                // Neither model creates anything called `raw_tables` — exactly the
+                // shape `examples/code-lists/arcform.yaml` ships.
+                (
+                    "models/load.sql",
+                    "CREATE OR REPLACE TABLE naics_raw AS SELECT 1;",
+                ),
+                (
+                    "models/consume.sql",
+                    "CREATE OR REPLACE TABLE naics_norm AS SELECT 2;",
+                ),
+            ],
+        );
+        let state = MockStateBackend::new();
+
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            3,
+            "run 1: preflight + 2 sql"
+        );
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 2: an ordering token is not a file — both steps must settle to \
+             preflight only"
+        );
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 3: and stay settled, rather than re-running forever"
+        );
+
+        // The control: editing the producer's SQL must still re-run both, so the
+        // settling above is a real staleness answer and not a dead graph.
+        fs::write(
+            dir.path().join("models/load.sql"),
+            "CREATE OR REPLACE TABLE naics_raw AS SELECT 99;",
+        )
+        .unwrap();
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            3,
+            "run 4: changed SQL must re-run the producer and propagate to its consumer"
+        );
+    }
+
+    // Round 9, P1 — the content half of the directory hash, which every existing
+    // directory test misses because they all move a *path*: they add or remove a
+    // file. Reduce `hash_directory_contents` to `(relative path, String::new())` and
+    // this is the only thing that notices. A release binary built with that reduction
+    // left a partition file's bytes changed, and truncated, both reading
+    // `[skip: hash_clean]` at exit 0 — this card's own headline defect, for the
+    // Directory kind.
+    //
+    // No path is created, removed or renamed anywhere in this test.
+    #[test]
+    fn test_directory_file_content_change_with_no_path_change_forces_rerun() {
+        let dir = project_with_seeded_directory(
+            "COPY orders TO 'build/parts' (FORMAT parquet, PARTITION_BY (year));",
+            &[
+                ("build/parts/year=2024.parquet", b"AAAA"),
+                ("build/parts/year=2025.parquet", b"BBBB"),
+            ],
+        );
+        let state = MockStateBackend::new();
+        let paths_now = || {
+            let mut v: Vec<String> = fs::read_dir(dir.path().join("build/parts"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        let paths_at_start = paths_now();
+
+        assert_eq!(engine_calls_for_one_run(dir.path(), &state), 2, "run 1");
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 2: unchanged directory must settle"
+        );
+
+        // Same path, same length, different bytes.
+        fs::write(dir.path().join("build/parts/year=2024.parquet"), b"ZZZZ").unwrap();
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 3: a partition file's BYTES changed under an unchanged set of paths \
+             — a hash over paths alone cannot see this"
+        );
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 4: settles again on the new content"
+        );
+
+        // Same path, truncated to empty.
+        fs::write(dir.path().join("build/parts/year=2024.parquet"), b"").unwrap();
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 5: truncating a partition file must force a re-run"
+        );
+
+        assert_eq!(
+            paths_now(),
+            paths_at_start,
+            "this test must never have added or removed a path — otherwise it is \
+             pinning the same thing the existing directory tests already pin"
+        );
+    }
+
+    // Round 9, P2 — the recursion. Real DuckDB nests: `COPY … PARTITION_BY` writes
+    // `build/parts/year=2024/data_0.parquet`, while the existing directory test
+    // hand-creates flat files directly under the target. Stop descending into
+    // subdirectories and the whole tree below the top level becomes invisible, so
+    // every run hashes the same empty manifest and the step settles over corruption.
+    //
+    // The top level of this tree holds no regular file at all, which is what makes
+    // run 3 the assertion that reddens.
+    #[test]
+    fn test_nested_directory_content_change_forces_rerun() {
+        let dir = project_with_seeded_directory(
+            "COPY orders TO 'build/parts' (FORMAT parquet, PARTITION_BY (year, month));",
+            &[
+                ("build/parts/year=2024/month=01/data_0.parquet", b"jan"),
+                ("build/parts/year=2024/month=02/data_0.parquet", b"feb"),
+            ],
+        );
+        let state = MockStateBackend::new();
+
+        assert_eq!(engine_calls_for_one_run(dir.path(), &state), 2, "run 1");
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 2: unchanged nested tree must settle"
+        );
+
+        fs::write(
+            dir.path()
+                .join("build/parts/year=2024/month=02/data_0.parquet"),
+            b"FEB",
+        )
+        .unwrap();
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 3: bytes two levels down changed — a non-recursive walk sees an \
+             empty manifest here and skips forever"
+        );
+
+        fs::remove_file(
+            dir.path()
+                .join("build/parts/year=2024/month=01/data_0.parquet"),
+        )
+        .unwrap();
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 4: a nested partition deleted must force a re-run too"
+        );
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 5: settles again"
+        );
+    }
+
+    // Round 9, P3 — the ordering guarantee `StepAssets::record` rests on. Phase 1
+    // (SQL introspection) records a real, source-derived kind; Phase 2 (a hand
+    // `produces:`) records a default. `or_insert` keeps the first. Change it to
+    // `insert` and the default wins: `build/parts` is a directory that DuckDB writes
+    // and a `File` to the runner, `fs::read` on it errors, and the step never
+    // settles.
+    //
+    // Run 2 is what reddens. This is what the four shipping `open_analytics`
+    // manifests' safety rests on, in the one configuration where the two phases
+    // disagree.
+    #[test]
+    fn test_a_hand_declaration_cannot_downgrade_sql_introspections_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: export\n    sql: models/export.sql\n    produces: [build/parts]\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[(
+                "models/export.sql",
+                "COPY orders TO 'build/parts' (FORMAT parquet, PARTITION_BY (year));",
+            )],
+        );
+        fs::create_dir_all(dir.path().join("build/parts")).unwrap();
+        fs::write(dir.path().join("build/parts/year=2024.parquet"), b"one").unwrap();
+        let state = MockStateBackend::new();
+
+        assert_eq!(engine_calls_for_one_run(dir.path(), &state), 2, "run 1");
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 2: the SQL said Directory and the later hand-declaration must not \
+             downgrade it to File — a File read of a directory never settles"
+        );
+
+        // Still hashing it AS a directory, not merely ignoring it: emptying it while
+        // keeping it present must be noticed.
+        fs::remove_file(dir.path().join("build/parts/year=2024.parquet")).unwrap();
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 3: emptied directory must force a re-run"
+        );
+    }
+
+    // Round 9, P4 — rounds 1 to 3's sentinel bug, unpinned for the Directory kind.
+    // `hash_directory_contents(&full)?` propagates `None` out of
+    // `produced_artifact_hash`, and `is_hash_stale` turns that into unconditional
+    // staleness. Fold it into a comparable `"MISSING"` string instead and the
+    // baseline recorded right after the step's own "success" already says MISSING, so
+    // every later run compares MISSING to MISSING and skips — the graph asserting a
+    // directory is produced while nothing is on disk, and the run reporting success.
+    //
+    // MockEngine executes no SQL, so `build/parts` is never created. Runs 2 and 3
+    // are what redden.
+    #[test]
+    fn test_absent_directory_produce_never_settles_into_skip() {
+        let dir = project_with_seeded_directory(
+            "COPY orders TO 'build/parts' (FORMAT parquet, PARTITION_BY (year));",
+            &[],
+        );
+        let state = MockStateBackend::new();
+
+        assert!(!dir.path().join("build/parts").exists());
+
+        assert_eq!(engine_calls_for_one_run(dir.path(), &state), 2, "run 1");
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 2: a produced directory that is not there must never read as \
+             unchanged, however stable the placeholder recorded for it"
+        );
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 3: same again"
+        );
+
+        // And it stops re-running the moment the directory really is there.
+        fs::create_dir_all(dir.path().join("build/parts")).unwrap();
+        fs::write(dir.path().join("build/parts/year=2024.parquet"), b"real").unwrap();
+        assert_eq!(engine_calls_for_one_run(dir.path(), &state), 2, "run 4");
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 5: settles once the directory exists — the staleness above was the \
+             absence, not a stuck step"
         );
     }
 }
