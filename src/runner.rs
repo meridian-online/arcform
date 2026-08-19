@@ -5445,6 +5445,61 @@ steps:
         );
     }
 
+    // The same escape hatch with a separator-free name — the exact spelling the
+    // withdrawn separator rule decided differently. A protocol whose `sql:` step
+    // writes `side.db` through an ATTACH is invisible to SQL introspection, so
+    // `assets:` is the only way to declare it, and it carries no separator.
+    //
+    // Runs 3 and 5 are what redden if a separator-free `assets:` name stops being a
+    // path: both would report 1 (preflight only), over a file that is deleted and
+    // then over one whose bytes changed.
+    #[test]
+    fn test_assets_override_with_a_separator_free_name_is_still_hashed() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: export\n    sql: models/export.sql\nassets:\n  side.db:\n    produced_by: export\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[(
+                "models/export.sql",
+                "ATTACH IF NOT EXISTS 'side.db' AS side;\n\
+                 CREATE OR REPLACE TABLE side.x AS SELECT 1;",
+            )],
+        );
+        let side = dir.path().join("side.db");
+        fs::write(&side, b"pretend duckdb file").unwrap();
+        let state = MockStateBackend::new();
+
+        assert_eq!(engine_calls_for_one_run(dir.path(), &state), 2, "run 1");
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 2: nothing changed, so the step settles"
+        );
+
+        fs::remove_file(&side).unwrap();
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 3: the declared artifact is GONE and the step must not certify it"
+        );
+
+        fs::write(&side, b"pretend duckdb file").unwrap();
+        assert_eq!(engine_calls_for_one_run(dir.path(), &state), 2, "run 4");
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 5: settles again on the restored bytes"
+        );
+
+        fs::write(&side, b"pretend duckdb FILE").unwrap();
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 6: same path, same length, different bytes"
+        );
+    }
+
     // Round 9, P1 — the content half of the directory hash, which every existing
     // directory test misses because they all move a *path*: they add or remove a
     // file. Reduce `hash_directory_contents` to `(relative path, String::new())` and
