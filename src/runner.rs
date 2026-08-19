@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use indexmap::IndexMap;
 use owo_colors::OwoColorize;
 
-use crate::asset::AssetGraph;
+use crate::asset::{AssetGraph, StepAssets};
+use crate::asset_kind::AssetKind;
 use crate::contract;
 use crate::engine::Engine;
 use crate::error::{Error, Result};
@@ -928,8 +929,12 @@ fn is_hash_stale(
             // be confidently hashed right now — it is currently unreadable (missing,
             // permission-denied — NOT truncated: `fs::read` succeeds on an empty
             // file and yields `Some(hash_of_empty)`, a real digest that compares
-            // correctly against a non-empty prior hash; NOT a directory or a glob —
-            // `looks_like_file` excludes both before this is ever reached), or its
+            // correctly against a non-empty prior hash; a Directory-kind asset is
+            // unreadable the same way when the directory itself is absent, via
+            // `hash_directory_contents` — never via a bare `is_dir()` presence
+            // check, which cannot tell an emptied directory from a populated one;
+            // a Pattern or Table never reaches this function at all — see
+            // `produced_artifact_hash`'s kind dispatch), or its
             // declared spelling is itself ambiguous (see `produced_artifact_hash`). Either way
             // this forces staleness unconditionally rather than comparing against
             // `prior_state.artifact_hash` — an absence must never be allowed to read
@@ -982,36 +987,61 @@ fn missing_declared_produces(
     assets
         .produces
         .iter()
-        .filter(|n| contract::looks_like_file(n))
+        .filter(|n| is_hashable_kind(assets, n))
         .filter_map(|lowered| {
             let raw = match assets.declared_case.get(lowered) {
                 Some(raws) if raws.len() == 1 => raws.iter().next().unwrap().as_str(),
                 _ => lowered.as_str(),
             };
             let full = dir.join(raw);
-            // A directory that exists is not "missing" — `fs::read` errors on it too
-            // (a real directory is not a file), which would otherwise misreport a
-            // correctly-created destination as an unproduced artifact. Asked once,
-            // here, the same way `produced_artifact_hash` asks it — see that
-            // function's doc for why this is answered at the resolved path rather
-            // than guessed from the name.
-            if std::fs::metadata(&full)
-                .map(|m| m.is_dir())
-                .unwrap_or(false)
-            {
-                return None;
-            }
-            std::fs::read(&full).is_err().then(|| raw.to_string())
+            // Dispatch on the declared kind, not on what happens to be on disk: a
+            // Directory-kind entry is "missing" only when the directory itself
+            // cannot be read at all (`hash_directory_contents` returns `None`) — an
+            // EMPTY-but-present directory is not reported here (that gap is
+            // `is_hash_stale`'s job, via the content hash changing), because this
+            // function names things the step's own work never created, not things
+            // that were created and later went bad. A File-kind entry is missing
+            // when `fs::read` fails, exactly as before.
+            let is_missing = match declared_kind_of(assets, lowered) {
+                AssetKind::Directory => state::hash_directory_contents(&full).is_none(),
+                _ => std::fs::read(&full).is_err(),
+            };
+            is_missing.then(|| raw.to_string())
         })
         .collect()
 }
 
-/// A combined content hash over every FILE asset a step is answerable for: what it
-/// produces, plus what it reads directly that nothing in the manifest produces (an
-/// external input — the shape of `build/gleif_ra_sec.csv` before `gleif_ra_fetch`
-/// existed to own it). Table/source assets are left to the existing config-hash and
-/// downstream-propagation machinery; this only ever adds file-backed bytes to the
-/// staleness question, never subtracts from it.
+/// Whether `assets.declared_kind` marks `name` as something [`produced_artifact_hash`]
+/// hashes at all — a `File` or a `Directory`. `Pattern` never resolves to one
+/// artifact (staleness comes from what produces the matches, not the pattern
+/// itself) and `Table` is not a path in the first place. Defaults to `File` for a
+/// name with no kind entry — every current insertion site populates one, so this is
+/// a defensive fallback, not a real path; it fails SAFE rather than silently,
+/// since a File-shaped read of an actual directory errors and forces staleness via
+/// `?`, never quietly skips the way an `is_dir()` opt-out did.
+fn is_hashable_kind(assets: &StepAssets, name: &str) -> bool {
+    matches!(
+        declared_kind_of(assets, name),
+        AssetKind::File | AssetKind::Directory
+    )
+}
+
+/// `assets.declared_kind.get(name)`, defaulting to `File` — the one place both
+/// `is_hashable_kind` and `produced_artifact_hash` resolve a name's kind, so the
+/// defensive default can never drift between the two call sites.
+fn declared_kind_of(assets: &StepAssets, name: &str) -> AssetKind {
+    assets.declared_kind.get(name).copied().unwrap_or(AssetKind::File)
+}
+
+/// A combined content hash over every asset a step is answerable for that is
+/// actually backed by bytes on disk — `File` and `Directory` kinds, per
+/// `declared_kind`: what it produces, plus what it reads directly that nothing in
+/// the manifest produces (an external input — the shape of `build/gleif_ra_sec.csv`
+/// before `gleif_ra_fetch` existed to own it). `Table` and `Pattern` never
+/// participate — a table is left to the existing config-hash and
+/// downstream-propagation machinery, and a pattern's staleness comes from what
+/// produces the matches, not from the pattern string itself. This only ever adds
+/// file-backed bytes to the staleness question, never subtracts from it.
 ///
 /// Resolves each name through [`crate::asset::StepAssets::declared_case`] — the RAW,
 /// exactly-as-declared spelling carried alongside the lowercased graph node — and
@@ -1025,24 +1055,27 @@ fn missing_declared_produces(
 /// spelling is the one thing scanning can never recover once it has been thrown away,
 /// so it is carried from the manifest instead of reconstructed from the filesystem.
 ///
-/// A name that resolves to an on-disk **directory** is skipped entirely — added to
-/// neither the hash buffer nor treated as missing — the same non-participation a
-/// glob already gets from `looks_like_file`. Checked here, at the resolved path,
-/// via `fs::metadata(..).is_dir()`, never by guessing from the declared name's
-/// extension: round 6 tried the latter (require a recognized extension even when
-/// `/` is present) and it silently stopped tracking every real file written under
-/// an extension not on that list — `parquet_export`'s `dest:` is an unconstrained
-/// string, so this is not a hypothetical. Asking the filesystem is exact; guessing
-/// from spelling was not.
+/// **Which strategy hashes a name is decided by `declared_kind`, set at the point
+/// the asset was declared — never by asking the filesystem what is there right
+/// now.** A `File` reads its bytes directly; a `Directory` hashes a manifest of its
+/// contents via [`crate::state::hash_directory_contents`], not a bare
+/// `fs::metadata(..).is_dir()` presence check — a presence check cannot tell an
+/// emptied directory from a populated one, so it would let a `COPY … PARTITION_BY`
+/// target or a pattern-only `archive_extract` `dest:` skip forever once every
+/// partition file inside it was deleted or corrupted while the directory itself
+/// survived. `Pattern` and `Table` are filtered out before this loop is ever
+/// reached (see `is_hashable_kind`), so this function has no name-based or
+/// extension-based guessing left in it at all — that was round 6 and round 7's
+/// mistake (an extension allowlist left 21 of 22 real files untracked; an
+/// unconditional directory skip re-opened the exact hole a content hash closes).
 ///
 /// Returns `None` — never a hash — in two OTHER cases, both forcing the caller
 /// (`is_hash_stale`) to unconditional staleness rather than a string comparison:
 ///
-/// - **A relevant file cannot be read right now**, under its declared spelling —
-///   missing or permission-denied (not truncated: `fs::read` succeeds on an empty
-///   file, yielding `Some(hash_of_empty)`; not a directory, handled above before
-///   this is ever reached; not a glob, excluded by `looks_like_file` — see its doc
-///   in `contract.rs`). Earlier designs
+/// - **A relevant asset cannot be read right now**, under its declared spelling —
+///   missing or permission-denied for a `File` (not truncated: `fs::read` succeeds
+///   on an empty file, yielding `Some(hash_of_empty)`); unreadable/absent for a
+///   `Directory`, via `hash_directory_contents` returning `None`. Earlier designs
 ///   folded this into a stable `"MISSING"` sentinel *string* and compared it like any
 ///   other digest, which reads as "unchanged" the moment a step's declared artifact
 ///   has never once existed under its declared name (its SQL wrote a differently-cased
@@ -1065,33 +1098,30 @@ fn missing_declared_produces(
 /// against: a truncated artifact whose stale `.arcmeta` sidecar still claims to be
 /// what the step wrote.
 ///
-/// A step with no file-typed produced or external-read assets hashes the empty
-/// input deterministically — stable across runs, so it never falsely reads as changed.
+/// A step with no file- or directory-typed produced/external-read assets hashes the
+/// empty input deterministically — stable across runs, so it never falsely reads as
+/// changed.
 fn produced_artifact_hash(
     step: &crate::manifest::Step,
     dir: &Path,
     asset_graph: &AssetGraph,
     all_produced: &std::collections::HashSet<String>,
 ) -> Option<String> {
+    let step_assets = asset_graph.steps.get(&step.name);
     let mut names: Vec<&String> = Vec::new();
-    if let Some(assets) = asset_graph.steps.get(&step.name) {
-        names.extend(
-            assets
-                .produces
-                .iter()
-                .filter(|n| contract::looks_like_file(n)),
-        );
+    if let Some(assets) = step_assets {
+        names.extend(assets.produces.iter().filter(|n| is_hashable_kind(assets, n)));
         names.extend(
             assets
                 .reads
                 .iter()
-                .filter(|n| contract::looks_like_file(n) && !all_produced.contains(n.as_str())),
+                .filter(|n| is_hashable_kind(assets, n) && !all_produced.contains(n.as_str())),
         );
     }
     names.sort();
     names.dedup();
 
-    let declared_case = asset_graph.steps.get(&step.name).map(|a| &a.declared_case);
+    let declared_case = step_assets.map(|a| &a.declared_case);
 
     let mut buf = String::new();
     for name in names {
@@ -1106,22 +1136,19 @@ fn produced_artifact_hash(
             _ => name,
         };
         let full = dir.join(raw);
-        // A directory is not a file to hash, and its presence or absence must never
-        // affect this step's staleness either way — the same treatment a glob
-        // already gets from `looks_like_file`, extended here to the one case that
-        // can only be told apart from a real file by asking the filesystem: an
-        // extension (round 6's mistake) is not evidence either way, since a shipped,
-        // unconstrained operator (`parquet_export`'s `dest:`) can write a real file
-        // under any extension at all. Checked once, at the resolved, exact-declared-
-        // case path, so it can never be fooled the way a name-only guess was.
-        if std::fs::metadata(&full)
-            .map(|m| m.is_dir())
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let bytes = std::fs::read(&full).ok()?;
-        let digest = state::content_hash(&bytes);
+        // Dispatch on the kind carried from declaration — see the doc comment above
+        // for why this replaced an `is_dir()` presence check. `step_assets` is
+        // `Some` whenever `names` is non-empty (the only source of `names`), so the
+        // `unwrap_or(File)` default here is unreachable in practice; it exists so
+        // this function has no path that panics.
+        let kind = step_assets.map(|a| declared_kind_of(a, name)).unwrap_or(AssetKind::File);
+        let digest = match kind {
+            AssetKind::Directory => state::hash_directory_contents(&full)?,
+            _ => {
+                let bytes = std::fs::read(&full).ok()?;
+                state::content_hash(&bytes)
+            }
+        };
         buf.push_str(name);
         buf.push('\u{1f}'); // unit separator — cheap guard against name/hash collision
         buf.push_str(&digest);
@@ -4798,20 +4825,22 @@ steps:
         );
     }
 
-    // Round 6, ground 2: the real edgar_gleif shape — `models/load.sql` reads
+    // The real edgar_gleif shape: `models/load.sql` reads
     // `read_csv('build/ncen/*/REGISTRANT.tsv', …)`, and SQL introspection captures
     // that glob verbatim as a `reads` entry. Nothing produces the literal string
     // `build/ncen/*/REGISTRANT.tsv` (only concrete per-quarter files do), so it took
-    // the external-read branch of `produced_artifact_hash`, and `looks_like_file`
-    // said yes (it contains `/`) — `fs::read` on a literal `*` always fails, so this
-    // step was `None` (forced stale) on every single run, forever, silently, no
-    // `--force` in sight. Confirmed against the real manifest: `load` re-ran on runs
-    // 2 through 5 with nothing else touched.
+    // the external-read branch of `produced_artifact_hash` — and a string-based
+    // classifier that only asked "does this contain `/`" said yes, so `fs::read` on
+    // a literal `*` always failed and this step was `None` (forced stale) on every
+    // single run, forever, silently, no `--force` in sight. Confirmed against the
+    // real manifest: `load` re-ran on runs 2 through 5 with nothing else touched.
     //
-    // `looks_like_file` now excludes glob metacharacters, so the glob is never added
-    // to this step's hashed-names list at all — proven here by the ordinary
-    // "unchanged, stays skipped" assertion, which a step with a permanently-`None`
-    // artifact hash could never reach.
+    // SQL introspection now classifies a lifted path literal containing a glob
+    // metacharacter as `AssetKind::Pattern` at the point it lifts it (see
+    // `introspect.rs`'s `is_glob`), and `is_hashable_kind` excludes `Pattern`
+    // (alongside `Table`) before this step's hashed-names list is even built — proven
+    // here by the ordinary "unchanged, stays skipped" assertion, which a step with a
+    // permanently-`None` artifact hash could never reach.
     #[test]
     fn test_sql_introspected_glob_does_not_force_perpetual_staleness() {
         let dir = tempfile::tempdir().unwrap();
