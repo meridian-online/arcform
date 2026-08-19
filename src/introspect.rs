@@ -11,14 +11,16 @@
 //! path-shaped names become file-kind assets downstream (see [`crate::contract`]). Lineage into
 //! and out of files is thus *discovered from the SQL*, never hand-declared via `depends_on:`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sqlparser::ast::{
-    CopySource, CopyTarget, Expr, FunctionArg, FunctionArgExpr, Insert, ObjectName, Statement,
-    TableFactor, TableObject, Value,
+    CopyOption, CopySource, CopyTarget, Expr, FunctionArg, FunctionArgExpr, Insert, ObjectName,
+    Statement, TableFactor, TableObject, Value,
 };
 use sqlparser::dialect::DuckDbDialect;
 use sqlparser::parser::Parser;
+
+use crate::asset_kind::AssetKind;
 
 /// Assets discovered from parsing a SQL file — four-set model.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -31,6 +33,30 @@ pub struct SqlAssets {
     pub internal: BTreeSet<String>,
     /// Tables/views this SQL drops — destructive operations tracked separately.
     pub destroys: BTreeSet<String>,
+    /// What each name in `outputs`/`inputs` actually is — set here, at the one place
+    /// that already knows: a bare identifier from CREATE/FROM/JOIN is a `Table`; a
+    /// path literal lifted from a file-reader argument or a `COPY … TO` target is a
+    /// `File`, unless it contains a glob metacharacter (`Pattern`) or the COPY
+    /// carries `PARTITION_BY` (`Directory`, since DuckDB then writes a directory
+    /// tree, not one file). Never reconstructed later from the string.
+    pub kinds: BTreeMap<String, AssetKind>,
+}
+
+impl SqlAssets {
+    fn record_output(&mut self, name: String, kind: AssetKind) {
+        self.kinds.insert(name.clone(), kind);
+        self.outputs.insert(name);
+    }
+
+    fn record_input(&mut self, name: String, kind: AssetKind) {
+        self.kinds.insert(name.clone(), kind);
+        self.inputs.insert(name);
+    }
+}
+
+/// Whether a lifted path literal is a glob pattern rather than one literal path.
+fn is_glob(path: &str) -> bool {
+    path.contains(['*', '?', '['])
 }
 
 /// Parse a SQL string and extract the assets it produces and consumes.
@@ -235,7 +261,7 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
         // CREATE TABLE foo AS SELECT ...
         Statement::CreateTable(create) => {
             let name = object_name_to_string(&create.name);
-            assets.outputs.insert(name);
+            assets.record_output(name, AssetKind::Table);
 
             // If it's a CTAS, the query's FROM tables are inputs.
             if let Some(ref query) = create.query {
@@ -245,14 +271,14 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
 
         // CREATE VIEW foo AS SELECT ...
         Statement::CreateView { name, query, .. } => {
-            assets.outputs.insert(object_name_to_string(name));
+            assets.record_output(object_name_to_string(name), AssetKind::Table);
             extract_inputs_from_query(query, assets);
         }
 
         // INSERT INTO foo SELECT ...
         Statement::Insert(Insert { table, source, .. }) => {
             if let TableObject::TableName(name) = table {
-                assets.outputs.insert(object_name_to_string(name));
+                assets.record_output(object_name_to_string(name), AssetKind::Table);
             }
             if let Some(src) = source {
                 extract_inputs_from_query(src.as_ref(), assets);
@@ -261,24 +287,44 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
 
         // COPY foo TO 'file.csv'
         // COPY foo FROM 'file.csv'
-        Statement::Copy { source, target, .. } => {
+        Statement::Copy {
+            source,
+            target,
+            options,
+            ..
+        } => {
             match source {
                 CopySource::Table { table_name, .. } => {
                     // COPY <table> ... — table is the source being read/written
                     match target {
                         CopyTarget::File { filename } => {
                             // COPY table TO 'file' — reading the table, producing the file.
-                            // The file path is a first-class produced asset (file-path lineage).
-                            assets.inputs.insert(object_name_to_string(table_name));
-                            assets.outputs.insert(filename.clone());
+                            // The file path is a first-class produced asset (file-path
+                            // lineage). PARTITION_BY makes DuckDB write a directory of
+                            // Hive-partitioned files under this name, not one file —
+                            // known here, from the COPY's own options, not guessed later.
+                            assets
+                                .record_input(object_name_to_string(table_name), AssetKind::Table);
+                            let kind = if options.iter().any(|opt| {
+                                matches!(opt, CopyOption::DuckDbOption { name, .. } if name.value.eq_ignore_ascii_case("PARTITION_BY"))
+                            }) {
+                                AssetKind::Directory
+                            } else {
+                                AssetKind::File
+                            };
+                            assets.record_output(filename.clone(), kind);
                         }
                         CopyTarget::Stdout => {
                             // COPY table TO STDOUT — reading from the table
-                            assets.inputs.insert(object_name_to_string(table_name));
+                            assets
+                                .record_input(object_name_to_string(table_name), AssetKind::Table);
                         }
                         CopyTarget::Stdin => {
                             // COPY table FROM STDIN — writing to the table
-                            assets.outputs.insert(object_name_to_string(table_name));
+                            assets.record_output(
+                                object_name_to_string(table_name),
+                                AssetKind::Table,
+                            );
                         }
                         _ => {}
                     }
@@ -298,12 +344,12 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
 
         // ALTER TABLE — modifies the asset (output), does not read data from it
         Statement::AlterTable { name, .. } => {
-            assets.outputs.insert(object_name_to_string(name));
+            assets.record_output(object_name_to_string(name), AssetKind::Table);
         }
 
         // ALTER VIEW — modifies the view (output), new query reads from tables (inputs)
         Statement::AlterView { name, query, .. } => {
-            assets.outputs.insert(object_name_to_string(name));
+            assets.record_output(object_name_to_string(name), AssetKind::Table);
             extract_inputs_from_query(query, assets);
         }
 
@@ -311,7 +357,7 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
         Statement::Merge { table, source, .. } => {
             // Target table → outputs
             if let TableFactor::Table { name, .. } = table {
-                assets.outputs.insert(object_name_to_string(name));
+                assets.record_output(object_name_to_string(name), AssetKind::Table);
             }
             // Source table → inputs
             extract_inputs_from_table_factor(source, assets);
@@ -389,14 +435,14 @@ fn extract_inputs_from_table_factor(factor: &TableFactor, assets: &mut SqlAssets
                 Some(table_args) if is_file_reader(&object_name_to_string(name)) => {
                     for arg in &table_args.args {
                         if let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg {
-                            extract_path_literals(expr, &mut assets.inputs);
+                            extract_path_literals(expr, assets);
                         }
                     }
                 }
                 // Any other table-valued function (`range(…)`, `generate_series(…)`) or a
                 // plain table name: record the name itself as the input, as before.
                 _ => {
-                    assets.inputs.insert(object_name_to_string(name));
+                    assets.record_input(object_name_to_string(name), AssetKind::Table);
                 }
             }
         }
@@ -463,16 +509,21 @@ fn is_file_reader(fn_name: &str) -> bool {
 /// case (filesystems are case-sensitive); everything else is ignored, so reader options
 /// like `format => 'array'` never masquerade as inputs (they arrive as named args, which
 /// the caller already skips, but a stray literal is harmless).
-fn extract_path_literals(expr: &Expr, out: &mut BTreeSet<String>) {
+fn extract_path_literals(expr: &Expr, assets: &mut SqlAssets) {
     match expr {
         Expr::Value(v) => {
             if let Value::SingleQuotedString(path) = &v.value {
-                out.insert(path.clone());
+                let kind = if is_glob(path) {
+                    AssetKind::Pattern
+                } else {
+                    AssetKind::File
+                };
+                assets.record_input(path.clone(), kind);
             }
         }
         Expr::Array(array) => {
             for elem in &array.elem {
-                extract_path_literals(elem, out);
+                extract_path_literals(elem, assets);
             }
         }
         _ => {}
@@ -1092,6 +1143,26 @@ mod tests {
         assert!(
             assets.outputs.contains("out/orders"),
             "output path produced"
+        );
+        // PARTITION_BY makes DuckDB write a directory of Hive-partitioned files under
+        // this name, not one file — the COPY's own options say so, so this is known
+        // here rather than guessed later from the string or the filesystem.
+        assert_eq!(
+            assets.kinds.get("out/orders"),
+            Some(&AssetKind::Directory),
+            "PARTITION_BY target must be classified as a directory, not a file"
+        );
+    }
+
+    // A plain COPY … TO (no PARTITION_BY) writes exactly one file — must not be
+    // misclassified as a directory just because it shares the COPY statement shape.
+    #[test]
+    fn test_copy_without_partition_by_is_a_file() {
+        let sql = "COPY orders TO 'out/orders.parquet' (FORMAT parquet);";
+        let assets = extract_assets(sql).expect("plain COPY must parse");
+        assert_eq!(
+            assets.kinds.get("out/orders.parquet"),
+            Some(&AssetKind::File)
         );
     }
 

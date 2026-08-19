@@ -87,6 +87,56 @@ pub fn content_hash(content: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Combined SHA-256 over a directory's contents, so a `Directory`-kind asset (a
+/// `COPY … PARTITION_BY` target, or an `archive_extract` pattern-only `dest:`) is
+/// answerable for drift the same way a `File` is answerable for its own bytes —
+/// not skipped because it is a directory, and not satisfied by the directory node
+/// merely existing while what is inside it changes underneath.
+///
+/// Walks every regular file in the tree (recursively, symlinks not followed),
+/// hashes each one's bytes, then hashes the sorted `(relative_path, file_hash)`
+/// pairs together. Sorted so the combined digest is independent of readdir order;
+/// keyed on relative path so a file moving to a different name inside the tree
+/// changes the digest even if no byte anywhere changed. `None` when the directory
+/// cannot be read at all (missing, or a permissions failure) — the same
+/// unconditional-staleness signal an unreadable file already produces, so an
+/// absent directory forces a re-run exactly as a deleted file does.
+pub fn hash_directory_contents(dir: &Path) -> Option<String> {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let read_dir = std::fs::read_dir(&current).ok()?;
+        for entry in read_dir {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file() {
+                let rel = path
+                    .strip_prefix(dir)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                let bytes = std::fs::read(&path).ok()?;
+                entries.push((rel, content_hash(&bytes)));
+            }
+            // Symlinks and other file types: neither hashed nor descended into —
+            // a directory tree with a dangling symlink still hashes deterministically
+            // over its real files rather than erroring the whole asset.
+        }
+    }
+    entries.sort();
+    let mut hasher = Sha256::new();
+    for (rel, hash) in &entries {
+        hasher.update(rel.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(hash.as_bytes());
+        hasher.update(b"\n");
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
 /// Trait for persisting step execution state across runs.
 pub trait StateBackend {
     /// Initialise the backend (create tables, etc.). Idempotent.
@@ -385,6 +435,66 @@ pub mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A populated directory hashes deterministically, independent of readdir order —
+    // two identical trees (built via different insertion order) hash equal.
+    #[test]
+    fn hash_directory_contents_is_order_independent() {
+        let dir_a = std::env::temp_dir().join(format!("arc-hdc-a-{}", std::process::id()));
+        let dir_b = std::env::temp_dir().join(format!("arc-hdc-b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        std::fs::create_dir_all(dir_a.join("sub")).unwrap();
+        std::fs::create_dir_all(dir_b.join("sub")).unwrap();
+
+        std::fs::write(dir_a.join("a.txt"), b"one").unwrap();
+        std::fs::write(dir_a.join("sub/b.txt"), b"two").unwrap();
+        // Same content, opposite write order.
+        std::fs::write(dir_b.join("sub/b.txt"), b"two").unwrap();
+        std::fs::write(dir_b.join("a.txt"), b"one").unwrap();
+
+        let hash_a = hash_directory_contents(&dir_a);
+        let hash_b = hash_directory_contents(&dir_b);
+        assert!(hash_a.is_some());
+        assert_eq!(hash_a, hash_b, "directory hash must not depend on readdir order");
+
+        std::fs::remove_dir_all(&dir_a).unwrap();
+        std::fs::remove_dir_all(&dir_b).unwrap();
+    }
+
+    // Emptying a directory (files removed, directory itself kept) must change the
+    // hash — this is round 7's regression: `fs::metadata().is_dir()` alone treats a
+    // present-but-emptied directory identically to a populated one, so corruption
+    // stands forever at exit 0. A content-manifest hash cannot make that mistake.
+    #[test]
+    fn hash_directory_contents_changes_when_emptied() {
+        let dir = std::env::temp_dir().join(format!("arc-hdc-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("part-0.parquet"), b"partition bytes").unwrap();
+
+        let populated = hash_directory_contents(&dir);
+        std::fs::remove_file(dir.join("part-0.parquet")).unwrap();
+        let emptied = hash_directory_contents(&dir);
+
+        assert!(populated.is_some());
+        assert!(emptied.is_some());
+        assert_ne!(
+            populated, emptied,
+            "emptying a directory while keeping it present must change the hash"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // An absent directory hashes to None — the same unconditional-staleness signal
+    // an unreadable file already gives.
+    #[test]
+    fn hash_directory_contents_none_when_absent() {
+        let dir = std::env::temp_dir().join(format!("arc-hdc-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(hash_directory_contents(&dir), None);
+    }
 
     // StateBackend trait compiles and MockStateBackend works.
     #[test]

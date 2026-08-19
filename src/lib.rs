@@ -34,6 +34,7 @@
 #![cfg_attr(not(feature = "cli"), allow(dead_code))]
 
 mod asset;
+mod asset_kind;
 mod bridge;
 #[cfg(feature = "cli")]
 mod cli;
