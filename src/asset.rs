@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
+use crate::asset_kind::{default_kind_for_declared_name, AssetKind};
 use crate::error::{Error, Result};
 use crate::introspect;
 use crate::manifest::Manifest;
@@ -44,25 +45,45 @@ pub struct StepAssets {
     /// directory recovers a real file's case once this is thrown away, so it has to
     /// be carried, not reconstructed.
     pub declared_case: BTreeMap<String, BTreeSet<String>>,
+    /// For every lowercased name in `produces` or `reads`, what it actually is —
+    /// carried from wherever it was declared (SQL introspection already knows a
+    /// `COPY … PARTITION_BY` target is a directory; an operator's typed config
+    /// already knows `dest:` is a file; only `produces:`/`depends_on:`/`assets:`
+    /// entries with no operator or parser to consult fall back to a guess). Never
+    /// reconstructed later from the string or the filesystem — this is what
+    /// `produced_artifact_hash` reads to decide HOW to hash a produced asset, not
+    /// WHETHER to hash it at all.
+    pub declared_kind: BTreeMap<String, AssetKind>,
 }
 
 impl StepAssets {
     /// Insert `raw` (a name exactly as declared — a SQL-introspected path, an
     /// operator's config value, an explicit `produces:`/`depends_on:` entry, or an
     /// `assets:` override) into `set`, lowercased for graph identity, while recording
-    /// `raw` itself in `declared_case` under that same lowercased key. The one path
-    /// every insertion into `produces`/`reads` goes through, so the two can never
-    /// drift apart.
+    /// `raw` itself in `declared_case` under that same lowercased key and `kind` in
+    /// `declared_kind` under the same key. The one path every insertion into
+    /// `produces`/`reads` goes through, so the three can never drift apart.
+    ///
+    /// `declared_kind` keeps the FIRST kind recorded for a given lowered name within
+    /// a step (`or_insert`, not overwrite): Phase 1 (SQL introspection) and Phase 1b
+    /// (operator config) carry real, source-derived kind; Phase 2/3's declaration
+    /// sites have no parser or operator to consult and fall back to a guess
+    /// (`default_kind_for_declared_name`). Running phases in that fixed order means
+    /// a later guess can never downgrade an earlier, better-informed answer for the
+    /// same step.
     fn record(
         set: &mut BTreeSet<String>,
         declared_case: &mut BTreeMap<String, BTreeSet<String>>,
+        declared_kind: &mut BTreeMap<String, AssetKind>,
         raw: &str,
+        kind: AssetKind,
     ) {
         let lowered = raw.to_lowercase();
         declared_case
             .entry(lowered.clone())
             .or_default()
             .insert(raw.to_string());
+        declared_kind.entry(lowered.clone()).or_insert(kind);
         set.insert(lowered);
     }
 }
@@ -107,17 +128,31 @@ impl AssetGraph {
                     Ok(sql_content) => match introspect::extract_assets(&sql_content) {
                         Ok(sql_assets) => {
                             for asset in &sql_assets.outputs {
+                                let kind = sql_assets
+                                    .kinds
+                                    .get(asset)
+                                    .copied()
+                                    .unwrap_or(AssetKind::Table);
                                 StepAssets::record(
                                     &mut step_assets.produces,
                                     &mut step_assets.declared_case,
+                                    &mut step_assets.declared_kind,
                                     asset,
+                                    kind,
                                 );
                             }
                             for asset in &sql_assets.inputs {
+                                let kind = sql_assets
+                                    .kinds
+                                    .get(asset)
+                                    .copied()
+                                    .unwrap_or(AssetKind::Table);
                                 StepAssets::record(
                                     &mut step_assets.reads,
                                     &mut step_assets.declared_case,
+                                    &mut step_assets.declared_kind,
                                     asset,
+                                    kind,
                                 );
                             }
                             step_assets.internal.extend(sql_assets.internal);
@@ -151,17 +186,31 @@ impl AssetGraph {
                 match crate::operator::assets_for(op_ref, step.with.as_ref()) {
                     Ok(op_assets) => {
                         for asset in &op_assets.produces {
+                            let kind = op_assets
+                                .kinds
+                                .get(asset)
+                                .copied()
+                                .unwrap_or_else(|| default_kind_for_declared_name(asset));
                             StepAssets::record(
                                 &mut step_assets.produces,
                                 &mut step_assets.declared_case,
+                                &mut step_assets.declared_kind,
                                 asset,
+                                kind,
                             );
                         }
                         for asset in &op_assets.reads {
+                            let kind = op_assets
+                                .kinds
+                                .get(asset)
+                                .copied()
+                                .unwrap_or_else(|| default_kind_for_declared_name(asset));
                             StepAssets::record(
                                 &mut step_assets.reads,
                                 &mut step_assets.declared_case,
+                                &mut step_assets.declared_kind,
                                 asset,
+                                kind,
                             );
                         }
                     }
@@ -181,14 +230,18 @@ impl AssetGraph {
                 StepAssets::record(
                     &mut step_assets.produces,
                     &mut step_assets.declared_case,
+                    &mut step_assets.declared_kind,
                     asset,
+                    default_kind_for_declared_name(asset),
                 );
             }
             for asset in &step.depends_on {
                 StepAssets::record(
                     &mut step_assets.reads,
                     &mut step_assets.declared_case,
+                    &mut step_assets.declared_kind,
                     asset,
+                    default_kind_for_declared_name(asset),
                 );
             }
 
@@ -202,12 +255,20 @@ impl AssetGraph {
                 StepAssets::record(
                     &mut step_assets.produces,
                     &mut step_assets.declared_case,
+                    &mut step_assets.declared_kind,
                     asset_name,
+                    default_kind_for_declared_name(asset_name),
                 );
 
                 // Add override dependencies as reads for the producing step.
                 for dep in &override_entry.depends_on {
-                    StepAssets::record(&mut step_assets.reads, &mut step_assets.declared_case, dep);
+                    StepAssets::record(
+                        &mut step_assets.reads,
+                        &mut step_assets.declared_case,
+                        &mut step_assets.declared_kind,
+                        dep,
+                        default_kind_for_declared_name(dep),
+                    );
                 }
             } else {
                 graph.warnings.push(format!(
@@ -502,6 +563,23 @@ mod tests {
         }
     }
 
+    /// Helper: create an `op:` step with a typed `with:` config.
+    fn op_step(name: &str, op_ref: &str, with: serde_yaml::Value) -> Step {
+        Step {
+            name: name.to_string(),
+            sql: None,
+            command: None,
+            produces: vec![],
+            depends_on: vec![],
+            preconditions: vec![],
+            op: Some(op_ref.to_string()),
+            with: Some(with),
+            output: None,
+            retry: None,
+            timeout_sec: None,
+        }
+    }
+
     /// Helper: set up a project directory with SQL files and build the graph.
     fn build_graph(
         dir: &Path,
@@ -551,6 +629,81 @@ mod tests {
         let step = graph.steps.get("load").unwrap();
         assert!(step.produces.contains("customers"));
         assert!(graph.warnings.is_empty());
+        // A bare CREATE TABLE target carries Table, not guessed from the name later.
+        assert_eq!(step.declared_kind.get("customers"), Some(&AssetKind::Table));
+    }
+
+    // SQL introspection's kind survives into `declared_kind` end to end — a
+    // `COPY … PARTITION_BY` target is a directory by the time it reaches the graph,
+    // not by the time something later stats the filesystem.
+    #[test]
+    fn test_sql_copy_partition_by_kind_reaches_declared_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = build_graph(
+            dir.path(),
+            vec![sql_step("export", "models/export.sql")],
+            HashMap::new(),
+            &[(
+                "models/export.sql",
+                "COPY orders TO 'build/orders' (FORMAT parquet, PARTITION_BY (year));",
+            )],
+        );
+
+        let step = graph.steps.get("export").unwrap();
+        assert!(step.produces.contains("build/orders"));
+        assert_eq!(
+            step.declared_kind.get("build/orders"),
+            Some(&AssetKind::Directory)
+        );
+    }
+
+    // An operator's typed config carries kind into the graph exactly as SQL
+    // introspection does — `archive_extract`'s pattern-only `dest:` lands as a
+    // Directory, not guessed later from whether the path has a `/` in it.
+    #[test]
+    fn test_op_declared_kind_reaches_declared_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let with: serde_yaml::Value = serde_yaml::from_str(
+            "archive: build/in.zip\npattern: '\\.tsv$'\ndest: build/out",
+        )
+        .unwrap();
+        let graph = build_graph(
+            dir.path(),
+            vec![op_step("extract", "archive_extract", with)],
+            HashMap::new(),
+            &[],
+        );
+
+        let step = graph.steps.get("extract").unwrap();
+        assert!(step.produces.contains("build/out"));
+        assert_eq!(
+            step.declared_kind.get("build/out"),
+            Some(&AssetKind::Directory)
+        );
+        assert_eq!(
+            step.declared_kind.get("build/in.zip"),
+            Some(&AssetKind::File)
+        );
+    }
+
+    // An explicit `produces:` entry with no operator or parser to consult falls
+    // back to `default_kind_for_declared_name`: File, unless it's a glob.
+    #[test]
+    fn test_explicit_produces_falls_back_to_default_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut step = cmd_step("build", "make build");
+        step.produces = vec!["build/out.bin".to_string(), "build/*.tmp".to_string()];
+        let graph = build_graph(dir.path(), vec![step], HashMap::new(), &[]);
+
+        let sa = graph.steps.get("build").unwrap();
+        assert_eq!(
+            sa.declared_kind.get("build/out.bin"),
+            Some(&AssetKind::File)
+        );
+        assert_eq!(
+            sa.declared_kind.get("build/*.tmp"),
+            Some(&AssetKind::Pattern)
+        );
     }
 
     // SQL steps auto-discover consumed assets.
@@ -1071,17 +1224,6 @@ mod tests {
         }
     }
 
-    // Round 7: the vendored fixtures above have no drift check. They are
-    // byte-identical to the four live manifests today, but that is a fact about
-    // today — the first `open-analytics` edit to any of them makes the test above
-    // stop testing the manifest it names, silently, since nothing here can see the
-    // other repo (CI checks out this one only). This does not close that gap — it
-    // cannot, without cross-repo CI this lane has no standing to add — but it closes
-    // the adjacent one: an accidental edit to the VENDORED COPY itself (as opposed
-    // to a deliberate, documented re-sync) fails loudly rather than silently
-    // changing what "the real shipping manifest" means in this test suite. See
-    // `tests/fixtures/open_analytics/SOURCE.md` for the re-sync procedure and the
-    // `open-analytics` commit these were last synced from.
     #[test]
     fn all_open_analytics_manifests_have_not_drifted_from_their_vendored_checksums() {
         let fixtures: &[(&str, &str, &str)] = &[
