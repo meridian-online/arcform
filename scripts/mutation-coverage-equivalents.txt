@@ -1,0 +1,30 @@
+# Surviving mutations ruled to be non-defects.
+#
+# A mutation survives when the suite stays green with the code changed.  Most of
+# the time that means a test is missing.  Sometimes it means the mutation cannot
+# change what the program does: the arm is unreachable from any manifest, the
+# input it depends on is never populated in production, or the only observable
+# difference is the wording of a warning that was already firing.  Those are
+# equivalent mutants, and a report that lists them next to a real hole is a report
+# that stops being read.
+#
+# So they are ruled here, once, by a person, with the reason in the tree where it
+# can be argued with — rather than suppressed by a flag or a comment nobody sees.
+# `scripts/check-mutation-coverage.py` prints a ruled survivor in its own section
+# with this reason beside it; it never hides one.
+#
+# FORMAT — six tab-separated fields, one ruling per line:
+#
+#   key   the 16-hex id the gate prints under the survivor.  It is a hash of the
+#         file, the function, the operator and the before/after text, so it
+#         survives the file being edited above the mutation and it does NOT
+#         survive the mutated code itself changing.  That is the direction you
+#         want: rewrite the code and the old ruling stops applying.
+#   path
+#   function
+#   operator
+#   date  when it was ruled, YYYY-MM-DD
+#   reason  one line, ending in why the mutation cannot change behaviour
+#
+# A ruling is not a way to make the job quiet.  If you cannot write the reason in
+# one line, the survivor is probably a missing test.

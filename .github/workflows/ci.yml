@@ -100,3 +100,98 @@ jobs:
       # recompiles one module rather than resolving a second dependency graph.
       - name: test (mcp feature)
         run: cargo test --workspace --features mcp
+
+  # A mechanism can be added, wired in and shipped, and deleting its body leaves
+  # `cargo test` green — which is how a change that does nothing reaches a merge
+  # with every check above passing. This job answers the question the suite
+  # cannot: if the lines this branch changed are broken on purpose, does anything
+  # go red? What it reports is the function and the exact rewrite that survived,
+  # never a coverage percentage — a line-coverage number goes green on a test
+  # that calls a function and asserts nothing about it, which is the case this
+  # exists to catch.
+  #
+  # SCOPED TO THE DIFF, never the crate. It mutates the lines this branch added
+  # or changed under `src/` and nothing else, so a one-function change costs one
+  # function's worth of mutations rather than a whole-crate run. With no changed
+  # lines under `src/` it exits before it builds anything, which is why there is
+  # no `paths:` filter on the job: a filtered job reports as SKIPPED, and a
+  # skipped required check is indistinguishable from a passing one.
+  #
+  # BOUNDED, and the bound is stated rather than hoped for. MUTATION_BUDGET_SECONDS
+  # caps the mutation loop at ten minutes of wall clock; whatever it did not reach
+  # is printed as NOT CHECKED rather than dropped in silence. With the baseline
+  # build and run in front of it the ceiling is the timeout below.
+  #
+  # BLOCKING, and the line it draws is about evidence. A mutation the tests
+  # DEMONSTRABLY execute — proved by a second run with a `panic!` at the same
+  # span, whose message has to appear in the output — and do not notice fails
+  # this job. So does a mutation whose reachability could not be measured at all,
+  # because "no probe compiles at this line" is a fact about the line's syntax
+  # and says nothing about whether a test drives it. The way past either is a
+  # test that reddens, or a ruling in
+  # scripts/mutation-coverage-equivalents.txt naming why the mutation cannot
+  # change behaviour — a line in the tree that can be argued with, not a flag.
+  #
+  # A survivor whose line no test executes is reported and does not fail the job
+  # on its own (`--strict` adds it). That one IS measured: the probe compiled,
+  # ran, and the line never executed, so the survivor has an established reason
+  # to exist. An unmeasured survivor has none, and an absence of evidence is not
+  # evidence of safety.
+  mutation-coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Full history: the gate diffs against the merge base with the target
+      # branch, and a shallow clone has no merge base to find.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+
+      # The gate's own regression test runs FIRST, for the reason the hygiene
+      # workflow does the same: a checker that cannot fail is green against
+      # working code and green against broken code, and the two runs look
+      # identical. "This branch is clean" means nothing until "the checker still
+      # bites" has been established. It builds a small crate of its own and needs
+      # no DuckDB, so it reports before the download below.
+      - name: mutation gate self-test
+        run: python3 scripts/check-mutation-coverage-selftest.py
+
+      # The same system DuckDB the build job provisions: the gate runs the real
+      # test suite once per mutation, and the suite links libduckdb.
+      - name: Install DuckDB (C library + CLI)
+        run: |
+          set -euo pipefail
+          base="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}"
+          mkdir -p "$HOME/duckdb"
+          curl -fsSL -o /tmp/libduckdb.zip "$base/libduckdb-linux-amd64.zip"
+          unzip -o /tmp/libduckdb.zip -d "$HOME/duckdb"
+          curl -fsSL -o /tmp/duckdb-cli.zip "$base/duckdb_cli-linux-amd64.zip"
+          unzip -o /tmp/duckdb-cli.zip -d "$HOME/duckdb"
+          chmod +x "$HOME/duckdb/duckdb"
+          {
+            echo "DUCKDB_LIB_DIR=$HOME/duckdb"
+            echo "DUCKDB_INCLUDE_DIR=$HOME/duckdb"
+            echo "LD_LIBRARY_PATH=$HOME/duckdb${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          } >> "$GITHUB_ENV"
+          echo "$HOME/duckdb" >> "$GITHUB_PATH"
+
+      # The base is chosen inside the step rather than by a job-level `if:`. A
+      # conditional job reports as SKIPPED, and a skipped check is
+      # indistinguishable from a passing one to anything reading the run.
+      - name: mutation coverage
+        env:
+          MUTATION_BUDGET_SECONDS: 600
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="origin/${{ github.base_ref }}"
+          else
+            base="HEAD^"
+          fi
+          echo "diffing against $base"
+          python3 scripts/check-mutation-coverage.py --base "$base"

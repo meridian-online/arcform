@@ -1779,6 +1779,54 @@ mod tests {
         );
     }
 
+    // The exemption path, in the one shape the two collision tests around it leave
+    // unexercised. Both of those collide with NO reader declared, so the
+    // `produces:`-only filter returns either the two colliding producer spellings or
+    // (inverted) the empty set — and neither has exactly one element, so both fall
+    // through to the refusal and an inverted filter still errors. Separating them
+    // needs a reader: two producer spellings plus exactly ONE reader spelling.
+    // Inverted, the filter then yields that single reader spelling, the
+    // one-producer exemption fires, and `validate_no_case_collisions` returns
+    // `Ok(())` on a genuine collision.
+    //
+    // Proof: rewriting the filter as `*kind != "produces:"` turns this red —
+    // `run(...)` returns `Ok` instead of `Err(ManifestValidation)` — while
+    // `test_produces_case_collision_refused_at_load` and
+    // `test_depends_on_case_collision_refused_at_load` both stay green, which is
+    // why neither of them covers this.
+    #[test]
+    fn test_produces_case_collision_is_refused_when_one_reader_matches_one_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/Report.csv]\n  - name: s2\n    sql: models/s2.sql\n    produces: [build/report.csv]\n  - name: s3\n    sql: models/s3.sql\n    depends_on: [build/report.csv]\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[
+                ("models/s1.sql", "SELECT 1;"),
+                ("models/s2.sql", "SELECT 2;"),
+                ("models/s3.sql", "SELECT 3;"),
+            ],
+        );
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        let err = run(dir.path(), &engine, &state, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("collision") && msg.contains("case"),
+            "expected a case-collision refusal, got: {msg}"
+        );
+        assert!(
+            msg.contains("build/Report.csv") && msg.contains("build/report.csv"),
+            "the refusal must name both producer spellings, got: {msg}"
+        );
+        assert!(
+            matches!(engine.calls.borrow().as_slice(), [MockCall::Preflight]),
+            "a refused manifest must not execute any step: {:?}",
+            engine.calls.borrow()
+        );
+    }
+
     // A stray, differently-cased file coexisting with the REAL declared artifact must
     // never be substituted for it, and deleting the declared artifact must be caught
     // even though only the decoy remains afterward — the shape round 3 missed by
