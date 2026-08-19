@@ -78,11 +78,6 @@ fn is_glob(path: &str) -> bool {
 /// three inputs are byte-identical in v1.5.2 (the `libduckdb-sys` this crate's
 /// lockfile pins) and v1.5.5 (the newest published at the time of writing); CI links
 /// v1.5.4, between them.
-///
-/// Two of these are format-conditional and cost nothing when the format does not
-/// take them: a copy function with no `rotate_files` rejects `FILE_SIZE_BYTES` at
-/// bind time, and a non-parquet format rejects `ROW_GROUPS_PER_FILE` as an unknown
-/// option, so such a statement fails before writing anything at all.
 const DIRECTORY_WRITING_COPY_OPTIONS: [&str; 4] = [
     "PARTITION_BY",
     "PER_THREAD_OUTPUT",
@@ -98,7 +93,7 @@ fn copy_to_target_kind(options: &[CopyOption]) -> AssetKind {
             DIRECTORY_WRITING_COPY_OPTIONS
                 .iter()
                 .any(|known| name.value.eq_ignore_ascii_case(known))
-                && copy_option_is_on(value)
+                && copy_option_is_on(&name.value, value)
         }
         _ => false,
     });
@@ -109,17 +104,67 @@ fn copy_to_target_kind(options: &[CopyOption]) -> AssetKind {
     }
 }
 
-/// Whether an option carrying one of those names is actually switched on, mirroring
-/// what DuckDB's binder does with the same token: `GetBooleanArg` reads a bare flag
-/// (`PER_THREAD_OUTPUT`) as true and an explicit `false` as false, and
-/// `partition_output` is `!partition_cols.empty()`, so `PARTITION_BY ()` leaves it
-/// off. Any other value — a size literal, a row-group count, a column list — is on.
-fn copy_option_is_on(value: &Option<Expr>) -> bool {
-    match value {
-        None => true,
-        Some(Expr::Value(v)) => !matches!(v.value, Value::Boolean(false)),
-        Some(Expr::Tuple(items)) => !items.is_empty(),
-        Some(_) => true,
+/// Whether an option carrying one of those names is actually switched on. DuckDB's
+/// binder applies three different rules to these four tokens, so this does too:
+///
+/// * `PARTITION_BY` — `partition_output = !partition_cols.empty()`, so an empty
+///   column list leaves it off.
+/// * `PER_THREAD_OUTPUT` — `GetBooleanArg`, which is
+///   `arg.empty() || arg[0].CastAs(BOOLEAN).GetValue<bool>()`. It **casts**, so the
+///   argument does not have to be the `false` keyword: see [`boolean_arg`].
+/// * `FILE_SIZE_BYTES` and `ROW_GROUPS_PER_FILE` — neither is read as a boolean at
+///   all. `rotate` is `file_size_bytes.IsValid() || row_groups_per_file.IsValid()`,
+///   set from the option carrying any value, so presence is the whole test. Measured
+///   on DuckDB v1.5.4 and v1.5.5: `FILE_SIZE_BYTES 0` writes a directory.
+fn copy_option_is_on(name: &str, value: &Option<Expr>) -> bool {
+    if name.eq_ignore_ascii_case("PARTITION_BY") {
+        !matches!(value, Some(Expr::Tuple(items)) if items.is_empty())
+    } else if name.eq_ignore_ascii_case("PER_THREAD_OUTPUT") {
+        boolean_arg(value)
+    } else {
+        true
+    }
+}
+
+/// DuckDB's `GetBooleanArg` for a `COPY` option: no argument is true, and otherwise
+/// the argument is **cast** to BOOLEAN rather than compared against a keyword.
+///
+/// Recognising only the `false` keyword is what this replaced, and it was wrong in
+/// the direction that never settles: `PER_THREAD_OUTPUT 0` and
+/// `PER_THREAD_OUTPUT 'false'` each wrote a single file on DuckDB v1.5.4 and v1.5.5,
+/// while a `Directory` classification would `read_dir` that file, get `None`, and
+/// re-run the step on every run while warning that it produced nothing.
+///
+/// The string arm is `TryCastStringBool` with `strict = false`, which is what
+/// `Value::CastAs` defaults to: `t`/`y`/`1`/`yes`/`true` and `f`/`n`/`0`/`no`/`false`,
+/// case-insensitively. A string outside that set is a conversion error in DuckDB and
+/// the statement writes nothing at all, so what this returns for it cannot be
+/// observed on disk; it stays `true`, the answer that forces staleness rather than
+/// certifying an artifact.
+fn boolean_arg(value: &Option<Expr>) -> bool {
+    let Some(Expr::Value(v)) = value else {
+        // No argument is a bare flag, which DuckDB reads as true. A non-literal
+        // expression is not something this can evaluate; leave it on.
+        return true;
+    };
+    match &v.value {
+        Value::Boolean(b) => *b,
+        Value::Number(n, _) => n.parse::<f64>().map(|x| x != 0.0).unwrap_or(true),
+        Value::SingleQuotedString(s)
+        | Value::DoubleQuotedString(s)
+        | Value::TripleSingleQuotedString(s)
+        | Value::TripleDoubleQuotedString(s) => cast_string_to_bool(s).unwrap_or(true),
+        _ => true,
+    }
+}
+
+/// `TryCastStringBool` with `strict = false`, from DuckDB's `cast_operators.hpp`.
+/// `None` where DuckDB raises a conversion error.
+fn cast_string_to_bool(s: &str) -> Option<bool> {
+    match s.to_ascii_lowercase().as_str() {
+        "t" | "y" | "1" | "yes" | "true" => Some(true),
+        "f" | "n" | "0" | "no" | "false" => Some(false),
+        _ => None,
     }
 }
 
@@ -1254,6 +1299,55 @@ mod tests {
         let sql = "COPY orders TO 'out/one.parquet' (FORMAT parquet, PER_THREAD_OUTPUT false);";
         let assets = extract_assets(sql).expect("PER_THREAD_OUTPUT false COPY must parse");
         assert_eq!(assets.kinds.get("out/one.parquet"), Some(&AssetKind::File));
+    }
+
+    // `GetBooleanArg` CASTS its argument to BOOLEAN; it does not compare it against
+    // the `false` keyword. Each of these spellings wrote a single 198-byte parquet
+    // file when driven on the DuckDB CLI at v1.5.4 and at v1.5.5, and each was
+    // classified `Directory` here until this round — `read_dir` on a regular file
+    // returns `None`, so the step re-ran on every run while warning that it had
+    // produced nothing.
+    #[test]
+    fn test_per_thread_output_cast_to_false_is_a_file() {
+        for arg in ["0", "'false'", "'FALSE'", "'no'", "'f'"] {
+            let sql = format!(
+                "COPY orders TO 'out/one.parquet' (FORMAT parquet, PER_THREAD_OUTPUT {arg});"
+            );
+            let assets = extract_assets(&sql).expect("COPY must parse");
+            assert_eq!(
+                assets.kinds.get("out/one.parquet"),
+                Some(&AssetKind::File),
+                "PER_THREAD_OUTPUT {arg} casts to false and writes one file"
+            );
+        }
+    }
+
+    // The same cast in the other direction, so the arm above cannot be satisfied by
+    // reading every PER_THREAD_OUTPUT argument as off. Each of these wrote a
+    // directory on both engines.
+    #[test]
+    fn test_per_thread_output_cast_to_true_is_a_directory() {
+        for arg in ["1", "'true'", "'yes'", "'t'", "'Y'"] {
+            let sql =
+                format!("COPY orders TO 'out/pto' (FORMAT parquet, PER_THREAD_OUTPUT {arg});");
+            let assets = extract_assets(&sql).expect("COPY must parse");
+            assert_eq!(
+                assets.kinds.get("out/pto"),
+                Some(&AssetKind::Directory),
+                "PER_THREAD_OUTPUT {arg} casts to true and writes a directory"
+            );
+        }
+    }
+
+    // The cast belongs to PER_THREAD_OUTPUT alone. `rotate` is set from
+    // `file_size_bytes.IsValid()`, not from a boolean, so a zero here is still on —
+    // `FILE_SIZE_BYTES 0` wrote a directory on both engines. Applying the boolean
+    // cast to all four names uniformly would get this one wrong.
+    #[test]
+    fn test_file_size_bytes_zero_is_still_a_directory() {
+        let sql = "COPY orders TO 'out/sized' (FORMAT parquet, FILE_SIZE_BYTES 0);";
+        let assets = extract_assets(sql).expect("FILE_SIZE_BYTES 0 COPY must parse");
+        assert_eq!(assets.kinds.get("out/sized"), Some(&AssetKind::Directory));
     }
 
     #[test]

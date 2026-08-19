@@ -5276,32 +5276,53 @@ steps:
         }
     }
 
-    // Round 9, C1's other half — an option that is NOT in the directory-writing set
-    // must leave the target a single file, or the perpetual re-run simply arrives
-    // from the other side (`hash_directory_contents` on a regular file cannot
-    // `read_dir` it, returns `None`, and the step never settles).
+    // The other half of the option enumeration — an option that is NOT in the
+    // directory-writing set, or one that is but is switched off, must leave the
+    // target a single file, or the perpetual re-run simply arrives from the other
+    // side (`hash_directory_contents` on a regular file cannot `read_dir` it,
+    // returns `None`, and the step never settles).
+    //
+    // The four spellings are one keyword and three that only a CAST reads as off,
+    // which is what DuckDB's `GetBooleanArg` does. Each wrote a single 198-byte
+    // parquet file when driven on the DuckDB CLI at v1.5.4 and v1.5.5. Run 2 of the
+    // last three is what reddens if `copy_option_is_on` goes back to matching the
+    // `false` keyword.
     #[test]
-    fn test_per_thread_output_false_is_hashed_as_one_file_and_settles() {
-        let dir = project_with_seeded_directory(
-            "COPY orders TO 'build/one.parquet' (FORMAT parquet, PER_THREAD_OUTPUT false);",
-            &[("build/one.parquet", b"one file, not a directory")],
-        );
-        let state = MockStateBackend::new();
+    fn test_per_thread_output_off_is_hashed_as_one_file_and_settles() {
+        for arg in ["false", "0", "'false'", "'no'"] {
+            let dir = project_with_seeded_directory(
+                &format!(
+                    "COPY orders TO 'build/one.parquet' (FORMAT parquet, PER_THREAD_OUTPUT {arg});"
+                ),
+                &[("build/one.parquet", b"one file, not a directory")],
+            );
+            let state = MockStateBackend::new();
 
-        assert_eq!(engine_calls_for_one_run(dir.path(), &state), 2, "run 1");
-        assert_eq!(
-            engine_calls_for_one_run(dir.path(), &state),
-            1,
-            "run 2 must settle — an explicit `false` writes one file, and treating it \
-             as a directory would make the step re-run forever"
-        );
+            assert_eq!(
+                engine_calls_for_one_run(dir.path(), &state),
+                2,
+                "{arg}: run 1"
+            );
+            assert_eq!(
+                engine_calls_for_one_run(dir.path(), &state),
+                1,
+                "{arg}: run 2 must settle — this argument casts to false and writes \
+                 one file, and treating it as a directory would make the step re-run \
+                 forever"
+            );
 
-        fs::write(dir.path().join("build/one.parquet"), b"different bytes").unwrap();
-        assert_eq!(
-            engine_calls_for_one_run(dir.path(), &state),
-            2,
-            "run 3: the file's bytes changed and it is really being hashed"
-        );
+            fs::write(dir.path().join("build/one.parquet"), b"different bytes").unwrap();
+            assert_eq!(
+                engine_calls_for_one_run(dir.path(), &state),
+                2,
+                "{arg}: run 3 — the file's bytes changed and it is really being hashed"
+            );
+            assert_eq!(
+                engine_calls_for_one_run(dir.path(), &state),
+                1,
+                "{arg}: run 4 must settle again"
+            );
+        }
     }
 
     // A hand-declared `produces:` name the step's own SQL never mentions is still a
