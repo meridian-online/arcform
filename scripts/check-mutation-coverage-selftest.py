@@ -409,6 +409,80 @@ def _() -> None:
     check("count reported", "561 passed" in detail, detail)
 
 
+@case("a mutant that hangs the suite is KILLED, not a survivor")
+def _() -> None:
+    # A mutation that sends the suite into a loop is caught behaviour, not a
+    # survivor.  Read as SURVIVED it becomes a report entry nobody can act on.
+    run = mc.SuiteRun(124, 0, 0, [], compile_error=False, timed_out=True, seconds=900.0)
+    verdict, detail = mc.classify(run)
+    check("verdict", verdict == "KILLED", verdict)
+    check("reason", "timed out" in detail, detail)
+
+
+@case("a probe run that reddens without the panic firing measured nothing")
+def _() -> None:
+    # A probe run can go red for a reason that has nothing to do with the probe.
+    # Reading the exit code alone then puts a survivor in the blocking tier on no
+    # evidence, which is the shape this whole gate exists to report.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "src").mkdir()
+        (root / "src" / "x.rs").write_text("let a = 1;\n")
+        tree = mc.Tree(root)
+        mutant = mc.Mutant(
+            path="src/x.rs",
+            start=0,
+            end=0,
+            operator="T",
+            before="let a = 1;\n",
+            after="let a = 2;\n",
+            probe=f'panic!("{mc.PROBE_MESSAGE}");\nlet a = 1;\n',
+            function="f",
+        )
+
+        def stub(exit_code: int, probe_fired: bool, **rest):
+            def fake(_root, _command, _timeout):
+                return mc.SuiteRun(
+                    exit_code=exit_code,
+                    passed=1,
+                    failed=0,
+                    failing_tests=[],
+                    compile_error=rest.get("compile_error", False),
+                    timed_out=rest.get("timed_out", False),
+                    seconds=0.1,
+                    probe_fired=probe_fired,
+                )
+
+            return fake
+
+        real = mc.run_suite
+        try:
+            mc.run_suite = stub(101, True)
+            answer, note = mc.probe_reachability(tree, mutant, [], 1, False)
+            check("the panic firing means the line was reached", answer == "yes", (answer, note))
+
+            mc.run_suite = stub(101, False)
+            answer, note = mc.probe_reachability(tree, mutant, [], 1, False)
+            check("red without the panic is not 'reached'", answer == "not probed", (answer, note))
+            check("and the report is told why", "without the panic" in note, note)
+
+            mc.run_suite = stub(0, False)
+            answer, note = mc.probe_reachability(tree, mutant, [], 1, False)
+            check("green means no test executes it", answer == "no", (answer, note))
+
+            mc.run_suite = stub(124, False, timed_out=True)
+            answer, note = mc.probe_reachability(tree, mutant, [], 1, False)
+            check("a probe that timed out measured nothing", answer == "not probed", (answer, note))
+
+            mc.run_suite = stub(101, False, compile_error=True)
+            answer, note = mc.probe_reachability(tree, mutant, [], 1, False)
+            check("a probe that would not compile measured nothing", answer == "not probed", (answer, note))
+        finally:
+            mc.run_suite = real
+        check("the file is back", (root / "src" / "x.rs").read_text() == "let a = 1;\n")
+        tree.cleanup()
+
+
 @case("a mutant the compiler rejects is KILLED and says so")
 def _() -> None:
     run = mc.SuiteRun(0, 0, 0, [], compile_error=True, timed_out=False, seconds=1.0)
