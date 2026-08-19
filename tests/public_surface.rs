@@ -91,8 +91,9 @@ const EXPORTED: [(&str, &str); 32] = [
 
 /// Every module file in the crate. Frozen so a new one cannot be added without
 /// passing under the checks below.
-const MODULE_FILES: [&str; 29] = [
+const MODULE_FILES: [&str; 30] = [
     "asset.rs",
+    "asset_kind.rs",
     "bridge.rs",
     "cli.rs",
     "contract.rs",
