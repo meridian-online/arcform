@@ -58,8 +58,8 @@ a second time with a `panic!` at the same span, and the report prints, beside ea
 one, what that probe answered:
 
   UNPINNED    the panic fired, so the tests DO execute this line — and none of
-              them noticed the behaviour change.  This is the tier to act on:
-              `report()` returns 1 for it, and without --strict for no other.
+              them noticed the behaviour change.  This is the tier to act on
+              first, and the one whose evidence is complete.
   UNREACHED   the probe compiled, ran, and did not fire: no test executes this
               line at all.  Either a test is missing outright, or the code is
               genuinely unreachable and the survivor is equivalent.  Either way
@@ -67,8 +67,15 @@ one, what that probe answered:
   UNPROBED    the probe could not answer.  It did not compile at that span, or
               the run timed out, or the suite reddened without the panic message
               appearing — so nothing measured whether a test executes this line.
-              Printing it beside UNPINNED would assert a measurement that was
-              never taken, which is the failure this tier exists to stop.
+              Reported under its own header, because printing it beside UNPINNED
+              asserts a measurement nobody took — and it FAILS THE JOB, because
+              "the probe could not be inserted here" says nothing about whether
+              the code is reachable.  It is a fact about this file's syntax, not
+              about the tests.  A single-line predicate inside a `.filter(..)`
+              chain is idiomatic Rust and was landing here while the tests drove
+              it on every load; treating that as advisory let a real defect
+              through with the job green.  The way out is `probe_for` reaching
+              the shape, a test that reddens, or a dated ruling.
   EQUIVALENT  ruled a non-defect by a human, in
               scripts/mutation-coverage-equivalents.txt, with a reason and a
               date.  Keyed on the mutation's content, not its line number, so
@@ -86,12 +93,16 @@ worth having: the failure it exists to stop is a mechanism arriving with no test
 that catches its removal, and a finding nobody has to act on is a finding that
 gets read past.  The escape hatch is not a flag but a ruling — one line in the
 equivalents registry, naming the reason and the date, which stays in the tree and
-can be argued with.  UNREACHED and UNPROBED do not block on their own (see
---strict), because neither says the tests execute the line: one says they do not
-and the other says nobody found out.
+can be argued with.  UNPINNED and UNPROBED both fail the job; UNREACHED does
+not, and --strict adds it.  The asymmetry is deliberate and it is about evidence,
+not severity: UNREACHED is a measurement — the probe compiled, ran, and the line
+never executed — so the survivor has a reason to exist that was established.
+UNPROBED has no measurement behind it at all.  A survivor with no evidence either
+way is not safer than one with evidence against it, and the registry is where a
+survivor goes when a person has decided it cannot change behaviour.
 
-Exit codes: 0 clean · 1 at least one UNPINNED survivor, or under --strict an
-UNREACHED or UNPROBED one · 2 usage · 3 the harness could not run (no baseline,
+Exit codes: 0 clean · 1 at least one UNPINNED or UNPROBED survivor, or under
+--strict an UNREACHED one · 2 usage · 3 the harness could not run (no baseline,
 dirty tree, cargo missing).
 """
 
@@ -425,16 +436,160 @@ def _statement_probe(lines: list[str], i: int) -> str:
     Deliberately not "replace the expression with `panic!`" — that needs the
     expression's left edge, which for a method chain cannot be found by looking
     at text.  Prepending a statement needs nothing but the indent.
-
-    Where the line is not in statement position — a match arm, a struct literal
-    field, a line in the middle of a method chain — the probe does not compile,
-    `probe_reachability` returns "not probed", and `report()` puts the survivor
-    in UNPROBED.  That tier is advisory and its header claims no measurement,
-    which is the point: the alternative is a blocking line asserting the tests
-    execute code nobody checked.
     """
     indent = lines[i][: len(lines[i]) - len(lines[i].lstrip())]
     return f'{indent}panic!("{PROBE_MESSAGE}");\n{lines[i]}'
+
+
+def _code_columns(line: str, mask: list[bool]) -> list[int]:
+    """Columns of `line` that are real code and not whitespace."""
+    return [p for p in range(min(len(line), len(mask))) if mask[p] and not line[p].isspace()]
+
+
+def _balanced(line: str, mask: list[bool], start: int, stop: int) -> bool:
+    """Do the brackets in `line[start:stop]` open and close within that slice?"""
+    depth = 0
+    for pos in range(start, stop):
+        if pos >= len(mask) or not mask[pos]:
+            continue
+        if line[pos] in "([{":
+            depth += 1
+        elif line[pos] in ")]}":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
+
+
+def _match_arm_probe(lines: list[str], masks: list[list[bool]], i: int) -> str | None:
+    """`PAT => EXPR,` becomes `PAT => { panic!(..); EXPR },`.
+
+    A match arm is not statement position, so `_statement_probe` cannot compile
+    there — and match arms are where a `BOOL_LIT_FLIP` on an option table lands.
+    Wrapping the arm's body answers exactly the question the probe asks: the panic
+    fires if and only if this arm is the one taken.
+
+    Refused unless the `=>` is at bracket depth 0 on the line, the body's own
+    brackets balance within the line, and the last code character is a comma — a
+    body that opens a block and closes it on a later line is not on this line to
+    wrap, and half of one would be rewritten into nonsense.
+    """
+    line, mask = lines[i], masks[i]
+    depth = 0
+    arrow = None
+    for pos in range(len(line) - 1):
+        if pos >= len(mask) or not mask[pos]:
+            continue
+        ch = line[pos]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "=" and depth == 0 and line[pos + 1] == ">" and mask[pos + 1]:
+            arrow = pos
+            break
+    if arrow is None:
+        return None
+    columns = _code_columns(line, mask)
+    if not columns or line[columns[-1]] != ",":
+        return None
+    last = columns[-1]
+    body = line[arrow + 2 : last]
+    if not body.strip() or not _balanced(line, mask, arrow + 2, last):
+        return None
+    head, tail = line[:arrow], line[last:]
+    return f'{head}=> {{ panic!("{PROBE_MESSAGE}");{body} }}{tail}'
+
+
+def _closure_body_probe(lines: list[str], masks: list[list[bool]], i: int) -> str | None:
+    """`.method(|args| EXPR)` becomes `.method(|args| {{ panic!(..); EXPR }})`.
+
+    The shape `_statement_probe` cannot reach and the one that matters most: a
+    single-line predicate in the middle of a `.filter(..)` / `.map(..)` chain is
+    idiomatic Rust, and a survivor there was being reported as unmeasured when the
+    tests drive it on every load.
+
+    Only when the closure's enclosing call closes at the end of the line, so the
+    mutated token cannot be sitting OUTSIDE the closure in a further link of the
+    chain.  `.map(|x| x != 0.0).unwrap_or(true)` is the case that rules out: the
+    mutation is on `true`, the closure may never run, and a probe answering "was
+    the closure called" would answer a different question from the one asked.
+    """
+    line, mask = lines[i], masks[i]
+    columns = _code_columns(line, mask)
+    if not columns:
+        return None
+    end = len(columns) - 1
+    while end > 0 and line[columns[end]] in ",;?":
+        end -= 1
+    close = columns[end]
+    if line[close] != ")":
+        return None
+    if any(line[c] not in ",;?" for c in columns[end + 1 :]):
+        return None
+    # The closure's parameter list: `|` … `|`, where the pipes sit at one depth
+    # and everything between them looks like a pattern rather than an expression.
+    depth = 0
+    open_pipe = None
+    for pos in range(close):
+        if pos >= len(mask) or not mask[pos]:
+            continue
+        ch = line[pos]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "|" and open_pipe is None:
+            before = line[:pos].rstrip()
+            if before.endswith(("(", ",", "move")) or not before:
+                open_pipe = (pos, depth)
+    if open_pipe is None:
+        return None
+    start, pipe_depth = open_pipe
+    depth = pipe_depth
+    shut_pipe = None
+    for pos in range(start + 1, close):
+        if pos >= len(mask) or not mask[pos]:
+            continue
+        ch = line[pos]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "|" and depth == pipe_depth:
+            shut_pipe = pos
+            break
+    if shut_pipe is None:
+        return None
+    params = line[start + 1 : shut_pipe]
+    if not re.fullmatch(r"[A-Za-z0-9_,&()\[\]:<>\s.*]*", params):
+        return None
+    body = line[shut_pipe + 1 : close]
+    if not body.strip() or body.lstrip().startswith("{"):
+        return None
+    if not _balanced(line, mask, shut_pipe + 1, close):
+        return None
+    head, tail = line[: shut_pipe + 1], line[close:]
+    return f'{head} {{ panic!("{PROBE_MESSAGE}");{body} }}{tail}'
+
+
+def probe_for(lines: list[str], masks: list[list[bool]], i: int) -> str:
+    """The probe most likely to compile at line `i`.
+
+    Three shapes, tried in this order, and the order is the point: a match arm's
+    body is the right thing to wrap even when it also contains a closure, because
+    the mutated token can be anywhere in the arm.  The statement prepend is last
+    because it is the one that works wherever it applies at all.
+
+    Whatever comes back may still fail to compile, and that is a reported answer
+    rather than a silent one — `probe_reachability` returns "not probed" with the
+    reason and `report()` blocks on it until it is ruled.
+    """
+    for build in (_match_arm_probe, _closure_body_probe):
+        got = build(lines, masks, i)
+        if got is not None:
+            return got
+    return _statement_probe(lines, i)
 
 
 def _macro_spans(line: str, mask: list[bool]) -> list[tuple[int, int]]:
@@ -503,7 +658,7 @@ def op_call_default(lines, masks, i, path, fn) -> list[Mutant]:
                 operator="CALL_DEFAULT",
                 before=line,
                 after=after,
-                probe=_statement_probe(lines, i),
+                probe=probe_for(lines, masks, i),
                 function=fn,
             )
         )
@@ -532,7 +687,7 @@ def op_try_default(lines, masks, i, path, fn) -> list[Mutant]:
                 operator="TRY_DEFAULT",
                 before=line,
                 after=after,
-                probe=_statement_probe(lines, i),
+                probe=probe_for(lines, masks, i),
                 function=fn,
             )
         ]
@@ -582,7 +737,7 @@ def op_entry_overwrite(lines, masks, i, path, fn) -> list[Mutant]:
             operator="ENTRY_OVERWRITE",
             before=line,
             after=after,
-            probe=_statement_probe(lines, i),
+            probe=probe_for(lines, masks, i),
             function=fn,
         )
     ]
@@ -615,7 +770,7 @@ def op_token_swap(lines, masks, i, path, fn) -> list[Mutant]:
     """
     line = lines[i]
     mask = masks[i]
-    probe = _statement_probe(lines, i)
+    probe = probe_for(lines, masks, i)
     out = []
     for operator, needle, replacement in TOKEN_SWAPS:
         pos = line.find(needle)
@@ -1228,9 +1383,11 @@ def report(
         elif m.reached == "yes":
             unpinned.append(m)
         else:
-            # Reachability was not measured.  Anything but an explicit "yes" that
-            # lands here has to stay out of the blocking tier: the header there
-            # says the tests execute the line, and nothing established that.
+            # Reachability was not measured.  It keeps its own header — the
+            # UNPINNED one asserts the tests execute the line and nothing
+            # established that — but it is in the failing set, because "no probe
+            # would compile here" is a fact about the line's syntax and not about
+            # whether a test drives it.
             unprobed.append(m)
 
     print()
@@ -1289,12 +1446,14 @@ def report(
         "equivalent.  Advisory unless --strict.",
     )
     show(
-        "UNPROBED — nothing measured whether a test executes this line",
+        "UNPROBED — the mutation survived and nothing measured whether a test runs it",
         unprobed,
-        "The mutation survived; the `panic!` probe could not answer, for the reason\n"
-        "printed beside each one.  This is NOT a claim that the tests run the line and\n"
-        "NOT a claim that they do not — it is the absence of the measurement the two\n"
-        "tiers above rest on.  Advisory unless --strict.",
+        "The `panic!` probe could not answer, for the reason printed beside each one.\n"
+        "This is NOT a claim that the tests run the line and NOT a claim that they do\n"
+        "not — it is the absence of the measurement the two tiers above rest on, and\n"
+        "the absence is not evidence of safety.  These fail the job.  Add a test that\n"
+        "reddens for the change shown, or rule it equivalent in\n"
+        "scripts/mutation-coverage-equivalents.txt with a reason.",
     )
     show(
         "RULED EQUIVALENT — a human has already decided these are non-defects",
@@ -1321,14 +1480,16 @@ def report(
         print("guard is invisible to this check; code review is what catches that one.")
 
     print()
-    if unpinned:
-        print(f"FAIL: {len(unpinned)} change(s) no test would notice.")
+    if unpinned or unprobed:
+        parts = []
+        if unpinned:
+            parts.append(f"{len(unpinned)} change(s) no test would notice")
+        if unprobed:
+            parts.append(f"{len(unprobed)} whose reachability was not measured")
+        print(f"FAIL: {', '.join(parts)}.")
         return 1
-    if strict and (unreached or unprobed):
-        print(
-            f"FAIL (--strict): {len(unreached)} change(s) no test executes, "
-            f"{len(unprobed)} whose reachability was not measured."
-        )
+    if strict and unreached:
+        print(f"FAIL (--strict): {len(unreached)} change(s) no test executes.")
         return 1
     print("PASS: every mutation the budget reached was either caught or ruled.")
     return 0

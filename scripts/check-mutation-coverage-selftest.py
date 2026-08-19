@@ -280,6 +280,57 @@ def _() -> None:
         check(f"{operator} rewrote {line.strip()}", got[0].one_line_after() == expected, got[0].after)
 
 
+@case("a match arm's body is wrapped, so the probe fires only if the arm is taken")
+def _() -> None:
+    # A match arm is not statement position, so a prepended `panic!` cannot compile
+    # there — and a match arm is where a BOOL_LIT_FLIP on an option table lands.
+    lines = ["            _ => true,\n"]
+    got = mc.probe_for(lines, mc.masks_for(lines), 0)
+    check(
+        "the arm's body is wrapped",
+        got.strip() == f'_ => {{ panic!("{mc.PROBE_MESSAGE}"); true }},',
+        got,
+    )
+    lines = ["    Value::Number(n, _) => n.parse::<f64>().map(|x| x != 0.0).unwrap_or(true),\n"]
+    got = mc.probe_for(lines, mc.masks_for(lines), 0)
+    check("a guarded, nested arm too", "=> { panic!(" in got and got.rstrip().endswith("},"), got)
+    # A body that opens a block here and closes it later is not on this line to wrap.
+    lines = ["        Some(x) => {\n"]
+    check(
+        "an arm whose block runs past the line is refused",
+        mc._match_arm_probe(lines, mc.masks_for(lines), 0) is None,
+        mc._match_arm_probe(lines, mc.masks_for(lines), 0),
+    )
+
+
+@case("a predicate in a method chain is probed inside its closure")
+def _() -> None:
+    # The shape that let a real defect through as "unmeasured": a single-line
+    # predicate mid-chain, which the tests drive on every load.
+    lines = ['                .filter(|(kind, _, _)| *kind == "produces:")\n']
+    got = mc.probe_for(lines, mc.masks_for(lines), 0)
+    check(
+        "the closure body is wrapped",
+        got.strip()
+        == f'.filter(|(kind, _, _)| {{ panic!("{mc.PROBE_MESSAGE}"); *kind == "produces:" }})',
+        got,
+    )
+    # And the case it must NOT take: the mutated token can be outside the closure
+    # when the chain continues, so "was the closure called" answers a different
+    # question from the one asked.
+    lines = ["                .map(|x| x != 0.0).unwrap_or(true)\n"]
+    check(
+        "a chain that continues past the closure is refused",
+        mc._closure_body_probe(lines, mc.masks_for(lines), 0) is None,
+        mc._closure_body_probe(lines, mc.masks_for(lines), 0),
+    )
+    check(
+        "and it falls back to the statement probe",
+        mc.probe_for(lines, mc.masks_for(lines), 0).lstrip().startswith("panic!"),
+        mc.probe_for(lines, mc.masks_for(lines), 0),
+    )
+
+
 @case("a mutation's identity follows its text, not its line number")
 def _() -> None:
     a = mc.mutation_key("src/x.rs", "f", "GUARD_FALSE", "    if a {\n", "    if false {\n")
@@ -822,15 +873,22 @@ mod tests {
 }
 """
 
-# One function, and the mutated line is in the middle of a method chain, so a
-# `panic!` statement cannot be prepended to it and the probe does not compile.
-# The offset is asserted on, which kills the whole-body swap; the predicate is
-# not, so the token swap survives with its reachability unmeasured.
-CRATE_UNPROBEABLE = """pub fn count_matches(v: &[usize], a: usize) -> usize {
-    99 + v
-        .iter()
-        .filter(|x| **x == a)
-        .count()
+# A struct literal field: not statement position, no `=>` to wrap, and no call
+# closing at the end of the line — so none of `probe_for`'s three shapes reaches
+# it and the survivor's reachability genuinely cannot be measured.  A method
+# chain used to be the example here and is no longer one: `_closure_body_probe`
+# reaches it, which is the point of that function.  `total` is asserted on, which
+# kills the whole-body swap; `same` is not, so the token swap survives.
+CRATE_UNPROBEABLE = """pub struct Pair {
+    pub same: bool,
+    pub total: usize,
+}
+
+pub fn describe(a: usize, b: usize) -> Pair {
+    Pair {
+        same: a == b,
+        total: 99 + a + b,
+    }
 }
 
 #[cfg(test)]
@@ -838,8 +896,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_offset_is_asserted_on_but_the_predicate_is_not() {
-        assert_eq!(count_matches(&[], 1), 99);
+    fn the_total_is_asserted_on_but_the_comparison_is_not() {
+        assert_eq!(describe(1, 2).total, 102);
     }
 }
 """
@@ -899,29 +957,46 @@ def _() -> None:
         )
 
 
-@case("END TO END: a survivor whose probe cannot compile is UNPROBED, never UNPINNED")
+@case("END TO END: an unmeasured survivor is UNPROBED, never UNPINNED, and blocks")
 def _() -> None:
-    # The refusal this tier exists for: `report()` used to send anything that was
-    # not "no" into the blocking tier, so a survivor nothing had measured printed
-    # under a header reading "the tests run this line and none of them noticed".
+    # Two refusals in one case, and they pull in opposite directions.  Round 1 put
+    # unmeasured survivors in the blocking tier under a header asserting the tests
+    # execute the line; that header is false and it stays fixed.  Round 2 made the
+    # honest tier advisory, and a real defect shipped through it with the job
+    # green — `.filter(|(kind, _, _)| *kind == "produces:")` in an asset graph's
+    # collision gate, which the tests drive on every load.  "No probe compiles
+    # here" is a fact about the line's syntax, not about the tests.
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         build_fixture_crate(root, CRATE_UNPROBEABLE)
         code, out = run_gate(root, "--quiet")
         check(
             "reported UNPROBED",
-            tier_of_operator(out, "count_matches", "CMP_FLIP") == "UNPROBED",
+            tier_of_operator(out, "describe", "CMP_FLIP") == "UNPROBED",
+            out[-3000:],
+        )
+        check(
+            "and NOT under a header claiming the tests execute it",
+            tier_of_operator(out, "describe", "CMP_FLIP") != "UNPINNED",
             out[-3000:],
         )
         check("the reason is printed", "not in statement position" in out, out[-2000:])
-        check("an unmeasured survivor does not fail the job", code == 0, f"exit {code}\n{out[-3000:]}")
-        code, out = run_gate(root, "--quiet", "--strict")
-        check("--strict fails on it", code == 1, f"exit {code}\n{out[-2000:]}")
+        check("an unmeasured survivor fails the job", code == 1, f"exit {code}\n{out[-3000:]}")
         check(
-            "and --strict says which count it failed on",
+            "and the failure line counts it",
             "reachability was not measured" in out,
             out[-1000:],
         )
+        # The way past it is the registry, the same door a measured equivalent uses.
+        keys = [ln.split("key:")[1].strip() for ln in out.splitlines() if "key:" in ln]
+        check("a key is printed to paste", len(keys) == 1, keys)
+        (root / "scripts").mkdir(exist_ok=True)
+        (root / "scripts" / "mutation-coverage-equivalents.txt").write_text(
+            f"{keys[0]}\tsrc/lib.rs\tdescribe\tCMP_FLIP\t2026-08-20\tfixture ruling\n"
+        )
+        code, out = run_gate(root, "--quiet")
+        check("a dated ruling clears it", code == 0, f"exit {code}\n{out[-3000:]}")
+        check("and the ruling stays visible", "RULED EQUIVALENT" in out, out[-2000:])
 
 
 @case("a diff that only DELETES lines says so instead of reading as a clean sweep")
