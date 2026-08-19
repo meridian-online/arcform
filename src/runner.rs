@@ -4990,4 +4990,206 @@ steps:
             "run 3: same again — must stay settled, not resume re-running"
         );
     }
+
+    // Round 8 pin #1 — the wider, SQL-introspection-driven instance of round 7's
+    // directory regression. `models/export.sql`'s `COPY orders TO 'build/orders'
+    // (… PARTITION_BY (year))` makes SQL introspection classify `build/orders` as
+    // `AssetKind::Directory` from the statement's own `options`, statically, at
+    // graph-build time — MockEngine never actually executes the SQL, so the test
+    // creates the partitioned directory by hand to stand in for what a real DuckDB
+    // COPY would have written, exactly as other tests here fake a SQL step's file
+    // output. This exercises the real end-to-end `run()` path, multi-invocation,
+    // asserting on `engine.calls` across five runs — not a call to
+    // `produced_artifact_hash` or `AssetKind` directly.
+    //
+    // Round 7's `fs::metadata(&full).map(|m| m.is_dir()).unwrap_or(false)` check
+    // would see "still a directory" at every one of these run 3/4 boundaries and
+    // skip forever; `hash_directory_contents` cannot make that mistake, because it
+    // hashes what is inside, not merely whether something is there.
+    #[test]
+    fn test_directory_emptied_while_kept_forces_rerun_not_perpetual_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: export\n    sql: models/export.sql\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[(
+                "models/export.sql",
+                "COPY orders TO 'build/orders' (FORMAT parquet, PARTITION_BY (year));",
+            )],
+        );
+
+        fs::create_dir_all(dir.path().join("build/orders")).unwrap();
+        fs::write(
+            dir.path().join("build/orders/year=2024.parquet"),
+            b"partition A",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("build/orders/year=2025.parquet"),
+            b"partition B",
+        )
+        .unwrap();
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "run 1: preflight + 1 sql (no prior state, always stale)"
+        );
+
+        // Run 2: nothing touched — establishes the settled-skip baseline a
+        // presence-only check and a content-manifest hash both agree on.
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "run 2: unchanged directory, must settle to skip"
+        );
+
+        // Corrupt: delete every partition file, keep the directory itself present.
+        fs::remove_file(dir.path().join("build/orders/year=2024.parquet")).unwrap();
+        fs::remove_file(dir.path().join("build/orders/year=2025.parquet")).unwrap();
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "run 3: directory emptied while kept present must force a re-run, not \
+             skip forever — round 7's regression, reproduced and closed"
+        );
+
+        // Restore (different) content — must also be detected, not compared against
+        // the emptied-directory baseline and called equal by coincidence.
+        fs::write(
+            dir.path().join("build/orders/year=2026.parquet"),
+            b"partition C",
+        )
+        .unwrap();
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "run 4: restored (different) content must also force a re-run"
+        );
+
+        // Run 5: unchanged again — must settle back to skip.
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "run 5: unchanged again, must settle back to skip"
+        );
+    }
+
+    // Round 8 pin #2 — round 7's regression #1, reproduced against the REAL
+    // `parquet_export` operator (not a stand-in): a bare, no-`/`, non-allowlisted-
+    // extension `dest:` (`registrant.avro`) must be tracked, not silently excluded
+    // by a name-based guess. `op:` steps run for real (see `run()`'s dispatch —
+    // MockEngine only intercepts `sql:`/`command:` steps), so this drives an actual
+    // DuckDB `COPY` through the operator against a real, pre-seeded `customers`
+    // table and reads the real file it writes.
+    //
+    // `engine.calls` cannot observe an `op:` step (it never reaches the engine at
+    // all), so this asserts on `state.runs`'s `steps_executed` count instead — the
+    // one observable that is meaningful for every step kind, SQL/command/op alike,
+    // recorded by the same `finish_run` call `engine.calls`-based tests rely on
+    // indirectly. Still the real end-to-end `run()` path, multi-invocation, not a
+    // call to `produced_artifact_hash` or `AssetKind` directly.
+    #[test]
+    fn test_parquet_export_bare_dest_forces_rerun_on_truncate_delete_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: export\n    op: parquet_export\n    with:\n      input: customers\n      dest: registrant.avro\n";
+        setup_project(dir.path(), yaml, &[]);
+
+        // Seed the real DuckDB file `parquet_export` opens with the table it reads —
+        // op: steps run for real, so this has to be a real table, not a mocked one.
+        {
+            let db_path = dir.path().join("test.duckdb");
+            let conn = duckdb::Connection::open(&db_path).unwrap();
+            conn.execute_batch("CREATE TABLE customers AS SELECT 1 AS id, 'a' AS name;")
+                .unwrap();
+        }
+
+        let last_steps_executed = |state: &MockStateBackend| -> usize {
+            state
+                .runs
+                .borrow()
+                .last()
+                .and_then(|(_, outcome)| outcome.clone())
+                .map(|(steps_executed, _)| steps_executed)
+                .expect("finish_run must have recorded this run")
+        };
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            last_steps_executed(&state),
+            1,
+            "run 1: no prior state, always stale"
+        );
+        let dest = dir.path().join("registrant.avro");
+        assert!(
+            dest.exists(),
+            "parquet_export must really write the bare-named, non-allowlisted-extension file"
+        );
+        let original_bytes = fs::read(&dest).unwrap();
+        assert!(!original_bytes.is_empty());
+
+        // Run 2: unchanged — must settle to skip.
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            last_steps_executed(&state),
+            0,
+            "run 2: unchanged, must settle to skip"
+        );
+
+        // Truncate the produced file underneath an unchanged manifest — round 7's
+        // exact regression shape: a bare, non-allowlisted-extension dest: went
+        // untracked and a truncation like this read as unchanged forever.
+        fs::write(&dest, b"").unwrap();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            last_steps_executed(&state),
+            1,
+            "run 3: truncated bare-named file must force a real re-run"
+        );
+        let rewritten_bytes = fs::read(&dest).unwrap();
+        assert_eq!(
+            rewritten_bytes, original_bytes,
+            "the re-run really re-executed parquet_export, restoring real bytes, \
+             not merely reporting success over the truncated file"
+        );
+
+        // Run 4: unchanged again (the just-restored file) — must settle to skip.
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            last_steps_executed(&state),
+            0,
+            "run 4: restored file unchanged, must settle to skip"
+        );
+
+        // Delete it outright — same requirement, the other direction.
+        fs::remove_file(&dest).unwrap();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            last_steps_executed(&state),
+            1,
+            "run 5: deleted bare-named file must force a real re-run"
+        );
+        assert!(
+            dest.exists(),
+            "deleted file must be really rewritten, not just reported fixed"
+        );
+    }
 }
