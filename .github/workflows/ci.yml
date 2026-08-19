@@ -122,10 +122,17 @@ jobs:
   # is printed as NOT CHECKED rather than dropped in silence. With the baseline
   # build and run in front of it the ceiling is the timeout below.
   #
-  # BLOCKING. A mutation the tests execute and do not notice fails this job. The
+  # BLOCKING, on one tier and not the others. A mutation the tests DEMONSTRABLY
+  # execute — proved by a second run with a `panic!` at the same span, whose
+  # message has to appear in the output — and do not notice fails this job. The
   # way past it is a test that reddens, or a ruling in
   # scripts/mutation-coverage-equivalents.txt naming why the mutation cannot
   # change behaviour — a line in the tree that can be argued with, not a flag.
+  #
+  # A survivor whose line no test executes, and a survivor whose probe could not
+  # be run at all, are reported and do not fail the job. Blocking on those would
+  # mean failing a branch on a measurement nobody took, which is the shape of
+  # defect this whole job exists to report.
   mutation-coverage:
     runs-on: ubuntu-latest
     timeout-minutes: 30

@@ -43,32 +43,42 @@ The operators, and the failure each is modelled on:
   ENTRY_OVERWRITE            `m.entry(k).or_insert(v)` becomes `m.insert(k, v)`,
                              so a later, worse-informed write wins over an
                              earlier, better-informed one.
-  CMP_FLIP / ORD_RELAX /     token swaps: `==`/`!=`, `<`/`<=`, `&&`/`||`, a
-  LOGIC_FLIP / NOT_DROP /    dropped `!`, a flipped bool literal.
-  BOOL_LIT_FLIP
+  CMP_FLIP / ORD_RELAX /     token swaps: `==`/`!=`, `<`/`<=`, `&&`/`||`, and
+  LOGIC_FLIP /               a flipped bool literal.  Built by op_token_swap,
+  BOOL_LIT_FLIP              which is the whole set: there is no dropped-`!`
+                             operator.
   FN_BODY_DEFAULT            the whole-body replacement, kept because a function
                              the suite never calls at all should still be named.
 
-THREE TIERS IN THE REPORT, and the split is the point.  A real codebase produces
+FOUR TIERS IN THE REPORT, and the split is the point.  A real codebase produces
 surviving mutations that are *equivalent* — the code cannot be reached in
 production, or the only thing that changes is a warning's wording.  Listing those
-next to a genuine hole is how a report becomes wallpaper.  So every survivor is
-probed a second time with a `panic!` at the same span:
+next to a genuine hole is how a report becomes wallpaper.  So a survivor is probed
+a second time with a `panic!` at the same span, and the report prints, beside each
+one, what that probe answered:
 
   UNPINNED    the panic fired, so the tests DO execute this line — and none of
-              them noticed the behaviour change.  This is the tier to act on.
-  UNREACHED   the panic did not fire: no test executes this line at all.  Either
-              a test is missing outright, or the code is genuinely unreachable
-              and the survivor is equivalent.  Either way it is a different
-              question from the tier above.
+              them noticed the behaviour change.  This is the tier to act on:
+              `report()` returns 1 for it, and without --strict for no other.
+  UNREACHED   the probe compiled, ran, and did not fire: no test executes this
+              line at all.  Either a test is missing outright, or the code is
+              genuinely unreachable and the survivor is equivalent.  Either way
+              it is a different question from the tier above.
+  UNPROBED    the probe could not answer.  It did not compile at that span, or
+              the run timed out, or the suite reddened without the panic message
+              appearing — so nothing measured whether a test executes this line.
+              Printing it beside UNPINNED would assert a measurement that was
+              never taken, which is the failure this tier exists to stop.
   EQUIVALENT  ruled a non-defect by a human, in
               scripts/mutation-coverage-equivalents.txt, with a reason and a
               date.  Keyed on the mutation's content, not its line number, so
               editing the file above it does not silently unrule it.
 
-The panic probe splits the "unreachable in production" half of that automatically
-and cannot split the "observable only in a warning" half — that one needs a
-ruling, which is what the registry is for.
+Each of the six entries in OPERATORS attaches a probe to every mutant it emits,
+so UNPROBED means a probe was built and could not be run — never that none was
+offered.  The probe splits the "unreachable in production" half of the
+equivalent-mutant problem automatically and cannot split the "observable only in
+a warning" half; that one needs a ruling, which is what the registry is for.
 
 BLOCKING, DELIBERATELY.  Exit 1 on an UNPINNED survivor fails the job.  This is a
 change in kind from a report-only check and it is the whole reason the check is
@@ -76,10 +86,13 @@ worth having: the failure it exists to stop is a mechanism arriving with no test
 that catches its removal, and a finding nobody has to act on is a finding that
 gets read past.  The escape hatch is not a flag but a ruling — one line in the
 equivalents registry, naming the reason and the date, which stays in the tree and
-can be argued with.  UNREACHED does not block on its own (see --strict).
+can be argued with.  UNREACHED and UNPROBED do not block on their own (see
+--strict), because neither says the tests execute the line: one says they do not
+and the other says nobody found out.
 
-Exit codes: 0 clean · 1 at least one UNPINNED survivor · 2 usage · 3 the harness
-could not run (no baseline, dirty tree, cargo missing).
+Exit codes: 0 clean · 1 at least one UNPINNED survivor, or under --strict an
+UNREACHED or UNPROBED one · 2 usage · 3 the harness could not run (no baseline,
+dirty tree, cargo missing).
 """
 
 from __future__ import annotations
@@ -322,7 +335,8 @@ class Mutant:
     function: str
     verdict: str = ""
     detail: str = ""
-    reached: str = ""  # "yes" | "no" | "not probed"
+    reached: str = ""  # "yes" | "no" | "not probed" | "" (not a survivor)
+    probe_note: str = ""  # why the probe could not answer, when it could not
     key: str = field(default="", init=False)
 
     def __post_init__(self) -> None:
@@ -410,9 +424,14 @@ def _statement_probe(lines: list[str], i: int) -> str:
 
     Deliberately not "replace the expression with `panic!`" — that needs the
     expression's left edge, which for a method chain cannot be found by looking
-    at text.  Prepending a statement needs nothing but the indent, and where the
-    line is not in statement position the probe simply fails to compile and the
-    survivor is reported as unprobed rather than mis-tiered.
+    at text.  Prepending a statement needs nothing but the indent.
+
+    Where the line is not in statement position — a match arm, a struct literal
+    field, a line in the middle of a method chain — the probe does not compile,
+    `probe_reachability` returns "not probed", and `report()` puts the survivor
+    in UNPROBED.  That tier is advisory and its header claims no measurement,
+    which is the point: the alternative is a blocking line asserting the tests
+    execute code nobody checked.
     """
     indent = lines[i][: len(lines[i]) - len(lines[i].lstrip())]
     return f'{indent}panic!("{PROBE_MESSAGE}");\n{lines[i]}'
@@ -582,8 +601,21 @@ TOKEN_SWAPS: list[tuple[str, str, str]] = [
 
 
 def op_token_swap(lines, masks, i, path, fn) -> list[Mutant]:
+    """A comparison, an ordering, a logical connective or a bool literal, flipped.
+
+    Every mutant here carries `_statement_probe`, the same probe the other
+    single-line operators take.  It did not, and the cost of that was the defect
+    this gate exists to find, one level in: `probe_reachability` returned
+    "not probed" without running anything, `report()` sent everything that was
+    not "no" into the blocking tier, and the survivor printed under a header
+    reading "the tests run this line and none of them noticed" when nothing had
+    measured whether any test runs it.  On a function no test calls, the same
+    line came out twice under opposite claims — UNREACHED from op_guard and
+    UNPINNED from here — and the false one failed the job.
+    """
     line = lines[i]
     mask = masks[i]
+    probe = _statement_probe(lines, i)
     out = []
     for operator, needle, replacement in TOKEN_SWAPS:
         pos = line.find(needle)
@@ -598,7 +630,7 @@ def op_token_swap(lines, masks, i, path, fn) -> list[Mutant]:
                 operator=operator,
                 before=line,
                 after=after,
-                probe=None,
+                probe=probe,
                 function=fn,
             )
         )
@@ -615,7 +647,7 @@ def op_token_swap(lines, masks, i, path, fn) -> list[Mutant]:
                 operator="BOOL_LIT_FLIP",
                 before=line,
                 after=line[: m.start()] + flipped + line[m.end() :],
-                probe=None,
+                probe=probe,
                 function=fn,
             )
         )
@@ -805,6 +837,11 @@ class SuiteRun:
     compile_error: bool
     timed_out: bool
     seconds: float
+    # Did PROBE_MESSAGE appear in the run's output?  A probe run that reddens for
+    # some other reason — a flaky test, a compile warning promoted to an error in
+    # one target — is not evidence that the probed line executed, and reading the
+    # exit code alone cannot tell the two apart.
+    probe_fired: bool = False
 
 
 def run_suite(root: Path, command: list[str], timeout: int) -> SuiteRun:
@@ -842,6 +879,7 @@ def run_suite(root: Path, command: list[str], timeout: int) -> SuiteRun:
         compile_error="could not compile" in out,
         timed_out=timed_out,
         seconds=seconds,
+        probe_fired=PROBE_MESSAGE in out,
     )
 
 
@@ -906,18 +944,49 @@ def merge_base(root: Path, base: str) -> str:
     return proc.stdout.strip() if proc.returncode == 0 and proc.stdout.strip() else base
 
 
+def diff_text(root: Path, base: str, paths: list[str] | None) -> str:
+    """The unified-0 diff this check reads, from the branch point to the tree."""
+    base = merge_base(root, base)
+    args = ["diff", "--unified=0", "--no-color", base, "--", *(paths or ["src"])]
+    return git(root, *args)
+
+
+def deleted_line_count(root: Path, base: str, paths: list[str] | None) -> int:
+    """Lines this diff REMOVED from `src/**/*.rs`, which nothing here can mutate.
+
+    Counted so the report can say so.  Without it a diff that only takes code away
+    prints the same clean sweep as a diff with nothing wrong in it, and those are
+    different facts.
+    """
+    total = 0
+    current: str | None = None
+    for line in diff_text(root, base, paths).splitlines():
+        if line.startswith("--- a/"):
+            current = line[6:]
+            continue
+        if line.startswith("--- /dev/null") or line.startswith("+++"):
+            if line.startswith("--- /dev/null"):
+                current = None
+            continue
+        if (
+            line.startswith("-")
+            and current
+            and current.startswith("src/")
+            and current.endswith(".rs")
+        ):
+            total += 1
+    return total
+
+
 def changed_lines(root: Path, base: str, paths: list[str] | None) -> dict[str, set[int]]:
     """0-based line indices added or modified in `src/**/*.rs` since `base`.
 
     Deleted lines are not represented: there is nothing left to mutate.  That is a
-    real hole and it is named in the report — a diff that only DELETES a guard is
-    invisible here, and the check that catches that one is code review.
+    real hole, and `deleted_line_count` counts them so `report()` names it — a
+    diff that only DELETES a guard is invisible here, and the check that catches
+    that one is code review.
     """
-    base = merge_base(root, base)
-    args = ["diff", "--unified=0", "--no-color", base, "--", "src"]
-    if paths:
-        args = ["diff", "--unified=0", "--no-color", base, "--", *paths]
-    diff = git(root, *args)
+    diff = diff_text(root, base, paths)
     result: dict[str, set[int]] = {}
     current: str | None = None
     for line in diff.splitlines():
@@ -1077,35 +1146,56 @@ def evaluate(
                 flush=True,
             )
         if mutant.verdict == "SURVIVED":
-            mutant.reached = probe_reachability(tree, mutant, command, timeout, verbose)
+            mutant.reached, mutant.probe_note = probe_reachability(
+                tree, mutant, command, timeout, verbose
+            )
         done.append(mutant)
     return done, []
 
 
 def probe_reachability(
     tree: Tree, mutant: Mutant, command: list[str], timeout: int, verbose: bool
-) -> str:
-    """Does any test execute this line at all?
+) -> tuple[str, str]:
+    """Does any test execute this line at all?  Returns (answer, why not).
 
     The whole of the equivalent-mutant problem in one question.  A survivor whose
-    line no test executes is a different finding from a survivor whose line every
-    test executes and none of them checks — and a report that cannot tell them
+    line no test executes is a different finding from a survivor whose line the
+    tests execute and none of them checks — and a report that cannot tell them
     apart is one that gets skimmed.  Put a `panic!` at the same span: if the suite
     stays green the line never runs.
+
+    The answer is "yes", "no", or "not probed" with a reason.  "yes" needs the
+    panic's own message in the output, not just a red exit code: a probe run that
+    reddens for an unrelated reason says nothing about the line, and treating it
+    as a reached line puts a survivor in the blocking tier on no evidence.
     """
     if mutant.probe is None:
-        return "not probed"
+        return "not probed", "this operator built no probe"
     tree.apply(mutant, mutant.probe)
     try:
         run = run_suite(tree.root, command, timeout)
     finally:
         tree.restore()
     if run.compile_error:
-        return "not probed"
-    result = "no" if run.exit_code == 0 else "yes"
+        return (
+            "not probed",
+            "the probe does not compile at this span (the line is not in statement position)",
+        )
+    if run.timed_out:
+        return "not probed", "the probe run hit the timeout"
+    if run.exit_code == 0:
+        result, note = "no", ""
+    elif run.probe_fired:
+        result, note = "yes", ""
+    else:
+        result, note = "not probed", "the probe run reddened without the panic firing"
     if verbose:
-        print(f"        reachability probe: executed by a test = {result}", flush=True)
-    return result
+        print(
+            f"        reachability probe: executed by a test = {result}"
+            + (f" ({note})" if note else ""),
+            flush=True,
+        )
+    return result, note
 
 
 # --------------------------------------------------------------------------- #
@@ -1121,9 +1211,11 @@ def report(
     command: list[str],
     elapsed: float,
     strict: bool,
+    deleted: int = 0,
 ) -> int:
     unpinned: list[Mutant] = []
     unreached: list[Mutant] = []
+    unprobed: list[Mutant] = []
     equivalent: list[Mutant] = []
     killed = 0
     for m in mutants:
@@ -1133,8 +1225,13 @@ def report(
             equivalent.append(m)
         elif m.reached == "no":
             unreached.append(m)
-        else:
+        elif m.reached == "yes":
             unpinned.append(m)
+        else:
+            # Reachability was not measured.  Anything but an explicit "yes" that
+            # lands here has to stay out of the blocking tier: the header there
+            # says the tests execute the line, and nothing established that.
+            unprobed.append(m)
 
     print()
     print("=" * 78)
@@ -1146,9 +1243,12 @@ def report(
     print(f"  killed          {killed}")
     print(f"  unpinned        {len(unpinned)}")
     print(f"  unreached       {len(unreached)}")
+    print(f"  unprobed        {len(unprobed)}")
     print(f"  ruled equiv.    {len(equivalent)}")
     if skipped:
         print(f"not checked       {len(skipped)} (budget exhausted)")
+    if deleted:
+        print(f"deleted lines     {deleted} under src/, not mutated — see the note below")
 
     def show(title: str, group: list[Mutant], note: str) -> None:
         if not group:
@@ -1164,6 +1264,13 @@ def report(
             print(f"    -  {m.one_line_before()[:150]}")
             print(f"    +  {m.one_line_after()[:150]}")
             print(f"    {m.detail}")
+            # Printed for every survivor, in every tier.  Two operators can land
+            # on one line and answer differently; without this the reader cannot
+            # tell which of the two lines rests on a measurement.
+            print(
+                f"    reached by a test: {m.reached or 'not measured'}"
+                + (f" — {m.probe_note}" if m.probe_note else "")
+            )
             if m.key in rulings:
                 print(f"    ruled: {rulings[m.key]}")
             print(f"    key: {m.key}")
@@ -1182,6 +1289,14 @@ def report(
         "equivalent.  Advisory unless --strict.",
     )
     show(
+        "UNPROBED — nothing measured whether a test executes this line",
+        unprobed,
+        "The mutation survived; the `panic!` probe could not answer, for the reason\n"
+        "printed beside each one.  This is NOT a claim that the tests run the line and\n"
+        "NOT a claim that they do not — it is the absence of the measurement the two\n"
+        "tiers above rest on.  Advisory unless --strict.",
+    )
+    show(
         "RULED EQUIVALENT — a human has already decided these are non-defects",
         equivalent,
         "Listed so the ruling stays visible and can be argued with, not hidden.",
@@ -1196,12 +1311,24 @@ def report(
         if len(skipped) > 20:
             print(f"  ... and {len(skipped) - 20} more")
 
+    if deleted:
+        print()
+        print("-" * 78)
+        print(f"NOT MUTATED — this diff DELETED {deleted} line(s) under src/")
+        print("-" * 78)
+        print("A removed line is not in the tree to rewrite, so no mutation can be built")
+        print("for it and nothing above covers it.  A diff whose only change is deleting a")
+        print("guard is invisible to this check; code review is what catches that one.")
+
     print()
     if unpinned:
         print(f"FAIL: {len(unpinned)} change(s) no test would notice.")
         return 1
-    if strict and unreached:
-        print(f"FAIL (--strict): {len(unreached)} change(s) no test executes.")
+    if strict and (unreached or unprobed):
+        print(
+            f"FAIL (--strict): {len(unreached)} change(s) no test executes, "
+            f"{len(unprobed)} whose reachability was not measured."
+        )
         return 1
     print("PASS: every mutation the budget reached was either caught or ruled.")
     return 0
@@ -1338,9 +1465,18 @@ def main(argv: list[str] | None = None) -> int:
         rulings = load_equivalents(equivalents)
 
         changed = changed_lines(root, args.base, args.paths)
+        deleted = deleted_line_count(root, args.base, args.paths)
         if not changed:
             print("No changed lines under src/ — nothing to mutate.")
-            print("(This check is scoped to the diff by design: it never walks the crate.)")
+            if deleted:
+                print(
+                    f"NOTE: this diff DELETED {deleted} line(s) under src/.  A removed line is"
+                )
+                print(
+                    "      not in the tree to rewrite, so a change that only takes code away"
+                )
+                print("      is invisible here.  Code review is what catches that one.")
+            print("(This check is scoped to the diff by design: it does not walk the crate.)")
             return 0
 
         mutants: list[Mutant] = []
@@ -1400,7 +1536,9 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             tree.cleanup()
         elapsed = time.monotonic() - started
-        return report(done, skipped, rulings, baseline, command, elapsed, args.strict)
+        return report(
+            done, skipped, rulings, baseline, command, elapsed, args.strict, deleted
+        )
     except Harness as exc:
         print(f"SETUP: {exc}", file=sys.stderr)
         return 3

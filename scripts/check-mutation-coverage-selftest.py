@@ -17,14 +17,22 @@ does not match, and a mutation that changes nothing.  A mutation that silently
 fails to apply produces exactly the same green as a test that cannot fail, so
 those two are errors here and not warnings.
 
-The end-to-end cases build a real, tiny cargo crate with three functions that
-differ only in how the tests treat them — one asserted on, one called and not
-asserted on, one never called — and run the whole gate against it.  This is the
-layer that pins the verdict path: that a caught mutation exits 0, that a survivor
-the tests execute exits 1, that a survivor nothing executes is separated from it
-rather than listed beside it, that a ruling moves a survivor out of the failing
-tier, and that a red baseline is a setup error rather than a pass.  Nothing
-short of running the real thing distinguishes those.
+The end-to-end cases build real, tiny cargo crates and run the whole gate against
+them.  The first has three functions differing only in how the tests treat them —
+one asserted on, one called and not asserted on, one never called.  The second
+repeats that shape with a token swap rather than a guard, because a token swap is
+tiered by `_statement_probe` and a guard is not: with only the first crate here,
+`op_token_swap` could be deleted and the probe could stop emitting its `panic!`,
+both with this file green.  The third puts the mutated line in the middle of a
+method chain, where the probe cannot compile, which is the case that has to reach
+UNPROBED rather than the blocking tier.
+
+This is the layer that pins the verdict path: that a caught mutation exits 0, that
+a survivor the tests execute exits 1, that a survivor nothing executes is
+separated from it rather than listed beside it, that a survivor nothing measured
+is separated from BOTH, that a ruling moves a survivor out of the failing tier,
+and that a red baseline is a setup error rather than a pass.  Nothing short of
+running the real thing distinguishes those.
 
 Exit 0 all cases passed · 1 at least one failed · 3 the harness could not run.
 """
@@ -192,6 +200,84 @@ def _() -> None:
         all(m.start < 3 for m in got),
         [(m.start, m.operator) for m in got],
     )
+
+
+ALL_OPERATORS_SOURCE = (
+    "pub fn every(a: usize, b: usize, m: &mut Map) -> Option<usize> {\n"  # 0
+    "    if a == b {\n"  # 1
+    "        return None;\n"  # 2
+    "    }\n"  # 3
+    "    let flag = true;\n"  # 4
+    "    let relax = a < b;\n"  # 5
+    "    let both = flag || relax;\n"  # 6
+    "    let hashed = compute(inner(a))?;\n"  # 7
+    "    m.entry(a).or_insert(b);\n"  # 8
+    "    Some(hashed)\n"  # 9
+    "}\n"  # 10
+)
+
+# The operator names `generate` is expected to emit for ALL_OPERATORS_SOURCE.
+# Written out rather than derived from OPERATORS so that deleting an operator
+# reddens this instead of quietly shrinking both sides of the comparison.
+EXPECTED_OPERATORS = {
+    "BOOL_LIT_FLIP",
+    "CALL_DEFAULT",
+    "CMP_FLIP",
+    "ENTRY_OVERWRITE",
+    "FN_BODY_DEFAULT",
+    "GUARD_FALSE",
+    "GUARD_TRUE",
+    "LOGIC_FLIP",
+    "ORD_RELAX",
+    "TRY_DEFAULT",
+}
+
+
+@case("every operator the docstring names is generated, and none is named that is not")
+def _() -> None:
+    # The gate's own defect, one level in: four of its operators had no case here
+    # at all, so `op_token_swap` could be deleted outright with this file green.
+    got = mc.generate("src/x.rs", ALL_OPERATORS_SOURCE, set(range(11)))
+    emitted = {m.operator for m in got}
+    check("no operator missing", EXPECTED_OPERATORS <= emitted, sorted(EXPECTED_OPERATORS - emitted))
+    check("no operator unexpected", emitted <= EXPECTED_OPERATORS, sorted(emitted - EXPECTED_OPERATORS))
+
+
+@case("every mutant carries a reachability probe that panics")
+def _() -> None:
+    # The claim in the module docstring, pinned.  A mutant with no probe is
+    # reported unmeasured, and an unmeasured survivor used to print under a
+    # header asserting the tests execute its line.
+    got = mc.generate("src/x.rs", ALL_OPERATORS_SOURCE, set(range(11)))
+    check("some mutants to check", len(got) >= len(EXPECTED_OPERATORS), len(got))
+    for m in got:
+        check(f"{m.operator} has a probe", m.probe is not None, m.one_line_before())
+        check(
+            f"{m.operator}'s probe panics",
+            mc.PROBE_MESSAGE in (m.probe or ""),
+            (m.operator, m.probe),
+        )
+
+
+@case("each token swap rewrites the token it is named for")
+def _() -> None:
+    swaps = [
+        ("CMP_FLIP", "    let v = a == b;\n", "let v = a != b;"),
+        ("CMP_FLIP", "    let v = a != b;\n", "let v = a == b;"),
+        ("ORD_RELAX", "    let v = a < b;\n", "let v = a <= b;"),
+        ("ORD_RELAX", "    let v = a > b;\n", "let v = a >= b;"),
+        ("ORD_RELAX", "    let v = a <= b;\n", "let v = a < b;"),
+        ("ORD_RELAX", "    let v = a >= b;\n", "let v = a > b;"),
+        ("LOGIC_FLIP", "    let v = a && b;\n", "let v = a || b;"),
+        ("LOGIC_FLIP", "    let v = a || b;\n", "let v = a && b;"),
+        ("BOOL_LIT_FLIP", "    let v = true;\n", "let v = false;"),
+        ("BOOL_LIT_FLIP", "    let v = false;\n", "let v = true;"),
+    ]
+    for operator, line, expected in swaps:
+        source = "fn f(a: usize, b: usize) {\n" + line + "}\n"
+        got = [m for m in mc.generate("src/x.rs", source, {1}) if m.operator == operator]
+        check(f"{operator} generated for {line.strip()}", len(got) == 1, len(got))
+        check(f"{operator} rewrote {line.strip()}", got[0].one_line_after() == expected, got[0].after)
 
 
 @case("a mutation's identity follows its text, not its line number")
@@ -496,21 +582,44 @@ def run_gate(root: Path, *extra: str) -> tuple[int, str]:
     return proc.returncode, proc.stdout + proc.stderr
 
 
+TIER_HEADINGS = {
+    "UNPINNED": "UNPINNED",
+    "UNREACHED": "UNREACHED",
+    "UNPROBED": "UNPROBED",
+    "RULED EQUIVALENT": "EQUIVALENT",
+    "NOT CHECKED": "NOT CHECKED",
+}
+
+
 def tier_of(output: str, function: str) -> str:
     """Which report section a function's survivor landed in."""
-    tiers = {
-        "UNPINNED": "UNPINNED",
-        "UNREACHED": "UNREACHED",
-        "RULED EQUIVALENT": "EQUIVALENT",
-        "NOT CHECKED": "NOT CHECKED",
-    }
     current = "KILLED"
     found = "KILLED"
     for line in output.splitlines():
-        for prefix, name in tiers.items():
+        for prefix, name in TIER_HEADINGS.items():
             if line.startswith(prefix + " "):
                 current = name
         if f"fn {function} " in line or line.rstrip().endswith(f"fn {function}"):
+            found = current
+    return found
+
+
+def tier_of_operator(output: str, function: str, operator: str) -> str:
+    """Which section ONE operator's survivor landed in.
+
+    `tier_of` answers for the whole function, and a function with two survivors in
+    two different tiers gives it whichever the report printed last.  Every case
+    that pins the probe needs the answer for one operator, because the point is
+    that two operators on the same function can disagree.
+    """
+    needle = f"fn {function}  [{operator}]"
+    current = "KILLED"
+    found = "KILLED"
+    for line in output.splitlines():
+        for prefix, name in TIER_HEADINGS.items():
+            if line.startswith(prefix + " "):
+                current = name
+        if needle in line:
             found = current
     return found
 
@@ -599,6 +708,178 @@ def _() -> None:
             out[-3000:],
         )
         check("the failure line says what it means", "no test would notice" in out, out[-800:])
+
+
+# A token swap on a line in statement position, in three functions that differ
+# only in what the tests do with them.  This is the crate that pins
+# `op_token_swap` end to end AND pins `_statement_probe` keeping its `panic!`:
+# every mutation here that is not a whole-body swap is tiered by that probe, and
+# nothing else in this file evaluates one.
+CRATE_TOKEN_SWAP = """pub fn compared_and_checked(a: usize, b: usize) -> usize {
+    let same = a == b;
+    same as usize
+}
+
+pub fn compared_but_unchecked(a: usize, b: usize) -> usize {
+    let same = a == b;
+    same as usize
+}
+
+pub fn compared_never_called(a: usize, b: usize) -> usize {
+    let same = a == b;
+    same as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compared_and_checked_is_asserted_on() {
+        assert_eq!(compared_and_checked(1, 1), 1);
+        assert_eq!(compared_and_checked(1, 2), 0);
+    }
+
+    #[test]
+    fn compared_but_unchecked_is_called_and_never_asserted_on() {
+        let _ = compared_but_unchecked(1, 1);
+        let _ = compared_but_unchecked(1, 2);
+    }
+}
+"""
+
+# One function, and the mutated line is in the middle of a method chain, so a
+# `panic!` statement cannot be prepended to it and the probe does not compile.
+# The offset is asserted on, which kills the whole-body swap; the predicate is
+# not, so the token swap survives with its reachability unmeasured.
+CRATE_UNPROBEABLE = """pub fn count_matches(v: &[usize], a: usize) -> usize {
+    99 + v
+        .iter()
+        .filter(|x| **x == a)
+        .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_offset_is_asserted_on_but_the_predicate_is_not() {
+        assert_eq!(count_matches(&[], 1), 99);
+    }
+}
+"""
+
+
+@case("END TO END: a token swap is generated, run, and tiered by its own probe")
+def _() -> None:
+    # `op_token_swap` could be deleted outright with this file green, because no
+    # case generated one.  Four of the gate's ten operators had no coverage at
+    # all, and the one that mattered most was the probe those operators now take.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        build_fixture_crate(root, CRATE_TOKEN_SWAP)
+        code, listing = run_gate(root, "--quiet", "--list-only")
+        check("list-only exits 0", code == 0, listing[-2000:])
+        check(
+            "one CMP_FLIP candidate per function",
+            listing.count("[CMP_FLIP]") == 3,
+            listing,
+        )
+        code, out = run_gate(root, "--quiet")
+        check("exit 1", code == 1, f"exit {code}\n{out[-3000:]}")
+        check(
+            "the swap in the asserted-on function is killed",
+            tier_of_operator(out, "compared_and_checked", "CMP_FLIP") == "KILLED",
+            out[-3000:],
+        )
+        check(
+            "the swap the tests execute and do not check is UNPINNED",
+            tier_of_operator(out, "compared_but_unchecked", "CMP_FLIP") == "UNPINNED",
+            out[-3000:],
+        )
+        check(
+            "the swap in the uncalled function is UNREACHED",
+            tier_of_operator(out, "compared_never_called", "CMP_FLIP") == "UNREACHED",
+            out[-3000:],
+        )
+
+
+@case("END TO END: the report prints the probe's answer beside every survivor")
+def _() -> None:
+    # Without this a reader cannot tell a measured survivor from an unmeasured
+    # one, and two operators landing on one line under opposite verdicts both
+    # read as authoritative.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        build_fixture_crate(root, CRATE_TOKEN_SWAP)
+        code, out = run_gate(root, "--quiet")
+        check("a survivor the tests reach says so", "reached by a test: yes" in out, out[-3000:])
+        check("a survivor they do not reach says so", "reached by a test: no" in out, out[-3000:])
+        survivors = [ln for ln in out.splitlines() if ln.strip().startswith("key:")]
+        answers = [ln for ln in out.splitlines() if "reached by a test:" in ln]
+        check(
+            "one answer printed per survivor",
+            len(answers) == len(survivors) == 4,
+            (len(answers), len(survivors)),
+        )
+
+
+@case("END TO END: a survivor whose probe cannot compile is UNPROBED, never UNPINNED")
+def _() -> None:
+    # The refusal this tier exists for: `report()` used to send anything that was
+    # not "no" into the blocking tier, so a survivor nothing had measured printed
+    # under a header reading "the tests run this line and none of them noticed".
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        build_fixture_crate(root, CRATE_UNPROBEABLE)
+        code, out = run_gate(root, "--quiet")
+        check(
+            "reported UNPROBED",
+            tier_of_operator(out, "count_matches", "CMP_FLIP") == "UNPROBED",
+            out[-3000:],
+        )
+        check("the reason is printed", "not in statement position" in out, out[-2000:])
+        check("an unmeasured survivor does not fail the job", code == 0, f"exit {code}\n{out[-3000:]}")
+        code, out = run_gate(root, "--quiet", "--strict")
+        check("--strict fails on it", code == 1, f"exit {code}\n{out[-2000:]}")
+        check(
+            "and --strict says which count it failed on",
+            "reachability was not measured" in out,
+            out[-1000:],
+        )
+
+
+@case("a diff that only DELETES lines says so instead of reading as a clean sweep")
+def _() -> None:
+    # `changed_lines` cannot represent a removed line, so a branch whose whole
+    # change is deleting a guard produces no candidates.  Before this the run
+    # printed "nothing to mutate" and exited 0, which is the same output as a
+    # diff with nothing wrong in it.
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "selftest",
+        "GIT_AUTHOR_EMAIL": "selftest@example.invalid",
+        "GIT_COMMITTER_NAME": "selftest",
+        "GIT_COMMITTER_EMAIL": "selftest@example.invalid",
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "src").mkdir()
+        (root / "src" / "x.rs").write_text(
+            "fn f(a: u8) -> u8 {\n    if a > 0 {\n        return 1;\n    }\n    0\n}\n"
+        )
+        for argv in (["init", "-q"], ["add", "-A"], ["commit", "-qm", "base"]):
+            subprocess.run(["git", *argv], cwd=root, check=True, env=env, capture_output=True)
+        # Take the guard away and change nothing else.
+        (root / "src" / "x.rs").write_text("fn f(a: u8) -> u8 {\n    0\n}\n")
+
+        check("the removal is what git sees", mc.deleted_line_count(root, "HEAD", None) == 3)
+        check("and nothing was added to mutate", mc.changed_lines(root, "HEAD", None) == {})
+        code, out = run_gate(root, "--quiet")
+        check("still exits 0", code == 0, f"exit {code}\n{out[-1500:]}")
+        check("but the report names the hole", "DELETED 3 line(s)" in out, out[-1500:])
+        check("and says what covers it instead", "Code review" in out, out[-1500:])
 
 
 @case("END TO END: a survivor no test executes is separated out, not listed beside it")
