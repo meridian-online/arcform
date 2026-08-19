@@ -10,7 +10,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-use crate::asset_kind::{AssetKind, default_kind_for_declared_name};
+use crate::asset_kind::{
+    AssetKind, default_kind_for_declared_name, default_kind_for_declared_produces,
+};
 use crate::error::{Error, Result};
 use crate::introspect;
 use crate::manifest::Manifest;
@@ -225,14 +227,16 @@ impl AssetGraph {
                 }
             }
 
-            // Phase 2: Explicit declarations (primarily for command steps).
+            // Phase 2: Explicit declarations (primarily for command steps). The
+            // produces side and the depends_on side get different defaults, for the
+            // reason set out on `default_kind_for_declared_produces`.
             for asset in &step.produces {
                 StepAssets::record(
                     &mut step_assets.produces,
                     &mut step_assets.declared_case,
                     &mut step_assets.declared_kind,
                     asset,
-                    default_kind_for_declared_name(asset),
+                    default_kind_for_declared_produces(asset),
                 );
             }
             for asset in &step.depends_on {
@@ -257,7 +261,7 @@ impl AssetGraph {
                     &mut step_assets.declared_case,
                     &mut step_assets.declared_kind,
                     asset_name,
-                    default_kind_for_declared_name(asset_name),
+                    default_kind_for_declared_produces(asset_name),
                 );
 
                 // Add override dependencies as reads for the producing step.
