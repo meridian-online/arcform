@@ -27,6 +27,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::asset::AssetGraph;
+use crate::asset_kind::{AssetKind, default_kind_for_declared_name};
 use crate::ingress_meta::FetchMeta;
 use crate::manifest::{Manifest, Param, Step};
 
@@ -97,11 +98,14 @@ pub struct ParamEntry {
 pub struct AssetEntry {
     /// Dotted id, e.g. `"table:customers"` / `"file:build/out.parquet"`.
     pub id: String,
-    /// `"table"`, `"source"` (read but never produced here), or `"file"`.
+    /// `"table"`, `"source"` (read but never produced here), `"file"`, or
+    /// `"directory"` (a produced tree — a `COPY … PARTITION_BY` target, or a
+    /// pattern-only `archive_extract` destination).
     pub kind: String,
     pub name: String,
-    /// Filesystem path for a `file` asset (relative to the protocol dir); `null` for
-    /// relational (`table`/`source`) assets, whose `name` is the relation.
+    /// Filesystem path for a `file`/`directory` asset (relative to the protocol
+    /// dir); `null` for relational (`table`/`source`) assets, whose `name` is the
+    /// relation.
     pub path: Option<String>,
     /// Measured byte size: on-disk length for `file` assets, DuckDB `estimated_size` for
     /// relational assets. `null` when the artifact can't be measured (missing/unqueryable).
@@ -393,24 +397,64 @@ fn build_assets(
         .map(|name| {
             let produced_by = producer.get(name).cloned();
             let consumed_by = consumers.get(name).cloned().unwrap_or_default();
-            let kind = if looks_like_file(name) {
-                "file"
-            } else if produced_by.is_none() {
-                "source"
-            } else {
-                "table"
+            // The kind carried from wherever this asset was declared — the producing
+            // step's own `declared_kind` when there is a producer (the step that
+            // wrote it knows best what it wrote), else any step that reads it (an
+            // external input still had its kind set at the point SQL introspection
+            // or an operator's config declared it), else a name-based guess for the
+            // one case nothing in the graph can answer (an asset referenced only via
+            // `assets:` with no matching producer or reader — a manifest defect the
+            // load-time warning already reports separately).
+            let asset_kind = producer
+                .get(name)
+                .and_then(|step_name| graph.steps.get(step_name))
+                .and_then(|sa| sa.declared_kind.get(name))
+                .copied()
+                .or_else(|| {
+                    consumers.get(name).and_then(|readers| {
+                        readers.iter().find_map(|step_name| {
+                            graph
+                                .steps
+                                .get(step_name)
+                                .and_then(|sa| sa.declared_kind.get(name))
+                                .copied()
+                        })
+                    })
+                })
+                .unwrap_or_else(|| default_kind_for_declared_name(name));
+            let kind = match asset_kind {
+                AssetKind::File => "file",
+                AssetKind::Directory => "directory",
+                // A pattern is never one relation either, but nothing in this
+                // report distinguishes it from a table with no producer today —
+                // both are unmeasurable through the engine and land as "source".
+                AssetKind::Pattern | AssetKind::Table => {
+                    if produced_by.is_none() {
+                        "source"
+                    } else {
+                        "table"
+                    }
+                }
             };
-            // Measure the asset net-new. Files are measured on disk; relational assets
-            // (table/source) are measured through the engine.
-            let (path, bytes, row_count, content_hash) = if kind == "file" {
-                let full = dir.join(name);
-                let (bytes, content_hash) = measure_file(&full);
-                (Some(name.clone()), bytes, None, content_hash)
-            } else {
-                let (bytes, content_hash) =
-                    conn.map(|c| measure_table(c, name)).unwrap_or((None, None));
-                let row_count = conn.and_then(|c| table_row_count(c, name));
-                (None, bytes, row_count, content_hash)
+            // Measure the asset net-new. Files and directories are measured on disk;
+            // relational assets (table/source) are measured through the engine.
+            let (path, bytes, row_count, content_hash) = match kind {
+                "file" => {
+                    let full = dir.join(name);
+                    let (bytes, content_hash) = measure_file(&full);
+                    (Some(name.clone()), bytes, None, content_hash)
+                }
+                "directory" => {
+                    let full = dir.join(name);
+                    let (bytes, content_hash) = measure_directory(&full);
+                    (Some(name.clone()), bytes, None, content_hash)
+                }
+                _ => {
+                    let (bytes, content_hash) =
+                        conn.map(|c| measure_table(c, name)).unwrap_or((None, None));
+                    let row_count = conn.and_then(|c| table_row_count(c, name));
+                    (None, bytes, row_count, content_hash)
+                }
             };
             AssetEntry {
                 id: format!("{kind}:{name}"),
@@ -443,6 +487,41 @@ fn measure_file(full: &Path) -> (Option<u64>, Option<String>) {
                 .map(|b| crate::state::content_hash(&b))
         });
     (bytes, content_hash)
+}
+
+/// On-disk measure for a `directory` asset: total byte length of every regular file
+/// in the tree, plus [`crate::state::hash_directory_contents`] — the same hash
+/// `produced_artifact_hash` uses for staleness, so a report and a staleness
+/// decision can never quietly disagree about what a directory asset's content
+/// identity is. No `.arcmeta` sidecar reuse here (unlike `measure_file`): a sidecar
+/// is written per-file by the fetch operators, and a directory asset is a tree of
+/// files, not one fetched artifact.
+fn measure_directory(full: &Path) -> (Option<u64>, Option<String>) {
+    let bytes = walk_file_sizes(full);
+    let content_hash = crate::state::hash_directory_contents(full);
+    (bytes, content_hash)
+}
+
+/// Sum of every regular file's byte length under `dir`, recursively. `None` when
+/// the directory cannot be read at all (missing, permission-denied) — mirrors
+/// `hash_directory_contents`'s own unreadable signal, so `bytes` and `content_hash`
+/// go missing together rather than one reporting a stale partial answer.
+fn walk_file_sizes(dir: &Path) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let read_dir = std::fs::read_dir(&current).ok()?;
+        for entry in read_dir {
+            let entry = entry.ok()?;
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if file_type.is_file() {
+                total += entry.metadata().ok()?.len();
+            }
+        }
+    }
+    Some(total)
 }
 
 /// Engine-side measure for a relational asset: DuckDB `estimated_size` bytes + a
@@ -723,18 +802,6 @@ fn redact_json(value: &mut serde_json::Value) {
     }
 }
 
-/// Whether an asset name denotes a file (path-shaped) rather than a table identifier.
-fn looks_like_file(name: &str) -> bool {
-    if name.contains('/') {
-        return true;
-    }
-    const EXTS: [&str; 13] = [
-        ".parquet", ".csv", ".tsv", ".json", ".ndjson", ".jsonl", ".txt", ".zip", ".gz", ".arrow",
-        ".xlsx", ".db", ".duckdb",
-    ];
-    EXTS.iter().any(|ext| name.ends_with(ext))
-}
-
 /// Whether `name` is a bare SQL identifier safe to interpolate into a count query.
 fn is_simple_ident(name: &str) -> bool {
     let mut chars = name.chars();
@@ -797,13 +864,62 @@ fn days_to_date(days: u64) -> (u64, u64, u64) {
 mod tests {
     use super::*;
 
+    // `build_assets` classifies by `declared_kind` (carried from the SQL/operator
+    // declaration), never by inspecting the name's shape — a File-kind produces
+    // entry with no recognized extension, a Directory-kind entry with no operator
+    // ever consulting its extension, a Table with a producer, and a Table with no
+    // producer (an external "source") each land correctly. This replaced
+    // `looks_like_file`'s standalone string tests once that function was removed —
+    // the classification now only exists as part of the graph it is carried
+    // through, so it is tested the same way.
     #[test]
-    fn looks_like_file_detects_paths_and_extensions() {
-        assert!(looks_like_file("build/out.parquet"));
-        assert!(looks_like_file("data.csv"));
-        assert!(looks_like_file("sources/raw.tsv"));
-        assert!(!looks_like_file("customers"));
-        assert!(!looks_like_file("edgar_gleif"));
+    fn build_assets_classifies_by_declared_kind_not_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("models")).unwrap();
+        std::fs::write(
+            dir.path().join("models/load.sql"),
+            "CREATE TABLE registry AS SELECT 1;",
+        )
+        .unwrap();
+
+        let yaml = "name: test
+steps:
+  - name: load
+    sql: models/load.sql
+  - name: export
+    op: parquet_export
+    with:
+      input: customers
+      dest: build/out.avro
+  - name: extract
+    op: archive_extract
+    with:
+      archive: build/in.zip
+      pattern: '\\.tsv$'
+      dest: build/out
+";
+        let manifest = Manifest::from_yaml_str(yaml).unwrap();
+        let graph = AssetGraph::build(&manifest, dir.path());
+        let assets = build_assets(&manifest, dir.path(), &graph, None);
+        let by_name: BTreeMap<&str, &AssetEntry> =
+            assets.iter().map(|a| (a.name.as_str(), a)).collect();
+
+        // A Table this manifest produces.
+        assert_eq!(by_name["registry"].kind, "table");
+        assert_eq!(by_name["registry"].produced_by.as_deref(), Some("load"));
+        // A Table nothing in this manifest produces — an external source.
+        assert_eq!(by_name["customers"].kind, "source");
+        assert!(by_name["customers"].produced_by.is_none());
+        // A File produced under an extension no allowlist would recognize —
+        // `parquet_export`'s `dest:` carries File from its own typed config, not
+        // from `.avro` being on a list.
+        assert_eq!(by_name["build/out.avro"].kind, "file");
+        // A File read with no producer in this graph at all.
+        assert_eq!(by_name["build/in.zip"].kind, "file");
+        // A Directory — `archive_extract`'s pattern-only `dest:` — never mistaken
+        // for a file because it happens to have no extension or because nothing
+        // stats the filesystem to check.
+        assert_eq!(by_name["build/out"].kind, "directory");
     }
 
     #[test]

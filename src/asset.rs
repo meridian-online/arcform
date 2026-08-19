@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
+use crate::asset_kind::{AssetKind, default_kind_for_declared_name};
 use crate::error::{Error, Result};
 use crate::introspect;
 use crate::manifest::Manifest;
@@ -17,14 +18,74 @@ use crate::manifest::Manifest;
 /// The assets associated with a single step.
 #[derive(Debug, Clone, Default)]
 pub struct StepAssets {
-    /// Asset names this step produces (creates/writes/modifies).
+    /// Asset names this step produces (creates/writes/modifies) — lowercased. A
+    /// DuckDB table identifier is case-insensitive, so two spellings of the same
+    /// table have to land on one graph node; this is the identity every other
+    /// consumer (propagation, `all_produced`, the printed graph) matches on.
     pub produces: BTreeSet<String>,
-    /// Asset names this step reads data from (external dependencies).
+    /// Asset names this step reads data from (external dependencies) — lowercased,
+    /// same reasoning as `produces`.
     pub reads: BTreeSet<String>,
     /// CTE names — step-internal assets visible in lineage but not cross-step dependencies.
     pub internal: BTreeSet<String>,
     /// Asset names this step destroys (DROP operations).
     pub destroys: BTreeSet<String>,
+    /// For every lowercased name in `produces` or `reads`, every RAW (case-preserved,
+    /// exactly as declared) spelling that lowercased to it — almost always exactly
+    /// one. More than one means two declarations collapsed onto the same graph node
+    /// purely by case, which `AssetGraph::validate_no_case_collisions` refuses at
+    /// load for BOTH `produces:` and `depends_on:`. That gate is what a manifest
+    /// author sees; it does not make this field a singleton by construction — a
+    /// caller reaching this map without having gone through `AssetGraph::build` plus
+    /// that validation (or a future insertion site the gate does not yet cover) can
+    /// still see 2+ entries here, so `produced_artifact_hash` treats that count, not
+    /// this doc comment, as the source of truth and refuses to pick one by iteration
+    /// order. This is what `produced_artifact_hash` reads bytes from — the lowercased
+    /// name is graph identity, never a filesystem path; no amount of scanning a
+    /// directory recovers a real file's case once this is thrown away, so it has to
+    /// be carried, not reconstructed.
+    pub declared_case: BTreeMap<String, BTreeSet<String>>,
+    /// For every lowercased name in `produces` or `reads`, what it actually is —
+    /// carried from wherever it was declared (SQL introspection already knows a
+    /// `COPY … PARTITION_BY` target is a directory; an operator's typed config
+    /// already knows `dest:` is a file; only `produces:`/`depends_on:`/`assets:`
+    /// entries with no operator or parser to consult fall back to a guess). Never
+    /// reconstructed later from the string or the filesystem — this is what
+    /// `produced_artifact_hash` reads to decide HOW to hash a produced asset, not
+    /// WHETHER to hash it at all.
+    pub declared_kind: BTreeMap<String, AssetKind>,
+}
+
+impl StepAssets {
+    /// Insert `raw` (a name exactly as declared — a SQL-introspected path, an
+    /// operator's config value, an explicit `produces:`/`depends_on:` entry, or an
+    /// `assets:` override) into `set`, lowercased for graph identity, while recording
+    /// `raw` itself in `declared_case` under that same lowercased key and `kind` in
+    /// `declared_kind` under the same key. The one path every insertion into
+    /// `produces`/`reads` goes through, so the three can never drift apart.
+    ///
+    /// `declared_kind` keeps the FIRST kind recorded for a given lowered name within
+    /// a step (`or_insert`, not overwrite): Phase 1 (SQL introspection) and Phase 1b
+    /// (operator config) carry real, source-derived kind; Phase 2/3's declaration
+    /// sites have no parser or operator to consult and fall back to a guess
+    /// (`default_kind_for_declared_name`). Running phases in that fixed order means
+    /// a later guess can never downgrade an earlier, better-informed answer for the
+    /// same step.
+    fn record(
+        set: &mut BTreeSet<String>,
+        declared_case: &mut BTreeMap<String, BTreeSet<String>>,
+        declared_kind: &mut BTreeMap<String, AssetKind>,
+        raw: &str,
+        kind: AssetKind,
+    ) {
+        let lowered = raw.to_lowercase();
+        declared_case
+            .entry(lowered.clone())
+            .or_default()
+            .insert(raw.to_string());
+        declared_kind.entry(lowered.clone()).or_insert(kind);
+        set.insert(lowered);
+    }
 }
 
 /// The complete asset graph for a pipeline.
@@ -56,14 +117,44 @@ impl AssetGraph {
         for step in &manifest.steps {
             let mut step_assets = StepAssets::default();
 
-            // Phase 1: SQL introspection.
+            // Phase 1: SQL introspection. Already case-preserved — a path embedded
+            // in SQL text (e.g. `read_csv('build/ncen/2026q2/REGISTRANT.tsv')`) is
+            // captured verbatim by the parser, never lowercased here, so its graph
+            // node IS its real on-disk spelling; `record` still runs so
+            // `declared_case` holds a uniform entry regardless of provenance.
             if let Some(ref sql_path) = step.sql {
                 let full_path = manifest_dir.join(sql_path);
                 match std::fs::read_to_string(&full_path) {
                     Ok(sql_content) => match introspect::extract_assets(&sql_content) {
                         Ok(sql_assets) => {
-                            step_assets.produces.extend(sql_assets.outputs);
-                            step_assets.reads.extend(sql_assets.inputs);
+                            for asset in &sql_assets.outputs {
+                                let kind = sql_assets
+                                    .kinds
+                                    .get(asset)
+                                    .copied()
+                                    .unwrap_or(AssetKind::Table);
+                                StepAssets::record(
+                                    &mut step_assets.produces,
+                                    &mut step_assets.declared_case,
+                                    &mut step_assets.declared_kind,
+                                    asset,
+                                    kind,
+                                );
+                            }
+                            for asset in &sql_assets.inputs {
+                                let kind = sql_assets
+                                    .kinds
+                                    .get(asset)
+                                    .copied()
+                                    .unwrap_or(AssetKind::Table);
+                                StepAssets::record(
+                                    &mut step_assets.reads,
+                                    &mut step_assets.declared_case,
+                                    &mut step_assets.declared_kind,
+                                    asset,
+                                    kind,
+                                );
+                            }
                             step_assets.internal.extend(sql_assets.internal);
                             step_assets.destroys.extend(sql_assets.destroys);
                         }
@@ -94,11 +185,33 @@ impl AssetGraph {
             if let Some(ref op_ref) = step.op {
                 match crate::operator::assets_for(op_ref, step.with.as_ref()) {
                     Ok(op_assets) => {
-                        for asset in op_assets.produces {
-                            step_assets.produces.insert(asset.to_lowercase());
+                        for asset in &op_assets.produces {
+                            let kind = op_assets
+                                .kinds
+                                .get(asset)
+                                .copied()
+                                .unwrap_or_else(|| default_kind_for_declared_name(asset));
+                            StepAssets::record(
+                                &mut step_assets.produces,
+                                &mut step_assets.declared_case,
+                                &mut step_assets.declared_kind,
+                                asset,
+                                kind,
+                            );
                         }
-                        for asset in op_assets.reads {
-                            step_assets.reads.insert(asset.to_lowercase());
+                        for asset in &op_assets.reads {
+                            let kind = op_assets
+                                .kinds
+                                .get(asset)
+                                .copied()
+                                .unwrap_or_else(|| default_kind_for_declared_name(asset));
+                            StepAssets::record(
+                                &mut step_assets.reads,
+                                &mut step_assets.declared_case,
+                                &mut step_assets.declared_kind,
+                                asset,
+                                kind,
+                            );
                         }
                     }
                     Err(e) => {
@@ -112,12 +225,27 @@ impl AssetGraph {
                 }
             }
 
-            // Phase 2: Explicit declarations (primarily for command steps).
+            // Phase 2: Explicit declarations (primarily for command steps). Both
+            // sides take the same default — see `default_kind_for_declared_name`
+            // for what a separator-free `produces:` token costs and why that cost
+            // is the one taken.
             for asset in &step.produces {
-                step_assets.produces.insert(asset.to_lowercase());
+                StepAssets::record(
+                    &mut step_assets.produces,
+                    &mut step_assets.declared_case,
+                    &mut step_assets.declared_kind,
+                    asset,
+                    default_kind_for_declared_name(asset),
+                );
             }
             for asset in &step.depends_on {
-                step_assets.reads.insert(asset.to_lowercase());
+                StepAssets::record(
+                    &mut step_assets.reads,
+                    &mut step_assets.declared_case,
+                    &mut step_assets.declared_kind,
+                    asset,
+                    default_kind_for_declared_name(asset),
+                );
             }
 
             graph.steps.insert(step.name.clone(), step_assets);
@@ -125,14 +253,25 @@ impl AssetGraph {
 
         // Phase 3: Apply overrides from the top-level assets: section.
         for (asset_name, override_entry) in &manifest.assets {
-            let name = asset_name.to_lowercase();
             if let Some(step_assets) = graph.steps.get_mut(&override_entry.produced_by) {
                 // Override: ensure this step produces the asset.
-                step_assets.produces.insert(name.clone());
+                StepAssets::record(
+                    &mut step_assets.produces,
+                    &mut step_assets.declared_case,
+                    &mut step_assets.declared_kind,
+                    asset_name,
+                    default_kind_for_declared_name(asset_name),
+                );
 
                 // Add override dependencies as reads for the producing step.
                 for dep in &override_entry.depends_on {
-                    step_assets.reads.insert(dep.to_lowercase());
+                    StepAssets::record(
+                        &mut step_assets.reads,
+                        &mut step_assets.declared_case,
+                        &mut step_assets.declared_kind,
+                        dep,
+                        default_kind_for_declared_name(dep),
+                    );
                 }
             } else {
                 graph.warnings.push(format!(
@@ -143,6 +282,114 @@ impl AssetGraph {
         }
 
         graph
+    }
+
+    /// Refuse a manifest where two declarations collapse onto the same graph node
+    /// purely because they differ only by case, **and there is no single producer to
+    /// arbitrate between them**. `asset.rs`'s lowercasing is what makes that collapse
+    /// happen at all (needed so a case-insensitive DuckDB table lands on one node).
+    ///
+    /// **Exempt: a step's `produces:` and another step's `depends_on:` naming the
+    /// same asset with different case.** That is the ordinary shape of a
+    /// producer→consumer edge, not a collision — the real edgar_gleif manifest has
+    /// exactly this, eight times over (`archive_extract` preserves `REGISTRANT.tsv`'s
+    /// real case in each quarter's `produces:`; `load`'s hand-written `depends_on:`
+    /// spells all eight lowercase), and refusing it would make the gate reject the
+    /// flagship manifest it exists to protect. The exemption is keyed on the ASSET,
+    /// not the step: any number of readers, in any steps, may spell it however they
+    /// like as long as exactly one producer spelling exists, because
+    /// `produced_artifact_hash` never consults a reader's own spelling for an asset
+    /// something else produces in the first place (`all_produced` filters it out
+    /// before `declared_case` is ever reached for it; propagation carries the
+    /// staleness instead) — so a reader's case variance was never going to be read
+    /// from disk under its own name regardless of what this gate decided.
+    ///
+    /// **Refused: two or more DISTINCT producer spellings** (`build/Report.csv` and
+    /// `build/report.csv` each declared as `produces:` — probe2's shape) — **or two
+    /// or more distinct spellings with no producer at all** (two `depends_on:`
+    /// entries and nothing that creates either file — an external input's declared
+    /// case is the only identity it has, so disagreement there is exactly as real as
+    /// disagreement between producers). This is a manifest defect independent of
+    /// anything happening on disk, caught here at load rather than left for a
+    /// staleness check to discover only once both files are already written.
+    ///
+    /// It is a complement to, not a replacement for, `produced_artifact_hash`'s own
+    /// read-time refusal to pick a raw spelling by iteration order — that refusal is
+    /// the backstop for a `declared_case` entry this gate did not (or could not yet)
+    /// inspect; it is not covering a *different kind* of collision. Nothing here
+    /// inspects the filesystem, so a coincidental, undeclared file sharing a
+    /// case-folded name with something real is not this gate's concern — no
+    /// declaration collides with it, and `produced_artifact_hash` never looks it up
+    /// at all.
+    pub fn validate_no_case_collisions(&self) -> Result<()> {
+        // (kind, step, raw), grouped by lowered name — kind labels the error with the
+        // manifest key a reader would actually go fix, since a `produces:` and a
+        // `depends_on:` entry can collide with each other, not just with their own kind.
+        let mut by_lowered: BTreeMap<&str, BTreeSet<(&str, &str, &str)>> = BTreeMap::new();
+        for (step_name, assets) in &self.steps {
+            for (kind, names) in [
+                ("produces:", &assets.produces),
+                ("depends_on:", &assets.reads),
+            ] {
+                for lowered in names {
+                    let Some(raws) = assets.declared_case.get(lowered) else {
+                        continue;
+                    };
+                    for raw in raws {
+                        by_lowered.entry(lowered.as_str()).or_default().insert((
+                            kind,
+                            step_name.as_str(),
+                            raw.as_str(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        for (lowered, entries) in &by_lowered {
+            // A SINGLE producer spelling makes any number of differently-cased
+            // READERS harmless, regardless of which step reads them — this is not a
+            // narrower "same step" exemption, because the shape it exists for is
+            // cross-step: the real edgar_gleif manifest has `archive_extract`
+            // preserve `REGISTRANT.tsv`'s real case in `extract_ncen_2025q3`'s
+            // `produces:`, while `load`'s hand-written `depends_on:` spells the same
+            // file lowercase eight times over (four quarters × two members). That is
+            // one asset referenced twice, not two assets colliding — and
+            // `produced_artifact_hash` already treats it that way structurally: a
+            // reader's own `reads` entry for an asset something else produces is
+            // filtered out by `all_produced` before `declared_case` is ever
+            // consulted for it (propagation carries the staleness instead), so the
+            // reader's spelling was never going to be read from disk under its own
+            // name regardless of what this gate decided.
+            let produces_raw: BTreeSet<&str> = entries
+                .iter()
+                .filter(|(kind, _, _)| *kind == "produces:")
+                .map(|(_, _, raw)| *raw)
+                .collect();
+            if produces_raw.len() == 1 {
+                continue;
+            }
+
+            // Otherwise: two or more PRODUCER spellings disagree (the genuine
+            // collision this gate exists for), or nothing produces this asset at all
+            // and two or more READERS disagree with no producer to arbitrate between
+            // them — an external input's own case is then the only identity it has,
+            // so ambiguity there is exactly as real as ambiguity between producers.
+            let distinct_raw: BTreeSet<&str> = entries.iter().map(|(_, _, raw)| *raw).collect();
+            if distinct_raw.len() > 1 {
+                let detail: Vec<String> = entries
+                    .iter()
+                    .map(|(kind, step, raw)| format!("'{raw}' ({kind} step '{step}')"))
+                    .collect();
+                return Err(Error::ManifestValidation(format!(
+                    "case collision — {} all collapse to the same asset '{}' by case alone; rename one so the spellings are genuinely distinct, or declare it once",
+                    detail.join(", "),
+                    lowered
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     /// Validate that the declared step order is consistent with the
@@ -319,6 +566,23 @@ mod tests {
         }
     }
 
+    /// Helper: create an `op:` step with a typed `with:` config.
+    fn op_step(name: &str, op_ref: &str, with: serde_yaml::Value) -> Step {
+        Step {
+            name: name.to_string(),
+            sql: None,
+            command: None,
+            produces: vec![],
+            depends_on: vec![],
+            preconditions: vec![],
+            op: Some(op_ref.to_string()),
+            with: Some(with),
+            output: None,
+            retry: None,
+            timeout_sec: None,
+        }
+    }
+
     /// Helper: set up a project directory with SQL files and build the graph.
     fn build_graph(
         dir: &Path,
@@ -368,6 +632,80 @@ mod tests {
         let step = graph.steps.get("load").unwrap();
         assert!(step.produces.contains("customers"));
         assert!(graph.warnings.is_empty());
+        // A bare CREATE TABLE target carries Table, not guessed from the name later.
+        assert_eq!(step.declared_kind.get("customers"), Some(&AssetKind::Table));
+    }
+
+    // SQL introspection's kind survives into `declared_kind` end to end — a
+    // `COPY … PARTITION_BY` target is a directory by the time it reaches the graph,
+    // not by the time something later stats the filesystem.
+    #[test]
+    fn test_sql_copy_partition_by_kind_reaches_declared_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = build_graph(
+            dir.path(),
+            vec![sql_step("export", "models/export.sql")],
+            HashMap::new(),
+            &[(
+                "models/export.sql",
+                "COPY orders TO 'build/orders' (FORMAT parquet, PARTITION_BY (year));",
+            )],
+        );
+
+        let step = graph.steps.get("export").unwrap();
+        assert!(step.produces.contains("build/orders"));
+        assert_eq!(
+            step.declared_kind.get("build/orders"),
+            Some(&AssetKind::Directory)
+        );
+    }
+
+    // An operator's typed config carries kind into the graph exactly as SQL
+    // introspection does — `archive_extract`'s pattern-only `dest:` lands as a
+    // Directory, not guessed later from whether the path has a `/` in it.
+    #[test]
+    fn test_op_declared_kind_reaches_declared_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let with: serde_yaml::Value =
+            serde_yaml::from_str("archive: build/in.zip\npattern: '\\.tsv$'\ndest: build/out")
+                .unwrap();
+        let graph = build_graph(
+            dir.path(),
+            vec![op_step("extract", "archive_extract", with)],
+            HashMap::new(),
+            &[],
+        );
+
+        let step = graph.steps.get("extract").unwrap();
+        assert!(step.produces.contains("build/out"));
+        assert_eq!(
+            step.declared_kind.get("build/out"),
+            Some(&AssetKind::Directory)
+        );
+        assert_eq!(
+            step.declared_kind.get("build/in.zip"),
+            Some(&AssetKind::File)
+        );
+    }
+
+    // An explicit `produces:` entry with no operator or parser to consult falls
+    // back to `default_kind_for_declared_name`: File, unless it's a glob.
+    #[test]
+    fn test_explicit_produces_falls_back_to_default_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut step = cmd_step("build", "make build");
+        step.produces = vec!["build/out.bin".to_string(), "build/*.tmp".to_string()];
+        let graph = build_graph(dir.path(), vec![step], HashMap::new(), &[]);
+
+        let sa = graph.steps.get("build").unwrap();
+        assert_eq!(
+            sa.declared_kind.get("build/out.bin"),
+            Some(&AssetKind::File)
+        );
+        assert_eq!(
+            sa.declared_kind.get("build/*.tmp"),
+            Some(&AssetKind::Pattern)
+        );
     }
 
     // SQL steps auto-discover consumed assets.
@@ -773,5 +1111,207 @@ mod tests {
         // this should NOT trigger a violation even though step-A creates a table named 'recent'.
         let order: Vec<String> = vec!["step-b".into(), "step-a".into()];
         graph.validate_order(&order).unwrap();
+    }
+
+    // Round 6, ground 1's second requirement: no test anywhere in this repo loaded a
+    // real shipping manifest through the case-collision gate before this one, which
+    // is exactly why the gate could refuse one (the real edgar_gleif manifest — see
+    // `validate_no_case_collisions`'s doc for the eight-collision shape it used to
+    // trip) and nothing here would have gone red. Byte-identical copies of all four
+    // manifests `open-analytics` ships, vendored under `tests/fixtures/
+    // open_analytics/` (both repos are public) so this is self-contained on CI, which
+    // checks out only this repo. A future manifest edit — or a future narrowing of
+    // this gate — that starts refusing a shape one of these four actually uses
+    // reddens here.
+    #[test]
+    fn all_open_analytics_manifests_load_and_pass_the_case_collision_gate() {
+        // (dataset name, arcform.yaml content, [(relative sql path, sql content)])
+        type Fixture<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+        let fixtures: &[Fixture] = &[
+            (
+                "gleif",
+                include_str!("../tests/fixtures/open_analytics/gleif/arcform.yaml"),
+                &[
+                    (
+                        "models/load.sql",
+                        include_str!("../tests/fixtures/open_analytics/gleif/models/load.sql"),
+                    ),
+                    (
+                        "models/package.sql",
+                        include_str!("../tests/fixtures/open_analytics/gleif/models/package.sql"),
+                    ),
+                ],
+            ),
+            (
+                "naics",
+                include_str!("../tests/fixtures/open_analytics/naics/arcform.yaml"),
+                &[
+                    (
+                        "models/load.sql",
+                        include_str!("../tests/fixtures/open_analytics/naics/models/load.sql"),
+                    ),
+                    (
+                        "models/package.sql",
+                        include_str!("../tests/fixtures/open_analytics/naics/models/package.sql"),
+                    ),
+                ],
+            ),
+            (
+                "edgar",
+                include_str!("../tests/fixtures/open_analytics/edgar/arcform.yaml"),
+                &[
+                    (
+                        "models/load.sql",
+                        include_str!("../tests/fixtures/open_analytics/edgar/models/load.sql"),
+                    ),
+                    (
+                        "models/package.sql",
+                        include_str!("../tests/fixtures/open_analytics/edgar/models/package.sql"),
+                    ),
+                ],
+            ),
+            (
+                "edgar_gleif",
+                include_str!("../tests/fixtures/open_analytics/edgar_gleif/arcform.yaml"),
+                &[
+                    (
+                        "models/sec_entities.sql",
+                        include_str!(
+                            "../tests/fixtures/open_analytics/edgar_gleif/models/sec_entities.sql"
+                        ),
+                    ),
+                    (
+                        "models/load.sql",
+                        include_str!(
+                            "../tests/fixtures/open_analytics/edgar_gleif/models/load.sql"
+                        ),
+                    ),
+                    (
+                        "models/tier.sql",
+                        include_str!(
+                            "../tests/fixtures/open_analytics/edgar_gleif/models/tier.sql"
+                        ),
+                    ),
+                    (
+                        "models/package.sql",
+                        include_str!(
+                            "../tests/fixtures/open_analytics/edgar_gleif/models/package.sql"
+                        ),
+                    ),
+                ],
+            ),
+        ];
+
+        for (name, yaml, sql_files) in fixtures {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("arcform.yaml"), yaml).unwrap();
+            for (path, content) in *sql_files {
+                let full = dir.path().join(path);
+                fs::create_dir_all(full.parent().unwrap()).unwrap();
+                fs::write(full, content).unwrap();
+            }
+
+            let manifest = Manifest::load(dir.path())
+                .unwrap_or_else(|e| panic!("{name}: manifest failed to load: {e}"));
+            let graph = AssetGraph::build(&manifest, dir.path());
+            assert!(
+                graph.warnings.is_empty(),
+                "{name}: unexpected asset-graph warnings (a step likely became opaque \
+                 because a referenced SQL file did not vendor cleanly): {:?}",
+                graph.warnings
+            );
+            graph.validate_no_case_collisions().unwrap_or_else(|e| {
+                panic!("{name}: case-collision gate refused a real shipping manifest: {e}")
+            });
+        }
+    }
+
+    #[test]
+    fn all_open_analytics_manifests_have_not_drifted_from_their_vendored_checksums() {
+        let fixtures: &[(&str, &str, &str)] = &[
+            (
+                "gleif/arcform.yaml",
+                include_str!("../tests/fixtures/open_analytics/gleif/arcform.yaml"),
+                "b9560912b49511e0f5d113406acf8e298811200ee6f55536149cfd90dfbbdbeb",
+            ),
+            (
+                "gleif/models/load.sql",
+                include_str!("../tests/fixtures/open_analytics/gleif/models/load.sql"),
+                "2f454ada74311a92c430c0bc355d0db79ff8b62b3bd3af51b8b294757b4450a6",
+            ),
+            (
+                "gleif/models/package.sql",
+                include_str!("../tests/fixtures/open_analytics/gleif/models/package.sql"),
+                "359276a8bb87c39636ae74703815b00b28e7da2be506c9da1526379beabef4f4",
+            ),
+            (
+                "naics/arcform.yaml",
+                include_str!("../tests/fixtures/open_analytics/naics/arcform.yaml"),
+                "3a9a3c870ce7e485ecb0d6d94c80e16bb33bc71bfcbeabe78677b34f55caceba",
+            ),
+            (
+                "naics/models/load.sql",
+                include_str!("../tests/fixtures/open_analytics/naics/models/load.sql"),
+                "a1b258a5d58739d609a871b09eae6d341ba71ae8a40fc370e7df6db7805d6019",
+            ),
+            (
+                "naics/models/package.sql",
+                include_str!("../tests/fixtures/open_analytics/naics/models/package.sql"),
+                "24181e6342dcd3c571756faad6245953dc3bf47fa644735f981267f480ab987e",
+            ),
+            (
+                "edgar/arcform.yaml",
+                include_str!("../tests/fixtures/open_analytics/edgar/arcform.yaml"),
+                "3dc51d55313c71df8562808eede1bbc65556b1c88be4a9159f050d02a6411439",
+            ),
+            (
+                "edgar/models/load.sql",
+                include_str!("../tests/fixtures/open_analytics/edgar/models/load.sql"),
+                "f472f769efb93e815020eb4062f283bb3aaf2f1680d4493c29ff1885f8999fe7",
+            ),
+            (
+                "edgar/models/package.sql",
+                include_str!("../tests/fixtures/open_analytics/edgar/models/package.sql"),
+                "b5fff7c311ac52e5c74d4602ae230af79c37f15f7d1e6925efac143070069975",
+            ),
+            (
+                "edgar_gleif/arcform.yaml",
+                include_str!("../tests/fixtures/open_analytics/edgar_gleif/arcform.yaml"),
+                "934e691a91868aad6ced19a66dd66b868fec7cd9759fc51c437f7adde5614c00",
+            ),
+            (
+                "edgar_gleif/models/sec_entities.sql",
+                include_str!(
+                    "../tests/fixtures/open_analytics/edgar_gleif/models/sec_entities.sql"
+                ),
+                "296223049072b164383aa6aa8278b1adfb98cb3ac63b178eaf9a5b4fe1f39efe",
+            ),
+            (
+                "edgar_gleif/models/load.sql",
+                include_str!("../tests/fixtures/open_analytics/edgar_gleif/models/load.sql"),
+                "f7a7281129a753919c64d443dafd95140e98fa34fe2f297b5c090b451ccf1240",
+            ),
+            (
+                "edgar_gleif/models/tier.sql",
+                include_str!("../tests/fixtures/open_analytics/edgar_gleif/models/tier.sql"),
+                "155534dbe397777c58caef91992dc6aeb0d244d56a37bab9bdea907010db7dda",
+            ),
+            (
+                "edgar_gleif/models/package.sql",
+                include_str!("../tests/fixtures/open_analytics/edgar_gleif/models/package.sql"),
+                "1806cbe9d1a0af36376b98d599cc73b2fa5008e467a90ee0ea6df18d75143097",
+            ),
+        ];
+
+        for (path, content, expected_sha256) in fixtures {
+            let actual = crate::state::content_hash(content.as_bytes());
+            assert_eq!(
+                &actual, expected_sha256,
+                "{path}: vendored fixture content does not match its recorded SHA-256 — \
+                 either the copy was edited directly (revert it and re-sync from \
+                 open-analytics deliberately) or this assertion needs updating as part \
+                 of a documented re-sync (see SOURCE.md)"
+            );
+        }
     }
 }

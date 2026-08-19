@@ -165,6 +165,34 @@ pub enum Error {
     Io(#[from] std::io::Error),
 }
 
+impl Error {
+    /// The process exit code `cli_main` reports for this error — two buckets, not one:
+    ///
+    /// - **1, "cannot run"**: `arc` (or this step) never got to attempt the substantive
+    ///   work — a manifest that will not load or validate, a config or input that is
+    ///   missing or malformed, infrastructure (the state backend, the registry
+    ///   transport) that is unavailable. Nothing was tried; nothing to distinguish.
+    /// - **2, "found a problem"**: `arc` attempted the work, and the attempt itself is
+    ///   what failed — a step's command or SQL, a precondition check, a timeout. This
+    ///   is the bucket a step forced to re-run by a corrected staleness decision lands
+    ///   in if that re-run then fails for a real reason.
+    ///
+    /// Kept distinguishable on purpose: a mutation test on the staleness gate that
+    /// reverts the fix and finds the run still exits 1 either way would prove nothing —
+    /// see [`crate::runner`]'s `is_hash_stale`, the gate this distinction exists for.
+    pub(crate) fn exit_code(&self) -> i32 {
+        match self {
+            Error::StepFailed { .. }
+            | Error::StepExecution { .. }
+            | Error::Precondition { .. }
+            | Error::ToolPrecondition { .. }
+            | Error::StepTimeout { .. }
+            | Error::PipelineTimeout { .. } => 2,
+            _ => 1,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
@@ -287,5 +315,70 @@ mod format_tests {
         };
         assert_single_line_registry(&e);
         assert!(e.to_string().contains("--latest rolling resolution"));
+    }
+}
+
+#[cfg(test)]
+mod exit_code_tests {
+    //! `cannot run` (1) and `found a problem` (2) must stay two different numbers, or
+    //! a mutation test on whichever check raises one of these variants cannot tell "the
+    //! gate did not fire" from "something unrelated stopped the run before it could."
+    use super::*;
+
+    #[test]
+    fn manifest_and_config_problems_cannot_run() {
+        for e in [
+            Error::ManifestNotFound,
+            Error::ManifestValidation("bad".into()),
+            Error::SqlFileNotFound {
+                step: "s".into(),
+                path: PathBuf::from("missing.sql"),
+            },
+            Error::MissingParam { name: "p".into() },
+            Error::EngineNotFound {
+                engine: "duckdb".into(),
+            },
+            Error::StateBackend("locked".into()),
+        ] {
+            assert_eq!(e.exit_code(), 1, "expected 'cannot run' (1) for {e:?}");
+        }
+    }
+
+    #[test]
+    fn execution_failures_found_a_problem() {
+        for e in [
+            Error::StepFailed {
+                step: "s".into(),
+                code: 1,
+                stderr: "boom".into(),
+            },
+            Error::Precondition {
+                step: "s".into(),
+                command: "test -f x".into(),
+                detail: "exit 1".into(),
+            },
+            Error::ToolPrecondition {
+                step: "s".into(),
+                tool: "duckdb".into(),
+                detail: "not found".into(),
+            },
+            Error::StepTimeout { step: "s".into() },
+            Error::PipelineTimeout {
+                step: "s".into(),
+                elapsed_sec: 3.0,
+            },
+        ] {
+            assert_eq!(e.exit_code(), 2, "expected 'found a problem' (2) for {e:?}");
+        }
+    }
+
+    #[test]
+    fn the_two_codes_are_actually_different() {
+        // A test with no non-trivial assertion (`1 != 1`) would pass whichever integer
+        // the two buckets happened to share — this pins that they are not the same.
+        assert_ne!(
+            Error::ManifestNotFound.exit_code(),
+            Error::StepTimeout { step: "s".into() }.exit_code()
+        );
     }
 }

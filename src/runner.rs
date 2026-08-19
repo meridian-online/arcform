@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use indexmap::IndexMap;
 use owo_colors::OwoColorize;
 
-use crate::asset::AssetGraph;
+use crate::asset::{AssetGraph, StepAssets};
+use crate::asset_kind::AssetKind;
 use crate::contract;
 use crate::engine::Engine;
 use crate::error::{Error, Result};
@@ -170,11 +171,21 @@ pub fn run_with_params(
 
     // Build the asset graph and validate dependency ordering.
     let asset_graph = AssetGraph::build(&manifest, dir);
+    // Who produces what — computed once, consulted both by staleness detection and by
+    // the artifact hash each successful step records for the *next* run to compare.
+    let all_produced = all_produced_assets(&asset_graph);
 
     // Print any warnings from asset discovery (e.g. unparseable SQL).
     for warning in &asset_graph.warnings {
         eprintln!("{} {}", "warning:".yellow(), warning);
     }
+
+    // A case collision (two produces:/depends_on: declarations differing only by
+    // case) is a manifest defect independent of anything on disk — refused before
+    // anything runs, not tolerated with a warning. Unconditional: the collision
+    // exists in the manifest whether or not `has_assets()` would otherwise gate the
+    // rest of this section.
+    asset_graph.validate_no_case_collisions()?;
 
     // If the graph has assets, validate step ordering against dependencies.
     if asset_graph.has_assets() {
@@ -184,7 +195,15 @@ pub fn run_with_params(
 
     // Determine which steps are stale, and — for the fresh ones — the typed reason
     // they can be skipped (recorded per step in the contract).
-    let staleness = compute_staleness(&manifest, dir, state, &asset_graph, force, &env_map)?;
+    let staleness = compute_staleness(
+        &manifest,
+        dir,
+        state,
+        &asset_graph,
+        &all_produced,
+        force,
+        &env_map,
+    )?;
 
     let db_path = manifest.db_path(dir);
     // The shared fetch cache, resolved once for the run and handed to every operator
@@ -397,7 +416,50 @@ pub fn run_with_params(
                     Ok(output) => {
                         succeeded += 1;
                         executed += 1;
-                        let _ = state.record_step(&step.name, &sql_hash, StepStatus::Success);
+                        // Hashed AFTER execution, so it reflects what the step just
+                        // wrote — the baseline the *next* run's staleness check
+                        // compares against. `is_hash_stale` never calls
+                        // `produced_artifact_hash` for a `command:` step regardless of
+                        // whether it ran or was skipped via preconditions (command
+                        // steps are always stale on hash alone — see
+                        // `compute_staleness`), so there is nothing to hash for them
+                        // here either. `None` (a relevant file still unreadable right
+                        // after "success," or an ambiguous declared spelling) records
+                        // a fixed, human-legible placeholder — its value is moot,
+                        // since `is_hash_stale` short-circuits to unconditional
+                        // staleness on the same condition before this string is ever
+                        // compared.
+                        let artifact_hash = if step.command.is_some() {
+                            String::new()
+                        } else {
+                            let hash =
+                                produced_artifact_hash(step, dir, &asset_graph, &all_produced);
+                            if hash.is_none() {
+                                // The step just "succeeded," and the run is about to
+                                // report success, while its own declared produces:
+                                // still cannot be read. Re-running (forced by `None`
+                                // above) is the safe outcome; it is not a legible one
+                                // on its own — say so, since exit 0 will not.
+                                let missing = missing_declared_produces(step, dir, &asset_graph);
+                                if !missing.is_empty() {
+                                    eprintln!(
+                                        "{} step '{}' succeeded but does not appear to have produced: {} — arc will \
+                                         keep re-running this step until its own work (or the manifest's \
+                                         produces:) matches",
+                                        "warning:".yellow(),
+                                        step.name,
+                                        missing.join(", ")
+                                    );
+                                }
+                            }
+                            hash.unwrap_or_else(|| "MISSING".to_string())
+                        };
+                        let _ = state.record_step(
+                            &step.name,
+                            &sql_hash,
+                            &artifact_hash,
+                            StepStatus::Success,
+                        );
                         // What the step's declared tools were at the moment it ran — the
                         // identity the next run compares against. Recorded here rather
                         // than at plan time so a step that was un-skipped and then never
@@ -443,7 +505,7 @@ pub fn run_with_params(
                     }
                     Err(e) => {
                         // Non-retryable errors (StepExecution, etc.) — halt immediately.
-                        let _ = state.record_step(&step.name, &sql_hash, StepStatus::Failed);
+                        let _ = state.record_step(&step.name, &sql_hash, "", StepStatus::Failed);
                         let _ = state.finish_run(&run_id, executed, "error", total_retries);
                         stream.step(&step.name, "failed");
                         step_outcomes.insert(
@@ -463,7 +525,7 @@ pub fn run_with_params(
             // If we exhausted all attempts with an error, record failure and halt.
             if let Some(err) = last_error {
                 executed += 1;
-                let _ = state.record_step(&step.name, &sql_hash, StepStatus::Failed);
+                let _ = state.record_step(&step.name, &sql_hash, "", StepStatus::Failed);
                 let _ = state.finish_run(&run_id, executed, "failed", total_retries);
                 stream.step(&step.name, "failed");
                 step_outcomes.insert(
@@ -674,6 +736,9 @@ fn precondition_skip_reason(preconditions: &[Precondition]) -> SkipReason {
 /// - It has no prior state (first run)
 /// - Its prior run failed
 /// - Its SQL file content hash changed
+/// - Any FILE asset it produced, or any file it reads that nothing in the manifest
+///   produces, no longer hashes to what it did after the step's last success —
+///   changed, truncated or deleted all count (see [`produced_artifact_hash`])
 /// - An upstream step (via asset graph) is stale (downstream propagation)
 ///
 /// For every step that stays fresh, a typed [`SkipReason`] is recorded so the run
@@ -683,6 +748,7 @@ fn compute_staleness(
     dir: &Path,
     state: &dyn StateBackend,
     asset_graph: &AssetGraph,
+    all_produced: &std::collections::HashSet<String>,
     force: bool,
     env: &HashMap<String, String>,
 ) -> Result<Staleness> {
@@ -719,8 +785,9 @@ fn compute_staleness(
             continue;
         }
 
-        // SQL/op step — check hash staleness (op steps hash their config).
-        let hash_stale = is_hash_stale(step, dir, state)?;
+        // SQL/op step — check hash staleness (op steps hash their config) AND
+        // artifact staleness (did the bytes this step is answerable for change).
+        let hash_stale = is_hash_stale(step, dir, state, asset_graph, all_produced)?;
 
         if step.preconditions.is_empty() {
             // No preconditions — SQL steps use hash only (backwards compat).
@@ -806,11 +873,21 @@ pub(crate) fn parse_params(raw: &[String]) -> Result<Vec<(String, String)>> {
 
 /// Check whether a SQL or op step's staleness hash has changed since the last run.
 ///
-/// Returns true (stale) if: no prior state, prior failure, hash mismatch, or missing file.
+/// Returns true (stale) if: no prior state, prior failure, config hash mismatch, a
+/// missing SQL file, **or the step's [`produced_artifact_hash`] no longer matches what
+/// was recorded at its last success** — i.e. a file it produced, or a file it reads
+/// that nothing in the manifest produces, was changed, truncated or deleted since.
+///
+/// The config-hash checks alone can only answer "would the same inputs produce the
+/// same outputs" — never "do the outputs still hold." An asset-centric engine has to
+/// ask the second question too, from the assets themselves, or a corrupted artifact
+/// with an unchanged SQL/op config looks identical to a genuinely fresh one.
 fn is_hash_stale(
     step: &crate::manifest::Step,
     dir: &Path,
     state: &dyn StateBackend,
+    asset_graph: &AssetGraph,
+    all_produced: &std::collections::HashSet<String>,
 ) -> Result<bool> {
     let prior = state.get_step_state(&step.name)?;
 
@@ -820,27 +897,276 @@ fn is_hash_stale(
             if prior_state.status == StepStatus::Failed {
                 return Ok(true); // Previously failed.
             }
-            if step.op.is_some() {
+
+            let config_stale = if step.op.is_some() {
                 // Op step — config hash (operator ref + serialized `with:`).
-                return Ok(op_config_hash(step) != prior_state.sql_hash);
-            }
-            if let Some(ref sql) = step.sql {
+                op_config_hash(step) != prior_state.sql_hash
+            } else if let Some(ref sql) = step.sql {
                 let sql_path = dir.join(sql);
                 if sql_path.exists() {
                     let content = std::fs::read(&sql_path).map_err(|e| Error::FileRead {
                         path: sql_path.clone(),
                         source: e,
                     })?;
-                    let current_hash = state::content_hash(&content);
-                    Ok(current_hash != prior_state.sql_hash)
+                    state::content_hash(&content) != prior_state.sql_hash
                 } else {
-                    Ok(true) // File missing — will error during execution.
+                    true // File missing — will error during execution.
                 }
             } else {
-                Ok(false) // No SQL file (shouldn't happen for SQL steps).
+                false // No SQL file (shouldn't happen for SQL steps).
+            };
+
+            if config_stale {
+                return Ok(true);
+            }
+
+            // Config is unchanged — now ask whether the assets this step is
+            // answerable for still hold. This is the check that catches a produced
+            // file being edited, truncated or deleted underneath an unchanged
+            // manifest, which config hashing alone structurally cannot see.
+            //
+            // `None` means at least one asset this step is answerable for could not
+            // be confidently hashed right now — it is currently unreadable (missing,
+            // permission-denied — NOT truncated: `fs::read` succeeds on an empty
+            // file and yields `Some(hash_of_empty)`, a real digest that compares
+            // correctly against a non-empty prior hash; a Directory-kind asset is
+            // unreadable the same way when the directory itself is absent, via
+            // `hash_directory_contents` — never via a bare `is_dir()` presence
+            // check, which cannot tell an emptied directory from a populated one;
+            // a Pattern or Table never reaches this function at all — see
+            // `produced_artifact_hash`'s kind dispatch), or its
+            // declared spelling is itself ambiguous (see `produced_artifact_hash`). Either way
+            // this forces staleness unconditionally rather than comparing against
+            // `prior_state.artifact_hash` — an absence must never be allowed to read
+            // as "unchanged" against a PRIOR absence. Two runs of a step whose
+            // declared artifact was never actually written under its declared name
+            // would otherwise both hash to the same `MISSING` sentinel and compare
+            // equal forever, which is the graph asserting a file is produced while
+            // nothing is on disk and the run reporting success — the defect this
+            // whole mechanism exists to close, reached through the one case a plain
+            // sentinel string cannot distinguish from genuine freshness.
+            match produced_artifact_hash(step, dir, asset_graph, all_produced) {
+                None => Ok(true),
+                Some(current_artifact_hash) => {
+                    Ok(current_artifact_hash != prior_state.artifact_hash)
+                }
             }
         }
     }
+}
+
+/// Every asset name produced by any step in the manifest — the global "who owns this"
+/// set `produced_artifact_hash` consults to tell a file a step reads directly with no
+/// producer (an external input) apart from one produced upstream (already covered by
+/// that producer's own staleness plus downstream propagation).
+fn all_produced_assets(asset_graph: &AssetGraph) -> std::collections::HashSet<String> {
+    asset_graph
+        .steps
+        .values()
+        .flat_map(|sa| sa.produces.iter().cloned())
+        .collect()
+}
+
+/// Every `produces:` name (raw, case-preserved) this step declares that cannot
+/// currently be read as a file. Checked right after the step "succeeds," so this
+/// names a real gap between the manifest's claim and what the step's own work
+/// (SQL/op/command) actually did — probe6's shape: `produces: [build/REGISTRANT.tsv]`
+/// declared, the step's SQL writes `build/registrant.tsv` instead, and
+/// `is_hash_stale` now correctly forces this step to keep re-running rather than
+/// silently certifying success (see `produced_artifact_hash`) — but re-running
+/// forever is a safe outcome, not a legible one. A run that exits 0 while the asset
+/// graph asserts a file is produced and nothing is on disk needs to say so.
+fn missing_declared_produces(
+    step: &crate::manifest::Step,
+    dir: &Path,
+    asset_graph: &AssetGraph,
+) -> Vec<String> {
+    let Some(assets) = asset_graph.steps.get(&step.name) else {
+        return Vec::new();
+    };
+    assets
+        .produces
+        .iter()
+        .filter(|n| is_hashable_kind(assets, n))
+        .filter_map(|lowered| {
+            let raw = match assets.declared_case.get(lowered) {
+                Some(raws) if raws.len() == 1 => raws.iter().next().unwrap().as_str(),
+                _ => lowered.as_str(),
+            };
+            let full = dir.join(raw);
+            // Dispatch on the declared kind, not on what happens to be on disk: a
+            // Directory-kind entry is "missing" when `hash_directory_contents`
+            // returns `None`, which covers the directory itself being absent or
+            // unlistable AND a child anywhere in the tree that cannot be read. An
+            // EMPTY-but-present directory is not reported here (that gap is
+            // `is_hash_stale`'s job, via the content hash changing), because this
+            // function names things the step's own work never created, not things
+            // that were created and later went bad. A File-kind entry is missing
+            // when `fs::read` fails, exactly as before.
+            let is_missing = match declared_kind_of(assets, lowered) {
+                AssetKind::Directory => state::hash_directory_contents(&full).is_none(),
+                _ => std::fs::read(&full).is_err(),
+            };
+            is_missing.then(|| raw.to_string())
+        })
+        .collect()
+}
+
+/// Whether `assets.declared_kind` marks `name` as something [`produced_artifact_hash`]
+/// hashes at all — a `File` or a `Directory`. `Pattern` never resolves to one
+/// artifact (staleness comes from what produces the matches, not the pattern
+/// itself) and `Table` is not a path in the first place. Defaults to `File` for a
+/// name with no kind entry — every current insertion site populates one, so this is
+/// a defensive fallback, not a real path; it fails SAFE rather than silently,
+/// since a File-shaped read of an actual directory errors and forces staleness via
+/// `?`, never quietly skips the way an `is_dir()` opt-out did.
+fn is_hashable_kind(assets: &StepAssets, name: &str) -> bool {
+    matches!(
+        declared_kind_of(assets, name),
+        AssetKind::File | AssetKind::Directory
+    )
+}
+
+/// `assets.declared_kind.get(name)`, defaulting to `File` — the one place both
+/// `is_hashable_kind` and `produced_artifact_hash` resolve a name's kind, so the
+/// defensive default can never drift between the two call sites.
+fn declared_kind_of(assets: &StepAssets, name: &str) -> AssetKind {
+    assets
+        .declared_kind
+        .get(name)
+        .copied()
+        .unwrap_or(AssetKind::File)
+}
+
+/// A combined content hash over every asset a step is answerable for that is
+/// actually backed by bytes on disk — `File` and `Directory` kinds, per
+/// `declared_kind`: what it produces, plus what it reads directly that nothing in
+/// the manifest produces (an external input — the shape of `build/gleif_ra_sec.csv`
+/// before `gleif_ra_fetch` existed to own it). `Table` and `Pattern` never
+/// participate — a table is left to the existing config-hash and
+/// downstream-propagation machinery, and a pattern's staleness comes from what
+/// produces the matches, not from the pattern string itself. This only ever adds
+/// file-backed bytes to the staleness question, never subtracts from it.
+///
+/// Resolves each name through [`crate::asset::StepAssets::declared_case`] — the RAW,
+/// exactly-as-declared spelling carried alongside the lowercased graph node — and
+/// joins that directly onto `dir`. **No scanning, no candidate-counting.** Two earlier
+/// designs here (a literal join with a lowercased fallback; a case-insensitive scan
+/// requiring exactly one match) were both unsound the same way: however many files
+/// happen to share a name case-insensitively on disk *right now* is not evidence about
+/// which one is the declared artifact, and stops being evidence at all the moment the
+/// declared file is deleted and only a decoy remains — at that point exactly one
+/// candidate exists, and a scan finds it confidently, and wrongly. The declared
+/// spelling is the one thing scanning can never recover once it has been thrown away,
+/// so it is carried from the manifest instead of reconstructed from the filesystem.
+///
+/// **Which strategy hashes a name is decided by `declared_kind`, set at the point
+/// the asset was declared — never by asking the filesystem what is there right
+/// now.** A `File` reads its bytes directly; a `Directory` hashes a manifest of its
+/// contents via [`crate::state::hash_directory_contents`], not a bare
+/// `fs::metadata(..).is_dir()` presence check — a presence check cannot tell an
+/// emptied directory from a populated one, so it would let a `COPY … PARTITION_BY`
+/// target or a pattern-only `archive_extract` `dest:` skip forever once every
+/// partition file inside it was deleted or corrupted while the directory itself
+/// survived. `Pattern` and `Table` are filtered out before this loop is ever
+/// reached (see `is_hashable_kind`), so this function has no name-based or
+/// extension-based guessing left in it at all — that was round 6 and round 7's
+/// mistake (an extension allowlist left real files untracked; an unconditional
+/// directory skip re-opened the exact hole a content hash closes).
+///
+/// Returns `None` — never a hash — in two OTHER cases, both forcing the caller
+/// (`is_hash_stale`) to unconditional staleness rather than a string comparison:
+///
+/// - **A relevant asset cannot be read right now**, under its declared spelling —
+///   missing or permission-denied for a `File` (not truncated: `fs::read` succeeds
+///   on an empty file, yielding `Some(hash_of_empty)`); unreadable/absent for a
+///   `Directory`, via `hash_directory_contents` returning `None`. Earlier designs
+///   folded this into a stable `"MISSING"` sentinel *string* and compared it like any
+///   other digest, which reads as "unchanged" the moment a step's declared artifact
+///   has never once existed under its declared name (its SQL wrote a differently-cased
+///   file, say): the baseline recorded right after the step's own "success" is already
+///   `MISSING`, so every later run compares `MISSING` to `MISSING` and skips forever —
+///   the graph asserting a file is produced while nothing is on disk, and the run
+///   reporting success. An absence can never be evidence of sameness, so it is never
+///   folded into the comparable string at all.
+/// - **A declared name resolves to more than one raw spelling** —
+///   `declared_case`'s entry for it has 2+ elements. `AssetGraph::
+///   validate_no_case_collisions` refuses this for both `produces:` and
+///   `depends_on:` at load, so a validated graph should never reach this branch; it
+///   exists as the read-time backstop precisely because *"the gate already checked
+///   it"* must not be the only thing standing between an ambiguous declaration and a
+///   silent, iteration-order-dependent pick of one spelling over the other.
+///
+/// Hashes the actual on-disk bytes directly — **never** a fetch sidecar's recorded
+/// digest (`crate::ingress_meta`, which [`crate::contract::measure_file`] prefers for
+/// reporting). Trusting a sidecar here would be exactly the failure this guards
+/// against: a truncated artifact whose stale `.arcmeta` sidecar still claims to be
+/// what the step wrote.
+///
+/// A step with no file- or directory-typed produced/external-read assets hashes the
+/// empty input deterministically — stable across runs, so it never falsely reads as
+/// changed.
+fn produced_artifact_hash(
+    step: &crate::manifest::Step,
+    dir: &Path,
+    asset_graph: &AssetGraph,
+    all_produced: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let step_assets = asset_graph.steps.get(&step.name);
+    let mut names: Vec<&String> = Vec::new();
+    if let Some(assets) = step_assets {
+        names.extend(
+            assets
+                .produces
+                .iter()
+                .filter(|n| is_hashable_kind(assets, n)),
+        );
+        names.extend(
+            assets
+                .reads
+                .iter()
+                .filter(|n| is_hashable_kind(assets, n) && !all_produced.contains(n.as_str())),
+        );
+    }
+    names.sort();
+    names.dedup();
+
+    let declared_case = step_assets.map(|a| &a.declared_case);
+
+    let mut buf = String::new();
+    for name in names {
+        // The declared, case-preserved spelling — never the lowercased graph node,
+        // which is identity, not a path. `raws.len() > 1` is the ambiguous-spelling
+        // backstop described above; `None` (no entry at all) falls back to the
+        // lowered name itself, defensive against a future insertion site that forgets
+        // to populate `declared_case` — every current one does.
+        let raw = match declared_case.and_then(|dc| dc.get(name)) {
+            Some(raws) if raws.len() == 1 => raws.iter().next().unwrap(),
+            Some(raws) if raws.len() > 1 => return None,
+            _ => name,
+        };
+        let full = dir.join(raw);
+        // Dispatch on the kind carried from declaration — see the doc comment above
+        // for why this replaced an `is_dir()` presence check. `step_assets` is
+        // `Some` whenever `names` is non-empty (the only source of `names`), so the
+        // `unwrap_or(File)` default here is unreachable in practice; it exists so
+        // this function has no path that panics.
+        let kind = step_assets
+            .map(|a| declared_kind_of(a, name))
+            .unwrap_or(AssetKind::File);
+        let digest = match kind {
+            AssetKind::Directory => state::hash_directory_contents(&full)?,
+            _ => {
+                let bytes = std::fs::read(&full).ok()?;
+                state::content_hash(&bytes)
+            }
+        };
+        buf.push_str(name);
+        buf.push('\u{1f}'); // unit separator — cheap guard against name/hash collision
+        buf.push_str(&digest);
+        buf.push('\n');
+    }
+    Some(state::content_hash(buf.as_bytes()))
 }
 
 #[cfg(test)]
@@ -1177,6 +1503,655 @@ mod tests {
             calls.len(),
             2,
             "stale step should re-run: preflight + 1 sql"
+        );
+    }
+
+    // Card `changing-an-input-file-arcform-did-not-produce-marks-nothing-stale`, AC1 +
+    // AC4: a step's own SQL/config hash is unchanged, but the FILE it declares as
+    // `produces:` was edited directly on disk — arc must not skip it. Mutation proof:
+    // reverting `is_hash_stale`'s artifact-hash check (folding `config_stale` straight
+    // into the returned `Ok(...)` it replaced, dropping the `produced_artifact_hash`
+    // comparison) turns this red — the third run stays at 1 call (preflight only)
+    // instead of 2, because the edited file goes undetected and the step is skipped
+    // `hash_clean` with the edited bytes left in place.
+    #[test]
+    fn test_produced_file_change_forces_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/out.csv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/out.csv"), "a,b\n1,2\n").unwrap();
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+
+        // First run — always stale (no prior state).
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "first run: preflight + 1 sql"
+        );
+
+        // Second run, nothing touched — the positive control. Config unchanged AND the
+        // produced file unchanged must still skip, or the fix has regressed the warm
+        // path this defect was supposed to leave alone.
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "unchanged produced file should stay skipped (preflight only)"
+        );
+
+        // Edit the produced file directly — the manifest and its SQL never change.
+        fs::write(dir.path().join("build/out.csv"), "a,b\n1,2\n3,4\n").unwrap();
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "edited produced file must force a re-run: preflight + 1 sql"
+        );
+    }
+
+    // Same defect, truncation — AC1's second failure mode.
+    #[test]
+    fn test_produced_file_truncated_forces_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/out.csv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/out.csv"), "a,b\n1,2\n").unwrap();
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        // Truncate to 0 bytes — content_hash of empty input differs from the recorded
+        // hash of the non-empty original, so this must not be mistaken for "unchanged".
+        fs::write(dir.path().join("build/out.csv"), "").unwrap();
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "truncated produced file must force a re-run: preflight + 1 sql"
+        );
+    }
+
+    // Same defect, deletion — AC1's third failure mode. The file is gone outright, not
+    // just changed, so `produced_artifact_hash` has to treat "cannot read" as a change
+    // rather than silently degrading to "nothing to compare."
+    #[test]
+    fn test_produced_file_deleted_forces_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/out.csv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/out.csv"), "a,b\n1,2\n").unwrap();
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        fs::remove_file(dir.path().join("build/out.csv")).unwrap();
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "deleted produced file must force a re-run: preflight + 1 sql"
+        );
+    }
+
+    // Regression: an independent verifier reproduced this live against `dd1ea78` on a
+    // real case-sensitive APFS volume (`hdiutil create -fs "Case-sensitive APFS"`),
+    // mirroring exactly what the real `extract_ncen_*` steps do —
+    // `archive_extract@1` with `members: [REGISTRANT.tsv, ...]` writes that case
+    // preserved to disk, while the op-declared and explicit-`produces:` lowercasing
+    // call sites in `asset.rs`, and every operator's `assets()` in `operator.rs`,
+    // normalize the graph's produces node to `.../registrant.tsv` (needed so two
+    // differently-cased spellings of the same case-insensitive DuckDB *table* land on
+    // one graph node — see `resolve_on_disk_case`'s doc for why that stays; SQL
+    // introspection's own produces/reads, by contrast, are captured verbatim from the
+    // SQL text and are not part of this). On a case-SENSITIVE filesystem
+    // (`ubuntu-latest`, which both `ci.yml` and the publish runner use) the pre-fix
+    // `dir.join(lowercased_name)` never finds the real, mixed-case file — not on the
+    // baseline run, not after a mutation — so it hashes to the same `MISSING` sentinel
+    // both times and `is_hash_stale`'s comparison can never fire. That is the original
+    // defect, reachable through the one shape the real manifest actually uses.
+    //
+    // These three only exercise the bug on a filesystem that distinguishes case — the
+    // default macOS temp dir does not (case-preserving but case-INsensitive), so both
+    // the broken and fixed code resolve the same bytes there regardless of which name
+    // is queried. They are unfiltered — no `#[ignore]` — so they execute as part of
+    // `cargo test --workspace` in `ci.yml`'s `build` job on `ubuntu-latest`, and that
+    // job on PR #54 at `a9a81d1` (which added them, fixed) is SUCCESS — confirming
+    // they run there, not that a red run was ever observed. The actual redden-on-
+    // reverted-code proof below was measured locally against a
+    // `hdiutil create -fs "Case-sensitive APFS"` volume mounted and used as `$TMPDIR`,
+    // not by watching CI turn red.
+    #[test]
+    fn test_case_mismatched_produced_file_change_forces_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        // Declared with the real member's case, matching `members: [REGISTRANT.tsv]`;
+        // the graph node the manifest's `produces:` list feeds is lowercased.
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/REGISTRANT.tsv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        // Written case-preserved, exactly as archive_extract's extract_members does.
+        fs::write(dir.path().join("build/REGISTRANT.tsv"), "cik\tlei\n1\tX\n").unwrap();
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "first run: preflight + 1 sql"
+        );
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "unchanged case-mismatched file should stay skipped (preflight only)"
+        );
+
+        fs::write(
+            dir.path().join("build/REGISTRANT.tsv"),
+            "cik\tlei\n1\tX\n2\tY\n",
+        )
+        .unwrap();
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "edited case-mismatched produced file must force a re-run: preflight + 1 sql"
+        );
+    }
+
+    #[test]
+    fn test_case_mismatched_produced_file_truncated_forces_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/REGISTRANT.tsv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/REGISTRANT.tsv"), "cik\tlei\n1\tX\n").unwrap();
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        fs::write(dir.path().join("build/REGISTRANT.tsv"), "").unwrap();
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "truncated case-mismatched produced file must force a re-run: preflight + 1 sql"
+        );
+    }
+
+    #[test]
+    fn test_case_mismatched_produced_file_deleted_forces_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/REGISTRANT.tsv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/REGISTRANT.tsv"), "cik\tlei\n1\tX\n").unwrap();
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        fs::remove_file(dir.path().join("build/REGISTRANT.tsv")).unwrap();
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "deleted case-mismatched produced file must force a re-run: preflight + 1 sql"
+        );
+    }
+
+    // Round 4, the actual fix Hugh chose: carry the declared, case-preserved spelling
+    // alongside the lowercased graph node, and resolve a produced/read file against
+    // THAT — never by counting how many files happen to share a name
+    // case-insensitively on disk right now. Round 3's "exactly one candidate, so the
+    // code is confident" heuristic was unsound with no collision ever required:
+    // deleting the declared artifact resolves the ambiguity by removing one of the
+    // two candidates, and the guess resumes — silently, no warning — on exactly the
+    // state that matters. A verifier drove this end to end against `14050f2`
+    // (probe2/probe6) and reproduced precisely that.
+    //
+    // Two `produces:` declarations differing only by case is now refused when the
+    // manifest loads — a manifest defect independent of anything on disk, closed at
+    // the source rather than tolerated at runtime. Proof: reverting
+    // `AssetGraph::validate_no_case_collisions` to `Ok(())` unconditionally turns
+    // this red — `run(...)` then succeeds instead of returning
+    // `Err(ManifestValidation)`.
+    #[test]
+    fn test_produces_case_collision_refused_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/Report.csv]\n  - name: s2\n    sql: models/s2.sql\n    produces: [build/report.csv]\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[
+                ("models/s1.sql", "SELECT 1;"),
+                ("models/s2.sql", "SELECT 2;"),
+            ],
+        );
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        let err = run(dir.path(), &engine, &state, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("collision") && msg.contains("case"),
+            "expected a case-collision refusal, got: {msg}"
+        );
+        // preflight (an engine-availability check, unrelated to manifest validity)
+        // runs before the asset graph is even built, so it is the one call this
+        // refusal cannot pre-empt — no step executes.
+        assert!(
+            matches!(engine.calls.borrow().as_slice(), [MockCall::Preflight]),
+            "a refused manifest must not execute any step: {:?}",
+            engine.calls.borrow()
+        );
+    }
+
+    // A stray, differently-cased file coexisting with the REAL declared artifact must
+    // never be substituted for it, and deleting the declared artifact must be caught
+    // even though only the decoy remains afterward — the shape round 3 missed by
+    // stopping its own test one run short of exactly this state. Carries probe1's full
+    // sequence through: baseline with a decoy present, an unchanged warm run, deletion
+    // of the declared file (decoy still there), and TWO runs after that — round 4's
+    // own regression was at the second of those: it correctly reran once (run 3) but
+    // then let the resulting `MISSING` baseline compare equal to itself forever
+    // (run 4 onward), which is the graph asserting a file is produced while nothing
+    // is on disk and the run reporting success. Both post-deletion runs must
+    // therefore re-run, not just the first.
+    //
+    // This scenario is only representable on a case-sensitive filesystem — the default
+    // macOS temp dir folds the two writes into one file, so it self-skips there with an
+    // explanation rather than failing for a reason unconnected to the code under test.
+    // `ubuntu-latest` (`ci.yml`'s `build` job and the publish runner) is case-sensitive,
+    // so this executes for real there.
+    #[test]
+    fn test_declared_artifact_deletion_is_caught_even_with_a_surviving_decoy() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/REGISTRANT.tsv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/REGISTRANT.tsv"), "real content\n").unwrap();
+        fs::write(dir.path().join("build/registrant.tsv"), "decoy content\n").unwrap();
+
+        if fs::read_dir(dir.path().join("build")).unwrap().count() < 2 {
+            eprintln!(
+                "skipping test_declared_artifact_deletion_is_caught_even_with_a_surviving_decoy: \
+                 {} does not distinguish case, so a genuine collision cannot be constructed here",
+                dir.path().display()
+            );
+            return;
+        }
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+
+        // Run 1: first run, always stale.
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(engine.calls.borrow().len(), 2, "run 1: preflight + 1 sql");
+
+        // Run 2: nothing touched, decoy still sitting there. The declared file is
+        // unchanged and the decoy is irrelevant — this must skip, not be treated as
+        // ambiguous forever (round 3's over-caution, which this design does not need).
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "run 2: unchanged declared file must stay skipped despite the decoy"
+        );
+
+        // Delete the DECLARED file. The decoy — never tracked, never hashed — is left
+        // exactly as it was.
+        fs::remove_file(dir.path().join("build/REGISTRANT.tsv")).unwrap();
+
+        // Run 3: this is the run round 3's own test stopped one short of. Round 3's
+        // scan would now find exactly one candidate (the decoy) and confidently, wrongly
+        // treat it as unchanged. Carrying the declared case means the lookup asks for
+        // build/REGISTRANT.tsv specifically, finds it gone, and must re-run.
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "run 3: deleting the declared artifact must force a re-run even though a \
+             differently-cased file survives it: preflight + 1 sql"
+        );
+
+        // Run 4: the mock step's own execution never recreates build/REGISTRANT.tsv
+        // (it does not touch the filesystem), so the declared file is genuinely,
+        // stably absent from here on. This must KEEP re-running, not settle into a
+        // skip — round 4's own regression: "MISSING compares equal to a prior
+        // MISSING" is exactly probe6's shape (a declared artifact that is never
+        // actually produced reads as permanently unchanged). An absence can never be
+        // evidence of sameness, run 3's or run 4's or any other run's.
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "run 4: a declared file that is STILL absent must force another re-run, \
+             not certify itself unchanged against its own prior absence: \
+             preflight + 1 sql"
+        );
+    }
+
+    // Probe6's shape, pinned on its own: a declared name that never existed on disk —
+    // not even for one run — while a differently-cased leftover (a stale file from
+    // before a fix landed, or a hand-authored copy under the wrong case) sits where
+    // the graph's lowercased query would have looked. This is round 4's own
+    // regression, reported independently of the decoy test above: `MISSING` (the
+    // baseline recorded after this step's first "success," since nothing — not the
+    // mock, not the leftover — ever writes build/REGISTRANT.tsv) compared equal to
+    // `MISSING` (every later run, for the same reason) forever. The graph asserts a
+    // file is produced by s1 while nothing is on disk, and the run reports success —
+    // the card's headline sentence. A declared artifact that has never once existed
+    // must force a re-run on every single invocation, not settle into a skip after
+    // the first: rerunning cannot itself fix anything here (the mock never writes
+    // the file either way), so the only honest signal is that the run keeps trying,
+    // visibly, rather than reporting quiet, permanent success.
+    //
+    // Also proves the leftover is genuinely never substituted for the declared
+    // file: mutating it changes nothing about *why* s1 reruns (still `None` —
+    // "absent," not "changed") or how often (every time, regardless).
+    //
+    // Representable on any filesystem in principle, but the declared name and the
+    // leftover fold to the same entry on one that does not distinguish case, which
+    // would make the leftover BE build/REGISTRANT.tsv rather than a decoy beside it —
+    // self-skips there rather than asserting something the setup cannot construct.
+    // `ubuntu-latest` is case-sensitive, so this executes for real there.
+    #[test]
+    fn test_declared_case_that_never_existed_forces_perpetual_staleness() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/REGISTRANT.tsv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        // A leftover under a case nothing declares. build/REGISTRANT.tsv never exists
+        // anywhere in this test.
+        fs::write(
+            dir.path().join("build/registrant.tsv"),
+            "leftover content\n",
+        )
+        .unwrap();
+
+        if dir.path().join("build/REGISTRANT.tsv").exists() {
+            eprintln!(
+                "skipping test_declared_case_that_never_existed_forces_perpetual_staleness: \
+                 {} does not distinguish case, so the declared name and the leftover are the same file",
+                dir.path().display()
+            );
+            return;
+        }
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap(); // run 1: first run, always stale
+
+        // Run 2: declared file still absent (the mock never writes it). Must re-run —
+        // a step whose declared artifact has never existed cannot certify "unchanged."
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "run 2: declared file still absent, must force a re-run rather than \
+             certify unchanged: preflight + 1 sql"
+        );
+
+        // Mutate the leftover — must not change WHY s1 reruns, only confirm it still
+        // does, for the same reason.
+        fs::write(
+            dir.path().join("build/registrant.tsv"),
+            "mutated leftover\n",
+        )
+        .unwrap();
+
+        // Run 3: same again. This must never settle into a skip while the declared
+        // artifact stays absent, no matter how many times it is asked, and regardless
+        // of what happens to an irrelevant, differently-cased leftover.
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "run 3: still absent, still must force a re-run — an artifact that has \
+             never existed cannot become 'stably unchanged'"
+        );
+    }
+
+    // Proves the habitat this whole case-collision test family depends on, rather
+    // than assuming it: a biconditional, computed once, true on BOTH a case-sensitive
+    // and a folding filesystem under correct code, false only on the one state worth
+    // catching. It measures case-sensitivity directly (write AAA/aaa, count entries)
+    // and SEPARATELY measures whether the runner's own behaviour implies it — does a
+    // step correctly go on ignoring a decoy's mutation, which is only possible when
+    // the decoy and the declared file are actually two different on-disk entries —
+    // then asserts the two agree:
+    //
+    //   case-sensitive  ⟺  a decoy's mutation is NOT detected
+    //
+    // On a real case-sensitive habitat, correct code ignores the decoy (it is never
+    // looked up at all), so both sides read true/not-detected. On a filesystem that
+    // folds case, "the decoy" IS build/REGISTRANT.tsv — there is no separate file to
+    // ignore — so mutating it necessarily changes the one real file's bytes and gets
+    // detected, regardless of whether this fix is present or reverted; both sides
+    // read false/detected. It reddens only when they disagree: either the probe is
+    // wrong about the filesystem, or (on a genuinely case-sensitive habitat) the
+    // runner is substituting a decoy for a declared artifact again.
+    //
+    // Narrower than "case-sensitive ⟺ the whole family executed" would be: the other
+    // case-family tests still self-skip on a folding filesystem, satisfying this
+    // biconditional there without proving any of THEM ran — so this catches the
+    // runner regressing, but would not by itself catch a CI habitat that started
+    // folding case while everything else in the family quietly went back to skipping.
+    #[test]
+    fn test_case_sensitivity_probe_agrees_with_observed_runner_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/REGISTRANT.tsv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/REGISTRANT.tsv"), "declared\n").unwrap();
+        fs::write(dir.path().join("build/registrant.tsv"), "decoy\n").unwrap();
+
+        // Measured directly, once, before anything else touches the directory.
+        let case_sensitive = fs::read_dir(dir.path().join("build")).unwrap().count() == 2;
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap(); // run 1: baseline
+
+        // Mutate ONLY the decoy's name — on a folding filesystem this IS the
+        // declared file; on a case-sensitive one it is a different, untracked entry.
+        fs::write(dir.path().join("build/registrant.tsv"), "mutated decoy\n").unwrap();
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        let mutation_detected = engine.calls.borrow().len() > 1;
+
+        assert_eq!(
+            case_sensitive,
+            !mutation_detected,
+            "incoherent habitat: case_sensitive={case_sensitive}, \
+             mutation_detected={mutation_detected} in {} — a case-sensitive habitat \
+             must ignore a decoy's mutation, and a folding one cannot have a separate \
+             decoy to ignore at all",
+            dir.path().display()
+        );
+    }
+
+    // Round 5, regression 2: the collision gate checked `produces:` only, so two
+    // `depends_on:` entries differing only by case never reached it — one graph node,
+    // no warning, `declared_case` silently holding both raw spellings. With
+    // build/DATA.csv and build/data.csv both real and distinct, `produced_artifact_hash`
+    // picked one by `BTreeSet` iteration order (`DATA.csv`, 0x44, before `data.csv`,
+    // 0x64) — deterministic, but arbitrary with respect to which file is the real
+    // dependency, and the loser was never hashed, never tracked, at all. `s1` here
+    // does not even declare a `sql:` file that touches either name; it is the
+    // `depends_on:` declaration alone that must be enough to make the collision
+    // reachable — this is a manifest-shape defect, not a read-behaviour one.
+    //
+    // Proof (see PR for the mutation report): reverting `validate_no_case_collisions`
+    // to only inspect `produces:` again turns this red — `run(...)` then succeeds
+    // instead of returning `Err(ManifestValidation)`.
+    //
+    // Representable on any filesystem; the gate is a static check over declared
+    // strings and never touches disk, so unlike the read-time tests above this one
+    // does not need — and does not get — a case-sensitivity guard.
+    #[test]
+    fn test_depends_on_case_collision_refused_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    depends_on: [build/DATA.csv, build/data.csv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        let err = run(dir.path(), &engine, &state, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("collision") && msg.contains("depends_on:"),
+            "expected a depends_on: case-collision refusal naming the manifest key, \
+             got: {msg}"
+        );
+        assert!(
+            matches!(engine.calls.borrow().as_slice(), [MockCall::Preflight]),
+            "a refused manifest must not execute any step: {:?}",
+            engine.calls.borrow()
+        );
+    }
+
+    // The other half of regression 2's fix: even with the gate above, a
+    // `declared_case` entry holding more than one raw spelling must never be resolved
+    // by picking one — that IS the exact ambiguity the gate exists to abolish, and
+    // "the gate already checked it" must not be the only thing standing between an
+    // ambiguous declaration and a silent, iteration-order-dependent choice. The gate
+    // refuses this shape before a real `run()` ever reaches `produced_artifact_hash`,
+    // so this bypasses `run()` and the gate entirely, hand-injecting the ambiguous
+    // graph state the gate exists to prevent, to prove the read-time refusal holds
+    // on its own rather than depending on the gate never having a gap.
+    #[test]
+    fn test_ambiguous_declared_case_forces_staleness_not_iteration_order_pick() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    depends_on: [build/data.csv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/DATA.csv"), "from DATA.csv\n").unwrap();
+        fs::write(dir.path().join("build/data.csv"), "from data.csv\n").unwrap();
+
+        if fs::read_dir(dir.path().join("build")).unwrap().count() < 2 {
+            eprintln!(
+                "skipping test_ambiguous_declared_case_forces_staleness_not_iteration_order_pick: \
+                 {} does not distinguish case, so a genuine collision cannot be constructed here",
+                dir.path().display()
+            );
+            return;
+        }
+
+        let manifest = crate::manifest::Manifest::load(dir.path()).unwrap();
+        let mut asset_graph = AssetGraph::build(&manifest, dir.path());
+        asset_graph
+            .steps
+            .get_mut("s1")
+            .unwrap()
+            .declared_case
+            .get_mut("build/data.csv")
+            .unwrap()
+            .insert("build/DATA.csv".to_string());
+
+        let step = manifest.steps.iter().find(|s| s.name == "s1").unwrap();
+        let all_produced = all_produced_assets(&asset_graph);
+        let result = produced_artifact_hash(step, dir.path(), &asset_graph, &all_produced);
+        assert_eq!(
+            result, None,
+            "an ambiguous declared_case entry (2+ raw spellings) must never be \
+             resolved by picking one — it must force staleness (None), not silently \
+             choose build/DATA.csv over build/data.csv by BTreeSet iteration order"
+        );
+    }
+
+    // The "(external source)" shape from the card's original 2026-08-12 evidence: a
+    // file a step *reads* (`depends_on:`) that nothing in the manifest produces. No
+    // step owns marking itself stale for this file via `produces:`, so
+    // `produced_artifact_hash` has to fold a step's *unproduced* direct reads in too,
+    // not just what it produces — otherwise this exact shape stays unfixed.
+    #[test]
+    fn test_external_unproduced_file_change_forces_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    depends_on: [external.csv]\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[
+                ("models/s1.sql", "SELECT 1;"),
+                ("external.csv", "a,b\n1,2\n"),
+            ],
+        );
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "first run: preflight + 1 sql"
+        );
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "unchanged external input should stay skipped (preflight only)"
+        );
+
+        // Nothing produces external.csv — it is edited directly, the only way an input
+        // like this ever changes.
+        fs::write(dir.path().join("external.csv"), "a,b\n1,2\n3,4\n").unwrap();
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "changed external input must force a re-run: preflight + 1 sql"
         );
     }
 
@@ -3859,6 +4834,901 @@ steps:
             fs::read(dir.path().join("build/artifact.bin")).unwrap(),
             bytes,
             "the bytes came off the shared store"
+        );
+    }
+
+    // The real edgar_gleif shape: `models/load.sql` reads
+    // `read_csv('build/ncen/*/REGISTRANT.tsv', …)`, and SQL introspection captures
+    // that glob verbatim as a `reads` entry. Nothing produces the literal string
+    // `build/ncen/*/REGISTRANT.tsv` (only concrete per-quarter files do), so it took
+    // the external-read branch of `produced_artifact_hash` — and a string-based
+    // classifier that only asked "does this contain `/`" said yes, so `fs::read` on
+    // a literal `*` always failed and this step was `None` (forced stale) on every
+    // single run, forever, silently, no `--force` in sight. Confirmed against the
+    // real manifest: `load` re-ran on runs 2 through 5 with nothing else touched.
+    //
+    // SQL introspection now classifies a lifted path literal containing a glob
+    // metacharacter as `AssetKind::Pattern` at the point it lifts it (see
+    // `introspect.rs`'s `is_glob`), and `is_hashable_kind` excludes `Pattern`
+    // (alongside `Table`) before this step's hashed-names list is even built — proven
+    // here by the ordinary "unchanged, stays skipped" assertion, which a step with a
+    // permanently-`None` artifact hash could never reach.
+    #[test]
+    fn test_sql_introspected_glob_does_not_force_perpetual_staleness() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: load\n    sql: models/load.sql\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[(
+                "models/load.sql",
+                "CREATE TABLE ncen_registrant AS SELECT * FROM read_csv('build/ncen/*/REGISTRANT.tsv');",
+            )],
+        );
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(engine.calls.borrow().len(), 2, "run 1: preflight + 1 sql");
+
+        // Run 2, 3: nothing touched. A step whose staleness check was still trying
+        // (and always failing) to hash the literal glob string would re-run every
+        // time; this must settle into skip instead.
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "run 2: unchanged SQL (including its glob) must skip, not re-run forever \
+             because a glob was mistaken for a hashable file"
+        );
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "run 3: same again — must stay skipped, not resume re-running"
+        );
+    }
+
+    // Round 7 pin #1: `missing_declared_produces` had zero regression protection —
+    // returning `Vec::new()` unconditionally would have reddened nothing, and it is
+    // the only legibility this whole card adds for a step that certifies success
+    // over work it did not do (probe6's shape). Calls it directly rather than
+    // capturing stderr, since the warning text is downstream of this and testing
+    // the source of the claim is the more direct pin.
+    #[test]
+    fn test_missing_declared_produces_names_the_gap_and_closes_when_fixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n    produces: [build/REGISTRANT.tsv]\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        // build/REGISTRANT.tsv is never written.
+
+        let manifest = crate::manifest::Manifest::load(dir.path()).unwrap();
+        let asset_graph = AssetGraph::build(&manifest, dir.path());
+        let step = manifest.steps.iter().find(|s| s.name == "s1").unwrap();
+
+        let missing = missing_declared_produces(step, dir.path(), &asset_graph);
+        assert_eq!(
+            missing,
+            vec!["build/REGISTRANT.tsv".to_string()],
+            "a declared produces: file that was never written must be named"
+        );
+
+        // Write it — the gap must close, not stay reported forever.
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/REGISTRANT.tsv"), "now it exists\n").unwrap();
+        let missing = missing_declared_produces(step, dir.path(), &asset_graph);
+        assert!(
+            missing.is_empty(),
+            "declared file now exists — must not still be reported missing: {missing:?}"
+        );
+    }
+
+    // Round 7 pin #2: the gate exemption's soundness rests on one unpinned line —
+    // `produced_artifact_hash`'s own `!all_produced.contains(..)` filter over its
+    // `reads`. Dropping it is exactly round 5's perpetual re-execution returning: a
+    // reader (`consume`, mirroring `load`'s hand-written depends_on:) would try to
+    // hash ITS OWN, differently-cased spelling of an asset a producer already owns —
+    // a path that does not exist on a case-sensitive filesystem — and never settle
+    // into skip. The gate's exemption argument depends on this filter meaning the
+    // reader's spelling is never consulted at all; this proves that half.
+    //
+    // Case-sensitivity dependent — self-skips on a filesystem that folds
+    // build/REGISTRANT.tsv and build/registrant.tsv into one entry, since then there
+    // is nothing to distinguish.
+    #[test]
+    fn test_reader_case_mismatch_settles_to_skip_not_perpetual_staleness() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: produce\n    sql: models/produce.sql\n    produces: [build/REGISTRANT.tsv]\n  - name: consume\n    sql: models/consume.sql\n    depends_on: [build/registrant.tsv]\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[
+                ("models/produce.sql", "SELECT 1;"),
+                ("models/consume.sql", "SELECT 2;"),
+            ],
+        );
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/REGISTRANT.tsv"), "real content\n").unwrap();
+
+        if dir.path().join("build/registrant.tsv").exists() {
+            eprintln!(
+                "skipping test_reader_case_mismatch_settles_to_skip_not_perpetual_staleness: \
+                 {} does not distinguish case, so build/registrant.tsv already exists via \
+                 folding",
+                dir.path().display()
+            );
+            return;
+        }
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(engine.calls.borrow().len(), 3, "run 1: preflight + 2 sql");
+
+        // Run 2, 3: nothing touched. "consume" must settle to skip — a reader still
+        // hashing its own case-mismatched spelling directly would find that path
+        // missing every time and never stop re-running.
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "run 2: both steps unchanged, must settle to preflight only"
+        );
+
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "run 3: same again — must stay settled, not resume re-running"
+        );
+    }
+
+    // Round 8 pin #1 — the wider, SQL-introspection-driven instance of round 7's
+    // directory regression. `models/export.sql`'s `COPY orders TO 'build/orders'
+    // (… PARTITION_BY (year))` makes SQL introspection classify `build/orders` as
+    // `AssetKind::Directory` from the statement's own `options`, statically, at
+    // graph-build time — MockEngine never actually executes the SQL, so the test
+    // creates the partitioned directory by hand to stand in for what a real DuckDB
+    // COPY would have written, exactly as other tests here fake a SQL step's file
+    // output. This exercises the real end-to-end `run()` path, multi-invocation,
+    // asserting on `engine.calls` across five runs — not a call to
+    // `produced_artifact_hash` or `AssetKind` directly.
+    //
+    // Round 7's `fs::metadata(&full).map(|m| m.is_dir()).unwrap_or(false)` check
+    // would see "still a directory" at every one of these run 3/4 boundaries and
+    // skip forever; `hash_directory_contents` cannot make that mistake, because it
+    // hashes what is inside, not merely whether something is there.
+    #[test]
+    fn test_directory_emptied_while_kept_forces_rerun_not_perpetual_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: export\n    sql: models/export.sql\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[(
+                "models/export.sql",
+                "COPY orders TO 'build/orders' (FORMAT parquet, PARTITION_BY (year));",
+            )],
+        );
+
+        fs::create_dir_all(dir.path().join("build/orders")).unwrap();
+        fs::write(
+            dir.path().join("build/orders/year=2024.parquet"),
+            b"partition A",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("build/orders/year=2025.parquet"),
+            b"partition B",
+        )
+        .unwrap();
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "run 1: preflight + 1 sql (no prior state, always stale)"
+        );
+
+        // Run 2: nothing touched — establishes the settled-skip baseline a
+        // presence-only check and a content-manifest hash both agree on.
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "run 2: unchanged directory, must settle to skip"
+        );
+
+        // Corrupt: delete every partition file, keep the directory itself present.
+        fs::remove_file(dir.path().join("build/orders/year=2024.parquet")).unwrap();
+        fs::remove_file(dir.path().join("build/orders/year=2025.parquet")).unwrap();
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "run 3: directory emptied while kept present must force a re-run, not \
+             skip forever — round 7's regression, reproduced and closed"
+        );
+
+        // Restore (different) content — must also be detected, not compared against
+        // the emptied-directory baseline and called equal by coincidence.
+        fs::write(
+            dir.path().join("build/orders/year=2026.parquet"),
+            b"partition C",
+        )
+        .unwrap();
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            2,
+            "run 4: restored (different) content must also force a re-run"
+        );
+
+        // Run 5: unchanged again — must settle back to skip.
+        drop(engine);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            engine.calls.borrow().len(),
+            1,
+            "run 5: unchanged again, must settle back to skip"
+        );
+    }
+
+    // Round 8 pin #2 — round 7's regression #1, reproduced against the REAL
+    // `parquet_export` operator (not a stand-in): a bare, no-`/`, non-allowlisted-
+    // extension `dest:` (`registrant.avro`) must be tracked, not silently excluded
+    // by a name-based guess. `op:` steps run for real (see `run()`'s dispatch —
+    // MockEngine only intercepts `sql:`/`command:` steps), so this drives an actual
+    // DuckDB `COPY` through the operator against a real, pre-seeded `customers`
+    // table and reads the real file it writes.
+    //
+    // `engine.calls` cannot observe an `op:` step (it never reaches the engine at
+    // all), so this asserts on `state.runs`'s `steps_executed` count instead — the
+    // one observable that is meaningful for every step kind, SQL/command/op alike,
+    // recorded by the same `finish_run` call `engine.calls`-based tests rely on
+    // indirectly. Still the real end-to-end `run()` path, multi-invocation, not a
+    // call to `produced_artifact_hash` or `AssetKind` directly.
+    #[test]
+    fn test_parquet_export_bare_dest_forces_rerun_on_truncate_delete_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: export\n    op: parquet_export\n    with:\n      input: customers\n      dest: registrant.avro\n";
+        setup_project(dir.path(), yaml, &[]);
+
+        // Seed the real DuckDB file `parquet_export` opens with the table it reads —
+        // op: steps run for real, so this has to be a real table, not a mocked one.
+        {
+            let db_path = dir.path().join("test.duckdb");
+            let conn = duckdb::Connection::open(&db_path).unwrap();
+            conn.execute_batch("CREATE TABLE customers AS SELECT 1 AS id, 'a' AS name;")
+                .unwrap();
+        }
+
+        let last_steps_executed = |state: &MockStateBackend| -> usize {
+            state
+                .runs
+                .borrow()
+                .last()
+                .and_then(|(_, outcome)| outcome.clone())
+                .map(|(steps_executed, _)| steps_executed)
+                .expect("finish_run must have recorded this run")
+        };
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            last_steps_executed(&state),
+            1,
+            "run 1: no prior state, always stale"
+        );
+        let dest = dir.path().join("registrant.avro");
+        assert!(
+            dest.exists(),
+            "parquet_export must really write the bare-named, non-allowlisted-extension file"
+        );
+        let original_bytes = fs::read(&dest).unwrap();
+        assert!(!original_bytes.is_empty());
+
+        // Run 2: unchanged — must settle to skip.
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            last_steps_executed(&state),
+            0,
+            "run 2: unchanged, must settle to skip"
+        );
+
+        // Truncate the produced file underneath an unchanged manifest — round 7's
+        // exact regression shape: a bare, non-allowlisted-extension dest: went
+        // untracked and a truncation like this read as unchanged forever.
+        fs::write(&dest, b"").unwrap();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            last_steps_executed(&state),
+            1,
+            "run 3: truncated bare-named file must force a real re-run"
+        );
+        let rewritten_bytes = fs::read(&dest).unwrap();
+        assert_eq!(
+            rewritten_bytes, original_bytes,
+            "the re-run really re-executed parquet_export, restoring real bytes, \
+             not merely reporting success over the truncated file"
+        );
+
+        // Run 4: unchanged again (the just-restored file) — must settle to skip.
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            last_steps_executed(&state),
+            0,
+            "run 4: restored file unchanged, must settle to skip"
+        );
+
+        // Delete it outright — same requirement, the other direction.
+        fs::remove_file(&dest).unwrap();
+        run(dir.path(), &engine, &state, false).unwrap();
+        assert_eq!(
+            last_steps_executed(&state),
+            1,
+            "run 5: deleted bare-named file must force a real re-run"
+        );
+        assert!(
+            dest.exists(),
+            "deleted file must be really rewritten, not just reported fixed"
+        );
+    }
+
+    // ---- Round 9 ----------------------------------------------------------
+    // Round 8's design is unchanged. What follows pins the parts of it that a
+    // mutation could delete with the suite staying green, plus the two places it
+    // was still inferring rather than carrying.
+
+    /// Drive `run()` once and report how many engine calls it made. Every pin below
+    /// asserts on this across a sequence of runs rather than on a predicate's return
+    /// value: 2 is preflight plus one executed `sql:` step, 1 is preflight alone,
+    /// which is what a skip looks like from outside.
+    fn engine_calls_for_one_run(dir: &Path, state: &MockStateBackend) -> usize {
+        let engine = MockEngine::new();
+        run(dir, &engine, state, false).unwrap();
+        let n = engine.calls.borrow().len();
+        drop(engine);
+        n
+    }
+
+    /// A one-step project whose SQL is `sql`, with `build/<dir_name>` pre-created and
+    /// seeded, standing in for what a real DuckDB COPY would have written (MockEngine
+    /// executes no SQL). Returns the temp dir.
+    fn project_with_seeded_directory(sql: &str, files: &[(&str, &[u8])]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: export\n    sql: models/export.sql\n";
+        setup_project(dir.path(), yaml, &[("models/export.sql", sql)]);
+        for (rel, bytes) in files {
+            let full = dir.path().join(rel);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(&full, bytes).unwrap();
+        }
+        dir
+    }
+
+    // Round 9, C1 — `PARTITION_BY` is not the whole set of COPY options that make
+    // DuckDB write a directory, and the three that were missing all failed the same
+    // way: classified `File`, `fs::read` on a directory errors, the hash is `None`,
+    // and the step re-runs on every run at exit 0 while warning that it produced
+    // nothing — with the files on disk.
+    //
+    // Run 2 of each of these is the assertion that reddens on the parent behaviour.
+    // `PARTITION_BY` is in the loop as the control: it settled before this change and
+    // must still settle.
+    #[test]
+    fn test_every_directory_writing_copy_option_settles_and_then_notices_a_change() {
+        for option in [
+            "PARTITION_BY (year)",
+            "PER_THREAD_OUTPUT true",
+            "FILE_SIZE_BYTES '1MB'",
+            "ROW_GROUPS_PER_FILE 1",
+        ] {
+            let sql = format!("COPY orders TO 'build/out' (FORMAT parquet, {option});");
+            let dir = project_with_seeded_directory(
+                &sql,
+                &[("build/out/data_0.parquet", b"first slice")],
+            );
+            let state = MockStateBackend::new();
+
+            assert_eq!(
+                engine_calls_for_one_run(dir.path(), &state),
+                2,
+                "{option}: run 1 has no prior state and must execute"
+            );
+            assert_eq!(
+                engine_calls_for_one_run(dir.path(), &state),
+                1,
+                "{option}: run 2 must settle to skip — a directory-writing COPY \
+                 classified as a File cannot be read and never settles"
+            );
+
+            fs::write(dir.path().join("build/out/data_1.parquet"), b"second slice").unwrap();
+            assert_eq!(
+                engine_calls_for_one_run(dir.path(), &state),
+                2,
+                "{option}: run 3 must notice a file added to the produced directory"
+            );
+            assert_eq!(
+                engine_calls_for_one_run(dir.path(), &state),
+                1,
+                "{option}: run 4 must settle again"
+            );
+        }
+    }
+
+    // The other half of the option enumeration — an option that is NOT in the
+    // directory-writing set, or one that is but is switched off, must leave the
+    // target a single file, or the perpetual re-run simply arrives from the other
+    // side (`hash_directory_contents` on a regular file cannot `read_dir` it,
+    // returns `None`, and the step never settles).
+    //
+    // The four spellings are one keyword and three that only a CAST reads as off,
+    // which is what DuckDB's `GetBooleanArg` does. Each wrote a single 198-byte
+    // parquet file when driven on the DuckDB CLI at v1.5.4 and v1.5.5. Run 2 of the
+    // last three is what reddens if `copy_option_is_on` goes back to matching the
+    // `false` keyword.
+    #[test]
+    fn test_per_thread_output_off_is_hashed_as_one_file_and_settles() {
+        for arg in ["false", "0", "'false'", "'no'"] {
+            let dir = project_with_seeded_directory(
+                &format!(
+                    "COPY orders TO 'build/one.parquet' (FORMAT parquet, PER_THREAD_OUTPUT {arg});"
+                ),
+                &[("build/one.parquet", b"one file, not a directory")],
+            );
+            let state = MockStateBackend::new();
+
+            assert_eq!(
+                engine_calls_for_one_run(dir.path(), &state),
+                2,
+                "{arg}: run 1"
+            );
+            assert_eq!(
+                engine_calls_for_one_run(dir.path(), &state),
+                1,
+                "{arg}: run 2 must settle — this argument casts to false and writes \
+                 one file, and treating it as a directory would make the step re-run \
+                 forever"
+            );
+
+            fs::write(dir.path().join("build/one.parquet"), b"different bytes").unwrap();
+            assert_eq!(
+                engine_calls_for_one_run(dir.path(), &state),
+                2,
+                "{arg}: run 3 — the file's bytes changed and it is really being hashed"
+            );
+            assert_eq!(
+                engine_calls_for_one_run(dir.path(), &state),
+                1,
+                "{arg}: run 4 must settle again"
+            );
+        }
+    }
+
+    // A hand-declared `produces:` name the step's own SQL never mentions is still a
+    // path, and the step therefore re-runs on every run: `<dir>/raw_tables` cannot be
+    // read, `produced_artifact_hash` returns `None`, staleness is forced, and
+    // propagation drags the consumer along. That cost is the trade taken over the
+    // alternative measured in round 9 — classifying such a name `Table`, which drops
+    // it out of the staleness path and lets a step that really did write bytes under
+    // that name skip over a truncated or deleted artifact at exit 0.
+    //
+    // Runs 2, 3 and 4 are what redden if that alternative comes back: each would
+    // report 1 (preflight only). `tests/bare_produces_ordering_token.rs` pins the
+    // other half of "loud" — the warning on stderr — which no engine-call count can
+    // see. `test_external_unproduced_file_change_forces_rerun` is the guard on the
+    // reads side: a bare `depends_on:` name that nothing produces is a real file and
+    // is really hashed.
+    #[test]
+    fn test_bare_produces_ordering_token_reruns_rather_than_settling() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: load\n    sql: models/load.sql\n    produces: [raw_tables]\n  - name: consume\n    sql: models/consume.sql\n    depends_on: [raw_tables]\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[
+                // Neither model creates anything called `raw_tables` — exactly the
+                // shape `examples/code-lists/arcform.yaml` ships.
+                (
+                    "models/load.sql",
+                    "CREATE OR REPLACE TABLE naics_raw AS SELECT 1;",
+                ),
+                (
+                    "models/consume.sql",
+                    "CREATE OR REPLACE TABLE naics_norm AS SELECT 2;",
+                ),
+            ],
+        );
+        let state = MockStateBackend::new();
+
+        for run in 1..=4 {
+            assert_eq!(
+                engine_calls_for_one_run(dir.path(), &state),
+                3,
+                "run {run}: `raw_tables` is a declared path with nothing at it, so the \
+                 producer must stay stale and drag its consumer with it — preflight \
+                 plus both sql steps, every run"
+            );
+        }
+
+        // The control: a `produces:` name the step's work DOES write settles, so the
+        // re-running above is this configuration and not every configuration.
+        let settling = tempfile::tempdir().unwrap();
+        let settling_yaml = "name: test\nsteps:\n  - name: load\n    sql: models/load.sql\n    produces: [build/loaded.txt]\n";
+        setup_project(
+            settling.path(),
+            settling_yaml,
+            &[(
+                "models/load.sql",
+                "CREATE OR REPLACE TABLE naics_raw AS SELECT 1;",
+            )],
+        );
+        fs::create_dir_all(settling.path().join("build")).unwrap();
+        fs::write(settling.path().join("build/loaded.txt"), b"written").unwrap();
+        let settling_state = MockStateBackend::new();
+        assert_eq!(
+            engine_calls_for_one_run(settling.path(), &settling_state),
+            2,
+            "control run 1"
+        );
+        assert_eq!(
+            engine_calls_for_one_run(settling.path(), &settling_state),
+            1,
+            "control run 2: a declared produces: name that IS on disk settles"
+        );
+    }
+
+    // An `assets:` override is by definition the escape hatch for an asset arcform
+    // cannot discover — no SQL introspection, no operator config, nothing but the
+    // string. So the default decides every one of them, which makes this the path
+    // most likely to be re-guessed. It must hash the file's BYTES.
+    //
+    // Runs 3 and 6 are what redden if the override's default stops being a path:
+    // both would report 1 (preflight only), certifying an artifact that is deleted
+    // and then one whose contents changed underneath.
+    #[test]
+    fn test_assets_override_naming_a_real_file_is_hashed_and_notices_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: export\n    sql: models/export.sql\nassets:\n  build/side.csv:\n    produced_by: export\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            // The SQL creates a table and never mentions build/side.csv — the
+            // discovery gap the `assets:` block exists to close.
+            &[(
+                "models/export.sql",
+                "CREATE OR REPLACE TABLE orders AS SELECT 1;",
+            )],
+        );
+        let side = dir.path().join("build/side.csv");
+        fs::create_dir_all(side.parent().unwrap()).unwrap();
+        fs::write(&side, b"id\n1\n").unwrap();
+        let state = MockStateBackend::new();
+
+        assert_eq!(engine_calls_for_one_run(dir.path(), &state), 2, "run 1");
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 2: nothing changed, so the step settles"
+        );
+
+        fs::remove_file(&side).unwrap();
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 3: the overridden asset was DELETED — a run that skips here reports \
+             success over an artifact that is gone"
+        );
+
+        fs::write(&side, b"id\n1\n").unwrap();
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 4: restored after an unreadable run, so still stale"
+        );
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 5: settles again on the restored bytes"
+        );
+
+        // Same path, same length, different bytes — presence is not enough.
+        fs::write(&side, b"id\n9\n").unwrap();
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 6: the overridden asset's BYTES changed under an unchanged path"
+        );
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 7: settles on the new contents"
+        );
+    }
+
+    // The same escape hatch with a separator-free name — the exact spelling the
+    // withdrawn separator rule decided differently. A protocol whose `sql:` step
+    // writes `side.db` through an ATTACH is invisible to SQL introspection, so
+    // `assets:` is the only way to declare it, and it carries no separator.
+    //
+    // Runs 3 and 5 are what redden if a separator-free `assets:` name stops being a
+    // path: both would report 1 (preflight only), over a file that is deleted and
+    // then over one whose bytes changed.
+    #[test]
+    fn test_assets_override_with_a_separator_free_name_is_still_hashed() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: export\n    sql: models/export.sql\nassets:\n  side.db:\n    produced_by: export\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[(
+                "models/export.sql",
+                "ATTACH IF NOT EXISTS 'side.db' AS side;\n\
+                 CREATE OR REPLACE TABLE side.x AS SELECT 1;",
+            )],
+        );
+        let side = dir.path().join("side.db");
+        fs::write(&side, b"pretend duckdb file").unwrap();
+        let state = MockStateBackend::new();
+
+        assert_eq!(engine_calls_for_one_run(dir.path(), &state), 2, "run 1");
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 2: nothing changed, so the step settles"
+        );
+
+        fs::remove_file(&side).unwrap();
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 3: the declared artifact is GONE and the step must not certify it"
+        );
+
+        fs::write(&side, b"pretend duckdb file").unwrap();
+        assert_eq!(engine_calls_for_one_run(dir.path(), &state), 2, "run 4");
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 5: settles again on the restored bytes"
+        );
+
+        fs::write(&side, b"pretend duckdb FILE").unwrap();
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 6: same path, same length, different bytes"
+        );
+    }
+
+    // Round 9, P1 — the content half of the directory hash, which every existing
+    // directory test misses because they all move a *path*: they add or remove a
+    // file. Reduce `hash_directory_contents` to `(relative path, String::new())` and
+    // this is the only thing that notices. A release binary built with that reduction
+    // left a partition file's bytes changed, and truncated, both reading
+    // `[skip: hash_clean]` at exit 0 — this card's own headline defect, for the
+    // Directory kind.
+    //
+    // No path is created, removed or renamed anywhere in this test.
+    #[test]
+    fn test_directory_file_content_change_with_no_path_change_forces_rerun() {
+        let dir = project_with_seeded_directory(
+            "COPY orders TO 'build/parts' (FORMAT parquet, PARTITION_BY (year));",
+            &[
+                ("build/parts/year=2024.parquet", b"AAAA"),
+                ("build/parts/year=2025.parquet", b"BBBB"),
+            ],
+        );
+        let state = MockStateBackend::new();
+        let paths_now = || {
+            let mut v: Vec<String> = fs::read_dir(dir.path().join("build/parts"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        let paths_at_start = paths_now();
+
+        assert_eq!(engine_calls_for_one_run(dir.path(), &state), 2, "run 1");
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 2: unchanged directory must settle"
+        );
+
+        // Same path, same length, different bytes.
+        fs::write(dir.path().join("build/parts/year=2024.parquet"), b"ZZZZ").unwrap();
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 3: a partition file's BYTES changed under an unchanged set of paths \
+             — a hash over paths alone cannot see this"
+        );
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 4: settles again on the new content"
+        );
+
+        // Same path, truncated to empty.
+        fs::write(dir.path().join("build/parts/year=2024.parquet"), b"").unwrap();
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 5: truncating a partition file must force a re-run"
+        );
+
+        assert_eq!(
+            paths_now(),
+            paths_at_start,
+            "this test must never have added or removed a path — otherwise it is \
+             pinning the same thing the existing directory tests already pin"
+        );
+    }
+
+    // Round 9, P2 — the recursion. Real DuckDB nests: `COPY … PARTITION_BY` writes
+    // `build/parts/year=2024/data_0.parquet`, while the existing directory test
+    // hand-creates flat files directly under the target. Stop descending into
+    // subdirectories and the whole tree below the top level becomes invisible, so
+    // every run hashes the same empty manifest and the step settles over corruption.
+    //
+    // The top level of this tree holds no regular file at all, which is what makes
+    // run 3 the assertion that reddens.
+    #[test]
+    fn test_nested_directory_content_change_forces_rerun() {
+        let dir = project_with_seeded_directory(
+            "COPY orders TO 'build/parts' (FORMAT parquet, PARTITION_BY (year, month));",
+            &[
+                ("build/parts/year=2024/month=01/data_0.parquet", b"jan"),
+                ("build/parts/year=2024/month=02/data_0.parquet", b"feb"),
+            ],
+        );
+        let state = MockStateBackend::new();
+
+        assert_eq!(engine_calls_for_one_run(dir.path(), &state), 2, "run 1");
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 2: unchanged nested tree must settle"
+        );
+
+        fs::write(
+            dir.path()
+                .join("build/parts/year=2024/month=02/data_0.parquet"),
+            b"FEB",
+        )
+        .unwrap();
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 3: bytes two levels down changed — a non-recursive walk sees an \
+             empty manifest here and skips forever"
+        );
+
+        fs::remove_file(
+            dir.path()
+                .join("build/parts/year=2024/month=01/data_0.parquet"),
+        )
+        .unwrap();
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 4: a nested partition deleted must force a re-run too"
+        );
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 5: settles again"
+        );
+    }
+
+    // Round 9, P3 — the ordering guarantee `StepAssets::record` rests on. Phase 1
+    // (SQL introspection) records a real, source-derived kind; Phase 2 (a hand
+    // `produces:`) records a default. `or_insert` keeps the first. Change it to
+    // `insert` and the default wins: `build/parts` is a directory that DuckDB writes
+    // and a `File` to the runner, `fs::read` on it errors, and the step never
+    // settles.
+    //
+    // Run 2 is what reddens. This is what the four shipping `open_analytics`
+    // manifests' safety rests on, in the one configuration where the two phases
+    // disagree.
+    #[test]
+    fn test_a_hand_declaration_cannot_downgrade_sql_introspections_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: export\n    sql: models/export.sql\n    produces: [build/parts]\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[(
+                "models/export.sql",
+                "COPY orders TO 'build/parts' (FORMAT parquet, PARTITION_BY (year));",
+            )],
+        );
+        fs::create_dir_all(dir.path().join("build/parts")).unwrap();
+        fs::write(dir.path().join("build/parts/year=2024.parquet"), b"one").unwrap();
+        let state = MockStateBackend::new();
+
+        assert_eq!(engine_calls_for_one_run(dir.path(), &state), 2, "run 1");
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 2: the SQL said Directory and the later hand-declaration must not \
+             downgrade it to File — a File read of a directory never settles"
+        );
+
+        // Still hashing it AS a directory, not merely ignoring it: emptying it while
+        // keeping it present must be noticed.
+        fs::remove_file(dir.path().join("build/parts/year=2024.parquet")).unwrap();
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 3: emptied directory must force a re-run"
+        );
+    }
+
+    // Round 9, P4 — rounds 1 to 3's sentinel bug, unpinned for the Directory kind.
+    // `hash_directory_contents(&full)?` propagates `None` out of
+    // `produced_artifact_hash`, and `is_hash_stale` turns that into unconditional
+    // staleness. Fold it into a comparable `"MISSING"` string instead and the
+    // baseline recorded right after the step's own "success" already says MISSING, so
+    // every later run compares MISSING to MISSING and skips — the graph asserting a
+    // directory is produced while nothing is on disk, and the run reporting success.
+    //
+    // MockEngine executes no SQL, so `build/parts` is never created. Runs 2 and 3
+    // are what redden.
+    #[test]
+    fn test_absent_directory_produce_never_settles_into_skip() {
+        let dir = project_with_seeded_directory(
+            "COPY orders TO 'build/parts' (FORMAT parquet, PARTITION_BY (year));",
+            &[],
+        );
+        let state = MockStateBackend::new();
+
+        assert!(!dir.path().join("build/parts").exists());
+
+        assert_eq!(engine_calls_for_one_run(dir.path(), &state), 2, "run 1");
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 2: a produced directory that is not there must never read as \
+             unchanged, however stable the placeholder recorded for it"
+        );
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            2,
+            "run 3: same again"
+        );
+
+        // And it stops re-running the moment the directory really is there.
+        fs::create_dir_all(dir.path().join("build/parts")).unwrap();
+        fs::write(dir.path().join("build/parts/year=2024.parquet"), b"real").unwrap();
+        assert_eq!(engine_calls_for_one_run(dir.path(), &state), 2, "run 4");
+        assert_eq!(
+            engine_calls_for_one_run(dir.path(), &state),
+            1,
+            "run 5: settles once the directory exists — the staleness above was the \
+             absence, not a stuck step"
         );
     }
 }

@@ -1,0 +1,85 @@
+# The `source.naics` Protocol — the reproducible *definition* of how the NAICS 2022
+# industry-classification Dataset is ingested from the official U.S. Census file.
+# `arc run` executes this manifest; one Run → one Dataset version. See ./README.md.
+#
+# ALL-CONFIG. Every step is a first-class `sql:` model or a typed `op:` operator (the
+# arcform catalog) — there are NO opaque `command:`/`sh -c` steps. The curl fetch is
+# now http_fetch; the terminal COPY is parquet_export; datapackage_describe emits the
+# descriptor from the built Parquet; finetype_validate gates it. (The Census workbook is
+# an .xlsx — load.sql reads it directly via DuckDB's `excel` extension, so no external
+# xlsx→csv tool is needed.) Operator code lives in the arcform repo, not here.
+#
+# BOUNDARY — do NOT fold this into this manifest:
+#   • PUBLISH (content-addressed R2 upload + manifest/catalog pointer flip) stays in
+#     the out-of-repo publish pipeline and READS this Protocol's terminal output,
+#     build/naics.parquet + the emitted datapackage.json. It is not an arcform step.
+#
+# Produces: build/naics.parquet  →  published as source.naics
+name: naics
+engine: duckdb
+engine_version: ">=1.2"
+db: build/naics.db
+
+# Transient API/network blips shouldn't sink a run — retry fetches with backoff.
+defaults:
+  retry:
+    max_attempts: 3
+    backoff_sec: 2.0
+
+steps:
+  # ── Fetch: the Census 2022 NAICS descriptions workbook ───────────────────────────
+  # http_fetch carries the content-freshness contract (conditional re-fetch). The 2022
+  # vintage is effectively frozen.
+  - name: fetch_naics
+    op: http_fetch@1
+    with:
+      url: https://www.census.gov/naics/2022NAICS/2022_NAICS_Descriptions.xlsx
+      out: build/naics_desc.xlsx
+      headers:
+        User-Agent: "Meridian Protocol (open-analytics; research@meridian.online)"
+
+  # ── Load + normalise: strip the trilateral 'T' marker, derive level, null blanks ─
+  # Reads the .xlsx directly (DuckDB `excel` extension, `read_xlsx`).
+  - name: load
+    sql: models/load.sql
+    depends_on: [build/naics_desc.xlsx]
+
+  # ── Package: materialise the terminal table (adds the search corpus) ─────────────
+  - name: package
+    sql: models/package.sql
+    produces: [naics_out]
+
+  # ── Export: write the terminal Parquet the publish seam consumes ─────────────────
+  # parquet_export replaces package.sql's old `COPY … (COMPRESSION zstd)` — a first-class
+  # produced asset the engine orders + stale-propagates. order_by code (the primary key)
+  # is a total order → reproducible bytes.
+  - name: export_naics
+    op: parquet_export@1
+    with:
+      input: naics_out
+      dest: build/naics.parquet
+      compression: zstd
+      order_by: "code"
+
+  # ── Describe: EMIT datapackage.json from the built Parquet ───────────────────────
+  # finetype types every column; descriptor.overrides.json overlays the curated half
+  # (identity, licenses, sources, per-field prose, primaryKey). Hard-fails on drift.
+  - name: describe
+    op: datapackage_describe@1
+    with:
+      parquet: build/naics.parquet
+      overrides: descriptor.overrides.json
+      out: datapackage.json
+
+  # ── Validate: GATE the built Parquet against the self-derived finetype contract ──
+  # finetype_validate (CHECK-ONLY) checks the terminal Parquet against schema.finetype.json
+  # (self-derived from THIS Parquet — see its $comment). Pass-through today, fail-closed
+  # drift tripwire for future Runs; writes nothing, so build/naics.parquet is untouched.
+  - name: validate
+    op: finetype_validate@1
+    with:
+      parquet: build/naics.parquet
+      schema: schema.finetype.json
+
+  # publish: the out-of-repo publish pipeline reads build/naics.parquet + the emitted
+  # datapackage.json (boundary — not an arc step). See README.

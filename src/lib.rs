@@ -34,6 +34,7 @@
 #![cfg_attr(not(feature = "cli"), allow(dead_code))]
 
 mod asset;
+mod asset_kind;
 mod bridge;
 #[cfg(feature = "cli")]
 mod cli;
@@ -67,8 +68,9 @@ pub mod spec;
 /// Calling it is not a library operation: it parses **the calling process's**
 /// `std::env::args` with `clap`, so an unrecognised argument prints `arc` usage to
 /// stderr and exits; on a dispatch error it prints to stderr and calls
-/// `std::process::exit(1)`. Nothing but the binary should call it, and it may change
-/// or disappear at any time.
+/// `std::process::exit`, with the code `Error::exit_code` gives that error — 1 for
+/// "cannot run", 2 for "found a problem" (see that method's doc for the split).
+/// Nothing but the binary should call it, and it may change or disappear at any time.
 #[cfg(feature = "cli")]
 #[doc(hidden)]
 pub fn cli_main() {
@@ -78,6 +80,6 @@ pub fn cli_main() {
 
     if let Err(e) = cli::dispatch(cli) {
         eprintln!("error: {}", e);
-        std::process::exit(1);
+        std::process::exit(e.exit_code());
     }
 }

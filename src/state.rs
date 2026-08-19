@@ -14,8 +14,15 @@ use crate::error::{Error, Result};
 /// Record of a step's last execution state.
 #[derive(Debug, Clone)]
 pub struct StepState {
-    /// SHA-256 hex digest of the SQL file contents at last run.
+    /// SHA-256 hex digest of the SQL file contents (or, for an `op:` step, its
+    /// operator ref + `with:` config) at last run.
     pub sql_hash: String,
+    /// SHA-256 hex digest over every FILE asset this step produced, plus every file it
+    /// reads that nothing in the manifest produces, as those files stood on disk right
+    /// after the step's last success. Empty string for a row written before this field
+    /// existed, or for a step with no file-typed produced/external-read assets — see
+    /// [`crate::runner`]'s `produced_artifact_hash`, the only writer.
+    pub artifact_hash: String,
     /// Result of last execution.
     pub status: StepStatus,
 }
@@ -80,6 +87,59 @@ pub fn content_hash(content: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Combined SHA-256 over a directory's contents, so a `Directory`-kind asset (a
+/// `COPY … PARTITION_BY` target, or an `archive_extract` pattern-only `dest:`) is
+/// answerable for drift the same way a `File` is answerable for its own bytes —
+/// not skipped because it is a directory, and not satisfied by the directory node
+/// merely existing while what is inside it changes underneath.
+///
+/// Walks every regular file in the tree (recursively, symlinks not followed),
+/// hashes each one's bytes, then hashes the sorted `(relative_path, file_hash)`
+/// pairs together. Sorted so the combined digest is independent of readdir order;
+/// keyed on relative path so a file moving to a different name inside the tree
+/// changes the digest even if no byte anywhere changed. `None` when any part of the
+/// walk fails to read: the directory itself missing or permission-denied, a
+/// subdirectory that cannot be listed, or a single child file whose bytes cannot be
+/// read — each of those is an `.ok()?` in the walk below. That is the same
+/// unconditional-staleness signal an
+/// unreadable file already produces, so an absent or damaged tree forces a re-run
+/// exactly as a deleted file does.
+pub fn hash_directory_contents(dir: &Path) -> Option<String> {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let read_dir = std::fs::read_dir(&current).ok()?;
+        for entry in read_dir {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file() {
+                let rel = path
+                    .strip_prefix(dir)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                let bytes = std::fs::read(&path).ok()?;
+                entries.push((rel, content_hash(&bytes)));
+            }
+            // Symlinks and other file types: neither hashed nor descended into —
+            // a directory tree with a dangling symlink still hashes deterministically
+            // over its real files rather than erroring the whole asset.
+        }
+    }
+    entries.sort();
+    let mut hasher = Sha256::new();
+    for (rel, hash) in &entries {
+        hasher.update(rel.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(hash.as_bytes());
+        hasher.update(b"\n");
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
 /// Trait for persisting step execution state across runs.
 pub trait StateBackend {
     /// Initialise the backend (create tables, etc.). Idempotent.
@@ -88,8 +148,15 @@ pub trait StateBackend {
     /// Get the last recorded state for a step, or None if never run.
     fn get_step_state(&self, step_name: &str) -> Result<Option<StepState>>;
 
-    /// Record a step's execution result.
-    fn record_step(&self, step_name: &str, sql_hash: &str, status: StepStatus) -> Result<()>;
+    /// Record a step's execution result: its config hash, its combined produced/
+    /// external-read artifact hash (see [`StepState::artifact_hash`]), and status.
+    fn record_step(
+        &self,
+        step_name: &str,
+        sql_hash: &str,
+        artifact_hash: &str,
+        status: StepStatus,
+    ) -> Result<()>;
 
     /// Record the start of a pipeline run. Returns a run ID.
     fn start_run(&self) -> Result<String>;
@@ -150,7 +217,14 @@ impl StateBackend for DuckDbStateBackend {
                 finished_at TIMESTAMP,
                 steps_executed INTEGER,
                 outcome TEXT
-            );",
+            );
+            -- Migration: a state db created before artifact hashing existed has no
+            -- such column. Idempotent, so every `init()` can run it unconditionally.
+            -- The empty-string default never matches a freshly computed hash (see
+            -- `produced_artifact_hash`), so the first post-upgrade run treats every
+            -- step as artifact-stale exactly once and reseeds it — safe because it
+            -- fails toward re-running, never toward skipping.
+            ALTER TABLE _arcform_state ADD COLUMN IF NOT EXISTS artifact_hash TEXT DEFAULT '';",
         )
         .map_err(|e| Error::StateBackend(e.to_string()))?;
         Ok(())
@@ -159,14 +233,18 @@ impl StateBackend for DuckDbStateBackend {
     fn get_step_state(&self, step_name: &str) -> Result<Option<StepState>> {
         let conn = self.open()?;
         let mut stmt = conn
-            .prepare("SELECT sql_hash, status FROM _arcform_state WHERE step_name = ?1")
+            .prepare(
+                "SELECT sql_hash, artifact_hash, status FROM _arcform_state WHERE step_name = ?1",
+            )
             .map_err(|e| Error::StateBackend(e.to_string()))?;
 
         let result = stmt.query_row([step_name], |row| {
             let hash: String = row.get(0)?;
-            let status: String = row.get(1)?;
+            let artifact_hash: String = row.get(1)?;
+            let status: String = row.get(2)?;
             Ok(StepState {
                 sql_hash: hash,
+                artifact_hash,
                 status: StepStatus::from_str(&status),
             })
         });
@@ -178,12 +256,18 @@ impl StateBackend for DuckDbStateBackend {
         }
     }
 
-    fn record_step(&self, step_name: &str, sql_hash: &str, status: StepStatus) -> Result<()> {
+    fn record_step(
+        &self,
+        step_name: &str,
+        sql_hash: &str,
+        artifact_hash: &str,
+        status: StepStatus,
+    ) -> Result<()> {
         let conn = self.open()?;
         conn.execute(
-            "INSERT OR REPLACE INTO _arcform_state (step_name, sql_hash, last_run_at, status)
-             VALUES (?1, ?2, current_timestamp, ?3)",
-            duckdb::params![step_name, sql_hash, status.as_str()],
+            "INSERT OR REPLACE INTO _arcform_state (step_name, sql_hash, artifact_hash, last_run_at, status)
+             VALUES (?1, ?2, ?3, current_timestamp, ?4)",
+            duckdb::params![step_name, sql_hash, artifact_hash, status.as_str()],
         )
         .map_err(|e| Error::StateBackend(e.to_string()))?;
         Ok(())
@@ -306,11 +390,18 @@ pub mod mock {
             Ok(self.states.borrow().get(step_name).cloned())
         }
 
-        fn record_step(&self, step_name: &str, sql_hash: &str, status: StepStatus) -> Result<()> {
+        fn record_step(
+            &self,
+            step_name: &str,
+            sql_hash: &str,
+            artifact_hash: &str,
+            status: StepStatus,
+        ) -> Result<()> {
             self.states.borrow_mut().insert(
                 step_name.to_string(),
                 StepState {
                     sql_hash: sql_hash.to_string(),
+                    artifact_hash: artifact_hash.to_string(),
                     status,
                 },
             );
@@ -348,6 +439,69 @@ pub mod mock {
 mod tests {
     use super::*;
 
+    // A populated directory hashes deterministically, independent of readdir order —
+    // two identical trees (built via different insertion order) hash equal.
+    #[test]
+    fn hash_directory_contents_is_order_independent() {
+        let dir_a = std::env::temp_dir().join(format!("arc-hdc-a-{}", std::process::id()));
+        let dir_b = std::env::temp_dir().join(format!("arc-hdc-b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        std::fs::create_dir_all(dir_a.join("sub")).unwrap();
+        std::fs::create_dir_all(dir_b.join("sub")).unwrap();
+
+        std::fs::write(dir_a.join("a.txt"), b"one").unwrap();
+        std::fs::write(dir_a.join("sub/b.txt"), b"two").unwrap();
+        // Same content, opposite write order.
+        std::fs::write(dir_b.join("sub/b.txt"), b"two").unwrap();
+        std::fs::write(dir_b.join("a.txt"), b"one").unwrap();
+
+        let hash_a = hash_directory_contents(&dir_a);
+        let hash_b = hash_directory_contents(&dir_b);
+        assert!(hash_a.is_some());
+        assert_eq!(
+            hash_a, hash_b,
+            "directory hash must not depend on readdir order"
+        );
+
+        std::fs::remove_dir_all(&dir_a).unwrap();
+        std::fs::remove_dir_all(&dir_b).unwrap();
+    }
+
+    // Emptying a directory (files removed, directory itself kept) must change the
+    // hash — this is round 7's regression: `fs::metadata().is_dir()` alone treats a
+    // present-but-emptied directory identically to a populated one, so corruption
+    // stands forever at exit 0. A content-manifest hash cannot make that mistake.
+    #[test]
+    fn hash_directory_contents_changes_when_emptied() {
+        let dir = std::env::temp_dir().join(format!("arc-hdc-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("part-0.parquet"), b"partition bytes").unwrap();
+
+        let populated = hash_directory_contents(&dir);
+        std::fs::remove_file(dir.join("part-0.parquet")).unwrap();
+        let emptied = hash_directory_contents(&dir);
+
+        assert!(populated.is_some());
+        assert!(emptied.is_some());
+        assert_ne!(
+            populated, emptied,
+            "emptying a directory while keeping it present must change the hash"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // An absent directory hashes to None — the same unconditional-staleness signal
+    // an unreadable file already gives.
+    #[test]
+    fn hash_directory_contents_none_when_absent() {
+        let dir = std::env::temp_dir().join(format!("arc-hdc-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(hash_directory_contents(&dir), None);
+    }
+
     // StateBackend trait compiles and MockStateBackend works.
     #[test]
     fn test_mock_state_backend() {
@@ -360,7 +514,7 @@ mod tests {
 
         // Record and retrieve.
         backend
-            .record_step("foo", "abc123", StepStatus::Success)
+            .record_step("foo", "abc123", "", StepStatus::Success)
             .unwrap();
         let state = backend.get_step_state("foo").unwrap().unwrap();
         assert_eq!(state.sql_hash, "abc123");
@@ -423,7 +577,9 @@ mod tests {
             "state db (and its parent) should be created"
         );
         // Tables are usable.
-        backend.record_step("s", "h", StepStatus::Success).unwrap();
+        backend
+            .record_step("s", "h", "", StepStatus::Success)
+            .unwrap();
         assert_eq!(backend.get_step_state("s").unwrap().unwrap().sql_hash, "h");
     }
 
@@ -438,7 +594,7 @@ mod tests {
         let sql = "CREATE TABLE foo (id INT);";
         let hash = content_hash(sql.as_bytes());
         backend
-            .record_step("load", &hash, StepStatus::Success)
+            .record_step("load", &hash, "", StepStatus::Success)
             .unwrap();
 
         let state = backend.get_step_state("load").unwrap().unwrap();

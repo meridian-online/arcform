@@ -8,17 +8,20 @@
 //! `read_csv(...)`, `read_json(['a.json','b.json'])` — is a table-valued function whose *first
 //! argument is a filesystem path*. Rather than record the opaque function name (`read_parquet`)
 //! as the input, we lift the path literal(s) it reads and a `COPY … TO 'file'` writes: those
-//! path-shaped names become file-kind assets downstream (see [`crate::contract`]). Lineage into
-//! and out of files is thus *discovered from the SQL*, never hand-declared via `depends_on:`.
+//! path-shaped names become filesystem-backed assets downstream (see [`crate::contract`]) —
+//! one file, a directory of files, or a glob, per [`SqlAssets::kinds`]. Lineage into and out of
+//! files is thus *discovered from the SQL*, never hand-declared via `depends_on:`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sqlparser::ast::{
-    CopySource, CopyTarget, Expr, FunctionArg, FunctionArgExpr, Insert, ObjectName, Statement,
-    TableFactor, TableObject, Value,
+    CopyOption, CopySource, CopyTarget, Expr, FunctionArg, FunctionArgExpr, Insert, ObjectName,
+    Statement, TableFactor, TableObject, Value,
 };
 use sqlparser::dialect::DuckDbDialect;
 use sqlparser::parser::Parser;
+
+use crate::asset_kind::AssetKind;
 
 /// Assets discovered from parsing a SQL file — four-set model.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -31,6 +34,138 @@ pub struct SqlAssets {
     pub internal: BTreeSet<String>,
     /// Tables/views this SQL drops — destructive operations tracked separately.
     pub destroys: BTreeSet<String>,
+    /// What each name in `outputs`/`inputs` actually is — set here, at the one place
+    /// that already knows. A bare identifier from CREATE/FROM/JOIN is a `Table`. A
+    /// path literal lifted from a file-reader argument is a `File`, or a `Pattern`
+    /// when [`is_glob`] holds. A `COPY … TO` target is classified by
+    /// [`copy_to_target_kind`] from the statement's own options and is never tested
+    /// for glob metacharacters — DuckDB's COPY target is a literal path, not a
+    /// pattern. Never reconstructed later from the string.
+    pub kinds: BTreeMap<String, AssetKind>,
+}
+
+impl SqlAssets {
+    fn record_output(&mut self, name: String, kind: AssetKind) {
+        self.kinds.insert(name.clone(), kind);
+        self.outputs.insert(name);
+    }
+
+    fn record_input(&mut self, name: String, kind: AssetKind) {
+        self.kinds.insert(name.clone(), kind);
+        self.inputs.insert(name);
+    }
+}
+
+/// Whether a lifted path literal is a glob pattern rather than one literal path.
+fn is_glob(path: &str) -> bool {
+    path.contains(['*', '?', '['])
+}
+
+/// The `COPY … TO 'target'` option names under which DuckDB writes a *directory* of
+/// files at `target` instead of one file at `target`.
+///
+/// Read out of DuckDB's own source rather than assembled from the cases someone
+/// happened to hit. `PhysicalCopyToFile::GetGlobalSinkState`
+/// (`src/execution/operator/persistent/physical_copy_to_file.cpp`) creates `target`
+/// as a directory on `partition_output || per_thread_output || rotate`;
+/// `Binder::BindCopyTo` (`src/planner/binder/statement/bind_copy.cpp`) sets the
+/// first from a non-empty `PARTITION_BY` column list, the second from
+/// `PER_THREAD_OUTPUT`, and the third from `CopyFunction::rotate_files`. The two
+/// `rotate_files` implementations that exist in the tree — `WriteCSVRotateFiles`
+/// (`src/function/table/copy_csv.cpp`) and `ParquetWriteRotateFiles`
+/// (`extension/parquet/parquet_extension.cpp`) — return true for `FILE_SIZE_BYTES`,
+/// and the parquet one additionally for `ROW_GROUPS_PER_FILE`. That branch and its
+/// three inputs are byte-identical in v1.5.2 (the `libduckdb-sys` this crate's
+/// lockfile pins) and v1.5.5 (the newest published at the time of writing); CI links
+/// v1.5.4, between them.
+const DIRECTORY_WRITING_COPY_OPTIONS: [&str; 4] = [
+    "PARTITION_BY",
+    "PER_THREAD_OUTPUT",
+    "FILE_SIZE_BYTES",
+    "ROW_GROUPS_PER_FILE",
+];
+
+/// What a `COPY … TO 'filename'` writes, decided from the statement's own options
+/// against [`DIRECTORY_WRITING_COPY_OPTIONS`].
+fn copy_to_target_kind(options: &[CopyOption]) -> AssetKind {
+    let writes_a_directory = options.iter().any(|opt| match opt {
+        CopyOption::DuckDbOption { name, value } => {
+            DIRECTORY_WRITING_COPY_OPTIONS
+                .iter()
+                .any(|known| name.value.eq_ignore_ascii_case(known))
+                && copy_option_is_on(&name.value, value)
+        }
+        _ => false,
+    });
+    if writes_a_directory {
+        AssetKind::Directory
+    } else {
+        AssetKind::File
+    }
+}
+
+/// Whether an option carrying one of those names is actually switched on. DuckDB's
+/// binder applies three different rules to these four tokens, so this does too:
+///
+/// * `PARTITION_BY` — `partition_output = !partition_cols.empty()`, so an empty
+///   column list leaves it off.
+/// * `PER_THREAD_OUTPUT` — `GetBooleanArg`, which is
+///   `arg.empty() || arg[0].CastAs(BOOLEAN).GetValue<bool>()`. It **casts**, so the
+///   argument does not have to be the `false` keyword: see [`boolean_arg`].
+/// * `FILE_SIZE_BYTES` and `ROW_GROUPS_PER_FILE` — neither is read as a boolean at
+///   all. `rotate` is `file_size_bytes.IsValid() || row_groups_per_file.IsValid()`,
+///   set from the option carrying any value, so presence is the whole test. Measured
+///   on DuckDB v1.5.4 and v1.5.5: `FILE_SIZE_BYTES 0` writes a directory.
+fn copy_option_is_on(name: &str, value: &Option<Expr>) -> bool {
+    if name.eq_ignore_ascii_case("PARTITION_BY") {
+        !matches!(value, Some(Expr::Tuple(items)) if items.is_empty())
+    } else if name.eq_ignore_ascii_case("PER_THREAD_OUTPUT") {
+        boolean_arg(value)
+    } else {
+        true
+    }
+}
+
+/// DuckDB's `GetBooleanArg` for a `COPY` option: no argument is true, and otherwise
+/// the argument is **cast** to BOOLEAN rather than compared against a keyword.
+///
+/// Recognising only the `false` keyword is what this replaced, and it was wrong in
+/// the direction that never settles: `PER_THREAD_OUTPUT 0` and
+/// `PER_THREAD_OUTPUT 'false'` each wrote a single file on DuckDB v1.5.4 and v1.5.5,
+/// while a `Directory` classification would `read_dir` that file, get `None`, and
+/// re-run the step on every run while warning that it produced nothing.
+///
+/// The string arm is `TryCastStringBool` with `strict = false`, which is what
+/// `Value::CastAs` defaults to: `t`/`y`/`1`/`yes`/`true` and `f`/`n`/`0`/`no`/`false`,
+/// case-insensitively. A string outside that set is a conversion error in DuckDB and
+/// the statement writes nothing at all, so what this returns for it cannot be
+/// observed on disk; it stays `true`, the answer that forces staleness rather than
+/// certifying an artifact.
+fn boolean_arg(value: &Option<Expr>) -> bool {
+    let Some(Expr::Value(v)) = value else {
+        // No argument is a bare flag, which DuckDB reads as true. A non-literal
+        // expression is not something this can evaluate; leave it on.
+        return true;
+    };
+    match &v.value {
+        Value::Boolean(b) => *b,
+        Value::Number(n, _) => n.parse::<f64>().map(|x| x != 0.0).unwrap_or(true),
+        Value::SingleQuotedString(s)
+        | Value::DoubleQuotedString(s)
+        | Value::TripleSingleQuotedString(s)
+        | Value::TripleDoubleQuotedString(s) => cast_string_to_bool(s).unwrap_or(true),
+        _ => true,
+    }
+}
+
+/// `TryCastStringBool` with `strict = false`, from DuckDB's `cast_operators.hpp`.
+/// `None` where DuckDB raises a conversion error.
+fn cast_string_to_bool(s: &str) -> Option<bool> {
+    match s.to_ascii_lowercase().as_str() {
+        "t" | "y" | "1" | "yes" | "true" => Some(true),
+        "f" | "n" | "0" | "no" | "false" => Some(false),
+        _ => None,
+    }
 }
 
 /// Parse a SQL string and extract the assets it produces and consumes.
@@ -235,7 +370,7 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
         // CREATE TABLE foo AS SELECT ...
         Statement::CreateTable(create) => {
             let name = object_name_to_string(&create.name);
-            assets.outputs.insert(name);
+            assets.record_output(name, AssetKind::Table);
 
             // If it's a CTAS, the query's FROM tables are inputs.
             if let Some(ref query) = create.query {
@@ -245,14 +380,14 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
 
         // CREATE VIEW foo AS SELECT ...
         Statement::CreateView { name, query, .. } => {
-            assets.outputs.insert(object_name_to_string(name));
+            assets.record_output(object_name_to_string(name), AssetKind::Table);
             extract_inputs_from_query(query, assets);
         }
 
         // INSERT INTO foo SELECT ...
         Statement::Insert(Insert { table, source, .. }) => {
             if let TableObject::TableName(name) = table {
-                assets.outputs.insert(object_name_to_string(name));
+                assets.record_output(object_name_to_string(name), AssetKind::Table);
             }
             if let Some(src) = source {
                 extract_inputs_from_query(src.as_ref(), assets);
@@ -261,24 +396,39 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
 
         // COPY foo TO 'file.csv'
         // COPY foo FROM 'file.csv'
-        Statement::Copy { source, target, .. } => {
+        Statement::Copy {
+            source,
+            target,
+            options,
+            ..
+        } => {
             match source {
                 CopySource::Table { table_name, .. } => {
                     // COPY <table> ... — table is the source being read/written
                     match target {
                         CopyTarget::File { filename } => {
                             // COPY table TO 'file' — reading the table, producing the file.
-                            // The file path is a first-class produced asset (file-path lineage).
-                            assets.inputs.insert(object_name_to_string(table_name));
-                            assets.outputs.insert(filename.clone());
+                            // The file path is a first-class produced asset (file-path
+                            // lineage). Whether that name is one file or a directory of
+                            // files is decided by the COPY's own options — see
+                            // `copy_to_target_kind` for the enumeration and where it came
+                            // from — so it is known here rather than guessed later.
+                            assets
+                                .record_input(object_name_to_string(table_name), AssetKind::Table);
+                            assets.record_output(
+                                filename.clone(),
+                                copy_to_target_kind(options.as_slice()),
+                            );
                         }
                         CopyTarget::Stdout => {
                             // COPY table TO STDOUT — reading from the table
-                            assets.inputs.insert(object_name_to_string(table_name));
+                            assets
+                                .record_input(object_name_to_string(table_name), AssetKind::Table);
                         }
                         CopyTarget::Stdin => {
                             // COPY table FROM STDIN — writing to the table
-                            assets.outputs.insert(object_name_to_string(table_name));
+                            assets
+                                .record_output(object_name_to_string(table_name), AssetKind::Table);
                         }
                         _ => {}
                     }
@@ -298,12 +448,12 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
 
         // ALTER TABLE — modifies the asset (output), does not read data from it
         Statement::AlterTable { name, .. } => {
-            assets.outputs.insert(object_name_to_string(name));
+            assets.record_output(object_name_to_string(name), AssetKind::Table);
         }
 
         // ALTER VIEW — modifies the view (output), new query reads from tables (inputs)
         Statement::AlterView { name, query, .. } => {
-            assets.outputs.insert(object_name_to_string(name));
+            assets.record_output(object_name_to_string(name), AssetKind::Table);
             extract_inputs_from_query(query, assets);
         }
 
@@ -311,7 +461,7 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
         Statement::Merge { table, source, .. } => {
             // Target table → outputs
             if let TableFactor::Table { name, .. } = table {
-                assets.outputs.insert(object_name_to_string(name));
+                assets.record_output(object_name_to_string(name), AssetKind::Table);
             }
             // Source table → inputs
             extract_inputs_from_table_factor(source, assets);
@@ -389,14 +539,14 @@ fn extract_inputs_from_table_factor(factor: &TableFactor, assets: &mut SqlAssets
                 Some(table_args) if is_file_reader(&object_name_to_string(name)) => {
                     for arg in &table_args.args {
                         if let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg {
-                            extract_path_literals(expr, &mut assets.inputs);
+                            extract_path_literals(expr, assets);
                         }
                     }
                 }
                 // Any other table-valued function (`range(…)`, `generate_series(…)`) or a
                 // plain table name: record the name itself as the input, as before.
                 _ => {
-                    assets.inputs.insert(object_name_to_string(name));
+                    assets.record_input(object_name_to_string(name), AssetKind::Table);
                 }
             }
         }
@@ -463,16 +613,21 @@ fn is_file_reader(fn_name: &str) -> bool {
 /// case (filesystems are case-sensitive); everything else is ignored, so reader options
 /// like `format => 'array'` never masquerade as inputs (they arrive as named args, which
 /// the caller already skips, but a stray literal is harmless).
-fn extract_path_literals(expr: &Expr, out: &mut BTreeSet<String>) {
+fn extract_path_literals(expr: &Expr, assets: &mut SqlAssets) {
     match expr {
         Expr::Value(v) => {
             if let Value::SingleQuotedString(path) = &v.value {
-                out.insert(path.clone());
+                let kind = if is_glob(path) {
+                    AssetKind::Pattern
+                } else {
+                    AssetKind::File
+                };
+                assets.record_input(path.clone(), kind);
             }
         }
         Expr::Array(array) => {
             for elem in &array.elem {
-                extract_path_literals(elem, out);
+                extract_path_literals(elem, assets);
             }
         }
         _ => {}
@@ -1093,6 +1248,141 @@ mod tests {
             assets.outputs.contains("out/orders"),
             "output path produced"
         );
+        // PARTITION_BY makes DuckDB write a directory of Hive-partitioned files under
+        // this name, not one file — the COPY's own options say so, so this is known
+        // here rather than guessed later from the string or the filesystem.
+        assert_eq!(
+            assets.kinds.get("out/orders"),
+            Some(&AssetKind::Directory),
+            "PARTITION_BY target must be classified as a directory, not a file"
+        );
+    }
+
+    // A COPY … TO carrying none of `copy_to_target_kind`'s directory-writing options
+    // writes one file — it must not be classified a directory just for sharing the
+    // COPY statement shape.
+    #[test]
+    fn test_copy_without_a_directory_writing_option_is_a_file() {
+        let sql = "COPY orders TO 'out/orders.parquet' (FORMAT parquet);";
+        let assets = extract_assets(sql).expect("plain COPY must parse");
+        assert_eq!(
+            assets.kinds.get("out/orders.parquet"),
+            Some(&AssetKind::File)
+        );
+    }
+
+    // The other three directory-writing options, each on its own. Until this round
+    // only PARTITION_BY was tested for, and the comment above this test asserted that
+    // a COPY without it "writes exactly one file" — false on the DuckDB this crate
+    // links: PER_THREAD_OUTPUT and FILE_SIZE_BYTES each wrote a directory, the
+    // File-kind classification then made `fs::read` fail on it, and the step re-ran
+    // forever while warning that nothing had been produced.
+    #[test]
+    fn test_per_thread_output_target_is_a_directory() {
+        let sql = "COPY orders TO 'out/pto' (FORMAT parquet, PER_THREAD_OUTPUT true);";
+        let assets = extract_assets(sql).expect("PER_THREAD_OUTPUT COPY must parse");
+        assert_eq!(assets.kinds.get("out/pto"), Some(&AssetKind::Directory));
+    }
+
+    #[test]
+    fn test_per_thread_output_bare_flag_is_a_directory() {
+        let sql = "COPY orders TO 'out/pto' (FORMAT parquet, PER_THREAD_OUTPUT);";
+        let assets = extract_assets(sql).expect("bare-flag COPY must parse");
+        assert_eq!(assets.kinds.get("out/pto"), Some(&AssetKind::Directory));
+    }
+
+    // DuckDB's own `GetBooleanArg` reads an explicit `false` as off, so this one
+    // really does write a single file and classifying it a directory would send the
+    // step into the same perpetual re-run from the other side.
+    #[test]
+    fn test_per_thread_output_false_is_a_file() {
+        let sql = "COPY orders TO 'out/one.parquet' (FORMAT parquet, PER_THREAD_OUTPUT false);";
+        let assets = extract_assets(sql).expect("PER_THREAD_OUTPUT false COPY must parse");
+        assert_eq!(assets.kinds.get("out/one.parquet"), Some(&AssetKind::File));
+    }
+
+    // `GetBooleanArg` CASTS its argument to BOOLEAN; it does not compare it against
+    // the `false` keyword. Each of these spellings wrote a single 198-byte parquet
+    // file when driven on the DuckDB CLI at v1.5.4 and at v1.5.5, and each was
+    // classified `Directory` here until this round — `read_dir` on a regular file
+    // returns `None`, so the step re-ran on every run while warning that it had
+    // produced nothing.
+    #[test]
+    fn test_per_thread_output_cast_to_false_is_a_file() {
+        for arg in ["0", "'false'", "'FALSE'", "'no'", "'f'"] {
+            let sql = format!(
+                "COPY orders TO 'out/one.parquet' (FORMAT parquet, PER_THREAD_OUTPUT {arg});"
+            );
+            let assets = extract_assets(&sql).expect("COPY must parse");
+            assert_eq!(
+                assets.kinds.get("out/one.parquet"),
+                Some(&AssetKind::File),
+                "PER_THREAD_OUTPUT {arg} casts to false and writes one file"
+            );
+        }
+    }
+
+    // The same cast in the other direction, so the arm above cannot be satisfied by
+    // reading every PER_THREAD_OUTPUT argument as off. Each of these wrote a
+    // directory on both engines.
+    #[test]
+    fn test_per_thread_output_cast_to_true_is_a_directory() {
+        for arg in ["1", "'true'", "'yes'", "'t'", "'Y'"] {
+            let sql =
+                format!("COPY orders TO 'out/pto' (FORMAT parquet, PER_THREAD_OUTPUT {arg});");
+            let assets = extract_assets(&sql).expect("COPY must parse");
+            assert_eq!(
+                assets.kinds.get("out/pto"),
+                Some(&AssetKind::Directory),
+                "PER_THREAD_OUTPUT {arg} casts to true and writes a directory"
+            );
+        }
+    }
+
+    // The cast belongs to PER_THREAD_OUTPUT alone. `rotate` is set from
+    // `file_size_bytes.IsValid()`, not from a boolean, so a zero here is still on —
+    // `FILE_SIZE_BYTES 0` wrote a directory on both engines. Applying the boolean
+    // cast to all four names uniformly would get this one wrong.
+    #[test]
+    fn test_file_size_bytes_zero_is_still_a_directory() {
+        let sql = "COPY orders TO 'out/sized' (FORMAT parquet, FILE_SIZE_BYTES 0);";
+        let assets = extract_assets(sql).expect("FILE_SIZE_BYTES 0 COPY must parse");
+        assert_eq!(assets.kinds.get("out/sized"), Some(&AssetKind::Directory));
+    }
+
+    #[test]
+    fn test_file_size_bytes_target_is_a_directory() {
+        let sql = "COPY orders TO 'out/sized' (FORMAT parquet, FILE_SIZE_BYTES '1MB');";
+        let assets = extract_assets(sql).expect("FILE_SIZE_BYTES COPY must parse");
+        assert_eq!(assets.kinds.get("out/sized"), Some(&AssetKind::Directory));
+    }
+
+    #[test]
+    fn test_row_groups_per_file_target_is_a_directory() {
+        let sql = "COPY orders TO 'out/rgpf' (FORMAT parquet, ROW_GROUPS_PER_FILE 1);";
+        let assets = extract_assets(sql).expect("ROW_GROUPS_PER_FILE COPY must parse");
+        assert_eq!(assets.kinds.get("out/rgpf"), Some(&AssetKind::Directory));
+    }
+
+    // An option NOT in the directory-writing set must not flip the classification,
+    // however directory-ish it reads: FILENAME_PATTERN and FILE_EXTENSION only shape
+    // the names DuckDB uses once something else has already made the target a
+    // directory, and OVERWRITE only decides what happens to what is already there.
+    #[test]
+    fn test_neighbouring_copy_options_do_not_make_a_directory() {
+        for sql in [
+            "COPY orders TO 'out/o.parquet' (FORMAT parquet, FILENAME_PATTERN 'part_{i}');",
+            "COPY orders TO 'out/o.parquet' (FORMAT parquet, FILE_EXTENSION 'pq');",
+            "COPY orders TO 'out/o.parquet' (FORMAT parquet, OVERWRITE_OR_IGNORE);",
+            "COPY orders TO 'out/o.parquet' (FORMAT parquet, ROW_GROUP_SIZE 100000);",
+        ] {
+            let assets = extract_assets(sql).expect("COPY must parse");
+            assert_eq!(
+                assets.kinds.get("out/o.parquet"),
+                Some(&AssetKind::File),
+                "not a directory-writing option: {sql}"
+            );
+        }
     }
 
     // ---- DuckDB's Python-style `lambda x: expr` lambda syntax. ----

@@ -1,0 +1,94 @@
+# The `source.edgar` Protocol — the reproducible *definition* of how the SEC EDGAR
+# company-tickers Dataset is ingested from the official SEC file. `arc run` executes
+# this manifest; one Run → one Dataset version (the freshness lever). See ./README.md.
+#
+# ALL-CONFIG. Every step is a first-class `sql:` model or a typed `op:` operator (the
+# arcform catalog) — there are NO opaque `command:`/`sh -c` steps. The curl fetch is
+# now http_fetch; the terminal COPY is parquet_export; datapackage_describe emits the
+# descriptor from the built Parquet; finetype_validate gates it against the self-derived
+# finetype contract. Operator code lives in the arcform repo (engine + catalog), not
+# here; this manifest REFERENCES operators by name@version.
+#
+# BOUNDARY — do NOT fold this into this manifest:
+#   • PUBLISH (content-addressed R2 upload + manifest/catalog pointer flip) stays in
+#     the out-of-repo publish pipeline and READS this Protocol's terminal output,
+#     build/edgar.parquet + the emitted datapackage.json. It is not an arcform step.
+#
+# INFORMATION RETRIEVAL ONLY — this is a clean IR dataset. The EDGAR ↔ GLEIF
+# entity-resolution "join" is NOT done here; it lives in the crosswalk.edgar_gleif
+# Protocol (probabilistic name resolution, published back as a Dataset).
+#
+# Produces: build/edgar.parquet  →  published as source.edgar
+name: edgar
+engine: duckdb
+engine_version: ">=1.2"
+db: build/edgar.db
+
+# Transient API/network blips shouldn't sink a run — retry fetches with backoff.
+defaults:
+  retry:
+    max_attempts: 3
+    backoff_sec: 2.0
+
+steps:
+  # ── Fetch: the SEC's company_tickers_exchange.json ───────────────────────────────
+  # http_fetch carries the content-freshness contract (ETag/Last-Modified in a sidecar
+  # → conditional re-fetch), so an unchanged upstream is a 304, not a re-download. The
+  # SEC requires a User-Agent carrying contact info.
+  - name: fetch_edgar
+    op: http_fetch@1
+    with:
+      url: https://www.sec.gov/files/company_tickers_exchange.json
+      out: build/edgar.json
+      headers:
+        User-Agent: "Meridian Protocol (open-analytics; research@meridian.online)"
+
+  # ── Load + normalise: flatten the columnar {fields, data} JSON to the 4-field schema ─
+  - name: load
+    sql: models/load.sql
+    depends_on: [build/edgar.json]
+
+  # ── Package: materialise the terminal table (adds the search corpus) ─────────────
+  - name: package
+    sql: models/package.sql
+    produces: [edgar_out]
+
+  # ── Export: write the terminal Parquet the publish seam consumes ─────────────────
+  # parquet_export replaces package.sql's old `COPY … (COMPRESSION zstd)` — a first-class
+  # produced asset the engine orders + stale-propagates, not a graph island. The TOTAL
+  # order_by (company_name has ties across cik/ticker) makes the bytes reproducible.
+  - name: export_edgar
+    op: parquet_export@1
+    with:
+      input: edgar_out
+      dest: build/edgar.parquet
+      compression: zstd
+      order_by: "company_name, cik, ticker"
+
+  # ── Describe: EMIT datapackage.json from the built Parquet ───────────────────────
+  # datapackage_describe types every column with finetype (`profile … -o datapackage`)
+  # and overlays descriptor.overrides.json (identity, licenses, sources, per-field prose,
+  # primaryKey). Hard-fails if a curated key names a column absent from the Parquet.
+  - name: describe
+    op: datapackage_describe@1
+    with:
+      parquet: build/edgar.parquet
+      overrides: descriptor.overrides.json
+      out: datapackage.json
+
+  # ── Validate: GATE the built Parquet against the self-derived finetype contract ──
+  # finetype_validate makes finetype LOAD-BEARING, not just descriptive: `finetype
+  # validate` (CHECK-ONLY) types every column and checks the terminal Parquet against
+  # schema.finetype.json. That contract is self-derived from THIS Parquet (finetype
+  # profile -o json-schema --stats, relaxed to the observable envelope — see the schema's
+  # $comment), so every current row passes: a pass-through today, a fail-closed DRIFT
+  # tripwire for future Runs. CHECK-ONLY writes nothing, so build/edgar.parquet stays
+  # byte-identical — this step READS the output.
+  - name: validate
+    op: finetype_validate@1
+    with:
+      parquet: build/edgar.parquet
+      schema: schema.finetype.json
+
+  # publish: the out-of-repo publish pipeline reads build/edgar.parquet + the emitted
+  # datapackage.json (boundary — not an arc step). See README.
