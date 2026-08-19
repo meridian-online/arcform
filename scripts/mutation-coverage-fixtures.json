@@ -1,0 +1,127 @@
+{
+  "comment": [
+    "Mutations taken from builds that really shipped, kept as the gate's regression fixture.",
+    "Each one left the whole test suite green at the commit it shipped in, and each was",
+    "found by an expensive review pass rather than by anything in the build. They are here",
+    "so a change to the harness has to keep answering SURVIVED where a mutation really was",
+    "unpinned and KILLED where it really is pinned \u2014 a harness that only ever says one of",
+    "those is broken in the direction that matters, and a fixture set with only one answer",
+    "in it cannot tell.",
+    "",
+    "Run:  python3 scripts/check-mutation-coverage.py --fixtures scripts/mutation-coverage-fixtures.json --ref <name>",
+    "in a checkout of the commit that <name> refers to. Not part of CI: it needs three",
+    "checkouts and a full build of each, which is the wrong cost to pay on every pull",
+    "request. The commits are kept reachable by the tags mutation-fixture-round-7 and",
+    "mutation-fixture-round-8.",
+    "",
+    "ABSENT is a recorded answer, not a gap. Round 7's two mutations delete a directory",
+    "presence check that round 8 replaced outright with a kind carried from the",
+    "declaration, so at round 8 and after there is no such check to delete. The harness",
+    "proves the anchor is gone rather than passing in silence."
+  ],
+  "refs": {
+    "round-7": "58ddb95 \u2014 the directory question answered by asking the filesystem",
+    "round-8": "19857ca \u2014 the kind carried from the declaration",
+    "main": "8b6353d \u2014 the merged result, where round 9 added the pins"
+  },
+  "fixtures": [
+    {
+      "id": "R7-M1",
+      "path": "src/runner.rs",
+      "function": "missing_declared_produces",
+      "operator": "GUARD_FALSE",
+      "before": "            if std::fs::metadata(&full)\n                .map(|m| m.is_dir())\n                .unwrap_or(false)\n            {\n",
+      "after": "            if false {\n",
+      "what": "Delete the directory skip in the missing-artifact report: a real, correctly created directory is then counted as an artifact the step failed to produce.",
+      "expect": {
+        "round-7": "SURVIVED",
+        "round-8": "ABSENT",
+        "main": "ABSENT"
+      }
+    },
+    {
+      "id": "R7-M2",
+      "path": "src/runner.rs",
+      "function": "produced_artifact_hash",
+      "operator": "GUARD_FALSE",
+      "before": "        if std::fs::metadata(&full)\n            .map(|m| m.is_dir())\n            .unwrap_or(false)\n        {\n",
+      "after": "        if false {\n",
+      "what": "Delete the directory skip in the artifact hash: fs::read on a directory errors, the hash is None, and the step re-runs on every run while reporting it produced nothing.",
+      "expect": {
+        "round-7": "SURVIVED",
+        "round-8": "ABSENT",
+        "main": "ABSENT"
+      }
+    },
+    {
+      "id": "R8-P1",
+      "path": "src/state.rs",
+      "function": "hash_directory_contents",
+      "operator": "CALL_DEFAULT",
+      "before": "                entries.push((rel, content_hash(&bytes)));\n",
+      "after": "                entries.push((rel, Default::default()));\n",
+      "what": "Reduce the directory hash to a manifest of filenames: a partition file whose BYTES change under an unchanged set of paths reads as unchanged, and the step skips at exit 0.",
+      "expect": {
+        "round-7": "ABSENT",
+        "round-8": "SURVIVED",
+        "main": "KILLED"
+      }
+    },
+    {
+      "id": "R8-P2",
+      "path": "src/state.rs",
+      "function": "hash_directory_contents",
+      "operator": "GUARD_FALSE",
+      "before": "            if file_type.is_dir() {\n",
+      "after": "            if false {\n",
+      "what": "Stop descending into subdirectories: a real PARTITION_BY tree has no regular file at its top level, so the whole tree hashes to the same empty manifest forever.",
+      "expect": {
+        "round-7": "ABSENT",
+        "round-8": "SURVIVED",
+        "main": "KILLED"
+      }
+    },
+    {
+      "id": "R8-P3",
+      "path": "src/asset.rs",
+      "function": "record",
+      "operator": "ENTRY_OVERWRITE",
+      "before": "        declared_kind.entry(lowered.clone()).or_insert(kind);\n",
+      "after": "        declared_kind.insert(lowered.clone(), kind);\n",
+      "what": "Let the last declaration win instead of the first: a hand-written produces: entry downgrades the kind SQL introspection derived, and a directory is read as a file.",
+      "expect": {
+        "round-7": "ABSENT",
+        "round-8": "SURVIVED",
+        "main": "KILLED"
+      }
+    },
+    {
+      "id": "R8-P4",
+      "path": "src/runner.rs",
+      "function": "produced_artifact_hash",
+      "operator": "TRY_DEFAULT",
+      "before": "            AssetKind::Directory => state::hash_directory_contents(&full)?,\n",
+      "after": "            AssetKind::Directory => state::hash_directory_contents(&full).unwrap_or_default(),\n",
+      "what": "Fold an unreadable directory into a stable value instead of propagating None: the baseline recorded after the step's own success already says the placeholder, so every later run compares it to itself and skips.",
+      "expect": {
+        "round-7": "ABSENT",
+        "round-8": "SURVIVED",
+        "main": "KILLED"
+      }
+    },
+    {
+      "id": "R8-P5",
+      "path": "src/state.rs",
+      "function": "hash_directory_contents",
+      "operator": "TRY_DEFAULT",
+      "before": "                let bytes = std::fs::read(&path).ok()?;\n",
+      "after": "                let bytes = std::fs::read(&path).ok().unwrap_or_default();\n",
+      "what": "Read every file in the tree as empty: the content half of the directory hash goes away by a second route, and an unreadable child file stops forcing staleness.",
+      "expect": {
+        "round-7": "ABSENT",
+        "round-8": "SURVIVED",
+        "main": "KILLED"
+      }
+    }
+  ]
+}

@@ -700,12 +700,18 @@ class Tree:
         return self.saved[rel]
 
     def apply(self, mutant: Mutant, text: str) -> None:
-        """Write one mutant, then read it back and prove it landed.
+        """Write one mutant, having first proved the span it claims to replace is there.
 
         A mutation that silently fails to apply produces the same green run as a
         test that cannot fail — the proof reports success in exactly the case it
-        exists to catch.  So the span is matched exactly before writing, the file
-        is read back after, and both are errors rather than warnings.
+        exists to catch.  Two things stop that here, and both are errors rather
+        than warnings: the span must match the recorded text byte for byte, and
+        the result must differ from what was there.
+
+        There is deliberately no read-back of the write.  One was written and then
+        deleted: `write_text` followed by `read_text` on the same path always
+        agrees, so no planted failure could make it fire, and a check that cannot
+        fail is the thing this whole gate exists to find.
         """
         self._pristine(mutant.path)
         target = self.root / mutant.path
@@ -722,8 +728,6 @@ class Tree:
         if mutated == original:
             raise Harness(f"mutation for {mutant.key} changes nothing in {mutant.path}")
         target.write_text(mutated)
-        if target.read_text() != mutated:
-            raise Harness(f"read-back failed for {mutant.key} in {mutant.path}")
 
     def restore(self) -> None:
         for rel, pristine in self.saved.items():
@@ -838,6 +842,25 @@ def git(root: Path, *args: str) -> str:
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 
+def merge_base(root: Path, base: str) -> str:
+    """Where this branch left `base`, not where `base` is now.
+
+    Diffing against the tip of the target branch attributes every commit that
+    landed on it since the branch was cut to this branch — as DELETIONS, which
+    produce no mutants, and as additions in files this branch never touched,
+    which produce mutants for somebody else's code.  The first wastes the budget
+    and the second reports a survivor against the wrong author.
+    """
+    proc = subprocess.run(
+        ["git", "merge-base", base, "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.stdout.strip() if proc.returncode == 0 and proc.stdout.strip() else base
+
+
 def changed_lines(root: Path, base: str, paths: list[str] | None) -> dict[str, set[int]]:
     """0-based line indices added or modified in `src/**/*.rs` since `base`.
 
@@ -845,6 +868,7 @@ def changed_lines(root: Path, base: str, paths: list[str] | None) -> dict[str, s
     real hole and it is named in the report — a diff that only DELETES a guard is
     invisible here, and the check that catches that one is code review.
     """
+    base = merge_base(root, base)
     args = ["diff", "--unified=0", "--no-color", base, "--", "src"]
     if paths:
         args = ["diff", "--unified=0", "--no-color", base, "--", *paths]

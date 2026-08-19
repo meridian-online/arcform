@@ -460,6 +460,72 @@ def tier_of(output: str, function: str) -> str:
     return found
 
 
+@case("the fixture table is well formed and can distinguish both answers")
+def _() -> None:
+    import json
+
+    spec = json.loads((HERE / "mutation-coverage-fixtures.json").read_text())
+    fixtures = spec["fixtures"]
+    check("fixtures present", len(fixtures) >= 7, len(fixtures))
+    ids = [f["id"] for f in fixtures]
+    check("ids unique", len(set(ids)) == len(ids), ids)
+    verdicts = set()
+    for f in fixtures:
+        for field in ("id", "path", "function", "operator", "before", "after", "expect", "what"):
+            check(f"{f.get('id')} has {field}", field in f, sorted(f))
+        check(f"{f['id']} really changes something", f["before"] != f["after"], f["id"])
+        check(f"{f['id']} names a ref in refs", set(f["expect"]) <= set(spec["refs"]), f["expect"])
+        verdicts |= set(f["expect"].values())
+    # A table where every recorded answer is the same cannot tell a harness that
+    # always says SURVIVED from one that works.
+    check("both answers are represented", {"SURVIVED", "KILLED"} <= verdicts, sorted(verdicts))
+
+
+@case("the base is the branch point, not the tip of the branch being merged into")
+def _() -> None:
+    import subprocess as sp
+
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "selftest",
+        "GIT_AUTHOR_EMAIL": "selftest@example.invalid",
+        "GIT_COMMITTER_NAME": "selftest",
+        "GIT_COMMITTER_EMAIL": "selftest@example.invalid",
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "src").mkdir()
+        (root / "src" / "a.rs").write_text("fn a() -> u8 { 1 }\n")
+
+        def g(*args: str) -> str:
+            return sp.run(
+                ["git", *args], cwd=root, env=env, capture_output=True, text=True, check=True
+            ).stdout
+
+        g("init", "-q", "-b", "trunk")
+        g("add", "-A")
+        g("commit", "-qm", "base")
+        branch_point = g("rev-parse", "HEAD").strip()
+        # trunk moves on, in a file this branch never touches
+        (root / "src" / "b.rs").write_text("fn b() -> u8 {\n    if true { 2 } else { 3 }\n}\n")
+        g("add", "-A")
+        g("commit", "-qm", "someone else's work")
+        g("checkout", "-q", "-b", "feature", branch_point)
+        (root / "src" / "a.rs").write_text("fn a() -> u8 {\n    if false { 1 } else { 4 }\n}\n")
+        g("add", "-A")
+        g("commit", "-qm", "my work")
+
+        resolved = mc.merge_base(root, "trunk")
+        check("resolves to the branch point", resolved == branch_point, (resolved, branch_point))
+        touched = mc.changed_lines(root, "trunk", None)
+        check("my file is in scope", "src/a.rs" in touched, sorted(touched))
+        check(
+            "the other branch's file is NOT attributed to me",
+            "src/b.rs" not in touched,
+            sorted(touched),
+        )
+
+
 @case("END TO END: a survivor the tests execute fails the job and is named UNPINNED")
 def _() -> None:
     with tempfile.TemporaryDirectory() as tmp:
@@ -545,6 +611,41 @@ def _() -> None:
         check("passes once ruled", code == 0, f"exit {code}\n{out[-3000:]}")
         check("and the ruling is still shown", "RULED EQUIVALENT" in out, out[-2000:])
         check("with its reason", "fixture ruling" in out, out[-2000:])
+
+
+@case("END TO END: a baseline that ran no tests at all is a setup error, not a pass")
+def _() -> None:
+    # A runner with nothing to run prints the same green as one that ran
+    # everything, and every mutation then "survives" for a reason that has
+    # nothing to do with the code.  The exit code alone cannot tell the two
+    # apart; the count can.
+    lib = CRATE_LIB.split("#[cfg(test)]")[0]
+    check("the fixture really has no tests", "#[test]" not in lib, lib[-200:])
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        build_fixture_crate(root, lib)
+        code, out = run_gate(root, "--quiet")
+        check("exit 3", code == 3, f"exit {code}\n{out[-2000:]}")
+        check("says why", "executed zero tests" in out, out[-1500:])
+
+
+@case("END TO END: the budget names what it did not reach instead of dropping it")
+def _() -> None:
+    # A cap that silently stops is worse than no cap: the report reads as a clean
+    # sweep of the diff when most of the diff was never touched.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        build_fixture_crate(root)
+        code, out = run_gate(root, "--quiet", "--max-mutants", "1")
+        check("NOT CHECKED section present", "NOT CHECKED" in out, out[-2500:])
+        check("it says why", "budget" in out, out[-2500:])
+        check("only one mutation ran", "mutations run     1 " in out, out[:900])
+        uncapped = run_gate(root, "--quiet")[1]
+        check(
+            "and uncapped there is nothing left over",
+            "NOT CHECKED" not in uncapped,
+            uncapped[-2500:],
+        )
 
 
 @case("END TO END: a red baseline is a setup error, not a report")
