@@ -321,10 +321,8 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
                         }
                         CopyTarget::Stdin => {
                             // COPY table FROM STDIN — writing to the table
-                            assets.record_output(
-                                object_name_to_string(table_name),
-                                AssetKind::Table,
-                            );
+                            assets
+                                .record_output(object_name_to_string(table_name), AssetKind::Table);
                         }
                         _ => {}
                     }

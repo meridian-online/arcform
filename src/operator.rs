@@ -2167,7 +2167,10 @@ impl Operator for ArchiveExtract {
             // exactly as `members` names them.
             let base = cfg.dest.trim_end_matches('/');
             for m in &cfg.members {
-                assets.record_produces(format!("{}/{}", base, m), crate::asset_kind::AssetKind::File);
+                assets.record_produces(
+                    format!("{}/{}", base, m),
+                    crate::asset_kind::AssetKind::File,
+                );
             }
         }
         Ok(assets)

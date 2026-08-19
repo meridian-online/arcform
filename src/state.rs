@@ -456,7 +456,10 @@ mod tests {
         let hash_a = hash_directory_contents(&dir_a);
         let hash_b = hash_directory_contents(&dir_b);
         assert!(hash_a.is_some());
-        assert_eq!(hash_a, hash_b, "directory hash must not depend on readdir order");
+        assert_eq!(
+            hash_a, hash_b,
+            "directory hash must not depend on readdir order"
+        );
 
         std::fs::remove_dir_all(&dir_a).unwrap();
         std::fs::remove_dir_all(&dir_b).unwrap();

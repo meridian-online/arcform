@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-use crate::asset_kind::{default_kind_for_declared_name, AssetKind};
+use crate::asset_kind::{AssetKind, default_kind_for_declared_name};
 use crate::error::{Error, Result};
 use crate::introspect;
 use crate::manifest::Manifest;
@@ -663,10 +663,9 @@ mod tests {
     #[test]
     fn test_op_declared_kind_reaches_declared_kind() {
         let dir = tempfile::tempdir().unwrap();
-        let with: serde_yaml::Value = serde_yaml::from_str(
-            "archive: build/in.zip\npattern: '\\.tsv$'\ndest: build/out",
-        )
-        .unwrap();
+        let with: serde_yaml::Value =
+            serde_yaml::from_str("archive: build/in.zip\npattern: '\\.tsv$'\ndest: build/out")
+                .unwrap();
         let graph = build_graph(
             dir.path(),
             vec![op_step("extract", "archive_extract", with)],

@@ -1030,7 +1030,11 @@ fn is_hashable_kind(assets: &StepAssets, name: &str) -> bool {
 /// `is_hashable_kind` and `produced_artifact_hash` resolve a name's kind, so the
 /// defensive default can never drift between the two call sites.
 fn declared_kind_of(assets: &StepAssets, name: &str) -> AssetKind {
-    assets.declared_kind.get(name).copied().unwrap_or(AssetKind::File)
+    assets
+        .declared_kind
+        .get(name)
+        .copied()
+        .unwrap_or(AssetKind::File)
 }
 
 /// A combined content hash over every asset a step is answerable for that is
@@ -1110,7 +1114,12 @@ fn produced_artifact_hash(
     let step_assets = asset_graph.steps.get(&step.name);
     let mut names: Vec<&String> = Vec::new();
     if let Some(assets) = step_assets {
-        names.extend(assets.produces.iter().filter(|n| is_hashable_kind(assets, n)));
+        names.extend(
+            assets
+                .produces
+                .iter()
+                .filter(|n| is_hashable_kind(assets, n)),
+        );
         names.extend(
             assets
                 .reads
@@ -1141,7 +1150,9 @@ fn produced_artifact_hash(
         // `Some` whenever `names` is non-empty (the only source of `names`), so the
         // `unwrap_or(File)` default here is unreachable in practice; it exists so
         // this function has no path that panics.
-        let kind = step_assets.map(|a| declared_kind_of(a, name)).unwrap_or(AssetKind::File);
+        let kind = step_assets
+            .map(|a| declared_kind_of(a, name))
+            .unwrap_or(AssetKind::File);
         let digest = match kind {
             AssetKind::Directory => state::hash_directory_contents(&full)?,
             _ => {
