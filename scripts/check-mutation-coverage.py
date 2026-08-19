@@ -193,19 +193,55 @@ def masks_for(lines: list[str]) -> list[list[bool]]:
     return out
 
 
-def test_region(lines: list[str], masks: list[list[bool]]) -> set[int]:
-    """0-based line indices belonging to a `#[cfg(test)]` item.
+CFG_ATTR = re.compile(r"^\s*#\[cfg\((?P<pred>.*)\)\]\s*$")
+CFG_FEATURE = re.compile(r'feature\s*=\s*"(?P<name>[A-Za-z0-9_.\-]+)"')
+
+
+def cfg_conditions(predicate: str) -> set[str]:
+    """What a `#[cfg(...)]` predicate requires: `test`, and `feature:<name>`.
+
+    `not(...)` anywhere in the predicate returns nothing at all.  Under a negation
+    the sense inverts — enabling the named feature REMOVES the code — and a
+    requirement read the wrong way round is worse than no requirement.
+    """
+    if "not(" in predicate:
+        return set()
+    found = {f"feature:{m.group('name')}" for m in CFG_FEATURE.finditer(predicate)}
+    if re.search(r"\btest\b", predicate):
+        found.add("test")
+    return found
+
+
+def cfg_regions(lines: list[str], masks: list[list[bool]]) -> dict[int, set[str]]:
+    """0-based line index -> the cfg conditions of every item it sits inside.
+
+    Two things depend on this and both were wrong when it only matched the exact
+    string `#[cfg(test)]`.
 
     Mutating a test is pointless — the mutant either fails or does not, and
-    either way it says nothing about whether production code is held.  `#[cfg(test)]`
-    guards a `mod` in most files here and a bare `fn` in at least one
-    (`runner.rs`'s parameterless `run`), and several files have more than one, not
-    all at the end, so this brace-matches each item rather than assuming the rest
-    of the file is tests.
+    either way it says nothing about whether production code is held.  But test
+    code is not always spelled `#[cfg(test)]`: `operator.rs` has a whole test
+    module behind `#[cfg(all(test, feature = "mcp"))]`, and an exact-string match
+    offered every line of it as a candidate.
+
+    And code behind a feature the test command does not enable is not compiled at
+    all, so mutating it changes nothing, the suite stays green, and the report
+    says the tests do not reach it.  That is true and useless: the tests may cover
+    it perfectly well with the feature on.  Knowing which feature guards a changed
+    line is what lets the run turn it on.
+
+    `#[cfg(test)]` guards a `mod` in most files here and a bare `fn` in at least
+    one (`runner.rs`'s parameterless `run`), and several files have more than one,
+    not all at the end, so this brace-matches each item rather than assuming the
+    rest of the file is tests.
     """
-    marked: set[int] = set()
+    marked: dict[int, set[str]] = {}
     for i, line in enumerate(lines):
-        if line.strip() != "#[cfg(test)]":
+        m = CFG_ATTR.match(line)
+        if not m:
+            continue
+        conditions = cfg_conditions(m.group("pred"))
+        if not conditions:
             continue
         # Walk forward to the item's opening brace, skipping further attributes
         # and doc comments.
@@ -221,13 +257,18 @@ def test_region(lines: list[str], masks: list[list[bool]]) -> set[int]:
                     started = True
                 elif ch == "}":
                     depth -= 1
-            marked.add(j)
+            marked.setdefault(j, set()).update(conditions)
             if started and depth <= 0:
                 break
             if not started and lines[j].rstrip().endswith(";"):
                 break  # an item with no body
             j += 1
     return marked
+
+
+def test_region(lines: list[str], masks: list[list[bool]]) -> set[int]:
+    """0-based line indices belonging to a test item, however its cfg is spelled."""
+    return {i for i, conditions in cfg_regions(lines, masks).items() if "test" in conditions}
 
 
 def enclosing_function(lines: list[str], index: int) -> str:
@@ -638,6 +679,12 @@ def op_fn_body_default(lines, masks, i, path, fn) -> list[Mutant]:
     ]
 
 
+# Every operator's span must stay inside the item its first line belongs to.
+# Nothing re-checks it downstream: a filter that did was removed after a planted
+# failure proved no operator can reach the case, and a check nothing can redden
+# is the defect this whole gate looks for.  An operator whose span could cross an
+# item boundary — into a `#[cfg(test)]` module, for instance — has to consult
+# `cfg_regions` itself.
 OPERATORS = [
     op_guard,
     op_call_default,
@@ -664,8 +711,6 @@ def generate(path: str, source: str, changed: set[int]) -> list[Mutant]:
         fn = enclosing_function(lines, i)
         for operator in OPERATORS:
             for mutant in operator(lines, masks, i, path, fn):
-                if any(line_no in skip for line_no in range(mutant.start, mutant.end + 1)):
-                    continue
                 if mutant.after == mutant.before:
                     continue
                 if mutant.key in seen:
@@ -893,18 +938,64 @@ def changed_lines(root: Path, base: str, paths: list[str] | None) -> dict[str, s
     return {p: v for p, v in result.items() if p.startswith("src/") and v}
 
 
-def features_for(paths: list[str]) -> list[str]:
-    """Cargo features the changed files need in order to be COMPILED at all.
+def declared_features(root: Path) -> set[str]:
+    """Feature names the crate actually declares, read from `Cargo.toml`.
+
+    Passing cargo a feature that does not exist is a hard error, so a name picked
+    out of a `cfg` attribute is checked against this before it is used.  A plain
+    scan of the `[features]` table rather than a TOML parse: `tomllib` is 3.11+,
+    and this file otherwise runs on any Python 3 a CI runner ships.
+    """
+    manifest = root / "Cargo.toml"
+    if not manifest.exists():
+        return set()
+    names: set[str] = set()
+    in_features = False
+    for raw in manifest.read_text().splitlines():
+        line = raw.strip()
+        if line.startswith("["):
+            in_features = line == "[features]"
+            continue
+        if in_features and "=" in line and not line.startswith("#"):
+            names.add(line.split("=", 1)[0].strip())
+    return names
+
+
+def features_for(root: Path, changed: dict[str, set[int]]) -> tuple[list[str], list[str]]:
+    """Cargo features the changed lines need in order to be COMPILED at all.
 
     Without this the gate has a blind spot of exactly the shape it exists to
-    catch: `src/mcp/` is behind an off-by-default feature, so the default test
-    command never builds it, every mutation there "survives" trivially, and a
-    report full of false survivors is one nobody reads.  CI runs the suite twice
-    for the same reason.
+    catch.  Code behind an off-by-default feature is not compiled by the default
+    test command, so every mutation in it survives for a reason that has nothing
+    to do with the tests, and a report full of false survivors is one nobody
+    reads.  CI runs the suite twice for the same reason.
+
+    Two sources.  `src/mcp/` is a whole module gated at its declaration in
+    `lib.rs`, where nothing inside the module says so.  Everything else is found
+    by reading the `cfg` attribute of the item each changed line sits in — which
+    is how `catalog_names`, a lone `#[cfg(feature = "mcp")]` function in the
+    middle of an otherwise unconditional file, gets its feature turned on.
+
+    Returns the cargo arguments and any feature names the crate does not declare,
+    which are reported rather than passed (cargo errors on an unknown feature).
     """
-    if any(p.startswith("src/mcp/") for p in paths):
-        return ["--features", "mcp"]
-    return []
+    wanted: set[str] = set()
+    if any(p.startswith("src/mcp/") for p in changed):
+        wanted.add("mcp")
+    for path, line_numbers in changed.items():
+        source_path = root / path
+        if not source_path.exists():
+            continue
+        lines = source_path.read_text().splitlines(keepends=True)
+        regions = cfg_regions(lines, masks_for(lines))
+        for i in line_numbers:
+            for condition in regions.get(i, ()):
+                if condition.startswith("feature:"):
+                    wanted.add(condition.split(":", 1)[1])
+    declared = declared_features(root)
+    unknown = sorted(wanted - declared)
+    usable = sorted(wanted & declared)
+    return (["--features", ",".join(usable)] if usable else [], unknown)
 
 
 # --------------------------------------------------------------------------- #
@@ -1271,8 +1362,14 @@ def main(argv: list[str] | None = None) -> int:
             print("No mutable code on the changed lines.")
             return 0
 
-        command = ["cargo", "test", "--workspace", *features_for(sorted(changed))]
+        feature_args, unknown_features = features_for(root, changed)
+        command = ["cargo", "test", "--workspace", *feature_args]
         print(f"test command      {' '.join(command)}")
+        if unknown_features:
+            print(
+                "note              a changed line is behind "
+                f"{', '.join(unknown_features)}, which Cargo.toml does not declare"
+            )
         print("baseline          running...", flush=True)
         baseline = run_suite(root, command, args.timeout)
         if baseline.exit_code != 0:

@@ -348,10 +348,65 @@ def _() -> None:
         check("reason carried", "unreachable" in rulings["abc123"], rulings)
 
 
-@case("`src/mcp/` in the diff turns on the feature that compiles it")
+CFG_SOURCE = (
+    "pub fn plain() -> u8 {\n    if true { 1 } else { 0 }\n}\n"  # 0 1 2
+    '#[cfg(feature = "mcp")]\n'  # 3
+    "pub fn gated() -> u8 {\n    if true { 2 } else { 0 }\n}\n"  # 4 5 6
+    '#[cfg(all(test, feature = "mcp"))]\n'  # 7
+    "mod gated_tests {\n    fn t() { if true { } }\n}\n"  # 8 9 10
+    '#[cfg(not(feature = "opendal"))]\n'  # 11
+    "pub fn without() -> u8 {\n    if true { 3 } else { 0 }\n}\n"  # 12 13 14
+)
+
+
+@case("a test module behind `#[cfg(all(test, ...))]` is still test code")
 def _() -> None:
-    check("mcp feature added", mc.features_for(["src/mcp/mod.rs"]) == ["--features", "mcp"])
-    check("otherwise no features", mc.features_for(["src/state.rs"]) == [])
+    # Found by running the gate over src/operator.rs: an exact-string match on
+    # `#[cfg(test)]` offered every line of a whole test module as a candidate,
+    # because that module is spelled `#[cfg(all(test, feature = "mcp"))]`.
+    lines = CFG_SOURCE.splitlines(keepends=True)
+    marked = mc.test_region(lines, mc.masks_for(lines))
+    check("the all(test, ..) module is skipped", {7, 8, 9, 10} <= marked, sorted(marked))
+    check("the plain function is not", 1 not in marked, sorted(marked))
+    check("the feature-gated function is not", 5 not in marked, sorted(marked))
+    got = mc.generate("src/x.rs", CFG_SOURCE, set(range(len(lines))))
+    check(
+        "and nothing inside it is a candidate",
+        all(not (7 <= m.start <= 10) for m in got),
+        [(m.start, m.operator) for m in got],
+    )
+
+
+@case("a changed line behind a feature turns that feature on for the test run")
+def _() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "src").mkdir()
+        (root / "src" / "x.rs").write_text(CFG_SOURCE)
+        (root / "Cargo.toml").write_text(
+            '[package]\nname = "x"\nversion = "0.0.0"\n\n[features]\nmcp = []\nopendal = []\n'
+        )
+        check("features are read from the manifest", mc.declared_features(root) == {"mcp", "opendal"})
+
+        args, unknown = mc.features_for(root, {"src/x.rs": {5}})
+        check("gated line asks for its feature", args == ["--features", "mcp"], args)
+        check("nothing unknown", unknown == [], unknown)
+
+        args, _ = mc.features_for(root, {"src/x.rs": {1}})
+        check("ungated line asks for nothing", args == [], args)
+
+        # `not(feature = ..)` inverts the sense: turning the feature ON removes
+        # the code, so it must not be requested.
+        args, _ = mc.features_for(root, {"src/x.rs": {13}})
+        check("a negated cfg asks for nothing", args == [], args)
+
+        args, _ = mc.features_for(root, {"src/mcp/mod.rs": {1}})
+        check("src/mcp/ still asks for mcp by path", args == ["--features", "mcp"], args)
+
+        (root / "Cargo.toml").write_text('[package]\nname = "x"\nversion = "0.0.0"\n')
+        args, unknown = mc.features_for(root, {"src/x.rs": {5}})
+        check("an undeclared feature is not passed to cargo", args == [], args)
+        check("but it is named", unknown == ["mcp"], unknown)
 
 
 # --------------------------------------------------------------------------- #
