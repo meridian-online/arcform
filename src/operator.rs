@@ -40,6 +40,31 @@ use crate::error::{Error, Result};
 pub struct OpAssets {
     pub produces: Vec<String>,
     pub reads: Vec<String>,
+    /// What each name in `produces`/`reads` actually is, set by the same operator
+    /// that declares the name — the one place that already knows, since it is the
+    /// operator's own typed config (`dest:`, `input:`, `members:`, …) that says so,
+    /// not a guess from the string or a filesystem probe made later. Populated via
+    /// `record_produces`/`record_reads` so a name can never land in `produces`/
+    /// `reads` without a kind alongside it.
+    pub kinds: BTreeMap<String, crate::asset_kind::AssetKind>,
+}
+
+impl OpAssets {
+    /// Record a produced asset with its kind, keeping `produces` and `kinds` from
+    /// ever drifting apart.
+    pub fn record_produces(&mut self, name: impl Into<String>, kind: crate::asset_kind::AssetKind) {
+        let name = name.into();
+        self.kinds.insert(name.clone(), kind);
+        self.produces.push(name);
+    }
+
+    /// Record a read asset with its kind, keeping `reads` and `kinds` from ever
+    /// drifting apart.
+    pub fn record_reads(&mut self, name: impl Into<String>, kind: crate::asset_kind::AssetKind) {
+        let name = name.into();
+        self.kinds.insert(name.clone(), kind);
+        self.reads.push(name);
+    }
 }
 
 /// Execution context handed to an operator's [`Operator::run`].
@@ -586,10 +611,10 @@ impl Operator for ParquetExport {
 
     fn assets(&self, with: &Value) -> Result<OpAssets> {
         let cfg = ParquetExportConfig::parse(with)?;
-        Ok(OpAssets {
-            reads: vec![cfg.input.clone()],
-            produces: vec![cfg.dest.clone()],
-        })
+        let mut assets = OpAssets::default();
+        assets.record_reads(cfg.input.clone(), crate::asset_kind::AssetKind::Table);
+        assets.record_produces(cfg.dest.clone(), crate::asset_kind::AssetKind::File);
+        Ok(assets)
     }
 
     fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
@@ -933,10 +958,9 @@ impl Operator for HttpFetch {
         // could not have matched.
         cfg.pinned_digest()?;
         // The network source is not a graph node; only the local artifact is.
-        Ok(OpAssets {
-            reads: vec![],
-            produces: vec![cfg.out.clone()],
-        })
+        let mut assets = OpAssets::default();
+        assets.record_produces(cfg.out.clone(), crate::asset_kind::AssetKind::File);
+        Ok(assets)
     }
 
     fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
@@ -1243,10 +1267,9 @@ impl Operator for OpendalFetch {
 
     fn assets(&self, with: &Value) -> Result<OpAssets> {
         let cfg = OpendalFetchConfig::parse(with)?;
-        Ok(OpAssets {
-            reads: vec![],
-            produces: vec![cfg.to.clone()],
-        })
+        let mut assets = OpAssets::default();
+        assets.record_produces(cfg.to.clone(), crate::asset_kind::AssetKind::File);
+        Ok(assets)
     }
 
     fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
@@ -1435,10 +1458,10 @@ impl Operator for DatapackageDescribe {
 
     fn assets(&self, with: &Value) -> Result<OpAssets> {
         let cfg = DatapackageDescribeConfig::parse(with)?;
-        Ok(OpAssets {
-            reads: vec![cfg.parquet.clone()],
-            produces: vec![cfg.out.clone()],
-        })
+        let mut assets = OpAssets::default();
+        assets.record_reads(cfg.parquet.clone(), crate::asset_kind::AssetKind::File);
+        assets.record_produces(cfg.out.clone(), crate::asset_kind::AssetKind::File);
+        Ok(assets)
     }
 
     fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
@@ -1574,10 +1597,10 @@ impl Operator for FinetypeValidate {
         // A gate produces no artifact (check-only). It READS both the Parquet — which
         // orders it downstream of the export that produces it (so a rebuilt Parquet
         // re-triggers the gate via stale-propagation) — and the schema contract.
-        Ok(OpAssets {
-            reads: vec![cfg.parquet.clone(), cfg.schema.clone()],
-            produces: vec![],
-        })
+        let mut assets = OpAssets::default();
+        assets.record_reads(cfg.parquet.clone(), crate::asset_kind::AssetKind::File);
+        assets.record_reads(cfg.schema.clone(), crate::asset_kind::AssetKind::File);
+        Ok(assets)
     }
 
     fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
@@ -1893,10 +1916,9 @@ impl Operator for HtmlLinkDiscover {
         let cfg = HtmlLinkDiscoverConfig::parse(with)?;
         cfg.compiled_pattern()?; // fail fast on a bad regex at manifest load
         // The network source is not a graph node; only the local URL list is.
-        Ok(OpAssets {
-            reads: vec![],
-            produces: vec![cfg.out.clone()],
-        })
+        let mut assets = OpAssets::default();
+        assets.record_produces(cfg.out.clone(), crate::asset_kind::AssetKind::File);
+        Ok(assets)
     }
 
     fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
@@ -2132,19 +2154,23 @@ impl Operator for ArchiveExtract {
         // Explicit `members` give per-file produced nodes; a pattern-only selection
         // isn't known until the archive is opened, so `dest` stands in as the coarse
         // produced node.
-        let produces = if cfg.members.is_empty() {
-            vec![cfg.dest.clone()]
+        let mut assets = OpAssets::default();
+        assets.record_reads(cfg.archive.clone(), crate::asset_kind::AssetKind::File);
+        if cfg.members.is_empty() {
+            // Pattern-only selection isn't known until the archive is opened, so
+            // `dest` stands in as the coarse produced node — and it really is a
+            // directory: extraction writes however many files the pattern matches
+            // into it, not one file under that name.
+            assets.record_produces(cfg.dest.clone(), crate::asset_kind::AssetKind::Directory);
         } else {
+            // Explicit `members` give per-file produced nodes, case-preserved
+            // exactly as `members` names them.
             let base = cfg.dest.trim_end_matches('/');
-            cfg.members
-                .iter()
-                .map(|m| format!("{}/{}", base, m))
-                .collect()
-        };
-        Ok(OpAssets {
-            reads: vec![cfg.archive.clone()],
-            produces,
-        })
+            for m in &cfg.members {
+                assets.record_produces(format!("{}/{}", base, m), crate::asset_kind::AssetKind::File);
+            }
+        }
+        Ok(assets)
     }
 
     fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
@@ -2257,10 +2283,11 @@ impl Operator for SplinkResolve {
 
     fn assets(&self, with: &Value) -> Result<OpAssets> {
         let cfg = SplinkResolveConfig::parse(with)?;
-        Ok(OpAssets {
-            reads: vec![cfg.edgar.clone(), cfg.gleif.clone()],
-            produces: vec![cfg.out.clone()],
-        })
+        let mut assets = OpAssets::default();
+        assets.record_reads(cfg.edgar.clone(), crate::asset_kind::AssetKind::File);
+        assets.record_reads(cfg.gleif.clone(), crate::asset_kind::AssetKind::File);
+        assets.record_produces(cfg.out.clone(), crate::asset_kind::AssetKind::File);
+        Ok(assets)
     }
 
     fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
@@ -2347,10 +2374,9 @@ impl Operator for GleifRaFetch {
     fn assets(&self, with: &Value) -> Result<OpAssets> {
         let cfg = GleifRaFetchConfig::parse(with)?;
         // Ingress: the network source is not a graph node; only the local CSV is.
-        Ok(OpAssets {
-            reads: vec![],
-            produces: vec![cfg.out.clone()],
-        })
+        let mut assets = OpAssets::default();
+        assets.record_produces(cfg.out.clone(), crate::asset_kind::AssetKind::File);
+        Ok(assets)
     }
 
     fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
@@ -3194,6 +3220,15 @@ mod tests {
                 "build/ncen/2024q1/FUND_REPORTED_INFO.tsv".to_string(),
             ]
         );
+        // Explicit members are individual files, not the coarse directory node.
+        assert_eq!(
+            a.kinds.get("build/ncen/2024q1/REGISTRANT.tsv"),
+            Some(&crate::asset_kind::AssetKind::File)
+        );
+        assert_eq!(
+            a.kinds.get("build/ncen/2024q1.zip"),
+            Some(&crate::asset_kind::AssetKind::File)
+        );
     }
 
     #[test]
@@ -3203,6 +3238,15 @@ mod tests {
         let a = assets_for("archive_extract", Some(&with)).unwrap();
         assert_eq!(a.reads, vec!["a.zip".to_string()]);
         assert_eq!(a.produces, vec!["build/out".to_string()]);
+        // A pattern-only selection isn't known until the archive is opened — however
+        // many files match land inside `dest`, so it is a directory, not one file.
+        // This is what fixes round 7's regression: emptying this directory while
+        // keeping it present must still be answerable for drift, which only a
+        // directory-content hash (not an `is_dir()` presence check) can do.
+        assert_eq!(
+            a.kinds.get("build/out"),
+            Some(&crate::asset_kind::AssetKind::Directory)
+        );
     }
 
     #[test]
