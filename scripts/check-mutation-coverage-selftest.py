@@ -301,6 +301,16 @@ def _() -> None:
         mc._match_arm_probe(lines, mc.masks_for(lines), 0) is None,
         mc._match_arm_probe(lines, mc.masks_for(lines), 0),
     )
+    # The last arm of a match may omit its comma.  Without the comma the body's
+    # right edge is not on the line to find, and taking the last code character
+    # as the edge lops a character off the expression instead — `tru` from
+    # `true`.  Refused rather than mangled.
+    lines = ["        _ => true\n"]
+    check(
+        "a comma-less arm is refused rather than truncated",
+        mc._match_arm_probe(lines, mc.masks_for(lines), 0) is None,
+        mc._match_arm_probe(lines, mc.masks_for(lines), 0),
+    )
 
 
 @case("a predicate in a method chain is probed inside its closure")

@@ -514,6 +514,14 @@ def _closure_body_probe(lines: list[str], masks: list[list[bool]], i: int) -> st
     chain.  `.map(|x| x != 0.0).unwrap_or(true)` is the case that rules out: the
     mutation is on `true`, the closure may never run, and a probe answering "was
     the closure called" would answer a different question from the one asked.
+
+    What enforces that is the balance check on the closure's body, and it is the
+    only thing that does — an explicit "nothing but `,;?` after the close paren"
+    test was written here and deleted, because `close` is chosen as the last code
+    character after stripping exactly those, so the test could not fail.  On the
+    `.map(..).unwrap_or(..)` line, `close` is `unwrap_or`'s paren while the pipes
+    belong to `map`, so the body would have to run past `map`'s own `)` and the
+    brackets do not balance.
     """
     line, mask = lines[i], masks[i]
     columns = _code_columns(line, mask)
@@ -524,8 +532,6 @@ def _closure_body_probe(lines: list[str], masks: list[list[bool]], i: int) -> st
         end -= 1
     close = columns[end]
     if line[close] != ")":
-        return None
-    if any(line[c] not in ",;?" for c in columns[end + 1 :]):
         return None
     # The closure's parameter list: `|` … `|`, where the pipes sit at one depth
     # and everything between them looks like a pattern rather than an expression.
