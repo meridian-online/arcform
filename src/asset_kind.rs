@@ -40,10 +40,19 @@ pub enum AssetKind {
 /// or SQL parser behind it to consult — a plain manifest string a human wrote, with
 /// no type syntax available.
 ///
-/// Decided on the one thing such a string carries syntactically: a glob metacharacter
-/// means it can never resolve to one path. Everything else is a path — the same
-/// answer on both sides, with no second rule keyed on a path separator and no
-/// enumeration of extensions.
+/// Decided on the two things such a string carries syntactically, and nothing else.
+/// A glob metacharacter means it can never resolve to one path, so the name is a
+/// [`AssetKind::Pattern`]. A TRAILING path separator means it can never be a regular
+/// file — `build/parts/` and `build/parts` name the same place, and only the first
+/// spelling says which of the two it is — so the name is a [`AssetKind::Directory`].
+/// Everything else is a file. Both rules read the string itself; neither enumerates
+/// extensions and neither asks the filesystem.
+///
+/// The trailing separator used to fall through to [`AssetKind::File`], and the cost
+/// was silent: `fs::read` on a directory errors, `runner::produced_artifact_hash`
+/// withholds the hash, and the step re-runs on every run — for a `depends_on:`
+/// entry with nothing on stderr, because `runner::missing_declared_produces`
+/// reports the `produces:` side only.
 ///
 /// **A separator-free `produces:` token is a path too, and for the ordering-edge
 /// shape `examples/code-lists/arcform.yaml` writes as `produces: [raw_tables]` that
@@ -74,6 +83,8 @@ pub enum AssetKind {
 pub fn default_kind_for_declared_name(raw: &str) -> AssetKind {
     if raw.contains(['*', '?', '[']) {
         AssetKind::Pattern
+    } else if raw.ends_with(['/', std::path::MAIN_SEPARATOR]) {
+        AssetKind::Directory
     } else {
         AssetKind::File
     }
@@ -112,5 +123,38 @@ mod tests {
         for name in ["build/ncen/*/REGISTRANT.tsv", "*.parquet", "x?.csv"] {
             assert_eq!(default_kind_for_declared_name(name), AssetKind::Pattern);
         }
+    }
+
+    // A name ending in a separator cannot be a regular file, and that is the whole
+    // of the reasoning — nothing is enumerated and the filesystem is not asked.
+    #[test]
+    fn a_trailing_separator_is_a_directory() {
+        for name in ["build/parts/", "build/", "data/ncen/2026q2/"] {
+            assert_eq!(
+                default_kind_for_declared_name(name),
+                AssetKind::Directory,
+                "{name} ends in a separator, so it cannot be a regular file"
+            );
+        }
+    }
+
+    // The rule reads the LAST character, not any separator: the same name without
+    // its trailing slash stays a file, which is what keeps every existing
+    // declaration on its current side.
+    #[test]
+    fn the_same_name_without_the_trailing_separator_stays_a_file() {
+        for name in ["build/parts", "build", "data/ncen/2026q2"] {
+            assert_eq!(default_kind_for_declared_name(name), AssetKind::File);
+        }
+    }
+
+    // A glob wins over a trailing separator: `build/*/` can still match several
+    // directories, so it is not one directory to hash.
+    #[test]
+    fn a_glob_with_a_trailing_separator_is_still_a_pattern() {
+        assert_eq!(
+            default_kind_for_declared_name("build/*/"),
+            AssetKind::Pattern
+        );
     }
 }
