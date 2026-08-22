@@ -1147,11 +1147,11 @@ enum Unreadable {
     ///
     /// A `command:` step is opaque — arc cannot see what the command wrote, and a
     /// `produces:` name with no file behind it is the shipped ordering-token
-    /// convention rather than a defect. Six of the eight precondition-gated command
-    /// steps in this repository's `examples/` declare one (`tides_csv`, `cask_json`,
-    /// `cask_30d`, `cask_90d`, `formula_30d`, `formula_90d`, plus `naics_source` and
-    /// `icd_source`), and withholding the hash for those would turn every one into an
-    /// unconditional re-run of a fetch the precondition exists to avoid.
+    /// convention rather than a defect. EVERY precondition-gated command step in this
+    /// repository's `examples/` declares one, and withholding the hash for those would
+    /// turn every one into an unconditional re-run of a fetch the precondition exists
+    /// to avoid. That claim is counted rather than asserted, by
+    /// `tests::every_precondition_gated_command_step_in_the_examples_declares_an_ordering_token`.
     ///
     /// This does not hand back "unchanged" for free. The SET of readable names is
     /// itself part of the hashed buffer — each entry writes its own name beside its
@@ -6275,41 +6275,122 @@ steps:
         );
     }
 
-    // The one genuine refusal: a directory that IS there and cannot be listed. The
-    // question was asked and the filesystem would not answer it, which is different
-    // from asking it and getting nothing back.
+    // A pattern hashes FILES. A directory that happens to match it is not one, and
+    // pushing it as a match makes the whole answer collapse to `None` — every reader
+    // of `build/src/*` stale forever, on a tree where nothing is wrong.
     #[test]
-    fn an_unreadable_directory_refuses_to_answer() {
-        use std::os::unix::fs::PermissionsExt;
+    fn a_pattern_matching_a_directory_hashes_the_files_beside_it() {
         let dir = pattern_tree();
         let base = dir.path();
-        let locked = base.join("build/src");
 
-        let original = fs::metadata(&locked).unwrap().permissions();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-        let answer = hash_pattern_matches(base, "build/src/*.csv");
-        fs::set_permissions(&locked, original).unwrap();
+        // `build/src/*` matches a.csv, b.csv, notes.txt AND the `nested` directory.
+        let everything = hash_pattern_matches(base, "build/src/*")
+            .expect("a directory among the matches is not a refusal to answer");
 
-        if fs::read_dir(base.join("build/src")).is_ok() && answer.is_some() {
-            // Running as root, where mode 0o000 does not stop a read. Nothing to
-            // assert — say so rather than passing quietly.
-            eprintln!(
-                "skipping an_unreadable_directory_refuses_to_answer: this process can                  read a 0o000 directory, so an unlistable one cannot be constructed here"
-            );
-            return;
-        }
+        // The same set with the directory removed hashes identically, which is what
+        // says the directory contributed nothing rather than being read as a file.
+        fs::remove_dir_all(base.join("build/src/nested")).unwrap();
         assert_eq!(
-            answer, None,
-            "a directory that exists and cannot be listed is undetermined — the caller              must force staleness rather than compare against a fabricated empty set"
+            everything,
+            hash_pattern_matches(base, "build/src/*").unwrap(),
+            "removing a directory that matched the pattern must not change the hash — \
+             it was never part of what the pattern names"
         );
     }
 
+    // A pattern with no components at all cannot be resolved into anything, so it is
+    // a refusal rather than the empty set. `AssetKind::Pattern` needs a metacharacter,
+    // so nothing on the staleness path reaches this — it is the degenerate input that
+    // must not be answered with a confident "nothing matched".
+    #[test]
+    fn a_pattern_with_no_components_refuses_to_answer() {
+        let dir = pattern_tree();
+        assert_eq!(hash_pattern_matches(dir.path(), ""), None);
+        assert_eq!(hash_pattern_matches(dir.path(), "/"), None);
+        assert_eq!(hash_pattern_matches(dir.path(), "././"), None);
+    }
+
+    /// Take all permissions from `path`, run `f`, and put them back — measuring, while
+    /// the permissions are still off, whether they actually stopped a read. Running as
+    /// root they do not, and then there is nothing to assert.
+    fn while_unreadable<T>(path: &Path, f: impl FnOnce() -> T) -> Option<T> {
+        use std::os::unix::fs::PermissionsExt;
+        let original = fs::metadata(path).unwrap().permissions();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        // Probed HERE, not after the restore below — asking afterwards always says
+        // "readable" and turns the whole test into a no-op that reports green.
+        let really_unreadable = if path.is_dir() {
+            fs::read_dir(path).is_err()
+        } else {
+            fs::read(path).is_err()
+        };
+        let answer = f();
+        fs::set_permissions(path, original).unwrap();
+        really_unreadable.then_some(answer)
+    }
+
+    // The one genuine refusal: something that IS there and cannot be read. The
+    // question was asked and the filesystem would not answer it, which is different
+    // from asking it and getting nothing back.
+    #[test]
+    fn an_unreadable_directory_or_file_refuses_to_answer() {
+        let dir = pattern_tree();
+        let base = dir.path();
+
+        // A directory the walk has to enumerate.
+        match while_unreadable(&base.join("build/src"), || {
+            hash_pattern_matches(base, "build/src/*.csv")
+        }) {
+            Some(answer) => assert_eq!(
+                answer, None,
+                "a directory that exists and cannot be listed is undetermined — the \
+                 caller must force staleness rather than compare against a fabricated \
+                 empty set"
+            ),
+            None => {
+                eprintln!("skipping the directory half: this process reads a 0o000 directory")
+            }
+        }
+
+        // A file the walk found and has to hash. An unreadable member is the same
+        // absence of an answer as an unreadable directory: folding it into empty
+        // bytes gives a real-looking digest for content nobody read.
+        match while_unreadable(&base.join("build/src/a.csv"), || {
+            hash_pattern_matches(base, "build/src/*.csv")
+        }) {
+            Some(answer) => assert_eq!(
+                answer, None,
+                "a matched file that cannot be read is undetermined, not empty bytes"
+            ),
+            None => eprintln!("skipping the file half: this process reads a 0o000 file"),
+        }
+
+        // And the refusal has to survive `**`'s zero-segment branch, which resolves
+        // the rest of the pattern from here before descending anywhere. Swallowing a
+        // refusal there would answer confidently from the subtrees that DID resolve.
+        fs::create_dir_all(base.join("build/other/src")).unwrap();
+        fs::write(base.join("build/other/src/e.csv"), b"elsewhere").unwrap();
+        match while_unreadable(&base.join("build/src"), || {
+            hash_pattern_matches(&base.join("build"), "**/src/*.csv")
+        }) {
+            Some(answer) => assert_eq!(
+                answer, None,
+                "`**` must not answer from build/other/src while build/src refused"
+            ),
+            None => {
+                eprintln!("skipping the `**` half: this process reads a 0o000 directory")
+            }
+        }
+    }
+
+    // `**` spans ZERO or more levels, and both ends have to be pinned separately: a
+    // `**` that consumed exactly one level would still reach the nested file, so a
+    // test that only checks the deep match cannot tell the two apart.
     #[test]
     fn a_double_star_spans_zero_or_more_directory_levels() {
         let dir = pattern_tree();
         let base = dir.path();
 
-        // `**` reaching both the top level and one below it.
         let all = hash_pattern_matches(base, "build/src/**/*.csv").unwrap();
         let shallow_only = hash_pattern_matches(base, "build/src/*.csv").unwrap();
         assert_ne!(
@@ -6317,15 +6398,40 @@ steps:
             "`**` must reach build/src/nested/c.csv, which `*` does not"
         );
 
-        // Changing the nested file moves the `**` hash and not the `*` one.
+        // ONE level down: changing the nested file moves the `**` hash and not the
+        // `*` one.
         fs::write(base.join("build/src/nested/c.csv"), b"changed").unwrap();
-        assert_ne!(
-            all,
-            hash_pattern_matches(base, "build/src/**/*.csv").unwrap()
-        );
+        let after_deep = hash_pattern_matches(base, "build/src/**/*.csv").unwrap();
+        assert_ne!(all, after_deep);
         assert_eq!(
             shallow_only,
             hash_pattern_matches(base, "build/src/*.csv").unwrap()
+        );
+
+        // ZERO levels down: changing a file directly in build/src moves it too. This
+        // is the half a `**` that always consumes a segment silently drops, and it is
+        // the half that matters for `build/**/*.parquet`-shaped reads of a flat
+        // directory.
+        fs::write(base.join("build/src/a.csv"), b"also changed").unwrap();
+        assert_ne!(
+            after_deep,
+            hash_pattern_matches(base, "build/src/**/*.csv").unwrap(),
+            "`**` must also match zero segments, so build/src/a.csv is in the set"
+        );
+
+        // `**` as the LAST component is every file below, at any depth, and it must
+        // be the files rather than the directories between them.
+        let everything = hash_pattern_matches(base, "build/src/**").unwrap();
+        let empty = hash_pattern_matches(base, "build/src/*.nothing").unwrap();
+        assert_ne!(
+            everything, empty,
+            "a trailing `**` must reach the files, not stop at the directories"
+        );
+        fs::write(base.join("build/src/nested/c.csv"), b"changed again").unwrap();
+        assert_ne!(
+            everything,
+            hash_pattern_matches(base, "build/src/**").unwrap(),
+            "and it must reach the ones below the top level too"
         );
     }
 
@@ -6605,6 +6711,126 @@ steps:
                  every run into a re-fetch"
             );
         }
+    }
+
+    /// A precondition-gated `command:` step declaring an ordering token — a
+    /// `produces:` name with no file behind it — seeded so that its FIRST run
+    /// executes and records a baseline. Without prior state the step is left to its
+    /// preconditions before the artifact hash is consulted at all, so a project that
+    /// never runs the step cannot say anything about how an unreadable name is
+    /// treated.
+    fn ordering_token_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  \
+                    - name: fetch\n    command: \"fetch-into build/src\"\n    \
+                    produces: [src_raw]\n    preconditions:\n      \
+                    - modified_after: { path: build/src/data.csv, period: 24h }\n";
+        setup_project(dir.path(), yaml, &[]);
+        fs::create_dir_all(dir.path().join("build/src")).unwrap();
+        fs::write(
+            dir.path().join("build/src/data.csv"),
+            b"lei,name\nA,Alpha\n",
+        )
+        .unwrap();
+        age_file(&dir.path().join("build/src/data.csv"), 48 * 3600);
+        dir
+    }
+
+    // The cost this change deliberately does NOT pay, pinned from the side that can
+    // actually observe it. `produces: [src_raw]` names nothing on disk, the step has
+    // run and recorded a baseline, and it must still settle to a skip. Treating that
+    // unreadable name the way a `sql:` step's is treated — withholding the hash and
+    // forcing staleness — turns every precondition-gated fetch in `examples/` into an
+    // unconditional re-run, and in the published `gleif` protocol that fetch is a
+    // 470 MB download the precondition exists to avoid.
+    #[test]
+    fn test_an_ordering_token_command_step_with_prior_state_still_skips() {
+        let dir = ordering_token_project();
+        let state = MockStateBackend::new();
+        let fetch = "fetch-into build/src".to_string();
+
+        assert_eq!(
+            executed_bodies(dir.path(), &state),
+            vec![fetch.clone()],
+            "run 1: the precondition is stale, so the step runs and records a baseline"
+        );
+        age_file(&dir.path().join("build/src/data.csv"), 0);
+
+        for warm in 1..=3 {
+            assert_eq!(
+                executed_bodies(dir.path(), &state),
+                Vec::<String>::new(),
+                "warm run {warm}: an unreadable `produces:` on a command step leaves the \
+                 skip to its precondition rather than turning every run into a re-fetch"
+            );
+        }
+
+        // The control, so the skips above are this configuration and not a step that
+        // can no longer be marked stale at all: the same step with a `produces:` its
+        // work really does write DOES notice that file changing.
+        let real = command_produces_file_project("fetch-into build/src");
+        let real_state = MockStateBackend::new();
+        executed_bodies(real.path(), &real_state);
+        age_file(&real.path().join("build/src/data.csv"), 0);
+        assert_eq!(
+            executed_bodies(real.path(), &real_state),
+            Vec::<String>::new()
+        );
+        fs::write(real.path().join("build/src/data.csv"), b"changed").unwrap();
+        assert_eq!(
+            executed_bodies(real.path(), &real_state).first(),
+            Some(&"fetch-into build/src".to_string()),
+            "control: a readable declared produces: is still hashed and still bites"
+        );
+    }
+
+    // The claim the `Unreadable::LeavesTheNameOut` doc comment rests on, counted from
+    // the manifests rather than asserted in prose. If a new example arrives whose
+    // precondition-gated command step declares a real path, this number moves and the
+    // comment has to move with it.
+    #[test]
+    fn every_precondition_gated_command_step_in_the_examples_declares_an_ordering_token() {
+        let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        let mut dirs: Vec<std::path::PathBuf> = fs::read_dir(&examples)
+            .expect("examples/ is checked in")
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.join("arcform.yaml").is_file())
+            .collect();
+        dirs.sort();
+        assert!(
+            !dirs.is_empty(),
+            "examples/ must hold at least one protocol"
+        );
+
+        let mut gated = 0usize;
+        let mut tokens = 0usize;
+        for d in &dirs {
+            let manifest = crate::manifest::Manifest::load(d)
+                .unwrap_or_else(|e| panic!("{} does not load: {e}", d.display()));
+            for step in &manifest.steps {
+                if step.command.is_none() || step.preconditions.is_empty() {
+                    continue;
+                }
+                gated += 1;
+                // An ordering token by SPELLING — a separator-free name, which is
+                // what the manifests carry and what a checked-in test can see
+                // without the build directories those steps would write into.
+                if !step.produces.is_empty()
+                    && step.produces.iter().all(|p| !p.contains(['/', '\\']))
+                {
+                    tokens += 1;
+                }
+            }
+        }
+        assert_eq!(
+            gated, 9,
+            "precondition-gated command steps across examples/"
+        );
+        assert_eq!(
+            tokens, gated,
+            "every one of them declares a separator-free `produces:` — the ordering \
+             token shape `Unreadable::LeavesTheNameOut` is built around"
+        );
     }
 
     // Every kind either has a hashing strategy or a stated reason not to, decided by

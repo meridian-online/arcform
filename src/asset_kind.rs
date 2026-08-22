@@ -83,7 +83,7 @@ pub enum AssetKind {
 pub fn default_kind_for_declared_name(raw: &str) -> AssetKind {
     if raw.contains(['*', '?', '[']) {
         AssetKind::Pattern
-    } else if raw.ends_with('/') || raw.ends_with(std::path::MAIN_SEPARATOR) {
+    } else if raw.ends_with(['/', std::path::MAIN_SEPARATOR]) {
         AssetKind::Directory
     } else {
         AssetKind::File

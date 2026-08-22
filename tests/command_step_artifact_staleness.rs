@@ -245,3 +245,76 @@ fn an_unrelated_file_beside_the_matched_one_does_not_drag_the_reader_stale() {
         "and rewriting it is not one either"
     );
 }
+
+/// The same fetch, declaring the path it really writes rather than an ordering token.
+const REAL_PRODUCES_MANIFEST: &str = r#"name: real_produces
+engine: duckdb
+db: build/real_produces.db
+steps:
+  - name: fetch
+    command: "mkdir -p build/src && printf 'lei,name\nA,Alpha\n' > build/src/data.csv"
+    produces: [build/src/data.csv]
+    preconditions:
+      - modified_after: { path: build/src/data.csv, period: 24h }
+"#;
+
+const NOTE: &str = "does not appear to have produced";
+
+fn project_from(manifest: &str, with_model: bool) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("arcform.yaml"), manifest).unwrap();
+    if with_model {
+        std::fs::create_dir_all(dir.path().join("models")).unwrap();
+        std::fs::write(dir.path().join("models/load.sql"), MODEL).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn a_command_step_whose_produces_names_no_file_says_so_when_it_runs() {
+    // No `build/src`, so the `modified_after` precondition is stale and the fetch
+    // really executes. It writes `build/src/data.csv`; its `produces:` says
+    // `src_raw`, and there is no file at that name — arc cannot hold the step to
+    // anything it declared, and exit 0 will not say so.
+    let dir = project_from(MANIFEST, true);
+    let p = dir.path();
+
+    let (_, stdout, stderr) = arc_run_raw(p);
+    assert_eq!(
+        step_outcome(&stdout, "fetch"),
+        "ran",
+        "the fetch must run with no build/src to be fresh about"
+    );
+    assert!(
+        stderr.contains(NOTE) && stderr.contains("src_raw"),
+        "the run must name the declared produces: it could not read:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("preconditions"),
+        "and say what the skip decision rests on instead, since it is not the \
+         artifact hash:\n{stderr}"
+    );
+
+    // The control: the same command declaring the path it actually writes is not
+    // warned about, on the run that writes it or on any run after. Without this,
+    // a note printed unconditionally passes the assertions above.
+    let control = project_from(REAL_PRODUCES_MANIFEST, false);
+    let c = control.path();
+    let (_, stdout, stderr) = arc_run_raw(c);
+    assert_eq!(step_outcome(&stdout, "fetch"), "ran");
+    assert!(
+        c.join("build/src/data.csv").is_file(),
+        "the control's command must really have written the file it declares"
+    );
+    assert!(
+        !stderr.contains(NOTE),
+        "a declared produces: that IS on disk must not be warned about:\n{stderr}"
+    );
+    let (_, stdout, stderr) = arc_run_raw(c);
+    assert_eq!(
+        step_outcome(&stdout, "fetch"),
+        "skip: precondition_modified_after",
+        "and it settles"
+    );
+    assert!(!stderr.contains(NOTE), "and stays quiet:\n{stderr}");
+}

@@ -28,3 +28,5 @@
 #
 # A ruling is not a way to make the job quiet.  If you cannot write the reason in
 # one line, the survivor is probably a missing test.
+35d881cb2a398a42	src/runner.rs	run_with_params	GUARD_TRUE	2026-08-22	the sql: and op: arms are already taken above and manifest validation guarantees one of the three, so a command step is the only kind that reaches this arm and the condition is true wherever it is evaluated
+6bb732022440726c	src/runner.rs	run_with_params	GUARD_TRUE	2026-08-22	the widened guard can only add the case hash.is_some() under WithholdsTheHash, and that policy returns None for exactly the unreadable produces: this block reports, so missing_declared_produces is empty there and nothing is printed
