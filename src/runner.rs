@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
@@ -335,6 +335,8 @@ pub fn run_with_params(
                 state::content_hash(&content)
             } else if step.op.is_some() {
                 op_config_hash(step)
+            } else if step.command.is_some() {
+                command_config_hash(step)
             } else {
                 String::new()
             };
@@ -418,37 +420,58 @@ pub fn run_with_params(
                         executed += 1;
                         // Hashed AFTER execution, so it reflects what the step just
                         // wrote — the baseline the *next* run's staleness check
-                        // compares against. `is_hash_stale` never calls
-                        // `produced_artifact_hash` for a `command:` step regardless of
-                        // whether it ran or was skipped via preconditions (command
-                        // steps are always stale on hash alone — see
-                        // `compute_staleness`), so there is nothing to hash for them
-                        // here either. `None` (a relevant file still unreadable right
-                        // after "success," or an ambiguous declared spelling) records
-                        // a fixed, human-legible placeholder — its value is moot,
-                        // since `is_hash_stale` short-circuits to unconditional
-                        // staleness on the same condition before this string is ever
-                        // compared.
-                        let artifact_hash = if step.command.is_some() {
-                            String::new()
-                        } else {
-                            let hash =
-                                produced_artifact_hash(step, dir, &asset_graph, &all_produced);
-                            if hash.is_none() {
-                                // The step just "succeeded," and the run is about to
-                                // report success, while its own declared produces:
-                                // still cannot be read. Re-running (forced by `None`
-                                // above) is the safe outcome; it is not a legible one
-                                // on its own — say so, since exit 0 will not.
+                        // compares against. Recorded for EVERY step kind, `command:`
+                        // included: a command step used to record an empty string
+                        // here and be short-circuited out of `is_hash_stale`, so a
+                        // precondition-gated one had nothing to compare and skipped
+                        // while the artifact it produced was rewritten underneath it.
+                        // `None` (a relevant file still unreadable right after
+                        // "success," or an ambiguous declared spelling) records a
+                        // fixed, human-legible placeholder — its value is moot, since
+                        // `is_hash_stale` short-circuits to unconditional staleness on
+                        // the same condition before this string is ever compared.
+                        let artifact_hash = {
+                            let unreadable = Unreadable::for_step(step);
+                            let hash = produced_artifact_hash(
+                                step,
+                                dir,
+                                &asset_graph,
+                                &all_produced,
+                                unreadable,
+                            );
+                            // The step just "succeeded," and the run is about to
+                            // report success, while a name in its own declared
+                            // produces: still cannot be read. Say so — exit 0 will
+                            // not. Asked whenever the hash was withheld, and for a
+                            // command step asked outright, because there the
+                            // unreadable name was left out of the hash rather than
+                            // withholding it and the hash alone no longer says.
+                            if hash.is_none() || unreadable == Unreadable::LeavesTheNameOut {
                                 let missing = missing_declared_produces(step, dir, &asset_graph);
                                 if !missing.is_empty() {
+                                    let consequence = match unreadable {
+                                        Unreadable::WithholdsTheHash => {
+                                            "arc will keep re-running this step until its own work \
+                                             (or the manifest's produces:) matches"
+                                        }
+                                        // A command step is opaque, so re-running it
+                                        // forever on an ordering token is not the
+                                        // trade taken — see `Unreadable`. What is
+                                        // owed instead is saying what arc cannot
+                                        // certify, and what is still holding the
+                                        // step back from running.
+                                        Unreadable::LeavesTheNameOut => {
+                                            "arc cannot tell whether that changed, so this step's \
+                                             skip rests on its preconditions and its command line \
+                                             alone"
+                                        }
+                                    };
                                     eprintln!(
-                                        "{} step '{}' succeeded but does not appear to have produced: {} — arc will \
-                                         keep re-running this step until its own work (or the manifest's \
-                                         produces:) matches",
+                                        "{} step '{}' succeeded but does not appear to have produced: {} — {}",
                                         "warning:".yellow(),
                                         step.name,
-                                        missing.join(", ")
+                                        missing.join(", "),
+                                        consequence
                                     );
                                 }
                             }
@@ -732,13 +755,15 @@ fn precondition_skip_reason(preconditions: &[Precondition]) -> SkipReason {
 ///
 /// A step is stale if:
 /// - `force` is true (all steps run)
-/// - It's a command step (always re-runs)
+/// - It's a command step with no `preconditions:` (always re-runs)
 /// - It has no prior state (first run)
 /// - Its prior run failed
-/// - Its SQL file content hash changed
-/// - Any FILE asset it produced, or any file it reads that nothing in the manifest
-///   produces, no longer hashes to what it did after the step's last success —
-///   changed, truncated or deleted all count (see [`produced_artifact_hash`])
+/// - Its configuration changed — a `sql:` file's bytes, an `op:` step's operator
+///   reference plus `with:` block, or a `command:` step's own command line
+/// - Any FILE, DIRECTORY or PATTERN asset it produced, or any such asset it reads
+///   that nothing in the manifest produces, no longer hashes to what it did after
+///   the step's last success — changed, truncated or deleted all count (see
+///   [`produced_artifact_hash`])
 /// - An upstream step (via asset graph) is stale (downstream propagation)
 ///
 /// For every step that stays fresh, a typed [`SkipReason`] is recorded so the run
@@ -769,28 +794,28 @@ fn compute_staleness(
     // Reasons are provisional until downstream propagation settles (Phase 3).
     let mut reasons: HashMap<String, SkipReason> = HashMap::new();
     for step in &manifest.steps {
-        if step.command.is_some() {
-            if step.preconditions.is_empty() {
-                // No preconditions — command steps always re-run (backwards compat).
-                stale.insert(step.name.clone());
-            } else if precondition::evaluate_all(&step.preconditions, dir, &step.name, env)? {
-                // All preconditions fresh — skippable via the precondition mechanism.
-                reasons.insert(
-                    step.name.clone(),
-                    precondition_skip_reason(&step.preconditions),
-                );
-            } else {
-                stale.insert(step.name.clone());
-            }
+        // A `command:` step with no `preconditions:` has no skip path at all, so
+        // there is nothing for a hash to decide. This is the one branch that reaches
+        // a verdict without asking `is_hash_stale`, and the verdict it reaches is
+        // STALE: every step that can actually be skipped goes through the artifact
+        // hash below, whatever kind of step it is. That is the invariant this
+        // function is arranged around — a step kind exempt from the hash is a step
+        // that can certify work it did not do.
+        if step.command.is_some() && step.preconditions.is_empty() {
+            stale.insert(step.name.clone());
             continue;
         }
 
-        // SQL/op step — check hash staleness (op steps hash their config) AND
-        // artifact staleness (did the bytes this step is answerable for change).
+        // Config staleness (a `sql:` file's bytes, an `op:` step's `with:` block, a
+        // `command:` step's own command line) AND artifact staleness (do the bytes
+        // this step is answerable for still hold). A `command:` step used to reach
+        // NEITHER — it returned above on its preconditions alone — so a
+        // precondition-gated one skipped while the artifact it produced was
+        // rewritten underneath it and while its own command line was edited.
         let hash_stale = is_hash_stale(step, dir, state, asset_graph, all_produced)?;
 
         if step.preconditions.is_empty() {
-            // No preconditions — SQL steps use hash only (backwards compat).
+            // No preconditions — hash only (backwards compat).
             if hash_stale {
                 stale.insert(step.name.clone());
             } else {
@@ -827,6 +852,29 @@ fn compute_staleness(
         stale,
         skip_reasons: reasons,
     })
+}
+
+/// Staleness hash for a `command:` step: its command line, exactly as written.
+///
+/// The counterpart of a `sql:` step's file hash and an `op:` step's
+/// [`op_config_hash`], stored in the same state column, and it closes the same hole
+/// on the third step kind: a precondition-gated command step whose command line was
+/// edited used to skip, because nothing about a command step reached the config hash
+/// at all — `run` recorded an empty string for it and `compute_staleness` returned
+/// before `is_hash_stale` was ever called.
+///
+/// It hashes the command TEXT, not what the command reads. A shell line that reaches
+/// a script file (`bash scripts/fetch.sh`) is unchanged by editing that script, and
+/// nothing here can see inside it; what covers that case is the step's produced
+/// artifacts, hashed by [`produced_artifact_hash`].
+///
+/// **The first run after this landed re-runs every precondition-gated command step
+/// once.** Prior state recorded `sql_hash = ""` for a command step, which no command
+/// line hashes to, so the comparison below reads as changed. That reseeds toward
+/// re-running rather than toward skipping, which is the safe direction, and it
+/// happens once per step.
+fn command_config_hash(step: &crate::manifest::Step) -> String {
+    state::content_hash(step.command.as_deref().unwrap_or_default().as_bytes())
 }
 
 /// Staleness hash for an `op:` step: the operator reference plus its serialized `with:`
@@ -901,6 +949,10 @@ fn is_hash_stale(
             let config_stale = if step.op.is_some() {
                 // Op step — config hash (operator ref + serialized `with:`).
                 op_config_hash(step) != prior_state.sql_hash
+            } else if step.command.is_some() {
+                // Command step — the command line itself. See `command_config_hash`
+                // for why the first run after this landed re-runs each one once.
+                command_config_hash(step) != prior_state.sql_hash
             } else if let Some(ref sql) = step.sql {
                 let sql_path = dir.join(sql);
                 if sql_path.exists() {
@@ -913,7 +965,7 @@ fn is_hash_stale(
                     true // File missing — will error during execution.
                 }
             } else {
-                false // No SQL file (shouldn't happen for SQL steps).
+                false // Neither sql:, op: nor command: — validation rejects this.
             };
 
             if config_stale {
@@ -945,7 +997,13 @@ fn is_hash_stale(
             // nothing is on disk and the run reporting success — the defect this
             // whole mechanism exists to close, reached through the one case a plain
             // sentinel string cannot distinguish from genuine freshness.
-            match produced_artifact_hash(step, dir, asset_graph, all_produced) {
+            match produced_artifact_hash(
+                step,
+                dir,
+                asset_graph,
+                all_produced,
+                Unreadable::for_step(step),
+            ) {
                 None => Ok(true),
                 Some(current_artifact_hash) => {
                     Ok(current_artifact_hash != prior_state.artifact_hash)
@@ -1005,6 +1063,11 @@ fn missing_declared_produces(
             // when `fs::read` fails, exactly as before.
             let is_missing = match declared_kind_of(assets, lowered) {
                 AssetKind::Directory => state::hash_directory_contents(&full).is_none(),
+                // A pattern is "missing" when the tree it would be matched against
+                // cannot be listed at all, NOT when it matches nothing: an empty
+                // match set is a determined answer about a readable directory, the
+                // same way an empty directory hashes rather than failing.
+                AssetKind::Pattern => hash_pattern_matches(dir, raw).is_none(),
                 _ => std::fs::read(&full).is_err(),
             };
             is_missing.then(|| raw.to_string())
@@ -1013,18 +1076,38 @@ fn missing_declared_produces(
 }
 
 /// Whether `assets.declared_kind` marks `name` as something [`produced_artifact_hash`]
-/// hashes at all — a `File` or a `Directory`. `Pattern` never resolves to one
-/// artifact (staleness comes from what produces the matches, not the pattern
-/// itself) and `Table` is not a path in the first place. Defaults to `File` for a
-/// name with no kind entry — every current insertion site populates one, so this is
-/// a defensive fallback, not a real path; it fails SAFE rather than silently,
-/// since a File-shaped read of an actual directory errors and forces staleness via
-/// `?`, never quietly skips the way an `is_dir()` opt-out did.
+/// hashes at all. Delegates to [`kind_is_hashed`] so the answer is decided in one
+/// place; see that function for which kinds are hashed and why. Defaults to `File`
+/// for a name with no kind entry — every current insertion site populates one, so
+/// this is a defensive fallback, not a real path; it fails SAFE rather than
+/// silently, since a File-shaped read of an actual directory errors and forces
+/// staleness, never quietly skips the way an `is_dir()` opt-out did.
 fn is_hashable_kind(assets: &StepAssets, name: &str) -> bool {
-    matches!(
-        declared_kind_of(assets, name),
-        AssetKind::File | AssetKind::Directory
-    )
+    kind_is_hashed(declared_kind_of(assets, name))
+}
+
+/// Whether the staleness path hashes an asset of this kind, decided by an exhaustive
+/// match so a new [`AssetKind`] variant cannot arrive without someone answering the
+/// question for it. That is the check the shapes in this file kept getting caught
+/// by: each one was a name that reached the staleness path carrying a kind nothing
+/// hashed, and each was found by measuring a live manifest rather than by anything
+/// in the tree.
+///
+/// - `File` — its bytes.
+/// - `Directory` — a manifest of its contents, via
+///   [`crate::state::hash_directory_contents`].
+/// - `Pattern` — a manifest of the files it currently matches, via
+///   [`hash_pattern_matches`]. The kind is NOT reclassified as a file: a glob is
+///   still not a path, and asking `fs::read` for one errors. What is hashed is what
+///   the pattern RESOLVES to, which is the set the reading step actually consumes.
+/// - `Table` — not hashed. It is not a filesystem path at all, so there are no bytes
+///   to read; staleness comes from the producing step's own config hash and
+///   downstream propagation.
+fn kind_is_hashed(kind: AssetKind) -> bool {
+    match kind {
+        AssetKind::File | AssetKind::Directory | AssetKind::Pattern => true,
+        AssetKind::Table => false,
+    }
 }
 
 /// `assets.declared_kind.get(name)`, defaulting to `File` — the one place both
@@ -1036,6 +1119,230 @@ fn declared_kind_of(assets: &StepAssets, name: &str) -> AssetKind {
         .get(name)
         .copied()
         .unwrap_or(AssetKind::File)
+}
+
+/// What an asset the staleness path cannot read right now means for the step that
+/// declared it. The two answers are genuinely different questions, so they are named
+/// rather than left as a bool at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unreadable {
+    /// **Withhold the whole hash**, which forces the step stale unconditionally
+    /// rather than comparing anything. A `sql:` or `op:` step's produced set is
+    /// derived from the SQL parser or the operator's own typed config, so arc knows
+    /// what the step's work was supposed to write; a declared name it cannot read is
+    /// the step's work and its declaration disagreeing, and an absence must never be
+    /// folded into a comparable string where it can read as "unchanged" against a
+    /// prior absence.
+    WithholdsTheHash,
+    /// **Leave the name out of the hash** and hash the rest.
+    ///
+    /// A `command:` step is opaque — arc cannot see what the command wrote, and a
+    /// `produces:` name with no file behind it is the shipped ordering-token
+    /// convention rather than a defect. Six of the eight precondition-gated command
+    /// steps in this repository's `examples/` declare one (`tides_csv`, `cask_json`,
+    /// `cask_30d`, `cask_90d`, `formula_30d`, `formula_90d`, plus `naics_source` and
+    /// `icd_source`), and withholding the hash for those would turn every one into an
+    /// unconditional re-run of a fetch the precondition exists to avoid.
+    ///
+    /// This does not hand back "unchanged" for free. The SET of readable names is
+    /// itself part of the hashed buffer — each entry writes its own name beside its
+    /// digest — so an artifact that WAS readable and has since been deleted drops out
+    /// and moves the digest. What stays silent is only a name that has never once
+    /// been readable, and `run` reports that on stderr the first time the step
+    /// executes, through [`missing_declared_produces`].
+    LeavesTheNameOut,
+}
+
+impl Unreadable {
+    /// The policy this step's kind is held to. One place, so the two call sites —
+    /// the staleness check and the baseline `run` records after a success — cannot
+    /// drift into comparing hashes built under different rules.
+    fn for_step(step: &crate::manifest::Step) -> Self {
+        if step.command.is_some() {
+            Unreadable::LeavesTheNameOut
+        } else {
+            Unreadable::WithholdsTheHash
+        }
+    }
+}
+
+/// A content hash over every regular file `pattern` currently matches under `base`,
+/// as a sorted manifest of relative path plus digest — the same shape (and for the
+/// same reason) as [`crate::state::hash_directory_contents`]. What a glob names is a
+/// SET, so a member's bytes changing, a member disappearing and a member arriving all
+/// have to move the digest, and only sorting makes that independent of readdir order.
+///
+/// **This is what the card-carrying hole in the staleness path was.** A glob is not a
+/// path and is not classified as one — that reading was tried and it made a shipping
+/// manifest refuse to run, because `fs::read("build/src/*.csv")` errors and an error
+/// forces staleness forever. But "not a path" was being read as "not hashable", and
+/// the two are different: a pattern resolves, and what it resolves to is exactly the
+/// bytes the reading step consumes. `read_csv('build/gleif_src/*.csv', ...)` is the
+/// live shape — the glob is the only declaration in that protocol that names the
+/// fetched bytes at all, so with the pattern unhashed nothing at either end hashed
+/// them and appending to, truncating or deleting the CSV each left the reading step
+/// `[skip: hash_clean]` at exit 0.
+///
+/// Returns `None` — undetermined, so the caller forces staleness — when a directory
+/// that has to be enumerated to answer the question cannot be read. Returns
+/// `Some(hash of the empty set)` when the enumeration succeeds and nothing matches:
+/// that IS an answer about a readable tree, and it is not the "absence read as
+/// sameness" case, because the empty set hashes differently from any non-empty one.
+/// Deleting the last file a pattern matched therefore reads as changed if the
+/// directory survives, and as undetermined if it does not — stale either way.
+fn hash_pattern_matches(base: &Path, pattern: &str) -> Option<String> {
+    let components: Vec<&str> = pattern
+        .split(['/', '\\'])
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    if components.is_empty() {
+        return None;
+    }
+    // An absolute pattern is rooted at the filesystem root; a relative one at the
+    // protocol directory, the same base every other declared name is joined onto.
+    let root: PathBuf = if pattern.starts_with('/') {
+        PathBuf::from("/")
+    } else {
+        base.to_path_buf()
+    };
+
+    let mut matches: Vec<PathBuf> = Vec::new();
+    expand_pattern(&root, &components, &mut matches)?;
+    matches.sort();
+    matches.dedup();
+
+    let mut buf = String::new();
+    for path in &matches {
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        let bytes = std::fs::read(path).ok()?;
+        buf.push_str(&rel);
+        buf.push('\u{1f}'); // unit separator — same guard produced_artifact_hash uses
+        buf.push_str(&state::content_hash(&bytes));
+        buf.push('\n');
+    }
+    Some(state::content_hash(buf.as_bytes()))
+}
+
+/// Collect every regular file under `current` that matches the remaining glob
+/// `components`, one path component at a time.
+///
+/// Walking component-wise rather than listing the whole tree and matching relative
+/// paths is what keeps the cost proportional to the pattern: a literal component is a
+/// `join` with no directory read at all, so `build/gleif_src/*.csv` reads exactly one
+/// directory.
+///
+/// `None` propagates the one thing that is not an answer: a directory that had to be
+/// enumerated and could not be read.
+fn expand_pattern(current: &Path, components: &[&str], out: &mut Vec<PathBuf>) -> Option<()> {
+    let Some((head, rest)) = components.split_first() else {
+        // Every component consumed. A directory is not a match: what is hashed is
+        // files, and a directory that a pattern lands on is covered by whichever
+        // pattern or Directory-kind declaration names its contents.
+        if current.is_file() {
+            out.push(current.to_path_buf());
+        }
+        return Some(());
+    };
+
+    // `**` spans zero or more path segments, which is two cases: consume nothing and
+    // match the rest here, or consume exactly one segment and try again from there.
+    if *head == "**" {
+        expand_pattern(current, rest, out)?;
+        for entry in std::fs::read_dir(current).ok()? {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            // One segment consumed by `**`, `rest` matched against the child.
+            expand_pattern(&path, rest, out)?;
+            if entry.file_type().ok()?.is_dir() {
+                // ...or `**` keeps going down.
+                expand_pattern(&path, components, out)?;
+            }
+        }
+        return Some(());
+    }
+
+    // A literal component names one child, so nothing has to be enumerated for it.
+    // A component that does not exist is not an error here: the walk simply finds no
+    // match, and the first directory that genuinely cannot be READ returns None.
+    if !head.contains(['*', '?', '[']) {
+        let child = current.join(head);
+        if rest.is_empty() {
+            if child.is_file() {
+                out.push(child);
+            }
+            return Some(());
+        }
+        if !child.is_dir() {
+            return Some(());
+        }
+        return expand_pattern(&child, rest, out);
+    }
+
+    for entry in std::fs::read_dir(current).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        if component_matches(head, &name.to_string_lossy()) {
+            expand_pattern(&entry.path(), rest, out)?;
+        }
+    }
+    Some(())
+}
+
+/// Whether one path component matches one glob component: `*` (any run of characters
+/// within the component, never across a separator), `?` (exactly one character), and
+/// `[abc]` / `[a-z]` / `[!abc]` character classes. An unclosed `[` is a literal
+/// bracket.
+fn component_matches(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    glob_match(&p, &n)
+}
+
+fn glob_match(p: &[char], n: &[char]) -> bool {
+    match p.first() {
+        None => n.is_empty(),
+        Some('*') => (0..=n.len()).any(|i| glob_match(&p[1..], &n[i..])),
+        Some('?') => !n.is_empty() && glob_match(&p[1..], &n[1..]),
+        Some('[') => {
+            let close = p.iter().skip(1).position(|c| *c == ']').map(|i| i + 1);
+            match close {
+                // `[]` and `[` with no closer carry no class, so the bracket is a
+                // literal character like any other.
+                Some(close) if close > 1 => {
+                    if n.is_empty() {
+                        return false;
+                    }
+                    let body = &p[1..close];
+                    let (negated, body) = match body.first() {
+                        Some('!') | Some('^') => (true, &body[1..]),
+                        _ => (false, body),
+                    };
+                    let mut hit = false;
+                    let mut i = 0;
+                    while i < body.len() {
+                        if i + 2 < body.len() && body[i + 1] == '-' {
+                            if body[i] <= n[0] && n[0] <= body[i + 2] {
+                                hit = true;
+                            }
+                            i += 3;
+                        } else {
+                            if body[i] == n[0] {
+                                hit = true;
+                            }
+                            i += 1;
+                        }
+                    }
+                    hit != negated && glob_match(&p[close + 1..], &n[1..])
+                }
+                _ => !n.is_empty() && n[0] == '[' && glob_match(&p[1..], &n[1..]),
+            }
+        }
+        Some(c) => !n.is_empty() && n[0] == *c && glob_match(&p[1..], &n[1..]),
+    }
 }
 
 /// A combined content hash over every asset a step is answerable for that is
@@ -1068,19 +1375,23 @@ fn declared_kind_of(assets: &StepAssets, name: &str) -> AssetKind {
 /// emptied directory from a populated one, so it would let a `COPY … PARTITION_BY`
 /// target or a pattern-only `archive_extract` `dest:` skip forever once every
 /// partition file inside it was deleted or corrupted while the directory itself
-/// survived. `Pattern` and `Table` are filtered out before this loop is ever
+/// survived. `Table` is filtered out before this loop is ever
 /// reached (see `is_hashable_kind`), so this function has no name-based or
-/// extension-based guessing left in it at all — that was round 6 and round 7's
-/// mistake (an extension allowlist left real files untracked; an unconditional
-/// directory skip re-opened the exact hole a content hash closes).
+/// extension-based guessing left in it at all — that was an extension allowlist that
+/// left real files untracked, and an unconditional directory skip that re-opened the
+/// exact hole a content hash closes.
 ///
 /// Returns `None` — never a hash — in two OTHER cases, both forcing the caller
-/// (`is_hash_stale`) to unconditional staleness rather than a string comparison:
+/// (`is_hash_stale`) to unconditional staleness rather than a string comparison.
+/// Which of them the FIRST one is depends on `unreadable`; see [`Unreadable`] for
+/// why a `command:` step answers it differently from a `sql:` or `op:` step.
 ///
 /// - **A relevant asset cannot be read right now**, under its declared spelling —
 ///   missing or permission-denied for a `File` (not truncated: `fs::read` succeeds
 ///   on an empty file, yielding `Some(hash_of_empty)`); unreadable/absent for a
-///   `Directory`, via `hash_directory_contents` returning `None`. Earlier designs
+///   `Directory`, via `hash_directory_contents` returning `None`; an unlistable tree
+///   for a `Pattern`, via `hash_pattern_matches` returning `None` (a pattern that
+///   matches nothing in a readable tree is NOT this case — it hashes the empty set). Earlier designs
 ///   folded this into a stable `"MISSING"` sentinel *string* and compared it like any
 ///   other digest, which reads as "unchanged" the moment a step's declared artifact
 ///   has never once existed under its declared name (its SQL wrote a differently-cased
@@ -1111,6 +1422,7 @@ fn produced_artifact_hash(
     dir: &Path,
     asset_graph: &AssetGraph,
     all_produced: &std::collections::HashSet<String>,
+    unreadable: Unreadable,
 ) -> Option<String> {
     let step_assets = asset_graph.steps.get(&step.name);
     let mut names: Vec<&String> = Vec::new();
@@ -1155,10 +1467,14 @@ fn produced_artifact_hash(
             .map(|a| declared_kind_of(a, name))
             .unwrap_or(AssetKind::File);
         let digest = match kind {
-            AssetKind::Directory => state::hash_directory_contents(&full)?,
-            _ => {
-                let bytes = std::fs::read(&full).ok()?;
-                state::content_hash(&bytes)
+            AssetKind::Directory => state::hash_directory_contents(&full),
+            AssetKind::Pattern => hash_pattern_matches(dir, raw),
+            _ => std::fs::read(&full).ok().map(|b| state::content_hash(&b)),
+        };
+        let Some(digest) = digest else {
+            match unreadable {
+                Unreadable::WithholdsTheHash => return None,
+                Unreadable::LeavesTheNameOut => continue,
             }
         };
         buf.push_str(name);
@@ -2144,7 +2460,13 @@ mod tests {
 
         let step = manifest.steps.iter().find(|s| s.name == "s1").unwrap();
         let all_produced = all_produced_assets(&asset_graph);
-        let result = produced_artifact_hash(step, dir.path(), &asset_graph, &all_produced);
+        let result = produced_artifact_hash(
+            step,
+            dir.path(),
+            &asset_graph,
+            &all_produced,
+            Unreadable::for_step(step),
+        );
         assert_eq!(
             result, None,
             "an ambiguous declared_case entry (2+ raw spellings) must never be \
