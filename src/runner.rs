@@ -6319,7 +6319,10 @@ steps:
 
         // Changing the nested file moves the `**` hash and not the `*` one.
         fs::write(base.join("build/src/nested/c.csv"), b"changed").unwrap();
-        assert_ne!(all, hash_pattern_matches(base, "build/src/**/*.csv").unwrap());
+        assert_ne!(
+            all,
+            hash_pattern_matches(base, "build/src/**/*.csv").unwrap()
+        );
         assert_eq!(
             shallow_only,
             hash_pattern_matches(base, "build/src/*.csv").unwrap()
@@ -6368,11 +6371,16 @@ steps:
             )],
         );
         fs::create_dir_all(dir.path().join("build/src")).unwrap();
-        fs::write(dir.path().join("build/src/data.csv"), b"lei,name\nA,Alpha\n").unwrap();
+        fs::write(
+            dir.path().join("build/src/data.csv"),
+            b"lei,name\nA,Alpha\n",
+        )
+        .unwrap();
         dir
     }
 
-    const LOAD_SQL: &str = "CREATE OR REPLACE TABLE t AS SELECT * FROM read_csv('build/src/*.csv');";
+    const LOAD_SQL: &str =
+        "CREATE OR REPLACE TABLE t AS SELECT * FROM read_csv('build/src/*.csv');";
 
     // The measured defect: neither end hashed the fetched bytes, so appending to,
     // truncating or deleting the CSV each left `load` skipping at exit 0 with the
@@ -6396,11 +6404,14 @@ steps:
         }
 
         for (case, mutate) in [
-            ("append", (|p: &Path| {
-                let mut existing = fs::read(p).unwrap();
-                existing.extend_from_slice(b"B,Beta\n");
-                fs::write(p, existing).unwrap();
-            }) as fn(&Path)),
+            (
+                "append",
+                (|p: &Path| {
+                    let mut existing = fs::read(p).unwrap();
+                    existing.extend_from_slice(b"B,Beta\n");
+                    fs::write(p, existing).unwrap();
+                }) as fn(&Path),
+            ),
             ("truncate", |p: &Path| fs::write(p, b"").unwrap()),
             ("delete", |p: &Path| fs::remove_file(p).unwrap()),
         ] {
@@ -6440,13 +6451,14 @@ steps:
         setup_project(
             dir.path(),
             &yaml,
-            &[(
-                "models/load.sql",
-                "CREATE OR REPLACE TABLE t AS SELECT 1;",
-            )],
+            &[("models/load.sql", "CREATE OR REPLACE TABLE t AS SELECT 1;")],
         );
         fs::create_dir_all(dir.path().join("build/src")).unwrap();
-        fs::write(dir.path().join("build/src/data.csv"), b"lei,name\nA,Alpha\n").unwrap();
+        fs::write(
+            dir.path().join("build/src/data.csv"),
+            b"lei,name\nA,Alpha\n",
+        )
+        .unwrap();
         // Age the file past the precondition's window so the FIRST run executes the
         // step and records a baseline. `MockEngine` runs no command, so the seeded
         // file stands in for what the command would have written. Without this the
@@ -6508,7 +6520,10 @@ steps:
         // mutations the defect was measured on, not because it isolates this
         // mechanism.
         for (case, mutate) in [
-            ("rewrite", (|p: &Path| fs::write(p, b"lei,name\nZ,Zeta\n").unwrap()) as fn(&Path)),
+            (
+                "rewrite",
+                (|p: &Path| fs::write(p, b"lei,name\nZ,Zeta\n").unwrap()) as fn(&Path),
+            ),
             ("truncate", |p: &Path| fs::write(p, b"").unwrap()),
             ("delete", |p: &Path| fs::remove_file(p).unwrap()),
         ] {

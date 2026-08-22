@@ -117,7 +117,13 @@ fn arc_run(project: &Path) -> String {
 fn table_rows(project: &Path) -> usize {
     let out = Command::new("duckdb")
         .arg(project.join("build/glob_read.db"))
-        .args(["-noheader", "-list", "-readonly", "-c", "SELECT count(*) FROM t"])
+        .args([
+            "-noheader",
+            "-list",
+            "-readonly",
+            "-c",
+            "SELECT count(*) FROM t",
+        ])
         .output()
         .expect("spawn duckdb");
     assert!(out.status.success(), "duckdb: {:?}", out);
@@ -154,14 +160,22 @@ fn a_change_to_what_a_command_step_fetched_makes_the_glob_reader_stale() {
     appended.extend_from_slice(b"B,Beta\n");
     std::fs::write(&csv, &appended).unwrap();
     let out = arc_run(p);
-    assert_eq!(step_outcome(&out, "load"), "ran", "append: load must re-run");
+    assert_eq!(
+        step_outcome(&out, "load"),
+        "ran",
+        "append: load must re-run"
+    );
     assert_eq!(
         step_outcome(&out, "fetch"),
         "skip: precondition_modified_after",
         "append: the fetch's precondition is untouched, and re-fetching is the \
          expensive answer this must not give"
     );
-    assert_eq!(table_rows(p), 2, "append: the table must hold what the CSV holds");
+    assert_eq!(
+        table_rows(p),
+        2,
+        "append: the table must hold what the CSV holds"
+    );
     assert_eq!(
         step_outcome(&arc_run(p), "load"),
         "skip: hash_clean",
@@ -188,7 +202,11 @@ fn a_change_to_what_a_command_step_fetched_makes_the_glob_reader_stale() {
     // one, which is the whole difference between the two behaviours.
     std::fs::remove_file(&csv).unwrap();
     let (code, stdout, stderr) = arc_run_raw(p);
-    assert_eq!(step_outcome(&stdout, "load"), "ran", "delete: load must re-run");
+    assert_eq!(
+        step_outcome(&stdout, "load"),
+        "ran",
+        "delete: load must re-run"
+    );
     assert_ne!(code, Some(0), "delete: the run must not report success");
     assert!(
         stderr.contains("build/src/*.csv"),
@@ -216,7 +234,11 @@ fn an_unrelated_file_beside_the_matched_one_does_not_drag_the_reader_stale() {
          what `load` reads"
     );
 
-    std::fs::write(p.join("build/src/README.txt"), b"rewritten, still not a csv").unwrap();
+    std::fs::write(
+        p.join("build/src/README.txt"),
+        b"rewritten, still not a csv",
+    )
+    .unwrap();
     assert_eq!(
         step_outcome(&arc_run(p), "load"),
         "skip: hash_clean",
