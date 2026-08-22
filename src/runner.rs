@@ -6164,10 +6164,32 @@ steps:
         assert!(!component_matches("q[0-9].tsv", "qx.tsv"));
         assert!(component_matches("[!0-9].csv", "a.csv"));
         assert!(!component_matches("[!0-9].csv", "5.csv"));
+        // A class lists its members; it is not the RANGE from the first to the last.
+        // `[axz]` matching `m` is the difference, and every class in this repo's
+        // manifests happens to be contiguous, which is how that reading survives
+        // being read.
+        assert!(component_matches("[axz].csv", "x.csv"));
+        assert!(!component_matches("[axz].csv", "m.csv"));
+        // A two-member class has no third character for a range to end at.
+        assert!(component_matches("[ab].csv", "b.csv"));
+        assert!(!component_matches("[ab].csv", "c.csv"));
         // An unclosed bracket is a literal bracket, not a class that swallows the
         // rest of the name.
         assert!(component_matches("[abc.csv", "[abc.csv"));
         assert!(!component_matches("[abc.csv", "a.csv"));
+        // `[]` carries no class either, for the same reason: there is nothing between
+        // the brackets to be a member of it. Reading it as an EMPTY class instead
+        // makes it match nothing at all, which silently drops a file whose name really
+        // does open with a bracket pair.
+        assert!(component_matches("[]x.csv", "[]x.csv"));
+        assert!(!component_matches("[]x.csv", "x.csv"));
+        // A class needs a character to test. Nothing on disk is named "", but a
+        // matcher that indexes before it has checked either panics here or answers
+        // yes to everything, and both are worse than answering no.
+        assert!(!component_matches("[abc]", ""));
+        assert!(!component_matches("[!abc]", ""));
+        assert!(!component_matches("?", ""));
+        assert!(component_matches("*", ""));
     }
 
     /// A directory tree for the pattern tests: two CSVs, a sibling of another
@@ -6364,23 +6386,45 @@ steps:
             ),
             None => eprintln!("skipping the file half: this process reads a 0o000 file"),
         }
+    }
 
-        // And the refusal has to survive `**`'s zero-segment branch, which resolves
-        // the rest of the pattern from here before descending anywhere. Swallowing a
-        // refusal there would answer confidently from the subtrees that DID resolve.
-        fs::create_dir_all(base.join("build/other/src")).unwrap();
-        fs::write(base.join("build/other/src/e.csv"), b"elsewhere").unwrap();
-        match while_unreadable(&base.join("build/src"), || {
-            hash_pattern_matches(&base.join("build"), "**/src/*.csv")
+    // `**`'s zero-segment branch resolves the rest of the pattern from where it
+    // stands, BEFORE descending anywhere, and a refusal there has to propagate.
+    // Swallowing it would answer confidently from the subtrees that did resolve.
+    //
+    // Reaching that branch on its own takes a symlink, and the reason is worth
+    // stating: `**` descends with `DirEntry::file_type`, which does not follow
+    // symlinks, while a literal component resolves with `Path::is_dir`, which does.
+    // So a symlink to an unreadable directory OUTSIDE the tree is refused by the
+    // zero-segment resolution and never visited by the descent — every unreadable
+    // directory INSIDE the tree is read by both, and either one alone would look
+    // like it had covered this.
+    #[test]
+    fn a_refusal_in_the_zero_segment_branch_of_a_double_star_propagates() {
+        let outside = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        fs::create_dir_all(base.join("other")).unwrap();
+        fs::write(base.join("other/x.csv"), b"readable").unwrap();
+        std::os::unix::fs::symlink(outside.path(), base.join("link")).unwrap();
+
+        match while_unreadable(outside.path(), || {
+            hash_pattern_matches(base, "**/link/*.csv")
         }) {
             Some(answer) => assert_eq!(
                 answer, None,
-                "`**` must not answer from build/other/src while build/src refused"
+                "the pattern reached a directory it could not read, so there is no                  answer — not the empty set assembled from `other/`"
             ),
-            None => {
-                eprintln!("skipping the `**` half: this process reads a 0o000 directory")
-            }
+            None => eprintln!(
+                "skipping a_refusal_in_the_zero_segment_branch_of_a_double_star_propagates:                  this process reads a 0o000 directory"
+            ),
         }
+
+        // The control: with that directory readable, the same pattern answers.
+        assert!(
+            hash_pattern_matches(base, "**/link/*.csv").is_some(),
+            "the refusal above was the permissions, not the shape of the pattern"
+        );
     }
 
     // `**` spans ZERO or more levels, and both ends have to be pinned separately: a
