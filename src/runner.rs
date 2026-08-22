@@ -940,7 +940,16 @@ fn is_hash_stale(
     let prior = state.get_step_state(&step.name)?;
 
     match prior {
-        None => Ok(true), // Never run before.
+        // Never run under this state store. For a `sql:` or `op:` step that is
+        // staleness outright: there is no baseline, so nothing can be certified.
+        // A `command:` step is left to its `preconditions:`, which is what it did
+        // before any of this and is the behaviour those preconditions are for — the
+        // shape is a fetch whose output is already on disk from an earlier checkout,
+        // and forcing it stale here would re-download on the first run in every
+        // fresh clone. The cost is that such a step's artifact hash is not baselined
+        // until it has run once; until then its bytes are covered by whatever reads
+        // them, not by it.
+        None => Ok(step.command.is_none()),
         Some(prior_state) => {
             if prior_state.status == StepStatus::Failed {
                 return Ok(true); // Previously failed.
@@ -1183,13 +1192,16 @@ impl Unreadable {
 /// them and appending to, truncating or deleting the CSV each left the reading step
 /// `[skip: hash_clean]` at exit 0.
 ///
-/// Returns `None` — undetermined, so the caller forces staleness — when a directory
-/// that has to be enumerated to answer the question cannot be read. Returns
-/// `Some(hash of the empty set)` when the enumeration succeeds and nothing matches:
-/// that IS an answer about a readable tree, and it is not the "absence read as
-/// sameness" case, because the empty set hashes differently from any non-empty one.
-/// Deleting the last file a pattern matched therefore reads as changed if the
-/// directory survives, and as undetermined if it does not — stale either way.
+/// Returns `Some(hash of the empty set)` whenever the walk completes and finds
+/// nothing — including when the tree the pattern points into is not there at all. A
+/// pattern claims nothing exists, so the empty set is a legitimate value of it, and
+/// that is the whole difference from a declared FILE name, whose absence is a failure
+/// to find the one thing it named. The empty set still hashes differently from any
+/// non-empty one, so deleting the last file a pattern matched reads as changed either
+/// way — which is the case that matters.
+///
+/// Returns `None` — undetermined, so the caller forces staleness — only when a
+/// directory that exists and has to be enumerated cannot be read.
 fn hash_pattern_matches(base: &Path, pattern: &str) -> Option<String> {
     let components: Vec<&str> = pattern
         .split(['/', '\\'])
@@ -1255,9 +1267,15 @@ fn expand_pattern(current: &Path, components: &[&str], out: &mut Vec<PathBuf>) -
         for entry in std::fs::read_dir(current).ok()? {
             let entry = entry.ok()?;
             let path = entry.path();
-            // One segment consumed by `**`, `rest` matched against the child.
-            expand_pattern(&path, rest, out)?;
-            if entry.file_type().ok()?.is_dir() {
+            let is_dir = entry.file_type().ok()?.is_dir();
+            // One segment consumed by `**`, `rest` matched against the child. A
+            // child that is not a directory can only be the match itself, never
+            // something to look inside — descending into it would ask `read_dir`
+            // for a file and turn a plain non-match into `None`.
+            if rest.is_empty() || is_dir {
+                expand_pattern(&path, rest, out)?;
+            }
+            if is_dir {
                 // ...or `**` keeps going down.
                 expand_pattern(&path, components, out)?;
             }
@@ -1266,26 +1284,41 @@ fn expand_pattern(current: &Path, components: &[&str], out: &mut Vec<PathBuf>) -
     }
 
     // A literal component names one child, so nothing has to be enumerated for it.
-    // A component that does not exist is not an error here: the walk simply finds no
-    // match, and the first directory that genuinely cannot be READ returns None.
     if !head.contains(['*', '?', '[']) {
         let child = current.join(head);
         if rest.is_empty() {
+            // The last component: a file here is the match, and anything else —
+            // a directory, or nothing at all — is a plain non-match. The parent
+            // was enumerated to get here, so this is an answer.
             if child.is_file() {
                 out.push(child);
             }
             return Some(());
         }
-        if !child.is_dir() {
-            return Some(());
+        if child.is_dir() {
+            return expand_pattern(&child, rest, out);
         }
-        return expand_pattern(&child, rest, out);
+        // A literal path the pattern would look inside that is not a directory —
+        // absent, or there and not a directory — has provably nothing under it,
+        // so the match set is empty. That is an ANSWER, and it is where a
+        // pattern differs from a declared file name: a file name claims one
+        // thing exists and its absence is a failure to find it, while a pattern
+        // claims nothing at all and the empty set is a legitimate value of it.
+        // Reading this as undetermined instead forces the reading step stale on
+        // every run for as long as the tree is absent, which is the regression
+        // `test_sql_introspected_glob_does_not_force_perpetual_staleness` pins.
+        return Some(());
     }
 
     for entry in std::fs::read_dir(current).ok()? {
         let entry = entry.ok()?;
         let name = entry.file_name();
-        if component_matches(head, &name.to_string_lossy()) {
+        if !component_matches(head, &name.to_string_lossy()) {
+            continue;
+        }
+        // Same as `**`: an enumerated entry that is not a directory cannot be
+        // descended into, and not matching is an answer rather than a failure.
+        if rest.is_empty() || entry.file_type().ok()?.is_dir() {
             expand_pattern(&entry.path(), rest, out)?;
         }
     }
@@ -6100,5 +6133,489 @@ steps:
             "run 5: settles once the directory exists — the staleness above was the \
              absence, not a stuck step"
         );
+    }
+    // ---- The glob matcher, on its own ----------------------------------------
+    //
+    // `hash_pattern_matches` is the only thing standing between a glob read and a
+    // step that skips over changed bytes, so its matching has to be exercised for
+    // what it accepts AND what it refuses. A matcher that said yes to everything
+    // would pass every end-to-end test below, because every one of those manifests
+    // has exactly one file for the pattern to find.
+
+    #[test]
+    fn a_star_matches_within_a_component_and_a_question_mark_matches_one_character() {
+        assert!(component_matches("*.csv", "data.csv"));
+        assert!(component_matches("*.csv", ".csv"));
+        assert!(component_matches("*", "anything"));
+        assert!(component_matches("part-*.parquet", "part-0001.parquet"));
+        assert!(!component_matches("*.csv", "data.tsv"));
+        assert!(!component_matches("part-*.parquet", "part-0001.csv"));
+
+        assert!(component_matches("x?.csv", "x1.csv"));
+        assert!(!component_matches("x?.csv", "x.csv"));
+        assert!(!component_matches("x?.csv", "x12.csv"));
+    }
+
+    #[test]
+    fn a_character_class_accepts_its_members_and_refuses_the_rest() {
+        assert!(component_matches("[abc].csv", "b.csv"));
+        assert!(!component_matches("[abc].csv", "d.csv"));
+        assert!(component_matches("q[0-9].tsv", "q7.tsv"));
+        assert!(!component_matches("q[0-9].tsv", "qx.tsv"));
+        assert!(component_matches("[!0-9].csv", "a.csv"));
+        assert!(!component_matches("[!0-9].csv", "5.csv"));
+        // An unclosed bracket is a literal bracket, not a class that swallows the
+        // rest of the name.
+        assert!(component_matches("[abc.csv", "[abc.csv"));
+        assert!(!component_matches("[abc.csv", "a.csv"));
+    }
+
+    /// A directory tree for the pattern tests: two CSVs, a sibling of another
+    /// extension, and a nested CSV a single-component `*` must not reach.
+    fn pattern_tree() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("build/src/nested")).unwrap();
+        fs::write(dir.path().join("build/src/a.csv"), b"one").unwrap();
+        fs::write(dir.path().join("build/src/b.csv"), b"two").unwrap();
+        fs::write(dir.path().join("build/src/notes.txt"), b"ignored").unwrap();
+        fs::write(dir.path().join("build/src/nested/c.csv"), b"deep").unwrap();
+        dir
+    }
+
+    // Every way the SET a pattern names can move has to move the digest, and the one
+    // way it can appear to move without moving must not. This is the whole contract
+    // `is_hash_stale` leans on for a glob read.
+    #[test]
+    fn a_patterns_hash_follows_the_files_it_matches_and_nothing_else() {
+        let dir = pattern_tree();
+        let base = dir.path();
+        let pattern = "build/src/*.csv";
+
+        let start = hash_pattern_matches(base, pattern).expect("a readable tree answers");
+
+        // A member's bytes change.
+        fs::write(base.join("build/src/a.csv"), b"one more").unwrap();
+        let after_edit = hash_pattern_matches(base, pattern).unwrap();
+        assert_ne!(start, after_edit, "a matched file's bytes changed");
+
+        // A member is truncated — the case a mtime-based check misses entirely.
+        fs::write(base.join("build/src/a.csv"), b"").unwrap();
+        let after_truncate = hash_pattern_matches(base, pattern).unwrap();
+        assert_ne!(after_edit, after_truncate, "a matched file was truncated");
+
+        // A member arrives.
+        fs::write(base.join("build/src/d.csv"), b"new").unwrap();
+        let after_add = hash_pattern_matches(base, pattern).unwrap();
+        assert_ne!(after_truncate, after_add, "a file joined the match set");
+
+        // A member leaves.
+        fs::remove_file(base.join("build/src/d.csv")).unwrap();
+        assert_eq!(
+            after_truncate,
+            hash_pattern_matches(base, pattern).unwrap(),
+            "removing what was added returns the same set to the same digest"
+        );
+
+        // A NON-member changes. Without this the assertions above are satisfied by a
+        // hash of the whole directory, which would drag every reader of any glob in
+        // that directory stale on an unrelated write.
+        let before_sibling = hash_pattern_matches(base, pattern).unwrap();
+        fs::write(base.join("build/src/notes.txt"), b"rewritten entirely").unwrap();
+        assert_eq!(
+            before_sibling,
+            hash_pattern_matches(base, pattern).unwrap(),
+            "notes.txt does not match *.csv, so rewriting it is not a change to the set"
+        );
+
+        // A single `*` component does not cross a separator.
+        fs::write(base.join("build/src/nested/c.csv"), b"rewritten").unwrap();
+        assert_eq!(
+            before_sibling,
+            hash_pattern_matches(base, pattern).unwrap(),
+            "build/src/*.csv must not reach build/src/nested/c.csv"
+        );
+    }
+
+    // The two ends of "nothing matches", which are different answers and must stay
+    // different: an empty set in a readable tree is an ANSWER, and a tree that
+    // cannot be listed is not.
+    #[test]
+    fn an_unmatched_pattern_answers_and_an_unlistable_tree_does_not() {
+        let dir = pattern_tree();
+        let base = dir.path();
+
+        let with_files = hash_pattern_matches(base, "build/src/*.csv").unwrap();
+        let empty = hash_pattern_matches(base, "build/src/*.jsonl")
+            .expect("a readable directory that matches nothing still answers");
+        assert_ne!(
+            with_files, empty,
+            "the empty set must not hash like a non-empty one, or deleting the last \
+             match would read as unchanged"
+        );
+
+        // A tree that is not there at all is the same empty answer, NOT a refusal.
+        // Reading it as a refusal forces every step whose glob points at a
+        // not-yet-built directory stale on every run — which is a documented
+        // regression this repo already pins from the other side, in
+        // `test_sql_introspected_glob_does_not_force_perpetual_staleness`.
+        assert_eq!(
+            hash_pattern_matches(base, "build/missing/*.csv"),
+            Some(empty.clone()),
+            "a pattern claims nothing exists, so an absent tree is the empty set"
+        );
+
+        // Deleting the last match, with the directory left standing, is that same
+        // empty answer — and it is a CHANGE, which is the case that matters.
+        fs::remove_file(base.join("build/src/a.csv")).unwrap();
+        fs::remove_file(base.join("build/src/b.csv")).unwrap();
+        assert_eq!(
+            hash_pattern_matches(base, "build/src/*.csv"),
+            Some(empty),
+            "an emptied match set hashes to the empty set"
+        );
+    }
+
+    // The one genuine refusal: a directory that IS there and cannot be listed. The
+    // question was asked and the filesystem would not answer it, which is different
+    // from asking it and getting nothing back.
+    #[test]
+    fn an_unreadable_directory_refuses_to_answer() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = pattern_tree();
+        let base = dir.path();
+        let locked = base.join("build/src");
+
+        let original = fs::metadata(&locked).unwrap().permissions();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let answer = hash_pattern_matches(base, "build/src/*.csv");
+        fs::set_permissions(&locked, original).unwrap();
+
+        if fs::read_dir(base.join("build/src")).is_ok() && answer.is_some() {
+            // Running as root, where mode 0o000 does not stop a read. Nothing to
+            // assert — say so rather than passing quietly.
+            eprintln!(
+                "skipping an_unreadable_directory_refuses_to_answer: this process can                  read a 0o000 directory, so an unlistable one cannot be constructed here"
+            );
+            return;
+        }
+        assert_eq!(
+            answer, None,
+            "a directory that exists and cannot be listed is undetermined — the caller              must force staleness rather than compare against a fabricated empty set"
+        );
+    }
+
+    #[test]
+    fn a_double_star_spans_zero_or_more_directory_levels() {
+        let dir = pattern_tree();
+        let base = dir.path();
+
+        // `**` reaching both the top level and one below it.
+        let all = hash_pattern_matches(base, "build/src/**/*.csv").unwrap();
+        let shallow_only = hash_pattern_matches(base, "build/src/*.csv").unwrap();
+        assert_ne!(
+            all, shallow_only,
+            "`**` must reach build/src/nested/c.csv, which `*` does not"
+        );
+
+        // Changing the nested file moves the `**` hash and not the `*` one.
+        fs::write(base.join("build/src/nested/c.csv"), b"changed").unwrap();
+        assert_ne!(all, hash_pattern_matches(base, "build/src/**/*.csv").unwrap());
+        assert_eq!(
+            shallow_only,
+            hash_pattern_matches(base, "build/src/*.csv").unwrap()
+        );
+    }
+
+    // ---- The step kinds, driven through a real `run()` ------------------------
+
+    /// One run's executed steps, named by the command line or SQL body the engine was
+    /// handed. `engine_calls_for_one_run` counts calls; this says WHICH, which is what
+    /// distinguishes "the right step re-ran" from "something re-ran".
+    fn executed_bodies(dir: &Path, state: &MockStateBackend) -> Vec<String> {
+        let engine = MockEngine::new();
+        run(dir, &engine, state, false).unwrap();
+        let calls = engine.calls.borrow();
+        calls
+            .iter()
+            .filter_map(|c| match c {
+                MockCall::Sql { sql_content, .. } => Some(sql_content.clone()),
+                MockCall::Command { command, .. } => Some(command.clone()),
+                MockCall::Preflight => None,
+            })
+            .collect()
+    }
+
+    /// The shape the published `gleif` protocol ships and the shape this whole change
+    /// is about: a precondition-gated `command:` step declaring an ordering token,
+    /// and a `sql:` step reading the fetched bytes through a glob. `MockEngine` runs
+    /// neither, so the CSV is seeded here exactly as the command would have written
+    /// it; the freshly created `build/src` keeps the `modified_after` precondition
+    /// fresh, so the fetch skips throughout and the only thing that can mark `load`
+    /// stale is the glob.
+    fn glob_read_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  \
+                    - name: fetch\n    command: \"fetch-into build/src\"\n    \
+                    produces: [src_raw]\n    preconditions:\n      \
+                    - modified_after: { path: build/src, period: 24h }\n  \
+                    - name: load\n    sql: models/load.sql\n    depends_on: [src_raw]\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[(
+                "models/load.sql",
+                "CREATE OR REPLACE TABLE t AS SELECT * FROM read_csv('build/src/*.csv');",
+            )],
+        );
+        fs::create_dir_all(dir.path().join("build/src")).unwrap();
+        fs::write(dir.path().join("build/src/data.csv"), b"lei,name\nA,Alpha\n").unwrap();
+        dir
+    }
+
+    const LOAD_SQL: &str = "CREATE OR REPLACE TABLE t AS SELECT * FROM read_csv('build/src/*.csv');";
+
+    // The measured defect: neither end hashed the fetched bytes, so appending to,
+    // truncating or deleting the CSV each left `load` skipping at exit 0 with the
+    // built table still holding the original row. The producer does not hash it
+    // (a `command:` step's `produces:` is an ordering token with nothing on disk)
+    // and the consumer's read is a glob.
+    #[test]
+    fn test_glob_read_change_forces_the_reading_step_stale() {
+        let dir = glob_read_project();
+        let state = MockStateBackend::new();
+        let csv = dir.path().join("build/src/data.csv");
+
+        // Settle. Two warm runs, so "it re-ran" below is not just "it always runs".
+        executed_bodies(dir.path(), &state);
+        for warm in 1..=2 {
+            assert_eq!(
+                executed_bodies(dir.path(), &state),
+                Vec::<String>::new(),
+                "warm run {warm}: nothing changed, so nothing may execute"
+            );
+        }
+
+        for (case, mutate) in [
+            ("append", (|p: &Path| {
+                let mut existing = fs::read(p).unwrap();
+                existing.extend_from_slice(b"B,Beta\n");
+                fs::write(p, existing).unwrap();
+            }) as fn(&Path)),
+            ("truncate", |p: &Path| fs::write(p, b"").unwrap()),
+            ("delete", |p: &Path| fs::remove_file(p).unwrap()),
+        ] {
+            mutate(&csv);
+            assert_eq!(
+                executed_bodies(dir.path(), &state),
+                vec![LOAD_SQL.to_string()],
+                "{case}: the step reading build/src/*.csv must re-run, and the fetch \
+                 above it must not — its precondition is still fresh and re-running \
+                 it is the expensive answer this change exists not to give"
+            );
+            // Put the file back so each case starts from a settled run.
+            fs::write(&csv, b"lei,name\nA,Alpha\n").unwrap();
+            executed_bodies(dir.path(), &state);
+        }
+
+        // The control: with the CSV untouched, the same project settles again.
+        assert_eq!(
+            executed_bodies(dir.path(), &state),
+            Vec::<String>::new(),
+            "control: the re-runs above were the mutations, not the harness"
+        );
+    }
+
+    /// A precondition-gated `command:` step whose `produces:` is a real path a
+    /// downstream `sql:` step reads. The consumer drops that read (a producer owns
+    /// it), so if the producer does not hash it, nothing does.
+    fn command_produces_file_project(command: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            "name: test\nsteps:\n  \
+             - name: fetch\n    command: \"{command}\"\n    \
+             produces: [build/src/data.csv]\n    preconditions:\n      \
+             - modified_after: {{ path: build/src/data.csv, period: 24h }}\n  \
+             - name: load\n    sql: models/load.sql\n    depends_on: [build/src/data.csv]\n"
+        );
+        setup_project(
+            dir.path(),
+            &yaml,
+            &[(
+                "models/load.sql",
+                "CREATE OR REPLACE TABLE t AS SELECT 1;",
+            )],
+        );
+        fs::create_dir_all(dir.path().join("build/src")).unwrap();
+        fs::write(dir.path().join("build/src/data.csv"), b"lei,name\nA,Alpha\n").unwrap();
+        // Age the file past the precondition's window so the FIRST run executes the
+        // step and records a baseline. `MockEngine` runs no command, so the seeded
+        // file stands in for what the command would have written. Without this the
+        // step skips on its precondition from cold, never records anything, and the
+        // artifact hash has nothing to compare against — which is itself the
+        // behaviour `test_pre_command_with_fresh_precondition_skipped` pins.
+        age_file(&dir.path().join("build/src/data.csv"), 48 * 3600);
+        dir
+    }
+
+    /// Set a file's modification time `seconds` into the past, so a `modified_after`
+    /// precondition reads it as stale.
+    fn age_file(path: &Path, seconds: u64) {
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(seconds);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    // The producer half, on its own: the file a `command:` step declares it produces
+    // is rewritten, emptied and deleted underneath it, and each has to re-run the
+    // step AND the step downstream of it. Before this, a command step recorded an
+    // empty artifact hash and `compute_staleness` returned before ever asking for
+    // one, so all three skipped at exit 0.
+    #[test]
+    fn test_command_step_produced_file_change_forces_it_and_its_consumer_stale() {
+        let dir = command_produces_file_project("fetch-into build/src");
+        let state = MockStateBackend::new();
+        let csv = dir.path().join("build/src/data.csv");
+        let fetch = "fetch-into build/src".to_string();
+        let load = "CREATE OR REPLACE TABLE t AS SELECT 1;".to_string();
+
+        // Run 1 executes the step (the seeded file is older than the precondition's
+        // window) and records the artifact hash. `MockEngine` runs no command, so
+        // stand in for the write the real command would have done by bringing the
+        // file's mtime forward — its CONTENT is unchanged, so the recorded hash still
+        // describes what is on disk and only the precondition moves.
+        assert_eq!(
+            executed_bodies(dir.path(), &state),
+            vec![fetch.clone(), load.clone()],
+            "run 1: the precondition is stale, so the step runs and records a baseline"
+        );
+        age_file(&csv, 0);
+        for warm in 1..=2 {
+            assert_eq!(
+                executed_bodies(dir.path(), &state),
+                Vec::<String>::new(),
+                "warm run {warm}: a settled command step must skip"
+            );
+        }
+
+        // `rewrite` and `truncate` both leave the mtime at NOW, so the
+        // `modified_after` precondition stays FRESH through them and the artifact
+        // hash is the only thing that can mark the step stale. `delete` is caught by
+        // the precondition as well — it is asserted because it is one of the three
+        // mutations the defect was measured on, not because it isolates this
+        // mechanism.
+        for (case, mutate) in [
+            ("rewrite", (|p: &Path| fs::write(p, b"lei,name\nZ,Zeta\n").unwrap()) as fn(&Path)),
+            ("truncate", |p: &Path| fs::write(p, b"").unwrap()),
+            ("delete", |p: &Path| fs::remove_file(p).unwrap()),
+        ] {
+            mutate(&csv);
+            assert_eq!(
+                executed_bodies(dir.path(), &state),
+                vec![fetch.clone(), load.clone()],
+                "{case}: the command step that declared build/src/data.csv must re-run, \
+                 and the sql step reading it must be dragged with it"
+            );
+            fs::write(&csv, b"lei,name\nA,Alpha\n").unwrap();
+            executed_bodies(dir.path(), &state);
+        }
+
+        assert_eq!(
+            executed_bodies(dir.path(), &state),
+            Vec::<String>::new(),
+            "control: untouched, it settles"
+        );
+    }
+
+    // The third thing a precondition-gated command step could change under and not
+    // notice: its own command line. A `sql:` step hashes its file and an `op:` step
+    // hashes its `with:` block; a command step hashed nothing, so editing the
+    // manifest left the old command's output standing at `[skip: precondition_*]`.
+    #[test]
+    fn test_command_line_edit_forces_the_command_step_stale() {
+        let dir = command_produces_file_project("fetch-into build/src");
+        let state = MockStateBackend::new();
+
+        executed_bodies(dir.path(), &state);
+        age_file(&dir.path().join("build/src/data.csv"), 0);
+        assert_eq!(
+            executed_bodies(dir.path(), &state),
+            Vec::<String>::new(),
+            "settled"
+        );
+
+        let yaml = fs::read_to_string(dir.path().join("arcform.yaml")).unwrap();
+        fs::write(
+            dir.path().join("arcform.yaml"),
+            yaml.replace("fetch-into build/src", "fetch-into build/src --v2"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            executed_bodies(dir.path(), &state),
+            vec![
+                "fetch-into build/src --v2".to_string(),
+                "CREATE OR REPLACE TABLE t AS SELECT 1;".to_string()
+            ],
+            "the edited command line must re-run its step"
+        );
+        assert_eq!(
+            executed_bodies(dir.path(), &state),
+            Vec::<String>::new(),
+            "and settle again on the new command line, rather than re-running forever"
+        );
+    }
+
+    // The cost this change deliberately does NOT pay, pinned so it cannot be paid by
+    // accident. A `command:` step declaring an ordering token — the shape six of the
+    // eight precondition-gated command steps in `examples/` ship — must keep skipping
+    // on its preconditions. Withholding the hash there instead would re-run a fetch
+    // on every single run; in the published `gleif` protocol that fetch is a 470 MB
+    // download the precondition exists to avoid.
+    #[test]
+    fn test_an_ordering_token_on_a_command_step_does_not_force_it_to_refetch() {
+        let dir = glob_read_project();
+        let state = MockStateBackend::new();
+
+        executed_bodies(dir.path(), &state);
+        for warm in 1..=3 {
+            assert_eq!(
+                executed_bodies(dir.path(), &state),
+                Vec::<String>::new(),
+                "warm run {warm}: `produces: [src_raw]` names nothing on disk, and that \
+                 must leave the fetch's skip to its precondition rather than turning \
+                 every run into a re-fetch"
+            );
+        }
+    }
+
+    // Every kind either has a hashing strategy or a stated reason not to, decided by
+    // an exhaustive match so a new variant cannot arrive with the question unanswered.
+    // That is the class every shape in this file belonged to: a name reaching the
+    // staleness path carrying a kind nothing hashed.
+    #[test]
+    fn every_asset_kind_answers_whether_the_staleness_path_hashes_it() {
+        for kind in [
+            AssetKind::File,
+            AssetKind::Directory,
+            AssetKind::Pattern,
+            AssetKind::Table,
+        ] {
+            let expected = match kind {
+                // File: its bytes. Directory: a manifest of its contents.
+                // Pattern: a manifest of what it resolves to.
+                AssetKind::File | AssetKind::Directory | AssetKind::Pattern => true,
+                // Table: not a filesystem path, so there are no bytes to read.
+                AssetKind::Table => false,
+            };
+            assert_eq!(
+                kind_is_hashed(kind),
+                expected,
+                "{kind:?} must keep the answer it was given deliberately"
+            );
+        }
     }
 }
