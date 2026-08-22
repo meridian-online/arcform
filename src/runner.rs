@@ -1181,7 +1181,7 @@ impl Unreadable {
 /// SET, so a member's bytes changing, a member disappearing and a member arriving all
 /// have to move the digest, and only sorting makes that independent of readdir order.
 ///
-/// **This is what the card-carrying hole in the staleness path was.** A glob is not a
+/// **This is where the staleness path stopped asking.** A glob is not a
 /// path and is not classified as one — that reading was tried and it made a shipping
 /// manifest refuse to run, because `fs::read("build/src/*.csv")` errors and an error
 /// forces staleness forever. But "not a path" was being read as "not hashable", and
