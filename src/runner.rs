@@ -6735,11 +6735,12 @@ steps:
     }
 
     // The cost this change deliberately does NOT pay, pinned so it cannot be paid by
-    // accident. A `command:` step declaring an ordering token — the shape six of the
-    // eight precondition-gated command steps in `examples/` ship — must keep skipping
-    // on its preconditions. Withholding the hash there instead would re-run a fetch
-    // on every single run; in the published `gleif` protocol that fetch is a 470 MB
-    // download the precondition exists to avoid.
+    // accident. A `command:` step declaring an ordering token — the shape EVERY
+    // precondition-gated command step in `examples/` ships, counted by
+    // `every_precondition_gated_command_step_in_the_examples_declares_an_ordering_token`
+    // below — must keep skipping on its preconditions. Withholding the hash there
+    // instead would re-run a fetch on every single run; in the published `gleif`
+    // protocol that fetch is a 470 MB download the precondition exists to avoid.
     #[test]
     fn test_an_ordering_token_on_a_command_step_does_not_force_it_to_refetch() {
         let dir = glob_read_project();
@@ -6874,6 +6875,121 @@ steps:
             tokens, gated,
             "every one of them declares a separator-free `produces:` — the ordering \
              token shape `Unreadable::LeavesTheNameOut` is built around"
+        );
+    }
+
+    /// A `produces:` and a `depends_on:` that each end in a path separator, on two
+    /// steps with no dependency between them so each can be attributed on its own.
+    /// Both directories are seeded: `MockEngine` executes no SQL, so they stand in
+    /// for what a partitioned write and an upstream tool would have left there.
+    ///
+    /// Declared BY HAND on purpose. SQL introspection types a `COPY … PARTITION_BY`
+    /// destination as a directory from the COPY options, and `declared_kind` keeps
+    /// the first kind recorded for a name — so a directory the manifest's own SQL
+    /// also writes is typed by the parser and says nothing about
+    /// `default_kind_for_declared_name`. Neither name here appears in any SQL.
+    fn trailing_separator_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  \
+                    - name: emit\n    sql: models/emit.sql\n    \
+                    produces: [build/parts_out/]\n  \
+                    - name: consume\n    sql: models/consume.sql\n    \
+                    depends_on: [build/parts_in/]\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[
+                (
+                    "models/emit.sql",
+                    "CREATE OR REPLACE TABLE emitted AS SELECT 1;",
+                ),
+                (
+                    "models/consume.sql",
+                    "CREATE OR REPLACE TABLE consumed AS SELECT 2;",
+                ),
+            ],
+        );
+        fs::create_dir_all(dir.path().join("build/parts_out")).unwrap();
+        fs::create_dir_all(dir.path().join("build/parts_in")).unwrap();
+        fs::write(dir.path().join("build/parts_out/year=2024.parquet"), b"out").unwrap();
+        fs::write(dir.path().join("build/parts_in/year=2024.parquet"), b"in").unwrap();
+        dir
+    }
+
+    const EMIT: &str = "CREATE OR REPLACE TABLE emitted AS SELECT 1;";
+    const CONSUME: &str = "CREATE OR REPLACE TABLE consumed AS SELECT 2;";
+
+    // A name ending in a separator is a directory, driven through a real `run()` over
+    // a sequence rather than asserted off the classifier's return value. Reading the
+    // separator as part of a FILE name makes `fs::read` error on a directory,
+    // `produced_artifact_hash` withhold the hash, and both steps re-run on every run
+    // at exit 0 — expensive rather than wrong, which is why nothing caught it, and
+    // silent on the `depends_on:` side because `missing_declared_produces` reports
+    // the `produces:` side only.
+    #[test]
+    fn test_a_trailing_separator_asset_settles_through_a_real_run() {
+        let dir = trailing_separator_project();
+        let state = MockStateBackend::new();
+
+        assert_eq!(
+            executed_bodies(dir.path(), &state),
+            vec![EMIT.to_string(), CONSUME.to_string()],
+            "run 1: nothing has run yet"
+        );
+        // Four warm runs, not one: a step that re-ran once and then went quiet and a
+        // step that never settles are the two things being told apart, and only a
+        // sequence tells them apart.
+        for warm in 2..=5 {
+            assert_eq!(
+                executed_bodies(dir.path(), &state),
+                Vec::<String>::new(),
+                "run {warm}: `build/parts_out/` and `build/parts_in/` are directories \
+                 that are there and unchanged, so neither step may execute"
+            );
+        }
+    }
+
+    // The control for the test above, and the reason settling is not enough on its
+    // own: a name dropped out of the staleness question altogether would settle too.
+    // Each directory's contents must still decide its own step, and only its own.
+    #[test]
+    fn test_a_trailing_separator_asset_is_still_hashed_by_its_contents() {
+        let dir = trailing_separator_project();
+        let state = MockStateBackend::new();
+        executed_bodies(dir.path(), &state);
+        assert_eq!(executed_bodies(dir.path(), &state), Vec::<String>::new());
+
+        // A file arriving in the READ directory moves only the reader.
+        fs::write(dir.path().join("build/parts_in/year=2025.parquet"), b"in2").unwrap();
+        assert_eq!(
+            executed_bodies(dir.path(), &state),
+            vec![CONSUME.to_string()],
+            "a file arriving in build/parts_in/ re-runs the step that declares it, and \
+             only that step"
+        );
+        assert_eq!(executed_bodies(dir.path(), &state), Vec::<String>::new());
+
+        // A file rewritten in the PRODUCED directory moves only the producer.
+        fs::write(
+            dir.path().join("build/parts_out/year=2024.parquet"),
+            b"rewritten",
+        )
+        .unwrap();
+        assert_eq!(
+            executed_bodies(dir.path(), &state),
+            vec![EMIT.to_string()],
+            "rewriting a file in build/parts_out/ re-runs the step that produced it"
+        );
+        assert_eq!(executed_bodies(dir.path(), &state), Vec::<String>::new());
+
+        // Emptied but still standing is the case a presence check cannot see.
+        fs::remove_file(dir.path().join("build/parts_in/year=2024.parquet")).unwrap();
+        fs::remove_file(dir.path().join("build/parts_in/year=2025.parquet")).unwrap();
+        assert!(dir.path().join("build/parts_in").is_dir());
+        assert_eq!(
+            executed_bodies(dir.path(), &state),
+            vec![CONSUME.to_string()],
+            "an emptied but surviving directory is a change to what the step reads"
         );
     }
 

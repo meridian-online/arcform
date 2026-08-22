@@ -21,6 +21,9 @@
 use std::path::Path;
 use std::process::Command;
 
+mod common;
+use common::{arc_run, arc_run_raw, step_outcome};
+
 const MANIFEST: &str = r#"name: glob_read
 engine: duckdb
 db: build/glob_read.db
@@ -52,63 +55,6 @@ fn project() -> tempfile::TempDir {
     std::fs::write(dir.path().join("models/load.sql"), MODEL).unwrap();
     std::fs::write(dir.path().join("build/src/data.csv"), SEED).unwrap();
     dir
-}
-
-/// Drop ANSI styling so a step line can be read as text. `arc` colours
-/// unconditionally, including when its stdout is a pipe.
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            for c in chars.by_ref() {
-                if c.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// What one `arc run` did to `step`: `"ran"`, or the skip reason it reported.
-fn step_outcome(stdout: &str, step: &str) -> String {
-    let plain = strip_ansi(stdout);
-    let line = plain
-        .lines()
-        .find(|l| l.starts_with('[') && l.contains(&format!("] {step} ")))
-        .unwrap_or_else(|| panic!("no step line for '{step}' in:\n{plain}"))
-        .to_string();
-    match line.split_once("[skip: ") {
-        Some((_, rest)) => format!("skip: {}", rest.trim_end_matches(']')),
-        None => "ran".to_string(),
-    }
-}
-
-/// One `arc run`, returning (exit code, stdout, stderr).
-fn arc_run_raw(project: &Path) -> (Option<i32>, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_arc"))
-        .current_dir(project)
-        .arg("run")
-        .output()
-        .expect("spawn arc run");
-    (
-        out.status.code(),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
-}
-
-fn arc_run(project: &Path) -> String {
-    let (code, stdout, stderr) = arc_run_raw(project);
-    assert_eq!(
-        code,
-        Some(0),
-        "arc run must exit 0 here:\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    stdout
 }
 
 /// The rows the built table actually holds, read back through the same DuckDB the
