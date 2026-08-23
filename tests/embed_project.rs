@@ -104,12 +104,10 @@ fn columns_of(parquet: &Path) -> Vec<(String, String)> {
             parquet.display()
         ))
         .unwrap();
-    let rows = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
         .unwrap()
         .map(|r| r.unwrap())
-        .collect();
-    rows
+        .collect()
 }
 
 /// AC2, and the half of it that CI runs. The model is a declared input, so a Protocol
