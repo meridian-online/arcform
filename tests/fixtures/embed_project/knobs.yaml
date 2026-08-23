@@ -1,0 +1,58 @@
+# A variant of arcform.yaml that projects the SAME corpus against the SAME model three
+# times, changing one documented knob each time. Staged over arcform.yaml by
+# `the_knobs_a_manifest_sets_change_the_map_not_just_the_argv`.
+#
+# It exists because asserting that `--neighbors` reaches the argv is not the same as
+# asserting that setting `neighbors:` changes anything. A script that accepted the flag
+# and then projected with its own default would satisfy the first and quietly hand a
+# Protocol author the wrong map. So the test compares BYTES across these three outputs:
+# each knob has to move them.
+#
+# Kept separate from arcform.yaml rather than folded into it: every other end-to-end
+# test runs the whole Protocol, and three projections where one is needed would treble
+# them all.
+name: embed_project_knobs
+engine: duckdb
+db: build/fixture.duckdb
+
+steps:
+  - name: load_corpus
+    sql: models/corpus.sql
+
+  - name: export_corpus
+    op: parquet_export@1
+    with:
+      input: corpus
+      dest: build/corpus.parquet
+      order_by: "id"
+
+  # Neither knob set: the script's own defaults (15 neighbours, min_dist 0.1) stand.
+  - name: project_default
+    op: embed_project@1
+    with:
+      input: build/corpus.parquet
+      text_column: description
+      model: model
+      out: build/default.parquet
+
+  # Only `neighbors` moves — 40 of the corpus's 48 rows, so each point is placed
+  # against most of the whole rather than its own locality.
+  - name: project_more_neighbours
+    op: embed_project@1
+    with:
+      input: build/corpus.parquet
+      text_column: description
+      model: model
+      out: build/more_neighbours.parquet
+      neighbors: 40
+
+  # Only `min_dist` moves — 0.9 against the default 0.1, so points are held far apart
+  # instead of being allowed to pack.
+  - name: project_looser_packing
+    op: embed_project@1
+    with:
+      input: build/corpus.parquet
+      text_column: description
+      model: model
+      out: build/looser_packing.parquet
+      min_dist: 0.9

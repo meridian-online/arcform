@@ -28,6 +28,19 @@
 #
 # A ruling is not a way to make the job quiet.  If you cannot write the reason in
 # one line, the survivor is probably a missing test.
+#
+# ON TRY_DEFAULT SPECIFICALLY, because the first ruling written against one here was
+# wrong and had to be withdrawn.  `expr?` folded to `expr.unwrap_or_default()` does
+# not stop at the failure and report it differently -- it CONTINUES, and the default
+# becomes an input to whatever the next line does with it.  An empty PathBuf handed to
+# a subprocess, a zero hash compared for equality, an empty Vec written to a file, a
+# None where a caller reads Some as consent.  So a TRY_DEFAULT ruling has to enumerate
+# what the DEFAULT VALUE is then consumed by, not what error the program eventually
+# reports.  The withdrawn one reasoned to the eventual message and missed that
+# `uv run --script ""` executes <cwd>/__main__.py and EXITS 0: a step that failed,
+# reported as a success, running whatever is in the Protocol directory.  It also
+# asserted a shared retryability the two spellings did not share.  If you cannot list
+# the consumers, you have not established equivalence -- you have established that you
+# stopped reading at the `?`.
 35d881cb2a398a42	src/runner.rs	run_with_params	GUARD_TRUE	2026-08-22	the sql: and op: arms are already taken above and manifest validation guarantees one of the three, so a command step is the only kind that reaches this arm and the condition is true wherever it is evaluated
 6bb732022440726c	src/runner.rs	run_with_params	GUARD_TRUE	2026-08-22	the widened guard can only add the case hash.is_some() under WithholdsTheHash, and that policy returns None for exactly the unreadable produces: this block reports, so missing_declared_produces is empty there and nothing is printed
-2aab47baa78f0c83	src/operator.rs	embed_project_invocation	TRY_DEFAULT	2026-08-24	materialize_frozen_script can only fail when the temp cache directory cannot be created, and on that path the default empty script path is handed to uv, which exits 1 — so both spellings raise StepFailed with code 1 and the same retryability, differing only in the stderr wording

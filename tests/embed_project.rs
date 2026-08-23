@@ -3,7 +3,7 @@
 //! coordinates a map needs.
 //!
 //! WHAT NEEDS `uv` AND WHAT DOES NOT. The projection itself runs Python on the uv-run
-//! substrate, so every test that produces a map skips — loudly, on stderr — where `uv`
+//! substrate, so every test that produces a map skips where `uv`
 //! is not installed, exactly as the `finetype_validate` gate skips without its
 //! extension. CI has no `uv`, so what CI runs here is the one test that does not need
 //! it: the refusal when the model asset is missing, which is decided in Rust before
@@ -326,5 +326,52 @@ fn the_step_completes_with_the_network_disabled_and_no_credentials() {
         online,
         sha256(&projected(project)),
         "an offline run must produce the same map as an online one"
+    );
+}
+
+/// The two documented knobs change the MAP, not just the command line.
+///
+/// `embed_project_args_pass_the_knobs_through` asserts that `neighbors:` and
+/// `min_dist:` reach the argv as the right strings, and that is a weaker claim than it
+/// looks: a script that accepted both flags and then projected with its own defaults
+/// would satisfy it completely, while every Protocol setting either field silently got
+/// a map it did not ask for. So this projects the same corpus against the same model
+/// three times, moving one knob at a time, and compares the bytes.
+#[test]
+fn the_knobs_a_manifest_sets_change_the_map_not_just_the_argv() {
+    if !have_uv() {
+        eprintln!("skipping the_knobs_a_manifest_sets_change_the_map: no `uv` on PATH");
+        return;
+    }
+    let tmp = staged_protocol();
+    let project = tmp.path();
+    std::fs::copy(project.join("knobs.yaml"), project.join("arcform.yaml")).unwrap();
+
+    let stdout = common::arc_run(project);
+    let out = |name: &str| sha256(&project.join(format!("build/{name}.parquet")));
+    for step in [
+        "project_default",
+        "project_more_neighbours",
+        "project_looser_packing",
+    ] {
+        assert_eq!(
+            common::step_outcome(&stdout, step),
+            "ran",
+            "every projection has to have executed, or the comparison below is between \
+             two files that were never written:\n{stdout}"
+        );
+    }
+
+    assert_ne!(
+        out("default"),
+        out("more_neighbours"),
+        "`neighbors: 40` produced the same bytes as the script's default of 15 — the \
+         field is documented, reaches the argv, and does not reach the layout"
+    );
+    assert_ne!(
+        out("default"),
+        out("looser_packing"),
+        "`min_dist: 0.9` produced the same bytes as the script's default of 0.1 — the \
+         field is documented, reaches the argv, and does not reach the layout"
     );
 }

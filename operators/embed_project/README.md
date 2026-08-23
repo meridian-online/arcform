@@ -38,17 +38,34 @@ model.safetensors   one 2-D float tensor, [vocab, dim], under the key `embedding
 tokenizer.json      a HuggingFace `tokenizers` serialisation
 ```
 
-Fetch one with the operators arcform already has, and the fetch becomes a step the
-Protocol declares:
+Fetch one with `http_fetch`, a step per file, and the fetch becomes something the
+Protocol declares rather than something the operator does:
 
 ```yaml
-- name: fetch_model
+- name: fetch_model_weights
   op: http_fetch@1
-  with: { url: https://…/potion-base-8M.tar.gz, out: build/model.tar.gz }
-- name: unpack_model
-  op: archive_extract@1
-  with: { archive: build/model.tar.gz, dest: models/potion-base-8M }
+  with:
+    url: https://huggingface.co/minishlab/potion-base-8M/resolve/main/model.safetensors
+    out: models/potion-base-8M/model.safetensors
+
+- name: fetch_model_tokenizer
+  op: http_fetch@1
+  with:
+    url: https://huggingface.co/minishlab/potion-base-8M/resolve/main/tokenizer.json
+    out: models/potion-base-8M/tokenizer.json
 ```
+
+**That is not an illustration — it was run verbatim.** `arc run` over a Protocol
+carrying those two steps ahead of a `project` step reported 5/5 succeeded on
+2026-08-24, fetching 28.8 MB of weights and 668 KB of tokenizer and writing the
+projected Parquet. Two things a reader should know before adapting it. The
+`http_fetch` steps write a `.arcmeta` sidecar beside each file; the operator reads
+only the two files it names, so the extra files are harmless, but they are inside the
+directory whose contents the staleness hash covers. And `arc run` printed
+`models/potion-base-8m [directory] produced by (external source)` alongside separate
+nodes for the two fetched files: arcform does not infer that a file written under a
+path feeds the directory node above it, so the fetches sit ahead of the projection by
+their position in the manifest and not by a graph edge. Keep them above it.
 
 Embedding is a lookup and a mean: tokenise with the model's own `tokenizer.json`,
 average the embedding-table rows for the token ids, L2-normalise. Measured on
