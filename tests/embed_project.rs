@@ -277,10 +277,18 @@ fn two_runs_from_a_cleared_cache_emit_byte_identical_parquet() {
 }
 
 /// AC5. With the model on disk and `uv`'s cache warm, the step needs nothing from the
-/// network and consults no credential: it completes with `UV_OFFLINE=1` — under which
-/// `uv` refuses every registry request — and with three plausible API-key variables
-/// set to values that would break anything that used them. And it lands on the same
-/// bytes as the run that had the network.
+/// network and consults no credential.
+///
+/// Outbound HTTP is made unavailable two ways, because one is not enough. `UV_OFFLINE`
+/// stops `uv` reaching a package registry, and nothing else — it does not constrain
+/// what the script itself does. So the proxy variables point every HTTP client in the
+/// step at a port nothing listens on: `urllib`, `requests`, `httpx` and
+/// `huggingface_hub` all honour them, which is the whole realistic set of ways a
+/// Python operator reaches out. A raw socket to an IP address would still get through
+/// and nothing here would see it; that is the limit of what this test asserts.
+///
+/// Three plausible API-key variables are set to values that would break anything that
+/// used them, and the run has to land on the same bytes as the one that had a network.
 #[test]
 fn the_step_completes_with_the_network_disabled_and_no_credentials() {
     if !have_uv() {
@@ -299,6 +307,12 @@ fn the_step_completes_with_the_network_disabled_and_no_credentials() {
     let mut env = HashMap::new();
     env.insert("UV_OFFLINE", "1");
     env.insert("HF_HUB_OFFLINE", "1");
+    // Port 1 on the loopback: a connection there is refused immediately rather than
+    // hanging, so a step that reaches for HTTP fails fast instead of timing out.
+    env.insert("HTTP_PROXY", "http://127.0.0.1:1");
+    env.insert("HTTPS_PROXY", "http://127.0.0.1:1");
+    env.insert("ALL_PROXY", "http://127.0.0.1:1");
+    env.insert("NO_PROXY", "");
     env.insert("OPENAI_API_KEY", "broken-on-purpose");
     env.insert("ANTHROPIC_API_KEY", "broken-on-purpose");
     env.insert("HF_TOKEN", "broken-on-purpose");
