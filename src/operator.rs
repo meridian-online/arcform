@@ -2603,47 +2603,61 @@ impl Operator for EmbedProject {
     fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
         let cfg = EmbedProjectConfig::parse(with)?;
         cfg.validate()?;
-        let input = ctx.dir.join(&cfg.input);
-        let model = ctx.dir.join(&cfg.model);
-        let out = ctx.dir.join(&cfg.out);
-        if let Some(parent) = out.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        // Before `uv`, and before anything that could be mistaken for a fetch.
-        //
-        // NON-retryable (`StepExecution`, the missing-binary class) rather than
-        // `StepFailed`. A model that is not on disk will not be on disk on the second
-        // attempt either, so a Protocol carrying `defaults.retry` would otherwise pay
-        // its backoff three times over to be told the same thing.
-        if let Some(part) = missing_model_part(&model) {
-            return Err(Error::StepExecution {
-                step: "embed_project".to_string(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!(
-                        "the model asset {} is not on disk — {} is missing. The model \
-                         is a declared input, so a step in this Protocol has to put it \
-                         there; this operator does not download one.",
-                        cfg.model,
-                        part.display()
-                    ),
-                ),
-            });
-        }
-
-        let script = materialize_frozen_script("embed_project", "1.0.0", EMBED_PROJECT_PY)?;
-        let extra = embed_project_args(
-            &input.display().to_string(),
-            &cfg.text_column,
-            &model.display().to_string(),
-            &out.display().to_string(),
-            cfg.neighbors,
-            cfg.min_dist,
-        );
-        let args = uv_run_args(&script.to_string_lossy(), &extra);
+        let args = embed_project_invocation(&cfg, ctx.dir)?;
         run_process("uv", &args, ctx, OutputMode::Capture, "embed_project")
     }
+}
+
+/// Everything that has to be decided BEFORE `uv` is spawned: refuse a model that is
+/// not on disk, materialise the frozen script, and build the full argv.
+///
+/// Split out of [`Operator::run`] rather than left inline, and the reason is that the
+/// projection needs a `uv` on PATH while the decision to attempt it does not. Inline,
+/// every one of these lines was reachable only through a test that runs Python — so on
+/// a machine without `uv`, which is every CI runner here, nothing checked that the
+/// script materialised at all, that `op@1` addressed the embedded bytes, or that an
+/// out-of-range knob stopped the step. As a function it is driven directly, argv and
+/// all, by a test that spawns nothing.
+fn embed_project_invocation(cfg: &EmbedProjectConfig, dir: &Path) -> Result<Vec<String>> {
+    let input = dir.join(&cfg.input);
+    let model = dir.join(&cfg.model);
+    let out = dir.join(&cfg.out);
+    if let Some(parent) = out.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    // Before `uv`, and before anything that could be mistaken for a fetch.
+    //
+    // NON-retryable (`StepExecution`, the missing-binary class) rather than
+    // `StepFailed`. A model that is not on disk will not be on disk on the second
+    // attempt either, so a Protocol carrying `defaults.retry` would otherwise pay its
+    // backoff three times over to be told the same thing.
+    if let Some(part) = missing_model_part(&model) {
+        return Err(Error::StepExecution {
+            step: "embed_project".to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "the model asset {} is not on disk — {} is missing. The model is a \
+                     declared input, so a step in this Protocol has to put it there; \
+                     this operator does not download one.",
+                    cfg.model,
+                    part.display()
+                ),
+            ),
+        });
+    }
+
+    let script = materialize_frozen_script("embed_project", "1.0.0", EMBED_PROJECT_PY)?;
+    let extra = embed_project_args(
+        &input.display().to_string(),
+        &cfg.text_column,
+        &model.display().to_string(),
+        &out.display().to_string(),
+        cfg.neighbors,
+        cfg.min_dist,
+    );
+    Ok(uv_run_args(&script.to_string_lossy(), &extra))
 }
 
 #[cfg(test)]
@@ -3391,6 +3405,19 @@ mod tests {
             Some(model.join("tokenizer.json")),
             "the tokenizer is checked too, not just the weights"
         );
+
+        // A `model:` that is there but is NOT a directory passes this check and is
+        // left to the script to read. The directory layout is the operator's
+        // contract; a caller pointing at something else gets the script's reading of
+        // it rather than a guess made here about what it should have contained.
+        let single_file = tmp.path().join("model.bin");
+        std::fs::write(&single_file, b"\0").unwrap();
+        assert_eq!(
+            missing_model_part(&single_file),
+            None,
+            "a model path that exists and is not a directory is not this check's to \
+             refuse"
+        );
     }
 
     /// AC2's second half, without a `uv` on PATH: the step refuses on the missing
@@ -3420,6 +3447,82 @@ mod tests {
         assert!(
             msg.contains("does not download one"),
             "the refusal says the model is the Protocol's job, not the operator's: {msg}"
+        );
+    }
+
+    /// A knob outside its bounds stops the step, not just the manifest load. `run`
+    /// re-validates rather than trusting that `assets` was called first — nothing in
+    /// the trait says it was.
+    #[test]
+    fn embed_project_run_refuses_an_out_of_range_knob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+        let ctx = test_ctx(tmp.path(), &env);
+        let with: Value = serde_yaml::from_str(
+            "input: corpus.parquet\ntext_column: description\nmodel: model\nout: out.parquet\nneighbors: 1",
+        )
+        .unwrap();
+        let err = EmbedProject
+            .run(&with, &ctx)
+            .expect_err("`neighbors: 1` cannot make a map and must stop the step");
+        assert!(
+            err.to_string().contains("below 2"),
+            "the refusal names the bound: {err}"
+        );
+    }
+
+    /// What is handed to `uv`, decided without spawning it: the frozen script is
+    /// materialised, it is named first, and the bytes on disk are the bytes `@1`
+    /// addresses. This is the half of `run` a machine with no `uv` can still check —
+    /// and every CI runner here is one.
+    #[test]
+    fn embed_project_invocation_materialises_the_frozen_script_and_names_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model = tmp.path().join("models/potion");
+        std::fs::create_dir_all(&model).unwrap();
+        for part in MODEL_PARTS {
+            std::fs::write(model.join(part), b"not a real model").unwrap();
+        }
+        let with: Value = serde_yaml::from_str(
+            "input: build/corpus.parquet\ntext_column: description\nmodel: models/potion\nout: build/mapped.parquet",
+        )
+        .unwrap();
+        let cfg = EmbedProjectConfig::parse(&with).unwrap();
+        let args = embed_project_invocation(&cfg, tmp.path()).expect("a complete model proceeds");
+
+        assert_eq!(args[0], "run");
+        assert_eq!(args[1], "--script");
+        let script = std::path::Path::new(&args[2]);
+        assert_eq!(
+            std::fs::read_to_string(script).unwrap(),
+            EMBED_PROJECT_PY,
+            "`op@1` addresses the embedded bytes: what lands on disk is what is \
+             compiled in, not a script found by path"
+        );
+        assert_eq!(
+            &args[3..],
+            [
+                "--input",
+                &tmp.path()
+                    .join("build/corpus.parquet")
+                    .display()
+                    .to_string(),
+                "--text-column",
+                "description",
+                "--model",
+                &model.display().to_string(),
+                "--out",
+                &tmp.path()
+                    .join("build/mapped.parquet")
+                    .display()
+                    .to_string(),
+            ],
+            "every path reaches the script resolved against the protocol directory"
+        );
+        assert!(
+            tmp.path().join("build").is_dir(),
+            "the output's parent directory is created before the script is asked to \
+             write into it"
         );
     }
 
