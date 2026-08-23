@@ -113,6 +113,7 @@ static DATAPACKAGE_DESCRIBE: DatapackageDescribe = DatapackageDescribe;
 static FINETYPE_VALIDATE: FinetypeValidate = FinetypeValidate;
 static SPLINK_RESOLVE: SplinkResolve = SplinkResolve;
 static GLEIF_RA_FETCH: GleifRaFetch = GleifRaFetch;
+static EMBED_PROJECT: EmbedProject = EmbedProject;
 #[cfg(feature = "opendal")]
 static OPENDAL_FETCH: OpendalFetch = OpendalFetch;
 
@@ -130,6 +131,7 @@ fn catalog() -> Vec<&'static dyn Operator> {
         &FINETYPE_VALIDATE,
         &SPLINK_RESOLVE,
         &GLEIF_RA_FETCH,
+        &EMBED_PROJECT,
     ];
     #[cfg(feature = "http-fetch")]
     ops.extend([
@@ -313,6 +315,17 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
                 "user_agent": { "type": "string", "description": "User-Agent request header. Defaults to the script's Meridian UA when omitted." }
             }),
             &["ra", "out"],
+        ),
+        "embed_project" => object(
+            json!({
+                "input": { "type": "string", "description": "Parquet holding the corpus." },
+                "text_column": { "type": "string", "description": "Column to embed." },
+                "model": { "type": "string", "description": "Static-embedding model directory (model.safetensors + tokenizer.json). A declared input: the Protocol fetches it, the operator never does." },
+                "out": { "type": "string", "description": "Parquet to write — every input column plus projection_x and projection_y as DOUBLE." },
+                "neighbors": { "type": "integer", "minimum": 2, "description": "UMAP n_neighbors: low reads local structure, high reads global. Defaults to the script's 15 when omitted." },
+                "min_dist": { "type": "number", "minimum": 0, "exclusiveMaximum": 1, "description": "UMAP min_dist: how tightly points may pack. Defaults to the script's 0.1 when omitted." }
+            }),
+            &["input", "text_column", "model", "out"],
         ),
         _ => return None,
     };
@@ -2411,6 +2424,228 @@ impl Operator for GleifRaFetch {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// embed_project (transform) — turn a text column into the two coordinates a map
+// needs. Reads one Parquet, embeds the named text column against a LOCAL static-
+// embedding model, reduces that embedding to two dimensions with UMAP, and writes a
+// Parquet carrying every input column plus `projection_x` and `projection_y`.
+//
+// Same uv-run substrate + frozen-script contract as datapackage_describe,
+// splink_resolve and gleif_ra_fetch: `op@1` addresses these exact script bytes, so
+// the seed and the projection parameters cannot drift under a manifest.
+//
+// THE MODEL IS A DECLARED READ, NOT A DOWNLOAD, and that is the whole reason this
+// belongs in an asset-centric engine rather than beside one. A model the operator
+// fetched invisibly would be a graph edge that does not appear in the graph: the
+// Protocol would depend on bytes it never names, a re-run could silently embed
+// against a different release, and the run's cost would include a transfer nobody
+// declared. Declared as a Directory read, the model is hashed for staleness like any
+// other input — swap the model and every downstream step re-runs — the Protocol's
+// dependency on it is legible, and the step needs no network at all. `run` refuses
+// before it spawns `uv` when the model is not on disk, naming the file that is
+// missing, rather than reaching for it.
+//
+// OutputMode::Capture, not Inherit: the script reports a fixable condition (no such
+// text column, a model directory missing a file, a column-name collision) as one line
+// on stderr, and Capture is what carries that line into the run's error. The cost is
+// that a long projection prints nothing until it finishes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The embed-and-project script, pinned into the binary. `@1` == these exact bytes.
+const EMBED_PROJECT_PY: &str = include_str!("../operators/embed_project/embed_project.py");
+
+/// The two files a static-embedding model directory carries — the layout a
+/// `model2vec` / `potion` release ships. Checked here, before `uv` is spawned, so a
+/// Protocol pointed at a model that was never fetched fails in milliseconds naming
+/// the missing file instead of after a dependency resolve.
+const MODEL_PARTS: [&str; 2] = ["model.safetensors", "tokenizer.json"];
+
+struct EmbedProject;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbedProjectConfig {
+    /// Parquet holding the corpus (a `reads` asset). Resolved against ctx.dir.
+    input: String,
+    /// The column to embed. A column that is not in the Parquet is the script's
+    /// refusal, not a load-time one — the manifest cannot know the schema.
+    text_column: String,
+    /// The static-embedding model directory (a `reads` asset, Directory kind — so a
+    /// changed model re-runs the step). Resolved against ctx.dir. The Protocol is
+    /// what puts it there; this operator never downloads it.
+    model: String,
+    /// Parquet to write: every input column, plus `projection_x` and `projection_y`
+    /// as DOUBLE (the `produces` asset). Resolved against ctx.dir.
+    out: String,
+    /// UMAP's `n_neighbors` — how much of the corpus each point is placed against.
+    /// Low reads local structure, high reads global. OMITTED from the argv when
+    /// unset, so the script's own default stands and a manifest predating this field
+    /// invokes it exactly as before.
+    #[serde(default)]
+    neighbors: Option<u64>,
+    /// UMAP's `min_dist` — how tightly points may pack. Omitted from the argv when
+    /// unset. Must be in `[0, 1)`: at or above the default spread of 1.0 the layout
+    /// has no room to separate anything.
+    #[serde(default)]
+    min_dist: Option<f64>,
+}
+
+impl EmbedProjectConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        serde_yaml::from_value(with.clone()).map_err(|e| {
+            Error::ManifestValidation(format!("embed_project: invalid `with:` config: {}", e))
+        })
+    }
+
+    /// Refuse a knob whose value cannot produce a map, at manifest load rather than
+    /// an hour into a run. Both bounds are UMAP's, not this operator's invention:
+    /// a neighbourhood of fewer than two points has no neighbourhood, and `min_dist`
+    /// is a fraction of the layout's spread.
+    fn validate(&self) -> Result<()> {
+        if let Some(n) = self.neighbors
+            && n < 2
+        {
+            return Err(Error::ManifestValidation(format!(
+                "embed_project: `neighbors: {}` is below 2 — a point placed against \
+                 fewer than two neighbours has no neighbourhood to be placed in",
+                n
+            )));
+        }
+        if let Some(d) = self.min_dist
+            && !(0.0..1.0).contains(&d)
+        {
+            return Err(Error::ManifestValidation(format!(
+                "embed_project: `min_dist: {}` is outside [0, 1) — it is a fraction of \
+                 the layout's spread, so at 1.0 and above nothing can separate",
+                d
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Build embed_project.py's argv tail (everything after the script path). The two
+/// optional knobs are emitted ONLY when the manifest set them, so the frozen script's
+/// own defaults stay the single place they are written down. Factored out so that
+/// rule — and the arg order — is unit-testable without spawning `uv`.
+fn embed_project_args(
+    input: &str,
+    text_column: &str,
+    model: &str,
+    out: &str,
+    neighbors: Option<u64>,
+    min_dist: Option<f64>,
+) -> Vec<String> {
+    let mut a = vec![
+        "--input".to_string(),
+        input.to_string(),
+        "--text-column".to_string(),
+        text_column.to_string(),
+        "--model".to_string(),
+        model.to_string(),
+        "--out".to_string(),
+        out.to_string(),
+    ];
+    if let Some(n) = neighbors {
+        a.push("--neighbors".to_string());
+        a.push(n.to_string());
+    }
+    if let Some(d) = min_dist {
+        a.push("--min-dist".to_string());
+        a.push(d.to_string());
+    }
+    a
+}
+
+/// What is missing from the declared model asset, or `None` when it is all there.
+///
+/// Answers with the path that is absent rather than a bare bool, because that path is
+/// the whole message: the fix for "the model is not here" is to run the step that
+/// puts it here, and the reader needs to know which file the operator looked for.
+/// A `model` that is not a directory is left to the script — the directory layout is
+/// this operator's contract, and a caller pointing at something else deserves the
+/// script's reading of it rather than a guess made here.
+fn missing_model_part(model: &Path) -> Option<PathBuf> {
+    if !model.exists() {
+        return Some(model.to_path_buf());
+    }
+    if model.is_dir() {
+        return MODEL_PARTS
+            .iter()
+            .map(|part| model.join(part))
+            .find(|part| !part.is_file());
+    }
+    None
+}
+
+impl Operator for EmbedProject {
+    fn name(&self) -> &'static str {
+        "embed_project"
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = EmbedProjectConfig::parse(with)?;
+        cfg.validate()?;
+        let mut assets = OpAssets::default();
+        assets.record_reads(cfg.input.clone(), crate::asset_kind::AssetKind::File);
+        // The model is an input like any other. Directory kind, so staleness hashes a
+        // manifest of its contents: a model swapped in place re-runs the projection
+        // rather than leaving a map built by a different one in place.
+        assets.record_reads(cfg.model.clone(), crate::asset_kind::AssetKind::Directory);
+        assets.record_produces(cfg.out.clone(), crate::asset_kind::AssetKind::File);
+        Ok(assets)
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        let cfg = EmbedProjectConfig::parse(with)?;
+        cfg.validate()?;
+        let input = ctx.dir.join(&cfg.input);
+        let model = ctx.dir.join(&cfg.model);
+        let out = ctx.dir.join(&cfg.out);
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        // Before `uv`, and before anything that could be mistaken for a fetch.
+        //
+        // NON-retryable (`StepExecution`, the missing-binary class) rather than
+        // `StepFailed`. A model that is not on disk will not be on disk on the second
+        // attempt either, so a Protocol carrying `defaults.retry` would otherwise pay
+        // its backoff three times over to be told the same thing.
+        if let Some(part) = missing_model_part(&model) {
+            return Err(Error::StepExecution {
+                step: "embed_project".to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "the model asset {} is not on disk — {} is missing. The model \
+                         is a declared input, so a step in this Protocol has to put it \
+                         there; this operator does not download one.",
+                        cfg.model,
+                        part.display()
+                    ),
+                ),
+            });
+        }
+
+        let script = materialize_frozen_script("embed_project", "1.0.0", EMBED_PROJECT_PY)?;
+        let extra = embed_project_args(
+            &input.display().to_string(),
+            &cfg.text_column,
+            &model.display().to_string(),
+            &out.display().to_string(),
+            cfg.neighbors,
+            cfg.min_dist,
+        );
+        let args = uv_run_args(&script.to_string_lossy(), &extra);
+        run_process("uv", &args, ctx, OutputMode::Capture, "embed_project")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2979,6 +3214,243 @@ mod tests {
         // which is a smoke-test-only CLI flag and deliberately not a config field.
         let bogus: Value = serde_yaml::from_str("ra: RA000665\nout: g.csv\nmax_pages: 2").unwrap();
         assert!(assets_for("gleif_ra_fetch", Some(&bogus)).is_err());
+    }
+
+    // ── embed_project ────────────────────────────────────────────────────────
+    //
+    // The catalog entry is UNCONDITIONAL, beside the other uv-run operators and
+    // unlike the ureq-backed ones. arcform validates a manifest against the same
+    // catalog it executes from, so a feature gate named for the transport would
+    // force a consumer that only wants to READ a Protocol naming this step — the
+    // brightfield viewer — to claim the capability to RUN it.
+
+    #[test]
+    fn embed_project_is_in_catalog_and_versioned() {
+        let op = resolve("embed_project@1").expect("embed_project is in the catalog");
+        assert_eq!(op.name(), "embed_project");
+        assert_eq!(op.version(), semver::Version::new(1, 0, 0));
+        // No feature gate: a consumer built without `http-fetch` still resolves it.
+        assert!(
+            catalog().iter().any(|o| o.name() == "embed_project"),
+            "embed_project must be in the catalog unconditionally"
+        );
+    }
+
+    /// The model is an INPUT, recorded beside the corpus rather than fetched — this
+    /// is what puts the Protocol's dependency on a specific model into the graph.
+    /// Directory kind, so staleness hashes its contents: swap the model and the
+    /// projection re-runs rather than leaving a map built by a different one.
+    #[test]
+    fn embed_project_declares_the_model_as_a_read_beside_the_corpus() {
+        let with: Value = serde_yaml::from_str(
+            "input: build/corpus.parquet\ntext_column: description\nmodel: models/potion\nout: build/mapped.parquet",
+        )
+        .unwrap();
+        let assets = assets_for("embed_project", Some(&with)).unwrap();
+        assert_eq!(assets.reads, vec!["build/corpus.parquet", "models/potion"]);
+        assert_eq!(assets.produces, vec!["build/mapped.parquet"]);
+        assert_eq!(
+            assets.kinds.get("models/potion"),
+            Some(&crate::asset_kind::AssetKind::Directory),
+            "the model is a directory, so staleness hashes what is in it"
+        );
+        assert_eq!(
+            assets.kinds.get("build/corpus.parquet"),
+            Some(&crate::asset_kind::AssetKind::File)
+        );
+        assert_eq!(
+            assets.kinds.get("build/mapped.parquet"),
+            Some(&crate::asset_kind::AssetKind::File)
+        );
+    }
+
+    #[test]
+    fn embed_project_rejects_bad_config() {
+        for missing in [
+            "text_column: t\nmodel: m\nout: o",
+            "input: i\nmodel: m\nout: o",
+            "input: i\ntext_column: t\nout: o",
+            "input: i\ntext_column: t\nmodel: m",
+        ] {
+            let with: Value = serde_yaml::from_str(missing).unwrap();
+            assert!(
+                assets_for("embed_project", Some(&with)).is_err(),
+                "a `with:` block missing a required field must not load: {missing}"
+            );
+        }
+        let bogus: Value =
+            serde_yaml::from_str("input: i\ntext_column: t\nmodel: m\nout: o\nbogus: 1").unwrap();
+        assert!(assets_for("embed_project", Some(&bogus)).is_err());
+    }
+
+    /// Both knobs are refused at manifest load rather than an hour into a run.
+    #[test]
+    fn embed_project_refuses_a_knob_that_cannot_make_a_map() {
+        let base = "input: i\ntext_column: t\nmodel: m\nout: o\n";
+        for (extra, expected) in [
+            ("neighbors: 1", "below 2"),
+            ("neighbors: 0", "below 2"),
+            ("min_dist: 1.0", "outside [0, 1)"),
+            ("min_dist: -0.1", "outside [0, 1)"),
+        ] {
+            let with: Value = serde_yaml::from_str(&format!("{base}{extra}")).unwrap();
+            let err = assets_for("embed_project", Some(&with))
+                .expect_err(&format!("`{extra}` must be refused at load"));
+            assert!(
+                err.to_string().contains(expected),
+                "`{extra}` must be refused naming the bound, got: {err}"
+            );
+        }
+        // The edges that ARE usable must still load.
+        for extra in ["neighbors: 2", "min_dist: 0.0", "min_dist: 0.999", ""] {
+            let with: Value = serde_yaml::from_str(&format!("{base}{extra}")).unwrap();
+            assert!(
+                assets_for("embed_project", Some(&with)).is_ok(),
+                "`{extra}` is a usable setting and must load"
+            );
+        }
+    }
+
+    /// Unset knobs are OMITTED from the argv entirely, so the frozen script's own
+    /// defaults stay the single place they are written down.
+    #[test]
+    fn embed_project_args_omit_the_knobs_the_manifest_did_not_set() {
+        assert_eq!(
+            embed_project_args("c.parquet", "description", "m", "o.parquet", None, None),
+            vec![
+                "--input",
+                "c.parquet",
+                "--text-column",
+                "description",
+                "--model",
+                "m",
+                "--out",
+                "o.parquet"
+            ],
+        );
+    }
+
+    #[test]
+    fn embed_project_args_pass_the_knobs_through() {
+        assert_eq!(
+            embed_project_args(
+                "c.parquet",
+                "description",
+                "m",
+                "o.parquet",
+                Some(30),
+                Some(0.25)
+            ),
+            vec![
+                "--input",
+                "c.parquet",
+                "--text-column",
+                "description",
+                "--model",
+                "m",
+                "--out",
+                "o.parquet",
+                "--neighbors",
+                "30",
+                "--min-dist",
+                "0.25"
+            ],
+        );
+    }
+
+    /// The check answers with the path that is absent, because that path is the
+    /// message: the fix is to run the step that puts it there.
+    #[test]
+    fn missing_model_part_names_the_file_that_is_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model = tmp.path().join("model");
+        assert_eq!(
+            missing_model_part(&model),
+            Some(model.clone()),
+            "a model directory that was never fetched is named by its own path"
+        );
+
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(model.join("tokenizer.json"), "{}").unwrap();
+        assert_eq!(
+            missing_model_part(&model),
+            Some(model.join("model.safetensors")),
+            "a half-extracted model names the file that did not arrive"
+        );
+
+        std::fs::write(model.join("model.safetensors"), b"\0").unwrap();
+        assert_eq!(
+            missing_model_part(&model),
+            None,
+            "both parts present — nothing is missing"
+        );
+
+        std::fs::remove_file(model.join("tokenizer.json")).unwrap();
+        assert_eq!(
+            missing_model_part(&model),
+            Some(model.join("tokenizer.json")),
+            "the tokenizer is checked too, not just the weights"
+        );
+    }
+
+    /// AC2's second half, without a `uv` on PATH: the step refuses on the missing
+    /// input and never gets as far as anything that could be mistaken for a fetch.
+    #[test]
+    fn embed_project_refuses_a_missing_model_before_it_spawns_uv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+        let ctx = test_ctx(tmp.path(), &env);
+        let with: Value = serde_yaml::from_str(
+            "input: corpus.parquet\ntext_column: description\nmodel: models/potion\nout: build/mapped.parquet",
+        )
+        .unwrap();
+        let err = EmbedProject
+            .run(&with, &ctx)
+            .expect_err("a model that is not on disk must stop the step");
+        assert!(
+            matches!(err, Error::StepExecution { .. }),
+            "a missing model is deterministic, so it must be the NON-retryable kind \
+             rather than a StepFailed the engine would back off and re-attempt: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("models/potion"),
+            "the refusal names the declared model: {msg}"
+        );
+        assert!(
+            msg.contains("does not download one"),
+            "the refusal says the model is the Protocol's job, not the operator's: {msg}"
+        );
+    }
+
+    /// The reproducibility contract, read off the frozen bytes `op@1` addresses: the
+    /// seed is in the script, and the script consults no credential and imports no
+    /// HTTP client — so a run's cost is the machine it runs on.
+    #[test]
+    fn embed_project_script_pins_its_seed_and_reads_no_credentials() {
+        assert!(
+            EMBED_PROJECT_PY.contains("SEED = 42"),
+            "the seed is frozen into the script, not exposed in `with:`"
+        );
+        assert!(
+            EMBED_PROJECT_PY.contains("random_state=SEED"),
+            "the seed has to reach the projection, or two runs diverge"
+        );
+        for forbidden in [
+            "os.getenv",
+            "environ.get",
+            "environ[\"OPENAI",
+            "import requests",
+            "import urllib",
+            "import httpx",
+            "import socket",
+        ] {
+            assert!(
+                !EMBED_PROJECT_PY.contains(forbidden),
+                "embed_project.py must not carry `{forbidden}`: the step reads no key \
+                 and opens no socket"
+            );
+        }
     }
 
     // ── finetype_validate ───────────────────────────────────────────────────
