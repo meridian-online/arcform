@@ -113,7 +113,8 @@ static DATAPACKAGE_DESCRIBE: DatapackageDescribe = DatapackageDescribe;
 static FINETYPE_VALIDATE: FinetypeValidate = FinetypeValidate;
 static SPLINK_RESOLVE: SplinkResolve = SplinkResolve;
 static GLEIF_RA_FETCH: GleifRaFetch = GleifRaFetch;
-static EMBED_PROJECT: EmbedProject = EmbedProject;
+static UMAP_PROJECT: UmapProject = UmapProject;
+static TEXT_EMBED: TextEmbed = TextEmbed;
 #[cfg(feature = "opendal")]
 static OPENDAL_FETCH: OpendalFetch = OpendalFetch;
 
@@ -131,7 +132,8 @@ fn catalog() -> Vec<&'static dyn Operator> {
         &FINETYPE_VALIDATE,
         &SPLINK_RESOLVE,
         &GLEIF_RA_FETCH,
-        &EMBED_PROJECT,
+        &UMAP_PROJECT,
+        &TEXT_EMBED,
     ];
     #[cfg(feature = "http-fetch")]
     ops.extend([
@@ -316,14 +318,24 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
             }),
             &["ra", "out"],
         ),
-        "embed_project" => object(
+        "umap_project" => object(
+            json!({
+                "input": { "type": "string", "description": "Parquet holding the columns to project." },
+                "columns": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "The numeric columns to reduce, in order. A numeric scalar contributes one feature; a list/array of numerics — a vector column — contributes one per element. There is no text column and no model: to map text, write a vector column from it first (text_embed, or the DuckDB embedding extension once it lands)." },
+                "out": { "type": "string", "description": "Parquet to write — every input column plus projection_x and projection_y as DOUBLE." },
+                "neighbors": { "type": "integer", "minimum": 2, "description": "UMAP n_neighbors: low reads local structure, high reads global. Defaults to the script's 15 when omitted." },
+                "min_dist": { "type": "number", "minimum": 0, "exclusiveMaximum": 1, "description": "UMAP min_dist: how tightly points may pack. Defaults to the script's 0.1 when omitted." },
+                "metric": { "type": "string", "enum": UMAP_METRICS, "description": "How the distance between two rows is measured. Defaults to the script's euclidean when omitted, which is the reading an arbitrary feature matrix wants; cosine is the reading an L2-normalised vector column wants. Nothing here scales your columns — under euclidean a wider-spread column dominates the layout, which is a decision for the SQL step that selects them." }
+            }),
+            &["input", "columns", "out"],
+        ),
+        "text_embed" => object(
             json!({
                 "input": { "type": "string", "description": "Parquet holding the corpus." },
                 "text_column": { "type": "string", "description": "Column to embed." },
                 "model": { "type": "string", "description": "Static-embedding model directory (model.safetensors + tokenizer.json). A declared input: the Protocol fetches it, the operator never does." },
-                "out": { "type": "string", "description": "Parquet to write — every input column plus projection_x and projection_y as DOUBLE." },
-                "neighbors": { "type": "integer", "minimum": 2, "description": "UMAP n_neighbors: low reads local structure, high reads global. Defaults to the script's 15 when omitted." },
-                "min_dist": { "type": "number", "minimum": 0, "exclusiveMaximum": 1, "description": "UMAP min_dist: how tightly points may pack. Defaults to the script's 0.1 when omitted." }
+                "out": { "type": "string", "description": "Parquet to write — every input column plus the vector column as FLOAT[]." },
+                "vector_column": { "type": "string", "description": "Column the vectors are written into. Defaults to the script's `embedding` when omitted; name another to embed a second column of the same corpus in a later step." }
             }),
             &["input", "text_column", "model", "out"],
         ),
@@ -2425,14 +2437,263 @@ impl Operator for GleifRaFetch {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// embed_project (transform) — turn a text column into the two coordinates a map
-// needs. Reads one Parquet, embeds the named text column against a LOCAL static-
-// embedding model, reduces that embedding to two dimensions with UMAP, and writes a
-// Parquet carrying every input column plus `projection_x` and `projection_y`.
+// umap_project (transform) — reduce numeric columns that ALREADY EXIST to the two
+// coordinates a map is drawn from. Reads one Parquet, builds a feature matrix from
+// the named columns, reduces it to two dimensions with UMAP, and writes a Parquet
+// carrying every input column plus `projection_x` and `projection_y`.
 //
-// Same uv-run substrate + frozen-script contract as datapackage_describe,
-// splink_resolve and gleif_ra_fetch: `op@1` addresses these exact script bytes, so
-// the seed and the projection parameters cannot drift under a manifest.
+// NO TEXT COLUMN AND NO MODEL, and that is the whole shape of it. `columns:` names
+// columns that are already numbers — a numeric scalar contributes one feature, a
+// list/array of numerics contributes one per element — so `[longitude, latitude]`
+// maps a table of places and `[embedding]` maps whatever wrote a vector column,
+// without this operator knowing which produced it. A step that insisted on embedding
+// text first could serve neither case alone.
+//
+// THE TIER, stated here because reaching past one requires naming what above cannot
+// do the job. arcform builds a capability as a DuckDB extension first, then in
+// Rust/C, and reaches a managed environment (`uv`) only when the tiers above cannot
+// carry the work. This is the third tier and the reason is UMAP: `umap-learn` is the
+// reference implementation, there is no DuckDB extension for it and no Rust one in
+// this stack, and a reimplementation would emit different coordinates from every
+// published UMAP map anyone might compare this one against. The capability is absent
+// above, not merely inconvenient.
+//
+// Same uv-run substrate + frozen-script contract as the other Python operators:
+// `op@1` addresses these exact script bytes, so the seed and the projection
+// parameters cannot drift under a manifest.
+//
+// OutputMode::Capture, not Inherit: the script reports a fixable condition (no such
+// column, a column that is not a number, a column-name collision) as one line on
+// stderr, and Capture is what carries that line into the run's error. The cost is
+// that a long projection prints nothing until it finishes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The projection script, pinned into the binary. `@1` == these exact bytes.
+const UMAP_PROJECT_PY: &str = include_str!("../operators/umap_project/umap_project.py");
+
+/// The script cache directory `materialize_frozen_script` builds for this operator,
+/// under the system temp directory. Test-only, because production never spells the
+/// path — it passes the name and version and lets the helper build it. A test traps
+/// that path to drive the cache's two failure paths, and if the helper ever spells it
+/// differently the trap stops biting, materialising succeeds, and the test goes RED on
+/// its own `expect_err`. It cannot drift quietly.
+#[cfg(test)]
+const UMAP_PROJECT_CACHE_DIR: &str = "arcform-op-umap_project-1.0.0";
+
+/// The metrics a manifest may ask for, and the single place they are written down:
+/// [`with_schema`] emits this array as the field's `enum`, so an authoring form and
+/// the load-time refusal below cannot disagree about what is accepted.
+///
+/// umap-learn accepts many more. These two are the ones the suite drives, and they
+/// are the two readings that matter: `euclidean` for an arbitrary feature matrix
+/// (umap-learn's own default), `cosine` for L2-normalised vectors, which is what an
+/// embedding is. A name outside the set is refused at manifest load rather than by an
+/// exception from inside UMAP an hour into a run.
+const UMAP_METRICS: [&str; 2] = ["euclidean", "cosine"];
+
+struct UmapProject;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UmapProjectConfig {
+    /// Parquet holding the columns to project (a `reads` asset). Resolved against
+    /// ctx.dir.
+    input: String,
+    /// The numeric columns to reduce. Whether a named column exists, and whether its
+    /// type is one that can be placed on a map, is the script's refusal rather than a
+    /// load-time one — the manifest cannot know the schema.
+    columns: Vec<String>,
+    /// Parquet to write: every input column, plus `projection_x` and `projection_y`
+    /// as DOUBLE (the `produces` asset). Resolved against ctx.dir.
+    out: String,
+    /// UMAP's `n_neighbors` — how much of the input each point is placed against.
+    /// Low reads local structure, high reads global. OMITTED from the argv when
+    /// unset, so the script's own default stands.
+    #[serde(default)]
+    neighbors: Option<u64>,
+    /// UMAP's `min_dist` — how tightly points may pack. Omitted from the argv when
+    /// unset. Must be in `[0, 1)`: at or above the default spread of 1.0 the layout
+    /// has no room to separate anything.
+    #[serde(default)]
+    min_dist: Option<f64>,
+    /// How distance between two rows is measured. Omitted from the argv when unset.
+    /// One of [`UMAP_METRICS`].
+    #[serde(default)]
+    metric: Option<String>,
+}
+
+impl UmapProjectConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        serde_yaml::from_value(with.clone()).map_err(|e| {
+            Error::ManifestValidation(format!("umap_project: invalid `with:` config: {}", e))
+        })
+    }
+
+    /// Refuse, at manifest load rather than an hour into a run, everything about this
+    /// config that is decidable without reading the input's schema. Both UMAP bounds
+    /// are UMAP's, not this operator's invention: a neighbourhood of fewer than two
+    /// points has no neighbourhood, and `min_dist` is a fraction of the layout's
+    /// spread.
+    fn validate(&self) -> Result<()> {
+        if self.columns.is_empty() {
+            return Err(Error::ManifestValidation(
+                "umap_project: `columns:` is empty — there is nothing to project. Name \
+                 the numeric columns the map is drawn from."
+                    .to_string(),
+            ));
+        }
+        for (at, column) in self.columns.iter().enumerate() {
+            if self.columns[..at].contains(column) {
+                return Err(Error::ManifestValidation(format!(
+                    "umap_project: `columns:` names {:?} more than once — each column \
+                     contributes its features once",
+                    column
+                )));
+            }
+        }
+        if let Some(n) = self.neighbors
+            && n < 2
+        {
+            return Err(Error::ManifestValidation(format!(
+                "umap_project: `neighbors: {}` is below 2 — a point placed against \
+                 fewer than two neighbours has no neighbourhood to be placed in",
+                n
+            )));
+        }
+        if let Some(d) = self.min_dist
+            && !(0.0..1.0).contains(&d)
+        {
+            return Err(Error::ManifestValidation(format!(
+                "umap_project: `min_dist: {}` is outside [0, 1) — it is a fraction of \
+                 the layout's spread, so at 1.0 and above nothing can separate",
+                d
+            )));
+        }
+        if let Some(m) = &self.metric
+            && !UMAP_METRICS.contains(&m.as_str())
+        {
+            return Err(Error::ManifestValidation(format!(
+                "umap_project: `metric: {}` is not one this operator will pass to UMAP \
+                 — it accepts {}",
+                m,
+                UMAP_METRICS.join(" or ")
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Build umap_project.py's argv tail (everything after the script path). One
+/// `--column` per projected column, in the order the manifest listed them, then the
+/// three optional knobs — emitted ONLY when the manifest set them, so the frozen
+/// script's own defaults stay the single place they are written down. Factored out so
+/// that rule — and the arg order — is unit-testable without spawning `uv`.
+fn umap_project_args(
+    input: &str,
+    columns: &[String],
+    out: &str,
+    neighbors: Option<u64>,
+    min_dist: Option<f64>,
+    metric: Option<&str>,
+) -> Vec<String> {
+    let mut a = vec!["--input".to_string(), input.to_string()];
+    for column in columns {
+        a.push("--column".to_string());
+        a.push(column.clone());
+    }
+    a.push("--out".to_string());
+    a.push(out.to_string());
+    if let Some(n) = neighbors {
+        a.push("--neighbors".to_string());
+        a.push(n.to_string());
+    }
+    if let Some(d) = min_dist {
+        a.push("--min-dist".to_string());
+        a.push(d.to_string());
+    }
+    if let Some(m) = metric {
+        a.push("--metric".to_string());
+        a.push(m.to_string());
+    }
+    a
+}
+
+impl Operator for UmapProject {
+    fn name(&self) -> &'static str {
+        "umap_project"
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = UmapProjectConfig::parse(with)?;
+        cfg.validate()?;
+        let mut assets = OpAssets::default();
+        assets.record_reads(cfg.input.clone(), crate::asset_kind::AssetKind::File);
+        assets.record_produces(cfg.out.clone(), crate::asset_kind::AssetKind::File);
+        Ok(assets)
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        let cfg = UmapProjectConfig::parse(with)?;
+        cfg.validate()?;
+        let args = umap_project_invocation(&cfg, ctx.dir)?;
+        run_process("uv", &args, ctx, OutputMode::Capture, "umap_project")
+    }
+}
+
+/// Everything that has to be decided BEFORE `uv` is spawned: materialise the frozen
+/// script and build the full argv.
+///
+/// Split out of [`Operator::run`] rather than left inline, and the reason is that the
+/// projection needs a `uv` on PATH while the decision to attempt it does not. Inline,
+/// every one of these lines was reachable only through a test that runs Python — so on
+/// a machine without `uv`, which is every CI runner here, nothing checked that the
+/// script materialised at all, that `op@1` addressed the embedded bytes, or that an
+/// out-of-range knob stopped the step. As a function it is driven directly, argv and
+/// all, by a test that spawns nothing.
+fn umap_project_invocation(cfg: &UmapProjectConfig, dir: &Path) -> Result<Vec<String>> {
+    let input = dir.join(&cfg.input);
+    let out = dir.join(&cfg.out);
+    if let Some(parent) = out.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let script = materialize_frozen_script("umap_project", "1.0.0", UMAP_PROJECT_PY)?;
+    let extra = umap_project_args(
+        &input.display().to_string(),
+        &cfg.columns,
+        &out.display().to_string(),
+        cfg.neighbors,
+        cfg.min_dist,
+        cfg.metric.as_deref(),
+    );
+    Ok(uv_run_args(&script.to_string_lossy(), &extra))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// text_embed (transform) — PROVISIONAL. ON ITS WAY OUT. DO NOT HARDEN IT.
+//
+// Embeds a text column against a LOCAL static-embedding model and writes a Parquet
+// carrying every input column plus a vector column of FLOAT. It writes vectors and
+// nothing else, which is the point of it being its own step: an analyst who wants
+// vectors for similarity, clustering, deduplication or classifier features stops
+// here, and one who wants a map feeds the vector column to `umap_project`, which
+// neither knows nor cares that an embedding produced it.
+//
+// WHERE THIS IS GOING, and why nothing here should grow. Embedding is a table lookup
+// and a mean. Under arcform's implementation order — a DuckDB extension first, then
+// Rust/C, then a managed environment — it does not belong at this tier at all: a
+// DuckDB scalar function returning a vector is being built for exactly this, and Rust
+// that loads a Model2Vec tokenizer and embedding matrix already ships elsewhere in
+// the stack. When the extension lands, a Protocol embeds from a SQL step
+// (`SELECT …, embed(description) AS embedding FROM …`) and this operator is DELETED
+// rather than maintained. It exists now because that extension does not exist yet,
+// and without it a Protocol has no route from a text column to a map at all.
+//
+// So: a stopgap, named as one. A knob proposed here belongs on the extension.
 //
 // THE MODEL IS A DECLARED READ, NOT A DOWNLOAD, and that is the whole reason this
 // belongs in an asset-centric engine rather than beside one. A model the operator
@@ -2444,24 +2705,16 @@ impl Operator for GleifRaFetch {
 // dependency on it is legible, and the step needs no network at all. `run` refuses
 // before it spawns `uv` when the model is not on disk, naming the file that is
 // missing, rather than reaching for it.
-//
-// OutputMode::Capture, not Inherit: the script reports a fixable condition (no such
-// text column, a model directory missing a file, a column-name collision) as one line
-// on stderr, and Capture is what carries that line into the run's error. The cost is
-// that a long projection prints nothing until it finishes.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The embed-and-project script, pinned into the binary. `@1` == these exact bytes.
-const EMBED_PROJECT_PY: &str = include_str!("../operators/embed_project/embed_project.py");
+/// The embedding script, pinned into the binary. `@1` == these exact bytes.
+const TEXT_EMBED_PY: &str = include_str!("../operators/text_embed/text_embed.py");
 
-/// The script cache directory `materialize_frozen_script` builds for this operator,
-/// under the system temp directory. Test-only, because production never spells the
-/// path — it passes the name and version and lets the helper build it. A test traps
-/// that path to drive the cache's two failure paths, and if the helper ever spells it
-/// differently the trap stops biting, materialising succeeds, and the test goes RED on
-/// its own `expect_err`. It cannot drift quietly.
+/// The script cache directory `materialize_frozen_script` builds for this operator.
+/// Test-only, for the same reason [`UMAP_PROJECT_CACHE_DIR`] is: production never
+/// spells the path, and a test traps it to drive the cache's two failure paths.
 #[cfg(test)]
-const SCRIPT_CACHE_DIR: &str = "arcform-op-embed_project-1.0.0";
+const TEXT_EMBED_CACHE_DIR: &str = "arcform-op-text_embed-1.0.0";
 
 /// The two files a static-embedding model directory carries — the layout a
 /// `model2vec` / `potion` release ships. Checked here, before `uv` is spawned, so a
@@ -2469,11 +2722,11 @@ const SCRIPT_CACHE_DIR: &str = "arcform-op-embed_project-1.0.0";
 /// the missing file instead of after a dependency resolve.
 const MODEL_PARTS: [&str; 2] = ["model.safetensors", "tokenizer.json"];
 
-struct EmbedProject;
+struct TextEmbed;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EmbedProjectConfig {
+struct TextEmbedConfig {
     /// Parquet holding the corpus (a `reads` asset). Resolved against ctx.dir.
     input: String,
     /// The column to embed. A column that is not in the Parquet is the script's
@@ -2483,67 +2736,47 @@ struct EmbedProjectConfig {
     /// changed model re-runs the step). Resolved against ctx.dir. The Protocol is
     /// what puts it there; this operator never downloads it.
     model: String,
-    /// Parquet to write: every input column, plus `projection_x` and `projection_y`
-    /// as DOUBLE (the `produces` asset). Resolved against ctx.dir.
+    /// Parquet to write: every input column, plus the vector column (the `produces`
+    /// asset). Resolved against ctx.dir.
     out: String,
-    /// UMAP's `n_neighbors` — how much of the corpus each point is placed against.
-    /// Low reads local structure, high reads global. OMITTED from the argv when
-    /// unset, so the script's own default stands and a manifest predating this field
-    /// invokes it exactly as before.
+    /// The column the vector is written into. OMITTED from the argv when unset, so
+    /// the script's own default stands. Name another to embed a second column of the
+    /// same corpus in a later step without colliding with this one's output.
     #[serde(default)]
-    neighbors: Option<u64>,
-    /// UMAP's `min_dist` — how tightly points may pack. Omitted from the argv when
-    /// unset. Must be in `[0, 1)`: at or above the default spread of 1.0 the layout
-    /// has no room to separate anything.
-    #[serde(default)]
-    min_dist: Option<f64>,
+    vector_column: Option<String>,
 }
 
-impl EmbedProjectConfig {
+impl TextEmbedConfig {
     fn parse(with: &Value) -> Result<Self> {
         serde_yaml::from_value(with.clone()).map_err(|e| {
-            Error::ManifestValidation(format!("embed_project: invalid `with:` config: {}", e))
+            Error::ManifestValidation(format!("text_embed: invalid `with:` config: {}", e))
         })
     }
 
-    /// Refuse a knob whose value cannot produce a map, at manifest load rather than
-    /// an hour into a run. Both bounds are UMAP's, not this operator's invention:
-    /// a neighbourhood of fewer than two points has no neighbourhood, and `min_dist`
-    /// is a fraction of the layout's spread.
     fn validate(&self) -> Result<()> {
-        if let Some(n) = self.neighbors
-            && n < 2
+        if let Some(name) = &self.vector_column
+            && name.trim().is_empty()
         {
-            return Err(Error::ManifestValidation(format!(
-                "embed_project: `neighbors: {}` is below 2 — a point placed against \
-                 fewer than two neighbours has no neighbourhood to be placed in",
-                n
-            )));
-        }
-        if let Some(d) = self.min_dist
-            && !(0.0..1.0).contains(&d)
-        {
-            return Err(Error::ManifestValidation(format!(
-                "embed_project: `min_dist: {}` is outside [0, 1) — it is a fraction of \
-                 the layout's spread, so at 1.0 and above nothing can separate",
-                d
-            )));
+            return Err(Error::ManifestValidation(
+                "text_embed: `vector_column:` is blank — it names the column the \
+                 vectors are written into, so it has to be a name."
+                    .to_string(),
+            ));
         }
         Ok(())
     }
 }
 
-/// Build embed_project.py's argv tail (everything after the script path). The two
-/// optional knobs are emitted ONLY when the manifest set them, so the frozen script's
-/// own defaults stay the single place they are written down. Factored out so that
-/// rule — and the arg order — is unit-testable without spawning `uv`.
-fn embed_project_args(
+/// Build text_embed.py's argv tail (everything after the script path). The optional
+/// vector-column name is emitted ONLY when the manifest set it, so the frozen
+/// script's own default stays the single place it is written down. Factored out so
+/// that rule — and the arg order — is unit-testable without spawning `uv`.
+fn text_embed_args(
     input: &str,
     text_column: &str,
     model: &str,
     out: &str,
-    neighbors: Option<u64>,
-    min_dist: Option<f64>,
+    vector_column: Option<&str>,
 ) -> Vec<String> {
     let mut a = vec![
         "--input".to_string(),
@@ -2555,13 +2788,9 @@ fn embed_project_args(
         "--out".to_string(),
         out.to_string(),
     ];
-    if let Some(n) = neighbors {
-        a.push("--neighbors".to_string());
-        a.push(n.to_string());
-    }
-    if let Some(d) = min_dist {
-        a.push("--min-dist".to_string());
-        a.push(d.to_string());
+    if let Some(name) = vector_column {
+        a.push("--vector-column".to_string());
+        a.push(name.to_string());
     }
     a
 }
@@ -2587,9 +2816,9 @@ fn missing_model_part(model: &Path) -> Option<PathBuf> {
     None
 }
 
-impl Operator for EmbedProject {
+impl Operator for TextEmbed {
     fn name(&self) -> &'static str {
-        "embed_project"
+        "text_embed"
     }
 
     fn version(&self) -> semver::Version {
@@ -2597,37 +2826,31 @@ impl Operator for EmbedProject {
     }
 
     fn assets(&self, with: &Value) -> Result<OpAssets> {
-        let cfg = EmbedProjectConfig::parse(with)?;
+        let cfg = TextEmbedConfig::parse(with)?;
         cfg.validate()?;
         let mut assets = OpAssets::default();
         assets.record_reads(cfg.input.clone(), crate::asset_kind::AssetKind::File);
         // The model is an input like any other. Directory kind, so staleness hashes a
-        // manifest of its contents: a model swapped in place re-runs the projection
-        // rather than leaving a map built by a different one in place.
+        // manifest of its contents: a model swapped in place re-runs the embedding
+        // rather than leaving vectors from a different one in place.
         assets.record_reads(cfg.model.clone(), crate::asset_kind::AssetKind::Directory);
         assets.record_produces(cfg.out.clone(), crate::asset_kind::AssetKind::File);
         Ok(assets)
     }
 
     fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
-        let cfg = EmbedProjectConfig::parse(with)?;
+        let cfg = TextEmbedConfig::parse(with)?;
         cfg.validate()?;
-        let args = embed_project_invocation(&cfg, ctx.dir)?;
-        run_process("uv", &args, ctx, OutputMode::Capture, "embed_project")
+        let args = text_embed_invocation(&cfg, ctx.dir)?;
+        run_process("uv", &args, ctx, OutputMode::Capture, "text_embed")
     }
 }
 
 /// Everything that has to be decided BEFORE `uv` is spawned: refuse a model that is
-/// not on disk, materialise the frozen script, and build the full argv.
-///
-/// Split out of [`Operator::run`] rather than left inline, and the reason is that the
-/// projection needs a `uv` on PATH while the decision to attempt it does not. Inline,
-/// every one of these lines was reachable only through a test that runs Python — so on
-/// a machine without `uv`, which is every CI runner here, nothing checked that the
-/// script materialised at all, that `op@1` addressed the embedded bytes, or that an
-/// out-of-range knob stopped the step. As a function it is driven directly, argv and
-/// all, by a test that spawns nothing.
-fn embed_project_invocation(cfg: &EmbedProjectConfig, dir: &Path) -> Result<Vec<String>> {
+/// not on disk, materialise the frozen script, and build the full argv. Split out for
+/// the same reason [`umap_project_invocation`] is — every CI runner here is a machine
+/// without `uv`, and this is the half of `run` such a machine can still drive.
+fn text_embed_invocation(cfg: &TextEmbedConfig, dir: &Path) -> Result<Vec<String>> {
     let input = dir.join(&cfg.input);
     let model = dir.join(&cfg.model);
     let out = dir.join(&cfg.out);
@@ -2643,7 +2866,7 @@ fn embed_project_invocation(cfg: &EmbedProjectConfig, dir: &Path) -> Result<Vec<
     // backoff three times over to be told the same thing.
     if let Some(part) = missing_model_part(&model) {
         return Err(Error::StepExecution {
-            step: "embed_project".to_string(),
+            step: "text_embed".to_string(),
             source: std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!(
@@ -2657,14 +2880,13 @@ fn embed_project_invocation(cfg: &EmbedProjectConfig, dir: &Path) -> Result<Vec<
         });
     }
 
-    let script = materialize_frozen_script("embed_project", "1.0.0", EMBED_PROJECT_PY)?;
-    let extra = embed_project_args(
+    let script = materialize_frozen_script("text_embed", "1.0.0", TEXT_EMBED_PY)?;
+    let extra = text_embed_args(
         &input.display().to_string(),
         &cfg.text_column,
         &model.display().to_string(),
         &out.display().to_string(),
-        cfg.neighbors,
-        cfg.min_dist,
+        cfg.vector_column.as_deref(),
     );
     Ok(uv_run_args(&script.to_string_lossy(), &extra))
 }
@@ -3239,7 +3461,7 @@ mod tests {
         assert!(assets_for("gleif_ra_fetch", Some(&bogus)).is_err());
     }
 
-    // ── embed_project ────────────────────────────────────────────────────────
+    // ── umap_project ─────────────────────────────────────────────────────────
     //
     // The catalog entry is UNCONDITIONAL, beside the other uv-run operators and
     // unlike the ureq-backed ones. arcform validates a manifest against the same
@@ -3248,30 +3470,495 @@ mod tests {
     // brightfield viewer — to claim the capability to RUN it.
 
     #[test]
-    fn embed_project_is_in_catalog_and_versioned() {
-        let op = resolve("embed_project@1").expect("embed_project is in the catalog");
-        assert_eq!(op.name(), "embed_project");
+    fn umap_project_is_in_catalog_and_versioned() {
+        let op = resolve("umap_project@1").expect("umap_project is in the catalog");
+        assert_eq!(op.name(), "umap_project");
         assert_eq!(op.version(), semver::Version::new(1, 0, 0));
         // No feature gate: a consumer built without `http-fetch` still resolves it.
         assert!(
-            catalog().iter().any(|o| o.name() == "embed_project"),
-            "embed_project must be in the catalog unconditionally"
+            catalog().iter().any(|o| o.name() == "umap_project"),
+            "umap_project must be in the catalog unconditionally"
         );
     }
+
+    #[test]
+    fn text_embed_is_in_catalog_and_versioned() {
+        let op = resolve("text_embed@1").expect("text_embed is in the catalog");
+        assert_eq!(op.name(), "text_embed");
+        assert_eq!(op.version(), semver::Version::new(1, 0, 0));
+        assert!(
+            catalog().iter().any(|o| o.name() == "text_embed"),
+            "text_embed must be in the catalog unconditionally"
+        );
+    }
+
+    /// The merged name is GONE, not aliased. It named two jobs, so a manifest asking
+    /// for it cannot be served correctly by either half — and an alias that quietly
+    /// resolved to one of them would hand a Protocol a step it did not ask for. The
+    /// refusal is the operator-unknown one, which names the catalog.
+    #[test]
+    fn the_name_that_covered_two_jobs_resolves_to_nothing() {
+        for reference in ["embed_project", "embed_project@1"] {
+            // `expect_err` needs `Debug` on the Ok side and `&dyn Operator` has none,
+            // so the success case is spelled out — which also lets it report WHICH
+            // operator answered to the merged name.
+            let err = match resolve(reference) {
+                Ok(op) => panic!(
+                    "`{reference}` named two jobs and must no longer resolve, but it \
+                     resolved to `{}`",
+                    op.name()
+                ),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains("unknown operator 'embed_project'"),
+                "the refusal names the operator that is gone: {err}"
+            );
+        }
+        assert!(
+            !catalog().iter().any(|o| o.name() == "embed_project"),
+            "no catalog entry may still carry the merged name"
+        );
+    }
+
+    /// AC1's load-time half, and the half CI can run: the projection declares an
+    /// input and an output and NOTHING ELSE. No model asset appears in the graph
+    /// because none is needed — a step that placed numbers on a map by way of a model
+    /// would still be two jobs.
+    #[test]
+    fn umap_project_declares_one_input_and_one_output_and_no_model() {
+        let with: Value = serde_yaml::from_str(
+            "input: build/homes.parquet\ncolumns: [longitude, latitude]\nout: build/mapped.parquet",
+        )
+        .unwrap();
+        let assets = assets_for("umap_project", Some(&with)).unwrap();
+        assert_eq!(assets.reads, vec!["build/homes.parquet"]);
+        assert_eq!(assets.produces, vec!["build/mapped.parquet"]);
+        assert_eq!(
+            assets.kinds.get("build/homes.parquet"),
+            Some(&crate::asset_kind::AssetKind::File)
+        );
+        assert_eq!(
+            assets.kinds.get("build/mapped.parquet"),
+            Some(&crate::asset_kind::AssetKind::File)
+        );
+        assert!(
+            !assets
+                .kinds
+                .values()
+                .any(|k| *k == crate::asset_kind::AssetKind::Directory),
+            "the projection reads no model directory — it takes numbers that already \
+             exist: {:?}",
+            assets.kinds
+        );
+    }
+
+    /// AC2 at the config level. `deny_unknown_fields` is what makes this a refusal
+    /// rather than a field silently ignored: a manifest carried over from the merged
+    /// operator stops at load, naming the field, instead of quietly projecting
+    /// without embedding anything.
+    #[test]
+    fn umap_project_refuses_the_fields_that_belonged_to_the_other_job() {
+        let base = "input: i.parquet\ncolumns: [lon, lat]\nout: o.parquet\n";
+        for orphan in ["text_column: description", "model: models/potion"] {
+            let with: Value = serde_yaml::from_str(&format!("{base}{orphan}")).unwrap();
+            let err = assets_for("umap_project", Some(&with))
+                .expect_err(&format!("`{orphan}` is meaningless to a projection"));
+            let field = orphan.split(':').next().unwrap();
+            assert!(
+                err.to_string().contains(field),
+                "the refusal names the field that does not belong: {err}"
+            );
+        }
+    }
+
+    /// The embedding step carries no projection knob, for the same reason: a field
+    /// that cannot change what the step produces must not be settable on it.
+    #[test]
+    fn text_embed_refuses_the_fields_that_belonged_to_the_other_job() {
+        let base = "input: i.parquet\ntext_column: t\nmodel: m\nout: o.parquet\n";
+        for orphan in ["neighbors: 15", "min_dist: 0.1", "metric: cosine"] {
+            let with: Value = serde_yaml::from_str(&format!("{base}{orphan}")).unwrap();
+            let err = assets_for("text_embed", Some(&with))
+                .expect_err(&format!("`{orphan}` is meaningless to an embedding"));
+            let field = orphan.split(':').next().unwrap();
+            assert!(
+                err.to_string().contains(field),
+                "the refusal names the field that does not belong: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn umap_project_rejects_bad_config() {
+        for missing in [
+            "columns: [lon]\nout: o",
+            "input: i\nout: o",
+            "input: i\ncolumns: [lon]",
+        ] {
+            let with: Value = serde_yaml::from_str(missing).unwrap();
+            assert!(
+                assets_for("umap_project", Some(&with)).is_err(),
+                "a `with:` block missing a required field must not load: {missing}"
+            );
+        }
+        let bogus: Value =
+            serde_yaml::from_str("input: i\ncolumns: [lon]\nout: o\nbogus: 1").unwrap();
+        assert!(assets_for("umap_project", Some(&bogus)).is_err());
+        // `columns:` is a list of names, not one name.
+        let scalar: Value = serde_yaml::from_str("input: i\ncolumns: lon\nout: o").unwrap();
+        assert!(
+            assets_for("umap_project", Some(&scalar)).is_err(),
+            "`columns:` takes a sequence — a bare string must not load"
+        );
+    }
+
+    /// Everything decidable from the manifest alone is refused at load rather than an
+    /// hour into a run.
+    #[test]
+    fn umap_project_refuses_a_setting_that_cannot_make_a_map() {
+        let base = "input: i\nout: o\n";
+        for (extra, expected) in [
+            ("columns: []", "is empty"),
+            ("columns: [lon, lat, lon]", "more than once"),
+            ("columns: [lon]\nneighbors: 1", "below 2"),
+            ("columns: [lon]\nneighbors: 0", "below 2"),
+            ("columns: [lon]\nmin_dist: 1.0", "outside [0, 1)"),
+            ("columns: [lon]\nmin_dist: -0.1", "outside [0, 1)"),
+            ("columns: [lon]\nmetric: manhattan", "euclidean or cosine"),
+        ] {
+            let with: Value = serde_yaml::from_str(&format!("{base}{extra}")).unwrap();
+            let err = assets_for("umap_project", Some(&with))
+                .expect_err(&format!("`{extra}` must be refused at load"));
+            assert!(
+                err.to_string().contains(expected),
+                "`{extra}` must be refused naming the bound, got: {err}"
+            );
+        }
+        // The settings that ARE usable must still load.
+        for extra in [
+            "columns: [lon]",
+            "columns: [lon, lat]",
+            "columns: [lon]\nneighbors: 2",
+            "columns: [lon]\nmin_dist: 0.0",
+            "columns: [lon]\nmin_dist: 0.999",
+            "columns: [lon]\nmetric: euclidean",
+            "columns: [lon]\nmetric: cosine",
+        ] {
+            let with: Value = serde_yaml::from_str(&format!("{base}{extra}")).unwrap();
+            assert!(
+                assets_for("umap_project", Some(&with)).is_ok(),
+                "`{extra}` is a usable setting and must load"
+            );
+        }
+    }
+
+    /// Unset knobs are OMITTED from the argv entirely, so the frozen script's own
+    /// defaults stay the single place they are written down.
+    #[test]
+    fn umap_project_args_omit_the_knobs_the_manifest_did_not_set() {
+        assert_eq!(
+            umap_project_args(
+                "h.parquet",
+                &["longitude".to_string(), "latitude".to_string()],
+                "o.parquet",
+                None,
+                None,
+                None,
+            ),
+            vec![
+                "--input",
+                "h.parquet",
+                "--column",
+                "longitude",
+                "--column",
+                "latitude",
+                "--out",
+                "o.parquet",
+            ],
+        );
+    }
+
+    #[test]
+    fn umap_project_args_pass_every_column_and_knob_through() {
+        assert_eq!(
+            umap_project_args(
+                "h.parquet",
+                &[
+                    "longitude".to_string(),
+                    "latitude".to_string(),
+                    "median_income".to_string(),
+                ],
+                "o.parquet",
+                Some(30),
+                Some(0.25),
+                Some("cosine"),
+            ),
+            vec![
+                "--input",
+                "h.parquet",
+                "--column",
+                "longitude",
+                "--column",
+                "latitude",
+                "--column",
+                "median_income",
+                "--out",
+                "o.parquet",
+                "--neighbors",
+                "30",
+                "--min-dist",
+                "0.25",
+                "--metric",
+                "cosine",
+            ],
+        );
+    }
+
+    /// What is handed to `uv`, decided without spawning it: the frozen script is
+    /// materialised, it is named first, and the bytes on disk are the bytes `@1`
+    /// addresses. This is the half of `run` a machine with no `uv` can still check —
+    /// and every CI runner here is one.
+    #[test]
+    fn umap_project_invocation_materialises_the_frozen_script_and_names_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let with: Value = serde_yaml::from_str(
+            "input: build/homes.parquet\ncolumns: [longitude, latitude]\nout: build/mapped.parquet",
+        )
+        .unwrap();
+        let cfg = UmapProjectConfig::parse(&with).unwrap();
+        let args = umap_project_invocation(&cfg, tmp.path()).expect("a projection proceeds");
+
+        assert_eq!(args[0], "run");
+        assert_eq!(args[1], "--script");
+        let script = std::path::Path::new(&args[2]);
+        assert_eq!(
+            std::fs::read_to_string(script).unwrap(),
+            UMAP_PROJECT_PY,
+            "`op@1` addresses the embedded bytes: what lands on disk is what is \
+             compiled in, not a script found by path"
+        );
+        assert_eq!(
+            &args[3..],
+            [
+                "--input",
+                &tmp.path().join("build/homes.parquet").display().to_string(),
+                "--column",
+                "longitude",
+                "--column",
+                "latitude",
+                "--out",
+                &tmp.path()
+                    .join("build/mapped.parquet")
+                    .display()
+                    .to_string(),
+            ],
+            "every path reaches the script resolved against the protocol directory"
+        );
+        assert!(
+            tmp.path().join("build").is_dir(),
+            "the output's parent directory is created before the script is asked to \
+             write into it"
+        );
+    }
+
+    /// A setting outside its bounds stops the step, not just the manifest load. `run`
+    /// re-validates rather than trusting that `assets` was called first — nothing in
+    /// the trait says it was.
+    #[test]
+    fn umap_project_run_refuses_an_out_of_range_knob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+        let ctx = test_ctx(tmp.path(), &env);
+        let with: Value = serde_yaml::from_str(
+            "input: homes.parquet\ncolumns: [longitude]\nout: out.parquet\nneighbors: 1",
+        )
+        .unwrap();
+        let err = UmapProject
+            .run(&with, &ctx)
+            .expect_err("`neighbors: 1` cannot make a map and must stop the step");
+        assert!(
+            err.to_string().contains("below 2"),
+            "the refusal names the bound: {err}"
+        );
+    }
+
+    /// The script cache is where `?` earns its keep, and both of its failure paths are
+    /// driven here for real rather than reasoned about — for BOTH uv-run operators
+    /// this change adds, through `Operator::run` rather than through the invocation
+    /// helper directly.
+    ///
+    /// `materialize_frozen_script` fails two ways — the cache directory cannot be
+    /// created, or the script cannot be written inside it — and a `?` that folded
+    /// either into `PathBuf::default()` would hand `uv` an empty `--script` path.
+    /// That is not a quieter error: measured on 2026-08-24, `uv run --script ""` with
+    /// `current_dir` set to the Protocol directory runs `<protocol>/__main__.py` if one
+    /// exists and EXITS 0 — a failed step reported as a success, executing whatever is
+    /// in the Protocol directory, with no output written.
+    ///
+    /// THROUGH `run`, and per operator, because that is what the coverage is about.
+    /// The helper is shared, so one test over one operator's invocation function looks
+    /// like enough; it is not. Each operator has its own `?` on the helper and its own
+    /// `?` on the invocation call inside `run`, and the mutation gate rewrote three of
+    /// those four lines with the suite still green when this test drove only
+    /// `umap_project_invocation` directly. Reaching them means entering at `run`.
+    ///
+    /// IN A CHILD PROCESS, and that is the whole reason this test looks the way it
+    /// does. The cache path comes from `std::env::temp_dir()`, which reads `TMPDIR`;
+    /// `TMPDIR` is process-global and the suite is threaded, so setting it in-process
+    /// would reach every other test running at that moment. Re-executing this binary
+    /// with `TMPDIR` pointed at a booby-trapped directory is the isolation. If a trap
+    /// ever stops biting — because the cache path is spelled differently — the child's
+    /// `expect_err` fires and this goes red; it cannot go quietly green.
+    ///
+    /// Neither child reaches `uv`: the `?` short-circuits before the spawn, which is
+    /// why this runs on a CI machine that has none.
+    #[test]
+    fn a_script_cache_that_cannot_be_written_stops_the_step() {
+        // The child half: TMPDIR is already trapped, so materialising must fail. Which
+        // operator to drive arrives in the same variable that marks this as the child.
+        if let Ok(which) = std::env::var("ARC_SCRIPT_CACHE_TRAP") {
+            let protocol = tempfile::tempdir().unwrap();
+            let env = HashMap::new();
+            let ctx = test_ctx(protocol.path(), &env);
+            let (err, cache_dir) = match which.as_str() {
+                "umap_project" => {
+                    let with: Value = serde_yaml::from_str(
+                        "input: homes.parquet\ncolumns: [longitude]\nout: out.parquet",
+                    )
+                    .unwrap();
+                    (
+                        UmapProject
+                            .run(&with, &ctx)
+                            .expect_err("a script cache that cannot be written must stop the step"),
+                        UMAP_PROJECT_CACHE_DIR,
+                    )
+                }
+                "text_embed" => {
+                    // The model check runs BEFORE the script is materialised, so it has
+                    // to pass or the refusal under test is never reached.
+                    let model = protocol.path().join("model");
+                    std::fs::create_dir_all(&model).unwrap();
+                    for part in MODEL_PARTS {
+                        std::fs::write(model.join(part), b"not a real model").unwrap();
+                    }
+                    let with: Value = serde_yaml::from_str(
+                        "input: corpus.parquet\ntext_column: description\nmodel: model\nout: out.parquet",
+                    )
+                    .unwrap();
+                    (
+                        TextEmbed
+                            .run(&with, &ctx)
+                            .expect_err("a script cache that cannot be written must stop the step"),
+                        TEXT_EMBED_CACHE_DIR,
+                    )
+                }
+                other => panic!("no operator called `{other}` to drive"),
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains(cache_dir),
+                "the refusal names the cache it could not write: {msg}"
+            );
+            return;
+        }
+
+        // The parent half: trap the cache two ways per operator and re-run this one
+        // test under each.
+        //
+        // `arcform-op-<name>-1.0.0` as a regular FILE blocks `create_dir_all`; as a
+        // directory holding a DIRECTORY called `<name>.py`, it lets the directory be
+        // created and blocks the write instead.
+        //
+        // `--exact` matches the test's FULL path, so the module prefix is not optional.
+        // Getting it wrong does not fail — libtest runs zero tests and exits 0 — which
+        // is why the assertion below reads what the child REPORTED and not only how it
+        // exited. A child that ran nothing is not a child that passed.
+        const CHILD: &str = "operator::tests::a_script_cache_that_cannot_be_written_stops_the_step";
+
+        for (operator, cache_dir, script) in [
+            ("umap_project", UMAP_PROJECT_CACHE_DIR, "umap_project.py"),
+            ("text_embed", TEXT_EMBED_CACHE_DIR, "text_embed.py"),
+        ] {
+            let block_the_directory = tempfile::tempdir().unwrap();
+            std::fs::write(block_the_directory.path().join(cache_dir), b"in the way").unwrap();
+
+            let block_the_write = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(block_the_write.path().join(cache_dir).join(script)).unwrap();
+
+            for trap in [block_the_directory.path(), block_the_write.path()] {
+                let out = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([CHILD, "--exact", "--nocapture"])
+                    .env("TMPDIR", trap)
+                    .env("ARC_SCRIPT_CACHE_TRAP", operator)
+                    .output()
+                    .expect("re-run this test binary");
+                let said = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert!(
+                    said.contains("1 passed"),
+                    "the child has to have RUN this test, not merely exited 0 — a filter \
+                     that matches nothing reports `0 passed` and exits 0. {operator} at \
+                     trap {}:\n{said}",
+                    trap.display(),
+                );
+                assert!(
+                    out.status.success(),
+                    "with {operator}'s script cache trapped at {}, materialising must \
+                     fail and the step must stop:\n{said}",
+                    trap.display(),
+                );
+            }
+        }
+    }
+
+    /// The reproducibility contract, read off the frozen bytes `op@1` addresses: the
+    /// seed is in the script, and the script consults no credential and imports no
+    /// HTTP client — so a run's cost is the machine it runs on.
+    #[test]
+    fn umap_project_script_pins_its_seed_and_reads_no_credentials() {
+        assert!(
+            UMAP_PROJECT_PY.contains("SEED = 42"),
+            "the seed is frozen into the script, not exposed in `with:`"
+        );
+        assert!(
+            UMAP_PROJECT_PY.contains("random_state=SEED"),
+            "the seed has to reach the projection, or two runs diverge"
+        );
+        for forbidden in [
+            "os.getenv",
+            "environ.get",
+            "import requests",
+            "import urllib",
+            "import httpx",
+            "import socket",
+        ] {
+            assert!(
+                !UMAP_PROJECT_PY.contains(forbidden),
+                "umap_project.py must not carry `{forbidden}`: the step reads no key \
+                 and opens no socket"
+            );
+        }
+    }
+
+    // ── text_embed ───────────────────────────────────────────────────────────
 
     /// The model is an INPUT, recorded beside the corpus rather than fetched — this
     /// is what puts the Protocol's dependency on a specific model into the graph.
     /// Directory kind, so staleness hashes its contents: swap the model and the
-    /// projection re-runs rather than leaving a map built by a different one.
+    /// embedding re-runs rather than leaving vectors from a different one.
     #[test]
-    fn embed_project_declares_the_model_as_a_read_beside_the_corpus() {
+    fn text_embed_declares_the_model_as_a_read_beside_the_corpus() {
         let with: Value = serde_yaml::from_str(
-            "input: build/corpus.parquet\ntext_column: description\nmodel: models/potion\nout: build/mapped.parquet",
+            "input: build/corpus.parquet\ntext_column: description\nmodel: models/potion\nout: build/embedded.parquet",
         )
         .unwrap();
-        let assets = assets_for("embed_project", Some(&with)).unwrap();
+        let assets = assets_for("text_embed", Some(&with)).unwrap();
         assert_eq!(assets.reads, vec!["build/corpus.parquet", "models/potion"]);
-        assert_eq!(assets.produces, vec!["build/mapped.parquet"]);
+        assert_eq!(assets.produces, vec!["build/embedded.parquet"]);
         assert_eq!(
             assets.kinds.get("models/potion"),
             Some(&crate::asset_kind::AssetKind::Directory),
@@ -3282,13 +3969,13 @@ mod tests {
             Some(&crate::asset_kind::AssetKind::File)
         );
         assert_eq!(
-            assets.kinds.get("build/mapped.parquet"),
+            assets.kinds.get("build/embedded.parquet"),
             Some(&crate::asset_kind::AssetKind::File)
         );
     }
 
     #[test]
-    fn embed_project_rejects_bad_config() {
+    fn text_embed_rejects_bad_config() {
         for missing in [
             "text_column: t\nmodel: m\nout: o",
             "input: i\nmodel: m\nout: o",
@@ -3297,49 +3984,43 @@ mod tests {
         ] {
             let with: Value = serde_yaml::from_str(missing).unwrap();
             assert!(
-                assets_for("embed_project", Some(&with)).is_err(),
+                assets_for("text_embed", Some(&with)).is_err(),
                 "a `with:` block missing a required field must not load: {missing}"
             );
         }
         let bogus: Value =
             serde_yaml::from_str("input: i\ntext_column: t\nmodel: m\nout: o\nbogus: 1").unwrap();
-        assert!(assets_for("embed_project", Some(&bogus)).is_err());
+        assert!(assets_for("text_embed", Some(&bogus)).is_err());
     }
 
-    /// Both knobs are refused at manifest load rather than an hour into a run.
+    /// `vector_column:` names the column the vectors land in, so a blank one names
+    /// nothing. Refused at load rather than by DuckDB's parser inside the script.
     #[test]
-    fn embed_project_refuses_a_knob_that_cannot_make_a_map() {
+    fn text_embed_refuses_a_vector_column_that_is_not_a_name() {
         let base = "input: i\ntext_column: t\nmodel: m\nout: o\n";
-        for (extra, expected) in [
-            ("neighbors: 1", "below 2"),
-            ("neighbors: 0", "below 2"),
-            ("min_dist: 1.0", "outside [0, 1)"),
-            ("min_dist: -0.1", "outside [0, 1)"),
-        ] {
-            let with: Value = serde_yaml::from_str(&format!("{base}{extra}")).unwrap();
-            let err = assets_for("embed_project", Some(&with))
-                .expect_err(&format!("`{extra}` must be refused at load"));
+        for blank in ["vector_column: \"\"", "vector_column: \"   \""] {
+            let with: Value = serde_yaml::from_str(&format!("{base}{blank}")).unwrap();
+            let err = assets_for("text_embed", Some(&with))
+                .expect_err(&format!("`{blank}` names no column and must be refused"));
             assert!(
-                err.to_string().contains(expected),
-                "`{extra}` must be refused naming the bound, got: {err}"
+                err.to_string().contains("is blank"),
+                "the refusal says what is wrong with it: {err}"
             );
         }
-        // The edges that ARE usable must still load.
-        for extra in ["neighbors: 2", "min_dist: 0.0", "min_dist: 0.999", ""] {
-            let with: Value = serde_yaml::from_str(&format!("{base}{extra}")).unwrap();
-            assert!(
-                assets_for("embed_project", Some(&with)).is_ok(),
-                "`{extra}` is a usable setting and must load"
-            );
-        }
+        let named: Value =
+            serde_yaml::from_str(&format!("{base}vector_column: title_vector")).unwrap();
+        assert!(
+            assets_for("text_embed", Some(&named)).is_ok(),
+            "a named vector column is the point of the field and must load"
+        );
     }
 
-    /// Unset knobs are OMITTED from the argv entirely, so the frozen script's own
-    /// defaults stay the single place they are written down.
+    /// An unset `vector_column` is OMITTED from the argv entirely, so the frozen
+    /// script's own default stays the single place it is written down.
     #[test]
-    fn embed_project_args_omit_the_knobs_the_manifest_did_not_set() {
+    fn text_embed_args_omit_the_vector_column_the_manifest_did_not_set() {
         assert_eq!(
-            embed_project_args("c.parquet", "description", "m", "o.parquet", None, None),
+            text_embed_args("c.parquet", "description", "m", "o.parquet", None),
             vec![
                 "--input",
                 "c.parquet",
@@ -3354,15 +4035,14 @@ mod tests {
     }
 
     #[test]
-    fn embed_project_args_pass_the_knobs_through() {
+    fn text_embed_args_pass_the_vector_column_through() {
         assert_eq!(
-            embed_project_args(
+            text_embed_args(
                 "c.parquet",
                 "description",
                 "m",
                 "o.parquet",
-                Some(30),
-                Some(0.25)
+                Some("title_vector")
             ),
             vec![
                 "--input",
@@ -3373,10 +4053,8 @@ mod tests {
                 "m",
                 "--out",
                 "o.parquet",
-                "--neighbors",
-                "30",
-                "--min-dist",
-                "0.25"
+                "--vector-column",
+                "title_vector"
             ],
         );
     }
@@ -3429,18 +4107,18 @@ mod tests {
         );
     }
 
-    /// AC2's second half, without a `uv` on PATH: the step refuses on the missing
-    /// input and never gets as far as anything that could be mistaken for a fetch.
+    /// Without a `uv` on PATH: the step refuses on the missing model and never gets as
+    /// far as anything that could be mistaken for a fetch.
     #[test]
-    fn embed_project_refuses_a_missing_model_before_it_spawns_uv() {
+    fn text_embed_refuses_a_missing_model_before_it_spawns_uv() {
         let tmp = tempfile::tempdir().unwrap();
         let env = HashMap::new();
         let ctx = test_ctx(tmp.path(), &env);
         let with: Value = serde_yaml::from_str(
-            "input: corpus.parquet\ntext_column: description\nmodel: models/potion\nout: build/mapped.parquet",
+            "input: corpus.parquet\ntext_column: description\nmodel: models/potion\nout: build/embedded.parquet",
         )
         .unwrap();
-        let err = EmbedProject
+        let err = TextEmbed
             .run(&with, &ctx)
             .expect_err("a model that is not on disk must stop the step");
         assert!(
@@ -3459,33 +4137,10 @@ mod tests {
         );
     }
 
-    /// A knob outside its bounds stops the step, not just the manifest load. `run`
-    /// re-validates rather than trusting that `assets` was called first — nothing in
-    /// the trait says it was.
+    /// What is handed to `uv`, decided without spawning it — the same check the
+    /// projection gets, for the same reason.
     #[test]
-    fn embed_project_run_refuses_an_out_of_range_knob() {
-        let tmp = tempfile::tempdir().unwrap();
-        let env = HashMap::new();
-        let ctx = test_ctx(tmp.path(), &env);
-        let with: Value = serde_yaml::from_str(
-            "input: corpus.parquet\ntext_column: description\nmodel: model\nout: out.parquet\nneighbors: 1",
-        )
-        .unwrap();
-        let err = EmbedProject
-            .run(&with, &ctx)
-            .expect_err("`neighbors: 1` cannot make a map and must stop the step");
-        assert!(
-            err.to_string().contains("below 2"),
-            "the refusal names the bound: {err}"
-        );
-    }
-
-    /// What is handed to `uv`, decided without spawning it: the frozen script is
-    /// materialised, it is named first, and the bytes on disk are the bytes `@1`
-    /// addresses. This is the half of `run` a machine with no `uv` can still check —
-    /// and every CI runner here is one.
-    #[test]
-    fn embed_project_invocation_materialises_the_frozen_script_and_names_it() {
+    fn text_embed_invocation_materialises_the_frozen_script_and_names_it() {
         let tmp = tempfile::tempdir().unwrap();
         let model = tmp.path().join("models/potion");
         std::fs::create_dir_all(&model).unwrap();
@@ -3493,18 +4148,18 @@ mod tests {
             std::fs::write(model.join(part), b"not a real model").unwrap();
         }
         let with: Value = serde_yaml::from_str(
-            "input: build/corpus.parquet\ntext_column: description\nmodel: models/potion\nout: build/mapped.parquet",
+            "input: build/corpus.parquet\ntext_column: description\nmodel: models/potion\nout: build/embedded.parquet",
         )
         .unwrap();
-        let cfg = EmbedProjectConfig::parse(&with).unwrap();
-        let args = embed_project_invocation(&cfg, tmp.path()).expect("a complete model proceeds");
+        let cfg = TextEmbedConfig::parse(&with).unwrap();
+        let args = text_embed_invocation(&cfg, tmp.path()).expect("a complete model proceeds");
 
         assert_eq!(args[0], "run");
         assert_eq!(args[1], "--script");
         let script = std::path::Path::new(&args[2]);
         assert_eq!(
             std::fs::read_to_string(script).unwrap(),
-            EMBED_PROJECT_PY,
+            TEXT_EMBED_PY,
             "`op@1` addresses the embedded bytes: what lands on disk is what is \
              compiled in, not a script found by path"
         );
@@ -3522,130 +4177,18 @@ mod tests {
                 &model.display().to_string(),
                 "--out",
                 &tmp.path()
-                    .join("build/mapped.parquet")
+                    .join("build/embedded.parquet")
                     .display()
                     .to_string(),
             ],
             "every path reaches the script resolved against the protocol directory"
         );
-        assert!(
-            tmp.path().join("build").is_dir(),
-            "the output's parent directory is created before the script is asked to \
-             write into it"
-        );
     }
 
-    /// The script cache is where `?` earns its keep, and both of its failure paths are
-    /// driven here for real rather than reasoned about.
-    ///
-    /// `materialize_frozen_script` fails two ways — the cache directory cannot be
-    /// created, or the script cannot be written inside it — and a `?` that folded
-    /// either into `PathBuf::default()` would hand `uv` an empty `--script` path.
-    /// That is not a quieter error: measured on 2026-08-24, `uv run --script ""` with
-    /// `current_dir` set to the Protocol directory runs `<protocol>/__main__.py` if one
-    /// exists and EXITS 0 — a failed step reported as a success, executing whatever is
-    /// in the Protocol directory, with no projection written.
-    ///
-    /// IN A CHILD PROCESS, and that is the whole reason this test looks the way it
-    /// does. The cache path comes from `std::env::temp_dir()`, which reads `TMPDIR`;
-    /// `TMPDIR` is process-global and the suite is threaded, so setting it in-process
-    /// would reach every other test running at that moment. Re-executing this binary
-    /// with `TMPDIR` pointed at a booby-trapped directory is the isolation. If the
-    /// trap ever stops biting — because the cache path is spelled differently — the
-    /// child's `expect_err` fires and this goes red; it cannot go quietly green.
+    /// The step reads no credential and opens no socket — the same scan the
+    /// projection gets, over the bytes `op@1` addresses.
     #[test]
-    fn embed_project_invocation_reports_a_script_cache_it_cannot_write() {
-        // The child half: TMPDIR is already trapped, so materialising must fail.
-        if std::env::var("ARC_EMBED_PROJECT_CACHE_TRAP").is_ok() {
-            let protocol = tempfile::tempdir().unwrap();
-            let model = protocol.path().join("model");
-            std::fs::create_dir_all(&model).unwrap();
-            for part in MODEL_PARTS {
-                std::fs::write(model.join(part), b"not a real model").unwrap();
-            }
-            let with: Value = serde_yaml::from_str(
-                "input: corpus.parquet\ntext_column: description\nmodel: model\nout: out.parquet",
-            )
-            .unwrap();
-            let cfg = EmbedProjectConfig::parse(&with).unwrap();
-            let err = embed_project_invocation(&cfg, protocol.path())
-                .expect_err("a script cache that cannot be written must stop the step");
-            let msg = err.to_string();
-            assert!(
-                msg.contains(SCRIPT_CACHE_DIR),
-                "the refusal names the cache it could not write: {msg}"
-            );
-            return;
-        }
-
-        // The parent half: trap the cache two ways and re-run this one test under each.
-        //
-        // `arcform-op-embed_project-1.0.0` as a regular FILE blocks `create_dir_all`;
-        // as a directory holding a DIRECTORY called `embed_project.py`, it lets the
-        // directory be created and blocks the write instead.
-        let block_the_directory = tempfile::tempdir().unwrap();
-        std::fs::write(
-            block_the_directory.path().join(SCRIPT_CACHE_DIR),
-            b"in the way",
-        )
-        .unwrap();
-
-        let block_the_write = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(
-            block_the_write
-                .path()
-                .join(SCRIPT_CACHE_DIR)
-                .join("embed_project.py"),
-        )
-        .unwrap();
-
-        // `--exact` matches the test's FULL path, so the module prefix is not optional.
-        // Getting it wrong does not fail — libtest runs zero tests and exits 0 — which
-        // is why the assertion below reads what the child REPORTED and not only how it
-        // exited. A child that ran nothing is not a child that passed.
-        const CHILD: &str =
-            "operator::tests::embed_project_invocation_reports_a_script_cache_it_cannot_write";
-
-        for trap in [block_the_directory.path(), block_the_write.path()] {
-            let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([CHILD, "--exact", "--nocapture"])
-                .env("TMPDIR", trap)
-                .env("ARC_EMBED_PROJECT_CACHE_TRAP", "1")
-                .output()
-                .expect("re-run this test binary");
-            let said = format!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            assert!(
-                said.contains("1 passed"),
-                "the child has to have RUN this test, not merely exited 0 — a filter \
-                 that matches nothing reports `0 passed` and exits 0. Trap {}:\n{said}",
-                trap.display(),
-            );
-            assert!(
-                out.status.success(),
-                "with the script cache trapped at {}, materialising must fail and the \
-                 step must stop:\n{said}",
-                trap.display(),
-            );
-        }
-    }
-
-    /// The reproducibility contract, read off the frozen bytes `op@1` addresses: the
-    /// seed is in the script, and the script consults no credential and imports no
-    /// HTTP client — so a run's cost is the machine it runs on.
-    #[test]
-    fn embed_project_script_pins_its_seed_and_reads_no_credentials() {
-        assert!(
-            EMBED_PROJECT_PY.contains("SEED = 42"),
-            "the seed is frozen into the script, not exposed in `with:`"
-        );
-        assert!(
-            EMBED_PROJECT_PY.contains("random_state=SEED"),
-            "the seed has to reach the projection, or two runs diverge"
-        );
+    fn text_embed_script_reads_no_credentials() {
         for forbidden in [
             "os.getenv",
             "environ.get",
@@ -3656,11 +4199,49 @@ mod tests {
             "import socket",
         ] {
             assert!(
-                !EMBED_PROJECT_PY.contains(forbidden),
-                "embed_project.py must not carry `{forbidden}`: the step reads no key \
+                !TEXT_EMBED_PY.contains(forbidden),
+                "text_embed.py must not carry `{forbidden}`: the step reads no key \
                  and opens no socket"
             );
         }
+    }
+
+    /// This operator is a stopgap and its own source has to say so, naming where the
+    /// capability is going — otherwise the next person to read it hardens a temporary
+    /// arrangement, which is how a second implementation of one capability becomes
+    /// permanent.
+    ///
+    /// A string assertion, deliberately: the thing being pinned IS text, and deleting
+    /// the notice while keeping the operator is exactly the change this has to catch.
+    ///
+    /// SCOPED TO THE OPENING OF THE DOCSTRING, not to the file, and that is the whole
+    /// difference between this test and a test that cannot fail. An assertion over the
+    /// whole file was GREEN with the notice deleted — measured 2026-08-24 by deleting
+    /// it — because `DuckDB extension` also occurs further down, in the paragraph
+    /// about the implementation order that the notice happens to sit above. What is
+    /// asserted here is that a reader opening this file meets the warning before
+    /// anything else, which is the only form of it that does any work.
+    #[test]
+    fn text_embed_marks_itself_provisional_and_names_where_it_is_going() {
+        let docstring = TEXT_EMBED_PY
+            .split("\"\"\"")
+            .nth(1)
+            .expect("text_embed.py opens with a module docstring");
+        let notice = docstring.lines().take(8).collect::<Vec<_>>().join("\n");
+        assert!(
+            notice.contains("PROVISIONAL"),
+            "text_embed.py must open by announcing that it is a stopgap:\n{notice}"
+        );
+        assert!(
+            notice.contains("DuckDB embedding extension"),
+            "the notice must name the DuckDB embedding extension as where this \
+             capability is going, not merely say it is temporary:\n{notice}"
+        );
+        assert!(
+            notice.contains("DELETED"),
+            "the notice must say the operator goes away rather than being ported:\n\
+             {notice}"
+        );
     }
 
     // ── finetype_validate ───────────────────────────────────────────────────
