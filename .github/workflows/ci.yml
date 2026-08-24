@@ -53,6 +53,13 @@ jobs:
       # line of that script is invisible to CI.
       - name: umap_project tests
         run: python3 operators/umap_project/test_umap_project.py
+      # Stdlib-only, same reason as the step above: results.json is committed, and
+      # nothing else re-checks that operators/umap_project/README.md and
+      # CHANGELOG.md still say what it says. Without this, a re-run of
+      # eval/map-refit-stability/measure.py that changes results.json and a prose
+      # edit that does not both look clean.
+      - name: map-refit-stability findings match results.json
+        run: python3 eval/map-refit-stability/check_findings.py
 
   # Clippy and the test suite both compile the crate against system DuckDB, so
   # they share a job that provisions the library once.

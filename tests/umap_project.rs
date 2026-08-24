@@ -379,6 +379,57 @@ fn projection_fit_id_agrees_with_an_identical_refit_and_moves_with_a_different_o
     );
 }
 
+/// The previous test moves the fit by changing the SHAPE of the feature matrix
+/// (fewer columns). That leaves an id built from `matrix.shape` — row count and
+/// feature count — rather than from `matrix.tobytes()` — the actual numbers —
+/// completely unable to tell the difference, and every other test in this file
+/// projects either the same values or a different column set, so none of them
+/// would have caught that either. This one holds row count AND feature count fixed
+/// and edits a single existing value, so only a fingerprint over the actual VALUES
+/// can move.
+#[test]
+fn projection_fit_id_moves_when_a_value_changes_with_the_shape_held_fixed() {
+    if !have_uv() {
+        eprintln!("skipping projection_fit_id_moves_when_a_value_changes: no `uv` on PATH");
+        return;
+    }
+    let tmp = staged_protocol();
+    let project = tmp.path();
+
+    common::arc_run(project);
+    let out = projected(project);
+    let first_id = fit_id_of(&out);
+    let first_rows = placed(&out).len();
+
+    let homes_csv = project.join("homes.csv");
+    let original = std::fs::read_to_string(&homes_csv).unwrap();
+    assert_eq!(
+        original.matches("7.20").count(),
+        1,
+        "the value this test perturbs must appear exactly once in the fixture, or \
+         the replacement below is ambiguous"
+    );
+    let mutated = original.replacen("7.20", "7.21", 1);
+    std::fs::write(&homes_csv, &mutated).unwrap();
+
+    clear_cache(project);
+    common::arc_run(project);
+    let second_out = projected(project);
+    assert_eq!(
+        placed(&second_out).len(),
+        first_rows,
+        "the row count must be unchanged — this test isolates a value edit from a \
+         shape change, and a row count that moved would mean it tested the wrong thing"
+    );
+    assert_ne!(
+        fit_id_of(&second_out),
+        first_id,
+        "one numeric value changed with row count and column count both held fixed — \
+         a fit_id built from the matrix's shape rather than its values would not move \
+         here, and that is exactly the gap this test closes"
+    );
+}
+
 /// The three documented knobs change the MAP, not just the command line.
 ///
 /// `umap_project_args_pass_every_column_and_knob_through` asserts that `neighbors:`,

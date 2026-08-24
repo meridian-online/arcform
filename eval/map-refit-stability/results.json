@@ -1,6 +1,7 @@
 {
-  "corpus": "examples/brewtrend/data/ranking.parquet",
-  "corpus_rows_available": 13332,
+  "corpus": "eval/map-refit-stability/corpus.parquet",
+  "corpus_provenance": "frozen 2026-08-24 from examples/brewtrend/data/ranking.parquet (gitignored, rebuilt from live rolling Homebrew analytics) \u2014 see the CORPUS section of this file's docstring for the exact query",
+  "corpus_rows_committed": 4500,
   "base_n": 3000,
   "append_fractions": {
     "append_05": 0.05,
@@ -57,5 +58,5 @@
       "knn_overlap_median": 0.3
     }
   },
-  "runtime_seconds": 344.7
+  "runtime_seconds": 336.3
 }

@@ -2806,7 +2806,8 @@ struct UmapProjectConfig {
     /// load-time one — the manifest cannot know the schema.
     columns: Vec<String>,
     /// Parquet to write: every input column, plus `projection_x` and `projection_y`
-    /// as DOUBLE (the `produces` asset). Resolved against ctx.dir.
+    /// as DOUBLE and `projection_fit_id` as VARCHAR (the `produces` asset). Resolved
+    /// against ctx.dir.
     out: String,
     /// UMAP's `n_neighbors` — how much of the input each point is placed against.
     /// Low reads local structure, high reads global. OMITTED from the argv when

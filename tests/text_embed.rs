@@ -228,6 +228,7 @@ fn the_route_from_a_text_column_to_coordinates_still_works() {
             ("embedding".to_string(), "FLOAT[]".to_string()),
             ("projection_x".to_string(), "DOUBLE".to_string()),
             ("projection_y".to_string(), "DOUBLE".to_string()),
+            ("projection_fit_id".to_string(), "VARCHAR".to_string()),
         ],
         "the coordinates arrive beside the vectors rather than instead of them — the \
          analyst who wanted both keeps both"

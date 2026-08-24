@@ -7,19 +7,32 @@
 # ///
 """measure.py — how far umap_project's map moves when rows are appended and refit.
 
-Answers AC1 of "the map reshuffles when rows are added": the projection has no
-out-of-sample transform, so appending rows means refitting the whole map, and a refit
-moves every point. Nobody had measured how much. This does, against a real corpus,
-through the shipped operators (`text_embed@1` then `umap_project@1`) rather than a
-reimplementation of either.
+The projection has no out-of-sample transform, so appending rows means refitting the
+whole map, and a refit moves every point. Nobody had measured how much. This does,
+against a real corpus, through the shipped operators (`text_embed@1` then
+`umap_project@1`) rather than a reimplementation of either.
 
-CORPUS. `examples/brewtrend/data/ranking.parquet` — this repository's own reference
-Protocol output, real Homebrew package descriptions (13,332 rows with a non-empty
-`description` after filtering; committed, not fetched). Rows are ordered by `name`
-(the corpus's own unique key) for a deterministic, non-cherry-picked split: the first
-BASE_N become the "existing" map, and the next rows in that same order become the
-appended rows, so append fraction f draws its rows from the same pool for every f up
-to the largest.
+CORPUS. `corpus.parquet` beside this script — 4,500 rows (`name`, `category`,
+`description`), COMMITTED, so a clean checkout can re-derive every number below
+without touching anything else. It is a frozen, deterministic slice: rows of
+`examples/brewtrend/data/ranking.parquet` with a non-empty `description`, ordered by
+`name` (the corpus's own unique key), first 4,500. That source file is NOT read here
+and could not be — `examples/brewtrend/data/` is gitignored, and even where present is
+rebuilt from six unpinned `curl` fetches of live, rolling 30/90-day Homebrew analytics
+(`examples/brewtrend/arcform.yaml`), so it is a moving snapshot rather than a fixed
+corpus. `corpus.parquet` was taken from it on 2026-08-24 with:
+
+    COPY (SELECT name, category, description
+          FROM read_parquet('examples/brewtrend/data/ranking.parquet')
+          WHERE description IS NOT NULL AND length(trim(description)) > 0
+          ORDER BY name LIMIT 4500)
+    TO 'eval/map-refit-stability/corpus.parquet' (FORMAT parquet)
+
+Re-running that query today will not reproduce `corpus.parquet` byte-for-byte — the
+source has moved on — which is exactly why the slice is frozen here instead of
+re-read. BASE_N of its rows become the "existing" map, and the next rows in the same
+order become the appended rows, so append fraction f draws its rows from the same
+pool for every f up to the largest.
 
 MODEL. `minishlab/potion-base-8M`, fetched into `.cache/` beside this script on first
 run (gitignored — the harness re-derives it rather than shipping 28.8 MB of weights
@@ -84,7 +97,7 @@ REPO = HERE.parent.parent
 CACHE = HERE / ".cache"
 BUILD = HERE / "build"
 MODEL_DIR = CACHE / "potion-base-8M"
-CORPUS = REPO / "examples" / "brewtrend" / "data" / "ranking.parquet"
+CORPUS = HERE / "corpus.parquet"  # committed — see the CORPUS section above
 TEXT_EMBED = REPO / "operators" / "text_embed" / "text_embed.py"
 UMAP_PROJECT = REPO / "operators" / "umap_project" / "umap_project.py"
 
@@ -260,10 +273,14 @@ def main() -> int:
 
     results = {
         "corpus": str(CORPUS.relative_to(REPO)),
-        "corpus_rows_available": int(
+        "corpus_provenance": (
+            "frozen 2026-08-24 from examples/brewtrend/data/ranking.parquet "
+            "(gitignored, rebuilt from live rolling Homebrew analytics) — see the "
+            "CORPUS section of this file's docstring for the exact query"
+        ),
+        "corpus_rows_committed": int(
             con.execute(
-                f"SELECT count(*) FROM read_parquet('{CORPUS.as_posix()}') "
-                f"WHERE description IS NOT NULL AND length(trim(description)) > 0"
+                f"SELECT count(*) FROM read_parquet('{CORPUS.as_posix()}')"
             ).fetchone()[0]
         ),
         "base_n": BASE_N,

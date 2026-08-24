@@ -104,17 +104,21 @@ X_COL = "projection_x"
 Y_COL = "projection_y"
 
 # A refit moves every point — there is no out-of-sample transform, so appending rows
-# means re-fitting the whole map (see the-map-reshuffles-when-rows-are-added). What an
-# analyst CAN tell from the file alone is whether two projections were fit on the same
-# footing: FIT_ID_COL carries a hash of the exact feature matrix this run fed to UMAP
-# together with the knobs that shaped the fit (n_neighbors, min_dist, metric, seed),
-# broadcast to every row. Two files with the same id were fit on byte-identical input
-# under byte-identical settings and — given the pinned seed, thread count and row
-# order documented above — are byte-identical themselves; a different id means either
-# the data or a knob changed and no position in the file may be compared
-# position-for-position against an older one. It answers "did the layout change", not
-# "did a particular row's data change" — that second question is answerable from the
-# row's own columns without this operator's help.
+# means re-fitting the whole map. What an analyst CAN tell from the file alone is
+# whether two projections were ASKED the same question: FIT_ID_COL carries a hash of
+# the exact feature matrix this run fed to UMAP together with the knobs that shaped
+# the fit (n_neighbors, min_dist, metric, seed), broadcast to every row. A DIFFERENT
+# id means the data or a knob changed, and no position in the file may be compared
+# position-for-position against an older one — that direction is the whole guarantee.
+# The converse does NOT hold: a MATCHING id means the same question was asked, not
+# that the same answer came back. This operator's dependency resolve is not pinned
+# (see "Does byte-identity survive a dependency upgrade?" above), so two machines — or
+# the same machine after `uv` re-resolves umap-learn, numba or DuckDB — can share a
+# fit_id and still emit different coordinates. Only on one pinned environment does a
+# matching id also mean byte-identical output, and that is the existing determinism
+# claim, not a new one this column makes. It answers "did the layout change", not "did
+# a particular row's data change" — that second question is answerable from the row's
+# own columns without this operator's help.
 FIT_ID_COL = "projection_fit_id"
 
 DEFAULT_NEIGHBORS = 15

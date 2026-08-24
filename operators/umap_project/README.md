@@ -153,20 +153,26 @@ not just the new ones. An analyst who appends rows and reruns cannot tell, from 
 map alone, whether the picture changed because the data did or because the layout was
 refit around it.
 
-**How much, measured 2026-08-24 against a real corpus, is `eval/map-refit-stability/`
+**How much, measured 2026-08-24, is `eval/map-refit-stability/`
 in this repository — `uv run eval/map-refit-stability/measure.py`, committed output in
-`results.json`.** 3,000 rows of Homebrew package descriptions
-(`examples/brewtrend/data/ranking.parquet`, 13,332 usable rows total, split
-deterministically by name so nothing is cherry-picked), embedded with
+`results.json`.** 3,000 rows of Homebrew package descriptions, embedded with
 `minishlab/potion-base-8M` through this operator's own sibling `text_embed@1`, then
-projected through this operator itself — no reimplementation of either. Two measures,
-because either alone misleads: raw+normalised displacement of a row's (x, y) between
-fits (UMAP's frame is arbitrary up to rotation/scale between independent fits, and
-that arbitrariness is itself part of what an analyst sees as "the map turned", so it
-is deliberately not aligned away), and the fraction of a row's 20 nearest *other*
-existing rows shared between the two fits — which isolates whether the refit
-rearranged the analyst's existing reading, as opposed to new rows simply now being
-nearby, which is expected.
+projected through this operator itself — no reimplementation of either. The corpus is
+`eval/map-refit-stability/corpus.parquet`, COMMITTED (not `examples/brewtrend`'s own
+output, which is gitignored and rebuilt from live, rolling analytics on every `arc
+run` — a moving snapshot that would silently change these numbers): a frozen,
+deterministic 4,500-row slice, ordered by `name` so nothing is cherry-picked, of which
+the first 3,000 are the "existing" map and the next rows are the appended ones. See
+`measure.py`'s own docstring for the exact query that produced it, and re-run the
+harness rather than trusting this table — that is what re-derivable means.
+
+Two measures, because either alone misleads: raw+normalised displacement of a row's
+(x, y) between fits (UMAP's frame is arbitrary up to rotation/scale between
+independent fits, and that arbitrariness is itself part of what an analyst sees as
+"the map turned", so it is deliberately not aligned away), and the fraction of a
+row's 20 nearest *other* existing rows shared between the two fits — which isolates
+whether the refit rearranged the analyst's existing reading, as opposed to new rows
+simply now being nearby, which is expected.
 
 The **no-new-rows control matters more than any other number here**: refitting the
 identical 3,000 rows from scratch, in a separate process, reproduces the prior run's
@@ -181,38 +187,57 @@ every other number below is read against, not zero.
 | 20% (600 rows) | 3,000 | 134× | 0.39 |
 | 50% (1,500 rows) | 3,000 | 268× | 0.35 |
 
-A modest, realistic append already destroys most of a point's visual neighbourhood:
-**a 5% append shares only 46% of a point's 20 nearest map-neighbours with the
-pre-append layout.** Read against a sibling measurement of how much neighbourhood
-structure survives *swapping the embedding model entirely* on a comparable text
-corpus, on the same kind of kNN-overlap scale (0.13 long-form, 0.28 short, 0.40
-very-short) — a 5% append already loses **more** structure than swapping models
-does on two of those three corpora, and every append fraction measured here loses more
-than the very-short-text case. Refitting on an ordinary append is not a small,
-forgivable jitter; it is the same order of disruption as changing the embedder.
+A modest, realistic append already destroys about half of a point's visual
+neighbourhood: **a 5% append shares only 46% of a point's 20 nearest map-neighbours
+with the pre-append layout**, and displacement grows from 38 to 268 times the map's
+own typical point spacing as the append grows — points do not drift, they land
+somewhere else on the map.
+
+Read against a sibling measurement of how much neighbourhood structure survives
+*swapping the embedding model entirely* on a comparable text corpus, on the same
+kind of kNN-overlap scale (0.13 long-form, 0.28 short, 0.40 very-short — higher is
+more retained): **the two disturbances are the same order of magnitude, not one
+uniformly worse than the other.** Ranked by how much structure survives, highest to
+lowest: 5% append (0.46) > swapping the embedder on very-short text (0.40) > 20%
+append (0.39) ≈ 50% append (0.35) > swapping the embedder on short text (0.28) >
+swapping the embedder on long-form text (0.13). A 5% append preserves *more*
+structure than any embedder swap measured; by 20%, an append has already lost
+slightly more than swapping the embedder does on its easiest (very-short-text) case,
+though every append fraction here still preserves more than swapping on short or
+long-form text. Refitting on an ordinary append is not a small, forgivable jitter —
+whether it is gentler or harsher than changing the embedder depends on the fraction
+and the corpus, but it sits in the same range.
 
 **The decision that follows: pin the layout, refit only on an explicit user
-action.** It needs no new mathematics inside this operator — arcform's own staleness
-model already means the projection step only re-runs when something asks it to — the
-gap is that nothing today tells a reader whether two projection outputs came from the
-same fit before they compare positions between them. This operator does not attempt
-the alternative of placing new rows approximately without a full refit (an
-out-of-sample transform): the measurement above establishes the problem is real before
-that heavier option would even be on the table, and the interface answer above is
-priced at effectively zero — implementing the transform is not, and is not undertaken
-here.
+action.** This does not rest on refitting being worse than an embedder swap — the
+corrected comparison above is a wash, not a verdict — it rests on the absolute
+numbers: even the smallest, most realistic append here loses over half of a point's
+neighbourhood, and displacement reaches into the hundreds of typical gaps by 50%. That
+is severe enough on its own that silently reshuffling on every append is a real cost
+to an analyst's reading. Pinning needs no new mathematics inside this operator —
+arcform's own staleness model already means the projection step only re-runs when
+something asks it to — the gap is that nothing today tells a reader whether two
+projection outputs came from the same fit before they compare positions between them.
+This operator does not attempt the alternative of placing new rows approximately
+without a full refit (an out-of-sample transform): the measurement above establishes
+the problem is real before that heavier option would even be on the table, and the
+interface answer above is priced at effectively zero — implementing the transform is
+not, and is not undertaken here.
 
 **Telling a refit from an append.** Every output row now carries `projection_fit_id` —
 a hash of the exact feature matrix and knobs (`neighbors`, `min_dist`, `metric`, seed)
-that fit consumed, the same value on every row. Two files with the same id were fit on
-byte-identical input under byte-identical settings and, given the determinism above,
-are byte-identical themselves; a different id means the fit's input or settings
-changed and no row's position may be compared position-for-position against an older
-file. That is the "is the surface telling me the layout changed or the data changed"
-question, answered from the file alone, without a UI change anywhere else — a
-downstream renderer (`brightfield`) that wants to hold a map still across an append and
-show it as stale rather than silently reshuffling reads this column; that surface work
-is not part of this operator and is not implemented here.
+that fit consumed, the same value on every row. A DIFFERENT id means the data or a
+knob changed, and no row's position may be compared position-for-position against an
+older file — that is the guarantee, and it is the whole answer AC3 needs: "is the
+surface telling me the layout changed or the data changed", from the file alone,
+without a UI change anywhere else. The converse does **not** hold: a MATCHING id
+means the same data and knobs were used, not that the coordinates are guaranteed
+identical — this operator's dependency resolve is not pinned (see "Does byte-identity
+survive a dependency upgrade?" above), so two machines, or the same machine after a
+resolve moves, can share a fit_id and still emit different coordinates. A downstream
+renderer (`brightfield`) that wants to hold a map still across an append and show it
+as stale rather than silently reshuffling reads this column; that surface work is not
+part of this operator and is not implemented here.
 
 ## Standalone
 

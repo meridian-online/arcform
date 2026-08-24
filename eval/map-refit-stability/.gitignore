@@ -1,4 +1,5 @@
-# Fetched model weights and intermediate Parquet slices — re-derived by measure.py,
-# not committed. results.json is the committed output.
+# Fetched model weights and intermediate per-experiment Parquet slices — re-derived
+# by measure.py, not committed. corpus.parquet (the frozen input), results.json (the
+# output) and check_findings.py are the committed files.
 .cache/
 build/
