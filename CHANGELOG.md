@@ -211,6 +211,44 @@ Rationale for each change is recorded in the project's design notes and commit h
 - **brewtrend reference pipeline** — the first complete runnable example under
   `examples/brewtrend/`, exercising command + SQL steps, preconditions, retries, and a runtime
   parameter; ships a Frictionless Data Package describing its output.
+- **`umap_project` writes `projection_fit_id`** (1.1.0). This operator persists
+  nothing between invocations, so appending rows and re-running today means the
+  whole map is refit and every point can move — measured at 3,000 real rows against
+  a frozen, committed corpus (`eval/map-refit-stability/`, re-derivable with `uv run
+  eval/map-refit-stability/measure.py`): a 5% append already shares only 46% of a
+  point's 20 nearest map-neighbours with the pre-append layout, growing to 39% at 20%
+  and 35% at 50%. That is the same order of magnitude as a sibling measurement (in a
+  different repository, its source not committed here, so this figure is context and
+  not one `check_findings.py` pins) of how much neighbourhood structure survives
+  swapping the embedding model entirely on a comparable corpus (0.13-0.40 depending on
+  text length) — neither disturbance is uniformly worse than the other; a 5% append
+  actually preserves more structure than any measured embedder swap, while a 20% or
+  50% append loses slightly more than swapping the embedder on its easiest case.
+  `umap-learn`'s `UMAP.transform()` — public, and verified by calling it
+  (`eval/map-refit-stability/price_transform.py`) — CAN place new rows into an
+  existing fit without moving the old ones (0.0 measured drift in the base rows'
+  own coordinates across every `.transform()` call), priced at a 3.6 MB persisted
+  model for a 3,000-row base. Placement fidelity is read against this corpus's own
+  ceiling, not against 1.0 or against the churn figure above, which is a different
+  quantity: scored against the 256-d embeddings as ground truth, a base row's own
+  fit recovers 30.5% of its true neighbourhood at k=20, a full refit places a new
+  row at 89-100% of the ceiling (30.4-27.3%, least close at the 50% append, where
+  the recommendation is most exposed), and `.transform()` places the same rows at
+  27.4-25.7% — 3 to 5 points under the ceiling, 1.0-3.0 points under the full refit
+  itself. Refitting only on an
+  explicit user action, by contrast, is not implementable in arcform today —
+  `compute_staleness` marks any step whose declared input changed stale
+  unconditionally, and no `arc run` flag can hold a hash-stale step un-run. See
+  `operators/umap_project/README.md`, "Appending rows moves the whole map," including
+  where the asymmetry argument for pinning stops being obvious. A DIFFERENT
+  `projection_fit_id` means a shared row's position must not be compared between two
+  files; it cannot today distinguish the data changing from the layout changing,
+  because every run is a full refit and those are the same event — a matching id
+  means the same data and knobs were used, not that the coordinates are guaranteed
+  identical (this operator's dependency resolve is not pinned — see "Does
+  byte-identity survive a dependency upgrade?" above). Persisting the fit and
+  discriminating the two is real design work of its own and is left to a separate
+  card.
 
 ### Changed
 

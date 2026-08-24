@@ -322,7 +322,7 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
             json!({
                 "input": { "type": "string", "description": "Parquet holding the columns to project." },
                 "columns": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "The numeric columns to reduce, in order. A numeric scalar contributes one feature; a list/array of numerics — a vector column — contributes one per element. There is no text column and no model: to map text, write a vector column from it first (text_embed, or the DuckDB embedding extension once it lands)." },
-                "out": { "type": "string", "description": "Parquet to write — every input column plus projection_x and projection_y as DOUBLE." },
+                "out": { "type": "string", "description": "Parquet to write — every input column plus projection_x and projection_y as DOUBLE, and projection_fit_id (VARCHAR, same value on every row) fingerprinting the exact numbers and knobs this fit consumed." },
                 "neighbors": { "type": "integer", "minimum": 2, "description": "UMAP n_neighbors: low reads local structure, high reads global. Defaults to the script's 15 when omitted." },
                 "min_dist": { "type": "number", "minimum": 0, "exclusiveMaximum": 1, "description": "UMAP min_dist: how tightly points may pack. Defaults to the script's 0.1 when omitted." },
                 "metric": { "type": "string", "enum": UMAP_METRICS, "description": "How the distance between two rows is measured. Defaults to the script's euclidean when omitted, which is the reading an arbitrary feature matrix wants; cosine is the reading an L2-normalised vector column wants. Nothing here scales your columns — under euclidean a wider-spread column dominates the layout, which is a decision for the SQL step that selects them." }
@@ -2736,7 +2736,14 @@ impl Operator for GleifRaFetch {
 // umap_project (transform) — reduce numeric columns that ALREADY EXIST to the two
 // coordinates a map is drawn from. Reads one Parquet, builds a feature matrix from
 // the named columns, reduces it to two dimensions with UMAP, and writes a Parquet
-// carrying every input column plus `projection_x` and `projection_y`.
+// carrying every input column plus `projection_x`, `projection_y` and
+// `projection_fit_id` — the last a fingerprint of the exact numbers and knobs one fit
+// consumed, broadcast to every row, so two files can be compared for "same fit" before
+// their positions are compared row for row. This operator persists nothing between
+// invocations, so appending rows means refitting the whole map and every position
+// can move, which is exactly what `projection_fit_id` differing between two files
+// says happened. See operators/umap_project/README.md, "Telling a refit from an
+// append."
 //
 // NO TEXT COLUMN AND NO MODEL, and that is the whole shape of it. `columns:` names
 // columns that are already numbers — a numeric scalar contributes one feature, a
@@ -2774,7 +2781,7 @@ const UMAP_PROJECT_PY: &str = include_str!("../operators/umap_project/umap_proje
 /// differently the trap stops biting, materialising succeeds, and the test goes RED on
 /// its own `expect_err`. It cannot drift quietly.
 #[cfg(test)]
-const UMAP_PROJECT_CACHE_DIR: &str = "arcform-op-umap_project-1.0.0";
+const UMAP_PROJECT_CACHE_DIR: &str = "arcform-op-umap_project-1.1.0";
 
 /// The metrics a manifest may ask for, and the single place they are written down:
 /// [`with_schema`] emits this array as the field's `enum`, so an authoring form and
@@ -2800,7 +2807,8 @@ struct UmapProjectConfig {
     /// load-time one — the manifest cannot know the schema.
     columns: Vec<String>,
     /// Parquet to write: every input column, plus `projection_x` and `projection_y`
-    /// as DOUBLE (the `produces` asset). Resolved against ctx.dir.
+    /// as DOUBLE and `projection_fit_id` as VARCHAR (the `produces` asset). Resolved
+    /// against ctx.dir.
     out: String,
     /// UMAP's `n_neighbors` — how much of the input each point is placed against.
     /// Low reads local structure, high reads global. OMITTED from the argv when
@@ -2919,8 +2927,13 @@ impl Operator for UmapProject {
         "umap_project"
     }
 
+    // 1.1.0, not 1.0.0: the script gained an output column (`projection_fit_id`), and
+    // `op@<version>` addressing exact bytes means a behaviour change is a version bump
+    // and a rebuild, never a silent edit (see `materialize_frozen_script`). Additive
+    // and backward compatible — every existing field, in the same order, is still
+    // there — so a minor bump; `@1` in a manifest still resolves it.
     fn version(&self) -> semver::Version {
-        semver::Version::new(1, 0, 0)
+        semver::Version::new(1, 1, 0)
     }
 
     fn assets(&self, with: &Value) -> Result<OpAssets> {
@@ -2957,7 +2970,7 @@ fn umap_project_invocation(cfg: &UmapProjectConfig, dir: &Path) -> Result<Vec<St
         let _ = std::fs::create_dir_all(parent);
     }
 
-    let script = materialize_frozen_script("umap_project", "1.0.0", UMAP_PROJECT_PY)?;
+    let script = materialize_frozen_script("umap_project", "1.1.0", UMAP_PROJECT_PY)?;
     let extra = umap_project_args(
         &input.display().to_string(),
         &cfg.columns,
@@ -3947,7 +3960,7 @@ mod tests {
     fn umap_project_is_in_catalog_and_versioned() {
         let op = resolve("umap_project@1").expect("umap_project is in the catalog");
         assert_eq!(op.name(), "umap_project");
-        assert_eq!(op.version(), semver::Version::new(1, 0, 0));
+        assert_eq!(op.version(), semver::Version::new(1, 1, 0));
         // No feature gate: a consumer built without `http-fetch` still resolves it.
         assert!(
             catalog().iter().any(|o| o.name() == "umap_project"),

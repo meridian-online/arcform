@@ -140,6 +140,19 @@ fn placed(parquet: &Path) -> Vec<(String, f64, f64)> {
     .collect()
 }
 
+/// The fit's own fingerprint — the same value on every row of one output (a separate
+/// test proves that), so reading the first row's is enough.
+fn fit_id_of(parquet: &Path) -> String {
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT projection_fit_id FROM read_parquet('{}') LIMIT 1",
+            parquet.display()
+        ))
+        .unwrap();
+    stmt.query_row([], |r| r.get::<_, String>(0)).unwrap()
+}
+
 /// THE CARD'S FIRST CRITERION, end to end. Columns that are already numbers become
 /// two coordinates, with no text column in the manifest and no model anywhere in the
 /// Protocol — and the coordinates carry the numbers' structure rather than being two
@@ -215,9 +228,10 @@ fn a_map_of_plain_numbers_needs_no_model_and_no_text_column() {
             ("rooms_per_household".to_string(), "DOUBLE".to_string()),
             ("projection_x".to_string(), "DOUBLE".to_string()),
             ("projection_y".to_string(), "DOUBLE".to_string()),
+            ("projection_fit_id".to_string(), "VARCHAR".to_string()),
         ],
         "every input column, in order — including the VARCHAR the projection did not \
-         name — then the two coordinates as floating point"
+         name — then the two coordinates as floating point, then the fit fingerprint"
     );
 
     let rows = placed(&out);
@@ -305,6 +319,117 @@ fn two_runs_from_a_cleared_cache_emit_byte_identical_parquet() {
     );
 }
 
+/// `projection_fit_id` is the file's own answer to "was this the same fit" — see
+/// operators/umap_project/README.md, "Telling a refit from an append". Broadcast to
+/// every row, so first: one value covers the whole file. Then: two runs over
+/// byte-identical input reproduce the identical id — it has to, given the determinism
+/// `two_runs_from_a_cleared_cache_emit_byte_identical_parquet` already proves — and a
+/// run over DIFFERENT columns of the same table carries a DIFFERENT id, because an id
+/// that could not move would tell a reader nothing about whether a refit happened.
+#[test]
+fn projection_fit_id_agrees_with_an_identical_refit_and_moves_with_a_different_one() {
+    if !have_uv() {
+        eprintln!("skipping projection_fit_id: no `uv` on PATH");
+        return;
+    }
+    let tmp = staged_protocol();
+    let project = tmp.path();
+
+    common::arc_run(project);
+    let out = projected(project);
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let distinct_ids: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT count(DISTINCT projection_fit_id) FROM read_parquet('{}')",
+                out.display()
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        distinct_ids, 1,
+        "one fit produces one id — every row of the same output must carry it"
+    );
+    let first_id = fit_id_of(&out);
+
+    clear_cache(project);
+    common::arc_run(project);
+    assert_eq!(
+        fit_id_of(&projected(project)),
+        first_id,
+        "refitting byte-identical input under byte-identical settings must reproduce \
+         the identical fit_id, not merely identical coordinates"
+    );
+
+    let manifest = project.join("arcform.yaml");
+    let rewritten = std::fs::read_to_string(&manifest).unwrap().replace(
+        "columns: [longitude, latitude, median_income, rooms_per_household]",
+        "columns: [longitude, latitude]",
+    );
+    std::fs::write(&manifest, rewritten).unwrap();
+    clear_cache(project);
+    common::arc_run(project);
+    assert_ne!(
+        fit_id_of(&projected(project)),
+        first_id,
+        "projecting different columns is a different fit and must carry a different \
+         fit_id"
+    );
+}
+
+/// The previous test moves the fit by changing the SHAPE of the feature matrix
+/// (fewer columns). That leaves an id built from `matrix.shape` — row count and
+/// feature count — rather than from `matrix.tobytes()` — the actual numbers —
+/// completely unable to tell the difference, and every other test in this file
+/// projects either the same values or a different column set, so none of them
+/// would have caught that either. This one holds row count AND feature count fixed
+/// and edits a single existing value, so only a fingerprint over the actual VALUES
+/// can move.
+#[test]
+fn projection_fit_id_moves_when_a_value_changes_with_the_shape_held_fixed() {
+    if !have_uv() {
+        eprintln!("skipping projection_fit_id_moves_when_a_value_changes: no `uv` on PATH");
+        return;
+    }
+    let tmp = staged_protocol();
+    let project = tmp.path();
+
+    common::arc_run(project);
+    let out = projected(project);
+    let first_id = fit_id_of(&out);
+    let first_rows = placed(&out).len();
+
+    let homes_csv = project.join("homes.csv");
+    let original = std::fs::read_to_string(&homes_csv).unwrap();
+    assert_eq!(
+        original.matches("7.20").count(),
+        1,
+        "the value this test perturbs must appear exactly once in the fixture, or \
+         the replacement below is ambiguous"
+    );
+    let mutated = original.replacen("7.20", "7.21", 1);
+    std::fs::write(&homes_csv, &mutated).unwrap();
+
+    clear_cache(project);
+    common::arc_run(project);
+    let second_out = projected(project);
+    assert_eq!(
+        placed(&second_out).len(),
+        first_rows,
+        "the row count must be unchanged — this test isolates a value edit from a \
+         shape change, and a row count that moved would mean it tested the wrong thing"
+    );
+    assert_ne!(
+        fit_id_of(&second_out),
+        first_id,
+        "one numeric value changed with row count and column count both held fixed — \
+         a fit_id built from the matrix's shape rather than its values would not move \
+         here, and that is exactly the gap this test closes"
+    );
+}
+
 /// The three documented knobs change the MAP, not just the command line.
 ///
 /// `umap_project_args_pass_every_column_and_knob_through` asserts that `neighbors:`,
@@ -324,7 +449,8 @@ fn the_knobs_a_manifest_sets_change_the_map_not_just_the_argv() {
     std::fs::copy(project.join("knobs.yaml"), project.join("arcform.yaml")).unwrap();
 
     let stdout = common::arc_run(project);
-    let out = |name: &str| sha256(&project.join(format!("build/{name}.parquet")));
+    let path = |name: &str| project.join(format!("build/{name}.parquet"));
+    let out = |name: &str| sha256(&path(name));
     for step in [
         "project_default",
         "project_more_neighbours",
@@ -358,6 +484,18 @@ fn the_knobs_a_manifest_sets_change_the_map_not_just_the_argv() {
             out(name),
             "{knob} produced the same bytes — the field is documented, reaches the \
              argv, and does not reach the layout"
+        );
+        // The coordinates moving is the whole layout claim above; this is the
+        // narrower one that `projection_fit_id` itself is built from the knobs and
+        // not only from the feature matrix — the SAME columns of the SAME table feed
+        // every one of these four fits, so a fit_id that only hashed the matrix would
+        // be identical across all four and the id would lie about "default" and
+        // "{name}" being different fits.
+        assert_ne!(
+            fit_id_of(&path("default")),
+            fit_id_of(&path(name)),
+            "{knob} produced the same fit_id as the default despite different \
+             coordinates — the id has to depend on the knob, not just the input rows"
         );
     }
 }

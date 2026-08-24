@@ -155,6 +155,56 @@ class FeatureWidthsTest(unittest.TestCase):
         self.assertIn("empty", str(ctx.exception))
 
 
+class ComputeFitIdTest(unittest.TestCase):
+    """`compute_fit_id` is stdlib-only, hoisted out of `main()` so this file — the one
+    test CI runs for this operator without `uv` — can pin its value-sensitivity
+    directly.
+
+    This does NOT cover the call site in `main()` — whether `main()` actually passes
+    `matrix.tobytes()` rather than something shape-only still needs `uv` and numpy to
+    exercise, and stays covered only by
+    tests/umap_project.rs::projection_fit_id_moves_when_a_value_changes_with_the_shape_held_fixed.
+    What this pins is narrower and still real: the hash function itself is sensitive
+    to its payload's CONTENT, not merely its length.
+    """
+
+    KNOBS = (15, 0.1, "cosine", 42)
+
+    def test_the_same_payload_and_knobs_give_the_same_id(self) -> None:
+        payload = b"\x00\x01\x02\x03" * 8
+        first = up.compute_fit_id(payload, *self.KNOBS)
+        second = up.compute_fit_id(payload, *self.KNOBS)
+        self.assertEqual(first, second)
+
+    def test_a_different_payload_of_the_same_length_moves_the_id(self) -> None:
+        # Same LENGTH (the byte-string analogue of "shape") on both sides, one byte
+        # different — this is the case `str(matrix.shape).encode()` collapses: a
+        # fingerprint built from shape alone cannot move here, because the shape
+        # never changes; only a fingerprint built from the actual bytes can.
+        payload_a = b"\x00\x01\x02\x03" * 8
+        payload_b = b"\x00\x01\x02\x04" * 8
+        self.assertEqual(len(payload_a), len(payload_b))
+        self.assertNotEqual(payload_a, payload_b)
+        self.assertNotEqual(
+            up.compute_fit_id(payload_a, *self.KNOBS),
+            up.compute_fit_id(payload_b, *self.KNOBS),
+        )
+
+    def test_a_different_knob_moves_the_id_even_with_the_same_payload(self) -> None:
+        payload = b"\x00\x01\x02\x03" * 8
+        baseline = up.compute_fit_id(payload, 15, 0.1, "cosine", 42)
+        self.assertNotEqual(baseline, up.compute_fit_id(payload, 40, 0.1, "cosine", 42))
+        self.assertNotEqual(baseline, up.compute_fit_id(payload, 15, 0.9, "cosine", 42))
+        self.assertNotEqual(
+            baseline, up.compute_fit_id(payload, 15, 0.1, "euclidean", 42)
+        )
+
+    def test_the_id_is_a_short_hex_string(self) -> None:
+        fit_id = up.compute_fit_id(b"anything", *self.KNOBS)
+        self.assertEqual(len(fit_id), 16)
+        int(fit_id, 16)  # raises ValueError if it is not hex
+
+
 class SqlQuotingTest(unittest.TestCase):
     def test_an_identifier_is_double_quoted_and_interior_quotes_are_doubled(self) -> None:
         self.assertEqual(up.sql_ident("median income"), '"median income"')
@@ -175,7 +225,16 @@ class DefaultsTest(unittest.TestCase):
         # It is added to the input's own columns and excluded again on the way out;
         # a plain name would collide with a real one and be silently dropped.
         self.assertTrue(up.ROW.startswith("__arc"))
-        self.assertNotIn(up.ROW, (up.X_COL, up.Y_COL))
+        self.assertNotIn(up.ROW, (up.X_COL, up.Y_COL, up.FIT_ID_COL))
+
+    def test_the_three_added_columns_are_pairwise_distinct(self) -> None:
+        # Each is checked for a clash against the input separately (see
+        # `clashes = [c for c in (X_COL, Y_COL, FIT_ID_COL) ...]` in main()); if two of
+        # them were equal, a Parquet carrying one of the names would be refused for the
+        # wrong reason, or the CREATE TABLE that adds all three would collide with
+        # itself.
+        added = (up.X_COL, up.Y_COL, up.FIT_ID_COL)
+        self.assertEqual(len(added), len(set(added)))
 
 
 if __name__ == "__main__":

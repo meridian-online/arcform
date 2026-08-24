@@ -144,6 +144,216 @@ not the coordinates.** The map is for seeing the shape of the whole — which is
 reason the two are separate steps: the answer to that question is the other step's
 output, and it is a file you already have.
 
+## Appending rows moves the whole map, and it was measured before it was decided
+
+**This operator has no memory between invocations.** It is a fresh `uv run` per
+step, given one Parquet and told to fit and project it — nothing about a previous
+fit survives to the next call. So appending rows and running the step again today
+means a full `fit_transform` over everything, old rows and new, and every point can
+move. That is a fact about what THIS OPERATOR does now, not about what the
+underlying library can do — see "Pricing the alternative" below.
+
+An analyst who appends rows and reruns cannot tell, from the map alone, whether the
+picture changed because the data did or because the layout was refit around it.
+
+**How much, measured 2026-08-24, is `eval/map-refit-stability/`
+in this repository — `uv run eval/map-refit-stability/measure.py`, committed output in
+`results.json`.** 3,000 rows of Homebrew package descriptions, embedded with
+`minishlab/potion-base-8M` through this operator's own sibling `text_embed@1`, then
+projected through this operator itself — no reimplementation of either. The corpus is
+`eval/map-refit-stability/corpus.parquet`, COMMITTED (not `examples/brewtrend`'s own
+output, which is gitignored and rebuilt from live, rolling analytics on every `arc
+run` — a moving snapshot that would silently change these numbers): a frozen,
+deterministic 4,500-row slice, ordered by `name` so nothing is cherry-picked, of which
+the first 3,000 are the "existing" map and the next rows are the appended ones. See
+`measure.py`'s own docstring for the exact query that produced it, and re-run the
+harness rather than trusting this table — that is what re-derivable means.
+
+Two measures, because either alone misleads: raw+normalised displacement of a row's
+(x, y) between fits (UMAP's frame is arbitrary up to rotation/scale between
+independent fits, and that arbitrariness is itself part of what an analyst sees as
+"the map turned", so it is deliberately not aligned away), and the fraction of a
+row's 20 nearest *other* existing rows shared between the two fits — which isolates
+whether the refit rearranged the analyst's existing reading, as opposed to new rows
+simply now being nearby, which is expected. This is CHURN: both sides of the
+comparison are the same 3,000 base rows, so its ceiling is 1.00 and the no-new-rows
+control below proves that ceiling is reached. It is a different quantity from the
+placement FIDELITY numbers further down, whose query is a new row and whose ceiling
+is not 1.00 — the two are not read against each other anywhere in this file.
+
+The **no-new-rows control matters more than any other number here**: refitting the
+identical 3,000 rows from scratch, in a separate process, reproduces the prior run's
+coordinates exactly — 0.0 displacement, 100% neighbourhood overlap — confirming this
+operator's documented determinism (pinned seed, thread count, row order) is the floor
+every other number below is read against, not zero.
+
+| append | shared rows scored | mean displacement (× median gap) | 20-NN overlap, mean |
+|---|---|---|---|
+| 0% (control) | 3,000 | 0× | 1.00 |
+| 5% (150 rows) | 3,000 | 38× | 0.46 |
+| 20% (600 rows) | 3,000 | 134× | 0.39 |
+| 50% (1,500 rows) | 3,000 | 268× | 0.35 |
+
+A modest, realistic append already destroys about half of a point's visual
+neighbourhood: **a 5% append shares only 46% of a point's 20 nearest map-neighbours
+with the pre-append layout**, and displacement grows from 38 to 268 times the map's
+own typical point spacing as the append grows — points do not drift, they land
+somewhere else on the map.
+
+Read against a sibling measurement of how much neighbourhood structure survives
+*swapping the embedding model entirely* on a comparable text corpus — **0.13
+long-form, 0.28 short, 0.40 very-short, higher is more retained; this figure comes
+from a measurement in a different repository, has no source committed here, and is
+NOT checked by `check_findings.py` for that reason — read it as context, not as a
+pinned claim of this card's** — on the same kind of kNN-overlap scale: **the two
+disturbances are the same order of magnitude, not one uniformly worse than the
+other.** Ranked by how much structure survives, highest to lowest: 5% append (0.46) >
+swapping the embedder on very-short text (0.40) > 20% append (0.39) ≈ 50% append
+(0.35) > swapping the embedder on short text (0.28) > swapping the embedder on
+long-form text (0.13). A 5% append preserves *more* structure than any embedder swap
+measured; by 20%, an append has already lost slightly more than swapping the embedder
+does on its easiest (very-short-text) case, though every append fraction here still
+preserves more than swapping on short or long-form text. Refitting on an ordinary
+append is not a small, forgivable jitter — whether it is gentler or harsher than
+changing the embedder depends on the fraction and the corpus, but it sits in the same
+range.
+
+### Pricing the alternative: `UMAP.transform` is real, and here is what it costs
+
+**`umap-learn`'s `UMAP.transform(X)` is public in the pinned bound
+(`umap-learn>=0.5,<0.6`, resolved 0.5.12 as of 2026-08-24), and places new rows into
+an existing fitted embedding without moving the rows already in it.** Verified by
+actually calling it — `eval/map-refit-stability/price_transform.py`,
+`uv run eval/map-refit-stability/price_transform.py`, committed output in
+`transform_pricing.json` — against the same 3,000-row base and the same 5/20/50%
+append pools this card's headline table uses, so the pricing below is comparable to
+it rather than a separate, smaller demo.
+
+Four costs, measured rather than assumed:
+
+1. **Model persistence.** `.transform()` needs the FITTED reducer object, not just
+   its output coordinates — the k-NN graph and the optimised embedding it walks to
+   place a new point have to survive between the process that ran `fit()` and a
+   later process that runs `.transform()`, and this operator today persists nothing
+   between invocations. Pickled, the fitted reducer for the 3,000-row base is
+   **3.6 MB**. It would need a place in a Protocol's asset graph — most naturally a
+   `produces` asset the first fit writes and a `reads` asset a later append-only run
+   reads back, the same shape `text_embed`'s `model:` directory already uses for a
+   different kind of model.
+
+2. **A compatibility rule that does not exist yet.** A persisted model is only valid
+   for the SAME base rows under the SAME knobs it was fit with — if a base row's
+   values changed, or a row was removed, or `neighbors:`/`min_dist:`/`metric:`
+   moved, the persisted model no longer describes the current input and
+   `.transform()` would silently place new rows against a mapping that has quietly
+   gone stale. Nothing prices or designs that check here; it is named as a real,
+   unbuilt requirement, not assumed away.
+
+3. **Whether the base rows actually stay put — measured, not assumed.**
+   `reducer.embedding_` was captured right after `fit()` and compared, by max
+   absolute difference, against `reducer.embedding_` after every `.transform()` call
+   in the pricing script: **0.0**. `.transform()`'s documented contract says it does
+   not re-optimise the training embedding; this is that claim executed rather than
+   taken on faith.
+
+4. **Placement fidelity, read against this corpus's own ceiling rather than against
+   1.00 or against the churn number above.** A 2D map cannot recover every
+   neighbour a 256-d embedding space has — this operator's own README already
+   measures that loss for a different corpus (34.9% at k=10, "What the coordinates
+   support" above). For THIS corpus, at the same k=20 used throughout: a BASE row's
+   own base fit recovers **30.5%** of its 256-d neighbourhood — the ceiling every
+   number below is read against. Scored the same way, against the 256-d embeddings
+   as ground truth (cosine, k=20, base rows as the candidate pool on both sides): a
+   **full refit** places a NEW row at 30.4% / 28.1% / 27.3% (5% / 20% / 50%
+   appends) — 89-100% of the ceiling, not always AT it, and least close where the
+   recommendation is most exposed (50% appended). **`.transform()`** places the
+   same new rows at 27.4% / 25.7% / 26.3% — 3 to 5 points below the ceiling, which
+   is the gap against the ceiling, not against the full refit (the gap against the
+   full refit itself is smaller: 3.0 / 2.4 / 1.0 points). On this corpus,
+   out-of-sample placement is close to as faithful as a full refit, not
+   indistinguishable from it.
+
+   (The pricing script also self-checks this: a full refit's fidelity against the
+   256-d truth should stay close to the ceiling, and an assertion fails loudly if it
+   does not — swapping the full refit's own base coordinates for the original base
+   fit's, a mistake made once while writing this measurement, drops that number
+   below 0.1 and the assertion catches it before the numbers reach this file.)
+
+### Pricing the other alternative: refit only on an explicit user action
+
+**This is not implementable in arcform today**, and saying so needs a mechanism
+named, not asserted. `compute_staleness` (`src/runner.rs`) marks a step stale
+whenever `is_hash_stale` finds its declared inputs have changed — appending a row to
+this step's input Parquet is exactly that — and where `preconditions:` exist,
+staleness is `hash_stale || !preconditions_fresh`: a precondition can only ADD
+staleness, never suppress a hash-driven one. There is no branch anywhere in that
+function, and no flag on `arc run` (`--force` and `--param` are the only ones; there
+is no per-step selector), that lets a step whose input changed stay un-run pending a
+separate, later user action. `runner::tests::test_glob_read_change_forces_the_reading_step_stale`
+pins exactly this: appending bytes to a step's read glob is one of three mutations
+the test proves forces that step stale, and it is asserted, not incidental.
+Building "hold this step's output until the user asks" would be a genuine addition to
+arcform's step model — every step today is a pure function of its declared,
+hash-checked inputs — and that is a different surface and a different card; it is not
+built here.
+
+### The choice, priced rather than assumed
+
+**Pin the existing rows by persisting the fitted model and placing appended rows with
+`.transform()`.** Not because the alternative above is free — it is not implementable
+at all today — and not because out-of-sample placement is a small compromise assumed
+away: it is 3 to 5 points below this corpus's own ceiling for the new rows, measured
+against the 256-d truth rather than against the churn number, which is a different
+quantity. The case for it is the asymmetry between what it protects and what it
+risks: the base rows — which is most of the corpus at every fraction measured here,
+and the ones an analyst has already built a reading around — are held EXACTLY, by
+construction and confirmed by measurement (§3 above), with zero drift. The rows
+placed a few points under the ceiling are exactly the rows the analyst has no prior
+reading of yet, because they are new. A full refit corrupts everyone's reading to
+place new rows barely better than `.transform()` does; pinning corrupts nothing and
+places the new rows almost as well. That asymmetry, not a claim that either technique
+is free, is the argument.
+
+**Where the asymmetry stops being obvious.** The argument assumes an analyst reading
+the BASE rows, whose positions are exactly held — not an analyst appending rows
+specifically to see where the NEW ones land, who gets a placement a few points off a
+full refit's own, with nothing in the interface to say so; that discrimination is
+part of what pinning would still need to design, not something this measurement
+provides. And it assumes appended rows stay a minority of what is on screen. At the
+20% fraction measured here, new rows are 600 of 3,600 — 17% of the map, still
+plainly a minority. At 50%, they are 1,500 of 4,500 — a third of the map, not "a
+handful". Somewhere between those two measured points the map stops being "mostly
+exact positions plus some approximate ones" and becomes a map where a substantial
+share of what is on screen carries the fidelity gap above; nothing measured here
+locates that point more precisely than the two fractions it is bracketed by.
+
+**None of this is implemented in this card.** A strategy is chosen and its
+trade-off stated, not built. What would be needed: model persistence and a
+compatibility check inside `operators/umap_project/umap_project.py` (this card's own
+surface, no runner change required for this half), and, if "the map does not move at
+all until asked" is wanted on top of that, the runner capability named above (a
+different surface). Neither is built here — persisting the fit and computing
+`projection_fit_id` from it rather than from the current input is real design work
+of its own and is a separate card.
+
+**Telling a refit from an append, as this operator ships today.** Every output row
+carries `projection_fit_id` — a hash of the exact feature matrix and knobs
+(`neighbors`, `min_dist`, `metric`, seed) that fit consumed, the same value on every
+row. It moves whenever the data or a knob changes, and it cannot tell you which —
+today, every run is a full refit, so "the data changed" and "the layout changed" are
+the same event and the id does not need to distinguish them. A DIFFERENT id means no
+row's position may be compared position-for-position against an older file. The
+converse does **not** hold: a MATCHING id means the same data and knobs were used,
+not that the coordinates are guaranteed identical — this operator's dependency
+resolve is not pinned (see "Does byte-identity survive a dependency upgrade?" above),
+so two machines, or the same machine after a resolve moves, can share a fit_id and
+still emit different coordinates. Discriminating "the data changed" from "the layout
+changed" arrives when pinning does, not before — computing the id from a persisted
+fit rather than from the current input is part of that future work, not this one. A
+downstream renderer (`brightfield`) that wants to warn an analyst a map has changed
+reads this column today for that coarser signal; distinguishing why it changed is not
+available from it yet.
+
 ## Standalone
 
 ```bash

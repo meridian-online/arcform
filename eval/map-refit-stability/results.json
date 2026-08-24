@@ -1,0 +1,62 @@
+{
+  "corpus": "eval/map-refit-stability/corpus.parquet",
+  "corpus_provenance": "frozen 2026-08-24 from examples/brewtrend/data/ranking.parquet (gitignored, rebuilt from live rolling Homebrew analytics) \u2014 see the CORPUS section of this file's docstring for the exact query",
+  "corpus_rows_committed": 4500,
+  "base_n": 3000,
+  "append_fractions": {
+    "append_05": 0.05,
+    "append_20": 0.2,
+    "append_50": 0.5
+  },
+  "model": "minishlab/potion-base-8M",
+  "umap_project_params": {
+    "metric": "cosine",
+    "neighbors": 15,
+    "min_dist": 0.1,
+    "seed": 42
+  },
+  "base_map_median_nn_spacing": 0.040765814010782976,
+  "comparisons": {
+    "control_B": {
+      "n_shared_rows": 3000,
+      "displacement_raw_mean": 0.0,
+      "displacement_raw_median": 0.0,
+      "displacement_normalised_mean": 0.0,
+      "displacement_normalised_median": 0.0,
+      "knn_overlap_k": 20,
+      "knn_overlap_mean": 1.0,
+      "knn_overlap_median": 1.0
+    },
+    "append_05": {
+      "n_shared_rows": 3000,
+      "displacement_raw_mean": 1.5585375781228947,
+      "displacement_raw_median": 1.112908506922508,
+      "displacement_normalised_mean": 38.231484294920385,
+      "displacement_normalised_median": 27.300043772660402,
+      "knn_overlap_k": 20,
+      "knn_overlap_mean": 0.45708333333333334,
+      "knn_overlap_median": 0.45
+    },
+    "append_20": {
+      "n_shared_rows": 3000,
+      "displacement_raw_mean": 5.480438708173143,
+      "displacement_raw_median": 5.46552338364463,
+      "displacement_normalised_mean": 134.437121916013,
+      "displacement_normalised_median": 134.07124366997658,
+      "knn_overlap_k": 20,
+      "knn_overlap_mean": 0.38616666666666666,
+      "knn_overlap_median": 0.35
+    },
+    "append_50": {
+      "n_shared_rows": 3000,
+      "displacement_raw_mean": 10.910892752150758,
+      "displacement_raw_median": 10.51036707572744,
+      "displacement_normalised_mean": 267.64810213932475,
+      "displacement_normalised_median": 257.8230640248553,
+      "knn_overlap_k": 20,
+      "knn_overlap_mean": 0.35395,
+      "knn_overlap_median": 0.3
+    }
+  },
+  "runtime_seconds": 336.3
+}
