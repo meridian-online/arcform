@@ -44,11 +44,6 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      # The finetype version gate — the guard that stops a stale binary on PATH
-      # typing published columns wrong while still emitting valid JSON.
-      - name: datapackage_describe tests
-        run: python3 operators/datapackage_describe/test_describe.py
-
       # umap_project.py runs under `uv` with umap-learn, numpy and DuckDB — none of
       # which this runner has, and the end-to-end tests that would exercise it skip
       # here for exactly that reason. So the script imports those three INSIDE

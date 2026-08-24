@@ -214,6 +214,36 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Changed
 
+- **`datapackage_describe` no longer runs Python.** A Frictionless Data Package is a
+  specification, not a runtime: the operator used to wrap `describe.py` — a frozen
+  script, run via `uv run --script`, that shelled to `finetype profile … -o
+  datapackage` and merged the curated `descriptor.overrides.json` sidecar over it in
+  a Python dict — and there was no library behind that script to justify the Python
+  runtime it needed. The JSON merge (`merge_datapackage` + `check_relations`) is now
+  native Rust over `serde_json::Value`; the machine-decidable half is UNCHANGED — the
+  operator still shells the `finetype` CLI directly (no longer through `uv`/Python)
+  and forms no opinion of its own about column types. Verified byte-identical to the
+  retired path against the real Parquet + `descriptor.overrides.json` for all four
+  published datasets (`edgar`, `naics`, `gleif`, `edgar_gleif`) — the only field that
+  differs between the two is `created`, the per-run timestamp `finetype profile`
+  itself stamps on every invocation, which was already non-deterministic before this
+  change. Confirmed separately with no Python interpreter or `uv` anywhere on PATH
+  (only `finetype` and the `duckdb` CLI every `arc run` already needs): the operator
+  still describes the dataset; the retired uv-run substrate could not have. `serde_json`
+  carries no `preserve_order` feature in this crate's own dependency edge (confirmed
+  via `cargo tree`), so its `Map` is BTreeMap-backed and keys serialize sorted at
+  every nesting level with no explicit sort step — matching Python's
+  `json.dump(..., indent=2, sort_keys=True, ensure_ascii=False)` byte for byte.
+  `operators/datapackage_describe/{describe.py,test_describe.py}` are deleted. The
+  operator's version stays `1.0.0`: the `with:` contract and the produced bytes are
+  unchanged, the same precedent set when `x-finetype-version` was added (also not a
+  version bump). The `op@<version>` guarantee `materialize_frozen_script`'s
+  write-if-changed cache gave the embedded script — a behaviour change is a rebuild,
+  never a silent edit — now holds by a simpler mechanism: there is no separate script
+  materialized at runtime anymore, so the operator's behaviour is entirely the
+  compiled binary, exactly like every other in-process operator in this catalog
+  (`parquet_export`, `archive_extract`, `finetype_validate`) that never needed
+  `materialize_frozen_script` to make that same claim.
 - **Raised the minimum `finetype` to 0.6.54 in both places that gate it.** finetype
   0.6.54 stopped eight-digit numbers typing as confident dates. Up to and including
   0.6.53, the year-first and day-first compact date leaves both validated on `^\d{8}$`,

@@ -25,8 +25,8 @@ use super::{ToolDef, ToolOutput, ToolResult};
 /// mislabelling 0.6.53 itself fixed: a consumer that follows the transform gets a
 /// corrupted column rather than a wrong name for a correct one.
 ///
-/// Kept in lockstep with `MIN_FINETYPE_VERSION` in
-/// `operators/datapackage_describe/describe.py` — both gate the same binary on PATH.
+/// Kept in lockstep with `MIN_FINETYPE_VERSION` in the `datapackage_describe` operator
+/// (`src/operator.rs`) — both gate the same binary on PATH.
 const MIN_VERSION: (u64, u64, u64) = (0, 6, 54);
 
 /// The `finetype` binary to run: `$FINETYPE_BIN` if set, else `finetype` on PATH.
