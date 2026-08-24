@@ -1485,12 +1485,32 @@ fn require_finetype(min_version: &str, ctx: &OpContext) -> Result<String> {
         "datapackage_describe",
     )?;
     let stdout = out.stdout.unwrap_or_default();
-    let got = parse_finetype_version(&stdout).ok_or_else(|| {
+    let got = resolve_finetype_version(&stdout)?;
+    check_finetype_floor(got, min_version)?;
+    Ok(format!("{}.{}.{}", got.0, got.1, got.2))
+}
+
+/// Parse `finetype --version`'s stdout into the resolved dotted version, or the
+/// refusal for output that does not contain one — PURE, no subprocess. Split out
+/// of `require_finetype` so the unparseable-output refusal is testable without
+/// spawning anything: a test pinning "output with no dotted triple is refused"
+/// has no business depending on whether a fork/exec succeeds, and coupling it to
+/// one made the test vulnerable to transient spawn flakiness under a loaded
+/// machine that has nothing to do with the behaviour being pinned.
+fn resolve_finetype_version(stdout: &str) -> Result<(u64, u64, u64)> {
+    parse_finetype_version(stdout).ok_or_else(|| {
         fetch_failed(format!(
             "datapackage_describe: could not parse a version from `finetype --version` ({:?}).",
             stdout
         ))
-    })?;
+    })
+}
+
+/// Fail closed unless `got` is `>= min_version` — PURE, no subprocess. Split out of
+/// `require_finetype` for the same reason `resolve_finetype_version` is: the floor
+/// is a boundary condition (an EXACT match must pass), and a test for it should
+/// exercise only the comparison, not a real `finetype` spawn.
+fn check_finetype_floor(got: (u64, u64, u64), min_version: &str) -> Result<()> {
     let want = parse_finetype_version(min_version)
         .expect("MIN_FINETYPE_VERSION must itself parse as a dotted version");
     if got < want {
@@ -1501,7 +1521,7 @@ fn require_finetype(min_version: &str, ctx: &OpContext) -> Result<String> {
             got.0, got.1, got.2, min_version
         )));
     }
-    Ok(format!("{}.{}.{}", got.0, got.1, got.2))
+    Ok(())
 }
 
 /// Fail closed unless the already-resolved `resolved` version equals `expect` — the
@@ -3221,51 +3241,41 @@ mod tests {
         assert!(msg.contains("0.6.60"));
     }
 
-    /// Writes a `finetype` that answers ONLY `--version` (with `version_line`) —
-    /// enough for `require_finetype`, which never calls `profile`.
-    fn write_fake_finetype_version_only(dir: &Path, version_line: &str) {
-        let script = dir.join("finetype");
-        std::fs::write(&script, format!("#!/bin/sh\necho \"{version_line}\"\n")).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        let mut perm = std::fs::metadata(&script).unwrap().permissions();
-        perm.set_mode(0o755);
-        std::fs::set_permissions(&script, perm).unwrap();
-    }
-
+    /// The floor is INCLUSIVE ("no older than") — a resolved version EQUAL to
+    /// MIN_FINETYPE_VERSION must pass, not just anything strictly newer. A `<=`
+    /// typo in the comparison would refuse exactly this case.
+    ///
+    /// PURE — no subprocess, no PATH, no tempdir. `require_finetype_at_exact_floor_
+    /// passes` used to drive this through a REAL spawned `finetype` fake on an
+    /// isolated PATH; under a heavily loaded machine that spawn was observed to
+    /// occasionally fail on its own (`StepFailed { code: 1, stderr: "" }`, nothing
+    /// to do with version comparison), making the test flake for a reason that had
+    /// nothing to do with what it was pinning. `check_finetype_floor` is the exact
+    /// same comparison `require_finetype` runs, extracted so this boundary is
+    /// testable without forking anything.
     #[test]
-    fn require_finetype_at_exact_floor_passes() {
-        // The floor is INCLUSIVE ("no older than") — a resolved version EQUAL to
-        // MIN_FINETYPE_VERSION must pass, not just anything strictly newer. A `<=`
-        // typo in the comparison would refuse exactly this case.
-        let finetype_dir = tempfile::tempdir().unwrap();
-        write_fake_finetype_version_only(
-            finetype_dir.path(),
-            &format!("finetype {MIN_FINETYPE_VERSION}"),
-        );
-        let dir = tempfile::tempdir().unwrap();
-        let mut env = HashMap::new();
-        env.insert(
-            "PATH".to_string(),
-            finetype_dir.path().display().to_string(),
-        );
-        let ctx = test_ctx(dir.path(), &env);
-        let resolved = require_finetype(MIN_FINETYPE_VERSION, &ctx)
+    fn check_finetype_floor_at_exact_floor_passes() {
+        let got = parse_finetype_version(MIN_FINETYPE_VERSION).unwrap();
+        check_finetype_floor(got, MIN_FINETYPE_VERSION)
             .expect("a finetype exactly at the floor must pass, not be refused");
-        assert_eq!(resolved, MIN_FINETYPE_VERSION);
     }
 
     #[test]
-    fn require_finetype_unparseable_version_fails_closed() {
-        let finetype_dir = tempfile::tempdir().unwrap();
-        write_fake_finetype_version_only(finetype_dir.path(), "finetype (unknown build)");
-        let dir = tempfile::tempdir().unwrap();
-        let mut env = HashMap::new();
-        env.insert(
-            "PATH".to_string(),
-            finetype_dir.path().display().to_string(),
-        );
-        let ctx = test_ctx(dir.path(), &env);
-        let err = require_finetype(MIN_FINETYPE_VERSION, &ctx).expect_err(
+    fn check_finetype_floor_one_patch_below_is_refused() {
+        let (major, minor, patch) = parse_finetype_version(MIN_FINETYPE_VERSION).unwrap();
+        let below = (major, minor, patch - 1);
+        let err = check_finetype_floor(below, MIN_FINETYPE_VERSION)
+            .expect_err("one patch below the floor must be refused");
+        assert!(err.to_string().contains("older"));
+    }
+
+    /// PURE, same rationale as `check_finetype_floor_at_exact_floor_passes` above:
+    /// `resolve_finetype_version` is the exact parse-or-refuse step `require_finetype`
+    /// runs on `finetype --version`'s stdout, extracted so the unparseable-output
+    /// refusal is testable without spawning anything.
+    #[test]
+    fn resolve_finetype_version_unparseable_fails_closed() {
+        let err = resolve_finetype_version("finetype (unknown build)").expect_err(
             "an unparseable `finetype --version` must stop the run, not default silently",
         );
         assert!(err.to_string().contains("could not parse"));
