@@ -2710,6 +2710,12 @@ fn umap_project_invocation(cfg: &UmapProjectConfig, dir: &Path) -> Result<Vec<St
 /// The embedding script, pinned into the binary. `@1` == these exact bytes.
 const TEXT_EMBED_PY: &str = include_str!("../operators/text_embed/text_embed.py");
 
+/// The script cache directory `materialize_frozen_script` builds for this operator.
+/// Test-only, for the same reason [`UMAP_PROJECT_CACHE_DIR`] is: production never
+/// spells the path, and a test traps it to drive the cache's two failure paths.
+#[cfg(test)]
+const TEXT_EMBED_CACHE_DIR: &str = "arcform-op-text_embed-1.0.0";
+
 /// The two files a static-embedding model directory carries — the layout a
 /// `model2vec` / `potion` release ships. Checked here, before `uv` is spawned, so a
 /// Protocol pointed at a model that was never fetched fails in milliseconds naming
@@ -3778,7 +3784,9 @@ mod tests {
     }
 
     /// The script cache is where `?` earns its keep, and both of its failure paths are
-    /// driven here for real rather than reasoned about.
+    /// driven here for real rather than reasoned about — for BOTH uv-run operators
+    /// this change adds, through `Operator::run` rather than through the invocation
+    /// helper directly.
     ///
     /// `materialize_frozen_script` fails two ways — the cache directory cannot be
     /// created, or the script cannot be written inside it — and a `?` that folded
@@ -3786,89 +3794,124 @@ mod tests {
     /// That is not a quieter error: measured on 2026-08-24, `uv run --script ""` with
     /// `current_dir` set to the Protocol directory runs `<protocol>/__main__.py` if one
     /// exists and EXITS 0 — a failed step reported as a success, executing whatever is
-    /// in the Protocol directory, with no projection written.
+    /// in the Protocol directory, with no output written.
     ///
-    /// The helper is shared by every uv-run operator, so it is driven once here rather
-    /// than once per operator.
+    /// THROUGH `run`, and per operator, because that is what the coverage is about.
+    /// The helper is shared, so one test over one operator's invocation function looks
+    /// like enough; it is not. Each operator has its own `?` on the helper and its own
+    /// `?` on the invocation call inside `run`, and the mutation gate rewrote three of
+    /// those four lines with the suite still green when this test drove only
+    /// `umap_project_invocation` directly. Reaching them means entering at `run`.
     ///
     /// IN A CHILD PROCESS, and that is the whole reason this test looks the way it
     /// does. The cache path comes from `std::env::temp_dir()`, which reads `TMPDIR`;
     /// `TMPDIR` is process-global and the suite is threaded, so setting it in-process
     /// would reach every other test running at that moment. Re-executing this binary
-    /// with `TMPDIR` pointed at a booby-trapped directory is the isolation. If the
-    /// trap ever stops biting — because the cache path is spelled differently — the
-    /// child's `expect_err` fires and this goes red; it cannot go quietly green.
+    /// with `TMPDIR` pointed at a booby-trapped directory is the isolation. If a trap
+    /// ever stops biting — because the cache path is spelled differently — the child's
+    /// `expect_err` fires and this goes red; it cannot go quietly green.
+    ///
+    /// Neither child reaches `uv`: the `?` short-circuits before the spawn, which is
+    /// why this runs on a CI machine that has none.
     #[test]
-    fn umap_project_invocation_reports_a_script_cache_it_cannot_write() {
-        // The child half: TMPDIR is already trapped, so materialising must fail.
-        if std::env::var("ARC_UMAP_PROJECT_CACHE_TRAP").is_ok() {
+    fn a_script_cache_that_cannot_be_written_stops_the_step() {
+        // The child half: TMPDIR is already trapped, so materialising must fail. Which
+        // operator to drive arrives in the same variable that marks this as the child.
+        if let Ok(which) = std::env::var("ARC_SCRIPT_CACHE_TRAP") {
             let protocol = tempfile::tempdir().unwrap();
-            let with: Value =
-                serde_yaml::from_str("input: homes.parquet\ncolumns: [lon]\nout: out.parquet")
+            let env = HashMap::new();
+            let ctx = test_ctx(protocol.path(), &env);
+            let (err, cache_dir) = match which.as_str() {
+                "umap_project" => {
+                    let with: Value = serde_yaml::from_str(
+                        "input: homes.parquet\ncolumns: [longitude]\nout: out.parquet",
+                    )
                     .unwrap();
-            let cfg = UmapProjectConfig::parse(&with).unwrap();
-            let err = umap_project_invocation(&cfg, protocol.path())
-                .expect_err("a script cache that cannot be written must stop the step");
+                    (
+                        UmapProject
+                            .run(&with, &ctx)
+                            .expect_err("a script cache that cannot be written must stop the step"),
+                        UMAP_PROJECT_CACHE_DIR,
+                    )
+                }
+                "text_embed" => {
+                    // The model check runs BEFORE the script is materialised, so it has
+                    // to pass or the refusal under test is never reached.
+                    let model = protocol.path().join("model");
+                    std::fs::create_dir_all(&model).unwrap();
+                    for part in MODEL_PARTS {
+                        std::fs::write(model.join(part), b"not a real model").unwrap();
+                    }
+                    let with: Value = serde_yaml::from_str(
+                        "input: corpus.parquet\ntext_column: description\nmodel: model\nout: out.parquet",
+                    )
+                    .unwrap();
+                    (
+                        TextEmbed
+                            .run(&with, &ctx)
+                            .expect_err("a script cache that cannot be written must stop the step"),
+                        TEXT_EMBED_CACHE_DIR,
+                    )
+                }
+                other => panic!("no operator called `{other}` to drive"),
+            };
             let msg = err.to_string();
             assert!(
-                msg.contains(UMAP_PROJECT_CACHE_DIR),
+                msg.contains(cache_dir),
                 "the refusal names the cache it could not write: {msg}"
             );
             return;
         }
 
-        // The parent half: trap the cache two ways and re-run this one test under each.
+        // The parent half: trap the cache two ways per operator and re-run this one
+        // test under each.
         //
-        // `arcform-op-umap_project-1.0.0` as a regular FILE blocks `create_dir_all`;
-        // as a directory holding a DIRECTORY called `umap_project.py`, it lets the
-        // directory be created and blocks the write instead.
-        let block_the_directory = tempfile::tempdir().unwrap();
-        std::fs::write(
-            block_the_directory.path().join(UMAP_PROJECT_CACHE_DIR),
-            b"in the way",
-        )
-        .unwrap();
-
-        let block_the_write = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(
-            block_the_write
-                .path()
-                .join(UMAP_PROJECT_CACHE_DIR)
-                .join("umap_project.py"),
-        )
-        .unwrap();
-
+        // `arcform-op-<name>-1.0.0` as a regular FILE blocks `create_dir_all`; as a
+        // directory holding a DIRECTORY called `<name>.py`, it lets the directory be
+        // created and blocks the write instead.
+        //
         // `--exact` matches the test's FULL path, so the module prefix is not optional.
         // Getting it wrong does not fail — libtest runs zero tests and exits 0 — which
         // is why the assertion below reads what the child REPORTED and not only how it
         // exited. A child that ran nothing is not a child that passed.
-        const CHILD: &str =
-            "operator::tests::umap_project_invocation_reports_a_script_cache_it_cannot_write";
+        const CHILD: &str = "operator::tests::a_script_cache_that_cannot_be_written_stops_the_step";
 
-        for trap in [block_the_directory.path(), block_the_write.path()] {
-            let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([CHILD, "--exact", "--nocapture"])
-                .env("TMPDIR", trap)
-                .env("ARC_UMAP_PROJECT_CACHE_TRAP", "1")
-                .output()
-                .expect("re-run this test binary");
-            let said = format!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            assert!(
-                said.contains("1 passed"),
-                "the child has to have RUN this test, not merely exited 0 — a filter \
-                 that matches nothing reports `0 passed` and exits 0. Trap {}:\n{said}",
-                trap.display(),
-            );
-            assert!(
-                out.status.success(),
-                "with the script cache trapped at {}, materialising must fail and the \
-                 step must stop:\n{said}",
-                trap.display(),
-            );
+        for (operator, cache_dir, script) in [
+            ("umap_project", UMAP_PROJECT_CACHE_DIR, "umap_project.py"),
+            ("text_embed", TEXT_EMBED_CACHE_DIR, "text_embed.py"),
+        ] {
+            let block_the_directory = tempfile::tempdir().unwrap();
+            std::fs::write(block_the_directory.path().join(cache_dir), b"in the way").unwrap();
+
+            let block_the_write = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(block_the_write.path().join(cache_dir).join(script)).unwrap();
+
+            for trap in [block_the_directory.path(), block_the_write.path()] {
+                let out = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([CHILD, "--exact", "--nocapture"])
+                    .env("TMPDIR", trap)
+                    .env("ARC_SCRIPT_CACHE_TRAP", operator)
+                    .output()
+                    .expect("re-run this test binary");
+                let said = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert!(
+                    said.contains("1 passed"),
+                    "the child has to have RUN this test, not merely exited 0 — a filter \
+                     that matches nothing reports `0 passed` and exits 0. {operator} at \
+                     trap {}:\n{said}",
+                    trap.display(),
+                );
+                assert!(
+                    out.status.success(),
+                    "with {operator}'s script cache trapped at {}, materialising must \
+                     fail and the step must stop:\n{said}",
+                    trap.display(),
+                );
+            }
         }
     }
 
