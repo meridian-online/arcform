@@ -232,8 +232,10 @@ Rationale for each change is recorded in the project's design notes and commit h
   ceiling, not against 1.0 or against the churn figure above, which is a different
   quantity: scored against the 256-d embeddings as ground truth, a base row's own
   fit recovers 30.5% of its true neighbourhood at k=20, a full refit places a new
-  row at 30.4-27.3% (essentially at the ceiling), and `.transform()` places the same
-  rows at 27.4-25.7% — 1 to 3 points under the ceiling. Refitting only on an
+  row at 89-100% of the ceiling (30.4-27.3%, least close at the 50% append, where
+  the recommendation is most exposed), and `.transform()` places the same rows at
+  27.4-25.7% — 3 to 5 points under the ceiling, 1.0-3.0 points under the full refit
+  itself. Refitting only on an
   explicit user action, by contrast, is not implementable in arcform today —
   `compute_staleness` marks any step whose declared input changed stale
   unconditionally, and no `arc run` flag can hold a hash-stale step un-run. See

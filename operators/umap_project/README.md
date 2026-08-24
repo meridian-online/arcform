@@ -265,11 +265,13 @@ Four costs, measured rather than assumed:
    number below is read against. Scored the same way, against the 256-d embeddings
    as ground truth (cosine, k=20, base rows as the candidate pool on both sides): a
    **full refit** places a NEW row at 30.4% / 28.1% / 27.3% (5% / 20% / 50%
-   appends) — essentially AT the ceiling, which is what a correct measurement
-   should show, since a full refit treats every row uniformly. **`.transform()`**
-   places the same new rows at 27.4% / 25.7% / 26.3% — 1 to 3 points below the
-   ceiling, not a fraction of it. On this corpus, out-of-sample placement is very
-   nearly as faithful as a full refit.
+   appends) — 89-100% of the ceiling, not always AT it, and least close where the
+   recommendation is most exposed (50% appended). **`.transform()`** places the
+   same new rows at 27.4% / 25.7% / 26.3% — 3 to 5 points below the ceiling, which
+   is the gap against the ceiling, not against the full refit (the gap against the
+   full refit itself is smaller: 3.0 / 2.4 / 1.0 points). On this corpus,
+   out-of-sample placement is close to as faithful as a full refit, not
+   indistinguishable from it.
 
    (The pricing script also self-checks this: a full refit's fidelity against the
    256-d truth should stay close to the ceiling, and an assertion fails loudly if it
@@ -300,7 +302,7 @@ built here.
 **Pin the existing rows by persisting the fitted model and placing appended rows with
 `.transform()`.** Not because the alternative above is free — it is not implementable
 at all today — and not because out-of-sample placement is a small compromise assumed
-away: it is 1 to 3 points below this corpus's own ceiling for the new rows, measured
+away: it is 3 to 5 points below this corpus's own ceiling for the new rows, measured
 against the 256-d truth rather than against the churn number, which is a different
 quantity. The case for it is the asymmetry between what it protects and what it
 risks: the base rows — which is most of the corpus at every fraction measured here,

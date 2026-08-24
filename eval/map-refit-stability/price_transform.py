@@ -84,13 +84,17 @@ BUILD = HERE / "build"
 APPEND_FRACTIONS = ("append_05", "append_20", "append_50")
 K_NEIGHBOURS = 20
 
-# The self-check §3 describes: a full refit's fidelity for a NEW row should not be
-# far below this corpus's own ceiling (a BASE row's fidelity, measured the same way).
-# 0.5 is a loose bound — real values here land within a few points of the ceiling,
-# not a fraction of it — chosen to catch a broken comparison (observed near 0.0-0.07
-# under the exact bug described above) without being brittle to ordinary corpus
-# variation.
+# The self-check §3 describes: neither placement's fidelity for a NEW row should be
+# far below this corpus's own ceiling (a BASE row's fidelity, measured the same way),
+# and neither should exceed it by more than trivial noise. 0.5 is a loose lower
+# bound — real values here land within a few points of the ceiling, not a fraction
+# of it — chosen to catch a broken comparison (observed near 0.0-0.07 under a pool
+# swap, and near 0.04 under its mirror) without being brittle to ordinary corpus
+# variation. 0.05 (five percentage points) is the upper slack, chosen to catch a
+# degenerate query-against-itself comparison (which reads 1.0) while allowing
+# ordinary measurement noise around the ceiling.
 CEILING_FRACTION_FLOOR = 0.5
+CEILING_SLACK = 0.05
 
 
 def load_embeddings(parquet: Path) -> tuple[list[str], np.ndarray]:
@@ -251,17 +255,39 @@ def main() -> int:
         full_refit_vs_truth = overlap_fractions(truth_nn, full_refit_2d_nn, k)
 
         full_refit_vs_truth_mean = float(full_refit_vs_truth.mean())
-        assert full_refit_vs_truth_mean >= CEILING_FRACTION_FLOOR * ceiling, (
-            f"{tag}: full-refit fidelity against the 256-d truth "
-            f"({full_refit_vs_truth_mean:.3f}) is far below the corpus ceiling "
-            f"({ceiling:.3f}) — this should not happen for a correct comparison "
-            f"(see the self-check note in this script's docstring) and most likely "
-            f"means the harness itself is broken, not that the finding is real."
-        )
+        transform_vs_truth_mean = float(transform_vs_truth.mean())
 
-        # Frame-invariant fidelity between the two PLACEMENTS themselves, kept for
-        # context: this is the number a prior version of this script reported as
-        # "the" fidelity claim, before the ceiling above existed to read it against.
+        # Both fidelity means are bounded against the ceiling, below AND above.
+        # BELOW, by the same floor for both: a mean far under the ceiling means the
+        # harness compared the wrong pools, not that placement is that bad (this is
+        # the guard that already existed for the full refit; extended here to
+        # transform, which is the arm the recommendation actually rests on — nothing
+        # bounded it before this). ABOVE, by CEILING_SLACK: neither quantity can
+        # legitimately exceed what the corpus's own base rows achieve by more than a
+        # small margin, so a mean at or near 1.0 — the value a query compared against
+        # itself would produce — is caught here rather than read as a real result.
+        for label, mean in (
+            ("full-refit", full_refit_vs_truth_mean),
+            ("transform", transform_vs_truth_mean),
+        ):
+            assert mean >= CEILING_FRACTION_FLOOR * ceiling, (
+                f"{tag}: {label} fidelity against the 256-d truth ({mean:.3f}) is far "
+                f"below the corpus ceiling ({ceiling:.3f}) — this should not happen for "
+                f"a correct comparison (see the self-check note in this script's "
+                f"docstring) and most likely means the harness itself is broken, not "
+                f"that the finding is real."
+            )
+            assert mean <= ceiling + CEILING_SLACK, (
+                f"{tag}: {label} fidelity against the 256-d truth ({mean:.3f}) exceeds "
+                f"the corpus ceiling ({ceiling:.3f}) by more than the stated slack "
+                f"({CEILING_SLACK}) — no placement of new rows should recover more "
+                f"structure than the corpus's own base rows do, so this most likely "
+                f"means the harness compared a query against itself or another "
+                f"degenerate pool, not that placement is unusually good."
+            )
+
+        # Frame-invariant fidelity between the two PLACEMENTS themselves — not read
+        # against the ceiling, since neither side of it is the 256-d truth.
         placement_nn_transform = nearest_indices_euclidean(placed, base_coords, k, exclude_self=False)
         placement_nn_full_refit = nearest_indices_euclidean(
             true_new_coords, base_coords_in_full_refit, k, exclude_self=False

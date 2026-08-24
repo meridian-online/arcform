@@ -6,7 +6,7 @@
     "min_dist": 0.1,
     "seed": 42
   },
-  "fit_seconds": 12.0,
+  "fit_seconds": 11.8,
   "pickled_reducer_bytes": 3642991,
   "base_map_median_nn_spacing": 0.04076581448316574,
   "base_rows_moved_by_transform": 0.0,
@@ -15,7 +15,7 @@
   "placements": {
     "append_05": {
       "new_rows": 150,
-      "transform_seconds": 1.86,
+      "transform_seconds": 1.79,
       "transform_repeat_max_abs_diff": 0.0,
       "transform_vs_256d_truth_mean": 0.27399999999999997,
       "full_refit_vs_256d_truth_mean": 0.30399999999999994,
@@ -25,7 +25,7 @@
     },
     "append_20": {
       "new_rows": 600,
-      "transform_seconds": 1.85,
+      "transform_seconds": 1.78,
       "transform_repeat_max_abs_diff": 0.0,
       "transform_vs_256d_truth_mean": 0.2569166666666666,
       "full_refit_vs_256d_truth_mean": 0.28125,
@@ -35,7 +35,7 @@
     },
     "append_50": {
       "new_rows": 1500,
-      "transform_seconds": 4.6,
+      "transform_seconds": 4.42,
       "transform_repeat_max_abs_diff": 0.0,
       "transform_vs_256d_truth_mean": 0.2628666666666667,
       "full_refit_vs_256d_truth_mean": 0.2725666666666667,

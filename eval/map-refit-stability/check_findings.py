@@ -165,9 +165,12 @@ def main() -> int:
     )
 
     # transform_pricing.json — the out-of-sample-placement pricing this card's review
-    # asked for. Same rule: every figure quoted in prose is derived here, not
-    # retyped, and the file's own internal invariants are checked whether or not
-    # prose quotes them.
+    # asked for. Same rule: every pricing figure below is computed from this file
+    # and required as a string, not typed a second time by hand — including the
+    # derived ones (the gap below the ceiling, the ceiling's share recovered, the
+    # gap below the full refit), not only the figures read straight off the JSON.
+    # The file's own internal invariants are checked whether or not prose quotes
+    # them.
     if PRICING.is_file():
         pricing = json.loads(PRICING.read_text())
 
@@ -219,6 +222,57 @@ def main() -> int:
                 readme,
                 joined_2dp,
                 f"README.md ({kind} fidelity vs 256-d truth, per-fraction)",
+            )
+
+        # The gap-below-the-ceiling and share-of-the-ceiling sentences — the ones a
+        # prior round of this card's review had to correct once already, because
+        # "points below the ceiling" and "points below the full refit" are different
+        # numbers and the wrong one was pinned first. Both are computed here, from
+        # the same pricing values checked above, rather than typed a second time.
+        ceiling_pct = pricing["corpus_ceiling_256d_vs_2d"] * 100
+        transform_pcts = [v * 100 for v in truth_fidelities["transform"]]
+        full_refit_pcts = [v * 100 for v in truth_fidelities["full_refit"]]
+
+        gaps_below_ceiling = [ceiling_pct - t for t in transform_pcts]
+        require(
+            readme,
+            f"{round(min(gaps_below_ceiling))} to {round(max(gaps_below_ceiling))} "
+            f"points below the ceiling",
+            "README.md (.transform() gap below the ceiling)",
+        )
+
+        ceiling_share = [f / ceiling_pct * 100 for f in full_refit_pcts]
+        require(
+            readme,
+            f"{round(min(ceiling_share))}-{round(max(ceiling_share))}% of the ceiling",
+            "README.md (full refit's share of the ceiling)",
+        )
+        require(
+            changelog,
+            f"{round(min(ceiling_share))}-{round(max(ceiling_share))}% of the ceiling",
+            "CHANGELOG.md (full refit's share of the ceiling)",
+        )
+
+        gaps_below_full_refit = [f - t for f, t in zip(full_refit_pcts, transform_pcts)]
+        require(
+            changelog,
+            f"{min(gaps_below_full_refit):.1f}-{max(gaps_below_full_refit):.1f} points "
+            f"under the full refit",
+            "CHANGELOG.md (.transform() gap below the full refit)",
+        )
+        require(
+            readme,
+            " / ".join(f"{v:.1f}" for v in gaps_below_full_refit),
+            "README.md (.transform() gap below the full refit, per-fraction)",
+        )
+
+        # CHANGELOG's own "30.4-27.3%" / "27.4-25.7%" range notation, distinct from
+        # the README's " / "-joined one checked above.
+        for kind, values in (("full_refit", full_refit_pcts), ("transform", transform_pcts)):
+            require(
+                changelog,
+                f"{max(values):.1f}-{min(values):.1f}%",
+                f"CHANGELOG.md ({kind} fidelity vs 256-d truth, hyphen range)",
             )
     else:
         problems.append(
