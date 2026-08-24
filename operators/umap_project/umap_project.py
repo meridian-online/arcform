@@ -11,7 +11,10 @@
 Reduces numeric columns that already exist to the two coordinates a map is drawn
 from. Reads one Parquet, builds a feature matrix from the named columns, reduces it
 to two dimensions with UMAP, and writes a Parquet carrying every input column plus
-`projection_x` and `projection_y` as DOUBLE.
+`projection_x` and `projection_y` as DOUBLE, and `projection_fit_id` as VARCHAR — a
+fingerprint of the exact numbers and knobs this run fit, the same on every row, so a
+reader can tell whether two files came from the same fit before comparing positions
+between them.
 
 NO TEXT COLUMN AND NO MODEL. `--column` names columns that are already numbers, and
 a column is numeric in either of two shapes:
@@ -85,6 +88,7 @@ for _var in (
     os.environ[_var] = "1"
 
 import argparse
+import hashlib
 import sys
 from pathlib import Path
 
@@ -94,10 +98,24 @@ SEED = 42  # frozen: the projection's random_state, so a re-run lands on the sam
 # it cannot collide with a real column by accident; a collision is refused outright.
 ROW = "__arc_project_row"
 
-# The two columns this operator adds. A conflict with an input column is refused
+# The three columns this operator adds. A conflict with an input column is refused
 # rather than silently overwritten — the caller asked for both sets of values.
 X_COL = "projection_x"
 Y_COL = "projection_y"
+
+# A refit moves every point — there is no out-of-sample transform, so appending rows
+# means re-fitting the whole map (see the-map-reshuffles-when-rows-are-added). What an
+# analyst CAN tell from the file alone is whether two projections were fit on the same
+# footing: FIT_ID_COL carries a hash of the exact feature matrix this run fed to UMAP
+# together with the knobs that shaped the fit (n_neighbors, min_dist, metric, seed),
+# broadcast to every row. Two files with the same id were fit on byte-identical input
+# under byte-identical settings and — given the pinned seed, thread count and row
+# order documented above — are byte-identical themselves; a different id means either
+# the data or a knob changed and no position in the file may be compared
+# position-for-position against an older one. It answers "did the layout change", not
+# "did a particular row's data change" — that second question is answerable from the
+# row's own columns without this operator's help.
+FIT_ID_COL = "projection_fit_id"
 
 DEFAULT_NEIGHBORS = 15
 DEFAULT_MIN_DIST = 0.1
@@ -257,13 +275,14 @@ def main() -> int:
 
     # `names` ends with the ordinal this step just added, so the input carried it too
     # only if it appears twice.
-    clashes = [c for c in (X_COL, Y_COL) if c in types]
+    clashes = [c for c in (X_COL, Y_COL, FIT_ID_COL) if c in types]
     if names.count(ROW) > 1:
         clashes.append(ROW)
     if clashes:
         raise Refusal(
             f"{src} already carries a column named {clashes[0]!r}; this operator adds "
-            f"{X_COL!r} and {Y_COL!r} and will not overwrite an input column."
+            f"{X_COL!r}, {Y_COL!r} and {FIT_ID_COL!r} and will not overwrite an input "
+            f"column."
         )
 
     columns: list[str] = args.columns
@@ -345,11 +364,23 @@ def main() -> int:
     )
     coordinates = np.asarray(reducer.fit_transform(matrix), dtype=np.float64)
 
-    con.execute(f"CREATE TABLE arc_proj ({ROW} BIGINT, {X_COL} DOUBLE, {Y_COL} DOUBLE)")
+    # Everything that determines the fit, not just the numbers: the same matrix under
+    # a different `neighbors:`/`min_dist:`/`metric:` is a different map, and a fit_id
+    # that only hashed the matrix would claim two such maps were comparable when they
+    # are not. SEED is a constant, included anyway so the id is a complete fingerprint
+    # of the call rather than one that happens to be complete only while SEED stays 42.
+    fit_id = hashlib.sha256(
+        matrix.tobytes() + f"|{k}|{args.min_dist}|{args.metric}|{SEED}".encode()
+    ).hexdigest()[:16]
+
+    con.execute(
+        f"CREATE TABLE arc_proj ({ROW} BIGINT, {X_COL} DOUBLE, {Y_COL} DOUBLE, "
+        f"{FIT_ID_COL} VARCHAR)"
+    )
     con.executemany(
-        "INSERT INTO arc_proj VALUES (?, ?, ?)",
+        "INSERT INTO arc_proj VALUES (?, ?, ?, ?)",
         [
-            (i, float(coordinates[i, 0]), float(coordinates[i, 1]))
+            (i, float(coordinates[i, 0]), float(coordinates[i, 1]), fit_id)
             for i in range(len(rows))
         ],
     )
@@ -357,13 +388,13 @@ def main() -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     con.execute(
-        f"COPY (SELECT s.* EXCLUDE ({ROW}), p.{X_COL}, p.{Y_COL} "
+        f"COPY (SELECT s.* EXCLUDE ({ROW}), p.{X_COL}, p.{Y_COL}, p.{FIT_ID_COL} "
         f"FROM arc_src s JOIN arc_proj p ON s.{ROW} = p.{ROW} ORDER BY s.{ROW}) "
         f"TO {sql_lit(str(out))} (FORMAT parquet, COMPRESSION zstd)"
     )
     print(
         f"[umap_project] {len(rows)} rows · {matrix.shape[1]} features from "
-        f"{len(columns)} column(s) · {args.metric} · seed {SEED} → {out}"
+        f"{len(columns)} column(s) · {args.metric} · seed {SEED} · fit_id {fit_id} → {out}"
     )
     return 0
 

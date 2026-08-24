@@ -1,0 +1,4 @@
+# Fetched model weights and intermediate Parquet slices — re-derived by measure.py,
+# not committed. results.json is the committed output.
+.cache/
+build/

@@ -211,6 +211,18 @@ Rationale for each change is recorded in the project's design notes and commit h
 - **brewtrend reference pipeline** — the first complete runnable example under
   `examples/brewtrend/`, exercising command + SQL steps, preconditions, retries, and a runtime
   parameter; ships a Frictionless Data Package describing its output.
+- **`umap_project` writes `projection_fit_id`** (1.1.0). There is no out-of-sample
+  transform, so appending rows and re-running means the whole map is refit and every
+  point can move — measured at 3,000 real rows (`eval/map-refit-stability/`): a 5%
+  append already shares only 46% of a point's 20 nearest map-neighbours with the
+  pre-append layout, worse than swapping the entire embedding model does on two of
+  three text corpora in a sibling measurement of neighbourhood survival on the same
+  kind of 2D map. `projection_fit_id` is a hash of the exact feature matrix and knobs
+  (`neighbors`, `min_dist`, `metric`, seed) one fit consumed, the same value on every
+  row of that fit's output — so a reader comparing two Parquets can tell whether they
+  came from the same fit before trusting that a shared row's position means the same
+  thing in both. See `operators/umap_project/README.md`, "Telling a refit from an
+  append."
 
 ### Changed
 

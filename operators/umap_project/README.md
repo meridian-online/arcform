@@ -144,6 +144,76 @@ not the coordinates.** The map is for seeing the shape of the whole — which is
 reason the two are separate steps: the answer to that question is the other step's
 output, and it is a file you already have.
 
+## Appending rows moves the whole map, and it was measured before it was decided
+
+**There is no out-of-sample transform.** `umap-learn`'s public API is fit-only: given
+new rows, the only route to coordinates for them is a fresh `fit_transform` over
+everything — old rows and new — so appending data and re-running moves every point,
+not just the new ones. An analyst who appends rows and reruns cannot tell, from the
+map alone, whether the picture changed because the data did or because the layout was
+refit around it.
+
+**How much, measured 2026-08-24 against a real corpus, is `eval/map-refit-stability/`
+in this repository — `uv run eval/map-refit-stability/measure.py`, committed output in
+`results.json`.** 3,000 rows of Homebrew package descriptions
+(`examples/brewtrend/data/ranking.parquet`, 13,332 usable rows total, split
+deterministically by name so nothing is cherry-picked), embedded with
+`minishlab/potion-base-8M` through this operator's own sibling `text_embed@1`, then
+projected through this operator itself — no reimplementation of either. Two measures,
+because either alone misleads: raw+normalised displacement of a row's (x, y) between
+fits (UMAP's frame is arbitrary up to rotation/scale between independent fits, and
+that arbitrariness is itself part of what an analyst sees as "the map turned", so it
+is deliberately not aligned away), and the fraction of a row's 20 nearest *other*
+existing rows shared between the two fits — which isolates whether the refit
+rearranged the analyst's existing reading, as opposed to new rows simply now being
+nearby, which is expected.
+
+The **no-new-rows control matters more than any other number here**: refitting the
+identical 3,000 rows from scratch, in a separate process, reproduces the prior run's
+coordinates exactly — 0.0 displacement, 100% neighbourhood overlap — confirming this
+operator's documented determinism (pinned seed, thread count, row order) is the floor
+every other number below is read against, not zero.
+
+| append | shared rows scored | mean displacement (× median gap) | 20-NN overlap, mean |
+|---|---|---|---|
+| 0% (control) | 3,000 | 0 | 1.00 |
+| 5% (150 rows) | 3,000 | 38× | 0.46 |
+| 20% (600 rows) | 3,000 | 134× | 0.39 |
+| 50% (1,500 rows) | 3,000 | 268× | 0.35 |
+
+A modest, realistic append already destroys most of a point's visual neighbourhood:
+**a 5% append shares only 46% of a point's 20 nearest map-neighbours with the
+pre-append layout.** Read against a sibling measurement of how much neighbourhood
+structure survives *swapping the embedding model entirely* on a comparable text
+corpus, on the same kind of kNN-overlap scale (0.13 long-form, 0.28 short, 0.40
+very-short) — a 5% append already loses **more** structure than swapping models
+does on two of those three corpora, and every append fraction measured here loses more
+than the very-short-text case. Refitting on an ordinary append is not a small,
+forgivable jitter; it is the same order of disruption as changing the embedder.
+
+**The decision that follows: pin the layout, refit only on an explicit user
+action.** It needs no new mathematics inside this operator — arcform's own staleness
+model already means the projection step only re-runs when something asks it to — the
+gap is that nothing today tells a reader whether two projection outputs came from the
+same fit before they compare positions between them. This operator does not attempt
+the alternative of placing new rows approximately without a full refit (an
+out-of-sample transform): the measurement above establishes the problem is real before
+that heavier option would even be on the table, and the interface answer above is
+priced at effectively zero — implementing the transform is not, and is not undertaken
+here.
+
+**Telling a refit from an append.** Every output row now carries `projection_fit_id` —
+a hash of the exact feature matrix and knobs (`neighbors`, `min_dist`, `metric`, seed)
+that fit consumed, the same value on every row. Two files with the same id were fit on
+byte-identical input under byte-identical settings and, given the determinism above,
+are byte-identical themselves; a different id means the fit's input or settings
+changed and no row's position may be compared position-for-position against an older
+file. That is the "is the surface telling me the layout changed or the data changed"
+question, answered from the file alone, without a UI change anywhere else — a
+downstream renderer (`brightfield`) that wants to hold a map still across an append and
+show it as stale rather than silently reshuffling reads this column; that surface work
+is not part of this operator and is not implemented here.
+
 ## Standalone
 
 ```bash

@@ -175,7 +175,16 @@ class DefaultsTest(unittest.TestCase):
         # It is added to the input's own columns and excluded again on the way out;
         # a plain name would collide with a real one and be silently dropped.
         self.assertTrue(up.ROW.startswith("__arc"))
-        self.assertNotIn(up.ROW, (up.X_COL, up.Y_COL))
+        self.assertNotIn(up.ROW, (up.X_COL, up.Y_COL, up.FIT_ID_COL))
+
+    def test_the_three_added_columns_are_pairwise_distinct(self) -> None:
+        # Each is checked for a clash against the input separately (see
+        # `clashes = [c for c in (X_COL, Y_COL, FIT_ID_COL) ...]` in main()); if two of
+        # them were equal, a Parquet carrying one of the names would be refused for the
+        # wrong reason, or the CREATE TABLE that adds all three would collide with
+        # itself.
+        added = (up.X_COL, up.Y_COL, up.FIT_ID_COL)
+        self.assertEqual(len(added), len(set(added)))
 
 
 if __name__ == "__main__":
