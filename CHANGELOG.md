@@ -234,8 +234,7 @@ Rationale for each change is recorded in the project's design notes and commit h
   via `cargo tree`), so its `Map` is BTreeMap-backed and keys serialize sorted at
   every nesting level with no explicit sort step — matching Python's
   `json.dump(..., indent=2, sort_keys=True, ensure_ascii=False)` byte for byte.
-  `operators/datapackage_describe/{describe.py,test_describe.py}` are deleted, and
-  CI's `operators` job (which only ever ran that one file) goes with them. The
+  `operators/datapackage_describe/{describe.py,test_describe.py}` are deleted. The
   operator's version stays `1.0.0`: the `with:` contract and the produced bytes are
   unchanged, the same precedent set when `x-finetype-version` was added (also not a
   version bump). The `op@<version>` guarantee `materialize_frozen_script`'s
