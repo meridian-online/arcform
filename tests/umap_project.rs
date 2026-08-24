@@ -161,17 +161,47 @@ fn a_map_of_plain_numbers_needs_no_model_and_no_text_column() {
     let project = tmp.path();
 
     // Not a setup detail: there is nothing in this Protocol that could embed anything.
-    let manifest = std::fs::read_to_string(project.join("arcform.yaml")).unwrap();
-    assert!(
-        !manifest.contains("text_column") && !manifest.contains("model"),
-        "the manifest must reach a map without naming a text column or a model:\n{manifest}"
+    //
+    // Read as PARSED YAML rather than as text. A `contains("model")` over the file
+    // matches this fixture's own comments, which are about the absence of a model —
+    // a scan of prose cannot tell a field from a sentence about that field, and the
+    // first version of this assertion failed on exactly that.
+    let manifest: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(project.join("arcform.yaml")).unwrap())
+            .unwrap();
+    let with = &manifest["steps"][2]["with"];
+    assert_eq!(
+        manifest["steps"][2]["op"].as_str(),
+        Some("umap_project@1"),
+        "the third step is the one under test"
+    );
+    let fields: Vec<&str> = with
+        .as_mapping()
+        .unwrap()
+        .keys()
+        .map(|k| k.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        fields,
+        vec!["input", "columns", "out", "metric"],
+        "the step reaches a map with these fields and no others — no text column and          no model appear anywhere in its configuration"
     );
     assert!(
         !project.join("model").exists(),
         "no model directory may exist in a Protocol that only projects numbers"
     );
 
-    common::arc_run(project);
+    let stdout = common::arc_run(project);
+
+    // The run's own asset graph, not the manifest: a model would be a Directory node
+    // in it, the way the text fixture's is. There is none, so nothing in this
+    // Protocol depends on bytes a model would have supplied.
+    let graph = common::strip_ansi(&stdout);
+    assert!(
+        !graph.contains("[directory]"),
+        "a projection of plain numbers declares no directory asset — a model would \
+         appear here as one:\n{graph}"
+    );
 
     let out = projected(project);
     assert_eq!(
