@@ -1408,35 +1408,300 @@ impl Operator for OpendalFetch {
 // curated descriptor.overrides.json (the hand half; overrides win, relational keys
 // hard-checked against the Parquet).
 //
-// Wraps an arcform-EMBEDDED copy of describe.py via the uv-run substrate — NOT a
-// Rust reimplementation of the JSON merge. That is deliberate: running the identical
-// script makes the output byte-identical to the retired scripts/describe.py by
-// construction, it needs no serde_json dep (and dodges its float/sort byte-equivalence
-// hazards vs Python's json.dump), and the operator becomes reusable by any dataset.
-// Python at the edges — the same posture as splink_resolve. describe.py itself has
-// no Python deps; it shells the `finetype` CLI (must be on PATH, as today).
+// NATIVE RUST — no Python, no `uv`. This operator used to wrap an arcform-embedded
+// copy of describe.py via the uv-run substrate (see CHANGELOG); the JSON merge is
+// now `merge_datapackage` below, over `serde_json::Value`. A Frictionless Data
+// Package is a specification, not a runtime, and merging two JSON objects needs
+// nothing Python provided — so the machine-decidable half still comes from
+// shelling the `finetype` CLI (`finetype profile … -o datapackage`, must be on
+// PATH, exactly as before) via the shared [`run_process`] substrate, and only the
+// merge that used to run inside describe.py moved into this process. The typing
+// boundary is untouched: finetype decides what it decides, this operator still
+// forms no opinion about column types, it only plumbs the two halves together.
 //
-// Verified byte-identical to the retired script on the live build, save two fields
-// `finetype` and this operator stamp themselves: the per-run `created` timestamp
-// (non-deterministic, and pre-existing; the command step had it too) and the new
-// `x-finetype-version` (deliberate — see below; it did not exist in the retired
-// script's output at all). datapackage.json is metadata, not the data; the parquet
-// (the byte-equivalence target) is untouched by this op.
+// Verified byte-identical to the retired uv/Python path against the real Parquet +
+// descriptor.overrides.json for all four published datasets, save the one field
+// that was ALREADY non-deterministic before this change: `created`, the per-run
+// timestamp `finetype profile` stamps into its own output on every invocation.
+// `x-finetype-version` — stamped by this operator, not by finetype — matches
+// exactly, because both runs resolve and shell the same `finetype` on PATH.
 //
-// The version stamp is produced in describe.py, not here, even though the Rust side
-// is the one that decided to add it. describe.py is what already talks to `finetype`
-// — it resolves the binary on PATH to check the `--min-finetype-version` floor before
-// this operator existed — so the stamp reuses THAT SAME resolved version rather than
-// this operator shelling `finetype --version` a second, independent time (which could
-// in principle race a PATH change between the two calls, or between the operator's
-// check and the version finetype used to type the columns). The Rust side's job is
-// only to plumb the manifest's declared `expect_finetype_version` (see AC2 below)
-// through to describe.py's `--expect-finetype-version` flag; it forms no opinion about
-// what the resolved version IS.
+// Version deliberately NOT bumped (`1.0.0`, unchanged): the `with:` contract and
+// the produced bytes are identical, matching the precedent set when
+// `x-finetype-version` was added (also not a version bump — see CHANGELOG). The
+// reproducibility guarantee `materialize_frozen_script`'s write-if-changed cache
+// gave the embedded script — `op@<version>` addresses exact bytes, so a behaviour
+// change is a version bump and a rebuild, never a silent edit — still holds, by a
+// different and simpler mechanism: there is no separate script materialized at
+// runtime anymore, so the operator's behaviour is entirely the compiled binary,
+// exactly like every other in-process operator in this catalog
+// (`parquet_export`, `archive_extract`, `finetype_validate`) that never needed
+// `materialize_frozen_script` to make that same claim.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The describe script, pinned into the binary. `@1` == these exact bytes.
-const DESCRIBE_PY: &str = include_str!("../operators/datapackage_describe/describe.py");
+/// The floor finetype version whose taxonomy types these datasets correctly. A
+/// drifted, older binary on PATH once silently shipped wrong labels — the guard
+/// below turns that into a stopped run. Bump this when a newer finetype is needed
+/// for correct labels; a Protocol may override it with `expect_finetype_version`.
+///
+/// 0.6.54 is the release that stopped eight-digit numbers typing as confident
+/// dates. Up to and including 0.6.53 the year-first and day-first compact date
+/// leaves both validated on `^\d{8}$`, so any eight-digit token — a financial
+/// figure, a surrogate key — came back as a high-confidence date WITH A `strptime`
+/// TRANSFORM ATTACHED. That is worse than a wrong label: a consumer that follows
+/// the transform gets a corrupted column, not a mislabelled one. 0.6.53 therefore
+/// has to be refused as firmly as 0.6.52 was.
+const MIN_FINETYPE_VERSION: &str = "0.6.54";
+
+/// Pull the first dotted numeric version out of `text` (e.g. `"finetype 0.6.53"`).
+fn parse_finetype_version(text: &str) -> Option<(u64, u64, u64)> {
+    let re = regex::Regex::new(r"(\d+)\.(\d+)\.(\d+)").ok()?;
+    let caps = re.captures(text)?;
+    Some((
+        caps.get(1)?.as_str().parse().ok()?,
+        caps.get(2)?.as_str().parse().ok()?,
+        caps.get(3)?.as_str().parse().ok()?,
+    ))
+}
+
+/// Fail closed unless the `finetype` on PATH is `>= min_version`.
+///
+/// Column typing is only as good as the installed binary, and a stale one is
+/// invisible here — its output is still valid JSON. So assert the version before
+/// profiling rather than trust whatever PATH resolves to.
+///
+/// Returns the resolved dotted version string (e.g. `"0.6.60"`) on success — the
+/// SAME string this call already parsed to check the floor, reused by the caller
+/// both to stamp `x-finetype-version` and to check `expect_finetype_version`.
+/// Resolving the version once and threading it through means the stamp can only
+/// ever name the binary this run actually asserted and ran, never a second,
+/// independent lookup that could in principle disagree with the first.
+fn require_finetype(min_version: &str, ctx: &OpContext) -> Result<String> {
+    let out = run_process(
+        "finetype",
+        &["--version".to_string()],
+        ctx,
+        OutputMode::Capture,
+        "datapackage_describe",
+    )?;
+    let stdout = out.stdout.unwrap_or_default();
+    let got = parse_finetype_version(&stdout).ok_or_else(|| {
+        fetch_failed(format!(
+            "datapackage_describe: could not parse a version from `finetype --version` ({:?}).",
+            stdout
+        ))
+    })?;
+    let want = parse_finetype_version(min_version)
+        .expect("MIN_FINETYPE_VERSION must itself parse as a dotted version");
+    if got < want {
+        return Err(fetch_failed(format!(
+            "datapackage_describe: finetype {}.{}.{} on PATH is older than the required {}; \
+             its labels are not trustworthy for these datasets. Update it \
+             (e.g. `cargo install --path crates/finetype-cli --force`) and re-run.",
+            got.0, got.1, got.2, min_version
+        )));
+    }
+    Ok(format!("{}.{}.{}", got.0, got.1, got.2))
+}
+
+/// Fail closed unless the already-resolved `resolved` version equals `expect` — the
+/// manifest's `expect_finetype_version` pin.
+///
+/// `MIN_FINETYPE_VERSION` is a floor: anything newer passes, because a newer
+/// finetype only ever has a taxonomy at least as good. `expect_finetype_version`
+/// is a pin: a caller that wants THIS EXACT release run (reproducing a prior
+/// descriptor, or holding a pipeline to a release under evaluation) asks for that
+/// directly, since "newer is fine" is not always true for a pinned pipeline — the
+/// engine that describes a dataset changing out from under it, silently, is
+/// exactly the failure `x-finetype-version` exists to make visible, and refusing
+/// up front is cheaper than discovering it by reading the stamp after the fact.
+fn require_exact_finetype_version(resolved: &str, expect: &str) -> Result<()> {
+    if resolved != expect {
+        return Err(fetch_failed(format!(
+            "datapackage_describe: finetype on PATH reports {}, but the manifest's \
+             `expect_finetype_version` requested exactly {}. Resolve which binary should \
+             produce this descriptor before running (e.g. `cargo install --path \
+             crates/finetype-cli --force` for a specific tag, or adjust \
+             `expect_finetype_version` if a newer release is intended).",
+            resolved, expect
+        )));
+    }
+    Ok(())
+}
+
+/// Run `finetype profile -f <parquet> -o datapackage` and parse its stdout as the
+/// Frictionless Data Package finetype computed from the built Parquet directly
+/// (including the resource `bytes` / `hash` / `format` / `mediatype`).
+fn finetype_datapackage(parquet: &Path, ctx: &OpContext) -> Result<serde_json::Value> {
+    let out = run_process(
+        "finetype",
+        &[
+            "profile".to_string(),
+            "-f".to_string(),
+            parquet.display().to_string(),
+            "-o".to_string(),
+            "datapackage".to_string(),
+        ],
+        ctx,
+        OutputMode::Capture,
+        "datapackage_describe",
+    )?;
+    let stdout = out.stdout.unwrap_or_default();
+    serde_json::from_str(&stdout).map_err(|e| {
+        fetch_failed(format!(
+            "datapackage_describe: could not parse finetype output as JSON: {}",
+            e
+        ))
+    })
+}
+
+/// Top-level override keys handled structurally — everything else is copied to the
+/// package root as-is (title / description / homepage / licenses / sources / …).
+const MERGE_STRUCTURAL: &[&str] = &["resource", "fields", "primaryKey", "foreignKeys"];
+
+/// Overlay the curated `descriptor.overrides.json` sidecar onto finetype's base
+/// descriptor — overrides win, finetype supplies everything the sidecar does not
+/// mention. Mirrors the retired describe.py's `_merge` + `_check_relations`
+/// exactly: same four structural keys, same per-field shallow-replace semantics
+/// (an override supplies a key, finetype's value for every OTHER key on that field
+/// survives), same primaryKey/foreignKey drift hard-fail.
+fn merge_datapackage(
+    mut base: serde_json::Value,
+    overrides: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let overrides_obj = overrides.as_object().ok_or_else(|| {
+        fetch_failed(
+            "datapackage_describe: descriptor.overrides.json must be a JSON object".to_string(),
+        )
+    })?;
+
+    // 1) Package-level curated keys (title, description, homepage, licenses, sources, …).
+    {
+        let base_obj = base.as_object_mut().ok_or_else(|| {
+            fetch_failed(
+                "datapackage_describe: finetype's profile output must be a JSON object".to_string(),
+            )
+        })?;
+        for (key, value) in overrides_obj {
+            if !MERGE_STRUCTURAL.contains(&key.as_str()) {
+                base_obj.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    // 2) Resource-level overrides (e.g. the published `path`; finetype writes the
+    //    local build path, which is not where consumers fetch the resource).
+    let resource_obj = base
+        .get_mut("resources")
+        .and_then(|r| r.as_array_mut())
+        .and_then(|arr| arr.first_mut())
+        .and_then(|r| r.as_object_mut())
+        .ok_or_else(|| {
+            fetch_failed("datapackage_describe: finetype's output has no resources[0]".to_string())
+        })?;
+    if let Some(res_overrides) = overrides_obj.get("resource").and_then(|v| v.as_object()) {
+        for (key, value) in res_overrides {
+            resource_obj.insert(key.clone(), value.clone());
+        }
+    }
+
+    let schema = resource_obj
+        .get_mut("schema")
+        .and_then(|s| s.as_object_mut())
+        .ok_or_else(|| fetch_failed("datapackage_describe: resource has no schema".to_string()))?;
+    let fields = schema
+        .get_mut("fields")
+        .and_then(|f| f.as_array_mut())
+        .ok_or_else(|| fetch_failed("datapackage_describe: schema has no fields".to_string()))?;
+
+    // The columns the built Parquet actually has, per finetype — computed BEFORE
+    // the per-field override loop below mutates field contents (it never touches
+    // `name`), so this set stays valid for both the stale-override warning and the
+    // relational drift check after it.
+    let present: std::collections::BTreeSet<String> = fields
+        .iter()
+        .filter_map(|f| f.get("name").and_then(|n| n.as_str()).map(str::to_string))
+        .collect();
+
+    // 3) Per-field overrides, matched by column name (adds `description`, or
+    //    corrects a `x-finetype-label`, etc.). A sidecar field that does not exist
+    //    in the Parquet is a stale override — warn so it gets cleaned up.
+    if let Some(field_overrides) = overrides_obj.get("fields").and_then(|v| v.as_object()) {
+        for name in field_overrides.keys() {
+            if !present.contains(name) {
+                eprintln!(
+                    "datapackage_describe: WARNING field override '{name}' is not in the \
+                     Parquet (stale sidecar entry?)"
+                );
+            }
+        }
+        for field in fields.iter_mut() {
+            let name = field
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(str::to_string);
+            let Some(name) = name else { continue };
+            if let Some(field_over) = field_overrides.get(&name).and_then(|v| v.as_object()) {
+                let field_obj = field
+                    .as_object_mut()
+                    .expect("finetype's field entries are JSON objects");
+                for (key, value) in field_over {
+                    field_obj.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+
+    // 4) Relational metadata. These are hand-curated and cannot be inferred, but
+    //    they MUST reference real columns — hard-fail on drift.
+    for rel_key in ["primaryKey", "foreignKeys"] {
+        if let Some(value) = overrides_obj.get(rel_key) {
+            schema.insert(rel_key.to_string(), value.clone());
+        }
+    }
+    check_relations(schema, &present)?;
+
+    Ok(base)
+}
+
+/// Fail if a curated `primaryKey` / `foreignKeys` names a column absent from the
+/// built Parquet — exactly the descriptor-drift this step exists to catch, and a
+/// silent mismatch would be worse than a stopped run.
+fn check_relations(
+    schema: &serde_json::Map<String, serde_json::Value>,
+    present: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    let mut missing = Vec::new();
+    if let Some(pk) = schema.get("primaryKey").and_then(|v| v.as_array()) {
+        for col in pk.iter().filter_map(|v| v.as_str()) {
+            if !present.contains(col) {
+                missing.push(format!("primaryKey → '{col}'"));
+            }
+        }
+    }
+    if let Some(fks) = schema.get("foreignKeys").and_then(|v| v.as_array()) {
+        for fk in fks {
+            if let Some(cols) = fk.get("fields").and_then(|v| v.as_array()) {
+                for col in cols.iter().filter_map(|v| v.as_str()) {
+                    if !present.contains(col) {
+                        missing.push(format!("foreignKey → '{col}'"));
+                    }
+                }
+            }
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let cols = present.iter().cloned().collect::<Vec<_>>().join(", ");
+    Err(fetch_failed(format!(
+        "datapackage_describe: curated relational metadata references columns not in the \
+         built Parquet — the descriptor has drifted from package.sql. \
+         Reconcile descriptor.overrides.json.\n  missing: {}\n  columns: {}",
+        missing.join("; "),
+        cols
+    )))
+}
 
 struct DatapackageDescribe;
 
@@ -1492,58 +1757,69 @@ impl Operator for DatapackageDescribe {
     fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
         let cfg = DatapackageDescribeConfig::parse(with)?;
         let parquet = ctx.dir.join(&cfg.parquet);
-        let overrides = ctx.dir.join(&cfg.overrides);
+        let overrides_path = ctx.dir.join(&cfg.overrides);
         let out = ctx.dir.join(&cfg.out);
         if let Some(parent) = out.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
 
-        let script = materialize_frozen_script("datapackage_describe", "1.0.0", DESCRIBE_PY)?;
-        let extra = datapackage_describe_extra_args(
-            &parquet.display().to_string(),
-            &overrides.display().to_string(),
-            &out.display().to_string(),
-            cfg.expect_finetype_version.as_deref(),
-        );
-        let args = uv_run_args(&script.to_string_lossy(), &extra);
-        run_process(
-            "uv",
-            &args,
-            ctx,
-            OutputMode::Capture,
-            "datapackage_describe",
-        )
-    }
-}
+        let version = require_finetype(MIN_FINETYPE_VERSION, ctx)?;
+        if let Some(expect) = cfg.expect_finetype_version.as_deref() {
+            require_exact_finetype_version(&version, expect)?;
+        }
 
-/// Build the extra (post `run --script <path>`) argv for `describe.py`. Split out of
-/// [`Operator::run`] so the flag order — and above all whether `--expect-finetype-version`
-/// is even emitted — is unit-testable without a `uv` binary or a filesystem.
-///
-/// `--expect-finetype-version` is omitted entirely when the manifest does not set
-/// `expect_finetype_version`, rather than passed empty: describe.py's own argparse
-/// treats a present-but-falsy value as "not pinned" too, but omitting it keeps the
-/// invocation identical to what a manifest without the field produced before this
-/// field existed.
-fn datapackage_describe_extra_args(
-    parquet: &str,
-    overrides: &str,
-    out: &str,
-    expect_finetype_version: Option<&str>,
-) -> Vec<String> {
-    let mut extra = vec![
-        "--parquet".to_string(),
-        parquet.to_string(),
-        "--overrides".to_string(),
-        overrides.to_string(),
-        "--out".to_string(),
-        out.to_string(),
-    ];
-    if let Some(expect) = expect_finetype_version {
-        extra.push("--expect-finetype-version".to_string());
-        extra.push(expect.to_string());
+        let base = finetype_datapackage(&parquet, ctx)?;
+
+        let overrides_text = std::fs::read_to_string(&overrides_path).map_err(|e| {
+            fetch_failed(format!(
+                "datapackage_describe: read {}: {}",
+                overrides_path.display(),
+                e
+            ))
+        })?;
+        let overrides: serde_json::Value = serde_json::from_str(&overrides_text).map_err(|e| {
+            fetch_failed(format!(
+                "datapackage_describe: parse {}: {}",
+                overrides_path.display(),
+                e
+            ))
+        })?;
+
+        let mut descriptor = merge_datapackage(base, &overrides)?;
+        // Stamped AFTER the merge, so a sidecar override cannot supply (or clobber)
+        // the identity of the engine that actually ran — this field is machine-derived
+        // like the rest of finetype's half of the descriptor, not hand-curated, and it
+        // is what makes a descriptor produced by a superseded finetype distinguishable
+        // from a current one just by reading the file.
+        descriptor
+            .as_object_mut()
+            .expect("merge_datapackage always returns a JSON object")
+            .insert(
+                "x-finetype-version".to_string(),
+                serde_json::Value::String(version),
+            );
+
+        let mut bytes = serde_json::to_vec_pretty(&descriptor).map_err(|e| {
+            fetch_failed(format!(
+                "datapackage_describe: serialize {}: {}",
+                out.display(),
+                e
+            ))
+        })?;
+        bytes.push(b'\n');
+        std::fs::write(&out, &bytes).map_err(|e| {
+            fetch_failed(format!(
+                "datapackage_describe: write {}: {}",
+                out.display(),
+                e
+            ))
+        })?;
+
+        Ok(StepOutput {
+            stderr: String::new(),
+            stdout: None,
+        })
     }
-    extra
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2916,38 +3192,128 @@ mod tests {
         );
     }
 
+    // ── datapackage_describe: native-Rust merge + version gate ──────────────────
+
     #[test]
-    fn datapackage_describe_extra_args_omits_expect_when_unset() {
-        // No `expect_finetype_version` in the manifest → no `--expect-finetype-version`
-        // flag at all, so a manifest predating the field invokes describe.py exactly
-        // as it did before this field existed.
-        assert_eq!(
-            datapackage_describe_extra_args("p.parquet", "o.json", "d.json", None),
-            vec![
-                "--parquet",
-                "p.parquet",
-                "--overrides",
-                "o.json",
-                "--out",
-                "d.json"
-            ],
-        );
+    fn parse_finetype_version_extracts_first_dotted_triple() {
+        assert_eq!(parse_finetype_version("finetype 0.6.53"), Some((0, 6, 53)));
+        assert_eq!(parse_finetype_version("v12.0.1-rc1"), Some((12, 0, 1)));
     }
 
     #[test]
-    fn datapackage_describe_extra_args_passes_expect_through() {
+    fn parse_finetype_version_none_when_absent() {
+        assert_eq!(parse_finetype_version("no version here"), None);
+    }
+
+    #[test]
+    fn require_exact_finetype_version_matching_does_not_raise() {
+        require_exact_finetype_version("0.6.60", "0.6.60").expect("exact match must pass");
+    }
+
+    #[test]
+    fn require_exact_finetype_version_newer_than_expected_still_refused() {
+        // A pin is exact, not a floor — 0.6.61 does not satisfy "expect 0.6.60" even
+        // though it would satisfy "min 0.6.60".
+        let err = require_exact_finetype_version("0.6.61", "0.6.60")
+            .expect_err("a pin is exact, a newer release must still be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("0.6.61"));
+        assert!(msg.contains("0.6.60"));
+    }
+
+    fn field(name: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut obj = extra.as_object().cloned().unwrap_or_default();
+        obj.insert(
+            "name".to_string(),
+            serde_json::Value::String(name.to_string()),
+        );
+        serde_json::Value::Object(obj)
+    }
+
+    fn base_descriptor(fields: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({
+            "name": "widgets",
+            "resources": [{
+                "name": "widgets",
+                "path": "build/widgets.parquet",
+                "schema": { "fields": fields }
+            }]
+        })
+    }
+
+    #[test]
+    fn merge_datapackage_package_level_overrides_win() {
+        let base = base_descriptor(vec![field("a", serde_json::json!({}))]);
+        let overrides = serde_json::json!({ "title": "Widgets — curated" });
+        let merged = merge_datapackage(base, &overrides).unwrap();
+        assert_eq!(merged["title"], "Widgets — curated");
+        // finetype's own package-level key, not mentioned by the override, survives.
+        assert_eq!(merged["name"], "widgets");
+    }
+
+    #[test]
+    fn merge_datapackage_field_override_is_a_shallow_replace_not_a_wipe() {
+        let base = base_descriptor(vec![field(
+            "cik",
+            serde_json::json!({ "type": "integer", "x-finetype-label": "identifier" }),
+        )]);
+        let overrides = serde_json::json!({
+            "fields": { "cik": { "description": "the CIK" } }
+        });
+        let merged = merge_datapackage(base, &overrides).unwrap();
+        let f = &merged["resources"][0]["schema"]["fields"][0];
+        assert_eq!(f["description"], "the CIK");
+        // Keys the override did not name survive from finetype's half — this is the
+        // override-precedence rule's OTHER half: overrides win where declared, and
+        // finetype supplies everything the sidecar does not mention.
+        assert_eq!(f["type"], "integer");
+        assert_eq!(f["x-finetype-label"], "identifier");
+    }
+
+    #[test]
+    fn merge_datapackage_primary_key_referencing_real_column_passes() {
+        let base = base_descriptor(vec![field("id", serde_json::json!({}))]);
+        let overrides = serde_json::json!({ "primaryKey": ["id"] });
+        let merged = merge_datapackage(base, &overrides).unwrap();
+        assert_eq!(merged["resources"][0]["schema"]["primaryKey"][0], "id");
+    }
+
+    #[test]
+    fn merge_datapackage_primary_key_referencing_missing_column_hard_fails() {
+        let base = base_descriptor(vec![field("id", serde_json::json!({}))]);
+        let overrides = serde_json::json!({ "primaryKey": ["not_a_real_column"] });
+        let err = merge_datapackage(base, &overrides)
+            .expect_err("a curated key naming an absent column must be refused, not published");
+        let msg = err.to_string();
+        assert!(msg.contains("not_a_real_column"));
+        assert!(msg.contains("drifted"));
+    }
+
+    #[test]
+    fn merge_datapackage_foreign_key_referencing_missing_column_hard_fails() {
+        let base = base_descriptor(vec![field("lei", serde_json::json!({}))]);
+        let overrides = serde_json::json!({
+            "foreignKeys": [{ "fields": ["ghost_column"], "reference": { "resource": "gleif", "fields": ["lei"] } }]
+        });
+        let err = merge_datapackage(base, &overrides)
+            .expect_err("a foreignKey naming an absent column must be refused");
+        assert!(err.to_string().contains("ghost_column"));
+    }
+
+    /// Pins the serialization shape AC1's byte-identity rests on: `serde_json`'s
+    /// pretty printer with NO `preserve_order` in this build's dependency graph
+    /// (confirmed separately via `cargo tree`) means its `Map` is BTreeMap-backed,
+    /// so every object's keys serialize in sorted order with no explicit sort step
+    /// — matching Python's `json.dump(..., indent=2, sort_keys=True)` byte for
+    /// byte: two-space indent, keys sorted at EVERY nesting level, and an empty
+    /// container rendered inline (`[]`, not `[\n  ]`).
+    #[test]
+    fn json_pretty_output_matches_pythons_sort_keys_format() {
+        let v = serde_json::json!({"b": 1, "a": {"z": 1, "y": 2}, "c": []});
+        let text = serde_json::to_string_pretty(&v).unwrap();
         assert_eq!(
-            datapackage_describe_extra_args("p.parquet", "o.json", "d.json", Some("0.6.60")),
-            vec![
-                "--parquet",
-                "p.parquet",
-                "--overrides",
-                "o.json",
-                "--out",
-                "d.json",
-                "--expect-finetype-version",
-                "0.6.60",
-            ],
+            text,
+            "{\n  \"a\": {\n    \"y\": 2,\n    \"z\": 1\n  },\n  \"b\": 1,\n  \"c\": []\n}"
         );
     }
 
