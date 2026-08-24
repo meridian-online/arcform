@@ -151,12 +151,7 @@ step, given one Parquet and told to fit and project it — nothing about a previ
 fit survives to the next call. So appending rows and running the step again today
 means a full `fit_transform` over everything, old rows and new, and every point can
 move. That is a fact about what THIS OPERATOR does now, not about what the
-underlying library can do — see "Pricing the alternative" below, which round three
-of this card's review corrected: an earlier version of this section claimed
-`umap-learn`'s public API has no out-of-sample transform at all, which is false and
-was checked against the wrong library (the card's `Evidence:` line is about Apple's
-Rust UMAP, which genuinely is fit-only; that claim does not carry over to
-`umap-learn`, and nobody ran `dir(umap.UMAP)` to check before writing it down).
+underlying library can do — see "Pricing the alternative" below.
 
 An analyst who appends rows and reruns cannot tell, from the map alone, whether the
 picture changed because the data did or because the layout was refit around it.
@@ -180,7 +175,11 @@ independent fits, and that arbitrariness is itself part of what an analyst sees 
 "the map turned", so it is deliberately not aligned away), and the fraction of a
 row's 20 nearest *other* existing rows shared between the two fits — which isolates
 whether the refit rearranged the analyst's existing reading, as opposed to new rows
-simply now being nearby, which is expected.
+simply now being nearby, which is expected. This is CHURN: both sides of the
+comparison are the same 3,000 base rows, so its ceiling is 1.00 and the no-new-rows
+control below proves that ceiling is reached. It is a different quantity from the
+placement FIDELITY numbers further down, whose query is a new row and whose ceiling
+is not 1.00 — the two are not read against each other anywhere in this file.
 
 The **no-new-rows control matters more than any other number here**: refitting the
 identical 3,000 rows from scratch, in a separate process, reproduces the prior run's
@@ -230,7 +229,7 @@ actually calling it — `eval/map-refit-stability/price_transform.py`,
 append pools this card's headline table uses, so the pricing below is comparable to
 it rather than a separate, smaller demo.
 
-Three costs, measured rather than assumed:
+Four costs, measured rather than assumed:
 
 1. **Model persistence.** `.transform()` needs the FITTED reducer object, not just
    its output coordinates — the k-NN graph and the optimised embedding it walks to
@@ -250,25 +249,33 @@ Three costs, measured rather than assumed:
    gone stale. Nothing prices or designs that check here; it is named as a real,
    unbuilt requirement, not assumed away.
 
-3. **Placement fidelity, measured the way this card's own headline number is
-   measured and for the same reason.** UMAP's frame is arbitrary between two
-   INDEPENDENT fits, so comparing "where `.transform()` placed a new row" against
-   "where a full refit placed the same row" by raw distance mixes genuine placement
-   error with the fact that a full refit lands in an unrelated frame — the same
-   reason the headline table above normalises rather than aligning. So fidelity here
-   is measured the frame-invariant way: for each newly placed row, its 20 nearest
-   neighbours AMONG THE BASE ROWS in `.transform()`'s frame, against its 20 nearest
-   base-row neighbours in a full refit's frame. Result: **0.38 / 0.30 / 0.27** mean
-   kNN overlap at 5% / 20% / 50% appends — LOWER than this card's own full-refit
-   churn number for pre-existing rows (0.46 / 0.39 / 0.35). Out-of-sample placement
-   is not a high-fidelity stand-in for a full refit: a newly appended row's exact
-   position is not reliable.
+3. **Whether the base rows actually stay put — measured, not assumed.**
+   `reducer.embedding_` was captured right after `fit()` and compared, by max
+   absolute difference, against `reducer.embedding_` after every `.transform()` call
+   in the pricing script: **0.0**. `.transform()`'s documented contract says it does
+   not re-optimise the training embedding; this is that claim executed rather than
+   taken on faith.
 
-**What is exact, not approximate, and not measured because it does not need to be:**
-the base rows are guaranteed unchanged, because `.transform()` by construction never
-re-optimises the training embedding — this was confirmed by never calling
-`fit_transform` on the combined table in the pricing script, not by measuring a small
-number and calling it good enough.
+4. **Placement fidelity, read against this corpus's own ceiling rather than against
+   1.00 or against the churn number above.** A 2D map cannot recover every
+   neighbour a 256-d embedding space has — this operator's own README already
+   measures that loss for a different corpus (34.9% at k=10, "What the coordinates
+   support" above). For THIS corpus, at the same k=20 used throughout: a BASE row's
+   own base fit recovers **30.5%** of its 256-d neighbourhood — the ceiling every
+   number below is read against. Scored the same way, against the 256-d embeddings
+   as ground truth (cosine, k=20, base rows as the candidate pool on both sides): a
+   **full refit** places a NEW row at 30.4% / 28.1% / 27.3% (5% / 20% / 50%
+   appends) — essentially AT the ceiling, which is what a correct measurement
+   should show, since a full refit treats every row uniformly. **`.transform()`**
+   places the same new rows at 27.4% / 25.7% / 26.3% — 1 to 3 points below the
+   ceiling, not a fraction of it. On this corpus, out-of-sample placement is very
+   nearly as faithful as a full refit.
+
+   (The pricing script also self-checks this: a full refit's fidelity against the
+   256-d truth should stay close to the ceiling, and an assertion fails loudly if it
+   does not — swapping the full refit's own base coordinates for the original base
+   fit's, a mistake made once while writing this measurement, drops that number
+   below 0.1 and the assertion catches it before the numbers reach this file.)
 
 ### Pricing the other alternative: refit only on an explicit user action
 
@@ -292,39 +299,58 @@ built here.
 
 **Pin the existing rows by persisting the fitted model and placing appended rows with
 `.transform()`.** Not because the alternative above is free — it is not implementable
-at all today — and not because `.transform()`'s placement of new rows is trustworthy
-— it measurably is not, at 0.27–0.38 fidelity against a full refit, worse than this
-card's own full-refit churn number. The case for it is the asymmetry between what it
-protects and what it risks: the base rows — which is most of the corpus, and the ones
-an analyst has already built a reading around — are held EXACTLY, by construction,
-with no approximation and no measured fidelity gap, because `.transform()` never
-touches them. The rows it places poorly are exactly the rows the analyst has no prior
+at all today — and not because out-of-sample placement is a small compromise assumed
+away: it is 1 to 3 points below this corpus's own ceiling for the new rows, measured
+against the 256-d truth rather than against the churn number, which is a different
+quantity. The case for it is the asymmetry between what it protects and what it
+risks: the base rows — which is most of the corpus at every fraction measured here,
+and the ones an analyst has already built a reading around — are held EXACTLY, by
+construction and confirmed by measurement (§3 above), with zero drift. The rows
+placed a few points under the ceiling are exactly the rows the analyst has no prior
 reading of yet, because they are new. A full refit corrupts everyone's reading to
-(imperfectly) place a handful of new rows; pinning corrupts nothing and places the new
-rows imperfectly. That asymmetry, not a claim that either technique is free, is the
-argument.
+place new rows barely better than `.transform()` does; pinning corrupts nothing and
+places the new rows almost as well. That asymmetry, not a claim that either technique
+is free, is the argument.
 
-**None of this is implemented in this card.** AC2 asks for a strategy chosen and its
+**Where the asymmetry stops being obvious.** The argument assumes an analyst reading
+the BASE rows, whose positions are exactly held — not an analyst appending rows
+specifically to see where the NEW ones land, who gets a placement a few points off a
+full refit's own, with nothing in the interface to say so; that discrimination is
+part of what pinning would still need to design, not something this measurement
+provides. And it assumes appended rows stay a minority of what is on screen. At the
+20% fraction measured here, new rows are 600 of 3,600 — 17% of the map, still
+plainly a minority. At 50%, they are 1,500 of 4,500 — a third of the map, not "a
+handful". Somewhere between those two measured points the map stops being "mostly
+exact positions plus some approximate ones" and becomes a map where a substantial
+share of what is on screen carries the fidelity gap above; nothing measured here
+locates that point more precisely than the two fractions it is bracketed by.
+
+**None of this is implemented in this card.** A strategy is chosen and its
 trade-off stated, not built. What would be needed: model persistence and a
 compatibility check inside `operators/umap_project/umap_project.py` (this card's own
 surface, no runner change required for this half), and, if "the map does not move at
 all until asked" is wanted on top of that, the runner capability named above (a
-different surface). Neither is built here.
+different surface). Neither is built here — persisting the fit and computing
+`projection_fit_id` from it rather than from the current input is real design work
+of its own and is a separate card.
 
-**Telling a refit from an append.** Every output row now carries `projection_fit_id` —
-a hash of the exact feature matrix and knobs (`neighbors`, `min_dist`, `metric`, seed)
-that fit consumed, the same value on every row. A DIFFERENT id means the data or a
-knob changed, and no row's position may be compared position-for-position against an
-older file — that is the guarantee, and it is the whole answer AC3 needs: "is the
-surface telling me the layout changed or the data changed", from the file alone,
-without a UI change anywhere else. The converse does **not** hold: a MATCHING id
-means the same data and knobs were used, not that the coordinates are guaranteed
-identical — this operator's dependency resolve is not pinned (see "Does byte-identity
-survive a dependency upgrade?" above), so two machines, or the same machine after a
-resolve moves, can share a fit_id and still emit different coordinates. A downstream
-renderer (`brightfield`) that wants to hold a map still across an append and show it
-as stale rather than silently reshuffling reads this column; that surface work is not
-part of this operator and is not implemented here.
+**Telling a refit from an append, as this operator ships today.** Every output row
+carries `projection_fit_id` — a hash of the exact feature matrix and knobs
+(`neighbors`, `min_dist`, `metric`, seed) that fit consumed, the same value on every
+row. It moves whenever the data or a knob changes, and it cannot tell you which —
+today, every run is a full refit, so "the data changed" and "the layout changed" are
+the same event and the id does not need to distinguish them. A DIFFERENT id means no
+row's position may be compared position-for-position against an older file. The
+converse does **not** hold: a MATCHING id means the same data and knobs were used,
+not that the coordinates are guaranteed identical — this operator's dependency
+resolve is not pinned (see "Does byte-identity survive a dependency upgrade?" above),
+so two machines, or the same machine after a resolve moves, can share a fit_id and
+still emit different coordinates. Discriminating "the data changed" from "the layout
+changed" arrives when pinning does, not before — computing the id from a persisted
+fit rather than from the current input is part of that future work, not this one. A
+downstream renderer (`brightfield`) that wants to warn an analyst a map has changed
+reads this column today for that coarser signal; distinguishing why it changed is not
+available from it yet.
 
 ## Standalone
 

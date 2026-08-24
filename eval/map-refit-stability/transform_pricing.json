@@ -6,36 +6,40 @@
     "min_dist": 0.1,
     "seed": 42
   },
-  "fit_seconds": 12.3,
+  "fit_seconds": 12.0,
   "pickled_reducer_bytes": 3642991,
   "base_map_median_nn_spacing": 0.04076581448316574,
   "base_rows_moved_by_transform": 0.0,
   "knn_overlap_k": 20,
+  "corpus_ceiling_256d_vs_2d": 0.3051833333333333,
   "placements": {
     "append_05": {
       "new_rows": 150,
-      "transform_seconds": 1.89,
+      "transform_seconds": 1.86,
       "transform_repeat_max_abs_diff": 0.0,
-      "knn_overlap_with_full_refit_mean": 0.3763333333333333,
-      "knn_overlap_with_full_refit_median": 0.35,
+      "transform_vs_256d_truth_mean": 0.27399999999999997,
+      "full_refit_vs_256d_truth_mean": 0.30399999999999994,
+      "transform_vs_full_refit_placement_mean": 0.3763333333333333,
       "raw_displacement_vs_full_refit_mean": 1.6861326361662388,
       "raw_displacement_vs_full_refit_normalised_mean": 41.36143623139255
     },
     "append_20": {
       "new_rows": 600,
-      "transform_seconds": 1.89,
+      "transform_seconds": 1.85,
       "transform_repeat_max_abs_diff": 0.0,
-      "knn_overlap_with_full_refit_mean": 0.30325,
-      "knn_overlap_with_full_refit_median": 0.25,
+      "transform_vs_256d_truth_mean": 0.2569166666666666,
+      "full_refit_vs_256d_truth_mean": 0.28125,
+      "transform_vs_full_refit_placement_mean": 0.30325,
       "raw_displacement_vs_full_refit_mean": 5.4634530586078,
       "raw_displacement_vs_full_refit_normalised_mean": 134.0204563032571
     },
     "append_50": {
       "new_rows": 1500,
-      "transform_seconds": 6.38,
+      "transform_seconds": 4.6,
       "transform_repeat_max_abs_diff": 0.0,
-      "knn_overlap_with_full_refit_mean": 0.2746,
-      "knn_overlap_with_full_refit_median": 0.2,
+      "transform_vs_256d_truth_mean": 0.2628666666666667,
+      "full_refit_vs_256d_truth_mean": 0.2725666666666667,
+      "transform_vs_full_refit_placement_mean": 0.2746,
       "raw_displacement_vs_full_refit_mean": 11.212429834850724,
       "raw_displacement_vs_full_refit_normalised_mean": 275.04491145346555
     }

@@ -156,22 +156,16 @@ class FeatureWidthsTest(unittest.TestCase):
 
 
 class ComputeFitIdTest(unittest.TestCase):
-    """Round three of this card's review found that `matrix.tobytes()` could be
-    replaced with `str(matrix.shape).encode()` at the fit_id call site in `main()`
-    and every test that ran without `uv` — cargo's workspace suite, this file,
-    check_findings.py — stayed green, because none of them exercised
-    value-sensitivity at a fixed shape. `compute_fit_id` was hoisted out of `main()`
-    specifically so this file — stdlib-only, and the one test CI runs for this
-    operator without `uv` — can pin that directly, rather than only through the
-    `uv`-dependent end-to-end Rust test.
+    """`compute_fit_id` is stdlib-only, hoisted out of `main()` so this file — the one
+    test CI runs for this operator without `uv` — can pin its value-sensitivity
+    directly.
 
     This does NOT cover the call site in `main()` — whether `main()` actually passes
     `matrix.tobytes()` rather than something shape-only still needs `uv` and numpy to
     exercise, and stays covered only by
     tests/umap_project.rs::projection_fit_id_moves_when_a_value_changes_with_the_shape_held_fixed.
     What this pins is narrower and still real: the hash function itself is sensitive
-    to its payload's CONTENT, not merely its length — the same property `str(...)`
-    would have destroyed had it been factored in here instead of at the call site.
+    to its payload's CONTENT, not merely its length.
     """
 
     KNOBS = (15, 0.1, "cosine", 42)

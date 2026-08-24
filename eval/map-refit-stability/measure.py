@@ -7,10 +7,10 @@
 # ///
 """measure.py — how far umap_project's map moves when rows are appended and refit.
 
-The projection has no out-of-sample transform, so appending rows means refitting the
-whole map, and a refit moves every point. Nobody had measured how much. This does,
-against a real corpus, through the shipped operators (`text_embed@1` then
-`umap_project@1`) rather than a reimplementation of either.
+This operator persists nothing between invocations, so appending rows means
+refitting the whole map on the next run, and a refit moves every point. Nobody had
+measured how much. This does, against a real corpus, through the shipped operators
+(`text_embed@1` then `umap_project@1`) rather than a reimplementation of either.
 
 CORPUS. `corpus.parquet` beside this script — 4,500 rows (`name`, `category`,
 `description`), COMMITTED, so a clean checkout can re-derive every number below

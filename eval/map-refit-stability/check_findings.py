@@ -3,25 +3,21 @@
 # dependencies = []
 # ///
 """check_findings.py — the committed prose about map-refit stability must agree with
-`results.json`, or a future re-run of `measure.py` can silently outdate every number
-in `operators/umap_project/README.md` and `CHANGELOG.md` while `results.json` moves
-underneath them. Stdlib-only, no `uv` needed, so CI can run it every time (wired into
-the `operators` job in .github/workflows/ci.yml, which already runs without `uv`).
+`results.json` and `transform_pricing.json`, or a future re-run of `measure.py` /
+`price_transform.py` can silently outdate every number in
+`operators/umap_project/README.md` and `CHANGELOG.md` while the JSON moves underneath
+them. Stdlib-only, no `uv` needed, so CI can run it every time (wired into the
+`operators` job in .github/workflows/ci.yml, which already runs without `uv`).
 
 This does not re-derive the numbers — that needs `uv`, DuckDB, UMAP and the fetched
-model, and is `measure.py`'s job, not this one's. It only checks that the two places a
-human reads the numbers (a README table meant to be skimmed, a CHANGELOG entry meant
-to stand alone) still say what the committed JSON says. A mismatch means someone
-edited the prose, or re-ran the harness and forgot the prose, and either is a bug this
-script exists to catch rather than to explain.
-
-EVERY figure checked below is DERIVED from `results.json` — none is a literal typed
-here that happens to match today's numbers. Round three of this card's review found
-exactly that mistake already made once: `control_B`'s table row was hardcoded as
-`("0", "1.00")` instead of read from the file, so a `results.json` edit that broke the
-no-new-rows control — the single number every other row is read against — would have
-left this checker green. It is the reason for this paragraph, not just a comment on
-one line.
+model, and is `measure.py`'s and `price_transform.py`'s job, not this one's. It
+checks two things: that the two places a human reads the numbers (a README table
+meant to be skimmed, a CHANGELOG entry meant to stand alone) still say what the
+committed JSON says, and that the JSON's own internal invariants — the same k used
+throughout, the same row count scored in every comparison — actually hold rather than
+being assumed. A mismatch means someone edited the prose, or re-ran a harness and
+forgot the prose, or a harness itself regressed; all three are bugs this script exists
+to catch rather than to explain.
 
 THREE FIGURES ARE NOT CHECKED, DELIBERATELY, AND SAY SO: the sibling embedder-swap
 kNN-overlap numbers (0.13 / 0.28 / 0.40) come from a measurement in a different
@@ -33,6 +29,7 @@ current — nothing here could tell.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -50,9 +47,6 @@ def pct(fraction: float) -> str:
 
 def multiplier(value: float) -> str:
     return f"{round(value)}×"
-
-
-import re
 
 
 def normalise_whitespace(text: str) -> str:
@@ -73,6 +67,8 @@ def main() -> int:
     base_n = results["base_n"]
     corpus_rows = results["corpus_rows_committed"]
     comparisons = results["comparisons"]
+    append_fractions = results["append_fractions"]
+    append_tags = ("append_05", "append_20", "append_50")
     problems: list[str] = []
 
     def require(haystack: str, needle: str, where: str) -> None:
@@ -80,14 +76,35 @@ def main() -> int:
         if needle not in haystack:
             problems.append(f"{where} does not contain {needle!r}")
 
-    # The README's own table: one row per comparison, EVERY cell read from
-    # results.json — no override, no exception for the control row.
-    table_labels = {
-        "control_B": "0% (control)",
-        "append_05": "5% (150 rows)",
-        "append_20": "20% (600 rows)",
-        "append_50": "50% (1,500 rows)",
-    }
+    # Internal consistency of results.json itself, independent of any prose: every
+    # comparison scored the same base rows, at the same k, and against the same
+    # base_n the file states — none of this is asserted by construction, so a
+    # regression in measure.py that broke one of them without changing the other
+    # would otherwise pass silently.
+    for tag in ("control_B", *append_tags):
+        c = comparisons[tag]
+        if c["n_shared_rows"] != base_n:
+            problems.append(
+                f"results.json: comparisons.{tag}.n_shared_rows "
+                f"({c['n_shared_rows']}) != base_n ({base_n})"
+            )
+    knn_ks = {comparisons[tag]["knn_overlap_k"] for tag in ("control_B", *append_tags)}
+    if len(knn_ks) != 1:
+        problems.append(f"results.json: knn_overlap_k is not the same across comparisons: {knn_ks}")
+    k = knn_ks.pop()
+
+    # The README's own table: one row per comparison. Every cell — including the
+    # label — is derived from results.json; none is a literal that happens to match
+    # today's numbers. control_B's "0% (control)" label is the one exception, and it
+    # is not a drift risk the way the append labels are: it names the zero-append
+    # case by the measurement's own definition, not a figure `measure.py` could
+    # silently move — there is no `append_fractions` entry for it to drift from.
+    table_labels = {"control_B": "0% (control)"}
+    for tag in append_tags:
+        frac = append_fractions[tag]
+        rows_added = round(base_n * frac)  # matches measure.py's own write_slice math
+        table_labels[tag] = f"{pct(frac)} ({rows_added:,} rows)"
+
     for tag, label in table_labels.items():
         c = comparisons[tag]
         disp = multiplier(c["displacement_normalised_mean"])
@@ -95,10 +112,15 @@ def main() -> int:
         row = f"| {label} | {base_n:,} | {disp} | {overlap} |"
         require(readme, row, f"README.md table ({tag})")
 
+    # Every place "20" (or whatever k actually is) appears as the neighbourhood size
+    # in prose is checked against the JSON's own knn_overlap_k, not hardcoded here.
+    require(readme, f"{k} nearest", "README.md (k, 'N nearest' phrasing)")
+    require(readme, f"{k}-NN overlap", "README.md (k, 'N-NN overlap' table header)")
+    require(readme, f"k={k}", "README.md (k, 'k=N' phrasing)")
+
     # The "38 to 268 times" sentence: the min and max normalised displacement across
     # the three append fractions, in the direction the prose states them (smallest
     # append first).
-    append_tags = ("append_05", "append_20", "append_50")
     normalised = [comparisons[t]["displacement_normalised_mean"] for t in append_tags]
     low = multiplier(min(normalised)).rstrip("×")
     high = multiplier(max(normalised)).rstrip("×")
@@ -142,37 +164,62 @@ def main() -> int:
         "CHANGELOG.md (sibling-figure disclosure)",
     )
 
-    # transform_pricing.json — the out-of-sample-placement pricing round three of
-    # this card's review asked for. Same rule: every figure quoted in prose is
-    # derived here, not retyped.
+    # transform_pricing.json — the out-of-sample-placement pricing this card's review
+    # asked for. Same rule: every figure quoted in prose is derived here, not
+    # retyped, and the file's own internal invariants are checked whether or not
+    # prose quotes them.
     if PRICING.is_file():
         pricing = json.loads(PRICING.read_text())
+
+        if pricing["base_rows"] != base_n:
+            problems.append(
+                f"transform_pricing.json: base_rows ({pricing['base_rows']}) != "
+                f"results.json base_n ({base_n}) — the two harnesses ran against "
+                f"different bases"
+            )
+        if pricing["knn_overlap_k"] != k:
+            problems.append(
+                f"transform_pricing.json: knn_overlap_k ({pricing['knn_overlap_k']}) "
+                f"!= results.json's ({k})"
+            )
+        for tag in append_tags:
+            drift = pricing["placements"][tag]["transform_repeat_max_abs_diff"]
+            if drift != 0.0:
+                problems.append(
+                    f"transform_pricing.json: placements.{tag}.transform_repeat_max_abs_diff "
+                    f"is {drift}, not 0.0 — .transform() is no longer deterministic on "
+                    f"repeat calls, and nothing in the committed prose says so"
+                )
+        base_drift = pricing["base_rows_moved_by_transform"]
+        if base_drift != 0.0:
+            problems.append(
+                f"transform_pricing.json: base_rows_moved_by_transform is {base_drift}, "
+                f"not 0.0 — the README's claim that the base rows stay exactly put is "
+                f"no longer true of this run"
+            )
+
         mb = f"{pricing['pickled_reducer_bytes'] / 1_000_000:.1f} MB"
         require(readme, mb, "README.md (pickled model size)")
         require(changelog, mb, "CHANGELOG.md (pickled model size)")
 
-        fidelity_values = [
-            pricing["placements"][t]["knn_overlap_with_full_refit_mean"]
-            for t in ("append_05", "append_20", "append_50")
-        ]
-        fidelities = [f"{v:.2f}" for v in fidelity_values]
-        require(
-            readme,
-            f"{fidelities[0]} / {fidelities[1]} / {fidelities[2]}",
-            "README.md (transform placement fidelity, per-fraction)",
-        )
-        low = f"{min(fidelity_values):.2f}"
-        high = f"{max(fidelity_values):.2f}"
-        require(
-            readme,
-            f"{low}–{high} fidelity",
-            "README.md (transform placement fidelity range)",
-        )
-        require(
-            changelog,
-            f"{low}-{high} placement fidelity",
-            "CHANGELOG.md (transform placement fidelity range)",
-        )
+        ceiling = f"{pricing['corpus_ceiling_256d_vs_2d'] * 100:.1f}%"
+        require(readme, ceiling, "README.md (corpus ceiling)")
+
+        truth_fidelities = {
+            "transform": [
+                pricing["placements"][t]["transform_vs_256d_truth_mean"] for t in append_tags
+            ],
+            "full_refit": [
+                pricing["placements"][t]["full_refit_vs_256d_truth_mean"] for t in append_tags
+            ],
+        }
+        for kind, values in truth_fidelities.items():
+            joined_2dp = " / ".join(f"{v * 100:.1f}%" for v in values)
+            require(
+                readme,
+                joined_2dp,
+                f"README.md ({kind} fidelity vs 256-d truth, per-fraction)",
+            )
     else:
         problems.append(
             "transform_pricing.json is missing — the out-of-sample pricing numbers "
@@ -184,14 +231,15 @@ def main() -> int:
         for p in problems:
             print(f"  - {p}", file=sys.stderr)
         print(
-            "\nEither the prose drifted from a re-run, or results.json moved and the "
-            "prose was not updated to match. Re-read eval/map-refit-stability/results.json "
-            "and fix operators/umap_project/README.md and/or CHANGELOG.md.",
+            "\nEither the prose drifted from a re-run, a harness itself regressed, or "
+            "results.json/transform_pricing.json moved and the prose was not updated to "
+            "match. Re-read the JSON and fix operators/umap_project/README.md and/or "
+            "CHANGELOG.md — or, if a harness invariant broke, fix the harness.",
             file=sys.stderr,
         )
         return 1
 
-    print("check_findings: README.md and CHANGELOG.md agree with results.json.")
+    print("check_findings: README.md and CHANGELOG.md agree with the committed JSON.")
     return 0
 
 

@@ -226,17 +226,27 @@ Rationale for each change is recorded in the project's design notes and commit h
   50% append loses slightly more than swapping the embedder on its easiest case.
   `umap-learn`'s `UMAP.transform()` — public, and verified by calling it
   (`eval/map-refit-stability/price_transform.py`) — CAN place new rows into an
-  existing fit without moving the old ones, priced at a 3.6 MB persisted model for a
-  3,000-row base and 0.27-0.38 placement fidelity for the new rows (worse than this
-  card's own full-refit churn number) against a full refit; refitting only on an
+  existing fit without moving the old ones (0.0 measured drift in the base rows'
+  own coordinates across every `.transform()` call), priced at a 3.6 MB persisted
+  model for a 3,000-row base. Placement fidelity is read against this corpus's own
+  ceiling, not against 1.0 or against the churn figure above, which is a different
+  quantity: scored against the 256-d embeddings as ground truth, a base row's own
+  fit recovers 30.5% of its true neighbourhood at k=20, a full refit places a new
+  row at 30.4-27.3% (essentially at the ceiling), and `.transform()` places the same
+  rows at 27.4-25.7% — 1 to 3 points under the ceiling. Refitting only on an
   explicit user action, by contrast, is not implementable in arcform today —
   `compute_staleness` marks any step whose declared input changed stale
   unconditionally, and no `arc run` flag can hold a hash-stale step un-run. See
-  `operators/umap_project/README.md`, "Appending rows moves the whole map." A
-  DIFFERENT `projection_fit_id` means a shared row's position must not be compared
-  between two files; a matching id means the same data and knobs were used, not that
-  the coordinates are guaranteed identical (this operator's dependency resolve is not
-  pinned — see "Does byte-identity survive a dependency upgrade?" above).
+  `operators/umap_project/README.md`, "Appending rows moves the whole map," including
+  where the asymmetry argument for pinning stops being obvious. A DIFFERENT
+  `projection_fit_id` means a shared row's position must not be compared between two
+  files; it cannot today distinguish the data changing from the layout changing,
+  because every run is a full refit and those are the same event — a matching id
+  means the same data and knobs were used, not that the coordinates are guaranteed
+  identical (this operator's dependency resolve is not pinned — see "Does
+  byte-identity survive a dependency upgrade?" above). Persisting the fit and
+  discriminating the two is real design work of its own and is left to a separate
+  card.
 
 ### Changed
 

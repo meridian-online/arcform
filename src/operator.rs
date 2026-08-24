@@ -2739,10 +2739,11 @@ impl Operator for GleifRaFetch {
 // carrying every input column plus `projection_x`, `projection_y` and
 // `projection_fit_id` — the last a fingerprint of the exact numbers and knobs one fit
 // consumed, broadcast to every row, so two files can be compared for "same fit" before
-// their positions are compared row for row. There is no out-of-sample transform:
-// appending rows means refitting the whole map and every position can move, which is
-// exactly what `projection_fit_id` differing between two files says happened. See
-// operators/umap_project/README.md, "Telling a refit from an append."
+// their positions are compared row for row. This operator persists nothing between
+// invocations, so appending rows means refitting the whole map and every position
+// can move, which is exactly what `projection_fit_id` differing between two files
+// says happened. See operators/umap_project/README.md, "Telling a refit from an
+// append."
 //
 // NO TEXT COLUMN AND NO MODEL, and that is the whole shape of it. `columns:` names
 // columns that are already numbers — a numeric scalar contributes one feature, a
