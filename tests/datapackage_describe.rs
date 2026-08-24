@@ -53,6 +53,19 @@ fn write_fake_finetype_profile_fails(dir: &Path, version: &str) {
     std::fs::set_permissions(&script, perm).unwrap();
 }
 
+/// Write an executable `finetype` whose `--version` answers with `version_line`
+/// VERBATIM (not necessarily a parseable dotted version) — for pinning the
+/// unparseable-output refusal end to end, through a real `arc run`.
+fn write_fake_finetype_version_only(dir: &Path, version_line: &str) {
+    let script = dir.join("finetype");
+    let body = format!("#!/bin/sh\necho \"{version_line}\"\n");
+    std::fs::write(&script, body).expect("write fake finetype");
+    use std::os::unix::fs::PermissionsExt;
+    let mut perm = std::fs::metadata(&script).unwrap().permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(&script, perm).unwrap();
+}
+
 /// The directory holding the real `duckdb` CLI, found on THIS process's ambient
 /// PATH. `arc run` always needs one (the same requirement `init_from_descriptor.rs`
 /// states) independent of this operator, so the isolated PATH built for these
@@ -90,6 +103,38 @@ fn write_project(project: &Path, overrides_json: &str) {
         \x20     parquet: widgets.parquet\n\
         \x20     overrides: descriptor.overrides.json\n\
         \x20     out: datapackage.json\n",
+    )
+    .unwrap();
+}
+
+/// Same fixture as `write_project`, but the manifest also pins
+/// `expect_finetype_version` — the ONLY way `run()`'s `require_exact_finetype_version`
+/// call is reached at all (no test drove this end to end before: the manifest field
+/// existed and was unit-tested in isolation, but nothing wired it through a real
+/// `arc run`).
+fn write_project_with_expect_version(project: &Path, overrides_json: &str, expect_version: &str) {
+    std::fs::create_dir_all(project).unwrap();
+    std::fs::write(
+        project.join("widgets.parquet"),
+        b"not a real parquet file -- the fake finetype never opens it",
+    )
+    .unwrap();
+    std::fs::write(project.join("descriptor.overrides.json"), overrides_json).unwrap();
+    std::fs::write(
+        project.join("arcform.yaml"),
+        format!(
+            "name: describe_test\n\
+             engine: duckdb\n\
+             db: build/test.db\n\
+             steps:\n\
+            \x20 - name: describe\n\
+            \x20   op: datapackage_describe@1\n\
+            \x20   with:\n\
+            \x20     parquet: widgets.parquet\n\
+            \x20     overrides: descriptor.overrides.json\n\
+            \x20     out: datapackage.json\n\
+            \x20     expect_finetype_version: \"{expect_version}\"\n"
+        ),
     )
     .unwrap();
 }
@@ -355,5 +400,103 @@ fn missing_overrides_file_is_refused() {
         stderr.contains("datapackage_describe: read"),
         "must fail at the read, not one step later at the parse: {stderr}"
     );
+    assert!(!project.join("datapackage.json").exists());
+}
+
+#[test]
+fn unparseable_finetype_version_is_refused_end_to_end() {
+    // `require_finetype`'s `resolve_finetype_version(&stdout)?` folded to
+    // `.unwrap_or_default()` still fails downstream (a (0,0,0) resolved version
+    // trips the floor gate) — so this pins the run failing for the RIGHT reason:
+    // the specific "could not parse" message, not just "something failed".
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    write_project(&project, "{}");
+
+    let finetype_dir = tempfile::tempdir().unwrap();
+    write_fake_finetype_version_only(finetype_dir.path(), "finetype (unknown build)");
+
+    let out = run_arc_with_fake_finetype(&project, finetype_dir.path());
+    assert!(
+        !out.status.success(),
+        "an unparseable `finetype --version` must stop the run"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("could not parse"), "stderr: {stderr}");
+    assert!(!project.join("datapackage.json").exists());
+}
+
+#[test]
+fn field_override_for_a_present_column_does_not_warn() {
+    // The stale-override warning fires ONLY for a name absent from the Parquet.
+    // Overriding a column that IS present (`note`, from base_profile_json) must
+    // produce no "WARNING" at all — the other half of the guard
+    // `stale_field_override_warns_but_does_not_fail` alone cannot pin, since a
+    // guard forced to fire unconditionally still warns correctly for an absent
+    // name.
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    write_project(
+        &project,
+        r#"{"fields": {"note": {"description": "a real column"}}}"#,
+    );
+
+    let finetype_dir = tempfile::tempdir().unwrap();
+    write_fake_finetype(finetype_dir.path(), "9.9.9", base_profile_json());
+
+    let out = run_arc_with_fake_finetype(&project, finetype_dir.path());
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("WARNING"),
+        "overriding a column that exists must not warn: {stderr}"
+    );
+}
+
+#[test]
+fn expect_finetype_version_matching_runs_and_stamps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    write_project_with_expect_version(&project, "{}", "9.9.9");
+
+    let finetype_dir = tempfile::tempdir().unwrap();
+    write_fake_finetype(finetype_dir.path(), "9.9.9", base_profile_json());
+
+    let out = run_arc_with_fake_finetype(&project, finetype_dir.path());
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let descriptor: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(project.join("datapackage.json")).unwrap()).unwrap();
+    assert_eq!(descriptor["x-finetype-version"], "9.9.9");
+}
+
+#[test]
+fn expect_finetype_version_mismatch_refuses_end_to_end() {
+    // The manifest pins an exact release the resolved binary does not report —
+    // must refuse, naming both versions, before anything is written. This is the
+    // ONLY path that reaches `run()`'s `require_exact_finetype_version(...)?call —
+    // no prior test wired `expect_finetype_version` through a real `arc run`.
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    write_project_with_expect_version(&project, "{}", "9.9.8");
+
+    let finetype_dir = tempfile::tempdir().unwrap();
+    write_fake_finetype(finetype_dir.path(), "9.9.9", base_profile_json());
+
+    let out = run_arc_with_fake_finetype(&project, finetype_dir.path());
+    assert!(
+        !out.status.success(),
+        "a resolved version that does not match the pin must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("9.9.9"), "stderr: {stderr}");
+    assert!(stderr.contains("9.9.8"), "stderr: {stderr}");
     assert!(!project.join("datapackage.json").exists());
 }
