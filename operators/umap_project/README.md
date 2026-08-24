@@ -33,7 +33,7 @@ that case.
 
 So `columns: [longitude, latitude]` maps a table of places and `columns: [embedding]`
 maps whatever wrote a vector column — including `text_embed`, and including a SQL step
-once the DuckDB embedding extension can produce one. The operator is not told which
+calling the DuckDB embedding extension's `embed()` directly. The operator is not told which
 produced it. Mixing the two shapes in one `columns:` list is allowed and they are
 concatenated in the order listed.
 
@@ -87,7 +87,8 @@ drawn the same way. That is a capability absent above, not one that is merely
 inconvenient to reach — which is what the escape hatch is for.
 
 The embedding half of this operator's predecessor had no such argument, which is why
-it is now a separate step (`text_embed`) explicitly marked as on its way to tier 1.
+it is now a separate step (`text_embed`) — and why the embedding itself has since moved
+to tier 1, leaving that step a wrapper around one SQL call.
 
 ## Does byte-identity survive a dependency upgrade?
 
@@ -156,10 +157,11 @@ underlying library can do — see "Pricing the alternative" below.
 An analyst who appends rows and reruns cannot tell, from the map alone, whether the
 picture changed because the data did or because the layout was refit around it.
 
-**How much, measured 2026-08-24, is `eval/map-refit-stability/`
+**How much, re-measured 2026-08-25, is `eval/map-refit-stability/`
 in this repository — `uv run eval/map-refit-stability/measure.py`, committed output in
 `results.json`.** 3,000 rows of Homebrew package descriptions, embedded with
-`minishlab/potion-base-8M` through this operator's own sibling `text_embed@1`, then
+`minishlab/potion-base-8M` through this operator's own sibling `text_embed@1` (which
+takes its vectors from the DuckDB embedding extension), then
 projected through this operator itself — no reimplementation of either. The corpus is
 `eval/map-refit-stability/corpus.parquet`, COMMITTED (not `examples/brewtrend`'s own
 output, which is gitignored and rebuilt from live, rolling analytics on every `arc
@@ -168,6 +170,19 @@ deterministic 4,500-row slice, ordered by `name` so nothing is cherry-picked, of
 the first 3,000 are the "existing" map and the next rows are the appended ones. See
 `measure.py`'s own docstring for the exact query that produced it, and re-run the
 harness rather than trusting this table — that is what re-derivable means.
+
+**These numbers moved on 2026-08-25 and the reason is worth stating, because it is the
+same effect the table measures.** `text_embed` stopped computing its own vectors and
+started taking them from the DuckDB embedding extension, so the input to every fit
+below changed — not by much (ordinary text agreed to float32 noise; package
+descriptions carrying tokens outside the vocabulary moved further), but a refit is
+chaotic in exactly the way this eval exists to show. The 5% append's mean displacement
+went from 38× to 61× the median gap and its neighbourhood overlap from 0.46 to 0.42;
+the 50% append landed at the same 268× and moved from 0.35 to 0.36. **The finding is
+unchanged and the control still holds** — refitting identical rows still reproduces
+identical coordinates — so what moved is the size of the effect on one corpus, not the
+conclusion. Do not read a difference between this table and an older copy of it as a
+change in `umap_project`; nothing in this operator changed.
 
 Two measures, because either alone misleads: raw+normalised displacement of a row's
 (x, y) between fits (UMAP's frame is arbitrary up to rotation/scale between
@@ -190,13 +205,13 @@ every other number below is read against, not zero.
 | append | shared rows scored | mean displacement (× median gap) | 20-NN overlap, mean |
 |---|---|---|---|
 | 0% (control) | 3,000 | 0× | 1.00 |
-| 5% (150 rows) | 3,000 | 38× | 0.46 |
-| 20% (600 rows) | 3,000 | 134× | 0.39 |
-| 50% (1,500 rows) | 3,000 | 268× | 0.35 |
+| 5% (150 rows) | 3,000 | 61× | 0.42 |
+| 20% (600 rows) | 3,000 | 168× | 0.39 |
+| 50% (1,500 rows) | 3,000 | 268× | 0.36 |
 
 A modest, realistic append already destroys about half of a point's visual
-neighbourhood: **a 5% append shares only 46% of a point's 20 nearest map-neighbours
-with the pre-append layout**, and displacement grows from 38 to 268 times the map's
+neighbourhood: **a 5% append shares only 42% of a point's 20 nearest map-neighbours
+with the pre-append layout**, and displacement grows from 61 to 268 times the map's
 own typical point spacing as the append grows — points do not drift, they land
 somewhere else on the map.
 
@@ -207,9 +222,9 @@ from a measurement in a different repository, has no source committed here, and 
 NOT checked by `check_findings.py` for that reason — read it as context, not as a
 pinned claim of this card's** — on the same kind of kNN-overlap scale: **the two
 disturbances are the same order of magnitude, not one uniformly worse than the
-other.** Ranked by how much structure survives, highest to lowest: 5% append (0.46) >
+other.** Ranked by how much structure survives, highest to lowest: 5% append (0.42) >
 swapping the embedder on very-short text (0.40) > 20% append (0.39) ≈ 50% append
-(0.35) > swapping the embedder on short text (0.28) > swapping the embedder on
+(0.36) > swapping the embedder on short text (0.28) > swapping the embedder on
 long-form text (0.13). A 5% append preserves *more* structure than any embedder swap
 measured; by 20%, an append has already lost slightly more than swapping the embedder
 does on its easiest (very-short-text) case, though every append fraction here still
@@ -238,8 +253,8 @@ Four costs, measured rather than assumed:
    between invocations. Pickled, the fitted reducer for the 3,000-row base is
    **3.6 MB**. It would need a place in a Protocol's asset graph — most naturally a
    `produces` asset the first fit writes and a `reads` asset a later append-only run
-   reads back, the same shape `text_embed`'s `model:` directory already uses for a
-   different kind of model.
+   reads back, the same shape `text_embed`'s declared extension artifact already uses
+   for a different kind of frozen input.
 
 2. **A compatibility rule that does not exist yet.** A persisted model is only valid
    for the SAME base rows under the SAME knobs it was fit with — if a base row's
@@ -261,15 +276,16 @@ Four costs, measured rather than assumed:
    neighbour a 256-d embedding space has — this operator's own README already
    measures that loss for a different corpus (34.9% at k=10, "What the coordinates
    support" above). For THIS corpus, at the same k=20 used throughout: a BASE row's
-   own base fit recovers **30.5%** of its 256-d neighbourhood — the ceiling every
+   own base fit recovers **30.3%** of its 256-d neighbourhood — the ceiling every
    number below is read against. Scored the same way, against the 256-d embeddings
    as ground truth (cosine, k=20, base rows as the candidate pool on both sides): a
-   **full refit** places a NEW row at 30.4% / 28.1% / 27.3% (5% / 20% / 50%
-   appends) — 89-100% of the ceiling, not always AT it, and least close where the
+   **full refit** places a NEW row at 29.6% / 28.1% / 27.0% (5% / 20% / 50%
+   appends) — 89-97% of the ceiling, never AT it, and least close where the
    recommendation is most exposed (50% appended). **`.transform()`** places the
-   same new rows at 27.4% / 25.7% / 26.3% — 3 to 5 points below the ceiling, which
+   same new rows at 27.0% / 26.4% / 27.2% — 3 to 4 points below the ceiling, which
    is the gap against the ceiling, not against the full refit (the gap against the
-   full refit itself is smaller: 3.0 / 2.4 / 1.0 points). On this corpus,
+   full refit itself is smaller: 2.6 / 1.7 / -0.2 points, and at the 50% append
+   `.transform()` is marginally AHEAD of the full refit). On this corpus,
    out-of-sample placement is close to as faithful as a full refit, not
    indistinguishable from it.
 

@@ -9,13 +9,14 @@
     "append_50": 0.5
   },
   "model": "minishlab/potion-base-8M",
+  "model_release": "minishlab/potion-base-8M@bf8b056651a2c21b8d2565580b8569da283cab23",
   "umap_project_params": {
     "metric": "cosine",
     "neighbors": 15,
     "min_dist": 0.1,
     "seed": 42
   },
-  "base_map_median_nn_spacing": 0.040765814010782976,
+  "base_map_median_nn_spacing": 0.039176290618352184,
   "comparisons": {
     "control_B": {
       "n_shared_rows": 3000,
@@ -29,34 +30,34 @@
     },
     "append_05": {
       "n_shared_rows": 3000,
-      "displacement_raw_mean": 1.5585375781228947,
-      "displacement_raw_median": 1.112908506922508,
-      "displacement_normalised_mean": 38.231484294920385,
-      "displacement_normalised_median": 27.300043772660402,
+      "displacement_raw_mean": 2.395441889093218,
+      "displacement_raw_median": 2.058383947347402,
+      "displacement_normalised_mean": 61.145193975334415,
+      "displacement_normalised_median": 52.54157335618572,
       "knn_overlap_k": 20,
-      "knn_overlap_mean": 0.45708333333333334,
-      "knn_overlap_median": 0.45
+      "knn_overlap_mean": 0.4193833333333334,
+      "knn_overlap_median": 0.4
     },
     "append_20": {
       "n_shared_rows": 3000,
-      "displacement_raw_mean": 5.480438708173143,
-      "displacement_raw_median": 5.46552338364463,
-      "displacement_normalised_mean": 134.437121916013,
-      "displacement_normalised_median": 134.07124366997658,
+      "displacement_raw_mean": 6.562408274083799,
+      "displacement_raw_median": 6.304920816780733,
+      "displacement_normalised_mean": 167.5096894193865,
+      "displacement_normalised_median": 160.9371565624231,
       "knn_overlap_k": 20,
-      "knn_overlap_mean": 0.38616666666666666,
+      "knn_overlap_mean": 0.39465,
       "knn_overlap_median": 0.35
     },
     "append_50": {
       "n_shared_rows": 3000,
-      "displacement_raw_mean": 10.910892752150758,
-      "displacement_raw_median": 10.51036707572744,
-      "displacement_normalised_mean": 267.64810213932475,
-      "displacement_normalised_median": 257.8230640248553,
+      "displacement_raw_mean": 10.50098140774228,
+      "displacement_raw_median": 10.950301082586325,
+      "displacement_normalised_mean": 268.04430031522895,
+      "displacement_normalised_median": 279.5134738319672,
       "knn_overlap_k": 20,
-      "knn_overlap_mean": 0.35395,
-      "knn_overlap_median": 0.3
+      "knn_overlap_mean": 0.3639666666666667,
+      "knn_overlap_median": 0.35
     }
   },
-  "runtime_seconds": 336.3
+  "runtime_seconds": 117.0
 }

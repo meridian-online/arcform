@@ -9,6 +9,76 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ## [Unreleased]
 
+### Changed
+
+- **`text_embed` takes its vectors from the DuckDB embedding extension instead of
+  computing its own, so one static embedder exists in the product rather than two.**
+  An analyst who embeds a column in SQL and an analyst whose Protocol embeds the same
+  column now get the same numbers, and before this nothing made that true.
+
+  It was not true. Measured over a 17-case corpus against byte-identical weights, the
+  Python path and the extension agreed to float32 summation noise (≤ 1.04e-07) on
+  ordinary text, case folding, accents, empty text, whitespace and ~120 tokens — and
+  disagreed everywhere else: **1.79e-01** for text made only of tokens outside the
+  vocabulary (norms 1.0 against 0.0), 2.2e-02 for such tokens mixed into real words,
+  and 2.06e-03 for text past 512 tokens. Nothing on either side went red, because each
+  was correct on its own terms. The causes were then confirmed rather than inferred:
+  dropping the unknown-token row and capping the ids at 512 in the Python path drove
+  every divergence to 0.000e+00 or float32 noise. Against
+  `model2vec.StaticModel.encode` the extension matched all fourteen non-NULL cases and
+  the Python path departed on five, so the Python path was the side that was wrong, and
+  it is deleted rather than corrected. `numpy`, `safetensors` and `tokenizers` leave
+  the script's dependency header; `duckdb` alone remains.
+
+  **`extension:` is a new required field, and the artifact is a declared `reads` asset**
+  on the same terms the model directory used to have: an input the Protocol puts there,
+  never a download and never a registry install. It is hashed for staleness, so
+  swapping the artifact re-runs the embedding rather than leaving vectors from a
+  different embedder in place, and `arc run` refuses before it spawns `uv` when it is
+  not on disk.
+
+  **`model:` is now optional, and is checked rather than loaded.** The weights live
+  inside the extension, so a model directory can no longer be read for them; what it
+  can do is state which model the Protocol believes it is embedding with. The
+  extension publishes a content address over its bundled assets, this operator
+  recomputes it from the declared directory, and a mismatch stops the run naming both.
+  Reproducing the address needs **three** files — `tokenizer.json`,
+  `model.safetensors` AND `config.json` — plus the release identity and revision, which
+  none of the files carries: hence `model_release: <model-id>@<revision>` beside
+  `model:`, and hence a directory holding only the weights and the tokenizer is refused
+  by name rather than checked against a weaker digest. Both fields are required
+  together, because either alone is a check that silently does not happen.
+
+  **Two claims this operator made about itself were false and are corrected.** The
+  `1.7e-08` agreement with `model2vec.StaticModel.encode` held only for text with no
+  out-of-vocabulary tokens and under the cap. And text made only of such tokens did
+  **not** embed as a zero vector — it averaged the tokenizer's unknown-token row into a
+  unit-norm vector for text nothing had been understood of, and those rows were not
+  counted on stderr. Both statements are true of the new path: with the documented
+  `coalesce(t, '')` bridge, NULL, empty, whitespace and out-of-vocabulary-only text all
+  embed as a full-width zero vector, and all of them are counted.
+
+  **Vectors move for out-of-vocabulary and over-length text, and no published dataset
+  is affected** — nothing published carries an embedding column. `eval/map-refit-stability`
+  is regenerated in the same change and its numbers move: UMAP is refit from vectors
+  that are no longer bit-identical, and a refit moves every point, which is the very
+  effect that eval exists to measure.
+
+  **Text past 512 tokens is truncated**, which the extension does and this operator
+  inherits. It is stated in the operator's README and is not reported per-run; the
+  count belongs in the SQL surface, where the person who cannot otherwise tell is
+  sitting.
+
+  The fixture's tiny generated model and `make_fixture_model.py` are deleted with the
+  code that read them, and the fixture Protocol declares the extension instead. The
+  artifact is tens of megabytes and is not committed, so the end-to-end tests stage one
+  from `ARC_STATICEMBED_EXTENSION` and return early without it; what CI runs from that
+  file is the refusal when the extension asset is missing, decided in Rust before
+  anything is spawned. `tests/text_embed_parity.rs` carries the value-for-value
+  comparison over the diverging cases, a probe of the 512-token cap that can fail in
+  both directions, and — running everywhere, needing nothing — a check that its own
+  comparison predicate still tells two vectors apart.
+
 ### Added
 
 - **`embed_project` is split into `umap_project` and `text_embed`, because one name
@@ -41,10 +111,9 @@ Rationale for each change is recorded in the project's design notes and commit h
   manifest that mixes them stop at load rather than silently ignore the field.
   **`text_embed` is marked PROVISIONAL in its own source and README, naming the DuckDB
   embedding extension as where the capability is going**: embedding is a table lookup
-  and a mean, it has no business at the `uv` tier, and when the extension lands a
-  Protocol embeds from a SQL step and the operator is deleted rather than ported. The
-  same capability is currently implemented twice in two languages, which is a cost
-  worth naming rather than tidying away.
+  and a mean, and it has no business at the `uv` tier. As shipped here the same
+  capability was implemented twice in two languages — a cost named rather than tidied
+  away, and one the next entry in this release settles.
 
   `embed_project` is GONE, not aliased — nothing outside arcform referenced it, so the
   rename is free today and would have been a breaking change the moment a Protocol
@@ -215,9 +284,9 @@ Rationale for each change is recorded in the project's design notes and commit h
   nothing between invocations, so appending rows and re-running today means the
   whole map is refit and every point can move — measured at 3,000 real rows against
   a frozen, committed corpus (`eval/map-refit-stability/`, re-derivable with `uv run
-  eval/map-refit-stability/measure.py`): a 5% append already shares only 46% of a
+  eval/map-refit-stability/measure.py`): a 5% append already shares only 42% of a
   point's 20 nearest map-neighbours with the pre-append layout, growing to 39% at 20%
-  and 35% at 50%. That is the same order of magnitude as a sibling measurement (in a
+  and 36% at 50%. That is the same order of magnitude as a sibling measurement (in a
   different repository, its source not committed here, so this figure is context and
   not one `check_findings.py` pins) of how much neighbourhood structure survives
   swapping the embedding model entirely on a comparable corpus (0.13-0.40 depending on
@@ -231,11 +300,11 @@ Rationale for each change is recorded in the project's design notes and commit h
   model for a 3,000-row base. Placement fidelity is read against this corpus's own
   ceiling, not against 1.0 or against the churn figure above, which is a different
   quantity: scored against the 256-d embeddings as ground truth, a base row's own
-  fit recovers 30.5% of its true neighbourhood at k=20, a full refit places a new
-  row at 89-100% of the ceiling (30.4-27.3%, least close at the 50% append, where
+  fit recovers 30.3% of its true neighbourhood at k=20, a full refit places a new
+  row at 89-97% of the ceiling (29.6-27.0%, least close at the 50% append, where
   the recommendation is most exposed), and `.transform()` places the same rows at
-  27.4-25.7% — 3 to 5 points under the ceiling, 1.0-3.0 points under the full refit
-  itself. Refitting only on an
+  27.2-26.4% — 3 to 4 points under the ceiling, -0.2-2.6 points under the full refit
+  itself (ahead of it, marginally, at the largest append). Refitting only on an
   explicit user action, by contrast, is not implementable in arcform today —
   `compute_staleness` marks any step whose declared input changed stale
   unconditionally, and no `arc run` flag can hold a hash-stale step un-run. See
