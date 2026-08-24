@@ -211,25 +211,32 @@ Rationale for each change is recorded in the project's design notes and commit h
 - **brewtrend reference pipeline** — the first complete runnable example under
   `examples/brewtrend/`, exercising command + SQL steps, preconditions, retries, and a runtime
   parameter; ships a Frictionless Data Package describing its output.
-- **`umap_project` writes `projection_fit_id`** (1.1.0). There is no out-of-sample
-  transform, so appending rows and re-running means the whole map is refit and every
-  point can move — measured at 3,000 real rows against a frozen, committed corpus
-  (`eval/map-refit-stability/`, re-derivable with `uv run
+- **`umap_project` writes `projection_fit_id`** (1.1.0). This operator persists
+  nothing between invocations, so appending rows and re-running today means the
+  whole map is refit and every point can move — measured at 3,000 real rows against
+  a frozen, committed corpus (`eval/map-refit-stability/`, re-derivable with `uv run
   eval/map-refit-stability/measure.py`): a 5% append already shares only 46% of a
   point's 20 nearest map-neighbours with the pre-append layout, growing to 39% at 20%
-  and 35% at 50%. That is the same order of magnitude as a sibling measurement of how
-  much neighbourhood structure survives swapping the embedding model entirely on a
-  comparable corpus (0.13-0.40 depending on text length) — neither disturbance is
-  uniformly worse than the other; a 5% append actually preserves more structure than
-  any measured embedder swap, while a 20% or 50% append loses slightly more than
-  swapping the embedder on its easiest case. `projection_fit_id` is a hash of the
-  exact feature matrix and knobs (`neighbors`, `min_dist`, `metric`, seed) one fit
-  consumed, the same value on every row of that fit's output. A DIFFERENT id means a
-  shared row's position must not be compared between two files; a matching id means
-  the same data and knobs were used, not that the coordinates are guaranteed
-  identical (this operator's dependency resolve is not pinned — see
-  "Does byte-identity survive a dependency upgrade?" above). See
-  `operators/umap_project/README.md`, "Telling a refit from an append."
+  and 35% at 50%. That is the same order of magnitude as a sibling measurement (in a
+  different repository, its source not committed here, so this figure is context and
+  not one `check_findings.py` pins) of how much neighbourhood structure survives
+  swapping the embedding model entirely on a comparable corpus (0.13-0.40 depending on
+  text length) — neither disturbance is uniformly worse than the other; a 5% append
+  actually preserves more structure than any measured embedder swap, while a 20% or
+  50% append loses slightly more than swapping the embedder on its easiest case.
+  `umap-learn`'s `UMAP.transform()` — public, and verified by calling it
+  (`eval/map-refit-stability/price_transform.py`) — CAN place new rows into an
+  existing fit without moving the old ones, priced at a 3.6 MB persisted model for a
+  3,000-row base and 0.27-0.38 placement fidelity for the new rows (worse than this
+  card's own full-refit churn number) against a full refit; refitting only on an
+  explicit user action, by contrast, is not implementable in arcform today —
+  `compute_staleness` marks any step whose declared input changed stale
+  unconditionally, and no `arc run` flag can hold a hash-stale step un-run. See
+  `operators/umap_project/README.md`, "Appending rows moves the whole map." A
+  DIFFERENT `projection_fit_id` means a shared row's position must not be compared
+  between two files; a matching id means the same data and knobs were used, not that
+  the coordinates are guaranteed identical (this operator's dependency resolve is not
+  pinned — see "Does byte-identity survive a dependency upgrade?" above).
 
 ### Changed
 

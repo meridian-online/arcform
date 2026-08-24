@@ -146,12 +146,20 @@ output, and it is a file you already have.
 
 ## Appending rows moves the whole map, and it was measured before it was decided
 
-**There is no out-of-sample transform.** `umap-learn`'s public API is fit-only: given
-new rows, the only route to coordinates for them is a fresh `fit_transform` over
-everything — old rows and new — so appending data and re-running moves every point,
-not just the new ones. An analyst who appends rows and reruns cannot tell, from the
-map alone, whether the picture changed because the data did or because the layout was
-refit around it.
+**This operator has no memory between invocations.** It is a fresh `uv run` per
+step, given one Parquet and told to fit and project it — nothing about a previous
+fit survives to the next call. So appending rows and running the step again today
+means a full `fit_transform` over everything, old rows and new, and every point can
+move. That is a fact about what THIS OPERATOR does now, not about what the
+underlying library can do — see "Pricing the alternative" below, which round three
+of this card's review corrected: an earlier version of this section claimed
+`umap-learn`'s public API has no out-of-sample transform at all, which is false and
+was checked against the wrong library (the card's `Evidence:` line is about Apple's
+Rust UMAP, which genuinely is fit-only; that claim does not carry over to
+`umap-learn`, and nobody ran `dir(umap.UMAP)` to check before writing it down).
+
+An analyst who appends rows and reruns cannot tell, from the map alone, whether the
+picture changed because the data did or because the layout was refit around it.
 
 **How much, measured 2026-08-24, is `eval/map-refit-stability/`
 in this repository — `uv run eval/map-refit-stability/measure.py`, committed output in
@@ -182,7 +190,7 @@ every other number below is read against, not zero.
 
 | append | shared rows scored | mean displacement (× median gap) | 20-NN overlap, mean |
 |---|---|---|---|
-| 0% (control) | 3,000 | 0 | 1.00 |
+| 0% (control) | 3,000 | 0× | 1.00 |
 | 5% (150 rows) | 3,000 | 38× | 0.46 |
 | 20% (600 rows) | 3,000 | 134× | 0.39 |
 | 50% (1,500 rows) | 3,000 | 268× | 0.35 |
@@ -194,35 +202,114 @@ own typical point spacing as the append grows — points do not drift, they land
 somewhere else on the map.
 
 Read against a sibling measurement of how much neighbourhood structure survives
-*swapping the embedding model entirely* on a comparable text corpus, on the same
-kind of kNN-overlap scale (0.13 long-form, 0.28 short, 0.40 very-short — higher is
-more retained): **the two disturbances are the same order of magnitude, not one
-uniformly worse than the other.** Ranked by how much structure survives, highest to
-lowest: 5% append (0.46) > swapping the embedder on very-short text (0.40) > 20%
-append (0.39) ≈ 50% append (0.35) > swapping the embedder on short text (0.28) >
-swapping the embedder on long-form text (0.13). A 5% append preserves *more*
-structure than any embedder swap measured; by 20%, an append has already lost
-slightly more than swapping the embedder does on its easiest (very-short-text) case,
-though every append fraction here still preserves more than swapping on short or
-long-form text. Refitting on an ordinary append is not a small, forgivable jitter —
-whether it is gentler or harsher than changing the embedder depends on the fraction
-and the corpus, but it sits in the same range.
+*swapping the embedding model entirely* on a comparable text corpus — **0.13
+long-form, 0.28 short, 0.40 very-short, higher is more retained; this figure comes
+from a measurement in a different repository, has no source committed here, and is
+NOT checked by `check_findings.py` for that reason — read it as context, not as a
+pinned claim of this card's** — on the same kind of kNN-overlap scale: **the two
+disturbances are the same order of magnitude, not one uniformly worse than the
+other.** Ranked by how much structure survives, highest to lowest: 5% append (0.46) >
+swapping the embedder on very-short text (0.40) > 20% append (0.39) ≈ 50% append
+(0.35) > swapping the embedder on short text (0.28) > swapping the embedder on
+long-form text (0.13). A 5% append preserves *more* structure than any embedder swap
+measured; by 20%, an append has already lost slightly more than swapping the embedder
+does on its easiest (very-short-text) case, though every append fraction here still
+preserves more than swapping on short or long-form text. Refitting on an ordinary
+append is not a small, forgivable jitter — whether it is gentler or harsher than
+changing the embedder depends on the fraction and the corpus, but it sits in the same
+range.
 
-**The decision that follows: pin the layout, refit only on an explicit user
-action.** This does not rest on refitting being worse than an embedder swap — the
-corrected comparison above is a wash, not a verdict — it rests on the absolute
-numbers: even the smallest, most realistic append here loses over half of a point's
-neighbourhood, and displacement reaches into the hundreds of typical gaps by 50%. That
-is severe enough on its own that silently reshuffling on every append is a real cost
-to an analyst's reading. Pinning needs no new mathematics inside this operator —
-arcform's own staleness model already means the projection step only re-runs when
-something asks it to — the gap is that nothing today tells a reader whether two
-projection outputs came from the same fit before they compare positions between them.
-This operator does not attempt the alternative of placing new rows approximately
-without a full refit (an out-of-sample transform): the measurement above establishes
-the problem is real before that heavier option would even be on the table, and the
-interface answer above is priced at effectively zero — implementing the transform is
-not, and is not undertaken here.
+### Pricing the alternative: `UMAP.transform` is real, and here is what it costs
+
+**`umap-learn`'s `UMAP.transform(X)` is public in the pinned bound
+(`umap-learn>=0.5,<0.6`, resolved 0.5.12 as of 2026-08-24), and places new rows into
+an existing fitted embedding without moving the rows already in it.** Verified by
+actually calling it — `eval/map-refit-stability/price_transform.py`,
+`uv run eval/map-refit-stability/price_transform.py`, committed output in
+`transform_pricing.json` — against the same 3,000-row base and the same 5/20/50%
+append pools this card's headline table uses, so the pricing below is comparable to
+it rather than a separate, smaller demo.
+
+Three costs, measured rather than assumed:
+
+1. **Model persistence.** `.transform()` needs the FITTED reducer object, not just
+   its output coordinates — the k-NN graph and the optimised embedding it walks to
+   place a new point have to survive between the process that ran `fit()` and a
+   later process that runs `.transform()`, and this operator today persists nothing
+   between invocations. Pickled, the fitted reducer for the 3,000-row base is
+   **3.6 MB**. It would need a place in a Protocol's asset graph — most naturally a
+   `produces` asset the first fit writes and a `reads` asset a later append-only run
+   reads back, the same shape `text_embed`'s `model:` directory already uses for a
+   different kind of model.
+
+2. **A compatibility rule that does not exist yet.** A persisted model is only valid
+   for the SAME base rows under the SAME knobs it was fit with — if a base row's
+   values changed, or a row was removed, or `neighbors:`/`min_dist:`/`metric:`
+   moved, the persisted model no longer describes the current input and
+   `.transform()` would silently place new rows against a mapping that has quietly
+   gone stale. Nothing prices or designs that check here; it is named as a real,
+   unbuilt requirement, not assumed away.
+
+3. **Placement fidelity, measured the way this card's own headline number is
+   measured and for the same reason.** UMAP's frame is arbitrary between two
+   INDEPENDENT fits, so comparing "where `.transform()` placed a new row" against
+   "where a full refit placed the same row" by raw distance mixes genuine placement
+   error with the fact that a full refit lands in an unrelated frame — the same
+   reason the headline table above normalises rather than aligning. So fidelity here
+   is measured the frame-invariant way: for each newly placed row, its 20 nearest
+   neighbours AMONG THE BASE ROWS in `.transform()`'s frame, against its 20 nearest
+   base-row neighbours in a full refit's frame. Result: **0.38 / 0.30 / 0.27** mean
+   kNN overlap at 5% / 20% / 50% appends — LOWER than this card's own full-refit
+   churn number for pre-existing rows (0.46 / 0.39 / 0.35). Out-of-sample placement
+   is not a high-fidelity stand-in for a full refit: a newly appended row's exact
+   position is not reliable.
+
+**What is exact, not approximate, and not measured because it does not need to be:**
+the base rows are guaranteed unchanged, because `.transform()` by construction never
+re-optimises the training embedding — this was confirmed by never calling
+`fit_transform` on the combined table in the pricing script, not by measuring a small
+number and calling it good enough.
+
+### Pricing the other alternative: refit only on an explicit user action
+
+**This is not implementable in arcform today**, and saying so needs a mechanism
+named, not asserted. `compute_staleness` (`src/runner.rs`) marks a step stale
+whenever `is_hash_stale` finds its declared inputs have changed — appending a row to
+this step's input Parquet is exactly that — and where `preconditions:` exist,
+staleness is `hash_stale || !preconditions_fresh`: a precondition can only ADD
+staleness, never suppress a hash-driven one. There is no branch anywhere in that
+function, and no flag on `arc run` (`--force` and `--param` are the only ones; there
+is no per-step selector), that lets a step whose input changed stay un-run pending a
+separate, later user action. `runner::tests::test_glob_read_change_forces_the_reading_step_stale`
+pins exactly this: appending bytes to a step's read glob is one of three mutations
+the test proves forces that step stale, and it is asserted, not incidental.
+Building "hold this step's output until the user asks" would be a genuine addition to
+arcform's step model — every step today is a pure function of its declared,
+hash-checked inputs — and that is a different surface and a different card; it is not
+built here.
+
+### The choice, priced rather than assumed
+
+**Pin the existing rows by persisting the fitted model and placing appended rows with
+`.transform()`.** Not because the alternative above is free — it is not implementable
+at all today — and not because `.transform()`'s placement of new rows is trustworthy
+— it measurably is not, at 0.27–0.38 fidelity against a full refit, worse than this
+card's own full-refit churn number. The case for it is the asymmetry between what it
+protects and what it risks: the base rows — which is most of the corpus, and the ones
+an analyst has already built a reading around — are held EXACTLY, by construction,
+with no approximation and no measured fidelity gap, because `.transform()` never
+touches them. The rows it places poorly are exactly the rows the analyst has no prior
+reading of yet, because they are new. A full refit corrupts everyone's reading to
+(imperfectly) place a handful of new rows; pinning corrupts nothing and places the new
+rows imperfectly. That asymmetry, not a claim that either technique is free, is the
+argument.
+
+**None of this is implemented in this card.** AC2 asks for a strategy chosen and its
+trade-off stated, not built. What would be needed: model persistence and a
+compatibility check inside `operators/umap_project/umap_project.py` (this card's own
+surface, no runner change required for this half), and, if "the map does not move at
+all until asked" is wanted on top of that, the runner capability named above (a
+different surface). Neither is built here.
 
 **Telling a refit from an append.** Every output row now carries `projection_fit_id` —
 a hash of the exact feature matrix and knobs (`neighbors`, `min_dist`, `metric`, seed)

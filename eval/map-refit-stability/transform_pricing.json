@@ -1,0 +1,43 @@
+{
+  "base_rows": 3000,
+  "umap_params": {
+    "metric": "cosine",
+    "neighbors": 15,
+    "min_dist": 0.1,
+    "seed": 42
+  },
+  "fit_seconds": 12.3,
+  "pickled_reducer_bytes": 3642991,
+  "base_map_median_nn_spacing": 0.04076581448316574,
+  "base_rows_moved_by_transform": 0.0,
+  "knn_overlap_k": 20,
+  "placements": {
+    "append_05": {
+      "new_rows": 150,
+      "transform_seconds": 1.89,
+      "transform_repeat_max_abs_diff": 0.0,
+      "knn_overlap_with_full_refit_mean": 0.3763333333333333,
+      "knn_overlap_with_full_refit_median": 0.35,
+      "raw_displacement_vs_full_refit_mean": 1.6861326361662388,
+      "raw_displacement_vs_full_refit_normalised_mean": 41.36143623139255
+    },
+    "append_20": {
+      "new_rows": 600,
+      "transform_seconds": 1.89,
+      "transform_repeat_max_abs_diff": 0.0,
+      "knn_overlap_with_full_refit_mean": 0.30325,
+      "knn_overlap_with_full_refit_median": 0.25,
+      "raw_displacement_vs_full_refit_mean": 5.4634530586078,
+      "raw_displacement_vs_full_refit_normalised_mean": 134.0204563032571
+    },
+    "append_50": {
+      "new_rows": 1500,
+      "transform_seconds": 6.38,
+      "transform_repeat_max_abs_diff": 0.0,
+      "knn_overlap_with_full_refit_mean": 0.2746,
+      "knn_overlap_with_full_refit_median": 0.2,
+      "raw_displacement_vs_full_refit_mean": 11.212429834850724,
+      "raw_displacement_vs_full_refit_normalised_mean": 275.04491145346555
+    }
+  }
+}

@@ -155,6 +155,62 @@ class FeatureWidthsTest(unittest.TestCase):
         self.assertIn("empty", str(ctx.exception))
 
 
+class ComputeFitIdTest(unittest.TestCase):
+    """Round three of this card's review found that `matrix.tobytes()` could be
+    replaced with `str(matrix.shape).encode()` at the fit_id call site in `main()`
+    and every test that ran without `uv` — cargo's workspace suite, this file,
+    check_findings.py — stayed green, because none of them exercised
+    value-sensitivity at a fixed shape. `compute_fit_id` was hoisted out of `main()`
+    specifically so this file — stdlib-only, and the one test CI runs for this
+    operator without `uv` — can pin that directly, rather than only through the
+    `uv`-dependent end-to-end Rust test.
+
+    This does NOT cover the call site in `main()` — whether `main()` actually passes
+    `matrix.tobytes()` rather than something shape-only still needs `uv` and numpy to
+    exercise, and stays covered only by
+    tests/umap_project.rs::projection_fit_id_moves_when_a_value_changes_with_the_shape_held_fixed.
+    What this pins is narrower and still real: the hash function itself is sensitive
+    to its payload's CONTENT, not merely its length — the same property `str(...)`
+    would have destroyed had it been factored in here instead of at the call site.
+    """
+
+    KNOBS = (15, 0.1, "cosine", 42)
+
+    def test_the_same_payload_and_knobs_give_the_same_id(self) -> None:
+        payload = b"\x00\x01\x02\x03" * 8
+        first = up.compute_fit_id(payload, *self.KNOBS)
+        second = up.compute_fit_id(payload, *self.KNOBS)
+        self.assertEqual(first, second)
+
+    def test_a_different_payload_of_the_same_length_moves_the_id(self) -> None:
+        # Same LENGTH (the byte-string analogue of "shape") on both sides, one byte
+        # different — this is the case `str(matrix.shape).encode()` collapses: a
+        # fingerprint built from shape alone cannot move here, because the shape
+        # never changes; only a fingerprint built from the actual bytes can.
+        payload_a = b"\x00\x01\x02\x03" * 8
+        payload_b = b"\x00\x01\x02\x04" * 8
+        self.assertEqual(len(payload_a), len(payload_b))
+        self.assertNotEqual(payload_a, payload_b)
+        self.assertNotEqual(
+            up.compute_fit_id(payload_a, *self.KNOBS),
+            up.compute_fit_id(payload_b, *self.KNOBS),
+        )
+
+    def test_a_different_knob_moves_the_id_even_with_the_same_payload(self) -> None:
+        payload = b"\x00\x01\x02\x03" * 8
+        baseline = up.compute_fit_id(payload, 15, 0.1, "cosine", 42)
+        self.assertNotEqual(baseline, up.compute_fit_id(payload, 40, 0.1, "cosine", 42))
+        self.assertNotEqual(baseline, up.compute_fit_id(payload, 15, 0.9, "cosine", 42))
+        self.assertNotEqual(
+            baseline, up.compute_fit_id(payload, 15, 0.1, "euclidean", 42)
+        )
+
+    def test_the_id_is_a_short_hex_string(self) -> None:
+        fit_id = up.compute_fit_id(b"anything", *self.KNOBS)
+        self.assertEqual(len(fit_id), 16)
+        int(fit_id, 16)  # raises ValueError if it is not hex
+
+
 class SqlQuotingTest(unittest.TestCase):
     def test_an_identifier_is_double_quoted_and_interior_quotes_are_doubled(self) -> None:
         self.assertEqual(up.sql_ident("median income"), '"median income"')

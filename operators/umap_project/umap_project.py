@@ -237,6 +237,23 @@ def feature_widths(rows: list, columns: list[str], shapes: list[str]) -> list[in
     return widths
 
 
+def compute_fit_id(
+    payload: bytes, neighbors: int, min_dist: float, metric: str, seed: int
+) -> str:
+    """The whole fingerprint contract in one place: a fit_id depends on the exact
+    VALUES a fit consumed (`payload`, the feature matrix's own bytes — not its shape,
+    not a summary of it) and the knobs that shaped the fit. Hoisted out of `main()` so
+    it needs nothing beyond the standard library: `test_umap_project.py` — stdlib-only,
+    and the one test file CI runs for this operator without `uv` — can pin that the id
+    moves when the payload's CONTENT changes, not only when its length does, directly
+    rather than only through the `uv`-dependent end-to-end test in
+    tests/umap_project.rs.
+    """
+    return hashlib.sha256(
+        payload + f"|{neighbors}|{min_dist}|{metric}|{seed}".encode()
+    ).hexdigest()[:16]
+
+
 def main() -> int:
     import duckdb
     import numpy as np
@@ -373,9 +390,7 @@ def main() -> int:
     # that only hashed the matrix would claim two such maps were comparable when they
     # are not. SEED is a constant, included anyway so the id is a complete fingerprint
     # of the call rather than one that happens to be complete only while SEED stays 42.
-    fit_id = hashlib.sha256(
-        matrix.tobytes() + f"|{k}|{args.min_dist}|{args.metric}|{SEED}".encode()
-    ).hexdigest()[:16]
+    fit_id = compute_fit_id(matrix.tobytes(), k, args.min_dist, args.metric, SEED)
 
     con.execute(
         f"CREATE TABLE arc_proj ({ROW} BIGINT, {X_COL} DOUBLE, {Y_COL} DOUBLE, "
