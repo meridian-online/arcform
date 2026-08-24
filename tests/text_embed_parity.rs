@@ -27,8 +27,6 @@
 //! is green against agreement and green against disagreement, and the two look
 //! identical from the outside.
 
-mod common;
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -98,18 +96,56 @@ fn session(artifact: &Path) -> duckdb::Connection {
 /// 512-token cap. IN-VOCABULARY IS THE POINT: a filler of unknown tokens would be
 /// dropped, and the length probes below would compare a text against itself.
 const FILLER: &[&str] = &[
-    "harbour", "tide", "vessel", "cargo", "market", "revenue", "quarter", "capital",
-    "channel", "survey", "anchor", "freight", "margin", "invoice", "auditor", "berth",
-    "current", "weather", "signal", "engine", "rudder", "compass", "ledger", "dividend",
-    "shipment", "customs", "warehouse", "forecast", "tonnage", "pilot",
+    "harbour",
+    "tide",
+    "vessel",
+    "cargo",
+    "market",
+    "revenue",
+    "quarter",
+    "capital",
+    "channel",
+    "survey",
+    "anchor",
+    "freight",
+    "margin",
+    "invoice",
+    "auditor",
+    "berth",
+    "current",
+    "weather",
+    "signal",
+    "engine",
+    "rudder",
+    "compass",
+    "ledger",
+    "dividend",
+    "shipment",
+    "customs",
+    "warehouse",
+    "forecast",
+    "tonnage",
+    "pilot",
 ];
 
 /// Words appended to probe the cap. Distinct from FILLER so that adding them changes
 /// the mean of a short text — the control that proves the probe can see a change at
 /// all.
 const APPENDED: &[&str] = &[
-    "volcano", "orchestra", "penguin", "trombone", "meadow", "lantern", "cinnamon",
-    "quarry", "saffron", "trellis", "mackerel", "pumice", "juniper", "cobalt",
+    "volcano",
+    "orchestra",
+    "penguin",
+    "trombone",
+    "meadow",
+    "lantern",
+    "cinnamon",
+    "quarry",
+    "saffron",
+    "trellis",
+    "mackerel",
+    "pumice",
+    "juniper",
+    "cobalt",
 ];
 
 fn repeat_words(words: &[&str], count: usize) -> String {
@@ -126,22 +162,54 @@ fn corpus() -> Vec<(i32, &'static str, Option<String>)> {
     let under_cap = repeat_words(FILLER, 30);
     let appended = APPENDED.join(" ");
     vec![
-        (1, "ordinary", Some("the harbour wakes as the tide turns and the fishing boats leave the quay".into())),
-        (2, "case folded", Some("The HARBOUR Wakes As The TIDE Turns".into())),
+        (
+            1,
+            "ordinary",
+            Some("the harbour wakes as the tide turns and the fishing boats leave the quay".into()),
+        ),
+        (
+            2,
+            "case folded",
+            Some("The HARBOUR Wakes As The TIDE Turns".into()),
+        ),
         (3, "accents", Some("café naïve façade".into())),
-        (4, "accents decomposed", Some("cafe\u{301} nai\u{308}ve fac\u{327}ade".into())),
+        (
+            4,
+            "accents decomposed",
+            Some("cafe\u{301} nai\u{308}ve fac\u{327}ade".into()),
+        ),
         (5, "empty", Some(String::new())),
         (6, "whitespace only", Some("  \t \n ".into())),
         (7, "out of vocabulary only, runic", Some("ᚠᚢᚦᚨᚱᚲ".into())),
         (8, "out of vocabulary only, alchemical", Some("🜁🜂🜃🜄".into())),
-        (9, "out of vocabulary mixed in", Some("steel ᚠ valve".into())),
-        (10, "out of vocabulary mixed in, emoji", Some("the 🜁 tide turns".into())),
+        (
+            9,
+            "out of vocabulary mixed in",
+            Some("steel ᚠ valve".into()),
+        ),
+        (
+            10,
+            "out of vocabulary mixed in, emoji",
+            Some("the 🜁 tide turns".into()),
+        ),
         (11, "around 120 tokens", Some(repeat_words(FILLER, 120))),
         (12, "past the cap", Some(over_cap.clone())),
-        (13, "past the cap, extended", Some(format!("{over_cap} {appended}"))),
+        (
+            13,
+            "past the cap, extended",
+            Some(format!("{over_cap} {appended}")),
+        ),
         (14, "under the cap", Some(under_cap.clone())),
-        (15, "under the cap, extended", Some(format!("{under_cap} {appended}"))),
-        (16, "an apostrophe and a quote", Some("the pilot's log said \"slack water\"".into())),
+        (
+            15,
+            "under the cap, extended",
+            Some(format!("{under_cap} {appended}")),
+        ),
+        (
+            16,
+            "an apostrophe and a quote",
+            Some("the pilot's log said \"slack water\"".into()),
+        ),
         (17, "null", None),
     ]
 }
@@ -254,7 +322,11 @@ fn a_protocol_run_and_a_sql_session_return_the_same_vector_for_every_case() {
     let mut stmt = conn.prepare(&sql).unwrap();
     let rows: Vec<(i32, String, bool)> = stmt
         .query_map([], |r| {
-            Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?))
+            Ok((
+                r.get::<_, i32>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, bool>(2)?,
+            ))
         })
         .unwrap()
         .map(|r| r.unwrap())
@@ -277,6 +349,80 @@ fn a_protocol_run_and_a_sql_session_return_the_same_vector_for_every_case() {
             .map(|(id, label, _)| format!("{id} ({label})"))
             .collect::<Vec<_>>()
             .join(", ")
+    );
+}
+
+/// THE OTHER HALF OF WHAT THIS OPERATOR USED TO GET WRONG. Text made only of tokens
+/// outside the vocabulary was handed back as a unit-norm average of the tokenizer's
+/// unknown-token row — a vector for text nothing had been understood of — and was NOT
+/// counted, so nothing said it had happened. Now it embeds as a zero vector like the
+/// empty string, and it is counted with them.
+///
+/// RUN DIRECTLY, not through `arc run`, because that is where the count is observable:
+/// the engine captures a successful step's output and does not print it, so the line
+/// this asserts exists but never reaches a person running a Protocol. That is a gap in
+/// the engine rather than in the operator, and closing it is not this file's to do.
+#[test]
+fn the_rows_that_carry_no_signal_are_counted_on_stderr() {
+    let Some(artifact) = extension_artifact() else {
+        eprintln!("skipping the zero-vector count: no ARC_STATICEMBED_EXTENSION");
+        return;
+    };
+    if !have_uv() {
+        eprintln!("skipping the zero-vector count: no `uv` on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path();
+    let corpus_path = project.join("corpus.parquet");
+    write_corpus(&duckdb::Connection::open_in_memory().unwrap(), &corpus_path);
+
+    // The expected number is derived from the corpus THROUGH THE EXTENSION rather than
+    // written down here, so adding a case to the corpus cannot leave this asserting a
+    // stale figure.
+    let conn = session(&artifact);
+    let expected: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT count(*) FROM read_parquet('{}') WHERE \
+                 list_sum(list_transform(embed(coalesce(description, '')), x -> abs(x))) = 0",
+                corpus_path.display()
+            ),
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert!(
+        expected > 0,
+        "the corpus has to contain text that carries no signal, or this asserts that \
+         zero rows were reported and passes on an operator that reports nothing"
+    );
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("operators/text_embed/text_embed.py");
+    let out = Command::new("uv")
+        .current_dir(project)
+        .args(["run", &script.display().to_string()])
+        .args(["--input", &corpus_path.display().to_string()])
+        .args(["--text-column", "description"])
+        .args(["--extension", &artifact.display().to_string()])
+        .args([
+            "--out",
+            &project.join("embedded.parquet").display().to_string(),
+        ])
+        .output()
+        .expect("spawn uv run");
+    let told = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "the script must succeed:\n{told}");
+    assert!(
+        told.contains(&format!(
+            "[text_embed] {expected} of {} rows tokenised to nothing",
+            corpus().len()
+        )),
+        "all {expected} rows that embed as a zero vector have to be reported:\n{told}"
     );
 }
 
@@ -351,12 +497,18 @@ fn the_corpus_still_contains_the_shapes_it_was_built_from() {
     // multiset — would report "truncated" against an implementation that truncates
     // nothing.
     assert!(
-        same(&by_label("past the cap"), &by_label("past the cap, extended")),
+        same(
+            &by_label("past the cap"),
+            &by_label("past the cap, extended")
+        ),
         "text past the cap is embedded from its opening, so appending to it must not \
          move the vector"
     );
     assert!(
-        !same(&by_label("under the cap"), &by_label("under the cap, extended")),
+        !same(
+            &by_label("under the cap"),
+            &by_label("under the cap, extended")
+        ),
         "appending those same words to a SHORT text must move the vector — otherwise \
          the check above passes on an implementation that truncates nothing"
     );
@@ -430,7 +582,13 @@ fn a_model_the_extension_does_not_carry_is_refused_naming_both() {
         std::fs::write(model.join(part), bytes).unwrap();
     }
 
-    let (_tmp, code, told) = run_protocol(&artifact, Some((&model, "someone/other-model@0123456789abcdef0123456789abcdef01234567")));
+    let (_tmp, code, told) = run_protocol(
+        &artifact,
+        Some((
+            &model,
+            "someone/other-model@0123456789abcdef0123456789abcdef01234567",
+        )),
+    );
     assert_ne!(code, Some(0), "a model mismatch must stop the run:\n{told}");
     assert!(
         told.contains("someone/other-model"),
@@ -449,7 +607,9 @@ fn a_model_the_extension_does_not_carry_is_refused_naming_both() {
 #[test]
 fn the_model_the_extension_carries_is_accepted() {
     let (Some(artifact), Some(model)) = (extension_artifact(), model_directory()) else {
-        eprintln!("skipping the model match check: needs ARC_STATICEMBED_EXTENSION and ARC_STATICEMBED_MODEL");
+        eprintln!(
+            "skipping the model match check: needs ARC_STATICEMBED_EXTENSION and ARC_STATICEMBED_MODEL"
+        );
         return;
     };
     if !have_uv() {
@@ -470,15 +630,21 @@ fn the_model_the_extension_carries_is_accepted() {
     );
 }
 
-/// The address covers THREE files, and this is the test that pins the third. Copy the
-/// model the extension carries, change one byte of `config.json` — the file a
-/// two-file check would never look at — and the run has to stop. Without this, an
-/// address computed over the tokenizer and the weights alone passes every other test
-/// in this file.
+/// The address covers THREE files, and this is the test that pins the third.
+///
+/// TWO RUNS, and the first one is why this test can fail for its own reason. Refusing
+/// the altered directory proves nothing on its own — an address computed over the
+/// tokenizer and the weights alone would ALSO refuse it, and would refuse the
+/// unaltered directory too. Measured 2026-08-25: dropping `config.json` from the
+/// digest left this test green when it asserted only the refusal. So the unaltered
+/// copy has to be ACCEPTED first, in the same test, and only then does the refusal of
+/// a copy differing by one byte of the third file mean the third file is hashed.
 #[test]
 fn changing_one_byte_of_the_third_file_is_a_different_model() {
     let (Some(artifact), Some(model)) = (extension_artifact(), model_directory()) else {
-        eprintln!("skipping the third-file check: needs ARC_STATICEMBED_EXTENSION and ARC_STATICEMBED_MODEL");
+        eprintln!(
+            "skipping the third-file check: needs ARC_STATICEMBED_EXTENSION and ARC_STATICEMBED_MODEL"
+        );
         return;
     };
     if !have_uv() {
@@ -486,19 +652,29 @@ fn changing_one_byte_of_the_third_file_is_a_different_model() {
         return;
     }
     let held = tempfile::tempdir().unwrap();
-    let altered = held.path().join("potion-altered");
-    std::fs::create_dir_all(&altered).unwrap();
+    let copied = held.path().join("potion-copied");
+    std::fs::create_dir_all(&copied).unwrap();
     for part in ["tokenizer.json", "model.safetensors", "config.json"] {
-        std::fs::copy(model.join(part), altered.join(part)).unwrap();
+        std::fs::copy(model.join(part), copied.join(part)).unwrap();
     }
-    // One byte, in the file neither the tokenizer nor the weights: a trailing space is
-    // JSON-insignificant and address-significant, which is exactly the point.
-    let config = altered.join("config.json");
+    let release = model_release();
+    let (_intact, intact_code, intact_told) = run_protocol(&artifact, Some((&copied, &release)));
+    assert_eq!(
+        intact_code,
+        Some(0),
+        "the copy is byte-for-byte the model the extension carries and has to be \
+         accepted — without this the refusal below happens for any broken address at \
+         all:\n{intact_told}"
+    );
+
+    // One byte, in the file that is neither the tokenizer nor the weights: a trailing
+    // space is JSON-insignificant and address-significant, which is exactly the point.
+    let config = copied.join("config.json");
     let mut bytes = std::fs::read(&config).unwrap();
     bytes.push(b' ');
     std::fs::write(&config, bytes).unwrap();
 
-    let (_tmp, code, told) = run_protocol(&artifact, Some((&altered, &model_release())));
+    let (_tmp, code, told) = run_protocol(&artifact, Some((&copied, &release)));
     assert_ne!(
         code,
         Some(0),

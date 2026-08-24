@@ -4402,8 +4402,7 @@ mod tests {
                 "text_embed" => {
                     // The extension check runs BEFORE the script is materialised, so it
                     // has to pass or the refusal under test is never reached.
-                    std::fs::write(protocol.path().join("staticembed.ext"), b"not real")
-                        .unwrap();
+                    std::fs::write(protocol.path().join("staticembed.ext"), b"not real").unwrap();
                     let with: Value = serde_yaml::from_str(
                         "input: corpus.parquet\ntext_column: description\nextension: staticembed.ext\nout: out.parquet",
                     )
@@ -4581,8 +4580,9 @@ mod tests {
             "model_release: minishlab/potion-base-8M@abcdef",
         ] {
             let with: Value = serde_yaml::from_str(&format!("{base}{half}")).unwrap();
-            let err = assets_for("text_embed", Some(&with))
-                .expect_err(&format!("`{half}` alone checks nothing and must be refused"));
+            let err = assets_for("text_embed", Some(&with)).expect_err(&format!(
+                "`{half}` alone checks nothing and must be refused"
+            ));
             assert!(
                 err.to_string().contains("Set both, or neither"),
                 "the refusal says what to do about it: {err}"
@@ -4870,7 +4870,8 @@ mod tests {
         ))
         .unwrap();
         let cfg = TextEmbedConfig::parse(&with).unwrap();
-        let args = text_embed_invocation(&cfg, tmp.path()).expect("a complete declaration proceeds");
+        let args =
+            text_embed_invocation(&cfg, tmp.path()).expect("a complete declaration proceeds");
 
         assert_eq!(args[0], "run");
         assert_eq!(args[1], "--script");

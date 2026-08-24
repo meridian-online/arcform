@@ -151,7 +151,10 @@ with on stdout, so the run's own output says which model produced the vectors.
 wants here, so the text is bridged with `coalesce(t, '')` — the bridge the extension
 documents. With that bridge, a row whose text is **NULL, empty, whitespace, or made
 only of tokens outside the model's vocabulary** embeds as a full-width **zero vector**,
-and the count of those rows is reported on stderr rather than passed over.
+and the count of those rows is reported on stderr rather than passed over — visible
+when the script is run standalone. `arc run` captures a successful step's output and
+does not print it today, so a Protocol run does not show that line; that is a gap in
+the engine rather than in this operator.
 
 **That is a change.** The Python path returned a zero vector for the first three cases
 only. For the fourth it averaged the tokenizer's unknown-token row and handed back a

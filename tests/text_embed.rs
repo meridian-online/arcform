@@ -262,7 +262,9 @@ fn an_embedding_is_a_finished_artifact_with_no_map_attached() {
 #[test]
 fn the_route_from_a_text_column_to_coordinates_still_works() {
     let Some(_) = extension_artifact() else {
-        eprintln!("skipping the_route_from_a_text_column_to_coordinates: no ARC_STATICEMBED_EXTENSION");
+        eprintln!(
+            "skipping the_route_from_a_text_column_to_coordinates: no ARC_STATICEMBED_EXTENSION"
+        );
         return;
     };
     if !have_uv() {
@@ -347,7 +349,8 @@ fn the_route_from_a_text_column_to_coordinates_still_works() {
     let markets_centre = centre(&markets);
 
     let separation = distance(harbour_centre, markets_centre);
-    let width = median_radius(&harbour, harbour_centre).max(median_radius(&markets, markets_centre));
+    let width =
+        median_radius(&harbour, harbour_centre).max(median_radius(&markets, markets_centre));
     assert!(
         separation > 4.0 * width,
         "the two subjects sit {separation:.3} apart with a median radius of \

@@ -45,8 +45,10 @@ column of NULLs is not what a Parquet consumer wants here, so the text is bridge
 text is NULL, empty, whitespace, or made only of tokens outside the model's vocabulary
 embeds as a full-width ZERO vector, and the count of those rows is reported on stderr
 rather than passed over. That is a change: this script used to average the tokenizer's
-`[UNK]` row for the third case and hand back a unit-norm vector for text it had
-understood nothing of, and it did not count those rows.
+`[UNK]` row for the fourth case and hand back a unit-norm vector for text it had
+understood nothing of, and it did not count those rows. The count is visible when the
+script is run standalone; `arc run` captures a successful step's output and does not
+print it today, so a Protocol run does not show it.
 
 TEXT PAST THE CAP IS TRUNCATED. The extension embeds the first 512 tokens of a text
 and drops the rest, so a long description is embedded from its opening. This script
