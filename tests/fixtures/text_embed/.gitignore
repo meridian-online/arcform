@@ -1,1 +1,4 @@
 build/
+# Staged by the tests from ARC_STATICEMBED_EXTENSION, or put here by hand to run this
+# Protocol. Tens of megabytes, most of them weights — never committed.
+staticembed.duckdb_extension
