@@ -1718,10 +1718,10 @@ struct DatapackageDescribeConfig {
     /// Pin the run to one exact finetype release. When set, the step refuses —
     /// naming both versions — unless the resolved `finetype` on PATH reports
     /// exactly this version, so a pinned pipeline cannot silently describe with a
-    /// different engine than the one it asked for. Independent of the operator's
-    /// own `--min-finetype-version` floor (unconfigurable here; describe.py's
-    /// `MIN_FINETYPE_VERSION` covers taxonomy correctness for every caller), which
-    /// stays a "no older than" check even when this is also set.
+    /// different engine than the one it asked for. Independent of this operator's
+    /// own `MIN_FINETYPE_VERSION` floor (unconfigurable here — it covers taxonomy
+    /// correctness for every caller), which stays a "no older than" check even
+    /// when this is also set.
     #[serde(default)]
     expect_finetype_version: Option<String>,
 }
@@ -3221,6 +3221,56 @@ mod tests {
         assert!(msg.contains("0.6.60"));
     }
 
+    /// Writes a `finetype` that answers ONLY `--version` (with `version_line`) —
+    /// enough for `require_finetype`, which never calls `profile`.
+    fn write_fake_finetype_version_only(dir: &Path, version_line: &str) {
+        let script = dir.join("finetype");
+        std::fs::write(&script, format!("#!/bin/sh\necho \"{version_line}\"\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(&script).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&script, perm).unwrap();
+    }
+
+    #[test]
+    fn require_finetype_at_exact_floor_passes() {
+        // The floor is INCLUSIVE ("no older than") — a resolved version EQUAL to
+        // MIN_FINETYPE_VERSION must pass, not just anything strictly newer. A `<=`
+        // typo in the comparison would refuse exactly this case.
+        let finetype_dir = tempfile::tempdir().unwrap();
+        write_fake_finetype_version_only(
+            finetype_dir.path(),
+            &format!("finetype {MIN_FINETYPE_VERSION}"),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = HashMap::new();
+        env.insert(
+            "PATH".to_string(),
+            finetype_dir.path().display().to_string(),
+        );
+        let ctx = test_ctx(dir.path(), &env);
+        let resolved = require_finetype(MIN_FINETYPE_VERSION, &ctx)
+            .expect("a finetype exactly at the floor must pass, not be refused");
+        assert_eq!(resolved, MIN_FINETYPE_VERSION);
+    }
+
+    #[test]
+    fn require_finetype_unparseable_version_fails_closed() {
+        let finetype_dir = tempfile::tempdir().unwrap();
+        write_fake_finetype_version_only(finetype_dir.path(), "finetype (unknown build)");
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = HashMap::new();
+        env.insert(
+            "PATH".to_string(),
+            finetype_dir.path().display().to_string(),
+        );
+        let ctx = test_ctx(dir.path(), &env);
+        let err = require_finetype(MIN_FINETYPE_VERSION, &ctx).expect_err(
+            "an unparseable `finetype --version` must stop the run, not default silently",
+        );
+        assert!(err.to_string().contains("could not parse"));
+    }
+
     fn field(name: &str, extra: serde_json::Value) -> serde_json::Value {
         let mut obj = extra.as_object().cloned().unwrap_or_default();
         obj.insert(
@@ -3298,6 +3348,54 @@ mod tests {
         let err = merge_datapackage(base, &overrides)
             .expect_err("a foreignKey naming an absent column must be refused");
         assert!(err.to_string().contains("ghost_column"));
+    }
+
+    #[test]
+    fn merge_datapackage_resource_override_wins() {
+        // Every production descriptor.overrides.json sets `resource.path` to the
+        // public URL — finetype writes the local build path, which is never where a
+        // consumer fetches the resource. This is the resource-level override path,
+        // distinct from the package-level and field-level ones above it.
+        let base = base_descriptor(vec![field("id", serde_json::json!({}))]);
+        let overrides = serde_json::json!({
+            "resource": { "path": "https://openlake.meridian.online/widgets.parquet" }
+        });
+        let merged = merge_datapackage(base, &overrides).unwrap();
+        assert_eq!(
+            merged["resources"][0]["path"],
+            "https://openlake.meridian.online/widgets.parquet"
+        );
+        // A resource key the override did not mention survives from finetype's half.
+        assert_eq!(merged["resources"][0]["name"], "widgets");
+    }
+
+    #[test]
+    fn merge_datapackage_structural_keys_never_leak_to_the_package_root() {
+        // Every production overrides file sets `resource` and `primaryKey` at the
+        // TOP LEVEL of descriptor.overrides.json — these are handled structurally
+        // (folded into resources[0] / its schema) and must never ALSO land as
+        // sibling keys on the package root next to title/description/etc.
+        let base = base_descriptor(vec![field("id", serde_json::json!({}))]);
+        let overrides = serde_json::json!({
+            "title": "Widgets",
+            "resource": { "path": "https://example.com/widgets.parquet" },
+            "fields": { "id": { "description": "the id" } },
+            "primaryKey": ["id"]
+        });
+        let merged = merge_datapackage(base, &overrides).unwrap();
+        assert_eq!(merged["title"], "Widgets");
+        assert!(
+            merged.get("resource").is_none(),
+            "`resource` must not leak onto the package root: {merged:#}"
+        );
+        assert!(
+            merged.get("fields").is_none(),
+            "`fields` must not leak onto the package root: {merged:#}"
+        );
+        assert!(
+            merged.get("primaryKey").is_none(),
+            "`primaryKey` must not leak onto the package root: {merged:#}"
+        );
     }
 
     /// Pins the serialization shape AC1's byte-identity rests on: `serde_json`'s

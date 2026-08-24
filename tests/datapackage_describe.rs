@@ -37,6 +37,22 @@ fn write_fake_finetype(dir: &Path, version: &str, profile_json: &str) {
     std::fs::set_permissions(&script, perm).unwrap();
 }
 
+/// Write an executable `finetype` whose `--version` answers normally but whose
+/// `profile` subcommand FAILS (nonzero exit, stderr message) — proves a profile
+/// failure propagates as a step failure rather than being silently swallowed into
+/// a default/null base descriptor.
+fn write_fake_finetype_profile_fails(dir: &Path, version: &str) {
+    let script = dir.join("finetype");
+    let body = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo \"finetype {version}\"\nelse\n  echo 'finetype: could not read parquet' >&2\n  exit 3\nfi\n"
+    );
+    std::fs::write(&script, body).expect("write fake finetype");
+    use std::os::unix::fs::PermissionsExt;
+    let mut perm = std::fs::metadata(&script).unwrap().permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(&script, perm).unwrap();
+}
+
 /// The directory holding the real `duckdb` CLI, found on THIS process's ambient
 /// PATH. `arc run` always needs one (the same requirement `init_from_descriptor.rs`
 /// states) independent of this operator, so the isolated PATH built for these
@@ -217,4 +233,127 @@ fn missing_finetype_is_refused() {
         !out.status.success(),
         "a missing `finetype` binary must stop the step, not silently skip typing"
     );
+}
+
+#[test]
+fn stale_field_override_warns_but_does_not_fail() {
+    // A sidecar field override naming a column absent from the Parquet is a stale
+    // entry — it warns (stderr), it does not stop the run. Regression-proofs the
+    // warning branch: silently dropping this check would not break the descriptor,
+    // only the operator's ability to say "this sidecar entry is dead, clean it up".
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    write_project(
+        &project,
+        r#"{"fields": {"ghost_column": {"description": "does not exist"}}}"#,
+    );
+
+    let finetype_dir = tempfile::tempdir().unwrap();
+    write_fake_finetype(finetype_dir.path(), "9.9.9", base_profile_json());
+
+    let out = run_arc_with_fake_finetype(&project, finetype_dir.path());
+    assert!(
+        out.status.success(),
+        "a stale field override must warn, not fail:\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("WARNING"), "stderr: {stderr}");
+    assert!(stderr.contains("ghost_column"), "stderr: {stderr}");
+    assert!(
+        project.join("datapackage.json").exists(),
+        "a merely-stale override must not stop the descriptor being written"
+    );
+}
+
+#[test]
+fn resource_path_override_wins_end_to_end() {
+    // Every production descriptor.overrides.json sets `resource.path` to the
+    // public URL, because finetype writes the local build path. If this merge
+    // regressed, every published descriptor would point consumers at a path that
+    // does not resolve on their machine.
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    write_project(
+        &project,
+        r#"{"resource": {"path": "https://openlake.meridian.online/widgets.parquet"}}"#,
+    );
+
+    let finetype_dir = tempfile::tempdir().unwrap();
+    write_fake_finetype(finetype_dir.path(), "9.9.9", base_profile_json());
+
+    let out = run_arc_with_fake_finetype(&project, finetype_dir.path());
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let descriptor: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(project.join("datapackage.json")).unwrap()).unwrap();
+    assert_eq!(
+        descriptor["resources"][0]["path"],
+        "https://openlake.meridian.online/widgets.parquet"
+    );
+    // A resource key the override did not mention survives from finetype's half.
+    assert_eq!(descriptor["resources"][0]["name"], "widgets");
+}
+
+#[test]
+fn finetype_profile_failure_is_not_silently_swallowed() {
+    // `--version` succeeds (passes the floor gate) but `profile` itself fails —
+    // must stop the run rather than continue with a default/null base descriptor.
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    write_project(&project, "{}");
+
+    let finetype_dir = tempfile::tempdir().unwrap();
+    write_fake_finetype_profile_fails(finetype_dir.path(), "9.9.9");
+
+    let out = run_arc_with_fake_finetype(&project, finetype_dir.path());
+    assert!(
+        !out.status.success(),
+        "a failing `finetype profile` must stop the run, not silently continue"
+    );
+    // Pinned to the REAL child stderr, not just "something failed" — a fold to
+    // `.unwrap_or_default()` would still fail downstream (merge_datapackage refuses
+    // a non-object base), but with a DIFFERENT message that never mentions this.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("could not read parquet"),
+        "the real finetype failure must be the reason given: {stderr}"
+    );
+    assert!(
+        !project.join("datapackage.json").exists(),
+        "a swallowed profile failure would still write a (wrong) descriptor; \
+         a propagated one must not write anything"
+    );
+}
+
+#[test]
+fn missing_overrides_file_is_refused() {
+    // The overrides sidecar itself is absent — the read must propagate as a step
+    // failure, not panic, not silently describe with no curation at all.
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    write_project(&project, "{}");
+    std::fs::remove_file(project.join("descriptor.overrides.json")).unwrap();
+
+    let finetype_dir = tempfile::tempdir().unwrap();
+    write_fake_finetype(finetype_dir.path(), "9.9.9", base_profile_json());
+
+    let out = run_arc_with_fake_finetype(&project, finetype_dir.path());
+    assert!(
+        !out.status.success(),
+        "a missing overrides sidecar must stop the run"
+    );
+    // Pinned to the READ failing, not just "something failed downstream" — a fold
+    // to `.unwrap_or_default()` (empty string) would still fail at the NEXT line
+    // (invalid JSON), but through a different message that never says "read".
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("datapackage_describe: read"),
+        "must fail at the read, not one step later at the parse: {stderr}"
+    );
+    assert!(!project.join("datapackage.json").exists());
 }
