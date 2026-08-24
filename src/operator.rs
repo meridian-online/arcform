@@ -4212,21 +4212,35 @@ mod tests {
     /// permanent.
     ///
     /// A string assertion, deliberately: the thing being pinned IS text, and deleting
-    /// the marker while keeping the operator is exactly the change this has to catch.
+    /// the notice while keeping the operator is exactly the change this has to catch.
+    ///
+    /// SCOPED TO THE OPENING OF THE DOCSTRING, not to the file, and that is the whole
+    /// difference between this test and a test that cannot fail. An assertion over the
+    /// whole file was GREEN with the notice deleted — measured 2026-08-24 by deleting
+    /// it — because `DuckDB extension` also occurs further down, in the paragraph
+    /// about the implementation order that the notice happens to sit above. What is
+    /// asserted here is that a reader opening this file meets the warning before
+    /// anything else, which is the only form of it that does any work.
     #[test]
     fn text_embed_marks_itself_provisional_and_names_where_it_is_going() {
+        let docstring = TEXT_EMBED_PY
+            .split("\"\"\"")
+            .nth(1)
+            .expect("text_embed.py opens with a module docstring");
+        let notice = docstring.lines().take(8).collect::<Vec<_>>().join("\n");
         assert!(
-            TEXT_EMBED_PY.contains("PROVISIONAL"),
-            "text_embed.py must announce that it is a stopgap in its own source"
+            notice.contains("PROVISIONAL"),
+            "text_embed.py must open by announcing that it is a stopgap:\n{notice}"
         );
         assert!(
-            TEXT_EMBED_PY.contains("DuckDB extension"),
-            "text_embed.py must name the DuckDB extension as where this capability is \
-             going, not merely say it is temporary"
+            notice.contains("DuckDB embedding extension"),
+            "the notice must name the DuckDB embedding extension as where this \
+             capability is going, not merely say it is temporary:\n{notice}"
         );
         assert!(
-            TEXT_EMBED_PY.contains("deleted"),
-            "text_embed.py must say the operator goes away rather than being ported"
+            notice.contains("DELETED"),
+            "the notice must say the operator goes away rather than being ported:\n\
+             {notice}"
         );
     }
 

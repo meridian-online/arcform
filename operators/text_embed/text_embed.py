@@ -9,20 +9,25 @@
 # ///
 """text_embed — arcform typed Python operator (uv-run).
 
-PROVISIONAL. THIS OPERATOR IS ON ITS WAY OUT — DO NOT HARDEN IT.
+PROVISIONAL. THIS OPERATOR IS ON ITS WAY OUT — DO NOT HARDEN IT. Embedding is a table
+lookup and a mean, and under arcform's implementation order it has no business running
+in a Python process at all. The DuckDB embedding extension being built for exactly this
+is where the capability is going; when it lands, a Protocol embeds from a SQL step —
+`SELECT …, embed(description) AS embedding FROM …` — and this operator is DELETED
+rather than ported. A knob proposed here belongs on the extension instead.
 
-Embedding is a table lookup and a mean. It does not need a Python process, and under
-arcform's implementation order it does not belong at this tier at all: a capability is
-built as a DuckDB extension first, then in Rust/C, and only then in a managed
-environment like `uv`. A DuckDB scalar function returning a vector is being built for
-exactly this, and Rust that loads a Model2Vec tokenizer and embedding matrix already
-ships elsewhere in the stack. When the extension lands, a Protocol embeds from a SQL
-step — `SELECT …, embed(description) AS embedding FROM …` — and this operator is
-deleted rather than maintained.
+The order this violates: a capability is built as a DuckDB extension first, then in
+Rust or C, and only then in a managed environment like `uv`. Reaching past a tier
+requires naming what in that tier cannot do the job, and here there is nothing to name
+— a DuckDB scalar function does a table lookup and a mean and composes with WHERE and
+LIMIT besides, and Rust that loads a Model2Vec tokenizer and embedding matrix already
+ships elsewhere in this stack.
 
 It exists now because that extension does not exist yet, and without it a Protocol has
-no route from a text column to a map at all. So: a stopgap, named as one. If you are
-about to add a knob here, add it to the extension instead. See README.md.
+no route from a text column to a map at all. So: a stopgap, named as one. The cost it
+carries meanwhile is that one capability is implemented twice in two languages, which
+is two places for a model version, a pooling rule or a normalisation to drift apart
+invisibly. See README.md.
 
 WHAT IT DOES. Reads one Parquet, embeds the named text column against a LOCAL
 static-embedding model, and writes a Parquet carrying every input column plus a vector

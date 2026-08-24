@@ -105,6 +105,14 @@ class NumericShapeTest(unittest.TestCase):
 
     def test_a_malformed_bracket_is_not_a_vector(self) -> None:
         self.assertIsNone(up.numeric_shape("DOUBLE]"))
+        # The DECIMAL case is the one that pins the guard rather than merely agreeing
+        # with it. A closing bracket with no opening one has to end the unwrapping
+        # loop, and `break` terminates it just as `return None` does — for "DOUBLE]"
+        # the two are indistinguishable, because the leftover "DOUBLE]" is not in the
+        # numeric set either way. DECIMAL is matched by PREFIX, so "DECIMAL(9,2)]"
+        # would come back a number under `break` and does not under the refusal. This
+        # test was green against both until this line was added.
+        self.assertIsNone(up.numeric_shape("DECIMAL(9,2)]"))
 
 
 class FeatureWidthsTest(unittest.TestCase):
