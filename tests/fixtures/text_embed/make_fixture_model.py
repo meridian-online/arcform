@@ -2,7 +2,7 @@
 # requires-python = ">=3.12,<3.13"
 # dependencies = ["numpy>=1.26,<3", "safetensors>=0.4,<1", "tokenizers>=0.20,<1"]
 # ///
-"""Regenerate the tiny static-embedding model this fixture points `embed_project` at.
+"""Regenerate the tiny static-embedding model this fixture points `text_embed` at.
 
 A real model (a `model2vec` / `potion` release) is tens of megabytes and arrives over
 the network, which is neither of the things a test fixture may be. This writes the
@@ -15,7 +15,7 @@ the subject it appears in, both directions when it appears in both, plus a small
 seeded jitter. So the fixture behaves like a real model in the one way the test cares
 about: the map it produces has structure, and that structure comes from the text.
 
-    uv run tests/fixtures/embed_project/make_fixture_model.py
+    uv run tests/fixtures/text_embed/make_fixture_model.py
 
 Deterministic — re-running rewrites byte-identical files.
 """

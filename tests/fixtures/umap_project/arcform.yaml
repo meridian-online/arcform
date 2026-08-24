@@ -1,0 +1,40 @@
+# Fixture Protocol for the umap_project operator.
+#
+# Three steps, and the third is the one under test: load a small table of properties,
+# export it as Parquet, then reduce four columns that are ALREADY NUMBERS to the two
+# coordinates a map needs.
+#
+# THERE IS NO MODEL IN THIS DIRECTORY AND NO TEXT COLUMN IN THE `with:` BLOCK, which
+# is the property under test. This is the case the merged operator this replaced could
+# not serve at all: it insisted on embedding a text column first, so a table of
+# longitudes and latitudes — the shape of the published Embedding Atlas housing
+# example — had no way through it.
+#
+# `metric: euclidean` is stated rather than left to the script's default, which is the
+# same value. Distance between two rows is a decision about what the map means, and a
+# Protocol that cares about its map should say which reading it wants.
+#
+# `district` is carried through and not projected: a column the projection does not
+# name survives into the output untouched.
+name: umap_project_fixture
+engine: duckdb
+db: build/fixture.duckdb
+
+steps:
+  - name: load_homes
+    sql: models/homes.sql
+
+  - name: export_homes
+    op: parquet_export@1
+    with:
+      input: homes
+      dest: build/homes.parquet
+      order_by: "id"
+
+  - name: project
+    op: umap_project@1
+    with:
+      input: build/homes.parquet
+      columns: [longitude, latitude, median_income, rooms_per_household]
+      out: build/homes_projected.parquet
+      metric: euclidean

@@ -49,6 +49,16 @@ jobs:
       - name: datapackage_describe tests
         run: python3 operators/datapackage_describe/test_describe.py
 
+      # umap_project.py runs under `uv` with umap-learn, numpy and DuckDB — none of
+      # which this runner has, and the end-to-end tests that would exercise it skip
+      # here for exactly that reason. So the script imports those three INSIDE
+      # `main()`, and the half above them that decides things — which column types can
+      # be placed on a map, how many features each contributes, the SQL quoting — is
+      # importable and tested with the standard library alone. Without this step every
+      # line of that script is invisible to CI.
+      - name: umap_project tests
+        run: python3 operators/umap_project/test_umap_project.py
+
   # Clippy and the test suite both compile the crate against system DuckDB, so
   # they share a job that provisions the library once.
   build:

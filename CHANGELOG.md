@@ -11,26 +11,68 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Added
 
-- **`embed_project` turns a text column into the two coordinates a map needs** — a
-  typed operator that reads a Parquet, embeds the named text column against a LOCAL
-  static-embedding model, reduces it to two dimensions with UMAP, and writes a Parquet
-  carrying every input column plus `projection_x` and `projection_y` as `DOUBLE`.
-  Python on the same `uv run --script` substrate `datapackage_describe`,
-  `splink_resolve` and `gleif_ra_fetch` use, with the same frozen-script contract:
-  `op@1` addresses those exact script bytes, so the seed cannot drift under a manifest.
-  The model is a DECLARED READ of kind Directory, not a download — it is a node in the
-  asset graph, it is hashed for staleness like any other input, and a model that is not
-  on disk stops the step naming the file it looked for before `uv` is spawned (and
-  non-retryably, since a missing declared input will not appear on a second attempt).
-  Registered unconditionally, beside the other uv-run operators: arcform validates a
-  manifest against the same catalog it executes from, so a feature named for the
-  transport would force a consumer that only wants to READ a Protocol naming this step
-  to claim the capability to run it. Byte-identity across runs is pinned by the seed,
-  by a thread count set before numpy/numba import, and by a row order carried through
-  an explicit ordinal; it holds within one resolved environment and not across a
-  dependency upgrade, which `operators/embed_project/README.md` states rather than
-  implies, alongside the measured 34.9% ten-nearest-neighbour overlap that is the
-  reason to read the output as regions rather than as a nearest-neighbour index.
+- **`embed_project` is split into `umap_project` and `text_embed`, because one name
+  over two jobs made each one reachable only through the other.** An analyst who
+  wanted vectors — for similarity, clustering, deduplication, or as classifier
+  features — could not get them from a Protocol without also computing a 2-D map they
+  had not asked for, and an analyst who wanted a map of columns that were ALREADY
+  numbers could not use the step at all, because it insisted on embedding text first.
+  The published Embedding Atlas gallery makes the second case concrete: its housing
+  example draws a map from a longitude and a latitude with no embedding anywhere
+  behind it, and the merged step could not serve it.
+
+  `umap_project@1` takes `columns:` — a list of columns that are already numbers — and
+  writes `projection_x` and `projection_y`. A numeric scalar contributes one feature; a
+  list or array of numerics (a vector column) contributes one per element, so
+  `[longitude, latitude]` maps a table of places and `[embedding]` maps whatever wrote
+  a vector column, without the operator knowing which. A fixed-size array survives a
+  Parquet round trip as a plain list, so `FLOAT[16]` and `FLOAT[]` are both accepted; a
+  chained Protocol would otherwise refuse its own previous step's output. A column that
+  is not a number is refused naming the column AND the type it found. A new `metric:`
+  (`euclidean` or `cosine`) is how a Protocol says what distance between two rows
+  means — `euclidean` by default, which is umap-learn's own and the right reading of an
+  arbitrary feature matrix. Nothing scales your columns, deliberately: under euclidean
+  a wider-spread column dominates the layout, and that decision belongs in the SQL step
+  that selects them, where it is visible.
+
+  `text_embed@1` writes vectors and nothing else, into a `FLOAT[]` column named by
+  `vector_column:` (default `embedding`). It carries no projection knob, and
+  `umap_project` carries no text column and no model — `deny_unknown_fields` makes a
+  manifest that mixes them stop at load rather than silently ignore the field.
+  **`text_embed` is marked PROVISIONAL in its own source and README, naming the DuckDB
+  embedding extension as where the capability is going**: embedding is a table lookup
+  and a mean, it has no business at the `uv` tier, and when the extension lands a
+  Protocol embeds from a SQL step and the operator is deleted rather than ported. The
+  same capability is currently implemented twice in two languages, which is a cost
+  worth naming rather than tidying away.
+
+  `embed_project` is GONE, not aliased — nothing outside arcform referenced it, so the
+  rename is free today and would have been a breaking change the moment a Protocol
+  depended on it. `op: embed_project@1` now fails manifest validation with the
+  unknown-operator refusal, which is a better answer than an alias quietly resolving to
+  one of the two halves. Both new names start at `@1`: neither is the old operator at a
+  later version, because each does strictly less than it did.
+
+  Everything the merged operator pinned is preserved. `op@1` still addresses exact
+  script bytes; the projection's seed is still frozen in the script rather than exposed
+  in `with:`; threads are still pinned before numpy/numba import and row order through
+  an explicit ordinal, so two runs over the same input still emit byte-identical
+  Parquet within one resolved environment. The model is still a DECLARED READ of kind
+  Directory rather than a download — a node in the asset graph, hashed for staleness,
+  and a model that is not on disk still stops the step non-retryably before `uv` is
+  spawned, naming the file it looked for. Both operators are registered
+  unconditionally, beside the other uv-run ops: arcform validates a manifest against
+  the same catalog it executes from, so a feature gate named for the transport would
+  force a consumer that only wants to READ a Protocol naming these steps to claim the
+  capability to run them.
+
+  `umap_project.py` imports duckdb, numpy and umap inside `main()` rather than at module
+  scope, so the half of the script that DECIDES — the column-type classifier, the
+  feature-width check, the SQL quoting — is importable with the standard library alone
+  and is covered by `operators/umap_project/test_umap_project.py` in CI. The
+  end-to-end tests need `uv` and skip on every runner here, so without that the script
+  had no CI coverage at all.
+
 - **`datapackage_describe` stamps `x-finetype-version` into every descriptor it
   writes** — the dotted version reported by the SAME `finetype` binary the step
   already resolves and runs to type the columns, so a descriptor names the engine
