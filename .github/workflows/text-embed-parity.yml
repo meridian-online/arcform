@@ -1,0 +1,177 @@
+name: text-embed-parity
+
+# THE STAGED GATE, as opposed to the routine one in `ci.yml`.
+#
+# `tests/text_embed_parity.rs` and `tests/text_embed.rs` carry the tests that prove a
+# Protocol run and a SQL session return the same vector for the same text — the whole
+# claim behind the `text_embed` operator. Most of those tests are `#[ignore]`d, because
+# they need a built `staticembed` extension (tens of megabytes, deliberately not
+# committed) and `uv`, and the routine gate has neither. This workflow is where they
+# actually run: it builds the extension from a pinned `staticembed` commit, stages the
+# model it bundles, installs `uv`, and runs both files with `--include-ignored` so
+# every one of those tests executes its real body instead of being skipped.
+#
+# ON A SCHEDULE AND ON DEMAND, deliberately not on every push or PR. Building a second
+# repo's extension and paying `uv`'s first-resolve cost on every commit would make this
+# workflow the slow, flaky part of arcform's routine gate for a comparison that changes
+# only when the operator, the extension's ABI, or the bundled model does. A `#[ignore]`d
+# test that is not run here yet is still visible as `ignored` rather than `ok` on every
+# PR — that is what the routine gate's own summary now shows — so nothing about this
+# schedule hides the gap while it waits its turn.
+on:
+  schedule:
+    # 05:17 UTC, daily. Off the hour so it does not queue behind everyone else's cron.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      staticembed_ref:
+        description: >-
+          staticembed commit to build the extension from. Defaults to the pinned
+          STATICEMBED_REF below — set this to try a newer commit before bumping the pin.
+        required: false
+
+concurrency:
+  group: text-embed-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The staticembed commit this run builds the extension from, pinned the same way
+  # ci.yml pins DUCKDB_VERSION: a deliberate bump in its own commit, not whatever
+  # staticembed's main branch happens to be the day the schedule fires. AC3 of "the
+  # parity suite proves the vectors agree and nothing ever runs it" — a pass names the
+  # artifact it passed against, and this is the name.
+  STATICEMBED_REF: 1105eb38f6ebf6d95f7efdc5b4ddc60d79e303e4
+  # Matches ci.yml's build job — arcform's own crate still links a system DuckDB to
+  # compile and run its tests, independent of the extension under test.
+  DUCKDB_VERSION: v1.5.4
+
+jobs:
+  # Unconditional: this job always builds its own artifact and always runs every test
+  # named above. There is no `if:` here to skip past — a required check that CAN skip
+  # satisfies branch protection without running anything, which is one layer up from
+  # the exact defect this workflow exists to close. That conditionality belongs inside
+  # a step (whether the artifact loaded, which build was used) rather than at the job
+  # level, and it stays there throughout this file.
+  parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out arcform
+        uses: actions/checkout@v4
+        with:
+          path: arcform
+
+      # A sibling PUBLIC repo — meridian-online/staticembed — checked out at a pinned
+      # commit rather than its default branch, so a change there cannot silently move
+      # what this workflow checks arcform against.
+      - name: Check out staticembed at the pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: meridian-online/staticembed
+          ref: ${{ github.event.inputs.staticembed_ref || env.STATICEMBED_REF }}
+          path: staticembed
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            arcform
+            staticembed
+
+      # The loadable extension links no system DuckDB — it exposes the C_STRUCT ABI
+      # DuckDB calls into rather than linking libduckdb itself — so this needs nothing
+      # beyond the Rust toolchain above and Python 3 for the packaging step `make
+      # extension` shells out to.
+      - name: Build the staticembed extension
+        working-directory: staticembed
+        run: make extension
+
+      - name: Install DuckDB (C library + CLI)
+        run: |
+          set -euo pipefail
+          base="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}"
+          mkdir -p "$HOME/duckdb"
+          curl -fsSL -o /tmp/libduckdb.zip "$base/libduckdb-linux-amd64.zip"
+          unzip -o /tmp/libduckdb.zip -d "$HOME/duckdb"
+          curl -fsSL -o /tmp/duckdb-cli.zip "$base/duckdb_cli-linux-amd64.zip"
+          unzip -o /tmp/duckdb-cli.zip -d "$HOME/duckdb"
+          chmod +x "$HOME/duckdb/duckdb"
+          "$HOME/duckdb/duckdb" --version
+          {
+            echo "DUCKDB_LIB_DIR=$HOME/duckdb"
+            echo "DUCKDB_INCLUDE_DIR=$HOME/duckdb"
+            echo "LD_LIBRARY_PATH=$HOME/duckdb${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          } >> "$GITHUB_ENV"
+          echo "$HOME/duckdb" >> "$GITHUB_PATH"
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # The model identity and revision come from staticembed's own Rust constants
+      # rather than being retyped here, so a model swap in that repo cannot leave this
+      # workflow declaring a release the extension does not carry.
+      - name: Point arcform's tests at the staged extension and model
+        run: |
+          set -euo pipefail
+          model_id=$(sed -n 's/^pub const MODEL_ID: &str = "\(.*\)";/\1/p' \
+            staticembed/crates/staticembed-core/src/model.rs)
+          model_revision=$(sed -n 's/^pub const MODEL_REVISION: &str = "\(.*\)";/\1/p' \
+            staticembed/crates/staticembed-core/src/model.rs)
+          if [ -z "$model_id" ] || [ -z "$model_revision" ]; then
+            echo "could not read MODEL_ID / MODEL_REVISION out of staticembed-core" >&2
+            exit 1
+          fi
+          {
+            echo "ARC_STATICEMBED_EXTENSION=$GITHUB_WORKSPACE/staticembed/build/staticembed.duckdb_extension"
+            echo "ARC_STATICEMBED_MODEL=$GITHUB_WORKSPACE/staticembed/models/potion-base-8M"
+            echo "ARC_STATICEMBED_MODEL_RELEASE=${model_id}@${model_revision}"
+          } >> "$GITHUB_ENV"
+
+      # AC3: which extension build the run used, recorded in the run's own output —
+      # the pinned commit, the artifact's size, and the extension's own version line —
+      # so a pass names the build it passed against rather than implying today's.
+      - name: Record which build this run checks against
+        working-directory: staticembed
+        run: |
+          set -euo pipefail
+          size=$(stat -c%s build/staticembed.duckdb_extension)
+          version=$("$HOME/duckdb/duckdb" -unsigned -noheader -list -c \
+            "LOAD 'build/staticembed.duckdb_extension'; SELECT staticembed_version();")
+          {
+            echo "### staticembed build under test"
+            echo
+            echo "- commit: [\`${STATICEMBED_REF}\`](https://github.com/meridian-online/staticembed/commit/${STATICEMBED_REF})"
+            echo "- artifact: \`build/staticembed.duckdb_extension\` (${size} bytes)"
+            echo "- \`staticembed_version()\`: \`${version}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # THE COMPARISON, for real. Every test in these two files that names
+      # ARC_STATICEMBED_EXTENSION or `uv` is #[ignore]d on the routine gate;
+      # --include-ignored is what makes it run its actual body here instead of being
+      # filtered out. A test that reaches its guard without what it needs — the
+      # artifact, the model directory, or uv — panics rather than returning quietly;
+      # see require_extension/require_model/require_uv in text_embed_parity.rs.
+      - name: The parity suite, staged
+        working-directory: arcform
+        run: |
+          set -euo pipefail
+          cargo test --workspace --test text_embed --test text_embed_parity \
+            -- --include-ignored 2>&1 | tee "$RUNNER_TEMP/parity-staged.log"
+
+      - name: Summarise what ran
+        if: always()
+        run: |
+          {
+            echo
+            echo "### text_embed / text_embed_parity — staged gate"
+            echo
+            grep '^test result:' "$RUNNER_TEMP/parity-staged.log" | sed 's/^/- /'
+            echo
+            echo "\`0 ignored\` above is the point of this workflow: every test that"
+            echo "needs the staged extension, the staged model or \`uv\` ran its real"
+            echo "body against the build named above rather than returning early."
+          } >> "$GITHUB_STEP_SUMMARY"

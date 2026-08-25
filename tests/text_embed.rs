@@ -11,16 +11,20 @@
 //!
 //! WHAT NEEDS WHAT, AND WHAT CI ACTUALLY RUNS. The embedding needs the loadable
 //! embedding extension, which is tens of megabytes and is not committed; the
-//! projection needs `uv`. CI has neither, so every test below that produces vectors
-//! returns early, and the one CI executes is the refusal when the extension asset is
-//! missing — decided in Rust before anything is spawned. `ARC_STATICEMBED_EXTENSION`
-//! names a built artifact and turns the rest on.
+//! projection needs `uv`. The routine gate (`ci.yml`'s `build` job, every push and PR)
+//! has neither, so every test below that produces vectors is `#[ignore]`d there — it
+//! shows in that job's `cargo test` summary as `ignored`, not `ok`. The one test the
+//! routine gate actually executes is the refusal when the extension asset is missing,
+//! decided in Rust before anything is spawned; it needs neither input, so it carries no
+//! `#[ignore]`.
 //!
-//! A TEST THAT RETURNS EARLY REPORTS AS `ok`, which is indistinguishable from a test
-//! that ran. That is a property of the harness and not something this file can fix,
-//! so each early return says on stderr which input it wanted, and the parity suite in
-//! `text_embed_parity.rs` carries a check of its own comparison logic that runs
-//! everywhere.
+//! The staged gate — `.github/workflows/text-embed-parity.yml`, on a schedule and on
+//! `workflow_dispatch` — builds the extension from a pinned `staticembed` commit,
+//! installs `uv`, and runs this file (and `text_embed_parity.rs`) with
+//! `--include-ignored`, so every `#[ignore]`d test here actually executes its body
+//! there. `ARC_STATICEMBED_EXTENSION` names the built artifact and turns the rest on;
+//! if a test ran without it staged anyway, `require_extension`/`require_uv` panic
+//! rather than returning quietly — see their doc comments.
 //!
 //! FIRST RUN COSTS A DOWNLOAD. `uv` resolves umap-learn, numba, scipy and
 //! scikit-learn on first use (a few hundred megabytes, cached thereafter) and numba
@@ -47,11 +51,36 @@ fn have_uv() -> bool {
         .unwrap_or(false)
 }
 
+/// `uv` on PATH, or a hard failure. Only called from a test carrying `#[ignore]` —
+/// reached only when something has deliberately asked to run it anyway
+/// (`--include-ignored`), so a missing `uv` at that point is the run being
+/// misconfigured, not a case to return quietly from.
+fn require_uv() {
+    assert!(
+        have_uv(),
+        "`uv` must be on PATH: this test is #[ignore]d on the routine gate for \
+         exactly this reason — see the staged workflow, text-embed-parity.yml"
+    );
+}
+
 /// The built embedding extension, or `None`. Every vector below comes out of this
-/// artifact, so without it there is nothing to assert.
+/// artifact, so without it there is nothing to assert. `None` is the ordinary case on
+/// the routine gate, where every test that calls `require_extension` instead is
+/// `#[ignore]`d and never reaches here.
 pub fn extension_artifact() -> Option<PathBuf> {
     let path = PathBuf::from(std::env::var_os("ARC_STATICEMBED_EXTENSION")?);
     path.is_file().then_some(path)
+}
+
+/// The built extension, or a hard failure. Same reasoning as `require_uv`.
+fn require_extension() -> PathBuf {
+    extension_artifact().unwrap_or_else(|| {
+        panic!(
+            "ARC_STATICEMBED_EXTENSION must point at a built, loadable extension: this \
+             test is #[ignore]d on the routine gate for exactly this reason — see the \
+             staged workflow, text-embed-parity.yml"
+        )
+    })
 }
 
 /// The vector width the extension itself reports, asked of the artifact rather than
@@ -191,15 +220,11 @@ fn an_extension_that_was_never_staged_stops_the_run_naming_the_file() {
 /// stops here. Before the split there was no such file: the only way to reach an
 /// embedding was to also compute a 2-D map.
 #[test]
+#[ignore = "needs a built ARC_STATICEMBED_EXTENSION and `uv` — run under the staged \
+            parity workflow (text-embed-parity.yml), not a bare `cargo test`"]
 fn an_embedding_is_a_finished_artifact_with_no_map_attached() {
-    let Some(artifact) = extension_artifact() else {
-        eprintln!("skipping an_embedding_is_a_finished_artifact: no ARC_STATICEMBED_EXTENSION");
-        return;
-    };
-    if !have_uv() {
-        eprintln!("skipping an_embedding_is_a_finished_artifact: no `uv` on PATH");
-        return;
-    }
+    let artifact = require_extension();
+    require_uv();
     let tmp = staged_protocol();
     let project = tmp.path();
     let stdout = common::arc_run(project);
@@ -260,17 +285,11 @@ fn an_embedding_is_a_finished_artifact_with_no_map_attached() {
 /// column and nothing else — it never sees `description` — so if the map separates
 /// the corpus's two subjects, the separation came through the embedding.
 #[test]
+#[ignore = "needs a built ARC_STATICEMBED_EXTENSION and `uv` — run under the staged \
+            parity workflow (text-embed-parity.yml), not a bare `cargo test`"]
 fn the_route_from_a_text_column_to_coordinates_still_works() {
-    let Some(_) = extension_artifact() else {
-        eprintln!(
-            "skipping the_route_from_a_text_column_to_coordinates: no ARC_STATICEMBED_EXTENSION"
-        );
-        return;
-    };
-    if !have_uv() {
-        eprintln!("skipping the_route_from_a_text_column_to_coordinates: no `uv` on PATH");
-        return;
-    }
+    require_extension();
+    require_uv();
     let tmp = staged_protocol();
     let project = tmp.path();
     common::arc_run(project);
@@ -391,17 +410,11 @@ fn the_route_from_a_text_column_to_coordinates_still_works() {
 /// Three plausible API-key variables are set to values that would break anything that
 /// used them, and the run has to land on the same bytes as the one that had a network.
 #[test]
+#[ignore = "needs a built ARC_STATICEMBED_EXTENSION and `uv` — run under the staged \
+            parity workflow (text-embed-parity.yml), not a bare `cargo test`"]
 fn the_steps_complete_with_the_network_disabled_and_no_credentials() {
-    let Some(_) = extension_artifact() else {
-        eprintln!(
-            "skipping the_steps_complete_with_the_network_disabled: no ARC_STATICEMBED_EXTENSION"
-        );
-        return;
-    };
-    if !have_uv() {
-        eprintln!("skipping the_steps_complete_with_the_network_disabled: no `uv` on PATH");
-        return;
-    }
+    require_extension();
+    require_uv();
     let tmp = staged_protocol();
     let project = tmp.path();
 
