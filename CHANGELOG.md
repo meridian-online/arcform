@@ -16,19 +16,25 @@ Rationale for each change is recorded in the project's design notes and commit h
   An analyst who embeds a column in SQL and an analyst whose Protocol embeds the same
   column now get the same numbers, and before this nothing made that true.
 
-  It was not true. Measured over a 17-case corpus against byte-identical weights, the
-  Python path and the extension agreed to float32 summation noise (≤ 1.04e-07) on
-  ordinary text, case folding, accents, empty text, whitespace and ~120 tokens — and
-  disagreed everywhere else: **1.79e-01** for text made only of tokens outside the
-  vocabulary (norms 1.0 against 0.0), 2.2e-02 for such tokens mixed into real words,
-  and 2.06e-03 for text past 512 tokens. Nothing on either side went red, because each
-  was correct on its own terms. The causes were then confirmed rather than inferred:
-  dropping the unknown-token row and capping the ids at 512 in the Python path drove
-  every divergence to 0.000e+00 or float32 noise. Against
-  `model2vec.StaticModel.encode` the extension matched all fourteen non-NULL cases and
-  the Python path departed on five, so the Python path was the side that was wrong, and
-  it is deleted rather than corrected. `numpy`, `safetensors` and `tokenizers` leave
-  the script's dependency header; `duckdb` alone remains.
+  It was not true. Measured against byte-identical weights over the corpus in
+  `tests/text_embed_parity.rs`, the Python path and the extension agreed to float32
+  summation order on ordinary text, case folding, accents, empty text, whitespace and
+  an apostrophe — and disagreed on three shapes: text made only of tokens outside the
+  vocabulary (the Python path averaged the tokenizer's unknown-token row into a
+  unit-norm vector, the extension drops those ids and returns a zero vector), such
+  tokens mixed into real words, and long text (the extension truncates it, the Python
+  path did not). Nothing on either side went red, because each was correct on its own
+  terms. The causes were confirmed rather than inferred: dropping the unknown-token row
+  and applying the extension's truncation in the Python path drove every divergence to
+  zero or to float32 summation order. Against `model2vec.StaticModel.encode` the
+  extension agreed on every case in that corpus that is not NULL and the Python path
+  did not, so the Python path was the side that was wrong, and it is deleted rather
+  than corrected. `numpy`, `safetensors` and `tokenizers` leave the script's dependency
+  header; `duckdb` alone remains.
+
+  **No divergence magnitude is quoted, deliberately.** The Python path is deleted, so
+  nothing regenerates a difference against it and no test reddens when such a figure
+  goes stale. What is quoted below is the truncation boundary, which a probe pins.
 
   **`extension:` is a new required field, and the artifact is a declared `reads` asset**
   on the same terms the model directory used to have: an input the Protocol puts there,
@@ -51,23 +57,26 @@ Rationale for each change is recorded in the project's design notes and commit h
 
   **Two claims this operator made about itself were false and are corrected.** The
   `1.7e-08` agreement with `model2vec.StaticModel.encode` held only for text with no
-  out-of-vocabulary tokens and under the cap. And text made only of such tokens did
+  out-of-vocabulary tokens and short enough not to be truncated. And text made only of such tokens did
   **not** embed as a zero vector — it averaged the tokenizer's unknown-token row into a
   unit-norm vector for text nothing had been understood of, and those rows were not
   counted on stderr. Both statements are true of the new path: with the documented
   `coalesce(t, '')` bridge, NULL, empty, whitespace and out-of-vocabulary-only text all
   embed as a full-width zero vector, and all of them are counted.
 
-  **Vectors move for out-of-vocabulary and over-length text, and no published dataset
+  **Vectors move for out-of-vocabulary and truncated text, and no published dataset
   is affected** — nothing published carries an embedding column. `eval/map-refit-stability`
   is regenerated in the same change and its numbers move: UMAP is refit from vectors
   that are no longer bit-identical, and a refit moves every point, which is the very
   effect that eval exists to measure.
 
-  **Text past 512 tokens is truncated**, which the extension does and this operator
-  inherits. It is stated in the operator's README and is not reported per-run; the
-  count belongs in the SQL surface, where the person who cannot otherwise tell is
-  sitting.
+  **Long text is truncated at whichever of two cuts comes first** — the raw text at
+  **3,072 characters**, before tokenising, and the token ids at **512** — which the
+  extension does and this operator inherits. The character cut is `512 × the model's
+  median token length`, and for ordinary English it usually wins: a text can be
+  truncated while still under 512 tokens. It is stated in the operator's README and is
+  not reported per-run; the count belongs in the SQL surface, where the person who
+  cannot otherwise tell is sitting.
 
   The fixture's tiny generated model and `make_fixture_model.py` are deleted with the
   code that read them, and the fixture Protocol declares the extension instead. The
@@ -75,9 +84,12 @@ Rationale for each change is recorded in the project's design notes and commit h
   from `ARC_STATICEMBED_EXTENSION` and return early without it; what CI runs from that
   file is the refusal when the extension asset is missing, decided in Rust before
   anything is spawned. `tests/text_embed_parity.rs` carries the value-for-value
-  comparison over the diverging cases, a probe of the 512-token cap that can fail in
-  both directions, and — running everywhere, needing nothing — a check that its own
-  comparison predicate still tells two vectors apart.
+  comparison over the diverging cases, a probe that pins both truncation cuts exactly
+  (each stated so that a boundary one character or one token out of place reddens it),
+  a declared model whose address agrees with the extension's for its leading characters
+  and diverges after — so a model check narrowed to a prefix of the published address
+  accepts it and reddens — and, running everywhere and needing nothing, a check that
+  its own comparison predicate still tells two vectors apart.
 
 ### Added
 

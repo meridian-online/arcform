@@ -57,22 +57,27 @@ does not index an embedding table, does not mean-pool and does not normalise. It
 the text to `embed()` and writes back what comes out.
 
 It used to do all four in Python, and that is worth knowing about because of what it
-cost. Measured on 2026-08-25 over a 17-case corpus against byte-identical weights, the
-Python path and the extension agreed to float32 noise on ordinary text and disagreed
-everywhere else:
+cost. Measured against byte-identical weights over the corpus in
+`tests/text_embed_parity.rs`, the Python path and the extension agreed on ordinary
+text to float32 summation order — and departed on three shapes:
 
-| case | max absolute difference | why |
-|---|---|---|
-| ordinary text, case folding, accents, empty, whitespace, ~120 tokens | ≤ 1.04e-07 | float32 summation order alone |
-| text made only of tokens outside the vocabulary | 1.79e-01 | one side averaged the tokenizer's unknown-token row; the other dropped it |
-| such tokens mixed into real words | 2.2e-02 | the same unknown-token row |
-| text past 512 tokens | 2.06e-03 | one side truncates at the cap; the other did not |
+| case | why the two differed |
+|---|---|
+| text made only of tokens outside the vocabulary | one side averaged the tokenizer's unknown-token row into a unit-norm vector for text it had understood nothing of; the other dropped those ids and returned a zero vector |
+| such tokens mixed into real words | the same unknown-token row |
+| long text | the extension truncates it; the Python path did not |
 
 Nothing on either side went red, because each was correct on its own terms. Against
-`model2vec.StaticModel.encode` the extension matched all fourteen non-NULL cases and
-the Python path departed on five, so the Python path was the side that was wrong and
-it was deleted rather than corrected. `tests/text_embed_parity.rs` re-checks the
-agreement over those same cases whenever a built extension is available.
+`model2vec.StaticModel.encode` the extension agreed to float32 summation order on
+every case in that corpus that is not NULL, and the Python path did not — so the
+Python path was the side that was wrong, and it was deleted rather than corrected.
+`tests/text_embed_parity.rs` re-checks the agreement over those same cases whenever a
+built extension is available.
+
+**No magnitude is quoted here, deliberately.** The Python path is deleted, so nothing
+regenerates a difference against it and no test reddens when a figure written here
+goes stale. A number in this file earns its place by having a test that fails when it
+is wrong — the truncation boundary below is the worked example.
 
 ## The extension is an input, not a download
 
@@ -161,16 +166,37 @@ only. For the fourth it averaged the tokenizer's unknown-token row and handed ba
 unit-norm vector for text it had understood nothing of — and did not count those rows,
 so nothing on screen said it had happened.
 
-## Text past 512 tokens is truncated
+## Long text is truncated
 
-The extension embeds the first 512 tokens of a text and drops the rest, so a long
-description is embedded from its opening. This operator inherits that. It does **not**
-report how many rows it happened to; the count belongs in the SQL surface, where the
-person who cannot otherwise tell is sitting, and is being added there.
+The extension cuts **twice**, and the boundary is **whichever comes first**: the raw
+text is cut to **3,072 characters** before it is tokenised, and the token ids are then
+cut to **512**. A long description is embedded from its opening either way.
 
-`tests/text_embed_parity.rs` probes the cap in a way that can fail: appending words to
-a text already past it must not move the vector, and appending those same words to a
-short text must.
+The character cut is `512 × the model's median token length`, so it moves with the
+model the extension carries — 3,072 is the value for the bundled `potion-base-8M`,
+whose median token is six characters. **For ordinary English the character cut usually
+wins**, because English runs shorter than six characters a token. 450 words of this
+operator's own test filler come to 3,404 characters and are cut there, while what
+survives is comfortably under 512 tokens. So *"under 512 tokens and your text is
+whole"* is wrong at a length a real description reaches — which matters here, because
+this operator does **not** report how many rows it happened to. That count belongs in
+the SQL surface, where the person who cannot otherwise tell is sitting, and is being
+added there.
+
+`tests/text_embed_parity.rs` pins both cuts against the built extension, each so that
+it can fail:
+
+* **the character cut** — a text longer than 3,072 characters must embed to the same
+  vector as its first 3,072 characters, and to a *different* vector from its first
+  3,071. Both halves are needed: the first alone passes for any boundary at or below
+  3,072, the second alone for any boundary above it, and together they hold only at
+  exactly 3,072;
+* **the token cut** — a text of 512 one-token words must not move when a 513th is
+  appended, and a text of 511 must move when a 512th is. Every one of those four texts
+  is under 3,072 characters, so the character cut cannot be what is acting;
+* **that the character cut really does bite first** — the 3,404-character text above is
+  truncated, and a 3,060-character prefix of it still takes a new word into its vector,
+  which a text sitting at the token cut could not.
 
 ## Which tier this sits at, and why that is a problem rather than a justification
 

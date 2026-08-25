@@ -16,14 +16,16 @@ belongs on the extension instead.
 
 WHY IT NO LONGER COMPUTES ANYTHING. It used to tokenise, look ids up in a
 `[vocab, dim]` matrix, mean-pool and L2-normalise, in Python. That made one capability
-exist twice in two languages, and the two disagreed: measured over a 15-case corpus
-against the same weights, the vectors matched to float32 noise for ordinary text and
-diverged by up to 1.8e-01 for text made of tokens the vocabulary does not carry, and
-by 2.1e-03 for text past the extension's 512-token cap. Against
-`model2vec.StaticModel.encode` the extension matched every non-NULL case and this
-script did not, so this script was the side that was wrong. Deleting the computation
-is what makes a SQL call and a Protocol run agree by construction rather than by
-tolerance.
+exist twice in two languages, and the two disagreed: measured against the same weights
+over the corpus in `tests/text_embed_parity.rs`, the vectors matched to float32
+summation order for ordinary text, and departed for text carrying tokens the
+vocabulary does not have and for text past the truncation boundary. Against
+`model2vec.StaticModel.encode` the extension matched every case in that corpus that is
+not NULL and this script did not, so this script was the side that was wrong. Deleting
+the computation is what makes a SQL call and a Protocol run agree by construction
+rather than by tolerance. No magnitude is quoted, deliberately: the Python path is
+gone, so nothing regenerates a difference against it and no test reddens when a figure
+written here rots.
 
 WHAT IT DOES. Reads one Parquet, embeds the named text column with the extension's
 `embed()`, and writes a Parquet carrying every input column plus a vector column
@@ -50,10 +52,12 @@ understood nothing of, and it did not count those rows. The count is visible whe
 script is run standalone; `arc run` captures a successful step's output and does not
 print it today, so a Protocol run does not show it.
 
-TEXT PAST THE CAP IS TRUNCATED. The extension embeds the first 512 tokens of a text
-and drops the rest, so a long description is embedded from its opening. This script
-inherits that and does not report how many rows it happened to — see the operator
-README.
+LONG TEXT IS TRUNCATED, AT WHICHEVER OF TWO CUTS COMES FIRST. The extension cuts the
+raw text to 3072 CHARACTERS before tokenising it, then cuts the token ids to 512 — so
+a text can be truncated while still under 512 tokens, and for ordinary English it
+usually is. A long description is embedded from its opening either way. This script
+inherits the boundary and does not report how many rows it happened to — see the
+operator README, and `tests/text_embed_parity.rs` for the probe that pins both cuts.
 
 THE MODEL IS CHECKED, NOT LOADED. The model lives inside the extension binary, so
 there is no model directory to read weights from. `--model` is therefore optional and
@@ -202,12 +206,19 @@ def check_declared_model(model_dir: Path, release: str, version: dict[str, str])
 
     recomputed = model_key(declared_id, declared_revision, parts)
     published = version["key"]
-    if recomputed[: len(published)] != published:
+    # EVERY character the extension published is compared, and the value compared is
+    # the value reported below — a comparison narrowed to a prefix of it would be a
+    # check on the first digits of an address rather than on which model this is.
+    # `tests/text_embed_parity.rs` declares a model whose address agrees with the
+    # published one for its leading characters and diverges after, so narrowing this
+    # to fewer than that many characters accepts that model and reddens the test.
+    checked = recomputed[: len(published)]
+    if checked != published:
         reported_release = f"{version['id']}@{version['revision']}"
         raise Refusal(
             f"the extension does not carry the model this Protocol declares. The "
             f"Protocol declares {declared_id}@{declared_revision} in {model_dir}, "
-            f"which addresses to {recomputed[: len(published)]}; the extension "
+            f"which addresses to {checked}; the extension "
             f"reports {reported_release} addressing to {published}. Either the "
             f"declared directory holds different bytes from the ones compiled into "
             f"the extension, or the extension derives its address a different way "
@@ -308,6 +319,15 @@ def main() -> int:
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
+    # The CAST is a WIDTH GUARD and nothing else. `embed()` returns FLOAT[] and DuckDB
+    # writes a Parquet LIST from either type, so the output file is byte-for-byte the
+    # same with the cast and without it — measured 2026-08-25. What it buys is a stop
+    # if `embed()` ever hands back a width other than the one `staticembed_version()`
+    # reported a moment earlier: `Cannot cast list with length N to array with length`.
+    # IT IS NOT PINNED BY A TEST, and it cannot be from this repo — firing it needs an
+    # extension whose `embed()` disagrees with its own version line, which is a build
+    # nothing here can produce. The width actually written is covered instead, by the
+    # parity comparison: two vectors of different widths are different values there.
     con.execute(
         f"COPY (SELECT s.* EXCLUDE ({ROW}), "
         f"CAST(v.vec AS FLOAT[{dim}]) AS {sql_ident(vector_column)} "

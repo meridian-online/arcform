@@ -3,12 +3,15 @@
 //!
 //! WHY THIS EXISTS. Until the operator was moved onto the extension, the same
 //! capability was implemented twice — Python in the operator, Rust in the extension —
-//! and the two disagreed. Measured over a corpus of the shapes below against
-//! byte-identical weights: ordinary text agreed to float32 noise, text made only of
-//! tokens the vocabulary does not carry differed by 1.8e-01 (one side averaged the
-//! tokenizer's unknown-token row, the other dropped it), text mixed with such tokens
-//! by 2.2e-02, and text past the 512-token cap by 2.1e-03. Nothing on either side went
-//! red, because each was correct on its own terms.
+//! and the two disagreed. Measured over the corpus below against byte-identical
+//! weights: ordinary text agreed to float32 summation order, and three shapes did not.
+//! Text made only of tokens the vocabulary does not carry (one side averaged the
+//! tokenizer's unknown-token row into a unit-norm vector, the other dropped those ids
+//! and returned a zero vector); text with such tokens mixed into real words, for the
+//! same reason; and long text, which the extension truncates and the Python path did
+//! not. Nothing on either side went red, because each was correct on its own terms.
+//! No magnitude is quoted: the Python path is deleted, so nothing regenerates a
+//! difference against it and no figure written here can be made to redden.
 //!
 //! WHAT IS ASSERTED, AND WHY IT IS NOT A TAUTOLOGY. Both sides now call the same
 //! `embed()`, so the interesting question is no longer which arithmetic each does — it
@@ -27,6 +30,8 @@
 //! is green against agreement and green against disagreement, and the two look
 //! identical from the outside.
 
+use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -74,6 +79,25 @@ fn mismatch(got: &str, want: &str) -> String {
     format!("(CAST({got} AS FLOAT[]) IS DISTINCT FROM CAST({want} AS FLOAT[]))")
 }
 
+/// TRUE when the extension returns the same vector for both texts. The single place
+/// two texts are compared through `embed()`, built on the same `mismatch` predicate
+/// the Protocol-versus-SQL comparison uses and that
+/// `the_comparison_notices_a_single_float_out_of_place` exercises.
+fn same_vector(conn: &duckdb::Connection, a: &str, b: &str) -> bool {
+    conn.query_row(
+        &format!(
+            "SELECT NOT {}",
+            mismatch(
+                &format!("embed({})", sql_lit(a)),
+                &format!("embed({})", sql_lit(b))
+            )
+        ),
+        [],
+        |r| r.get::<_, bool>(0),
+    )
+    .unwrap()
+}
+
 /// A DuckDB connection with the extension loaded. Unsigned, because a locally built
 /// artifact is not signed.
 fn session(artifact: &Path) -> duckdb::Connection {
@@ -93,8 +117,12 @@ fn session(artifact: &Path) -> duckdb::Connection {
 // is the version that passes while the interesting cases are wrong.
 
 /// Words the model's vocabulary carries. Used to build texts long enough to cross the
-/// 512-token cap. IN-VOCABULARY IS THE POINT: a filler of unknown tokens would be
-/// dropped, and the length probes below would compare a text against itself.
+/// truncation boundary. IN-VOCABULARY IS THE POINT: a filler of unknown tokens would
+/// be dropped, and the length probes below would compare a text against itself.
+///
+/// ASCII, and it has to stay ASCII: the character cut counts Unicode scalars, so the
+/// byte slices the boundary probe takes are only the right characters while every word
+/// here is one byte per character. `the_truncation_boundary_is_two_cuts` asserts it.
 const FILLER: &[&str] = &[
     "harbour",
     "tide",
@@ -128,9 +156,9 @@ const FILLER: &[&str] = &[
     "pilot",
 ];
 
-/// Words appended to probe the cap. Distinct from FILLER so that adding them changes
-/// the mean of a short text — the control that proves the probe can see a change at
-/// all.
+/// Words appended to probe truncation. Distinct from FILLER so that adding them
+/// changes the mean of a short text — the control that proves the probe can see a
+/// change at all.
 const APPENDED: &[&str] = &[
     "volcano",
     "orchestra",
@@ -428,9 +456,9 @@ fn the_rows_that_carry_no_signal_are_counted_on_stderr() {
 
 /// AC3's cases are only worth comparing if they are the shapes they claim to be. This
 /// asserts the corpus still contains what it was built to contain — text that
-/// tokenises to nothing, text past the cap, and ordinary text — so that a future edit
-/// to the word lists cannot quietly turn the comparison above into a comparison over
-/// seventeen ordinary sentences.
+/// tokenises to nothing, text past the truncation boundary, and ordinary text — so
+/// that a future edit to the word lists cannot quietly turn the comparison above into
+/// a comparison over ordinary sentences.
 #[test]
 fn the_corpus_still_contains_the_shapes_it_was_built_from() {
     let Some(artifact) = extension_artifact() else {
@@ -456,20 +484,7 @@ fn the_corpus_still_contains_the_shapes_it_was_built_from() {
         )
         .unwrap()
     };
-    let same = |a: &str, b: &str| -> bool {
-        conn.query_row(
-            &format!(
-                "SELECT NOT {}",
-                mismatch(
-                    &format!("embed({})", sql_lit(a)),
-                    &format!("embed({})", sql_lit(b))
-                )
-            ),
-            [],
-            |r| r.get::<_, bool>(0),
-        )
-        .unwrap()
-    };
+    let same = |a: &str, b: &str| same_vector(&conn, a, b);
 
     for label in [
         "empty",
@@ -490,19 +505,23 @@ fn the_corpus_still_contains_the_shapes_it_was_built_from() {
         );
     }
 
-    // THE CAP, probed so that it can fail. Appending the same words to a text already
-    // past the cap must change nothing, and appending them to a short text must change
-    // the vector. The second half is the control: without it, a probe whose appended
-    // words were all outside the vocabulary — or whose two texts had the same token
-    // multiset — would report "truncated" against an implementation that truncates
-    // nothing.
+    // TRUNCATION HAPPENS, probed so that it can fail. Appending the same words to a
+    // text already past the boundary must change nothing, and appending them to a
+    // short text must change the vector. The second half is the control: without it, a
+    // probe whose appended words were all outside the vocabulary — or whose two texts
+    // had the same token multiset — would report "truncated" against an implementation
+    // that truncates nothing.
+    //
+    // WHERE the boundary is, as opposed to that there is one, is
+    // `the_truncation_boundary_is_two_cuts` below. This test only needs the corpus to
+    // still straddle it.
     assert!(
         same(
             &by_label("past the cap"),
             &by_label("past the cap, extended")
         ),
-        "text past the cap is embedded from its opening, so appending to it must not \
-         move the vector"
+        "text past the boundary is embedded from its opening, so appending to it must \
+         not move the vector"
     );
     assert!(
         !same(
@@ -511,6 +530,145 @@ fn the_corpus_still_contains_the_shapes_it_was_built_from() {
         ),
         "appending those same words to a SHORT text must move the vector — otherwise \
          the check above passes on an implementation that truncates nothing"
+    );
+}
+
+/// The raw text is cut to this many CHARACTERS before it is tokenised. model2vec
+/// computes it as `TOKEN_CUT × the model's median token length`, which is six for the
+/// bundled `potion-base-8M`, so it MOVES WITH THE MODEL the extension carries. A red
+/// here after the extension is rebuilt on a different model is a number to update in
+/// this file and in the operator README, not a fault.
+const CHAR_CUT: usize = 3072;
+
+/// …and the token ids are then cut to this many.
+const TOKEN_CUT: usize = 512;
+
+/// WHERE the truncation boundary is, pinned to the character and to the token.
+///
+/// The extension truncates TWICE: model2vec cuts the raw string to `CHAR_CUT`
+/// characters BEFORE tokenising it, then cuts the token ids to `TOKEN_CUT`. **The
+/// boundary is whichever comes first**, and for ordinary English it is the character
+/// cut, because English runs shorter than the six characters a token that cut assumes.
+/// The operator's README states both numbers and this is what makes them reddenable —
+/// before this test, "text past 512 tokens is truncated" was documented, wrong, and
+/// unfalsifiable, because a text can be truncated while under 512 tokens.
+///
+/// THE PAIRS ARE THE POINT, not either half. `embed(t) == embed(t[..CUT])` on its own
+/// passes for any boundary at or below CUT; `embed(t) != embed(t[..CUT - 1])` on its
+/// own passes for any boundary above it. Only together do they hold at exactly CUT, so
+/// a constant one character or one token out of place reddens this test.
+#[test]
+fn the_truncation_boundary_is_two_cuts() {
+    let Some(artifact) = extension_artifact() else {
+        eprintln!("skipping the truncation boundary: no ARC_STATICEMBED_EXTENSION");
+        return;
+    };
+    let conn = session(&artifact);
+    let same = |a: &str, b: &str| same_vector(&conn, a, b);
+
+    // ── the CHARACTER cut ────────────────────────────────────────────────────
+    //
+    // The cut counts Unicode scalars, so a byte slice is the right prefix only while
+    // the text is ASCII. Asserted rather than assumed: a non-ASCII word added to
+    // FILLER would silently move every index below.
+    let long = repeat_words(FILLER, 700);
+    assert!(
+        long.is_ascii(),
+        "the boundary probe slices by BYTE and the extension cuts by CHARACTER, so \
+         the filler has to stay one byte per character"
+    );
+    assert!(
+        long.len() > CHAR_CUT,
+        "the probe text is {} characters and has to exceed the {CHAR_CUT}-character \
+         cut, or nothing below is measuring truncation at all",
+        long.len()
+    );
+    assert!(
+        same(&long, &long[..CHAR_CUT]),
+        "a text longer than {CHAR_CUT} characters has to embed to the same vector as \
+         its first {CHAR_CUT} — if it does not, the character cut is somewhere BELOW \
+         {CHAR_CUT}"
+    );
+    assert!(
+        !same(&long, &long[..CHAR_CUT - 1]),
+        "…and to a DIFFERENT vector from its first {} — if it does not, the character \
+         cut is somewhere ABOVE {CHAR_CUT} and the assertion before this one passed \
+         only because both texts were being cut to the same shorter prefix",
+        CHAR_CUT - 1
+    );
+
+    // ── the TOKEN cut ────────────────────────────────────────────────────────
+    //
+    // `tide` and `salt` are each exactly one token in this model's vocabulary, so a
+    // text of N of them is N tokens. That is load-bearing and self-checking: if `tide`
+    // stopped being one token, the text below would already be past the cut and the
+    // `!=` assertion would fail rather than pass quietly.
+    let at_cut = repeat_words(&["tide"], TOKEN_CUT);
+    let below_cut = repeat_words(&["tide"], TOKEN_CUT - 1);
+    let at_cut_extended = format!("{at_cut} salt");
+    let below_cut_extended = format!("{below_cut} salt");
+    for (label, text) in [
+        ("at the cut", &at_cut),
+        ("at the cut, extended", &at_cut_extended),
+        ("below the cut", &below_cut),
+        ("below the cut, extended", &below_cut_extended),
+    ] {
+        assert!(
+            text.len() < CHAR_CUT,
+            "`{label}` is {} characters, which is past the {CHAR_CUT}-character cut — \
+             every text in this half has to stay under it, or the character cut is \
+             what these assertions measure and the token cut is untested",
+            text.len()
+        );
+    }
+    assert!(
+        same(&at_cut, &at_cut_extended),
+        "a text of {TOKEN_CUT} one-token words must not move when a {}th token is \
+         appended — if it moves, the token cut is above {TOKEN_CUT}",
+        TOKEN_CUT + 1
+    );
+    assert!(
+        !same(&below_cut, &below_cut_extended),
+        "…but a text of {} must move when the {TOKEN_CUT}th is appended — if it does \
+         not, the token cut is below {TOKEN_CUT} and the assertion before this one \
+         passed on a cut that had already bitten",
+        TOKEN_CUT - 1
+    );
+
+    // ── and the character cut is the one that bites, for ordinary English ────
+    //
+    // This is the half the old documentation got wrong. 450 words of the same filler
+    // are past the character cut while what survives them is well under the token cut,
+    // so a reader told "under 512 tokens and your text is whole" is wrong at a length
+    // a real description reaches.
+    let english = repeat_words(FILLER, 450);
+    assert!(
+        english.len() > CHAR_CUT,
+        "the ordinary-English case is {} characters and has to exceed {CHAR_CUT}",
+        english.len()
+    );
+    assert!(
+        same(&english, &english[..CHAR_CUT]),
+        "{} characters of ordinary English are truncated by the character cut",
+        english.len()
+    );
+    // What survives is under the token cut: a prefix short enough to escape the
+    // character cut still takes a new word into its vector, which a text sitting at
+    // the token cut could not. Without this the paragraph above would be consistent
+    // with the token cut having done the truncating.
+    let head = &english[..CHAR_CUT - 12];
+    let head_extended = format!("{head} volcano");
+    assert!(
+        head_extended.len() < CHAR_CUT,
+        "the control has to stay under the character cut to say anything about tokens"
+    );
+    assert!(
+        !same(head, &head_extended),
+        "{} characters of this filler are still under the {TOKEN_CUT}-token cut — a \
+         new word has to reach the vector. If it does not, the two cuts coincide here \
+         and the claim that a text can be truncated while under {TOKEN_CUT} tokens is \
+         not what this file is showing",
+        head.len()
     );
 }
 
@@ -599,6 +757,15 @@ fn a_model_the_extension_does_not_carry_is_refused_naming_both() {
         "the refusal names what the extension carries, so the reader can see which \
          of the two to change:\n{told}"
     );
+    // The WHOLE published address, not the phrase around it. A check weakened by
+    // shortening the published side — comparing and then reporting a prefix of it —
+    // would still print "the extension reports" and would fail here.
+    let published = published_key(&session(&artifact));
+    assert!(
+        told.contains(&published),
+        "the refusal quotes every character of the address the extension published \
+         ({published}), because that is how many the operator compared:\n{told}"
+    );
 }
 
 /// The other half, and the reason the test above is not a check that refuses
@@ -683,5 +850,211 @@ fn changing_one_byte_of_the_third_file_is_a_different_model() {
     assert!(
         told.contains("the extension reports"),
         "the refusal is the address mismatch, not something incidental:\n{told}"
+    );
+}
+
+// ── AC4: how much of the address is compared, not just which way it points ────
+
+/// How many leading characters of the published address the near-miss fixture below
+/// shares with it. A model check narrowed to fewer than this many characters accepts
+/// that fixture and reddens the test; raising this multiplies the search by sixteen.
+///
+/// FIVE, not one. The refusal that produced this test used one — a check comparing a
+/// single hex character left every other test in this file green, and would accept a
+/// genuinely different model about one time in sixteen. Pinning five moves the
+/// weakest surviving check from one character to six, so a different model gets
+/// through a weakened check at worst about one time in sixteen million rather than
+/// one time in sixteen. It cannot be pushed much further: finding a fixture that
+/// agrees on k characters costs 16^k digests.
+const NEAR_MISS_CHARS: usize = 5;
+
+/// How many candidate fixtures the search below will try. The expected cost is
+/// `16^NEAR_MISS_CHARS`; the ceiling is twenty times that, so exhausting it means
+/// something is wrong with the derivation rather than that the search was unlucky.
+const NEAR_MISS_SEARCH_LIMIT: u64 = 20 * (1 << (4 * NEAR_MISS_CHARS as u64));
+
+/// The content address the extension published, out of its own version line.
+fn published_key(conn: &duckdb::Connection) -> String {
+    let line: String = conn
+        .query_row("SELECT staticembed_version()", [], |r| r.get(0))
+        .expect("the extension answers staticembed_version()");
+    line.split("key ")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .unwrap_or_else(|| panic!("no `key <hex>` in the version line: {line}"))
+        .trim()
+        .to_string()
+}
+
+/// A DECLARED MODEL WHOSE ADDRESS NEARLY MATCHES IS STILL REFUSED.
+///
+/// WHY THE OTHER AC4 TESTS ARE NOT ENOUGH. They pin that the check points the right
+/// way — a wrong model is refused, the right one is accepted, the third file is
+/// hashed. None of them pins its STRENGTH. Measured 2026-08-25: narrowing the
+/// comparison in `check_declared_model` to a single hex character left all of them
+/// green, and a run would then report success while embedding with weights the
+/// Protocol had not declared, which is the failure AC4 exists to stop. Direction is
+/// cheap to test and worth nothing on its own; strength needs an input that a weak
+/// check and a strong check disagree about, and that input is this fixture.
+///
+/// HOW THE FIXTURE IS BUILT. The address is a SHA-256 over a domain tag, the release
+/// identity and revision, and the three model files in a fixed order — so holding
+/// everything but the tail of `config.json` fixed lets a counter be appended and the
+/// digest state cloned per candidate. The search takes the first counter whose address
+/// agrees with the published one for `NEAR_MISS_CHARS` characters.
+///
+/// AND THE DERIVATION IS CHECKED BEFORE IT IS TRUSTED. This test recomputes the
+/// address a second time, in Rust, which would be worthless if it had drifted from the
+/// operator's Python — a "near miss" that was not near would be refused by any check,
+/// weak or strong, and this test would pass while proving nothing. So a candidate
+/// chosen to share NO leading character is run first, and the address the operator
+/// itself reports for it has to be the one computed here.
+#[test]
+fn a_model_whose_address_nearly_matches_is_still_refused() {
+    let Some(artifact) = extension_artifact() else {
+        eprintln!("skipping the near-miss address check: no ARC_STATICEMBED_EXTENSION");
+        return;
+    };
+    if !have_uv() {
+        eprintln!("skipping the near-miss address check: no `uv` on PATH");
+        return;
+    }
+    let published = published_key(&session(&artifact));
+    assert!(
+        published.len() > NEAR_MISS_CHARS,
+        "the extension publishes {} characters of address, so a fixture agreeing on \
+         {NEAR_MISS_CHARS} of them would BE the published address — this test would \
+         then be asserting that the RIGHT model is refused",
+        published.len()
+    );
+
+    // The declared release and the two files that are not varied. Deliberately not the
+    // model the extension carries: the point is an address that nearly matches, not a
+    // model that does.
+    const RELEASE_ID: &str = "someone/other-model";
+    const RELEASE_REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
+    const TOKENIZER: &[u8] = b"{\"not\": \"the tokenizer\"}";
+    const WEIGHTS: &[u8] = b"not the weights";
+    const CONFIG: &[u8] = b"{\"normalize\": true}";
+    // Mirrors `MODEL_KEY_DOMAIN` and `MODEL_PARTS` in text_embed.py. The assertion
+    // below is what keeps the mirror honest.
+    let mut base = Sha256::new();
+    base.update(b"staticembed/model-key/v1");
+    base.update(RELEASE_ID.as_bytes());
+    base.update([0u8]);
+    base.update(RELEASE_REVISION.as_bytes());
+    base.update([0u8]);
+    base.update(TOKENIZER);
+    base.update(WEIGHTS);
+    base.update(CONFIG);
+
+    let digest_of = |counter: u64| {
+        let mut digest = base.clone();
+        digest.update(counter.to_le_bytes());
+        digest.finalize()
+    };
+    let address_of = |counter: u64| -> String {
+        let mut hex = String::with_capacity(published.len());
+        for byte in digest_of(counter).iter() {
+            let _ = write!(hex, "{byte:02x}");
+        }
+        hex.truncate(published.len());
+        hex
+    };
+    // Nibble-wise so the search does not format a string per candidate.
+    let want: Vec<u8> = published
+        .chars()
+        .map(|c| c.to_digit(16).expect("the address is hex") as u8)
+        .collect();
+    let agreement_of = |counter: u64| -> usize {
+        let out = digest_of(counter);
+        (0..want.len())
+            .take_while(|&i| {
+                let byte = out[i / 2];
+                let nibble = if i % 2 == 0 { byte >> 4 } else { byte & 0x0f };
+                nibble == want[i]
+            })
+            .count()
+    };
+    let search = |wanted: fn(usize) -> bool| -> u64 {
+        (0..NEAR_MISS_SEARCH_LIMIT)
+            .find(|&counter| wanted(agreement_of(counter)))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no candidate in {NEAR_MISS_SEARCH_LIMIT} agreed as asked with \
+                     {published}; the address derivation mirrored here has almost \
+                     certainly drifted from the operator's"
+                )
+            })
+    };
+
+    let held = tempfile::tempdir().unwrap();
+    let write_fixture = |name: &str, counter: u64| -> PathBuf {
+        let dir = held.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tokenizer.json"), TOKENIZER).unwrap();
+        std::fs::write(dir.join("model.safetensors"), WEIGHTS).unwrap();
+        // Not valid JSON past the counter, and it does not need to be: the address is
+        // over bytes, and nothing in this path parses the file.
+        let mut config = CONFIG.to_vec();
+        config.extend_from_slice(&counter.to_le_bytes());
+        std::fs::write(dir.join("config.json"), config).unwrap();
+        dir
+    };
+    let release = format!("{RELEASE_ID}@{RELEASE_REVISION}");
+
+    // STEP ONE — check the mirror. A fixture sharing no leading character is refused
+    // by a check of any strength, so the address the operator reports for it is
+    // readable whatever state the check is in, and it has to be the one computed here.
+    let far = search(|agreed| agreed == 0);
+    let far_dir = write_fixture("far", far);
+    let (_far_tmp, far_code, far_told) = run_protocol(&artifact, Some((&far_dir, &release)));
+    assert_ne!(
+        far_code,
+        Some(0),
+        "a model sharing no character of the published address must be refused:\n{far_told}"
+    );
+    let reported = far_told
+        .split("addresses to ")
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .unwrap_or_else(|| panic!("the refusal has to name the recomputed address:\n{far_told}"))
+        .trim();
+    assert_eq!(
+        reported,
+        address_of(far),
+        "this test recomputes the model address a second time so it can build a near \
+         miss, and the operator disagrees with it — every conclusion below would be \
+         about an address the operator never computes:\n{far_told}"
+    );
+
+    // STEP TWO — the near miss. Same shape of fixture, chosen so its address agrees
+    // with the published one for its first NEAR_MISS_CHARS characters and diverges
+    // after. A check comparing every published character refuses it; a check narrowed
+    // to NEAR_MISS_CHARS or fewer accepts it and the run embeds with weights the
+    // Protocol did not declare.
+    let near = search(|agreed| agreed >= NEAR_MISS_CHARS);
+    let near_address = address_of(near);
+    assert_ne!(
+        near_address, published,
+        "the near miss has to be a DIFFERENT model — an address equal to the published \
+         one would make the refusal below wrong rather than strong"
+    );
+    assert_eq!(
+        near_address[..NEAR_MISS_CHARS],
+        published[..NEAR_MISS_CHARS],
+        "the fixture only tests what it was built to test if it really does agree for \
+         {NEAR_MISS_CHARS} characters"
+    );
+    let near_dir = write_fixture("near", near);
+    let (_near_tmp, near_code, near_told) = run_protocol(&artifact, Some((&near_dir, &release)));
+    assert_ne!(
+        near_code,
+        Some(0),
+        "a declared model whose address is {near_address} against the extension's \
+         {published} — the same first {NEAR_MISS_CHARS} characters, a different model \
+         — must stop the run. Accepting it means the check compares a prefix of the \
+         address rather than the address, and a Protocol can embed with weights it did \
+         not declare while the run reports success:\n{near_told}"
     );
 }
