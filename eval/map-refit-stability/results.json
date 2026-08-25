@@ -17,6 +17,7 @@
     "seed": 42
   },
   "base_map_median_nn_spacing": 0.039176290618352184,
+  "vector_knn_overlap_k": 20,
   "comparisons": {
     "control_B": {
       "n_shared_rows": 3000,
@@ -26,7 +27,12 @@
       "displacement_normalised_median": 0.0,
       "knn_overlap_k": 20,
       "knn_overlap_mean": 1.0,
-      "knn_overlap_median": 1.0
+      "knn_overlap_median": 1.0,
+      "vector_pool_size": 3000,
+      "vector_knn_overlap_mean": 1.0,
+      "vector_knn_overlap_median": 1.0,
+      "map_vs_vector_overlap_gap_mean": 0.0,
+      "map_vs_vector_overlap_gap_median": 0.0
     },
     "append_05": {
       "n_shared_rows": 3000,
@@ -36,7 +42,12 @@
       "displacement_normalised_median": 52.54157335618572,
       "knn_overlap_k": 20,
       "knn_overlap_mean": 0.4193833333333334,
-      "knn_overlap_median": 0.4
+      "knn_overlap_median": 0.4,
+      "vector_pool_size": 3150,
+      "vector_knn_overlap_mean": 0.9578333333333333,
+      "vector_knn_overlap_median": 0.95,
+      "map_vs_vector_overlap_gap_mean": 0.5384499999999999,
+      "map_vs_vector_overlap_gap_median": 0.5499999999999999
     },
     "append_20": {
       "n_shared_rows": 3000,
@@ -46,7 +57,12 @@
       "displacement_normalised_median": 160.9371565624231,
       "knn_overlap_k": 20,
       "knn_overlap_mean": 0.39465,
-      "knn_overlap_median": 0.35
+      "knn_overlap_median": 0.35,
+      "vector_pool_size": 3600,
+      "vector_knn_overlap_mean": 0.8492666666666667,
+      "vector_knn_overlap_median": 0.85,
+      "map_vs_vector_overlap_gap_mean": 0.4546166666666667,
+      "map_vs_vector_overlap_gap_median": 0.5
     },
     "append_50": {
       "n_shared_rows": 3000,
@@ -56,8 +72,27 @@
       "displacement_normalised_median": 279.5134738319672,
       "knn_overlap_k": 20,
       "knn_overlap_mean": 0.3639666666666667,
-      "knn_overlap_median": 0.35
+      "knn_overlap_median": 0.35,
+      "vector_pool_size": 4500,
+      "vector_knn_overlap_mean": 0.7034666666666666,
+      "vector_knn_overlap_median": 0.7,
+      "map_vs_vector_overlap_gap_mean": 0.33949999999999986,
+      "map_vs_vector_overlap_gap_median": 0.35
     }
   },
-  "runtime_seconds": 117.0
+  "runtime_seconds": 113.8,
+  "base_vectors_moved_by_append": 0.0,
+  "ac5_distribution_shift_control": {
+    "description": "duplicates the 150 base rows with the smallest own-corpus 20-NN cosine distance (the rows already most redundant with the rest of control_A) instead of append_05's natural next-in-order sample, at the same row count, so the comparison isolates which rows were appended rather than how many",
+    "n_appended_rows": 150,
+    "knn_overlap_k": 20,
+    "vector_knn_overlap_mean": 0.8844666666666667,
+    "vector_knn_overlap_median": 0.95,
+    "append_05_vector_knn_overlap_mean": 0.9578333333333333,
+    "gap_below_append_05_vector_overlap": 0.07336666666666658
+  },
+  "ac4_movement_reading": {
+    "verdict": "mostly_artefact",
+    "explanation": "At every append fraction measured \u2014 append_05 gap=0.538 (map=0.419 vs vector=0.958), append_20 gap=0.455 (map=0.395 vs vector=0.849), append_50 gap=0.339 (map=0.364 vs vector=0.703) \u2014 the map-space overlap is well below the vector-space overlap for the same 3000 base rows at k=20. A base row's own 256-d vector never moves when other rows are appended (base_vectors_moved_by_append=0.0); what moves, and moves far less than the map does, is which OTHER rows count as its true nearest neighbours. AC5's control shows this comparison is not just reporting near-1.0 by construction: a same-size, deliberately concentrated append drops vector overlap to 0.884 against append_05's 0.958. So the map's rearrangement at every fraction tested is mostly a projection artefact, not the data changing underneath it."
+  }
 }
