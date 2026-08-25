@@ -23,22 +23,53 @@
 //! one implementation there is no rounding left to forgive.
 //!
 //! WHAT RUNS WHERE. Everything that produces a vector needs the built extension
-//! (`ARC_STATICEMBED_EXTENSION`) and `uv`; CI has neither, so those tests return early
-//! there. `the_comparison_notices_a_single_float_out_of_place` needs nothing and runs
-//! everywhere — it drives the same predicate the comparison uses and fails if that
-//! predicate stops distinguishing vectors. A comparison whose predicate has gone blind
-//! is green against agreement and green against disagreement, and the two look
-//! identical from the outside.
+//! (`ARC_STATICEMBED_EXTENSION`) and `uv`. The routine gate (`ci.yml`'s `build` job,
+//! every push and PR) has neither, so every test that needs either is `#[ignore]`d —
+//! it shows in that job's own `cargo test` summary as `ignored`, not `ok`, which is
+//! the difference between "this did not run" being visible and being indistinguishable
+//! from a pass. `the_comparison_notices_a_single_float_out_of_place` needs nothing and
+//! is the only one of these that is not `#[ignore]`d — it drives the same predicate the
+//! comparison uses and fails if that predicate stops distinguishing vectors. A
+//! comparison whose predicate has gone blind is green against agreement and green
+//! against disagreement, and the two look identical from the outside.
+//!
+//! The staged gate — `.github/workflows/text-embed-parity.yml`, on a schedule and on
+//! `workflow_dispatch` — builds the extension from a pinned `staticembed` commit, stages
+//! the bundled model, installs `uv`, and runs this file and `text_embed.rs` with
+//! `--include-ignored`. There every `#[ignore]`d test above actually executes its real
+//! body. If it somehow ran there without the artifact or `uv` staged, the `require_*`
+//! helpers below panic rather than returning quietly — an `#[ignore]`d test that is not
+//! filtered out is a test something has deliberately asked to run, and a missing
+//! prerequisite at that point is a misconfiguration to fail loudly on, not a reason to
+//! look away a second way.
 
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The built embedding extension, or `None`.
+/// The built embedding extension, or `None`. `None` is the ordinary case on the
+/// routine gate, where every test that calls `require_extension` instead is
+/// `#[ignore]`d and never reaches here.
 fn extension_artifact() -> Option<PathBuf> {
     let path = PathBuf::from(std::env::var_os("ARC_STATICEMBED_EXTENSION")?);
     path.is_file().then_some(path)
+}
+
+/// The built extension, or a hard failure. Only called from a test carrying
+/// `#[ignore]` — reached only when something has deliberately asked to run it anyway
+/// (`--include-ignored`), so a missing artifact at that point is the run being
+/// misconfigured, not a case to return quietly from.
+fn require_extension() -> PathBuf {
+    extension_artifact().unwrap_or_else(|| {
+        panic!(
+            "ARC_STATICEMBED_EXTENSION must point at a built, loadable extension: this \
+             test is #[ignore]d on the routine gate for exactly this reason, so \
+             reaching here means it was run anyway (--include-ignored) without \
+             staging what it needs — see the staged workflow, \
+             text-embed-parity.yml"
+        )
+    })
 }
 
 /// A directory holding the three files of the model the extension bundles, or `None`.
@@ -46,6 +77,17 @@ fn extension_artifact() -> Option<PathBuf> {
 fn model_directory() -> Option<PathBuf> {
     let path = PathBuf::from(std::env::var_os("ARC_STATICEMBED_MODEL")?);
     path.is_dir().then_some(path)
+}
+
+/// The model directory, or a hard failure. Same reasoning as `require_extension`.
+fn require_model() -> PathBuf {
+    model_directory().unwrap_or_else(|| {
+        panic!(
+            "ARC_STATICEMBED_MODEL must point at a three-file model directory: this \
+             test is #[ignore]d on the routine gate for exactly this reason — see \
+             require_extension's doc comment"
+        )
+    })
 }
 
 /// The release the model directory above was taken from. Declared rather than
@@ -63,6 +105,15 @@ fn have_uv() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// `uv` on PATH, or a hard failure. Same reasoning as `require_extension`.
+fn require_uv() {
+    assert!(
+        have_uv(),
+        "`uv` must be on PATH: this test is #[ignore]d on the routine gate for \
+         exactly this reason — see require_extension's doc comment"
+    );
 }
 
 fn sql_lit(s: &str) -> String {
@@ -321,15 +372,11 @@ fn run_protocol(
 /// SQL session returns for the same text, exactly — including the cases where the two
 /// implementations used to disagree, and including the NULL the operator bridges.
 #[test]
+#[ignore = "needs a built ARC_STATICEMBED_EXTENSION and `uv` — run under the staged \
+            parity workflow (text-embed-parity.yml), not a bare `cargo test`"]
 fn a_protocol_run_and_a_sql_session_return_the_same_vector_for_every_case() {
-    let Some(artifact) = extension_artifact() else {
-        eprintln!("skipping the parity comparison: no ARC_STATICEMBED_EXTENSION");
-        return;
-    };
-    if !have_uv() {
-        eprintln!("skipping the parity comparison: no `uv` on PATH");
-        return;
-    }
+    let artifact = require_extension();
+    require_uv();
     let (tmp, code, told) = run_protocol(&artifact, None);
     assert_eq!(code, Some(0), "the embedding step must succeed:\n{told}");
     let project = tmp.path();
@@ -391,15 +438,11 @@ fn a_protocol_run_and_a_sql_session_return_the_same_vector_for_every_case() {
 /// this asserts exists but never reaches a person running a Protocol. That is a gap in
 /// the engine rather than in the operator, and closing it is not this file's to do.
 #[test]
+#[ignore = "needs a built ARC_STATICEMBED_EXTENSION and `uv` — run under the staged \
+            parity workflow (text-embed-parity.yml), not a bare `cargo test`"]
 fn the_rows_that_carry_no_signal_are_counted_on_stderr() {
-    let Some(artifact) = extension_artifact() else {
-        eprintln!("skipping the zero-vector count: no ARC_STATICEMBED_EXTENSION");
-        return;
-    };
-    if !have_uv() {
-        eprintln!("skipping the zero-vector count: no `uv` on PATH");
-        return;
-    }
+    let artifact = require_extension();
+    require_uv();
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path();
     let corpus_path = project.join("corpus.parquet");
@@ -460,11 +503,10 @@ fn the_rows_that_carry_no_signal_are_counted_on_stderr() {
 /// that a future edit to the word lists cannot quietly turn the comparison above into
 /// a comparison over ordinary sentences.
 #[test]
+#[ignore = "needs a built ARC_STATICEMBED_EXTENSION — run under the staged parity \
+            workflow (text-embed-parity.yml), not a bare `cargo test`"]
 fn the_corpus_still_contains_the_shapes_it_was_built_from() {
-    let Some(artifact) = extension_artifact() else {
-        eprintln!("skipping the corpus shape check: no ARC_STATICEMBED_EXTENSION");
-        return;
-    };
+    let artifact = require_extension();
     let conn = session(&artifact);
     let by_label = |label: &str| -> String {
         corpus()
@@ -562,11 +604,10 @@ const TOKEN_CUT: usize = 512;
 /// own passes for any boundary above it. Only together do they hold at exactly CUT, so
 /// a constant one character or one token out of place reddens this test.
 #[test]
+#[ignore = "needs a built ARC_STATICEMBED_EXTENSION — run under the staged parity \
+            workflow (text-embed-parity.yml), not a bare `cargo test`"]
 fn the_truncation_boundary_is_two_cuts() {
-    let Some(artifact) = extension_artifact() else {
-        eprintln!("skipping the truncation boundary: no ARC_STATICEMBED_EXTENSION");
-        return;
-    };
+    let artifact = require_extension();
     let conn = session(&artifact);
     let same = |a: &str, b: &str| same_vector(&conn, a, b);
 
@@ -724,15 +765,11 @@ fn the_comparison_notices_a_single_float_out_of_place() {
 /// A Protocol that declares a model the extension does not carry is stopped, and told
 /// both addresses — the one its own files produce and the one the extension reports.
 #[test]
+#[ignore = "needs a built ARC_STATICEMBED_EXTENSION and `uv` — run under the staged \
+            parity workflow (text-embed-parity.yml), not a bare `cargo test`"]
 fn a_model_the_extension_does_not_carry_is_refused_naming_both() {
-    let Some(artifact) = extension_artifact() else {
-        eprintln!("skipping the model mismatch check: no ARC_STATICEMBED_EXTENSION");
-        return;
-    };
-    if !have_uv() {
-        eprintln!("skipping the model mismatch check: no `uv` on PATH");
-        return;
-    }
+    let artifact = require_extension();
+    require_uv();
     let held = tempfile::tempdir().unwrap();
     let model = held.path().join("some-other-model");
     std::fs::create_dir_all(&model).unwrap();
@@ -776,17 +813,13 @@ fn a_model_the_extension_does_not_carry_is_refused_naming_both() {
 /// everything: the model the extension DOES carry is accepted, and the run produces
 /// vectors.
 #[test]
+#[ignore = "needs a built ARC_STATICEMBED_EXTENSION, ARC_STATICEMBED_MODEL and `uv` — \
+            run under the staged parity workflow (text-embed-parity.yml), not a bare \
+            `cargo test`"]
 fn the_model_the_extension_carries_is_accepted() {
-    let (Some(artifact), Some(model)) = (extension_artifact(), model_directory()) else {
-        eprintln!(
-            "skipping the model match check: needs ARC_STATICEMBED_EXTENSION and ARC_STATICEMBED_MODEL"
-        );
-        return;
-    };
-    if !have_uv() {
-        eprintln!("skipping the model match check: no `uv` on PATH");
-        return;
-    }
+    let artifact = require_extension();
+    let model = require_model();
+    require_uv();
     let release = model_release();
     let (tmp, code, told) = run_protocol(&artifact, Some((&model, &release)));
     assert_eq!(
@@ -811,17 +844,13 @@ fn the_model_the_extension_carries_is_accepted() {
 /// copy has to be ACCEPTED first, in the same test, and only then does the refusal of
 /// a copy differing by one byte of the third file mean the third file is hashed.
 #[test]
+#[ignore = "needs a built ARC_STATICEMBED_EXTENSION, ARC_STATICEMBED_MODEL and `uv` — \
+            run under the staged parity workflow (text-embed-parity.yml), not a bare \
+            `cargo test`"]
 fn changing_one_byte_of_the_third_file_is_a_different_model() {
-    let (Some(artifact), Some(model)) = (extension_artifact(), model_directory()) else {
-        eprintln!(
-            "skipping the third-file check: needs ARC_STATICEMBED_EXTENSION and ARC_STATICEMBED_MODEL"
-        );
-        return;
-    };
-    if !have_uv() {
-        eprintln!("skipping the third-file check: no `uv` on PATH");
-        return;
-    }
+    let artifact = require_extension();
+    let model = require_model();
+    require_uv();
     let held = tempfile::tempdir().unwrap();
     let copied = held.path().join("potion-copied");
     std::fs::create_dir_all(&copied).unwrap();
@@ -914,15 +943,11 @@ fn published_key(conn: &duckdb::Connection) -> String {
 /// chosen to share NO leading character is run first, and the address the operator
 /// itself reports for it has to be the one computed here.
 #[test]
+#[ignore = "needs a built ARC_STATICEMBED_EXTENSION and `uv` — run under the staged \
+            parity workflow (text-embed-parity.yml), not a bare `cargo test`"]
 fn a_model_whose_address_nearly_matches_is_still_refused() {
-    let Some(artifact) = extension_artifact() else {
-        eprintln!("skipping the near-miss address check: no ARC_STATICEMBED_EXTENSION");
-        return;
-    };
-    if !have_uv() {
-        eprintln!("skipping the near-miss address check: no `uv` on PATH");
-        return;
-    }
+    let artifact = require_extension();
+    require_uv();
     let published = published_key(&session(&artifact));
     assert!(
         published.len() > NEAR_MISS_CHARS,

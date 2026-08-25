@@ -105,6 +105,30 @@ jobs:
       - name: test
         run: cargo test --workspace
 
+      # tests/text_embed.rs and tests/text_embed_parity.rs carry #[ignore]d tests that
+      # need a built staticembed extension and `uv`, neither of which this runner has —
+      # see the module doc at the top of each file. The `test` step above already
+      # reports them as `ignored` rather than `ok`, in its own `cargo test` summary;
+      # this step re-runs just those two already-built binaries (nothing to recompile)
+      # so that count lands in the job summary too, where a PR reader sees it without
+      # opening a log.
+      - name: Summarise the parity suite's routine coverage
+        run: |
+          set -euo pipefail
+          cargo test --workspace --test text_embed --test text_embed_parity \
+            2>&1 | tee "$RUNNER_TEMP/parity-routine.log"
+          {
+            echo "### text_embed / text_embed_parity — routine gate"
+            echo
+            echo "Needs a staged \`staticembed\` extension and \`uv\`; this runner has"
+            echo "neither, so:"
+            echo
+            grep '^test result:' "$RUNNER_TEMP/parity-routine.log" | sed 's/^/- /'
+            echo
+            echo "Ignored here is not a pass — those tests run for real on a schedule"
+            echo "and on demand, in \`text-embed-parity.yml\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # `mcp` is off by default, so the run above compiles none of the MCP module —
       # including the tests that pin the finetype min-version gate. A gate whose test
       # never executes is not a gate, so run the suite once more with the feature on.

@@ -229,6 +229,34 @@ pick a newer DuckDB, which writes its own version into the Parquet footer. The s
 environment reproduces the same bytes; two machines are not thereby made to agree. The
 vectors themselves are the extension's and do not move with the resolve.
 
+## What CI actually checks, and what it does not
+
+There are two gates, and they cover different guarantees.
+
+**The routine gate** — `ci.yml`'s `build` job, every push and every PR — has no
+extension artifact and no `uv`. It compiles `tests/text_embed.rs` and
+`tests/text_embed_parity.rs`, and it runs the handful of tests in them that need
+neither: that a Protocol declaring an extension asset which was never staged stops the
+run naming the file, and that the value-comparison predicate itself still tells two
+vectors apart (`the_comparison_notices_a_single_float_out_of_place`). Every other test
+in those two files is `#[ignore]`d, which is a structural difference from returning
+early: `cargo test`'s own summary reports them as `ignored`, distinct from the `ok` a
+test that ran and passed gets, and the routine gate's job summary repeats that count
+under its own heading so a PR reader sees it without opening a log. **What the routine
+gate does not check, on any given PR: that a Protocol run and a SQL session agree on a
+single vector.**
+
+**The staged gate** — `.github/workflows/text-embed-parity.yml`, on a daily schedule
+and on `workflow_dispatch` — builds the extension from a pinned `staticembed` commit,
+stages the model directory it bundles, installs `uv`, and runs both files again with
+`--include-ignored`. There every test above actually executes: the Protocol/SQL
+parity comparison over the full corpus, the zero-vector count on stderr, the
+truncation-boundary pins, and all four of the model-address checks. Its job summary
+names the `staticembed` commit and the extension's own `staticembed_version()` line, so
+a pass there names the build it passed against rather than implying whatever
+`staticembed` currently is. A change that breaks the vectors is caught here, not on
+the PR that made it — up to a day later, or on demand.
+
 ## Standalone
 
 ```bash
@@ -240,8 +268,11 @@ uv run operators/text_embed/text_embed.py \
 
 The fixture Protocol in `tests/fixtures/text_embed/` is a complete working example of
 the whole chain. The extension artifact is not committed — it is tens of megabytes,
-most of them weights — so the tests stage one from `ARC_STATICEMBED_EXTENSION` and
-return early without it, and running the fixture by hand means putting a built
-artifact beside `arcform.yaml` yourself.
+most of them weights — so the tests that need one are staged from
+`ARC_STATICEMBED_EXTENSION` and `#[ignore]`d without it (see *What CI actually checks*
+above). Running the fixture by hand means putting a built artifact beside
+`arcform.yaml` yourself; running the ignored tests by hand means setting
+`ARC_STATICEMBED_EXTENSION` (and, for the model checks, `ARC_STATICEMBED_MODEL` and
+`ARC_STATICEMBED_MODEL_RELEASE`) and passing `cargo test -- --include-ignored`.
 
 [model2vec]: https://github.com/MinishLab/model2vec
