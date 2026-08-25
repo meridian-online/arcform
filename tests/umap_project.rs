@@ -153,7 +153,7 @@ fn fit_id_of(parquet: &Path) -> String {
     stmt.query_row([], |r| r.get::<_, String>(0)).unwrap()
 }
 
-/// THE CARD'S FIRST CRITERION, end to end. Columns that are already numbers become
+/// THE PROJECTION'S CORE GUARANTEE, end to end. Columns that are already numbers become
 /// two coordinates, with no text column in the manifest and no model anywhere in the
 /// Protocol — and the coordinates carry the numbers' structure rather than being two
 /// columns of anything.

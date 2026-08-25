@@ -85,7 +85,20 @@
 #
 # * Acceptance criteria. Case-INSENSITIVE, but a match may not be followed by a
 #   hex digit — that is what keeps lockfile git revisions out, where a rev can
-#   end `...ac#4afea48...`.
+#   end `...ac#4afea48...`. Two shapes share this one label: the original
+#   punctuated form (the letters "ac", an optional space, then a REQUIRED "#",
+#   then digits) and a BARE form added later with no space and no "#" at all —
+#   measurement showed the bare spelling, with no punctuation whatsoever, is how
+#   this is written everywhere in practice, and the punctuated-only original
+#   passed a diff carrying about fifteen bare references. The bare shape
+#   deliberately requires the digits to sit with NO space before them: this
+#   file's own self-test assembles several `spec-ac-id` fixtures as adjacent
+#   printf arguments that read, in the raw source, as the letters "ac" a space
+#   and then two digits — a space-tolerant bare pattern matched its own test
+#   harness's source on exactly that line. Requiring the digits flush against
+#   the letters closes that self-collision without weakening what it catches,
+#   since the space-and-no-punctuation spelling is not a form this project's
+#   evidence showed anyone actually writing.
 #
 # * Spec AC ids. Deliberately NOT guarded against being part of a larger
 #   identifier: test-function names and temp-dir literals that embed a spec AC id
@@ -96,6 +109,40 @@
 #
 # * Card ids. Three or four digits required; the workflow vocabulary word "card"
 #   and the literal UI cards in the renderer carry no number and are left alone.
+#
+# * Card slugs. A card in the private tracker is named by a long kebab-case
+#   title, not a number — a real one reads like a whole clause, seven, eight,
+#   ten or more words joined by single hyphens, e.g. (fictional, for
+#   illustration only) a slug meaning "renaming the output column broke the
+#   downstream join" — the "card ids" rule above, three-or-four digits, cannot
+#   see this shape at all. Guard: SIX OR MORE lowercase `word[0-9]*` segments
+#   joined by single hyphens. That threshold was picked by measurement, not
+#   guesswork: at six segments this repository's own first-party tree
+#   (everything except `vendor/`) has zero matches, and every card slug sampled
+#   from the private tracker runs eight segments or longer, so there is real
+#   margin on both sides. `vendor/**` is excluded from this one rule (nowhere
+#   else): the vendored `sqlparser` crate's doc comments cite third-party
+#   documentation URLs whose path segments are themselves long lowercase kebab
+#   runs — two dozen of them, all upstream prose this repository does not
+#   author and cannot rewrite. A leak requires someone here to have WRITTEN the
+#   slug; vendored source was not.
+#   Known residual: a card whose title is unusually short — five segments or
+#   fewer, about 2% of the tracker measured — is not caught by this rule alone.
+#   The bare-`ACn` and card-noun rules are the backstop for that case.
+#
+# * Card noun references. A bare reference to an unnamed card in the tracker —
+#   the words "this", "that" or "the" immediately followed by the singular noun
+#   for a tracker item, no number, no slug — leaked in a runtime
+#   `AssertionError` message and a committed JSON value in the same session
+#   that surfaced the other gaps here — neither a comment nor a docstring,
+#   which is why this rule is not scoped to either. It does NOT fire on generic
+#   mentions of the vocabulary with no specific referent (already in the
+#   innocent-strings fixture) — only the determiner immediately against the
+#   noun. The trailing guard is a full negative lookahead, not a bare `\b`: it
+#   excludes a following letter, digit or underscore (keeps the plural silent)
+#   AND a following hyphen — without that second part this rule matched its own
+#   label inside phrases like "the card-slug rule", written directly above and
+#   below it in this file's own commentary.
 #
 # If a pattern flags something legitimate, FIX THE PATTERN and add the innocent
 # string to the fixture. The allowlist is for genuine content that must stay,
@@ -145,10 +192,21 @@ RULES=(
 	'milestone-id|(?i)(?<![-_A-Za-z0-9/])m-[0-9]{2,}(?![-_A-Za-z0-9])'
 	'milestone-id|(?i)(?<![A-Za-z0-9])milestones?[ _-](?:m[-_]?)?[0-9]+(?![-_A-Za-z0-9])'
 	'acceptance-criterion|(?i)(?<![A-Za-z0-9])ac ?#[0-9]+(?![0-9a-f])'
+	'acceptance-criterion|(?i)(?<![A-Za-z0-9])ac[0-9]+(?![0-9a-f])'
 	'private-doc-id|(?i)(?<![A-Za-z0-9])doc[-_][0-9]+(?![A-Za-z])'
 	'planning-card-id|(?i)(?<![A-Za-z0-9])cards?[ _-]#?[0-9]{3,4}(?![0-9])'
 	'spec-ac-id|(?i)[a-z]{2,6}[-_]ac[-_]?[0-9]+[a-z]?(?![0-9])'
 	'spec-ac-id|(?i)(?<![A-Za-z0-9])ac[-_][0-9]+[a-z]?(?![0-9])'
+	'card-slug|(?i)(?<![A-Za-z0-9-])[a-z][a-z0-9]*(?:-[a-z][a-z0-9]*){5,}(?![A-Za-z0-9-])'
+	'card-noun-reference|(?i)(?<![A-Za-z0-9])(?:this|that|the) card(?![-_A-Za-z0-9])'
+)
+
+# Labels whose scan must exclude additional paths beyond the allowlist, as
+# "<label> <pathspec>" pairs. Only card-slug needs this today — see the
+# "Card slugs" guard above for why vendor/** is excluded from that one rule and
+# no other.
+RULE_EXTRA_EXCLUDES=(
+	'card-slug :(exclude)vendor/**'
 )
 
 # ---------------------------------------------------------------------------
@@ -364,7 +422,10 @@ sed 's|/.*||' "$tracked" | sort -u >"$toplevel" || exit 2
 # Anything above 1 is fatal and names the rule.
 scan_or_die() {
 	local label="$1" pattern="$2" rc errline
-	git grep -PIn -o -e "$pattern" -- . ":(exclude)$ALLOWLIST" >"$hits" 2>"$errs"
+	shift 2
+	# Remaining args, if any, are extra git pathspecs (e.g. ":(exclude)vendor/**")
+	# a single rule needs on top of the allowlist exclusion every rule gets.
+	git grep -PIn -o -e "$pattern" -- . ":(exclude)$ALLOWLIST" "$@" >"$hits" 2>"$errs"
 	rc=$?
 	[[ $rc -le 1 ]] && return 0
 	echo "check-public-hygiene: RULE FAILED TO RUN — '$label' (git grep exited $rc)" >&2
@@ -397,7 +458,16 @@ report() {
 for rule in "${RULES[@]}"; do
 	label="${rule%%|*}"
 	pattern="${rule#*|}"
-	scan_or_die "$label" "$pattern"
+
+	extra=""
+	for entry in "${RULE_EXTRA_EXCLUDES[@]}"; do
+		[[ "${entry%% *}" == "$label" ]] && extra="${entry#* }"
+	done
+	if [[ -n "$extra" ]]; then
+		scan_or_die "$label" "$pattern" "$extra"
+	else
+		scan_or_die "$label" "$pattern"
+	fi
 
 	while IFS= read -r hit; do
 		[[ -z "$hit" ]] && continue

@@ -3,13 +3,13 @@
 //! these need neither network nor a real finetype/uv install and run the same in
 //! CI as on a developer machine.
 //!
-//! AC3 (no Python runtime) is the point of `describes_with_no_python_on_path`:
+//! Running with no Python runtime on PATH is the point of `describes_with_no_python_on_path`:
 //! PATH resolves to the fake `finetype` and the real `duckdb` CLI ONLY — no
 //! interpreter and no `uv` exist anywhere on it. The retired uv-run substrate
 //! would fail to spawn under this PATH; the operator succeeds because it now
 //! talks to `finetype` directly.
 //!
-//! AC2 (override precedence) is `override_wins_generated_fills_the_rest`: a
+//! Override precedence is the point of `override_wins_generated_fills_the_rest`: a
 //! curated field key wins over finetype's value for that SAME key, and finetype's
 //! value for every OTHER key on that field survives untouched.
 
