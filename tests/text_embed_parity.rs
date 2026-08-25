@@ -186,8 +186,8 @@ fn repeat_words(words: &[&str], count: usize) -> String {
 /// `(id, label, text)`. A `None` text is SQL NULL — a case in its own right, and the
 /// only one where the two sides legitimately differ before the bridge is applied.
 fn corpus() -> Vec<(i32, &'static str, Option<String>)> {
-    let over_cap = repeat_words(FILLER, 700);
-    let under_cap = repeat_words(FILLER, 30);
+    let over_boundary = repeat_words(FILLER, 700);
+    let under_boundary = repeat_words(FILLER, 30);
     let appended = APPENDED.join(" ");
     vec![
         (
@@ -221,17 +221,17 @@ fn corpus() -> Vec<(i32, &'static str, Option<String>)> {
             Some("the 🜁 tide turns".into()),
         ),
         (11, "around 120 tokens", Some(repeat_words(FILLER, 120))),
-        (12, "past the cap", Some(over_cap.clone())),
+        (12, "past the boundary", Some(over_boundary.clone())),
         (
             13,
-            "past the cap, extended",
-            Some(format!("{over_cap} {appended}")),
+            "past the boundary, extended",
+            Some(format!("{over_boundary} {appended}")),
         ),
-        (14, "under the cap", Some(under_cap.clone())),
+        (14, "under the boundary", Some(under_boundary.clone())),
         (
             15,
-            "under the cap, extended",
-            Some(format!("{under_cap} {appended}")),
+            "under the boundary, extended",
+            Some(format!("{under_boundary} {appended}")),
         ),
         (
             16,
@@ -497,7 +497,11 @@ fn the_corpus_still_contains_the_shapes_it_was_built_from() {
             "`{label}` has to carry no signal, or it is not the case it is named for"
         );
     }
-    for label in ["ordinary", "out of vocabulary mixed in", "past the cap"] {
+    for label in [
+        "ordinary",
+        "out of vocabulary mixed in",
+        "past the boundary",
+    ] {
         assert!(
             !is_zero(&by_label(label)),
             "`{label}` has to carry signal, or the comparison is comparing two zero \
@@ -517,16 +521,16 @@ fn the_corpus_still_contains_the_shapes_it_was_built_from() {
     // still straddle it.
     assert!(
         same(
-            &by_label("past the cap"),
-            &by_label("past the cap, extended")
+            &by_label("past the boundary"),
+            &by_label("past the boundary, extended")
         ),
         "text past the boundary is embedded from its opening, so appending to it must \
          not move the vector"
     );
     assert!(
         !same(
-            &by_label("under the cap"),
-            &by_label("under the cap, extended")
+            &by_label("under the boundary"),
+            &by_label("under the boundary, extended")
         ),
         "appending those same words to a SHORT text must move the vector — otherwise \
          the check above passes on an implementation that truncates nothing"

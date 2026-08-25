@@ -2997,12 +2997,15 @@ fn umap_project_invocation(cfg: &UmapProjectConfig, dir: &Path) -> Result<Vec<St
 // IT NO LONGER COMPUTES AN EMBEDDING, and that is the change worth knowing about.
 // The script used to tokenise, index a `[vocab, dim]` matrix, mean-pool and
 // L2-normalise in Python, which made one capability exist twice in two languages.
-// The two disagreed — over a 15-case corpus against the same weights the vectors
-// agreed to float32 noise for ordinary text and departed by up to 1.8e-01 for text
-// the vocabulary does not carry, and the Python side was the one that departed from
-// the reference implementation both claimed to follow. The computation is deleted
-// rather than corrected, so a SQL `embed()` call and a Protocol run agree by
-// construction instead of by tolerance.
+// The two disagreed — over the corpus in `tests/text_embed_parity.rs`, against the
+// same weights, the vectors agreed to float32 summation order for ordinary text and
+// departed for text carrying tokens the vocabulary does not have and for text past
+// the truncation boundary, and the Python side was the one that departed from the
+// reference implementation both claimed to follow. No magnitude is quoted: the Python
+// path is deleted, so nothing regenerates a difference against it and no test reddens
+// when a figure written here rots. The computation is deleted rather than corrected,
+// so a SQL `embed()` call and a Protocol run agree by construction instead of by
+// tolerance.
 //
 // WHERE THIS IS GOING, and why nothing here should grow. What is left is a
 // Parquet-in/Parquet-out wrapper around one SQL statement, which is a step a Protocol
