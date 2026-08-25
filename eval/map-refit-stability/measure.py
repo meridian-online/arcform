@@ -91,20 +91,36 @@ SAME base rows and the SAME K=20 the map side uses, so the two overlaps are dire
 subtractable. A base row's own EMBEDDING VECTOR never changes when other rows are
 appended — `text_embed` is a per-row function of that row's text alone, confirmed here
 by `base_vectors_moved_by_append` in results.json, which measures 0.0 every run — so
-the only way a base row's true neighbour SET can change is genuine competition: an
-appended row lands close enough in cosine space to displace one of its previous
-neighbours. That is why, unlike the map side, the candidate pool here is NOT restricted
-to base rows: it is every row present in the comparison experiment (base + appended),
-because excluding the appended rows would make this side incapable of ever moving (the
-vectors of the base rows are fixed, so a fixed candidate pool could only ever score
-1.0) and the reactivity controls below exist precisely to catch a measurement that
-cannot move. Reported per append tag as `vector_knn_overlap_mean`/`_median` beside the
-map's own `knn_overlap_mean`/`_median`, and as `map_vs_vector_overlap_gap_mean`/`_median`
+what changes a base row's true neighbour SET is competition: an appended row lands
+close enough in cosine space to displace one of its previous neighbours. Competition
+is not the whole of it — TIE-BREAKING below is the other part — but it is the part
+this comparison is about. That is why, unlike the map side, the candidate pool here
+is NOT restricted to base rows: it is every row present in the comparison experiment
+(base + appended), because excluding the appended rows would make this side incapable
+of ever moving (the vectors of the base rows are fixed, so a fixed candidate pool
+could only ever score 1.0) and the reactivity controls below exist precisely to catch
+a measurement that cannot move. Reported per append tag as
+`vector_knn_overlap_mean`/`_median` beside the map's own `knn_overlap_mean`/`_median`,
+and as `map_vs_vector_overlap_gap_mean`/`_median`
 — vector overlap minus map overlap — so a reader gets the gap the finding rests on
 without doing the subtraction themselves. A positive gap means the true vector
 relationships held together more than the map did: movement the map shows that the
 data does not support, i.e. artefact. A gap near zero means the map moved about as
 much as the data actually did: information.
+
+TIE-BREAKING, and it is a property of the instrument rather than of the data. Some
+base rows have their K-th and (K+1)-th nearest neighbours at exactly the same cosine
+distance — the corpus contains exactly-duplicate descriptions — so for those rows
+there is no unique set of K nearest neighbours to compare. `cosine_knn_sets` selects
+with `np.argpartition`, which resolves such a tie arbitrarily, and the reference pool
+and the comparison pool are different arrays, so the two resolve it arbitrarily
+DIFFERENTLY. Part of the neighbourhood change every vector overlap below reports is
+therefore a tie broken the other way rather than a row genuinely displaced, and each
+figure sits at or below what an exact-tie convention would give. How many base rows
+are affected is counted per run and written to results.json as
+`vector_knn_tie_breaking`. It is disclosed rather than corrected because a stable
+convention would move the committed figures without changing the comparison they are
+read for — the gaps, the control bars and the verdict all survive it.
 
 REACTIVITY CONTROLS (can this comparison move, in both directions, or is it just
 reporting near-1.0 by construction). A vector-space overlap that always comes back
@@ -125,17 +141,32 @@ missing:
 
   out_of_distribution_control — appends, at the same row count, real English prose
     from domains the corpus has nothing to do with (legal, medical, culinary, literary
-    — nothing about the corpus's own subject matter). Genuinely unrelated content is,
-    by construction, too far away in cosine distance to compete for any base row's
-    true top-K neighbourhood — a base row's own K-th-nearest-neighbour distance among
-    its own kind is comfortably smaller than an out-of-distribution row's distance to
-    its nearest base row — so this control's vector overlap must come back AT OR ABOVE
-    append_05's own natural figure. A run reporting it BELOW would mean the comparison
-    is responding to something other than genuine neighbourhood competition, which is
-    the observable failure this control exists to catch. That the metric stays put
-    under unrelated content is not a control that failed to move — it is the metric
-    behaving correctly, and it strengthens the map-vs-vector reading rather than
-    weakening it.
+    — nothing about the corpus's own subject matter). Genuinely unrelated content is
+    MOSTLY too far away in cosine distance to compete for a base row's true top-K
+    neighbourhood — the typical base row's own K-th-nearest-neighbour distance among
+    its own kind is well inside the typical out-of-distribution row's distance to its
+    nearest base row — so this control's vector overlap must come back AT OR ABOVE
+    append_05's own natural figure. Mostly, not entirely: a row that far away can
+    still land inside some base row's own top-K radius, which is why the figure is
+    measured and reported rather than asserted to be 1.0. A run reporting it BELOW
+    would mean the comparison is responding to something other than genuine
+    neighbourhood competition, which is the observable failure this control exists to
+    catch. That the metric stays put under unrelated content is not a control that
+    failed to move — it is the metric behaving correctly, and it strengthens the
+    map-vs-vector reading rather than weakening it.
+
+  Each control also WITNESSES ITS OWN INPUT, separately from the number it reports,
+    because the second of them cannot do it any other way. Its criterion is that the
+    overlap stays HIGH, and an append that never happened produces exactly that: drop
+    the appended rows and every base row keeps the neighbours it had, so the overlap
+    comes back 1.0 and the assertion passes on a comparison that was never run. An
+    assertion in the "stays high" direction cannot pin its own input. So the builders
+    return the row count read back from the file they wrote rather than the count they
+    were asked for, and `checked_pool_size()` requires each control's candidate pool to
+    hold BASE_N + n rows, all of the base rows, and no vector that is zero or
+    non-finite — a row that embeds to the zero vector is in the pool and still absent
+    from the measurement, since cosine distance is undefined for it and it can never be
+    selected. Both counts reach results.json as `vector_pool_size`.
 
 Run: `uv run eval/map-refit-stability/measure.py`. Writes results.json beside this
 file. No flags — the corpus, split and fractions are the measurement, not parameters
@@ -193,11 +224,16 @@ DENSITY_DUP_SUFFIX = "__density_dup"
 # stopped moving without being brittle to a small corpus or model change.
 MIN_DENSITY_CONTROL_GAP = 0.03
 
-# out_of_distribution_control's bar for "at or above, allowing for float noise". The
-# measured margin on the committed corpus/model is comfortably positive (the control
-# lands noticeably above append_05's own figure, not merely tied with it), so a small
-# tolerance below zero catches a comparison that started scoring unrelated content as
-# competitive without being brittle to floating-point round-off between runs.
+# out_of_distribution_control's bar for "at or above", and what it separates is worth
+# being exact about, because it is narrower than it looks. It separates appended
+# content that competes for the base rows' own neighbourhoods from content that does
+# not. It does NOT discriminate among kinds of non-competing content: an appended
+# corpus far enough away to leave the neighbourhoods alone clears this bar whatever it
+# is made of, INCLUDING one that embeds to the zero vector and is therefore incapable
+# of being anyone's neighbour at all. That last case is refused before this bar is
+# read — by checked_pool_size(), not by tightening the number — because a control
+# corpus that embeds to nothing is not a control. The tolerance sits below zero rather
+# than at zero because the bar compares two separately measured means.
 MAX_OOD_CONTROL_DEFICIT = 0.01
 
 # out_of_distribution_control's corpus: real English prose from domains this corpus's
@@ -319,13 +355,91 @@ def build_corpus_slices(con: duckdb.DuckDBPyConnection) -> dict[str, int]:
     return counts
 
 
+def slice_rows_written(con: duckdb.DuckDBPyConnection, dest: Path) -> int:
+    """How many rows the COPY that just ran actually put in `dest`, read back from
+    the file. A builder that returns the count its caller asked for witnesses
+    nothing about the SQL it ran: `assert n_written == n_requested` then reduces to
+    `assert n == n` and stays green with the append half of the query deleted."""
+    return int(
+        con.execute(f"SELECT count(*) FROM read_parquet('{dest.as_posix()}')").fetchone()[0]
+    )
+
+
+def checked_pool_size(
+    tag: str,
+    pool_vectors: dict[str, np.ndarray],
+    base_names: list[str],
+    expected_appended: int,
+) -> int:
+    """The size of `tag`'s candidate pool, returned only after checking that the
+    rows it is supposed to contain are in it and are vectors the cosine metric can
+    act on. Raises rather than returning a number nobody can trust.
+
+    This exists because a control whose success criterion is that an overlap STAYS
+    HIGH is satisfied by an input that never arrived. Drop the appended rows and
+    every base row keeps exactly the neighbours it had, so the overlap comes back
+    1.0, the "at or above" assertion passes, and the run reports a control that was
+    never exercised. Presence one step further in is not enough either: a row whose
+    text embeds to the zero vector normalises to NaN, sorts behind everything in
+    cosine_knn_sets, and cannot be selected as anyone's neighbour — it is in the
+    pool and still inert. Neither failure shows up in the number the control
+    reports, which is why it is checked here instead of read off the result."""
+    expected_total = len(base_names) + expected_appended
+    if len(pool_vectors) != expected_total:
+        raise RuntimeError(
+            f"{tag}: candidate pool holds {len(pool_vectors)} rows, expected "
+            f"{expected_total} ({len(base_names)} base + {expected_appended} "
+            f"appended). The appended rows did not reach the comparison, so any "
+            f"overlap it reports is a measurement of the base rows against "
+            f"themselves."
+        )
+    missing = [n for n in base_names if n not in pool_vectors]
+    if missing:
+        raise RuntimeError(
+            f"{tag}: {len(missing)} base row(s) are absent from the candidate pool "
+            f"(e.g. {missing[0]!r}), so the comparison is not over the same rows the "
+            f"reference is."
+        )
+    inert = [
+        n
+        for n, v in pool_vectors.items()
+        if not np.isfinite(v).all() or float(np.linalg.norm(v)) == 0.0
+    ]
+    if inert:
+        raise RuntimeError(
+            f"{tag}: {len(inert)} row(s) in the candidate pool embed to a zero or "
+            f"non-finite vector (e.g. {inert[0]!r}). Cosine distance is undefined "
+            f"for them and cosine_knn_sets can never select one as a neighbour, so "
+            f"they are present in the pool and absent from the measurement — a "
+            f"control made of them would report the same near-1.0 overlap as a "
+            f"control that was never appended at all."
+        )
+    return len(pool_vectors)
+
+
+def kth_distance_ties(
+    vectors_by_name: dict[str, np.ndarray], names: list[str], k: int
+) -> int:
+    """How many of `names` have their k-th and (k+1)-th nearest OTHER `names` at
+    exactly the same cosine distance — the rows for which "which rows are the k
+    nearest" has no unique answer, because the corpus contains exactly-duplicate
+    descriptions. Reported so the tie-breaking caveat in this file's docstring
+    carries a figure from this run rather than a remembered one."""
+    vecs = np.array([vectors_by_name[n] for n in names])
+    vecs = vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
+    dist = 1.0 - (vecs @ vecs.T)
+    np.fill_diagonal(dist, np.inf)
+    k = min(k, len(names) - 2)
+    ordered = np.sort(dist, axis=1)
+    return int((ordered[:, k - 1] == ordered[:, k]).sum())
+
+
 def build_density_control_slice(con: duckdb.DuckDBPyConnection, target_names: list[str]) -> int:
     """density_control's slice: BASE_N base rows plus a VERBATIM DUPLICATE (same
     category, same description, a suffixed name) of each row in `target_names` —
     appended mass concentrated on the corpus's own most-redundant rows rather than
-    append_05's natural next-in-order sample. Returns the number of duplicate rows
-    written (equal to len(target_names), asserted below the call site against
-    append_05's own count)."""
+    append_05's natural next-in-order sample. Returns the number of rows the COPY
+    actually landed in the file, read back from it — see slice_rows_written()."""
     if any(DENSITY_DUP_SUFFIX in n for n in target_names):
         raise RuntimeError(
             f"a target name already contains {DENSITY_DUP_SUFFIX!r} — the suffix is "
@@ -344,15 +458,15 @@ def build_density_control_slice(con: duckdb.DuckDBPyConnection, target_names: li
         """,
         [target_names],
     )
-    return len(target_names)
+    return slice_rows_written(con, dest)
 
 
 def build_ood_control_slice(con: duckdb.DuckDBPyConnection, n_rows: int) -> int:
     """out_of_distribution_control's slice: BASE_N base rows plus n_rows rows of real
     English prose from domains this corpus's own subject matter has nothing to do
     with — OOD_SENTENCES cycled to reach n_rows, each given a unique prefixed name.
-    Returns n_rows (asserted at the call site against append_05's own count, for a
-    same-size comparison)."""
+    Returns the number of rows the COPY actually landed in the file, read back from
+    it — see slice_rows_written()."""
     existing = con.execute(
         f"SELECT count(*) FROM ordered WHERE ord < {BASE_N} AND "
         f"name LIKE '{OOD_NAME_PREFIX}%'"
@@ -381,7 +495,7 @@ def build_ood_control_slice(con: duckdb.DuckDBPyConnection, n_rows: int) -> int:
         ) TO '{dest.as_posix()}' (FORMAT parquet)
         """
     )
-    return n_rows
+    return slice_rows_written(con, dest)
 
 
 def embed(tag: str) -> Path:
@@ -453,7 +567,12 @@ def cosine_knn_sets(
     """Each query row's k nearest OTHER pool rows by cosine distance, keyed by name
     rather than position — unlike knn_overlap()'s 2D version, query and pool here are
     genuinely different sets (the pool may include appended rows the query set does
-    not), so nothing here can assume they line up positionally."""
+    not), so nothing here can assume they line up positionally.
+
+    `np.argpartition` resolves a tie at the k-th distance arbitrarily, and this is
+    called on pools that are different arrays, so the same tie can resolve differently
+    between two calls. See TIE-BREAKING in this file's docstring for what that costs
+    and why it is reported rather than removed."""
     q = np.array([query_vectors[n] for n in query_names])
     p = np.array([pool_vectors[n] for n in pool_names])
     q = q / np.linalg.norm(q, axis=1, keepdims=True)
@@ -575,6 +694,8 @@ def main() -> int:
     scale = median_nn_spacing(ref_coords)
 
     base_vectors = vectors["control_A"]
+    checked_pool_size("control_A", base_vectors, base_names, 0)
+    ref_ties = kth_distance_ties(base_vectors, base_names, K_NEIGHBOURS)
     ref_nn = cosine_knn_sets(base_vectors, base_names, base_vectors, base_names, K_NEIGHBOURS)
 
     results = {
@@ -596,6 +717,25 @@ def main() -> int:
         "umap_project_params": {"metric": "cosine", "neighbors": 15, "min_dist": 0.1, "seed": 42},
         "base_map_median_nn_spacing": scale,
         "vector_knn_overlap_k": K_NEIGHBOURS,
+        "vector_knn_tie_breaking": {
+            "reference_rows_scored": len(base_names),
+            "reference_rows_with_tied_kth_distance": ref_ties,
+            "note": (
+                f"{ref_ties} of the {len(base_names)} base rows have their "
+                f"{K_NEIGHBOURS}th and {K_NEIGHBOURS + 1}th nearest other base rows "
+                "at exactly the same cosine distance, because the corpus contains "
+                "exactly-duplicate descriptions. For those rows there is no unique "
+                "set of nearest neighbours, and the selection here picks one "
+                "arbitrarily (np.argpartition) — differently in the reference pool "
+                "and in each comparison pool, since they are different arrays. Part "
+                "of the neighbourhood change every vector_knn_overlap figure below "
+                "reports is therefore a tie resolved the other way rather than a row "
+                "genuinely displaced, and each figure sits at or below what an "
+                "exact-tie convention would give. It is disclosed rather than "
+                "corrected: a stable convention would move the committed figures "
+                "without changing the comparison they are read for."
+            ),
+        },
         "comparisons": {},
         "runtime_seconds": None,
     }
@@ -612,11 +752,13 @@ def main() -> int:
         drift = max(float(np.max(np.abs(tag_vectors[n] - base_vectors[n]))) for n in base_names)
         max_base_vector_drift = max(max_base_vector_drift, drift)
 
+        entry["vector_pool_size"] = checked_pool_size(
+            tag, tag_vectors, base_names, counts[tag] - BASE_N
+        )
         cmp_nn = cosine_knn_sets(
             tag_vectors, base_names, tag_vectors, list(tag_vectors.keys()), K_NEIGHBOURS
         )
         v_mean, v_median = vector_overlap(ref_nn, cmp_nn, base_names, K_NEIGHBOURS)
-        entry["vector_pool_size"] = len(tag_vectors)
         entry["vector_knn_overlap_mean"] = v_mean
         entry["vector_knn_overlap_median"] = v_median
         entry["map_vs_vector_overlap_gap_mean"] = v_mean - entry["knn_overlap_mean"]
@@ -636,13 +778,21 @@ def main() -> int:
     n_density = round(BASE_N * APPEND_FRACTIONS["append_05"])
     own_dist = own_neighbour_distances(base_vectors, base_names, K_NEIGHBOURS)
     density_targets = sorted(base_names, key=lambda n: (own_dist[n], n))[:n_density]
-    n_dup = build_density_control_slice(con, density_targets)
-    assert n_dup == n_density
+    density_rows_written = build_density_control_slice(con, density_targets)
+    assert density_rows_written == BASE_N + n_density, (
+        f"density_control's slice holds {density_rows_written} rows, expected "
+        f"{BASE_N + n_density} ({BASE_N} base rows + {n_density} duplicates). The "
+        "duplicate rows never reached the file, so the control below would score "
+        "the base rows against themselves."
+    )
 
     t0 = time.time()
     density_embedded = embed("density_control")
     print(f"[measure] density_control embedded in {time.time() - t0:.1f}s", file=sys.stderr)
     density_vectors = load_vectors(con, density_embedded)
+    density_pool_size = checked_pool_size(
+        "density_control", density_vectors, base_names, n_density
+    )
 
     density_cmp_nn = cosine_knn_sets(
         density_vectors, base_names, density_vectors, list(density_vectors.keys()), K_NEIGHBOURS
@@ -660,7 +810,7 @@ def main() -> int:
         "density_control self-check failed: its vector overlap "
         f"({density_mean:.4f}) is not at least {MIN_DENSITY_CONTROL_GAP} below "
         f"append_05's own vector overlap ({append_05_vector_mean:.4f}) at the same "
-        f"row count ({n_dup}). The vector-space comparison above would then be "
+        f"row count ({n_density}). The vector-space comparison above would then be "
         "unable to tell a genuine 'movement is information' reading from a "
         "measurement that cannot register a neighbourhood change at all — see the "
         "REACTIVITY CONTROLS section of this file's docstring."
@@ -668,16 +818,18 @@ def main() -> int:
 
     results["density_control"] = {
         "description": (
-            f"duplicates the {n_dup} base rows with the smallest own-corpus "
+            f"duplicates the {n_density} base rows with the smallest own-corpus "
             f"{K_NEIGHBOURS}-NN cosine distance (the rows already most redundant "
             "with the rest of control_A) instead of append_05's natural "
             "next-in-order sample, at the same row count, so the comparison "
             "isolates which rows were appended rather than how many. Must drive "
             "vector overlap measurably BELOW append_05's own — proof the "
             "comparison can say 'the neighbourhoods changed more' when they "
-            "genuinely did."
+            "genuinely did. vector_pool_size is the separate witness that these "
+            "rows reached the comparison at all."
         ),
-        "n_appended_rows": n_dup,
+        "n_appended_rows": n_density,
+        "vector_pool_size": density_pool_size,
         "knn_overlap_k": K_NEIGHBOURS,
         "vector_knn_overlap_mean": density_mean,
         "vector_knn_overlap_median": density_median,
@@ -687,17 +839,28 @@ def main() -> int:
 
     # out_of_distribution_control: same row count as append_05, drawn from real
     # English prose the corpus's own subject matter has nothing to do with — the
-    # opposite direction from density_control. Genuinely unrelated rows cannot
-    # compete for an existing row's true top-K neighbourhood, so this control's own
-    # vector overlap must land AT OR ABOVE append_05's own natural figure.
+    # opposite direction from density_control. Genuinely unrelated rows are mostly
+    # too far away to compete for an existing row's true top-K neighbourhood, so this
+    # control's own vector overlap must land AT OR ABOVE append_05's own natural
+    # figure — at or above, not at exactly 1.0, which is why the bar is a comparison
+    # against append_05 rather than an equality.
     n_ood = round(BASE_N * APPEND_FRACTIONS["append_05"])
-    n_ood_written = build_ood_control_slice(con, n_ood)
-    assert n_ood_written == n_ood
+    ood_rows_written = build_ood_control_slice(con, n_ood)
+    assert ood_rows_written == BASE_N + n_ood, (
+        f"out_of_distribution_control's slice holds {ood_rows_written} rows, "
+        f"expected {BASE_N + n_ood} ({BASE_N} base rows + {n_ood} out-of-"
+        "distribution rows). The out-of-distribution rows never reached the file, "
+        "and this control's own criterion — that the overlap stays HIGH — is "
+        "satisfied by exactly that failure, so nothing downstream would notice."
+    )
 
     t0 = time.time()
     ood_embedded = embed("ood_control")
     print(f"[measure] ood_control embedded in {time.time() - t0:.1f}s", file=sys.stderr)
     ood_vectors = load_vectors(con, ood_embedded)
+    ood_pool_size = checked_pool_size(
+        "out_of_distribution_control", ood_vectors, base_names, n_ood
+    )
 
     ood_cmp_nn = cosine_knn_sets(
         ood_vectors, base_names, ood_vectors, list(ood_vectors.keys()), K_NEIGHBOURS
@@ -714,8 +877,8 @@ def main() -> int:
         "out_of_distribution_control self-check failed: its vector overlap "
         f"({ood_mean:.4f}) is more than {MAX_OOD_CONTROL_DEFICIT} below append_05's "
         f"own vector overlap ({append_05_vector_mean:.4f}) at the same row count "
-        f"({n_ood_written}). Genuinely unrelated content should not be able to "
-        "displace an existing row's true neighbours, so a deficit this large means "
+        f"({n_ood}). Genuinely unrelated content should rarely displace an "
+        "existing row's true neighbours, so a deficit this large means "
         "the vector-space comparison above is responding to something other than "
         "genuine neighbourhood competition — see the REACTIVITY CONTROLS section of "
         "this file's docstring."
@@ -723,19 +886,25 @@ def main() -> int:
 
     results["out_of_distribution_control"] = {
         "description": (
-            f"appends {n_ood_written} rows of real English prose from domains this "
+            f"appends {n_ood} rows of real English prose from domains this "
             "corpus's own subject matter has nothing to do with (legal, medical, "
             "culinary, literary), at append_05's own row count, so the comparison "
             "is exercised in the opposite direction from density_control. Must "
             "leave vector overlap AT OR ABOVE append_05's own — content this far "
-            "away cannot compete for an existing row's true top-K neighbourhood, "
-            "so a run reporting it below would be responding to something other "
-            "than genuine neighbourhood change. That the metric stays put here is "
-            "not a control that failed to move; it is the metric behaving "
-            "correctly, and it strengthens rather than weakens the map-vs-vector "
-            "reading below."
+            "away mostly cannot compete for an existing row's true top-K "
+            "neighbourhood, so a run reporting it below would be responding to "
+            "something other than genuine neighbourhood change. Mostly rather than "
+            "entirely: a row that far away can still land inside a base row's own "
+            "top-K radius, so the figure is measured rather than assumed to be 1.0. "
+            "That the metric stays put here is not a control that failed to move; "
+            "it is the metric behaving correctly, and it strengthens rather than "
+            "weakens the map-vs-vector reading below. vector_pool_size is the "
+            "separate witness that these rows reached the comparison at all — an "
+            "overlap that stays high is also exactly what an append that never "
+            "happened would report."
         ),
-        "n_appended_rows": n_ood_written,
+        "n_appended_rows": n_ood,
+        "vector_pool_size": ood_pool_size,
         "knn_overlap_k": K_NEIGHBOURS,
         "vector_knn_overlap_mean": ood_mean,
         "vector_knn_overlap_median": ood_median,
@@ -768,10 +937,14 @@ def main() -> int:
         f"{append_05_vector_mean:.3f}, while a same-size append of content unrelated "
         f"to the corpus (out_of_distribution_control) leaves it at {ood_mean:.3f} — "
         "at or above append_05's own figure, as it should, since content that far "
-        "away cannot compete for an existing row's true neighbours. That the "
-        "out-of-distribution figure does not fall is itself informative: unrelated "
-        "data genuinely should not disturb existing relationships, and the map "
-        "rearranges anyway."
+        "away mostly cannot compete for an existing row's true neighbours. Mostly "
+        "rather than entirely: a row that far away can still land inside a base "
+        "row's own top-K radius, and the tie-breaking recorded under "
+        "vector_knn_tie_breaking contributes as well, which is why that figure is "
+        "measured rather than assumed to be 1.0. Each control's vector_pool_size is "
+        "the separate witness that the rows it is supposed to append actually "
+        "reached the comparison, which the number alone cannot show for a control "
+        "whose criterion is that the overlap stays high."
     )
     explanation = (
         f"At every append fraction measured — {gap_summary} — the map-space overlap "
