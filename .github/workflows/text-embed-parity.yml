@@ -37,9 +37,9 @@ concurrency:
 env:
   # The staticembed commit this run builds the extension from, pinned the same way
   # ci.yml pins DUCKDB_VERSION: a deliberate bump in its own commit, not whatever
-  # staticembed's main branch happens to be the day the schedule fires. AC3 of "the
-  # parity suite proves the vectors agree and nothing ever runs it" — a pass names the
-  # artifact it passed against, and this is the name.
+  # staticembed's main branch happens to be the day the schedule fires. A pass that
+  # cannot say which artifact it ran against proves nothing repeatable — this pin is
+  # that name.
   STATICEMBED_REF: 1105eb38f6ebf6d95f7efdc5b4ddc60d79e303e4
   # Matches ci.yml's build job — arcform's own crate still links a system DuckDB to
   # compile and run its tests, independent of the extension under test.
@@ -131,8 +131,8 @@ jobs:
             echo "ARC_STATICEMBED_MODEL_RELEASE=${model_id}@${model_revision}"
           } >> "$GITHUB_ENV"
 
-      # AC3: which extension build the run used, recorded in the run's own output —
-      # the pinned commit, the artifact's size, and the extension's own version line —
+      # Records which extension build the run used in the run's own output — the
+      # pinned commit, the artifact's size, and the extension's own version line —
       # so a pass names the build it passed against rather than implying today's.
       - name: Record which build this run checks against
         working-directory: staticembed
