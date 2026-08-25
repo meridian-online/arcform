@@ -118,16 +118,19 @@
 #   see this shape at all. Guard: SIX OR MORE lowercase `word[0-9]*` segments
 #   joined by single hyphens. That threshold was picked by measurement, not
 #   guesswork: at six segments this repository's own first-party tree
-#   (everything except `vendor/`) has zero matches, and every card slug sampled
-#   from the private tracker runs eight segments or longer, so there is real
-#   margin on both sides. `vendor/**` is excluded from this one rule (nowhere
+#   (everything except `vendor/`) has zero matches. The upper side has LESS
+#   margin than an earlier version of this comment claimed: most such slugs are
+#   eight segments or longer, but roughly one in eight runs six or seven and a
+#   few sit exactly at six, so the threshold is a floor with little room above
+#   it rather than a comfortable gap. Do not raise it without re-measuring.
+#   `vendor/**` is excluded from this one rule (nowhere
 #   else): the vendored `sqlparser` crate's doc comments cite third-party
 #   documentation URLs whose path segments are themselves long lowercase kebab
 #   runs — two dozen of them, all upstream prose this repository does not
 #   author and cannot rewrite. A leak requires someone here to have WRITTEN the
 #   slug; vendored source was not.
-#   Known residual: a card whose title is unusually short — five segments or
-#   fewer, about 2% of the tracker measured — is not caught by this rule alone.
+#   Known residual: an unusually short title — five segments or fewer, close to
+#   one percent of those measured — is not caught by this rule alone.
 #   The bare-`ACn` and card-noun rules are the backstop for that case.
 #
 # * Card noun references. A bare reference to an unnamed card in the tracker —

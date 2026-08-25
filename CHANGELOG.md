@@ -329,7 +329,7 @@ Rationale for each change is recorded in the project's design notes and commit h
   identical (this operator's dependency resolve is not pinned — see "Does
   byte-identity survive a dependency upgrade?" above). Persisting the fit and
   discriminating the two is real design work of its own and is left to a separate
-  card.
+  separately.
 
 ### Changed
 

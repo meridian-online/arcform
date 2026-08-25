@@ -310,7 +310,7 @@ pins exactly this: appending bytes to a step's read glob is one of three mutatio
 the test proves forces that step stale, and it is asserted, not incidental.
 Building "hold this step's output until the user asks" would be a genuine addition to
 arcform's step model — every step today is a pure function of its declared,
-hash-checked inputs — and that is a different surface and a different card; it is not
+hash-checked inputs — and that is a different surface and separate work; it is not
 built here.
 
 ### The choice, priced rather than assumed
@@ -350,7 +350,7 @@ surface, no runner change required for this half), and, if "the map does not mov
 all until asked" is wanted on top of that, the runner capability named above (a
 different surface). Neither is built here — persisting the fit and computing
 `projection_fit_id` from it rather than from the current input is real design work
-of its own and is a separate card.
+of its own and is tracked separately.
 
 **Telling a refit from an append, as this operator ships today.** Every output row
 carries `projection_fit_id` — a hash of the exact feature matrix and knobs

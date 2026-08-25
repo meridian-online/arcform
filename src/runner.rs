@@ -5299,7 +5299,7 @@ steps:
 
     // Round 7 pin #1: `missing_declared_produces` had zero regression protection —
     // returning `Vec::new()` unconditionally would have reddened nothing, and it is
-    // the only legibility this whole card adds for a step that certifies success
+    // the only legibility this whole change adds for a step that certifies success
     // over work it did not do (probe6's shape). Calls it directly rather than
     // capturing stderr, since the warning text is downstream of this and testing
     // the source of the claim is the more direct pin.
