@@ -62,6 +62,17 @@ Words that merely start with a covered prefix
     docs-2026 is a directory
     cardinality-1000 is a metric name
     a card in the deck, and the cards it sits with
+    the card-slug rule and the card-noun-reference rule are section headings
+    a mac-address-parsing-helper is one hyphenated identifier
+
+Kebab-case runs below the card-slug threshold
+----------------------------------------------
+Five hyphen-joined words is one segment short of the six the card-slug rule
+requires. Most real titles run eight or more, but roughly one in eight runs six
+or seven, so six is a floor with little room above it.
+
+    alpha-bravo-charlie-delta-echo is a five-segment placeholder
+    a form-n-cen-data-set is SEC filing vocabulary, not a card title
 
 Prose that mentions the vocabulary without an identifier
 ---------------------------------------------------------

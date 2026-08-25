@@ -1855,14 +1855,13 @@ mod tests {
         );
     }
 
-    // Card `changing-an-input-file-arcform-did-not-produce-marks-nothing-stale`, AC1 +
-    // AC4: a step's own SQL/config hash is unchanged, but the FILE it declares as
-    // `produces:` was edited directly on disk — arc must not skip it. Mutation proof:
-    // reverting `is_hash_stale`'s artifact-hash check (folding `config_stale` straight
-    // into the returned `Ok(...)` it replaced, dropping the `produced_artifact_hash`
-    // comparison) turns this red — the third run stays at 1 call (preflight only)
-    // instead of 2, because the edited file goes undetected and the step is skipped
-    // `hash_clean` with the edited bytes left in place.
+    // A step's own SQL/config hash can be unchanged while the FILE it declares as
+    // `produces:` was edited directly on disk — arc must not skip it in that case.
+    // Mutation proof: reverting `is_hash_stale`'s artifact-hash check (folding
+    // `config_stale` straight into the returned `Ok(...)` it replaced, dropping the
+    // `produced_artifact_hash` comparison) turns this red — the third run stays at 1
+    // call (preflight only) instead of 2, because the edited file goes undetected and
+    // the step is skipped `hash_clean` with the edited bytes left in place.
     #[test]
     fn test_produced_file_change_forces_rerun() {
         let dir = tempfile::tempdir().unwrap();
@@ -1907,7 +1906,8 @@ mod tests {
         );
     }
 
-    // Same defect, truncation — AC1's second failure mode.
+    // Same defect, but via truncation rather than an edit — a second way the
+    // produced file can go stale without the step's own hash changing.
     #[test]
     fn test_produced_file_truncated_forces_rerun() {
         let dir = tempfile::tempdir().unwrap();
@@ -1934,9 +1934,9 @@ mod tests {
         );
     }
 
-    // Same defect, deletion — AC1's third failure mode. The file is gone outright, not
-    // just changed, so `produced_artifact_hash` has to treat "cannot read" as a change
-    // rather than silently degrading to "nothing to compare."
+    // Same defect again, but the file is gone outright rather than just changed, so
+    // `produced_artifact_hash` has to treat "cannot read" as a change rather than
+    // silently degrading to "nothing to compare."
     #[test]
     fn test_produced_file_deleted_forces_rerun() {
         let dir = tempfile::tempdir().unwrap();
@@ -2276,7 +2276,7 @@ mod tests {
     // mock, not the leftover — ever writes build/REGISTRANT.tsv) compared equal to
     // `MISSING` (every later run, for the same reason) forever. The graph asserts a
     // file is produced by s1 while nothing is on disk, and the run reports success —
-    // the card's headline sentence. A declared artifact that has never once existed
+    // exactly the failure mode this test exists to close. A declared artifact that has never once existed
     // must force a re-run on every single invocation, not settle into a skip after
     // the first: rerunning cannot itself fix anything here (the mock never writes
     // the file either way), so the only honest signal is that the run keeps trying,
@@ -2508,7 +2508,7 @@ mod tests {
         );
     }
 
-    // The "(external source)" shape from the card's original 2026-08-12 evidence: a
+    // The "(external source)" shape, evidenced 2026-08-12: a
     // file a step *reads* (`depends_on:`) that nothing in the manifest produces. No
     // step owns marking itself stale for this file via `produces:`, so
     // `produced_artifact_hash` has to fold a step's *unproduced* direct reads in too,
@@ -5299,7 +5299,7 @@ steps:
 
     // Round 7 pin #1: `missing_declared_produces` had zero regression protection —
     // returning `Vec::new()` unconditionally would have reddened nothing, and it is
-    // the only legibility this whole card adds for a step that certifies success
+    // the only legibility this whole change adds for a step that certifies success
     // over work it did not do (probe6's shape). Calls it directly rather than
     // capturing stderr, since the warning text is downstream of this and testing
     // the source of the claim is the more direct pin.
@@ -5929,8 +5929,8 @@ steps:
     // file. Reduce `hash_directory_contents` to `(relative path, String::new())` and
     // this is the only thing that notices. A release binary built with that reduction
     // left a partition file's bytes changed, and truncated, both reading
-    // `[skip: hash_clean]` at exit 0 — this card's own headline defect, for the
-    // Directory kind.
+    // `[skip: hash_clean]` at exit 0 — exactly the defect this test exists to close, for
+    // the Directory kind.
     //
     // No path is created, removed or renamed anywhere in this test.
     #[test]

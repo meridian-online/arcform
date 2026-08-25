@@ -3502,7 +3502,7 @@ mod tests {
         );
     }
 
-    /// Pins the serialization shape AC1's byte-identity rests on: `serde_json`'s
+    /// Pins the serialization shape this operator's byte-identity guarantee rests on: `serde_json`'s
     /// pretty printer with NO `preserve_order` in this build's dependency graph
     /// (confirmed separately via `cargo tree`) means its `Map` is BTreeMap-backed,
     /// so every object's keys serialize in sorted order with no explicit sort step
@@ -4089,7 +4089,7 @@ mod tests {
         );
     }
 
-    /// AC1's load-time half, and the half CI can run: the projection declares an
+    /// The load-time half of the no-model guarantee, and the half CI can run: the projection declares an
     /// input and an output and NOTHING ELSE. No model asset appears in the graph
     /// because none is needed — a step that placed numbers on a map by way of a model
     /// would still be two jobs.
@@ -4121,7 +4121,7 @@ mod tests {
         );
     }
 
-    /// AC2 at the config level. `deny_unknown_fields` is what makes this a refusal
+    /// The same no-model guarantee at the config level. `deny_unknown_fields` is what makes this a refusal
     /// rather than a field silently ignored: a manifest carried over from the merged
     /// operator stops at load, naming the field, instead of quietly projecting
     /// without embedding anything.
@@ -5607,7 +5607,7 @@ mod tests {
         HttpFetch.run(&with, &test_ctx(dir, &env))
     }
 
-    // AC1/AC4: the sidecar records the validator the REDIRECT offered, not the one
+    // The sidecar records the validator the REDIRECT offered, not the one
     // the redirect target answered under. Reverting to the final hop's `ETag` puts
     // `STORAGE_VALIDATOR` in the sidecar and reddens this.
     #[cfg(feature = "http-fetch")]
@@ -5628,7 +5628,7 @@ mod tests {
         assert_eq!(meta.content_sha256.as_deref(), Some(digest.as_str()));
     }
 
-    // AC2: a second run against an unchanged remote transfers no payload — the
+    // A second run against an unchanged remote transfers no payload — the
     // origin's byte counter does not move, and the redirect target is not asked
     // for at all.
     #[cfg(feature = "http-fetch")]
@@ -5659,7 +5659,7 @@ mod tests {
         );
     }
 
-    // AC2 for the other redirect shape — a `302` carrying no `ETag`, no
+    // The same no-retransfer guarantee for the other redirect shape — a `302` carrying no `ETag`, no
     // `Last-Modified` and no `X-Linked-ETag`, which is what an http→https upgrade or
     // a release redirect sends. Nothing on the first hop is storable, so the second
     // run's `304` can only come from the target's validator, reached by forwarding
@@ -5718,7 +5718,7 @@ mod tests {
         assert!(meta.etag.is_none(), "{:?}", meta.etag);
     }
 
-    // AC3: where the origin declares a content hash on the redirect, the sidecar
+    // Where the origin declares a content hash on the redirect, the sidecar
     // records it with no body transferred — here on a sidecar that predates the
     // field, against an origin that ignores conditional requests entirely.
     #[cfg(feature = "http-fetch")]

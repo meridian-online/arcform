@@ -220,7 +220,7 @@ Read against a sibling measurement of how much neighbourhood structure survives
 long-form, 0.28 short, 0.40 very-short, higher is more retained; this figure comes
 from a measurement in a different repository, has no source committed here, and is
 NOT checked by `check_findings.py` for that reason — read it as context, not as a
-pinned claim of this card's** — on the same kind of kNN-overlap scale: **the two
+pinned claim here** — on the same kind of kNN-overlap scale: **the two
 disturbances are the same order of magnitude, not one uniformly worse than the
 other.** Ranked by how much structure survives, highest to lowest: 5% append (0.42) >
 swapping the embedder on very-short text (0.40) > 20% append (0.39) ≈ 50% append
@@ -241,7 +241,7 @@ an existing fitted embedding without moving the rows already in it.** Verified b
 actually calling it — `eval/map-refit-stability/price_transform.py`,
 `uv run eval/map-refit-stability/price_transform.py`, committed output in
 `transform_pricing.json` — against the same 3,000-row base and the same 5/20/50%
-append pools this card's headline table uses, so the pricing below is comparable to
+append pools the headline table above uses, so the pricing below is comparable to
 it rather than a separate, smaller demo.
 
 Four costs, measured rather than assumed:
@@ -310,7 +310,7 @@ pins exactly this: appending bytes to a step's read glob is one of three mutatio
 the test proves forces that step stale, and it is asserted, not incidental.
 Building "hold this step's output until the user asks" would be a genuine addition to
 arcform's step model — every step today is a pure function of its declared,
-hash-checked inputs — and that is a different surface and a different card; it is not
+hash-checked inputs — and that is a different surface and separate work; it is not
 built here.
 
 ### The choice, priced rather than assumed
@@ -343,14 +343,14 @@ exact positions plus some approximate ones" and becomes a map where a substantia
 share of what is on screen carries the fidelity gap above; nothing measured here
 locates that point more precisely than the two fractions it is bracketed by.
 
-**None of this is implemented in this card.** A strategy is chosen and its
+**None of this is implemented here.** A strategy is chosen and its
 trade-off stated, not built. What would be needed: model persistence and a
-compatibility check inside `operators/umap_project/umap_project.py` (this card's own
+compatibility check inside `operators/umap_project/umap_project.py` (this operator's own
 surface, no runner change required for this half), and, if "the map does not move at
 all until asked" is wanted on top of that, the runner capability named above (a
 different surface). Neither is built here — persisting the fit and computing
 `projection_fit_id` from it rather than from the current input is real design work
-of its own and is a separate card.
+of its own and is tracked separately.
 
 **Telling a refit from an append, as this operator ships today.** Every output row
 carries `projection_fit_id` — a hash of the exact feature matrix and knobs

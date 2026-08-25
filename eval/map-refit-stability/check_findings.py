@@ -164,8 +164,8 @@ def main() -> int:
         "CHANGELOG.md (sibling-figure disclosure)",
     )
 
-    # transform_pricing.json — the out-of-sample-placement pricing this card's review
-    # asked for. Same rule: every pricing figure below is computed from this file
+    # transform_pricing.json — the out-of-sample-placement pricing figures this check
+    # pins. Same rule: every pricing figure below is computed from this file
     # and required as a string, not typed a second time by hand — including the
     # derived ones (the gap below the ceiling, the ceiling's share recovered, the
     # gap below the full refit), not only the figures read straight off the JSON.
@@ -224,8 +224,8 @@ def main() -> int:
                 f"README.md ({kind} fidelity vs 256-d truth, per-fraction)",
             )
 
-        # The gap-below-the-ceiling and share-of-the-ceiling sentences — the ones a
-        # prior round of this card's review had to correct once already, because
+        # The gap-below-the-ceiling and share-of-the-ceiling sentences — the ones an
+        # earlier pass over this file had to correct once already, because
         # "points below the ceiling" and "points below the full refit" are different
         # numbers and the wrong one was pinned first. Both are computed here, from
         # the same pricing values checked above, rather than typed a second time.

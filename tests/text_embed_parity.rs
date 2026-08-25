@@ -366,11 +366,12 @@ fn run_protocol(
     (tmp, out.status.code(), told)
 }
 
-// ── AC2 and AC3 ──────────────────────────────────────────────────────────────
+// ── Full-corpus parity, and the guards that keep its corpus honest ────────────
 
-/// THE CARD'S WHOLE CLAIM. Every vector in the Protocol's output file is the value a
-/// SQL session returns for the same text, exactly — including the cases where the two
-/// implementations used to disagree, and including the NULL the operator bridges.
+/// THE WHOLE CLAIM THIS FILE PROVES. Every vector in the Protocol's output file is the
+/// value a SQL session returns for the same text, exactly — including the cases where
+/// the two implementations used to disagree, and including the NULL the operator
+/// bridges.
 #[test]
 #[ignore = "needs a built ARC_STATICEMBED_EXTENSION and `uv` — run under the staged \
             parity workflow (text-embed-parity.yml), not a bare `cargo test`"]
@@ -497,8 +498,9 @@ fn the_rows_that_carry_no_signal_are_counted_on_stderr() {
     );
 }
 
-/// AC3's cases are only worth comparing if they are the shapes they claim to be. This
-/// asserts the corpus still contains what it was built to contain — text that
+/// The full-corpus comparison above is only worth trusting if its cases are the
+/// shapes they claim to be. This asserts the corpus still contains what it was built
+/// to contain — text that
 /// tokenises to nothing, text past the truncation boundary, and ordinary text — so
 /// that a future edit to the word lists cannot quietly turn the comparison above into
 /// a comparison over ordinary sentences.
@@ -760,7 +762,7 @@ fn the_comparison_notices_a_single_float_out_of_place() {
     );
 }
 
-// ── AC4 ──────────────────────────────────────────────────────────────────────
+// ── Model-address checks: which model was declared, and how precisely it must match ──
 
 /// A Protocol that declares a model the extension does not carry is stopped, and told
 /// both addresses — the one its own files produce and the one the extension reports.
@@ -886,7 +888,7 @@ fn changing_one_byte_of_the_third_file_is_a_different_model() {
     );
 }
 
-// ── AC4: how much of the address is compared, not just which way it points ────
+// ── How much of the address is compared, not just which way it points ────────
 
 /// How many leading characters of the published address the near-miss fixture below
 /// shares with it. A model check narrowed to fewer than this many characters accepts
@@ -921,14 +923,15 @@ fn published_key(conn: &duckdb::Connection) -> String {
 
 /// A DECLARED MODEL WHOSE ADDRESS NEARLY MATCHES IS STILL REFUSED.
 ///
-/// WHY THE OTHER AC4 TESTS ARE NOT ENOUGH. They pin that the check points the right
-/// way — a wrong model is refused, the right one is accepted, the third file is
-/// hashed. None of them pins its STRENGTH. Measured 2026-08-25: narrowing the
+/// WHY THE OTHER MODEL-ADDRESS TESTS ARE NOT ENOUGH. They pin that the check points
+/// the right way — a wrong model is refused, the right one is accepted, the third file
+/// is hashed. None of them pins its STRENGTH. Measured 2026-08-25: narrowing the
 /// comparison in `check_declared_model` to a single hex character left all of them
 /// green, and a run would then report success while embedding with weights the
-/// Protocol had not declared, which is the failure AC4 exists to stop. Direction is
-/// cheap to test and worth nothing on its own; strength needs an input that a weak
-/// check and a strong check disagree about, and that input is this fixture.
+/// Protocol had not declared, which is the failure this near-miss check exists to
+/// stop. Direction is cheap to test and worth nothing on its own; strength needs an
+/// input that a weak check and a strong check disagree about, and that input is this
+/// fixture.
 ///
 /// HOW THE FIXTURE IS BUILT. The address is a SHA-256 over a domain tag, the release
 /// identity and revision, and the three model files in a fixed order — so holding
