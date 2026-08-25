@@ -321,7 +321,7 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
         "umap_project" => object(
             json!({
                 "input": { "type": "string", "description": "Parquet holding the columns to project." },
-                "columns": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "The numeric columns to reduce, in order. A numeric scalar contributes one feature; a list/array of numerics — a vector column — contributes one per element. There is no text column and no model: to map text, write a vector column from it first (text_embed, or the DuckDB embedding extension once it lands)." },
+                "columns": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "The numeric columns to reduce, in order. A numeric scalar contributes one feature; a list/array of numerics — a vector column — contributes one per element. There is no text column and no model: to map text, write a vector column from it first (text_embed, or a SQL step calling the DuckDB embedding extension)." },
                 "out": { "type": "string", "description": "Parquet to write — every input column plus projection_x and projection_y as DOUBLE, and projection_fit_id (VARCHAR, same value on every row) fingerprinting the exact numbers and knobs this fit consumed." },
                 "neighbors": { "type": "integer", "minimum": 2, "description": "UMAP n_neighbors: low reads local structure, high reads global. Defaults to the script's 15 when omitted." },
                 "min_dist": { "type": "number", "minimum": 0, "exclusiveMaximum": 1, "description": "UMAP min_dist: how tightly points may pack. Defaults to the script's 0.1 when omitted." },
@@ -333,11 +333,13 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
             json!({
                 "input": { "type": "string", "description": "Parquet holding the corpus." },
                 "text_column": { "type": "string", "description": "Column to embed." },
-                "model": { "type": "string", "description": "Static-embedding model directory (model.safetensors + tokenizer.json). A declared input: the Protocol fetches it, the operator never does." },
+                "extension": { "type": "string", "description": "The loadable embedding-extension artifact. A declared input: the Protocol puts it there, the operator never downloads or installs one." },
                 "out": { "type": "string", "description": "Parquet to write — every input column plus the vector column as FLOAT[]." },
-                "vector_column": { "type": "string", "description": "Column the vectors are written into. Defaults to the script's `embedding` when omitted; name another to embed a second column of the same corpus in a later step." }
+                "vector_column": { "type": "string", "description": "Column the vectors are written into. Defaults to the script's `embedding` when omitted; name another to embed a second column of the same corpus in a later step." },
+                "model": { "type": "string", "description": "Optional. A model directory (tokenizer.json + model.safetensors + config.json) to CHECK the extension against — never read for weights, which live inside the extension. Set with model_release." },
+                "model_release": { "type": "string", "description": "Optional. `<model-id>@<revision>` naming the release the `model` directory was taken from. Both go into the content address the extension publishes, so the check cannot be made from the directory alone. Set with model." }
             }),
-            &["input", "text_column", "model", "out"],
+            &["input", "text_column", "extension", "out"],
         ),
         _ => return None,
     };
@@ -2985,35 +2987,47 @@ fn umap_project_invocation(cfg: &UmapProjectConfig, dir: &Path) -> Result<Vec<St
 // ─────────────────────────────────────────────────────────────────────────────
 // text_embed (transform) — PROVISIONAL. ON ITS WAY OUT. DO NOT HARDEN IT.
 //
-// Embeds a text column against a LOCAL static-embedding model and writes a Parquet
+// Embeds a text column with the DuckDB embedding extension and writes a Parquet
 // carrying every input column plus a vector column of FLOAT. It writes vectors and
 // nothing else, which is the point of it being its own step: an analyst who wants
 // vectors for similarity, clustering, deduplication or classifier features stops
 // here, and one who wants a map feeds the vector column to `umap_project`, which
 // neither knows nor cares that an embedding produced it.
 //
-// WHERE THIS IS GOING, and why nothing here should grow. Embedding is a table lookup
-// and a mean. Under arcform's implementation order — a DuckDB extension first, then
-// Rust/C, then a managed environment — it does not belong at this tier at all: a
-// DuckDB scalar function returning a vector is being built for exactly this, and Rust
-// that loads a Model2Vec tokenizer and embedding matrix already ships elsewhere in
-// the stack. When the extension lands, a Protocol embeds from a SQL step
-// (`SELECT …, embed(description) AS embedding FROM …`) and this operator is DELETED
-// rather than maintained. It exists now because that extension does not exist yet,
-// and without it a Protocol has no route from a text column to a map at all.
+// IT NO LONGER COMPUTES AN EMBEDDING, and that is the change worth knowing about.
+// The script used to tokenise, index a `[vocab, dim]` matrix, mean-pool and
+// L2-normalise in Python, which made one capability exist twice in two languages.
+// The two disagreed — over the corpus in `tests/text_embed_parity.rs`, against the
+// same weights, the vectors agreed to float32 summation order for ordinary text and
+// departed for text carrying tokens the vocabulary does not have and for text past
+// the truncation boundary, and the Python side was the one that departed from the
+// reference implementation both claimed to follow. No magnitude is quoted: the Python
+// path is deleted, so nothing regenerates a difference against it and no test reddens
+// when a figure written here rots. The computation is deleted rather than corrected,
+// so a SQL `embed()` call and a Protocol run agree by construction instead of by
+// tolerance.
 //
-// So: a stopgap, named as one. A knob proposed here belongs on the extension.
+// WHERE THIS IS GOING, and why nothing here should grow. What is left is a
+// Parquet-in/Parquet-out wrapper around one SQL statement, which is a step a Protocol
+// can write for itself. It survives only because the extension is a file a Protocol
+// has to carry rather than something installable; when that changes, this operator is
+// DELETED rather than maintained. A knob proposed here belongs on the extension.
 //
-// THE MODEL IS A DECLARED READ, NOT A DOWNLOAD, and that is the whole reason this
-// belongs in an asset-centric engine rather than beside one. A model the operator
+// THE EXTENSION IS A DECLARED READ, NOT A DOWNLOAD, and that is the whole reason this
+// belongs in an asset-centric engine rather than beside one. An artifact the operator
 // fetched invisibly would be a graph edge that does not appear in the graph: the
 // Protocol would depend on bytes it never names, a re-run could silently embed
-// against a different release, and the run's cost would include a transfer nobody
-// declared. Declared as a Directory read, the model is hashed for staleness like any
-// other input — swap the model and every downstream step re-runs — the Protocol's
-// dependency on it is legible, and the step needs no network at all. `run` refuses
-// before it spawns `uv` when the model is not on disk, naming the file that is
-// missing, rather than reaching for it.
+// against a different build, and the run's cost would include a transfer nobody
+// declared. Declared as a read, it is hashed for staleness like any other input —
+// swap the extension and every downstream step re-runs — and `run` refuses before it
+// spawns `uv` when it is not on disk, naming the file that is missing.
+//
+// THE MODEL IS CHECKED, NOT LOADED. The weights live inside the extension binary, so
+// there is no directory to read them from and `model:` is optional. When it is set it
+// declares WHICH model the Protocol believes it is embedding with, and the script
+// refuses unless the extension's own content address over its bundled assets is
+// reproduced by the declared directory. That address covers three files, so `run`
+// refuses before `uv` when the directory carries fewer.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The embedding script, pinned into the binary. `@1` == these exact bytes.
@@ -3025,11 +3039,14 @@ const TEXT_EMBED_PY: &str = include_str!("../operators/text_embed/text_embed.py"
 #[cfg(test)]
 const TEXT_EMBED_CACHE_DIR: &str = "arcform-op-text_embed-1.0.0";
 
-/// The two files a static-embedding model directory carries — the layout a
-/// `model2vec` / `potion` release ships. Checked here, before `uv` is spawned, so a
-/// Protocol pointed at a model that was never fetched fails in milliseconds naming
-/// the missing file instead of after a dependency resolve.
-const MODEL_PARTS: [&str; 2] = ["model.safetensors", "tokenizer.json"];
+/// The three files a published `model2vec` / `potion` release ships, and the three
+/// the extension's model address is computed over. Checked here, before `uv` is
+/// spawned, so a Protocol pointed at a directory that cannot reproduce that address
+/// fails in milliseconds naming the missing file instead of after a dependency
+/// resolve. TWO of these are not enough: a directory holding only the weights and the
+/// tokenizer produces a different digest, which is indistinguishable from the wrong
+/// model — so the missing file is named rather than the check being weakened.
+const MODEL_PARTS: [&str; 3] = ["tokenizer.json", "model.safetensors", "config.json"];
 
 struct TextEmbed;
 
@@ -3041,10 +3058,10 @@ struct TextEmbedConfig {
     /// The column to embed. A column that is not in the Parquet is the script's
     /// refusal, not a load-time one — the manifest cannot know the schema.
     text_column: String,
-    /// The static-embedding model directory (a `reads` asset, Directory kind — so a
-    /// changed model re-runs the step). Resolved against ctx.dir. The Protocol is
-    /// what puts it there; this operator never downloads it.
-    model: String,
+    /// The loadable embedding-extension artifact (a `reads` asset). Resolved against
+    /// ctx.dir. The Protocol is what puts it there; this operator never downloads it,
+    /// and never installs one from a registry.
+    extension: String,
     /// Parquet to write: every input column, plus the vector column (the `produces`
     /// asset). Resolved against ctx.dir.
     out: String,
@@ -3053,6 +3070,16 @@ struct TextEmbedConfig {
     /// same corpus in a later step without colliding with this one's output.
     #[serde(default)]
     vector_column: Option<String>,
+    /// A model directory to CHECK the extension against (a `reads` asset, Directory
+    /// kind). Optional, and never read for weights — the weights are inside the
+    /// extension. Set with `model_release`, or not at all.
+    #[serde(default)]
+    model: Option<String>,
+    /// `<model-id>@<revision>` naming the release `model` was taken from. The
+    /// extension hashes both into its content address, so the address cannot be
+    /// reproduced from the directory alone and this is not a label.
+    #[serde(default)]
+    model_release: Option<String>,
 }
 
 impl TextEmbedConfig {
@@ -3072,6 +3099,14 @@ impl TextEmbedConfig {
                     .to_string(),
             ));
         }
+        if self.model.is_some() != self.model_release.is_some() {
+            return Err(Error::ManifestValidation(
+                "text_embed: `model:` and `model_release:` are checked against each \
+                 other and against the extension, so neither means anything alone. \
+                 Set both, or neither."
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -3083,23 +3118,30 @@ impl TextEmbedConfig {
 fn text_embed_args(
     input: &str,
     text_column: &str,
-    model: &str,
+    extension: &str,
     out: &str,
     vector_column: Option<&str>,
+    model: Option<(&str, &str)>,
 ) -> Vec<String> {
     let mut a = vec![
         "--input".to_string(),
         input.to_string(),
         "--text-column".to_string(),
         text_column.to_string(),
-        "--model".to_string(),
-        model.to_string(),
+        "--extension".to_string(),
+        extension.to_string(),
         "--out".to_string(),
         out.to_string(),
     ];
     if let Some(name) = vector_column {
         a.push("--vector-column".to_string());
         a.push(name.to_string());
+    }
+    if let Some((dir, release)) = model {
+        a.push("--model".to_string());
+        a.push(dir.to_string());
+        a.push("--model-release".to_string());
+        a.push(release.to_string());
     }
     a
 }
@@ -3139,10 +3181,16 @@ impl Operator for TextEmbed {
         cfg.validate()?;
         let mut assets = OpAssets::default();
         assets.record_reads(cfg.input.clone(), crate::asset_kind::AssetKind::File);
-        // The model is an input like any other. Directory kind, so staleness hashes a
-        // manifest of its contents: a model swapped in place re-runs the embedding
-        // rather than leaving vectors from a different one in place.
-        assets.record_reads(cfg.model.clone(), crate::asset_kind::AssetKind::Directory);
+        // The extension is an input like any other, and it is the one that decides
+        // what a vector IS: swap the artifact and every vector downstream of it is
+        // from a different model, so it is hashed for staleness like the corpus.
+        assets.record_reads(cfg.extension.clone(), crate::asset_kind::AssetKind::File);
+        // The model directory, when declared, is read only to be hashed against what
+        // the extension reports. Directory kind, so editing a file in it re-runs the
+        // step rather than leaving a check that passed against different bytes.
+        if let Some(model) = &cfg.model {
+            assets.record_reads(model.clone(), crate::asset_kind::AssetKind::Directory);
+        }
         assets.record_produces(cfg.out.clone(), crate::asset_kind::AssetKind::File);
         Ok(assets)
     }
@@ -3161,41 +3209,74 @@ impl Operator for TextEmbed {
 /// without `uv`, and this is the half of `run` such a machine can still drive.
 fn text_embed_invocation(cfg: &TextEmbedConfig, dir: &Path) -> Result<Vec<String>> {
     let input = dir.join(&cfg.input);
-    let model = dir.join(&cfg.model);
+    let extension = dir.join(&cfg.extension);
     let out = dir.join(&cfg.out);
     if let Some(parent) = out.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    // Before `uv`, and before anything that could be mistaken for a fetch.
+    // Before `uv`, and before anything that could be mistaken for a fetch or an
+    // install.
     //
     // NON-retryable (`StepExecution`, the missing-binary class) rather than
-    // `StepFailed`. A model that is not on disk will not be on disk on the second
+    // `StepFailed`. An artifact that is not on disk will not be on disk on the second
     // attempt either, so a Protocol carrying `defaults.retry` would otherwise pay its
     // backoff three times over to be told the same thing.
-    if let Some(part) = missing_model_part(&model) {
+    if !extension.is_file() {
         return Err(Error::StepExecution {
             step: "text_embed".to_string(),
             source: std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!(
-                    "the model asset {} is not on disk — {} is missing. The model is a \
-                     declared input, so a step in this Protocol has to put it there; \
-                     this operator does not download one.",
-                    cfg.model,
-                    part.display()
+                    "the extension asset {} is not on disk — {} is missing. The \
+                     embedding extension is a declared input, so a step in this \
+                     Protocol has to put it there; this operator does not download \
+                     one and does not install one from a registry.",
+                    cfg.extension,
+                    extension.display()
+                ),
+            ),
+        });
+    }
+
+    // The model directory, when declared, has to be able to reproduce the extension's
+    // content address, and it cannot do that with a file missing. Refused here so the
+    // reader is told WHICH file rather than being told the address did not match.
+    let model = cfg.model.as_ref().map(|m| dir.join(m));
+    if let (Some(name), Some(path)) = (&cfg.model, &model)
+        && let Some(part) = missing_model_part(path)
+    {
+        return Err(Error::StepExecution {
+            step: "text_embed".to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "the declared model asset {} cannot be checked against the \
+                     extension — {} is missing. The extension's model address covers \
+                     {}, so a directory carrying fewer than all three cannot \
+                     reproduce it. This operator does not download one.",
+                    name,
+                    part.display(),
+                    MODEL_PARTS.join(", ")
                 ),
             ),
         });
     }
 
     let script = materialize_frozen_script("text_embed", "1.0.0", TEXT_EMBED_PY)?;
+    let model_arg = model
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .zip(cfg.model_release.clone());
     let extra = text_embed_args(
         &input.display().to_string(),
         &cfg.text_column,
-        &model.display().to_string(),
+        &extension.display().to_string(),
         &out.display().to_string(),
         cfg.vector_column.as_deref(),
+        model_arg
+            .as_ref()
+            .map(|(dir, release)| (dir.as_str(), release.as_str())),
     );
     Ok(uv_run_args(&script.to_string_lossy(), &extra))
 }
@@ -4063,7 +4144,7 @@ mod tests {
     /// that cannot change what the step produces must not be settable on it.
     #[test]
     fn text_embed_refuses_the_fields_that_belonged_to_the_other_job() {
-        let base = "input: i.parquet\ntext_column: t\nmodel: m\nout: o.parquet\n";
+        let base = "input: i.parquet\ntext_column: t\nextension: e\nout: o.parquet\n";
         for orphan in ["neighbors: 15", "min_dist: 0.1", "metric: cosine"] {
             let with: Value = serde_yaml::from_str(&format!("{base}{orphan}")).unwrap();
             let err = assets_for("text_embed", Some(&with))
@@ -4322,15 +4403,11 @@ mod tests {
                     )
                 }
                 "text_embed" => {
-                    // The model check runs BEFORE the script is materialised, so it has
-                    // to pass or the refusal under test is never reached.
-                    let model = protocol.path().join("model");
-                    std::fs::create_dir_all(&model).unwrap();
-                    for part in MODEL_PARTS {
-                        std::fs::write(model.join(part), b"not a real model").unwrap();
-                    }
+                    // The extension check runs BEFORE the script is materialised, so it
+                    // has to pass or the refusal under test is never reached.
+                    std::fs::write(protocol.path().join("staticembed.ext"), b"not real").unwrap();
                     let with: Value = serde_yaml::from_str(
-                        "input: corpus.parquet\ntext_column: description\nmodel: model\nout: out.parquet",
+                        "input: corpus.parquet\ntext_column: description\nextension: staticembed.ext\nout: out.parquet",
                     )
                     .unwrap();
                     (
@@ -4433,23 +4510,29 @@ mod tests {
 
     // ── text_embed ───────────────────────────────────────────────────────────
 
-    /// The model is an INPUT, recorded beside the corpus rather than fetched — this
-    /// is what puts the Protocol's dependency on a specific model into the graph.
-    /// Directory kind, so staleness hashes its contents: swap the model and the
-    /// embedding re-runs rather than leaving vectors from a different one.
+    /// The EXTENSION is an INPUT, recorded beside the corpus rather than installed —
+    /// this is what puts the Protocol's dependency on one particular build of the
+    /// embedder into the graph. It decides what a vector is, so swapping it has to
+    /// re-run the embedding exactly as swapping the corpus does.
     #[test]
-    fn text_embed_declares_the_model_as_a_read_beside_the_corpus() {
+    fn text_embed_declares_the_extension_as_a_read_beside_the_corpus() {
         let with: Value = serde_yaml::from_str(
-            "input: build/corpus.parquet\ntext_column: description\nmodel: models/potion\nout: build/embedded.parquet",
+            "input: build/corpus.parquet\ntext_column: description\nextension: vendor/staticembed.duckdb_extension\nout: build/embedded.parquet",
         )
         .unwrap();
         let assets = assets_for("text_embed", Some(&with)).unwrap();
-        assert_eq!(assets.reads, vec!["build/corpus.parquet", "models/potion"]);
+        assert_eq!(
+            assets.reads,
+            vec![
+                "build/corpus.parquet",
+                "vendor/staticembed.duckdb_extension"
+            ]
+        );
         assert_eq!(assets.produces, vec!["build/embedded.parquet"]);
         assert_eq!(
-            assets.kinds.get("models/potion"),
-            Some(&crate::asset_kind::AssetKind::Directory),
-            "the model is a directory, so staleness hashes what is in it"
+            assets.kinds.get("vendor/staticembed.duckdb_extension"),
+            Some(&crate::asset_kind::AssetKind::File),
+            "the extension is one file, hashed for staleness like the corpus"
         );
         assert_eq!(
             assets.kinds.get("build/corpus.parquet"),
@@ -4461,13 +4544,70 @@ mod tests {
         );
     }
 
+    /// The model directory is OPTIONAL and, when declared, is a read like any other —
+    /// so editing a file inside it re-runs the step rather than leaving a check that
+    /// passed against bytes that are no longer there.
+    #[test]
+    fn text_embed_records_a_declared_model_as_a_directory_read_and_omits_it_otherwise() {
+        let base = "input: c.parquet\ntext_column: description\nextension: e.ext\nout: o.parquet\n";
+        let without: Value = serde_yaml::from_str(base).unwrap();
+        assert_eq!(
+            assets_for("text_embed", Some(&without)).unwrap().reads,
+            vec!["c.parquet", "e.ext"],
+            "no model declared means no model asset — the weights are in the extension"
+        );
+
+        let with: Value = serde_yaml::from_str(&format!(
+            "{base}model: models/potion\nmodel_release: minishlab/potion-base-8M@abcdef"
+        ))
+        .unwrap();
+        let assets = assets_for("text_embed", Some(&with)).unwrap();
+        assert_eq!(assets.reads, vec!["c.parquet", "e.ext", "models/potion"]);
+        assert_eq!(
+            assets.kinds.get("models/potion"),
+            Some(&crate::asset_kind::AssetKind::Directory),
+            "a declared model is a directory, so staleness hashes what is in it"
+        );
+    }
+
+    /// `model:` and `model_release:` are two halves of one check — the extension
+    /// hashes the release identity together with the files, so a directory without a
+    /// release names bytes whose address cannot be computed, and a release without a
+    /// directory names an address with nothing to compute it from. Either alone is a
+    /// check that silently does not happen, which is why it is refused at load.
+    #[test]
+    fn text_embed_refuses_half_a_model_declaration() {
+        let base = "input: c.parquet\ntext_column: description\nextension: e.ext\nout: o.parquet\n";
+        for half in [
+            "model: models/potion",
+            "model_release: minishlab/potion-base-8M@abcdef",
+        ] {
+            let with: Value = serde_yaml::from_str(&format!("{base}{half}")).unwrap();
+            let err = assets_for("text_embed", Some(&with)).expect_err(&format!(
+                "`{half}` alone checks nothing and must be refused"
+            ));
+            assert!(
+                err.to_string().contains("Set both, or neither"),
+                "the refusal says what to do about it: {err}"
+            );
+        }
+        let both: Value = serde_yaml::from_str(&format!(
+            "{base}model: models/potion\nmodel_release: minishlab/potion-base-8M@abcdef"
+        ))
+        .unwrap();
+        assert!(
+            assets_for("text_embed", Some(&both)).is_ok(),
+            "both halves together are the point of the fields and must load"
+        );
+    }
+
     #[test]
     fn text_embed_rejects_bad_config() {
         for missing in [
-            "text_column: t\nmodel: m\nout: o",
-            "input: i\nmodel: m\nout: o",
+            "text_column: t\nextension: e\nout: o",
+            "input: i\nextension: e\nout: o",
             "input: i\ntext_column: t\nout: o",
-            "input: i\ntext_column: t\nmodel: m",
+            "input: i\ntext_column: t\nextension: e",
         ] {
             let with: Value = serde_yaml::from_str(missing).unwrap();
             assert!(
@@ -4476,7 +4616,8 @@ mod tests {
             );
         }
         let bogus: Value =
-            serde_yaml::from_str("input: i\ntext_column: t\nmodel: m\nout: o\nbogus: 1").unwrap();
+            serde_yaml::from_str("input: i\ntext_column: t\nextension: e\nout: o\nbogus: 1")
+                .unwrap();
         assert!(assets_for("text_embed", Some(&bogus)).is_err());
     }
 
@@ -4484,7 +4625,7 @@ mod tests {
     /// nothing. Refused at load rather than by DuckDB's parser inside the script.
     #[test]
     fn text_embed_refuses_a_vector_column_that_is_not_a_name() {
-        let base = "input: i\ntext_column: t\nmodel: m\nout: o\n";
+        let base = "input: i\ntext_column: t\nextension: e\nout: o\n";
         for blank in ["vector_column: \"\"", "vector_column: \"   \""] {
             let with: Value = serde_yaml::from_str(&format!("{base}{blank}")).unwrap();
             let err = assets_for("text_embed", Some(&with))
@@ -4507,14 +4648,14 @@ mod tests {
     #[test]
     fn text_embed_args_omit_the_vector_column_the_manifest_did_not_set() {
         assert_eq!(
-            text_embed_args("c.parquet", "description", "m", "o.parquet", None),
+            text_embed_args("c.parquet", "description", "e.ext", "o.parquet", None, None),
             vec![
                 "--input",
                 "c.parquet",
                 "--text-column",
                 "description",
-                "--model",
-                "m",
+                "--extension",
+                "e.ext",
                 "--out",
                 "o.parquet"
             ],
@@ -4527,22 +4668,61 @@ mod tests {
             text_embed_args(
                 "c.parquet",
                 "description",
-                "m",
+                "e.ext",
                 "o.parquet",
-                Some("title_vector")
+                Some("title_vector"),
+                None
             ),
             vec![
                 "--input",
                 "c.parquet",
                 "--text-column",
                 "description",
-                "--model",
-                "m",
+                "--extension",
+                "e.ext",
                 "--out",
                 "o.parquet",
                 "--vector-column",
                 "title_vector"
             ],
+        );
+    }
+
+    /// An undeclared model is OMITTED from the argv entirely rather than passed as an
+    /// empty string — the script's model check is skipped by its absence, and a blank
+    /// path would be a directory it went looking for and did not find.
+    #[test]
+    fn text_embed_args_carry_the_model_declaration_only_when_there_is_one() {
+        let release = "minishlab/potion-base-8M@bf8b056651a2c21b8d2565580b8569da283cab23";
+        assert_eq!(
+            text_embed_args(
+                "c.parquet",
+                "description",
+                "e.ext",
+                "o.parquet",
+                None,
+                Some(("models/potion", release))
+            ),
+            vec![
+                "--input",
+                "c.parquet",
+                "--text-column",
+                "description",
+                "--extension",
+                "e.ext",
+                "--out",
+                "o.parquet",
+                "--model",
+                "models/potion",
+                "--model-release",
+                release
+            ],
+        );
+        assert!(
+            !text_embed_args("c.parquet", "description", "e.ext", "o.parquet", None, None)
+                .iter()
+                .any(|a| a == "--model" || a == "--model-release"),
+            "no declaration means neither flag reaches the script"
         );
     }
 
@@ -4569,8 +4749,16 @@ mod tests {
         std::fs::write(model.join("model.safetensors"), b"\0").unwrap();
         assert_eq!(
             missing_model_part(&model),
+            Some(model.join("config.json")),
+            "the weights and the tokenizer are not enough: the extension's model \
+             address is computed over three files, and two of them cannot reproduce it"
+        );
+
+        std::fs::write(model.join("config.json"), "{}").unwrap();
+        assert_eq!(
+            missing_model_part(&model),
             None,
-            "both parts present — nothing is missing"
+            "all three parts present — nothing is missing"
         );
 
         std::fs::remove_file(model.join("tokenizer.json")).unwrap();
@@ -4594,33 +4782,75 @@ mod tests {
         );
     }
 
-    /// Without a `uv` on PATH: the step refuses on the missing model and never gets as
-    /// far as anything that could be mistaken for a fetch.
+    /// Without a `uv` on PATH: the step refuses on the missing extension and never
+    /// gets as far as anything that could be mistaken for a fetch or an install.
     #[test]
-    fn text_embed_refuses_a_missing_model_before_it_spawns_uv() {
+    fn text_embed_refuses_a_missing_extension_before_it_spawns_uv() {
         let tmp = tempfile::tempdir().unwrap();
         let env = HashMap::new();
         let ctx = test_ctx(tmp.path(), &env);
         let with: Value = serde_yaml::from_str(
-            "input: corpus.parquet\ntext_column: description\nmodel: models/potion\nout: build/embedded.parquet",
+            "input: corpus.parquet\ntext_column: description\nextension: vendor/staticembed.duckdb_extension\nout: build/embedded.parquet",
         )
         .unwrap();
         let err = TextEmbed
             .run(&with, &ctx)
-            .expect_err("a model that is not on disk must stop the step");
+            .expect_err("an extension that is not on disk must stop the step");
         assert!(
             matches!(err, Error::StepExecution { .. }),
-            "a missing model is deterministic, so it must be the NON-retryable kind \
-             rather than a StepFailed the engine would back off and re-attempt: {err:?}"
+            "a missing extension is deterministic, so it must be the NON-retryable \
+             kind rather than a StepFailed the engine would back off and re-attempt: \
+             {err:?}"
         );
         let msg = err.to_string();
         assert!(
-            msg.contains("models/potion"),
-            "the refusal names the declared model: {msg}"
+            msg.contains("vendor/staticembed.duckdb_extension"),
+            "the refusal names the declared extension: {msg}"
         );
         assert!(
             msg.contains("does not download one"),
-            "the refusal says the model is the Protocol's job, not the operator's: {msg}"
+            "the refusal says the artifact is the Protocol's job, not the operator's: \
+             {msg}"
+        );
+        assert!(
+            msg.contains("does not install one from a registry"),
+            "an extension has a second way to arrive by itself, and the refusal has \
+             to close that one too: {msg}"
+        );
+    }
+
+    /// A DECLARED model that cannot reproduce the extension's address stops the step
+    /// before `uv`, naming the file that makes it impossible. The alternative — going
+    /// ahead and reporting that the address did not match — is true and useless: the
+    /// reader cannot tell a wrong model from an incomplete directory.
+    #[test]
+    fn text_embed_refuses_a_model_directory_that_cannot_reproduce_the_address() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+        let ctx = test_ctx(tmp.path(), &env);
+        std::fs::write(tmp.path().join("staticembed.ext"), b"not real").unwrap();
+        let model = tmp.path().join("models/potion");
+        std::fs::create_dir_all(&model).unwrap();
+        // The two files the operator used to want, and one short of what the address
+        // is computed over.
+        std::fs::write(model.join("tokenizer.json"), "{}").unwrap();
+        std::fs::write(model.join("model.safetensors"), b"\0").unwrap();
+        let with: Value = serde_yaml::from_str(
+            "input: corpus.parquet\ntext_column: description\nextension: staticembed.ext\nout: build/embedded.parquet\nmodel: models/potion\nmodel_release: minishlab/potion-base-8M@abcdef",
+        )
+        .unwrap();
+        let err = TextEmbed
+            .run(&with, &ctx)
+            .expect_err("a model directory one file short must stop the step");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("config.json"),
+            "the refusal names the file that is missing, not merely that a check \
+             failed: {msg}"
+        );
+        assert!(
+            msg.contains("models/potion"),
+            "the refusal names the declared model: {msg}"
         );
     }
 
@@ -4634,12 +4864,17 @@ mod tests {
         for part in MODEL_PARTS {
             std::fs::write(model.join(part), b"not a real model").unwrap();
         }
-        let with: Value = serde_yaml::from_str(
-            "input: build/corpus.parquet\ntext_column: description\nmodel: models/potion\nout: build/embedded.parquet",
-        )
+        let extension = tmp.path().join("vendor/staticembed.duckdb_extension");
+        std::fs::create_dir_all(extension.parent().unwrap()).unwrap();
+        std::fs::write(&extension, b"not a real extension").unwrap();
+        let release = "minishlab/potion-base-8M@bf8b056651a2c21b8d2565580b8569da283cab23";
+        let with: Value = serde_yaml::from_str(&format!(
+            "input: build/corpus.parquet\ntext_column: description\nextension: vendor/staticembed.duckdb_extension\nout: build/embedded.parquet\nmodel: models/potion\nmodel_release: {release}"
+        ))
         .unwrap();
         let cfg = TextEmbedConfig::parse(&with).unwrap();
-        let args = text_embed_invocation(&cfg, tmp.path()).expect("a complete model proceeds");
+        let args =
+            text_embed_invocation(&cfg, tmp.path()).expect("a complete declaration proceeds");
 
         assert_eq!(args[0], "run");
         assert_eq!(args[1], "--script");
@@ -4660,13 +4895,17 @@ mod tests {
                     .to_string(),
                 "--text-column",
                 "description",
-                "--model",
-                &model.display().to_string(),
+                "--extension",
+                &extension.display().to_string(),
                 "--out",
                 &tmp.path()
                     .join("build/embedded.parquet")
                     .display()
                     .to_string(),
+                "--model",
+                &model.display().to_string(),
+                "--model-release",
+                release,
             ],
             "every path reaches the script resolved against the protocol directory"
         );

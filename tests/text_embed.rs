@@ -9,12 +9,18 @@
 //! projection that follows is handed a numeric column and is not told an embedding
 //! produced it. One merged step made each half reachable only through the other.
 //!
-//! WHAT NEEDS `uv` AND WHAT DOES NOT. The embedding and the projection both run Python
-//! on the uv-run substrate, so every test that produces vectors skips where `uv` is
-//! not installed, exactly as the `finetype_validate` gate skips without its extension.
-//! CI has no `uv`, so what CI runs here is the one test that does not need it: the
-//! refusal when the model asset is missing, which is decided in Rust before anything
-//! is spawned. The rest are for a developer machine.
+//! WHAT NEEDS WHAT, AND WHAT CI ACTUALLY RUNS. The embedding needs the loadable
+//! embedding extension, which is tens of megabytes and is not committed; the
+//! projection needs `uv`. CI has neither, so every test below that produces vectors
+//! returns early, and the one CI executes is the refusal when the extension asset is
+//! missing — decided in Rust before anything is spawned. `ARC_STATICEMBED_EXTENSION`
+//! names a built artifact and turns the rest on.
+//!
+//! A TEST THAT RETURNS EARLY REPORTS AS `ok`, which is indistinguishable from a test
+//! that ran. That is a property of the harness and not something this file can fix,
+//! so each early return says on stderr which input it wanted, and the parity suite in
+//! `text_embed_parity.rs` carries a check of its own comparison logic that runs
+//! everywhere.
 //!
 //! FIRST RUN COSTS A DOWNLOAD. `uv` resolves umap-learn, numba, scipy and
 //! scikit-learn on first use (a few hundred megabytes, cached thereafter) and numba
@@ -32,13 +38,34 @@ fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/text_embed")
 }
 
-/// Is `uv` on PATH? Every test that produces vectors needs it.
+/// Is `uv` on PATH? The projection step needs it.
 fn have_uv() -> bool {
     Command::new("uv")
         .arg("--version")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// The built embedding extension, or `None`. Every vector below comes out of this
+/// artifact, so without it there is nothing to assert.
+pub fn extension_artifact() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("ARC_STATICEMBED_EXTENSION")?);
+    path.is_file().then_some(path)
+}
+
+/// The vector width the extension itself reports, asked of the artifact rather than
+/// written down here. A constant would have to be edited in lockstep with a model
+/// swap, and would not fail if it were not.
+fn extension_dim(artifact: &Path) -> i64 {
+    let config = duckdb::Config::default()
+        .allow_unsigned_extensions()
+        .expect("allow unsigned extensions");
+    let conn = duckdb::Connection::open_in_memory_with_flags(config).unwrap();
+    conn.execute_batch(&format!("LOAD '{}';", artifact.display()))
+        .expect("the artifact loads");
+    conn.query_row("SELECT len(embed('width probe'))", [], |r| r.get(0))
+        .expect("the extension answers")
 }
 
 /// Copy the fixture tree, skipping `build/` — a developer who has run `arc run` in the
@@ -62,9 +89,14 @@ fn copy_tree(src: &Path, dst: &Path) {
 }
 
 /// The fixture Protocol, staged in a temp directory so a run cannot dirty the tree.
+/// The extension is copied in only when there is one; the Protocol names it either
+/// way, which is what makes the missing-asset refusal testable.
 fn staged_protocol() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     copy_tree(&fixture_dir(), tmp.path());
+    if let Some(artifact) = extension_artifact() {
+        std::fs::copy(artifact, tmp.path().join("staticembed.duckdb_extension")).unwrap();
+    }
     tmp
 }
 
@@ -111,36 +143,45 @@ fn columns_of(parquet: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The half of AC2 that CI runs. The model is a declared input, so a Protocol pointed
-/// at one nothing has fetched stops — naming the file it looked for — instead of
-/// quietly reaching the network for a model of its own choosing.
+/// The half of this file that CI runs. The extension is a declared input, so a
+/// Protocol pointed at one nothing has put there stops — naming the file it looked
+/// for — instead of quietly fetching a build of its own choosing or installing one
+/// from a registry.
 #[test]
-fn a_model_that_was_never_fetched_stops_the_run_naming_the_file() {
+fn an_extension_that_was_never_staged_stops_the_run_naming_the_file() {
     let tmp = staged_protocol();
     let project = tmp.path();
-    std::fs::remove_dir_all(project.join("model")).unwrap();
+    let artifact = project.join("staticembed.duckdb_extension");
+    if artifact.exists() {
+        std::fs::remove_file(&artifact).unwrap();
+    }
 
     let (code, stdout, stderr) = common::arc_run_raw(project);
     assert_ne!(code, Some(0), "the run must fail:\n{stdout}\n{stderr}");
     let told = format!("{stdout}{stderr}");
     assert!(
-        told.contains("the model asset model is not on disk"),
-        "the refusal names the declared model asset:\n{told}"
+        told.contains("the extension asset staticembed.duckdb_extension is not on disk"),
+        "the refusal names the declared extension asset:\n{told}"
     );
     assert!(
-        told.contains("this operator does not download one"),
-        "the refusal says fetching the model is the Protocol's job:\n{told}"
+        told.contains("does not download one"),
+        "the refusal says putting it there is the Protocol's job:\n{told}"
+    );
+    assert!(
+        told.contains("does not install one from a registry"),
+        "an extension has a second way to arrive by itself, and the refusal closes \
+         that one too:\n{told}"
     );
     assert!(
         !embedded(project).exists(),
-        "nothing may be written when the model is missing"
+        "nothing may be written when the extension is missing"
     );
-    // The model is in the graph, not beside it: `arc run` prints it as a node the
+    // The extension is in the graph, not beside it: `arc run` prints it as a node the
     // embedding step feeds from.
     let graph = common::strip_ansi(&stdout);
     assert!(
-        graph.contains("model [directory]"),
-        "the model is an asset-graph node, not an invisible dependency:\n{graph}"
+        graph.contains("staticembed.duckdb_extension"),
+        "the extension is an asset-graph node, not an invisible dependency:\n{graph}"
     );
 }
 
@@ -151,6 +192,10 @@ fn a_model_that_was_never_fetched_stops_the_run_naming_the_file() {
 /// embedding was to also compute a 2-D map.
 #[test]
 fn an_embedding_is_a_finished_artifact_with_no_map_attached() {
+    let Some(artifact) = extension_artifact() else {
+        eprintln!("skipping an_embedding_is_a_finished_artifact: no ARC_STATICEMBED_EXTENSION");
+        return;
+    };
     if !have_uv() {
         eprintln!("skipping an_embedding_is_a_finished_artifact: no `uv` on PATH");
         return;
@@ -178,8 +223,10 @@ fn an_embedding_is_a_finished_artifact_with_no_map_attached() {
          coordinate column here would mean the embedding still drags a map behind it"
     );
 
-    // The vectors are real: 16 dimensions (the fixture model's) and L2-normalised, so
-    // a cosine metric downstream reads them as directions.
+    // The vectors are real: the extension's own width, and L2-normalised, so a cosine
+    // metric downstream reads them as directions. The width is not written down here —
+    // it is read from the extension, because a constant would have to be updated in
+    // lockstep with a model swap and would not fail if it were not.
     let conn = duckdb::Connection::open_in_memory().unwrap();
     let mut stmt = conn
         .prepare(&format!(
@@ -196,8 +243,12 @@ fn an_embedding_is_a_finished_artifact_with_no_map_attached() {
         .map(|r| r.unwrap())
         .collect();
     assert_eq!(vectors.len(), 48, "one vector per corpus row");
-    for (dim, norm) in &vectors {
-        assert_eq!(*dim, 16, "the fixture model is 16-dimensional");
+    let dim = extension_dim(&artifact);
+    for (width, norm) in &vectors {
+        assert_eq!(
+            *width, dim,
+            "the vector width is the extension's, and the extension says {dim}"
+        );
         assert!(
             (norm - 1.0).abs() < 1e-5,
             "an embedding is L2-normalised; this one has norm {norm}"
@@ -205,11 +256,17 @@ fn an_embedding_is_a_finished_artifact_with_no_map_attached() {
     }
 }
 
-/// AC3, and the proof that the vectors carry the text. The projection is handed the
-/// vector column and nothing else — it never sees `description` — so if the map
-/// separates the corpus's two subjects, the separation came through the embedding.
+/// The proof that the vectors carry the text. The projection is handed the vector
+/// column and nothing else — it never sees `description` — so if the map separates
+/// the corpus's two subjects, the separation came through the embedding.
 #[test]
 fn the_route_from_a_text_column_to_coordinates_still_works() {
+    let Some(_) = extension_artifact() else {
+        eprintln!(
+            "skipping the_route_from_a_text_column_to_coordinates: no ARC_STATICEMBED_EXTENSION"
+        );
+        return;
+    };
     if !have_uv() {
         eprintln!("skipping the_route_from_a_text_column_to_coordinates: no `uv` on PATH");
         return;
@@ -261,6 +318,19 @@ fn the_route_from_a_text_column_to_coordinates_still_works() {
     // corpus.csv rows 1..=24 are the harbour subject, 25..=48 the company-results
     // subject. The projection saw only `embedding`, so a map that separates them is a
     // map whose structure came through the text.
+    //
+    // TWO STATEMENTS, because either alone can be satisfied by a map with no
+    // structure. The subjects sit further apart than they are wide, and almost every
+    // row lands on its own side. A map built from vectors that carried nothing would
+    // put the two centres on top of each other while the rows stayed spread out, and
+    // would assign about half the rows correctly by chance.
+    //
+    // The thresholds have room in them and are not the measurement. On a real model
+    // this fixture separates the centres by 9.3 against a median subject radius of
+    // 0.87 — a factor of ten — and places 47 of 48 rows correctly; one harbour row
+    // about a silted channel sits out among the company results, which is a fact
+    // about the sentence rather than a defect. Four times the radius, and 90% of the
+    // rows, leave that headroom while staying out of reach of a structureless map.
     let centre = |group: &[&(i32, f64, f64)]| {
         let n = group.len() as f64;
         (
@@ -268,26 +338,47 @@ fn the_route_from_a_text_column_to_coordinates_still_works() {
             group.iter().map(|r| r.2).sum::<f64>() / n,
         )
     };
+    let distance = |(x, y): (f64, f64), (cx, cy): (f64, f64)| (x - cx).hypot(y - cy);
+    let median_radius = |group: &[&(i32, f64, f64)], c: (f64, f64)| {
+        let mut radii: Vec<f64> = group.iter().map(|r| distance((r.1, r.2), c)).collect();
+        radii.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        radii[radii.len() / 2]
+    };
     let (harbour, markets): (Vec<_>, Vec<_>) = rows.iter().partition(|(id, _, _)| *id <= 24);
     let harbour_centre = centre(&harbour);
     let markets_centre = centre(&markets);
-    let distance = |(x, y): (f64, f64), (cx, cy): (f64, f64)| (x - cx).hypot(y - cy);
-    for (id, x, y) in &rows {
-        let (own, other) = if *id <= 24 {
-            (harbour_centre, markets_centre)
-        } else {
-            (markets_centre, harbour_centre)
-        };
-        assert!(
-            distance((*x, *y), own) < distance((*x, *y), other),
-            "row {id} at ({x:.3}, {y:.3}) is nearer the other subject's centre — the \
-             coordinates do not carry the text"
-        );
-    }
+
+    let separation = distance(harbour_centre, markets_centre);
+    let width =
+        median_radius(&harbour, harbour_centre).max(median_radius(&markets, markets_centre));
+    assert!(
+        separation > 4.0 * width,
+        "the two subjects sit {separation:.3} apart with a median radius of \
+         {width:.3} — a map whose two halves overlap is a map that did not read the \
+         text"
+    );
+
+    let placed = rows
+        .iter()
+        .filter(|(id, x, y)| {
+            let (own, other) = if *id <= 24 {
+                (harbour_centre, markets_centre)
+            } else {
+                (markets_centre, harbour_centre)
+            };
+            distance((*x, *y), own) < distance((*x, *y), other)
+        })
+        .count();
+    assert!(
+        placed * 10 >= rows.len() * 9,
+        "{placed} of {} rows are nearer their own subject's centre; a map carrying no \
+         information about the text would manage about half",
+        rows.len()
+    );
 }
 
-/// With the model on disk and `uv`'s cache warm, neither step needs anything from the
-/// network and neither consults a credential.
+/// With the extension on disk and `uv`'s cache warm, neither step needs anything from
+/// the network and neither consults a credential.
 ///
 /// Outbound HTTP is made unavailable two ways, because one is not enough. `UV_OFFLINE`
 /// stops `uv` reaching a package registry, and nothing else — it does not constrain
@@ -301,6 +392,12 @@ fn the_route_from_a_text_column_to_coordinates_still_works() {
 /// used them, and the run has to land on the same bytes as the one that had a network.
 #[test]
 fn the_steps_complete_with_the_network_disabled_and_no_credentials() {
+    let Some(_) = extension_artifact() else {
+        eprintln!(
+            "skipping the_steps_complete_with_the_network_disabled: no ARC_STATICEMBED_EXTENSION"
+        );
+        return;
+    };
     if !have_uv() {
         eprintln!("skipping the_steps_complete_with_the_network_disabled: no `uv` on PATH");
         return;

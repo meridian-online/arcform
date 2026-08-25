@@ -34,9 +34,17 @@ re-read. BASE_N of its rows become the "existing" map, and the next rows in the 
 order become the appended rows, so append fraction f draws its rows from the same
 pool for every f up to the largest.
 
-MODEL. `minishlab/potion-base-8M`, fetched into `.cache/` beside this script on first
-run (gitignored — the harness re-derives it rather than shipping 28.8 MB of weights
-in git). Same model and fetch URLs as operators/text_embed/README.md's worked example.
+MODEL. `minishlab/potion-base-8M`, at the revision the embedding extension was built
+from. The weights are inside the extension; the three files fetched into `.cache/`
+beside this script exist so the harness can DECLARE which model it is embedding with
+and have the run refuse if the extension carries a different one — the same
+`model:` + `model_release:` pair a Protocol would write. Gitignored: the harness
+re-derives them rather than shipping 28.8 MB in git.
+
+EXTENSION. Set `ARC_STATICEMBED_EXTENSION` to a built artifact. It is not fetched here
+and there is no default path — it is an input to the measurement like the corpus, and a
+harness that quietly found one somewhere would not be able to say which build produced
+these numbers.
 
 METHOD. For each experiment, write a Parquet slice, run the real
 `operators/text_embed/text_embed.py` over it (--metric is umap_project's, not
@@ -83,6 +91,7 @@ to explore; change the constants below and re-run to ask a different question.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -101,9 +110,15 @@ CORPUS = HERE / "corpus.parquet"  # committed — see the CORPUS section above
 TEXT_EMBED = REPO / "operators" / "text_embed" / "text_embed.py"
 UMAP_PROJECT = REPO / "operators" / "umap_project" / "umap_project.py"
 
+# Pinned to the revision the extension was built from, not to `main`. The model check
+# is over exact bytes, so a branch that moves would make the declaration uncheckable
+# the next time someone re-derived the cache.
+MODEL_ID = "minishlab/potion-base-8M"
+MODEL_REVISION = "bf8b056651a2c21b8d2565580b8569da283cab23"
+MODEL_RELEASE = f"{MODEL_ID}@{MODEL_REVISION}"
 MODEL_URLS = {
-    "model.safetensors": "https://huggingface.co/minishlab/potion-base-8M/resolve/main/model.safetensors",
-    "tokenizer.json": "https://huggingface.co/minishlab/potion-base-8M/resolve/main/tokenizer.json",
+    name: f"https://huggingface.co/{MODEL_ID}/resolve/{MODEL_REVISION}/{name}"
+    for name in ("model.safetensors", "tokenizer.json", "config.json")
 }
 
 BASE_N = 3000
@@ -120,6 +135,20 @@ def ensure_model() -> None:
         print(f"[measure] fetching {name} …", file=sys.stderr)
         with urllib.request.urlopen(url, timeout=120) as resp, open(dest, "wb") as f:
             f.write(resp.read())
+
+
+def extension() -> Path:
+    raw = os.environ.get("ARC_STATICEMBED_EXTENSION")
+    if not raw:
+        raise SystemExit(
+            "measure.py: set ARC_STATICEMBED_EXTENSION to a built embedding-extension "
+            "artifact. The vectors come from it, so which build was used is part of "
+            "the measurement rather than something to discover at run time."
+        )
+    path = Path(raw)
+    if not path.is_file():
+        raise SystemExit(f"measure.py: ARC_STATICEMBED_EXTENSION={raw} is not a file.")
+    return path
 
 
 def run(cmd: list[str]) -> None:
@@ -176,8 +205,12 @@ def embed_and_project(tag: str) -> Path:
             "uv", "run", str(TEXT_EMBED),
             "--input", str(src),
             "--text-column", "description",
-            "--model", str(MODEL_DIR),
+            "--extension", str(extension()),
             "--out", str(embedded),
+            # Declared and checked: if the artifact carries a different model, the run
+            # stops instead of writing numbers nobody could attribute.
+            "--model", str(MODEL_DIR),
+            "--model-release", MODEL_RELEASE,
         ]
     )
     run(
@@ -253,6 +286,7 @@ def compare(
 
 def main() -> int:
     started = time.time()
+    extension()  # fail before the fetch if the artifact is missing
     ensure_model()
     con = duckdb.connect()
     counts = build_corpus_slices(con)
@@ -285,7 +319,8 @@ def main() -> int:
         ),
         "base_n": BASE_N,
         "append_fractions": APPEND_FRACTIONS,
-        "model": "minishlab/potion-base-8M",
+        "model": MODEL_ID,
+        "model_release": MODEL_RELEASE,
         "umap_project_params": {"metric": "cosine", "neighbors": 15, "min_dist": 0.1, "seed": 42},
         "base_map_median_nn_spacing": scale,
         "comparisons": {},
