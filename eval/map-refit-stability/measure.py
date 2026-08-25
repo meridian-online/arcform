@@ -166,7 +166,9 @@ missing:
     hold BASE_N + n rows, all of the base rows, and no vector that is zero or
     non-finite — a row that embeds to the zero vector is in the pool and still absent
     from the measurement, since cosine distance is undefined for it and it can never be
-    selected. Both counts reach results.json as `vector_pool_size`.
+    selected. It also checks the candidate list about to be handed to
+    `cosine_knn_sets`, because a pool loaded and then not passed in fails the same
+    silent way. Both counts reach results.json as `vector_pool_size`.
 
 Run: `uv run eval/map-refit-stability/measure.py`. Writes results.json beside this
 file. No flags — the corpus, split and fractions are the measurement, not parameters
@@ -370,6 +372,7 @@ def checked_pool_size(
     pool_vectors: dict[str, np.ndarray],
     base_names: list[str],
     expected_appended: int,
+    pool_names: list[str],
 ) -> int:
     """The size of `tag`'s candidate pool, returned only after checking that the
     rows it is supposed to contain are in it and are vectors the cosine metric can
@@ -383,7 +386,13 @@ def checked_pool_size(
     text embeds to the zero vector normalises to NaN, sorts behind everything in
     cosine_knn_sets, and cannot be selected as anyone's neighbour — it is in the
     pool and still inert. Neither failure shows up in the number the control
-    reports, which is why it is checked here instead of read off the result."""
+    reports, which is why it is checked here instead of read off the result.
+
+    `pool_names` is the list the caller is about to hand to cosine_knn_sets, and it
+    is checked rather than assumed for the same reason: a pool loaded correctly and
+    then not passed to the measurement fails in exactly the way a pool that was
+    never loaded does, and it fails silently — hand the base names instead and every
+    overlap comes back 1.0."""
     expected_total = len(base_names) + expected_appended
     if len(pool_vectors) != expected_total:
         raise RuntimeError(
@@ -413,6 +422,15 @@ def checked_pool_size(
             f"they are present in the pool and absent from the measurement — a "
             f"control made of them would report the same near-1.0 overlap as a "
             f"control that was never appended at all."
+        )
+    unmeasured = set(pool_vectors) - set(pool_names)
+    if unmeasured or len(pool_names) != len(pool_vectors):
+        raise RuntimeError(
+            f"{tag}: the candidate pool holds {len(pool_vectors)} rows but the "
+            f"measurement is being given {len(pool_names)} of them "
+            f"({len(unmeasured)} never offered as a neighbour). A pool that is "
+            f"loaded and then not handed over fails exactly the way a pool that was "
+            f"never loaded does, and just as quietly."
         )
     return len(pool_vectors)
 
@@ -694,7 +712,7 @@ def main() -> int:
     scale = median_nn_spacing(ref_coords)
 
     base_vectors = vectors["control_A"]
-    checked_pool_size("control_A", base_vectors, base_names, 0)
+    checked_pool_size("control_A", base_vectors, base_names, 0, base_names)
     ref_ties = kth_distance_ties(base_vectors, base_names, K_NEIGHBOURS)
     ref_nn = cosine_knn_sets(base_vectors, base_names, base_vectors, base_names, K_NEIGHBOURS)
 
@@ -752,11 +770,12 @@ def main() -> int:
         drift = max(float(np.max(np.abs(tag_vectors[n] - base_vectors[n]))) for n in base_names)
         max_base_vector_drift = max(max_base_vector_drift, drift)
 
+        pool_names = list(tag_vectors.keys())
         entry["vector_pool_size"] = checked_pool_size(
-            tag, tag_vectors, base_names, counts[tag] - BASE_N
+            tag, tag_vectors, base_names, counts[tag] - BASE_N, pool_names
         )
         cmp_nn = cosine_knn_sets(
-            tag_vectors, base_names, tag_vectors, list(tag_vectors.keys()), K_NEIGHBOURS
+            tag_vectors, base_names, tag_vectors, pool_names, K_NEIGHBOURS
         )
         v_mean, v_median = vector_overlap(ref_nn, cmp_nn, base_names, K_NEIGHBOURS)
         entry["vector_knn_overlap_mean"] = v_mean
@@ -790,12 +809,13 @@ def main() -> int:
     density_embedded = embed("density_control")
     print(f"[measure] density_control embedded in {time.time() - t0:.1f}s", file=sys.stderr)
     density_vectors = load_vectors(con, density_embedded)
+    density_pool_names = list(density_vectors.keys())
     density_pool_size = checked_pool_size(
-        "density_control", density_vectors, base_names, n_density
+        "density_control", density_vectors, base_names, n_density, density_pool_names
     )
 
     density_cmp_nn = cosine_knn_sets(
-        density_vectors, base_names, density_vectors, list(density_vectors.keys()), K_NEIGHBOURS
+        density_vectors, base_names, density_vectors, density_pool_names, K_NEIGHBOURS
     )
     density_mean, density_median = vector_overlap(ref_nn, density_cmp_nn, base_names, K_NEIGHBOURS)
     append_05_vector_mean = results["comparisons"]["append_05"]["vector_knn_overlap_mean"]
@@ -858,12 +878,13 @@ def main() -> int:
     ood_embedded = embed("ood_control")
     print(f"[measure] ood_control embedded in {time.time() - t0:.1f}s", file=sys.stderr)
     ood_vectors = load_vectors(con, ood_embedded)
+    ood_pool_names = list(ood_vectors.keys())
     ood_pool_size = checked_pool_size(
-        "out_of_distribution_control", ood_vectors, base_names, n_ood
+        "out_of_distribution_control", ood_vectors, base_names, n_ood, ood_pool_names
     )
 
     ood_cmp_nn = cosine_knn_sets(
-        ood_vectors, base_names, ood_vectors, list(ood_vectors.keys()), K_NEIGHBOURS
+        ood_vectors, base_names, ood_vectors, ood_pool_names, K_NEIGHBOURS
     )
     ood_mean, ood_median = vector_overlap(ref_nn, ood_cmp_nn, base_names, K_NEIGHBOURS)
 
