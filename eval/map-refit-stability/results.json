@@ -18,6 +18,11 @@
   },
   "base_map_median_nn_spacing": 0.039176290618352184,
   "vector_knn_overlap_k": 20,
+  "vector_knn_tie_breaking": {
+    "reference_rows_scored": 3000,
+    "reference_rows_with_tied_kth_distance": 166,
+    "note": "166 of the 3000 base rows have their 20th-nearest other base row at exactly the same cosine distance as the next one out, because the corpus contains exactly-duplicate descriptions. For those rows there is no unique set of nearest neighbours, and the selection here picks one arbitrarily (np.argpartition) \u2014 differently in the reference pool and in each comparison pool, since they are different arrays. Part of the neighbourhood change every vector_knn_overlap figure below reports is therefore a tie resolved the other way rather than a row genuinely displaced, and each figure sits at or below what an exact-tie convention would give. It is disclosed rather than corrected: a stable convention would move the committed figures without changing the comparison they are read for."
+  },
   "comparisons": {
     "control_B": {
       "n_shared_rows": 3000,
@@ -80,11 +85,12 @@
       "map_vs_vector_overlap_gap_median": 0.35
     }
   },
-  "runtime_seconds": 105.8,
+  "runtime_seconds": 101.0,
   "base_vectors_moved_by_append": 0.0,
   "density_control": {
-    "description": "duplicates the 150 base rows with the smallest own-corpus 20-NN cosine distance (the rows already most redundant with the rest of control_A) instead of append_05's natural next-in-order sample, at the same row count, so the comparison isolates which rows were appended rather than how many. Must drive vector overlap measurably BELOW append_05's own \u2014 proof the comparison can say 'the neighbourhoods changed more' when they genuinely did.",
+    "description": "duplicates the 150 base rows with the smallest own-corpus 20-NN cosine distance (the rows already most redundant with the rest of control_A) instead of append_05's natural next-in-order sample, at the same row count, so the comparison isolates which rows were appended rather than how many. Must drive vector overlap measurably BELOW append_05's own \u2014 proof the comparison can say 'the neighbourhoods changed more' when they genuinely did. vector_pool_size is the separate witness that these rows reached the comparison at all.",
     "n_appended_rows": 150,
+    "vector_pool_size": 3150,
     "knn_overlap_k": 20,
     "vector_knn_overlap_mean": 0.8844666666666667,
     "vector_knn_overlap_median": 0.95,
@@ -92,8 +98,9 @@
     "gap_below_append_05_vector_overlap": 0.07336666666666658
   },
   "out_of_distribution_control": {
-    "description": "appends 150 rows of real English prose from domains this corpus's own subject matter has nothing to do with (legal, medical, culinary, literary), at append_05's own row count, so the comparison is exercised in the opposite direction from density_control. Must leave vector overlap AT OR ABOVE append_05's own \u2014 content this far away cannot compete for an existing row's true top-K neighbourhood, so a run reporting it below would be responding to something other than genuine neighbourhood change. That the metric stays put here is not a control that failed to move; it is the metric behaving correctly, and it strengthens rather than weakens the map-vs-vector reading below.",
+    "description": "appends 150 rows of real English prose from domains this corpus's own subject matter has nothing to do with (legal, medical, culinary, literary), at append_05's own row count, so the comparison is exercised in the opposite direction from density_control. Must leave vector overlap AT OR ABOVE append_05's own \u2014 content this far away mostly cannot compete for an existing row's true top-K neighbourhood, so a run reporting it below would be responding to something other than genuine neighbourhood change. Mostly rather than entirely: a row that far away can still land inside a base row's own top-K radius, so the figure is measured rather than assumed to be 1.0. That the metric stays put here is not a control that failed to move; it is the metric behaving correctly, and it strengthens rather than weakens the map-vs-vector reading below. vector_pool_size is the separate witness that these rows reached the comparison at all \u2014 an overlap that stays high is also exactly what an append that never happened would report.",
     "n_appended_rows": 150,
+    "vector_pool_size": 3150,
     "knn_overlap_k": 20,
     "vector_knn_overlap_mean": 0.9974666666666667,
     "vector_knn_overlap_median": 1.0,
@@ -102,6 +109,6 @@
   },
   "movement_reading": {
     "verdict": "mostly_artefact",
-    "explanation": "At every append fraction measured \u2014 append_05 gap=0.538 (map=0.419 vs vector=0.958), append_20 gap=0.455 (map=0.395 vs vector=0.849), append_50 gap=0.339 (map=0.364 vs vector=0.703) \u2014 the map-space overlap is well below the vector-space overlap for the same 3000 base rows at k=20. A base row's own 256-d vector never moves when other rows are appended (base_vectors_moved_by_append=0.0); what moves, and moves far less than the map does, is which OTHER rows count as its true nearest neighbours \u2014 the reactivity controls confirm this comparison can move in both directions: a same-size, deliberately concentrated append (density_control) drops vector overlap to 0.884 against append_05's 0.958, while a same-size append of content unrelated to the corpus (out_of_distribution_control) leaves it at 0.997 \u2014 at or above append_05's own figure, as it should, since content that far away cannot compete for an existing row's true neighbours. That the out-of-distribution figure does not fall is itself informative: unrelated data genuinely should not disturb existing relationships, and the map rearranges anyway. So the map's rearrangement at every fraction tested is mostly a projection artefact, not the data changing underneath it."
+    "explanation": "At every append fraction measured \u2014 append_05 gap=0.538 (map=0.419 vs vector=0.958), append_20 gap=0.455 (map=0.395 vs vector=0.849), append_50 gap=0.339 (map=0.364 vs vector=0.703) \u2014 the map-space overlap is well below the vector-space overlap for the same 3000 base rows at k=20. A base row's own 256-d vector never moves when other rows are appended (base_vectors_moved_by_append=0.0); what moves, and moves far less than the map does, is which OTHER rows count as its true nearest neighbours \u2014 the reactivity controls confirm this comparison can move in both directions: a same-size, deliberately concentrated append (density_control) drops vector overlap to 0.884 against append_05's 0.958, while a same-size append of content unrelated to the corpus (out_of_distribution_control) leaves it at 0.997 \u2014 at or above append_05's own figure, as it should, since content that far away mostly cannot compete for an existing row's true neighbours. Mostly rather than entirely: a row that far away can still land inside a base row's own top-K radius, and the tie-breaking recorded under vector_knn_tie_breaking contributes as well, which is why that figure is measured rather than assumed to be 1.0. Each control's vector_pool_size is the separate witness that the rows it is supposed to append actually reached the comparison, which the number alone cannot show for a control whose criterion is that the overlap stays high. So the map's rearrangement at every fraction tested is mostly a projection artefact, not the data changing underneath it."
   }
 }

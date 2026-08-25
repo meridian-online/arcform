@@ -722,8 +722,8 @@ def main() -> int:
             "reference_rows_with_tied_kth_distance": ref_ties,
             "note": (
                 f"{ref_ties} of the {len(base_names)} base rows have their "
-                f"{K_NEIGHBOURS}th and {K_NEIGHBOURS + 1}th nearest other base rows "
-                "at exactly the same cosine distance, because the corpus contains "
+                f"{K_NEIGHBOURS}th-nearest other base row at exactly the same cosine "
+                "distance as the next one out, because the corpus contains "
                 "exactly-duplicate descriptions. For those rows there is no unique "
                 "set of nearest neighbours, and the selection here picks one "
                 "arbitrarily (np.argpartition) — differently in the reference pool "
