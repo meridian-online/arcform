@@ -80,10 +80,10 @@
       "map_vs_vector_overlap_gap_median": 0.35
     }
   },
-  "runtime_seconds": 113.8,
+  "runtime_seconds": 105.8,
   "base_vectors_moved_by_append": 0.0,
-  "ac5_distribution_shift_control": {
-    "description": "duplicates the 150 base rows with the smallest own-corpus 20-NN cosine distance (the rows already most redundant with the rest of control_A) instead of append_05's natural next-in-order sample, at the same row count, so the comparison isolates which rows were appended rather than how many",
+  "density_control": {
+    "description": "duplicates the 150 base rows with the smallest own-corpus 20-NN cosine distance (the rows already most redundant with the rest of control_A) instead of append_05's natural next-in-order sample, at the same row count, so the comparison isolates which rows were appended rather than how many. Must drive vector overlap measurably BELOW append_05's own \u2014 proof the comparison can say 'the neighbourhoods changed more' when they genuinely did.",
     "n_appended_rows": 150,
     "knn_overlap_k": 20,
     "vector_knn_overlap_mean": 0.8844666666666667,
@@ -91,8 +91,17 @@
     "append_05_vector_knn_overlap_mean": 0.9578333333333333,
     "gap_below_append_05_vector_overlap": 0.07336666666666658
   },
-  "ac4_movement_reading": {
+  "out_of_distribution_control": {
+    "description": "appends 150 rows of real English prose from domains this corpus's own subject matter has nothing to do with (legal, medical, culinary, literary), at append_05's own row count, so the comparison is exercised in the opposite direction from density_control. Must leave vector overlap AT OR ABOVE append_05's own \u2014 content this far away cannot compete for an existing row's true top-K neighbourhood, so a run reporting it below would be responding to something other than genuine neighbourhood change. That the metric stays put here is not a control that failed to move; it is the metric behaving correctly, and it strengthens rather than weakens the map-vs-vector reading below.",
+    "n_appended_rows": 150,
+    "knn_overlap_k": 20,
+    "vector_knn_overlap_mean": 0.9974666666666667,
+    "vector_knn_overlap_median": 1.0,
+    "append_05_vector_knn_overlap_mean": 0.9578333333333333,
+    "margin_at_or_above_append_05_vector_overlap": 0.03963333333333341
+  },
+  "movement_reading": {
     "verdict": "mostly_artefact",
-    "explanation": "At every append fraction measured \u2014 append_05 gap=0.538 (map=0.419 vs vector=0.958), append_20 gap=0.455 (map=0.395 vs vector=0.849), append_50 gap=0.339 (map=0.364 vs vector=0.703) \u2014 the map-space overlap is well below the vector-space overlap for the same 3000 base rows at k=20. A base row's own 256-d vector never moves when other rows are appended (base_vectors_moved_by_append=0.0); what moves, and moves far less than the map does, is which OTHER rows count as its true nearest neighbours. AC5's control shows this comparison is not just reporting near-1.0 by construction: a same-size, deliberately concentrated append drops vector overlap to 0.884 against append_05's 0.958. So the map's rearrangement at every fraction tested is mostly a projection artefact, not the data changing underneath it."
+    "explanation": "At every append fraction measured \u2014 append_05 gap=0.538 (map=0.419 vs vector=0.958), append_20 gap=0.455 (map=0.395 vs vector=0.849), append_50 gap=0.339 (map=0.364 vs vector=0.703) \u2014 the map-space overlap is well below the vector-space overlap for the same 3000 base rows at k=20. A base row's own 256-d vector never moves when other rows are appended (base_vectors_moved_by_append=0.0); what moves, and moves far less than the map does, is which OTHER rows count as its true nearest neighbours \u2014 the reactivity controls confirm this comparison can move in both directions: a same-size, deliberately concentrated append (density_control) drops vector overlap to 0.884 against append_05's 0.958, while a same-size append of content unrelated to the corpus (out_of_distribution_control) leaves it at 0.997 \u2014 at or above append_05's own figure, as it should, since content that far away cannot compete for an existing row's true neighbours. That the out-of-distribution figure does not fall is itself informative: unrelated data genuinely should not disturb existing relationships, and the map rearranges anyway. So the map's rearrangement at every fraction tested is mostly a projection artefact, not the data changing underneath it."
   }
 }

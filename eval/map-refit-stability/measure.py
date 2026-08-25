@@ -97,27 +97,45 @@ neighbours. That is why, unlike the map side, the candidate pool here is NOT res
 to base rows: it is every row present in the comparison experiment (base + appended),
 because excluding the appended rows would make this side incapable of ever moving (the
 vectors of the base rows are fixed, so a fixed candidate pool could only ever score
-1.0) and AC5 exists precisely to catch a measurement that cannot move. Reported per
-append tag as `vector_knn_overlap_mean`/`_median` beside the map's own
-`knn_overlap_mean`/`_median`, and as `map_vs_vector_overlap_gap_mean`/`_median` —
-vector overlap minus map overlap — so a reader gets the gap the finding rests on
+1.0) and the reactivity controls below exist precisely to catch a measurement that
+cannot move. Reported per append tag as `vector_knn_overlap_mean`/`_median` beside the
+map's own `knn_overlap_mean`/`_median`, and as `map_vs_vector_overlap_gap_mean`/`_median`
+— vector overlap minus map overlap — so a reader gets the gap the finding rests on
 without doing the subtraction themselves. A positive gap means the true vector
 relationships held together more than the map did: movement the map shows that the
 data does not support, i.e. artefact. A gap near zero means the map moved about as
 much as the data actually did: information.
 
-DISTRIBUTION-SHIFT CONTROL (AC5 — can this comparison ever say "more"). A vector-space
-overlap that always comes back near 1.0 would be indistinguishable from a measurement
-that never looks at the appended rows at all. So one more experiment,
-`shift_control`, appends — at append_05's own row count, for a same-size comparison —
-not the natural next rows in corpus order but VERBATIM DUPLICATES of the base rows
-already closest to their own K-th nearest OTHER base row (smallest own-corpus K-NN
-cosine distance in control_A — the rows most redundant with the rest of the corpus
-already). Concentrating appended mass on the corpus's most crowded existing regions,
-rather than spreading it the way a natural append does, measurably lowers vector
-overlap further than append_05's own natural rows do at the same count — checked by an
-assertion in `main()` that fails loudly, not a number a reader has to notice is
-missing, if a future corpus or model change ever makes that stop being true.
+REACTIVITY CONTROLS (can this comparison move, in both directions, or is it just
+reporting near-1.0 by construction). A vector-space overlap that always comes back
+near 1.0 would be indistinguishable from a measurement that never looks at the
+appended rows at all, and a measurement that always says "lower" would be just as
+uninformative in the other direction. Two more experiments, checked by assertions in
+`main()` that fail loudly rather than leave a number a reader has to notice is
+missing:
+
+  density_control — appends, at append_05's own row count for a same-size comparison,
+    not the natural next rows in corpus order but VERBATIM DUPLICATES of the base rows
+    already closest to their own K-th nearest OTHER base row (smallest own-corpus K-NN
+    cosine distance in control_A — the rows most redundant with the rest of the corpus
+    already). Concentrating appended mass on the corpus's most crowded existing
+    regions, rather than spreading it the way a natural append does, must measurably
+    LOWER vector overlap below append_05's own natural rows at the same count — proof
+    the comparison can say "the neighbourhoods changed more" when they genuinely did.
+
+  out_of_distribution_control — appends, at the same row count, real English prose
+    from domains the corpus has nothing to do with (legal, medical, culinary, literary
+    — nothing about the corpus's own subject matter). Genuinely unrelated content is,
+    by construction, too far away in cosine distance to compete for any base row's
+    true top-K neighbourhood — a base row's own K-th-nearest-neighbour distance among
+    its own kind is comfortably smaller than an out-of-distribution row's distance to
+    its nearest base row — so this control's vector overlap must come back AT OR ABOVE
+    append_05's own natural figure. A run reporting it BELOW would mean the comparison
+    is responding to something other than genuine neighbourhood competition, which is
+    the observable failure this control exists to catch. That the metric stays put
+    under unrelated content is not a control that failed to move — it is the metric
+    behaving correctly, and it strengthens the map-vs-vector reading rather than
+    weakening it.
 
 Run: `uv run eval/map-refit-stability/measure.py`. Writes results.json beside this
 file. No flags — the corpus, split and fractions are the measurement, not parameters
@@ -161,21 +179,58 @@ BASE_N = 3000
 APPEND_FRACTIONS = {"append_05": 0.05, "append_20": 0.20, "append_50": 0.50}
 K_NEIGHBOURS = 20  # matches finetype's static-embedding-map-fidelity kNN-overlap K
 
-# AC5's control. Suffix, not a random one, so a re-run is byte-identical: it is
+# density_control's suffix. Not a random one, so a re-run is byte-identical: it is
 # appended to an existing `name` (the corpus's own unique key), so it must not
-# already appear in the corpus — asserted in build_shift_control_slice() rather than
-# assumed.
-SHIFT_DUP_SUFFIX = "__shift_dup"
+# already appear in the corpus — asserted in build_density_control_slice() rather
+# than assumed.
+DENSITY_DUP_SUFFIX = "__density_dup"
 
-# AC5's bar for "measurably more". The measured gap between shift_control and
+# density_control's bar for "measurably lower". The measured gap between it and
 # append_05's own vector overlap is ~0.073 on the committed corpus/model — every
 # figure here is exactly deterministic (text_embed is a pure per-row function, UMAP's
 # SEED is pinned), so this is not read against sampling noise. 0.03 is comfortably
 # below the measured gap and comfortably above zero, so it catches a comparison that
 # stopped moving without being brittle to a small corpus or model change.
-MIN_SHIFT_CONTROL_GAP = 0.03
+MIN_DENSITY_CONTROL_GAP = 0.03
 
-# AC4's verdict thresholds, read against the map-vs-vector overlap gap (vector minus
+# out_of_distribution_control's bar for "at or above, allowing for float noise". The
+# measured margin on the committed corpus/model is comfortably positive (the control
+# lands noticeably above append_05's own figure, not merely tied with it), so a small
+# tolerance below zero catches a comparison that started scoring unrelated content as
+# competitive without being brittle to floating-point round-off between runs.
+MAX_OOD_CONTROL_DEFICIT = 0.01
+
+# out_of_distribution_control's corpus: real English prose from domains this corpus's
+# own subject matter has nothing to do with — legal, medical, culinary, literary. Real
+# prose, not duplicated corpus rows and not gibberish (gibberish would tokenise to
+# near-nothing and land near the zero vector, a different and less interesting failure
+# mode than genuinely unrelated content landing far away). Cycled to reach whatever row count the
+# comparison needs.
+OOD_SENTENCES = [
+    "Preheat the oven to 190 degrees and cream the butter with the sugar until pale and fluffy.",
+    "The tenant shall indemnify the landlord against any claim arising from a breach of this covenant.",
+    "Administer the medication twice daily with food and monitor closely for gastrointestinal distress.",
+    "It was the best of times, it was the worst of times, it was the age of wisdom and the age of foolishness.",
+    "The defendant's motion to dismiss was denied for lack of proper venue and insufficient jurisdiction.",
+    "Fold the whipped cream gently into the melted chocolate until no streaks of white remain visible.",
+    "The patient presented with elevated blood pressure and a persistent cough lasting three weeks.",
+    "She wandered lonely as a cloud that floats on high o'er vales and hills, when all at once she saw a crowd.",
+    "The board of directors convened an emergency session to discuss the terms of the pending merger.",
+    "Season the lamb shanks generously with rosemary and thyme before searing them on all sides.",
+    "The plaintiff alleges a breach of fiduciary duty and seeks both compensatory and punitive damages.",
+    "A gentle rain fell over the moor as the shepherd counted his flock before the light failed entirely.",
+    "The clinical trial enrolled several thousand participants across a dozen independent sites.",
+    "Whisk the flour, baking soda and salt together before folding in the wet ingredients by hand.",
+    "The treaty was ratified by both legislatures after eighteen months of difficult negotiation.",
+    "Braise the short ribs low and slow until the meat falls easily away from the bone.",
+    "The appellate court reversed the lower court's ruling and remanded the case for further proceedings.",
+    "He measured out his life in coffee spoons and watched the evening spread out against the sky.",
+    "The surgeon reviewed the imaging carefully before scheduling the procedure for the following week.",
+    "Simmer the stock for several hours, skimming the surface occasionally, until it turns rich and clear.",
+]
+OOD_NAME_PREFIX = "__ood_control_"
+
+# The written-answer verdict thresholds, read against the map-vs-vector overlap gap (vector minus
 # map) at EVERY append fraction. 0.15 is a large fraction of the 0-1 overlap scale —
 # comfortably below the ~0.34-0.54 gaps measured on the committed corpus — chosen so
 # "mostly artefact" requires the vectors to visibly outperform the map at every
@@ -264,25 +319,25 @@ def build_corpus_slices(con: duckdb.DuckDBPyConnection) -> dict[str, int]:
     return counts
 
 
-def build_shift_control_slice(con: duckdb.DuckDBPyConnection, target_names: list[str]) -> int:
-    """AC5's control slice: BASE_N base rows plus a VERBATIM DUPLICATE (same category,
-    same description, a suffixed name) of each row in `target_names` — a distribution
-    concentrated on the corpus's own most-redundant rows rather than append_05's
-    natural next-in-order sample. Returns the number of duplicate rows written (equal
-    to len(target_names), asserted below the call site against append_05's own
-    count)."""
-    if any(SHIFT_DUP_SUFFIX in n for n in target_names):
+def build_density_control_slice(con: duckdb.DuckDBPyConnection, target_names: list[str]) -> int:
+    """density_control's slice: BASE_N base rows plus a VERBATIM DUPLICATE (same
+    category, same description, a suffixed name) of each row in `target_names` —
+    appended mass concentrated on the corpus's own most-redundant rows rather than
+    append_05's natural next-in-order sample. Returns the number of duplicate rows
+    written (equal to len(target_names), asserted below the call site against
+    append_05's own count)."""
+    if any(DENSITY_DUP_SUFFIX in n for n in target_names):
         raise RuntimeError(
-            f"a target name already contains {SHIFT_DUP_SUFFIX!r} — the suffix is no "
-            "longer safe to use as a uniqueness guarantee for the duplicate rows."
+            f"a target name already contains {DENSITY_DUP_SUFFIX!r} — the suffix is "
+            "no longer safe to use as a uniqueness guarantee for the duplicate rows."
         )
-    dest = BUILD / "shift_control.parquet"
+    dest = BUILD / "density_control.parquet"
     con.execute(
         f"""
         COPY (
             SELECT name, category, description FROM ordered WHERE ord < {BASE_N}
             UNION ALL
-            SELECT name || '{SHIFT_DUP_SUFFIX}' AS name, category, description
+            SELECT name || '{DENSITY_DUP_SUFFIX}' AS name, category, description
             FROM ordered
             WHERE ord < {BASE_N} AND name = ANY(?)
         ) TO '{dest.as_posix()}' (FORMAT parquet)
@@ -290,6 +345,43 @@ def build_shift_control_slice(con: duckdb.DuckDBPyConnection, target_names: list
         [target_names],
     )
     return len(target_names)
+
+
+def build_ood_control_slice(con: duckdb.DuckDBPyConnection, n_rows: int) -> int:
+    """out_of_distribution_control's slice: BASE_N base rows plus n_rows rows of real
+    English prose from domains this corpus's own subject matter has nothing to do
+    with — OOD_SENTENCES cycled to reach n_rows, each given a unique prefixed name.
+    Returns n_rows (asserted at the call site against append_05's own count, for a
+    same-size comparison)."""
+    existing = con.execute(
+        f"SELECT count(*) FROM ordered WHERE ord < {BASE_N} AND "
+        f"name LIKE '{OOD_NAME_PREFIX}%'"
+    ).fetchone()[0]
+    if existing:
+        raise RuntimeError(
+            f"{existing} base row name(s) already start with {OOD_NAME_PREFIX!r} — "
+            "the prefix is no longer safe to use as a uniqueness guarantee for the "
+            "out-of-distribution rows."
+        )
+    con.execute(
+        "CREATE OR REPLACE TABLE ood_rows (name VARCHAR, category VARCHAR, description VARCHAR)"
+    )
+    rows = [
+        (f"{OOD_NAME_PREFIX}{i:04d}", "out_of_distribution", OOD_SENTENCES[i % len(OOD_SENTENCES)])
+        for i in range(n_rows)
+    ]
+    con.executemany("INSERT INTO ood_rows VALUES (?, ?, ?)", rows)
+    dest = BUILD / "ood_control.parquet"
+    con.execute(
+        f"""
+        COPY (
+            SELECT name, category, description FROM ordered WHERE ord < {BASE_N}
+            UNION ALL
+            SELECT name, category, description FROM ood_rows
+        ) TO '{dest.as_posix()}' (FORMAT parquet)
+        """
+    )
+    return n_rows
 
 
 def embed(tag: str) -> Path:
@@ -397,7 +489,7 @@ def own_neighbour_distances(
 ) -> dict[str, float]:
     """Each name's cosine distance to its own k-th nearest OTHER name in `names` — how
     redundant that row already is with the rest of the corpus. Small distance means
-    many close relatives already exist; used by the AC5 control to pick which rows to
+    many close relatives already exist; used by density_control to pick which rows to
     duplicate, not by anything else here."""
     vecs = np.array([vectors_by_name[n] for n in names])
     vecs = vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
@@ -508,10 +600,10 @@ def main() -> int:
         "runtime_seconds": None,
     }
 
-    # AC1 + AC2: the map-space comparison (unchanged) plus, beside it, the same
-    # comparison run in the 256-d vector space over the same base rows and the same
-    # k, and the gap between the two — vector overlap minus map overlap, so a reader
-    # does not have to subtract two figures to get the number the fix decides on.
+    # The map-space comparison (unchanged) plus, beside it, the same comparison run
+    # in the 256-d vector space over the same base rows and the same k, and the gap
+    # between the two — vector overlap minus map overlap, so a reader does not have
+    # to subtract two figures to get the number the fix decides on.
     max_base_vector_drift = 0.0
     for tag in ("control_B", *APPEND_FRACTIONS):
         entry = compare(xy["control_A"], xy[tag], base_names, scale)
@@ -538,58 +630,120 @@ def main() -> int:
     # VECTOR-SPACE COMPARISON section of this file's docstring.
     results["base_vectors_moved_by_append"] = max_base_vector_drift
 
-    # AC5: the distribution-shift control. Same row count as append_05, drawn from a
-    # deliberately different distribution — duplicates of the base rows already
-    # closest to their own K-th nearest neighbour, not the natural next rows.
-    n_shift = round(BASE_N * APPEND_FRACTIONS["append_05"])
+    # density_control: same row count as append_05, drawn from a deliberately
+    # concentrated distribution — duplicates of the base rows already closest to
+    # their own K-th nearest neighbour, not the natural next rows.
+    n_density = round(BASE_N * APPEND_FRACTIONS["append_05"])
     own_dist = own_neighbour_distances(base_vectors, base_names, K_NEIGHBOURS)
-    shift_targets = sorted(base_names, key=lambda n: (own_dist[n], n))[:n_shift]
-    n_dup = build_shift_control_slice(con, shift_targets)
-    assert n_dup == n_shift
+    density_targets = sorted(base_names, key=lambda n: (own_dist[n], n))[:n_density]
+    n_dup = build_density_control_slice(con, density_targets)
+    assert n_dup == n_density
 
     t0 = time.time()
-    shift_embedded = embed("shift_control")
-    print(f"[measure] shift_control embedded in {time.time() - t0:.1f}s", file=sys.stderr)
-    shift_vectors = load_vectors(con, shift_embedded)
+    density_embedded = embed("density_control")
+    print(f"[measure] density_control embedded in {time.time() - t0:.1f}s", file=sys.stderr)
+    density_vectors = load_vectors(con, density_embedded)
 
-    shift_cmp_nn = cosine_knn_sets(
-        shift_vectors, base_names, shift_vectors, list(shift_vectors.keys()), K_NEIGHBOURS
+    density_cmp_nn = cosine_knn_sets(
+        density_vectors, base_names, density_vectors, list(density_vectors.keys()), K_NEIGHBOURS
     )
-    shift_mean, shift_median = vector_overlap(ref_nn, shift_cmp_nn, base_names, K_NEIGHBOURS)
+    density_mean, density_median = vector_overlap(ref_nn, density_cmp_nn, base_names, K_NEIGHBOURS)
     append_05_vector_mean = results["comparisons"]["append_05"]["vector_knn_overlap_mean"]
 
-    # The self-check this control exists to run: if it does not move the vector
+    # The self-check density_control exists to run: if it does not move the vector
     # neighbourhoods measurably more than append_05's own natural rows do at the same
     # count, the vector-space comparison above cannot be trusted to distinguish a
     # real "movement is information" reading from a probe that never really looks —
-    # fail loudly rather than let AC4's conclusion rest on an unproven instrument.
-    assert append_05_vector_mean - shift_mean >= MIN_SHIFT_CONTROL_GAP, (
-        "AC5 self-check failed: the distribution-shift control's vector overlap "
-        f"({shift_mean:.4f}) is not at least {MIN_SHIFT_CONTROL_GAP} below append_05's "
-        f"own vector overlap ({append_05_vector_mean:.4f}) at the same row count "
-        f"({n_dup}). The vector-space comparison above would then be unable to tell "
-        "a genuine 'movement is information' reading from a measurement that cannot "
-        "register a distribution shift at all — see AC5 in the card and the "
-        "DISTRIBUTION-SHIFT CONTROL section of this file's docstring."
+    # fail loudly rather than let the written reading below rest on an unproven
+    # instrument.
+    assert append_05_vector_mean - density_mean >= MIN_DENSITY_CONTROL_GAP, (
+        "density_control self-check failed: its vector overlap "
+        f"({density_mean:.4f}) is not at least {MIN_DENSITY_CONTROL_GAP} below "
+        f"append_05's own vector overlap ({append_05_vector_mean:.4f}) at the same "
+        f"row count ({n_dup}). The vector-space comparison above would then be "
+        "unable to tell a genuine 'movement is information' reading from a "
+        "measurement that cannot register a neighbourhood change at all — see the "
+        "REACTIVITY CONTROLS section of this file's docstring."
     )
 
-    results["ac5_distribution_shift_control"] = {
+    results["density_control"] = {
         "description": (
             f"duplicates the {n_dup} base rows with the smallest own-corpus "
             f"{K_NEIGHBOURS}-NN cosine distance (the rows already most redundant "
             "with the rest of control_A) instead of append_05's natural "
             "next-in-order sample, at the same row count, so the comparison "
-            "isolates which rows were appended rather than how many"
+            "isolates which rows were appended rather than how many. Must drive "
+            "vector overlap measurably BELOW append_05's own — proof the "
+            "comparison can say 'the neighbourhoods changed more' when they "
+            "genuinely did."
         ),
         "n_appended_rows": n_dup,
         "knn_overlap_k": K_NEIGHBOURS,
-        "vector_knn_overlap_mean": shift_mean,
-        "vector_knn_overlap_median": shift_median,
+        "vector_knn_overlap_mean": density_mean,
+        "vector_knn_overlap_median": density_median,
         "append_05_vector_knn_overlap_mean": append_05_vector_mean,
-        "gap_below_append_05_vector_overlap": append_05_vector_mean - shift_mean,
+        "gap_below_append_05_vector_overlap": append_05_vector_mean - density_mean,
     }
 
-    # AC4: a short written answer, built from this run's own numbers so it cannot go
+    # out_of_distribution_control: same row count as append_05, drawn from real
+    # English prose the corpus's own subject matter has nothing to do with — the
+    # opposite direction from density_control. Genuinely unrelated rows cannot
+    # compete for an existing row's true top-K neighbourhood, so this control's own
+    # vector overlap must land AT OR ABOVE append_05's own natural figure.
+    n_ood = round(BASE_N * APPEND_FRACTIONS["append_05"])
+    n_ood_written = build_ood_control_slice(con, n_ood)
+    assert n_ood_written == n_ood
+
+    t0 = time.time()
+    ood_embedded = embed("ood_control")
+    print(f"[measure] ood_control embedded in {time.time() - t0:.1f}s", file=sys.stderr)
+    ood_vectors = load_vectors(con, ood_embedded)
+
+    ood_cmp_nn = cosine_knn_sets(
+        ood_vectors, base_names, ood_vectors, list(ood_vectors.keys()), K_NEIGHBOURS
+    )
+    ood_mean, ood_median = vector_overlap(ref_nn, ood_cmp_nn, base_names, K_NEIGHBOURS)
+
+    # The self-check out_of_distribution_control exists to run: content this far
+    # away in cosine space cannot enter any base row's true top-K neighbourhood, so
+    # if this control's overlap comes back measurably BELOW append_05's own natural
+    # figure, the vector-space comparison above is responding to something other
+    # than genuine neighbourhood competition — fail loudly rather than let the
+    # written reading below rest on an unproven instrument.
+    assert ood_mean >= append_05_vector_mean - MAX_OOD_CONTROL_DEFICIT, (
+        "out_of_distribution_control self-check failed: its vector overlap "
+        f"({ood_mean:.4f}) is more than {MAX_OOD_CONTROL_DEFICIT} below append_05's "
+        f"own vector overlap ({append_05_vector_mean:.4f}) at the same row count "
+        f"({n_ood_written}). Genuinely unrelated content should not be able to "
+        "displace an existing row's true neighbours, so a deficit this large means "
+        "the vector-space comparison above is responding to something other than "
+        "genuine neighbourhood competition — see the REACTIVITY CONTROLS section of "
+        "this file's docstring."
+    )
+
+    results["out_of_distribution_control"] = {
+        "description": (
+            f"appends {n_ood_written} rows of real English prose from domains this "
+            "corpus's own subject matter has nothing to do with (legal, medical, "
+            "culinary, literary), at append_05's own row count, so the comparison "
+            "is exercised in the opposite direction from density_control. Must "
+            "leave vector overlap AT OR ABOVE append_05's own — content this far "
+            "away cannot compete for an existing row's true top-K neighbourhood, "
+            "so a run reporting it below would be responding to something other "
+            "than genuine neighbourhood change. That the metric stays put here is "
+            "not a control that failed to move; it is the metric behaving "
+            "correctly, and it strengthens rather than weakens the map-vs-vector "
+            "reading below."
+        ),
+        "n_appended_rows": n_ood_written,
+        "knn_overlap_k": K_NEIGHBOURS,
+        "vector_knn_overlap_mean": ood_mean,
+        "vector_knn_overlap_median": ood_median,
+        "append_05_vector_knn_overlap_mean": append_05_vector_mean,
+        "margin_at_or_above_append_05_vector_overlap": ood_mean - append_05_vector_mean,
+    }
+
+    # A short written answer, built from this run's own numbers so it cannot go
     # stale the way prose committed once and never revisited does (the reason
     # check_findings.py exists for the figures above).
     append_tags = list(APPEND_FRACTIONS)
@@ -607,32 +761,41 @@ def main() -> int:
         f"vector={results['comparisons'][t]['vector_knn_overlap_mean']:.3f})"
         for t in append_tags
     )
+    reactivity_summary = (
+        f"the reactivity controls confirm this comparison can move in both "
+        f"directions: a same-size, deliberately concentrated append (density_control) "
+        f"drops vector overlap to {density_mean:.3f} against append_05's "
+        f"{append_05_vector_mean:.3f}, while a same-size append of content unrelated "
+        f"to the corpus (out_of_distribution_control) leaves it at {ood_mean:.3f} — "
+        "at or above append_05's own figure, as it should, since content that far "
+        "away cannot compete for an existing row's true neighbours. That the "
+        "out-of-distribution figure does not fall is itself informative: unrelated "
+        "data genuinely should not disturb existing relationships, and the map "
+        "rearranges anyway."
+    )
     explanation = (
         f"At every append fraction measured — {gap_summary} — the map-space overlap "
         "is well below the vector-space overlap for the same "
         f"{BASE_N} base rows at k={K_NEIGHBOURS}. A base row's own 256-d vector never "
         f"moves when other rows are appended (base_vectors_moved_by_append="
         f"{max_base_vector_drift}); what moves, and moves far less than the map "
-        "does, is which OTHER rows count as its true nearest neighbours. AC5's "
-        f"control shows this comparison is not just reporting near-1.0 by "
-        f"construction: a same-size, deliberately concentrated append drops vector "
-        f"overlap to {shift_mean:.3f} against append_05's {append_05_vector_mean:.3f}. "
-        "So the map's rearrangement at every fraction tested is mostly a projection "
-        "artefact, not the data changing underneath it."
+        f"does, is which OTHER rows count as its true nearest neighbours — "
+        f"{reactivity_summary} So the map's rearrangement at every fraction tested "
+        "is mostly a projection artefact, not the data changing underneath it."
         if verdict == "mostly_artefact"
         else f"At every append fraction measured — {gap_summary} — the map-space and "
         "vector-space overlaps track closely, so the map's rearrangement mostly "
-        "reflects genuine change in the underlying data rather than an artefact of "
-        "the projection."
+        f"reflects genuine change in the underlying data rather than an artefact of "
+        f"the projection. {reactivity_summary}"
         if verdict == "mostly_information"
         else f"At every append fraction measured — {gap_summary} — the gap between "
         "map-space and vector-space overlap is neither consistently large nor "
         "consistently small, so the map's movement reads as genuinely mixed: part "
-        "artefact, part real change in the data, and the fractions do not point the "
-        "same way."
+        f"artefact, part real change in the data, and the fractions do not point the "
+        f"same way. {reactivity_summary}"
     )
-    results["ac4_movement_reading"] = {"verdict": verdict, "explanation": explanation}
-    print(f"[measure] AC4 reading: {verdict}", file=sys.stderr)
+    results["movement_reading"] = {"verdict": verdict, "explanation": explanation}
+    print(f"[measure] movement reading: {verdict}", file=sys.stderr)
     print(f"[measure] {explanation}", file=sys.stderr)
 
     results["runtime_seconds"] = round(time.time() - started, 1)
