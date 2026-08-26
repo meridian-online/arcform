@@ -1508,18 +1508,50 @@ mod tests {
         })
     }
 
-    // Write an executable script — the stand-in for a released binary. `body` is the
-    // whole script, so a test controls exactly what the version command reports.
+    // The stand-in for a released binary — `body` is the whole script, so a test
+    // controls exactly what the version command reports.
+    //
+    // Does NOT write an executable at `path` and exec it: that is the exact
+    // write-then-exec race `fake_finetype` in src/mcp/finetype.rs used to have, and
+    // this crate has twelve call sites of it (see
+    // tests/fixtures/fake_tool_dispatcher.sh for the mechanism this repeats and why
+    // it removes the race, not just narrows it). `path` becomes a symlink to that
+    // checked-in dispatcher — `symlink()` is a directory-entry operation, never an
+    // open-for-write of its target, so creating or replacing it can't race anyone's
+    // fork — and `body` lands in a sidecar `<path>.script` that the dispatcher hands
+    // to `sh` to interpret. `sh` reading that sidecar is a read(), never an
+    // execve() of it, so a concurrent write to the sidecar (never marked
+    // executable, unlike the file this replaced) can't trip ETXTBSY either.
+    #[cfg(unix)]
+    fn write_tool(path: &Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let dispatcher = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_tool_dispatcher.sh"
+        ));
+        let mut script_name = path.as_os_str().to_owned();
+        script_name.push(".script");
+        fs::write(PathBuf::from(script_name), body).unwrap();
+        // A repeat call at the same path (several tests rewrite the same tool to
+        // change its reported version) replaces a prior symlink; `symlink` itself
+        // refuses to overwrite, so the stale entry is unlinked first. Removing a
+        // directory entry is not a write to the dispatcher it may point at, so this
+        // cannot reintroduce the race either.
+        let _ = fs::remove_file(path);
+        std::os::unix::fs::symlink(dispatcher, path).unwrap();
+    }
+
+    // No symlinks off unix, and every one of these tests already runs only where the
+    // exec they drive (`sh -c "$ARC_TOOL"`) can. Kept compiling rather than exec-safe,
+    // matching this crate's existing unix-only CI.
+    #[cfg(not(unix))]
     fn write_tool(path: &Path, body: &str) {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, body).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
     }
 
     fn banner(version: &str) -> String {
