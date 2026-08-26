@@ -129,8 +129,11 @@ DEFAULT_MIN_DIST = 0.1
 # load rather than by an exception from inside UMAP an hour into a run. `euclidean` is
 # umap-learn's own default and the right reading of an arbitrary feature matrix;
 # `cosine` is the right reading of L2-normalised vectors, which is what an embedding
-# is. Adding a third is a line here, a line in the operator's config validation, and a
-# test that the map moves.
+# is. Adding a third is a line here AND a line changing UMAP_METRICS in src/operator.rs
+# (which both the authoring schema's `enum` and the operator's config validation read
+# from) — `umap_project_metrics_list_agrees_with_the_script` parses this exact tuple out
+# of the frozen bytes and reddens if the two lists disagree, so this is not a comment
+# asking you to remember, it is a test that fails if you do not.
 METRICS = ("euclidean", "cosine")
 DEFAULT_METRIC = "euclidean"
 

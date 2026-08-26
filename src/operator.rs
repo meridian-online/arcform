@@ -4287,11 +4287,22 @@ mod tests {
     /// materialised, it is named first, and the bytes on disk are the bytes `@1`
     /// addresses. This is the half of `run` a machine with no `uv` can still check —
     /// and every CI runner here is one.
+    ///
+    /// All three optional knobs are set here, to distinct non-default values, rather
+    /// than left unset as an argv-builder test alone would: `umap_project_args_*`
+    /// already proves the pure builder emits the right flags when handed values
+    /// directly, but nothing before this test drove the WIRING between a parsed
+    /// config and that builder — `cfg.neighbors`, `cfg.min_dist` and
+    /// `cfg.metric.as_deref()` at the call site in `umap_project_invocation`. A config
+    /// with every knob unset cannot tell "threaded" from "silently dropped", because
+    /// omitted-and-defaulted look identical in the argv: setting all three here is
+    /// what makes this test redden if any one of the three is replaced with `None` or
+    /// a constant at that call site.
     #[test]
     fn umap_project_invocation_materialises_the_frozen_script_and_names_it() {
         let tmp = tempfile::tempdir().unwrap();
         let with: Value = serde_yaml::from_str(
-            "input: build/homes.parquet\ncolumns: [longitude, latitude]\nout: build/mapped.parquet",
+            "input: build/homes.parquet\ncolumns: [longitude, latitude]\nout: build/mapped.parquet\nneighbors: 30\nmin_dist: 0.25\nmetric: cosine",
         )
         .unwrap();
         let cfg = UmapProjectConfig::parse(&with).unwrap();
@@ -4320,8 +4331,17 @@ mod tests {
                     .join("build/mapped.parquet")
                     .display()
                     .to_string(),
+                "--neighbors",
+                "30",
+                "--min-dist",
+                "0.25",
+                "--metric",
+                "cosine",
             ],
-            "every path reaches the script resolved against the protocol directory"
+            "every path reaches the script resolved against the protocol directory, \
+             and `neighbors:`, `min_dist:` and `metric:` reach the invocation with the \
+             values the manifest set — not just the values `umap_project_args` would \
+             emit if handed them directly"
         );
         assert!(
             tmp.path().join("build").is_dir(),
@@ -4506,6 +4526,39 @@ mod tests {
                  and opens no socket"
             );
         }
+    }
+
+    /// [`UMAP_METRICS`] is the one place the authoring schema's `enum` (`with_schema`)
+    /// and this operator's `validate` both read from — those two cannot disagree with
+    /// each other. What they COULD still disagree with is the frozen script's own
+    /// tuple, which is a separate literal in a different language: narrowing one side
+    /// without the other lets a manifest validate a metric the script's argparse then
+    /// refuses (or the reverse — a manifest refused for a metric the script would
+    /// have accepted). Parsed out of the embedded bytes `op@1` addresses rather than
+    /// copied by hand, so that divergence reddens here instead of an hour into a run.
+    #[test]
+    fn umap_project_metrics_list_agrees_with_the_script() {
+        let needle = "METRICS = (";
+        let start = UMAP_PROJECT_PY
+            .find(needle)
+            .expect("umap_project.py must define METRICS = (...)")
+            + needle.len();
+        let end = UMAP_PROJECT_PY[start..]
+            .find(')')
+            .expect("the METRICS tuple must close")
+            + start;
+        let script_metrics: Vec<&str> = UMAP_PROJECT_PY[start..end]
+            .split(',')
+            .map(|s| s.trim().trim_matches('"'))
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(
+            script_metrics,
+            UMAP_METRICS.to_vec(),
+            "umap_project.py's METRICS tuple has diverged from UMAP_METRICS in \
+             src/operator.rs, which the authoring schema's `enum` and this \
+             operator's `validate` both read from"
+        );
     }
 
     // ── text_embed ───────────────────────────────────────────────────────────
@@ -4856,6 +4909,14 @@ mod tests {
 
     /// What is handed to `uv`, decided without spawning it — the same check the
     /// projection gets, for the same reason.
+    ///
+    /// `vector_column:` is set here, to a name distinct from every other string in
+    /// this manifest, for the same reason the projection's three knobs are set to
+    /// distinct values in its own version of this test: `text_embed_args_*` already
+    /// proves the pure builder emits `--vector-column` when handed one directly, but
+    /// nothing before this test drove `cfg.vector_column.as_deref()` at the call site
+    /// in `text_embed_invocation` — a manifest that never sets it cannot tell
+    /// "threaded" from "silently dropped" in the resulting argv.
     #[test]
     fn text_embed_invocation_materialises_the_frozen_script_and_names_it() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4869,7 +4930,7 @@ mod tests {
         std::fs::write(&extension, b"not a real extension").unwrap();
         let release = "minishlab/potion-base-8M@bf8b056651a2c21b8d2565580b8569da283cab23";
         let with: Value = serde_yaml::from_str(&format!(
-            "input: build/corpus.parquet\ntext_column: description\nextension: vendor/staticembed.duckdb_extension\nout: build/embedded.parquet\nmodel: models/potion\nmodel_release: {release}"
+            "input: build/corpus.parquet\ntext_column: description\nextension: vendor/staticembed.duckdb_extension\nout: build/embedded.parquet\nvector_column: description_vector\nmodel: models/potion\nmodel_release: {release}"
         ))
         .unwrap();
         let cfg = TextEmbedConfig::parse(&with).unwrap();
@@ -4902,12 +4963,17 @@ mod tests {
                     .join("build/embedded.parquet")
                     .display()
                     .to_string(),
+                "--vector-column",
+                "description_vector",
                 "--model",
                 &model.display().to_string(),
                 "--model-release",
                 release,
             ],
-            "every path reaches the script resolved against the protocol directory"
+            "every path reaches the script resolved against the protocol directory, \
+             and `vector_column:` reaches the invocation with the name the manifest \
+             set — not just the name `text_embed_args` would emit if handed it \
+             directly"
         );
     }
 
