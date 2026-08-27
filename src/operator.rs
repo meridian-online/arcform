@@ -115,6 +115,7 @@ static SPLINK_RESOLVE: SplinkResolve = SplinkResolve;
 static GLEIF_RA_FETCH: GleifRaFetch = GleifRaFetch;
 static UMAP_PROJECT: UmapProject = UmapProject;
 static TEXT_EMBED: TextEmbed = TextEmbed;
+static UV: Uv = Uv;
 #[cfg(feature = "opendal")]
 static OPENDAL_FETCH: OpendalFetch = OpendalFetch;
 
@@ -134,6 +135,7 @@ fn catalog() -> Vec<&'static dyn Operator> {
         &GLEIF_RA_FETCH,
         &UMAP_PROJECT,
         &TEXT_EMBED,
+        &UV,
     ];
     #[cfg(feature = "http-fetch")]
     ops.extend([
@@ -340,6 +342,17 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
                 "model_release": { "type": "string", "description": "Optional. `<model-id>@<revision>` naming the release the `model` directory was taken from. Both go into the content address the extension publishes, so the check cannot be made from the directory alone. Set with model." }
             }),
             &["input", "text_column", "extension", "out"],
+        ),
+        "uv" => object(
+            json!({
+                "script": { "type": "string", "description": "The Python script to run, relative to the protocol directory. The Protocol carries it; this operator never fetches one." },
+                "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "The script's SHA-256, lowercase hex. Checked against the bytes on disk before uv is spawned, so `op: uv@1` addresses exact bytes the way a frozen-script operator does. Editing the script is therefore a manifest edit too; the refusal prints the digest it found." },
+                "deps": { "type": "array", "items": { "type": "string", "pattern": "^[A-Za-z0-9._-]+(\\[[A-Za-z0-9._,-]+\\])?==[A-Za-z0-9._+-]+$" }, "description": "Third-party requirements, each pinned `package==version`, passed to uv as --with. A range, a wildcard, an environment marker or a direct reference is refused at manifest load: any of them lets two Runs a month apart install different code while the manifest reads as unchanged." },
+                "args": { "type": "array", "items": { "type": "string" }, "description": "Arguments appended after the script path, verbatim and in order." },
+                "reads": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "What the step consumes. Required and non-empty — this is what puts the step in the asset graph, so a changed input marks it stale instead of being silently skipped. Names follow the same rule as a manifest `depends_on:`: a trailing separator is a directory, a glob metacharacter is a pattern." },
+                "produces": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "What the step writes. Required and non-empty, so a step downstream of this one can go stale in turn." }
+            }),
+            &["script", "sha256", "reads", "produces"],
         ),
         _ => return None,
     };
@@ -3279,6 +3292,328 @@ fn text_embed_invocation(cfg: &TextEmbedConfig, dir: &Path) -> Result<Vec<String
             .map(|(dir, release)| (dir.as_str(), release.as_str())),
     );
     Ok(uv_run_args(&script.to_string_lossy(), &extra))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// uv (activate) — a Protocol's OWN Python step, inside the asset graph.
+//
+// The generic counterpart to the frozen-script operators (`splink_resolve`,
+// `gleif_ra_fetch`, `umap_project`, `text_embed`): the same `uv run --script`
+// substrate, but the script is the Protocol's rather than one compiled into this
+// binary. Without it, a Python step has to be `command:` — which addresses no exact
+// bytes, declares no assets, and runs under whatever `python3` the machine has.
+//
+// TWO PROPERTIES ARE ENFORCED, NOT DOCUMENTED, and they are the whole reason to build
+// this rather than ship a nicer `command:`:
+//
+//   * `reads:`/`produces:` are REFUSED when absent, so the step cannot be a graph
+//     island. The shape this closes is a `command:` step declaring neither: nothing
+//     downstream knows its output went stale, and the step beside it skips
+//     `hash_clean` against inputs that moved weeks ago.
+//   * `sha256:` pins the script's bytes, so `op: uv@1` addresses an EXACT script the
+//     way `op: text_embed@1` addresses an exact frozen one.
+//
+// THE COST, ACCEPTED WHEN THIS WAS CUT: an ordinary edit to a `.py` file becomes a
+// manifest edit too. That is the trade the frozen-bytes operators already make, and
+// here it also does the staleness work — the digest is inside `op_config_hash`, so
+// re-pinning is itself what marks the step stale. The refusal carries the digest
+// found, so re-pinning is a copy-paste rather than a hunt.
+//
+// THE SCRIPT IS DELIBERATELY NOT A `reads:` ASSET. Declaring it would be a weaker
+// version of the pin — a hash compared against the last run rather than against what
+// the manifest says the step is entitled to run — and it would let an edited script
+// execute once before anything objected. The pin refuses it instead.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct Uv;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UvConfig {
+    /// The Python script to run, relative to the protocol directory.
+    script: String,
+    /// The script's SHA-256, lowercase hex. Checked against the bytes on disk before
+    /// `uv` is spawned; a mismatch is the step's refusal, not a warning.
+    sha256: String,
+    /// Third-party requirements, each pinned `package==version`. Passed to `uv run`
+    /// as `--with`, so the step gets them whether or not the host has them. An
+    /// unpinned entry is refused at load — see [`unpinned_dependency`].
+    #[serde(default)]
+    deps: Vec<String>,
+    /// Arguments appended after the script path, verbatim and in order.
+    #[serde(default)]
+    args: Vec<String>,
+    /// What the step reads. REQUIRED and non-empty: a Python step invisible to
+    /// staleness is the defect this operator exists to close.
+    #[serde(default)]
+    reads: Vec<String>,
+    /// What the step produces. REQUIRED and non-empty, for the same reason.
+    #[serde(default)]
+    produces: Vec<String>,
+}
+
+/// Why `spec` is not a pin, or `None` when it is one.
+///
+/// AC5's rule is `package==version` and nothing else, and the reason is a fact about
+/// time rather than about style: a range resolves to whatever the index holds on the
+/// day it runs, so two Runs a month apart install different code while the manifest,
+/// the digest and the asset graph all read as unchanged. Every other 508 spelling
+/// that leaves the version open is refused by name so the message says which one.
+fn unpinned_dependency(spec: &str) -> Option<String> {
+    let s = spec.trim();
+    if s.is_empty() {
+        return Some("it is blank, so it names no package".to_string());
+    }
+    if s.contains(';') {
+        return Some(
+            "an environment marker (`;`) makes what is installed a property of the \
+             machine rather than of the manifest"
+                .to_string(),
+        );
+    }
+    if s.contains('@') {
+        return Some(
+            "a direct reference (`@`) names a location, not a version — what is at \
+             that location can change without the manifest changing"
+                .to_string(),
+        );
+    }
+    let Some((name, version)) = s.split_once("==") else {
+        return Some(
+            "it carries no `==`, so the resolver picks the version on the day it runs"
+                .to_string(),
+        );
+    };
+    if name.contains(['<', '>', '!', '~', '=', ','])
+        || version.contains(['<', '>', '!', '~', '=', ','])
+    {
+        return Some(
+            "a pin is exactly one `==` and nothing else — this carries a second \
+             constraint, which leaves a range open"
+                .to_string(),
+        );
+    }
+    let base = match name.split_once('[') {
+        Some((base, extras)) => {
+            let Some(extras) = extras.strip_suffix(']') else {
+                return Some("its `[` is never closed".to_string());
+            };
+            if extras.trim().is_empty()
+                || !extras
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ','))
+            {
+                return Some(format!("`[{}]` is not a list of extras", extras));
+            }
+            base
+        }
+        None => name,
+    };
+    let base = base.trim();
+    if base.is_empty()
+        || !base
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        return Some(format!("`{}` is not a distribution name", base));
+    }
+    let v = version.trim();
+    if v.is_empty() {
+        return Some("its `==` has nothing after it".to_string());
+    }
+    if v.contains('*') {
+        return Some(format!(
+            "`{}` is a wildcard, which is a range written as a pin",
+            v
+        ));
+    }
+    if !v
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
+    {
+        return Some(format!("`{}` is not a version", v));
+    }
+    None
+}
+
+impl UvConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        serde_yaml::from_value(with.clone())
+            .map_err(|e| Error::ManifestValidation(format!("uv: invalid `with:` config: {}", e)))
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.script.trim().is_empty() {
+            return Err(Error::ManifestValidation(
+                "uv: `script:` is blank — it names the Python file this step runs, \
+                 relative to the protocol directory."
+                    .to_string(),
+            ));
+        }
+        // The two declarations that make this an operator rather than a `command:`.
+        // Absent and empty are refused identically because they cost the same thing:
+        // a step with no edges is a graph island either way.
+        for (field, values, what) in [
+            (
+                "reads",
+                &self.reads,
+                "what it consumes, so a changed input marks it stale",
+            ),
+            (
+                "produces",
+                &self.produces,
+                "what it writes, so a step downstream of it can go stale in turn",
+            ),
+        ] {
+            if values.iter().all(|v| v.trim().is_empty()) {
+                return Err(Error::ManifestValidation(format!(
+                    "uv: `{}:` declares nothing. A `uv@1` step must name {} — that \
+                     declaration is what puts it in the asset graph, and a Python \
+                     step the graph cannot see is the defect this operator exists to \
+                     close. Use `command:` if you genuinely want a step nothing \
+                     tracks.",
+                    field, what
+                )));
+            }
+        }
+        let d = self.sha256.trim();
+        if d.len() != 64 || !d.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(Error::ManifestValidation(format!(
+                "uv: `sha256:` must be 64 hex characters — the SHA-256 of {}. Got \
+                 {} character(s). `shasum -a 256 {}` prints it.",
+                self.script,
+                d.len(),
+                self.script
+            )));
+        }
+        if d.chars().any(|c| c.is_ascii_uppercase()) {
+            return Err(Error::ManifestValidation(format!(
+                "uv: `sha256:` is compared as text against a lowercase hex digest, so \
+                 write it lowercase: {}",
+                d.to_ascii_lowercase()
+            )));
+        }
+        for dep in &self.deps {
+            if let Some(why) = unpinned_dependency(dep) {
+                return Err(Error::ManifestValidation(format!(
+                    "uv: dependency `{}` is not pinned — {}. Write it as \
+                     `package==version`, so this Run and a Run next month install the \
+                     same code.",
+                    dep, why
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `uv run --with <dep>… --script <path> <arg>…` — every `--with` before `--script`,
+/// in the order the manifest wrote them, so the argv is a function of the config and
+/// nothing else. Factored out for the same reason [`text_embed_args`] is: every CI
+/// runner here is a machine without `uv`, and this is the half a runner can drive.
+fn uv_op_args(script: &str, deps: &[String], args: &[String]) -> Vec<String> {
+    let mut extra: Vec<String> = Vec::with_capacity(deps.len() * 2);
+    for dep in deps {
+        extra.push("--with".to_string());
+        extra.push(dep.trim().to_string());
+    }
+    let mut a = vec!["run".to_string()];
+    a.extend(extra);
+    a.push("--script".to_string());
+    a.push(script.to_string());
+    a.extend_from_slice(args);
+    a
+}
+
+/// Everything decided BEFORE `uv` is spawned: resolve the script, check its bytes
+/// against the pin, build the argv.
+///
+/// Both refusals are NON-retryable [`Error::StepExecution`], the missing-binary class.
+/// A script that is absent will be absent on the second attempt, and one whose bytes
+/// disagree with the manifest will disagree again — a Protocol carrying
+/// `defaults.retry` would otherwise pay its backoff three times to be told the same
+/// thing.
+fn uv_invocation(cfg: &UvConfig, dir: &Path) -> Result<Vec<String>> {
+    let script = dir.join(cfg.script.trim());
+    let bytes = std::fs::read(&script).map_err(|e| Error::StepExecution {
+        step: "uv".to_string(),
+        source: std::io::Error::new(
+            e.kind(),
+            format!(
+                "the script {} is not readable at {}: {}. `uv@1` runs a file the \
+                 Protocol carries; it does not fetch one.",
+                cfg.script,
+                script.display(),
+                e
+            ),
+        ),
+    })?;
+    let found = crate::state::content_hash(&bytes);
+    let expected = cfg.sha256.trim().to_ascii_lowercase();
+    if found != expected {
+        return Err(Error::StepExecution {
+            step: "uv".to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the script {} does not match the digest this step pins.\n  \
+                     expected  {}\n  found     {}\nA `uv@1` step addresses exact \
+                     bytes, so editing the script is a manifest edit as well. If the \
+                     new bytes are the ones you want, set `sha256: {}`.",
+                    cfg.script, expected, found, found
+                ),
+            ),
+        });
+    }
+    Ok(uv_op_args(
+        &script.to_string_lossy(),
+        &cfg.deps,
+        &cfg.args,
+    ))
+}
+
+impl Operator for Uv {
+    fn name(&self) -> &'static str {
+        "uv"
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = UvConfig::parse(with)?;
+        cfg.validate()?;
+        let mut assets = OpAssets::default();
+        // `default_kind_for_declared_name` and nothing else. These are strings a
+        // human wrote with no parser behind them — the one declaration site that
+        // function exists for — so the rule that reads a trailing separator and a
+        // glob metacharacter is the rule that applies here too.
+        for name in cfg.reads.iter().map(|n| n.trim()).filter(|n| !n.is_empty()) {
+            let kind = crate::asset_kind::default_kind_for_declared_name(name);
+            assets.record_reads(name.to_string(), kind);
+        }
+        for name in cfg
+            .produces
+            .iter()
+            .map(|n| n.trim())
+            .filter(|n| !n.is_empty())
+        {
+            let kind = crate::asset_kind::default_kind_for_declared_name(name);
+            assets.record_produces(name.to_string(), kind);
+        }
+        Ok(assets)
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        let cfg = UvConfig::parse(with)?;
+        cfg.validate()?;
+        let args = uv_invocation(&cfg, ctx.dir)?;
+        // Inherit, not Capture: a Protocol's own script is the one place a person
+        // put print statements on purpose, and Inherit is also the mode that honours
+        // the step timeout.
+        run_process("uv", &args, ctx, OutputMode::Inherit, "uv")
+    }
 }
 
 #[cfg(test)]
