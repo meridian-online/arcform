@@ -3383,9 +3383,12 @@ fn unpinned_dependency(spec: &str) -> Option<String> {
             "it carries no `==`, so the resolver picks the version on the day it runs".to_string(),
         );
     };
-    if name.contains(['<', '>', '!', '~', '=', ','])
-        || version.contains(['<', '>', '!', '~', '=', ','])
-    {
+    // `!=` rather than a bare `!`, so a PEP 440 epoch (`1!5.5`) is not refused with a
+    // message about a second constraint it does not carry. The epoch is still refused
+    // — by the version character check below, which says so truthfully.
+    let second_constraint =
+        |part: &str| part.contains("!=") || part.contains(['<', '>', '~', '=', ',']);
+    if second_constraint(name) || second_constraint(version) {
         return Some(
             "a pin is exactly one `==` and nothing else — this carries a second \
              constraint, which leaves a range open"
@@ -6860,44 +6863,68 @@ produces: ["build/coverage.json"]
         }
     }
 
-    /// Every spelling that leaves the resolver a choice, refused by name. The
-    /// property is about time, not style: a range resolves to whatever the index
+    /// Every spelling that leaves the resolver a choice, refused **by name** — and
+    /// the assertion is on the reason, not on the fact of a refusal.
+    ///
+    /// The distinction is the whole test. `unpinned_dependency` is a ladder of
+    /// guards, and deleting any rung leaves a lower one catching the same input for a
+    /// different reason: strike `s.contains(';')` and an environment marker is caught
+    /// by the second-constraint rung instead, because `python_version < '3.13'`
+    /// carries a `<`. A test asserting only that the entry was refused is green
+    /// against every one of those deletions. The mutation gate found exactly that,
+    /// four rungs at once, and this is the repair — each row names the rung that is
+    /// supposed to catch it.
+    ///
+    /// The property is about time, not style: a range resolves to whatever the index
     /// holds on the day it runs, so two Runs a month apart install different code
     /// while the manifest, the digest and the asset graph all read as unchanged.
     #[test]
-    fn uv_refuses_every_unpinned_dependency_spelling() {
-        for spec in [
-            "duckdb",
-            "duckdb>=1.5.5",
-            "duckdb<2",
-            "duckdb~=1.5.5",
-            "duckdb!=1.5.4",
-            "duckdb==1.5.*",
-            "duckdb>=1.5,<2",
-            "duckdb==1.5.5,!=1.5.4",
-            "duckdb==1.5.5; python_version < '3.13'",
-            "duckdb @ https://example.invalid/duckdb.whl",
-            "duckdb===1.5.5",
-            "duckdb==",
-            "",
+    fn uv_refuses_every_unpinned_dependency_spelling_for_the_right_reason() {
+        for (spec, rung) in [
+            ("", "names no package"),
+            (
+                "duckdb==1.5.5; python_version < '3.13'",
+                "environment marker",
+            ),
+            (
+                "duckdb @ https://example.invalid/duckdb.whl",
+                "direct reference",
+            ),
+            ("duckdb", "carries no `==`"),
+            ("duckdb>=1.5.5", "carries no `==`"),
+            ("duckdb<2", "carries no `==`"),
+            ("duckdb~=1.5.5", "carries no `==`"),
+            ("duckdb!=1.5.4", "carries no `==`"),
+            ("duckdb>=1.5,<2", "carries no `==`"),
+            ("duckdb==1.5.5,!=1.5.4", "exactly one `==`"),
+            ("duckdb===1.5.5", "exactly one `==`"),
+            ("duckdb[==1.5.5", "never closed"),
+            ("duckdb[]==1.5.5", "not a list of extras"),
+            ("duckdb[a b]==1.5.5", "not a list of extras"),
+            ("[extras]==1.5.5", "not a distribution name"),
+            ("duck db==1.5.5", "not a distribution name"),
+            ("duckdb==", "nothing after it"),
+            ("duckdb==1.5.*", "wildcard"),
+            ("duckdb==1!5.5", "not a version"),
         ] {
+            let why = unpinned_dependency(spec)
+                .unwrap_or_else(|| panic!("`{spec}` leaves the version open and must be refused"));
             assert!(
-                unpinned_dependency(spec).is_some(),
-                "`{spec}` leaves the version open and must be refused"
+                why.contains(rung),
+                "`{spec}` must be refused for `{rung}`, not for: {why}"
             );
+
+            // And the refusal reaches a manifest author with the entry quoted.
             let mut with = uv_ok();
             with.as_mapping_mut().unwrap().insert(
                 Value::from("deps"),
                 Value::Sequence(vec![Value::from(spec)]),
             );
             let err = Uv.assets(&with).unwrap_err().to_string();
-            assert!(
-                err.contains(spec) || spec.is_empty(),
-                "the refusal must quote the entry it rejected: {err}"
-            );
+            assert!(err.contains(rung), "the reason reaches the author: {err}");
             assert!(
                 err.contains("package==version"),
-                "and say what the pinned form is: {err}"
+                "and so does the pinned form: {err}"
             );
         }
     }
@@ -6921,6 +6948,23 @@ produces: ["build/coverage.json"]
                 unpinned_dependency(spec),
                 None,
                 "`{spec}` is a pin and must be accepted"
+            );
+        }
+    }
+
+    /// A blank `script:` names no file, so it is refused rather than turned into a
+    /// `dir.join("")` that resolves to the protocol directory itself.
+    #[test]
+    fn uv_refuses_a_blank_script() {
+        for spelling in ["", "   "] {
+            let mut with = uv_ok();
+            with.as_mapping_mut()
+                .unwrap()
+                .insert(Value::from("script"), Value::from(spelling));
+            let err = Uv.assets(&with).unwrap_err().to_string();
+            assert!(
+                err.contains("`script:` is blank"),
+                "a blank script must be refused, got: {err}"
             );
         }
     }
@@ -6950,6 +6994,32 @@ produces: ["build/coverage.json"]
                 "`{digest}` must be refused for {expect}, got: {err}"
             );
         }
+    }
+
+    /// `run` validates again rather than trusting that manifest load did.
+    ///
+    /// It is not redundant and it is not covered by the load-time tests: those call
+    /// `assets`, and neutering `run`'s own `cfg.validate()?` left all of them green.
+    /// A caller that reaches `run` without going through manifest validation — a
+    /// generated step, a future embedding of the engine — would otherwise spawn `uv`
+    /// on a config the operator has already decided is not expressible.
+    #[test]
+    fn uv_run_refuses_an_invalid_config_rather_than_spawning() {
+        let mut with = uv_ok();
+        with.as_mapping_mut().unwrap().remove(Value::from("reads"));
+        let tmp = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+        let err = Uv
+            .run(&with, &test_ctx(tmp.path(), &env))
+            .expect_err("run must refuse a config assets() would have refused");
+        assert!(
+            err.to_string().contains("`reads:` declares nothing"),
+            "and refuse it for the same reason: {err}"
+        );
+        assert!(
+            matches!(err, Error::ManifestValidation(_)),
+            "a config defect is a validation error wherever it is caught"
+        );
     }
 
     /// A Run whose script bytes differ from the pin refuses BEFORE `uv` is spawned,
@@ -7001,9 +7071,21 @@ produces: ["build/coverage.json"]
             matches!(err, Error::StepExecution { .. }),
             "a missing script is not retryable"
         );
+        let msg = err.to_string();
+        assert!(msg.contains("scripts/derive.py"), "names the script: {msg}");
+        // Pinned at the WORDING, not merely at the type. Letting the read error fall
+        // through would hash empty bytes instead, and the digest mismatch that
+        // followed is also a `StepExecution` that also names the script — so an
+        // assertion on either of those alone cannot tell a missing file from an
+        // edited one, and would tell the reader the wrong thing about their tree.
         assert!(
-            err.to_string().contains("scripts/derive.py"),
-            "names the script: {err}"
+            msg.contains("is not readable"),
+            "says the file is absent rather than reporting a digest mismatch \
+             against empty bytes: {msg}"
+        );
+        assert!(
+            !msg.contains("does not match the digest"),
+            "a missing script is not a pin failure: {msg}"
         );
     }
 
