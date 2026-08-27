@@ -3438,6 +3438,111 @@ fn unpinned_dependency(spec: &str) -> Option<String> {
     None
 }
 
+/// The `dependencies` a script declares in its own PEP 723 header, or `Err` when the
+/// header is there and cannot be read.
+///
+/// **THIS IS WHY THE DIGEST PIN IS NOT ENOUGH ON ITS OWN.** `uv run --script` reads a
+/// `# /// script … ///` block inside the file and installs what it names, *in addition
+/// to* every `--with` on the command line. So a step can declare no `deps:` at all,
+/// pin its script byte-for-byte, and still resolve an unpinned package on the day it
+/// runs — because the unpinned declaration is *part of the bytes the digest pins*.
+/// Reproduced end to end before this existed: a script whose header said
+/// `dependencies = ["iniconfig"]` installed one and the Run succeeded.
+///
+/// The class, which is worth more than the instance: **a byte digest over an artifact
+/// secures the artifact's bytes, not what the artifact's own declarative sub-language
+/// asks the runtime to fetch at execution time.** A Dockerfile's `FROM` tag inside a
+/// pinned Dockerfile is the same shape. Pinning the wrapper is not pinning the
+/// behaviour.
+///
+/// Returning `Err` rather than an empty list when a block cannot be parsed is
+/// deliberate: an unreadable declaration is not an absent one, and the whole point of
+/// this function is that what it cannot see gets installed anyway.
+fn script_declared_dependencies(source: &str) -> std::result::Result<Vec<String>, String> {
+    // The block is comment lines between `# /// script` and a closing `# ///`, per
+    // PEP 723. Anchored at line starts so a mention inside the script's own prose is
+    // not read as the block.
+    let opener = "# /// script";
+    let Some(open_at) = source
+        .find(opener)
+        .filter(|i| *i == 0 || source.as_bytes()[i - 1] == b'\n')
+    else {
+        return Ok(Vec::new());
+    };
+    let body_start = open_at + opener.len();
+    let mut lines = Vec::new();
+    let mut closed = false;
+    for line in source[body_start..].lines().skip(1) {
+        let trimmed = line.trim_end();
+        if trimmed == "# ///" || trimmed == "#///" {
+            closed = true;
+            break;
+        }
+        let Some(rest) = trimmed.strip_prefix('#') else {
+            return Err(format!(
+                "the PEP 723 block is not closed by a `# ///` line — it runs into \
+                 non-comment source at {:?}",
+                trimmed.chars().take(40).collect::<String>()
+            ));
+        };
+        lines.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+    }
+    if !closed {
+        return Err(
+            "the PEP 723 block opens with `# /// script` and never closes with `# ///`".to_string(),
+        );
+    }
+    let block = lines.join("\n");
+
+    // `dependencies = [ … ]`, as a key at the start of a line. Anything else named
+    // `dependencies` (a value inside another table, a word in a comment) is not it.
+    let key = "dependencies";
+    let Some(key_at) = block
+        .match_indices(key)
+        .find(|(i, _)| *i == 0 || block.as_bytes()[i - 1] == b'\n')
+        .map(|(i, _)| i)
+    else {
+        return Ok(Vec::new());
+    };
+    let after = &block[key_at + key.len()..];
+    let Some(open_bracket) = after.find('[') else {
+        return Err("the PEP 723 block declares `dependencies` without a list".to_string());
+    };
+    // Reject anything between the key and the bracket that is not `=` and whitespace,
+    // so `dependencies_note = "…" … [` cannot be read as the list.
+    if after[..open_bracket]
+        .chars()
+        .any(|c| c != '=' && !c.is_whitespace())
+    {
+        return Err("the PEP 723 block's `dependencies` is not a list assignment".to_string());
+    }
+    let rest = &after[open_bracket + 1..];
+    let Some(close_bracket) = rest.find(']') else {
+        return Err("the PEP 723 block's `dependencies` list is not closed".to_string());
+    };
+    let mut out = Vec::new();
+    let mut chars = rest[..close_bracket].chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '"' || c == '\'' {
+            let quote = c;
+            let mut value = String::new();
+            let mut terminated = false;
+            for c in chars.by_ref() {
+                if c == quote {
+                    terminated = true;
+                    break;
+                }
+                value.push(c);
+            }
+            if !terminated {
+                return Err("the PEP 723 block has an unterminated dependency string".to_string());
+            }
+            out.push(value);
+        }
+    }
+    Ok(out)
+}
+
 impl UvConfig {
     fn parse(with: &Value) -> Result<Self> {
         serde_yaml::from_value(with.clone())
@@ -3566,6 +3671,43 @@ fn uv_invocation(cfg: &UvConfig, dir: &Path) -> Result<Vec<String>> {
                 ),
             ),
         });
+    }
+    // EVERY DEPENDENCY REACHING `uv` IS PINNED, WHEREVER IT IS DECLARED. The digest
+    // above secures the script's bytes; it says nothing about what those bytes ask
+    // `uv` to fetch. `uv run --script` reads the file's own PEP 723 header and
+    // installs what it names IN ADDITION TO every `--with`, so a step with no `deps:`
+    // at all could resolve an unpinned package on the day it ran, with the manifest,
+    // the digest and the asset graph all reading as unchanged. Same rule, both sites.
+    let source = String::from_utf8_lossy(&bytes);
+    let declared = script_declared_dependencies(&source).map_err(|why| Error::StepExecution {
+        step: "uv".to_string(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} carries a PEP 723 script block this operator cannot read: {}. \
+                 What it cannot read, `uv` installs anyway, so it is refused rather \
+                 than ignored.",
+                cfg.script, why
+            ),
+        ),
+    })?;
+    for dep in &declared {
+        if let Some(why) = unpinned_dependency(dep) {
+            return Err(Error::StepExecution {
+                step: "uv".to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{}'s own PEP 723 block declares `{}`, which is not pinned — \
+                         {}. `uv run --script` installs what that block names as well \
+                         as what `deps:` names, so pinning the script's bytes does not \
+                         pin what it fetches. Write it as `package==version` there, or \
+                         move it to the step's `deps:`.",
+                        cfg.script, dep, why
+                    ),
+                ),
+            });
+        }
     }
     Ok(uv_op_args(&script.to_string_lossy(), &cfg.deps, &cfg.args))
 }
@@ -7058,6 +7200,135 @@ produces: ["build/coverage.json"]
             .insert(Value::from("sha256"), Value::from(real.as_str()));
         let cfg = UvConfig::parse(&with).unwrap();
         uv_invocation(&cfg, tmp.path()).expect("the pin now matches the bytes");
+    }
+
+    /// The hole a byte digest structurally cannot close: `uv run --script` reads the
+    /// script's OWN PEP 723 header and installs what it names, in addition to every
+    /// `--with`. So a step declaring no `deps:` at all, with its script pinned
+    /// byte-for-byte, could resolve an unpinned package on the day it ran — because
+    /// the unpinned declaration is part of the bytes the digest pins.
+    ///
+    /// Reproduced end to end before this test existed, with a header reading
+    /// `dependencies = ["iniconfig"]`: `arc run` installed one and succeeded.
+    #[test]
+    fn uv_refuses_an_unpinned_dependency_declared_inside_the_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("scripts")).unwrap();
+        let body = "# /// script\n# requires-python = \">=3.12\"\n# dependencies = [\n#   \"iniconfig\",\n# ]\n# ///\nprint('hi')\n";
+        std::fs::write(tmp.path().join("scripts/derive.py"), body).unwrap();
+
+        let mut with = uv_ok();
+        with.as_mapping_mut().unwrap().insert(
+            Value::from("sha256"),
+            Value::from(crate::state::content_hash(body.as_bytes())),
+        );
+        // No `deps:` at all — the manifest is silent, which is exactly the case the
+        // digest was assumed to cover.
+        with.as_mapping_mut().unwrap().remove(Value::from("deps"));
+        let cfg = UvConfig::parse(&with).unwrap();
+        let err = uv_invocation(&cfg, tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("iniconfig"), "names the entry: {err}");
+        assert!(err.contains("PEP 723"), "and where it came from: {err}");
+
+        // And a PINNED one in the same place is accepted, so the rule is about the pin
+        // rather than about the block.
+        let pinned = body.replace("\"iniconfig\"", "\"iniconfig==2.0.0\"");
+        std::fs::write(tmp.path().join("scripts/derive.py"), &pinned).unwrap();
+        let mut with = uv_ok();
+        with.as_mapping_mut().unwrap().insert(
+            Value::from("sha256"),
+            Value::from(crate::state::content_hash(pinned.as_bytes())),
+        );
+        with.as_mapping_mut().unwrap().remove(Value::from("deps"));
+        let cfg = UvConfig::parse(&with).unwrap();
+        uv_invocation(&cfg, tmp.path()).expect("a pinned PEP 723 dependency is fine");
+    }
+
+    /// A block this operator cannot read is refused, not ignored — what it cannot see,
+    /// `uv` installs anyway.
+    #[test]
+    fn uv_refuses_a_pep_723_block_it_cannot_read() {
+        for (label, body) in [
+            (
+                "never closed",
+                "# /// script\n# dependencies = [\n#   \"x==1\",\n# ]\nprint('hi')\n",
+            ),
+            (
+                "unterminated string",
+                "# /// script\n# dependencies = [\n#   \"x==1,\n# ]\n# ///\nprint('hi')\n",
+            ),
+            (
+                "list not closed",
+                "# /// script\n# dependencies = [\n#   \"x==1\",\n# ///\nprint('hi')\n",
+            ),
+            // The block runs to END OF FILE. This is the case the `!closed` branch
+            // exists for, and it is NOT the same as the first: there the loop meets a
+            // non-comment line and refuses on that, so returning an empty list at
+            // end-of-file was invisible until this row. The dependency here is PINNED
+            // on purpose, so the only thing that can refuse it is the unclosed block.
+            (
+                "closes at end of file",
+                "# /// script\n# dependencies = [\n#   \"x==1\",\n# ]\n",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(tmp.path().join("scripts")).unwrap();
+            std::fs::write(tmp.path().join("scripts/derive.py"), body).unwrap();
+            let mut with = uv_ok();
+            with.as_mapping_mut().unwrap().insert(
+                Value::from("sha256"),
+                Value::from(crate::state::content_hash(body.as_bytes())),
+            );
+            let cfg = UvConfig::parse(&with).unwrap();
+            let err = uv_invocation(&cfg, tmp.path()).unwrap_err().to_string();
+            assert!(
+                err.contains("PEP 723"),
+                "`{label}` must be refused as an unreadable block, got: {err}"
+            );
+        }
+    }
+
+    /// The parser reads the block and only the block. Each case is a shape that would
+    /// let an unpinned dependency through if it were read wrongly.
+    #[test]
+    fn script_declared_dependencies_reads_the_block_and_nothing_else() {
+        // No block at all.
+        assert_eq!(
+            script_declared_dependencies("print('hi')\n").unwrap(),
+            Vec::<String>::new()
+        );
+        // A block with no dependencies key.
+        assert_eq!(
+            script_declared_dependencies("# /// script\n# requires-python = \">=3.12\"\n# ///\n")
+                .unwrap(),
+            Vec::<String>::new()
+        );
+        // The real shape, single and double quoted, across lines.
+        assert_eq!(
+            script_declared_dependencies(
+                "# /// script\n# dependencies = [\n#   \"duckdb==1.5.5\",\n#   'numpy==2.0.0',\n# ]\n# ///\n"
+            )
+            .unwrap(),
+            vec!["duckdb==1.5.5".to_string(), "numpy==2.0.0".to_string()]
+        );
+        // A mention of the opener inside prose is not the block — it is not at a line
+        // start, so it is not read.
+        assert_eq!(
+            script_declared_dependencies("x = \"# /// script\"\n").unwrap(),
+            Vec::<String>::new()
+        );
+        // A key that merely starts with `dependencies` is not the list.
+        assert!(
+            script_declared_dependencies(
+                "# /// script\n# dependencies_note = \"see below\"\n# ///\n"
+            )
+            .is_err()
+                || script_declared_dependencies(
+                    "# /// script\n# dependencies_note = \"see below\"\n# ///\n"
+                )
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A script that is not on disk is the same class — deterministic, so

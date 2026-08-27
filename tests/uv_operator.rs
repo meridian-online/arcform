@@ -241,6 +241,49 @@ fn a_script_that_does_not_match_its_pin_fails_the_run() {
     );
 }
 
+/// The hole the digest cannot close, driven through the real binary.
+///
+/// `uv run --script` reads the script's OWN PEP 723 header and installs what it names,
+/// on top of every `--with`. So this manifest declares no `deps:` at all and pins its
+/// script byte-for-byte, and before the check existed `arc run` installed an unpinned
+/// package and exited 0 — because the unpinned declaration is part of the bytes the
+/// digest pins.
+///
+/// It needs no `uv`: the refusal is before the spawn, which is the point.
+#[test]
+fn a_dependency_the_script_declares_for_itself_is_pinned_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    protocol(tmp.path(), "");
+    let script = "# /// script\n# requires-python = \">=3.12\"\n# dependencies = [\n#   \"iniconfig\",\n# ]\n# ///\nimport json, sys\nsrc, dest = sys.argv[1], sys.argv[2]\njson.dump({\"chars\": len(open(src).read())}, open(dest, \"w\"))\n";
+    std::fs::write(tmp.path().join("scripts/derive.py"), script).unwrap();
+    edit_manifest(
+        tmp.path(),
+        &std::fs::read_to_string(tmp.path().join("arcform.yaml"))
+            .unwrap()
+            .lines()
+            .find_map(|l| {
+                l.trim()
+                    .strip_prefix("sha256: \"")
+                    .map(|d| d.trim_end_matches('"').to_string())
+            })
+            .unwrap(),
+        &sha256_of(script.as_bytes()),
+    );
+
+    let (code, stdout, stderr) = arc_run_stubbed(tmp.path());
+    let all = format!("{stdout}{stderr}");
+    assert_ne!(code, Some(0), "the run must be refused:\n{all}");
+    assert!(all.contains("iniconfig"), "names the entry: {all}");
+    assert!(
+        all.contains("PEP 723"),
+        "and says where it was declared, since the manifest declares no deps at all: {all}"
+    );
+    assert!(
+        !tmp.path().join("build/derived.json").exists(),
+        "nothing may run with an unpinned dependency reachable"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The asset-graph edge, in both directions.
 // ─────────────────────────────────────────────────────────────────────────────
