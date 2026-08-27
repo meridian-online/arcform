@@ -3354,7 +3354,7 @@ struct UvConfig {
 
 /// Why `spec` is not a pin, or `None` when it is one.
 ///
-/// AC5's rule is `package==version` and nothing else, and the reason is a fact about
+/// The rule is `package==version` and nothing else, and the reason is a fact about
 /// time rather than about style: a range resolves to whatever the index holds on the
 /// day it runs, so two Runs a month apart install different code while the manifest,
 /// the digest and the asset graph all read as unchanged. Every other 508 spelling
@@ -3380,8 +3380,7 @@ fn unpinned_dependency(spec: &str) -> Option<String> {
     }
     let Some((name, version)) = s.split_once("==") else {
         return Some(
-            "it carries no `==`, so the resolver picks the version on the day it runs"
-                .to_string(),
+            "it carries no `==`, so the resolver picks the version on the day it runs".to_string(),
         );
     };
     if name.contains(['<', '>', '!', '~', '=', ','])
@@ -3565,11 +3564,7 @@ fn uv_invocation(cfg: &UvConfig, dir: &Path) -> Result<Vec<String>> {
             ),
         });
     }
-    Ok(uv_op_args(
-        &script.to_string_lossy(),
-        &cfg.deps,
-        &cfg.args,
-    ))
+    Ok(uv_op_args(&script.to_string_lossy(), &cfg.deps, &cfg.args))
 }
 
 impl Operator for Uv {
@@ -6775,5 +6770,297 @@ mod tests {
             filed.etag,
             "the store was filed again by a run that had nothing new to tell it"
         );
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+    // uv@1 — the two refusals that make it an operator rather than a `command:`,
+    // the dependency pin, and the argv.
+    //
+    // Each refusal below is driven from a config that is otherwise VALID, changed
+    // in exactly one way. That is the shape the mutation half of this work needs:
+    // the passing case and the refusing case differ by the one field under test,
+    // so a refusal that stops firing cannot be masked by a second defect.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// A `with:` block that passes every check — the base each refusal mutates.
+    fn uv_ok() -> Value {
+        serde_yaml::from_str(
+            r#"
+script: scripts/derive.py
+sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+deps: ["duckdb==1.5.5"]
+args: ["--db", "build/pipeline.duckdb"]
+reads: ["build/crosswalk.parquet"]
+produces: ["build/coverage.json"]
+"#,
+        )
+        .unwrap()
+    }
+
+    /// The base config is genuinely accepted. Without this, every refusal below
+    /// could be firing for a reason that has nothing to do with the field it names.
+    #[test]
+    fn uv_accepts_a_fully_declared_step() {
+        let assets = Uv.assets(&uv_ok()).expect("the base config must be valid");
+        assert_eq!(assets.reads, vec!["build/crosswalk.parquet".to_string()]);
+        assert_eq!(assets.produces, vec!["build/coverage.json".to_string()]);
+    }
+
+    /// Drop `reads:` from the base config and the operator refuses, naming the
+    /// field. A Python step invisible to staleness is the defect `uv@1` exists to
+    /// close, so it must not be expressible.
+    #[test]
+    fn uv_refuses_a_step_that_declares_no_reads() {
+        let mut with = uv_ok();
+        with.as_mapping_mut().unwrap().remove(Value::from("reads"));
+        let err = Uv.assets(&with).unwrap_err().to_string();
+        assert!(
+            err.contains("`reads:` declares nothing"),
+            "the refusal must name the field: {err}"
+        );
+        assert!(err.contains("asset graph"), "and say why it matters: {err}");
+    }
+
+    /// The same for `produces:`, which is the half that lets a step DOWNSTREAM of
+    /// this one go stale.
+    #[test]
+    fn uv_refuses_a_step_that_declares_no_produces() {
+        let mut with = uv_ok();
+        with.as_mapping_mut()
+            .unwrap()
+            .remove(Value::from("produces"));
+        let err = Uv.assets(&with).unwrap_err().to_string();
+        assert!(
+            err.contains("`produces:` declares nothing"),
+            "the refusal must name the field: {err}"
+        );
+    }
+
+    /// `reads: []` costs exactly what an absent `reads:` costs — a step with no
+    /// edges — so it is refused identically. A rule that reads only for the key's
+    /// presence is a rule with one spelling of its own defect left open.
+    #[test]
+    fn uv_refuses_an_empty_reads_list_the_same_way_as_an_absent_one() {
+        for yaml in ["reads: []", r#"reads: ["", "  "]"#] {
+            let mut with = uv_ok();
+            let empty: Value = serde_yaml::from_str(yaml).unwrap();
+            let list = empty
+                .as_mapping()
+                .unwrap()
+                .get(Value::from("reads"))
+                .unwrap()
+                .clone();
+            with.as_mapping_mut()
+                .unwrap()
+                .insert(Value::from("reads"), list);
+            let err = Uv.assets(&with).unwrap_err().to_string();
+            assert!(
+                err.contains("`reads:` declares nothing"),
+                "`{yaml}` must be refused like an absent reads:, got: {err}"
+            );
+        }
+    }
+
+    /// Every spelling that leaves the resolver a choice, refused by name. The
+    /// property is about time, not style: a range resolves to whatever the index
+    /// holds on the day it runs, so two Runs a month apart install different code
+    /// while the manifest, the digest and the asset graph all read as unchanged.
+    #[test]
+    fn uv_refuses_every_unpinned_dependency_spelling() {
+        for spec in [
+            "duckdb",
+            "duckdb>=1.5.5",
+            "duckdb<2",
+            "duckdb~=1.5.5",
+            "duckdb!=1.5.4",
+            "duckdb==1.5.*",
+            "duckdb>=1.5,<2",
+            "duckdb==1.5.5,!=1.5.4",
+            "duckdb==1.5.5; python_version < '3.13'",
+            "duckdb @ https://example.invalid/duckdb.whl",
+            "duckdb===1.5.5",
+            "duckdb==",
+            "",
+        ] {
+            assert!(
+                unpinned_dependency(spec).is_some(),
+                "`{spec}` leaves the version open and must be refused"
+            );
+            let mut with = uv_ok();
+            with.as_mapping_mut().unwrap().insert(
+                Value::from("deps"),
+                Value::Sequence(vec![Value::from(spec)]),
+            );
+            let err = Uv.assets(&with).unwrap_err().to_string();
+            assert!(
+                err.contains(spec) || spec.is_empty(),
+                "the refusal must quote the entry it rejected: {err}"
+            );
+            assert!(
+                err.contains("package==version"),
+                "and say what the pinned form is: {err}"
+            );
+        }
+    }
+
+    /// The other direction, which matters as much: a rule that bites an honest pin
+    /// is worse than the gap it closes. Extras, epochs-free local versions and
+    /// pre-releases are all legitimate pins.
+    #[test]
+    fn uv_accepts_the_pinned_spellings() {
+        for spec in [
+            "duckdb==1.5.5",
+            "pandas==2.2.3",
+            "tomli_w==1.2.0",
+            "tomli-w==1.2.0",
+            "pydantic[email]==2.9.2",
+            "torch==2.4.0+cpu",
+            "numpy==2.0.0rc1",
+            "  duckdb==1.5.5  ",
+        ] {
+            assert_eq!(
+                unpinned_dependency(spec),
+                None,
+                "`{spec}` is a pin and must be accepted"
+            );
+        }
+    }
+
+    /// `sha256:` is compared as text against a lowercase hex digest, so anything
+    /// that is not one is refused at load rather than mismatching at run.
+    #[test]
+    fn uv_refuses_a_sha256_that_is_not_lowercase_hex() {
+        for (digest, expect) in [
+            ("deadbeef", "64 hex characters"),
+            (
+                "00000000000000000000000000000000000000000000000000000000000000zz",
+                "64 hex characters",
+            ),
+            (
+                "ABCDEF0000000000000000000000000000000000000000000000000000000000",
+                "lowercase",
+            ),
+        ] {
+            let mut with = uv_ok();
+            with.as_mapping_mut()
+                .unwrap()
+                .insert(Value::from("sha256"), Value::from(digest));
+            let err = Uv.assets(&with).unwrap_err().to_string();
+            assert!(
+                err.contains(expect),
+                "`{digest}` must be refused for {expect}, got: {err}"
+            );
+        }
+    }
+
+    /// A Run whose script bytes differ from the pin refuses BEFORE `uv` is spawned,
+    /// and the message carries the step, the digest expected and the digest found —
+    /// so re-pinning is a copy-paste rather than a hunt.
+    #[test]
+    fn uv_refuses_a_script_whose_bytes_do_not_match_the_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("scripts")).unwrap();
+        let body = b"print('hello')\n";
+        std::fs::write(tmp.path().join("scripts/derive.py"), body).unwrap();
+        let real = crate::state::content_hash(body);
+
+        let cfg = UvConfig::parse(&uv_ok()).unwrap();
+        let err = uv_invocation(&cfg, tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("uv"), "names the step: {msg}");
+        assert!(
+            msg.contains(&"0".repeat(64)),
+            "names the digest the manifest pinned: {msg}"
+        );
+        assert!(msg.contains(&real), "names the digest found: {msg}");
+
+        // Non-retryable: a script whose bytes disagree with the manifest will
+        // disagree again, so a Protocol carrying `defaults.retry` must not pay its
+        // backoff three times to be told the same thing.
+        assert!(
+            matches!(err, Error::StepExecution { .. }),
+            "a digest mismatch is deterministic, so it is not a retryable failure"
+        );
+
+        // And with the digest corrected, the same config builds an invocation.
+        let mut with = uv_ok();
+        with.as_mapping_mut()
+            .unwrap()
+            .insert(Value::from("sha256"), Value::from(real.as_str()));
+        let cfg = UvConfig::parse(&with).unwrap();
+        uv_invocation(&cfg, tmp.path()).expect("the pin now matches the bytes");
+    }
+
+    /// A script that is not on disk is the same class — deterministic, so
+    /// non-retryable — and the message says this operator does not fetch one.
+    #[test]
+    fn uv_refuses_a_script_that_is_not_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = UvConfig::parse(&uv_ok()).unwrap();
+        let err = uv_invocation(&cfg, tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, Error::StepExecution { .. }),
+            "a missing script is not retryable"
+        );
+        assert!(
+            err.to_string().contains("scripts/derive.py"),
+            "names the script: {err}"
+        );
+    }
+
+    /// Every `--with` precedes `--script`, and the script's own arguments follow
+    /// the path. `uv` reads `--with` as its own flag and everything after the
+    /// script path as the script's, so this order is not cosmetic.
+    #[test]
+    fn uv_op_args_put_every_with_before_the_script() {
+        assert_eq!(
+            uv_op_args(
+                "/cache/derive.py",
+                &["duckdb==1.5.5".to_string(), "tomli_w==1.2.0".to_string()],
+                &["--db".to_string(), "build/p.duckdb".to_string()],
+            ),
+            vec![
+                "run",
+                "--with",
+                "duckdb==1.5.5",
+                "--with",
+                "tomli_w==1.2.0",
+                "--script",
+                "/cache/derive.py",
+                "--db",
+                "build/p.duckdb",
+            ]
+        );
+    }
+
+    /// With no dependencies the argv is exactly what the frozen-script operators
+    /// build, so `uv@1` is the same substrate rather than a parallel one.
+    #[test]
+    fn uv_op_args_with_no_deps_match_the_frozen_script_invocation() {
+        assert_eq!(
+            uv_op_args("/cache/derive.py", &[], &["--x".to_string()]),
+            uv_run_args("/cache/derive.py", &["--x".to_string()])
+        );
+    }
+
+    /// The declared names carry the kind their spelling implies — the same rule a
+    /// manifest `depends_on:` gets, because these are strings a human wrote with
+    /// no parser behind them.
+    #[test]
+    fn uv_declares_the_kind_each_name_spells() {
+        let with: Value = serde_yaml::from_str(
+            r#"
+script: s.py
+sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+reads: ["build/in.parquet", "build/parts/", "build/shards/*.parquet"]
+produces: ["build/out.json"]
+"#,
+        )
+        .unwrap();
+        let assets = Uv.assets(&with).unwrap();
+        use crate::asset_kind::AssetKind;
+        assert_eq!(assets.kinds["build/in.parquet"], AssetKind::File);
+        assert_eq!(assets.kinds["build/parts/"], AssetKind::Directory);
+        assert_eq!(assets.kinds["build/shards/*.parquet"], AssetKind::Pattern);
+        assert_eq!(assets.kinds["build/out.json"], AssetKind::File);
     }
 }

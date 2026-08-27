@@ -111,6 +111,9 @@ mcp = ["cli"]
 [dev-dependencies]
 tempfile = "3"
 filetime = "0.2"
+# Already a dependency; named here so `tests/uv_operator.rs` can compute the digest a
+# `uv@1` step pins rather than hard-coding one into a fixture that would then rot.
+sha2 = "0.10"
 
 # Vendored sqlparser: a local fork of sqlparser 0.55.0 that teaches the DuckDB
 # dialect three grammars the published crate rejects — statement-form PIVOT/UNPIVOT

@@ -24,7 +24,8 @@
 //!
 //! WHAT RUNS WHERE. Everything that produces a vector needs the built extension
 //! (`ARC_STATICEMBED_EXTENSION`) and `uv`. The routine gate (`ci.yml`'s `build` job,
-//! every push and PR) has neither, so every test that needs either is `#[ignore]`d —
+//! every push and PR) installs `uv` — `tests/uv_operator.rs` needs a real one — but
+//! stages no extension, so every test that needs the extension is `#[ignore]`d —
 //! it shows in that job's own `cargo test` summary as `ignored`, not `ok`, which is
 //! the difference between "this did not run" being visible and being indistinguishable
 //! from a pass. `the_comparison_notices_a_single_float_out_of_place` needs nothing and
@@ -107,12 +108,15 @@ fn have_uv() -> bool {
         .unwrap_or(false)
 }
 
-/// `uv` on PATH, or a hard failure. Same reasoning as `require_extension`.
+/// `uv` on PATH, or a hard failure. Same reasoning as `require_extension`, minus its
+/// premise: the routine gate does install `uv`, so what keeps these tests off it is
+/// the extension alone. This stays as the legible failure for a run that reaches here
+/// without one anyway.
 fn require_uv() {
     assert!(
         have_uv(),
-        "`uv` must be on PATH: this test is #[ignore]d on the routine gate for \
-         exactly this reason — see require_extension's doc comment"
+        "`uv` must be on PATH: reaching this line means something asked for the \
+         #[ignore]d tests — see require_extension's doc comment"
     );
 }
 
