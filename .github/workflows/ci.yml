@@ -105,9 +105,30 @@ jobs:
       - name: test
         run: cargo test --workspace
 
+      # `uv` — and unlike the staticembed extension, it is cheap enough to belong on
+      # the routine gate. `tests/uv_operator.rs` proves three of its four properties
+      # with no `uv` at all (the two load-time refusals and the digest pin refuse
+      # before anything is spawned, and the asset-graph edge runs against a stub);
+      # the fourth is the operator's whole reason to exist — that a Protocol's Python
+      # step gets the packages it declares whether or not the machine has them — and
+      # that one cannot be stubbed. It resolves a single pure-Python wheel, so it
+      # costs seconds rather than the extension build `text-embed-parity.yml` exists
+      # to keep off this job.
+      #
+      # `--include-ignored` on that one test binary, not on the whole suite: the
+      # staticembed tests stay ignored here, and their count still lands in the
+      # summary below.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: test (uv operator, including the test that needs a real uv)
+        run: cargo test --workspace --test uv_operator -- --include-ignored
+
       # tests/text_embed.rs and tests/text_embed_parity.rs carry #[ignore]d tests that
-      # need a built staticembed extension and `uv`, neither of which this runner has —
-      # see the module doc at the top of each file. The `test` step above already
+      # need a built staticembed extension, which this runner does not stage — and,
+      # for the projection half, the several hundred megabytes `uv` resolves for
+      # umap-learn. The `uv` installed above is not enough to turn them on, and is not
+      # what keeps them off. See the module doc at the top of each file. The `test` step above already
       # reports them as `ignored` rather than `ok`, in its own `cargo test` summary;
       # this step re-runs just those two already-built binaries (nothing to recompile)
       # so that count lands in the job summary too, where a PR reader sees it without
@@ -120,8 +141,8 @@ jobs:
           {
             echo "### text_embed / text_embed_parity — routine gate"
             echo
-            echo "Needs a staged \`staticembed\` extension and \`uv\`; this runner has"
-            echo "neither, so:"
+            echo "Needs a staged \`staticembed\` extension — this runner installs"
+            echo "\`uv\` but stages no extension, so:"
             echo
             grep '^test result:' "$RUNNER_TEMP/parity-routine.log" | sed 's/^/- /'
             echo

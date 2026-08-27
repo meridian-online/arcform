@@ -115,6 +115,7 @@ static SPLINK_RESOLVE: SplinkResolve = SplinkResolve;
 static GLEIF_RA_FETCH: GleifRaFetch = GleifRaFetch;
 static UMAP_PROJECT: UmapProject = UmapProject;
 static TEXT_EMBED: TextEmbed = TextEmbed;
+static UV: Uv = Uv;
 #[cfg(feature = "opendal")]
 static OPENDAL_FETCH: OpendalFetch = OpendalFetch;
 
@@ -134,6 +135,7 @@ fn catalog() -> Vec<&'static dyn Operator> {
         &GLEIF_RA_FETCH,
         &UMAP_PROJECT,
         &TEXT_EMBED,
+        &UV,
     ];
     #[cfg(feature = "http-fetch")]
     ops.extend([
@@ -340,6 +342,17 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
                 "model_release": { "type": "string", "description": "Optional. `<model-id>@<revision>` naming the release the `model` directory was taken from. Both go into the content address the extension publishes, so the check cannot be made from the directory alone. Set with model." }
             }),
             &["input", "text_column", "extension", "out"],
+        ),
+        "uv" => object(
+            json!({
+                "script": { "type": "string", "description": "The Python script to run, relative to the protocol directory. The Protocol carries it; this operator never fetches one." },
+                "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "The script's SHA-256, lowercase hex. Checked against the bytes on disk before uv is spawned, so `op: uv@1` addresses exact bytes the way a frozen-script operator does. Editing the script is therefore a manifest edit too; the refusal prints the digest it found." },
+                "deps": { "type": "array", "items": { "type": "string", "pattern": "^[A-Za-z0-9._-]+(\\[[A-Za-z0-9._,-]+\\])?==[A-Za-z0-9._+-]+$" }, "description": "Third-party requirements, each pinned `package==version`, passed to uv as --with. A range, a wildcard, an environment marker or a direct reference is refused at manifest load: any of them lets two Runs a month apart install different code while the manifest reads as unchanged." },
+                "args": { "type": "array", "items": { "type": "string" }, "description": "Arguments appended after the script path, verbatim and in order." },
+                "reads": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "What the step consumes. Required and non-empty — this is what puts the step in the asset graph, so a changed input marks it stale instead of being silently skipped. Names follow the same rule as a manifest `depends_on:`: a trailing separator is a directory, a glob metacharacter is a pattern." },
+                "produces": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "What the step writes. Required and non-empty, so a step downstream of this one can go stale in turn." }
+            }),
+            &["script", "sha256", "reads", "produces"],
         ),
         _ => return None,
     };
@@ -3279,6 +3292,468 @@ fn text_embed_invocation(cfg: &TextEmbedConfig, dir: &Path) -> Result<Vec<String
             .map(|(dir, release)| (dir.as_str(), release.as_str())),
     );
     Ok(uv_run_args(&script.to_string_lossy(), &extra))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// uv (activate) — a Protocol's OWN Python step, inside the asset graph.
+//
+// The generic counterpart to the frozen-script operators (`splink_resolve`,
+// `gleif_ra_fetch`, `umap_project`, `text_embed`): the same `uv run --script`
+// substrate, but the script is the Protocol's rather than one compiled into this
+// binary. Without it, a Python step has to be `command:` — which addresses no exact
+// bytes, declares no assets, and runs under whatever `python3` the machine has.
+//
+// TWO PROPERTIES ARE ENFORCED, NOT DOCUMENTED, and they are the whole reason to build
+// this rather than ship a nicer `command:`:
+//
+//   * `reads:`/`produces:` are REFUSED when absent, so the step cannot be a graph
+//     island. The shape this closes is a `command:` step declaring neither: nothing
+//     downstream knows its output went stale, and the step beside it skips
+//     `hash_clean` against inputs that moved weeks ago.
+//   * `sha256:` pins the script's bytes, so `op: uv@1` addresses an EXACT script the
+//     way `op: text_embed@1` addresses an exact frozen one.
+//
+// THE COST, ACCEPTED WHEN THIS WAS CUT: an ordinary edit to a `.py` file becomes a
+// manifest edit too. That is the trade the frozen-bytes operators already make, and
+// here it also does the staleness work — the digest is inside `op_config_hash`, so
+// re-pinning is itself what marks the step stale. The refusal carries the digest
+// found, so re-pinning is a copy-paste rather than a hunt.
+//
+// THE SCRIPT IS DELIBERATELY NOT A `reads:` ASSET. Declaring it would be a weaker
+// version of the pin — a hash compared against the last run rather than against what
+// the manifest says the step is entitled to run — and it would let an edited script
+// execute once before anything objected. The pin refuses it instead.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct Uv;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UvConfig {
+    /// The Python script to run, relative to the protocol directory.
+    script: String,
+    /// The script's SHA-256, lowercase hex. Checked against the bytes on disk before
+    /// `uv` is spawned; a mismatch is the step's refusal, not a warning.
+    sha256: String,
+    /// Third-party requirements, each pinned `package==version`. Passed to `uv run`
+    /// as `--with`, so the step gets them whether or not the host has them. An
+    /// unpinned entry is refused at load — see [`unpinned_dependency`].
+    #[serde(default)]
+    deps: Vec<String>,
+    /// Arguments appended after the script path, verbatim and in order.
+    #[serde(default)]
+    args: Vec<String>,
+    /// What the step reads. REQUIRED and non-empty: a Python step invisible to
+    /// staleness is the defect this operator exists to close.
+    #[serde(default)]
+    reads: Vec<String>,
+    /// What the step produces. REQUIRED and non-empty, for the same reason.
+    #[serde(default)]
+    produces: Vec<String>,
+}
+
+/// Why `spec` is not a pin, or `None` when it is one.
+///
+/// The rule is `package==version` and nothing else, and the reason is a fact about
+/// time rather than about style: a range resolves to whatever the index holds on the
+/// day it runs, so two Runs a month apart install different code while the manifest,
+/// the digest and the asset graph all read as unchanged. Every other 508 spelling
+/// that leaves the version open is refused by name so the message says which one.
+fn unpinned_dependency(spec: &str) -> Option<String> {
+    let s = spec.trim();
+    if s.is_empty() {
+        return Some("it is blank, so it names no package".to_string());
+    }
+    if s.contains(';') {
+        return Some(
+            "an environment marker (`;`) makes what is installed a property of the \
+             machine rather than of the manifest"
+                .to_string(),
+        );
+    }
+    if s.contains('@') {
+        return Some(
+            "a direct reference (`@`) names a location, not a version — what is at \
+             that location can change without the manifest changing"
+                .to_string(),
+        );
+    }
+    let Some((name, version)) = s.split_once("==") else {
+        return Some(
+            "it carries no `==`, so the resolver picks the version on the day it runs".to_string(),
+        );
+    };
+    // `!=` rather than a bare `!`, so a PEP 440 epoch (`1!5.5`) is not refused with a
+    // message about a second constraint it does not carry. The epoch is still refused
+    // — by the version character check below, which says so truthfully.
+    let second_constraint =
+        |part: &str| part.contains("!=") || part.contains(['<', '>', '~', '=', ',']);
+    if second_constraint(name) || second_constraint(version) {
+        return Some(
+            "a pin is exactly one `==` and nothing else — this carries a second \
+             constraint, which leaves a range open"
+                .to_string(),
+        );
+    }
+    let base = match name.split_once('[') {
+        Some((base, extras)) => {
+            let Some(extras) = extras.strip_suffix(']') else {
+                return Some("its `[` is never closed".to_string());
+            };
+            if extras.trim().is_empty()
+                || !extras
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ','))
+            {
+                return Some(format!("`[{}]` is not a list of extras", extras));
+            }
+            base
+        }
+        None => name,
+    };
+    let base = base.trim();
+    if base.is_empty()
+        || !base
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        return Some(format!("`{}` is not a distribution name", base));
+    }
+    let v = version.trim();
+    if v.is_empty() {
+        return Some("its `==` has nothing after it".to_string());
+    }
+    if v.contains('*') {
+        return Some(format!(
+            "`{}` is a wildcard, which is a range written as a pin",
+            v
+        ));
+    }
+    if !v
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
+    {
+        return Some(format!("`{}` is not a version", v));
+    }
+    None
+}
+
+/// The `dependencies` a script declares in its own PEP 723 header, or `Err` when the
+/// header is there and cannot be read.
+///
+/// **THIS IS WHY THE DIGEST PIN IS NOT ENOUGH ON ITS OWN.** `uv run --script` reads a
+/// `# /// script … ///` block inside the file and installs what it names, *in addition
+/// to* every `--with` on the command line. So a step can declare no `deps:` at all,
+/// pin its script byte-for-byte, and still resolve an unpinned package on the day it
+/// runs — because the unpinned declaration is *part of the bytes the digest pins*.
+/// Reproduced end to end before this existed: a script whose header said
+/// `dependencies = ["iniconfig"]` installed one and the Run succeeded.
+///
+/// The class, which is worth more than the instance: **a byte digest over an artifact
+/// secures the artifact's bytes, not what the artifact's own declarative sub-language
+/// asks the runtime to fetch at execution time.** A Dockerfile's `FROM` tag inside a
+/// pinned Dockerfile is the same shape. Pinning the wrapper is not pinning the
+/// behaviour.
+///
+/// Returning `Err` rather than an empty list when a block cannot be parsed is
+/// deliberate: an unreadable declaration is not an absent one, and the whole point of
+/// this function is that what it cannot see gets installed anyway.
+fn script_declared_dependencies(source: &str) -> std::result::Result<Vec<String>, String> {
+    // The block is comment lines between `# /// script` and a closing `# ///`, per
+    // PEP 723. Anchored at line starts so a mention inside the script's own prose is
+    // not read as the block.
+    let opener = "# /// script";
+    let Some(open_at) = source
+        .find(opener)
+        .filter(|i| *i == 0 || source.as_bytes()[i - 1] == b'\n')
+    else {
+        return Ok(Vec::new());
+    };
+    let body_start = open_at + opener.len();
+    let mut lines = Vec::new();
+    let mut closed = false;
+    for line in source[body_start..].lines().skip(1) {
+        let trimmed = line.trim_end();
+        if trimmed == "# ///" || trimmed == "#///" {
+            closed = true;
+            break;
+        }
+        let Some(rest) = trimmed.strip_prefix('#') else {
+            return Err(format!(
+                "the PEP 723 block is not closed by a `# ///` line — it runs into \
+                 non-comment source at {:?}",
+                trimmed.chars().take(40).collect::<String>()
+            ));
+        };
+        lines.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+    }
+    if !closed {
+        return Err(
+            "the PEP 723 block opens with `# /// script` and never closes with `# ///`".to_string(),
+        );
+    }
+    let block = lines.join("\n");
+
+    // `dependencies = [ … ]`, as a key at the start of a line. Anything else named
+    // `dependencies` (a value inside another table, a word in a comment) is not it.
+    let key = "dependencies";
+    let Some(key_at) = block
+        .match_indices(key)
+        .find(|(i, _)| *i == 0 || block.as_bytes()[i - 1] == b'\n')
+        .map(|(i, _)| i)
+    else {
+        return Ok(Vec::new());
+    };
+    let after = &block[key_at + key.len()..];
+    let Some(open_bracket) = after.find('[') else {
+        return Err("the PEP 723 block declares `dependencies` without a list".to_string());
+    };
+    // Reject anything between the key and the bracket that is not `=` and whitespace,
+    // so `dependencies_note = "…" … [` cannot be read as the list.
+    if after[..open_bracket]
+        .chars()
+        .any(|c| c != '=' && !c.is_whitespace())
+    {
+        return Err("the PEP 723 block's `dependencies` is not a list assignment".to_string());
+    }
+    let rest = &after[open_bracket + 1..];
+    let Some(close_bracket) = rest.find(']') else {
+        return Err("the PEP 723 block's `dependencies` list is not closed".to_string());
+    };
+    let mut out = Vec::new();
+    let mut chars = rest[..close_bracket].chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '"' || c == '\'' {
+            let quote = c;
+            let mut value = String::new();
+            let mut terminated = false;
+            for c in chars.by_ref() {
+                if c == quote {
+                    terminated = true;
+                    break;
+                }
+                value.push(c);
+            }
+            if !terminated {
+                return Err("the PEP 723 block has an unterminated dependency string".to_string());
+            }
+            out.push(value);
+        }
+    }
+    Ok(out)
+}
+
+impl UvConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        serde_yaml::from_value(with.clone())
+            .map_err(|e| Error::ManifestValidation(format!("uv: invalid `with:` config: {}", e)))
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.script.trim().is_empty() {
+            return Err(Error::ManifestValidation(
+                "uv: `script:` is blank — it names the Python file this step runs, \
+                 relative to the protocol directory."
+                    .to_string(),
+            ));
+        }
+        // The two declarations that make this an operator rather than a `command:`.
+        // Absent and empty are refused identically because they cost the same thing:
+        // a step with no edges is a graph island either way.
+        for (field, values, what) in [
+            (
+                "reads",
+                &self.reads,
+                "what it consumes, so a changed input marks it stale",
+            ),
+            (
+                "produces",
+                &self.produces,
+                "what it writes, so a step downstream of it can go stale in turn",
+            ),
+        ] {
+            if values.iter().all(|v| v.trim().is_empty()) {
+                return Err(Error::ManifestValidation(format!(
+                    "uv: `{}:` declares nothing. A `uv@1` step must name {} — that \
+                     declaration is what puts it in the asset graph, and a Python \
+                     step the graph cannot see is the defect this operator exists to \
+                     close. Use `command:` if you genuinely want a step nothing \
+                     tracks.",
+                    field, what
+                )));
+            }
+        }
+        let d = self.sha256.trim();
+        if d.len() != 64 || !d.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(Error::ManifestValidation(format!(
+                "uv: `sha256:` must be 64 hex characters — the SHA-256 of {}. Got \
+                 {} character(s). `shasum -a 256 {}` prints it.",
+                self.script,
+                d.len(),
+                self.script
+            )));
+        }
+        if d.chars().any(|c| c.is_ascii_uppercase()) {
+            return Err(Error::ManifestValidation(format!(
+                "uv: `sha256:` is compared as text against a lowercase hex digest, so \
+                 write it lowercase: {}",
+                d.to_ascii_lowercase()
+            )));
+        }
+        for dep in &self.deps {
+            if let Some(why) = unpinned_dependency(dep) {
+                return Err(Error::ManifestValidation(format!(
+                    "uv: dependency `{}` is not pinned — {}. Write it as \
+                     `package==version`, so this Run and a Run next month install the \
+                     same code.",
+                    dep, why
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `uv run --with <dep>… --script <path> <arg>…` — every `--with` before `--script`,
+/// in the order the manifest wrote them, so the argv is a function of the config and
+/// nothing else. Factored out for the same reason [`text_embed_args`] is: every CI
+/// runner here is a machine without `uv`, and this is the half a runner can drive.
+fn uv_op_args(script: &str, deps: &[String], args: &[String]) -> Vec<String> {
+    let mut extra: Vec<String> = Vec::with_capacity(deps.len() * 2);
+    for dep in deps {
+        extra.push("--with".to_string());
+        extra.push(dep.trim().to_string());
+    }
+    let mut a = vec!["run".to_string()];
+    a.extend(extra);
+    a.push("--script".to_string());
+    a.push(script.to_string());
+    a.extend_from_slice(args);
+    a
+}
+
+/// Everything decided BEFORE `uv` is spawned: resolve the script, check its bytes
+/// against the pin, build the argv.
+///
+/// Both refusals are NON-retryable [`Error::StepExecution`], the missing-binary class.
+/// A script that is absent will be absent on the second attempt, and one whose bytes
+/// disagree with the manifest will disagree again — a Protocol carrying
+/// `defaults.retry` would otherwise pay its backoff three times to be told the same
+/// thing.
+fn uv_invocation(cfg: &UvConfig, dir: &Path) -> Result<Vec<String>> {
+    let script = dir.join(cfg.script.trim());
+    let bytes = std::fs::read(&script).map_err(|e| Error::StepExecution {
+        step: "uv".to_string(),
+        source: std::io::Error::new(
+            e.kind(),
+            format!(
+                "the script {} is not readable at {}: {}. `uv@1` runs a file the \
+                 Protocol carries; it does not fetch one.",
+                cfg.script,
+                script.display(),
+                e
+            ),
+        ),
+    })?;
+    let found = crate::state::content_hash(&bytes);
+    let expected = cfg.sha256.trim().to_ascii_lowercase();
+    if found != expected {
+        return Err(Error::StepExecution {
+            step: "uv".to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the script {} does not match the digest this step pins.\n  \
+                     expected  {}\n  found     {}\nA `uv@1` step addresses exact \
+                     bytes, so editing the script is a manifest edit as well. If the \
+                     new bytes are the ones you want, set `sha256: {}`.",
+                    cfg.script, expected, found, found
+                ),
+            ),
+        });
+    }
+    // EVERY DEPENDENCY REACHING `uv` IS PINNED, WHEREVER IT IS DECLARED. The digest
+    // above secures the script's bytes; it says nothing about what those bytes ask
+    // `uv` to fetch. `uv run --script` reads the file's own PEP 723 header and
+    // installs what it names IN ADDITION TO every `--with`, so a step with no `deps:`
+    // at all could resolve an unpinned package on the day it ran, with the manifest,
+    // the digest and the asset graph all reading as unchanged. Same rule, both sites.
+    let source = String::from_utf8_lossy(&bytes);
+    let declared = script_declared_dependencies(&source).map_err(|why| Error::StepExecution {
+        step: "uv".to_string(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} carries a PEP 723 script block this operator cannot read: {}. \
+                 What it cannot read, `uv` installs anyway, so it is refused rather \
+                 than ignored.",
+                cfg.script, why
+            ),
+        ),
+    })?;
+    for dep in &declared {
+        if let Some(why) = unpinned_dependency(dep) {
+            return Err(Error::StepExecution {
+                step: "uv".to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{}'s own PEP 723 block declares `{}`, which is not pinned — \
+                         {}. `uv run --script` installs what that block names as well \
+                         as what `deps:` names, so pinning the script's bytes does not \
+                         pin what it fetches. Write it as `package==version` there, or \
+                         move it to the step's `deps:`.",
+                        cfg.script, dep, why
+                    ),
+                ),
+            });
+        }
+    }
+    Ok(uv_op_args(&script.to_string_lossy(), &cfg.deps, &cfg.args))
+}
+
+impl Operator for Uv {
+    fn name(&self) -> &'static str {
+        "uv"
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = UvConfig::parse(with)?;
+        cfg.validate()?;
+        let mut assets = OpAssets::default();
+        // `default_kind_for_declared_name` and nothing else. These are strings a
+        // human wrote with no parser behind them — the one declaration site that
+        // function exists for — so the rule that reads a trailing separator and a
+        // glob metacharacter is the rule that applies here too.
+        for name in cfg.reads.iter().map(|n| n.trim()).filter(|n| !n.is_empty()) {
+            let kind = crate::asset_kind::default_kind_for_declared_name(name);
+            assets.record_reads(name.to_string(), kind);
+        }
+        for name in cfg
+            .produces
+            .iter()
+            .map(|n| n.trim())
+            .filter(|n| !n.is_empty())
+        {
+            let kind = crate::asset_kind::default_kind_for_declared_name(name);
+            assets.record_produces(name.to_string(), kind);
+        }
+        Ok(assets)
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        let cfg = UvConfig::parse(with)?;
+        cfg.validate()?;
+        let args = uv_invocation(&cfg, ctx.dir)?;
+        // Inherit, not Capture: a Protocol's own script is the one place a person
+        // put print statements on purpose, and Inherit is also the mode that honours
+        // the step timeout.
+        run_process("uv", &args, ctx, OutputMode::Inherit, "uv")
+    }
 }
 
 #[cfg(test)]
@@ -6440,5 +6915,505 @@ mod tests {
             filed.etag,
             "the store was filed again by a run that had nothing new to tell it"
         );
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+    // uv@1 — the two refusals that make it an operator rather than a `command:`,
+    // the dependency pin, and the argv.
+    //
+    // Each refusal below is driven from a config that is otherwise VALID, changed
+    // in exactly one way. That is the shape the mutation half of this work needs:
+    // the passing case and the refusing case differ by the one field under test,
+    // so a refusal that stops firing cannot be masked by a second defect.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// A `with:` block that passes every check — the base each refusal mutates.
+    fn uv_ok() -> Value {
+        serde_yaml::from_str(
+            r#"
+script: scripts/derive.py
+sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+deps: ["duckdb==1.5.5"]
+args: ["--db", "build/pipeline.duckdb"]
+reads: ["build/crosswalk.parquet"]
+produces: ["build/coverage.json"]
+"#,
+        )
+        .unwrap()
+    }
+
+    /// The base config is genuinely accepted. Without this, every refusal below
+    /// could be firing for a reason that has nothing to do with the field it names.
+    #[test]
+    fn uv_accepts_a_fully_declared_step() {
+        let assets = Uv.assets(&uv_ok()).expect("the base config must be valid");
+        assert_eq!(assets.reads, vec!["build/crosswalk.parquet".to_string()]);
+        assert_eq!(assets.produces, vec!["build/coverage.json".to_string()]);
+    }
+
+    /// Drop `reads:` from the base config and the operator refuses, naming the
+    /// field. A Python step invisible to staleness is the defect `uv@1` exists to
+    /// close, so it must not be expressible.
+    #[test]
+    fn uv_refuses_a_step_that_declares_no_reads() {
+        let mut with = uv_ok();
+        with.as_mapping_mut().unwrap().remove(Value::from("reads"));
+        let err = Uv.assets(&with).unwrap_err().to_string();
+        assert!(
+            err.contains("`reads:` declares nothing"),
+            "the refusal must name the field: {err}"
+        );
+        assert!(err.contains("asset graph"), "and say why it matters: {err}");
+    }
+
+    /// The same for `produces:`, which is the half that lets a step DOWNSTREAM of
+    /// this one go stale.
+    #[test]
+    fn uv_refuses_a_step_that_declares_no_produces() {
+        let mut with = uv_ok();
+        with.as_mapping_mut()
+            .unwrap()
+            .remove(Value::from("produces"));
+        let err = Uv.assets(&with).unwrap_err().to_string();
+        assert!(
+            err.contains("`produces:` declares nothing"),
+            "the refusal must name the field: {err}"
+        );
+    }
+
+    /// `reads: []` costs exactly what an absent `reads:` costs — a step with no
+    /// edges — so it is refused identically. A rule that reads only for the key's
+    /// presence is a rule with one spelling of its own defect left open.
+    #[test]
+    fn uv_refuses_an_empty_reads_list_the_same_way_as_an_absent_one() {
+        for yaml in ["reads: []", r#"reads: ["", "  "]"#] {
+            let mut with = uv_ok();
+            let empty: Value = serde_yaml::from_str(yaml).unwrap();
+            let list = empty
+                .as_mapping()
+                .unwrap()
+                .get(Value::from("reads"))
+                .unwrap()
+                .clone();
+            with.as_mapping_mut()
+                .unwrap()
+                .insert(Value::from("reads"), list);
+            let err = Uv.assets(&with).unwrap_err().to_string();
+            assert!(
+                err.contains("`reads:` declares nothing"),
+                "`{yaml}` must be refused like an absent reads:, got: {err}"
+            );
+        }
+    }
+
+    /// Every spelling that leaves the resolver a choice, refused **by name** — and
+    /// the assertion is on the reason, not on the fact of a refusal.
+    ///
+    /// The distinction is the whole test. `unpinned_dependency` is a ladder of
+    /// guards, and deleting any rung leaves a lower one catching the same input for a
+    /// different reason: strike `s.contains(';')` and an environment marker is caught
+    /// by the second-constraint rung instead, because `python_version < '3.13'`
+    /// carries a `<`. A test asserting only that the entry was refused is green
+    /// against every one of those deletions. The mutation gate found exactly that,
+    /// four rungs at once, and this is the repair — each row names the rung that is
+    /// supposed to catch it.
+    ///
+    /// The property is about time, not style: a range resolves to whatever the index
+    /// holds on the day it runs, so two Runs a month apart install different code
+    /// while the manifest, the digest and the asset graph all read as unchanged.
+    #[test]
+    fn uv_refuses_every_unpinned_dependency_spelling_for_the_right_reason() {
+        for (spec, rung) in [
+            ("", "names no package"),
+            (
+                "duckdb==1.5.5; python_version < '3.13'",
+                "environment marker",
+            ),
+            (
+                "duckdb @ https://example.invalid/duckdb.whl",
+                "direct reference",
+            ),
+            ("duckdb", "carries no `==`"),
+            ("duckdb>=1.5.5", "carries no `==`"),
+            ("duckdb<2", "carries no `==`"),
+            ("duckdb~=1.5.5", "carries no `==`"),
+            ("duckdb!=1.5.4", "carries no `==`"),
+            ("duckdb>=1.5,<2", "carries no `==`"),
+            ("duckdb==1.5.5,!=1.5.4", "exactly one `==`"),
+            ("duckdb===1.5.5", "exactly one `==`"),
+            ("duckdb[==1.5.5", "never closed"),
+            ("duckdb[]==1.5.5", "not a list of extras"),
+            ("duckdb[a b]==1.5.5", "not a list of extras"),
+            ("[extras]==1.5.5", "not a distribution name"),
+            ("duck db==1.5.5", "not a distribution name"),
+            ("duckdb==", "nothing after it"),
+            ("duckdb==1.5.*", "wildcard"),
+            ("duckdb==1!5.5", "not a version"),
+        ] {
+            let why = unpinned_dependency(spec)
+                .unwrap_or_else(|| panic!("`{spec}` leaves the version open and must be refused"));
+            assert!(
+                why.contains(rung),
+                "`{spec}` must be refused for `{rung}`, not for: {why}"
+            );
+
+            // And the refusal reaches a manifest author with the entry quoted.
+            let mut with = uv_ok();
+            with.as_mapping_mut().unwrap().insert(
+                Value::from("deps"),
+                Value::Sequence(vec![Value::from(spec)]),
+            );
+            let err = Uv.assets(&with).unwrap_err().to_string();
+            assert!(err.contains(rung), "the reason reaches the author: {err}");
+            assert!(
+                err.contains("package==version"),
+                "and so does the pinned form: {err}"
+            );
+        }
+    }
+
+    /// The other direction, which matters as much: a rule that bites an honest pin
+    /// is worse than the gap it closes. Extras, epochs-free local versions and
+    /// pre-releases are all legitimate pins.
+    #[test]
+    fn uv_accepts_the_pinned_spellings() {
+        for spec in [
+            "duckdb==1.5.5",
+            "pandas==2.2.3",
+            "tomli_w==1.2.0",
+            "tomli-w==1.2.0",
+            "pydantic[email]==2.9.2",
+            "torch==2.4.0+cpu",
+            "numpy==2.0.0rc1",
+            "  duckdb==1.5.5  ",
+        ] {
+            assert_eq!(
+                unpinned_dependency(spec),
+                None,
+                "`{spec}` is a pin and must be accepted"
+            );
+        }
+    }
+
+    /// A blank `script:` names no file, so it is refused rather than turned into a
+    /// `dir.join("")` that resolves to the protocol directory itself.
+    #[test]
+    fn uv_refuses_a_blank_script() {
+        for spelling in ["", "   "] {
+            let mut with = uv_ok();
+            with.as_mapping_mut()
+                .unwrap()
+                .insert(Value::from("script"), Value::from(spelling));
+            let err = Uv.assets(&with).unwrap_err().to_string();
+            assert!(
+                err.contains("`script:` is blank"),
+                "a blank script must be refused, got: {err}"
+            );
+        }
+    }
+
+    /// `sha256:` is compared as text against a lowercase hex digest, so anything
+    /// that is not one is refused at load rather than mismatching at run.
+    #[test]
+    fn uv_refuses_a_sha256_that_is_not_lowercase_hex() {
+        for (digest, expect) in [
+            ("deadbeef", "64 hex characters"),
+            (
+                "00000000000000000000000000000000000000000000000000000000000000zz",
+                "64 hex characters",
+            ),
+            (
+                "ABCDEF0000000000000000000000000000000000000000000000000000000000",
+                "lowercase",
+            ),
+        ] {
+            let mut with = uv_ok();
+            with.as_mapping_mut()
+                .unwrap()
+                .insert(Value::from("sha256"), Value::from(digest));
+            let err = Uv.assets(&with).unwrap_err().to_string();
+            assert!(
+                err.contains(expect),
+                "`{digest}` must be refused for {expect}, got: {err}"
+            );
+        }
+    }
+
+    /// `run` validates again rather than trusting that manifest load did.
+    ///
+    /// It is not redundant and it is not covered by the load-time tests: those call
+    /// `assets`, and neutering `run`'s own `cfg.validate()?` left all of them green.
+    /// A caller that reaches `run` without going through manifest validation — a
+    /// generated step, a future embedding of the engine — would otherwise spawn `uv`
+    /// on a config the operator has already decided is not expressible.
+    #[test]
+    fn uv_run_refuses_an_invalid_config_rather_than_spawning() {
+        let mut with = uv_ok();
+        with.as_mapping_mut().unwrap().remove(Value::from("reads"));
+        let tmp = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+        let err = Uv
+            .run(&with, &test_ctx(tmp.path(), &env))
+            .expect_err("run must refuse a config assets() would have refused");
+        assert!(
+            err.to_string().contains("`reads:` declares nothing"),
+            "and refuse it for the same reason: {err}"
+        );
+        assert!(
+            matches!(err, Error::ManifestValidation(_)),
+            "a config defect is a validation error wherever it is caught"
+        );
+    }
+
+    /// A Run whose script bytes differ from the pin refuses BEFORE `uv` is spawned,
+    /// and the message carries the step, the digest expected and the digest found —
+    /// so re-pinning is a copy-paste rather than a hunt.
+    #[test]
+    fn uv_refuses_a_script_whose_bytes_do_not_match_the_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("scripts")).unwrap();
+        let body = b"print('hello')\n";
+        std::fs::write(tmp.path().join("scripts/derive.py"), body).unwrap();
+        let real = crate::state::content_hash(body);
+
+        let cfg = UvConfig::parse(&uv_ok()).unwrap();
+        let err = uv_invocation(&cfg, tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("uv"), "names the step: {msg}");
+        assert!(
+            msg.contains(&"0".repeat(64)),
+            "names the digest the manifest pinned: {msg}"
+        );
+        assert!(msg.contains(&real), "names the digest found: {msg}");
+
+        // Non-retryable: a script whose bytes disagree with the manifest will
+        // disagree again, so a Protocol carrying `defaults.retry` must not pay its
+        // backoff three times to be told the same thing.
+        assert!(
+            matches!(err, Error::StepExecution { .. }),
+            "a digest mismatch is deterministic, so it is not a retryable failure"
+        );
+
+        // And with the digest corrected, the same config builds an invocation.
+        let mut with = uv_ok();
+        with.as_mapping_mut()
+            .unwrap()
+            .insert(Value::from("sha256"), Value::from(real.as_str()));
+        let cfg = UvConfig::parse(&with).unwrap();
+        uv_invocation(&cfg, tmp.path()).expect("the pin now matches the bytes");
+    }
+
+    /// The hole a byte digest structurally cannot close: `uv run --script` reads the
+    /// script's OWN PEP 723 header and installs what it names, in addition to every
+    /// `--with`. So a step declaring no `deps:` at all, with its script pinned
+    /// byte-for-byte, could resolve an unpinned package on the day it ran — because
+    /// the unpinned declaration is part of the bytes the digest pins.
+    ///
+    /// Reproduced end to end before this test existed, with a header reading
+    /// `dependencies = ["iniconfig"]`: `arc run` installed one and succeeded.
+    #[test]
+    fn uv_refuses_an_unpinned_dependency_declared_inside_the_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("scripts")).unwrap();
+        let body = "# /// script\n# requires-python = \">=3.12\"\n# dependencies = [\n#   \"iniconfig\",\n# ]\n# ///\nprint('hi')\n";
+        std::fs::write(tmp.path().join("scripts/derive.py"), body).unwrap();
+
+        let mut with = uv_ok();
+        with.as_mapping_mut().unwrap().insert(
+            Value::from("sha256"),
+            Value::from(crate::state::content_hash(body.as_bytes())),
+        );
+        // No `deps:` at all — the manifest is silent, which is exactly the case the
+        // digest was assumed to cover.
+        with.as_mapping_mut().unwrap().remove(Value::from("deps"));
+        let cfg = UvConfig::parse(&with).unwrap();
+        let err = uv_invocation(&cfg, tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("iniconfig"), "names the entry: {err}");
+        assert!(err.contains("PEP 723"), "and where it came from: {err}");
+
+        // And a PINNED one in the same place is accepted, so the rule is about the pin
+        // rather than about the block.
+        let pinned = body.replace("\"iniconfig\"", "\"iniconfig==2.0.0\"");
+        std::fs::write(tmp.path().join("scripts/derive.py"), &pinned).unwrap();
+        let mut with = uv_ok();
+        with.as_mapping_mut().unwrap().insert(
+            Value::from("sha256"),
+            Value::from(crate::state::content_hash(pinned.as_bytes())),
+        );
+        with.as_mapping_mut().unwrap().remove(Value::from("deps"));
+        let cfg = UvConfig::parse(&with).unwrap();
+        uv_invocation(&cfg, tmp.path()).expect("a pinned PEP 723 dependency is fine");
+    }
+
+    /// A block this operator cannot read is refused, not ignored — what it cannot see,
+    /// `uv` installs anyway.
+    #[test]
+    fn uv_refuses_a_pep_723_block_it_cannot_read() {
+        for (label, body) in [
+            (
+                "never closed",
+                "# /// script\n# dependencies = [\n#   \"x==1\",\n# ]\nprint('hi')\n",
+            ),
+            (
+                "unterminated string",
+                "# /// script\n# dependencies = [\n#   \"x==1,\n# ]\n# ///\nprint('hi')\n",
+            ),
+            (
+                "list not closed",
+                "# /// script\n# dependencies = [\n#   \"x==1\",\n# ///\nprint('hi')\n",
+            ),
+            // The block runs to END OF FILE. This is the case the `!closed` branch
+            // exists for, and it is NOT the same as the first: there the loop meets a
+            // non-comment line and refuses on that, so returning an empty list at
+            // end-of-file was invisible until this row. The dependency here is PINNED
+            // on purpose, so the only thing that can refuse it is the unclosed block.
+            (
+                "closes at end of file",
+                "# /// script\n# dependencies = [\n#   \"x==1\",\n# ]\n",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(tmp.path().join("scripts")).unwrap();
+            std::fs::write(tmp.path().join("scripts/derive.py"), body).unwrap();
+            let mut with = uv_ok();
+            with.as_mapping_mut().unwrap().insert(
+                Value::from("sha256"),
+                Value::from(crate::state::content_hash(body.as_bytes())),
+            );
+            let cfg = UvConfig::parse(&with).unwrap();
+            let err = uv_invocation(&cfg, tmp.path()).unwrap_err().to_string();
+            assert!(
+                err.contains("PEP 723"),
+                "`{label}` must be refused as an unreadable block, got: {err}"
+            );
+        }
+    }
+
+    /// The parser reads the block and only the block. Each case is a shape that would
+    /// let an unpinned dependency through if it were read wrongly.
+    #[test]
+    fn script_declared_dependencies_reads_the_block_and_nothing_else() {
+        // No block at all.
+        assert_eq!(
+            script_declared_dependencies("print('hi')\n").unwrap(),
+            Vec::<String>::new()
+        );
+        // A block with no dependencies key.
+        assert_eq!(
+            script_declared_dependencies("# /// script\n# requires-python = \">=3.12\"\n# ///\n")
+                .unwrap(),
+            Vec::<String>::new()
+        );
+        // The real shape, single and double quoted, across lines.
+        assert_eq!(
+            script_declared_dependencies(
+                "# /// script\n# dependencies = [\n#   \"duckdb==1.5.5\",\n#   'numpy==2.0.0',\n# ]\n# ///\n"
+            )
+            .unwrap(),
+            vec!["duckdb==1.5.5".to_string(), "numpy==2.0.0".to_string()]
+        );
+        // A mention of the opener inside prose is not the block — it is not at a line
+        // start, so it is not read.
+        assert_eq!(
+            script_declared_dependencies("x = \"# /// script\"\n").unwrap(),
+            Vec::<String>::new()
+        );
+        // A key that merely starts with `dependencies` is not the list.
+        assert!(
+            script_declared_dependencies(
+                "# /// script\n# dependencies_note = \"see below\"\n# ///\n"
+            )
+            .is_err()
+                || script_declared_dependencies(
+                    "# /// script\n# dependencies_note = \"see below\"\n# ///\n"
+                )
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A script that is not on disk is the same class — deterministic, so
+    /// non-retryable — and the message says this operator does not fetch one.
+    #[test]
+    fn uv_refuses_a_script_that_is_not_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = UvConfig::parse(&uv_ok()).unwrap();
+        let err = uv_invocation(&cfg, tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, Error::StepExecution { .. }),
+            "a missing script is not retryable"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("scripts/derive.py"), "names the script: {msg}");
+        // Pinned at the WORDING, not merely at the type. Letting the read error fall
+        // through would hash empty bytes instead, and the digest mismatch that
+        // followed is also a `StepExecution` that also names the script — so an
+        // assertion on either of those alone cannot tell a missing file from an
+        // edited one, and would tell the reader the wrong thing about their tree.
+        assert!(
+            msg.contains("is not readable"),
+            "says the file is absent rather than reporting a digest mismatch \
+             against empty bytes: {msg}"
+        );
+        assert!(
+            !msg.contains("does not match the digest"),
+            "a missing script is not a pin failure: {msg}"
+        );
+    }
+
+    /// Every `--with` precedes `--script`, and the script's own arguments follow
+    /// the path. `uv` reads `--with` as its own flag and everything after the
+    /// script path as the script's, so this order is not cosmetic.
+    #[test]
+    fn uv_op_args_put_every_with_before_the_script() {
+        assert_eq!(
+            uv_op_args(
+                "/cache/derive.py",
+                &["duckdb==1.5.5".to_string(), "tomli_w==1.2.0".to_string()],
+                &["--db".to_string(), "build/p.duckdb".to_string()],
+            ),
+            vec![
+                "run",
+                "--with",
+                "duckdb==1.5.5",
+                "--with",
+                "tomli_w==1.2.0",
+                "--script",
+                "/cache/derive.py",
+                "--db",
+                "build/p.duckdb",
+            ]
+        );
+    }
+
+    /// With no dependencies the argv is exactly what the frozen-script operators
+    /// build, so `uv@1` is the same substrate rather than a parallel one.
+    #[test]
+    fn uv_op_args_with_no_deps_match_the_frozen_script_invocation() {
+        assert_eq!(
+            uv_op_args("/cache/derive.py", &[], &["--x".to_string()]),
+            uv_run_args("/cache/derive.py", &["--x".to_string()])
+        );
+    }
+
+    /// The declared names carry the kind their spelling implies — the same rule a
+    /// manifest `depends_on:` gets, because these are strings a human wrote with
+    /// no parser behind them.
+    #[test]
+    fn uv_declares_the_kind_each_name_spells() {
+        let with: Value = serde_yaml::from_str(
+            r#"
+script: s.py
+sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+reads: ["build/in.parquet", "build/parts/", "build/shards/*.parquet"]
+produces: ["build/out.json"]
+"#,
+        )
+        .unwrap();
+        let assets = Uv.assets(&with).unwrap();
+        use crate::asset_kind::AssetKind;
+        assert_eq!(assets.kinds["build/in.parquet"], AssetKind::File);
+        assert_eq!(assets.kinds["build/parts/"], AssetKind::Directory);
+        assert_eq!(assets.kinds["build/shards/*.parquet"], AssetKind::Pattern);
+        assert_eq!(assets.kinds["build/out.json"], AssetKind::File);
     }
 }

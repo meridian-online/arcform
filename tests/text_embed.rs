@@ -11,11 +11,14 @@
 //!
 //! WHAT NEEDS WHAT, AND WHAT CI ACTUALLY RUNS. The embedding needs the loadable
 //! embedding extension, which is tens of megabytes and is not committed; the
-//! projection needs `uv`. The routine gate (`ci.yml`'s `build` job, every push and PR)
-//! has neither, so every test below that produces vectors is `#[ignore]`d there — it
-//! shows in that job's `cargo test` summary as `ignored`, not `ok`. The one test the
-//! routine gate actually executes is the refusal when the extension asset is missing,
-//! decided in Rust before anything is spawned; it needs neither input, so it carries no
+//! projection needs `uv` AND the several hundred megabytes `uv` resolves for it
+//! (umap-learn, numba, scipy, scikit-learn). The routine gate (`ci.yml`'s `build`
+//! job, every push and PR) installs `uv` — it is cheap, and `tests/uv_operator.rs`
+//! needs a real one — but it stages no extension and pays no resolve, so every test
+//! below that produces vectors is still `#[ignore]`d there. It shows in that job's
+//! `cargo test` summary as `ignored`, not `ok`. The one test the routine gate
+//! actually executes is the refusal when the extension asset is missing, decided in
+//! Rust before anything is spawned; it needs neither input, so it carries no
 //! `#[ignore]`.
 //!
 //! The staged gate — `.github/workflows/text-embed-parity.yml`, on a schedule and on
@@ -55,11 +58,17 @@ fn have_uv() -> bool {
 /// reached only when something has deliberately asked to run it anyway
 /// (`--include-ignored`), so a missing `uv` at that point is the run being
 /// misconfigured, not a case to return quietly from.
+///
+/// `uv`'s absence is NOT why the callers are `#[ignore]`d — the routine gate has had
+/// `uv` since `tests/uv_operator.rs` needed one. They are ignored for the extension
+/// and for the resolve those tests pay; this stays because a run that reaches here
+/// without `uv` would otherwise fail somewhere less legible.
 fn require_uv() {
     assert!(
         have_uv(),
-        "`uv` must be on PATH: this test is #[ignore]d on the routine gate for \
-         exactly this reason — see the staged workflow, text-embed-parity.yml"
+        "`uv` must be on PATH: reaching this line means something asked for the \
+         #[ignore]d tests, and the staged workflow (text-embed-parity.yml) is what \
+         stages the rest of what they need"
     );
 }
 
