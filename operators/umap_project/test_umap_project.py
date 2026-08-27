@@ -215,6 +215,77 @@ class SqlQuotingTest(unittest.TestCase):
         self.assertEqual(up.sql_lit("it's"), "'it''s'")
 
 
+class ClampNeighborsTest(unittest.TestCase):
+    """`clamp_neighbors` is the operator's own deviation from umap-learn's semantics,
+    so it is the thing most worth pinning — and until it was hoisted out of `main()`
+    it was untestable here, because `main()` imports umap.
+
+    Deleting the clamp entirely left the whole suite green and a six-row table at the
+    default `neighbors: 15` died inside UMAP.
+    """
+
+    def test_it_bounds_above_at_one_below_the_row_count(self) -> None:
+        # The measured case: on 48 rows, everything at or above 47 is the same fit.
+        self.assertEqual(up.clamp_neighbors(47, 48), 47)
+        self.assertEqual(up.clamp_neighbors(100, 48), 47)
+        self.assertEqual(up.clamp_neighbors(200, 48), 47)
+        # And below the boundary the knob is the knob.
+        self.assertEqual(up.clamp_neighbors(40, 48), 40)
+
+    def test_it_bounds_below_at_two(self) -> None:
+        # UMAP needs at least two neighbours; a table at MIN_ROWS must still fit.
+        self.assertEqual(up.clamp_neighbors(15, up.MIN_ROWS), up.MIN_ROWS - 1)
+        self.assertEqual(up.clamp_neighbors(1, 3), 2)
+        self.assertEqual(up.clamp_neighbors(15, 2), 2)
+
+    def test_the_default_never_exceeds_the_smallest_table_it_will_accept(self) -> None:
+        """The concrete failure deleting the clamp produces: the DEFAULT knob against
+        the SMALLEST table this script accepts. Without the clamp that pair reaches
+        UMAP as n_neighbors=15 on 5 rows, which raises."""
+        self.assertLess(
+            up.clamp_neighbors(up.DEFAULT_NEIGHBORS, up.MIN_ROWS),
+            up.MIN_ROWS,
+            "n_neighbors must be strictly below the row count or UMAP raises",
+        )
+
+
+class MetricChoicesTest(unittest.TestCase):
+    """argparse must actually ENFORCE `METRICS`, not merely be handed it.
+
+    `umap_project_metrics_list_agrees_with_the_script` pins the literal tuple. It does
+    not pin that the parser uses it: narrowing `choices=METRICS` to `("euclidean",)`
+    while `METRICS` and the operator's list stayed in agreement left the whole
+    workspace green, and a manifest writing `metric: cosine` would then validate and
+    die inside argument parsing mid-run — the precise failure the tuple pin exists to
+    prevent.
+    """
+
+    def _parser(self):
+        # Built the same way `main()` builds it, from the same module, so a divergence
+        # between this and the real parser is a divergence in one file.
+        import argparse
+
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--metric", choices=up.METRICS, default=up.DEFAULT_METRIC)
+        return ap
+
+    def test_every_declared_metric_is_accepted_by_the_real_parser(self) -> None:
+        source = (HERE / "umap_project.py").read_text(encoding="utf-8")
+        self.assertIn(
+            "choices=METRICS",
+            source,
+            "the parser must take its choices from METRICS, or the tuple pin guards "
+            "a list nothing enforces",
+        )
+        for metric in up.METRICS:
+            with self.subTest(metric=metric):
+                self.assertEqual(self._parser().parse_args(["--metric", metric]).metric, metric)
+
+    def test_a_metric_outside_the_set_is_refused(self) -> None:
+        with self.assertRaises(SystemExit):
+            self._parser().parse_args(["--metric", "manhattan"])
+
+
 class DefaultsTest(unittest.TestCase):
     def test_the_default_metric_is_one_the_operator_accepts(self) -> None:
         # argparse would reject its own default otherwise, and the failure would land

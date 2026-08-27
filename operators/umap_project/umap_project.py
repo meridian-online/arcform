@@ -129,8 +129,11 @@ DEFAULT_MIN_DIST = 0.1
 # load rather than by an exception from inside UMAP an hour into a run. `euclidean` is
 # umap-learn's own default and the right reading of an arbitrary feature matrix;
 # `cosine` is the right reading of L2-normalised vectors, which is what an embedding
-# is. Adding a third is a line here, a line in the operator's config validation, and a
-# test that the map moves.
+# is. Adding a third is a line here AND a line changing UMAP_METRICS in src/operator.rs
+# (which both the authoring schema's `enum` and the operator's config validation read
+# from) — `umap_project_metrics_list_agrees_with_the_script` parses this exact tuple out
+# of the frozen bytes and reddens if the two lists disagree, so this is not a comment
+# asking you to remember, it is a test that fails if you do not.
 METRICS = ("euclidean", "cosine")
 DEFAULT_METRIC = "euclidean"
 
@@ -138,6 +141,28 @@ DEFAULT_METRIC = "euclidean"
 # this there is no neighbourhood structure to find and a map would be noise wearing
 # coordinates.
 MIN_ROWS = 5
+
+
+def clamp_neighbors(requested: int, n_rows: int) -> int:
+    """The `n_neighbors` UMAP is actually given, which is NOT always what was asked.
+
+    UMAP fits a k-nearest-neighbour graph, so `n_neighbors` must be strictly below the
+    row count; above that it raises. Clamping rather than failing keeps a small input
+    on a map instead of on an exception from inside a library.
+
+    THE COST IS THAT THE KNOB STOPS ABOVE `n_rows - 1` AND SAYS NOTHING. On a 48-row
+    input, `neighbors:` of 47, 100 and 200 all produce byte-identical output; 40 moves
+    the bytes. That is a real deviation from umap-learn's documented meaning for this
+    parameter, and it is arcform's, not umap-learn's — which is why the READMEs and
+    the authoring schema state it instead of pointing a reader at umap-learn's own
+    docs for what `n_neighbors` does.
+
+    Hoisted out of `main()` deliberately: `main()` imports umap, numpy and duckdb
+    inside itself so this module stays importable on a machine with none of the three,
+    which is every routine CI runner. A clamp inline in `main()` is a clamp no runner
+    can test, and deleting it left the whole suite green.
+    """
+    return max(2, min(requested, n_rows - 1))
 
 # DuckDB's numeric scalar types, by the name `DESCRIBE` reports. DECIMAL is matched by
 # prefix because it reports its precision and scale.
@@ -372,9 +397,9 @@ def main() -> int:
             f"number has no position on a map."
         )
 
-    # n_neighbors must be strictly below the row count; clamp rather than fail, so a
-    # small input still lands on a map instead of on an exception from inside UMAP.
-    k = max(2, min(args.neighbors, len(rows) - 1))
+    # See `clamp_neighbors` for what this costs and why it is disclosed rather than
+    # hidden: above `len(rows) - 1` the knob stops moving and nothing says so.
+    k = clamp_neighbors(args.neighbors, len(rows))
     reducer = umap.UMAP(
         n_components=2,
         n_neighbors=k,

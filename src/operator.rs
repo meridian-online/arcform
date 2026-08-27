@@ -325,7 +325,7 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
                 "input": { "type": "string", "description": "Parquet holding the columns to project." },
                 "columns": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "The numeric columns to reduce, in order. A numeric scalar contributes one feature; a list/array of numerics — a vector column — contributes one per element. There is no text column and no model: to map text, write a vector column from it first (text_embed, or a SQL step calling the DuckDB embedding extension)." },
                 "out": { "type": "string", "description": "Parquet to write — every input column plus projection_x and projection_y as DOUBLE, and projection_fit_id (VARCHAR, same value on every row) fingerprinting the exact numbers and knobs this fit consumed." },
-                "neighbors": { "type": "integer", "minimum": 2, "description": "UMAP n_neighbors: low reads local structure, high reads global. Defaults to the script's 15 when omitted." },
+                "neighbors": { "type": "integer", "minimum": 2, "description": "UMAP n_neighbors: low reads local structure, high reads global. Defaults to the script's 15 when omitted. CLAMPED to one below the input's row count: above that the value stops changing the fit and the run still succeeds, so a larger number here is not an error and is not an effect either. That clamp is arcform's, not umap-learn's, so umap-learn's documentation for n_neighbors does not describe what happens above the boundary." },
                 "min_dist": { "type": "number", "minimum": 0, "exclusiveMaximum": 1, "description": "UMAP min_dist: how tightly points may pack. Defaults to the script's 0.1 when omitted." },
                 "metric": { "type": "string", "enum": UMAP_METRICS, "description": "How the distance between two rows is measured. Defaults to the script's euclidean when omitted, which is the reading an arbitrary feature matrix wants; cosine is the reading an L2-normalised vector column wants. Nothing here scales your columns — under euclidean a wider-spread column dominates the layout, which is a decision for the SQL step that selects them." }
             }),
@@ -4762,11 +4762,22 @@ mod tests {
     /// materialised, it is named first, and the bytes on disk are the bytes `@1`
     /// addresses. This is the half of `run` a machine with no `uv` can still check —
     /// and every CI runner here is one.
+    ///
+    /// All three optional knobs are set here, to distinct non-default values, rather
+    /// than left unset as an argv-builder test alone would: `umap_project_args_*`
+    /// already proves the pure builder emits the right flags when handed values
+    /// directly, but nothing before this test drove the WIRING between a parsed
+    /// config and that builder — `cfg.neighbors`, `cfg.min_dist` and
+    /// `cfg.metric.as_deref()` at the call site in `umap_project_invocation`. A config
+    /// with every knob unset cannot tell "threaded" from "silently dropped", because
+    /// omitted-and-defaulted look identical in the argv: setting all three here is
+    /// what makes this test redden if any one of the three is replaced with `None` or
+    /// a constant at that call site.
     #[test]
     fn umap_project_invocation_materialises_the_frozen_script_and_names_it() {
         let tmp = tempfile::tempdir().unwrap();
         let with: Value = serde_yaml::from_str(
-            "input: build/homes.parquet\ncolumns: [longitude, latitude]\nout: build/mapped.parquet",
+            "input: build/homes.parquet\ncolumns: [longitude, latitude]\nout: build/mapped.parquet\nneighbors: 30\nmin_dist: 0.25\nmetric: cosine",
         )
         .unwrap();
         let cfg = UmapProjectConfig::parse(&with).unwrap();
@@ -4795,8 +4806,17 @@ mod tests {
                     .join("build/mapped.parquet")
                     .display()
                     .to_string(),
+                "--neighbors",
+                "30",
+                "--min-dist",
+                "0.25",
+                "--metric",
+                "cosine",
             ],
-            "every path reaches the script resolved against the protocol directory"
+            "every path reaches the script resolved against the protocol directory, \
+             and `neighbors:`, `min_dist:` and `metric:` reach the invocation with the \
+             values the manifest set — not just the values `umap_project_args` would \
+             emit if handed them directly"
         );
         assert!(
             tmp.path().join("build").is_dir(),
@@ -4981,6 +5001,105 @@ mod tests {
                  and opens no socket"
             );
         }
+    }
+
+    /// [`UMAP_METRICS`] is the one place the authoring schema's `enum` (`with_schema`)
+    /// and this operator's `validate` both read from — those two cannot disagree with
+    /// each other. What they COULD still disagree with is the frozen script's own
+    /// tuple, which is a separate literal in a different language: narrowing one side
+    /// without the other lets a manifest validate a metric the script's argparse then
+    /// refuses (or the reverse — a manifest refused for a metric the script would
+    /// have accepted). Parsed out of the embedded bytes `op@1` addresses rather than
+    /// copied by hand, so that divergence reddens here instead of an hour into a run.
+    #[test]
+    fn umap_project_metrics_list_agrees_with_the_script() {
+        // ANCHORED AT THE START OF A LINE, not merely found anywhere. A bare
+        // `.find("METRICS = (")` takes the first SUBSTRING, so a comment line above
+        // the real tuple reads as the tuple — `# UMAP_METRICS = ("euclidean",)` above
+        // it defeated this assertion entirely — and so does the string
+        // `UMAP_METRICS = (` itself, which contains the needle. A pin at the shape of
+        // the source is not a pin at what the source does, and a source-text scan
+        // cannot see through indirection; anchoring is the cheapest thing that makes
+        // this one read the definition rather than a mention of it.
+        let needle = "\nMETRICS = (";
+        let start = UMAP_PROJECT_PY
+            .find(needle)
+            .expect("umap_project.py must define METRICS = (...) at the start of a line")
+            + needle.len();
+        assert!(
+            UMAP_PROJECT_PY[start..].find(needle).is_none(),
+            "umap_project.py defines METRICS more than once at line start; this \
+             assertion would silently pin whichever came first"
+        );
+        let end = UMAP_PROJECT_PY[start..]
+            .find(')')
+            .expect("the METRICS tuple must close")
+            + start;
+        let script_metrics: Vec<&str> = UMAP_PROJECT_PY[start..end]
+            .split(',')
+            .map(|s| s.trim().trim_matches('"'))
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(
+            script_metrics,
+            UMAP_METRICS.to_vec(),
+            "umap_project.py's METRICS tuple has diverged from UMAP_METRICS in \
+             src/operator.rs, which the authoring schema's `enum` and this \
+             operator's `validate` both read from"
+        );
+    }
+
+    /// The authoring schema's `metric` enum must BE [`UMAP_METRICS`], not merely
+    /// resemble it.
+    ///
+    /// [`umap_project_metrics_list_agrees_with_the_script`] pins the frozen script's
+    /// tuple against that constant. Nothing pinned the third reader. Replacing
+    /// `"enum": UMAP_METRICS` with a hand-written literal, or deleting the key
+    /// outright, left the whole workspace green — and this schema is what `arc mcp`'s
+    /// `operator_describe` emits, so an authoring client would offer a metric set
+    /// that the operator's own validation then refuses.
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn umap_project_schema_enum_is_the_metrics_constant() {
+        let schema = with_schema("umap_project").expect("umap_project has a with: schema");
+        let declared = schema["properties"]["metric"]["enum"]
+            .as_array()
+            .expect("the metric property must declare an enum, or a manifest can name anything");
+        let declared: Vec<&str> = declared.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(
+            declared,
+            UMAP_METRICS.to_vec(),
+            "the authoring schema's metric enum has diverged from UMAP_METRICS, which \
+             the operator's own validation reads from"
+        );
+    }
+
+    /// The `neighbors` description an authoring client is shown must disclose the
+    /// clamp.
+    ///
+    /// It is the one place a manifest author meets this knob without reading the
+    /// operator's README — editor completion and `operator_describe` show these
+    /// strings and nothing else — so a README edit does not discharge it. Above
+    /// `rows - 1` the value stops changing the fit and the run still exits 0, which
+    /// is the shape of defect this operator is least able to afford: a confident
+    /// picture that is not true.
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn umap_project_schema_discloses_the_neighbors_clamp() {
+        let schema = with_schema("umap_project").expect("umap_project has a with: schema");
+        let described = schema["properties"]["neighbors"]["description"]
+            .as_str()
+            .expect("neighbors carries a description");
+        assert!(
+            described.contains("clamp"),
+            "the neighbors description must name the clamp — an authoring client \
+             shows this string and never the README: {described}"
+        );
+        assert!(
+            described.contains("row count"),
+            "and must say what it is clamped TO, or the disclosure is unactionable: \
+             {described}"
+        );
     }
 
     // ── text_embed ───────────────────────────────────────────────────────────
@@ -5331,6 +5450,14 @@ mod tests {
 
     /// What is handed to `uv`, decided without spawning it — the same check the
     /// projection gets, for the same reason.
+    ///
+    /// `vector_column:` is set here, to a name distinct from every other string in
+    /// this manifest, for the same reason the projection's three knobs are set to
+    /// distinct values in its own version of this test: `text_embed_args_*` already
+    /// proves the pure builder emits `--vector-column` when handed one directly, but
+    /// nothing before this test drove `cfg.vector_column.as_deref()` at the call site
+    /// in `text_embed_invocation` — a manifest that never sets it cannot tell
+    /// "threaded" from "silently dropped" in the resulting argv.
     #[test]
     fn text_embed_invocation_materialises_the_frozen_script_and_names_it() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5344,7 +5471,7 @@ mod tests {
         std::fs::write(&extension, b"not a real extension").unwrap();
         let release = "minishlab/potion-base-8M@bf8b056651a2c21b8d2565580b8569da283cab23";
         let with: Value = serde_yaml::from_str(&format!(
-            "input: build/corpus.parquet\ntext_column: description\nextension: vendor/staticembed.duckdb_extension\nout: build/embedded.parquet\nmodel: models/potion\nmodel_release: {release}"
+            "input: build/corpus.parquet\ntext_column: description\nextension: vendor/staticembed.duckdb_extension\nout: build/embedded.parquet\nvector_column: description_vector\nmodel: models/potion\nmodel_release: {release}"
         ))
         .unwrap();
         let cfg = TextEmbedConfig::parse(&with).unwrap();
@@ -5377,12 +5504,17 @@ mod tests {
                     .join("build/embedded.parquet")
                     .display()
                     .to_string(),
+                "--vector-column",
+                "description_vector",
                 "--model",
                 &model.display().to_string(),
                 "--model-release",
                 release,
             ],
-            "every path reaches the script resolved against the protocol directory"
+            "every path reaches the script resolved against the protocol directory, \
+             and `vector_column:` reaches the invocation with the name the manifest \
+             set — not just the name `text_embed_args` would emit if handed it \
+             directly"
         );
     }
 

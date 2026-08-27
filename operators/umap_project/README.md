@@ -12,15 +12,99 @@ input column plus `projection_x` and `projection_y` as `DOUBLE`.
     input: build/homes.parquet
     columns: [longitude, latitude, median_income]
     out: build/homes_mapped.parquet
-    # optional, each omitted from the script's argv when unset:
-    metric: euclidean # how distance is measured — euclidean or cosine
-    neighbors: 15     # UMAP n_neighbors — low reads local structure, high reads global
-    min_dist: 0.1     # UMAP min_dist — how tightly points may pack, in [0, 1)
+    # optional, each omitted from the script's argv when unset. Each is PROVEN to
+    # reach this script's own `uv run` invocation carrying the exact value set here —
+    # see "What each knob is proven to do" below for what that does and does not cover:
+    metric: euclidean # forwarded to UMAP's `metric=` — euclidean or cosine, per umap-learn's own docs
+    neighbors: 15     # UMAP's `n_neighbors=`, CLAMPED to one below the row count — see "The neighbours clamp" below
+    min_dist: 0.1     # forwarded to UMAP's `min_dist=` — how tightly points may pack, in [0, 1), per umap-learn's own docs
 ```
 
 There is **no text column and no model**. A map of longitudes and latitudes needs
 neither, and demanding them is what made the merged step this replaced unusable for
 that case.
+
+## What each knob is proven to do, and what it is not
+
+`umap_project_invocation_materialises_the_frozen_script_and_names_it`
+(`src/operator.rs`) sets `metric:`, `neighbors:` and `min_dist:` in a manifest and
+asserts the built `uv run` invocation carries each value verbatim. That closes a real
+gap: it used to be possible for a knob to be silently dropped between the manifest and
+the subprocess argv **with every test still green under CI conditions** — that is, on
+a runner with no `uv`, which is every routine runner here. With a real `uv` the
+pre-existing byte test already reddened for `metric:`. The qualifier is the whole
+claim: what was missing was cover on the machines that actually run the suite.
+
+**What it does not prove is that, once inside the frozen script, each value is wired to
+the UMAP parameter its name promises rather than to a different one.**
+`operators/umap_project/umap_project.py` passes them straight through —
+`min_dist=args.min_dist`, `metric=args.metric` — in the one call to `umap.UMAP(...)`
+inside `main()`.
+
+There **is** an existing check aimed at exactly this —
+`the_knobs_a_manifest_sets_change_the_map_not_just_the_argv` in `tests/umap_project.rs`
+runs four real projections through a real `uv` and `umap-learn` and asserts each
+knobbed run's output bytes differ from the default run's — and it is not enough,
+measured rather than assumed. Mutating the call above to
+`min_dist=DEFAULT_MIN_DIST, metric=args.metric, set_op_mix_ratio=args.min_dist` — the
+manifest's `min_dist:` silently controlling `set_op_mix_ratio` instead, a real UMAP
+keyword that also takes a float in `[0, 1)` — and re-running that one test leaves it
+`ok`, `1 passed; 0 failed`, exit 0. The bytes still move (a different keyword still
+changes the fit), so `assert_ne!` is satisfied for the wrong reason, and nothing in
+this repository's suite would fail if that swap actually happened.
+
+A test that told the two apart would need to assert something about *which way* the
+layout moved as the knob moved — mean pairwise distance rising as `min_dist` rises is
+the obvious candidate for that knob — rather than only that it moved at all. That test
+does not exist, and adding it would not close it as a CI gate regardless: it needs real
+`umap-learn`, `main()` imports `umap`, `numpy` and `duckdb` inside itself precisely so
+the rest of this script (and `test_umap_project.py`) stays importable and runnable on a
+machine with none of the three, which is every CI runner (see "Which tier this sits at"
+below) — and the one workflow that does stage a real environment
+(`text-embed-parity.yml`) runs on a schedule, not on a pull request. Until a test like
+that exists and runs somewhere a defect in it is guaranteed to be seen, this
+repository does not independently verify that a manifest's `metric:`, `neighbors:` or
+`min_dist:` moves the layout the way its name says. What it verifies is that the value
+the manifest set is what reaches the script.
+
+**Two sentences that used to stand here have been deleted rather than rewritten, and
+what replaced them is smaller on purpose.** One offered umap-learn's own documentation
+as the reading of these three knobs. The other offered, as the guarantee a reader still
+had after every other one was withdrawn, that the layout moves *somehow* when a knob
+changes. Both are false for `neighbors:` — see below — and a residual guarantee that
+does not hold is worse than no guarantee, because it is the one a reader relies on
+precisely when they have been told to trust nothing else.
+
+## The neighbours clamp
+
+**`neighbors:` stops working above one below the input's row count, the run still
+succeeds, and nothing prints.** `clamp_neighbors` in `umap_project.py` is
+`max(2, min(requested, n_rows - 1))`, and UMAP is given the clamped value. The clamp is
+there because UMAP raises when `n_neighbors` reaches the row count, and a small table
+landing on a map beats a small table landing on a traceback.
+
+Measured end to end through `arc run` on a real 48-row input with a real `uv` and
+`umap-learn`: `neighbors: 47`, `100` and `200` all produce `sha256 29e51cc98b16974f`
+and `fit_id cae3df77263a1dff` — byte-identical maps — while `neighbors: 40` on the same
+input moves the bytes. The step's stdout prints rows, features, metric, seed and
+`fit_id`, and never `k`.
+
+**This is arcform's deviation, not umap-learn's**, which is why umap-learn's
+documentation for `n_neighbors` does not describe what happens above the boundary, and
+why this file no longer sends you there. `projection_fit_id` is computed from the
+clamped `k` rather than from the value the manifest set, so two manifests that differ
+only above the boundary produce the same fingerprint — which is correct, since they
+produce the same fit.
+
+**Nothing refuses `neighbors:` above the boundary.** The authoring schema declares
+`"minimum": 2` and no maximum, and `validate()` bounds it only below. Refusing at load
+is impossible — the manifest cannot know the row count — and refusing at run needs a
+mechanism this repository has not decided on yet. Until then this is disclosed rather
+than prevented, in three places that stay in step: here, in `clamp_neighbors`'s own
+docstring, and in the `neighbors` description the authoring schema emits, which is what
+an editor and `arc mcp`'s `operator_describe` show and which no edit to this file
+reaches. `umap_project_schema_discloses_the_neighbors_clamp` reddens if that third one
+loses the disclosure.
 
 ## What counts as a column it can project
 
