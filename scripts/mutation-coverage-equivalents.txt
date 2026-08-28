@@ -44,3 +44,18 @@
 # stopped reading at the `?`.
 35d881cb2a398a42	src/runner.rs	run_with_params	GUARD_TRUE	2026-08-22	the sql: and op: arms are already taken above and manifest validation guarantees one of the three, so a command step is the only kind that reaches this arm and the condition is true wherever it is evaluated
 6bb732022440726c	src/runner.rs	run_with_params	GUARD_TRUE	2026-08-22	the widened guard can only add the case hash.is_some() under WithholdsTheHash, and that policy returns None for exactly the unreadable produces: this block reports, so missing_declared_produces is empty there and nothing is printed
+# THE FOUR `row.get` READS IN `sample_offending_values`, AND THE `row` ITSELF.
+# One class, ruled five times because the file is keyed per mutation. Each `?` here
+# is folded to `.unwrap_or_default()`, which on the Ok path returns the same value
+# and on the Err path continues with a default. What the default would be consumed
+# by is spelled out per line below. The arm that would produce it is unreachable for
+# a different reason than usual: this function BUILDS the query it is reading, three
+# lines above, with an explicit cast on every projected column, so there is no
+# manifest, no user input and no upstream schema that can make column N a type
+# `row.get::<_, T>(N)` refuses. Change the SELECT list and the ruling stops applying,
+# because the key hashes the mutated text and the function it sits in.
+9f034ba15bc437d3	src/operator.rs	sample_offending_values	TRY_DEFAULT	2026-08-29	the default None then "" would be pushed as the value string in DriftSample::values and printed between quotes in the refusal, but column 0 is `"<col>"::VARCHAR AS v` cast by this function's own SELECT, so get::<_, Option<String>> has no type it can refuse and the Err arm never runs
+0554e61129560cd4	src/operator.rs	sample_offending_values	TRY_DEFAULT	2026-08-29	the default None then "?" would be pushed as the clause token and printed in square brackets beside the value, but column 1 is r['constraint'] off ft_validate_text's declared STRUCT(valid BOOLEAN, constraint VARCHAR, message VARCHAR), so the requested Option<String> matches by construction and the Err arm never runs
+9c3f57f092eeb2c2	src/operator.rs	sample_offending_values	TRY_DEFAULT	2026-08-29	the default 0 would be pushed as the per-value row count and printed after the multiplication sign, but column 2 is count(*)::BIGINT cast by this function's own SELECT and count is never NULL, so the requested i64 matches by construction and the Err arm never runs
+0dced2d6d62d224b	src/operator.rs	sample_offending_values	TRY_DEFAULT	2026-08-29	the default 0 would become distinct_total, printed as the "N of M distinct" denominator and used to decide whether the list was cut, but column 3 is (SELECT count(*) FROM d)::BIGINT cast by this function's own SELECT and never NULL, so the requested i64 matches by construction and the Err arm never runs
+df3650cf03afe0fe	src/operator.rs	sample_offending_values	TRY_DEFAULT	2026-08-29	the default ("", "", 0, 0) would be pushed as one more sampled value, printed as '' with a zero count and a zero denominator, but this Result is the closure above returning Ok of the four reads already ruled here, so it is Err only if one of them is and none of them can be

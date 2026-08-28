@@ -5938,9 +5938,15 @@ mod tests {
         // validator that refuses every run satisfies everything below.
         let clean = run_validate(dir.path(), &ext, "data.parquet", "pass.json")
             .expect("the accepting contract must pass");
+        // Two assertions, not one conjunction: `&&` folded to `||` is a real mutation
+        // of this line, and it leaves an assertion that passes when either half holds.
         assert!(
-            clean.stderr.is_empty() && clean.stdout.is_none(),
-            "a passing validate run stays silent, got {clean:?}"
+            clean.stderr.is_empty(),
+            "a passing validate run writes no stderr, got {clean:?}"
+        );
+        assert!(
+            clean.stdout.is_none(),
+            "a passing validate run writes no stdout, got {clean:?}"
         );
 
         let stderr = run_validate(dir.path(), &ext, "data.parquet", "drift.json")
