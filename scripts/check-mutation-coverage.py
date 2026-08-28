@@ -153,17 +153,38 @@ TRIVIAL_CALLEES = {
 # --------------------------------------------------------------------------- #
 
 
-def code_mask(line: str, in_block_comment: bool = False) -> tuple[list[bool], bool]:
-    """Positions in `line` that are real code, and whether a block comment is open.
+def code_mask(
+    line: str, in_block_comment: bool = False, raw_close: str | None = None
+) -> tuple[list[bool], bool, str | None]:
+    """Positions in `line` that are real code, plus the state open at its end.
 
     False for anything inside a string literal, a char literal, a `//` comment or
     a `/* */` comment.  Every operator below consults this before matching, so a
     `==` inside a doc comment or an `if` inside a string is never mutated.
+
+    RAW STRINGS ARE STATE, not a line-local special case, and the earlier version
+    treated them as one.  It recognised `r"` only, by looking at the character
+    BEFORE a quote, so `r#"…"#` fell through to the ordinary-string branch and was
+    parsed as a string ending at the next `"` inside it — leaving the rest of the
+    literal, braces included, marked as code.  A JSON fixture spanning several
+    lines then fed unbalanced `{` into the brace matching that decides where a
+    `#[cfg(test)]` module ends, `test_region` closed the module a thousand lines
+    early, and every test below that point was offered as a mutation candidate.
+    Measured on `src/operator.rs`: the module was detected as ending at line 5932
+    of 8016.  `raw_close` is the closing delimiter still being looked for, carried
+    across lines by `masks_for`.
     """
     mask = [False] * len(line)
     i = 0
     n = len(line)
     while i < n:
+        if raw_close is not None:
+            end = line.find(raw_close, i)
+            if end == -1:
+                return mask, in_block_comment, raw_close
+            i = end + len(raw_close)
+            raw_close = None
+            continue
         if in_block_comment:
             if line.startswith("*/", i):
                 in_block_comment = False
@@ -178,11 +199,21 @@ def code_mask(line: str, in_block_comment: bool = False) -> tuple[list[bool], bo
             in_block_comment = True
             i += 2
             continue
+        if c == "r":
+            # `r"`, `r#"`, `r##"` … — the close is a quote followed by the same
+            # number of hashes.  Anything else starting with `r` is an ordinary
+            # identifier and falls through to be marked as code.
+            j = i + 1
+            while j < n and line[j] == "#":
+                j += 1
+            if j < n and line[j] == '"':
+                close = '"' + "#" * (j - i - 1)
+                end = line.find(close, j + 1)
+                if end == -1:
+                    return mask, in_block_comment, close
+                i = end + len(close)
+                continue
         if c == '"':
-            # Raw strings (r"..", r#".."#) end differently; treat the rest of the
-            # line as non-code, which is conservative in the safe direction.
-            if i >= 1 and line[i - 1] == "r":
-                break
             i += 1
             while i < n:
                 if line[i] == "\\":
@@ -205,14 +236,15 @@ def code_mask(line: str, in_block_comment: bool = False) -> tuple[list[bool], bo
             continue
         mask[i] = True
         i += 1
-    return mask, in_block_comment
+    return mask, in_block_comment, raw_close
 
 
 def masks_for(lines: list[str]) -> list[list[bool]]:
     out = []
     open_block = False
+    open_raw: str | None = None
     for line in lines:
-        mask, open_block = code_mask(line, open_block)
+        mask, open_block, open_raw = code_mask(line, open_block, open_raw)
         out.append(mask)
     return out
 
