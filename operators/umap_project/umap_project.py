@@ -409,7 +409,7 @@ def fit_header(
 def describe_mismatch(stored: dict, current: dict) -> str | None:
     """The one line naming why a persisted fit does not describe this input, or `None`.
 
-    THIS IS THE FUNCTION AC4 IS ABOUT AND IT IS PURE ON PURPOSE. A persisted fit outlives
+    THIS IS THE WHOLE REFUSAL SURFACE AND IT IS PURE ON PURPOSE. A persisted fit outlives
     the data it was built from. A fit for different columns, for a vector of a different
     width, under a different `neighbors:`/`min_dist:`/`metric:`, or from a different
     umap-learn will all unpickle without complaint and all place rows at coordinates that
@@ -661,7 +661,7 @@ def main() -> int:
                 stored["reducer"].transform(matrix[appended]), dtype=np.float64
             )
 
-        # AC3's surface. The id names the LAYOUT, not this run's input, so a file with
+        # The id names the LAYOUT, not this run's input, so a file with
         # appended rows carries the same id as the file before the append and the two
         # may be read row for row against each other. A refit — no `--fit`, or a fit
         # this run had to build — carries a different one, which is what says the

@@ -152,8 +152,8 @@ class PersistedFitTest(unittest.TestCase):
         cls._tmp.cleanup()
 
     def test_every_pre_existing_row_keeps_its_exact_coordinates(self) -> None:
-        """AC1, stated as the number a reader would act on: not 'close', not 'within a
-        tolerance' — the same float. A tolerance here would pass on a re-placement of the
+        """The claim, stated as the number a reader would act on: not 'close', not
+        'within a tolerance' — the same float. A tolerance here would pass on a re-placement of the
         base rows through `.transform()`, which is the plausible wrong implementation and
         the one an analyst could not see."""
         self.assertEqual(len(self.first), BASE_ROWS)
@@ -191,7 +191,7 @@ class PersistedFitTest(unittest.TestCase):
         )
 
     def test_the_fit_id_names_the_layout_so_an_append_stays_comparable(self) -> None:
-        """AC3. One id per file, the same across the append — the two files may be read
+        """One id per file, the same across the append — so the two files may be read
         row for row against each other — and a different one for the refit, which is what
         says they may not be."""
         first = _fit_ids(self.dir / "first.parquet")
@@ -210,8 +210,8 @@ class PersistedFitTest(unittest.TestCase):
 
 
 class RefusesAFitThatDoesNotDescribeTheInputTest(unittest.TestCase):
-    """AC4, driven through the real script rather than through `describe_mismatch`
-    alone: a fit that loads, produces plausible coordinates, and is wrong."""
+    """Driven through the real script rather than through `describe_mismatch` alone:
+    a fit that loads, produces plausible coordinates, and is wrong."""
 
     @classmethod
     def setUpClass(cls) -> None:

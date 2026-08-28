@@ -372,7 +372,7 @@ class MatchBaseRowsTest(unittest.TestCase):
 
 
 class DescribeMismatchTest(unittest.TestCase):
-    """AC4's whole surface: a persisted fit that does not describe the current input.
+    """The whole refusal surface: a persisted fit that does not describe the input.
 
     The expensive failure is not a crash. A fit for different columns, a different
     vector width, a different knob or a different umap-learn unpickles cleanly and
@@ -438,8 +438,8 @@ class DescribeMismatchTest(unittest.TestCase):
 
     def test_the_width_refusal_names_both_widths_and_the_column(self) -> None:
         # A fit built on a 256-d embedding, an input now carrying 384-d vectors: the
-        # case the card calls out, because both are "one vector column" and only the
-        # width says they are different maps.
+        # expensive case, because both are "one vector column" and only the width says
+        # they are different maps.
         said = up.describe_mismatch(
             self.header(columns=["embedding"], widths=[256]),
             self.header(columns=["embedding"], widths=[384]),
@@ -472,7 +472,8 @@ class DescribeMismatchTest(unittest.TestCase):
 
 class FitHeaderTest(unittest.TestCase):
     def test_every_field_the_header_records_is_a_field_that_is_compared(self) -> None:
-        """The invariant that keeps AC4 true as this grows. `operator` and `fit_format`
+        """The invariant that keeps the refusal honest as this grows. `operator` and
+        `fit_format`
         identify the FILE and are checked first, separately, so they are excluded here.
         Every other field is a property of the fit, and a property the fit records but
         `describe_mismatch` never compares is a difference an analyst cannot see."""

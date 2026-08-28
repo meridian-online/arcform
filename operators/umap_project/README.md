@@ -231,15 +231,17 @@ output, and it is a file you already have.
 
 ## Appending rows moves the whole map, and it was measured before it was decided
 
-**This operator has no memory between invocations.** It is a fresh `uv run` per
-step, given one Parquet and told to fit and project it — nothing about a previous
-fit survives to the next call. So appending rows and running the step again today
+**Without `--fit`, this operator has no memory between invocations.** It is a fresh
+`uv run` per step, given one Parquet and told to fit and project it — nothing about a
+previous fit survives to the next call. So appending rows and running the step again
 means a full `fit_transform` over everything, old rows and new, and every point can
-move. That is a fact about what THIS OPERATOR does now, not about what the
-underlying library can do — see "Pricing the alternative" below.
+move. An analyst who appends rows and reruns cannot tell, from the map alone, whether
+the picture changed because the data did or because the layout was refit around it.
 
-An analyst who appends rows and reruns cannot tell, from the map alone, whether the
-picture changed because the data did or because the layout was refit around it.
+**With `--fit`, it does have a memory**, and everything below is why. The measurement
+came first: this section is what refitting costs, "Pricing the alternative" is what the
+way out costs, and "Placing appended rows into a persisted fit" at the end is what was
+built once both were in.
 
 **How much, re-measured 2026-08-25, is `eval/map-refit-stability/`
 in this repository — `uv run eval/map-refit-stability/measure.py`, committed output in
@@ -427,32 +429,78 @@ exact positions plus some approximate ones" and becomes a map where a substantia
 share of what is on screen carries the fidelity gap above; nothing measured here
 locates that point more precisely than the two fractions it is bracketed by.
 
-**None of this is implemented here.** A strategy is chosen and its
-trade-off stated, not built. What would be needed: model persistence and a
-compatibility check inside `operators/umap_project/umap_project.py` (this operator's own
-surface, no runner change required for this half), and, if "the map does not move at
-all until asked" is wanted on top of that, the runner capability named above (a
-different surface). Neither is built here — persisting the fit and computing
-`projection_fit_id` from it rather than from the current input is real design work
-of its own and is tracked separately.
+## Placing appended rows into a persisted fit
 
-**Telling a refit from an append, as this operator ships today.** Every output row
-carries `projection_fit_id` — a hash of the exact feature matrix and knobs
-(`neighbors`, `min_dist`, `metric`, seed) that fit consumed, the same value on every
-row. It moves whenever the data or a knob changes, and it cannot tell you which —
-today, every run is a full refit, so "the data changed" and "the layout changed" are
-the same event and the id does not need to distinguish them. A DIFFERENT id means no
-row's position may be compared position-for-position against an older file. The
-converse does **not** hold: a MATCHING id means the same data and knobs were used,
-not that the coordinates are guaranteed identical — this operator's dependency
-resolve is not pinned (see "Does byte-identity survive a dependency upgrade?" above),
-so two machines, or the same machine after a resolve moves, can share a fit_id and
-still emit different coordinates. Discriminating "the data changed" from "the layout
-changed" arrives when pinning does, not before — computing the id from a persisted
-fit rather than from the current input is part of that future work, not this one. A
-downstream renderer (`brightfield`) that wants to warn an analyst a map has changed
-reads this column today for that coarser signal; distinguishing why it changed is not
-available from it yet.
+**`--fit PATH` is the strategy above, built.** The fitted projection is written to PATH
+on the run that fits it and READ BACK on every later run against the same PATH. A row
+whose numbers the fit already holds keeps the exact coordinates the fit gave it; a row
+the fit has never seen is placed into that same layout with `UMAP.transform`. Omit
+`--fit` and nothing changes — the whole input is refit, exactly as before.
+
+```bash
+# fits, and writes the fit
+uv run operators/umap_project/umap_project.py \
+    --input homes.parquet --column longitude --column latitude \
+    --out homes_mapped.parquet --fit build/homes.umap
+
+# rows appended to homes.parquet; the map does not move
+uv run operators/umap_project/umap_project.py \
+    --input homes.parquet --column longitude --column latitude \
+    --out homes_mapped.parquet --fit build/homes.umap
+```
+
+**A row's identity is its own feature values, not its position in the file.** A SQL step
+with an `ORDER BY` is the ordinary producer of this operator's input, so an appended row
+lands wherever its sort key falls — often in the middle. A rule that assumed appends
+arrive last would call most of the table new and re-place rows the fit already holds,
+which is precisely the movement `--fit` exists to prevent.
+
+**The fit is written once and not rewritten.** An append run reads it and leaves the
+bytes alone, so a Protocol hashing that artifact does not see it move on every run.
+
+**A fit that does not describe the current input is refused, naming what differs.** This
+is the part worth reading before using the flag, because every one of these cases LOADS
+and produces coordinates that look like coordinates:
+
+| what differs | what happens |
+|---|---|
+| the projected columns | refused, naming both column lists |
+| a vector column's width — a fit for 256-d embeddings, an input now carrying 384-d | refused, naming both widths per column |
+| `neighbors`, `min_dist`, `metric` or the seed | refused, naming the knob and both values |
+| the umap-learn the fit was built by | refused, naming both versions |
+| the file is not a fit this operator wrote | refused, naming what it is |
+| a row the fit was built from is no longer in the input — removed, or edited | refused with a count. A fit places APPENDED rows into an existing layout; it cannot describe an input rows were taken out of |
+
+The comparison is a pure function (`describe_mismatch`) over a header the fit records,
+and `test_umap_project.py` drives every field of it with the standard library alone, so
+it is checked on every CI run rather than only where `uv` exists. The end-to-end
+behaviour — appended rows placed, pre-existing rows byte-identical — is
+`test_umap_project_fit.py`, which runs the real projection.
+
+**What is NOT wired yet: a manifest cannot set this.** `--fit` is the script's flag, and
+the operator's `with:` block in `src/operator.rs` has no `fit:` field, so a Protocol step
+cannot yet name the fit as an asset it reads and produces. Until it does, `--fit` is
+reachable standalone and not through `arc run`. The asset-graph shape that field needs is
+a real question rather than a line of plumbing: a step that both reads and produces one
+path is a self-edge, and the fit's pickled bytes are not reproducible run to run even
+where the coordinates are, so hashing it as an input would report a step stale that is
+not. That is a different surface and separate work.
+
+**Telling a refit from an append.** Every output row carries `projection_fit_id`, the
+same value on every row of one file. WITHOUT `--fit` it is a hash of the exact feature
+matrix and knobs (`neighbors`, `min_dist`, `metric`, seed) that fit consumed, so it moves
+whenever the data or a knob changes and cannot tell you which — every run is a full
+refit, so "the data changed" and "the layout changed" are the same event. WITH `--fit` it
+is read back out of the persisted fit, so it names the LAYOUT: a file with appended rows
+carries the same id as the file before the append, and the two may be read row for row
+against each other. That is the discrimination this column could not previously offer.
+A DIFFERENT id still means no row's position may be compared position-for-position
+against an older file. The converse does **not** hold: a MATCHING id means the same
+layout was used, not that the coordinates are guaranteed identical — this operator's
+dependency resolve is not pinned (see "Does byte-identity survive a dependency upgrade?"
+above), so two machines, or the same machine after a resolve moves, can share a fit_id
+and still emit different coordinates. A downstream renderer (`brightfield`) that wants to
+warn an analyst a map has changed reads this column.
 
 ## Standalone
 

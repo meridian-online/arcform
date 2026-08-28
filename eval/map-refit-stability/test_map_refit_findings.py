@@ -53,7 +53,7 @@ COMMITTED = json.loads((HERE / "transform_pricing.json").read_text())
 
 
 class TheFlatteringFailureTest(unittest.TestCase):
-    """The bound the residual on this card is about: two arms that are one measurement."""
+    """The bound this file exists for: two arms that are one measurement."""
 
     def test_the_committed_measurement_clears_every_bound(self) -> None:
         self.assertEqual(bounds.pricing_problems(COMMITTED, APPEND_TAGS), [])
