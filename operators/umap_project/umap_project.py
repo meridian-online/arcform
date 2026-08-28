@@ -16,6 +16,17 @@ fingerprint of the exact numbers and knobs this run fit, the same on every row, 
 reader can tell whether two files came from the same fit before comparing positions
 between them.
 
+A PERSISTED FIT IS OPTIONAL AND CHANGES WHAT AN APPEND MEANS. Without `--fit` this
+script fits the whole input every time, so appending a row re-draws the entire map and
+every point can move — measured in `eval/map-refit-stability/`, and mostly an artefact
+of the drawing rather than the data. With `--fit PATH` the fitted projection is written
+to PATH the first time and READ back on every later run: rows the fit already holds keep
+their exact coordinates, and rows it has never seen are placed into that same layout
+with `UMAP.transform`. `projection_fit_id` then comes from the persisted fit rather than
+from the current input, so two files that share an id share a LAYOUT and their positions
+may be compared row for row even though one has more rows in it. See README.md,
+"Appending rows moves the whole map".
+
 NO TEXT COLUMN AND NO MODEL. `--column` names columns that are already numbers, and
 a column is numeric in either of two shapes:
 
@@ -89,6 +100,7 @@ for _var in (
 
 import argparse
 import hashlib
+import pickle
 import sys
 from pathlib import Path
 
@@ -103,9 +115,13 @@ ROW = "__arc_project_row"
 X_COL = "projection_x"
 Y_COL = "projection_y"
 
-# A refit moves every point — this operator persists nothing between invocations, so
-# appending rows means re-fitting the whole map on the next run. What an analyst CAN
-# tell from the file alone is whether two projections were ASKED the same question:
+# WITHOUT `--fit`, a refit moves every point: nothing survives between invocations, so
+# appending rows means re-fitting the whole map on the next run. WITH `--fit`, the id is
+# read back out of the persisted fit and does not move when rows are appended, because
+# the layout did not — that is the whole of what a persisted fit buys a reader, and
+# `fit_id_source` below is the one line that decides which of the two a file carries.
+# What an analyst CAN tell from the file alone is whether two projections were ASKED the
+# same question:
 # FIT_ID_COL carries a hash of the exact feature matrix this run fed to UMAP together
 # with the knobs that shaped the fit (n_neighbors, min_dist, metric, seed), broadcast
 # to every row. A DIFFERENT id means the data or a knob changed, and no position in the
@@ -123,6 +139,29 @@ FIT_ID_COL = "projection_fit_id"
 
 DEFAULT_NEIGHBORS = 15
 DEFAULT_MIN_DIST = 0.1
+
+# The name a persisted fit records for the thing that wrote it, and the shape of the
+# record. `--fit` reads back a pickle, and a pickle is executable bytes with no type of
+# its own: a file that is not this operator's fit, or is one from a future shape of it,
+# is refused by name here rather than unpickled into a plausible-looking map.
+OPERATOR_NAME = "umap_project"
+FIT_FORMAT = 1
+
+# The header fields a persisted fit and the run trying to use it must agree on, in the
+# order they are reported. THE POINT OF THE LIST IS THAT A MISMATCH IS NAMED: a fit for
+# different columns, a different vector width, a different knob or a different
+# umap-learn will all LOAD, and all place rows somewhere plausible, which is the failure
+# that costs the most because nothing about the output looks wrong. `describe_mismatch`
+# below turns each into one line the caller can act on.
+FIT_COMPARED_FIELDS = (
+    "columns",
+    "feature_widths",
+    "neighbors",
+    "min_dist",
+    "metric",
+    "seed",
+    "umap_learn_version",
+)
 
 # The metrics this operator will pass to UMAP. umap-learn accepts many more; these two
 # are the ones the test suite drives, and a name outside the set is refused at manifest
@@ -279,6 +318,126 @@ def compute_fit_id(
     ).hexdigest()[:16]
 
 
+def row_digest(row_bytes: bytes) -> str:
+    """One feature row's identity, used to ask whether a persisted fit has seen it.
+
+    A row IS its numbers here: the fit records a digest per base row, and a later run
+    asks, row by row, whether the fit already holds a position for these exact values.
+    Nothing about the input's ORDER is used, deliberately — appended rows sorted into
+    the middle of a table are the ordinary case (a SQL step with an `ORDER BY name`
+    puts them wherever the name falls), and a rule that assumed appends land at the end
+    would silently mis-identify every one of them.
+    """
+    return hashlib.sha256(row_bytes).hexdigest()
+
+
+def match_base_rows(
+    current_digests: list[str], base_digests: list[str]
+) -> tuple[list[int | None], list[int]]:
+    """Which rows of this input the persisted fit already holds a position for.
+
+    Returns `(placement, missing)`. `placement[i]` is the index into the fit's stored
+    coordinates for current row `i`, or `None` when the fit has never seen that row and
+    it must be placed with `.transform()`. `missing` is every fit row no current row
+    claims — a row the fit was built from that is no longer in the input, which means
+    the input was not appended to but EDITED, and the caller refuses rather than drawing
+    a map from a layout that describes rows which are gone.
+
+    DUPLICATE FEATURE ROWS ARE HANDED OUT IN ORDER AND THEN REUSED. Two input rows with
+    identical numbers are one point as far as a projection is concerned; if the fit holds
+    two such rows, the first two claimants take one each, and a third takes the last
+    again. That keeps the mapping a pure function of the input's own content rather than
+    of how many duplicates happen to arrive, and identical numbers landing on identical
+    coordinates is the answer a reader expects either way.
+    """
+    by_digest: dict[str, list[int]] = {}
+    for index, digest in enumerate(base_digests):
+        by_digest.setdefault(digest, []).append(index)
+
+    claimed_count: dict[str, int] = {}
+    placement: list[int | None] = []
+    for digest in current_digests:
+        candidates = by_digest.get(digest)
+        if not candidates:
+            placement.append(None)
+            continue
+        taken = claimed_count.get(digest, 0)
+        placement.append(candidates[min(taken, len(candidates) - 1)])
+        claimed_count[digest] = taken + 1
+
+    claimed = {index for index in placement if index is not None}
+    missing = [index for index in range(len(base_digests)) if index not in claimed]
+    return placement, missing
+
+
+def describe_mismatch(stored: dict, current: dict) -> str | None:
+    """The one line naming why a persisted fit does not describe this input, or `None`.
+
+    THIS IS THE FUNCTION AC4 IS ABOUT AND IT IS PURE ON PURPOSE. A persisted fit outlives
+    the data it was built from. A fit for different columns, for a vector of a different
+    width, under a different `neighbors:`/`min_dist:`/`metric:`, or from a different
+    umap-learn will all unpickle without complaint and all place rows at coordinates that
+    look like coordinates — which is the expensive failure, because nothing downstream
+    can tell. Every one of those is a field compared here, and the answer names the field
+    and both values so the caller can decide whether to fix the input or discard the fit.
+
+    Hoisted out of `main()` alongside the classifier for the same reason: `main()` imports
+    umap, numpy and duckdb, so a check left inline is a check no routine CI runner can
+    execute. `test_umap_project.py` drives this one directly.
+    """
+    if not isinstance(stored, dict) or "operator" not in stored:
+        kind = type(stored).__name__
+        return (
+            f"it holds a {kind} that records no operator name — every fit this operator "
+            f"writes names {OPERATOR_NAME!r} as the thing that wrote it, so this file is "
+            f"not one. Point --fit at a file {OPERATOR_NAME} produced."
+        )
+    if stored["operator"] != OPERATOR_NAME:
+        return (
+            f"it was written by {stored['operator']!r}, not by {OPERATOR_NAME!r}. "
+            f"Point --fit at a file this operator produced."
+        )
+    if stored.get("fit_format") != FIT_FORMAT:
+        return (
+            f"it is fit format {stored.get('fit_format')!r} and this operator writes "
+            f"and reads format {FIT_FORMAT}. Delete it and let this run fit again."
+        )
+    for field in FIT_COMPARED_FIELDS:
+        was, now = stored.get(field), current.get(field)
+        if was == now:
+            continue
+        if field == "feature_widths":
+            return (
+                f"it was fit on {sum(was)} features ({_widths_by_column(stored)}) and "
+                f"this input offers {sum(now)} ({_widths_by_column(current)}). A layout "
+                f"built for one vector width cannot place a row of another."
+            )
+        if field == "columns":
+            return (
+                f"it was fit on columns {was!r} and this run projects {now!r}. A layout "
+                f"built from different numbers places rows against a structure this "
+                f"input does not have."
+            )
+        if field == "umap_learn_version":
+            return (
+                f"it was fit by umap-learn {was}, and this run has umap-learn {now}. "
+                f"The fitted object loads across versions and places rows either way, "
+                f"so the version is compared rather than trusted."
+            )
+        return (
+            f"it was fit with {field}={was!r} and this run asks for {field}={now!r}. "
+            f"The same numbers under a different knob are a different map."
+        )
+    return None
+
+
+def _widths_by_column(header: dict) -> str:
+    return ", ".join(
+        f"{name}={width}"
+        for name, width in zip(header.get("columns", []), header.get("feature_widths", []))
+    )
+
+
 def main() -> int:
     import duckdb
     import numpy as np
@@ -296,6 +455,16 @@ def main() -> int:
         help="A numeric column to project. Repeat for each one.",
     )
     ap.add_argument("--out", required=True, help="Parquet to write.")
+    ap.add_argument(
+        "--fit",
+        default=None,
+        help=(
+            "Where the fitted projection lives. Written on the first run and READ on "
+            "every later one: rows the fit already holds keep their exact coordinates "
+            "and new rows are placed into that layout with UMAP.transform. Omit it and "
+            "every run refits the whole input, which moves every point."
+        ),
+    )
     ap.add_argument("--neighbors", type=int, default=DEFAULT_NEIGHBORS)
     ap.add_argument("--min-dist", type=float, default=DEFAULT_MIN_DIST)
     ap.add_argument("--metric", choices=METRICS, default=DEFAULT_METRIC)
@@ -400,22 +569,109 @@ def main() -> int:
     # See `clamp_neighbors` for what this costs and why it is disclosed rather than
     # hidden: above `len(rows) - 1` the knob stops moving and nothing says so.
     k = clamp_neighbors(args.neighbors, len(rows))
-    reducer = umap.UMAP(
-        n_components=2,
-        n_neighbors=k,
-        min_dist=args.min_dist,
-        metric=args.metric,
-        random_state=SEED,
-        verbose=False,
-    )
-    coordinates = np.asarray(reducer.fit_transform(matrix), dtype=np.float64)
 
-    # Everything that determines the fit, not just the numbers: the same matrix under
-    # a different `neighbors:`/`min_dist:`/`metric:` is a different map, and a fit_id
-    # that only hashed the matrix would claim two such maps were comparable when they
-    # are not. SEED is a constant, included anyway so the id is a complete fingerprint
-    # of the call rather than one that happens to be complete only while SEED stays 42.
-    fit_id = compute_fit_id(matrix.tobytes(), k, args.min_dist, args.metric, SEED)
+    # The header a persisted fit is compared against. `neighbors` is what the CALLER
+    # asked for, not the clamped `k`: an append makes the table longer, so the clamp can
+    # legitimately land somewhere else on the second run while the manifest is untouched,
+    # and comparing the clamped value would refuse every append of a small table.
+    header = {
+        "operator": OPERATOR_NAME,
+        "fit_format": FIT_FORMAT,
+        "columns": list(columns),
+        "feature_widths": list(widths),
+        "neighbors": args.neighbors,
+        "min_dist": args.min_dist,
+        "metric": args.metric,
+        "seed": SEED,
+        "umap_learn_version": getattr(umap, "__version__", "unknown"),
+    }
+
+    fit_path = Path(args.fit) if args.fit else None
+    digests = [row_digest(matrix[i].tobytes()) for i in range(len(rows))]
+    reused = 0
+
+    if fit_path is not None and fit_path.is_file():
+        with open(fit_path, "rb") as handle:
+            stored = pickle.load(handle)
+        # The header is what is compared, but an unrecognisable file has no header, and
+        # naming the object actually on disk is more use than naming the None that
+        # reading a missing key returns.
+        record = (
+            stored["header"]
+            if isinstance(stored, dict) and isinstance(stored.get("header"), dict)
+            else stored
+        )
+        mismatch = describe_mismatch(record, header)
+        if mismatch is not None:
+            raise Refusal(
+                f"the persisted fit {fit_path} does not describe this input: {mismatch}"
+            )
+
+        placement, gone = match_base_rows(digests, stored["base_row_digests"])
+        if gone:
+            raise Refusal(
+                f"{len(gone)} of the {len(stored['base_row_digests'])} rows the "
+                f"persisted fit {fit_path} was built from are not in {src}. A fit places "
+                f"appended rows into an existing layout; it cannot describe an input "
+                f"rows were removed from or edited in. Delete the fit to re-fit, or "
+                f"restore the rows."
+            )
+
+        base_embedding = np.asarray(stored["base_embedding"], dtype=np.float64)
+        coordinates = np.empty((len(rows), 2), dtype=np.float64)
+        appended = [i for i, at in enumerate(placement) if at is None]
+        for i, at in enumerate(placement):
+            if at is not None:
+                coordinates[i] = base_embedding[at]
+        reused = len(rows) - len(appended)
+        if appended:
+            # The whole point: the rows already on the map keep the coordinates the fit
+            # gave them, byte for byte, and only the new ones are placed.
+            coordinates[appended] = np.asarray(
+                stored["reducer"].transform(matrix[appended]), dtype=np.float64
+            )
+
+        # AC3's surface. The id names the LAYOUT, not this run's input, so a file with
+        # appended rows carries the same id as the file before the append and the two
+        # may be read row for row against each other. A refit — no `--fit`, or a fit
+        # this run had to build — carries a different one, which is what says the
+        # positions are not comparable.
+        fit_id = stored["header"]["fit_id"]
+        fit_id_source = f"persisted fit {fit_path}"
+    else:
+        reducer = umap.UMAP(
+            n_components=2,
+            n_neighbors=k,
+            min_dist=args.min_dist,
+            metric=args.metric,
+            random_state=SEED,
+            verbose=False,
+        )
+        coordinates = np.asarray(reducer.fit_transform(matrix), dtype=np.float64)
+
+        # Everything that determines the fit, not just the numbers: the same matrix
+        # under a different `neighbors:`/`min_dist:`/`metric:` is a different map, and a
+        # fit_id that only hashed the matrix would claim two such maps were comparable
+        # when they are not. SEED is a constant, included anyway so the id is a complete
+        # fingerprint of the call rather than one that happens to be complete only while
+        # SEED stays 42.
+        fit_id = compute_fit_id(matrix.tobytes(), k, args.min_dist, args.metric, SEED)
+        fit_id_source = "this run's own fit"
+
+        if fit_path is not None:
+            fit_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(fit_path, "wb") as handle:
+                pickle.dump(
+                    {
+                        "header": {**header, "fit_id": fit_id},
+                        "base_row_digests": digests,
+                        "base_embedding": coordinates,
+                        "reducer": reducer,
+                    },
+                    handle,
+                    protocol=5,
+                )
+            fit_id_source = f"this run's own fit, written to {fit_path}"
 
     con.execute(
         f"CREATE TABLE arc_proj ({ROW} BIGINT, {X_COL} DOUBLE, {Y_COL} DOUBLE, "
@@ -436,9 +692,15 @@ def main() -> int:
         f"FROM arc_src s JOIN arc_proj p ON s.{ROW} = p.{ROW} ORDER BY s.{ROW}) "
         f"TO {sql_lit(str(out))} (FORMAT parquet, COMPRESSION zstd)"
     )
+    placed = (
+        f"{reused} held + {len(rows) - reused} placed"
+        if reused
+        else f"{len(rows)} fitted"
+    )
     print(
-        f"[umap_project] {len(rows)} rows · {matrix.shape[1]} features from "
-        f"{len(columns)} column(s) · {args.metric} · seed {SEED} · fit_id {fit_id} → {out}"
+        f"[umap_project] {len(rows)} rows ({placed}) · {matrix.shape[1]} features from "
+        f"{len(columns)} column(s) · {args.metric} · seed {SEED} · fit_id {fit_id} "
+        f"from {fit_id_source} → {out}"
     )
     return 0
 
