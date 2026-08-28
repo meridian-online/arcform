@@ -2000,24 +2000,39 @@ impl Operator for FinetypeValidate {
         }
 
         if total_rejects > 0 {
-            // Fail-report UX: surface the offending {column, rejects, sample_message}
-            // rows before failing closed — a strict upgrade on the old exit-code signal.
-            eprintln!(
-                "finetype_validate: {} contract violation(s) in {} vs {} — DRIFT, failing closed:",
-                total_rejects, cfg.parquet, cfg.schema
+            // The refusal carries the subject, the clause and an example — everything
+            // the reader's next two questions ask for ("which column?", "what value?"),
+            // all of it already in hand at the moment the gate decides to refuse. It
+            // goes in `StepFailed.stderr` and NOWHERE else: that field is what
+            // `Error`'s Display prints and therefore the only channel that survives
+            // anything wrapping `arc`. A second copy on `eprintln!` used to carry the
+            // per-column line and is deliberately gone — one failure, one report.
+            let mut detail = format!(
+                "finetype_validate: {} column(s) drifted from {} ({} rejecting row(s))",
+                offenders.len(),
+                cfg.schema,
+                total_rejects
             );
             for (col, total, rejects, msg) in &offenders {
-                eprintln!("  ✗ {col}: {rejects}/{total} row(s) reject — {msg}");
+                detail.push_str(&format!(
+                    "\n  ✗ {col}: {rejects}/{total} row(s) reject — {}",
+                    elide(msg, DRIFT_MESSAGE_WIDTH)
+                ));
+                match sample_offending_values(&conn, &schema, col, DRIFT_SAMPLE_LIMIT) {
+                    Ok(sample) => detail.push_str(&format!("\n{}", sample.render())),
+                    // A sampling query that fails must not turn an actionable drift
+                    // refusal into a confusing one: the column, the counts and
+                    // ft_validate's own message above are already reported, so say
+                    // what could not be sampled and keep going.
+                    Err(e) => detail.push_str(&format!(
+                        "\n      offending values unavailable for {col}: {e}"
+                    )),
+                }
             }
             return Err(Error::StepFailed {
                 step: String::new(), // runner rewrites with the step name
                 code: 1,
-                stderr: format!(
-                    "finetype_validate: {} column(s) drifted from {} ({} rejecting row(s))",
-                    offenders.len(),
-                    cfg.schema,
-                    total_rejects
-                ),
+                stderr: detail,
             });
         }
 
@@ -2026,6 +2041,139 @@ impl Operator for FinetypeValidate {
             stdout: None,
         })
     }
+}
+
+/// How many DISTINCT offending values a drift refusal reports per column. Bounded on
+/// purpose: a column whose every row rejects would otherwise print the whole column
+/// into a step error. The number is printed in the message, and the message says the
+/// list was cut when it was, so the reader is never left guessing whether five was all
+/// of them.
+const DRIFT_SAMPLE_LIMIT: usize = 5;
+
+/// How wide a single offending value is allowed to print before it is elided. A cell
+/// can hold a whole document; the point is to recognise the value, not to transport it.
+const DRIFT_VALUE_WIDTH: usize = 120;
+
+/// How wide `ft_validate`'s own sample message may print. It quotes the offending value
+/// back inside a sentence, so it is exactly as unbounded as the cell is — bounding the
+/// sampled values and not this one would leave the whole document in the refusal after
+/// all. Wider than [`DRIFT_VALUE_WIDTH`] because the value arrives wrapped in prose.
+const DRIFT_MESSAGE_WIDTH: usize = 200;
+
+/// The bounded evidence behind one drifted column: up to [`DRIFT_SAMPLE_LIMIT`] distinct
+/// offending values, the clause each failed, how many rows carry it, and how many
+/// distinct offenders there were in total (so the message can say the list was cut).
+struct DriftSample {
+    /// (value, constraint token, rows carrying it), most-frequent first.
+    values: Vec<(String, String, i64)>,
+    /// Distinct (value, clause) pairs that reject — `values.len()` before the bound.
+    distinct_total: i64,
+    /// The bound that was applied, so the rendered line can state it.
+    limit: usize,
+}
+
+impl DriftSample {
+    fn render(&self) -> String {
+        if self.values.is_empty() {
+            // ft_validate counted rejects for this column but the per-cell re-query
+            // found none — a real disagreement, worth saying rather than printing an
+            // empty list that reads like "no values".
+            return "      offending values: none re-derived (ft_validate and the \
+                    per-cell check disagree)"
+                .to_string();
+        }
+        let cut = if (self.values.len() as i64) < self.distinct_total {
+            format!(" — list cut at the {} shown", self.limit)
+        } else {
+            String::new()
+        };
+        let rendered: Vec<String> = self
+            .values
+            .iter()
+            .map(|(v, clause, n)| format!("'{}' ×{n} [{clause}]", elide(v, DRIFT_VALUE_WIDTH)))
+            .collect();
+        format!(
+            "      offending values, {} of {} distinct{}: {}",
+            self.values.len(),
+            self.distinct_total,
+            cut,
+            rendered.join(", ")
+        )
+    }
+}
+
+/// Truncate a value for display on a character boundary, marking that it was cut.
+fn elide(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(width).collect();
+    format!("{head}…")
+}
+
+/// Re-derive the actual offending values for one drifted column.
+///
+/// `ft_validate` reports per-column counts and ONE sample message; it does not report
+/// which values failed. `ft_validate_text` — the per-cell engine that same macro calls
+/// under the hood — does, so this runs it over the column against the column's own
+/// `$.properties.<col>` subschema and groups the rejects. `LIMIT` bounds what is
+/// returned; the unbounded `count(*)` beside it is what makes "cut at 5 of 37" sayable.
+///
+/// Errors are returned as a string rather than an [`Error`]: the caller is already
+/// building a refusal and must not have it replaced by a failure to decorate it.
+fn sample_offending_values(
+    conn: &duckdb::Connection,
+    schema: &std::path::Path,
+    column: &str,
+    limit: usize,
+) -> std::result::Result<DriftSample, String> {
+    // The column name lands in two places with different escaping rules: a quoted
+    // identifier (`"` doubled) and a JSON path segment inside a SQL string literal
+    // (`'` doubled). The macro this mirrors quotes the same way.
+    let ident = column.replace('"', "\"\"");
+    let path = format!("$.\"properties\".\"{}\"", column.replace('"', "\\\""));
+    let sql = format!(
+        "WITH sub(j) AS (\
+           SELECT json_extract((SELECT content FROM read_text('{schema}')), '{path}')::VARCHAR\
+         ), bad AS (\
+           SELECT \"{ident}\"::VARCHAR AS v, \
+                  ft_validate_text(\"{ident}\"::VARCHAR, (SELECT j FROM sub)) AS r FROM _ftv\
+         ), d AS (\
+           SELECT v, r['constraint'] AS clause, count(*)::BIGINT AS n \
+           FROM bad WHERE NOT r['valid'] GROUP BY v, r['constraint']\
+         ) \
+         SELECT v, clause, n, (SELECT count(*) FROM d)::BIGINT \
+         FROM d ORDER BY n DESC, v LIMIT {limit}",
+        schema = sql_lit(&schema.display().to_string()),
+        path = sql_lit(&path),
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("prepare value sample: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(1)?
+                    .unwrap_or_else(|| "?".into()),
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|e| format!("run value sample: {e}"))?;
+
+    let mut values = Vec::new();
+    let mut distinct_total = 0i64;
+    for row in rows {
+        let (v, clause, n, total) = row.map_err(|e| format!("read value sample: {e}"))?;
+        distinct_total = total;
+        values.push((v, clause, n));
+    }
+    Ok(DriftSample {
+        values,
+        distinct_total,
+        limit,
+    })
 }
 
 /// Resolve the finetype DuckDB extension path for the in-engine gate: a per-step
@@ -5619,18 +5767,73 @@ mod tests {
         assert!(assets_for("finetype_validate", Some(&bogus)).is_err());
     }
 
+    /// The finetype DuckDB extension the in-engine gate LOADs, or `None` to skip.
+    ///
+    /// `ci.yml` stages the published community build and sets
+    /// `ARCFORM_REQUIRE_FINETYPE_EXT=1`. With that set a missing extension PANICS
+    /// instead of skipping: a staging step that is deleted, renamed or silently starts
+    /// resolving nothing would otherwise turn every test below back into a skip, and a
+    /// skip reads as `ok` to everything except a human counting the test summary.
+    fn finetype_ext_or_skip() -> Option<String> {
+        match std::env::var("FINETYPE_DUCKDB_EXT") {
+            Ok(p) if std::path::Path::new(&p).exists() => Some(p),
+            found => {
+                assert!(
+                    std::env::var_os("ARCFORM_REQUIRE_FINETYPE_EXT").is_none(),
+                    "ARCFORM_REQUIRE_FINETYPE_EXT is set, so this run promised a staged \
+                     finetype extension, but FINETYPE_DUCKDB_EXT is {found:?} — the \
+                     staging step is gone or points at nothing"
+                );
+                eprintln!("skipping finetype_validate: FINETYPE_DUCKDB_EXT unset or missing");
+                None
+            }
+        }
+    }
+
+    /// Write a Parquet from a `SELECT` and return its path — the gate reads Parquet via
+    /// `read_parquet`, so the fixtures are materialised by DuckDB itself.
+    fn write_parquet(dir: &Path, name: &str, select: &str) -> PathBuf {
+        let path = dir.join(name);
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY ({select}) TO '{}' (FORMAT parquet);",
+            sql_lit(&path.display().to_string())
+        ))
+        .unwrap();
+        path
+    }
+
+    /// Run `finetype_validate` over `parquet` against `schema`, returning the stderr the
+    /// runner surfaces (`StepFailed.stderr`, which is what `Error`'s Display prints) or
+    /// the `StepOutput` of a clean run.
+    fn run_validate(
+        dir: &Path,
+        ext: &str,
+        parquet: &str,
+        schema: &str,
+    ) -> std::result::Result<StepOutput, String> {
+        let env = HashMap::new();
+        let ctx = test_ctx(dir, &env);
+        let op = resolve("finetype_validate").unwrap();
+        let with: Value = serde_yaml::from_str(&format!(
+            "parquet: {parquet}\nschema: {schema}\nextension: {ext}"
+        ))
+        .unwrap();
+        match op.run(&with, &ctx) {
+            Ok(out) => Ok(out),
+            Err(Error::StepFailed { stderr, .. }) => Err(stderr),
+            other => panic!("expected Ok or StepFailed, got {:?}", other.map(|_| ())),
+        }
+    }
+
     /// A minimal Parquet + a JSON Schema it satisfies, then a schema it violates — the
     /// two halves of the in-engine gate. Needs the built finetype DuckDB extension: the
     /// verify harness exports `FINETYPE_DUCKDB_EXT` to point at it; if it is unset or
     /// absent (e.g. CI without the extension) the test SKIPS rather than false-fails.
     #[test]
     fn finetype_validate_passes_clean_and_fails_on_drift() {
-        let ext = match std::env::var("FINETYPE_DUCKDB_EXT") {
-            Ok(p) if std::path::Path::new(&p).exists() => p,
-            _ => {
-                eprintln!("skipping finetype_validate: FINETYPE_DUCKDB_EXT unset or missing");
-                return;
-            }
+        let Some(ext) = finetype_ext_or_skip() else {
+            return;
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -5684,6 +5887,268 @@ mod tests {
             Err(Error::StepFailed { .. }) => {}
             other => panic!("drift must fail the gate, got {:?}", other.map(|_| ())),
         }
+    }
+
+    /// A real refusal, end to end, asserted on the stderr the runner surfaces — not on
+    /// what a formatting function returns.
+    ///
+    /// The fixture has TWO columns and only one of them drifts, so the assertions pin
+    /// WHICH column is named and WHICH value is quoted, rather than that some name and
+    /// some value are present. A sample drawn from the wrong column reddens this on both
+    /// halves: the drifted value goes missing and the clean column's value appears.
+    ///
+    /// It runs the accepting schema FIRST and requires it to pass. Without that pairing
+    /// the whole test is satisfied by a validator that refuses every run for the wrong
+    /// reason.
+    #[test]
+    fn finetype_validate_drift_names_the_column_the_clause_and_the_value() {
+        let Some(ext) = finetype_ext_or_skip() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        write_parquet(
+            dir.path(),
+            "data.parquet",
+            "SELECT * FROM (VALUES \
+               ('ISSUED', 'Acme Holdings'), \
+               ('ISSUED', 'Beta Trading'), \
+               ('PENDING_ARCHIVAL', 'Globex Systems')) t(reg_status, legal_name)",
+        );
+        // Accepting contract: the enum lists both statuses, the name is unconstrained
+        // beyond a length floor. Zero rejects.
+        std::fs::write(
+            dir.path().join("pass.json"),
+            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{
+                 "reg_status":{"type":"string","enum":["ISSUED","PENDING_ARCHIVAL"]},
+                 "legal_name":{"type":"string","minLength":1}}}"#,
+        )
+        .unwrap();
+        // The same contract with ONE value dropped from the enum — the shape of the
+        // real drift: a live upstream status the committed enum never listed.
+        std::fs::write(
+            dir.path().join("drift.json"),
+            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{
+                 "reg_status":{"type":"string","enum":["ISSUED"]},
+                 "legal_name":{"type":"string","minLength":1}}}"#,
+        )
+        .unwrap();
+
+        // The pairing: the accepting run must pass, and pass SILENTLY — no new
+        // output on the happy path, same empty StepOutput as before. Without it a
+        // validator that refuses every run satisfies everything below.
+        let clean = run_validate(dir.path(), &ext, "data.parquet", "pass.json")
+            .expect("the accepting contract must pass");
+        // Two assertions, not one conjunction: `&&` folded to `||` is a real mutation
+        // of this line, and it leaves an assertion that passes when either half holds.
+        assert!(
+            clean.stderr.is_empty(),
+            "a passing validate run writes no stderr, got {clean:?}"
+        );
+        assert!(
+            clean.stdout.is_none(),
+            "a passing validate run writes no stdout, got {clean:?}"
+        );
+
+        let stderr = run_validate(dir.path(), &ext, "data.parquet", "drift.json")
+            .expect_err("the drifted contract must refuse");
+
+        assert!(
+            stderr.contains("reg_status"),
+            "the refusal must name the drifted column; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("PENDING_ARCHIVAL"),
+            "the refusal must quote the offending value; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("[enum]"),
+            "the refusal must name the clause the value failed; got:\n{stderr}"
+        );
+        // Value, the rows carrying it, and the clause as ONE rendered unit — three
+        // separate `contains` would be satisfied by three facts about three
+        // different columns.
+        assert!(
+            stderr.contains("'PENDING_ARCHIVAL' ×1 [enum]"),
+            "the value, its row count and its clause belong together; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("1/3 row(s) reject"),
+            "the refusal must retain the rejecting-row count; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("1 of 1 distinct"),
+            "the refusal must say how many distinct offenders it found; got:\n{stderr}"
+        );
+        // Nothing was cut here, so nothing may claim it was — the truncation notice
+        // has to track the truncation rather than always print.
+        assert!(
+            !stderr.contains("list cut"),
+            "a complete list must not be announced as cut; got:\n{stderr}"
+        );
+        // The clean column and its values are the control. A sample that draws from
+        // the wrong column, or a message that names every column rather than the
+        // offenders, trips one of these.
+        assert!(
+            !stderr.contains("legal_name"),
+            "the refusal must not name a column that did not drift; got:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("Globex"),
+            "the refusal must not quote a value from a column that did not drift; \
+             got:\n{stderr}"
+        );
+    }
+
+    /// A column where EVERY row rejects prints a bounded list and says so.
+    ///
+    /// Twelve distinct values all violate `maxLength: 2`. The refusal must show the
+    /// five the bound allows, name the total it cut from, and leave the other seven
+    /// out — an unbounded sample would put the whole column into a step error.
+    #[test]
+    fn finetype_validate_drift_sample_is_bounded_and_says_it_was_cut() {
+        let Some(ext) = finetype_ext_or_skip() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        write_parquet(
+            dir.path(),
+            "wide.parquet",
+            "SELECT 'v' || lpad(i::VARCHAR, 2, '0') AS token FROM range(1, 13) t(i)",
+        );
+        std::fs::write(
+            dir.path().join("short.json"),
+            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema",
+                "properties":{"token":{"type":"string","maxLength":2}}}"#,
+        )
+        .unwrap();
+
+        let stderr = run_validate(dir.path(), &ext, "wide.parquet", "short.json")
+            .expect_err("every row violates maxLength, so the gate must refuse");
+
+        let shown = (1..=12)
+            .filter(|i| stderr.contains(&format!("'v{i:02}'")))
+            .count();
+        assert_eq!(
+            shown, DRIFT_SAMPLE_LIMIT,
+            "the sample is bounded at {DRIFT_SAMPLE_LIMIT} distinct values, {shown} \
+             appeared; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("5 of 12 distinct"),
+            "the reader must be told how many of the total were shown; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("list cut at the 5 shown"),
+            "the reader must be told the list was cut; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("'v01' ×1 [max_length]"),
+            "each sampled value carries its own row count and clause; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("[max_length]"),
+            "the refusal must name the clause; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("12/12 row(s) reject"),
+            "the rejecting-row count is retained alongside the bounded sample; \
+             got:\n{stderr}"
+        );
+    }
+
+    /// The other bound: how WIDE one value may print. A cell can hold a document, and
+    /// five of those would be the same defect as printing the whole column.
+    ///
+    /// Two offending values, one exactly `DRIFT_VALUE_WIDTH` characters and one well
+    /// over it. The first must print whole and the second must not, which is what
+    /// separates "elide past the width" from "always elide" and from "never elide" —
+    /// the three ways the comparison can be written.
+    #[test]
+    fn finetype_validate_elides_a_value_wider_than_the_display_bound() {
+        let Some(ext) = finetype_ext_or_skip() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let exact = "a".repeat(DRIFT_VALUE_WIDTH);
+        // Past BOTH bounds: the sampled-value width and the width of ft_validate's own
+        // message, which quotes the same cell back inside a sentence.
+        let over = "b".repeat(DRIFT_VALUE_WIDTH + DRIFT_MESSAGE_WIDTH);
+        write_parquet(
+            dir.path(),
+            "wide.parquet",
+            &format!(
+                "SELECT * FROM (VALUES (repeat('a', {})), (repeat('b', {}))) t(blob)",
+                DRIFT_VALUE_WIDTH,
+                DRIFT_VALUE_WIDTH + DRIFT_MESSAGE_WIDTH
+            ),
+        );
+        std::fs::write(
+            dir.path().join("short.json"),
+            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema",
+                "properties":{"blob":{"type":"string","maxLength":2}}}"#,
+        )
+        .unwrap();
+
+        let stderr = run_validate(dir.path(), &ext, "wide.parquet", "short.json")
+            .expect_err("both values violate maxLength, so the gate must refuse");
+
+        // At the width: printed whole, closing quote straight after the last
+        // character. "Always elide" puts an ellipsis there instead.
+        assert!(
+            stderr.contains(&format!("'{exact}' ")),
+            "a value exactly at the display bound prints whole; got:\n{stderr}"
+        );
+        // Past the width: the head, marked as cut, and the tail nowhere.
+        assert!(
+            stderr.contains(&format!("'{}…'", "b".repeat(DRIFT_VALUE_WIDTH))),
+            "a value past the display bound is cut to the bound and marked; \
+             got:\n{stderr}"
+        );
+        // ft_validate's own message quotes the cell too, and is cut at its own bound.
+        assert!(
+            stderr.contains(&format!("\"{}…", "b".repeat(DRIFT_MESSAGE_WIDTH - 1))),
+            "the validator's own message is cut at its bound; got:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains(&over),
+            "the whole over-wide value must not reach the message; got:\n{stderr}"
+        );
+    }
+
+    /// `ft_validate` counting rejects while the per-cell re-query finds none is a
+    /// disagreement between two validators, and the message says so rather than
+    /// printing an empty list that reads like "no values".
+    ///
+    /// Asserted directly on `render` because the operator cannot be driven into that
+    /// state through DuckDB; the claim that the refusal reaches the operator's caller
+    /// at all is carried by the end-to-end tests above, not by this one.
+    #[test]
+    fn drift_sample_renders_an_empty_re_query_as_a_disagreement() {
+        let empty = DriftSample {
+            values: vec![],
+            distinct_total: 0,
+            limit: DRIFT_SAMPLE_LIMIT,
+        };
+        assert!(
+            empty.render().contains("none re-derived"),
+            "an empty sample names itself as a disagreement; got {}",
+            empty.render()
+        );
+        let found = DriftSample {
+            values: vec![("X".to_string(), "enum".to_string(), 2)],
+            distinct_total: 1,
+            limit: DRIFT_SAMPLE_LIMIT,
+        };
+        assert!(
+            !found.render().contains("none re-derived"),
+            "a sample that found values must not report a disagreement; got {}",
+            found.render()
+        );
+        assert!(
+            found.render().contains("'X' ×2 [enum]"),
+            "got {}",
+            found.render()
+        );
     }
 
     #[cfg(feature = "http-fetch")]

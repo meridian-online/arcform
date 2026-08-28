@@ -97,7 +97,7 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 @case("a `==` inside a string or a comment is not code")
 def _() -> None:
     line = 'let s = "a == b"; // c == d\n'
-    mask, _ = mc.code_mask(line)
+    mask, *_ = mc.code_mask(line)
     positions = [i for i, ok in enumerate(mask) if ok]
     text = "".join(line[i] for i in positions)
     check("string content masked", "a == b" not in text, text)
@@ -594,6 +594,60 @@ def _() -> None:
     check(
         "and nothing inside it is a candidate",
         all(not (7 <= m.start <= 10) for m in got),
+        [(m.start, m.operator) for m in got],
+    )
+
+
+@case("a hashed raw string masks its own contents and nothing after it")
+def _() -> None:
+    # `r#"..."#` was not recognised at all: the mask looked at the character
+    # before a quote and only knew `r"`, so the hashed form was parsed as an
+    # ordinary string ending at the first quote INSIDE it.  Everything after that
+    # -- braces and all -- was marked as code.
+    line = 'let s = r#"{"zebra": "quokka"} == 1"#; let n = 1 == 2;\n'
+    mask, *_ = mc.code_mask(line)
+    text = "".join(line[i] for i, ok in enumerate(mask) if ok)
+    # The words are the assertion: parsed as an ordinary string, the literal's
+    # quotes pair up wrongly and its content lands OUTSIDE the pairs, so these
+    # come back marked as code.
+    check("content between the inner quotes is masked", "zebra" not in text, text)
+    check("and so is the rest of it", "quokka" not in text, text)
+    check("a == inside the literal is not a candidate", text.count("==") == 1, text)
+    check("and code after the literal is still code", "let n" in text, text)
+
+
+@case("a raw string spanning lines does not leak its braces into the cfg scan")
+def _() -> None:
+    # The real one, from src/operator.rs: a multi-line `r#"..."#` JSON fixture
+    # inside `#[cfg(test)] mod tests`.  Its opening line carries an unmatched `{`,
+    # which the brace matcher counted, closed the module a thousand lines early,
+    # and offered every test after it as a candidate.
+    source = (
+        "pub fn before() -> u8 { if true { 1 } else { 0 } }\n"  # 0
+        "#[cfg(test)]\n"  # 1
+        "mod tests {\n"  # 2
+        "    fn fixture() -> &'static str {\n"  # 3
+        '        r#"{"a": {\n'  # 4
+        '            "b": 1}}"#\n'  # 5
+        "    }\n"  # 6
+        "    fn t() { if true { } }\n"  # 7
+        "}\n"  # 8
+        "pub fn after() -> u8 { if true { 3 } else { 0 } }\n"  # 9
+    )
+    lines = source.splitlines(keepends=True)
+    marked = mc.test_region(lines, mc.masks_for(lines))
+    check("the module runs to its real closing brace", {2, 7, 8} <= marked, sorted(marked))
+    check("production before it is not test code", 0 not in marked, sorted(marked))
+    check("production after it is not test code", 9 not in marked, sorted(marked))
+    got = mc.generate("src/x.rs", source, set(range(len(lines))))
+    check(
+        "so nothing inside the module is a candidate",
+        all(not (1 <= m.start <= 8) for m in got),
+        [(m.start, m.operator) for m in got],
+    )
+    check(
+        "while the production functions either side still are",
+        {m.start for m in got} == {0, 9},
         [(m.start, m.operator) for m in got],
     )
 
