@@ -139,6 +139,20 @@ class EveryStatementIsCheckedTest(unittest.TestCase):
     def run_checker(self) -> int:
         return check_findings.main()
 
+    def run_checker_saying(self) -> tuple[int, str]:
+        """The exit code AND what was said. An exit code alone is not enough for any test
+        that stages a broken JSON: changing a figure in the JSON also puts the prose out
+        of step with it, so the checker returns 1 for a reason that has nothing to do with
+        what the test is about. Deleting the bound under test left both such tests green
+        on the exit code — found by breaking the code, not by reading it."""
+        import contextlib
+        import io
+
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            code = check_findings.main()
+        return code, captured.getvalue()
+
     def test_the_committed_prose_passes(self) -> None:
         self.assertEqual(self.run_checker(), 0)
 
@@ -189,10 +203,20 @@ class EveryStatementIsCheckedTest(unittest.TestCase):
         self.assertEqual(self.run_checker(), 1)
 
     def test_a_stale_extra_fidelity_triple_reddens(self) -> None:
-        """The set rule. Two triples are legitimate; a third, wherever it came from, is
-        a figure nothing in the JSON supports."""
+        """The set rule, in the direction where the file says too much. Two triples are
+        legitimate; a third, wherever it came from, is a figure nothing supports."""
         text = self.readme.read_text()
         self.readme.write_text(text + "\n\nAn older draft said 31.4% / 30.2% / 29.9%.\n")
+        self.assertEqual(self.run_checker(), 1)
+
+    def test_a_fidelity_triple_that_stops_being_stated_reddens(self) -> None:
+        """The other direction, and it is a separate test because a subset rule catches
+        only the first. Weakening the set comparison to `found <= expected` left the test
+        above green — a figure the JSON supports and the prose no longer states is a
+        reader who cannot find the number, and it has to redden too."""
+        text = self.readme.read_text()
+        self.assertIn("27.0% / 26.4% / 27.2%", text)
+        self.readme.write_text(text.replace("27.0% / 26.4% / 27.2%", "not stated any more"))
         self.assertEqual(self.run_checker(), 1)
 
     def test_the_pickled_model_size_is_checked_in_both_files(self) -> None:
@@ -217,7 +241,14 @@ class EveryStatementIsCheckedTest(unittest.TestCase):
         saved = check_findings.PRICING
         check_findings.PRICING = staged
         try:
-            self.assertEqual(self.run_checker(), 1)
+            code, said = self.run_checker_saying()
+            self.assertEqual(code, 1)
+            self.assertIn(
+                "are the same number",
+                said,
+                "the checker reddened, but not for the bound this test is about — a "
+                "staged pricing file also puts the prose out of step with itself",
+            )
         finally:
             check_findings.PRICING = saved
 

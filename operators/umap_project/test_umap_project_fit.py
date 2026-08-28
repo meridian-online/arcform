@@ -139,6 +139,7 @@ class PersistedFitTest(unittest.TestCase):
 
         _project(input=d / "base.parquet", out=d / "first.parquet", fit=d / "fit.pkl")
         cls.fit_bytes = (d / "fit.pkl").read_bytes()
+        cls.fit_mtime = (d / "fit.pkl").stat().st_mtime_ns
         _project(input=d / "appended.parquet", out=d / "second.parquet", fit=d / "fit.pkl")
         # No `--fit`: the refit control, and the thing this feature exists to replace.
         _project(input=d / "appended.parquet", out=d / "refit.parquet")
@@ -204,9 +205,16 @@ class PersistedFitTest(unittest.TestCase):
 
     def test_the_append_run_does_not_rewrite_the_fit(self) -> None:
         """The fit is written once. A run that re-pickled it on every append would move
-        the artifact's bytes without moving the map, and a Protocol hashing that asset
-        would call the next step stale for no reason."""
-        self.assertEqual((self.dir / "fit.pkl").read_bytes(), self.fit_bytes)
+        the artifact without moving the map, and a Protocol hashing that asset would call
+        the next step stale for no reason.
+
+        THE TIMESTAMP IS CHECKED AS WELL AS THE BYTES, and that is not belt-and-braces:
+        re-pickling the SAME object graph in the same process can reproduce the same
+        bytes, so a bytes-only assertion is green against a re-write that really happened.
+        Breaking the code on purpose is how that was found."""
+        fit = self.dir / "fit.pkl"
+        self.assertEqual(fit.read_bytes(), self.fit_bytes)
+        self.assertEqual(fit.stat().st_mtime_ns, self.fit_mtime, "the fit was re-written")
 
 
 class RefusesAFitThatDoesNotDescribeTheInputTest(unittest.TestCase):
