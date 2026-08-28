@@ -2147,7 +2147,8 @@ fn sample_offending_values(
         .query_map([], |row| {
             Ok((
                 row.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                row.get::<_, Option<String>>(1)?.unwrap_or_else(|| "?".into()),
+                row.get::<_, Option<String>>(1)?
+                    .unwrap_or_else(|| "?".into()),
                 row.get::<_, i64>(2)?,
                 row.get::<_, i64>(3)?,
             ))
@@ -5759,18 +5760,73 @@ mod tests {
         assert!(assets_for("finetype_validate", Some(&bogus)).is_err());
     }
 
+    /// The finetype DuckDB extension the in-engine gate LOADs, or `None` to skip.
+    ///
+    /// `ci.yml` stages the published community build and sets
+    /// `ARCFORM_REQUIRE_FINETYPE_EXT=1`. With that set a missing extension PANICS
+    /// instead of skipping: a staging step that is deleted, renamed or silently starts
+    /// resolving nothing would otherwise turn every test below back into a skip, and a
+    /// skip reads as `ok` to everything except a human counting the test summary.
+    fn finetype_ext_or_skip() -> Option<String> {
+        match std::env::var("FINETYPE_DUCKDB_EXT") {
+            Ok(p) if std::path::Path::new(&p).exists() => Some(p),
+            found => {
+                assert!(
+                    std::env::var_os("ARCFORM_REQUIRE_FINETYPE_EXT").is_none(),
+                    "ARCFORM_REQUIRE_FINETYPE_EXT is set, so this run promised a staged \
+                     finetype extension, but FINETYPE_DUCKDB_EXT is {found:?} — the \
+                     staging step is gone or points at nothing"
+                );
+                eprintln!("skipping finetype_validate: FINETYPE_DUCKDB_EXT unset or missing");
+                None
+            }
+        }
+    }
+
+    /// Write a Parquet from a `SELECT` and return its path — the gate reads Parquet via
+    /// `read_parquet`, so the fixtures are materialised by DuckDB itself.
+    fn write_parquet(dir: &Path, name: &str, select: &str) -> PathBuf {
+        let path = dir.join(name);
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY ({select}) TO '{}' (FORMAT parquet);",
+            sql_lit(&path.display().to_string())
+        ))
+        .unwrap();
+        path
+    }
+
+    /// Run `finetype_validate` over `parquet` against `schema`, returning the stderr the
+    /// runner surfaces (`StepFailed.stderr`, which is what `Error`'s Display prints) or
+    /// the `StepOutput` of a clean run.
+    fn run_validate(
+        dir: &Path,
+        ext: &str,
+        parquet: &str,
+        schema: &str,
+    ) -> std::result::Result<StepOutput, String> {
+        let env = HashMap::new();
+        let ctx = test_ctx(dir, &env);
+        let op = resolve("finetype_validate").unwrap();
+        let with: Value = serde_yaml::from_str(&format!(
+            "parquet: {parquet}\nschema: {schema}\nextension: {ext}"
+        ))
+        .unwrap();
+        match op.run(&with, &ctx) {
+            Ok(out) => Ok(out),
+            Err(Error::StepFailed { stderr, .. }) => Err(stderr),
+            other => panic!("expected Ok or StepFailed, got {:?}", other.map(|_| ())),
+        }
+    }
+
     /// A minimal Parquet + a JSON Schema it satisfies, then a schema it violates — the
     /// two halves of the in-engine gate. Needs the built finetype DuckDB extension: the
     /// verify harness exports `FINETYPE_DUCKDB_EXT` to point at it; if it is unset or
     /// absent (e.g. CI without the extension) the test SKIPS rather than false-fails.
     #[test]
     fn finetype_validate_passes_clean_and_fails_on_drift() {
-        let ext = match std::env::var("FINETYPE_DUCKDB_EXT") {
-            Ok(p) if std::path::Path::new(&p).exists() => p,
-            _ => {
-                eprintln!("skipping finetype_validate: FINETYPE_DUCKDB_EXT unset or missing");
-                return;
-            }
+        let Some(ext) = finetype_ext_or_skip() else {
+            return;
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -5824,6 +5880,149 @@ mod tests {
             Err(Error::StepFailed { .. }) => {}
             other => panic!("drift must fail the gate, got {:?}", other.map(|_| ())),
         }
+    }
+
+    /// A real refusal, end to end, asserted on the stderr the runner surfaces — not on
+    /// what a formatting function returns.
+    ///
+    /// The fixture has TWO columns and only one of them drifts, so the assertions pin
+    /// WHICH column is named and WHICH value is quoted, rather than that some name and
+    /// some value are present. A sample drawn from the wrong column reddens this on both
+    /// halves: the drifted value goes missing and the clean column's value appears.
+    ///
+    /// It runs the accepting schema FIRST and requires it to pass. Without that pairing
+    /// the whole test is satisfied by a validator that refuses every run for the wrong
+    /// reason.
+    #[test]
+    fn finetype_validate_drift_names_the_column_the_clause_and_the_value() {
+        let Some(ext) = finetype_ext_or_skip() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        write_parquet(
+            dir.path(),
+            "data.parquet",
+            "SELECT * FROM (VALUES \
+               ('ISSUED', 'Acme Holdings'), \
+               ('ISSUED', 'Beta Trading'), \
+               ('PENDING_ARCHIVAL', 'Globex Systems')) t(reg_status, legal_name)",
+        );
+        // Accepting contract: the enum lists both statuses, the name is unconstrained
+        // beyond a length floor. Zero rejects.
+        std::fs::write(
+            dir.path().join("pass.json"),
+            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{
+                 "reg_status":{"type":"string","enum":["ISSUED","PENDING_ARCHIVAL"]},
+                 "legal_name":{"type":"string","minLength":1}}}"#,
+        )
+        .unwrap();
+        // The same contract with ONE value dropped from the enum — the shape of the
+        // real drift: a live upstream status the committed enum never listed.
+        std::fs::write(
+            dir.path().join("drift.json"),
+            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{
+                 "reg_status":{"type":"string","enum":["ISSUED"]},
+                 "legal_name":{"type":"string","minLength":1}}}"#,
+        )
+        .unwrap();
+
+        // AC5's pairing: the accepting run must pass, and pass SILENTLY — no new
+        // output on the happy path, same empty StepOutput as before.
+        let clean = run_validate(dir.path(), &ext, "data.parquet", "pass.json")
+            .expect("the accepting contract must pass");
+        assert!(
+            clean.stderr.is_empty() && clean.stdout.is_none(),
+            "a passing validate run stays silent, got {clean:?}"
+        );
+
+        let stderr = run_validate(dir.path(), &ext, "data.parquet", "drift.json")
+            .expect_err("the drifted contract must refuse");
+
+        assert!(
+            stderr.contains("reg_status"),
+            "the refusal must name the drifted column; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("PENDING_ARCHIVAL"),
+            "the refusal must quote the offending value; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("[enum]"),
+            "the refusal must name the clause the value failed; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("1/3 row(s) reject"),
+            "the refusal must retain the rejecting-row count; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("1 of 1 distinct"),
+            "the refusal must say how many distinct offenders it found; got:\n{stderr}"
+        );
+        // The clean column and its values are the control. A sample that draws from
+        // the wrong column, or a message that names every column rather than the
+        // offenders, trips one of these.
+        assert!(
+            !stderr.contains("legal_name"),
+            "the refusal must not name a column that did not drift; got:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("Globex"),
+            "the refusal must not quote a value from a column that did not drift; \
+             got:\n{stderr}"
+        );
+    }
+
+    /// A column where EVERY row rejects prints a bounded list and says so.
+    ///
+    /// Twelve distinct values all violate `maxLength: 2`. The refusal must show the
+    /// five the bound allows, name the total it cut from, and leave the other seven
+    /// out — an unbounded sample would put the whole column into a step error.
+    #[test]
+    fn finetype_validate_drift_sample_is_bounded_and_says_it_was_cut() {
+        let Some(ext) = finetype_ext_or_skip() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        write_parquet(
+            dir.path(),
+            "wide.parquet",
+            "SELECT 'v' || lpad(i::VARCHAR, 2, '0') AS token FROM range(1, 13) t(i)",
+        );
+        std::fs::write(
+            dir.path().join("short.json"),
+            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema",
+                "properties":{"token":{"type":"string","maxLength":2}}}"#,
+        )
+        .unwrap();
+
+        let stderr = run_validate(dir.path(), &ext, "wide.parquet", "short.json")
+            .expect_err("every row violates maxLength, so the gate must refuse");
+
+        let shown = (1..=12)
+            .filter(|i| stderr.contains(&format!("'v{i:02}'")))
+            .count();
+        assert_eq!(
+            shown, DRIFT_SAMPLE_LIMIT,
+            "the sample is bounded at {DRIFT_SAMPLE_LIMIT} distinct values, {shown} \
+             appeared; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("5 of 12 distinct"),
+            "the reader must be told how many of the total were shown; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("list cut at the 5 shown"),
+            "the reader must be told the list was cut; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("[max_length]"),
+            "the refusal must name the clause; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("12/12 row(s) reject"),
+            "the rejecting-row count is retained alongside the bounded sample; \
+             got:\n{stderr}"
+        );
     }
 
     #[cfg(feature = "http-fetch")]

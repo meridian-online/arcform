@@ -98,6 +98,32 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "$HOME/duckdb" >> "$GITHUB_PATH"
 
+      # Stage the PUBLISHED finetype DuckDB extension. Without it the
+      # `finetype_validate` tests — the ones that drive a real refusal and read the
+      # message it hands the operator — return early and report as `ok`, which is
+      # indistinguishable from having run. This is one `INSTALL ... FROM community`
+      # of a ~14 MB artifact, not a second repo's build, so it belongs on the routine
+      # gate rather than in a scheduled workflow the way `staticembed` does.
+      #
+      # `test -f` makes a registry that served nothing a red step here rather than a
+      # silent skip three steps later, and `ARCFORM_REQUIRE_FINETYPE_EXT` makes the
+      # tests themselves refuse to skip: delete this step and they PANIC instead of
+      # quietly going back to reporting `ok` without executing.
+      #
+      # The artifact is whatever the community registry currently publishes for
+      # `DUCKDB_VERSION` — deliberately, because that is the build a deployment
+      # stages. `DUCKDB_VERSION` is the pin that fixes which one is asked for.
+      - name: Stage the finetype DuckDB extension
+        run: |
+          set -euo pipefail
+          "$HOME/duckdb/duckdb" -c "INSTALL finetype FROM community;"
+          ext="$HOME/.duckdb/extensions/${DUCKDB_VERSION}/linux_amd64/finetype.duckdb_extension"
+          test -f "$ext"
+          {
+            echo "FINETYPE_DUCKDB_EXT=$ext"
+            echo "ARCFORM_REQUIRE_FINETYPE_EXT=1"
+          } >> "$GITHUB_ENV"
+
       # `--all-targets` so the test modules are linted too, not just the binary.
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -236,6 +262,21 @@ jobs:
             echo "LD_LIBRARY_PATH=$HOME/duckdb${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           } >> "$GITHUB_ENV"
           echo "$HOME/duckdb" >> "$GITHUB_PATH"
+
+      # The same staging as the build job, for a different reason. This gate runs the
+      # suite once per mutation; a test that skips here cannot notice a mutated line,
+      # so every mutation of the drift-refusal path would be reported as a survivor
+      # whose line no test executes — true, and only because the extension was absent.
+      - name: Stage the finetype DuckDB extension
+        run: |
+          set -euo pipefail
+          "$HOME/duckdb/duckdb" -c "INSTALL finetype FROM community;"
+          ext="$HOME/.duckdb/extensions/${DUCKDB_VERSION}/linux_amd64/finetype.duckdb_extension"
+          test -f "$ext"
+          {
+            echo "FINETYPE_DUCKDB_EXT=$ext"
+            echo "ARCFORM_REQUIRE_FINETYPE_EXT=1"
+          } >> "$GITHUB_ENV"
 
       # The base is chosen inside the step rather than by a job-level `if:`. A
       # conditional job reports as SKIPPED, and a skipped check is
