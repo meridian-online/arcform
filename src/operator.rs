@@ -2015,7 +2015,8 @@ impl Operator for FinetypeValidate {
             );
             for (col, total, rejects, msg) in &offenders {
                 detail.push_str(&format!(
-                    "\n  ✗ {col}: {rejects}/{total} row(s) reject — {msg}"
+                    "\n  ✗ {col}: {rejects}/{total} row(s) reject — {}",
+                    elide(msg, DRIFT_MESSAGE_WIDTH)
                 ));
                 match sample_offending_values(&conn, &schema, col, DRIFT_SAMPLE_LIMIT) {
                     Ok(sample) => detail.push_str(&format!("\n{}", sample.render())),
@@ -2052,6 +2053,12 @@ const DRIFT_SAMPLE_LIMIT: usize = 5;
 /// How wide a single offending value is allowed to print before it is elided. A cell
 /// can hold a whole document; the point is to recognise the value, not to transport it.
 const DRIFT_VALUE_WIDTH: usize = 120;
+
+/// How wide `ft_validate`'s own sample message may print. It quotes the offending value
+/// back inside a sentence, so it is exactly as unbounded as the cell is — bounding the
+/// sampled values and not this one would leave the whole document in the refusal after
+/// all. Wider than [`DRIFT_VALUE_WIDTH`] because the value arrives wrapped in prose.
+const DRIFT_MESSAGE_WIDTH: usize = 200;
 
 /// The bounded evidence behind one drifted column: up to [`DRIFT_SAMPLE_LIMIT`] distinct
 /// offending values, the clause each failed, how many rows carry it, and how many
@@ -5951,6 +5958,13 @@ mod tests {
             stderr.contains("[enum]"),
             "the refusal must name the clause the value failed; got:\n{stderr}"
         );
+        // Value, the rows carrying it, and the clause as ONE rendered unit — three
+        // separate `contains` would be satisfied by three facts about three
+        // different columns.
+        assert!(
+            stderr.contains("'PENDING_ARCHIVAL' ×1 [enum]"),
+            "the value, its row count and its clause belong together; got:\n{stderr}"
+        );
         assert!(
             stderr.contains("1/3 row(s) reject"),
             "the refusal must retain the rejecting-row count; got:\n{stderr}"
@@ -5958,6 +5972,12 @@ mod tests {
         assert!(
             stderr.contains("1 of 1 distinct"),
             "the refusal must say how many distinct offenders it found; got:\n{stderr}"
+        );
+        // Nothing was cut here, so nothing may claim it was — the truncation notice
+        // has to track the truncation rather than always print.
+        assert!(
+            !stderr.contains("list cut"),
+            "a complete list must not be announced as cut; got:\n{stderr}"
         );
         // The clean column and its values are the control. A sample that draws from
         // the wrong column, or a message that names every column rather than the
@@ -6016,6 +6036,10 @@ mod tests {
             "the reader must be told the list was cut; got:\n{stderr}"
         );
         assert!(
+            stderr.contains("'v01' ×1 [max_length]"),
+            "each sampled value carries its own row count and clause; got:\n{stderr}"
+        );
+        assert!(
             stderr.contains("[max_length]"),
             "the refusal must name the clause; got:\n{stderr}"
         );
@@ -6023,6 +6047,101 @@ mod tests {
             stderr.contains("12/12 row(s) reject"),
             "the rejecting-row count is retained alongside the bounded sample; \
              got:\n{stderr}"
+        );
+    }
+
+    /// The other bound: how WIDE one value may print. A cell can hold a document, and
+    /// five of those would be the same defect as printing the whole column.
+    ///
+    /// Two offending values, one exactly `DRIFT_VALUE_WIDTH` characters and one well
+    /// over it. The first must print whole and the second must not, which is what
+    /// separates "elide past the width" from "always elide" and from "never elide" —
+    /// the three ways the comparison can be written.
+    #[test]
+    fn finetype_validate_elides_a_value_wider_than_the_display_bound() {
+        let Some(ext) = finetype_ext_or_skip() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let exact = "a".repeat(DRIFT_VALUE_WIDTH);
+        // Past BOTH bounds: the sampled-value width and the width of ft_validate's own
+        // message, which quotes the same cell back inside a sentence.
+        let over = "b".repeat(DRIFT_VALUE_WIDTH + DRIFT_MESSAGE_WIDTH);
+        write_parquet(
+            dir.path(),
+            "wide.parquet",
+            &format!(
+                "SELECT * FROM (VALUES (repeat('a', {})), (repeat('b', {}))) t(blob)",
+                DRIFT_VALUE_WIDTH,
+                DRIFT_VALUE_WIDTH + DRIFT_MESSAGE_WIDTH
+            ),
+        );
+        std::fs::write(
+            dir.path().join("short.json"),
+            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema",
+                "properties":{"blob":{"type":"string","maxLength":2}}}"#,
+        )
+        .unwrap();
+
+        let stderr = run_validate(dir.path(), &ext, "wide.parquet", "short.json")
+            .expect_err("both values violate maxLength, so the gate must refuse");
+
+        // At the width: printed whole, closing quote straight after the last
+        // character. "Always elide" puts an ellipsis there instead.
+        assert!(
+            stderr.contains(&format!("'{exact}' ")),
+            "a value exactly at the display bound prints whole; got:\n{stderr}"
+        );
+        // Past the width: the head, marked as cut, and the tail nowhere.
+        assert!(
+            stderr.contains(&format!("'{}…'", "b".repeat(DRIFT_VALUE_WIDTH))),
+            "a value past the display bound is cut to the bound and marked; \
+             got:\n{stderr}"
+        );
+        // ft_validate's own message quotes the cell too, and is cut at its own bound.
+        assert!(
+            stderr.contains(&format!("\"{}…", "b".repeat(DRIFT_MESSAGE_WIDTH - 1))),
+            "the validator's own message is cut at its bound; got:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains(&over),
+            "the whole over-wide value must not reach the message; got:\n{stderr}"
+        );
+    }
+
+    /// `ft_validate` counting rejects while the per-cell re-query finds none is a
+    /// disagreement between two validators, and the message says so rather than
+    /// printing an empty list that reads like "no values".
+    ///
+    /// Asserted directly on `render` because the operator cannot be driven into that
+    /// state through DuckDB; the claim that the refusal reaches the operator's caller
+    /// at all is carried by the end-to-end tests above, not by this one.
+    #[test]
+    fn drift_sample_renders_an_empty_re_query_as_a_disagreement() {
+        let empty = DriftSample {
+            values: vec![],
+            distinct_total: 0,
+            limit: DRIFT_SAMPLE_LIMIT,
+        };
+        assert!(
+            empty.render().contains("none re-derived"),
+            "an empty sample names itself as a disagreement; got {}",
+            empty.render()
+        );
+        let found = DriftSample {
+            values: vec![("X".to_string(), "enum".to_string(), 2)],
+            distinct_total: 1,
+            limit: DRIFT_SAMPLE_LIMIT,
+        };
+        assert!(
+            !found.render().contains("none re-derived"),
+            "a sample that found values must not report a disagreement; got {}",
+            found.render()
+        );
+        assert!(
+            found.render().contains("'X' ×2 [enum]"),
+            "got {}",
+            found.render()
         );
     }
 
