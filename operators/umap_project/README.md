@@ -402,7 +402,7 @@ built here.
 **Pin the existing rows by persisting the fitted model and placing appended rows with
 `.transform()`.** Not because the alternative above is free — it is not implementable
 at all today — and not because out-of-sample placement is a small compromise assumed
-away: it is 3 to 5 points below this corpus's own ceiling for the new rows, measured
+away: it is 3 to 4 points below this corpus's own ceiling for the new rows, measured
 against the 256-d truth rather than against the churn number, which is a different
 quantity. The case for it is the asymmetry between what it protects and what it
 risks: the base rows — which is most of the corpus at every fraction measured here,

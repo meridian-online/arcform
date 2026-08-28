@@ -48,14 +48,17 @@ FOUR THINGS THIS PRICES:
    headline table above) would be comparing two different queries against two
    different references; this does not do that.
 
-   A SELF-CHECK GUARDS THIS FROM SILENTLY BREAKING: if the full-refit fidelity ever
-   fell far below the ceiling, the more likely explanation is a bug in this script —
-   a full refit treats every row uniformly, so a new row's fidelity should resemble a
-   base row's — not a real finding, and the assertion below fails loudly rather than
-   letting a broken measurement read as a poor one. (Swapping the full refit's own
-   base coordinates for the ORIGINAL base fit's, a real mistake made once while
-   writing this script, drops full-refit fidelity to near zero and the assertion
-   catches it.)
+   SELF-CHECKS GUARD THIS FROM SILENTLY BREAKING, and they live in
+   `placement_bounds.py` rather than here, because a bound only this file asserts is a
+   bound nothing observes until someone re-runs this file. `check_findings.py` applies
+   the same functions to the committed JSON on every CI run. Three shapes are caught:
+   a fidelity far below the ceiling (swapping the full refit's own base coordinates for
+   the ORIGINAL base fit's, a real mistake made once while writing this script, drops it
+   to near zero); a fidelity above the ceiling, which is what a query compared against
+   itself reads; and the two arms coming back as the SAME number, which is what scoring
+   `.transform()`'s rows against the full refit's own base pool produces and which sits
+   comfortably inside the ceiling window at every fraction. See that file for why the
+   third bound is not `transform < full_refit`.
 
 4. RAW DISPLACEMENT, reported but not the fidelity claim: UMAP's frame is arbitrary
    up to rotation/reflection/rescaling between two INDEPENDENT fits (the same reason
@@ -81,20 +84,15 @@ import umap
 HERE = Path(__file__).resolve().parent
 BUILD = HERE / "build"
 
+# The bounds live beside this file, stdlib-only, so CI can apply them to the committed
+# JSON without `uv`. Imported by path rather than assumed to be on sys.path, because
+# `uv run` may be invoked from anywhere in the tree.
+sys.path.insert(0, str(HERE))
+import placement_bounds  # noqa: E402
+
 APPEND_FRACTIONS = ("append_05", "append_20", "append_50")
 K_NEIGHBOURS = 20
 
-# The self-check §3 describes: neither placement's fidelity for a NEW row should be
-# far below this corpus's own ceiling (a BASE row's fidelity, measured the same way),
-# and neither should exceed it by more than trivial noise. 0.5 is a loose lower
-# bound — real values here land within a few points of the ceiling, not a fraction
-# of it — chosen to catch a broken comparison (observed near 0.0-0.07 under a pool
-# swap, and near 0.04 under its mirror) without being brittle to ordinary corpus
-# variation. 0.05 (five percentage points) is the upper slack, chosen to catch a
-# degenerate query-against-itself comparison (which reads 1.0) while allowing
-# ordinary measurement noise around the ceiling.
-CEILING_FRACTION_FLOOR = 0.5
-CEILING_SLACK = 0.05
 
 
 def load_embeddings(parquet: Path) -> tuple[list[str], np.ndarray]:
@@ -257,34 +255,18 @@ def main() -> int:
         full_refit_vs_truth_mean = float(full_refit_vs_truth.mean())
         transform_vs_truth_mean = float(transform_vs_truth.mean())
 
-        # Both fidelity means are bounded against the ceiling, below AND above.
-        # BELOW, by the same floor for both: a mean far under the ceiling means the
-        # harness compared the wrong pools, not that placement is that bad (this is
-        # the guard that already existed for the full refit; extended here to
-        # transform, which is the arm the recommendation actually rests on — nothing
-        # bounded it before this). ABOVE, by CEILING_SLACK: neither quantity can
-        # legitimately exceed what the corpus's own base rows achieve by more than a
-        # small margin, so a mean at or near 1.0 — the value a query compared against
-        # itself would produce — is caught here rather than read as a real result.
-        for label, mean in (
-            ("full-refit", full_refit_vs_truth_mean),
-            ("transform", transform_vs_truth_mean),
-        ):
-            assert mean >= CEILING_FRACTION_FLOOR * ceiling, (
-                f"{tag}: {label} fidelity against the 256-d truth ({mean:.3f}) is far "
-                f"below the corpus ceiling ({ceiling:.3f}) — this should not happen for "
-                f"a correct comparison (see the self-check note in this script's "
-                f"docstring) and most likely means the harness itself is broken, not "
-                f"that the finding is real."
-            )
-            assert mean <= ceiling + CEILING_SLACK, (
-                f"{tag}: {label} fidelity against the 256-d truth ({mean:.3f}) exceeds "
-                f"the corpus ceiling ({ceiling:.3f}) by more than the stated slack "
-                f"({CEILING_SLACK}) — no placement of new rows should recover more "
-                f"structure than the corpus's own base rows do, so this most likely "
-                f"means the harness compared a query against itself or another "
-                f"degenerate pool, not that placement is unusually good."
-            )
+        # The bounds, from placement_bounds.py — the same functions check_findings.py
+        # applies to the committed JSON in CI. Asserted here so a broken measurement
+        # stops before its numbers are written, and there so one that already was
+        # written stops before it is believed.
+        breaches = placement_bounds.ceiling_problems(
+            tag, "full-refit", full_refit_vs_truth_mean, ceiling
+        ) + placement_bounds.ceiling_problems(
+            tag, "transform", transform_vs_truth_mean, ceiling
+        ) + placement_bounds.separation_problems(
+            tag, transform_vs_truth_mean, full_refit_vs_truth_mean
+        )
+        assert not breaches, "\n".join(breaches)
 
         # Frame-invariant fidelity between the two PLACEMENTS themselves — not read
         # against the ceiling, since neither side of it is the 256-d truth.
