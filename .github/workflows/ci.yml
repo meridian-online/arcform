@@ -53,11 +53,23 @@ jobs:
       # line of that script is invisible to CI.
       - name: umap_project tests
         run: python3 operators/umap_project/test_umap_project.py
+      # The checkers' own regression test runs FIRST, for the same reason the hygiene
+      # and mutation workflows do it: a checker is green over working prose and green
+      # over broken prose, and the two runs look identical. Both defects it drives were
+      # live here — a figure staled at its second site while a correct first site kept
+      # the checker quiet, and a placement measurement whose two arms were one
+      # measurement sitting inside the ceiling window. Stdlib-only, seconds to report.
+      - name: map-refit-stability checkers still bite
+        run: python3 eval/map-refit-stability/test_map_refit_findings.py
+
       # Stdlib-only, same reason as the step above: results.json is committed, and
       # nothing else re-checks that operators/umap_project/README.md and
       # CHANGELOG.md still say what it says. Without this, a re-run of
       # eval/map-refit-stability/measure.py that changes results.json and a prose
-      # edit that does not both look clean.
+      # edit that does not both look clean. It also applies
+      # eval/map-refit-stability/placement_bounds.py to the committed pricing JSON —
+      # bounds that were price_transform.py's harness-time assertions and nothing
+      # else, so no gate ever observed whether they were clearing.
       - name: map-refit-stability findings match results.json
         run: python3 eval/map-refit-stability/check_findings.py
 
@@ -149,6 +161,17 @@ jobs:
 
       - name: test (uv operator, including the test that needs a real uv)
         run: cargo test --workspace --test uv_operator -- --include-ignored
+
+      # `umap_project --fit` end to end, and it has to be here rather than in the
+      # `operators` job because it runs a real projection: UMAP, numpy and DuckDB under
+      # `uv`, which that job deliberately has none of. What it pins is the one thing the
+      # stdlib suite cannot reach — that a row already on the map comes back with the
+      # SAME float after rows are appended — and a bookkeeping test is green whether or
+      # not the stored coordinates were ever used. Eight invocations share one process
+      # so numba JIT-compiles UMAP once: ~200s locally, against roughly a quarter of an
+      # hour spawning each. The step above has already resolved this dependency set.
+      - name: umap_project persisted-fit end to end
+        run: uv run operators/umap_project/test_umap_project_fit.py
 
       # tests/text_embed.rs and tests/text_embed_parity.rs carry #[ignore]d tests that
       # need a built staticembed extension, which this runner does not stage — and,

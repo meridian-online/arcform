@@ -11,6 +11,79 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Changed
 
+- **`umap_project` can place appended rows into a persisted fit instead of refitting the
+  map, so an analyst who adds data keeps the reading they already formed.** `--fit PATH`
+  writes the fitted projection on the run that fits it and reads it back on every later
+  run: a row whose numbers the fit already holds keeps the exact coordinates the fit gave
+  it, and a row the fit has never seen is placed into that same layout with
+  `UMAP.transform`. Without `--fit` nothing changes and the whole input is refit.
+
+  **Measured rather than asserted.** On a 60-row fixture appended to 66, every one of the
+  60 pre-existing rows comes back as the same float — maximum absolute difference 0.0 —
+  and the refit control beside it moves those same rows by up to 11.5 map units.
+  `operators/umap_project/test_umap_project_fit.py` runs that comparison for real, in CI.
+
+  **A row's identity is its own feature values, not its position in the file.** A SQL
+  step with an `ORDER BY` puts an appended row wherever its sort key falls, so a rule
+  that assumed appends arrive last would call most of the table new and re-place rows the
+  fit already holds — the exact movement this flag exists to prevent.
+
+  **`projection_fit_id` now names the LAYOUT when a fit is persisted**, not the run's
+  input. A file with appended rows carries the same id as the file before the append, so
+  the two may be read row for row against each other; a refit carries a different one,
+  which is what says they may not be. That is the discrimination this column previously
+  could not offer, because every run was a full refit and "the data changed" and "the
+  layout changed" were the same event.
+
+  **A fit that does not describe the current input is refused, naming what differs.**
+  Different projected columns, a different vector width (a fit for 256-d embeddings
+  against an input now carrying 384-d), a different `neighbors`/`min_dist`/`metric`/seed,
+  a different umap-learn, a file naming another operator, or an input a fit row is no
+  longer present in — every one of those LOADS and produces plausible coordinates, which
+  is why each is compared rather than trusted. The comparison is a pure function over a
+  header the fit records, so CI drives every field of it with the standard library alone.
+
+  **And a file that is not a usable fit at all is refused the same way.** A header
+  comparison can only answer a file that HAS a header. An empty file left by an
+  interrupted write, a Parquet passed to `--fit` by mistake, a truncated or corrupted
+  fit, a record missing the row identities or the fitted projection behind that header,
+  or `--fit` naming a directory — every one of those was an unhandled Python traceback,
+  and two of them were worse: a record whose `reducer` cannot place a row RAN TO
+  COMPLETION and wrote plausible coordinates, because the reducer is touched only when
+  there are appended rows, so the failure waited for the first append. Every use of the
+  file's contents now happens inside one function that returns three plain values or
+  raises a refusal, and the operator's own test sweeps the fit it just wrote — every key,
+  every header field, truncation and byte-corruption across its length — rather than a
+  list of cases written beside it.
+
+  **A manifest cannot set this yet.** `--fit` is the script's flag; the operator's `with:`
+  block has no `fit:` field, so a Protocol step cannot name the fit as an asset it reads
+  and produces. The asset-graph shape that needs is a real question — a step that both
+  reads and produces one path is a self-edge, and the pickled fit is not reproducible run
+  to run even where the coordinates are, so hashing it as an input would report a step
+  stale that is not. See `operators/umap_project/README.md`, "Placing appended rows into
+  a persisted fit."
+
+- **`eval/map-refit-stability/check_findings.py` checks every statement of a figure, not
+  the first one it finds — and the placement bounds now run in CI.** The checker asked
+  whether a correct rendering existed ANYWHERE in a file, so a stale copy elsewhere was
+  invisible, and one had shipped: the operator README stated the `.transform()` gap
+  correctly in one paragraph and staled it in its conclusion three paragraphs down. That
+  figure is corrected, and `require_every`/`require_exact_set` now take a figure's SHAPE
+  and compare every rendering of it in both files — reporting, too, when a shape matches
+  nothing, because a check that has stopped checking must not read as agreement.
+
+  `eval/map-refit-stability/placement_bounds.py` holds the bounds a placement measurement
+  clears. `price_transform.py` asserts them at harness time as before; `check_findings.py`
+  applies the same functions to the committed pricing JSON in CI, which is the half that
+  was missing — nothing in CI ran the harness, so whether its bounds were clearing was
+  never observed. A third bound is added: the two fidelity arms must not be the same
+  number. Setting `.transform()`'s fidelity equal to the full refit's — what scoring its
+  rows against the full refit's own base pool produces — cleared every previous bound at
+  all three fractions, and the page would then have read that out-of-sample placement is
+  exactly as faithful as a refit. `test_map_refit_findings.py` is the self-test and runs
+  in CI ahead of both checkers.
+
 - **`text_embed` takes its vectors from the DuckDB embedding extension instead of
   computing its own, so one static embedder exists in the product rather than two.**
   An analyst who embeds a column in SQL and an analyst whose Protocol embeds the same

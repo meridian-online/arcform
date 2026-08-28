@@ -308,5 +308,346 @@ class DefaultsTest(unittest.TestCase):
         self.assertEqual(len(added), len(set(added)))
 
 
+class RowDigestTest(unittest.TestCase):
+    """A row's identity is its numbers. Same reasoning as `ComputeFitIdTest`: a digest
+    over a row's LENGTH rather than its content would let an edited row read as the row
+    the fit already holds a position for, and the operator would hand back a coordinate
+    for numbers that are no longer there."""
+
+    def test_the_same_bytes_give_the_same_identity(self) -> None:
+        self.assertEqual(up.row_digest(b"\x01\x02"), up.row_digest(b"\x01\x02"))
+
+    def test_a_different_row_of_the_same_length_is_a_different_row(self) -> None:
+        a, b = b"\x00\x01\x02\x03" * 4, b"\x00\x01\x02\x04" * 4
+        self.assertEqual(len(a), len(b))
+        self.assertNotEqual(up.row_digest(a), up.row_digest(b))
+
+
+class MatchBaseRowsTest(unittest.TestCase):
+    """Which rows a persisted fit already holds a position for.
+
+    This is the half of `--fit` that decides, and it is pure so CI can drive it: which
+    rows keep their coordinates, which are handed to `.transform()`, and whether the
+    input is an append at all.
+    """
+
+    def test_an_unchanged_input_claims_every_fit_row_in_place(self) -> None:
+        base = ["a", "b", "c"]
+        placement, missing = up.match_base_rows(base, base)
+        self.assertEqual(placement, [0, 1, 2])
+        self.assertEqual(missing, [])
+
+    def test_a_row_appended_into_the_MIDDLE_is_the_only_new_one(self) -> None:
+        # THE CASE A POSITIONAL RULE GETS WRONG, which is why identity is the row's own
+        # bytes. A SQL step with `ORDER BY name` puts an appended row wherever its name
+        # falls, so "the first N rows are the base" would call every row from the
+        # insertion point onwards new, re-place rows the fit already holds, and move
+        # coordinates the whole feature exists to keep still.
+        placement, missing = up.match_base_rows(["a", "NEW", "b", "c"], ["a", "b", "c"])
+        self.assertEqual(placement, [0, None, 1, 2])
+        self.assertEqual(missing, [])
+
+    def test_a_removed_base_row_is_reported_as_missing(self) -> None:
+        placement, missing = up.match_base_rows(["a", "c"], ["a", "b", "c"])
+        self.assertEqual(placement, [0, 2])
+        self.assertEqual(missing, [1], "the fit holds a position for a row that is gone")
+
+    def test_an_edited_base_row_reads_as_removed_and_added(self) -> None:
+        # An edit changes the row's bytes, so its old identity is missing and its new
+        # one is unknown — both halves have to show, or an edited row would quietly take
+        # the coordinate its previous values earned.
+        placement, missing = up.match_base_rows(["a", "b-EDITED", "c"], ["a", "b", "c"])
+        self.assertEqual(placement, [0, None, 2])
+        self.assertEqual(missing, [1])
+
+    def test_duplicate_rows_are_handed_out_in_order_then_reused(self) -> None:
+        placement, missing = up.match_base_rows(["d", "d", "d"], ["d", "d"])
+        self.assertEqual(placement, [0, 1, 1])
+        self.assertEqual(missing, [], "both fit rows were claimed")
+
+    def test_an_empty_fit_leaves_every_row_to_be_placed(self) -> None:
+        placement, missing = up.match_base_rows(["a", "b"], [])
+        self.assertEqual(placement, [None, None])
+        self.assertEqual(missing, [])
+
+
+class DescribeMismatchTest(unittest.TestCase):
+    """One layer of the refusal surface: a persisted fit that does not DESCRIBE the input.
+
+    Not the whole of it, and reading it as the whole of it is what let a corrupted `--fit`
+    crash. `DescribeUnusableFitTest` below covers the record behind the header, and
+    `test_umap_project_fit.py` covers everything neither function enumerates.
+
+    The expensive failure is not a crash. A fit for different columns, a different
+    vector width, a different knob or a different umap-learn unpickles cleanly and
+    places rows at coordinates that look like coordinates, and nothing downstream can
+    tell. Every case below asserts the refusal NAMES what differs — a bare "incompatible
+    fit" would leave the caller guessing which of five things to change.
+    """
+
+    def header(self, **overrides):
+        base = dict(
+            columns=["lon", "lat"],
+            widths=[1, 1],
+            neighbors=15,
+            min_dist=0.1,
+            metric="euclidean",
+            seed=42,
+            umap_learn_version="0.5.12",
+        )
+        base.update(overrides)
+        return up.fit_header(**base)
+
+    def test_a_fit_of_the_same_shape_is_accepted(self) -> None:
+        self.assertIsNone(up.describe_mismatch(self.header(), self.header()))
+
+    def test_every_compared_field_actually_refuses_when_it_moves(self) -> None:
+        """The class check, not one case of it. Each field in `FIT_COMPARED_FIELDS` is
+        perturbed in turn and must produce a refusal that names it or its values.
+        Dropping any single comparison from `describe_mismatch` — or adding a field to
+        the tuple and forgetting to compare it — reddens here rather than shipping a fit
+        that records a property and does not check it."""
+        # field -> (the value this run asks for, a string the refusal must carry so the
+        # caller can see WHICH thing moved).
+        moved = {
+            "columns": (["lon", "median_income"], "median_income"),
+            "feature_widths": ([1, 256], "256"),
+            "neighbors": (30, "30"),
+            "min_dist": (0.9, "0.9"),
+            "metric": ("cosine", "cosine"),
+            "seed": (7, "7"),
+            "umap_learn_version": ("0.5.11", "0.5.11"),
+        }
+        self.assertEqual(
+            sorted(moved), sorted(up.FIT_COMPARED_FIELDS),
+            "this test must perturb every compared field, or it stops covering the tuple",
+        )
+        stored = self.header()
+        for field, (value, witness) in moved.items():
+            with self.subTest(field=field):
+                current = dict(stored)
+                current[field] = value
+                said = up.describe_mismatch(stored, current)
+                self.assertIsNotNone(said, f"a fit with a different {field} was accepted")
+                self.assertIn(
+                    witness,
+                    said,
+                    f"the refusal for {field} does not say what this run asked for",
+                )
+
+    def test_the_columns_refusal_names_both_lists(self) -> None:
+        said = up.describe_mismatch(self.header(), self.header(columns=["lon", "income"]))
+        self.assertIn("'lat'", said)
+        self.assertIn("'income'", said)
+
+    def test_the_width_refusal_names_both_widths_and_the_column(self) -> None:
+        # A fit built on a 256-d embedding, an input now carrying 384-d vectors: the
+        # expensive case, because both are "one vector column" and only the width says
+        # they are different maps.
+        said = up.describe_mismatch(
+            self.header(columns=["embedding"], widths=[256]),
+            self.header(columns=["embedding"], widths=[384]),
+        )
+        self.assertIn("embedding=256", said)
+        self.assertIn("embedding=384", said)
+
+    def test_the_umap_version_refusal_names_both_versions(self) -> None:
+        said = up.describe_mismatch(self.header(), self.header(umap_learn_version="0.5.9"))
+        self.assertIn("0.5.12", said)
+        self.assertIn("0.5.9", said)
+
+    def test_a_fit_from_another_format_is_refused_before_its_fields_are_read(self) -> None:
+        stored = dict(self.header(), fit_format=up.FIT_FORMAT + 1)
+        said = up.describe_mismatch(stored, self.header())
+        self.assertIsNotNone(said)
+        self.assertIn(str(up.FIT_FORMAT), said)
+
+    def test_a_file_that_is_not_a_fit_at_all_is_refused(self) -> None:
+        for stranger in (None, [1, 2, 3], {"not": "a fit"}, "a string"):
+            with self.subTest(stranger=stranger):
+                said = up.describe_mismatch(stranger, self.header())
+                self.assertIsNotNone(said, f"{stranger!r} was accepted as a fit")
+                self.assertIn(up.OPERATOR_NAME, said)
+
+    def test_a_fit_written_by_a_different_operator_is_refused_by_name(self) -> None:
+        said = up.describe_mismatch(dict(self.header(), operator="splink_resolve"), self.header())
+        self.assertIn("splink_resolve", said)
+
+
+class _StandInReducer:
+    """A fitted projection's one method, and nothing else — enough for the structural
+    validator, which asks whether a row can be placed and not how well."""
+
+    def transform(self, matrix):  # pragma: no cover - never called by these tests
+        return [[0.0, 0.0] for _ in matrix]
+
+
+class DescribeUnusableFitTest(unittest.TestCase):
+    """The layer `describe_mismatch` is not: a fit whose header compares CLEAN and whose
+    record is still unusable.
+
+    The whole class of defect this closes was invisible to the header comparison because
+    the header was fine. A fit truncated by an interrupted write, or one from a build
+    whose record held other keys, agrees on columns, widths, knobs and umap-learn and then
+    has nothing behind them. Measured on this branch before the boundary existed: three of
+    those cases were `KeyError`, one an `IndexError` inside the placement loop, one a
+    Refusal with the wrong diagnosis, and TWO RAN TO COMPLETION and wrote plausible
+    coordinates — a fit with no reducer, and one whose reducer cannot transform, because
+    the reducer is touched only when there are appended rows.
+    """
+
+    def header(self, **overrides):
+        base = dict(
+            columns=["lon", "lat"],
+            widths=[1, 1],
+            neighbors=15,
+            min_dist=0.1,
+            metric="euclidean",
+            seed=42,
+            umap_learn_version="0.5.12",
+        )
+        base.update(overrides)
+        return up.fit_header(**base)
+
+    def reference(self):
+        """Built through `fit_record` — the same function the operator persists with, so
+        these cases are about the object that really goes on disk."""
+        return up.fit_record(
+            self.header(),
+            "0123456789abcdef",
+            ["digest-a", "digest-b", "digest-c"],
+            [[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]],
+            _StandInReducer(),
+        )
+
+    def test_the_record_the_operator_writes_is_usable(self) -> None:
+        self.assertIsNone(up.describe_unusable_fit(self.reference()))
+
+    def test_losing_any_key_the_record_carries_is_refused(self) -> None:
+        """Swept over `fit_record`'s OWN keys rather than a list written out here. That is
+        the difference that matters: a field added to the persisted record and left
+        unvalidated reddens this without anyone remembering to add a case for it, which is
+        how the four missing checks got in.
+        """
+        for key in sorted(self.reference()):
+            with self.subTest(key=key):
+                damaged = self.reference()
+                del damaged[key]
+                said = up.describe_unusable_fit(damaged)
+                self.assertIsNotNone(said, f"a fit carrying no {key!r} was accepted")
+                self.assertIn(key, said, f"the refusal does not name {key!r}")
+
+    def test_losing_any_header_field_the_record_carries_is_refused(self) -> None:
+        """The same sweep one level down, and it spans BOTH validators on purpose: some
+        header fields are `describe_mismatch`'s (`columns`, the knobs) and `fit_id` is
+        this one's. What is asserted is that no field of the written header can go missing
+        without SOMETHING refusing — which is the statement a caller relies on, and is not
+        a statement either function makes alone."""
+        current = self.header()
+        for key in sorted(self.reference()["header"]):
+            with self.subTest(key=key):
+                damaged = self.reference()
+                del damaged["header"][key]
+                said = up.describe_mismatch(
+                    damaged["header"], current
+                ) or up.describe_unusable_fit(damaged)
+                self.assertIsNotNone(
+                    said, f"a fit whose header carries no {key!r} was accepted"
+                )
+
+    def test_a_reducer_that_cannot_place_a_row_is_refused_before_the_first_append(
+        self,
+    ) -> None:
+        """The most expensive case, called out separately from the sweep because the
+        sweep's `del` is not how it arises. A fit can carry a `reducer` that is not one,
+        and the run that reads it does not touch `.transform()` unless rows were appended
+        — so the failure waits, silently, for the run whose entire purpose was to not move
+        the map."""
+        for stand_in in (None, object(), "a reducer", {"transform": True}):
+            with self.subTest(reducer=type(stand_in).__name__):
+                damaged = self.reference()
+                damaged["reducer"] = stand_in
+                said = up.describe_unusable_fit(damaged)
+                self.assertIsNotNone(said, f"{stand_in!r} was accepted as a reducer")
+                self.assertIn("reducer", said)
+
+    def test_a_layout_that_cannot_say_where_its_own_rows_sit_is_refused(self) -> None:
+        """Counting is the check, and both directions of it: a record whose stored
+        positions and row identities disagree indexes out of bounds in the placement loop,
+        or silently drops rows off the end."""
+        for held in ([[0.0, 1.0]], [[0.0, 1.0], [2.0, 3.0]], [[0.0, 1.0]] * 4):
+            with self.subTest(held=len(held)):
+                damaged = self.reference()
+                damaged["base_embedding"] = held
+                said = up.describe_unusable_fit(damaged)
+                self.assertIsNotNone(said, f"{len(held)} positions for 3 rows was accepted")
+                self.assertIn(str(len(held)), said)
+                self.assertIn("3", said)
+
+    def test_row_identities_that_are_not_a_list_of_identities_are_refused(self) -> None:
+        """Before the check, `base_row_digests="nope"` produced a REFUSAL — the wrong one.
+        `match_base_rows` read it as four rows, because `len("nope")` is 4, and the caller
+        was told four rows had been removed from an input nothing had been removed from.
+        A plausible refusal is as expensive as a plausible map."""
+        for wrong in ("nope", None, 4, {"a": 1}, ["digest-a", 7, "digest-c"]):
+            with self.subTest(wrong=repr(wrong)):
+                damaged = self.reference()
+                damaged["base_row_digests"] = wrong
+                self.assertIsNotNone(
+                    up.describe_unusable_fit(damaged),
+                    f"{wrong!r} was accepted as the list of row identities",
+                )
+
+    def test_an_object_that_is_not_a_record_at_all_is_refused_naming_its_type(self) -> None:
+        for stranger in (None, [1, 2, 3], "a string", 7):
+            with self.subTest(stranger=stranger):
+                said = up.describe_unusable_fit(stranger)
+                self.assertIsNotNone(said)
+                self.assertIn(type(stranger).__name__, said)
+
+
+class FitHeaderTest(unittest.TestCase):
+    def test_every_field_the_header_records_is_a_field_that_is_compared(self) -> None:
+        """The invariant that keeps the refusal honest as this grows. `operator` and
+        `fit_format`
+        identify the FILE and are checked first, separately, so they are excluded here.
+        Every other field is a property of the fit, and a property the fit records but
+        `describe_mismatch` never compares is a difference an analyst cannot see."""
+        recorded = set(
+            up.fit_header(["lon"], [1], 15, 0.1, "euclidean", 42, "0.5.12")
+        ) - {"operator", "fit_format"}
+        self.assertEqual(
+            recorded,
+            set(up.FIT_COMPARED_FIELDS),
+            "a header field outside FIT_COMPARED_FIELDS is recorded and never checked",
+        )
+
+    def test_the_header_records_what_the_caller_asked_for(self) -> None:
+        header = up.fit_header(["a", "b"], [1, 4], 30, 0.25, "cosine", 42, "0.5.12")
+        self.assertEqual(header["columns"], ["a", "b"])
+        self.assertEqual(header["feature_widths"], [1, 4])
+        self.assertEqual(header["neighbors"], 30)
+        self.assertEqual(header["min_dist"], 0.25)
+        self.assertEqual(header["metric"], "cosine")
+        self.assertEqual(header["operator"], up.OPERATOR_NAME)
+        self.assertEqual(header["fit_format"], up.FIT_FORMAT)
+
+
+class FitFlagTest(unittest.TestCase):
+    """`--fit` has to reach the script's own parser, not merely be documented. The
+    operator's Rust side is a separate file in a separate language; the flag being
+    optional here is what keeps every manifest that does not set it running unchanged."""
+
+    def test_the_fit_flag_is_optional_and_defaults_to_no_persistence(self) -> None:
+        source = (HERE / "umap_project.py").read_text(encoding="utf-8")
+        self.assertIn('"--fit"', source)
+        import argparse
+
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--fit", default=None)
+        self.assertIsNone(ap.parse_args([]).fit)
+        self.assertEqual(ap.parse_args(["--fit", "m.pkl"]).fit, "m.pkl")
+
+
 if __name__ == "__main__":
     unittest.main()

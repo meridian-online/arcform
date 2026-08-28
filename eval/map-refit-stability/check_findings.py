@@ -19,6 +19,21 @@ being assumed. A mismatch means someone edited the prose, or re-ran a harness an
 forgot the prose, or a harness itself regressed; all three are bugs this script exists
 to catch rather than to explain.
 
+EVERY STATEMENT OF A FIGURE IS CHECKED, NOT THE FIRST ONE FOUND. `require` below asks
+whether a correct rendering exists ANYWHERE in a file, and that is green while a stale
+copy of the same figure sits three paragraphs down — which is the defect this script was
+written to prevent, inherited by the script itself. It shipped one: the README stated the
+`.transform()` gap as "3 to 5 points below this corpus's own ceiling" in its conclusion
+while the committed JSON said 3 to 4 and the first occurrence said so too, and this
+checker was green over it. `require_every` and `require_exact_set` take the figure's
+SHAPE — the words around it with the numbers left open — so a second, third or tenth
+rendering is found and compared rather than ignored.
+
+THE PLACEMENT BOUNDS ARE APPLIED HERE TOO, from `placement_bounds.py`. They were
+`price_transform.py`'s harness-time assertions and nothing else, so their greenness was
+never observed by a gate: a run that stopped clearing them looked exactly like a run
+nobody had done.
+
 THREE FIGURES ARE NOT CHECKED, DELIBERATELY, AND SAY SO: the sibling embedder-swap
 kNN-overlap numbers (0.13 / 0.28 / 0.40) come from a measurement in a different
 repository. There is no copy of that source here to check against, so this script
@@ -34,6 +49,9 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import placement_bounds  # noqa: E402
+
 REPO = HERE.parent.parent
 RESULTS = HERE / "results.json"
 PRICING = HERE / "transform_pricing.json"
@@ -75,6 +93,46 @@ def main() -> int:
         needle = normalise_whitespace(needle)
         if needle not in haystack:
             problems.append(f"{where} does not contain {needle!r}")
+
+    def require_every(haystack: str, shape: str, expected: tuple[str, ...], where: str) -> None:
+        """EVERY statement of this figure must carry the current value, and there must be
+        at least one.
+
+        `shape` is a regex describing how the figure is written — the surrounding words,
+        with the numbers as capture groups — so it finds every rendering in the file
+        rather than the one whose exact text was typed into this script. `require` above
+        cannot do this: it is satisfied by a single correct copy and says nothing about
+        the others.
+
+        No match at all is also a problem. A figure that is supposed to be stated and is
+        not, or whose wording moved out from under this shape, is a check that has
+        stopped checking — and a check that cannot fail is green over anything.
+        """
+        matches = list(re.finditer(shape, haystack))
+        if not matches:
+            problems.append(
+                f"{where}: nothing matches {shape!r}. Either the figure is no longer "
+                f"stated, or its wording moved and this check now guards nothing."
+            )
+            return
+        wrong = [m.group(0) for m in matches if m.groups() != expected]
+        if wrong:
+            problems.append(
+                f"{where}: {len(wrong)} of {len(matches)} statements of this figure "
+                f"disagree with the committed JSON (which gives {expected}): {wrong}"
+            )
+
+    def require_exact_set(haystack: str, shape: str, expected: set[str], where: str) -> None:
+        """The same rule where one shape carries SEVERAL legitimate figures — the README
+        states a full-refit triple and a `.transform()` triple in identical notation, so
+        no single expected value covers both. The set found must be exactly the set the
+        JSON supports: a stale fourth triple reddens, and so does a missing one."""
+        found = {m.group(0) for m in re.finditer(shape, haystack)}
+        if found != expected:
+            problems.append(
+                f"{where}: the figures written in this notation are {sorted(found)}; the "
+                f"committed JSON supports {sorted(expected)}"
+            )
 
     # Internal consistency of results.json itself, independent of any prose: every
     # comparison scored the same base rows, at the same k, and against the same
@@ -201,12 +259,35 @@ def main() -> int:
                 f"no longer true of this run"
             )
 
-        mb = f"{pricing['pickled_reducer_bytes'] / 1_000_000:.1f} MB"
-        require(readme, mb, "README.md (pickled model size)")
-        require(changelog, mb, "CHANGELOG.md (pickled model size)")
+        # The bounds a correct placement measurement clears, applied to the committed
+        # numbers. Same functions price_transform.py asserts at harness time — see
+        # placement_bounds.py for what each catches and why the relational one is not
+        # `transform < full_refit`.
+        problems.extend(placement_bounds.pricing_problems(pricing, append_tags))
 
-        ceiling = f"{pricing['corpus_ceiling_256d_vs_2d'] * 100:.1f}%"
-        require(readme, ceiling, "README.md (corpus ceiling)")
+        # ── the figures, each checked at EVERY site it is written, not the first ──
+        #
+        # Each entry is a SHAPE — the words around a figure with its numbers as capture
+        # groups — and the value the committed JSON gives. `require_every` finds every
+        # rendering in the file and compares all of them. The predecessor of this block
+        # asked only whether one correct rendering existed anywhere, and shipped a
+        # README whose conclusion stated a stale "3 to 5" three paragraphs under a
+        # correct "3 to 4".
+        mb = f"{pricing['pickled_reducer_bytes'] / 1_000_000:.1f}"
+        for text, where in ((readme, "README.md"), (changelog, "CHANGELOG.md")):
+            require_every(
+                text, r"(\d+\.\d) MB", (mb,), f"{where} (pickled model size)"
+            )
+
+        ceiling_pct = pricing["corpus_ceiling_256d_vs_2d"] * 100
+        require_every(
+            readme,
+            # `**` optional: the README bolds this one, and a check that required the
+            # emphasis would stop matching the day someone unbolded it.
+            r"(\d+\.\d)%\*{0,2} of its 256-d neighbourhood",
+            (f"{ceiling_pct:.1f}",),
+            "README.md (corpus ceiling)",
+        )
 
         truth_fidelities = {
             "transform": [
@@ -216,64 +297,80 @@ def main() -> int:
                 pricing["placements"][t]["full_refit_vs_256d_truth_mean"] for t in append_tags
             ],
         }
-        for kind, values in truth_fidelities.items():
-            joined_2dp = " / ".join(f"{v * 100:.1f}%" for v in values)
-            require(
-                readme,
-                joined_2dp,
-                f"README.md ({kind} fidelity vs 256-d truth, per-fraction)",
-            )
-
-        # The gap-below-the-ceiling and share-of-the-ceiling sentences — the ones an
-        # earlier pass over this file had to correct once already, because
-        # "points below the ceiling" and "points below the full refit" are different
-        # numbers and the wrong one was pinned first. Both are computed here, from
-        # the same pricing values checked above, rather than typed a second time.
-        ceiling_pct = pricing["corpus_ceiling_256d_vs_2d"] * 100
         transform_pcts = [v * 100 for v in truth_fidelities["transform"]]
         full_refit_pcts = [v * 100 for v in truth_fidelities["full_refit"]]
 
-        gaps_below_ceiling = [ceiling_pct - t for t in transform_pcts]
-        require(
+        # Both per-fraction triples are written in one notation, so no single expected
+        # value covers them; the SET of triples in the file must be exactly the set the
+        # JSON supports. A stale third triple reddens here, and so does a missing one.
+        require_exact_set(
             readme,
-            f"{round(min(gaps_below_ceiling))} to {round(max(gaps_below_ceiling))} "
-            f"points below the ceiling",
-            "README.md (.transform() gap below the ceiling)",
+            r"-?\d+\.\d% / -?\d+\.\d% / -?\d+\.\d%",
+            {
+                " / ".join(f"{v:.1f}%" for v in values)
+                for values in (transform_pcts, full_refit_pcts)
+            },
+            "README.md (fidelity vs 256-d truth, per-fraction)",
         )
+
+        # The gap-below-the-ceiling and share-of-the-ceiling figures — the ones an
+        # earlier pass over this file had to correct once already, because "points below
+        # the ceiling" and "points below the full refit" are different numbers and the
+        # wrong one was pinned first. Both are computed here from the same pricing values
+        # rather than typed a second time, and both are now checked wherever they appear,
+        # in both files, under either preposition.
+        gaps_below_ceiling = [ceiling_pct - t for t in transform_pcts]
+        gap_shape = r"(\d+) to (\d+) points (?:below|under) (?:the |this corpus's own )ceiling"
+        expected_gap = (
+            str(round(min(gaps_below_ceiling))),
+            str(round(max(gaps_below_ceiling))),
+        )
+        for text, where in ((readme, "README.md"), (changelog, "CHANGELOG.md")):
+            require_every(
+                text, gap_shape, expected_gap, f"{where} (.transform() gap below the ceiling)"
+            )
 
         ceiling_share = [f / ceiling_pct * 100 for f in full_refit_pcts]
-        require(
-            readme,
-            f"{round(min(ceiling_share))}-{round(max(ceiling_share))}% of the ceiling",
-            "README.md (full refit's share of the ceiling)",
+        expected_share = (
+            str(round(min(ceiling_share))),
+            str(round(max(ceiling_share))),
         )
-        require(
-            changelog,
-            f"{round(min(ceiling_share))}-{round(max(ceiling_share))}% of the ceiling",
-            "CHANGELOG.md (full refit's share of the ceiling)",
-        )
+        for text, where in ((readme, "README.md"), (changelog, "CHANGELOG.md")):
+            require_every(
+                text,
+                r"(\d+)-(\d+)% of the ceiling",
+                expected_share,
+                f"{where} (full refit's share of the ceiling)",
+            )
 
         gaps_below_full_refit = [f - t for f, t in zip(full_refit_pcts, transform_pcts)]
-        require(
+        require_every(
             changelog,
-            f"{min(gaps_below_full_refit):.1f}-{max(gaps_below_full_refit):.1f} points "
-            f"under the full refit",
+            r"(-?\d+\.\d)-(-?\d+\.\d) points under the full refit",
+            (
+                f"{min(gaps_below_full_refit):.1f}",
+                f"{max(gaps_below_full_refit):.1f}",
+            ),
             "CHANGELOG.md (.transform() gap below the full refit)",
         )
-        require(
+        require_exact_set(
             readme,
-            " / ".join(f"{v:.1f}" for v in gaps_below_full_refit),
+            r"-?\d+\.\d / -?\d+\.\d / -?\d+\.\d(?!%)",
+            {" / ".join(f"{v:.1f}" for v in gaps_below_full_refit)},
             "README.md (.transform() gap below the full refit, per-fraction)",
         )
 
-        # CHANGELOG's own "30.4-27.3%" / "27.4-25.7%" range notation, distinct from
-        # the README's " / "-joined one checked above.
-        for kind, values in (("full_refit", full_refit_pcts), ("transform", transform_pcts)):
-            require(
-                changelog,
-                f"{max(values):.1f}-{min(values):.1f}%",
-                f"CHANGELOG.md ({kind} fidelity vs 256-d truth, hyphen range)",
-            )
+        # CHANGELOG's own hyphen-range notation for the same two triples, distinct from
+        # the README's " / "-joined one. Same set rule, same reason.
+        require_exact_set(
+            changelog,
+            r"\d+\.\d-\d+\.\d%",
+            {
+                f"{max(values):.1f}-{min(values):.1f}%"
+                for values in (full_refit_pcts, transform_pcts)
+            },
+            "CHANGELOG.md (fidelity vs 256-d truth, hyphen range)",
+        )
     else:
         problems.append(
             "transform_pricing.json is missing — the out-of-sample pricing numbers "
