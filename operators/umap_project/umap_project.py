@@ -370,6 +370,42 @@ def match_base_rows(
     return placement, missing
 
 
+def fit_header(
+    columns: list[str],
+    widths: list[int],
+    neighbors: int,
+    min_dist: float,
+    metric: str,
+    seed: int,
+    umap_learn_version: str,
+) -> dict:
+    """Everything about a fit that a later run has to agree with before it may place a
+    row into that fit — and nothing about the fit's contents, which live beside it.
+
+    `neighbors` is what the CALLER asked for, not the clamped `k`. An append makes the
+    table longer, so `clamp_neighbors` can legitimately return a different value on the
+    second run while the manifest is untouched; comparing the clamped value would refuse
+    every append to a table small enough for the clamp to bite.
+
+    A pure function rather than a dict literal inside `main()`, so
+    `test_umap_project.py` can pin the one invariant that keeps `describe_mismatch`
+    honest as this grows: every field here except the two that identify the FILE is in
+    `FIT_COMPARED_FIELDS`. A field added to the header and not to that tuple is a
+    property the fit records, reports, and silently does not check.
+    """
+    return {
+        "operator": OPERATOR_NAME,
+        "fit_format": FIT_FORMAT,
+        "columns": list(columns),
+        "feature_widths": list(widths),
+        "neighbors": neighbors,
+        "min_dist": min_dist,
+        "metric": metric,
+        "seed": seed,
+        "umap_learn_version": umap_learn_version,
+    }
+
+
 def describe_mismatch(stored: dict, current: dict) -> str | None:
     """The one line naming why a persisted fit does not describe this input, or `None`.
 
@@ -570,21 +606,15 @@ def main() -> int:
     # hidden: above `len(rows) - 1` the knob stops moving and nothing says so.
     k = clamp_neighbors(args.neighbors, len(rows))
 
-    # The header a persisted fit is compared against. `neighbors` is what the CALLER
-    # asked for, not the clamped `k`: an append makes the table longer, so the clamp can
-    # legitimately land somewhere else on the second run while the manifest is untouched,
-    # and comparing the clamped value would refuse every append of a small table.
-    header = {
-        "operator": OPERATOR_NAME,
-        "fit_format": FIT_FORMAT,
-        "columns": list(columns),
-        "feature_widths": list(widths),
-        "neighbors": args.neighbors,
-        "min_dist": args.min_dist,
-        "metric": args.metric,
-        "seed": SEED,
-        "umap_learn_version": getattr(umap, "__version__", "unknown"),
-    }
+    header = fit_header(
+        columns,
+        widths,
+        args.neighbors,
+        args.min_dist,
+        args.metric,
+        SEED,
+        getattr(umap, "__version__", "unknown"),
+    )
 
     fit_path = Path(args.fit) if args.fit else None
     digests = [row_digest(matrix[i].tobytes()) for i in range(len(rows))]
