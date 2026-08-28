@@ -5926,8 +5926,9 @@ mod tests {
         )
         .unwrap();
 
-        // AC5's pairing: the accepting run must pass, and pass SILENTLY — no new
-        // output on the happy path, same empty StepOutput as before.
+        // The pairing: the accepting run must pass, and pass SILENTLY — no new
+        // output on the happy path, same empty StepOutput as before. Without it a
+        // validator that refuses every run satisfies everything below.
         let clean = run_validate(dir.path(), &ext, "data.parquet", "pass.json")
             .expect("the accepting contract must pass");
         assert!(
