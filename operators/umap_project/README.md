@@ -458,9 +458,9 @@ which is precisely the movement `--fit` exists to prevent.
 **The fit is written once and not rewritten.** An append run reads it and leaves the
 bytes alone, so a Protocol hashing that artifact does not see it move on every run.
 
-**A fit that does not describe the current input is refused, naming what differs.** This
-is the part worth reading before using the flag, because every one of these cases LOADS
-and produces coordinates that look like coordinates:
+**A fit that LOADS and is wrong is refused, naming what differs.** This is the part worth
+reading before using the flag, because every one of these cases produces coordinates that
+look like coordinates:
 
 | what differs | what happens |
 |---|---|
@@ -468,14 +468,47 @@ and produces coordinates that look like coordinates:
 | a vector column's width — a fit for 256-d embeddings, an input now carrying 384-d | refused, naming both widths per column |
 | `neighbors`, `min_dist`, `metric` or the seed | refused, naming the knob and both values |
 | the umap-learn the fit was built by | refused, naming both versions |
-| the file is not a fit this operator wrote | refused, naming what it is |
+| the file names another operator, or a fit format this build does not read | refused, naming what wrote it |
 | a row the fit was built from is no longer in the input — removed, or edited | refused with a count. A fit places APPENDED rows into an existing layout; it cannot describe an input rows were taken out of |
 
-The comparison is a pure function (`describe_mismatch`) over a header the fit records,
-and `test_umap_project.py` drives every field of it with the standard library alone, so
-it is checked on every CI run rather than only where `uv` exists. The end-to-end
-behaviour — appended rows placed, pre-existing rows byte-identical — is
-`test_umap_project_fit.py`, which runs the real projection.
+**A file that is not a usable fit at all is refused the same way, and until 2026-08-29 it
+was not.** The table above compares a header. A file can carry a header this operator
+agrees with in every field and have nothing behind it, and a file that is not a pickle at
+all has no header to compare — so each of these left the operator as a Python traceback
+while this page promised a named line:
+
+| what the file is | what happens |
+|---|---|
+| not a pickle: an empty file from an interrupted write, a Parquet passed to `--fit` by mistake, a truncated or corrupted fit | refused, naming the file and the error that reading it raised |
+| a fit record missing `base_row_digests`, `base_embedding`, `reducer` or its `fit_id` | refused, naming the field |
+| a fit whose stored positions and row identities disagree in number | refused, naming both counts |
+| a fit whose `reducer` cannot place a row | refused **on the run that reads it**, not on the first run that appends. Such a fit is unusable from the moment it is written; it used to run to completion and say nothing until the first append, which is the one run whose entire purpose was to not move the map |
+| `--fit` naming a directory, or a path under a file | refused, naming the flag |
+
+A refused run writes no output.
+
+**The guarantee is a containment, not a longer list of checks.** `--fit` names a file the
+caller chose, and the ways it can be wrong are not enumerable: `pickle.load` runs
+constructors named in the bytes, so it raises whatever those constructors raise, from
+whatever they import. What IS enumerable is the three values a run takes out of a fit —
+coordinates, a fit id, a count of rows the fit already held — so every use of the file's
+contents happens inside `place_into_persisted_fit`, which returns those three or raises a
+`Refusal`, and nothing derived from the file leaves it. A field the record grows later
+has to come out through that return, and anything leaving through it was checked on the
+way out.
+
+Two pure functions make the common damage legible rather than generic — `describe_mismatch`
+over the header, `describe_unusable_fit` over the record — and `test_umap_project.py`
+drives both with the standard library alone, so they are checked on every CI run rather
+than only where `uv` exists. `test_umap_project_fit.py` drives the rest against the real
+operator: it takes the fit the operator itself just wrote and sweeps it, deleting each key
+the record carries and each field of its header in turn, truncating it across its length,
+flipping a byte across its length, and pointing `--fit` at four files that are not fits.
+The sweeps read their cases off the artifact rather than from a list written beside them,
+so a field added to the persisted record is covered without anyone remembering to add one.
+One case runs the operator as a subprocess and reads its exit code and stderr, because
+every in-process case is green on an operator that raises a perfectly good refusal and
+then prints a traceback of it.
 
 **What is NOT wired yet: a manifest cannot set this.** `--fit` is the script's flag, and
 the operator's `with:` block in `src/operator.rs` has no `fit:` field, so a Protocol step

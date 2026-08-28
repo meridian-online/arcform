@@ -38,11 +38,23 @@ Rationale for each change is recorded in the project's design notes and commit h
   **A fit that does not describe the current input is refused, naming what differs.**
   Different projected columns, a different vector width (a fit for 256-d embeddings
   against an input now carrying 384-d), a different `neighbors`/`min_dist`/`metric`/seed,
-  a different umap-learn, a file that is not a fit this operator wrote, or an input a fit
-  row is no longer present in — every one of those LOADS and produces plausible
-  coordinates, which is why each is compared rather than trusted. The comparison is a
-  pure function over a header the fit records, so CI drives every field of it with the
-  standard library alone.
+  a different umap-learn, a file naming another operator, or an input a fit row is no
+  longer present in — every one of those LOADS and produces plausible coordinates, which
+  is why each is compared rather than trusted. The comparison is a pure function over a
+  header the fit records, so CI drives every field of it with the standard library alone.
+
+  **And a file that is not a usable fit at all is refused the same way.** A header
+  comparison can only answer a file that HAS a header. An empty file left by an
+  interrupted write, a Parquet passed to `--fit` by mistake, a truncated or corrupted
+  fit, a record missing the row identities or the fitted projection behind that header,
+  or `--fit` naming a directory — every one of those was an unhandled Python traceback,
+  and two of them were worse: a record whose `reducer` cannot place a row RAN TO
+  COMPLETION and wrote plausible coordinates, because the reducer is touched only when
+  there are appended rows, so the failure waited for the first append. Every use of the
+  file's contents now happens inside one function that returns three plain values or
+  raises a refusal, and the operator's own test sweeps the fit it just wrote — every key,
+  every header field, truncation and byte-corruption across its length — rather than a
+  list of cases written beside it.
 
   **A manifest cannot set this yet.** `--fit` is the script's flag; the operator's `with:`
   block has no `fit:` field, so a Protocol step cannot name the fit as an asset it reads
