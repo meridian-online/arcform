@@ -2000,24 +2000,38 @@ impl Operator for FinetypeValidate {
         }
 
         if total_rejects > 0 {
-            // Fail-report UX: surface the offending {column, rejects, sample_message}
-            // rows before failing closed — a strict upgrade on the old exit-code signal.
-            eprintln!(
-                "finetype_validate: {} contract violation(s) in {} vs {} — DRIFT, failing closed:",
-                total_rejects, cfg.parquet, cfg.schema
+            // The refusal carries the subject, the clause and an example — everything
+            // the reader's next two questions ask for ("which column?", "what value?"),
+            // all of it already in hand at the moment the gate decides to refuse. It
+            // goes in `StepFailed.stderr` and NOWHERE else: that field is what
+            // `Error`'s Display prints and therefore the only channel that survives
+            // anything wrapping `arc`. A second copy on `eprintln!` used to carry the
+            // per-column line and is deliberately gone — one failure, one report.
+            let mut detail = format!(
+                "finetype_validate: {} column(s) drifted from {} ({} rejecting row(s))",
+                offenders.len(),
+                cfg.schema,
+                total_rejects
             );
             for (col, total, rejects, msg) in &offenders {
-                eprintln!("  ✗ {col}: {rejects}/{total} row(s) reject — {msg}");
+                detail.push_str(&format!(
+                    "\n  ✗ {col}: {rejects}/{total} row(s) reject — {msg}"
+                ));
+                match sample_offending_values(&conn, &schema, col, DRIFT_SAMPLE_LIMIT) {
+                    Ok(sample) => detail.push_str(&format!("\n{}", sample.render())),
+                    // A sampling query that fails must not turn an actionable drift
+                    // refusal into a confusing one: the column, the counts and
+                    // ft_validate's own message above are already reported, so say
+                    // what could not be sampled and keep going.
+                    Err(e) => detail.push_str(&format!(
+                        "\n      offending values unavailable for {col}: {e}"
+                    )),
+                }
             }
             return Err(Error::StepFailed {
                 step: String::new(), // runner rewrites with the step name
                 code: 1,
-                stderr: format!(
-                    "finetype_validate: {} column(s) drifted from {} ({} rejecting row(s))",
-                    offenders.len(),
-                    cfg.schema,
-                    total_rejects
-                ),
+                stderr: detail,
             });
         }
 
@@ -2026,6 +2040,132 @@ impl Operator for FinetypeValidate {
             stdout: None,
         })
     }
+}
+
+/// How many DISTINCT offending values a drift refusal reports per column. Bounded on
+/// purpose: a column whose every row rejects would otherwise print the whole column
+/// into a step error. The number is printed in the message, and the message says the
+/// list was cut when it was, so the reader is never left guessing whether five was all
+/// of them.
+const DRIFT_SAMPLE_LIMIT: usize = 5;
+
+/// How wide a single offending value is allowed to print before it is elided. A cell
+/// can hold a whole document; the point is to recognise the value, not to transport it.
+const DRIFT_VALUE_WIDTH: usize = 120;
+
+/// The bounded evidence behind one drifted column: up to [`DRIFT_SAMPLE_LIMIT`] distinct
+/// offending values, the clause each failed, how many rows carry it, and how many
+/// distinct offenders there were in total (so the message can say the list was cut).
+struct DriftSample {
+    /// (value, constraint token, rows carrying it), most-frequent first.
+    values: Vec<(String, String, i64)>,
+    /// Distinct (value, clause) pairs that reject — `values.len()` before the bound.
+    distinct_total: i64,
+    /// The bound that was applied, so the rendered line can state it.
+    limit: usize,
+}
+
+impl DriftSample {
+    fn render(&self) -> String {
+        if self.values.is_empty() {
+            // ft_validate counted rejects for this column but the per-cell re-query
+            // found none — a real disagreement, worth saying rather than printing an
+            // empty list that reads like "no values".
+            return "      offending values: none re-derived (ft_validate and the \
+                    per-cell check disagree)"
+                .to_string();
+        }
+        let cut = if (self.values.len() as i64) < self.distinct_total {
+            format!(" — list cut at the {} shown", self.limit)
+        } else {
+            String::new()
+        };
+        let rendered: Vec<String> = self
+            .values
+            .iter()
+            .map(|(v, clause, n)| format!("'{}' ×{n} [{clause}]", elide(v, DRIFT_VALUE_WIDTH)))
+            .collect();
+        format!(
+            "      offending values, {} of {} distinct{}: {}",
+            self.values.len(),
+            self.distinct_total,
+            cut,
+            rendered.join(", ")
+        )
+    }
+}
+
+/// Truncate a value for display on a character boundary, marking that it was cut.
+fn elide(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(width).collect();
+    format!("{head}…")
+}
+
+/// Re-derive the actual offending values for one drifted column.
+///
+/// `ft_validate` reports per-column counts and ONE sample message; it does not report
+/// which values failed. `ft_validate_text` — the per-cell engine that same macro calls
+/// under the hood — does, so this runs it over the column against the column's own
+/// `$.properties.<col>` subschema and groups the rejects. `LIMIT` bounds what is
+/// returned; the unbounded `count(*)` beside it is what makes "cut at 5 of 37" sayable.
+///
+/// Errors are returned as a string rather than an [`Error`]: the caller is already
+/// building a refusal and must not have it replaced by a failure to decorate it.
+fn sample_offending_values(
+    conn: &duckdb::Connection,
+    schema: &std::path::Path,
+    column: &str,
+    limit: usize,
+) -> std::result::Result<DriftSample, String> {
+    // The column name lands in two places with different escaping rules: a quoted
+    // identifier (`"` doubled) and a JSON path segment inside a SQL string literal
+    // (`'` doubled). The macro this mirrors quotes the same way.
+    let ident = column.replace('"', "\"\"");
+    let path = format!("$.\"properties\".\"{}\"", column.replace('"', "\\\""));
+    let sql = format!(
+        "WITH sub(j) AS (\
+           SELECT json_extract((SELECT content FROM read_text('{schema}')), '{path}')::VARCHAR\
+         ), bad AS (\
+           SELECT \"{ident}\"::VARCHAR AS v, \
+                  ft_validate_text(\"{ident}\"::VARCHAR, (SELECT j FROM sub)) AS r FROM _ftv\
+         ), d AS (\
+           SELECT v, r['constraint'] AS clause, count(*)::BIGINT AS n \
+           FROM bad WHERE NOT r['valid'] GROUP BY v, r['constraint']\
+         ) \
+         SELECT v, clause, n, (SELECT count(*) FROM d)::BIGINT \
+         FROM d ORDER BY n DESC, v LIMIT {limit}",
+        schema = sql_lit(&schema.display().to_string()),
+        path = sql_lit(&path),
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("prepare value sample: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(1)?.unwrap_or_else(|| "?".into()),
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|e| format!("run value sample: {e}"))?;
+
+    let mut values = Vec::new();
+    let mut distinct_total = 0i64;
+    for row in rows {
+        let (v, clause, n, total) = row.map_err(|e| format!("read value sample: {e}"))?;
+        distinct_total = total;
+        values.push((v, clause, n));
+    }
+    Ok(DriftSample {
+        values,
+        distinct_total,
+        limit,
+    })
 }
 
 /// Resolve the finetype DuckDB extension path for the in-engine gate: a per-step
