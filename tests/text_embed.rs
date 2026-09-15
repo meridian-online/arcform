@@ -102,8 +102,10 @@ fn extension_dim(artifact: &Path) -> i64 {
     let conn = duckdb::Connection::open_in_memory_with_flags(config).unwrap();
     conn.execute_batch(&format!("LOAD '{}';", artifact.display()))
         .expect("the artifact loads");
-    conn.query_row("SELECT len(subtoken_embed('width probe'))", [], |r| r.get(0))
-        .expect("the extension answers")
+    conn.query_row("SELECT len(subtoken_embed('width probe'))", [], |r| {
+        r.get(0)
+    })
+    .expect("the extension answers")
 }
 
 /// Copy the fixture tree, skipping `build/` — a developer who has run `arc run` in the

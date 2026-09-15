@@ -5265,10 +5265,7 @@ mod tests {
         let assets = assets_for("text_embed", Some(&with)).unwrap();
         assert_eq!(
             assets.reads,
-            vec![
-                "build/corpus.parquet",
-                "vendor/subtoken.duckdb_extension"
-            ]
+            vec!["build/corpus.parquet", "vendor/subtoken.duckdb_extension"]
         );
         assert_eq!(assets.produces, vec!["build/embedded.parquet"]);
         assert_eq!(
