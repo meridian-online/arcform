@@ -9,7 +9,7 @@
 PROVISIONAL. THIS OPERATOR IS ON ITS WAY OUT — DO NOT HARDEN IT. The vectors now come
 from the DuckDB embedding extension: this script LOADs it and issues one SQL
 statement, and it computes nothing about an embedding itself. What is left is a
-Parquet-in/Parquet-out wrapper around `SELECT embed(t)`, which is a step a Protocol
+Parquet-in/Parquet-out wrapper around `SELECT subtoken_embed(t)`, which is a step a Protocol
 can write for itself. When the extension is installable rather than a file a Protocol
 has to carry, this operator is DELETED rather than ported. A knob proposed here
 belongs on the extension instead.
@@ -28,7 +28,7 @@ gone, so nothing regenerates a difference against it and no test reddens when a 
 written here rots.
 
 WHAT IT DOES. Reads one Parquet, embeds the named text column with the extension's
-`embed()`, and writes a Parquet carrying every input column plus a vector column
+`subtoken_embed()`, and writes a Parquet carrying every input column plus a vector column
 (`embedding` unless `--vector-column` says otherwise) of FLOAT.
 
 IT WRITES VECTORS AND NOTHING ELSE, which is the point of it being its own step. An
@@ -41,7 +41,7 @@ artifact the Protocol declares as an asset — the same discipline the model dir
 used to get. It is loaded with unsigned extensions allowed, because a locally built
 artifact is not signed; nothing here installs one, and nothing here opens a socket.
 
-WHAT COMES BACK FOR TEXT WITH NOTHING IN IT. `embed(NULL)` is SQL NULL and a vector
+WHAT COMES BACK FOR TEXT WITH NOTHING IN IT. `subtoken_embed(NULL)` is SQL NULL and a vector
 column of NULLs is not what a Parquet consumer wants here, so the text is bridged with
 `coalesce(t, '')` — the bridge the extension documents. With that bridge a row whose
 text is NULL, empty, whitespace, or made only of tokens outside the model's vocabulary
@@ -64,7 +64,7 @@ there is no model directory to read weights from. `--model` is therefore optiona
 means something narrower than it used to: it declares WHICH model this Protocol
 believes it is embedding with, and the run stops if the extension disagrees. The
 extension publishes a content address over its bundled assets through
-`staticembed_version()`, and this script recomputes that address from the declared
+`subtoken_version()`, and this script recomputes that address from the declared
 directory and `--model-release`. Reproducing it needs the three files a published
 model2vec/potion release ships:
 
@@ -84,7 +84,7 @@ order. What is NOT pinned is the dependency set — see README.md.
 Run standalone:
     uv run operators/text_embed/text_embed.py \
         --input corpus.parquet --text-column description \
-        --extension vendor/staticembed.duckdb_extension \
+        --extension vendor/subtoken.duckdb_extension \
         --out corpus_embedded.parquet
 """
 from __future__ import annotations
@@ -113,11 +113,11 @@ MODEL_PARTS = ("tokenizer.json", "model.safetensors", "config.json")
 # confused with a plain SHA-256 of any one asset. Reproduced here rather than read from
 # anywhere, which couples this check to version 1 of that derivation: a build using a
 # later one will not match, and the refusal below says that is a possible cause.
-MODEL_KEY_DOMAIN = b"staticembed/model-key/v1"
+MODEL_KEY_DOMAIN = b"subtoken/model-key/v1"
 
-# `staticembed 0.1.0 (model minishlab/potion-base-8M@bf8b056651a2, key 1266aa250400, dim 256)`
+# `subtoken 0.1.0 (model minishlab/potion-base-8M@bf8b056651a2, key 1266aa250400, dim 256)`
 VERSION_RE = re.compile(
-    r"^staticembed (?P<build>\S+) \(model (?P<id>\S+)@(?P<revision>[0-9a-f]+), "
+    r"^subtoken (?P<build>\S+) \(model (?P<id>\S+)@(?P<revision>[0-9a-f]+), "
     r"key (?P<key>[0-9a-f]+), dim (?P<dim>\d+)\)$"
 )
 
@@ -161,7 +161,7 @@ def parse_version(reported: str) -> dict[str, str]:
     if match is None:
         raise Refusal(
             f"the extension reported a version line this operator cannot read: "
-            f"{reported!r}. It expects `staticembed <build> (model <id>@<revision>, "
+            f"{reported!r}. It expects `subtoken <build> (model <id>@<revision>, "
             f"key <hex>, dim <n>)`; a line saying the model is unavailable means the "
             f"artifact loaded but its weights did not."
         )
@@ -231,7 +231,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Embed a text column into a vector column.")
     ap.add_argument("--input", required=True, help="Parquet to read.")
     ap.add_argument("--text-column", required=True, help="Column to embed.")
-    ap.add_argument("--extension", required=True, help="staticembed extension artifact.")
+    ap.add_argument("--extension", required=True, help="subtoken extension artifact.")
     ap.add_argument("--out", required=True, help="Parquet to write.")
     ap.add_argument(
         "--vector-column",
@@ -262,7 +262,7 @@ def main() -> int:
     # configuration this script sets on the connection.
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
     con.execute(f"LOAD {sql_lit(str(extension))}")
-    version = parse_version(con.execute("SELECT staticembed_version()").fetchone()[0])
+    version = parse_version(con.execute("SELECT subtoken_version()").fetchone()[0])
     dim = int(version["dim"])
     if args.model:
         check_declared_model(Path(args.model), args.model_release, version)
@@ -299,11 +299,11 @@ def main() -> int:
         raise Refusal(f"{src} has no rows to embed.")
 
     # The one place a text becomes a vector, and it is a call into the extension.
-    # `coalesce` is the bridge the extension documents: embed(NULL) is NULL, and a
+    # `coalesce` is the bridge the extension documents: subtoken_embed(NULL) is NULL, and a
     # NULL where a vector belongs is not what a Parquet consumer can use.
     con.execute(
         f"CREATE TABLE arc_vec AS SELECT {ROW}, "
-        f"embed(coalesce(CAST({sql_ident(args.text_column)} AS VARCHAR), '')) AS vec "
+        f"subtoken_embed(coalesce(CAST({sql_ident(args.text_column)} AS VARCHAR), '')) AS vec "
         f"FROM arc_src"
     )
     empty = con.execute(
@@ -319,13 +319,13 @@ def main() -> int:
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    # The CAST is a WIDTH GUARD and nothing else. `embed()` returns FLOAT[] and DuckDB
+    # The CAST is a WIDTH GUARD and nothing else. `subtoken_embed()` returns FLOAT[] and DuckDB
     # writes a Parquet LIST from either type, so the output file is byte-for-byte the
     # same with the cast and without it — measured 2026-08-25. What it buys is a stop
-    # if `embed()` ever hands back a width other than the one `staticembed_version()`
+    # if `subtoken_embed()` ever hands back a width other than the one `subtoken_version()`
     # reported a moment earlier: `Cannot cast list with length N to array with length`.
     # IT IS NOT PINNED BY A TEST, and it cannot be from this repo — firing it needs an
-    # extension whose `embed()` disagrees with its own version line, which is a build
+    # extension whose `subtoken_embed()` disagrees with its own version line, which is a build
     # nothing here can produce. The width actually written is covered instead, by the
     # parity comparison: two vectors of different widths are different values there.
     con.execute(

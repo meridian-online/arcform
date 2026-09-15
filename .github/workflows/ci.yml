@@ -115,7 +115,7 @@ jobs:
       # message it hands the operator — return early and report as `ok`, which is
       # indistinguishable from having run. This is one `INSTALL ... FROM community`
       # of a ~14 MB artifact, not a second repo's build, so it belongs on the routine
-      # gate rather than in a scheduled workflow the way `staticembed` does.
+      # gate rather than in a scheduled workflow the way `subtoken` does.
       #
       # `test -f` makes a registry that served nothing a red step here rather than a
       # silent skip three steps later, and `ARCFORM_REQUIRE_FINETYPE_EXT` makes the
@@ -143,7 +143,7 @@ jobs:
       - name: test
         run: cargo test --workspace
 
-      # `uv` — and unlike the staticembed extension, it is cheap enough to belong on
+      # `uv` — and unlike the subtoken extension, it is cheap enough to belong on
       # the routine gate. `tests/uv_operator.rs` proves three of its four properties
       # with no `uv` at all (the two load-time refusals and the digest pin refuse
       # before anything is spawned, and the asset-graph edge runs against a stub);
@@ -154,7 +154,7 @@ jobs:
       # to keep off this job.
       #
       # `--include-ignored` on that one test binary, not on the whole suite: the
-      # staticembed tests stay ignored here, and their count still lands in the
+      # subtoken tests stay ignored here, and their count still lands in the
       # summary below.
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -174,7 +174,7 @@ jobs:
         run: uv run operators/umap_project/test_umap_project_fit.py
 
       # tests/text_embed.rs and tests/text_embed_parity.rs carry #[ignore]d tests that
-      # need a built staticembed extension, which this runner does not stage — and,
+      # need a built subtoken extension, which this runner does not stage — and,
       # for the projection half, the several hundred megabytes `uv` resolves for
       # umap-learn. The `uv` installed above is not enough to turn them on, and is not
       # what keeps them off. See the module doc at the top of each file. The `test` step above already
@@ -190,7 +190,7 @@ jobs:
           {
             echo "### text_embed / text_embed_parity — routine gate"
             echo
-            echo "Needs a staged \`staticembed\` extension — this runner installs"
+            echo "Needs a staged \`subtoken\` extension — this runner installs"
             echo "\`uv\` but stages no extension, so:"
             echo
             grep '^test result:' "$RUNNER_TEMP/parity-routine.log" | sed 's/^/- /'

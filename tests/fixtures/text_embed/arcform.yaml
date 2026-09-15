@@ -21,7 +21,7 @@
 # thing that decides what a vector IS is a node in the graph rather than something
 # the step reaches for, and one that is not there stops the run naming the file it
 # looked for. It is NOT committed beside this file — it is tens of megabytes, most of
-# them weights. `tests/text_embed.rs` stages one from ARC_STATICEMBED_EXTENSION and
+# them weights. `tests/text_embed.rs` stages one from ARC_SUBTOKEN_EXTENSION and
 # skips when that is unset; running this Protocol by hand means putting a built
 # artifact at the path below yourself.
 #
@@ -49,7 +49,7 @@ steps:
     with:
       input: build/corpus.parquet
       text_column: description
-      extension: staticembed.duckdb_extension
+      extension: subtoken.duckdb_extension
       out: build/corpus_embedded.parquet
 
   - name: project

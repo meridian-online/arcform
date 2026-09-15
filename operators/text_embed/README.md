@@ -3,13 +3,13 @@
 > **Provisional. This operator is on its way out — do not harden it.**
 > It no longer computes an embedding: it loads the DuckDB embedding extension and
 > issues one SQL statement. What is left is a Parquet-in/Parquet-out wrapper around
-> `SELECT embed(t)`, and it survives only because the extension is a file a Protocol
+> `SELECT subtoken_embed(t)`, and it survives only because the extension is a file a Protocol
 > has to carry rather than something installable. When that changes, this operator is
 > **deleted** rather than ported. See *Which tier this sits at* below. A knob proposed
 > here belongs on the extension.
 
 Turns a text column into a **vector column**. `op: text_embed@1` reads one Parquet,
-embeds the named text column with the extension's `embed()`, and writes a Parquet
+embeds the named text column with the extension's `subtoken_embed()`, and writes a Parquet
 carrying every input column plus a vector column of `FLOAT`.
 
 ```yaml
@@ -18,7 +18,7 @@ carrying every input column plus a vector column of `FLOAT`.
   with:
     input: build/corpus.parquet
     text_column: description
-    extension: vendor/staticembed.duckdb_extension
+    extension: vendor/subtoken.duckdb_extension
     out: build/corpus_embedded.parquet
     # optional, omitted from the script's argv when unset:
     vector_column: embedding   # name another to embed a second column in a later step
@@ -54,7 +54,7 @@ step made impossible.
 **A vector this step writes and a vector a SQL session returns for the same text are
 the same value, exactly.** They are the same call: this operator does not tokenise,
 does not index an embedding table, does not mean-pool and does not normalise. It hands
-the text to `embed()` and writes back what comes out.
+the text to `subtoken_embed()` and writes back what comes out.
 
 It used to do all four in Python, and that is worth knowing about because of what it
 cost. Measured against byte-identical weights over the corpus in
@@ -106,7 +106,7 @@ declares *which model this Protocol believes it is embedding with*, and the run 
 if the extension disagrees.
 
 The extension publishes a content address over its bundled assets through
-`staticembed_version()`. This operator recomputes that address from the declared
+`subtoken_version()`. This operator recomputes that address from the declared
 directory and compares. A mismatch names both — what the Protocol declared and what
 the extension reports — so the reader can see which of the two to change.
 
@@ -152,7 +152,7 @@ with on stdout, so the run's own output says which model produced the vectors.
 
 ## What comes back for text with nothing in it
 
-`embed(NULL)` is SQL NULL, and a vector column of NULLs is not what a Parquet consumer
+`subtoken_embed(NULL)` is SQL NULL, and a vector column of NULLs is not what a Parquet consumer
 wants here, so the text is bridged with `coalesce(t, '')` — the bridge the extension
 documents. With that bridge, a row whose text is **NULL, empty, whitespace, or made
 only of tokens outside the model's vocabulary** embeds as a full-width **zero vector**,
@@ -247,14 +247,14 @@ gate does not check, on any given PR: that a Protocol run and a SQL session agre
 single vector.**
 
 **The staged gate** — `.github/workflows/text-embed-parity.yml`, on a daily schedule
-and on `workflow_dispatch` — builds the extension from a pinned `staticembed` commit,
+and on `workflow_dispatch` — builds the extension from a pinned `subtoken` commit,
 stages the model directory it bundles, installs `uv`, and runs both files again with
 `--include-ignored`. There every test above actually executes: the Protocol/SQL
 parity comparison over the full corpus, the zero-vector count on stderr, the
 truncation-boundary pins, and all four of the model-address checks. Its job summary
-names the `staticembed` commit and the extension's own `staticembed_version()` line, so
+names the `subtoken` commit and the extension's own `subtoken_version()` line, so
 a pass there names the build it passed against rather than implying whatever
-`staticembed` currently is. A change that breaks the vectors is caught here, not on
+`subtoken` currently is. A change that breaks the vectors is caught here, not on
 the PR that made it — up to a day later, or on demand.
 
 ## Standalone
@@ -262,17 +262,17 @@ the PR that made it — up to a day later, or on demand.
 ```bash
 uv run operators/text_embed/text_embed.py \
     --input corpus.parquet --text-column description \
-    --extension vendor/staticembed.duckdb_extension \
+    --extension vendor/subtoken.duckdb_extension \
     --out corpus_embedded.parquet
 ```
 
 The fixture Protocol in `tests/fixtures/text_embed/` is a complete working example of
 the whole chain. The extension artifact is not committed — it is tens of megabytes,
 most of them weights — so the tests that need one are staged from
-`ARC_STATICEMBED_EXTENSION` and `#[ignore]`d without it (see *What CI actually checks*
+`ARC_SUBTOKEN_EXTENSION` and `#[ignore]`d without it (see *What CI actually checks*
 above). Running the fixture by hand means putting a built artifact beside
 `arcform.yaml` yourself; running the ignored tests by hand means setting
-`ARC_STATICEMBED_EXTENSION` (and, for the model checks, `ARC_STATICEMBED_MODEL` and
-`ARC_STATICEMBED_MODEL_RELEASE`) and passing `cargo test -- --include-ignored`.
+`ARC_SUBTOKEN_EXTENSION` (and, for the model checks, `ARC_SUBTOKEN_MODEL` and
+`ARC_SUBTOKEN_MODEL_RELEASE`) and passing `cargo test -- --include-ignored`.
 
 [model2vec]: https://github.com/MinishLab/model2vec

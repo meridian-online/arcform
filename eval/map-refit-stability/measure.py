@@ -41,7 +41,7 @@ and have the run refuse if the extension carries a different one — the same
 `model:` + `model_release:` pair a Protocol would write. Gitignored: the harness
 re-derives them rather than shipping 28.8 MB in git.
 
-EXTENSION. Set `ARC_STATICEMBED_EXTENSION` to a built artifact. It is not fetched here
+EXTENSION. Set `ARC_SUBTOKEN_EXTENSION` to a built artifact. It is not fetched here
 and there is no default path — it is an input to the measurement like the corpus, and a
 harness that quietly found one somewhere would not be able to say which build produced
 these numbers.
@@ -299,16 +299,16 @@ def ensure_model() -> None:
 
 
 def extension() -> Path:
-    raw = os.environ.get("ARC_STATICEMBED_EXTENSION")
+    raw = os.environ.get("ARC_SUBTOKEN_EXTENSION")
     if not raw:
         raise SystemExit(
-            "measure.py: set ARC_STATICEMBED_EXTENSION to a built embedding-extension "
+            "measure.py: set ARC_SUBTOKEN_EXTENSION to a built embedding-extension "
             "artifact. The vectors come from it, so which build was used is part of "
             "the measurement rather than something to discover at run time."
         )
     path = Path(raw)
     if not path.is_file():
-        raise SystemExit(f"measure.py: ARC_STATICEMBED_EXTENSION={raw} is not a file.")
+        raise SystemExit(f"measure.py: ARC_SUBTOKEN_EXTENSION={raw} is not a file.")
     return path
 
 

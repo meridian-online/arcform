@@ -3165,7 +3165,7 @@ fn umap_project_invocation(cfg: &UmapProjectConfig, dir: &Path) -> Result<Vec<St
 // reference implementation both claimed to follow. No magnitude is quoted: the Python
 // path is deleted, so nothing regenerates a difference against it and no test reddens
 // when a figure written here rots. The computation is deleted rather than corrected,
-// so a SQL `embed()` call and a Protocol run agree by construction instead of by
+// so a SQL `subtoken_embed()` call and a Protocol run agree by construction instead of by
 // tolerance.
 //
 // WHERE THIS IS GOING, and why nothing here should grow. What is left is a
@@ -5048,9 +5048,9 @@ mod tests {
                 "text_embed" => {
                     // The extension check runs BEFORE the script is materialised, so it
                     // has to pass or the refusal under test is never reached.
-                    std::fs::write(protocol.path().join("staticembed.ext"), b"not real").unwrap();
+                    std::fs::write(protocol.path().join("subtoken.ext"), b"not real").unwrap();
                     let with: Value = serde_yaml::from_str(
-                        "input: corpus.parquet\ntext_column: description\nextension: staticembed.ext\nout: out.parquet",
+                        "input: corpus.parquet\ntext_column: description\nextension: subtoken.ext\nout: out.parquet",
                     )
                     .unwrap();
                     (
@@ -5259,20 +5259,17 @@ mod tests {
     #[test]
     fn text_embed_declares_the_extension_as_a_read_beside_the_corpus() {
         let with: Value = serde_yaml::from_str(
-            "input: build/corpus.parquet\ntext_column: description\nextension: vendor/staticembed.duckdb_extension\nout: build/embedded.parquet",
+            "input: build/corpus.parquet\ntext_column: description\nextension: vendor/subtoken.duckdb_extension\nout: build/embedded.parquet",
         )
         .unwrap();
         let assets = assets_for("text_embed", Some(&with)).unwrap();
         assert_eq!(
             assets.reads,
-            vec![
-                "build/corpus.parquet",
-                "vendor/staticembed.duckdb_extension"
-            ]
+            vec!["build/corpus.parquet", "vendor/subtoken.duckdb_extension"]
         );
         assert_eq!(assets.produces, vec!["build/embedded.parquet"]);
         assert_eq!(
-            assets.kinds.get("vendor/staticembed.duckdb_extension"),
+            assets.kinds.get("vendor/subtoken.duckdb_extension"),
             Some(&crate::asset_kind::AssetKind::File),
             "the extension is one file, hashed for staleness like the corpus"
         );
@@ -5532,7 +5529,7 @@ mod tests {
         let env = HashMap::new();
         let ctx = test_ctx(tmp.path(), &env);
         let with: Value = serde_yaml::from_str(
-            "input: corpus.parquet\ntext_column: description\nextension: vendor/staticembed.duckdb_extension\nout: build/embedded.parquet",
+            "input: corpus.parquet\ntext_column: description\nextension: vendor/subtoken.duckdb_extension\nout: build/embedded.parquet",
         )
         .unwrap();
         let err = TextEmbed
@@ -5546,7 +5543,7 @@ mod tests {
         );
         let msg = err.to_string();
         assert!(
-            msg.contains("vendor/staticembed.duckdb_extension"),
+            msg.contains("vendor/subtoken.duckdb_extension"),
             "the refusal names the declared extension: {msg}"
         );
         assert!(
@@ -5570,7 +5567,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let env = HashMap::new();
         let ctx = test_ctx(tmp.path(), &env);
-        std::fs::write(tmp.path().join("staticembed.ext"), b"not real").unwrap();
+        std::fs::write(tmp.path().join("subtoken.ext"), b"not real").unwrap();
         let model = tmp.path().join("models/potion");
         std::fs::create_dir_all(&model).unwrap();
         // The two files the operator used to want, and one short of what the address
@@ -5578,7 +5575,7 @@ mod tests {
         std::fs::write(model.join("tokenizer.json"), "{}").unwrap();
         std::fs::write(model.join("model.safetensors"), b"\0").unwrap();
         let with: Value = serde_yaml::from_str(
-            "input: corpus.parquet\ntext_column: description\nextension: staticembed.ext\nout: build/embedded.parquet\nmodel: models/potion\nmodel_release: minishlab/potion-base-8M@abcdef",
+            "input: corpus.parquet\ntext_column: description\nextension: subtoken.ext\nout: build/embedded.parquet\nmodel: models/potion\nmodel_release: minishlab/potion-base-8M@abcdef",
         )
         .unwrap();
         let err = TextEmbed
@@ -5614,12 +5611,12 @@ mod tests {
         for part in MODEL_PARTS {
             std::fs::write(model.join(part), b"not a real model").unwrap();
         }
-        let extension = tmp.path().join("vendor/staticembed.duckdb_extension");
+        let extension = tmp.path().join("vendor/subtoken.duckdb_extension");
         std::fs::create_dir_all(extension.parent().unwrap()).unwrap();
         std::fs::write(&extension, b"not a real extension").unwrap();
         let release = "minishlab/potion-base-8M@bf8b056651a2c21b8d2565580b8569da283cab23";
         let with: Value = serde_yaml::from_str(&format!(
-            "input: build/corpus.parquet\ntext_column: description\nextension: vendor/staticembed.duckdb_extension\nout: build/embedded.parquet\nvector_column: description_vector\nmodel: models/potion\nmodel_release: {release}"
+            "input: build/corpus.parquet\ntext_column: description\nextension: vendor/subtoken.duckdb_extension\nout: build/embedded.parquet\nvector_column: description_vector\nmodel: models/potion\nmodel_release: {release}"
         ))
         .unwrap();
         let cfg = TextEmbedConfig::parse(&with).unwrap();
