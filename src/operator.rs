@@ -325,6 +325,7 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
                 "input": { "type": "string", "description": "Parquet holding the columns to project." },
                 "columns": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "The numeric columns to reduce, in order. A numeric scalar contributes one feature; a list/array of numerics — a vector column — contributes one per element. There is no text column and no model: to map text, write a vector column from it first (text_embed, or a SQL step calling the DuckDB embedding extension)." },
                 "out": { "type": "string", "description": "Parquet to write — every input column plus projection_x and projection_y as DOUBLE, and projection_fit_id (VARCHAR, same value on every row) fingerprinting the exact numbers and knobs this fit consumed." },
+                "fit": { "type": "string", "description": "Where the fitted projection is kept between runs, and the field that makes the map hold still when rows are appended. Declared as an asset this step both READS and PRODUCES: the first run writes it, every later run reads it back, and rows the fit already holds come back with the same coordinates while appended rows are placed into that layout instead of starting a new one. Omit it and every run refits the whole input, so appending one row moves every point. Two consequences worth knowing before you set it: deleting the file marks the step stale and refits, which is how you ask for a new layout on purpose; and moving neighbors, min_dist or metric while a fit exists is REFUSED naming the mismatch, because those knobs are part of what the fit is." },
                 "neighbors": { "type": "integer", "minimum": 2, "description": "UMAP n_neighbors: low reads local structure, high reads global. Defaults to the script's 15 when omitted. CLAMPED to one below the input's row count: above that the value stops changing the fit and the run still succeeds, so a larger number here is not an error and is not an effect either. That clamp is arcform's, not umap-learn's, so umap-learn's documentation for n_neighbors does not describe what happens above the boundary." },
                 "min_dist": { "type": "number", "minimum": 0, "exclusiveMaximum": 1, "description": "UMAP min_dist: how tightly points may pack. Defaults to the script's 0.1 when omitted." },
                 "metric": { "type": "string", "enum": UMAP_METRICS, "description": "How the distance between two rows is measured. Defaults to the script's euclidean when omitted, which is the reading an arbitrary feature matrix wants; cosine is the reading an L2-normalised vector column wants. Nothing here scales your columns — under euclidean a wider-spread column dominates the layout, which is a decision for the SQL step that selects them." }
@@ -2902,11 +2903,35 @@ impl Operator for GleifRaFetch {
 // carrying every input column plus `projection_x`, `projection_y` and
 // `projection_fit_id` — the last a fingerprint of the exact numbers and knobs one fit
 // consumed, broadcast to every row, so two files can be compared for "same fit" before
-// their positions are compared row for row. This operator persists nothing between
-// invocations, so appending rows means refitting the whole map and every position
-// can move, which is exactly what `projection_fit_id` differing between two files
-// says happened. See operators/umap_project/README.md, "Telling a refit from an
-// append."
+// their positions are compared row for row. See operators/umap_project/README.md,
+// "Telling a refit from an append."
+//
+// `fit:` IS WHAT MAKES THE MAP HOLD STILL, and it is the one field here that names an
+// asset on BOTH sides of the step. Omit it and every run refits the whole input, so
+// appending one row moves every point and `projection_fit_id` changes to say so. Set
+// it and the first run writes the fitted projection to that path while every later
+// run reads it back: rows the fit already holds keep their exact coordinates, and
+// appended rows are placed into that layout with `UMAP.transform` instead of starting
+// a new one.
+//
+// SO THE STEP BOTH `produces` THE FIT AND `reads` IT, and that declaration is what
+// earns the caching rather than decorating it. The asset graph carries the shape
+// already: `AssetGraph::validate_order` treats a name a step reads and produces as a
+// self-contained operation rather than an ordering violation, `downstream_steps` will
+// not drag a step downstream of itself, and `produced_artifact_hash` sorts and dedups
+// the names so the fit is hashed once. What the declaration buys is that the fit's
+// BYTES are part of what the step is answerable for: delete or corrupt it and the
+// artifact hash moves, which marks the step stale and refits; leave it alone with the
+// input unchanged and the step is hash-clean and skips without spawning `uv` at all.
+// Undeclared, the fit would be a file arc could not see, and a deleted one would look
+// exactly like a fresh run.
+//
+// A FIT THAT NO LONGER MATCHES THE INPUT IS REFUSED, naming the mismatch, rather than
+// placing rows into a layout built for different columns. That covers a manifest edit
+// too: `neighbors:`, `min_dist:` and `metric:` are part of what a fit IS, so moving
+// one marks the step stale, the run finds a fit built under the old value, and it
+// stops. Refitting under new knobs means deleting the fit — an analyst's decision,
+// and not one a re-run gets to make on their behalf by moving every point.
 //
 // NO TEXT COLUMN AND NO MODEL, and that is the whole shape of it. `columns:` names
 // columns that are already numbers — a numeric scalar contributes one feature, a
@@ -2944,7 +2969,7 @@ const UMAP_PROJECT_PY: &str = include_str!("../operators/umap_project/umap_proje
 /// differently the trap stops biting, materialising succeeds, and the test goes RED on
 /// its own `expect_err`. It cannot drift quietly.
 #[cfg(test)]
-const UMAP_PROJECT_CACHE_DIR: &str = "arcform-op-umap_project-1.1.0";
+const UMAP_PROJECT_CACHE_DIR: &str = "arcform-op-umap_project-1.2.0";
 
 /// The metrics a manifest may ask for, and the single place they are written down:
 /// [`with_schema`] emits this array as the field's `enum`, so an authoring form and
@@ -2973,6 +2998,14 @@ struct UmapProjectConfig {
     /// as DOUBLE and `projection_fit_id` as VARCHAR (the `produces` asset). Resolved
     /// against ctx.dir.
     out: String,
+    /// Where the fitted projection is kept between runs — declared as an asset this
+    /// step BOTH reads and produces, which is what lets a second run find it instead
+    /// of refitting. Written by the first run, read by every later one. OMITTED when
+    /// unset, in which case the operator persists nothing and every run refits the
+    /// whole input, which is the behaviour every Protocol had before this field
+    /// existed. Resolved against ctx.dir.
+    #[serde(default)]
+    fit: Option<String>,
     /// UMAP's `n_neighbors` — how much of the input each point is placed against.
     /// Low reads local structure, high reads global. OMITTED from the argv when
     /// unset, so the script's own default stands.
@@ -3059,6 +3092,7 @@ fn umap_project_args(
     input: &str,
     columns: &[String],
     out: &str,
+    fit: Option<&str>,
     neighbors: Option<u64>,
     min_dist: Option<f64>,
     metric: Option<&str>,
@@ -3070,6 +3104,10 @@ fn umap_project_args(
     }
     a.push("--out".to_string());
     a.push(out.to_string());
+    if let Some(f) = fit {
+        a.push("--fit".to_string());
+        a.push(f.to_string());
+    }
     if let Some(n) = neighbors {
         a.push("--neighbors".to_string());
         a.push(n.to_string());
@@ -3090,13 +3128,16 @@ impl Operator for UmapProject {
         "umap_project"
     }
 
-    // 1.1.0, not 1.0.0: the script gained an output column (`projection_fit_id`), and
-    // `op@<version>` addressing exact bytes means a behaviour change is a version bump
-    // and a rebuild, never a silent edit (see `materialize_frozen_script`). Additive
-    // and backward compatible — every existing field, in the same order, is still
-    // there — so a minor bump; `@1` in a manifest still resolves it.
+    // 1.2.0, not 1.1.0: the operator gained `fit:`, which is a new asset edge and a
+    // new flag on the frozen script, and `op@<version>` addressing exact bytes means a
+    // behaviour change is a version bump and a rebuild, never a silent edit (see
+    // `materialize_frozen_script`). Additive and backward compatible — a manifest
+    // that sets no `fit:` gets exactly the argv, the assets and the map it got at
+    // 1.1.0 — so a minor bump; `@1` in a manifest still resolves it. 1.1.0 was the
+    // bump for `projection_fit_id`, the output column that says WHICH fit a file was
+    // drawn from; this one is the fit itself.
     fn version(&self) -> semver::Version {
-        semver::Version::new(1, 1, 0)
+        semver::Version::new(1, 2, 0)
     }
 
     fn assets(&self, with: &Value) -> Result<OpAssets> {
@@ -3105,6 +3146,18 @@ impl Operator for UmapProject {
         let mut assets = OpAssets::default();
         assets.record_reads(cfg.input.clone(), crate::asset_kind::AssetKind::File);
         assets.record_produces(cfg.out.clone(), crate::asset_kind::AssetKind::File);
+        // The fit is declared on BOTH sides, and neither side alone is enough. As a
+        // `produces` its bytes join the step's artifact hash, so deleting it marks the
+        // step stale and the next run refits rather than reporting clean over a fit
+        // that is gone. As a `reads` it is what the step consumes, which is the
+        // lineage an asset-centric engine is for — and it is the half that keeps the
+        // declaration honest if a later Protocol ever has one step write a fit that
+        // another places into. See this module's `fit:` paragraph for why the graph
+        // carries a name on both sides without contradiction.
+        if let Some(fit) = &cfg.fit {
+            assets.record_reads(fit.clone(), crate::asset_kind::AssetKind::File);
+            assets.record_produces(fit.clone(), crate::asset_kind::AssetKind::File);
+        }
         Ok(assets)
     }
 
@@ -3133,11 +3186,22 @@ fn umap_project_invocation(cfg: &UmapProjectConfig, dir: &Path) -> Result<Vec<St
         let _ = std::fs::create_dir_all(parent);
     }
 
-    let script = materialize_frozen_script("umap_project", "1.1.0", UMAP_PROJECT_PY)?;
+    // The fit gets the same treatment as the output, and for the same reason: the
+    // script is asked to WRITE this path on a first run, so a `fit:` under a `build/`
+    // that no step has created yet must not fail on the directory rather than on
+    // anything about the projection. `None` when the manifest set no `fit:`, which is
+    // the whole of what "this operator persists nothing" now means.
+    let fit = cfg.fit.as_ref().map(|f| dir.join(f));
+    if let Some(parent) = fit.as_ref().and_then(|f| f.parent()) {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let script = materialize_frozen_script("umap_project", "1.2.0", UMAP_PROJECT_PY)?;
     let extra = umap_project_args(
         &input.display().to_string(),
         &cfg.columns,
         &out.display().to_string(),
+        fit.as_ref().map(|f| f.display().to_string()).as_deref(),
         cfg.neighbors,
         cfg.min_dist,
         cfg.metric.as_deref(),
@@ -4664,7 +4728,7 @@ mod tests {
     fn umap_project_is_in_catalog_and_versioned() {
         let op = resolve("umap_project@1").expect("umap_project is in the catalog");
         assert_eq!(op.name(), "umap_project");
-        assert_eq!(op.version(), semver::Version::new(1, 1, 0));
+        assert_eq!(op.version(), semver::Version::new(1, 2, 0));
         // No feature gate: a consumer built without `http-fetch` still resolves it.
         assert!(
             catalog().iter().any(|o| o.name() == "umap_project"),
@@ -4856,6 +4920,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
             vec![
                 "--input",
@@ -4881,6 +4946,7 @@ mod tests {
                     "median_income".to_string(),
                 ],
                 "o.parquet",
+                Some("homes.fit"),
                 Some(30),
                 Some(0.25),
                 Some("cosine"),
@@ -4896,6 +4962,8 @@ mod tests {
                 "median_income",
                 "--out",
                 "o.parquet",
+                "--fit",
+                "homes.fit",
                 "--neighbors",
                 "30",
                 "--min-dist",
@@ -4970,6 +5038,140 @@ mod tests {
             tmp.path().join("build").is_dir(),
             "the output's parent directory is created before the script is asked to \
              write into it"
+        );
+    }
+
+    /// AC2's load-time half, and the half CI can run: a Protocol that sets `fit:`
+    /// puts the fitted projection in the asset graph on BOTH sides of the step.
+    ///
+    /// Asserting membership is not enough on its own and the shape of this test says
+    /// why. `reads` alone would declare a dependency on a file nothing is answerable
+    /// for; `produces` alone would hash the bytes without saying the step consumes
+    /// them. So both lists are checked for the name, the `out` and `input` entries
+    /// are checked to still be exactly where they were (a fit that displaced the
+    /// output would pass a looser `contains`), and the kind is checked — a fit
+    /// declared as anything but a File would be hashed by the wrong branch of
+    /// `produced_artifact_hash` and a missing one would read as unchanged.
+    #[test]
+    fn umap_project_declares_the_fit_it_reads_and_the_fit_it_writes() {
+        let with: Value = serde_yaml::from_str(
+            "input: build/homes.parquet\ncolumns: [longitude, latitude]\n\
+             out: build/mapped.parquet\nfit: build/homes.fit",
+        )
+        .unwrap();
+        let assets = assets_for("umap_project", Some(&with)).unwrap();
+        assert_eq!(
+            assets.reads,
+            vec!["build/homes.parquet", "build/homes.fit"],
+            "a persisted fit is something this step CONSUMES — a second run reads it \
+             rather than refitting"
+        );
+        assert_eq!(
+            assets.produces,
+            vec!["build/mapped.parquet", "build/homes.fit"],
+            "and something it WRITES — the first run creates it, and deleting it has \
+             to mark the step stale rather than reading as a clean run"
+        );
+        assert_eq!(
+            assets.kinds.get("build/homes.fit"),
+            Some(&crate::asset_kind::AssetKind::File),
+            "the fit is one file: a Directory or Pattern kind would be hashed by a \
+             branch that cannot see its bytes"
+        );
+    }
+
+    /// The control for the test above, and the compatibility claim the version bump
+    /// rests on: a Protocol that sets no `fit:` declares exactly what it declared
+    /// before the field existed. Without this, "the fit is in the graph" could be
+    /// satisfied by a graph that always carries one, which would put a file no
+    /// Protocol asked for into every projection's artifact hash and force a permanent
+    /// refit.
+    #[test]
+    fn umap_project_without_a_fit_declares_no_extra_asset() {
+        let with: Value = serde_yaml::from_str(
+            "input: build/homes.parquet\ncolumns: [longitude, latitude]\n\
+             out: build/mapped.parquet",
+        )
+        .unwrap();
+        let assets = assets_for("umap_project", Some(&with)).unwrap();
+        assert_eq!(assets.reads, vec!["build/homes.parquet"]);
+        assert_eq!(assets.produces, vec!["build/mapped.parquet"]);
+        assert_eq!(
+            assets.kinds.len(),
+            2,
+            "no `fit:` is no third asset: {:?}",
+            assets.kinds
+        );
+    }
+
+    /// The other end of the same wire: `fit:` reaches the script's argv, resolved
+    /// against the protocol directory exactly as `input:` and `out:` are, and its
+    /// parent directory exists before the script is asked to write into it.
+    ///
+    /// A separate directory from the output's on purpose. With both under `build/`,
+    /// the `create_dir_all` for `out` would make the assertion below pass whether or
+    /// not the fit's own parent was ever created — which is the case that bites a
+    /// Protocol keeping its fits somewhere other than beside its Parquet, and the
+    /// exact shape of a test that is green because something else did the work.
+    #[test]
+    fn umap_project_invocation_passes_the_fit_resolved_against_the_protocol_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let with: Value = serde_yaml::from_str(
+            "input: build/homes.parquet\ncolumns: [longitude, latitude]\n\
+             out: build/mapped.parquet\nfit: fits/homes.fit",
+        )
+        .unwrap();
+        let cfg = UmapProjectConfig::parse(&with).unwrap();
+        let args = umap_project_invocation(&cfg, tmp.path()).expect("a projection proceeds");
+
+        let fit = tmp.path().join("fits/homes.fit").display().to_string();
+        let at = args
+            .iter()
+            .position(|a| a == "--fit")
+            .expect("a manifest that sets `fit:` reaches the script with --fit");
+        assert_eq!(
+            args[at + 1],
+            fit,
+            "the fit is resolved against the protocol directory, not passed through \
+             as the manifest spelled it — a relative path would land wherever `uv` \
+             happened to be started from"
+        );
+        assert!(
+            tmp.path().join("fits").is_dir(),
+            "the fit's own parent directory is created before the script is asked to \
+             write into it, even when it is not the output's"
+        );
+    }
+
+    /// The frozen-script path and the operator's own `version()` agree.
+    ///
+    /// Three literals say what version this operator is — `version()`, the string
+    /// `umap_project_invocation` hands `materialize_frozen_script`, and the test-only
+    /// [`UMAP_PROJECT_CACHE_DIR`] — and nothing but this test stops them drifting. The
+    /// cost of drift is quiet: a bump applied to `version()` alone would leave two
+    /// releases of the script sharing one cache directory, which is precisely what
+    /// `op@<version>` addressing exact bytes exists to prevent.
+    #[test]
+    fn umap_project_materialises_its_script_under_its_own_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let with: Value =
+            serde_yaml::from_str("input: i.parquet\ncolumns: [longitude]\nout: o.parquet").unwrap();
+        let cfg = UmapProjectConfig::parse(&with).unwrap();
+        let args = umap_project_invocation(&cfg, tmp.path()).expect("a projection proceeds");
+        let version = resolve("umap_project@1").unwrap().version().to_string();
+        let expected = format!("arcform-op-umap_project-{version}");
+        assert_eq!(
+            expected, UMAP_PROJECT_CACHE_DIR,
+            "the cache-directory trap has to name the version the operator reports, \
+             or the tests that drive the cache stop biting the real path"
+        );
+        assert!(
+            std::path::Path::new(&args[2])
+                .parent()
+                .unwrap()
+                .ends_with(&expected),
+            "the script materialises under the operator's own version; got {}",
+            args[2]
         );
     }
 

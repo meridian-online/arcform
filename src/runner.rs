@@ -6586,6 +6586,151 @@ steps:
         );
     }
 
+    /// A `umap_project` step that persists its fitted projection, staged in a
+    /// directory with the fit and the input already on disk and a settled prior run
+    /// recorded. Never executed — `run()` would spawn `uv` and fit a real UMAP — so
+    /// everything here drives `compute_staleness` directly, which is the function
+    /// that decides whether a second run re-does the fit or finds it.
+    fn persisted_fit_project(declare_fit: bool) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let fit_line = if declare_fit {
+            "\n      fit: build/homes.fit"
+        } else {
+            ""
+        };
+        let yaml = format!(
+            "name: test\nsteps:\n  - name: project\n    op: umap_project@1\n    with:\n      \
+             input: build/homes.parquet\n      columns: [longitude, latitude]\n      \
+             out: build/mapped.parquet{fit_line}\n"
+        );
+        setup_project(dir.path(), &yaml, &[]);
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/homes.parquet"), b"PAR1-input").unwrap();
+        fs::write(dir.path().join("build/mapped.parquet"), b"PAR1-output").unwrap();
+        fs::write(dir.path().join("build/homes.fit"), b"pickled-reducer").unwrap();
+        dir
+    }
+
+    /// Record the state a successful run would have left, so the NEXT call to
+    /// `compute_staleness` is a warm one. This is the same pair `run()` records —
+    /// the op step's config hash and its artifact hash under the same `Unreadable`
+    /// policy — computed here rather than by executing the step.
+    fn settle(dir: &Path, state: &MockStateBackend) {
+        let manifest = crate::manifest::Manifest::load(dir).unwrap();
+        let asset_graph = AssetGraph::build(&manifest, dir);
+        let all_produced = all_produced_assets(&asset_graph);
+        for step in &manifest.steps {
+            let artifact = produced_artifact_hash(
+                step,
+                dir,
+                &asset_graph,
+                &all_produced,
+                Unreadable::for_step(step),
+            )
+            .unwrap_or_else(|| "MISSING".to_string());
+            state
+                .record_step(
+                    &step.name,
+                    &op_config_hash(step),
+                    &artifact,
+                    StepStatus::Success,
+                )
+                .unwrap();
+        }
+    }
+
+    /// Is the `project` step stale right now?
+    fn project_is_stale(dir: &Path, state: &MockStateBackend) -> bool {
+        let manifest = crate::manifest::Manifest::load(dir).unwrap();
+        let asset_graph = AssetGraph::build(&manifest, dir);
+        let all_produced = all_produced_assets(&asset_graph);
+        let env = HashMap::new();
+        compute_staleness(
+            &manifest,
+            dir,
+            state,
+            &asset_graph,
+            &all_produced,
+            false,
+            &env,
+        )
+        .unwrap()
+        .stale
+        .contains("project")
+    }
+
+    /// AC2, at the layer it lives in: a Protocol that declares `fit:` gets a second
+    /// run that FINDS the fitted projection rather than re-doing it, and a fit that
+    /// is gone or has been rewritten sends the step back to work.
+    ///
+    /// This is the half of the claim no Python test can reach and no `uv` is needed
+    /// for. `operators/umap_project/test_umap_project_fit.py` proves that the script,
+    /// handed a fit, places rows into it; what it cannot see is whether arc ever
+    /// reaches the script a second time, or reports the step clean over a fit
+    /// somebody deleted. That is `compute_staleness`'s answer, and it is an answer
+    /// only because the operator declares the fit — hence the control below, which
+    /// is the same project with the field omitted.
+    #[test]
+    fn a_declared_fit_makes_the_second_run_find_it_and_a_missing_one_refit() {
+        let dir = persisted_fit_project(true);
+        let state = MockStateBackend::new();
+        let fit = dir.path().join("build/homes.fit");
+        settle(dir.path(), &state);
+
+        assert!(
+            !project_is_stale(dir.path(), &state),
+            "nothing changed, so the second run must find the fit and skip — a step \
+             that goes stale here refits on every run and the map never holds still"
+        );
+
+        fs::remove_file(&fit).unwrap();
+        assert!(
+            project_is_stale(dir.path(), &state),
+            "a fit that is GONE must send the step back to work. Reporting clean here \
+             would leave the graph asserting a fitted projection exists while nothing \
+             is on disk, and the next append would have nothing to place into"
+        );
+
+        fs::write(&fit, b"pickled-reducer").unwrap();
+        assert!(
+            !project_is_stale(dir.path(), &state),
+            "control: putting the same bytes back settles the step again, so the \
+             re-run above was the missing file and not the harness"
+        );
+
+        fs::write(&fit, b"pickled-reducer-but-edited").unwrap();
+        assert!(
+            project_is_stale(dir.path(), &state),
+            "a fit whose BYTES moved is a different layout, and a step that skipped \
+             here would ship coordinates drawn from a projection its own state has \
+             never seen"
+        );
+    }
+
+    /// The control, and it is what makes the test above about the declaration rather
+    /// than about the file. Identical project with `fit:` omitted: the same file on
+    /// disk, deleted the same way, and the step stays clean — because nothing in the
+    /// manifest ever said the step was answerable for it.
+    #[test]
+    fn an_undeclared_fit_is_a_file_arc_cannot_see() {
+        let dir = persisted_fit_project(false);
+        let state = MockStateBackend::new();
+        settle(dir.path(), &state);
+
+        assert!(
+            !project_is_stale(dir.path(), &state),
+            "a settled run with no `fit:` is clean, as it was before the field existed"
+        );
+
+        fs::remove_file(dir.path().join("build/homes.fit")).unwrap();
+        assert!(
+            !project_is_stale(dir.path(), &state),
+            "with no `fit:` declared, deleting the file changes nothing arc can see — \
+             which is exactly why the declaration is the work AC2 asks for, and not a \
+             restatement of what the operator already did"
+        );
+    }
+
     /// A precondition-gated `command:` step whose `produces:` is a real path a
     /// downstream `sql:` step reads. The consumer drops that read (a producer owns
     /// it), so if the producer does not hash it, nothing does.
