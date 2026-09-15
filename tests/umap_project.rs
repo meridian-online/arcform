@@ -585,3 +585,153 @@ fn the_step_completes_with_the_network_disabled_and_no_credentials() {
         "an offline run must produce the same map as an online one"
     );
 }
+
+/// Six rows appended to the fixture's CSV, at ids past the 48 already there. The
+/// values sit inside the two districts' existing ranges rather than off on their own,
+/// so the append is the ordinary case — rows that belong in the map — and not a set of
+/// outliers a layout would have to stretch to reach.
+const APPENDED: &str = "\
+49,coastal,-122.31,37.88,7.95,5.81
+50,inland,-120.94,38.68,3.71,4.16
+51,coastal,-122.24,37.99,8.02,5.69
+52,inland,-120.83,38.81,3.83,4.29
+53,coastal,-122.35,37.84,7.72,5.88
+54,inland,-120.97,38.65,3.68,4.11
+";
+
+fn append_rows(project: &Path) {
+    let csv = project.join("homes.csv");
+    let mut existing = std::fs::read_to_string(&csv).unwrap();
+    assert!(
+        existing.ends_with('\n'),
+        "the fixture CSV ends with a newline, or the first appended row joins the last \
+         existing one"
+    );
+    existing.push_str(APPENDED);
+    std::fs::write(&csv, existing).unwrap();
+}
+
+/// The coordinates of the rows that were already on the map, in id order.
+fn first_48(parquet: &Path) -> Vec<(String, f64, f64)> {
+    placed(parquet).into_iter().take(48).collect()
+}
+
+/// AC2 END TO END, through a manifest: a Protocol that declares `fit:` finds the
+/// fitted projection on its second run instead of re-doing it, and the rows that were
+/// already on the map come back with the same coordinates after an append.
+///
+/// THE CONTROL IS THE SECOND HALF OF THIS TEST AND IT IS NOT OPTIONAL. "The
+/// coordinates did not move" is also what a projection that ignored the appended rows
+/// would produce, what a cached output nobody rewrote would produce, and what a
+/// comparison between a file and itself would produce. So the same append is run twice
+/// over the same fixture — once under `fit.yaml`, once under the stock `arcform.yaml`
+/// that declares no fit — and the second one has to MOVE those same rows. Without it
+/// this test would pass against an operator that never opened the fit.
+///
+/// The skip on the second run is the other half of AC2's own words, "a second run
+/// finds it rather than refitting". `arc` reports it on the step line, and it is a
+/// stronger statement than an unchanged output file: the step did not execute at all,
+/// so no `uv` was spawned and no UMAP was fitted.
+#[test]
+fn a_protocol_that_declares_a_fit_keeps_its_map_when_rows_are_appended() {
+    if !have_uv() {
+        eprintln!("skipping a_protocol_that_declares_a_fit: no `uv` on PATH");
+        return;
+    }
+
+    // ── With `fit:` ───────────────────────────────────────────────────────────
+    let tmp = staged_protocol();
+    let project = tmp.path();
+    std::fs::copy(project.join("fit.yaml"), project.join("arcform.yaml")).unwrap();
+
+    let stdout = common::arc_run(project);
+    assert_eq!(
+        common::step_outcome(&stdout, "project"),
+        "ran",
+        "the first run has nothing to read, so it fits:\n{stdout}"
+    );
+    let fit = project.join("build/homes.umap");
+    assert!(
+        fit.is_file(),
+        "a manifest that declares `fit:` has to leave the fitted projection on disk — \
+         it is a `produces` asset, and nothing later can read what was never written"
+    );
+    let fit_bytes = sha256(&fit);
+    let before = first_48(&projected(project));
+    let fit_id_before = fit_id_of(&projected(project));
+
+    // Nothing changed. The fit is found, and the step does not run.
+    let stdout = common::arc_run(project);
+    assert!(
+        common::step_outcome(&stdout, "project").starts_with("skip"),
+        "with the input and the fit both unchanged the step is hash-clean and must \
+         skip — a step that re-executes here refits on every run, which is the whole \
+         cost this field exists to remove:\n{stdout}"
+    );
+
+    append_rows(project);
+    let stdout = common::arc_run(project);
+    assert_eq!(
+        common::step_outcome(&stdout, "project"),
+        "ran",
+        "appending rows changes the input, so the step has to execute — a skip here \
+         would leave the appended rows off the map entirely:\n{stdout}"
+    );
+
+    let after = placed(&projected(project));
+    assert_eq!(
+        after.len(),
+        54,
+        "the appended rows have to reach the output, or 'nothing moved' is just a \
+         table that never grew"
+    );
+    assert_eq!(
+        first_48(&projected(project)),
+        before,
+        "every row that was already on the map keeps its EXACT coordinates — this is \
+         the reading an analyst formed yesterday, and a float that differs in the last \
+         place is still a map that moved"
+    );
+    for (district, x, y) in &after[48..] {
+        assert!(
+            x.is_finite() && y.is_finite(),
+            "an appended {district} row was placed at ({x}, {y}), which is not a \
+             position — holding the old rows still is worthless if the new ones land \
+             nowhere"
+        );
+    }
+    assert_eq!(
+        fit_id_of(&projected(project)),
+        fit_id_before,
+        "the fit_id names the LAYOUT, so a file with appended rows carries the id of \
+         the file before the append and the two may be read row for row"
+    );
+    assert_eq!(
+        sha256(&fit),
+        fit_bytes,
+        "the append run reads the fit and leaves its bytes alone. This is what keeps \
+         the declaration from forcing a permanent refit: the hash arc records after \
+         one run is the hash it computes on the next"
+    );
+
+    // ── The control: the same append, with no `fit:` ──────────────────────────
+    let tmp = staged_protocol();
+    let project = tmp.path();
+    common::arc_run(project);
+    let control_before = first_48(&projected(project));
+    append_rows(project);
+    common::arc_run(project);
+    let control_after = first_48(&projected(project));
+    assert_eq!(
+        control_before.len(),
+        48,
+        "the control has to have projected the same 48 rows, or it is comparing \
+         something else"
+    );
+    assert_ne!(
+        control_after, control_before,
+        "CONTROL FAILED: the same append left the same rows in the same places with no \
+         `fit:` declared. Then the fit is not what held them still, and the test above \
+         is green for a reason that has nothing to do with this change"
+    );
+}

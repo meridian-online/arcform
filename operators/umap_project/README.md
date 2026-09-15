@@ -12,6 +12,12 @@ input column plus `projection_x` and `projection_y` as `DOUBLE`.
     input: build/homes.parquet
     columns: [longitude, latitude, median_income]
     out: build/homes_mapped.parquet
+    # optional, and the one that makes the map hold still when rows are appended: the
+    # fitted projection is written here on the run that fits it and read back on every
+    # later run, so pre-existing rows keep their exact coordinates. Declared as an asset
+    # this step both READS and PRODUCES — see "Placing appended rows into a persisted
+    # fit" below. Omit it and every run refits the whole input, which moves every point:
+    fit: build/homes.umap
     # optional, each omitted from the script's argv when unset. Each is PROVEN to
     # reach this script's own `uv run` invocation carrying the exact value set here —
     # see "What each knob is proven to do" below for what that does and does not cover:
@@ -510,14 +516,50 @@ One case runs the operator as a subprocess and reads its exit code and stderr, b
 every in-process case is green on an operator that raises a perfectly good refusal and
 then prints a traceback of it.
 
-**What is NOT wired yet: a manifest cannot set this.** `--fit` is the script's flag, and
-the operator's `with:` block in `src/operator.rs` has no `fit:` field, so a Protocol step
-cannot yet name the fit as an asset it reads and produces. Until it does, `--fit` is
-reachable standalone and not through `arc run`. The asset-graph shape that field needs is
-a real question rather than a line of plumbing: a step that both reads and produces one
-path is a self-edge, and the fit's pickled bytes are not reproducible run to run even
-where the coordinates are, so hashing it as an input would report a step stale that is
-not. That is a different surface and separate work.
+**A manifest sets this, as `fit:`, and the fit is an asset the step both reads and
+produces.** `op: umap_project@1.2` resolves the path against the protocol directory the
+way `input:` and `out:` are resolved, creates its parent directory before the script is
+asked to write into it, and records the fit in the asset graph on both sides of the step.
+
+```yaml
+- name: project
+  op: umap_project@1
+  with:
+    input: build/homes.parquet
+    columns: [longitude, latitude]
+    out: build/homes_mapped.parquet
+    fit: build/homes.umap
+```
+
+**What the declaration buys is that arc can see the fit at all.** With it, a second run
+over an unchanged input is hash-clean and SKIPS — the fit is found rather than re-done,
+and `uv` is not spawned. Delete the fit and the step's artifact hash moves, which marks
+it stale and refits; rewrite its bytes and the same thing happens, because a fit whose
+bytes moved is a different layout. Omit `fit:` and none of that is visible to arc: the
+file on disk is one no step is answerable for, deleting it changes nothing, and a run
+reports clean over a fitted projection that is gone. `a_declared_fit_makes_the_second_run_find_it_and_a_missing_one_refit`
+and `an_undeclared_fit_is_a_file_arc_cannot_see` (`src/runner.rs`) are that pair, and the
+second is what makes the first a claim about the declaration rather than about the file.
+
+**Two objections were raised against this field before it was built, and here is what
+answered them.** The first: a step that reads and produces one path is a self-edge. The
+asset graph already carried that shape for SQL steps that read and write one table —
+`validate_order` treats a self-reference as a self-contained operation rather than an
+ordering violation, `downstream_steps` will not drag a step downstream of itself, and
+`produced_artifact_hash` sorts and dedups the names, so the fit is hashed once. This is
+the first OPERATOR to declare it. The second, and the one that actually mattered: a fit's
+pickled bytes are not reproducible run to run, so hashing them would report a step stale
+that is not. It does not, and the reason is one line above in this page — **the fit is
+written once and not rewritten**. An append run reads it and leaves the bytes alone, so
+the hash recorded after one run is the hash the next run computes. A fit is re-written
+only on a run that had none to read, and that run records its hash afterwards.
+
+**Moving a knob while a fit exists is refused, and that is the shipped refusal rather
+than a new one.** `neighbors:`, `min_dist:` and `metric:` are part of what a fit IS, so
+editing one marks the step stale, the run finds a fit built under the old value, and it
+stops naming both values. Asking for a new layout under new knobs means deleting the
+fit — an analyst's decision, and not one a re-run gets to make on their behalf by moving
+every point.
 
 **Telling a refit from an append.** Every output row carries `projection_fit_id`, the
 same value on every row of one file. WITHOUT `--fit` it is a hash of the exact feature
