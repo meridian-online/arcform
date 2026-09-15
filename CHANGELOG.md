@@ -56,13 +56,34 @@ Rationale for each change is recorded in the project's design notes and commit h
   every header field, truncation and byte-corruption across its length — rather than a
   list of cases written beside it.
 
-  **A manifest cannot set this yet.** `--fit` is the script's flag; the operator's `with:`
-  block has no `fit:` field, so a Protocol step cannot name the fit as an asset it reads
-  and produces. The asset-graph shape that needs is a real question — a step that both
-  reads and produces one path is a self-edge, and the pickled fit is not reproducible run
-  to run even where the coordinates are, so hashing it as an input would report a step
-  stale that is not. See `operators/umap_project/README.md`, "Placing appended rows into
-  a persisted fit."
+  **A manifest sets this as `fit:`, and the fit is an asset the step both reads and
+  produces** (`umap_project` 1.1.0 -> 1.2.0; `@1` in a manifest still resolves it, and a
+  Protocol that sets no `fit:` gets the argv, the assets and the map it got before). The
+  path resolves against the protocol directory the way `input:` and `out:` do, and its
+  parent directory is created before the script is asked to write into it.
+
+  What the declaration buys is that arc can see the fit at all. A second run over an
+  unchanged input is hash-clean and SKIPS, so the fit is found rather than re-done and no
+  `uv` is spawned; delete the fit, or rewrite its bytes, and the step goes stale and
+  refits. With no `fit:` declared the same file on disk is one no step is answerable for,
+  and deleting it changes nothing arc can see — that control is what makes this a claim
+  about the declaration rather than about the file.
+
+  Two objections were raised against this field before it was built. The self-edge is a
+  shape the asset graph already carried for SQL steps that read and write one table, and
+  this is the first operator to declare it. The other was the real one — a fit's pickled
+  bytes are not reproducible run to run, so hashing them would report a step stale that
+  is not — and the answer is that the fit is written once and not rewritten: an append
+  run reads it and leaves the bytes alone, so the hash recorded after one run is the hash
+  the next run computes.
+
+  **Moving a knob while a fit exists is refused**, which is the refusal above doing its
+  job rather than a new one: `neighbors:`, `min_dist:` and `metric:` are part of what a
+  fit is, so editing one marks the step stale and the run then finds a fit built under
+  the old value. Asking for a new layout under new knobs means deleting the fit, which is
+  a decision rather than something a re-run makes on an analyst's behalf by moving every
+  point. See `operators/umap_project/README.md`, "Placing appended rows into a persisted
+  fit."
 
 - **`eval/map-refit-stability/check_findings.py` checks every statement of a figure, not
   the first one it finds — and the placement bounds now run in CI.** The checker asked
