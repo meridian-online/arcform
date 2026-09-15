@@ -509,7 +509,6 @@ fn expect_finetype_version_mismatch_refuses_end_to_end() {
     assert!(!project.join("datapackage.json").exists());
 }
 
-
 // ---------------------------------------------------------------------------
 // The sidecar cannot forge or contradict a finetype nomination.
 //
@@ -650,11 +649,7 @@ fn type_claim_on_a_field_nobody_nominated_warns_and_still_writes() {
             r#""identifier""#,
             serde_json::json!("identifier"),
         ),
-        (
-            "x-finetype-confidence",
-            "0.42",
-            serde_json::json!(0.42),
-        ),
+        ("x-finetype-confidence", "0.42", serde_json::json!(0.42)),
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("project");
