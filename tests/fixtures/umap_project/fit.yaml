@@ -1,0 +1,36 @@
+# A variant of arcform.yaml that persists its fitted projection. Staged over
+# arcform.yaml by `a_protocol_that_declares_a_fit_keeps_its_map_when_rows_are_appended`.
+#
+# The ONLY difference from arcform.yaml is the `fit:` line, and that is the point: the
+# test runs this manifest and arcform.yaml over the same append and compares what each
+# does to the coordinates of the rows that were already there. Without `fit:` every run
+# refits the whole input and every point moves; with it the fitted projection is written
+# on the first run, read back on the second, and a row the fit already holds comes back
+# with the same numbers.
+#
+# `build/homes.umap` sits beside the Parquet rather than under a directory of its own so
+# that `clear_cache` (which removes `build/`) takes the fit with it — a test that left a
+# fit behind would place the next case's rows into the previous case's layout.
+name: umap_project_fit
+engine: duckdb
+db: build/fixture.duckdb
+
+steps:
+  - name: load_homes
+    sql: models/homes.sql
+
+  - name: export_homes
+    op: parquet_export@1
+    with:
+      input: homes
+      dest: build/homes.parquet
+      order_by: "id"
+
+  - name: project
+    op: umap_project@1
+    with:
+      input: build/homes.parquet
+      columns: [longitude, latitude, median_income, rooms_per_household]
+      out: build/homes_projected.parquet
+      fit: build/homes.umap
+      metric: euclidean
