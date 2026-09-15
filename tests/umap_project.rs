@@ -616,9 +616,9 @@ fn first_48(parquet: &Path) -> Vec<(String, f64, f64)> {
     placed(parquet).into_iter().take(48).collect()
 }
 
-/// AC2 END TO END, through a manifest: a Protocol that declares `fit:` finds the
-/// fitted projection on its second run instead of re-doing it, and the rows that were
-/// already on the map come back with the same coordinates after an append.
+/// THE PERSISTED FIT END TO END, through a manifest: a Protocol that declares `fit:`
+/// finds the fitted projection on its second run instead of re-doing it, and the rows
+/// that were already on the map come back with the same coordinates after an append.
 ///
 /// THE CONTROL IS THE SECOND HALF OF THIS TEST AND IT IS NOT OPTIONAL. "The
 /// coordinates did not move" is also what a projection that ignored the appended rows
@@ -628,8 +628,8 @@ fn first_48(parquet: &Path) -> Vec<(String, f64, f64)> {
 /// that declares no fit — and the second one has to MOVE those same rows. Without it
 /// this test would pass against an operator that never opened the fit.
 ///
-/// The skip on the second run is the other half of AC2's own words, "a second run
-/// finds it rather than refitting". `arc` reports it on the step line, and it is a
+/// The skip on the second run is the other half of the claim — that a second run
+/// FINDS the fit rather than refitting. `arc` reports it on the step line, and it is a
 /// stronger statement than an unchanged output file: the step did not execute at all,
 /// so no `uv` was spawned and no UMAP was fitted.
 #[test]

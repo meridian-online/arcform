@@ -5053,8 +5053,9 @@ mod tests {
         );
     }
 
-    /// AC2's load-time half, and the half CI can run: a Protocol that sets `fit:`
-    /// puts the fitted projection in the asset graph on BOTH sides of the step.
+    /// The load-time half of the persisted fit, and the half CI can run: a Protocol
+    /// that sets `fit:` puts the fitted projection in the asset graph on BOTH sides of
+    /// the step.
     ///
     /// Asserting membership is not enough on its own and the shape of this test says
     /// why. `reads` alone would declare a dependency on a file nothing is answerable

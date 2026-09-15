@@ -6659,9 +6659,9 @@ steps:
         .contains("project")
     }
 
-    /// AC2, at the layer it lives in: a Protocol that declares `fit:` gets a second
-    /// run that FINDS the fitted projection rather than re-doing it, and a fit that
-    /// is gone or has been rewritten sends the step back to work.
+    /// The claim at the layer it lives in: a Protocol that declares `fit:` gets a
+    /// second run that FINDS the fitted projection rather than re-doing it, and a fit
+    /// that is gone or has been rewritten sends the step back to work.
     ///
     /// This is the half of the claim no Python test can reach and no `uv` is needed
     /// for. `operators/umap_project/test_umap_project_fit.py` proves that the script,
@@ -6726,7 +6726,7 @@ steps:
         assert!(
             !project_is_stale(dir.path(), &state),
             "with no `fit:` declared, deleting the file changes nothing arc can see — \
-             which is exactly why the declaration is the work AC2 asks for, and not a \
+             which is exactly why the declaration is the work here, and not a \
              restatement of what the operator already did"
         );
     }
