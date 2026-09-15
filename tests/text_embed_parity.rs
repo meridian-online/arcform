@@ -14,8 +14,8 @@
 //! difference against it and no figure written here can be made to redden.
 //!
 //! WHAT IS ASSERTED, AND WHY IT IS NOT A TAUTOLOGY. Both sides now call the same
-//! `embed()`, so the interesting question is no longer which arithmetic each does — it
-//! is whether the operator delivers what `embed()` returned, unaltered, to the row it
+//! `subtoken_embed()`, so the interesting question is no longer which arithmetic each does — it
+//! is whether the operator delivers what `subtoken_embed()` returned, unaltered, to the row it
 //! belongs to. Between the call and the analyst's file sit a NULL bridge, a cast to a
 //! fixed-width vector, a join on an ordinal, an ORDER BY, and a Parquet round trip.
 //! Each of those can lose or move a value while every vector in the file still looks
@@ -23,7 +23,7 @@
 //! one implementation there is no rounding left to forgive.
 //!
 //! WHAT RUNS WHERE. Everything that produces a vector needs the built extension
-//! (`ARC_STATICEMBED_EXTENSION`) and `uv`. The routine gate (`ci.yml`'s `build` job,
+//! (`ARC_SUBTOKEN_EXTENSION`) and `uv`. The routine gate (`ci.yml`'s `build` job,
 //! every push and PR) installs `uv` — `tests/uv_operator.rs` needs a real one — but
 //! stages no extension, so every test that needs the extension is `#[ignore]`d —
 //! it shows in that job's own `cargo test` summary as `ignored`, not `ok`, which is
@@ -35,7 +35,7 @@
 //! against disagreement, and the two look identical from the outside.
 //!
 //! The staged gate — `.github/workflows/text-embed-parity.yml`, on a schedule and on
-//! `workflow_dispatch` — builds the extension from a pinned `staticembed` commit, stages
+//! `workflow_dispatch` — builds the extension from a pinned `subtoken` commit, stages
 //! the bundled model, installs `uv`, and runs this file and `text_embed.rs` with
 //! `--include-ignored`. There every `#[ignore]`d test above actually executes its real
 //! body. If it somehow ran there without the artifact or `uv` staged, the `require_*`
@@ -53,7 +53,7 @@ use std::process::Command;
 /// routine gate, where every test that calls `require_extension` instead is
 /// `#[ignore]`d and never reaches here.
 fn extension_artifact() -> Option<PathBuf> {
-    let path = PathBuf::from(std::env::var_os("ARC_STATICEMBED_EXTENSION")?);
+    let path = PathBuf::from(std::env::var_os("ARC_SUBTOKEN_EXTENSION")?);
     path.is_file().then_some(path)
 }
 
@@ -64,7 +64,7 @@ fn extension_artifact() -> Option<PathBuf> {
 fn require_extension() -> PathBuf {
     extension_artifact().unwrap_or_else(|| {
         panic!(
-            "ARC_STATICEMBED_EXTENSION must point at a built, loadable extension: this \
+            "ARC_SUBTOKEN_EXTENSION must point at a built, loadable extension: this \
              test is #[ignore]d on the routine gate for exactly this reason, so \
              reaching here means it was run anyway (--include-ignored) without \
              staging what it needs — see the staged workflow, \
@@ -76,7 +76,7 @@ fn require_extension() -> PathBuf {
 /// A directory holding the three files of the model the extension bundles, or `None`.
 /// Only the tests that exercise the model check want it.
 fn model_directory() -> Option<PathBuf> {
-    let path = PathBuf::from(std::env::var_os("ARC_STATICEMBED_MODEL")?);
+    let path = PathBuf::from(std::env::var_os("ARC_SUBTOKEN_MODEL")?);
     path.is_dir().then_some(path)
 }
 
@@ -84,7 +84,7 @@ fn model_directory() -> Option<PathBuf> {
 fn require_model() -> PathBuf {
     model_directory().unwrap_or_else(|| {
         panic!(
-            "ARC_STATICEMBED_MODEL must point at a three-file model directory: this \
+            "ARC_SUBTOKEN_MODEL must point at a three-file model directory: this \
              test is #[ignore]d on the routine gate for exactly this reason — see \
              require_extension's doc comment"
         )
@@ -95,7 +95,7 @@ fn require_model() -> PathBuf {
 /// discovered: the extension hashes the identity and the revision together with the
 /// files, so a directory alone cannot say which release it is.
 fn model_release() -> String {
-    std::env::var("ARC_STATICEMBED_MODEL_RELEASE").unwrap_or_else(|_| {
+    std::env::var("ARC_SUBTOKEN_MODEL_RELEASE").unwrap_or_else(|_| {
         "minishlab/potion-base-8M@bf8b056651a2c21b8d2565580b8569da283cab23".to_string()
     })
 }
@@ -135,7 +135,7 @@ fn mismatch(got: &str, want: &str) -> String {
 }
 
 /// TRUE when the extension returns the same vector for both texts. The single place
-/// two texts are compared through `embed()`, built on the same `mismatch` predicate
+/// two texts are compared through `subtoken_embed()`, built on the same `mismatch` predicate
 /// the Protocol-versus-SQL comparison uses and that
 /// `the_comparison_notices_a_single_float_out_of_place` exercises.
 fn same_vector(conn: &duckdb::Connection, a: &str, b: &str) -> bool {
@@ -143,8 +143,8 @@ fn same_vector(conn: &duckdb::Connection, a: &str, b: &str) -> bool {
         &format!(
             "SELECT NOT {}",
             mismatch(
-                &format!("embed({})", sql_lit(a)),
-                &format!("embed({})", sql_lit(b))
+                &format!("subtoken_embed({})", sql_lit(a)),
+                &format!("subtoken_embed({})", sql_lit(b))
             )
         ),
         [],
@@ -328,7 +328,7 @@ fn run_protocol(
     let project = tmp.path();
     let conn = duckdb::Connection::open_in_memory().unwrap();
     write_corpus(&conn, &project.join("corpus.parquet"));
-    std::fs::copy(artifact, project.join("staticembed.duckdb_extension")).unwrap();
+    std::fs::copy(artifact, project.join("subtoken.duckdb_extension")).unwrap();
 
     let model_lines = match model {
         Some((dir, release)) => format!(
@@ -350,7 +350,7 @@ fn run_protocol(
              \x20   with:\n\
              \x20     input: corpus.parquet\n\
              \x20     text_column: description\n\
-             \x20     extension: staticembed.duckdb_extension\n\
+             \x20     extension: subtoken.duckdb_extension\n\
              \x20     out: build/embedded.parquet\n\
              {model_lines}"
         ),
@@ -377,7 +377,7 @@ fn run_protocol(
 /// the two implementations used to disagree, and including the NULL the operator
 /// bridges.
 #[test]
-#[ignore = "needs a built ARC_STATICEMBED_EXTENSION and `uv` — run under the staged \
+#[ignore = "needs a built ARC_SUBTOKEN_EXTENSION and `uv` — run under the staged \
             parity workflow (text-embed-parity.yml), not a bare `cargo test`"]
 fn a_protocol_run_and_a_sql_session_return_the_same_vector_for_every_case() {
     let artifact = require_extension();
@@ -395,7 +395,7 @@ fn a_protocol_run_and_a_sql_session_return_the_same_vector_for_every_case() {
          FROM read_parquet('{corpus}') c \
          JOIN read_parquet('{out}') o USING (id) \
          ORDER BY c.id",
-        mismatch = mismatch("o.embedding", "embed(coalesce(c.description, ''))"),
+        mismatch = mismatch("o.embedding", "subtoken_embed(coalesce(c.description, ''))"),
         corpus = project.join("corpus.parquet").display(),
         out = project.join("build/embedded.parquet").display(),
     );
@@ -443,7 +443,7 @@ fn a_protocol_run_and_a_sql_session_return_the_same_vector_for_every_case() {
 /// this asserts exists but never reaches a person running a Protocol. That is a gap in
 /// the engine rather than in the operator, and closing it is not this file's to do.
 #[test]
-#[ignore = "needs a built ARC_STATICEMBED_EXTENSION and `uv` — run under the staged \
+#[ignore = "needs a built ARC_SUBTOKEN_EXTENSION and `uv` — run under the staged \
             parity workflow (text-embed-parity.yml), not a bare `cargo test`"]
 fn the_rows_that_carry_no_signal_are_counted_on_stderr() {
     let artifact = require_extension();
@@ -461,7 +461,7 @@ fn the_rows_that_carry_no_signal_are_counted_on_stderr() {
         .query_row(
             &format!(
                 "SELECT count(*) FROM read_parquet('{}') WHERE \
-                 list_sum(list_transform(embed(coalesce(description, '')), x -> abs(x))) = 0",
+                 list_sum(list_transform(subtoken_embed(coalesce(description, '')), x -> abs(x))) = 0",
                 corpus_path.display()
             ),
             [],
@@ -509,7 +509,7 @@ fn the_rows_that_carry_no_signal_are_counted_on_stderr() {
 /// that a future edit to the word lists cannot quietly turn the comparison above into
 /// a comparison over ordinary sentences.
 #[test]
-#[ignore = "needs a built ARC_STATICEMBED_EXTENSION — run under the staged parity \
+#[ignore = "needs a built ARC_SUBTOKEN_EXTENSION — run under the staged parity \
             workflow (text-embed-parity.yml), not a bare `cargo test`"]
 fn the_corpus_still_contains_the_shapes_it_was_built_from() {
     let artifact = require_extension();
@@ -524,7 +524,7 @@ fn the_corpus_still_contains_the_shapes_it_was_built_from() {
     let is_zero = |text: &str| -> bool {
         conn.query_row(
             &format!(
-                "SELECT list_sum(list_transform(embed({}), x -> abs(x))) = 0",
+                "SELECT list_sum(list_transform(subtoken_embed({}), x -> abs(x))) = 0",
                 sql_lit(text)
             ),
             [],
@@ -605,12 +605,12 @@ const TOKEN_CUT: usize = 512;
 /// before this test, "text past 512 tokens is truncated" was documented, wrong, and
 /// unfalsifiable, because a text can be truncated while under 512 tokens.
 ///
-/// THE PAIRS ARE THE POINT, not either half. `embed(t) == embed(t[..CUT])` on its own
-/// passes for any boundary at or below CUT; `embed(t) != embed(t[..CUT - 1])` on its
+/// THE PAIRS ARE THE POINT, not either half. `subtoken_embed(t) == subtoken_embed(t[..CUT])` on its own
+/// passes for any boundary at or below CUT; `subtoken_embed(t) != subtoken_embed(t[..CUT - 1])` on its
 /// own passes for any boundary above it. Only together do they hold at exactly CUT, so
 /// a constant one character or one token out of place reddens this test.
 #[test]
-#[ignore = "needs a built ARC_STATICEMBED_EXTENSION — run under the staged parity \
+#[ignore = "needs a built ARC_SUBTOKEN_EXTENSION — run under the staged parity \
             workflow (text-embed-parity.yml), not a bare `cargo test`"]
 fn the_truncation_boundary_is_two_cuts() {
     let artifact = require_extension();
@@ -771,7 +771,7 @@ fn the_comparison_notices_a_single_float_out_of_place() {
 /// A Protocol that declares a model the extension does not carry is stopped, and told
 /// both addresses — the one its own files produce and the one the extension reports.
 #[test]
-#[ignore = "needs a built ARC_STATICEMBED_EXTENSION and `uv` — run under the staged \
+#[ignore = "needs a built ARC_SUBTOKEN_EXTENSION and `uv` — run under the staged \
             parity workflow (text-embed-parity.yml), not a bare `cargo test`"]
 fn a_model_the_extension_does_not_carry_is_refused_naming_both() {
     let artifact = require_extension();
@@ -819,7 +819,7 @@ fn a_model_the_extension_does_not_carry_is_refused_naming_both() {
 /// everything: the model the extension DOES carry is accepted, and the run produces
 /// vectors.
 #[test]
-#[ignore = "needs a built ARC_STATICEMBED_EXTENSION, ARC_STATICEMBED_MODEL and `uv` — \
+#[ignore = "needs a built ARC_SUBTOKEN_EXTENSION, ARC_SUBTOKEN_MODEL and `uv` — \
             run under the staged parity workflow (text-embed-parity.yml), not a bare \
             `cargo test`"]
 fn the_model_the_extension_carries_is_accepted() {
@@ -850,7 +850,7 @@ fn the_model_the_extension_carries_is_accepted() {
 /// copy has to be ACCEPTED first, in the same test, and only then does the refusal of
 /// a copy differing by one byte of the third file mean the third file is hashed.
 #[test]
-#[ignore = "needs a built ARC_STATICEMBED_EXTENSION, ARC_STATICEMBED_MODEL and `uv` — \
+#[ignore = "needs a built ARC_SUBTOKEN_EXTENSION, ARC_SUBTOKEN_MODEL and `uv` — \
             run under the staged parity workflow (text-embed-parity.yml), not a bare \
             `cargo test`"]
 fn changing_one_byte_of_the_third_file_is_a_different_model() {
@@ -915,8 +915,8 @@ const NEAR_MISS_SEARCH_LIMIT: u64 = 20 * (1 << (4 * NEAR_MISS_CHARS as u64));
 /// The content address the extension published, out of its own version line.
 fn published_key(conn: &duckdb::Connection) -> String {
     let line: String = conn
-        .query_row("SELECT staticembed_version()", [], |r| r.get(0))
-        .expect("the extension answers staticembed_version()");
+        .query_row("SELECT subtoken_version()", [], |r| r.get(0))
+        .expect("the extension answers subtoken_version()");
     line.split("key ")
         .nth(1)
         .and_then(|rest| rest.split(',').next())
@@ -950,7 +950,7 @@ fn published_key(conn: &duckdb::Connection) -> String {
 /// chosen to share NO leading character is run first, and the address the operator
 /// itself reports for it has to be the one computed here.
 #[test]
-#[ignore = "needs a built ARC_STATICEMBED_EXTENSION and `uv` — run under the staged \
+#[ignore = "needs a built ARC_SUBTOKEN_EXTENSION and `uv` — run under the staged \
             parity workflow (text-embed-parity.yml), not a bare `cargo test`"]
 fn a_model_whose_address_nearly_matches_is_still_refused() {
     let artifact = require_extension();
@@ -975,7 +975,7 @@ fn a_model_whose_address_nearly_matches_is_still_refused() {
     // Mirrors `MODEL_KEY_DOMAIN` and `MODEL_PARTS` in text_embed.py. The assertion
     // below is what keeps the mirror honest.
     let mut base = Sha256::new();
-    base.update(b"staticembed/model-key/v1");
+    base.update(b"subtoken/model-key/v1");
     base.update(RELEASE_ID.as_bytes());
     base.update([0u8]);
     base.update(RELEASE_REVISION.as_bytes());

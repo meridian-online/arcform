@@ -117,7 +117,7 @@ loses the disclosure.
 
 So `columns: [longitude, latitude]` maps a table of places and `columns: [embedding]`
 maps whatever wrote a vector column — including `text_embed`, and including a SQL step
-calling the DuckDB embedding extension's `embed()` directly. The operator is not told which
+calling the DuckDB embedding extension's `subtoken_embed()` directly. The operator is not told which
 produced it. Mixing the two shapes in one `columns:` list is allowed and they are
 concatenated in the order listed.
 

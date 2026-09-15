@@ -22,10 +22,10 @@
 //! `#[ignore]`.
 //!
 //! The staged gate — `.github/workflows/text-embed-parity.yml`, on a schedule and on
-//! `workflow_dispatch` — builds the extension from a pinned `staticembed` commit,
+//! `workflow_dispatch` — builds the extension from a pinned `subtoken` commit,
 //! installs `uv`, and runs this file (and `text_embed_parity.rs`) with
 //! `--include-ignored`, so every `#[ignore]`d test here actually executes its body
-//! there. `ARC_STATICEMBED_EXTENSION` names the built artifact and turns the rest on;
+//! there. `ARC_SUBTOKEN_EXTENSION` names the built artifact and turns the rest on;
 //! if a test ran without it staged anyway, `require_extension`/`require_uv` panic
 //! rather than returning quietly — see their doc comments.
 //!
@@ -77,7 +77,7 @@ fn require_uv() {
 /// the routine gate, where every test that calls `require_extension` instead is
 /// `#[ignore]`d and never reaches here.
 pub fn extension_artifact() -> Option<PathBuf> {
-    let path = PathBuf::from(std::env::var_os("ARC_STATICEMBED_EXTENSION")?);
+    let path = PathBuf::from(std::env::var_os("ARC_SUBTOKEN_EXTENSION")?);
     path.is_file().then_some(path)
 }
 
@@ -85,7 +85,7 @@ pub fn extension_artifact() -> Option<PathBuf> {
 fn require_extension() -> PathBuf {
     extension_artifact().unwrap_or_else(|| {
         panic!(
-            "ARC_STATICEMBED_EXTENSION must point at a built, loadable extension: this \
+            "ARC_SUBTOKEN_EXTENSION must point at a built, loadable extension: this \
              test is #[ignore]d on the routine gate for exactly this reason — see the \
              staged workflow, text-embed-parity.yml"
         )
@@ -102,7 +102,7 @@ fn extension_dim(artifact: &Path) -> i64 {
     let conn = duckdb::Connection::open_in_memory_with_flags(config).unwrap();
     conn.execute_batch(&format!("LOAD '{}';", artifact.display()))
         .expect("the artifact loads");
-    conn.query_row("SELECT len(embed('width probe'))", [], |r| r.get(0))
+    conn.query_row("SELECT len(subtoken_embed('width probe'))", [], |r| r.get(0))
         .expect("the extension answers")
 }
 
@@ -133,7 +133,7 @@ fn staged_protocol() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     copy_tree(&fixture_dir(), tmp.path());
     if let Some(artifact) = extension_artifact() {
-        std::fs::copy(artifact, tmp.path().join("staticembed.duckdb_extension")).unwrap();
+        std::fs::copy(artifact, tmp.path().join("subtoken.duckdb_extension")).unwrap();
     }
     tmp
 }
@@ -189,7 +189,7 @@ fn columns_of(parquet: &Path) -> Vec<(String, String)> {
 fn an_extension_that_was_never_staged_stops_the_run_naming_the_file() {
     let tmp = staged_protocol();
     let project = tmp.path();
-    let artifact = project.join("staticembed.duckdb_extension");
+    let artifact = project.join("subtoken.duckdb_extension");
     if artifact.exists() {
         std::fs::remove_file(&artifact).unwrap();
     }
@@ -198,7 +198,7 @@ fn an_extension_that_was_never_staged_stops_the_run_naming_the_file() {
     assert_ne!(code, Some(0), "the run must fail:\n{stdout}\n{stderr}");
     let told = format!("{stdout}{stderr}");
     assert!(
-        told.contains("the extension asset staticembed.duckdb_extension is not on disk"),
+        told.contains("the extension asset subtoken.duckdb_extension is not on disk"),
         "the refusal names the declared extension asset:\n{told}"
     );
     assert!(
@@ -218,7 +218,7 @@ fn an_extension_that_was_never_staged_stops_the_run_naming_the_file() {
     // embedding step feeds from.
     let graph = common::strip_ansi(&stdout);
     assert!(
-        graph.contains("staticembed.duckdb_extension"),
+        graph.contains("subtoken.duckdb_extension"),
         "the extension is an asset-graph node, not an invisible dependency:\n{graph}"
     );
 }
@@ -229,7 +229,7 @@ fn an_extension_that_was_never_staged_stops_the_run_naming_the_file() {
 /// stops here. Before the split there was no such file: the only way to reach an
 /// embedding was to also compute a 2-D map.
 #[test]
-#[ignore = "needs a built ARC_STATICEMBED_EXTENSION and `uv` — run under the staged \
+#[ignore = "needs a built ARC_SUBTOKEN_EXTENSION and `uv` — run under the staged \
             parity workflow (text-embed-parity.yml), not a bare `cargo test`"]
 fn an_embedding_is_a_finished_artifact_with_no_map_attached() {
     let artifact = require_extension();
@@ -294,7 +294,7 @@ fn an_embedding_is_a_finished_artifact_with_no_map_attached() {
 /// column and nothing else — it never sees `description` — so if the map separates
 /// the corpus's two subjects, the separation came through the embedding.
 #[test]
-#[ignore = "needs a built ARC_STATICEMBED_EXTENSION and `uv` — run under the staged \
+#[ignore = "needs a built ARC_SUBTOKEN_EXTENSION and `uv` — run under the staged \
             parity workflow (text-embed-parity.yml), not a bare `cargo test`"]
 fn the_route_from_a_text_column_to_coordinates_still_works() {
     require_extension();
@@ -419,7 +419,7 @@ fn the_route_from_a_text_column_to_coordinates_still_works() {
 /// Three plausible API-key variables are set to values that would break anything that
 /// used them, and the run has to land on the same bytes as the one that had a network.
 #[test]
-#[ignore = "needs a built ARC_STATICEMBED_EXTENSION and `uv` — run under the staged \
+#[ignore = "needs a built ARC_SUBTOKEN_EXTENSION and `uv` — run under the staged \
             parity workflow (text-embed-parity.yml), not a bare `cargo test`"]
 fn the_steps_complete_with_the_network_disabled_and_no_credentials() {
     require_extension();

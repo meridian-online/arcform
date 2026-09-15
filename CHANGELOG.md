@@ -154,7 +154,7 @@ Rationale for each change is recorded in the project's design notes and commit h
   The fixture's tiny generated model and `make_fixture_model.py` are deleted with the
   code that read them, and the fixture Protocol declares the extension instead. The
   artifact is tens of megabytes and is not committed, so the end-to-end tests stage one
-  from `ARC_STATICEMBED_EXTENSION` and return early without it; what CI runs from that
+  from `ARC_SUBTOKEN_EXTENSION` and return early without it; what CI runs from that
   file is the refusal when the extension asset is missing, decided in Rust before
   anything is spawned. `tests/text_embed_parity.rs` carries the value-for-value
   comparison over the diverging cases, a probe that pins both truncation cuts exactly
