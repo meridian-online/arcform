@@ -3146,14 +3146,26 @@ impl Operator for UmapProject {
         let mut assets = OpAssets::default();
         assets.record_reads(cfg.input.clone(), crate::asset_kind::AssetKind::File);
         assets.record_produces(cfg.out.clone(), crate::asset_kind::AssetKind::File);
-        // The fit is declared on BOTH sides, and neither side alone is enough. As a
-        // `produces` its bytes join the step's artifact hash, so deleting it marks the
-        // step stale and the next run refits rather than reporting clean over a fit
-        // that is gone. As a `reads` it is what the step consumes, which is the
-        // lineage an asset-centric engine is for — and it is the half that keeps the
-        // declaration honest if a later Protocol ever has one step write a fit that
-        // another places into. See this module's `fit:` paragraph for why the graph
-        // carries a name on both sides without contradiction.
+        // The fit is declared on BOTH sides, and the two sides do NOT split the work
+        // evenly — this comment used to say each carried half of it, and deleting one
+        // line at a time is how that was found to be wrong. EITHER side alone puts the
+        // fit's bytes into the step's artifact hash, because `produced_artifact_hash`
+        // folds in what a step produces AND the reads that nothing in the manifest
+        // produces; drop `record_produces` here and the staleness behaviour is
+        // unchanged. What each side actually buys:
+        //
+        // `reads` is the lineage — this is a file the step CONSUMES, and it is the
+        // side that would order this step after another if a Protocol ever had one
+        // step write a fit that a second places rows into.
+        //
+        // `produces` is answerability. It is what `missing_declared_produces` reads,
+        // so a run that "succeeds" without leaving a fit on disk says so by name
+        // instead of exiting 0 in silence — the shape of an operator that took the
+        // field and ignored it. Read-only, that run is indistinguishable from one
+        // whose fit was simply an input it did not have to make.
+        //
+        // See this module's `fit:` paragraph for why the graph carries one name on
+        // both sides without contradiction.
         if let Some(fit) = &cfg.fit {
             assets.record_reads(fit.clone(), crate::asset_kind::AssetKind::File);
             assets.record_produces(fit.clone(), crate::asset_kind::AssetKind::File);

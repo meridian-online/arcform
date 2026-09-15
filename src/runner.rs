@@ -6731,6 +6731,41 @@ steps:
         );
     }
 
+    /// What the `produces` half of the fit declaration buys, which is NOT the
+    /// staleness the two tests above measure.
+    ///
+    /// Deleting `record_produces` from the operator and re-running those two leaves
+    /// both green, because `produced_artifact_hash` folds in a step's produces AND the
+    /// reads that nothing in the manifest produces — either declaration alone puts the
+    /// fit's bytes in the hash. So the `produces` side needs a test of its own or it
+    /// is decoration that two passing tests appear to cover.
+    ///
+    /// It buys answerability. `missing_declared_produces` is what `run` consults after
+    /// a step reports success, and it reads `produces` only: a run that "succeeded"
+    /// and left no fit on disk is named on stderr rather than exiting 0 in silence.
+    /// That is the shape of an operator handed `fit:` and ignoring it, and read-only
+    /// the fit would be indistinguishable from an input the step never had to make.
+    #[test]
+    fn a_fit_a_run_claims_to_have_written_and_did_not_is_named() {
+        let dir = persisted_fit_project(true);
+        let manifest = crate::manifest::Manifest::load(dir.path()).unwrap();
+        let asset_graph = AssetGraph::build(&manifest, dir.path());
+        let step = manifest.steps.iter().find(|s| s.name == "project").unwrap();
+
+        assert!(
+            missing_declared_produces(step, dir.path(), &asset_graph).is_empty(),
+            "with the fit on disk there is nothing to report"
+        );
+
+        fs::remove_file(dir.path().join("build/homes.fit")).unwrap();
+        assert_eq!(
+            missing_declared_produces(step, dir.path(), &asset_graph),
+            vec!["build/homes.fit".to_string()],
+            "a step that declared a fit and left none has to be named — by the fit's \
+             own path, so the reader knows which of the step's outputs is missing"
+        );
+    }
+
     /// A precondition-gated `command:` step whose `produces:` is a real path a
     /// downstream `sql:` step reads. The consumer drops that read (a producer owns
     /// it), so if the producer does not hash it, nothing does.
