@@ -11,6 +11,48 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Changed
 
+- **`datapackage_describe` refuses a curated sidecar that forges or contradicts a
+  finetype nomination, and warns on one that pre-empts it.** The per-field overlay in
+  `descriptor.overrides.json` was a blind key-by-key insert: whatever a field block
+  named was copied onto the field with no validation. That is fine while every type in
+  the descriptor is inferred and stops being fine the moment finetype can be TOLD a
+  column's type, because a nominated field carries `x-finetype-nominated: true` and a
+  sidecar that can write that key can make a hand-typed field claim to be a declared
+  one — the mark forgeable by exactly the mechanism it exists to distinguish itself
+  from. Four outcomes, checked before a single key is copied:
+
+  - **Refused** — a field block that sets `x-finetype-nominated` itself, on any base.
+    That mark is the engine's.
+  - **Refused** — a field block that sets `type`, `x-finetype-label` or
+    `x-finetype-confidence` on a column finetype already marked nominated. A nomination
+    is taken as given.
+  - **Warned, exit zero** — the same three keys on a column nobody nominated. Nine live
+    fields across three published sidecars do this today, and the repo holding them
+    never runs `arc` in its own CI, so refusing would redden nothing there and would
+    instead fail the next rebuild of three published datasets. The warning is the
+    deprecation notice; the refusal follows when the last sidecar is clean.
+  - **Warned, exit zero** — a nominated column whose `constraints` the sidecar replaces
+    while claiming none of the three keys above. Tightening bounds under a nominated
+    label is legitimate curation, so the warning prints both sets rather than refusing.
+
+  The forgery outranks both warnings: a block that sets the mark AND a label is refused
+  for the forgery, not warned about for the label.
+
+  **The refusal is structural — it fires on the mark, never on the constraint
+  vocabulary.** arcform links no finetype crate and reaches the engine only as a
+  subprocess, so deciding whether a type and a constraint keyword belong together would
+  mean copying finetype's vocabulary table into this repo. finetype already filters
+  every field's constraints to its declared type, so that pair-level refusal is done and
+  is not arcform's. Two gaps stay open and are named here rather than left implied: a
+  sidecar that overrides `type` alone on a non-nominated field leaves constraints
+  finetype filtered for a different type, and a sidecar that supplies `constraints`
+  alone bypasses that filter entirely. Both need the vocabulary table; neither is caught
+  here.
+
+  No configuration changed and no manifest needs editing — a sidecar that curates
+  `description`, `title`, `resource.path` or relational metadata behaves exactly as
+  before.
+
 - **`umap_project` can place appended rows into a persisted fit instead of refitting the
   map, so an analyst who adds data keeps the reading they already formed.** `--fit PATH`
   writes the fitted projection on the run that fits it and reads it back on every later
