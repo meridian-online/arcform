@@ -4889,8 +4889,29 @@ mod tests {
         )
         .unwrap();
         let a = assets_for("datapackage_describe", Some(&with)).unwrap();
-        assert_eq!(a.reads, vec!["build/edgar_gleif.parquet".to_string()]);
+        // The curated sidecar is a read: an edit to it must re-describe.
+        assert_eq!(
+            a.reads,
+            vec![
+                "build/edgar_gleif.parquet".to_string(),
+                "descriptor.overrides.json".to_string()
+            ]
+        );
         assert_eq!(a.produces, vec!["datapackage.json".to_string()]);
+        // So is the nominations file, when the step declares one.
+        let with_nominations: Value = serde_yaml::from_str(
+            "parquet: p\noverrides: o\nout: d\nnominations: nominations.finetype.json",
+        )
+        .unwrap();
+        let a = assets_for("datapackage_describe", Some(&with_nominations)).unwrap();
+        assert_eq!(
+            a.reads,
+            vec![
+                "p".to_string(),
+                "o".to_string(),
+                "nominations.finetype.json".to_string()
+            ]
+        );
         // unknown field rejected (deny_unknown_fields)
         let bad: Value = serde_yaml::from_str("parquet: p\noverrides: o\nout: d\nx: 1").unwrap();
         assert!(assets_for("datapackage_describe", Some(&bad)).is_err());
