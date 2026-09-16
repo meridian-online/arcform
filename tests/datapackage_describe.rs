@@ -16,6 +16,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// Only `step_outcome` is used here; the other helpers serve the suites that run `arc`
+// on the ambient PATH, which these tests must not.
+#[allow(dead_code)]
+mod common;
+use common::step_outcome;
+
 fn base_profile_json() -> &'static str {
     r#"{"name":"widgets","resources":[{"name":"widgets","path":"widgets.parquet","schema":{"fields":[{"name":"id","type":"integer","x-finetype-label":"identifier"},{"name":"note","type":"string","x-finetype-label":"representation.text.plain_text"}]}}]}"#
 }
@@ -784,5 +790,312 @@ fn curating_a_nominated_field_without_claiming_a_type_is_silent() {
     assert_eq!(
         id["constraints"],
         serde_json::json!({"minLength": 4, "maxLength": 16})
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A declared type reaches finetype: `nominations:` in the step's `with:` block.
+//
+// The fake below records every argv it is spawned with, because the claim is about
+// what arcform HANDS finetype, and only the child can see that. The fakes above
+// discard their argv, so a test driven through them passes whether `--nominations`
+// is sent, sent with the wrong path, or not sent at all.
+// ---------------------------------------------------------------------------
+
+/// The first finetype release carrying `--nominations`, as the operator's
+/// `MIN_FINETYPE_NOMINATIONS_VERSION` states it. Written out here rather than read
+/// from the crate so a change to the constant has to move this line too.
+const NOMINATIONS_RELEASE: &str = "0.6.60";
+
+/// The newest finetype release WITHOUT the flag.
+const RELEASE_BEFORE_NOMINATIONS: &str = "0.6.59";
+
+/// Like `write_fake_finetype`, but every invocation appends one line to the returned
+/// log: its arguments, each followed by a tab. `profile` echoes `profile_json`.
+fn write_fake_finetype_recording_argv(dir: &Path, version: &str, profile_json: &str) -> PathBuf {
+    let log = dir.join("argv.log");
+    let script = dir.join("finetype");
+    let quoted = format!("'{}'", profile_json.replace('\'', "'\\''"));
+    let log_quoted = format!("'{}'", log.display());
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\t' \"$@\" >> {log_quoted}\nprintf '\\n' >> {log_quoted}\n\
+         if [ \"$1\" = \"--version\" ]; then\n  echo \"finetype {version}\"\nelse\n  echo {quoted}\nfi\n"
+    );
+    std::fs::write(&script, body).expect("write fake finetype");
+    use std::os::unix::fs::PermissionsExt;
+    let mut perm = std::fs::metadata(&script).unwrap().permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(&script, perm).unwrap();
+    log
+}
+
+/// Every recorded invocation, as its argument list.
+fn recorded_invocations(log: &Path) -> Vec<Vec<String>> {
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    text.lines()
+        .map(|line| {
+            line.split('\t')
+                .filter(|a| !a.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .collect()
+}
+
+const NOMINATIONS_JSON: &str = r#"{"version": 1, "resources": {"widgets": {"id": {"label": "identifier", "why": "a surrogate key"}}}}"#;
+
+/// `write_project`'s Protocol with `nominations: nominations.finetype.json` on the
+/// step, and that file beside the manifest.
+fn write_project_with_nominations(project: &Path, overrides_json: &str) {
+    write_project(project, overrides_json);
+    std::fs::write(project.join("nominations.finetype.json"), NOMINATIONS_JSON).unwrap();
+    let manifest = std::fs::read_to_string(project.join("arcform.yaml")).unwrap();
+    std::fs::write(
+        project.join("arcform.yaml"),
+        format!("{manifest}\x20     nominations: nominations.finetype.json\n"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn nominations_reach_finetype_resolved_against_the_manifest_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    write_project_with_nominations(&project, "{}");
+
+    let finetype_dir = tempfile::tempdir().unwrap();
+    let log = write_fake_finetype_recording_argv(
+        finetype_dir.path(),
+        NOMINATIONS_RELEASE,
+        nominated_profile_json(),
+    );
+
+    let out = run_arc_with_fake_finetype(&project, finetype_dir.path());
+    assert!(
+        out.status.success(),
+        "a finetype exactly at the nominations release must be accepted:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let invocations = recorded_invocations(&log);
+    let profile = invocations
+        .iter()
+        .find(|argv| argv.first().map(String::as_str) == Some("profile"))
+        .unwrap_or_else(|| panic!("`profile` was never spawned: {invocations:?}"));
+    let flag = profile
+        .iter()
+        .position(|a| a == "--nominations")
+        .unwrap_or_else(|| panic!("`--nominations` missing from the profile argv: {profile:?}"));
+    // `arc run` takes the manifest directory from its working directory, which the
+    // OS reports resolved (on macOS a tempdir under /var is really /private/var).
+    let expected = project
+        .canonicalize()
+        .unwrap()
+        .join("nominations.finetype.json");
+    assert_eq!(
+        profile.get(flag + 1).map(PathBuf::from),
+        Some(expected),
+        "`--nominations` must be followed by the file resolved against the manifest \
+         directory, not the relative name the manifest wrote: {profile:?}"
+    );
+
+    let descriptor: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(project.join("datapackage.json")).unwrap()).unwrap();
+    let fields = descriptor["resources"][0]["schema"]["fields"]
+        .as_array()
+        .unwrap();
+    let id = fields.iter().find(|f| f["name"] == "id").unwrap();
+    assert_eq!(
+        id["x-finetype-nominated"],
+        serde_json::json!(true),
+        "the nomination mark finetype wrote must reach datapackage.json intact"
+    );
+}
+
+#[test]
+fn a_step_without_nominations_sends_no_nominations_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    write_project(&project, "{}");
+
+    let finetype_dir = tempfile::tempdir().unwrap();
+    let log = write_fake_finetype_recording_argv(finetype_dir.path(), "9.9.9", base_profile_json());
+
+    let out = run_arc_with_fake_finetype(&project, finetype_dir.path());
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let invocations = recorded_invocations(&log);
+    let profile = invocations
+        .iter()
+        .find(|argv| argv.first().map(String::as_str) == Some("profile"))
+        .unwrap_or_else(|| panic!("`profile` was never spawned: {invocations:?}"));
+    assert!(
+        !profile.iter().any(|a| a == "--nominations"),
+        "a step that declares nothing must not pass the flag, which every finetype \
+         before {NOMINATIONS_RELEASE} rejects: {profile:?}"
+    );
+}
+
+#[test]
+fn nominations_refuse_a_finetype_that_predates_the_flag_before_profiling() {
+    // Two binaries: one just below the nominations release, and one below the general
+    // floor too, which must still be refused for the nominations reason.
+    for version in [RELEASE_BEFORE_NOMINATIONS, "0.6.41"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        write_project_with_nominations(&project, "{}");
+
+        let finetype_dir = tempfile::tempdir().unwrap();
+        let log =
+            write_fake_finetype_recording_argv(finetype_dir.path(), version, base_profile_json());
+
+        let out = run_arc_with_fake_finetype(&project, finetype_dir.path());
+        assert!(
+            !out.status.success(),
+            "finetype {version} predates `--nominations` and must be refused"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(NOMINATIONS_RELEASE),
+            "the refusal must name the release that carries the flag: {stderr}"
+        );
+        assert!(
+            stderr.contains(version),
+            "the refusal must name the version it found: {stderr}"
+        );
+        let invocations = recorded_invocations(&log);
+        assert!(
+            !invocations
+                .iter()
+                .any(|argv| argv.first().map(String::as_str) == Some("profile")),
+            "the refusal must come before `profile` is spawned: {invocations:?}"
+        );
+        assert!(!project.join("datapackage.json").exists());
+    }
+}
+
+#[test]
+fn without_nominations_the_general_floor_still_admits_its_own_release() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    write_project(&project, "{}");
+
+    let finetype_dir = tempfile::tempdir().unwrap();
+    write_fake_finetype(finetype_dir.path(), "0.6.54", base_profile_json());
+
+    let out = run_arc_with_fake_finetype(&project, finetype_dir.path());
+    assert!(
+        out.status.success(),
+        "a step that declares no nominations is held to 0.6.54, not to {NOMINATIONS_RELEASE}:\n\
+         stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Editing a curated input re-describes on a warm run.
+// ---------------------------------------------------------------------------
+
+/// A two-step Protocol: `package` writes the Parquet with DuckDB, and `describe`
+/// reads it with `nominations:` set. `package` is what "upstream stays clean" is
+/// measured against.
+fn write_two_step_project(project: &Path) {
+    std::fs::create_dir_all(project.join("models")).unwrap();
+    std::fs::write(
+        project.join("models/package.sql"),
+        "COPY (SELECT 1 AS id, 'a' AS note) TO 'widgets.parquet' (FORMAT parquet);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("descriptor.overrides.json"),
+        r#"{"title": "Widgets"}"#,
+    )
+    .unwrap();
+    std::fs::write(project.join("nominations.finetype.json"), NOMINATIONS_JSON).unwrap();
+    std::fs::write(
+        project.join("arcform.yaml"),
+        "name: describe_staleness\n\
+         engine: duckdb\n\
+         db: build/test.db\n\
+         steps:\n\
+        \x20 - name: package\n\
+        \x20   sql: models/package.sql\n\
+        \x20 - name: describe\n\
+        \x20   op: datapackage_describe@1\n\
+        \x20   with:\n\
+        \x20     parquet: widgets.parquet\n\
+        \x20     overrides: descriptor.overrides.json\n\
+        \x20     out: datapackage.json\n\
+        \x20     nominations: nominations.finetype.json\n",
+    )
+    .unwrap();
+}
+
+/// Run once and return (`package`, `describe`) outcomes, requiring exit 0.
+fn two_step_outcomes(project: &Path, finetype_bin: &Path) -> (String, String) {
+    let out = run_arc_with_fake_finetype(project, finetype_bin);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (
+        step_outcome(&stdout, "package"),
+        step_outcome(&stdout, "describe"),
+    )
+}
+
+/// Build, settle, edit `file`, and return the outcomes of the run after the edit.
+fn outcomes_after_editing(file: &str, new_contents: &str) -> (String, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    write_two_step_project(&project);
+    let finetype_dir = tempfile::tempdir().unwrap();
+    write_fake_finetype(
+        finetype_dir.path(),
+        NOMINATIONS_RELEASE,
+        base_profile_json(),
+    );
+
+    assert_eq!(
+        two_step_outcomes(&project, finetype_dir.path()),
+        ("ran".into(), "ran".into()),
+        "cold run"
+    );
+    // The control: with nothing edited, both settle. Without it, a `describe` that
+    // re-ran on every run would satisfy the assertion the callers make.
+    assert_eq!(
+        two_step_outcomes(&project, finetype_dir.path()),
+        ("skip: hash_clean".into(), "skip: hash_clean".into()),
+        "warm run with nothing edited"
+    );
+
+    std::fs::write(project.join(file), new_contents).unwrap();
+    two_step_outcomes(&project, finetype_dir.path())
+}
+
+#[test]
+fn editing_the_nominations_file_re_describes_and_upstream_stays_clean() {
+    assert_eq!(
+        outcomes_after_editing(
+            "nominations.finetype.json",
+            r#"{"version": 1, "resources": {"widgets": {"note": {"label": "representation.text.plain_text", "why": "free text"}}}}"#,
+        ),
+        ("skip: hash_clean".into(), "ran".into()),
+        "an edited nominations file must re-run `describe` alone"
+    );
+}
+
+#[test]
+fn editing_the_overrides_sidecar_re_describes_and_upstream_stays_clean() {
+    assert_eq!(
+        outcomes_after_editing("descriptor.overrides.json", r#"{"title": "Gadgets"}"#),
+        ("skip: hash_clean".into(), "ran".into()),
+        "an edited sidecar must re-run `describe` alone"
     );
 }
