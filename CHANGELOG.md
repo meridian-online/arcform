@@ -243,6 +243,30 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Added
 
+- **`datapackage_describe@1.1.0` passes declared column types to finetype through a
+  new `nominations:` key.** A step whose `with:` block carries
+  `nominations: nominations.finetype.json` resolves that path against the manifest
+  directory and appends `--nominations <FILE>` to its `finetype profile` call, so a
+  declared type reaches the engine, and comes back marked `x-finetype-nominated`,
+  instead of being hand-copied into `descriptor.overrides.json`. Before this key the
+  step's config refused any unknown field, so the only place a maintainer could write
+  a type was the sidecar. `@1` still resolves; a step without the key sends no flag
+  and behaves as before.
+
+  - **New refusal: a finetype older than 0.6.60 on a step with `nominations:`.**
+    `MIN_FINETYPE_NOMINATIONS_VERSION` is 0.6.60, the first finetype release whose
+    `profile` takes `--nominations`. Without it, the general 0.6.54 floor would admit
+    0.6.54 through 0.6.59, and the step would die inside the subprocess on clap's
+    unknown-flag error, which names no release to install. The refusal happens before
+    `profile` is spawned and names both the required and the found version. A step
+    without `nominations:` is still held to 0.6.54.
+  - **Fixed: editing a curated input left `describe` hash-clean.** The step recorded
+    the Parquet as its only read, so an edit to `descriptor.overrides.json` changed
+    neither the step config nor any hashed asset, and a warm `arc run` skipped
+    `describe` and kept the stale `datapackage.json`. Both the sidecar and the
+    nominations file are now reads: editing either re-runs `describe` alone, and the
+    steps upstream of it stay `[skip: hash_clean]`.
+
 - **`embed_project` is split into `umap_project` and `text_embed`, because one name
   over two jobs made each one reachable only through the other.** An analyst who
   wanted vectors — for similarity, clustering, deduplication, or as classifier
