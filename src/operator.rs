@@ -290,7 +290,8 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
                 "parquet": { "type": "string", "description": "Built Parquet whose columns FineType types." },
                 "overrides": { "type": "string", "description": "Curated descriptor sidecar (JSON) overlaid onto FineType's base." },
                 "out": { "type": "string", "description": "datapackage.json to write." },
-                "expect_finetype_version": { "type": "string", "description": "Pin the run to one exact finetype release. Refuses, naming both versions, unless the resolved `finetype` on PATH reports exactly this version." }
+                "expect_finetype_version": { "type": "string", "description": "Pin the run to one exact finetype release. Refuses, naming both versions, unless the resolved `finetype` on PATH reports exactly this version." },
+                "nominations": { "type": "string", "description": "Declared column types (conventionally `nominations.finetype.json`) passed to `finetype profile --nominations`. Needs a finetype that carries the flag; the step refuses before profiling when the one on PATH is older." }
             }),
             &["parquet", "overrides", "out"],
         ),
@@ -1469,6 +1470,14 @@ impl Operator for OpendalFetch {
 /// has to be refused as firmly as 0.6.52 was.
 const MIN_FINETYPE_VERSION: &str = "0.6.54";
 
+/// The first finetype release whose `profile` subcommand takes `--nominations <FILE>`.
+/// A step that sets `nominations:` is held to this floor instead of
+/// `MIN_FINETYPE_VERSION`, because an older binary does not refuse the declaration
+/// politely: clap rejects the unknown flag inside the subprocess, and the run dies on
+/// a usage error that says nothing about which release to install. 0.6.59 has no such
+/// flag and 0.6.60 is the tag that added it.
+const MIN_FINETYPE_NOMINATIONS_VERSION: &str = "0.6.60";
+
 /// Pull the first dotted numeric version out of `text` (e.g. `"finetype 0.6.53"`).
 fn parse_finetype_version(text: &str) -> Option<(u64, u64, u64)> {
     let re = regex::Regex::new(r"(\d+)\.(\d+)\.(\d+)").ok()?;
@@ -1492,7 +1501,12 @@ fn parse_finetype_version(text: &str) -> Option<(u64, u64, u64)> {
 /// Resolving the version once and threading it through means the stamp can only
 /// ever name the binary this run actually asserted and ran, never a second,
 /// independent lookup that could in principle disagree with the first.
-fn require_finetype(min_version: &str, ctx: &OpContext) -> Result<String> {
+///
+/// `nominations` is whether this step passes `--nominations`. When it does, the
+/// nominations floor is checked FIRST: it sits above `MIN_FINETYPE_VERSION`, so a
+/// binary below both is refused with the reason that actually applies to this step
+/// rather than with the general one.
+fn require_finetype(min_version: &str, nominations: bool, ctx: &OpContext) -> Result<String> {
     let out = run_process(
         "finetype",
         &["--version".to_string()],
@@ -1502,6 +1516,9 @@ fn require_finetype(min_version: &str, ctx: &OpContext) -> Result<String> {
     )?;
     let stdout = out.stdout.unwrap_or_default();
     let got = resolve_finetype_version(&stdout)?;
+    if nominations {
+        check_nominations_floor(got, MIN_FINETYPE_NOMINATIONS_VERSION)?;
+    }
     check_finetype_floor(got, min_version)?;
     Ok(format!("{}.{}.{}", got.0, got.1, got.2))
 }
@@ -1540,6 +1557,27 @@ fn check_finetype_floor(got: (u64, u64, u64), min_version: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fail closed unless `got` is `>= min_version`, for a step that declares
+/// `nominations:` — PURE, no subprocess, and split from `check_finetype_floor` for
+/// its message: that one says the labels are untrustworthy, and a binary that merely
+/// predates `--nominations` is refused for a different reason, which is the one a
+/// maintainer needs to read. The message names both versions.
+fn check_nominations_floor(got: (u64, u64, u64), min_version: &str) -> Result<()> {
+    let want = parse_finetype_version(min_version)
+        .expect("MIN_FINETYPE_NOMINATIONS_VERSION must itself parse as a dotted version");
+    if got < want {
+        return Err(fetch_failed(format!(
+            "datapackage_describe: this step declares `nominations:`, which needs finetype \
+             {} or newer — the first release whose `profile` takes `--nominations` — but \
+             finetype {}.{}.{} on PATH is older and would reject the flag. Update it \
+             (e.g. `cargo install --path crates/finetype-cli --force`) or remove \
+             `nominations:` from the step.",
+            min_version, got.0, got.1, got.2
+        )));
+    }
+    Ok(())
+}
+
 /// Fail closed unless the already-resolved `resolved` version equals `expect` — the
 /// manifest's `expect_finetype_version` pin.
 ///
@@ -1568,16 +1606,30 @@ fn require_exact_finetype_version(resolved: &str, expect: &str) -> Result<()> {
 /// Run `finetype profile -f <parquet> -o datapackage` and parse its stdout as the
 /// Frictionless Data Package finetype computed from the built Parquet directly
 /// (including the resource `bytes` / `hash` / `format` / `mediatype`).
-fn finetype_datapackage(parquet: &Path, ctx: &OpContext) -> Result<serde_json::Value> {
+///
+/// `nominations`, when present, is appended as `--nominations <FILE>`, already
+/// resolved against the manifest directory by the caller: the child's working
+/// directory is not a contract, so a relative path here would name whatever file
+/// happens to sit beside wherever `finetype` was spawned.
+fn finetype_datapackage(
+    parquet: &Path,
+    nominations: Option<&Path>,
+    ctx: &OpContext,
+) -> Result<serde_json::Value> {
+    let mut args = vec![
+        "profile".to_string(),
+        "-f".to_string(),
+        parquet.display().to_string(),
+        "-o".to_string(),
+        "datapackage".to_string(),
+    ];
+    if let Some(nominations) = nominations {
+        args.push("--nominations".to_string());
+        args.push(nominations.display().to_string());
+    }
     let out = run_process(
         "finetype",
-        &[
-            "profile".to_string(),
-            "-f".to_string(),
-            parquet.display().to_string(),
-            "-o".to_string(),
-            "datapackage".to_string(),
-        ],
+        &args,
         ctx,
         OutputMode::Capture,
         "datapackage_describe",
@@ -1940,6 +1992,12 @@ struct DatapackageDescribeConfig {
     /// when this is also set.
     #[serde(default)]
     expect_finetype_version: Option<String>,
+    /// Declared column types, passed to `finetype profile --nominations`. Resolved
+    /// against ctx.dir, and a `reads` asset, so editing the file re-describes on the
+    /// next warm run. Setting it raises the finetype floor to
+    /// `MIN_FINETYPE_NOMINATIONS_VERSION`.
+    #[serde(default)]
+    nominations: Option<String>,
 }
 
 impl DatapackageDescribeConfig {
@@ -1959,13 +2017,21 @@ impl Operator for DatapackageDescribe {
     }
 
     fn version(&self) -> semver::Version {
-        semver::Version::new(1, 0, 0)
+        semver::Version::new(1, 1, 0)
     }
 
     fn assets(&self, with: &Value) -> Result<OpAssets> {
         let cfg = DatapackageDescribeConfig::parse(with)?;
         let mut assets = OpAssets::default();
         assets.record_reads(cfg.parquet.clone(), crate::asset_kind::AssetKind::File);
+        // Both curated inputs are reads. Neither is produced by any step, so without
+        // this the step's hash covered the Parquet and its own config and nothing
+        // else: an edit to either file left `describe` hash-clean, and the written
+        // descriptor kept describing the file as it was before the edit.
+        assets.record_reads(cfg.overrides.clone(), crate::asset_kind::AssetKind::File);
+        if let Some(nominations) = &cfg.nominations {
+            assets.record_reads(nominations.clone(), crate::asset_kind::AssetKind::File);
+        }
         assets.record_produces(cfg.out.clone(), crate::asset_kind::AssetKind::File);
         Ok(assets)
     }
@@ -1975,16 +2041,17 @@ impl Operator for DatapackageDescribe {
         let parquet = ctx.dir.join(&cfg.parquet);
         let overrides_path = ctx.dir.join(&cfg.overrides);
         let out = ctx.dir.join(&cfg.out);
+        let nominations = cfg.nominations.as_deref().map(|n| ctx.dir.join(n));
         if let Some(parent) = out.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
 
-        let version = require_finetype(MIN_FINETYPE_VERSION, ctx)?;
+        let version = require_finetype(MIN_FINETYPE_VERSION, nominations.is_some(), ctx)?;
         if let Some(expect) = cfg.expect_finetype_version.as_deref() {
             require_exact_finetype_version(&version, expect)?;
         }
 
-        let base = finetype_datapackage(&parquet, ctx)?;
+        let base = finetype_datapackage(&parquet, nominations.as_deref(), ctx)?;
 
         let overrides_text = std::fs::read_to_string(&overrides_path).map_err(|e| {
             fetch_failed(format!(
