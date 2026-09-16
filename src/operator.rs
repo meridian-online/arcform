@@ -1595,12 +1595,37 @@ fn finetype_datapackage(parquet: &Path, ctx: &OpContext) -> Result<serde_json::V
 /// package root as-is (title / description / homepage / licenses / sources / …).
 const MERGE_STRUCTURAL: &[&str] = &["resource", "fields", "primaryKey", "foreignKeys"];
 
+/// The per-field key finetype stamps on a column whose type was DECLARED in
+/// `nominations.finetype.json` rather than inferred from the data. A sidecar that
+/// could set it would make a hand-typed field indistinguishable from a declared one,
+/// which is the exact distinction the mark exists to carry.
+///
+/// [`check_field_claims`] refuses it in a curated `fields` block, which is the block
+/// the four published sidecars use. It does NOT see a `resource.schema` or a top-level
+/// `resources` override, both of which replace the field array wholesale and can carry
+/// the mark through — see the CHANGELOG entry, which names that hole rather than
+/// leaving a reader to infer from this guard that the whole class is closed.
+const NOMINATED_KEY: &str = "x-finetype-nominated";
+
+/// The per-field keys that state a typing verdict: the type itself, the taxonomy
+/// label behind it and the engine's confidence in it. On a nominated field these are
+/// the nomination's to set; on any field the sidecar setting one is pre-empting
+/// finetype's typing rather than curating around it.
+const NOMINATION_CLAIM_KEYS: &[&str] = &["type", "x-finetype-label", "x-finetype-confidence"];
+
+/// Where a declared type belongs instead of the curated sidecar. Named in every
+/// refusal and every warning below, because "this is wrong" without "put it here"
+/// leaves the maintainer to guess.
+const NOMINATIONS_FILE: &str = "nominations.finetype.json";
+
 /// Overlay the curated `descriptor.overrides.json` sidecar onto finetype's base
 /// descriptor — overrides win, finetype supplies everything the sidecar does not
-/// mention. Mirrors the retired describe.py's `_merge` + `_check_relations`
-/// exactly: same four structural keys, same per-field shallow-replace semantics
-/// (an override supplies a key, finetype's value for every OTHER key on that field
-/// survives), same primaryKey/foreignKey drift hard-fail.
+/// mention. Mirrors the retired describe.py's `_merge` + `_check_relations` for the
+/// four structural keys, the per-field shallow-replace semantics (an override
+/// supplies a key, finetype's value for every OTHER key on that field survives) and
+/// the primaryKey/foreignKey drift hard-fail, and adds one thing describe.py never
+/// had: [`check_field_claims`], which refuses a sidecar that forges or contradicts a
+/// finetype NOMINATION before any of that copying happens.
 fn merge_datapackage(
     mut base: serde_json::Value,
     overrides: &serde_json::Value,
@@ -1659,10 +1684,34 @@ fn merge_datapackage(
         .filter_map(|f| f.get("name").and_then(|n| n.as_str()).map(str::to_string))
         .collect();
 
+    // The columns finetype marked NOMINATED, each with the `constraints` object the
+    // engine carried for it. Captured here for the same reason as `present` and one
+    // more: the per-field loop below overwrites both the mark and the constraints, so
+    // a guard reading them afterwards would be comparing the sidecar's claim against
+    // the sidecar's own value. It has to compare against what the ENGINE declared.
+    let nominated: std::collections::BTreeMap<String, serde_json::Value> = fields
+        .iter()
+        .filter(|f| f.get(NOMINATED_KEY).and_then(|v| v.as_bool()) == Some(true))
+        .filter_map(|f| {
+            let name = f.get("name").and_then(|n| n.as_str())?.to_string();
+            let constraints = f
+                .get("constraints")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            Some((name, constraints))
+        })
+        .collect();
+
     // 3) Per-field overrides, matched by column name (adds `description`, or
     //    corrects a `x-finetype-label`, etc.). A sidecar field that does not exist
     //    in the Parquet is a stale override — warn so it gets cleaned up.
     if let Some(field_overrides) = overrides_obj.get("fields").and_then(|v| v.as_object()) {
+        // Before any copying: a sidecar may curate around finetype's typing, never
+        // over it. Refuses on a forged or contradicted nomination; warns on a claim
+        // that merely pre-empts one.
+        for line in check_field_claims(field_overrides, &nominated)? {
+            eprintln!("{line}");
+        }
         for name in field_overrides.keys() {
             if !present.contains(name) {
                 eprintln!(
@@ -1698,6 +1747,137 @@ fn merge_datapackage(
     check_relations(schema, &present)?;
 
     Ok(base)
+}
+
+/// Decide, for every field block in the curated sidecar, whether it is curating
+/// around finetype's typing or over it.
+///
+/// Three outcomes partition the input space, and the refusal outranks both warnings
+/// wherever their givens also match:
+///
+/// * **Refuse — forgery.** The block sets `x-finetype-nominated` itself. That mark is
+///   finetype's statement that a human declared this column's type in
+///   `nominations.finetype.json`; a sidecar that can write it can make a hand-typed
+///   field claim to be a declared one, and the mark stops meaning anything.
+/// * **Refuse — contradiction.** The block sets `type`, `x-finetype-label` or
+///   `x-finetype-confidence` on a column finetype already marked nominated. A
+///   nomination is taken as given, so nothing downstream may overturn it — least of
+///   all a file with no contract on the far side of the pipeline.
+/// * **Warn — pre-emption.** The same three keys on a column nobody nominated. Nine
+///   live fields across three published sidecars do exactly this today, and open-analytics
+///   CI never runs `arc`, so a refusal here would not redden that repo's own gates — it
+///   would fail the next rebuild of three published datasets instead. The warning is the
+///   deprecation notice; the refusal follows when the last sidecar is clean.
+/// * **Warn — lost bounds.** A nominated column whose `constraints` the sidecar
+///   replaces, and which claims none of the three keys above. Tightening bounds under a
+///   nominated label is legitimate curation, so this is not a refusal; losing the
+///   nominated bounds without noticing is what the warning exists to stop, which is why
+///   it prints both sets.
+///
+/// `nominated` maps each column finetype marked nominated to the `constraints` the
+/// ENGINE carried for it, read before the merge overwrote anything.
+///
+/// Warnings are RETURNED rather than printed, for two reasons. A refusal aborts the
+/// step, so advice about a field in a descriptor that will never be written is noise
+/// and is discarded. And a returned value can be compared exactly by a test, while a
+/// side effect can only be searched: every assertion on this function's output was
+/// once `stderr.contains(<substring>)`, which is monotone — adding a line or swapping
+/// one rendering for another leaves every substring present — so no branch whose only
+/// effect is on message CONTENT could be pinned at all. Three such branches shipped
+/// unpinned and the mutation gate caught all three.
+fn check_field_claims(
+    field_overrides: &serde_json::Map<String, serde_json::Value>,
+    nominated: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<Vec<String>> {
+    let mut forged: Vec<String> = Vec::new();
+    let mut contradicted: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    for (name, block) in field_overrides {
+        let Some(block) = block.as_object() else {
+            continue;
+        };
+        let base_constraints = nominated.get(name);
+        let claims: Vec<&str> = NOMINATION_CLAIM_KEYS
+            .iter()
+            .copied()
+            .filter(|key| block.contains_key(*key))
+            .collect();
+
+        if block.contains_key(NOMINATED_KEY) {
+            // Checked before the contradiction arm and before both warnings, so a
+            // block that forges the mark AND claims a label is refused for the
+            // forgery rather than warned about for the label.
+            forged.push(format!("'{name}' → '{NOMINATED_KEY}'"));
+            continue;
+        }
+
+        let Some(base_constraints) = base_constraints else {
+            for key in &claims {
+                warnings.push(format!(
+                    "datapackage_describe: WARNING field '{name}' sets '{key}' in \
+                     descriptor.overrides.json, pre-empting finetype's typing. Declare \
+                     the type in {NOMINATIONS_FILE} instead — this override will be \
+                     refused once the published sidecars are clean."
+                ));
+            }
+            continue;
+        };
+
+        if !claims.is_empty() {
+            for key in &claims {
+                contradicted.push(format!("'{name}' → '{key}'"));
+            }
+            continue;
+        }
+
+        if let Some(sidecar_constraints) = block.get("constraints") {
+            warnings.push(format!(
+                "datapackage_describe: WARNING field '{name}' is nominated and \
+                 descriptor.overrides.json replaces its constraints — the bounds that \
+                 came with the nomination in {NOMINATIONS_FILE} are gone unless the \
+                 sidecar restates them.\n  nominated: {}\n  sidecar:   {}",
+                render_constraints(base_constraints),
+                render_constraints(sidecar_constraints),
+            ));
+        }
+    }
+
+    if forged.is_empty() && contradicted.is_empty() {
+        return Ok(warnings);
+    }
+
+    let mut detail = Vec::new();
+    if !forged.is_empty() {
+        detail.push(format!(
+            "  forges the nomination mark: {}",
+            forged.join(", ")
+        ));
+    }
+    if !contradicted.is_empty() {
+        detail.push(format!(
+            "  contradicts a field finetype already nominated: {}",
+            contradicted.join(", ")
+        ));
+    }
+    Err(fetch_failed(format!(
+        "datapackage_describe: descriptor.overrides.json states a type claim that is \
+         not its to state — a declared type, its label and its confidence belong in \
+         {NOMINATIONS_FILE}, which finetype reads, not in the curated sidecar, which \
+         nothing reads back.\n{}",
+        detail.join("\n")
+    )))
+}
+
+/// Render a field's `constraints` for a warning. A field finetype gave no constraints
+/// at all reads as `(none)` rather than as the bare `null` a JSON render would produce,
+/// because `null` looks like a value that was set.
+fn render_constraints(value: &serde_json::Value) -> String {
+    if value.is_null() {
+        "(none)".to_string()
+    } else {
+        value.to_string()
+    }
 }
 
 /// Fail if a curated `primaryKey` / `foreignKeys` names a column absent from the
@@ -4735,6 +4915,212 @@ mod tests {
     // catalog it executes from, so a feature gate named for the transport would
     // force a consumer that only wants to READ a Protocol naming this step — the
     // brightfield viewer — to claim the capability to RUN it.
+
+    // -----------------------------------------------------------------------
+    // What the sidecar guard ASSEMBLES, asserted as a value.
+    //
+    // The end-to-end tests in tests/datapackage_describe.rs pin what the guard
+    // DECIDES — refuse, warn, stay silent — by searching the real `arc` binary's
+    // stderr. `contains` is monotone: adding a line, or swapping one rendering for
+    // another, leaves every substring it was asked about still present. So three
+    // branches whose only effect is on message content shipped unpinned, and the
+    // mutation gate found all three. These compare the whole string, which is not
+    // monotone, and the degenerate inputs those branches exist for are driven here
+    // because reaching them through a real `arc run` needs a base descriptor no
+    // pipeline would produce.
+    // -----------------------------------------------------------------------
+
+    /// Call the guard with a `fields` override block and an explicit map of what the
+    /// engine nominated, so a test states both halves of the comparison outright.
+    fn guard(
+        overrides: serde_json::Value,
+        engine_nominated: &[(&str, serde_json::Value)],
+    ) -> Result<Vec<String>> {
+        let nominated: std::collections::BTreeMap<String, serde_json::Value> = engine_nominated
+            .iter()
+            .map(|(name, constraints)| ((*name).to_string(), constraints.clone()))
+            .collect();
+        check_field_claims(overrides.as_object().expect("a JSON object"), &nominated)
+    }
+
+    /// The refusal text a maintainer actually reads, or a panic naming what came back
+    /// instead — a guard that returned the wrong error VARIANT would otherwise read as
+    /// a passing assertion on a message nobody sees.
+    fn refusal(result: Result<Vec<String>>) -> String {
+        match result {
+            Err(Error::StepFailed { stderr, .. }) => stderr,
+            Err(other) => panic!("expected a StepFailed, got {other}"),
+            Ok(warnings) => panic!("expected a refusal, got warnings: {warnings:?}"),
+        }
+    }
+
+    const REFUSAL_HEADER: &str = "datapackage_describe: descriptor.overrides.json \
+         states a type claim that is not its to state — a declared type, its label and \
+         its confidence belong in nominations.finetype.json, which finetype reads, not \
+         in the curated sidecar, which nothing reads back.";
+
+    #[test]
+    fn a_pure_forgery_refusal_carries_no_contradiction_section() {
+        let text = refusal(guard(
+            serde_json::json!({"note": {"x-finetype-nominated": true}}),
+            &[],
+        ));
+        assert_eq!(
+            text,
+            format!(
+                "{REFUSAL_HEADER}\n  forges the nomination mark: 'note' → 'x-finetype-nominated'"
+            )
+        );
+    }
+
+    #[test]
+    fn a_pure_contradiction_refusal_carries_no_forgery_section() {
+        // The section headers are emitted only for the arm that fired. A refusal that
+        // printed an empty "forges the nomination mark:" line here would accuse the
+        // maintainer of forging nothing, on an input that forged nothing — and every
+        // substring the end-to-end tests look for would still be present.
+        let text = refusal(guard(
+            serde_json::json!({"id": {"type": "integer"}}),
+            &[("id", serde_json::json!({"minLength": 4}))],
+        ));
+        assert_eq!(
+            text,
+            format!(
+                "{REFUSAL_HEADER}\n  contradicts a field finetype already nominated: 'id' → 'type'"
+            )
+        );
+    }
+
+    #[test]
+    fn a_refusal_that_fires_both_arms_carries_both_sections_in_order() {
+        let text = refusal(guard(
+            serde_json::json!({
+                "note": {"x-finetype-nominated": true},
+                "id": {"type": "integer", "x-finetype-label": "identifier"},
+            }),
+            &[("id", serde_json::json!({"minLength": 4}))],
+        ));
+        assert_eq!(
+            text,
+            format!(
+                "{REFUSAL_HEADER}\n  \
+                 forges the nomination mark: 'note' → 'x-finetype-nominated'\n  \
+                 contradicts a field finetype already nominated: \
+                 'id' → 'type', 'id' → 'x-finetype-label'"
+            )
+        );
+    }
+
+    #[test]
+    fn the_pre_emption_warning_is_one_exact_line_per_claimed_key() {
+        let warnings = guard(
+            serde_json::json!({"note": {"type": "integer", "x-finetype-confidence": 0.5}}),
+            &[],
+        )
+        .expect("a claim on a field nobody nominated warns rather than refusing");
+        assert_eq!(
+            warnings,
+            vec![
+                "datapackage_describe: WARNING field 'note' sets 'type' in \
+                 descriptor.overrides.json, pre-empting finetype's typing. Declare the \
+                 type in nominations.finetype.json instead — this override will be \
+                 refused once the published sidecars are clean."
+                    .to_string(),
+                "datapackage_describe: WARNING field 'note' sets 'x-finetype-confidence' in \
+                 descriptor.overrides.json, pre-empting finetype's typing. Declare the \
+                 type in nominations.finetype.json instead — this override will be \
+                 refused once the published sidecars are clean."
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_lost_bounds_warning_prints_both_constraint_sets() {
+        let warnings = guard(
+            serde_json::json!({"id": {"constraints": {"minLength": 8}}}),
+            &[("id", serde_json::json!({"minLength": 4, "maxLength": 16}))],
+        )
+        .expect("replacing a nominated field's constraints warns rather than refusing");
+        assert_eq!(
+            warnings,
+            vec![
+                "datapackage_describe: WARNING field 'id' is nominated and \
+                 descriptor.overrides.json replaces its constraints — the bounds that came \
+                 with the nomination in nominations.finetype.json are gone unless the \
+                 sidecar restates them.\n  \
+                 nominated: {\"maxLength\":16,\"minLength\":4}\n  \
+                 sidecar:   {\"minLength\":8}"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_nomination_that_carried_no_bounds_renders_as_none_not_null() {
+        // The case `render_constraints` exists for, and an ordinary one: a taxonomy
+        // definition with no validation bounds nominates a column with no
+        // `constraints` at all. Rendering that as the bare `null` a JSON dump would
+        // produce reads as a value somebody set. Nothing drove this path before —
+        // every fixture nominated a field WITH bounds — so the branch was unpinned,
+        // and a substring assertion could not have pinned it in either case.
+        let warnings = guard(
+            serde_json::json!({"id": {"constraints": {"minLength": 8}}}),
+            &[("id", serde_json::Value::Null)],
+        )
+        .expect("a nomination with no bounds still warns rather than refusing");
+        assert_eq!(
+            warnings,
+            vec![
+                "datapackage_describe: WARNING field 'id' is nominated and \
+                 descriptor.overrides.json replaces its constraints — the bounds that came \
+                 with the nomination in nominations.finetype.json are gone unless the \
+                 sidecar restates them.\n  \
+                 nominated: (none)\n  \
+                 sidecar:   {\"minLength\":8}"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_field_block_that_is_not_an_object_claims_nothing() {
+        // `"note": "a string"` is malformed rather than hostile — the merge ignores it
+        // (only `as_object()` blocks are copied), so the guard must ignore it too
+        // rather than refusing a sidecar the merge would have tolerated.
+        let warnings = guard(
+            serde_json::json!({"note": "not an object", "id": ["nor", "this"]}),
+            &[("id", serde_json::json!({"minLength": 4}))],
+        )
+        .expect("a non-object field block is ignored, not refused");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn a_base_field_with_no_name_is_not_a_column_and_carries_no_nomination() {
+        // A nomination is addressed by column name. finetype's own output always names
+        // its fields, so this base is malformed — but the map that records what the
+        // engine nominated has to DROP a nameless field rather than filing it under the
+        // empty string, or a sidecar block keyed `""` inherits that field's nomination
+        // and every type claim in it is refused. Driven through `merge_datapackage`
+        // itself because that is where the map is built.
+        let base = serde_json::json!({
+            "resources": [{"schema": {"fields": [
+                {"x-finetype-nominated": true, "constraints": {"minLength": 4}},
+                {"name": "note", "type": "string"},
+            ]}}]
+        });
+        let overrides = serde_json::json!({"fields": {"": {"type": "integer"}}});
+        let merged = merge_datapackage(base, &overrides)
+            .expect("a nameless base field must not lend its nomination to the '' block");
+        let fields = merged["resources"][0]["schema"]["fields"]
+            .as_array()
+            .expect("fields survive the merge");
+        // The nameless field is skipped by the per-field loop too, so the `""` block
+        // reaches nothing: no `type` was applied to either field.
+        assert_eq!(fields[0].get("type"), None);
+        assert_eq!(fields[1]["type"], "string");
+    }
 
     #[test]
     fn umap_project_is_in_catalog_and_versioned() {

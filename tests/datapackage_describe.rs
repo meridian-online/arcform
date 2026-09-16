@@ -20,6 +20,14 @@ fn base_profile_json() -> &'static str {
     r#"{"name":"widgets","resources":[{"name":"widgets","path":"widgets.parquet","schema":{"fields":[{"name":"id","type":"integer","x-finetype-label":"identifier"},{"name":"note","type":"string","x-finetype-label":"representation.text.plain_text"}]}}]}"#
 }
 
+/// A base descriptor in which `id` carries finetype's NOMINATION mark and the bounds
+/// that came with it, and `note` carries an ordinary inferred label. The guard on the
+/// sidecar partitions on exactly that difference, and no file in any repo carries the
+/// mark yet — so every test that needs a nominated column writes one here.
+fn nominated_profile_json() -> &'static str {
+    r#"{"name":"widgets","resources":[{"name":"widgets","path":"widgets.parquet","schema":{"fields":[{"name":"id","type":"string","x-finetype-label":"identifier","x-finetype-nominated":true,"constraints":{"minLength":4,"maxLength":16}},{"name":"note","type":"string","x-finetype-label":"representation.text.plain_text"}]}}]}"#
+}
+
 /// Write an executable `finetype` into `dir` that answers BOTH subcommands the
 /// operator calls: `--version` (the floor gate) and `profile -f … -o datapackage`
 /// (the machine-decidable half). `#!/bin/sh` + builtins only — this fake needs no
@@ -499,4 +507,282 @@ fn expect_finetype_version_mismatch_refuses_end_to_end() {
     assert!(stderr.contains("9.9.9"), "stderr: {stderr}");
     assert!(stderr.contains("9.9.8"), "stderr: {stderr}");
     assert!(!project.join("datapackage.json").exists());
+}
+
+// ---------------------------------------------------------------------------
+// The sidecar cannot forge or contradict a finetype nomination.
+//
+// No DATA file in any of the three repos carries `x-finetype-nominated` — the key
+// appears in this repo only in the guard, in these tests and in CHANGELOG.md — so
+// none of these givens can be produced by a descriptor or sidecar that exists. Every
+// test below writes the base descriptor it needs. A refusal that reddens a real
+// pipeline would be a bug in the guard, not a finding.
+//
+// These pin what the guard DECIDES. What it ASSEMBLES is pinned by unit tests beside
+// the operator, because `stderr.contains` is monotone and cannot see a message gaining
+// a line or changing a rendering.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sidecar_forging_the_nomination_mark_is_refused() {
+    // The mark is finetype's statement that a human DECLARED this column's type. A
+    // sidecar that can write it makes a hand-typed field indistinguishable from a
+    // declared one, which is the whole distinction the mark exists to carry — so it
+    // is refused even on a base where nothing is nominated at all.
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    write_project(
+        &project,
+        r#"{"fields": {"note": {"x-finetype-nominated": true}}}"#,
+    );
+
+    let finetype_dir = tempfile::tempdir().unwrap();
+    write_fake_finetype(finetype_dir.path(), "9.9.9", base_profile_json());
+
+    let out = run_arc_with_fake_finetype(&project, finetype_dir.path());
+    assert!(
+        !out.status.success(),
+        "a sidecar that marks a field nominated must stop the run:\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The field, the key, and where the claim belongs instead — a refusal that names
+    // none of the three leaves the maintainer to guess which block to edit.
+    assert!(stderr.contains("'note'"), "must name the field: {stderr}");
+    assert!(
+        stderr.contains("x-finetype-nominated"),
+        "must name the key: {stderr}"
+    );
+    assert!(
+        stderr.contains("nominations.finetype.json"),
+        "must name where the claim belongs: {stderr}"
+    );
+    assert!(
+        !project.join("datapackage.json").exists(),
+        "a refused descriptor must not be written"
+    );
+}
+
+#[test]
+fn sidecar_contradicting_a_nominated_field_is_refused() {
+    // A nomination is taken as given: nothing downstream overturns it, least of all a
+    // file with no contract on the far side of the pipeline. Each of the three keys
+    // that state a typing verdict is driven separately — a guard that caught only the
+    // first would leave the other two forgeable.
+    for (key, value) in [
+        ("type", r#""integer""#),
+        ("x-finetype-label", r#""representation.text.plain_text""#),
+        ("x-finetype-confidence", "0.42"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        write_project(
+            &project,
+            &format!(r#"{{"fields": {{"id": {{"{key}": {value}}}}}}}"#),
+        );
+
+        let finetype_dir = tempfile::tempdir().unwrap();
+        write_fake_finetype(finetype_dir.path(), "9.9.9", nominated_profile_json());
+
+        let out = run_arc_with_fake_finetype(&project, finetype_dir.path());
+        assert!(
+            !out.status.success(),
+            "'{key}' on a nominated field must stop the run:\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("'id'"), "must name the field: {stderr}");
+        assert!(stderr.contains(key), "must name '{key}': {stderr}");
+        assert!(
+            stderr.contains("nominations.finetype.json"),
+            "must name where the claim belongs: {stderr}"
+        );
+        assert!(
+            !project.join("datapackage.json").exists(),
+            "a refused descriptor must not be written"
+        );
+    }
+}
+
+#[test]
+fn forging_the_mark_outranks_the_pre_emption_warning() {
+    // The one input the two arms both match: a NON-nominated field whose block sets
+    // the mark AND a label. Read as a pre-emption it warns and exits zero; read as a
+    // forgery it refuses. It must refuse — a forged mark that merely warns is a
+    // descriptor published with a lie in it. This is the precedence, pinned directly
+    // rather than inferred from the two arms passing in isolation.
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    write_project(
+        &project,
+        r#"{"fields": {"note": {"x-finetype-nominated": true, "x-finetype-label": "identifier"}}}"#,
+    );
+
+    let finetype_dir = tempfile::tempdir().unwrap();
+    write_fake_finetype(finetype_dir.path(), "9.9.9", base_profile_json());
+
+    let out = run_arc_with_fake_finetype(&project, finetype_dir.path());
+    assert!(
+        !out.status.success(),
+        "a block that forges the mark must be refused, not warned about:\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("x-finetype-nominated"),
+        "the refusal must be the forgery, naming the mark: {stderr}"
+    );
+    assert!(
+        !project.join("datapackage.json").exists(),
+        "a refused descriptor must not be written"
+    );
+}
+
+#[test]
+fn type_claim_on_a_field_nobody_nominated_warns_and_still_writes() {
+    // Nine live fields across three published sidecars do exactly this, and the repo
+    // that holds them never runs `arc` in its own CI — so a refusal here would redden
+    // nothing there and would instead fail the next rebuild of three published
+    // datasets. It warns, and the descriptor is still written with the override
+    // applied. Asserting the zero exit AND the warning text together is what keeps
+    // the warning from rotting into silence: dropping the `eprintln!` leaves a green
+    // run either way.
+    for (key, value, merged) in [
+        ("type", r#""integer""#, serde_json::json!("integer")),
+        (
+            "x-finetype-label",
+            r#""identifier""#,
+            serde_json::json!("identifier"),
+        ),
+        ("x-finetype-confidence", "0.42", serde_json::json!(0.42)),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        write_project(
+            &project,
+            &format!(r#"{{"fields": {{"note": {{"{key}": {value}}}}}}}"#),
+        );
+
+        let finetype_dir = tempfile::tempdir().unwrap();
+        write_fake_finetype(finetype_dir.path(), "9.9.9", base_profile_json());
+
+        let out = run_arc_with_fake_finetype(&project, finetype_dir.path());
+        assert!(
+            out.status.success(),
+            "'{key}' on a field nobody nominated must warn, not fail:\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("WARNING"), "stderr: {stderr}");
+        assert!(stderr.contains("'note'"), "must name the field: {stderr}");
+        assert!(stderr.contains(key), "must name '{key}': {stderr}");
+        assert!(
+            stderr.contains("nominations.finetype.json"),
+            "must name where the claim belongs: {stderr}"
+        );
+
+        let descriptor: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(project.join("datapackage.json")).unwrap())
+                .unwrap();
+        let fields = descriptor["resources"][0]["schema"]["fields"]
+            .as_array()
+            .unwrap();
+        let note = fields.iter().find(|f| f["name"] == "note").unwrap();
+        assert_eq!(
+            note[key], merged,
+            "a warned override is still applied — this is a deprecation notice, not a drop"
+        );
+    }
+}
+
+#[test]
+fn replacing_a_nominated_fields_constraints_warns_and_still_writes() {
+    // Tightening bounds under a nominated label is legitimate curation, so this is a
+    // warning and not a refusal. What it has to stop is losing the nominated bounds
+    // WITHOUT noticing — so the warning prints both sets, and this pins both.
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    write_project(
+        &project,
+        r#"{"fields": {"id": {"constraints": {"minLength": 8}}}}"#,
+    );
+
+    let finetype_dir = tempfile::tempdir().unwrap();
+    write_fake_finetype(finetype_dir.path(), "9.9.9", nominated_profile_json());
+
+    let out = run_arc_with_fake_finetype(&project, finetype_dir.path());
+    assert!(
+        out.status.success(),
+        "replacing a nominated field's constraints must warn, not fail:\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("WARNING"), "stderr: {stderr}");
+    assert!(stderr.contains("'id'"), "must name the field: {stderr}");
+    // The bounds that came with the nomination, and the ones replacing them. A
+    // warning that names neither set tells the reader nothing they did not already
+    // know from having written the sidecar.
+    assert!(
+        stderr.contains("\"minLength\":4") && stderr.contains("\"maxLength\":16"),
+        "must name the nominated constraints: {stderr}"
+    );
+    assert!(
+        stderr.contains("\"minLength\":8"),
+        "must name the sidecar's constraints: {stderr}"
+    );
+
+    let descriptor: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(project.join("datapackage.json")).unwrap()).unwrap();
+    let fields = descriptor["resources"][0]["schema"]["fields"]
+        .as_array()
+        .unwrap();
+    let id = fields.iter().find(|f| f["name"] == "id").unwrap();
+    assert_eq!(
+        id["constraints"],
+        serde_json::json!({"minLength": 8}),
+        "the replacement is still applied — the warning is a notice, not a veto"
+    );
+    // And the nomination itself survives the merge untouched.
+    assert_eq!(id["x-finetype-nominated"], serde_json::json!(true));
+}
+
+#[test]
+fn curating_a_nominated_field_without_claiming_a_type_is_silent() {
+    // The counterpart every one of the tests above needs: a guard wired to fire
+    // unconditionally passes all of them. A `description` on a nominated field claims
+    // no type and replaces no constraints, so it must produce no warning and no
+    // refusal at all.
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    write_project(
+        &project,
+        r#"{"fields": {"id": {"description": "the row identifier"}}}"#,
+    );
+
+    let finetype_dir = tempfile::tempdir().unwrap();
+    write_fake_finetype(finetype_dir.path(), "9.9.9", nominated_profile_json());
+
+    let out = run_arc_with_fake_finetype(&project, finetype_dir.path());
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("WARNING"),
+        "curating a nominated field without claiming a type must not warn: {stderr}"
+    );
+    let descriptor: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(project.join("datapackage.json")).unwrap()).unwrap();
+    let fields = descriptor["resources"][0]["schema"]["fields"]
+        .as_array()
+        .unwrap();
+    let id = fields.iter().find(|f| f["name"] == "id").unwrap();
+    assert_eq!(id["description"], "the row identifier");
+    // finetype's nominated bounds survive a curation that did not touch them.
+    assert_eq!(
+        id["constraints"],
+        serde_json::json!({"minLength": 4, "maxLength": 16})
+    );
 }
