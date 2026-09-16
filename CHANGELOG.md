@@ -49,6 +49,20 @@ Rationale for each change is recorded in the project's design notes and commit h
   alone bypasses that filter entirely. Both need the vocabulary table; neither is caught
   here.
 
+  **One hole is larger than those two and is named here rather than left to be found.**
+  The guard reads the sidecar's `fields` block, which is the block all four published
+  sidecars use. It does not see two other paths in the same file that write the same
+  field objects: a `resource` override carrying a `schema`, and a top-level `resources`
+  array. Either replaces finetype's field list wholesale, so either can carry
+  `x-finetype-nominated` through to the published descriptor. Measured against the real
+  `arc` binary: the mark in a `fields` block exits 2 and writes nothing, while the same
+  mark in a `resource.schema` override and in a top-level `resources` array each exit 0,
+  print no warning, and write a descriptor carrying it. A hand-written sidecar can
+  therefore still publish a forged nomination mark by moving it one block up. Closing
+  that means comparing the merged descriptor's nominated columns against finetype's own
+  output rather than against the post-merge state, which is a change to the merge's order
+  and not to this guard.
+
   No configuration changed and no manifest needs editing — a sidecar that curates
   `description`, `title`, `resource.path` or relational metadata behaves exactly as
   before.

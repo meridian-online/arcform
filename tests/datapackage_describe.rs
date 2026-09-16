@@ -512,10 +512,15 @@ fn expect_finetype_version_mismatch_refuses_end_to_end() {
 // ---------------------------------------------------------------------------
 // The sidecar cannot forge or contradict a finetype nomination.
 //
-// Nothing in arcform, open-analytics or finetype carries `x-finetype-nominated`
-// today, so none of these givens can be produced by a file that exists — every
+// No DATA file in any of the three repos carries `x-finetype-nominated` — the key
+// appears in this repo only in the guard, in these tests and in CHANGELOG.md — so
+// none of these givens can be produced by a descriptor or sidecar that exists. Every
 // test below writes the base descriptor it needs. A refusal that reddens a real
 // pipeline would be a bug in the guard, not a finding.
+//
+// These pin what the guard DECIDES. What it ASSEMBLES is pinned by unit tests beside
+// the operator, because `stderr.contains` is monotone and cannot see a message gaining
+// a line or changing a rendering.
 // ---------------------------------------------------------------------------
 
 #[test]
