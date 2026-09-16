@@ -1607,10 +1607,11 @@ fn require_exact_finetype_version(resolved: &str, expect: &str) -> Result<()> {
 /// Frictionless Data Package finetype computed from the built Parquet directly
 /// (including the resource `bytes` / `hash` / `format` / `mediatype`).
 ///
-/// `nominations`, when present, is appended as `--nominations <FILE>`, already
-/// resolved against the manifest directory by the caller: the child's working
-/// directory is not a contract, so a relative path here would name whatever file
-/// happens to sit beside wherever `finetype` was spawned.
+/// `nominations`, when present, is appended as `--nominations <FILE>`, resolved
+/// against the manifest directory by the caller exactly as `parquet` is, so the argv
+/// names one file on its own rather than one that depends on `run_process` also
+/// setting the child's working directory, and so an error finetype prints about the
+/// file names the path that was actually opened.
 fn finetype_datapackage(
     parquet: &Path,
     nominations: Option<&Path>,
@@ -4309,6 +4310,40 @@ mod tests {
         assert!(err.to_string().contains("older"));
     }
 
+    /// The nominations floor replaces the general one for a step that declares
+    /// `nominations:`, so it has to sit at or above it: below, a step with
+    /// nominations would admit a binary the general floor exists to refuse.
+    #[test]
+    fn the_nominations_floor_is_not_below_the_general_floor() {
+        assert!(
+            parse_finetype_version(MIN_FINETYPE_NOMINATIONS_VERSION).unwrap()
+                >= parse_finetype_version(MIN_FINETYPE_VERSION).unwrap()
+        );
+    }
+
+    #[test]
+    fn check_nominations_floor_at_exact_floor_passes() {
+        let got = parse_finetype_version(MIN_FINETYPE_NOMINATIONS_VERSION).unwrap();
+        check_nominations_floor(got, MIN_FINETYPE_NOMINATIONS_VERSION)
+            .expect("the release that carries `--nominations` must pass its own floor");
+    }
+
+    #[test]
+    fn check_nominations_floor_one_patch_below_is_refused_naming_both_versions() {
+        let (major, minor, patch) =
+            parse_finetype_version(MIN_FINETYPE_NOMINATIONS_VERSION).unwrap();
+        let below = (major, minor, patch - 1);
+        let msg = check_nominations_floor(below, MIN_FINETYPE_NOMINATIONS_VERSION)
+            .expect_err("one patch below the nominations release must be refused")
+            .to_string();
+        assert!(msg.contains(MIN_FINETYPE_NOMINATIONS_VERSION), "{msg}");
+        assert!(
+            msg.contains(&format!("{major}.{minor}.{}", patch - 1)),
+            "{msg}"
+        );
+        assert!(msg.contains("--nominations"), "{msg}");
+    }
+
     /// PURE, same rationale as `check_finetype_floor_at_exact_floor_passes` above:
     /// `resolve_finetype_version` is the exact parse-or-refuse step `require_finetype`
     /// runs on `finetype --version`'s stdout, extracted so the unparseable-output
@@ -5199,6 +5234,15 @@ mod tests {
             catalog().iter().any(|o| o.name() == "umap_project"),
             "umap_project must be in the catalog unconditionally"
         );
+    }
+
+    /// 1.1.0 added `nominations:`. `@1` must still resolve, which is what keeps the
+    /// four published Protocols and every manifest string in the tests loading.
+    #[test]
+    fn datapackage_describe_is_in_catalog_and_versioned() {
+        let op = resolve("datapackage_describe@1").expect("datapackage_describe@1 resolves");
+        assert_eq!(op.name(), "datapackage_describe");
+        assert_eq!(op.version(), semver::Version::new(1, 1, 0));
     }
 
     #[test]
