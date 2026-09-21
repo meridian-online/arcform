@@ -153,7 +153,7 @@ fn real_duckdb() -> PathBuf {
         )
 }
 
-// AC1: told, with no duckdb anywhere on the search path, the run completes and writes
+// Told, with no duckdb anywhere on the search path, the run completes and writes
 // its run record. The first run, without the variable, proves the search path really is
 // empty: it is the situation the variable exists for.
 #[test]
@@ -189,7 +189,7 @@ fn a_told_engine_runs_with_no_duckdb_on_the_search_path() {
     assert_eq!(fx.run_records(), vec![(1, "success".to_string())]);
 }
 
-// AC1 with a real DuckDB: the SQL step's table is in the database afterwards, so the told
+// Told a real DuckDB, with no duckdb on the search path: the SQL step's table is in the database afterwards, so the told
 // binary did the work, and the run record says the run succeeded.
 #[test]
 fn a_told_real_duckdb_writes_the_table_with_no_duckdb_on_the_search_path() {
@@ -215,7 +215,7 @@ fn a_told_real_duckdb_writes_the_table_with_no_duckdb_on_the_search_path() {
     assert_eq!(answer, 42);
 }
 
-// AC2: unset, arc finds `duckdb` on the search path, as a command-line user expects.
+// Unset, arc finds `duckdb` on the search path, as a command-line user expects.
 #[test]
 fn unset_arc_runs_the_duckdb_on_the_search_path() {
     let fx = Fixture::new(None, "SELECT 42;");
@@ -235,7 +235,7 @@ fn unset_arc_runs_the_duckdb_on_the_search_path() {
     assert_eq!(duckdb.sql_calls(), 1, "calls: {:?}", duckdb.calls());
 }
 
-// AC3: a told path that is not an executable file refuses the run, naming the variable
+// A told path that is not an executable file refuses the run, naming the variable
 // and the path, and the working `duckdb` on the search path is never started.
 #[test]
 fn a_told_path_that_is_not_an_executable_file_is_refused_and_path_is_not_tried() {
@@ -280,7 +280,7 @@ fn a_told_path_that_is_not_an_executable_file_is_refused_and_path_is_not_tried()
     }
 }
 
-// AC4: the version preflight and the SQL step both reach the told engine, and neither
+// The version preflight and the SQL step both reach the told engine, and neither
 // reaches the `duckdb` on the search path.
 #[test]
 fn preflight_and_sql_both_reach_the_told_engine() {
@@ -347,7 +347,7 @@ fn run_on_version(
     (code, stderr, told.sql_calls())
 }
 
-// AC5: with no `engine_version:`, an engine outside the tested range is refused before a
+// With no `engine_version:`, an engine outside the tested range is refused before a
 // step runs, and the message names the version, the range and the override.
 #[test]
 fn an_engine_outside_the_range_is_refused_before_a_step_runs() {
@@ -363,8 +363,8 @@ fn an_engine_outside_the_range_is_refused_before_a_step_runs() {
     assert_eq!(sql, 1);
 }
 
-// AC6: a manifest's constraint narrows the range and does not replace it. `>=1.2`, what
-// every manifest that states one says, does not switch the ceiling off.
+// A manifest's constraint narrows the range and does not replace it. `>=1.2`, the
+// constraint the Protocols in this repository state, does not switch the ceiling off.
 #[test]
 fn a_manifest_constraint_narrows_the_range_and_does_not_replace_it() {
     let (code, stderr, sql) = run_on_version(Some(">=1.2"), "2.0.0", false);
@@ -381,7 +381,7 @@ fn a_manifest_constraint_narrows_the_range_and_does_not_replace_it() {
     );
 }
 
-// AC7: the override runs an untested engine with a warning naming the version and the
+// The override runs an untested engine with a warning naming the version and the
 // range, and lifts only arc's range: a manifest's own constraint still refuses.
 #[test]
 fn the_override_runs_an_untested_engine_with_a_warning_and_keeps_the_manifest_constraint() {

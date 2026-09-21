@@ -127,7 +127,7 @@ pub fn run(dir: &Path, engine: &dyn Engine, state: &dyn StateBackend, force: boo
 /// existed: unreadable `--version` output is evidence about arc's parser, not that the
 /// engine is a new major. A pre-release build such as `1.6.0-dev` does not meet the range,
 /// because semver matches a pre-release only against a comparator on the same
-/// major.minor.patch; it is untested, as every manifest stating `>=1.2` already treated it.
+/// major.minor.patch; it is untested, as a manifest stating `>=1.2` already treated it.
 pub(crate) fn check_engine_version(
     found: Option<&semver::Version>,
     manifest_constraint: Option<&str>,
