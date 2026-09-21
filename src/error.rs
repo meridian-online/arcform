@@ -72,6 +72,30 @@ pub enum Error {
     #[error("engine version mismatch: requires {required}, found {found}")]
     VersionMismatch { required: String, found: String },
 
+    // The engine arc was told to run is unusable. The search path is deliberately not
+    // tried instead: a told engine that silently becomes whichever `duckdb` sorts first
+    // on PATH is two installs deciding which one writes your data.
+    #[error(
+        "{var} names '{}', which is not a usable DuckDB executable ({reason}); \
+         point it at one, or unset it to use the `duckdb` on PATH",
+        path.display()
+    )]
+    EngineBinInvalid {
+        var: &'static str,
+        path: PathBuf,
+        reason: String,
+    },
+
+    #[error(
+        "engine DuckDB {found} is outside the versions arc is tested on ({range}); \
+         use a DuckDB in that range, or set {override_var}=1 to run on {found} at your own risk"
+    )]
+    UntestedEngine {
+        found: String,
+        range: &'static str,
+        override_var: &'static str,
+    },
+
     #[error("step '{step}' failed (exit code {code}):\n{stderr}")]
     StepFailed {
         step: String,
@@ -337,6 +361,16 @@ mod exit_code_tests {
             Error::MissingParam { name: "p".into() },
             Error::EngineNotFound {
                 engine: "duckdb".into(),
+            },
+            Error::EngineBinInvalid {
+                var: "ARC_DUCKDB_BIN",
+                path: PathBuf::from("/nope/duckdb"),
+                reason: "no such file".into(),
+            },
+            Error::UntestedEngine {
+                found: "2.0.0".into(),
+                range: ">=1.2, <2",
+                override_var: "ARC_ALLOW_UNTESTED_ENGINE",
             },
             Error::StateBackend("locked".into()),
         ] {

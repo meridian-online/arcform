@@ -8,7 +8,7 @@ use owo_colors::OwoColorize;
 use crate::asset::{AssetGraph, StepAssets};
 use crate::asset_kind::AssetKind;
 use crate::contract;
-use crate::engine::Engine;
+use crate::engine::{ALLOW_UNTESTED_ENGINE_ENV, Engine, SUPPORTED_ENGINE_RANGE};
 use crate::error::{Error, Result};
 use crate::manifest::{Manifest, Param, RetryPolicy};
 use crate::operator;
@@ -114,6 +114,65 @@ pub fn run(dir: &Path, engine: &dyn Engine, state: &dyn StateBackend, force: boo
     run_with_params(dir, engine, state, force, &[])
 }
 
+/// Decide whether a run may proceed on the engine version preflight found, returning the
+/// warnings to print when it may.
+///
+/// Two constraints apply and they are not the same kind. The manifest's `engine_version:`
+/// is its author's, and nothing here lifts it. [`SUPPORTED_ENGINE_RANGE`] is arc's own, the
+/// versions it is tested on, and applies whether or not the manifest states a constraint,
+/// so a manifest narrows it and cannot widen it. `allow_untested` lifts arc's range, with
+/// a warning, and only arc's.
+///
+/// A version arc cannot read warns and proceeds, as it did before the default range
+/// existed: unreadable `--version` output is evidence about arc's parser, not that the
+/// engine is a new major. A pre-release build such as `1.6.0-dev` does not meet the range,
+/// because semver matches a pre-release only against a comparator on the same
+/// major.minor.patch; it is untested, as every manifest stating `>=1.2` already treated it.
+pub(crate) fn check_engine_version(
+    found: Option<&semver::Version>,
+    manifest_constraint: Option<&str>,
+    allow_untested: bool,
+) -> Result<Vec<String>> {
+    let supported = semver::VersionReq::parse(SUPPORTED_ENGINE_RANGE)
+        .expect("SUPPORTED_ENGINE_RANGE is a valid semver requirement");
+    // An invalid constraint cannot reach here: manifest validation refuses it at load.
+    let manifest_req =
+        manifest_constraint.and_then(|s| semver::VersionReq::parse(s).ok().map(|r| (s, r)));
+
+    let Some(ver) = found else {
+        let required = match &manifest_req {
+            Some((s, _)) => format!("{s} and {SUPPORTED_ENGINE_RANGE}"),
+            None => SUPPORTED_ENGINE_RANGE.to_string(),
+        };
+        return Ok(vec![format!(
+            "could not detect engine version — skipping version check (requires {required})"
+        )]);
+    };
+
+    if let Some((s, req)) = &manifest_req
+        && !req.matches(ver)
+    {
+        return Err(Error::VersionMismatch {
+            required: s.to_string(),
+            found: ver.to_string(),
+        });
+    }
+    if supported.matches(ver) {
+        return Ok(Vec::new());
+    }
+    if allow_untested {
+        return Ok(vec![format!(
+            "engine DuckDB {ver} is outside the versions arc is tested on \
+             ({SUPPORTED_ENGINE_RANGE}); running anyway because {ALLOW_UNTESTED_ENGINE_ENV} is set"
+        )]);
+    }
+    Err(Error::UntestedEngine {
+        found: ver.to_string(),
+        range: SUPPORTED_ENGINE_RANGE,
+        override_var: ALLOW_UNTESTED_ENGINE_ENV,
+    })
+}
+
 /// Run a pipeline with CLI parameter overrides.
 pub fn run_with_params(
     dir: &Path,
@@ -124,34 +183,18 @@ pub fn run_with_params(
 ) -> Result<()> {
     let manifest = Manifest::load(dir)?;
 
-    // If there are SQL steps, verify the engine is available and check version.
+    // If there are SQL steps, verify the engine is available and check its version.
     if manifest.has_sql_steps() {
         let info = engine.preflight()?;
-
-        // Check engine version constraint if specified.
-        if let Some(ref constraint_str) = manifest.engine_version
-            && let Ok(req) = semver::VersionReq::parse(constraint_str)
-        {
-            match &info.version {
-                Some(ver) => {
-                    if !req.matches(ver) {
-                        return Err(Error::VersionMismatch {
-                            required: constraint_str.clone(),
-                            found: ver.to_string(),
-                        });
-                    }
-                }
-                None => {
-                    // Version unparseable — warn but don't block.
-                    eprintln!(
-                        "{} could not detect engine version — skipping version check (requires {})",
-                        "warning:".yellow(),
-                        constraint_str,
-                    );
-                }
-            }
+        let allow_untested =
+            std::env::var_os(ALLOW_UNTESTED_ENGINE_ENV).is_some_and(|v| !v.is_empty());
+        for warning in check_engine_version(
+            info.version.as_ref(),
+            manifest.engine_version.as_deref(),
+            allow_untested,
+        )? {
+            eprintln!("{} {}", "warning:".yellow(), warning);
         }
-        // If constraint_str is invalid, manifest validation already caught it.
     }
 
     if manifest.steps.is_empty() {
