@@ -11,6 +11,8 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Changed
 
+- **`arc run` can be told which DuckDB to run, and refuses a DuckDB outside `>=1.2, <2` by default.** `ARC_DUCKDB_BIN` names the executable the version preflight and the SQL steps run; unset, arc runs the `duckdb` on `PATH` as before. A set value that is missing, empty, a directory or not executable refuses the run with the variable and the path named, and `PATH` is not tried instead, so a told engine never silently becomes another install. A relative value resolves against the working directory. The version guard used to enforce only a manifest's `engine_version:`, and a manifest stating `">=1.2"` ran on any 2.x; arc now enforces its own tested range on every run with a SQL step, a manifest's constraint narrows it without replacing it, and `ARC_ALLOW_UNTESTED_ENGINE=1` lifts arc's range with a warning while leaving the manifest's constraint in force. A pre-release build is outside the range; an unreadable version still warns and runs.
+
 - **`datapackage_describe` refuses a curated sidecar that forges or contradicts a
   finetype nomination, and warns on one that pre-empts it.** The per-field overlay in
   `descriptor.overrides.json` was a blind key-by-key insert: whatever a field block
