@@ -2778,7 +2778,7 @@ mod tests {
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
 
         let engine = MockEngine::new();
-        // MockEngine defaults to v2.0.0, set it to 1.3.0 to trigger mismatch.
+        // 1.3.0 is inside arc's range, so only the manifest's >=2.0 can refuse it.
         engine.set_version(Some(semver::Version::new(1, 3, 0)));
         let state = MockStateBackend::new();
 
@@ -2815,21 +2815,110 @@ mod tests {
         );
     }
 
-    // No engine_version skips the version check.
+    // No engine_version still meets arc's own range: an engine outside it is refused
+    // before any step runs, on either side of the range.
     #[test]
-    fn test_lrp_no_version_constraint_skips_check() {
+    fn test_lrp_no_version_constraint_still_meets_the_supported_range() {
+        for (major, minor, patch) in [(2, 0, 0), (1, 1, 9)] {
+            let dir = tempfile::tempdir().unwrap();
+            let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+            setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+
+            let engine = MockEngine::new();
+            engine.set_version(Some(semver::Version::new(major, minor, patch)));
+            let state = MockStateBackend::new();
+
+            let err = run(dir.path(), &engine, &state, false).unwrap_err();
+            assert!(
+                matches!(err, Error::UntestedEngine { .. }),
+                "{major}.{minor}.{patch}: expected UntestedEngine, got {err:?}"
+            );
+            let calls = engine.calls.borrow();
+            assert_eq!(calls.len(), 1, "only preflight should be called");
+            assert!(matches!(calls[0], MockCall::Preflight));
+        }
+    }
+
+    // In range with no constraint runs the step.
+    #[test]
+    fn test_lrp_no_version_constraint_in_range_runs() {
         let dir = tempfile::tempdir().unwrap();
-        // No engine_version in YAML — should skip version check.
         let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
 
         let engine = MockEngine::new();
-        // Even with a very old version, no constraint means no check.
-        engine.set_version(Some(semver::Version::new(0, 1, 0)));
+        engine.set_version(Some(semver::Version::new(1, 2, 0)));
         let state = MockStateBackend::new();
 
-        // Should succeed — no version comparison.
         run(dir.path(), &engine, &state, false).unwrap();
+        let calls = engine.calls.borrow();
+        assert!(calls.iter().any(|c| matches!(c, MockCall::Sql { .. })));
+    }
+
+    fn v(s: &str) -> semver::Version {
+        semver::Version::parse(s).unwrap()
+    }
+
+    // The range's two ends, with no manifest constraint and no override.
+    #[test]
+    fn test_check_engine_version_range_bounds() {
+        for ok in ["1.2.0", "1.5.4", "1.99.99"] {
+            assert!(
+                check_engine_version(Some(&v(ok)), None, false)
+                    .unwrap()
+                    .is_empty(),
+                "{ok} is in range and must pass without a warning"
+            );
+        }
+        for refused in ["1.1.9", "2.0.0", "3.1.0"] {
+            let err = check_engine_version(Some(&v(refused)), None, false).unwrap_err();
+            assert!(
+                matches!(err, Error::UntestedEngine { .. }),
+                "{refused}: expected UntestedEngine, got {err:?}"
+            );
+        }
+    }
+
+    // A development build is untested: semver matches a pre-release only against a
+    // comparator on the same major.minor.patch. The override runs it, with a warning.
+    #[test]
+    fn test_check_engine_version_pre_release_is_untested() {
+        let dev = v("1.6.0-dev123");
+        let err = check_engine_version(Some(&dev), None, false).unwrap_err();
+        assert!(matches!(err, Error::UntestedEngine { .. }), "got {err:?}");
+        let warnings = check_engine_version(Some(&dev), None, true).unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("1.6.0-dev123"), "{warnings:?}");
+    }
+
+    // The manifest's constraint is checked before arc's range and the override never
+    // lifts it: the error is the author's, not the one the override would clear.
+    #[test]
+    fn test_check_engine_version_manifest_constraint_survives_the_override() {
+        for allow in [false, true] {
+            let err = check_engine_version(Some(&v("1.5.4")), Some(">=1.6"), allow).unwrap_err();
+            assert!(
+                matches!(&err, Error::VersionMismatch { required, found }
+                    if required == ">=1.6" && found == "1.5.4"),
+                "allow={allow}: got {err:?}"
+            );
+        }
+        let err = check_engine_version(Some(&v("2.0.0")), Some("<2"), true).unwrap_err();
+        assert!(matches!(err, Error::VersionMismatch { .. }), "got {err:?}");
+    }
+
+    // An unreadable version proceeds with a warning that names arc's range as well as
+    // the manifest's constraint, since both went unchecked.
+    #[test]
+    fn test_check_engine_version_unparseable_warns_naming_both_constraints() {
+        let warnings = check_engine_version(None, Some(">=1.5"), false).unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains(">=1.5"), "{warnings:?}");
+        assert!(warnings[0].contains(SUPPORTED_ENGINE_RANGE), "{warnings:?}");
+
+        let warnings = check_engine_version(None, None, false).unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains(SUPPORTED_ENGINE_RANGE), "{warnings:?}");
     }
 
     // Version that satisfies constraint passes.
