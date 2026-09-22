@@ -8,7 +8,7 @@ Arcform is a Rust-based workflow engine built for data analysts who want the pow
 
 ## Design Principles
 
-**Local-first.** Arcform runs on your machine: no managed services, no cloud accounts, no ops overhead. What it does need is the `duckdb` CLI on `PATH`, and whatever binaries your steps invoke.
+**Local-first.** Arcform runs on your machine: no managed services, no cloud accounts, no ops overhead. What it does need is a DuckDB CLI, the one `ARC_DUCKDB_BIN` names or else `duckdb` on `PATH` (see [Engine](#engine)), and whatever binaries your steps invoke.
 
 **Asset-aware.** Inspired by Dagster's software-defined asset model, Arcform treats data outputs — not tasks — as the primary unit of work. The pipeline graph reflects data dependencies, not just execution order.
 
@@ -27,10 +27,21 @@ Arcform runs your steps on your machine, as you. There is no sandbox, no contain
 | `command:` on a step | `sh -c <command>` |
 | `command:` on a precondition | `sh -c <command>`, evaluated while Arcform works out what is stale — so it runs even when the step it guards is then skipped |
 | `command:` on a hook (`on_init`, `on_success`, `on_failure`, `on_exit`) | `sh -c <command>`, the same path as a step |
-| `sql:` on a step or hook | passed to the `duckdb` CLI, which reads and writes whatever the SQL directs |
+| `sql:` on a step or hook | passed to the DuckDB CLI arc was told to run or found on `PATH` (see [Engine](#engine)), which reads and writes whatever the SQL directs |
 | `op:` on a step | a catalog operator: in this process — which may itself spawn a tool (`datapackage_describe` runs `finetype`) — or `uv run --script` on a script embedded in the `arc` binary, which may spawn tools of its own too. No shell, and no confinement either |
 
 Each of those inherits the environment Arcform assembled, including the `ARC_PARAM_*` values from `params:`, your dotenv files and `--param` — and the stdout of any earlier step that declared `output:`, which is captured into `ARC_PARAM_<OUTPUT>` for everything that runs after it. `arc registry run` fetches a Protocol and runs it through the same path, so read one before you run it.
+
+### Engine
+
+Arcform runs SQL through the DuckDB CLI, and finds it in this order:
+
+1. `ARC_DUCKDB_BIN`, when set, names the executable. A program that ships Arcform sets it, because an app started from the desktop does not see the `PATH` a terminal does. A set value is final: if it names something that is not an executable file, the run is refused with the variable and the path in the message, and `PATH` is not tried instead.
+2. Otherwise, `duckdb` on `PATH`.
+
+The version preflight and the SQL steps run the same executable. A `command:` step that calls `duckdb` by name still gets the one on `PATH`; Arcform does not rewrite commands.
+
+Arcform is tested on DuckDB `>=1.2, <2`, and a run with a SQL step on any other version is refused before a step runs. A Protocol's `engine_version:` narrows that range and cannot widen it: `">=1.6"` refuses 1.5 as well, and `">=1.2"` still refuses 2.0. Set `ARC_ALLOW_UNTESTED_ENGINE=1` to run on an engine outside Arcform's range at your own risk; the run prints a warning naming the version and the range, and a Protocol's own `engine_version:` still applies. A development build such as `1.6.0-dev` is outside the range. When Arcform cannot read the engine's version it warns and runs.
 
 ---
 

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -123,7 +123,77 @@ pub(crate) fn wait_with_timeout(
     }
 }
 
-/// DuckDB CLI engine implementation.
+/// Names the DuckDB executable arc runs. A program that ships arc sets it, because an
+/// app started outside a login shell does not see the PATH a terminal user has.
+pub const DUCKDB_BIN_ENV: &str = "ARC_DUCKDB_BIN";
+
+/// The DuckDB versions arc is tested on. Enforced on every run with a SQL step, whether or
+/// not the manifest states an `engine_version:`; a manifest's constraint narrows this and
+/// never widens it.
+pub const SUPPORTED_ENGINE_RANGE: &str = ">=1.2, <2";
+
+/// Set to any non-empty value, lifts [`SUPPORTED_ENGINE_RANGE`] for a person who accepts
+/// an engine arc was not tested on. The run warns, and a manifest's own `engine_version:`
+/// still refuses what it refused before.
+pub const ALLOW_UNTESTED_ENGINE_ENV: &str = "ARC_ALLOW_UNTESTED_ENGINE";
+
+/// The DuckDB executable arc runs: the one `ARC_DUCKDB_BIN` names when it is set, else
+/// `duckdb` found on the search path.
+///
+/// A set variable is final. When it names something that is not an executable file the
+/// run is refused and PATH is not consulted, so a told engine can never silently become
+/// a different install. A relative value is made absolute against the working directory,
+/// because a bare file name handed to `Command::new` is itself a PATH lookup.
+pub(crate) fn duckdb_program() -> Result<DuckDbProgram> {
+    match std::env::var_os(DUCKDB_BIN_ENV) {
+        None => Ok(DuckDbProgram::SearchPath),
+        Some(raw) => {
+            let path = PathBuf::from(raw);
+            let invalid = |reason: String| Error::EngineBinInvalid {
+                var: DUCKDB_BIN_ENV,
+                path: path.clone(),
+                reason,
+            };
+            if path.as_os_str().is_empty() {
+                return Err(invalid("it is empty".to_string()));
+            }
+            let path_abs = std::path::absolute(&path).map_err(|e| invalid(e.to_string()))?;
+            let meta = std::fs::metadata(&path_abs).map_err(|e| invalid(e.to_string()))?;
+            if !meta.is_file() {
+                return Err(invalid("not a file".to_string()));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if meta.permissions().mode() & 0o111 == 0 {
+                    return Err(invalid("not executable".to_string()));
+                }
+            }
+            Ok(DuckDbProgram::Told(path_abs))
+        }
+    }
+}
+
+/// Where the DuckDB executable came from, so a failure can name the route that failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DuckDbProgram {
+    /// `ARC_DUCKDB_BIN`, made absolute.
+    Told(PathBuf),
+    /// `duckdb`, resolved on PATH by the operating system.
+    SearchPath,
+}
+
+impl DuckDbProgram {
+    fn command(&self) -> Command {
+        match self {
+            DuckDbProgram::Told(path) => Command::new(path),
+            DuckDbProgram::SearchPath => Command::new("duckdb"),
+        }
+    }
+}
+
+/// DuckDB CLI engine implementation. It resolves its executable on every call through
+/// [`duckdb_program`], so the version preflight and the SQL steps reach the same one.
 pub struct DuckDbEngine;
 
 impl Engine for DuckDbEngine {
@@ -135,7 +205,8 @@ impl Engine for DuckDbEngine {
         timeout: Option<Duration>,
     ) -> Result<StepOutput> {
         let step_name = sql_path.display().to_string();
-        let mut child = Command::new("duckdb")
+        let mut child = duckdb_program()?
+            .command()
             .arg(db_path)
             .arg("-f")
             .arg(sql_path)
@@ -225,15 +296,24 @@ impl Engine for DuckDbEngine {
     }
 
     fn preflight(&self) -> Result<EngineInfo> {
-        let output = Command::new("duckdb").arg("--version").output();
+        let program = duckdb_program()?;
+        let output = program.command().arg("--version").output();
 
-        match output {
-            Ok(o) if o.status.success() => {
+        match (output, program) {
+            (Ok(o), _) if o.status.success() => {
                 let stdout = String::from_utf8_lossy(&o.stdout);
                 let version = parse_version_output(&stdout);
                 Ok(EngineInfo { version })
             }
-            _ => Err(Error::EngineNotFound {
+            (output, DuckDbProgram::Told(path)) => Err(Error::EngineBinInvalid {
+                var: DUCKDB_BIN_ENV,
+                path,
+                reason: match output {
+                    Ok(o) => format!("`--version` exited with {}", o.status),
+                    Err(e) => format!("`--version` could not start: {e}"),
+                },
+            }),
+            (_, DuckDbProgram::SearchPath) => Err(Error::EngineNotFound {
                 engine: "duckdb".to_string(),
             }),
         }
@@ -277,7 +357,8 @@ pub mod mock {
         exec_count: RefCell<usize>,
         /// If true, preflight returns EngineNotFound.
         pub preflight_should_fail: RefCell<bool>,
-        /// Version to report from preflight. Defaults to 2.0.0.
+        /// Version to report from preflight. Defaults to 1.5.4, inside the range arc is
+        /// tested on, so a test that does not care about the version is not refused by it.
         pub version: RefCell<Option<semver::Version>>,
         /// Simulated stdout for command steps with capture_stdout=true.
         pub simulated_stdout: RefCell<Option<String>>,
@@ -308,7 +389,7 @@ pub mod mock {
                 fail_on_call: RefCell::new(None),
                 exec_count: RefCell::new(0),
                 preflight_should_fail: RefCell::new(false),
-                version: RefCell::new(Some(semver::Version::new(2, 0, 0))),
+                version: RefCell::new(Some(semver::Version::new(1, 5, 4))),
                 simulated_stdout: RefCell::new(None),
                 timeout_should_fire: RefCell::new(false),
             }
@@ -494,9 +575,9 @@ mod tests {
     fn test_lrp_mock_engine_configurable_version() {
         let engine = mock::MockEngine::new();
 
-        // Default is 2.0.0.
+        // Default is 1.5.4, inside the supported range.
         let info = engine.preflight().unwrap();
-        assert_eq!(info.version.unwrap(), semver::Version::new(2, 0, 0));
+        assert_eq!(info.version.unwrap(), semver::Version::new(1, 5, 4));
 
         // Set custom version.
         engine.set_version(Some(semver::Version::new(1, 3, 0)));
