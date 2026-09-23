@@ -27,6 +27,8 @@ use serde_yaml::Value;
 use crate::engine::StepOutput;
 use crate::error::{Error, Result};
 
+mod ducklake_publish;
+
 /// Assets an operator step reads and produces — merged into the [`crate::asset::AssetGraph`]
 /// exactly as SQL introspection and command `produces`/`depends_on` are.
 ///
@@ -116,6 +118,7 @@ static GLEIF_RA_FETCH: GleifRaFetch = GleifRaFetch;
 static UMAP_PROJECT: UmapProject = UmapProject;
 static TEXT_EMBED: TextEmbed = TextEmbed;
 static UV: Uv = Uv;
+static DUCKLAKE_PUBLISH: ducklake_publish::DucklakePublish = ducklake_publish::DucklakePublish;
 #[cfg(feature = "opendal")]
 static OPENDAL_FETCH: OpendalFetch = OpendalFetch;
 
@@ -136,6 +139,7 @@ fn catalog() -> Vec<&'static dyn Operator> {
         &UMAP_PROJECT,
         &TEXT_EMBED,
         &UV,
+        &DUCKLAKE_PUBLISH,
     ];
     #[cfg(feature = "http-fetch")]
     ops.extend([
@@ -356,6 +360,25 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
             }),
             &["script", "sha256", "reads", "produces"],
         ),
+        "ducklake_publish" => object(
+            json!({
+                "file": { "type": "string", "description": "The built Parquet to publish, relative to the protocol directory. Declared as a read, so the step runs after whatever produces it and re-runs only when it was rebuilt. A byte-for-byte copy is registered, never the file itself: a build rewrites its output in place, and a registered file must never change." },
+                "catalog": { "type": "string", "description": "The DuckLake catalog: a local catalog file, relative to the protocol directory, or a DuckLake connection string such as `postgres:dbname=lake`. A leading `ducklake:` is accepted." },
+                "data_path": { "type": "string", "description": "Optional DATA_PATH for the attach. Omitted, DuckLake uses the path the catalog records, or `<catalog>.files/` for a new file catalog. Must be local in this version." },
+                "table": { "type": "string", "description": "`table` (schema main) or `schema.table`. Created from the file's schema if it does not exist. Each publish replaces the table's rows with the file's, as one snapshot; an unchanged file is a no-op that reports the snapshot already holding it." },
+                "credential": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "description": "Optional. A DuckDB secret whose values come from the environment; the step refuses, naming the variables, when any is unset.",
+                    "properties": {
+                        "type": { "type": "string", "description": "The DuckDB secret TYPE: s3, r2, gcs, postgres, …" },
+                        "env": { "type": "object", "minProperties": 1, "additionalProperties": { "type": "string" }, "description": "Secret parameter → the environment variable holding its value, e.g. `key_id: R2_ACCESS_KEY_ID`." }
+                    },
+                    "required": ["type", "env"]
+                }
+            }),
+            &["file", "catalog", "table"],
+        ),
         _ => return None,
     };
     // Name the schema after the operator so an authoring form can title it.
@@ -478,6 +501,7 @@ fn run_process(
             Ok(StepOutput {
                 stderr: String::new(),
                 stdout: None,
+                report: None,
             })
         }
         OutputMode::Capture => {
@@ -496,6 +520,7 @@ fn run_process(
             Ok(StepOutput {
                 stderr,
                 stdout: Some(String::from_utf8_lossy(&out.stdout).to_string()),
+                report: None,
             })
         }
     }
@@ -682,6 +707,7 @@ impl Operator for ParquetExport {
         Ok(StepOutput {
             stderr: String::new(),
             stdout: None,
+            report: None,
         })
     }
 }
@@ -843,6 +869,7 @@ fn unchanged() -> StepOutput {
     StepOutput {
         stderr: String::new(),
         stdout: None,
+        report: None,
     }
 }
 
@@ -1250,6 +1277,7 @@ impl Operator for HttpFetch {
         Ok(StepOutput {
             stderr: String::new(),
             stdout: None,
+            report: None,
         })
     }
 }
@@ -1415,6 +1443,7 @@ impl Operator for OpendalFetch {
         Ok(StepOutput {
             stderr: String::new(),
             stdout: None,
+            report: None,
         })
     }
 }
@@ -2102,6 +2131,7 @@ impl Operator for DatapackageDescribe {
         Ok(StepOutput {
             stderr: String::new(),
             stdout: None,
+            report: None,
         })
     }
 }
@@ -2288,6 +2318,7 @@ impl Operator for FinetypeValidate {
         Ok(StepOutput {
             stderr: String::new(),
             stdout: None,
+            report: None,
         })
     }
 }
@@ -2706,6 +2737,7 @@ impl Operator for HtmlLinkDiscover {
         Ok(StepOutput {
             stderr: String::new(),
             stdout: None,
+            report: None,
         })
     }
 }
@@ -2928,6 +2960,7 @@ impl Operator for ArchiveExtract {
         Ok(StepOutput {
             stderr: String::new(),
             stdout: None,
+            report: None,
         })
     }
 }

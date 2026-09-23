@@ -24,6 +24,11 @@ pub struct StepOutput {
     /// Captured stdout from a command step when output capture is active.
     /// None for SQL steps and command steps without output capture.
     pub stdout: Option<String>,
+    /// What an `op:` step reports about its own execution — `ducklake_publish`'s
+    /// snapshot id, for one. The runner copies it into the run contract's step entry
+    /// verbatim, so the record of a Run carries what the step did and not only that it
+    /// succeeded. `None` for SQL and command steps and for operators that report nothing.
+    pub report: Option<serde_json::Value>,
 }
 
 /// Read stderr from a child process, streaming it to the terminal in real-time
@@ -234,6 +239,7 @@ impl Engine for DuckDbEngine {
         Ok(StepOutput {
             stderr,
             stdout: None,
+            report: None,
         })
     }
 
@@ -292,6 +298,7 @@ impl Engine for DuckDbEngine {
         Ok(StepOutput {
             stderr: String::new(),
             stdout: captured_stdout,
+            report: None,
         })
     }
 
@@ -480,6 +487,7 @@ pub mod mock {
             Ok(StepOutput {
                 stderr: String::new(),
                 stdout: None,
+                report: None,
             })
         }
 
@@ -520,6 +528,7 @@ pub mod mock {
             Ok(StepOutput {
                 stderr: String::new(),
                 stdout,
+                report: None,
             })
         }
 

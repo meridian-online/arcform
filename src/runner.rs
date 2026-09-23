@@ -343,6 +343,7 @@ pub fn run_with_params(
                         attempts: 0,
                         skip_reason,
                         duration_sec: None,
+                        report: None,
                     },
                 );
                 continue;
@@ -548,6 +549,7 @@ pub fn run_with_params(
                                 attempts: attempt,
                                 skip_reason: None,
                                 duration_sec: Some(step_start.elapsed().as_secs_f64()),
+                                report: output.report,
                             },
                         );
                         break;
@@ -581,6 +583,7 @@ pub fn run_with_params(
                                 attempts: attempt,
                                 skip_reason: None,
                                 duration_sec: Some(step_start.elapsed().as_secs_f64()),
+                                report: None,
                             },
                         );
                         return Err(e);
@@ -601,6 +604,7 @@ pub fn run_with_params(
                         attempts: max_attempts,
                         skip_reason: None,
                         duration_sec: Some(step_start.elapsed().as_secs_f64()),
+                        report: None,
                     },
                 );
                 return Err(err);
