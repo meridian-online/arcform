@@ -290,10 +290,9 @@ struct Hashing<W> {
 
 impl<W: Write> Write for Hashing<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.inner.write(buf).map(|n| {
-            self.hasher.update(&buf[..n]);
-            n
-        })
+        self.inner
+            .write(buf)
+            .inspect(|&n| self.hasher.update(&buf[..n]))
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
