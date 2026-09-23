@@ -154,6 +154,13 @@ pub struct StepEntry {
     pub io: IoInfo,
     /// Ingress freshness sidecar (`.arcmeta`) for a fetched artifact, if present.
     pub ingress_meta: Option<FetchMeta>,
+    /// What an `op:` step reported about THIS run's execution of it — for
+    /// `ducklake_publish`, the snapshot it created or found already holding the bytes.
+    /// `null` for a step that was skipped, failed or never reached, and for every step
+    /// kind that reports nothing, so a value here is always this run's own account.
+    /// Added under `b4/1` rather than a new tag: it is one nullable field, and every
+    /// reader of the contract ignores fields it does not know.
+    pub report: Option<serde_json::Value>,
     pub narrative: Narrative,
 }
 
@@ -288,6 +295,9 @@ pub struct StepOutcome {
     pub skip_reason: Option<crate::state::SkipReason>,
     /// Wall-clock duration of the step; `None` when skipped or never reached.
     pub duration_sec: Option<f64>,
+    /// The operator's own report of a successful execution (see
+    /// [`crate::engine::StepOutput::report`]); `None` otherwise.
+    pub report: Option<serde_json::Value>,
 }
 
 /// Inputs to [`build_contract`] — grouped to keep the call site readable.
@@ -644,6 +654,7 @@ fn build_step(
         attempts: 0,
         skip_reason: None,
         duration_sec: None,
+        report: None,
     });
 
     // Effective retry policy: a step override wins, else the manifest default.
@@ -679,6 +690,7 @@ fn build_step(
         timeout_sec: step.timeout_sec,
         io: IoInfo::default(),
         ingress_meta,
+        report: outcome.report,
         narrative: Narrative::default(),
     }
 }
