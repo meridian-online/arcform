@@ -139,7 +139,7 @@ fn sha256(path: &Path) -> String {
     format!("{:x}", Sha256::digest(std::fs::read(path).unwrap()))
 }
 
-/// AC2 and AC4: the publish runs after the build, is skipped with it, runs again when
+/// The publish runs after the build, is skipped with it, runs again when
 /// it rebuilds, and the run contract names the snapshot it committed.
 #[test]
 fn a_run_publishes_its_build_once_and_again_only_when_it_rebuilds() {
@@ -189,7 +189,7 @@ fn a_run_publishes_its_build_once_and_again_only_when_it_rebuilds() {
     assert_eq!(row_count(p), 7);
 }
 
-/// AC3: a Run whose build fails never reaches the publish, and the catalog gains no
+/// A Run whose build fails never reaches the publish, and the catalog gains no
 /// snapshot. Starts from a Run that did publish, then breaks the build.
 #[test]
 fn a_failed_build_never_reaches_the_publish() {
@@ -213,7 +213,7 @@ fn a_failed_build_never_reaches_the_publish() {
     assert_eq!(row_count(p), 5);
 }
 
-/// AC5: a declared credential that is not in the environment refuses the publish,
+/// A declared credential that is not in the environment refuses the publish,
 /// naming the step and the variable, and nothing is published. The same Run with the
 /// variables set publishes.
 #[test]
@@ -245,7 +245,7 @@ fn a_publish_without_its_credential_refuses_naming_the_step_and_the_variable() {
     assert_eq!(row_count(p), 5);
 }
 
-/// AC6: forcing a Run over an unchanged build re-executes the publish, and the publish
+/// Forcing a Run over an unchanged build re-executes the publish, and the publish
 /// is a no-op that reports the snapshot already holding the bytes.
 #[test]
 fn a_forced_run_over_an_unchanged_build_publishes_nothing_new() {

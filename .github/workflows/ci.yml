@@ -136,6 +136,19 @@ jobs:
             echo "ARCFORM_REQUIRE_FINETYPE_EXT=1"
           } >> "$GITHUB_ENV"
 
+      # `ducklake_publish` runs `INSTALL ducklake` itself, and its credential tests
+      # create an `s3` secret, which autoloads `httpfs`. Staging both here is not what
+      # makes those tests pass: it turns a registry that serves nothing into a red step
+      # rather than a failure inside the suite, and it keeps the suite's concurrent
+      # tests from each downloading the same extension at once on a cold runner.
+      - name: Stage the ducklake and httpfs DuckDB extensions
+        run: |
+          set -euo pipefail
+          "$HOME/duckdb/duckdb" -c "INSTALL ducklake; INSTALL httpfs;"
+          dir="$HOME/.duckdb/extensions/${DUCKDB_VERSION}/linux_amd64"
+          test -f "$dir/ducklake.duckdb_extension"
+          test -f "$dir/httpfs.duckdb_extension"
+
       # `--all-targets` so the test modules are linted too, not just the binary.
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -300,6 +313,19 @@ jobs:
             echo "FINETYPE_DUCKDB_EXT=$ext"
             echo "ARCFORM_REQUIRE_FINETYPE_EXT=1"
           } >> "$GITHUB_ENV"
+
+      # `ducklake_publish` runs `INSTALL ducklake` itself, and its credential tests
+      # create an `s3` secret, which autoloads `httpfs`. Staging both here is not what
+      # makes those tests pass: it turns a registry that serves nothing into a red step
+      # rather than a failure inside the suite, and it keeps the suite's concurrent
+      # tests from each downloading the same extension at once on a cold runner.
+      - name: Stage the ducklake and httpfs DuckDB extensions
+        run: |
+          set -euo pipefail
+          "$HOME/duckdb/duckdb" -c "INSTALL ducklake; INSTALL httpfs;"
+          dir="$HOME/.duckdb/extensions/${DUCKDB_VERSION}/linux_amd64"
+          test -f "$dir/ducklake.duckdb_extension"
+          test -f "$dir/httpfs.duckdb_extension"
 
       # The base is chosen inside the step rather than by a job-level `if:`. A
       # conditional job reports as SKIPPED, and a skipped check is
