@@ -47,7 +47,7 @@
 //! production: this operator publishes whenever it runs.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -282,32 +282,46 @@ struct Report {
     marker: Marker,
 }
 
+/// A writer that hashes exactly the bytes its inner writer accepted.
+struct Hashing<W> {
+    inner: W,
+    hasher: Sha256,
+}
+
+impl<W: Write> Write for Hashing<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf).map(|n| {
+            self.hasher.update(&buf[..n]);
+            n
+        })
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Copy `from` to a new file `to`, returning the SHA-256 of the bytes written. One
 /// read serves both, so the digest is of the copy itself and never of a file read at
 /// another moment. `create_new`: a registered file is never overwritten.
 fn copy_hashing(from: &Path, to: &Path) -> std::io::Result<String> {
     let mut reader = std::fs::File::open(from)?;
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(to)?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        file.write_all(&buf[..n])?;
-        hasher.update(&buf[..n]);
-    }
-    file.sync_all()?;
-    Ok(format!("{:x}", hasher.finalize()))
+    let mut writer = Hashing {
+        inner: file,
+        hasher: Sha256::new(),
+    };
+    std::io::copy(&mut reader, &mut writer)
+        .and_then(|_| writer.inner.sync_all())
+        .map(|()| format!("{:x}", writer.hasher.finalize()))
 }
 
-/// The directory the copy goes into: `<data path>/<schema>/<table>/`, where DuckLake
-/// keeps a table's own files. Refused when the data path is not local, because the
-/// copy is a filesystem write.
+/// The directory the copy goes into, created: `<data path>/<schema>/<table>/`, where
+/// DuckLake keeps a table's own files. Refused when the data path is not local,
+/// because the copy is a filesystem write.
 fn table_dir(data_path: &str, schema: &str, table: &str) -> Result<PathBuf> {
     if has_scheme(data_path) {
         return Err(failed(format!(
@@ -316,70 +330,103 @@ fn table_dir(data_path: &str, schema: &str, table: &str) -> Result<PathBuf> {
              whose data path is local"
         )));
     }
-    Ok(Path::new(data_path).join(schema).join(table))
+    let dir = Path::new(data_path).join(schema).join(table);
+    std::fs::create_dir_all(&dir)
+        .map(|()| dir.clone())
+        .map_err(|e| failed(format!("create {}: {e}", dir.display())))
 }
 
 fn db(context: &str) -> impl Fn(duckdb::Error) -> Error + '_ {
     move |e| failed(format!("{context}: {e}"))
 }
 
-/// The last snapshot this operator committed for `table`, with the marker it wrote.
-fn last_publish(conn: &duckdb::Connection, table: &str) -> Result<Option<(i64, Marker)>> {
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT snapshot_id, commit_extra_info FROM ducklake_snapshots('{LAKE}') \
-             WHERE commit_extra_info IS NOT NULL ORDER BY snapshot_id DESC"
-        ))
-        .map_err(db("read the catalog's snapshots"))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(db("read the catalog's snapshots"))?;
-    for row in rows {
-        let (snapshot, info) = row.map_err(db("read the catalog's snapshots"))?;
-        if let Ok(marker) = serde_json::from_str::<Marker>(&info)
-            && marker.op == NAME
-            && marker.table == table
-        {
-            return Ok(Some((snapshot, marker)));
-        }
-    }
-    Ok(None)
+/// What the catalog says about earlier publishes into one table. No `Default`: a
+/// catalog that could not be read must never stand in for one with nothing in it.
+struct Published {
+    /// The catalog's current snapshot.
+    current: i64,
+    /// The last snapshot this operator committed for the table, with its marker.
+    last: Option<(i64, Marker)>,
 }
 
-/// Whether anything changed `schema.table` after `snapshot` — a write from outside
-/// arc, for one. `ducklake_table_changes` refuses a range starting past the current
-/// snapshot, so "nothing has been committed since" is answered first.
-fn changed_since(
+/// Read every snapshot once: the newest is the current one, and the newest carrying
+/// this operator's marker for `table` is the last publish.
+fn published(conn: &duckdb::Connection, table: &str) -> Result<Published> {
+    conn.prepare(&format!(
+        "SELECT snapshot_id, commit_extra_info FROM ducklake_snapshots('{LAKE}') \
+         ORDER BY snapshot_id DESC"
+    ))
+    .and_then(|mut stmt| {
+        stmt.query_map([], |row| {
+            row.get::<_, i64>(0)
+                .and_then(|id| row.get::<_, Option<String>>(1).map(|info| (id, info)))
+        })
+        .and_then(|rows| rows.collect::<duckdb::Result<Vec<_>>>())
+    })
+    .map(|snapshots| Published {
+        current: snapshots.first().map_or(0, |(id, _)| *id),
+        last: snapshots.into_iter().find_map(|(id, info)| {
+            info.and_then(|info| serde_json::from_str::<Marker>(&info).ok())
+                .filter(|marker| marker.op == NAME && marker.table == table)
+                .map(|marker| (id, marker))
+        }),
+    })
+    .map_err(db("read the catalog's snapshots"))
+}
+
+/// Whether `schema.table` still holds what `snapshot` committed. No `Default`, for
+/// the reason [`Published`] has none: "could not tell" is not "unchanged".
+#[derive(Debug, PartialEq)]
+enum Since {
+    Unchanged,
+    Changed,
+}
+
+/// Whether anything changed `schema.table` after `snapshot` — a write or a drop from
+/// outside arc. `ducklake_table_changes` refuses a range that starts past the current
+/// snapshot, and a table that no longer exists at its end, so both are answered first.
+fn since(
     conn: &duckdb::Connection,
     schema: &str,
     table: &str,
     snapshot: i64,
-) -> Result<bool> {
-    let current: i64 = conn
-        .query_row(
-            &format!("SELECT id::BIGINT FROM {LAKE}.current_snapshot()"),
-            [],
-            |row| row.get(0),
-        )
-        .map_err(db("read the current snapshot"))?;
+    current: i64,
+) -> Result<Since> {
     if snapshot >= current {
-        return Ok(false);
+        return Ok(Since::Unchanged);
     }
-    let changes: i64 = conn
-        .query_row(
+    let (schema, table) = (sql_string_literal(schema), sql_string_literal(table));
+    conn.query_row(
+        &format!(
+            "SELECT count(*) > 0 FROM duckdb_tables() WHERE database_name = '{LAKE}' \
+             AND schema_name = {schema} AND table_name = {table}"
+        ),
+        [],
+        |row| row.get::<_, bool>(0),
+    )
+    .and_then(|exists| {
+        if !exists {
+            return Ok(Since::Changed);
+        }
+        conn.query_row(
             &format!(
-                "SELECT count(*) FROM ducklake_table_changes('{LAKE}', {}, {}, {}, {current})",
-                sql_string_literal(schema),
-                sql_string_literal(table),
-                snapshot + 1,
+                "SELECT count(*) FROM ducklake_table_changes('{LAKE}', {schema}, {table}, {}, \
+                 {current})",
+                snapshot + 1
             ),
             [],
-            |row| row.get(0),
+            |row| {
+                row.get::<_, i64>(0).map(|changes| {
+                    if changes > 0 {
+                        Since::Changed
+                    } else {
+                        Since::Unchanged
+                    }
+                })
+            },
         )
-        .map_err(db("read the table's changes"))?;
-    Ok(changes > 0)
+    })
+    .map_err(db("read the table's changes since the last publish"))
 }
 
 /// Register `marker.data_file` as the table's whole content, in one transaction, and
@@ -412,16 +459,19 @@ fn register(
         "register {} into {}",
         marker.source, marker.table
     )))?;
-    tx.commit().map_err(db("commit the publish"))?;
-    conn.query_row(
-        &format!(
-            "SELECT snapshot_id FROM ducklake_snapshots('{LAKE}') WHERE commit_extra_info = {}",
-            sql_string_literal(&info)
-        ),
-        [],
-        |row| row.get(0),
-    )
-    .map_err(db("find the snapshot the publish committed"))
+    tx.commit()
+        .and_then(|()| {
+            conn.query_row(
+                &format!(
+                    "SELECT snapshot_id FROM ducklake_snapshots('{LAKE}') \
+                     WHERE commit_extra_info = {}",
+                    sql_string_literal(&info)
+                ),
+                [],
+                |row| row.get(0),
+            )
+        })
+        .map_err(db("commit the publish"))
 }
 
 /// Everything after the copy is placed: either an unchanged no-op or a registration.
@@ -431,9 +481,10 @@ fn publish_copy(
     table: &str,
     marker: Marker,
 ) -> Result<Report> {
-    if let Some((snapshot, last)) = last_publish(conn, &marker.table)?
+    let published = published(conn, &marker.table)?;
+    if let Some((snapshot, last)) = published.last
         && last.sha256 == marker.sha256
-        && !changed_since(conn, schema, table, snapshot)?
+        && since(conn, schema, table, snapshot, published.current)? == Since::Unchanged
     {
         return Ok(Report {
             action: "unchanged",
@@ -500,28 +551,26 @@ impl Operator for DucklakePublish {
         };
 
         let mut conn = duckdb::Connection::open_in_memory().map_err(db("open duckdb"))?;
-        conn.execute_batch("INSTALL ducklake; LOAD ducklake;")
-            .map_err(db("load the ducklake extension"))?;
         if let Some(sql) = secret {
             conn.execute_batch(&sql)
                 .map_err(db("create the credential's secret"))?;
         }
-        conn.execute_batch(&cfg.attach_sql(ctx.dir))
-            .map_err(db(&format!("attach the catalog `{}`", cfg.catalog)))?;
-        let data_path: String = conn
+        conn.execute_batch(&format!(
+            "INSTALL ducklake; LOAD ducklake; {}",
+            cfg.attach_sql(ctx.dir)
+        ))
+        .map_err(db(&format!("attach the catalog `{}`", cfg.catalog)))?;
+        let dir = conn
             .query_row(
                 &format!(
                     "SELECT value FROM __ducklake_metadata_{LAKE}.ducklake_metadata \
                      WHERE key = 'data_path'"
                 ),
                 [],
-                |row| row.get(0),
+                |row| row.get::<_, String>(0),
             )
-            .map_err(db("read the catalog's data path"))?;
-
-        let dir = table_dir(&data_path, schema, table)?;
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| failed(format!("create {}: {e}", dir.display())))?;
+            .map_err(db("read the catalog's data path"))
+            .and_then(|data_path| table_dir(&data_path, schema, table))?;
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -913,17 +962,48 @@ mod tests {
 
     #[test]
     fn a_data_path_on_object_storage_is_refused() {
-        let err = table_dir("s3://bucket/lake/", "main", "t")
+        let dir = tempfile::tempdir().unwrap();
+        build(dir.path(), "SELECT 1 AS id");
+        let yaml = format!("{PUBLISH}data_path: s3://bucket/lake/\n");
+        let err = publish_with(dir.path(), &yaml, &HashMap::new())
             .unwrap_err()
             .to_string();
         assert!(
             err.contains("`s3://bucket/lake/` is not a local directory"),
             "{err}"
         );
-        assert_eq!(
-            table_dir("/data/lake/", "main", "t").unwrap(),
-            PathBuf::from("/data/lake/main/t")
+        let local = dir.path().join("files");
+        let made = table_dir(&local.display().to_string(), "main", "t").unwrap();
+        assert_eq!(made, local.join("main/t"));
+        assert!(made.is_dir(), "the table's directory is created");
+    }
+
+    #[test]
+    fn a_catalog_that_cannot_be_attached_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        build(dir.path(), "SELECT 1 AS id");
+        let yaml = "file: build/out.parquet\ncatalog: no/such/dir/lake.ducklake\ntable: t\n";
+        let err = publish_with(dir.path(), yaml, &HashMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("attach the catalog `no/such/dir/lake.ducklake`"),
+            "{err}"
         );
+    }
+
+    #[test]
+    fn a_table_dropped_outside_arc_is_published_again() {
+        let dir = tempfile::tempdir().unwrap();
+        build(dir.path(), "SELECT range AS id FROM range(5)");
+        publish(dir.path(), PUBLISH);
+        lake(dir.path(), |c| {
+            c.execute_batch("DROP TABLE lake.t;").unwrap()
+        });
+
+        let again = publish(dir.path(), PUBLISH);
+        assert_eq!(again["action"], "registered");
+        assert_eq!(rows(dir.path(), "t"), vec![0, 1, 2, 3, 4]);
     }
 
     #[test]

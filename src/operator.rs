@@ -415,6 +415,28 @@ mod with_schema_tests {
     }
 
     #[test]
+    fn ducklake_publish_schema_shape() {
+        let schema = with_schema("ducklake_publish").expect("ducklake_publish has a schema");
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(required, ["file", "catalog", "table"]);
+        // The credential is typed config like the rest: an authoring form offering a
+        // key the operator's `deny_unknown_fields` would refuse builds a `with:` block
+        // that will not load.
+        let credential = &schema["properties"]["credential"];
+        assert_eq!(credential["additionalProperties"], false);
+        assert_eq!(credential["required"], serde_json::json!(["type", "env"]));
+        assert_eq!(
+            credential["properties"]["env"]["additionalProperties"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
     fn parquet_export_schema_shape() {
         let schema = with_schema("parquet_export").expect("parquet_export has a schema");
         assert_eq!(schema["type"], "object");
