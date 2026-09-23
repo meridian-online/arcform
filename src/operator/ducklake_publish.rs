@@ -564,3 +564,488 @@ impl Operator for DucklakePublish {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    const PUBLISH: &str = "file: build/out.parquet\ncatalog: lake.ducklake\ntable: t\n";
+
+    fn write_parquet(path: &Path, select: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY ({select}) TO {} (FORMAT parquet);",
+            sql_string_literal(&path.display().to_string())
+        ))
+        .unwrap();
+    }
+
+    fn build(dir: &Path, select: &str) {
+        write_parquet(&dir.join("build/out.parquet"), select);
+    }
+
+    fn with(yaml: &str) -> Value {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    fn publish_with(
+        dir: &Path,
+        yaml: &str,
+        env: &HashMap<String, String>,
+    ) -> Result<serde_json::Value> {
+        let ctx = OpContext {
+            dir,
+            db_path: dir,
+            env,
+            timeout: None,
+            cache: None,
+        };
+        DucklakePublish
+            .run(&with(yaml), &ctx)
+            .map(|out| out.report.expect("a publish reports what it did"))
+    }
+
+    fn publish(dir: &Path, yaml: &str) -> serde_json::Value {
+        publish_with(dir, yaml, &HashMap::new()).unwrap()
+    }
+
+    /// Read the catalog through a connection of the test's own, closed again before
+    /// the next publish opens it.
+    fn lake<T>(dir: &Path, read: impl FnOnce(&duckdb::Connection) -> T) -> T {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "LOAD ducklake; ATTACH {} AS lake;",
+            sql_string_literal(&format!("ducklake:{}", dir.join("lake.ducklake").display()))
+        ))
+        .unwrap();
+        read(&conn)
+    }
+
+    fn snapshots(dir: &Path) -> i64 {
+        lake(dir, |c| {
+            c.query_row("SELECT count(*) FROM ducklake_snapshots('lake')", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        })
+    }
+
+    fn ids(conn: &duckdb::Connection, sql: &str) -> Vec<i64> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn rows(dir: &Path, table: &str) -> Vec<i64> {
+        lake(dir, |c| {
+            ids(c, &format!("SELECT id FROM lake.{table} ORDER BY id"))
+        })
+    }
+
+    /// The copies this operator has placed for `main.t` — every one a snapshot
+    /// references, and any it failed to clean up.
+    fn copies(dir: &Path) -> Vec<PathBuf> {
+        let table_dir = dir.join("lake.ducklake.files/main/t");
+        let Ok(entries) = std::fs::read_dir(&table_dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<PathBuf> = entries.map(|e| e.unwrap().path()).collect();
+        out.sort();
+        out
+    }
+
+    fn hash(path: &Path) -> String {
+        crate::fetch_cache::hash_file(path).unwrap()
+    }
+
+    #[test]
+    fn a_publish_registers_a_byte_identical_copy_and_reports_its_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        build(dir.path(), "SELECT range AS id FROM range(5)");
+        let report = publish(dir.path(), PUBLISH);
+
+        assert_eq!(report["action"], "registered");
+        let current: i64 = lake(dir.path(), |c| {
+            c.query_row(
+                "SELECT max(snapshot_id) FROM ducklake_snapshots('lake')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        });
+        assert_eq!(
+            report["snapshot_id"], current,
+            "the report names the snapshot the publish created"
+        );
+
+        let registered: Vec<String> = lake(dir.path(), |c| {
+            let mut stmt = c
+                .prepare("SELECT data_file FROM ducklake_list_files('lake', 't')")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        });
+        assert_eq!(
+            registered,
+            vec![report["data_file"].as_str().unwrap().to_string()]
+        );
+        let built = dir.path().join("build/out.parquet");
+        let object = Path::new(&registered[0]);
+        assert_ne!(
+            object,
+            built.as_path(),
+            "the build output itself is never registered"
+        );
+        assert_eq!(
+            hash(object),
+            hash(&built),
+            "the registered object holds the built bytes"
+        );
+        assert_eq!(report["sha256"], hash(&built));
+        assert_eq!(report["table"], "main.t");
+        assert_eq!(report["source"], "build/out.parquet");
+        assert_eq!(rows(dir.path(), "t"), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn an_unchanged_build_is_a_no_op_that_reports_the_snapshot_holding_it() {
+        let dir = tempfile::tempdir().unwrap();
+        build(dir.path(), "SELECT range AS id FROM range(5)");
+        let first = publish(dir.path(), PUBLISH);
+        let before = snapshots(dir.path());
+
+        let second = publish(dir.path(), PUBLISH);
+        assert_eq!(second["action"], "unchanged");
+        assert_eq!(second["snapshot_id"], first["snapshot_id"]);
+        assert_eq!(second["data_file"], first["data_file"]);
+        assert_eq!(
+            snapshots(dir.path()),
+            before,
+            "an unchanged build commits nothing"
+        );
+        assert_eq!(
+            rows(dir.path(), "t"),
+            vec![0, 1, 2, 3, 4],
+            "and the rows are not doubled"
+        );
+        // Compared by name: DuckLake records the data path canonicalised, and a
+        // macOS temp directory is reached through a symlink.
+        let names: Vec<_> = copies(dir.path())
+            .iter()
+            .map(|p| p.file_name().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                Path::new(first["data_file"].as_str().unwrap())
+                    .file_name()
+                    .unwrap()
+                    .to_owned()
+            ],
+            "the no-op's own copy is removed, not left for orphan cleanup"
+        );
+    }
+
+    #[test]
+    fn a_publish_to_another_table_in_between_does_not_make_an_unchanged_build_publish_again() {
+        let dir = tempfile::tempdir().unwrap();
+        build(dir.path(), "SELECT range AS id FROM range(5)");
+        write_parquet(&dir.path().join("build/other.parquet"), "SELECT 9 AS id");
+        let first = publish(dir.path(), PUBLISH);
+        publish(
+            dir.path(),
+            "file: build/other.parquet\ncatalog: lake.ducklake\ntable: other\n",
+        );
+        let before = snapshots(dir.path());
+
+        let again = publish(dir.path(), PUBLISH);
+        assert_eq!(again["action"], "unchanged");
+        assert_eq!(again["snapshot_id"], first["snapshot_id"]);
+        assert_eq!(snapshots(dir.path()), before);
+    }
+
+    #[test]
+    fn a_write_from_outside_arc_makes_an_unchanged_build_publish_again() {
+        let dir = tempfile::tempdir().unwrap();
+        build(dir.path(), "SELECT range AS id FROM range(5)");
+        let first = publish(dir.path(), PUBLISH);
+        lake(dir.path(), |c| {
+            c.execute_batch("INSERT INTO lake.t VALUES (99);").unwrap()
+        });
+
+        let again = publish(dir.path(), PUBLISH);
+        assert_eq!(again["action"], "registered");
+        assert!(again["snapshot_id"].as_i64() > first["snapshot_id"].as_i64());
+        assert_eq!(
+            rows(dir.path(), "t"),
+            vec![0, 1, 2, 3, 4],
+            "the stray row is replaced"
+        );
+    }
+
+    #[test]
+    fn a_rebuild_replaces_the_rows_and_history_still_reads_the_old_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        build(dir.path(), "SELECT range AS id FROM range(5)");
+        let first = publish(dir.path(), PUBLISH);
+        // The build rewrites its output path in place, as `parquet_export` does.
+        build(dir.path(), "SELECT range + 100 AS id FROM range(3)");
+
+        let second = publish(dir.path(), PUBLISH);
+        assert_eq!(second["action"], "registered");
+        assert_ne!(second["sha256"], first["sha256"]);
+        assert_eq!(rows(dir.path(), "t"), vec![100, 101, 102]);
+        let then = first["snapshot_id"].as_i64().unwrap();
+        let old = lake(dir.path(), |c| {
+            ids(
+                c,
+                &format!("SELECT id FROM lake.t AT (VERSION => {then}) ORDER BY id"),
+            )
+        });
+        assert_eq!(
+            old,
+            vec![0, 1, 2, 3, 4],
+            "the first snapshot still reads its own bytes"
+        );
+        assert_eq!(
+            hash(Path::new(first["data_file"].as_str().unwrap())),
+            first["sha256"]
+        );
+    }
+
+    #[test]
+    fn a_declared_credential_missing_from_the_environment_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        build(dir.path(), "SELECT range AS id FROM range(5)");
+        let yaml = format!(
+            "{PUBLISH}credential:\n  type: s3\n  env:\n    key_id: ARC_TEST_DUCKLAKE_KEY_ID_UNSET\n    secret: ARC_TEST_DUCKLAKE_SECRET_UNSET\n"
+        );
+
+        let err = publish_with(dir.path(), &yaml, &HashMap::new()).unwrap_err();
+        let Error::StepFailed { stderr, .. } = &err else {
+            panic!("expected a step failure, got {err:?}")
+        };
+        assert!(stderr.contains("no credential available"), "{stderr}");
+        assert!(
+            stderr.contains("ARC_TEST_DUCKLAKE_KEY_ID_UNSET, ARC_TEST_DUCKLAKE_SECRET_UNSET"),
+            "{stderr}"
+        );
+        assert!(
+            !dir.path().join("lake.ducklake").exists(),
+            "nothing is attached before the refusal"
+        );
+
+        // One supplied, one still missing: the refusal names only the one missing.
+        let mut env = HashMap::new();
+        env.insert(
+            "ARC_TEST_DUCKLAKE_KEY_ID_UNSET".to_string(),
+            "id".to_string(),
+        );
+        env.insert("ARC_TEST_DUCKLAKE_SECRET_UNSET".to_string(), String::new());
+        let err = publish_with(dir.path(), &yaml, &env)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("names ARC_TEST_DUCKLAKE_SECRET_UNSET but it is unset or empty"),
+            "{err}"
+        );
+
+        env.insert(
+            "ARC_TEST_DUCKLAKE_SECRET_UNSET".to_string(),
+            "secret".to_string(),
+        );
+        let report = publish_with(dir.path(), &yaml, &env).unwrap();
+        assert_eq!(report["action"], "registered");
+    }
+
+    #[test]
+    fn a_credential_the_database_rejects_fails_the_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        build(dir.path(), "SELECT 1 AS id");
+        let yaml = format!("{PUBLISH}credential:\n  type: s3\n  env:\n    not_a_parameter: V\n");
+        let mut env = HashMap::new();
+        env.insert("V".to_string(), "x".to_string());
+        let err = publish_with(dir.path(), &yaml, &env)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("create the credential's secret"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_registration_leaves_no_copy_and_no_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        build(dir.path(), "SELECT range AS id FROM range(5)");
+        lake(dir.path(), |c| {
+            c.execute_batch("CREATE TABLE lake.t (name VARCHAR);")
+                .unwrap()
+        });
+        let before = snapshots(dir.path());
+
+        let err = publish_with(dir.path(), PUBLISH, &HashMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("register build/out.parquet into main.t"),
+            "{err}"
+        );
+        assert_eq!(snapshots(dir.path()), before);
+        assert_eq!(copies(dir.path()), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn a_missing_build_output_fails_and_leaves_no_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = publish_with(dir.path(), PUBLISH, &HashMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("copy build/out.parquet into the catalog"),
+            "{err}"
+        );
+        assert_eq!(copies(dir.path()), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn a_data_path_on_object_storage_is_refused() {
+        let err = table_dir("s3://bucket/lake/", "main", "t")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`s3://bucket/lake/` is not a local directory"),
+            "{err}"
+        );
+        assert_eq!(
+            table_dir("/data/lake/", "main", "t").unwrap(),
+            PathBuf::from("/data/lake/main/t")
+        );
+    }
+
+    #[test]
+    fn a_schema_qualified_table_and_an_explicit_data_path_are_honoured() {
+        let dir = tempfile::tempdir().unwrap();
+        build(dir.path(), "SELECT 7 AS id");
+        let report = publish(
+            dir.path(),
+            "file: build/out.parquet\ncatalog: ducklake:lake.ducklake\ndata_path: files/\ntable: pub.t\n",
+        );
+        assert_eq!(report["table"], "pub.t");
+        let expected = dir.path().join("files/pub/t");
+        assert!(
+            Path::new(report["data_file"].as_str().unwrap()).starts_with(&expected),
+            "{report}"
+        );
+        assert_eq!(
+            lake(dir.path(), |c| ids(c, "SELECT id FROM lake.pub.t")),
+            vec![7]
+        );
+    }
+
+    #[test]
+    fn the_file_is_declared_as_a_read_and_nothing_as_produced() {
+        let assets = DucklakePublish.assets(&with(PUBLISH)).unwrap();
+        assert_eq!(assets.reads, vec!["build/out.parquet".to_string()]);
+        assert!(assets.produces.is_empty());
+        assert_eq!(
+            assets.kinds.get("build/out.parquet"),
+            Some(&crate::asset_kind::AssetKind::File)
+        );
+    }
+
+    #[test]
+    fn a_table_is_bare_or_schema_qualified_and_nothing_else() {
+        assert_eq!(split_table("t"), Some(("main", "t")));
+        assert_eq!(split_table("s.t"), Some(("s", "t")));
+        for bad in ["", "s.", ".t", "a.b.c"] {
+            assert_eq!(split_table(bad), None, "{bad:?}");
+            let yaml = format!("file: f.parquet\ncatalog: c\ntable: '{bad}'\n");
+            let err = DucklakePublishConfig::parse(&with(&yaml))
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(
+                err.contains("must be `table` or `schema.table`"),
+                "{bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn identifiers_and_schemes_are_told_apart_from_paths() {
+        assert!(is_identifier("key_id") && is_identifier("_x") && is_identifier("s3"));
+        assert!(!is_identifier("") && !is_identifier("3s") && !is_identifier("a-b"));
+        assert!(!is_identifier("a b") && !is_identifier("a'"));
+        assert!(has_scheme("postgres:dbname=lake") && has_scheme("s3://bucket/x"));
+        assert!(!has_scheme("build/lake.ducklake") && !has_scheme("C:/lake"));
+        assert!(!has_scheme(":x") && !has_scheme("a b:c"));
+        let dir = Path::new("/p");
+        assert_eq!(resolve_location(dir, "lake.ducklake"), "/p/lake.ducklake");
+        assert_eq!(
+            resolve_location(dir, "/abs/lake.ducklake"),
+            "/abs/lake.ducklake"
+        );
+        assert_eq!(
+            resolve_location(dir, "postgres:dbname=lake"),
+            "postgres:dbname=lake"
+        );
+    }
+
+    #[test]
+    fn the_attach_resolves_against_the_manifest_directory() {
+        let dir = Path::new("/p");
+        let parse = |yaml: &str| DucklakePublishConfig::parse(&with(yaml)).unwrap();
+        assert_eq!(
+            parse(PUBLISH).attach_sql(dir),
+            "ATTACH 'ducklake:/p/lake.ducklake' AS arc_publish_lake;"
+        );
+        assert_eq!(
+            parse("file: f\ncatalog: ducklake:postgres:dbname=l\ndata_path: d/\ntable: t\n")
+                .attach_sql(dir),
+            "ATTACH 'ducklake:postgres:dbname=l' AS arc_publish_lake (DATA_PATH '/p/d/');"
+        );
+    }
+
+    #[test]
+    fn a_credential_names_a_type_and_at_least_one_parameter() {
+        let parse = |credential: &str| {
+            DucklakePublishConfig::parse(&with(&format!("{PUBLISH}credential:\n{credential}")))
+                .err()
+                .map(|e| e.to_string())
+        };
+        let err = parse("  type: \"s3; DROP\"\n  env: { key_id: K }\n").unwrap();
+        assert!(err.contains("is not a DuckDB secret type"), "{err}");
+        let err = parse("  type: s3\n  env: {}\n").unwrap();
+        assert!(err.contains("names no environment variables"), "{err}");
+        let err = parse("  type: s3\n  env: { \"key id\": K }\n").unwrap();
+        assert!(
+            err.contains("key `key id` is not a secret parameter name"),
+            "{err}"
+        );
+        assert_eq!(parse("  type: s3\n  env: { key_id: K }\n"), None);
+    }
+
+    #[test]
+    fn the_secret_is_temporary_and_holds_the_resolved_values() {
+        let credential = CredentialConfig {
+            kind: "s3".to_string(),
+            env: BTreeMap::from([
+                ("key_id".to_string(), "K".to_string()),
+                ("secret".to_string(), "S".to_string()),
+            ]),
+        };
+        let values = credential.resolve(|var| Some(format!("{var}'v"))).unwrap();
+        assert_eq!(
+            credential.create_secret_sql(&values),
+            "CREATE TEMPORARY SECRET arc_ducklake_publish (TYPE s3, key_id 'K''v', secret 'S''v');"
+        );
+        assert_eq!(
+            credential.resolve(|var| (var == "S").then(|| "x".to_string())),
+            Err(vec!["K".to_string()])
+        );
+    }
+}
