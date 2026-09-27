@@ -1,0 +1,25 @@
+# Weekly tonnage through each port, as a hand-written Mosaic chart.
+# Not an arcform.yaml: no `name:`, no `steps:`.
+meta:
+  title: Port throughput
+data:
+  flows:
+    file: data/flows.parquet
+vconcat:
+  # Tonnage over time, one line per port.
+  - plot:
+      - mark: lineY
+        data: { from: flows }
+        x: week
+        y: tonnes
+        stroke: port
+    yScale: linear   # throw to log when one port dwarfs the rest
+    height: 240
+
+  # The same weeks as a bar per port.
+  - plot:
+      - mark: barY
+        data: { from: flows }
+        x: port
+        y: { sum: tonnes }
+    width: 680

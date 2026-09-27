@@ -542,7 +542,8 @@ fn add_key(text: &str, path: &[PathPart], key: &str, value: &str) -> Result<Stri
             }
             yamlpath::FeatureKind::BlockMapping => {
                 let (start, end) = element_span_at(text, &doc, path)?;
-                let child_indent = block_child_indent(text, start, end);
+                let first_key = feature.location.byte_span.0;
+                let child_indent = block_child_indent(text, start, end, first_key);
                 let mut entry = format!("{}{key}: {value}\n", " ".repeat(child_indent));
                 if end == text.len() && !text.ends_with('\n') {
                     entry.insert(0, '\n');
@@ -742,9 +743,16 @@ pub(crate) fn sequence_item_indent(text: &str, path: &[PathPart]) -> Result<Stri
 }
 
 /// The indentation for a new key in the block mapping spanning
-/// `[start, end)`: the indent of its first existing child line, or two deeper
-/// than the anchor line when no child line exists to read.
-fn block_child_indent(text: &str, start: usize, end: usize) -> usize {
+/// `[start, end)`: the column of its keys. When the first key sits on the
+/// element's own line — a sequence item's `- key:` — that key's column is the
+/// answer, because the line below it may be the first key's nested value
+/// (`- plot:` over `    - mark: …`) rather than a sibling. Otherwise it is the
+/// indent of the first child line, or two deeper than the anchor line when no
+/// child line exists to read.
+fn block_child_indent(text: &str, start: usize, end: usize, first_key: usize) -> usize {
+    if line_start(text, first_key) == start {
+        return first_key - start;
+    }
     let anchor_indent = indent_of(text, start);
     let mut at = line_end(text, start);
     while at < end {
