@@ -99,6 +99,22 @@ fn adding_a_key_adds_one_line_inside_the_plots_mapping() {
     assert_eq!(out.lines().count(), CHART.lines().count() + 1);
 }
 
+/// A path the chart does not have is refused with the path named, as the spec
+/// entries refuse it, and no text comes back: a refusal from the splice is
+/// never swallowed into an empty document, which would load as YAML.
+#[test]
+fn a_missing_target_is_refused_with_its_path() {
+    let edit = SpecEdit::Replace {
+        path: vec!["vconcat".into(), 5.into(), "yScale".into()],
+        value: "log".into(),
+    };
+    let err = apply_yaml_edits(CHART, &[edit]).expect_err("the chart has two plots, not six");
+    match err {
+        Error::EditTarget { path, .. } => assert_eq!(path, "vconcat[5].yScale"),
+        other => panic!("expected the splice's refusal naming the path, got: {other}"),
+    }
+}
+
 /// The one gate the YAML splice keeps: a result that no longer loads as YAML is
 /// refused with the reason, not handed back as text to write.
 #[test]
