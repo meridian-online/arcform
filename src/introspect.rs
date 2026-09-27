@@ -533,20 +533,29 @@ fn extract_inputs_from_table_factor(factor: &TableFactor, assets: &mut SqlAssets
     match factor {
         // A bare table reference, or a table-valued function call (`args: Some`).
         TableFactor::Table { name, args, .. } => {
+            let fn_name = object_name_to_string(name);
             match args {
-                // `read_parquet('x.parquet')` / `read_csv([...])` etc: the function reads
-                // files — lift its path literal(s) as file inputs, not the opaque fn name.
-                Some(table_args) if is_file_reader(&object_name_to_string(name)) => {
+                // `read_parquet('x.parquet')` / `read_csv([...])` / `glob('data/*.csv')`
+                // etc: the function reads a path — file contents, or, for `glob`, the
+                // filenames it lists — so lift its path literal(s) as file/pattern
+                // inputs, not the opaque fn name.
+                Some(table_args) if is_file_reader(&fn_name) || fn_name == "glob" => {
                     for arg in &table_args.args {
                         if let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg {
                             extract_path_literals(expr, assets);
                         }
                     }
                 }
-                // Any other table-valued function (`range(…)`, `generate_series(…)`) or a
-                // plain table name: record the name itself as the input, as before.
+                // DuckDB row-generators (`range(…)`, `generate_series(…)`) and catalog
+                // introspection functions (`duckdb_functions()`, `duckdb_tables()`,
+                // `duckdb_secrets()`) produce rows with no backing table at all — there
+                // is nothing to record as an input, and none as the fn name either.
+                Some(_) if reads_no_table(&fn_name) => {}
+                // Any other table-valued function (an extension's, a table macro,
+                // `query(…)`) or a plain table name: record the name itself as the
+                // input, as before.
                 _ => {
-                    assets.record_input(object_name_to_string(name), AssetKind::Table);
+                    assets.record_input(fn_name, AssetKind::Table);
                 }
             }
         }
@@ -589,7 +598,7 @@ fn object_name_to_string(name: &ObjectName) -> String {
 /// is a path (or list of paths). Matched case-insensitively against the fn name that
 /// [`object_name_to_string`] already lowercased.
 fn is_file_reader(fn_name: &str) -> bool {
-    const READERS: [&str; 12] = [
+    const READERS: [&str; 17] = [
         "read_parquet",
         "parquet_scan",
         "read_csv",
@@ -602,8 +611,30 @@ fn is_file_reader(fn_name: &str) -> bool {
         "read_ndjson_objects",
         "read_text",
         "read_blob",
+        "read_xlsx",
+        "read_xml",
+        "read_dta",
+        "read_stat",
+        "st_read",
     ];
     READERS.contains(&fn_name)
+}
+
+/// Whether a table-valued function name produces rows with no backing table to
+/// record — a row-generator (`range`, `generate_series`) or a catalog/introspection
+/// function (`duckdb_functions`, `duckdb_tables`, `duckdb_secrets`). Matched
+/// case-insensitively against the fn name that [`object_name_to_string`] already
+/// lowercased. `glob` is not here: it reads a path pattern, handled alongside
+/// [`is_file_reader`] instead.
+fn reads_no_table(fn_name: &str) -> bool {
+    const NO_TABLE: [&str; 5] = [
+        "range",
+        "generate_series",
+        "duckdb_functions",
+        "duckdb_tables",
+        "duckdb_secrets",
+    ];
+    NO_TABLE.contains(&fn_name)
 }
 
 /// Lift filesystem-path string literals out of a file-reader argument expression.
@@ -1070,6 +1101,97 @@ mod tests {
         assert!(assets.outputs.contains("brew"));
     }
 
+    // read_xlsx, read_xml, read_dta, read_stat and ST_Read lift the path they read,
+    // exactly like read_parquet/read_csv/read_json — not the opaque fn name.
+    #[test]
+    fn test_five_new_readers_lift_path_not_function_name() {
+        for (reader, path) in [
+            ("read_xlsx", "build/budget.xlsx"),
+            ("read_xml", "build/catalog.xml"),
+            ("read_dta", "build/survey.dta"),
+            ("read_stat", "build/survey.sas7bdat"),
+            ("ST_Read", "data/shapes.shp"),
+        ] {
+            let sql = format!("CREATE TABLE r AS SELECT * FROM {reader}('{path}');");
+            let assets = extract_assets(&sql).unwrap();
+            assert!(
+                assets.inputs.contains(path),
+                "{reader}: path {path} should be the input, got {:?}",
+                assets.inputs
+            );
+            assert!(
+                !assets.inputs.contains(&reader.to_lowercase()),
+                "{reader}: fn name must not be recorded as a table input"
+            );
+            assert_eq!(assets.kinds.get(path), Some(&AssetKind::File));
+        }
+    }
+
+    // A glob-shaped path to one of the five new readers is a Pattern, same as it
+    // already is for the twelve existing readers.
+    #[test]
+    fn test_five_new_readers_glob_path_is_a_pattern() {
+        for (reader, pattern) in [
+            ("read_xlsx", "build/*.xlsx"),
+            ("read_xml", "build/report-?.xml"),
+            ("ST_Read", "data/[a-z].shp"),
+        ] {
+            let sql = format!("CREATE TABLE r AS SELECT * FROM {reader}('{pattern}');");
+            let assets = extract_assets(&sql).unwrap();
+            assert_eq!(
+                assets.kinds.get(pattern),
+                Some(&AssetKind::Pattern),
+                "{reader}: {pattern} should be a Pattern"
+            );
+        }
+    }
+
+    // range, generate_series and DuckDB's catalog-introspection table functions
+    // produce rows from no backing table at all: nothing is recorded as an input,
+    // and the fn name is not recorded as a table either.
+    #[test]
+    fn test_row_generators_and_catalog_functions_read_no_table() {
+        for call in [
+            "range(3)",
+            "generate_series(1, 5)",
+            "duckdb_functions()",
+            "duckdb_tables()",
+            "duckdb_secrets()",
+        ] {
+            let sql = format!("CREATE TABLE c AS SELECT * FROM {call};");
+            let assets = extract_assets(&sql).unwrap();
+            assert!(
+                assets.inputs.is_empty(),
+                "{call}: no table should be read, got {:?}",
+                assets.inputs
+            );
+        }
+    }
+
+    // glob('pattern') lifts the pattern itself as an input, not a table named `glob`.
+    #[test]
+    fn test_glob_function_lifts_pattern_not_table_name() {
+        let sql = "CREATE TABLE c AS SELECT * FROM glob('data/*.csv');";
+        let assets = extract_assets(sql).unwrap();
+        assert!(assets.inputs.contains("data/*.csv"), "pattern is the input");
+        assert!(!assets.inputs.contains("glob"), "fn name is not an input");
+        assert_eq!(assets.kinds.get("data/*.csv"), Some(&AssetKind::Pattern));
+    }
+
+    // An extension-supplied table function that reads tables named in its own
+    // arguments (not a path) keeps recording its own name — this layer cannot see
+    // what its string arguments mean.
+    #[test]
+    fn test_extension_table_function_with_table_args_unchanged() {
+        let sql = r#"CREATE TABLE model AS SELECT * FROM mlpack_random_forest_train("X", "Y", "params", "model");"#;
+        let assets = extract_assets(sql).unwrap();
+        assert!(
+            assets.inputs.contains("mlpack_random_forest_train"),
+            "extension TVF name should still be recorded, got {:?}",
+            assets.inputs
+        );
+    }
+
     // COPY <table> TO 'file' produces the file path as an output (file-path lineage).
     #[test]
     fn test_copy_to_produces_file() {
@@ -1085,11 +1207,15 @@ mod tests {
     // a non-file table function keeps recording its name (unchanged behaviour).
     #[test]
     fn test_non_file_table_function_unchanged() {
-        let sql = "SELECT * FROM generate_series(1, 10);";
+        // A table macro (or any other extension-supplied table function that is
+        // neither a file reader nor a row-generator) still records its own name —
+        // it may read tables named in its own definition, which this layer cannot
+        // see, so the name is the only handle lineage has on it.
+        let sql = "SELECT * FROM recent();";
         let assets = extract_assets(sql).unwrap();
         assert!(
-            assets.inputs.contains("generate_series"),
-            "non-file TVF name still recorded"
+            assets.inputs.contains("recent"),
+            "non-file, non-generator TVF name still recorded"
         );
     }
 
