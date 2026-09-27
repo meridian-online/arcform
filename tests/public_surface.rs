@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 
 /// Every type, constant and function `arc::spec` re-exports, and the module that
 /// owns it. An `impl` on any of these names may only appear in its owning file.
-const EXPORTED: [(&str, &str); 32] = [
+const EXPORTED: [(&str, &str); 33] = [
     ("Manifest", "manifest.rs"),
     ("Step", "manifest.rs"),
     ("Param", "manifest.rs"),
@@ -67,6 +67,7 @@ const EXPORTED: [(&str, &str); 32] = [
     ("SpecEdit", "edit.rs"),
     ("ValidatedSpec", "edit.rs"),
     ("apply_edits", "edit.rs"),
+    ("apply_yaml_edits", "edit.rs"),
     ("create_spec", "edit.rs"),
     ("edit_spec", "edit.rs"),
     // The record path: an exploration promoted into a step, and the ownership
@@ -984,6 +985,7 @@ fn exported_modules_declare_only_contracted_items() {
             "ValidatedSpec",
             // Re-exported entry points.
             "apply_edits",
+            "apply_yaml_edits",
             "create_spec",
             "edit_spec",
             // `ValidatedSpec`'s accessors and its atomic write. The splicing

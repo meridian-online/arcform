@@ -54,6 +54,15 @@
 //! machinery is involved. It still passes the same validation gate and the same
 //! atomic write, and it refuses to overwrite an existing spec: once a file
 //! exists it may have been hand-edited, and edits go through [`edit_spec`].
+//!
+//! # Any YAML, not only a spec
+//!
+//! Nothing in the splice reads a field of the Protocol: a path resolves over
+//! YAML text, and the spec is only the gate at the end. [`apply_yaml_edits`] is
+//! that splice without the spec gate, for YAML a sibling tool owns — a chart
+//! file — and checks against its own schema. Its result must still load as
+//! YAML. [`apply_edits`] and [`edit_spec`] keep the spec gate, so text that is
+//! not a Protocol is refused on those two entries.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -99,8 +108,9 @@ impl From<usize> for PathPart {
 /// already indented for the position they land in, and a new sequence item must
 /// carry its own `- ` line(s). Nothing here reformats on the caller's behalf —
 /// that is what keeps the rest of the document byte-identical. A malformed
-/// splice cannot reach disk: every application ends at the
-/// [`Manifest::from_yaml_str`] gate.
+/// splice is refused before it is returned: [`apply_edits`] ends at the
+/// [`Manifest::from_yaml_str`] gate, and [`apply_yaml_edits`], which edits YAML
+/// that is not a spec, ends at a YAML load.
 ///
 /// In a batch, each edit sees the document as the previous edits left it, so
 /// indices refer to the already-partially-edited spec.
@@ -199,15 +209,28 @@ impl ValidatedSpec {
 /// naming the path that failed to resolve, or the loader's own parse/validation
 /// error for a result that would not load.
 pub fn apply_edits(original: &str, edits: &[SpecEdit]) -> Result<ValidatedSpec> {
-    let mut text = original.to_string();
-    for edit in edits {
-        text = apply_one(&text, edit)?;
-    }
-    if !text.ends_with('\n') {
-        text.push('\n');
-    }
+    let text = splice_edits(original, edits)?;
     let manifest = Manifest::from_yaml_str(&text)?;
     Ok(ValidatedSpec { text, manifest })
+}
+
+/// Apply `edits` to YAML text of any shape — a chart file, a config, anything
+/// that is not an `arcform.yaml` — and return the edited text. It is the same
+/// splice [`apply_edits`] runs, with the same byte preservation and the same
+/// single normalisation (the final newline); what it does not do is ask
+/// whether the result is a Protocol. The one gate it keeps is that the result
+/// still loads as YAML, so a malformed splice is refused here rather than
+/// handed back as text to write. Whether the YAML means anything is the
+/// caller's schema to check.
+///
+/// Nothing is read or written: the caller owns the file and its write.
+pub fn apply_yaml_edits(original: &str, edits: &[SpecEdit]) -> Result<String> {
+    let text = splice_edits(original, edits)?;
+    serde_yaml::from_str::<serde_yaml::Value>(&text).map_err(|e| Error::EditTarget {
+        path: "(document)".to_string(),
+        detail: format!("the edited text no longer loads as YAML: {e}"),
+    })?;
+    Ok(text)
 }
 
 /// The whole write path against a protocol directory: read `arcform.yaml`,
@@ -247,6 +270,20 @@ pub fn create_spec(dir: &Path, manifest: &Manifest) -> Result<ValidatedSpec> {
 }
 
 // ------------------------------------------------------------------- splicing
+
+/// Apply every edit in order, each to the text the previous one left, then
+/// add the final newline if it is missing. It resolves paths over YAML text
+/// and names no field of any schema; the gate is its callers'.
+fn splice_edits(original: &str, edits: &[SpecEdit]) -> Result<String> {
+    let mut text = original.to_string();
+    for edit in edits {
+        text = apply_one(&text, edit)?;
+    }
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    Ok(text)
+}
 
 /// Apply a single edit to `text`, returning the new text or the refusal.
 fn apply_one(text: &str, edit: &SpecEdit) -> Result<String> {
