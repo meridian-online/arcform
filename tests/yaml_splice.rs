@@ -99,6 +99,28 @@ fn adding_a_key_adds_one_line_inside_the_plots_mapping() {
     assert_eq!(out.lines().count(), CHART.lines().count() + 1);
 }
 
+/// The other shape a mapping takes: its first key on a line of its own below
+/// the parent key. The new line lands after the mapping's last entry at its
+/// keys' column, read from that first key's line.
+#[test]
+fn adding_a_key_to_a_mapping_that_opens_on_its_own_line_uses_its_keys_column() {
+    let edit = SpecEdit::Add {
+        path: vec!["data".into(), "flows".into()],
+        key: "format".into(),
+        value: "parquet".into(),
+    };
+    let out = apply_yaml_edits(CHART, &[edit]).expect("a clean add applies");
+
+    let expected = once(
+        "    file: data/flows.parquet\n",
+        "    file: data/flows.parquet\n    format: parquet\n",
+    );
+    assert_eq!(
+        out, expected,
+        "one line is added and every other byte is kept"
+    );
+}
+
 /// A path the chart does not have is refused with the path named, as the spec
 /// entries refuse it, and no text comes back: a refusal from the splice is
 /// never swallowed into an empty document, which would load as YAML.
