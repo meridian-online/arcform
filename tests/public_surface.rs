@@ -92,12 +92,14 @@ const EXPORTED: [(&str, &str); 33] = [
 
 /// Every module file in the crate. Frozen so a new one cannot be added without
 /// passing under the checks below.
-const MODULE_FILES: [&str; 31] = [
+const MODULE_FILES: [&str; 32] = [
     "asset.rs",
     "asset_kind.rs",
     "bridge.rs",
     "cli.rs",
     "contract.rs",
+    // Reads a DuckDB SQL step from DuckDB 2.0's own parse of it. Private to the crate.
+    "duckdb_lineage.rs",
     "edit.rs",
     "engine.rs",
     "error.rs",
@@ -1028,6 +1030,13 @@ fn exported_modules_declare_only_contracted_items() {
             "entries",
             "read",
             "restore",
+            // The same five on one file rather than a protocol directory:
+            // a file beside the spec keeps a history of its own.
+            "record_save_for_file",
+            "record_checkpoint_for_file",
+            "entries_for_file",
+            "read_for_file",
+            "restore_for_file",
             "edit_spec_with_history",
             "record_step_with_history",
         ]),

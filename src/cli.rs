@@ -81,17 +81,21 @@ pub enum Commands {
         op: EditOp,
     },
 
-    /// Local history for a protocol's spec: list, inspect and restore
-    /// earlier states of `arcform.yaml` — no git repository or account
+    /// Local history for a protocol's spec, or for one file beside it: list,
+    /// inspect and restore earlier states of `arcform.yaml`, or with
+    /// `--file <FILE>` of that one file — no git repository or account
     /// required.
     ///
     /// The middle tier between editor undo and version control: saving
     /// records an entry and every machine edit checkpoints the state it is
     /// about to replace, into `$ARCFORM_HISTORY_DIR` (default
     /// `~/.arcform/history`) — outside the protocol directory, invisible to
-    /// `git status`. At most 50 entries are kept per spec, oldest pruned
-    /// first, and saves within 10 seconds of the newest save merge into it.
-    /// Nothing is ever promoted to git.
+    /// `git status`. Each file keeps a history of its own: `--file
+    /// panels/a.yaml` lists, shows and restores that file's entries and no
+    /// other's, and a relative `--file` is read from `--dir`. At most 50
+    /// entries are kept per spec and per file, oldest pruned first, and
+    /// saves within 10 seconds of the newest save merge into it. Nothing is
+    /// ever promoted to git.
     History {
         #[command(subcommand)]
         cmd: HistoryCmd,
@@ -239,15 +243,22 @@ pub enum EditOp {
     },
 }
 
-/// The local-history verbs. Entry ids come from `arc history list`.
+/// The local-history verbs. Entry ids come from `arc history list`, and a
+/// file's ids from `arc history list --file` for that same file.
 #[derive(Subcommand)]
 pub enum HistoryCmd {
-    /// List the recorded states of the protocol's spec, oldest first, with
-    /// the retention policy that governs them.
+    /// List the recorded states of the protocol's spec, or with `--file` of
+    /// that one file, oldest first, with the retention policy that governs
+    /// them.
     List {
         /// Protocol directory (where arcform.yaml lives).
         #[arg(long, default_value = ".")]
         dir: PathBuf,
+
+        /// List this file's own history instead of the spec's — a chart file
+        /// beside the spec, say. A relative path is read from `--dir`.
+        #[arg(long)]
+        file: Option<PathBuf>,
     },
     /// Print the exact bytes an entry recorded, to stdout.
     Show {
@@ -257,9 +268,15 @@ pub enum HistoryCmd {
         /// Protocol directory (where arcform.yaml lives).
         #[arg(long, default_value = ".")]
         dir: PathBuf,
+
+        /// Read the entry from this file's own history instead of the
+        /// spec's. A relative path is read from `--dir`.
+        #[arg(long)]
+        file: Option<PathBuf>,
     },
-    /// Roll the spec back to the state an entry recorded. The state being
-    /// replaced is checkpointed first, so a restore can itself be undone.
+    /// Roll the spec, or with `--file` that one file, back to the state an
+    /// entry recorded. The state being replaced is checkpointed first, so a
+    /// restore can itself be undone.
     Restore {
         /// The entry id, as listed by `arc history list`.
         id: String,
@@ -267,6 +284,11 @@ pub enum HistoryCmd {
         /// Protocol directory (where arcform.yaml lives).
         #[arg(long, default_value = ".")]
         dir: PathBuf,
+
+        /// Restore this file from its own history instead of the spec; no
+        /// other file is written. A relative path is read from `--dir`.
+        #[arg(long)]
+        file: Option<PathBuf>,
     },
 }
 
@@ -409,18 +431,43 @@ fn parse_path(raw: &str) -> Result<Vec<PathPart>> {
     Ok(parts)
 }
 
-/// Execute `arc history list`: the recorded states of the spec in `dir`,
-/// oldest first (the newest lands beside the prompt), with the retention
-/// policy printed under the entries it governs — a user should never have to
-/// hunt for the rules deciding what this command shows.
-pub fn history_list(dir: &Path, history: &LocalHistory, out: &mut impl Write) -> Result<()> {
-    let spec = dir.join(crate::spec::MANIFEST_FILENAME);
-    let entries = history.entries(dir)?;
+/// The path `--file` names: a relative path is read from the protocol
+/// directory, the way `--dir` scopes everything else a history verb touches,
+/// and an absolute one is taken as it stands.
+fn history_file(dir: &Path, file: &Path) -> PathBuf {
+    dir.join(file)
+}
+
+/// Execute `arc history list`: the recorded states of the spec in `dir`, or
+/// given `file` of that one file, oldest first (the newest lands beside the
+/// prompt), with the retention policy printed under the entries it governs —
+/// a user should never have to hunt for the rules deciding what this command
+/// shows.
+pub fn history_list(
+    dir: &Path,
+    file: Option<&Path>,
+    history: &LocalHistory,
+    out: &mut impl Write,
+) -> Result<()> {
+    let (subject, noun, entries, restore) = match file {
+        None => (
+            dir.join(crate::spec::MANIFEST_FILENAME),
+            "spec",
+            history.entries(dir)?,
+            "`arc history restore <id>`".to_string(),
+        ),
+        Some(file) => {
+            let path = history_file(dir, file);
+            let entries = history.entries_for_file(&path)?;
+            let restore = format!("`arc history restore <id> --file {}`", file.display());
+            (path, "file", entries, restore)
+        }
+    };
     if entries.is_empty() {
         writeln!(
             out,
-            "no local history for {} yet — entries are recorded as the spec is saved or machine-edited",
-            spec.display()
+            "no local history for {} yet — entries are recorded as the {noun} is saved or machine-edited",
+            subject.display()
         )?;
     } else {
         for entry in &entries {
@@ -435,7 +482,7 @@ pub fn history_list(dir: &Path, history: &LocalHistory, out: &mut impl Write) ->
         }
         writeln!(
             out,
-            "({} recorded state(s), newest last — `arc history restore <id>` rolls back)",
+            "({} recorded state(s), newest last — {restore} rolls back)",
             entries.len()
         )?;
     }
@@ -444,36 +491,56 @@ pub fn history_list(dir: &Path, history: &LocalHistory, out: &mut impl Write) ->
 }
 
 /// Execute `arc history show`: the exact recorded bytes and nothing else —
-/// the output is the historical spec, fit for a diff or a redirect.
+/// the output is the historical spec, or given `file` that file's historical
+/// text, fit for a diff or a redirect.
 pub fn history_show(
     dir: &Path,
+    file: Option<&Path>,
     id: &str,
     history: &LocalHistory,
     out: &mut impl Write,
 ) -> Result<()> {
-    write!(out, "{}", history.read(dir, id)?)?;
+    let text = match file {
+        None => history.read(dir, id)?,
+        Some(file) => history.read_for_file(&history_file(dir, file), id)?,
+    };
+    write!(out, "{text}")?;
     Ok(())
 }
 
-/// Execute `arc history restore`: roll the spec back to a recorded state.
-/// The library checkpoints the state being replaced first — a restore is a
-/// machine write like any other — and recovery is byte-faithful rather than
-/// gated, so the one thing left to check is whether the restored state still
-/// loads; when it does not, that is said out loud instead of silently
-/// handing back a spec `arc run` will refuse.
+/// Execute `arc history restore`: roll the spec, or given `file` that one
+/// file, back to a recorded state. The library checkpoints the state being
+/// replaced first — a restore is a machine write like any other — and
+/// recovery is byte-faithful rather than gated, so the one thing left to
+/// check is whether a restored spec still loads; when it does not, that is
+/// said out loud instead of silently handing back a spec `arc run` will
+/// refuse. A file that is not the spec is not a spec, and is not asked to
+/// load as one.
 pub fn history_restore(
     dir: &Path,
+    file: Option<&Path>,
     id: &str,
     history: &LocalHistory,
     out: &mut impl Write,
 ) -> Result<()> {
-    let text = history.restore(dir, id)?;
+    let (target, text) = match file {
+        None => (
+            dir.join(crate::spec::MANIFEST_FILENAME),
+            history.restore(dir, id)?,
+        ),
+        Some(file) => {
+            let path = history_file(dir, file);
+            let text = history.restore_for_file(&path, id)?;
+            (path, text)
+        }
+    };
     writeln!(
         out,
         "restored {} to {id} — the replaced state was checkpointed first",
-        dir.join(crate::spec::MANIFEST_FILENAME).display()
+        target.display()
     )?;
-    if let Err(e) = Manifest::from_yaml_str(&text) {
+    let is_spec = target.file_name() == Some(crate::spec::MANIFEST_FILENAME.as_ref());
+    if is_spec && let Err(e) = Manifest::from_yaml_str(&text) {
         writeln!(out, "note: the restored state does not load as a spec: {e}")?;
     }
     Ok(())
@@ -608,9 +675,15 @@ fn dispatch_history(cmd: HistoryCmd) -> Result<()> {
     let history = LocalHistory::open_default()?;
     let mut stdout = std::io::stdout();
     match cmd {
-        HistoryCmd::List { dir } => history_list(&dir, &history, &mut stdout),
-        HistoryCmd::Show { id, dir } => history_show(&dir, &id, &history, &mut stdout),
-        HistoryCmd::Restore { id, dir } => history_restore(&dir, &id, &history, &mut stdout),
+        HistoryCmd::List { dir, file } => {
+            history_list(&dir, file.as_deref(), &history, &mut stdout)
+        }
+        HistoryCmd::Show { id, dir, file } => {
+            history_show(&dir, file.as_deref(), &id, &history, &mut stdout)
+        }
+        HistoryCmd::Restore { id, dir, file } => {
+            history_restore(&dir, file.as_deref(), &id, &history, &mut stdout)
+        }
     }
 }
 
@@ -1100,15 +1173,46 @@ mod tests {
     }
 
     // `arc history list` / `show <id>` / `restore <id>` parse, with the
-    // directory defaulting to the cwd.
+    // directory defaulting to the cwd and no file unless `--file` names one.
     #[test]
     fn test_history_subcommands_parse() {
         let cli = Cli::try_parse_from(["arc", "history", "list"]).unwrap();
         match cli.command {
             Commands::History {
-                cmd: HistoryCmd::List { dir },
-            } => assert_eq!(dir, PathBuf::from(".")),
+                cmd: HistoryCmd::List { dir, file },
+            } => {
+                assert_eq!(dir, PathBuf::from("."));
+                assert_eq!(file, None);
+            }
             _ => panic!("expected History/List"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["arc", "history", "list", "--file", "panels/a.yaml"]).unwrap();
+        match cli.command {
+            Commands::History {
+                cmd: HistoryCmd::List { file, .. },
+            } => assert_eq!(file, Some(PathBuf::from("panels/a.yaml"))),
+            _ => panic!("expected History/List"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "arc",
+            "history",
+            "show",
+            "1700000000000-000-save",
+            "--file",
+            "panels/a.yaml",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::History {
+                cmd: HistoryCmd::Show { id, file, .. },
+            } => {
+                assert_eq!(id, "1700000000000-000-save");
+                assert_eq!(file, Some(PathBuf::from("panels/a.yaml")));
+            }
+            _ => panic!("expected History/Show"),
         }
 
         let cli = Cli::try_parse_from([
@@ -1122,11 +1226,28 @@ mod tests {
         .unwrap();
         match cli.command {
             Commands::History {
-                cmd: HistoryCmd::Restore { id, dir },
+                cmd: HistoryCmd::Restore { id, dir, file },
             } => {
                 assert_eq!(id, "1700000000000-000-save");
                 assert_eq!(dir, PathBuf::from("notes"));
+                assert_eq!(file, None);
             }
+            _ => panic!("expected History/Restore"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "arc",
+            "history",
+            "restore",
+            "1700000000000-000-save",
+            "--file",
+            "panels/a.yaml",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::History {
+                cmd: HistoryCmd::Restore { file, .. },
+            } => assert_eq!(file, Some(PathBuf::from("panels/a.yaml"))),
             _ => panic!("expected History/Restore"),
         }
     }
@@ -1183,7 +1304,7 @@ mod tests {
         assert_ne!(created, edited);
 
         let mut listed = Vec::new();
-        history_list(&dir, &history, &mut listed).unwrap();
+        history_list(&dir, None, &history, &mut listed).unwrap();
         let listed = String::from_utf8(listed).unwrap();
         assert!(listed.contains("save"), "{listed}");
         assert!(
@@ -1198,12 +1319,12 @@ mod tests {
             .find(|e| history.read(&dir, &e.id).unwrap() == created)
             .expect("the created state is recorded");
         let mut shown = Vec::new();
-        history_show(&dir, &pre_edit.id, &history, &mut shown).unwrap();
+        history_show(&dir, None, &pre_edit.id, &history, &mut shown).unwrap();
         assert_eq!(String::from_utf8(shown).unwrap(), created);
 
         // Restore rolls the file back and says so.
         let mut out = Vec::new();
-        history_restore(&dir, &pre_edit.id.clone(), &history, &mut out).unwrap();
+        history_restore(&dir, None, &pre_edit.id.clone(), &history, &mut out).unwrap();
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("restored"), "{out}");
         assert_eq!(
@@ -1213,7 +1334,7 @@ mod tests {
 
         // An unknown id is refused by name.
         let mut sink = Vec::new();
-        let err = history_restore(&dir, "not-an-id", &history, &mut sink).unwrap_err();
+        let err = history_restore(&dir, None, "not-an-id", &history, &mut sink).unwrap_err();
         assert!(matches!(err, Error::HistoryEntryNotFound { .. }), "{err}");
     }
 

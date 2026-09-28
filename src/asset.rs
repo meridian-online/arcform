@@ -113,6 +113,11 @@ impl AssetGraph {
             warnings: Vec::new(),
         };
 
+        // Each (step, table function) pair where a SQL step calls a function with
+        // arguments arc does not read — warned about after Phase 3, once everything the
+        // step declares is known.
+        let mut unread_calls: Vec<(&str, String)> = Vec::new();
+
         // Phase 1 & 2: Infer from SQL + merge declared fields.
         for step in &manifest.steps {
             let mut step_assets = StepAssets::default();
@@ -157,6 +162,12 @@ impl AssetGraph {
                             }
                             step_assets.internal.extend(sql_assets.internal);
                             step_assets.destroys.extend(sql_assets.destroys);
+                            unread_calls.extend(
+                                sql_assets
+                                    .unread_table_functions
+                                    .into_iter()
+                                    .map(|function| (step.name.as_str(), function)),
+                            );
                         }
                         Err(warnings) => {
                             // Warn on parse failure, treat as opaque.
@@ -277,6 +288,30 @@ impl AssetGraph {
                 graph.warnings.push(format!(
                     "asset '{}' references step '{}' which does not exist",
                     asset_name, override_entry.produced_by
+                ));
+            }
+        }
+
+        // A table function called with a string or a quoted identifier records no input
+        // (see `SqlAssets::unread_table_functions`), so arc cannot tell what the step
+        // reads or writes. It asks for a declaration rather than inferring one: which
+        // arguments are tables is the function's signature, and arc does not carry
+        // extension signatures. A step that declares anything — `depends_on:`,
+        // `produces:`, or a top-level `assets:` entry it produces — has answered.
+        for (step_name, function) in unread_calls {
+            let declares = manifest
+                .steps
+                .iter()
+                .find(|step| step.name == step_name)
+                .is_some_and(|step| !step.depends_on.is_empty() || !step.produces.is_empty())
+                || manifest
+                    .assets
+                    .values()
+                    .any(|entry| entry.produced_by == step_name);
+            if !declares {
+                graph.warnings.push(format!(
+                    "step '{step_name}' calls the table function '{function}', whose arguments arc does not read, \
+                     so what the step reads and writes is unknown — `depends_on:` and `produces:` declare what the step reads and writes"
                 ));
             }
         }
@@ -829,6 +864,138 @@ mod tests {
             msg.contains("load-customers"),
             "should name producer: {msg}"
         );
+    }
+
+    // A table function called with quoted identifiers records no input under its own
+    // name, and the step is asked — once, naming the step and the function — for a
+    // `depends_on:` and a `produces:`.
+    #[test]
+    fn test_unread_table_function_warns_once_naming_step_and_function() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = build_graph(
+            dir.path(),
+            vec![sql_step("train", "models/train.sql")],
+            HashMap::new(),
+            &[(
+                "models/train.sql",
+                // Two statements call the same function: still one warning.
+                r#"CREATE TABLE fitted AS SELECT * FROM mlpack_random_forest_train("X", "Y", "params", "model");
+                   CREATE TABLE refit AS SELECT * FROM mlpack_random_forest_train("X2", "Y", "params", "model");"#,
+            )],
+        );
+
+        let step = graph.steps.get("train").unwrap();
+        assert!(!step.reads.contains("mlpack_random_forest_train"));
+        assert!(step.reads.is_empty(), "reads: {:?}", step.reads);
+        assert!(step.produces.contains("fitted") && step.produces.contains("refit"));
+        assert_eq!(graph.warnings.len(), 1, "warnings: {:?}", graph.warnings);
+        let warning = &graph.warnings[0];
+        assert!(
+            warning.contains("step 'train'"),
+            "names the step: {warning}"
+        );
+        assert!(
+            warning.contains("'mlpack_random_forest_train'"),
+            "names the function: {warning}"
+        );
+        assert!(
+            warning
+                .contains("`depends_on:` and `produces:` declare what the step reads and writes"),
+            "asks for the declarations: {warning}"
+        );
+    }
+
+    // With `depends_on:` and `produces:` declared, the step reads what it declared,
+    // produces what it declared and what the SQL creates, and there is no warning.
+    #[test]
+    fn test_unread_table_function_with_declarations_reads_them_and_does_not_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut step = sql_step("train", "models/train.sql");
+        step.depends_on = vec!["x".into(), "y".into(), "params".into()];
+        step.produces = vec!["model".into()];
+        let graph = build_graph(
+            dir.path(),
+            vec![step],
+            HashMap::new(),
+            &[(
+                "models/train.sql",
+                r#"CREATE TABLE fitted AS SELECT * FROM mlpack_random_forest_train("X", "Y", "params", "model");"#,
+            )],
+        );
+
+        let step = graph.steps.get("train").unwrap();
+        let reads: Vec<&str> = step.reads.iter().map(String::as_str).collect();
+        assert_eq!(reads, ["params", "x", "y"]);
+        let produces: Vec<&str> = step.produces.iter().map(String::as_str).collect();
+        assert_eq!(produces, ["fitted", "model"]);
+        assert!(graph.warnings.is_empty(), "warnings: {:?}", graph.warnings);
+    }
+
+    // Declaring one of the two, or an `assets:` entry the step produces, is an answer
+    // too: arc asks, and does not keep asking once the step has been told anything.
+    #[test]
+    fn test_unread_table_function_with_any_declaration_does_not_warn() {
+        let sql = r#"CREATE TABLE fitted AS SELECT * FROM mlpack_random_forest_train("X", "Y", "params", "model");"#;
+        let mut depends_only = sql_step("train", "models/train.sql");
+        depends_only.depends_on = vec!["x".into()];
+        let mut produces_only = sql_step("train", "models/train.sql");
+        produces_only.produces = vec!["model".into()];
+        let by_assets_entry = sql_step("train", "models/train.sql");
+
+        for (label, step, assets) in [
+            ("depends_on only", depends_only, HashMap::new()),
+            ("produces only", produces_only, HashMap::new()),
+            (
+                "assets: entry",
+                by_assets_entry,
+                HashMap::from([(
+                    "model".to_string(),
+                    AssetOverride {
+                        produced_by: "train".to_string(),
+                        depends_on: vec![],
+                    },
+                )]),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let graph = build_graph(dir.path(), vec![step], assets, &[("models/train.sql", sql)]);
+            assert!(
+                graph.warnings.is_empty(),
+                "{label}: warnings {:?}",
+                graph.warnings
+            );
+        }
+    }
+
+    // The declaration that silences the warning is the step's own: an `assets:` entry
+    // another step produces, and a declaration on another step, leave this one asked.
+    #[test]
+    fn test_unread_table_function_warning_is_not_silenced_by_another_steps_declaration() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut other = sql_step("other", "models/other.sql");
+        other.produces = vec!["model".into()];
+        other.depends_on = vec!["x".into()];
+        let graph = build_graph(
+            dir.path(),
+            vec![other, sql_step("train", "models/train.sql")],
+            HashMap::from([(
+                "elsewhere".to_string(),
+                AssetOverride {
+                    produced_by: "other".to_string(),
+                    depends_on: vec![],
+                },
+            )]),
+            &[
+                ("models/other.sql", "CREATE TABLE t AS SELECT 1;"),
+                (
+                    "models/train.sql",
+                    r#"CREATE TABLE fitted AS SELECT * FROM mlpack_random_forest_train("X", "Y", "params", "model");"#,
+                ),
+            ],
+        );
+
+        assert_eq!(graph.warnings.len(), 1, "warnings: {:?}", graph.warnings);
+        assert!(graph.warnings[0].contains("step 'train'"));
     }
 
     // Valid order passes validation.

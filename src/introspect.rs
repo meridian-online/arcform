@@ -13,10 +13,11 @@
 //! files is thus *discovered from the SQL*, never hand-declared via `depends_on:`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::ControlFlow;
 
 use sqlparser::ast::{
     CopyOption, CopySource, CopyTarget, Expr, FunctionArg, FunctionArgExpr, Insert, ObjectName,
-    Statement, TableFactor, TableObject, Value,
+    Statement, TableFactor, TableFunctionArgs, TableObject, Value, visit_expressions,
 };
 use sqlparser::dialect::DuckDbDialect;
 use sqlparser::parser::Parser;
@@ -42,6 +43,14 @@ pub struct SqlAssets {
     /// for glob metacharacters — DuckDB's COPY target is a literal path, not a
     /// pattern. Never reconstructed later from the string.
     pub kinds: BTreeMap<String, AssetKind>,
+    /// Table-valued functions this SQL calls with a string or a quoted identifier among
+    /// their arguments, other than the file readers and row-generators this layer knows —
+    /// `mlpack_random_forest_train("X", "Y", "params", "model")`, `query('SELECT …')`. What
+    /// such an argument names depends on the function's signature, which arc does not
+    /// carry, so the call records no input at all, not even one under the function's own
+    /// name: the function is listed here for `AssetGraph::build` to ask the step for a
+    /// `depends_on:` and a `produces:`. Lowercased; a function called twice is listed once.
+    pub unread_table_functions: BTreeSet<String>,
 }
 
 impl SqlAssets {
@@ -434,7 +443,18 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
                     }
                 }
                 CopySource::Query(query) => {
+                    // COPY (SELECT …) TO 'file' — the query reads its tables and the
+                    // COPY produces the file, the same two facts `COPY <table> TO
+                    // 'file'` records above, with the target classified the same way.
+                    // The parser refuses `COPY (query) FROM`, so a query source is
+                    // always a `TO`.
                     extract_inputs_from_query(query, assets);
+                    if let CopyTarget::File { filename } = target {
+                        assets.record_output(
+                            filename.clone(),
+                            copy_to_target_kind(options.as_slice()),
+                        );
+                    }
                 }
             }
         }
@@ -551,8 +571,16 @@ fn extract_inputs_from_table_factor(factor: &TableFactor, assets: &mut SqlAssets
                 // `duckdb_secrets()`) produce rows with no backing table at all — there
                 // is nothing to record as an input, and none as the fn name either.
                 Some(_) if reads_no_table(&fn_name) => {}
-                // Any other table-valued function (an extension's, a table macro,
-                // `query(…)`) or a plain table name: record the name itself as the
+                // Any other table-valued function whose arguments hold a string or a quoted
+                // identifier (an extension's `mlpack_…_train("X", "Y", …)`, `query('…')`):
+                // those arguments name tables, files or queries, and arc does not carry
+                // the signature that says which. The call records no input — the
+                // function's own name is not a table — and is reported as unread instead.
+                Some(table_args) if args_name_something(table_args) => {
+                    assets.unread_table_functions.insert(fn_name);
+                }
+                // A table macro (`recent()`), a function called with numbers and bare
+                // names only, or a plain table name: record the name itself as the
                 // input, as before.
                 _ => {
                     assets.record_input(fn_name, AssetKind::Table);
@@ -635,6 +663,34 @@ fn reads_no_table(fn_name: &str) -> bool {
         "duckdb_secrets",
     ];
     NO_TABLE.contains(&fn_name)
+}
+
+/// Whether a table-valued function's arguments hold a string literal or a quoted
+/// identifier, at any depth — the two forms in which a DuckDB call names a table, a file
+/// or a query (`"X"`, `'x.parquet'`, `'SELECT …'`). A call with neither
+/// (`recent()`, `range(10)`, `f(days := 7)`) names nothing arc could be missing.
+fn args_name_something(table_args: &TableFunctionArgs) -> bool {
+    visit_expressions(table_args, |expr| {
+        let names = match expr {
+            Expr::Value(v) => matches!(
+                v.value,
+                Value::SingleQuotedString(_)
+                    | Value::DoubleQuotedString(_)
+                    | Value::DollarQuotedString(_)
+                    | Value::EscapedStringLiteral(_)
+                    | Value::NationalStringLiteral(_)
+            ),
+            Expr::Identifier(ident) => ident.quote_style.is_some(),
+            Expr::CompoundIdentifier(parts) => parts.iter().any(|p| p.quote_style.is_some()),
+            _ => false,
+        };
+        if names {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break()
 }
 
 /// Lift filesystem-path string literals out of a file-reader argument expression.
@@ -1179,17 +1235,106 @@ mod tests {
     }
 
     // An extension-supplied table function that reads tables named in its own
-    // arguments (not a path) keeps recording its own name — this layer cannot see
-    // what its string arguments mean.
+    // arguments (`"X"` is a quoted identifier) records no input — not even one under its
+    // own name, which is not a table — and is listed as unread, so the step can be
+    // asked for what it reads and writes.
     #[test]
-    fn test_extension_table_function_with_table_args_unchanged() {
-        let sql = r#"CREATE TABLE model AS SELECT * FROM mlpack_random_forest_train("X", "Y", "params", "model");"#;
+    fn test_table_function_with_quoted_identifier_args_is_unread_not_recorded() {
+        let sql = r#"CREATE TABLE fitted AS SELECT * FROM mlpack_random_forest_train("X", "Y", "params", "model");"#;
         let assets = extract_assets(sql).unwrap();
         assert!(
-            assets.inputs.contains("mlpack_random_forest_train"),
-            "extension TVF name should still be recorded, got {:?}",
+            !assets.inputs.contains("mlpack_random_forest_train"),
+            "the function's name is not a table, got {:?}",
             assets.inputs
         );
+        assert!(
+            assets.inputs.is_empty(),
+            "no input at all: {:?}",
+            assets.inputs
+        );
+        assert_eq!(
+            assets.unread_table_functions,
+            BTreeSet::from(["mlpack_random_forest_train".to_string()])
+        );
+        assert!(
+            assets.outputs.contains("fitted"),
+            "the CTAS target is still produced"
+        );
+    }
+
+    // The other form a call names something in: a string. Each of these is a table
+    // function arc has no signature for, called with a string at some depth — a plain
+    // argument, a list element, a named argument's value, a schema-qualified call.
+    #[test]
+    fn test_table_function_with_a_string_arg_is_unread() {
+        for sql in [
+            "SELECT * FROM query('SELECT 1');",
+            "SELECT * FROM my_ext_scan(['a', 'b']);",
+            "SELECT * FROM my_ext_scan(3, source := 'orders');",
+            "SELECT * FROM my_ext.my_ext_scan('orders');",
+        ] {
+            let assets = extract_assets(sql).unwrap();
+            assert!(
+                assets.inputs.is_empty(),
+                "{sql}: records no input, got {:?}",
+                assets.inputs
+            );
+            assert_eq!(
+                assets.unread_table_functions.len(),
+                1,
+                "{sql}: one function is unread, got {:?}",
+                assets.unread_table_functions
+            );
+        }
+    }
+
+    // A function called twice is listed once; two functions are listed twice.
+    #[test]
+    fn test_unread_table_functions_are_a_set_of_names() {
+        let sql = "SELECT * FROM my_scan('a'); SELECT * FROM my_scan('b'); SELECT * FROM other_scan('c');";
+        let assets = extract_assets(sql).unwrap();
+        assert_eq!(
+            assets.unread_table_functions,
+            BTreeSet::from(["my_scan".to_string(), "other_scan".to_string()])
+        );
+    }
+
+    // A call with no string and no quoted identifier names nothing arc could be missing:
+    // it is not listed as unread. `recent()` and `recent(days := 7)` (a table macro)
+    // keep recording their own name; `range(10)` records nothing, as before.
+    #[test]
+    fn test_table_function_with_no_string_or_quoted_identifier_is_not_unread() {
+        for (sql, records) in [
+            ("SELECT * FROM range(10);", None),
+            ("SELECT * FROM recent();", Some("recent")),
+            (
+                "SELECT * FROM recent(days := 7, strict := true);",
+                Some("recent"),
+            ),
+            (
+                "SELECT * FROM my_ext_scan(10, 2.5, x);",
+                Some("my_ext_scan"),
+            ),
+            // An argument that is not a leaf but holds no string: a list of numbers, a
+            // sum, a negation. Only a string or a quoted identifier names anything.
+            ("SELECT * FROM my_ext_scan([1, 2]);", Some("my_ext_scan")),
+            ("SELECT * FROM my_ext_scan(1 + 2, -3);", Some("my_ext_scan")),
+        ] {
+            let assets = extract_assets(sql).unwrap();
+            assert!(
+                assets.unread_table_functions.is_empty(),
+                "{sql}: not unread, got {:?}",
+                assets.unread_table_functions
+            );
+            assert_eq!(
+                assets.inputs,
+                records
+                    .map(str::to_string)
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                "{sql}: inputs"
+            );
+        }
     }
 
     // COPY <table> TO 'file' produces the file path as an output (file-path lineage).
@@ -1204,18 +1349,133 @@ mod tests {
         );
     }
 
-    // a non-file table function keeps recording its name (unchanged behaviour).
+    // COPY (SELECT …) TO 'file' reads what its query reads and produces the file, as
+    // COPY <table> TO 'file' does.
+    #[test]
+    fn test_copy_from_query_produces_file() {
+        let sql = "COPY (SELECT * FROM a WHERE x > 1) TO 'out.csv' (HEADER);";
+        let assets = extract_assets(sql).unwrap();
+        assert_eq!(
+            assets.inputs,
+            BTreeSet::from(["a".to_string()]),
+            "the query's table is read"
+        );
+        assert_eq!(
+            assets.outputs,
+            BTreeSet::from(["out.csv".to_string()]),
+            "the file is produced, and nothing else is"
+        );
+        assert_eq!(assets.kinds.get("out.csv"), Some(&AssetKind::File));
+    }
+
+    // A query that reads several tables (a CTE and a join) has each of them recorded as
+    // read, and the CTE's own name is not one of them.
+    #[test]
+    fn test_copy_from_query_reads_every_table_its_query_reads() {
+        let sql = "COPY (WITH c AS (SELECT * FROM a) \
+                   SELECT * FROM c JOIN b ON c.x = b.x) \
+                   TO 'out.csv';";
+        let assets = extract_per_statement(sql).unwrap().remove(0);
+        assert_eq!(
+            assets.inputs,
+            ["a", "b"].map(str::to_string).into_iter().collect(),
+            "tables the query reads"
+        );
+        assert_eq!(assets.outputs, BTreeSet::from(["out.csv".to_string()]));
+    }
+
+    // The target of COPY (query) is classified from the statement's own options, and
+    // classified as COPY <table> TO classifies it: the same options give the same kind
+    // whichever the source. The expected kinds are listed too, so two arms that were
+    // both wrong the same way would not pass.
+    #[test]
+    fn test_copy_from_query_target_kind_follows_the_options_as_copy_from_table_does() {
+        for (options, expected) in [
+            ("(HEADER)", AssetKind::File),
+            ("(FORMAT parquet)", AssetKind::File),
+            (
+                "(FORMAT parquet, PARTITION_BY (region))",
+                AssetKind::Directory,
+            ),
+            ("(PER_THREAD_OUTPUT)", AssetKind::Directory),
+            ("(PER_THREAD_OUTPUT false)", AssetKind::File),
+            ("(FORMAT csv, FILE_SIZE_BYTES '1GB')", AssetKind::Directory),
+            (
+                "(FORMAT parquet, ROW_GROUPS_PER_FILE 2)",
+                AssetKind::Directory,
+            ),
+        ] {
+            let from_table = extract_assets(&format!("COPY a TO 'out' {options};")).unwrap();
+            let from_query =
+                extract_assets(&format!("COPY (SELECT * FROM a) TO 'out' {options};")).unwrap();
+            assert_eq!(
+                from_table.kinds.get("out"),
+                Some(&expected),
+                "COPY a TO 'out' {options}"
+            );
+            assert_eq!(
+                from_query.kinds.get("out"),
+                Some(&expected),
+                "COPY (SELECT * FROM a) TO 'out' {options}"
+            );
+        }
+    }
+
+    // Only a file target produces an asset: a COPY (query) to STDOUT reads its tables
+    // and writes nothing arc can track.
+    #[test]
+    fn test_copy_from_query_to_stdout_produces_nothing() {
+        let assets = extract_assets("COPY (SELECT * FROM a) TO STDOUT;").unwrap();
+        assert_eq!(assets.inputs, BTreeSet::from(["a".to_string()]));
+        assert!(
+            assets.outputs.is_empty(),
+            "no output for STDOUT, got {:?}",
+            assets.outputs
+        );
+    }
+
+    // The two COPY <table> forms record what they recorded before COPY (query) did.
+    // `COPY a FROM 'in.csv'` records the file as *produced* — the direction is not
+    // read from the statement — and this change leaves that as it is.
+    #[test]
+    fn test_copy_table_forms_record_what_they_recorded_before() {
+        let to = extract_assets("COPY a TO 'out.csv' (HEADER);").unwrap();
+        assert_eq!(to.inputs, BTreeSet::from(["a".to_string()]), "TO: reads");
+        assert_eq!(
+            to.outputs,
+            BTreeSet::from(["out.csv".to_string()]),
+            "TO: produces"
+        );
+        assert_eq!(to.kinds.get("out.csv"), Some(&AssetKind::File));
+
+        let from = extract_assets("COPY a FROM 'in.csv';").unwrap();
+        assert_eq!(
+            from.inputs,
+            BTreeSet::from(["a".to_string()]),
+            "FROM: reads"
+        );
+        assert_eq!(
+            from.outputs,
+            BTreeSet::from(["in.csv".to_string()]),
+            "FROM: produces"
+        );
+        assert_eq!(from.kinds.get("in.csv"), Some(&AssetKind::File));
+    }
+
+    // A table function called with no string and no quoted identifier — a table macro
+    // such as `recent()` — keeps recording its name. One called with a string or a
+    // quoted identifier records nothing under its name; see the `unread` tests above.
     #[test]
     fn test_non_file_table_function_unchanged() {
-        // A table macro (or any other extension-supplied table function that is
-        // neither a file reader nor a row-generator) still records its own name —
-        // it may read tables named in its own definition, which this layer cannot
-        // see, so the name is the only handle lineage has on it.
+        // A table macro (an extension-supplied table function that is neither a file
+        // reader nor a row-generator, called with no string and no quoted identifier)
+        // still records its own name — it may read tables named in its own definition,
+        // which this layer cannot see, so the name is the only handle lineage has on it.
         let sql = "SELECT * FROM recent();";
         let assets = extract_assets(sql).unwrap();
         assert!(
             assets.inputs.contains("recent"),
-            "non-file, non-generator TVF name still recorded"
+            "a table macro called with no string or quoted identifier still records its name"
         );
     }
 
