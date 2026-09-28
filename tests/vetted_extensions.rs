@@ -231,6 +231,31 @@ fn a_repository_setting_and_an_install_by_path_are_refused_by_name() {
 }
 
 #[test]
+fn a_parser_switch_is_refused_by_name() {
+    for (sql, named) in [
+        ("CALL enable_peg_parser();", "names enable_peg_parser"),
+        (
+            "SET allow_parser_override_extension = 'fallback';",
+            "names allow_parser_override_extension",
+        ),
+        (
+            "SET allow_parser_override_extension = 'strict';",
+            "names allow_parser_override_extension",
+        ),
+    ] {
+        let run = Protocol::steps(&[("s", sql)]).run(VETTED_ON);
+        run.assert_refused(sql);
+        assert!(
+            run.stderr.contains(&format!(
+                "models/s.sql, line 1) {named}, which switches DuckDB to a second parser"
+            )),
+            "[{sql}] should name {named:?}:\n{}",
+            run.stderr
+        );
+    }
+}
+
+#[test]
 fn a_hook_is_read_as_a_step_is() {
     let protocol = Protocol::with(
         "name: vetted\nsteps:\n  - name: s\n    sql: models/s.sql\nhooks:\n  on_init:\n    name: setup\n    sql: models/setup.sql\n",
@@ -520,9 +545,10 @@ fn between<'a>(text: &'a str, before: &str, after: &str) -> Option<&'a str> {
 
 /// Each case in `ran` holds `@@` where a statement goes. DuckDB runs the case with `@@` as a
 /// `CREATE TABLE`, and arc reads it with `@@` as an unvetted `INSTALL`: arc has to refuse
-/// exactly the cases in which DuckDB ran the statement. The cases hold each rule arc copies
-/// from DuckDB's CLI, its parser's pre-pass and its scanner, and at least one input each rule
-/// changes the reading of.
+/// exactly the cases in which DuckDB ran the statement, for the `INSTALL` or for a switch to
+/// DuckDB's second parser before it. The cases hold each rule arc copies from DuckDB's CLI,
+/// its parser's pre-pass and its scanner, at least one input each rule changes the reading
+/// of, and each form of the switch.
 ///
 /// Each case in `names` holds `@@` where the repository goes. DuckDB installs from a
 /// directory that is not there, and its error names the extension it tried to fetch; arc
@@ -617,6 +643,18 @@ fn arc_refuses_an_install_exactly_where_duckdb_would_run_it() {
         ".bail off\nSELECT 1 /* /* */ ;\n@@; -- */",
         // A NUL byte drops the rest of the chunk the CLI read it in.
         "SELECT 1; \0/*\n@@; -- */",
+        // After DuckDB's second parser is switched on, a block comment does not nest and a
+        // backslash escapes nothing inside E'...'. arc refuses the switch.
+        "CALL enable_peg_parser();\n/* /* */ @@; -- */",
+        "CALL enable_peg_parser();\nSELECT E'\\' ; @@; --';",
+        "FROM enable_peg_parser();\n/* /* */ @@; -- */",
+        "SET allow_parser_override_extension = 'fallback';\n/* /* */ @@; -- */",
+        "SET allow_parser_override_extension = 'strict';\n/* /* */ @@; -- */",
+        "PRAGMA allow_parser_override_extension = 'strict';\n/* /* */ @@; -- */",
+        "FROM query('FROM enable_peg_parser()');\n/* /* */ @@; -- */",
+        // ... and a switch in a comment switches nothing.
+        "-- CALL enable_peg_parser();\n/* /* */ @@; -- */",
+        "/* SET allow_parser_override_extension = 'strict'; */\nSELECT E'\\' ; @@; --';",
     ]
     .map(String::from)
     .to_vec();
@@ -672,7 +710,10 @@ fn arc_refuses_an_install_exactly_where_duckdb_would_run_it() {
         .run(VETTED_ON);
         let refused = run
             .stderr
-            .contains("anofox_forecast is not on the vetted list");
+            .contains("anofox_forecast is not on the vetted list")
+            || run
+                .stderr
+                .contains("which switches DuckDB to a second parser");
         if ran != refused {
             disagreements.push(format!(
                 "{case:?}: DuckDB ran it: {ran}; arc refused: {refused}"
