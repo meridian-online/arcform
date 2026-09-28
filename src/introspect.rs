@@ -443,7 +443,18 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
                     }
                 }
                 CopySource::Query(query) => {
+                    // COPY (SELECT …) TO 'file' — the query reads its tables and the
+                    // COPY produces the file, the same two facts `COPY <table> TO
+                    // 'file'` records above, with the target classified the same way.
+                    // The parser refuses `COPY (query) FROM`, so a query source is
+                    // always a `TO`.
                     extract_inputs_from_query(query, assets);
+                    if let CopyTarget::File { filename } = target {
+                        assets.record_output(
+                            filename.clone(),
+                            copy_to_target_kind(options.as_slice()),
+                        );
+                    }
                 }
             }
         }
@@ -1338,18 +1349,133 @@ mod tests {
         );
     }
 
-    // a non-file table function keeps recording its name (unchanged behaviour).
+    // COPY (SELECT …) TO 'file' reads what its query reads and produces the file, as
+    // COPY <table> TO 'file' does.
+    #[test]
+    fn test_copy_from_query_produces_file() {
+        let sql = "COPY (SELECT * FROM a WHERE x > 1) TO 'out.csv' (HEADER);";
+        let assets = extract_assets(sql).unwrap();
+        assert_eq!(
+            assets.inputs,
+            BTreeSet::from(["a".to_string()]),
+            "the query's table is read"
+        );
+        assert_eq!(
+            assets.outputs,
+            BTreeSet::from(["out.csv".to_string()]),
+            "the file is produced, and nothing else is"
+        );
+        assert_eq!(assets.kinds.get("out.csv"), Some(&AssetKind::File));
+    }
+
+    // A query that reads several tables (a CTE and a join) has each of them recorded as
+    // read, and the CTE's own name is not one of them.
+    #[test]
+    fn test_copy_from_query_reads_every_table_its_query_reads() {
+        let sql = "COPY (WITH c AS (SELECT * FROM a) \
+                   SELECT * FROM c JOIN b ON c.x = b.x) \
+                   TO 'out.csv';";
+        let assets = extract_per_statement(sql).unwrap().remove(0);
+        assert_eq!(
+            assets.inputs,
+            ["a", "b"].map(str::to_string).into_iter().collect(),
+            "tables the query reads"
+        );
+        assert_eq!(assets.outputs, BTreeSet::from(["out.csv".to_string()]));
+    }
+
+    // The target of COPY (query) is classified from the statement's own options, and
+    // classified as COPY <table> TO classifies it: the same options give the same kind
+    // whichever the source. The expected kinds are listed too, so two arms that were
+    // both wrong the same way would not pass.
+    #[test]
+    fn test_copy_from_query_target_kind_follows_the_options_as_copy_from_table_does() {
+        for (options, expected) in [
+            ("(HEADER)", AssetKind::File),
+            ("(FORMAT parquet)", AssetKind::File),
+            (
+                "(FORMAT parquet, PARTITION_BY (region))",
+                AssetKind::Directory,
+            ),
+            ("(PER_THREAD_OUTPUT)", AssetKind::Directory),
+            ("(PER_THREAD_OUTPUT false)", AssetKind::File),
+            ("(FORMAT csv, FILE_SIZE_BYTES '1GB')", AssetKind::Directory),
+            (
+                "(FORMAT parquet, ROW_GROUPS_PER_FILE 2)",
+                AssetKind::Directory,
+            ),
+        ] {
+            let from_table = extract_assets(&format!("COPY a TO 'out' {options};")).unwrap();
+            let from_query =
+                extract_assets(&format!("COPY (SELECT * FROM a) TO 'out' {options};")).unwrap();
+            assert_eq!(
+                from_table.kinds.get("out"),
+                Some(&expected),
+                "COPY a TO 'out' {options}"
+            );
+            assert_eq!(
+                from_query.kinds.get("out"),
+                Some(&expected),
+                "COPY (SELECT * FROM a) TO 'out' {options}"
+            );
+        }
+    }
+
+    // Only a file target produces an asset: a COPY (query) to STDOUT reads its tables
+    // and writes nothing arc can track.
+    #[test]
+    fn test_copy_from_query_to_stdout_produces_nothing() {
+        let assets = extract_assets("COPY (SELECT * FROM a) TO STDOUT;").unwrap();
+        assert_eq!(assets.inputs, BTreeSet::from(["a".to_string()]));
+        assert!(
+            assets.outputs.is_empty(),
+            "no output for STDOUT, got {:?}",
+            assets.outputs
+        );
+    }
+
+    // The two COPY <table> forms record what they recorded before COPY (query) did.
+    // `COPY a FROM 'in.csv'` records the file as *produced* — the direction is not
+    // read from the statement — and this change leaves that as it is.
+    #[test]
+    fn test_copy_table_forms_record_what_they_recorded_before() {
+        let to = extract_assets("COPY a TO 'out.csv' (HEADER);").unwrap();
+        assert_eq!(to.inputs, BTreeSet::from(["a".to_string()]), "TO: reads");
+        assert_eq!(
+            to.outputs,
+            BTreeSet::from(["out.csv".to_string()]),
+            "TO: produces"
+        );
+        assert_eq!(to.kinds.get("out.csv"), Some(&AssetKind::File));
+
+        let from = extract_assets("COPY a FROM 'in.csv';").unwrap();
+        assert_eq!(
+            from.inputs,
+            BTreeSet::from(["a".to_string()]),
+            "FROM: reads"
+        );
+        assert_eq!(
+            from.outputs,
+            BTreeSet::from(["in.csv".to_string()]),
+            "FROM: produces"
+        );
+        assert_eq!(from.kinds.get("in.csv"), Some(&AssetKind::File));
+    }
+
+    // A table function called with no string and no quoted identifier — a table macro
+    // such as `recent()` — keeps recording its name. One called with a string or a
+    // quoted identifier records nothing under its name; see the `unread` tests above.
     #[test]
     fn test_non_file_table_function_unchanged() {
-        // A table macro (or any other extension-supplied table function that is
-        // neither a file reader nor a row-generator) still records its own name —
-        // it may read tables named in its own definition, which this layer cannot
-        // see, so the name is the only handle lineage has on it.
+        // A table macro (an extension-supplied table function that is neither a file
+        // reader nor a row-generator, called with no string and no quoted identifier)
+        // still records its own name — it may read tables named in its own definition,
+        // which this layer cannot see, so the name is the only handle lineage has on it.
         let sql = "SELECT * FROM recent();";
         let assets = extract_assets(sql).unwrap();
         assert!(
             assets.inputs.contains("recent"),
-            "non-file, non-generator TVF name still recorded"
+            "a table macro called with no string or quoted identifier still records its name"
         );
     }
 
