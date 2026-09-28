@@ -39,6 +39,7 @@ mod bridge;
 #[cfg(feature = "cli")]
 mod cli;
 mod contract;
+mod duckdb_lineage;
 mod edit;
 mod engine;
 mod error;
