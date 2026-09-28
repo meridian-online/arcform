@@ -49,6 +49,18 @@ The operators, and the failure each is modelled on:
                              operator.
   FN_BODY_DEFAULT            the whole-body replacement, kept because a function
                              the suite never calls at all should still be named.
+  ARM_DELETE                 one arm of a `match` deleted, so the values it took
+                             fall to the arms below it.  A shipped build added an
+                             arm for a new variant, and the suite passed with the
+                             arm gone.
+  ARM_WIDEN                  one arm's pattern widened to `_`, its guard kept.  A
+                             shipped build's guard, written against `Some(_)`,
+                             passed the suite widened, because no test's `None`
+                             made the guard true.
+                             Both work on an arm whose head — pattern, guard and
+                             `=>` — the diff changed, and neither touches the last
+                             arm of a match; the comment above `op_arm_delete`
+                             says why.
 
 FOUR TIERS IN THE REPORT, and the split is the point.  A real codebase produces
 surviving mutations that are *equivalent* — the code cannot be reached in
@@ -81,7 +93,7 @@ one, what that probe answered:
               date.  Keyed on the mutation's content, not its line number, so
               editing the file above it does not silently unrule it.
 
-Each of the six entries in OPERATORS attaches a probe to every mutant it emits,
+Each entry in OPERATORS attaches a probe to every mutant it emits,
 so UNPROBED means a probe was built and could not be run — never that none was
 offered.  The probe splits the "unreachable in production" half of the
 equivalent-mutant problem automatically and cannot split the "observable only in
@@ -100,6 +112,12 @@ never executed — so the survivor has a reason to exist that was established.
 UNPROBED has no measurement behind it at all.  A survivor with no evidence either
 way is not safer than one with evidence against it, and the registry is where a
 survivor goes when a person has decided it cannot change behaviour.
+
+SET ASIDE is not a tier of survivors.  A mutation from ARM_DELETE or ARM_WIDEN
+that the compiler refuses has tested nothing: deleting an arm can leave a match
+that is not exhaustive, and widening a pattern can drop a binding the arm uses.
+It is counted on a line of its own and listed, and it neither counts as killed
+nor fails the job.  The other operators still count a compiler refusal as a kill.
 
 Exit codes: 0 clean · 1 at least one UNPINNED or UNPROBED survivor, or under
 --strict an UNREACHED one · 2 usage · 3 the harness could not run (no baseline,
@@ -1183,9 +1201,9 @@ def op_arm_delete(lines, masks, i, path, fn) -> list[Mutant]:
 def op_arm_widen(lines, masks, i, path, fn) -> list[Mutant]:
     """Widen one arm's pattern to `_`, keeping its guard where it has one.
 
-    Modelled on a guard written against `Some(_)` whose `None` case no test fed
-    it: `Some(_) if reads_no_table(&fn_name)` widened to `_ if reads_no_table(..)`
-    left the suite green, so nothing held the pattern half of the arm.
+    Modelled on the arm `Some(_) if reads_no_table(&fn_name)`: widened to
+    `_ if reads_no_table(..)` it left the suite green, because no test's `None`
+    made the guard true, so nothing held the pattern half of the arm.
 
     A pattern whose binding the guard or body uses stops compiling once widened;
     the compiler's refusal is set aside by `classify`, not counted as a kill.
