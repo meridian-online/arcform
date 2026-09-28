@@ -167,9 +167,8 @@ jobs:
       # the 2.0 preview and runs them when this commit changes the reader or this
       # workflow; the tests that read from captured answers ran above either way. The
       # preview's address names no version and the build behind it moves, so a change
-      # elsewhere does not run them, and a new preview build cannot redden an unrelated
-      # pull request. The step prints the version it downloaded, and each test prints
-      # the version it asked.
+      # elsewhere does not run them. The step prints the version it downloaded, and
+      # each test prints the version it asked.
       - name: test (DuckDB lineage reader, on the DuckDB 2.0 preview)
         run: |
           set -euo pipefail
