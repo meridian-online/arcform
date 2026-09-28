@@ -683,4 +683,73 @@ mod tests {
         assert!(bystander.exists(), "the bystander survives");
         assert!(models.exists(), "a non-empty directory is left standing");
     }
+
+    // ------------------------------------------------------- the catalogue
+
+    #[test]
+    fn every_long_name_is_lower_case_hyphenated_and_appears_once() {
+        let mut seen = std::collections::BTreeSet::new();
+        for op in operations() {
+            assert!(
+                !op.long_name.is_empty()
+                    && op
+                        .long_name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '-'),
+                "`{}` is not a lower case, hyphenated long name",
+                op.long_name
+            );
+            assert!(
+                seen.insert(op.long_name),
+                "`{}` is held twice, so a lookup could not tell them apart",
+                op.long_name
+            );
+            assert!(
+                !op.summary.trim().is_empty() && !op.summary.contains('\n'),
+                "`{}` has no one-line summary",
+                op.long_name
+            );
+        }
+    }
+
+    #[test]
+    fn an_operation_is_found_by_its_exact_long_name_and_no_other_spelling() {
+        assert_eq!(
+            operation(FILTER_ROWS).map(|op| op.long_name),
+            Some(FILTER_ROWS)
+        );
+        for near_miss in ["", "Filter-Rows", "filter", "filter-rows ", "filter_rows"] {
+            assert!(
+                operation(near_miss).is_none(),
+                "`{near_miss}` was found as if it were `{FILTER_ROWS}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_description_extends_the_listing_with_what_it_is_applied_to_and_its_schema() {
+        let op = operation(FILTER_ROWS).expect("the filter is held");
+        let listing = op.listing();
+        let description = op.description();
+
+        assert_eq!(listing["long_name"], FILTER_ROWS);
+        assert_eq!(description["long_name"], listing["long_name"]);
+        assert_eq!(description["summary"], listing["summary"]);
+        assert_eq!(listing["summary"], op.summary);
+        assert_eq!(
+            description["applied_to"],
+            serde_json::json!({ "kind": "table", "count": 1 })
+        );
+        assert_eq!(description["parameters"], filter_rows_parameters());
+    }
+
+    #[test]
+    fn the_filter_takes_one_required_string_and_no_other_key() {
+        let schema = filter_rows_parameters();
+
+        assert_eq!(schema["required"], serde_json::json!(["where"]));
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+        assert_eq!(schema["properties"]["where"]["type"], "string");
+        assert_eq!(schema["properties"].as_object().map(|p| p.len()), Some(1));
+    }
 }
