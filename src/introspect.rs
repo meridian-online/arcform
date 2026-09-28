@@ -1037,6 +1037,21 @@ mod tests {
         }
     }
 
+    // DuckDB reads `1_000` as 1000, which casts to true: measured on v1.5.5,
+    // `PER_THREAD_OUTPUT 1_000` wrote a directory, and the 2.0 preview's tokenizer gives
+    // `1_000` as one number. Rust's `f64` parse refuses the separator, so the number is
+    // one the rule cannot read, and a value it cannot read leaves the option on.
+    #[test]
+    fn a_number_the_rule_cannot_read_leaves_per_thread_output_on() {
+        let value = duckdb_copy_option(&Some(ArgValue::Number("1_000".to_string())));
+        assert_eq!(value, CopyOptionValue::Number("1_000".to_string()));
+        assert_eq!(
+            copy_to_target_kind(&[("PER_THREAD_OUTPUT".to_string(), value)]),
+            AssetKind::Directory,
+            "PER_THREAD_OUTPUT 1_000 writes a directory"
+        );
+    }
+
     #[test]
     fn a_pivot_joined_to_another_table_is_not_read_as_its_first() {
         let read = read_by_duckdb(recorded_steps::PIVOT_JOIN);
