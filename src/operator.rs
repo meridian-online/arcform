@@ -607,6 +607,18 @@ mod frozen_script_write_tests {
         format!("# {}\n", char::from(fill)).repeat(128 * 1024)
     }
 
+    /// The directory `materialize_frozen_script` made for a test's own operator name,
+    /// removed when the test ends. The two tests that go through `materialize_frozen_script`
+    /// itself, and so through the real temp directory, use a name of their own so that
+    /// no other test's cache is written.
+    struct CacheDir(PathBuf);
+
+    impl Drop for CacheDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// A reader that opens the script's path while a writer is replacing it reads the
     /// whole script — the one before the write or the one after — and reads neither an
     /// empty file nor part of one.
@@ -615,12 +627,15 @@ mod frozen_script_write_tests {
     /// scripts, and every read has to be one of the two in full. With the write made in
     /// place (`std::fs::write`), a read that lands between the truncate and the write
     /// returns `""`, and one that lands inside the write returns part of the script.
+    ///
+    /// The writer is `materialize_frozen_script`, not the function under it, so the write
+    /// made in place is caught wherever in the two it is made.
     #[test]
     fn a_reader_of_a_script_being_replaced_reads_the_whole_of_one_version() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("op.py");
+        let name = format!("frozen_write_probe_reader_{}", std::process::id());
         let (a, b) = (script(b'a'), script(b'b'));
-        write_script_if_changed(&path, &a).unwrap();
+        let path = materialize_frozen_script(&name, "0", &a).unwrap();
+        let _cleanup = CacheDir(path.parent().unwrap().to_path_buf());
 
         let writing = AtomicBool::new(true);
         let torn = std::thread::scope(|s| {
@@ -635,7 +650,13 @@ mod frozen_script_write_tests {
                 torn
             });
             for i in 0..200 {
-                write_script_if_changed(&path, if i % 2 == 0 { &b } else { &a }).unwrap();
+                let written =
+                    materialize_frozen_script(&name, "0", if i % 2 == 0 { &b } else { &a })
+                        .unwrap();
+                assert_eq!(
+                    written, path,
+                    "the path handed back is the same one each time"
+                );
             }
             writing.store(false, Ordering::Release);
             reader.join().unwrap()
@@ -659,14 +680,14 @@ mod frozen_script_write_tests {
         use std::io::Read;
         use std::os::unix::fs::MetadataExt;
 
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("op.py");
+        let name = format!("frozen_write_probe_inode_{}", std::process::id());
         let (old, new) = (script(b'o'), script(b'n'));
-        write_script_if_changed(&path, &old).unwrap();
+        let path = materialize_frozen_script(&name, "0", &old).unwrap();
+        let _cleanup = CacheDir(path.parent().unwrap().to_path_buf());
         let mut held = std::fs::File::open(&path).unwrap();
         let old_inode = held.metadata().unwrap().ino();
 
-        write_script_if_changed(&path, &new).unwrap();
+        materialize_frozen_script(&name, "0", &new).unwrap();
 
         assert_ne!(
             std::fs::metadata(&path).unwrap().ino(),
