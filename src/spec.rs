@@ -24,6 +24,12 @@
 //! scratch has no prior authorship to protect, so it serialises a [`Manifest`]
 //! directly — through the same gate and the same atomic write.
 //!
+//! The splice is not particular to a Protocol. [`apply_yaml_edits`] runs it over
+//! YAML text of any shape — a chart file, say — and returns the edited text,
+//! gated only on the result still loading as YAML. It reads and writes nothing, and
+//! the Protocol gate stays on [`apply_edits`] and [`edit_spec`]: text that is not a
+//! spec is refused there as before.
+//!
 //! **Do not round-trip a spec through `serde` yourself.** The exported types derive
 //! `serde::Serialize` because generated-manifest emission ([`create_spec`], and
 //! `arc`'s own `arc init` scaffolding) serialises into a place that has no manifest
@@ -167,7 +173,9 @@
 //! # }
 //! ```
 
-pub use crate::edit::{PathPart, SpecEdit, ValidatedSpec, apply_edits, create_spec, edit_spec};
+pub use crate::edit::{
+    PathPart, SpecEdit, ValidatedSpec, apply_edits, apply_yaml_edits, create_spec, edit_spec,
+};
 pub use crate::error::{Error, Result};
 pub use crate::history::{
     HISTORY_MAX_ENTRIES, HISTORY_MERGE_WINDOW, HistoryEntry, HistoryKind, LocalHistory,
