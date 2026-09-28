@@ -467,9 +467,10 @@ fn quote_continues(c: &[char], mut j: usize) -> Option<usize> {
 
 /// The character a backslash escape in an `E'…'` string stands for, as DuckDB's scanner
 /// decodes it, and how many characters after the backslash the escape spans: `\b`, `\f`,
-/// `\n`, `\r` and `\t`; one to three octal digits; `\x` and one or two hex digits; `\u` and
-/// four hex digits, or `\U` and eight. Any other character stands for itself, and a
-/// backslash at the end of the input for a backslash.
+/// `\n`, `\r` and `\t`; one to three octal digits; `\x` and one or two hex digits. Any other
+/// character stands for itself, and a backslash at the end of the input for a backslash.
+/// DuckDB's CLI refuses a file whose SQL holds a `\u` or `\U` escape, so arc reads those as
+/// the letter, which can only turn a name the list holds into one it does not.
 fn e_escape(c: &[char], at: usize) -> (char, usize) {
     let digits = |from: usize, radix: u32, most: usize| {
         c.get(from..)
@@ -488,23 +489,12 @@ fn e_escape(c: &[char], at: usize) -> (char, usize) {
     let Some(&ch) = c.get(at) else {
         return ('\\', 0);
     };
-    match (ch, digits(at + 1, 16, 8)) {
+    match (ch, digits(at + 1, 16, 2)) {
         ('0'..='7', _) => {
             let len = digits(at, 8, 3);
             (byte(value(at, len, 8)), len)
         }
-        ('x', 1..) => {
-            let len = digits(at + 1, 16, 2);
-            (byte(value(at + 1, len, 16)), len + 1)
-        }
-        ('u', 4..) => (
-            char::from_u32(value(at + 1, 4, 16)).unwrap_or('\u{fffd}'),
-            5,
-        ),
-        ('U', 8) => (
-            char::from_u32(value(at + 1, 8, 16)).unwrap_or('\u{fffd}'),
-            9,
-        ),
+        ('x', len @ 1..) => (byte(value(at + 1, len, 16)), len + 1),
         ('b', _) => ('\u{8}', 1),
         ('f', _) => ('\u{c}', 1),
         ('n', _) => ('\n', 1),

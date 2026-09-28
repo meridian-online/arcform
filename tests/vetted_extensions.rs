@@ -493,14 +493,45 @@ fn every_licence_on_the_list_is_permissive() {
     }
 }
 
-// ---- arc reads comments and strings as DuckDB does ----
+// ---- arc reads a SQL file as DuckDB does ----
 
-/// Each case holds `@@` where a statement goes. DuckDB runs the case with `@@` as a
+/// Run the DuckDB CLI on `sql` as `arc run` runs a step, `duckdb <db> -f <file>`, with a home
+/// directory of its own so no `~/.duckdbrc` is read, and return what it printed.
+fn duckdb_runs(scratch: &Path, label: &str, sql: &str) -> (PathBuf, String) {
+    let db = scratch.join(format!("{label}.duckdb"));
+    let file = scratch.join(format!("{label}.sql"));
+    fs::write(&file, sql).unwrap();
+    let out = Command::new("duckdb")
+        .arg(&db)
+        .arg("-f")
+        .arg(&file)
+        .env("HOME", scratch)
+        .output()
+        .expect("the DuckDB CLI on PATH");
+    let printed = String::from_utf8_lossy(&out.stdout).to_string();
+    (db, printed + &String::from_utf8_lossy(&out.stderr))
+}
+
+/// The text between `before` and the next `after` in `text`, if `before` is there.
+fn between<'a>(text: &'a str, before: &str, after: &str) -> Option<&'a str> {
+    let rest = &text[text.find(before)? + before.len()..];
+    Some(&rest[..rest.find(after)?])
+}
+
+/// Each case in `ran` holds `@@` where a statement goes. DuckDB runs the case with `@@` as a
 /// `CREATE TABLE`, and arc reads it with `@@` as an unvetted `INSTALL`: arc has to refuse
-/// exactly the cases in which DuckDB ran the statement.
+/// exactly the cases in which DuckDB ran the statement. The cases hold each rule arc copies
+/// from DuckDB's CLI, its parser's pre-pass and its scanner, and at least one input each rule
+/// changes the reading of.
+///
+/// Each case in `names` holds `@@` where the repository goes. DuckDB installs from a
+/// directory that is not there, and its error names the extension it tried to fetch; arc
+/// reads the community registry, and its refusal names the extension it read. The two names
+/// have to be the same, or both absent.
 #[test]
 fn arc_refuses_an_install_exactly_where_duckdb_would_run_it() {
-    let cases = [
+    let mut ran: Vec<String> = [
+        // Comments and strings.
         "-- @@;\nSELECT 1;",
         "/* @@; */ SELECT 1;",
         "/* /* */ @@; */ SELECT 1;",
@@ -515,32 +546,110 @@ fn arc_refuses_an_install_exactly_where_duckdb_would_run_it() {
         "SELECT 1 AS \"x;@@\";",
         "SELECT 1; -- note\n@@;",
         "SELECT 1 /* x */; @@;",
+        // A `--` comment ends at a bare `\r`.
+        "SELECT 1; -- note\r@@;",
+        // The parser's unicode spaces, and two it does not count.
+        "\u{feff}@@;",
+        "-- setup\n\u{feff}@@;",
+        "\u{200b}@@;",
+        "\u{a0}@@;",
+        "\u{2000}@@;",
+        "\u{202f}@@;",
+        "\u{205f}@@;",
+        "\u{2060}@@;",
+        "\u{3000}@@;",
+        "\u{200c}@@;",
+        "\u{2028}@@;",
+        // What the pre-pass reads as a string or a comment, where a unicode space stays.
+        "/* it's */ \u{200b}@@;",
+        "SELECT 'a'; \u{200b}@@;",
+        "SELECT 1 AS \"a\"; \u{200b}@@;",
+        "SELECT $$ ' $$; \u{200b}@@;",
+        "SELECT $t$ ' $t$; \u{200b}@@;",
+        "-- '\n\u{200b}@@;",
+        "-- '\r\u{200b}@@;",
+        "SELECT 1 AS a$b$; \u{200b}@@;",
+        // A `.` or a `#` line where no statement is open is not SQL.
+        ".print /*\n@@;\n.print */",
+        ".print '\n@@;\n.print '",
+        ".print \"\n@@;\n.print \"",
+        ".print $$\n@@;\n.print $$",
+        "SELECT 1;\n.print /*\n@@;",
+        "# '\n@@;\n# '",
+        "# /*\n@@;",
+        // ... and is SQL inside a statement, after a space, or after a byte-order mark.
+        "SELECT 1\n.print /*\n; @@; -- */",
+        "SELECT 1;\n .print /*\n@@; -- */",
+        "\u{feff}.print /*\n@@; -- */",
+        // A line starting with \x03 drops the lines held before it.
+        "SELECT '\n\u{3}\n@@;",
+        // Lines of spaces and comments hold nothing, and a `.` line after them is not SQL.
+        "/* x */\n.print '\n@@;",
+        "-- x\n.print '\n@@;",
+        "\u{b}\n.print '\n@@;",
+        "/* x\n.print */ '\n@@;",
+        // Where the CLI ends a batch: a `;` outside what it reads as a string or comment,
+        // on the line just read.
+        "SELECT ';\n.print'; @@;",
+        "SELECT 1 AS \";\n.print\"; @@;",
+        "SELECT 1 /* ;\n.print */; @@;",
+        "SELECT -- ;\n.5; @@;",
+        "SELECT 1; -- note\n.print '\n@@;",
+        "SELECT $$;\n.print$$; @@;",
+        "SELECT $a1$;\n.print$a1$; @@;",
+        "SELECT $\u{e9}$;\n.print$\u{e9}$; @@;",
+        "SELECT $1$;\n.print$1$; @@;",
+        "SELECT 1;\u{b}\n.print '\n@@;",
+        "SELECT 1; /*\n*/\n.print '\n@@;",
+        // A batch the CLI ends inside a comment its scanner reads as open.
+        ".bail off\nSELECT 1 /* /* */ ;\n@@; -- */",
+        // A NUL byte drops the rest of the chunk the CLI read it in.
+        "SELECT 1; \0/*\n@@; -- */",
+    ]
+    .map(String::from)
+    .to_vec();
+    // The first chunk ends at byte 99, so `@@` starts the second and is kept.
+    ran.push(format!("SELECT 1; \0{}@@;", "x".repeat(88)));
+    ran.push(format!("SELECT 1; \0{}@@;", "x".repeat(87)));
+    let names = [
+        "INSTALL anofox_forecast FROM @@;",
+        "INSTALL anofox_forecast\r\nFROM @@;",
+        "INSTALL anofox_forecast\rFROM @@;",
+        "INSTALL\u{c}anofox_forecast FROM @@;",
+        "INSTALL\u{a0}anofox_forecast FROM @@;",
+        "INSTALL \u{2028}anofox_forecast FROM @@;",
+        "INSTALL \"Anofox_Forecast\" FROM @@;",
+        // Two strings with a line end between them are one.
+        "INSTALL 'anofox_'\n'forecast' FROM @@;",
+        "INSTALL 'anofox_'\r'forecast' FROM @@;",
+        "INSTALL 'anofox_' -- note\n'forecast' FROM @@;",
+        "INSTALL 'anofox_'\n  -- note\n\t'forecast' FROM @@;",
+        "INSTALL 'anofox_' 'forecast' FROM @@;",
+        "INSTALL 'anofox_'\n/* note */\n'forecast' FROM @@;",
+        // The escapes of an E'...' string.
+        r"INSTALL E'anofox\x5fforecast' FROM @@;",
+        r"INSTALL E'anofox\137forecast' FROM @@;",
+        "INSTALL E'anofox_'\n'fore\\x63ast' FROM @@;",
     ];
     let scratch = tempfile::tempdir().unwrap();
     let mut disagreements = Vec::new();
-    for (i, case) in cases.iter().enumerate() {
-        let db = scratch.path().join(format!("case{i}.duckdb"));
-        let sql = scratch.path().join(format!("case{i}.sql"));
-        fs::write(&sql, case.replace("@@", "CREATE TABLE probe AS SELECT 1")).unwrap();
-        let duckdb = |args: &[&std::ffi::OsStr]| {
-            Command::new("duckdb")
-                .args(args)
-                .env("HOME", scratch.path())
-                .output()
-                .expect("the DuckDB CLI on PATH")
-        };
-        duckdb(&[db.as_os_str(), "-f".as_ref(), sql.as_os_str()]);
-        let probe = duckdb(&[
-            db.as_os_str(),
-            "-csv".as_ref(),
-            "-noheader".as_ref(),
-            "-c".as_ref(),
-            "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'probe'".as_ref(),
-        ]);
+    for (i, case) in ran.iter().enumerate() {
+        let (db, _) = duckdb_runs(
+            scratch.path(),
+            &format!("ran{i}"),
+            &case.replace("@@", "CREATE TABLE probe AS SELECT 1"),
+        );
+        let probe = Command::new("duckdb")
+            .arg(&db)
+            .args(["-csv", "-noheader", "-c"])
+            .arg("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'probe'")
+            .env("HOME", scratch.path())
+            .output()
+            .expect("the DuckDB CLI on PATH");
         let ran = match String::from_utf8_lossy(&probe.stdout).trim() {
             "1" => true,
             "0" => false,
-            other => panic!("[{case}] DuckDB answered {other:?}"),
+            other => panic!("[{case:?}] DuckDB answered {other:?}"),
         };
         let run = Protocol::steps(&[(
             "s",
@@ -553,6 +662,23 @@ fn arc_refuses_an_install_exactly_where_duckdb_would_run_it() {
         if ran != refused {
             disagreements.push(format!(
                 "{case:?}: DuckDB ran it: {ran}; arc refused: {refused}"
+            ));
+        }
+    }
+    let repo = scratch.path().join("no-such-repository");
+    for (i, case) in names.iter().enumerate() {
+        let (_, printed) = duckdb_runs(
+            scratch.path(),
+            &format!("name{i}"),
+            &case.replace("@@", &format!("'{}'", repo.display())),
+        );
+        let fetched = between(&printed, "local extension \"", "\"").map(str::to_string);
+        let run = Protocol::steps(&[("s", &case.replace("@@", "community"))]).run(VETTED_ON);
+        let read =
+            between(&run.stderr, ") installs ", " from the community registry").map(str::to_string);
+        if fetched != read {
+            disagreements.push(format!(
+                "{case:?}: DuckDB fetched {fetched:?}; arc refused {read:?}"
             ));
         }
     }
