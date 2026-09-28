@@ -960,6 +960,39 @@ def _first_code(lines, masks, line: int, col: int) -> tuple[int, int] | None:
     return next(((j, p) for j, p, _ in _code_after(lines, masks, line, col)), None)
 
 
+def _first_token(lines, line: int, col: int) -> tuple[int, int] | None:
+    """The first character from (line, col) on that is not whitespace or comment.
+
+    Unlike `_first_code`, this stops at a string, char or raw-string literal.  The
+    code mask hides a literal and a comment alike, so an arm whose pattern opens
+    with `"b"` was taken to begin after the literal, and its widening came out as
+    `"b" _ if …`, which the compiler refuses.  (line, col) has to sit outside any
+    literal or comment, as the position after a code character does.
+    """
+    j, p = line, col
+    while j < len(lines):
+        text = lines[j]
+        if p >= len(text):
+            j, p = j + 1, 0
+        elif text[p].isspace():
+            p += 1
+        elif text.startswith("//", p):
+            p = len(text)
+        elif text.startswith("/*", p):
+            # Unnested, as `code_mask` reads a block comment.
+            close = text.find("*/", p + 2)
+            while close == -1:
+                j += 1
+                if j >= len(lines):
+                    return None
+                text = lines[j]
+                close = text.find("*/")
+            p = close + 2
+        else:
+            return j, p
+    return None
+
+
 def _is_word(ch: str) -> bool:
     return ch.isalnum() or ch == "_"
 
@@ -1063,7 +1096,7 @@ def arm_at(lines: list[str], masks: list[list[bool]], i: int) -> Arm | None:
             return None
     if boundary is None:
         return None
-    start = _first_code(lines, masks, boundary[0], boundary[1] + 1)
+    start = _first_token(lines, boundary[0], boundary[1] + 1)
     if start is None or start[0] == boundary[0]:
         return None
     if lines[start[0]][start[1]] in "|#":
