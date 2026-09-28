@@ -788,7 +788,10 @@ mod tests {
             "The table\nwhose rows.",
             "Is it? Yes.",
         ] {
-            assert!(!is_one_sentence(not_one), "{not_one:?}");
+            assert!(
+                !is_one_sentence(not_one),
+                "{not_one:?} was read as one sentence"
+            );
         }
     }
 
@@ -912,7 +915,8 @@ mod tests {
                     "of": "table",
                     "description": op.applied_to[1].description,
                 },
-            ])
+            ]),
+            "the filter is applied to a table, then a column of that table"
         );
         assert_eq!(description["parameters"], filter_rows_parameters());
     }
@@ -922,11 +926,26 @@ mod tests {
         let schema = filter_rows_parameters();
         let where_ = &schema["properties"]["where"];
 
-        assert_eq!(schema["required"], serde_json::json!(["where"]));
-        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
-        assert_eq!(schema["properties"].as_object().map(|p| p.len()), Some(1));
-        assert_eq!(where_["type"], "string");
-        assert_eq!(where_["x-kind"], "condition");
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["where"]),
+            "`where` is the one required parameter"
+        );
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::json!(false),
+            "the schema is closed to any other key"
+        );
+        assert_eq!(
+            schema["properties"].as_object().map(|p| p.len()),
+            Some(1),
+            "`where` is the one parameter; the column is not an argument"
+        );
+        assert_eq!(where_["type"], "string", "`where` is a string");
+        assert_eq!(
+            where_["x-kind"], "condition",
+            "`where` does not say its value is a condition"
+        );
         assert!(
             where_["description"]
                 .as_str()
@@ -953,7 +972,8 @@ mod tests {
                 { "word": "under", "sign": "<" },
                 { "word": "between", "sign": "between" },
                 { "word": "is null", "sign": "is null" },
-            ])
+            ]),
+            "the comparisons offered, in order, as a word and a sign"
         );
     }
 }
