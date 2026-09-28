@@ -310,6 +310,12 @@ ARM_SOURCE = (
     "        $e + $e\n"  # 35
     "    };\n"  # 36
     "}\n"  # 37
+    "pub fn waits(rx: Rx, tick: Tick) -> u8 {\n"  # 38
+    "    select! {\n"  # 39
+    "        v = rx => v,\n"  # 40
+    "        _ = tick => 0,\n"  # 41
+    "    }\n"  # 42
+    "}\n"  # 43
 )
 
 
@@ -331,6 +337,7 @@ def _() -> None:
         # 22: from its second line the arm cannot be told from one opening with a
         # leading `|`, and is left.  23 and 24: an arm under an attribute is left.
         # 25: two arms on one line cannot be cut out by whole lines, and are left.
+        # 34, 40 and 41: a macro's rules and arms are not a match's.
         26: (26, 27, False, False),  # a body over two lines with no bracket around it
         28: (28, 28, False, True),  # the outer match's last arm
     }
@@ -376,7 +383,7 @@ def _() -> None:
     )
 
 
-@case("the last arm of a match, a body line, and a macro rule are not arms to mutate")
+@case("the last arm of a match, a body line, and a macro's arms are not arms to mutate")
 def _() -> None:
     # The last arm: in a match that compiles, every value reaching it already
     # matches it, so widening it changes nothing and deleting it cannot compile.
@@ -386,6 +393,10 @@ def _() -> None:
     check("no arm mutant on a body line", not [m for m in got if m.operator.startswith("ARM_")], got)
     got = mc.generate("src/x.rs", ARM_SOURCE, {34})
     check("no arm mutant in a macro_rules!", not [m for m in got if m.operator.startswith("ARM_")], got)
+    # `select!` separates its arms with commas as a match does, so nothing but the
+    # check that the enclosing brace is a match's tells the two apart.
+    got = mc.generate("src/x.rs", ARM_SOURCE, {40, 41})
+    check("no arm mutant in a select!", not [m for m in got if m.operator.startswith("ARM_")], got)
 
 
 @case("a diff that changes no arm lists what it listed without the arm operators")
