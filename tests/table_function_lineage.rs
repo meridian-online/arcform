@@ -54,7 +54,7 @@ fn find<'a>(assets: &'a [serde_json::Value], name: &str) -> Option<&'a serde_jso
     assets.iter().find(|a| a["name"] == name)
 }
 
-// AC1 (end to end): read_xlsx lifts the file path in the printed graph and the
+// End to end: read_xlsx lifts the file path in the printed graph and the
 // contract, and records no table named `read_xlsx`.
 #[test]
 fn read_xlsx_lifts_the_path_in_the_printed_graph_and_contract() {
@@ -72,8 +72,8 @@ fn read_xlsx_lifts_the_path_in_the_printed_graph_and_contract() {
     assert!(find(&assets, "read_xlsx").is_none());
 }
 
-// AC3 (end to end, the card's own reproduction): a step reading `range(3)` prints
-// an asset graph with no node named `range`.
+// End to end: a step reading `range(3)` prints an asset graph with no node named
+// `range`.
 #[test]
 fn range_reads_no_table_in_the_printed_graph_and_contract() {
     let sql = "CREATE OR REPLACE TABLE c AS SELECT * FROM range(3);";
@@ -90,7 +90,7 @@ fn range_reads_no_table_in_the_printed_graph_and_contract() {
     assert_eq!(assets[0]["name"], "c");
 }
 
-// AC4 (end to end): glob('pattern') lifts the pattern in the contract, not a table
+// End to end: glob('pattern') lifts the pattern in the contract, not a table
 // named `glob`.
 #[test]
 fn glob_lifts_the_pattern_in_the_contract_not_a_table_named_glob() {
@@ -103,8 +103,8 @@ fn glob_lifts_the_pattern_in_the_contract_not_a_table_named_glob() {
     assert!(find(&assets, "glob").is_none(), "no table named glob");
 }
 
-// AC5/AC6 (end to end): an extension table function taking table arguments, and a
-// plain table reference, are unaffected — both still show up under their own name.
+// End to end: an extension table function taking table arguments, and a plain
+// table reference, are unaffected — both still show up under their own name.
 #[test]
 fn extension_function_and_plain_table_are_unaffected_end_to_end() {
     let sql = r#"CREATE OR REPLACE TABLE model AS SELECT * FROM mlpack_random_forest_train("X", "Y", "params", "model");"#;
