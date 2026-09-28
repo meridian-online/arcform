@@ -235,8 +235,9 @@ fn the_bound_holds_per_file() {
 }
 
 #[test]
-fn a_path_naming_a_directory_or_no_file_is_refused() {
+fn a_path_naming_a_directory_or_no_file_is_refused_by_every_file_call() {
     let f = setup();
+    let id = "1700000000000-000-save";
     // The empty path is the one a directory check alone would let through:
     // it names no file, and it is not a directory either.
     for path in [
@@ -244,14 +245,140 @@ fn a_path_naming_a_directory_or_no_file_is_refused() {
         f.dir.join("panels").join(".."),
         PathBuf::new(),
     ] {
-        let refused = f.history.record_save_for_file(&path, SPEC).unwrap_err();
-        assert!(
-            matches!(&refused, Error::FileRead { path: p, .. } if *p == path),
-            "{path:?}: {refused}"
-        );
+        let refusals = [
+            (
+                "record_save_for_file",
+                f.history.record_save_for_file(&path, SPEC).map(drop),
+            ),
+            (
+                "record_checkpoint_for_file",
+                f.history.record_checkpoint_for_file(&path, SPEC).map(drop),
+            ),
+            (
+                "entries_for_file",
+                f.history.entries_for_file(&path).map(drop),
+            ),
+            (
+                "read_for_file",
+                f.history.read_for_file(&path, id).map(drop),
+            ),
+            (
+                "restore_for_file",
+                f.history.restore_for_file(&path, id).map(drop),
+            ),
+        ];
+        for (call, result) in refusals {
+            let refused = result.expect_err(call);
+            assert!(
+                matches!(&refused, Error::FileRead { path: p, .. } if *p == path),
+                "{call}({path:?}): {refused}"
+            );
+        }
     }
     // Refused before anything is recorded: the store was never created.
     assert!(!f.history.root().exists());
+}
+
+#[test]
+fn a_file_whose_directory_does_not_exist_is_refused_naming_the_directory() {
+    let f = setup();
+    let missing = f.dir.join("missing");
+    let refused = f
+        .history
+        .record_save_for_file(&missing.join("c.yaml"), CHART_A)
+        .unwrap_err();
+    assert!(
+        matches!(&refused, Error::FileRead { path, .. } if *path == missing),
+        "{refused}"
+    );
+    assert!(!f.history.root().exists());
+}
+
+#[test]
+fn rapid_saves_of_one_chart_merge_into_one_entry() {
+    let f = setup();
+    f.history.record_save_for_file(&f.a, "mark: dot\n").unwrap();
+    f.history.record_save_for_file(&f.a, CHART_A).unwrap();
+    assert_eq!(texts_for_file(&f.history, &f.a), vec![CHART_A]);
+}
+
+#[test]
+fn a_deleted_chart_is_restored_from_its_own_history() {
+    let f = setup();
+    let saved = f
+        .history
+        .record_save_for_file(&f.a, CHART_A)
+        .unwrap()
+        .expect("recorded");
+    fs::remove_file(&f.a).unwrap();
+
+    assert_eq!(
+        f.history.restore_for_file(&f.a, &saved.id).unwrap(),
+        CHART_A
+    );
+    assert_eq!(fs::read_to_string(&f.a).unwrap(), CHART_A);
+    // Nothing stood at the path, so there was nothing to checkpoint.
+    assert_eq!(texts_for_file(&f.history, &f.a), vec![CHART_A]);
+}
+
+#[test]
+fn a_restore_over_a_chart_that_is_not_text_is_refused_and_the_bytes_kept() {
+    let f = setup();
+    let saved = f
+        .history
+        .record_save_for_file(&f.a, CHART_A)
+        .unwrap()
+        .expect("recorded");
+    let not_text = [0xff, 0xfe, b'\n'];
+    fs::write(&f.a, not_text).unwrap();
+
+    let refused = f.history.restore_for_file(&f.a, &saved.id).unwrap_err();
+    assert!(
+        matches!(&refused, Error::FileRead { path, .. } if *path == f.a),
+        "{refused}"
+    );
+    assert_eq!(fs::read(&f.a).unwrap(), not_text);
+}
+
+#[test]
+fn a_restore_whose_checkpoint_cannot_be_recorded_writes_nothing() {
+    let f = setup();
+    let saved = f
+        .history
+        .record_save_for_file(&f.a, CHART_A)
+        .unwrap()
+        .expect("recorded");
+    let edited = "# chart a\nmark: areaY\n";
+    fs::write(&f.a, edited).unwrap();
+
+    // The chart's key directory is the only one in the store. A directory
+    // named as its newest entry cannot be read as text, so the checkpoint the
+    // restore records first fails on every platform and for every user.
+    let key_dirs: Vec<PathBuf> = fs::read_dir(f.history.root())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    let [key_dir] = key_dirs.as_slice() else {
+        panic!("one key directory, found {key_dirs:?}");
+    };
+    fs::create_dir(key_dir.join("9999999999999-000-save.yaml")).unwrap();
+
+    assert!(f.history.restore_for_file(&f.a, &saved.id).is_err());
+    assert_eq!(fs::read_to_string(&f.a).unwrap(), edited);
+}
+
+#[test]
+fn the_directory_restore_still_refuses_a_missing_directory_by_name() {
+    let f = setup();
+    let missing = f.dir.join("missing");
+    let refused = f
+        .history
+        .restore(&missing, "1700000000000-000-save")
+        .unwrap_err();
+    assert!(
+        matches!(&refused, Error::FileRead { path, .. } if *path == missing),
+        "{refused}"
+    );
 }
 
 #[test]
