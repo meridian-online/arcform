@@ -163,7 +163,7 @@ fn assert_wired(label: &str, first_stmt: &str) -> Run {
     run
 }
 
-// ---- AC1: `INSTALL … FROM <repository>` and `FORCE INSTALL` ----
+// ---- `INSTALL … FROM <repository>` and `FORCE INSTALL` ----
 
 #[test]
 fn install_from_community() {
@@ -196,7 +196,7 @@ fn force_install_bare() {
     assert_wired("force_install_bare", "FORCE INSTALL spatial;");
 }
 
-// ---- AC2: an empty-string COPY option disables it instead of refusing to parse ----
+// ---- an empty-string COPY option disables it instead of refusing to parse ----
 
 #[test]
 fn copy_with_empty_quote_writes_the_file() {
@@ -237,7 +237,7 @@ fn copy_with_empty_delimiter_writes_the_file() {
     );
 }
 
-// ---- AC3: PRAGMA as a function call — several positional args, and a named one ----
+// ---- PRAGMA as a function call — several positional args, and a named one ----
 
 fn assert_pragma_fts_wired(label: &str, trailing_args: &str) {
     let load_source = "CREATE TABLE a AS SELECT * FROM (VALUES (1), (2), (3)) AS t(x);\n\
@@ -263,7 +263,7 @@ fn pragma_with_a_named_arg() {
     assert_pragma_fts_wired("pragma_with_a_named_arg", ", overwrite = 1");
 }
 
-// ---- AC4: `SET VARIABLE <name> = <expr>` ----
+// ---- `SET VARIABLE <name> = <expr>` ----
 
 #[test]
 fn set_variable_with_a_typed_value() {
@@ -273,7 +273,7 @@ fn set_variable_with_a_typed_value() {
     );
 }
 
-// ---- AC5: a dialect that refused these forms before still refuses them.
+// ---- a dialect that refused these forms before still refuses them.
 // Checked directly against the grammar, since arc's own introspection always
 // parses with `DuckDbDialect` and never reaches PostgreSQL's. ----
 
@@ -304,7 +304,7 @@ fn postgres_still_refuses_the_new_forms() {
     }
 }
 
-// ---- AC7: the forms this change does not touch keep parsing exactly as they
+// ---- the forms this change does not touch keep parsing exactly as they
 // did on f9a5f44. Arc can only observe "parsed, no opaque warning", so each
 // case also pins the syntax tree the form lands in — a form that still parsed
 // but had migrated into one of the new fields would be invisible to arc and is
