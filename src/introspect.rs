@@ -1,6 +1,13 @@
-//! SQL introspection via sqlparser-rs.
+//! SQL introspection: what a SQL step reads and produces.
 //!
-//! Parses SQL files using the DuckDB dialect to extract:
+//! Two readers take a step apart. By default sqlparser-rs parses it with its DuckDB
+//! dialect. With `ARC_SQL_READER=duckdb` DuckDB's own parse is read instead, through
+//! [`crate::duckdb_lineage`], from the DuckDB arc runs, which has to be a 2.0 build. Either
+//! reader's statements pass through the same rules here: which table function reads a
+//! file, which reads no table, which one's arguments arc does not read, and whether a
+//! `COPY … TO` writes a file or a directory.
+//!
+//! Extracted from each statement:
 //! - **Outputs**: tables/views created or written to (CREATE TABLE, CREATE VIEW, CTAS, INSERT INTO, COPY TO)
 //! - **Inputs**: tables read from (FROM, JOIN clauses)
 //!
@@ -13,6 +20,7 @@
 //! files is thus *discovered from the SQL*, never hand-declared via `depends_on:`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
@@ -23,6 +31,7 @@ use sqlparser::dialect::DuckDbDialect;
 use sqlparser::parser::Parser;
 
 use crate::asset_kind::AssetKind;
+use crate::duckdb_lineage::{self, ArgValue, Relation, TableCall};
 
 /// Assets discovered from parsing a SQL file — four-set model.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -70,6 +79,15 @@ fn is_glob(path: &str) -> bool {
     path.contains(['*', '?', '['])
 }
 
+/// What a path a statement reads names: a glob pattern, or one file.
+fn read_path_kind(path: &str) -> AssetKind {
+    if is_glob(path) {
+        AssetKind::Pattern
+    } else {
+        AssetKind::File
+    }
+}
+
 /// The `COPY … TO 'target'` option names under which DuckDB writes a *directory* of
 /// files at `target` instead of one file at `target`.
 ///
@@ -94,23 +112,60 @@ const DIRECTORY_WRITING_COPY_OPTIONS: [&str; 4] = [
     "ROW_GROUPS_PER_FILE",
 ];
 
+/// A `COPY … TO` option's value, as either reader gives it: what
+/// [`copy_option_is_on`] reads of it.
+#[derive(Debug, Clone, PartialEq)]
+enum CopyOptionValue {
+    /// The option is given without a value: `PER_THREAD_OUTPUT`.
+    Absent,
+    Boolean(bool),
+    Number(String),
+    String(String),
+    /// `()`.
+    EmptyList,
+    /// Anything else: a bare word, a list with something in it, an expression.
+    Other,
+}
+
 /// What a `COPY … TO 'filename'` writes, decided from the statement's own options
 /// against [`DIRECTORY_WRITING_COPY_OPTIONS`].
-fn copy_to_target_kind(options: &[CopyOption]) -> AssetKind {
-    let writes_a_directory = options.iter().any(|opt| match opt {
-        CopyOption::DuckDbOption { name, value } => {
-            DIRECTORY_WRITING_COPY_OPTIONS
-                .iter()
-                .any(|known| name.value.eq_ignore_ascii_case(known))
-                && copy_option_is_on(&name.value, value)
-        }
-        _ => false,
+fn copy_to_target_kind(options: &[(String, CopyOptionValue)]) -> AssetKind {
+    let writes_a_directory = options.iter().any(|(name, value)| {
+        DIRECTORY_WRITING_COPY_OPTIONS
+            .iter()
+            .any(|known| name.eq_ignore_ascii_case(known))
+            && copy_option_is_on(name, value)
     });
     if writes_a_directory {
         AssetKind::Directory
     } else {
         AssetKind::File
     }
+}
+
+/// sqlparser's `COPY` options, as [`copy_to_target_kind`] reads them.
+fn sqlparser_copy_options(options: &[CopyOption]) -> Vec<(String, CopyOptionValue)> {
+    let value = |value: &Option<Expr>| match value {
+        None => CopyOptionValue::Absent,
+        Some(Expr::Tuple(items)) if items.is_empty() => CopyOptionValue::EmptyList,
+        Some(Expr::Value(v)) => match &v.value {
+            Value::Boolean(b) => CopyOptionValue::Boolean(*b),
+            Value::Number(n, _) => CopyOptionValue::Number(n.clone()),
+            Value::SingleQuotedString(s)
+            | Value::DoubleQuotedString(s)
+            | Value::TripleSingleQuotedString(s)
+            | Value::TripleDoubleQuotedString(s) => CopyOptionValue::String(s.clone()),
+            _ => CopyOptionValue::Other,
+        },
+        Some(_) => CopyOptionValue::Other,
+    };
+    options
+        .iter()
+        .filter_map(|opt| match opt {
+            CopyOption::DuckDbOption { name, value: v } => Some((name.value.clone(), value(v))),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Whether an option carrying one of those names is actually switched on. DuckDB's
@@ -125,9 +180,9 @@ fn copy_to_target_kind(options: &[CopyOption]) -> AssetKind {
 ///   all. `rotate` is `file_size_bytes.IsValid() || row_groups_per_file.IsValid()`,
 ///   set from the option carrying any value, so presence is the whole test. Measured
 ///   on DuckDB v1.5.4 and v1.5.5: `FILE_SIZE_BYTES 0` writes a directory.
-fn copy_option_is_on(name: &str, value: &Option<Expr>) -> bool {
+fn copy_option_is_on(name: &str, value: &CopyOptionValue) -> bool {
     if name.eq_ignore_ascii_case("PARTITION_BY") {
-        !matches!(value, Some(Expr::Tuple(items)) if items.is_empty())
+        *value != CopyOptionValue::EmptyList
     } else if name.eq_ignore_ascii_case("PER_THREAD_OUTPUT") {
         boolean_arg(value)
     } else {
@@ -149,21 +204,14 @@ fn copy_option_is_on(name: &str, value: &Option<Expr>) -> bool {
 /// case-insensitively. A string outside that set is a conversion error in DuckDB and
 /// the statement writes nothing at all, so what this returns for it cannot be
 /// observed on disk; it stays `true`, the answer that forces staleness rather than
-/// certifying an artifact.
-fn boolean_arg(value: &Option<Expr>) -> bool {
-    let Some(Expr::Value(v)) = value else {
-        // No argument is a bare flag, which DuckDB reads as true. A non-literal
-        // expression is not something this can evaluate; leave it on.
-        return true;
-    };
-    match &v.value {
-        Value::Boolean(b) => *b,
-        Value::Number(n, _) => n.parse::<f64>().map(|x| x != 0.0).unwrap_or(true),
-        Value::SingleQuotedString(s)
-        | Value::DoubleQuotedString(s)
-        | Value::TripleSingleQuotedString(s)
-        | Value::TripleDoubleQuotedString(s) => cast_string_to_bool(s).unwrap_or(true),
-        _ => true,
+/// certifying an artifact. A value that is not a literal is not something this can
+/// evaluate, and stays `true` for the same reason.
+fn boolean_arg(value: &CopyOptionValue) -> bool {
+    match value {
+        CopyOptionValue::Boolean(b) => *b,
+        CopyOptionValue::Number(n) => n.parse::<f64>().map(|x| x != 0.0).unwrap_or(true),
+        CopyOptionValue::String(s) => cast_string_to_bool(s).unwrap_or(true),
+        CopyOptionValue::Absent | CopyOptionValue::EmptyList | CopyOptionValue::Other => true,
     }
 }
 
@@ -177,12 +225,79 @@ fn cast_string_to_bool(s: &str) -> Option<bool> {
     }
 }
 
+/// Names the reader that takes a SQL step's reads and produces. Unset, sqlparser-rs
+/// reads the step; `duckdb` reads DuckDB's own parse of it.
+pub(crate) const SQL_READER_ENV: &str = "ARC_SQL_READER";
+
+/// The value of [`SQL_READER_ENV`] that chooses DuckDB's parse.
+const DUCKDB_READER: &str = "duckdb";
+
+/// Which reader [`SQL_READER_ENV`] chooses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reader {
+    Sqlparser,
+    DuckDb,
+}
+
+fn reader() -> Result<Reader, String> {
+    match std::env::var_os(SQL_READER_ENV) {
+        None => Ok(Reader::Sqlparser),
+        Some(value) if value == DUCKDB_READER => Ok(Reader::DuckDb),
+        Some(value) => Err(format!(
+            "{SQL_READER_ENV} is '{}', and the one value it takes is `{DUCKDB_READER}`, which \
+             reads a SQL step with DuckDB's own parser; unset it to read steps with arc's own",
+            value.to_string_lossy()
+        )),
+    }
+}
+
+/// The DuckDB arc runs, which is the one asked for its parse.
+fn duckdb_program() -> Result<OsString, String> {
+    match crate::engine::duckdb_program().map_err(|e| e.to_string())? {
+        crate::engine::DuckDbProgram::Told(path) => Ok(path.into_os_string()),
+        crate::engine::DuckDbProgram::SearchPath => Ok(OsString::from("duckdb")),
+    }
+}
+
+/// Refuses a run, before a step runs, when [`SQL_READER_ENV`] names no reader, or names
+/// DuckDB's and the DuckDB arc runs is not a 2.0 build that gives its parse. The DuckDB is
+/// asked only when the Protocol has a SQL step for it to read.
+pub(crate) fn check_reader(has_sql_steps: bool) -> Result<(), String> {
+    if reader()? == Reader::DuckDb && has_sql_steps {
+        duckdb_lineage::read_step(&duckdb_program()?, "")
+            .map_err(|refusal| format!("{SQL_READER_ENV}={DUCKDB_READER}: {refusal}"))?;
+    }
+    Ok(())
+}
+
+/// DuckDB's reading of each statement of `sql`, as [`SqlAssets`].
+fn read_with_duckdb(sql: &str) -> Result<Vec<SqlAssets>, Vec<String>> {
+    let program = duckdb_program().map_err(|e| vec![e])?;
+    let reading = duckdb_lineage::read_step(&program, sql).map_err(|e| vec![e.to_string()])?;
+    Ok(reading.statements.iter().map(duckdb_statement).collect())
+}
+
 /// Parse a SQL string and extract the assets it produces and consumes.
 ///
 /// Returns `Ok(SqlAssets)` on success, or `Err(warnings)` if the SQL
 /// cannot be parsed. The caller should treat parse failures as opaque
 /// steps (warn, don't block).
 pub fn extract_assets(sql: &str) -> Result<SqlAssets, Vec<String>> {
+    if reader().map_err(|e| vec![e])? == Reader::DuckDb {
+        // DuckDB's reading leaves a `WITH` name out of the reads of the statement it is
+        // in scope in, so nothing is filtered here.
+        let mut assets = SqlAssets::default();
+        for statement in read_with_duckdb(sql)? {
+            assets.outputs.extend(statement.outputs);
+            assets.inputs.extend(statement.inputs);
+            assets.kinds.extend(statement.kinds);
+            assets
+                .unread_table_functions
+                .extend(statement.unread_table_functions);
+        }
+        return Ok(assets);
+    }
+
     let dialect = DuckDbDialect {};
     let statements = Parser::parse_sql(&dialect, sql).map_err(|e| vec![e.to_string()])?;
 
@@ -212,6 +327,14 @@ pub fn extract_assets(sql: &str) -> Result<SqlAssets, Vec<String>> {
 /// Returns `Ok(Vec<SqlAssets>)` on success, or `Err(warnings)` if the SQL cannot be
 /// parsed (caller treats a parse failure as an opaque step).
 pub fn extract_per_statement(sql: &str) -> Result<Vec<SqlAssets>, Vec<String>> {
+    if reader().map_err(|e| vec![e])? == Reader::DuckDb {
+        return read_with_duckdb(sql);
+    }
+    sqlparser_per_statement(sql)
+}
+
+/// [`extract_per_statement`] with sqlparser-rs as the reader.
+fn sqlparser_per_statement(sql: &str) -> Result<Vec<SqlAssets>, Vec<String>> {
     let dialect = DuckDbDialect {};
     let statements = Parser::parse_sql(&dialect, sql).map_err(|e| vec![e.to_string()])?;
 
@@ -227,6 +350,128 @@ pub fn extract_per_statement(sql: &str) -> Result<Vec<SqlAssets>, Vec<String>> {
         per_statement.push(assets);
     }
     Ok(per_statement)
+}
+
+/// One statement of DuckDB's reading, through the rules sqlparser's statements pass
+/// through. A table is named by its last part, lowercased, as [`object_name_to_string`]
+/// names one. A statement the reader could not read keeps what its words made certain.
+fn duckdb_statement(statement: &duckdb_lineage::Statement) -> SqlAssets {
+    let mut assets = SqlAssets::default();
+    let options: Vec<(String, CopyOptionValue)> = statement
+        .options
+        .iter()
+        .map(|option| (option.name.clone(), duckdb_copy_option(&option.value)))
+        .collect();
+    for produced in &statement.produces {
+        match produced {
+            Relation::Table(table) => {
+                assets.record_output(table.name.to_lowercase(), AssetKind::Table)
+            }
+            // The one file a statement produces is a `COPY … TO` target.
+            Relation::File(path) => {
+                assets.record_output(path.clone(), copy_to_target_kind(&options))
+            }
+        }
+    }
+    for read in &statement.reads {
+        match read {
+            Relation::Table(table) => {
+                assets.record_input(table.name.to_lowercase(), AssetKind::Table)
+            }
+            Relation::File(path) => assets.record_input(path.clone(), read_path_kind(path)),
+        }
+    }
+    for call in &statement.calls {
+        record_table_call(&duckdb_call(call), &mut assets);
+    }
+    assets
+}
+
+/// A DuckDB `COPY` option's value, as [`copy_to_target_kind`] reads it.
+fn duckdb_copy_option(value: &Option<ArgValue>) -> CopyOptionValue {
+    match value {
+        None => CopyOptionValue::Absent,
+        Some(ArgValue::Identifier(word)) if word.eq_ignore_ascii_case("true") => {
+            CopyOptionValue::Boolean(true)
+        }
+        Some(ArgValue::Identifier(word)) if word.eq_ignore_ascii_case("false") => {
+            CopyOptionValue::Boolean(false)
+        }
+        Some(ArgValue::Number(n)) => CopyOptionValue::Number(n.clone()),
+        Some(ArgValue::String(s)) => CopyOptionValue::String(s.clone()),
+        Some(ArgValue::List(items)) if items.is_empty() => CopyOptionValue::EmptyList,
+        Some(_) => CopyOptionValue::Other,
+    }
+}
+
+/// A DuckDB table function call, as [`record_table_call`] reads it.
+fn duckdb_call(call: &TableCall) -> FunctionCall {
+    fn paths(value: &ArgValue, out: &mut Vec<String>) {
+        match value {
+            ArgValue::String(path) => out.push(path.clone()),
+            ArgValue::List(items) => items.iter().for_each(|item| paths(item, out)),
+            _ => {}
+        }
+    }
+    fn names_something(value: &ArgValue) -> bool {
+        match value {
+            ArgValue::String(_) | ArgValue::QuotedIdentifier(_) => true,
+            ArgValue::List(items) => items.iter().any(names_something),
+            ArgValue::Expression { quotes, .. } => *quotes,
+            ArgValue::Number(_) | ArgValue::Identifier(_) => false,
+        }
+    }
+    let mut unnamed_paths = Vec::new();
+    for arg in call.args.iter().filter(|arg| arg.name.is_none()) {
+        paths(&arg.value, &mut unnamed_paths);
+    }
+    FunctionCall {
+        function: call.function.to_lowercase(),
+        paths: unnamed_paths,
+        names_something: call.args.iter().any(|arg| names_something(&arg.value)),
+    }
+}
+
+/// A table function call, as either reader gives it: what [`record_table_call`] reads.
+struct FunctionCall {
+    /// Lowercased, without a schema.
+    function: String,
+    /// The strings among its unnamed arguments, and in the lists among them: the paths a
+    /// file reader reads.
+    paths: Vec<String>,
+    /// Whether any argument, named or not, holds a string or a quoted identifier at any
+    /// depth — the two forms in which a DuckDB call names a table, a file or a query
+    /// (`"X"`, `'x.parquet'`, `'SELECT …'`). A call with neither (`recent()`,
+    /// `range(10)`, `f(days := 7)`) names nothing arc could be missing.
+    names_something: bool,
+}
+
+/// What a table function call reads, by the same rules whichever reader found it.
+fn record_table_call(call: &FunctionCall, assets: &mut SqlAssets) {
+    if is_file_reader(&call.function) || call.function == "glob" {
+        // `read_parquet('x.parquet')` / `read_csv([...])` / `glob('data/*.csv')` etc: the
+        // function reads a path — file contents, or, for `glob`, the filenames it lists —
+        // so its path literal(s) are file/pattern inputs, not the opaque fn name.
+        for path in &call.paths {
+            assets.record_input(path.clone(), read_path_kind(path));
+        }
+    } else if reads_no_table(&call.function) {
+        // DuckDB row-generators (`range(…)`, `generate_series(…)`) and catalog
+        // introspection functions (`duckdb_functions()`, `duckdb_tables()`,
+        // `duckdb_secrets()`) produce rows with no backing table at all — there is
+        // nothing to record as an input, and none as the fn name either.
+    } else if call.names_something {
+        // Any other table-valued function whose arguments hold a string or a quoted
+        // identifier (an extension's `mlpack_…_train("X", "Y", …)`, `query('…')`): those
+        // arguments name tables, files or queries, and arc does not carry the signature
+        // that says which. The call records no input — the function's own name is not a
+        // table — and is reported as unread instead.
+        assets.unread_table_functions.insert(call.function.clone());
+    } else {
+        // A table macro (`recent()`), or a function called with numbers and bare names
+        // only: record the name itself as the input, as before.
+        assets.record_input(call.function.clone(), AssetKind::Table);
+    }
 }
 
 /// The `[start, end)` byte offset of each top-level statement in `sql`, in source order.
@@ -426,7 +671,7 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
                                 .record_input(object_name_to_string(table_name), AssetKind::Table);
                             assets.record_output(
                                 filename.clone(),
-                                copy_to_target_kind(options.as_slice()),
+                                copy_to_target_kind(&sqlparser_copy_options(options)),
                             );
                         }
                         CopyTarget::Stdout => {
@@ -452,7 +697,7 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
                     if let CopyTarget::File { filename } = target {
                         assets.record_output(
                             filename.clone(),
-                            copy_to_target_kind(options.as_slice()),
+                            copy_to_target_kind(&sqlparser_copy_options(options)),
                         );
                     }
                 }
@@ -555,36 +800,21 @@ fn extract_inputs_from_table_factor(factor: &TableFactor, assets: &mut SqlAssets
         TableFactor::Table { name, args, .. } => {
             let fn_name = object_name_to_string(name);
             match args {
-                // `read_parquet('x.parquet')` / `read_csv([...])` / `glob('data/*.csv')`
-                // etc: the function reads a path — file contents, or, for `glob`, the
-                // filenames it lists — so lift its path literal(s) as file/pattern
-                // inputs, not the opaque fn name.
-                Some(table_args) if is_file_reader(&fn_name) || fn_name == "glob" => {
+                Some(table_args) => {
+                    let mut paths = Vec::new();
                     for arg in &table_args.args {
                         if let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg {
-                            extract_path_literals(expr, assets);
+                            path_literals(expr, &mut paths);
                         }
                     }
+                    let call = FunctionCall {
+                        function: fn_name,
+                        paths,
+                        names_something: args_name_something(table_args),
+                    };
+                    record_table_call(&call, assets);
                 }
-                // DuckDB row-generators (`range(…)`, `generate_series(…)`) and catalog
-                // introspection functions (`duckdb_functions()`, `duckdb_tables()`,
-                // `duckdb_secrets()`) produce rows with no backing table at all — there
-                // is nothing to record as an input, and none as the fn name either.
-                Some(_) if reads_no_table(&fn_name) => {}
-                // Any other table-valued function whose arguments hold a string or a quoted
-                // identifier (an extension's `mlpack_…_train("X", "Y", …)`, `query('…')`):
-                // those arguments name tables, files or queries, and arc does not carry
-                // the signature that says which. The call records no input — the
-                // function's own name is not a table — and is reported as unread instead.
-                Some(table_args) if args_name_something(table_args) => {
-                    assets.unread_table_functions.insert(fn_name);
-                }
-                // A table macro (`recent()`), a function called with numbers and bare
-                // names only, or a plain table name: record the name itself as the
-                // input, as before.
-                _ => {
-                    assets.record_input(fn_name, AssetKind::Table);
-                }
+                None => assets.record_input(fn_name, AssetKind::Table),
             }
         }
         TableFactor::Derived { subquery, .. } => {
@@ -693,28 +923,23 @@ fn args_name_something(table_args: &TableFunctionArgs) -> bool {
     .is_break()
 }
 
-/// Lift filesystem-path string literals out of a file-reader argument expression.
+/// The filesystem-path string literals of a file-reader argument expression.
 ///
 /// Handles a single quoted path (`'x.parquet'`) and a bracketed/`ARRAY` list of them
 /// (`['a.json', 'b.json']`) — DuckDB's multi-file glob form. Paths keep their original
 /// case (filesystems are case-sensitive); everything else is ignored, so reader options
 /// like `format => 'array'` never masquerade as inputs (they arrive as named args, which
 /// the caller already skips, but a stray literal is harmless).
-fn extract_path_literals(expr: &Expr, assets: &mut SqlAssets) {
+fn path_literals(expr: &Expr, paths: &mut Vec<String>) {
     match expr {
         Expr::Value(v) => {
             if let Value::SingleQuotedString(path) = &v.value {
-                let kind = if is_glob(path) {
-                    AssetKind::Pattern
-                } else {
-                    AssetKind::File
-                };
-                assets.record_input(path.clone(), kind);
+                paths.push(path.clone());
             }
         }
         Expr::Array(array) => {
             for elem in &array.elem {
-                extract_path_literals(elem, assets);
+                path_literals(elem, paths);
             }
         }
         _ => {}
@@ -724,6 +949,105 @@ fn extract_path_literals(expr: &Expr, assets: &mut SqlAssets) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::duckdb_lineage::recorded_steps;
+
+    /// What the rules make of DuckDB's reading of `sql`, from the answers the 2.0 preview
+    /// gave for it: what [`extract_per_statement`] returns with `ARC_SQL_READER=duckdb`.
+    fn read_by_duckdb(sql: &str) -> Vec<SqlAssets> {
+        recorded_steps::read(sql)
+            .iter()
+            .map(duckdb_statement)
+            .collect()
+    }
+
+    fn read_by_sqlparser(sql: &str) -> Vec<SqlAssets> {
+        sqlparser_per_statement(sql).unwrap_or_else(|e| panic!("sqlparser refused {sql:?}: {e:?}"))
+    }
+
+    fn set(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn duckdb_reads_an_asof_join_sqlparser_cannot_parse() {
+        let sql = recorded_steps::ASOF;
+        assert!(
+            sqlparser_per_statement(sql).is_err(),
+            "sqlparser parses {sql:?} now; the step no longer shows what the switch is for"
+        );
+        let read = read_by_duckdb(sql);
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].outputs, set(&["r"]), "{sql}");
+        assert_eq!(read[0].inputs, set(&["t", "u"]), "{sql}");
+        assert_eq!(read[0].kinds.get("r"), Some(&AssetKind::Table));
+    }
+
+    #[test]
+    fn table_functions_are_read_by_the_same_rules_under_either_reader() {
+        for sql in [
+            recorded_steps::READ_XLSX,
+            recorded_steps::RANGE,
+            recorded_steps::MLPACK,
+        ] {
+            assert_eq!(read_by_duckdb(sql), read_by_sqlparser(sql), "{sql}");
+        }
+        let xlsx = &read_by_duckdb(recorded_steps::READ_XLSX)[0];
+        assert_eq!(
+            xlsx.inputs,
+            set(&["build/budget.xlsx"]),
+            "read_xlsx reads its file"
+        );
+        assert_eq!(xlsx.kinds.get("build/budget.xlsx"), Some(&AssetKind::File));
+        let range = &read_by_duckdb(recorded_steps::RANGE)[0];
+        assert_eq!(range.inputs, set(&[]), "range reads no table");
+        assert_eq!(range.unread_table_functions, set(&[]));
+        let mlpack = &read_by_duckdb(recorded_steps::MLPACK)[0];
+        assert_eq!(
+            mlpack.inputs,
+            set(&[]),
+            "the call names no table arc can read"
+        );
+        assert_eq!(
+            mlpack.unread_table_functions,
+            set(&["mlpack_random_forest_train"]),
+            "the call is listed for the warning that asks for depends_on: and produces:"
+        );
+    }
+
+    #[test]
+    fn a_copy_is_read_by_the_same_rules_under_either_reader() {
+        for (sql, file, kind) in [
+            (recorded_steps::COPY_QUERY, "out.csv", AssetKind::File),
+            (
+                recorded_steps::COPY_PARTITIONED,
+                "parts",
+                AssetKind::Directory,
+            ),
+            (
+                recorded_steps::COPY_ONE_FILE_PER_THREAD_OFF,
+                "one.parquet",
+                AssetKind::File,
+            ),
+        ] {
+            let read = read_by_duckdb(sql);
+            assert_eq!(read, read_by_sqlparser(sql), "{sql}");
+            assert_eq!(read[0].outputs, set(&[file]), "{sql}");
+            assert_eq!(read[0].kinds.get(file), Some(&kind), "{sql}");
+            assert_eq!(read[0].inputs, set(&["a"]), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_pivot_joined_to_another_table_is_not_read_as_its_first() {
+        let read = read_by_duckdb(recorded_steps::PIVOT_JOIN);
+        assert_eq!(read.len(), 1);
+        assert_ne!(
+            read[0].inputs,
+            set(&["t"]),
+            "the pivot reads the rows of t and u, and is read as reading t alone"
+        );
+        assert_eq!(read[0].inputs, set(&[]), "the statement is unread");
+    }
 
     // CREATE TABLE is discovered as an output.
     #[test]

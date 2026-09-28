@@ -23,11 +23,10 @@
 //! a plain identifier. A token's text and start do not change, and they are all the
 //! reader takes from a token.
 //!
-//! A table function is returned as a call, its name and its arguments. Which function
-//! reads a file and which reads no table is decided by whoever reads the call.
-
-// Nothing calls the reader yet. The attribute goes when `arc run` reads a step with it.
-#![allow(dead_code)]
+//! A table function is returned as a call, its name and its arguments, and a `COPY … TO`
+//! with its options. Which function reads a file, which reads no table, and which options
+//! write a directory, are decided by whoever reads the statement: `crate::introspect`,
+//! which applies the same rules to what arc's other reader returns.
 
 use std::cmp::Ordering;
 use std::ffi::OsStr;
@@ -99,8 +98,19 @@ pub(crate) enum ArgValue {
     QuotedIdentifier(String),
     /// A bare name.
     Identifier(String),
-    /// Any other expression, as written.
-    Expression(String),
+    /// A list, `['a.json', 'b.json']`, or a `COPY` option's parenthesised values.
+    List(Vec<ArgValue>),
+    /// Any other expression, as written. `quotes` is whether it holds a string or a
+    /// double-quoted name at any depth: `lower('X')` and `"Q" + 1` do, `1 + 2` does not.
+    Expression { text: String, quotes: bool },
+}
+
+/// An option of a `COPY … TO`, `FORMAT parquet` or `HEADER`, with its value as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CopyOption {
+    pub(crate) name: String,
+    /// `None` for an option given without one: `HEADER`.
+    pub(crate) value: Option<ArgValue>,
 }
 
 /// What kind of statement it is, as far as what it reads and produces goes.
@@ -133,6 +143,8 @@ pub(crate) struct Statement {
     pub(crate) reads: Vec<Relation>,
     pub(crate) produces: Vec<Relation>,
     pub(crate) calls: Vec<TableCall>,
+    /// The options of a `COPY … TO`, in order. Empty for any other statement.
+    pub(crate) options: Vec<CopyOption>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,6 +428,7 @@ struct Frame {
     produces: Vec<Relation>,
     /// A query the statement holds, to be asked for its tree.
     query: Option<String>,
+    options: Vec<CopyOption>,
 }
 
 fn frame(piece: &Piece) -> Frame {
@@ -448,6 +461,7 @@ fn frame(piece: &Piece) -> Frame {
         reads: Vec::new(),
         produces: Vec::new(),
         query: None,
+        options: Vec::new(),
     })
 }
 
@@ -473,6 +487,7 @@ impl Frame {
             reads: Vec::new(),
             produces: Vec::new(),
             query: None,
+            options: Vec::new(),
         }
     }
 }
@@ -499,6 +514,7 @@ fn create(w: &mut Words) -> Option<Frame> {
         reads: Vec::new(),
         produces: vec![Relation::Table(name)],
         query,
+        options: Vec::new(),
     })
 }
 
@@ -535,11 +551,13 @@ fn insert(w: &mut Words) -> Option<Frame> {
         reads: Vec::new(),
         produces: vec![Relation::Table(name)],
         query,
+        options: Vec::new(),
     })
 }
 
-/// `COPY name [(cols)] TO 'file'`, `COPY name [(cols)] FROM 'file'`, `COPY (query) TO
-/// 'file'`. A target DuckDB takes as a bare name, `COPY t TO out`, is not framed.
+/// `COPY name [(cols)] TO 'file' [options]`, `COPY name [(cols)] FROM 'file'`, `COPY
+/// (query) TO 'file' [options]`. A target DuckDB takes as a bare name, `COPY t TO out`, is
+/// not framed.
 fn copy(w: &mut Words) -> Option<Frame> {
     let Some(name) = w.name() else {
         let inner = w.group();
@@ -552,16 +570,18 @@ fn copy(w: &mut Words) -> Option<Frame> {
             reads: Vec::new(),
             produces: vec![Relation::File(file)],
             query: Some(w.text[inner].to_string()),
+            options: copy_options(w),
         });
     };
     let table = Relation::Table(name);
     if w.is(0, "(") {
         w.group();
     }
-    let (reads, produces) = if w.eat("to") {
-        (table, Relation::File(w.string()?))
+    let (reads, produces, options) = if w.eat("to") {
+        let file = Relation::File(w.string()?);
+        (table, file, copy_options(w))
     } else if w.eat("from") {
-        (Relation::File(w.string()?), table)
+        (Relation::File(w.string()?), table, Vec::new())
     } else {
         return None;
     };
@@ -570,11 +590,80 @@ fn copy(w: &mut Words) -> Option<Frame> {
         reads: vec![reads],
         produces: vec![produces],
         query: None,
+        options,
     })
 }
 
-/// `PIVOT name|'file'|(query) ON …`. DuckDB gives no tree for a `PIVOT` whose columns
-/// it would have to read the data to know. A source that calls a function is not framed.
+/// `[WITH] (name [value], …)` after a `COPY … TO`'s file. A value is one word, a
+/// parenthesised list, or an expression running to the next `,` or `)`.
+fn copy_options(w: &mut Words) -> Vec<CopyOption> {
+    let mut options = Vec::new();
+    w.eat("with");
+    if !w.eat("(") {
+        return options;
+    }
+    while let Some(name) = w.ident() {
+        let value = if w.is(0, ",") || w.is(0, ")") {
+            None
+        } else if w.is(0, "(") {
+            let from = w.at + 1;
+            w.group();
+            let inside = &w.tokens[from..w.at.saturating_sub(1)];
+            Some(ArgValue::List(
+                items(inside)
+                    .into_iter()
+                    .map(|item| w.value(item))
+                    .collect(),
+            ))
+        } else {
+            let from = w.at;
+            let mut depth = 0usize;
+            while let Some(word) = w.word(0) {
+                match word {
+                    "(" => depth += 1,
+                    ")" if depth == 0 => break,
+                    ")" => depth -= 1,
+                    "," if depth == 0 => break,
+                    _ => {}
+                }
+                w.at += 1;
+            }
+            Some(w.value(&w.tokens[from..w.at]))
+        };
+        options.push(CopyOption { name, value });
+        if !w.eat(",") {
+            break;
+        }
+    }
+    options
+}
+
+/// `tokens` split at each `,` outside a group, with an empty list for no tokens.
+fn items(tokens: &[Token]) -> Vec<&[Token]> {
+    let mut items = Vec::new();
+    let (mut from, mut depth) = (0, 0usize);
+    for (i, token) in tokens.iter().enumerate() {
+        match token.word.as_str() {
+            "(" => depth += 1,
+            ")" => depth = depth.saturating_sub(1),
+            "," if depth == 0 => {
+                items.push(&tokens[from..i]);
+                from = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if from < tokens.len() {
+        items.push(&tokens[from..]);
+    }
+    items
+}
+
+/// `PIVOT name|'file'|(query) [[AS] alias] ON …`. DuckDB gives no tree for a `PIVOT`
+/// whose columns it would have to read the data to know. A source that calls a function
+/// is not framed, and neither is one that `ON` does not follow: `PIVOT t JOIN u USING (k)
+/// ON …` pivots the rows of both tables, and a frame reading the first alone would
+/// under-read it.
 fn pivot(w: &mut Words) -> Option<Frame> {
     let (reads, query) = if let Some(name) = w.name() {
         if w.is(0, "(") {
@@ -587,11 +676,19 @@ fn pivot(w: &mut Words) -> Option<Frame> {
         let inner = w.group();
         (Vec::new(), Some(w.text[inner].to_string()))
     };
+    if !w.eat("on") {
+        w.eat("as");
+        w.ident()?;
+        if !w.eat("on") {
+            return None;
+        }
+    }
     Some(Frame {
         form: Form::Pivot,
         reads,
         produces: Vec::new(),
         query,
+        options: Vec::new(),
     })
 }
 
@@ -610,6 +707,7 @@ fn set(w: &mut Words) -> Option<Frame> {
         reads: Vec::new(),
         produces: Vec::new(),
         query: Some(format!("SELECT {}", w.rest())),
+        options: Vec::new(),
     })
 }
 
@@ -708,6 +806,36 @@ impl Words<'_> {
         })
     }
 
+    /// What `tokens`, a run of this statement's tokens, write as a value: a string, a
+    /// double-quoted name, a number or a bare word when they are one token, and an
+    /// expression otherwise.
+    fn value(&self, tokens: &[Token]) -> ArgValue {
+        let unquote =
+            |word: &str, quote: &str| word[1..word.len() - 1].replace(&quote.repeat(2), quote);
+        match tokens {
+            [one] if one.word.starts_with('\'') => ArgValue::String(unquote(&one.word, "'")),
+            [one] if one.word.starts_with('"') => {
+                ArgValue::QuotedIdentifier(unquote(&one.word, "\""))
+            }
+            [one]
+                if one
+                    .word
+                    .starts_with(|c: char| c.is_ascii_digit() || c == '.') =>
+            {
+                ArgValue::Number(one.word.clone())
+            }
+            [one] => ArgValue::Identifier(one.word.clone()),
+            _ => {
+                let start = tokens.first().map_or(0, |t| t.start);
+                let end = tokens.last().map_or(0, |t| t.start + t.word.len());
+                ArgValue::Expression {
+                    text: self.text.get(start..end).unwrap_or_default().to_string(),
+                    quotes: tokens.iter().any(|t| t.word.starts_with(['\'', '"'])),
+                }
+            }
+        }
+    }
+
     /// A single-quoted string, without its quotes.
     fn string(&mut self) -> Option<String> {
         let value = match self.word(0) {
@@ -773,12 +901,14 @@ fn read_statement(
         reads: frame.reads,
         produces: frame.produces,
         calls: Vec::new(),
+        options: frame.options,
     };
     let (tree, text) = match answer(tree) {
         Answer::Tree(tree) => {
             statement.form = Form::Query;
             statement.reads.clear();
             statement.produces.clear();
+            statement.options.clear();
             (tree, piece.text.as_str())
         }
         Answer::Parser(message) => {
@@ -969,6 +1099,10 @@ fn arg_value(expression: &Value, text: &str) -> ArgValue {
     let written = written(expression, text);
     let literal = &expression["literal"];
     let literal_text = literal["text"].as_str().unwrap_or_default().to_string();
+    let other = || ArgValue::Expression {
+        text: written.to_string(),
+        quotes: quotes(expression, text),
+    };
     match (expression["class"].as_str(), literal["kind"].as_str()) {
         (Some("CONSTANT"), Some("INTEGER" | "NUMERIC")) => ArgValue::Number(literal_text),
         (Some("CONSTANT"), Some("STRING")) => ArgValue::String(literal_text),
@@ -977,9 +1111,73 @@ fn arg_value(expression: &Value, text: &str) -> ArgValue {
                 ArgValue::QuotedIdentifier(name.clone())
             }
             Some([Value::String(name)]) => ArgValue::Identifier(name.clone()),
-            _ => ArgValue::Expression(written.to_string()),
+            _ => other(),
         },
-        _ => ArgValue::Expression(written.to_string()),
+        // `['a.json', 'b.json']` is DuckDB's `list_value` of its elements.
+        (Some("FUNCTION"), _)
+            if expression["function_name"] == "list_value"
+                && expression["is_operator"] == Value::Bool(false) =>
+        {
+            let items = expression["arguments"].as_array().into_iter().flatten();
+            ArgValue::List(items.map(|a| arg_value(&a["expression"], text)).collect())
+        }
+        _ => other(),
+    }
+}
+
+/// Whether an expression holds a string, or a double-quoted name, at any depth.
+fn quotes(v: &Value, text: &str) -> bool {
+    match v {
+        Value::Array(items) => items.iter().any(|item| quotes(item, text)),
+        Value::Object(node) => {
+            (v["class"] == "CONSTANT" && v["literal"]["kind"] == "STRING")
+                || (v["class"] == "COLUMN_REF" && written(v, text).contains('"'))
+                || node.values().any(|child| quotes(child, text))
+        }
+        _ => false,
+    }
+}
+
+/// Steps `crate::introspect`'s tests read through the reader, and the reading of each
+/// from the answers the preview gave. Each is read by a check below, so it is recorded.
+#[cfg(test)]
+pub(crate) mod recorded_steps {
+    pub(crate) const ASOF: &str =
+        "CREATE TABLE r AS SELECT * EXCLUDE (a) FROM t ASOF LEFT JOIN u USING (k);";
+    pub(crate) const READ_XLSX: &str =
+        "CREATE TABLE b AS SELECT * FROM read_xlsx('build/budget.xlsx');";
+    pub(crate) const RANGE: &str = "CREATE TABLE g AS SELECT * FROM range(10);";
+    pub(crate) const MLPACK: &str = "CREATE TABLE m AS SELECT * FROM \
+         mlpack_random_forest_train(\"X\", \"Y\", \"params\", \"model\");";
+    pub(crate) const COPY_QUERY: &str = "COPY (SELECT * FROM a WHERE x > 1) TO 'out.csv' (HEADER);";
+    pub(crate) const COPY_PARTITIONED: &str =
+        "COPY (SELECT * FROM a) TO 'parts' (FORMAT parquet, PARTITION_BY (region));";
+    pub(crate) const COPY_ONE_FILE_PER_THREAD_OFF: &str =
+        "COPY a TO 'one.parquet' (FORMAT parquet, PER_THREAD_OUTPUT false);";
+    pub(crate) const PIVOT_JOIN: &str = "PIVOT t JOIN u USING (k) ON c USING sum(v);";
+
+    /// The steps above, each with the form, reads and produces of its one statement.
+    pub(crate) const ALL: [(&str, &str, &[&str], &[&str]); 8] = [
+        (ASOF, "CREATE", &["t", "u"], &["r"]),
+        (READ_XLSX, "CREATE", &[], &["b"]),
+        (RANGE, "CREATE", &[], &["g"]),
+        (MLPACK, "CREATE", &[], &["m"]),
+        (COPY_QUERY, "COPY", &["a"], &["file 'out.csv'"]),
+        (COPY_PARTITIONED, "COPY", &["a"], &["file 'parts'"]),
+        (
+            COPY_ONE_FILE_PER_THREAD_OFF,
+            "COPY",
+            &["a"],
+            &["file 'one.parquet'"],
+        ),
+        (PIVOT_JOIN, "PIVOT", &[], &[]),
+    ];
+
+    /// The reading of `sql`, one of the steps above, from the recorded answers.
+    pub(crate) fn read(sql: &str) -> Vec<super::Statement> {
+        super::read_step_with(&mut super::tests::Recorded::load(), sql)
+            .unwrap_or_else(|e| panic!("reading {sql:?} was refused: {e}"))
+            .statements
     }
 }
 
@@ -1077,14 +1275,14 @@ mod tests {
 "WITH c AS (SELECT * FROM a) SELECT * FROM c":{"error":false,"statements":[{"named_param_map":[],"node":{"aggregate_handling":"STANDARD_HANDLING","cte_map":{"map":[{"key":"c","value":{"aliases":[],"key_targets":[],"materialized":"CTE_MATERIALIZE_DEFAULT","payload_aggregates":[],"query_node":{"aggregate_handling":"STANDARD_HANDLING","cte_map":{"map":[]},"from_table":{"alias":"","at_clause":null,"catalog_name":"","column_name_alias":[],"qualified_name":{"path":["a"]},"query_location":25,"query_location_length":1,"sample":null,"schema_name":"","table_name":"a","type":"BASE_TABLE"},"group_expressions":[],"group_sets":[],"having":null,"modifiers":[],"qualify":null,"sample":null,"select_list":[{"alias":"","class":"STAR","columns":false,"exclude_list":[],"expr":null,"qualified_exclude_list":[],"query_location":18,"query_location_length":1,"relation_name":"","rename_list":[],"replace_list":[],"type":"STAR"}],"type":"SELECT_NODE","where_clause":null}}}]},"from_table":{"alias":"","at_clause":null,"catalog_name":"","column_name_alias":[],"qualified_name":{"path":["c"]},"query_location":42,"query_location_length":1,"sample":null,"schema_name":"","table_name":"c","type":"BASE_TABLE"},"group_expressions":[],"group_sets":[],"having":null,"modifiers":[],"qualify":null,"sample":null,"select_list":[{"alias":"","class":"STAR","columns":false,"exclude_list":[],"expr":null,"qualified_exclude_list":[],"query_location":35,"query_location_length":1,"relation_name":"","rename_list":[],"replace_list":[],"type":"STAR"}],"type":"SELECT_NODE","where_clause":null}}]},
 "WITH x AS (SELECT * FROM y), y AS (SELECT * FROM x) SELECT * FROM y":{"error":false,"statements":[{"named_param_map":[],"node":{"aggregate_handling":"STANDARD_HANDLING","cte_map":{"map":[{"key":"x","value":{"aliases":[],"key_targets":[],"materialized":"CTE_MATERIALIZE_DEFAULT","payload_aggregates":[],"query_node":{"aggregate_handling":"STANDARD_HANDLING","cte_map":{"map":[]},"from_table":{"alias":"","at_clause":null,"catalog_name":"","column_name_alias":[],"qualified_name":{"path":["y"]},"query_location":25,"query_location_length":1,"sample":null,"schema_name":"","table_name":"y","type":"BASE_TABLE"},"group_expressions":[],"group_sets":[],"having":null,"modifiers":[],"qualify":null,"sample":null,"select_list":[{"alias":"","class":"STAR","columns":false,"exclude_list":[],"expr":null,"qualified_exclude_list":[],"query_location":18,"query_location_length":1,"relation_name":"","rename_list":[],"replace_list":[],"type":"STAR"}],"type":"SELECT_NODE","where_clause":null}}},{"key":"y","value":{"aliases":[],"key_targets":[],"materialized":"CTE_MATERIALIZE_DEFAULT","payload_aggregates":[],"query_node":{"aggregate_handling":"STANDARD_HANDLING","cte_map":{"map":[]},"from_table":{"alias":"","at_clause":null,"catalog_name":"","column_name_alias":[],"qualified_name":{"path":["x"]},"query_location":49,"query_location_length":1,"sample":null,"schema_name":"","table_name":"x","type":"BASE_TABLE"},"group_expressions":[],"group_sets":[],"having":null,"modifiers":[],"qualify":null,"sample":null,"select_list":[{"alias":"","class":"STAR","columns":false,"exclude_list":[],"expr":null,"qualified_exclude_list":[],"query_location":42,"query_location_length":1,"relation_name":"","rename_list":[],"replace_list":[],"type":"STAR"}],"type":"SELECT_NODE","where_clause":null}}}]},"from_table":{"alias":"","at_clause":null,"catalog_name":"","column_name_alias":[],"qualified_name":{"path":["y"]},"query_location":66,"query_location_length":1,"sample":null,"schema_name":"","table_name":"y","type":"BASE_TABLE"},"group_expressions":[],"group_sets":[],"having":null,"modifiers":[],"qualify":null,"sample":null,"select_list":[{"alias":"","class":"STAR","columns":false,"exclude_list":[],"expr":null,"qualified_exclude_list":[],"query_location":59,"query_location_length":1,"relation_name":"","rename_list":[],"replace_list":[],"type":"STAR"}],"type":"SELECT_NODE","where_clause":null}}]}}}"##;
 
-    struct Recorded {
+    pub(super) struct Recorded {
         version: String,
         tokens: BTreeMap<String, Vec<Token>>,
         trees: BTreeMap<String, Value>,
     }
 
     impl Recorded {
-        fn load() -> Recorded {
+        pub(super) fn load() -> Recorded {
             let all: Value = serde_json::from_str(RECORDED).expect("RECORDED is JSON");
             Recorded {
                 version: all["version"].as_str().unwrap_or_default().to_string(),
@@ -1378,7 +1576,10 @@ mod tests {
             "SELECT * FROM read_csv('x.csv', header = true, sep := ',', \"quote\" = 'q'), \
              f(bare, 1 + 2, t.col, 1.5, NULL);",
         );
-        let expression = |text: &str| ArgValue::Expression(text.to_string());
+        let expression = |text: &str| ArgValue::Expression {
+            text: text.to_string(),
+            quotes: false,
+        };
         assert_eq!(
             s[0].calls[0].args,
             [
@@ -1563,6 +1764,115 @@ mod tests {
         );
     }
 
+    fn a_pivot_whose_source_is_joined_is_unread(ask: &mut dyn Ask) {
+        let s = read(
+            ask,
+            "PIVOT t JOIN u USING (k) ON c USING sum(v);\n\
+             PIVOT (FROM t) JOIN u USING (k) ON c USING sum(v);\n\
+             PIVOT t AS x JOIN u USING (k) ON c USING sum(v);\n\
+             PIVOT 'p.csv' JOIN u USING (k) ON c USING sum(v);\n\
+             PIVOT t ON c USING sum(v);\n\
+             PIVOT t AS x ON c USING sum(v);",
+        );
+        let shapes: Vec<_> = s.iter().map(shape).collect();
+        let unread = || expect(Form::Unread("PIVOT".to_string()), &[], &[]);
+        assert_eq!(
+            shapes,
+            [
+                unread(),
+                unread(),
+                unread(),
+                unread(),
+                expect(Form::Pivot, &["t"], &[]),
+                expect(Form::Pivot, &["t"], &[]),
+            ],
+            "a PIVOT whose source is joined to another relation is unread, not read as the \
+             first relation alone; a PIVOT of one table, aliased or not, reads it"
+        );
+    }
+
+    fn copy_to_options_are_read(ask: &mut dyn Ask) {
+        let s = read(
+            ask,
+            "COPY t TO 'd' (FORMAT parquet, PARTITION_BY (a, b), PER_THREAD_OUTPUT false, \
+             FILE_SIZE_BYTES '1MB', HEADER);\n\
+             COPY (SELECT * FROM a) TO 'e' WITH (PARTITION_BY (), PER_THREAD_OUTPUT 0);\n\
+             COPY t FROM 'in.csv' (HEADER);",
+        );
+        let option = |name: &str, value: Option<ArgValue>| CopyOption {
+            name: name.to_string(),
+            value,
+        };
+        let word = |w: &str| Some(ArgValue::Identifier(w.to_string()));
+        assert_eq!(
+            s[0].options,
+            [
+                option("FORMAT", word("parquet")),
+                option(
+                    "PARTITION_BY",
+                    Some(ArgValue::List(vec![
+                        ArgValue::Identifier("a".to_string()),
+                        ArgValue::Identifier("b".to_string()),
+                    ])),
+                ),
+                option("PER_THREAD_OUTPUT", word("false")),
+                option("FILE_SIZE_BYTES", Some(ArgValue::String("1MB".to_string()))),
+                option("HEADER", None),
+            ],
+            "each option of a COPY … TO, with its value as written"
+        );
+        assert_eq!(
+            s[1].options,
+            [
+                option("PARTITION_BY", Some(ArgValue::List(Vec::new()))),
+                option("PER_THREAD_OUTPUT", Some(ArgValue::Number("0".to_string()))),
+            ],
+            "WITH before the options, and an empty list"
+        );
+        assert_eq!(s[2].options, [], "a COPY … FROM keeps no options");
+    }
+
+    fn lists_and_quoted_expressions_are_told_apart(ask: &mut dyn Ask) {
+        let s = read(
+            ask,
+            "SELECT * FROM read_json(['a.json', 'b.json']), f(lower('X')), g(\"Q\" + 1);",
+        );
+        let args: Vec<_> = s[0].calls.iter().map(|c| c.args.clone()).collect();
+        let expression = |text: &str, quotes: bool| ArgValue::Expression {
+            text: text.to_string(),
+            quotes,
+        };
+        assert_eq!(
+            args,
+            [
+                vec![arg(
+                    None,
+                    ArgValue::List(vec![
+                        ArgValue::String("a.json".to_string()),
+                        ArgValue::String("b.json".to_string()),
+                    ]),
+                )],
+                vec![arg(None, expression("lower('X')", true))],
+                vec![arg(None, expression("\"Q\" + 1", true))],
+            ],
+            "a list holds its values; an expression says whether it holds a string or a \
+             quoted name"
+        );
+    }
+
+    fn the_steps_introspect_reads_are_read(ask: &mut dyn Ask) {
+        for (sql, first_word, reads, produces) in recorded_steps::ALL {
+            let s = read(ask, sql);
+            assert_eq!(s.len(), 1, "one statement in {sql:?}");
+            let form = match first_word {
+                "CREATE" => Form::CreateTable,
+                "COPY" => Form::Copy,
+                _ => Form::Unread(first_word.to_string()),
+            };
+            assert_eq!(shape(&s[0]), expect(form, reads, produces), "{sql}");
+        }
+    }
+
     /// Each check runs twice: from the preview's recorded answers in every `cargo test`,
     /// and against the preview itself when it is staged.
     macro_rules! checks {
@@ -1609,6 +1919,10 @@ mod tests {
         copies_are_framed_from_their_words,
         pivots_read_their_source,
         what_the_reader_cannot_frame_is_unread,
+        a_pivot_whose_source_is_joined_is_unread,
+        copy_to_options_are_read,
+        lists_and_quoted_expressions_are_told_apart,
+        the_steps_introspect_reads_are_read,
     );
 
     #[test]
