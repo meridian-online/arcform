@@ -424,39 +424,40 @@ fn is_ident_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_' || ch == '$' || !ch.is_ascii()
 }
 
-/// Read a quoted run that starts just after its opening `quote`, returning its text and the
-/// index after its closing quote, or the end of the input when it has none.
+/// Read a quoted run from `*i`, just after its opening `quote`, to its closing quote or the
+/// end of the input, and leave `*i` after it.
 fn read_quoted(
     c: &[char],
-    mut i: usize,
+    i: &mut usize,
     quote: char,
     escapes: Escapes,
     line: &mut usize,
-) -> (String, usize) {
+) -> String {
     let mut text = String::new();
-    while i < c.len() {
-        let ch = c[i];
+    while *i < c.len() {
+        let ch = c[*i];
         if escapes == Escapes::Backslash && ch == '\\' {
-            if let Some(&next) = c.get(i + 1) {
+            if let Some(&next) = c.get(*i + 1) {
                 *line += usize::from(next == '\n');
                 text.push(next);
             }
-            i += 2;
+            *i += 2;
             continue;
         }
         if ch == quote {
-            if escapes != Escapes::None && c.get(i + 1) == Some(&quote) {
+            if escapes != Escapes::None && c.get(*i + 1) == Some(&quote) {
                 text.push(quote);
-                i += 2;
+                *i += 2;
                 continue;
             }
-            return (text, i + 1);
+            *i += 1;
+            return text;
         }
         *line += usize::from(ch == '\n');
         text.push(ch);
-        i += 1;
+        *i += 1;
     }
-    (text, c.len())
+    text
 }
 
 /// The length of the `$tag$` or `$$` that opens a dollar-quoted string at `i`, if one does.
@@ -477,6 +478,10 @@ fn dollar_tag_len(c: &[char], i: usize) -> Option<usize> {
 /// nests; `''` is a quote inside `'…'`; a backslash escapes only inside `E'…'`; `$$…$$` and
 /// `$tag$…$tag$` are string constants. Text left open at the end of the input runs to the
 /// end, where DuckDB refuses the statement rather than running it.
+///
+/// Every branch consumes the characters it matched before it calls a helper or loops, so the
+/// scan advances on each pass whatever a helper returns: a lexer that can stall would hang
+/// `arc run` on one bad edit and fill memory with tokens.
 fn lex_sql(sql: &str) -> Vec<(Tok, usize)> {
     let c: Vec<char> = sql.chars().collect();
     let n = c.len();
@@ -492,28 +497,28 @@ fn lex_sql(sql: &str) -> Vec<(Tok, usize)> {
         } else if ch.is_whitespace() {
             i += 1;
         } else if ch == '-' && c.get(i + 1) == Some(&'-') {
+            i += 2;
             while i < n && c[i] != '\n' {
                 i += 1;
             }
         } else if ch == '/' && c.get(i + 1) == Some(&'*') {
-            let mut depth = 0usize;
-            while i < n {
+            let mut depth = 1usize;
+            i += 2;
+            while i < n && depth > 0 {
                 if c[i] == '/' && c.get(i + 1) == Some(&'*') {
                     depth += 1;
                     i += 2;
                 } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
                     depth -= 1;
                     i += 2;
-                    if depth == 0 {
-                        break;
-                    }
                 } else {
                     line += usize::from(c[i] == '\n');
                     i += 1;
                 }
             }
         } else if ch == '\'' || ch == '"' {
-            let (text, next) = read_quoted(&c, i + 1, ch, Escapes::Doubled, &mut line);
+            i += 1;
+            let text = read_quoted(&c, &mut i, ch, Escapes::Doubled, &mut line);
             out.push((
                 if ch == '"' {
                     Tok::Word { text, quoted: true }
@@ -522,7 +527,6 @@ fn lex_sql(sql: &str) -> Vec<(Tok, usize)> {
                 },
                 at,
             ));
-            i = next;
         } else if let Some(tag_len) = (ch == '$').then(|| dollar_tag_len(&c, i)).flatten() {
             let tag = &c[i..i + tag_len];
             let body = i + tag_len;
@@ -533,6 +537,7 @@ fn lex_sql(sql: &str) -> Vec<(Tok, usize)> {
             i = close.map_or(n, |k| k + tag_len);
         } else if is_ident_start(ch) {
             let start = i;
+            i += 1;
             while i < n && is_ident_char(c[i]) {
                 i += 1;
             }
@@ -544,9 +549,9 @@ fn lex_sql(sql: &str) -> Vec<(Tok, usize)> {
             };
             match prefixed {
                 Some(escapes) if c.get(i) == Some(&'\'') => {
-                    let (text, next) = read_quoted(&c, i + 1, '\'', escapes, &mut line);
+                    i += 1;
+                    let text = read_quoted(&c, &mut i, '\'', escapes, &mut line);
                     out.push((Tok::Str(text), at));
-                    i = next;
                 }
                 _ => out.push((
                     Tok::Word {
