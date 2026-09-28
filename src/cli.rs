@@ -1229,4 +1229,39 @@ mod tests {
             );
         }
     }
+
+    // ------------------------------------------------------ arc operation
+
+    /// A writer whose every write fails, standing in for a closed pipe or a
+    /// full disk on stdout.
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("stdout is closed"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // A listing that could not be written is an error, not an empty success:
+    // an agent reading a truncated list must be told it is truncated.
+    #[test]
+    fn operation_list_reports_a_failed_write_in_both_forms() {
+        for json in [false, true] {
+            let err = operation_list(json, &mut FailingWriter).unwrap_err();
+            assert!(
+                err.to_string().contains("stdout is closed"),
+                "json={json}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn operation_describe_reports_a_failed_write() {
+        let err = operation_describe("filter-rows", &mut FailingWriter).unwrap_err();
+        assert!(err.to_string().contains("stdout is closed"), "{err}");
+    }
 }
