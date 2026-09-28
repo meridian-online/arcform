@@ -1028,6 +1028,13 @@ fn exported_modules_declare_only_contracted_items() {
             "entries",
             "read",
             "restore",
+            // The same five on one file rather than a protocol directory:
+            // a file beside the spec keeps a history of its own.
+            "record_save_for_file",
+            "record_checkpoint_for_file",
+            "entries_for_file",
+            "read_for_file",
+            "restore_for_file",
             "edit_spec_with_history",
             "record_step_with_history",
         ]),

@@ -87,7 +87,11 @@
 //! outside the project; machine edits checkpoint the state they replace before
 //! writing, and nothing is ever promoted to git):
 //!
-//! - [`LocalHistory`] — the store handle; conventional root or an explicit one
+//! - [`LocalHistory`] — the store handle; conventional root or an explicit one.
+//!   Its calls take a protocol directory and keep that spec's history, and each
+//!   has a `_for_file` twin that keeps one file's history under the file's own
+//!   path — a chart file beside the spec, say — listed, bounded and restored
+//!   apart from every other file's, the spec's included
 //! - [`HistoryEntry`], [`HistoryKind`] — one recorded state; save vs checkpoint
 //! - [`edit_spec_with_history`] — [`edit_spec`] on the checkpointed road: the
 //!   replaced bytes are snapshotted first, and no checkpoint means no write

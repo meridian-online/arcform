@@ -1,5 +1,6 @@
-//! Local history for `arcform.yaml`: the middle tier between editor undo and
-//! version control, and the checkpoint a machine edit takes before it lands.
+//! Local history for `arcform.yaml` and the files beside it: the middle tier
+//! between editor undo and version control, and the checkpoint a machine edit
+//! takes before it lands.
 //!
 //! # The three tiers
 //!
@@ -43,7 +44,7 @@
 //! out of diffs, out of archives, out of anything shared. Recording an entry
 //! changes nothing in the protocol directory.
 //!
-//! Inside the root, each spec gets a directory keyed by a hash of its
+//! Inside the root, each file gets a directory keyed by a hash of its
 //! canonical path, holding a `spec-path` file (the path in the clear, for a
 //! human inspecting the store) and one snapshot file per entry, named
 //! `<millis>-<seq>-<kind>.yaml`. Entries are whole snapshots, not deltas: a
@@ -59,10 +60,25 @@
 //! authored artifact — is what the net keeps. Versioning the whole working
 //! tree is the third tier's job, not this one's.
 //!
+//! # A file's own history
+//!
+//! The calls above take a protocol directory and keep the history of the
+//! `arcform.yaml` inside it. A file a tool writes beside the spec — a chart
+//! file under `panels/`, say — keeps a history of its own through the twin
+//! calls that take a file: [`LocalHistory::record_save_for_file`],
+//! [`LocalHistory::record_checkpoint_for_file`],
+//! [`LocalHistory::entries_for_file`], [`LocalHistory::read_for_file`] and
+//! [`LocalHistory::restore_for_file`]. Each file is keyed by its own
+//! canonical path, so two files in one directory never list, restore or prune
+//! each other's entries, and a restore writes the one file it was given. The
+//! spec's key is the same either way: the calls that take a file, given a
+//! directory's `arcform.yaml`, read and write the history the calls that take
+//! the directory recorded.
+//!
 //! # Retention policy
 //!
-//! - At most [`HISTORY_MAX_ENTRIES`] entries per spec; the oldest are pruned
-//!   first.
+//! - At most [`HISTORY_MAX_ENTRIES`] entries per file; the oldest are pruned
+//!   first, and one file's entries never count against another's.
 //! - A save recorded through [`LocalHistory::record_save`] within
 //!   [`HISTORY_MERGE_WINDOW`] of the newest entry — when that entry is
 //!   itself a save — **merges into it**: the newer state replaces the older
@@ -87,8 +103,8 @@ use crate::error::{Error, Result};
 use crate::manifest::MANIFEST_FILENAME;
 use crate::record::RecordedStep;
 
-/// The most entries kept per spec; recording past the bound prunes the
-/// oldest. Fifty matches the established local-history precedent and holds a
+/// The most entries kept per file; recording past the bound prunes that
+/// file's oldest. Fifty matches the established local-history precedent and holds a
 /// few weeks of real editing.
 pub const HISTORY_MAX_ENTRIES: usize = 50;
 
@@ -223,25 +239,99 @@ impl LocalHistory {
     /// tell the user when the restored state does not load — `arc history
     /// restore` does.
     pub fn restore(&self, dir: &Path, id: &str) -> Result<String> {
-        let text = self.read(dir, id)?;
-        let manifest_path = dir.join(MANIFEST_FILENAME);
-        if manifest_path.exists() {
-            let current = std::fs::read_to_string(&manifest_path).map_err(|e| Error::FileRead {
-                path: manifest_path.clone(),
-                source: e,
-            })?;
-            self.record_checkpoint(dir, &current)?;
-        }
-        write_atomic(&manifest_path, text.as_bytes())?;
-        Ok(text)
+        self.restore_keyed(self.key_dir(dir)?, &dir.join(MANIFEST_FILENAME), id)
+    }
+
+    // ------------------------------------------------------ the calls on a file
+
+    /// [`record_save`](Self::record_save) for the file at `file` — a chart
+    /// file beside a Protocol's spec, say. The file's history is its own:
+    /// another file in the same directory, the Protocol's spec included,
+    /// neither sees these entries nor shares the bound.
+    ///
+    /// The file is keyed by its canonical path, which is the key the calls
+    /// that take a directory give `<dir>/arcform.yaml`: this call given a
+    /// Protocol's `arcform.yaml` reads and writes that Protocol's history.
+    /// The file need not exist — a deleted file's history stays readable and
+    /// restorable — but its directory must, and a path naming a directory, or
+    /// naming no file at all, is refused.
+    pub fn record_save_for_file(&self, file: &Path, text: &str) -> Result<Option<HistoryEntry>> {
+        self.record_keyed(
+            self.file_key(file)?,
+            text,
+            HistoryKind::Save,
+            SystemTime::now(),
+            true,
+        )
+    }
+
+    /// [`record_checkpoint`](Self::record_checkpoint) for the file at
+    /// `file`, keyed as [`record_save_for_file`](Self::record_save_for_file)
+    /// describes.
+    pub fn record_checkpoint_for_file(
+        &self,
+        file: &Path,
+        text: &str,
+    ) -> Result<Option<HistoryEntry>> {
+        self.record_keyed(
+            self.file_key(file)?,
+            text,
+            HistoryKind::Checkpoint,
+            SystemTime::now(),
+            false,
+        )
+    }
+
+    /// Every entry recorded for the file at `file`, oldest first — that
+    /// file's entries and no other's.
+    pub fn entries_for_file(&self, file: &Path) -> Result<Vec<HistoryEntry>> {
+        let (key_dir, _) = self.file_key(file)?;
+        entries_in(&key_dir)
+    }
+
+    /// The exact bytes entry `id` recorded for the file at `file`.
+    pub fn read_for_file(&self, file: &Path, id: &str) -> Result<String> {
+        let (key_dir, _) = self.file_key(file)?;
+        read_entry(&key_dir, id)
+    }
+
+    /// Roll the file at `file` back to the state entry `id` recorded, with
+    /// [`restore`](Self::restore)'s discipline: the text being replaced is
+    /// checkpointed in this file's history first, then the recorded bytes land
+    /// atomically at `file`. Nothing else in the directory is read or written.
+    pub fn restore_for_file(&self, file: &Path, id: &str) -> Result<String> {
+        self.restore_keyed(self.file_key(file)?, file, id)
     }
 
     // ---------------------------------------------------------------- internals
 
-    /// Record one entry. `now` is a parameter so the debounce window and
-    /// ordering rules are testable without a clock; `merge` engages the save
-    /// debounce, and is true only for the save-boundary entry point — see
-    /// the retention-policy discussion in the module docs.
+    /// The restore both kinds of call share: read entry `id` under `key`,
+    /// checkpoint what `target` holds now under the same key — no checkpoint,
+    /// no write — and write the entry's bytes to `target`.
+    fn restore_keyed(&self, key: (PathBuf, PathBuf), target: &Path, id: &str) -> Result<String> {
+        let text = read_entry(&key.0, id)?;
+        if target.exists() {
+            let current = std::fs::read_to_string(target).map_err(|e| Error::FileRead {
+                path: target.to_path_buf(),
+                source: e,
+            })?;
+            self.record_keyed(
+                key,
+                &current,
+                HistoryKind::Checkpoint,
+                SystemTime::now(),
+                false,
+            )?;
+        }
+        write_atomic(target, text.as_bytes())?;
+        Ok(text)
+    }
+
+    /// Record one entry for the spec in `dir`. `now` is a parameter so the
+    /// debounce window and ordering rules are testable without a clock;
+    /// `merge` engages the save debounce, and is true only for the
+    /// save-boundary entry point — see the retention-policy discussion in the
+    /// module docs.
     fn record(
         &self,
         dir: &Path,
@@ -250,7 +340,19 @@ impl LocalHistory {
         now: SystemTime,
         merge: bool,
     ) -> Result<Option<HistoryEntry>> {
-        let (key_dir, spec_path) = self.key_dir(dir)?;
+        self.record_keyed(self.key_dir(dir)?, text, kind, now, merge)
+    }
+
+    /// Record one entry under `key`, the pair [`key_for`](Self::key_for)
+    /// returns.
+    fn record_keyed(
+        &self,
+        (key_dir, spec_path): (PathBuf, PathBuf),
+        text: &str,
+        kind: HistoryKind,
+        now: SystemTime,
+        merge: bool,
+    ) -> Result<Option<HistoryEntry>> {
         std::fs::create_dir_all(&key_dir)?;
 
         // Name the spec in the clear for anyone inspecting the store.
@@ -308,21 +410,57 @@ impl LocalHistory {
         }))
     }
 
-    /// The per-spec directory: the store root plus a hash of the canonical
-    /// spec path. Hashing makes the key filesystem-safe for any path;
-    /// `spec-path` inside the directory keeps it human-legible.
+    /// The key of the spec in `dir`: its `arcform.yaml` under the canonical
+    /// directory.
     fn key_dir(&self, dir: &Path) -> Result<(PathBuf, PathBuf)> {
         let canonical = dir.canonicalize().map_err(|e| Error::FileRead {
             path: dir.to_path_buf(),
             source: e,
         })?;
-        let spec_path = canonical.join(MANIFEST_FILENAME);
+        Ok(self.key_for(canonical.join(MANIFEST_FILENAME)))
+    }
+
+    /// The key of the file at `file`: its name under its canonical directory.
+    /// The directory is canonicalised and the name is not, so the key is the
+    /// one [`key_dir`](Self::key_dir) gives the file's directory when the
+    /// name is `arcform.yaml`, whether or not the file exists or is a link.
+    fn file_key(&self, file: &Path) -> Result<(PathBuf, PathBuf)> {
+        let refuse = |why: &str| Error::FileRead {
+            path: file.to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, why),
+        };
+        // `Path::file_name` reads `a/..` as naming no file; `a/.` it reads as
+        // `a`, so the directory check below is what refuses that shape.
+        let name = file
+            .file_name()
+            .ok_or_else(|| refuse("the path names no file"))?;
+        if file.is_dir() {
+            return Err(refuse(
+                "the path is a directory; local history keeps a file's versions",
+            ));
+        }
+        let parent = match file.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let canonical = parent.canonicalize().map_err(|e| Error::FileRead {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+        Ok(self.key_for(canonical.join(name)))
+    }
+
+    /// The per-file directory for `spec_path`, a canonical file path: the
+    /// store root plus a hash of that path. Hashing makes the key
+    /// filesystem-safe for any path; `spec-path` inside the directory keeps
+    /// it human-legible. Returns the directory and `spec_path`.
+    fn key_for(&self, spec_path: PathBuf) -> (PathBuf, PathBuf) {
         let digest = Sha256::digest(spec_path.as_os_str().as_encoded_bytes());
         let mut key = String::with_capacity(16);
         for byte in &digest[..8] {
             key.push_str(&format!("{byte:02x}"));
         }
-        Ok((self.root.join(key), spec_path))
+        (self.root.join(key), spec_path)
     }
 }
 
