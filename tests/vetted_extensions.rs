@@ -150,7 +150,7 @@ fn an_unvetted_community_install_is_refused_before_a_step_runs() {
         ("after", "SELECT 1;\n"),
     ]);
     let run = protocol.run(VETTED_ON);
-    run.assert_refused("AC1");
+    run.assert_refused("unvetted");
     for needle in [
         "step 'add_forecast'",
         "anofox_forecast",
@@ -243,7 +243,7 @@ fn a_hook_is_read_as_a_step_is() {
         ],
     );
     let run = protocol.run(VETTED_ON);
-    run.assert_refused("AC8b");
+    run.assert_refused("hook");
     assert!(
         run.stderr.contains("hook on_init 'setup'")
             && run
@@ -275,7 +275,7 @@ fn a_step_arc_cannot_parse_is_checked_too() {
         &format!("INSTALL anofox_forecast FROM community;\n{unparseable}"),
     )])
     .run(VETTED_ON);
-    run.assert_refused("AC7");
+    run.assert_refused("unparseable");
     assert!(
         run.stderr.contains("step 's'")
             && run
@@ -292,7 +292,7 @@ fn a_step_arc_cannot_parse_is_checked_too() {
 fn a_vetted_community_install_starts_its_step() {
     let run =
         Protocol::steps(&[("s", "INSTALL mlpack FROM community; LOAD mlpack;\n")]).run(VETTED_ON);
-    run.assert_not_refused("AC2", &["s.sql"]);
+    run.assert_not_refused("vetted", &["s.sql"]);
 }
 
 #[test]
