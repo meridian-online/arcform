@@ -27,7 +27,9 @@ both with this file green.  The third puts the mutated line in a struct literal'
 field, where no probe compiles, which is the case that has to reach UNPROBED
 rather than the blocking tier.  The fourth repeats the first's shape for the arm
 operators, with one match per function, and adds an arm whose deletion and
-widening the compiler refuses.
+widening the compiler refuses.  The fifth has guarded arms led by a string and a
+char literal, whose widenings have to compile and survive, where a widening that
+kept the literal was refused and set aside.
 
 This is the layer that pins the verdict path: that a caught mutation exits 0, that
 a survivor the tests execute exits 1, that a survivor nothing executes is
@@ -413,6 +415,87 @@ def _() -> None:
         mc.OPERATORS = saved
     check("some candidates to compare", older, older)
     check("the same list", full == older, (full, older))
+
+
+# Arms whose pattern begins with a literal.  The code mask hides a literal as it
+# hides a comment, and an arm finder that read its start through the mask began
+# these arms after the literal, so their widening kept it: `"b" _ if loud`.
+LITERAL_ARM_SOURCE = (
+    "pub fn level(k: &str, c: char, loud: bool) -> u8 {\n"  # 0
+    "    let a = match k {\n"  # 1
+    '        "a" => 1,\n'  # 2
+    '        "b" if loud => 2,\n'  # 3
+    '        r"c" if loud => 3,\n'  # 4
+    '        r#"d"# => 4,\n'  # 5
+    "        // a comment above an arm\n"  # 6
+    '        "e" | "f" => 5,\n'  # 7
+    '        /* inline */ "g" => 6,\n'  # 8
+    '        "h"\n'  # 9
+    '        | "i" if loud => 7,\n'  # 10
+    '        b"j" => 8,\n'  # 11
+    "        _ => 0,\n"  # 12
+    "    };\n"  # 13
+    "    let b = match c {\n"  # 14
+    "        'x' if loud => 1,\n"  # 15
+    "        'a'..='z' => 2,\n"  # 16
+    "        _ => 0,\n"  # 17
+    "    };\n"  # 18
+    "    a + b\n"  # 19
+    "}\n"  # 20
+)
+
+
+@case("an arm whose pattern begins with a literal starts at the literal, and widens to `_`")
+def _() -> None:
+    lines = LITERAL_ARM_SOURCE.splitlines(keepends=True)
+    masks = mc.masks_for(lines)
+    # (line the scan starts from) -> (start, pattern, has a guard, last), or None
+    expected = {
+        2: (2, '"a"', False, False),
+        3: (3, '"b"', True, False),  # a guarded string literal
+        4: (4, 'r"c"', True, False),  # a guarded raw string
+        5: (5, 'r#"d"#', False, False),
+        7: (7, '"e" | "f"', False, False),  # below a comment, which is not the arm
+        8: (8, '"g"', False, False),  # after a comment on its own line
+        # 9: a line holding only a literal holds no code to start a scan from; the
+        # arm is found from the next line of its head.
+        10: (9, '"h" | "i"', True, False),  # an or-pattern whose first line is a literal
+        11: (11, 'b"j"', False, False),
+        12: (12, "_", False, True),
+        15: (15, "'x'", True, False),  # a guarded char literal
+        16: (16, "'a'..='z'", False, False),  # a char range
+        17: (17, "_", False, True),
+    }
+    for i in range(len(lines)):
+        arm = mc.arm_at(lines, masks, i)
+        got = None if arm is None else (arm.start, arm.pattern, arm.guard is not None, arm.last)
+        want = expected.get(i)
+        check(f"line {i}", got == want, f"got {got}, want {want}: {lines[i]!r}")
+    listed = mc.generate("src/x.rs", LITERAL_ARM_SOURCE, set(range(len(lines))))
+    widened = {m.start: m for m in listed if m.operator == "ARM_WIDEN"}
+    after = {
+        2: "        _ => 1,\n",
+        3: "        _ if loud => 2,\n",
+        4: "        _ if loud => 3,\n",
+        5: "        _ => 4,\n",
+        7: "        _ => 5,\n",
+        8: "        /* inline */ _ => 6,\n",
+        9: "        _ if loud => 7,\n",
+        11: "        _ => 8,\n",
+        15: "        _ if loud => 1,\n",
+        16: "        _ => 2,\n",
+    }
+    check("every arm but the last two is widened", sorted(widened) == sorted(after), sorted(widened))
+    for start, want in after.items():
+        m = widened.get(start)
+        if m is None:
+            continue
+        check(f"line {start} widens to `_`, its guard kept", m.after == want, m.after)
+        check(
+            f"line {start}'s probe is a `_` arm in front of it",
+            m.probe == want.split("_")[0] + f'_ => panic!("{mc.PROBE_MESSAGE}"),\n' + m.before,
+            m.probe,
+        )
 
 
 @case("each token swap rewrites the token it is named for")
@@ -1228,6 +1311,77 @@ def _() -> None:
                     out[-4000:],
                 )
         check("and the report counts the four", "set aside       4 " in out, out[:1500])
+
+
+# A guarded arm led by a string literal and one led by a char literal, each
+# asserted on for every value the tests pass, and each widened to `_ if loud`
+# with the suite still green: no test passes a loud value outside the pattern.
+# Every other arm mutation here is killed, and none is refused.
+CRATE_LITERAL_ARMS = """pub fn str_arm(k: &str, loud: bool) -> u8 {
+    match k {
+        "a" => 1,
+        "b" if loud => 2,
+        _ => 0,
+    }
+}
+
+pub fn char_arm(c: char, loud: bool) -> u8 {
+    match c {
+        'a' => 1,
+        'b' if loud => 3,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_arm_is_asserted_on_and_no_quiet_value_reaches_a_guard() {
+        assert_eq!(str_arm("a", true), 1);
+        assert_eq!(str_arm("b", true), 2);
+        assert_eq!(str_arm("b", false), 0);
+        assert_eq!(str_arm("z", false), 0);
+        assert_eq!(char_arm('a', true), 1);
+        assert_eq!(char_arm('b', true), 3);
+        assert_eq!(char_arm('b', false), 0);
+        assert_eq!(char_arm('z', false), 0);
+    }
+}
+"""
+
+
+@case("END TO END: a guarded arm led by a string or char literal is widened and reported UNPINNED")
+def _() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        build_fixture_crate(root, CRATE_LITERAL_ARMS)
+        code, listing = run_gate(root, "--quiet", "--list-only")
+        check("list-only exits 0", code == 0, listing[-2000:])
+        for where, rewrite in (("src/lib.rs:4", "_ if loud => 2,"), ("src/lib.rs:12", "_ if loud => 3,")):
+            rows = listing.splitlines()
+            at = [
+                k
+                for k, ln in enumerate(rows)
+                if ln.strip().startswith(where + " fn ") and "[ARM_WIDEN]" in ln
+            ]
+            check(f"ARM_WIDEN listed at {where}", len(at) == 1, listing)
+            check(
+                f"the widening at {where} drops the literal and keeps the guard",
+                at and rows[at[0] + 2].strip() == "+ " + rewrite,
+                listing,
+            )
+        code, out = run_gate(root, "--quiet")
+        check("exit 1", code == 1, f"exit {code}\n{out[-3000:]}")
+        for where in ("src/lib.rs:4", "src/lib.rs:12"):
+            check(
+                f"the widening at {where} is UNPINNED",
+                tier_at(out, where, "ARM_WIDEN") == "UNPINNED",
+                out[-4000:],
+            )
+        check("nothing is set aside", "set aside       0 " in out, out[:1500])
+        check("and the other eight are killed", "killed          8\n" in out, out[:1500])
 
 
 @case("END TO END: a token swap is generated, run, and tiered by its own probe")
