@@ -96,6 +96,11 @@ pub enum Error {
         override_var: &'static str,
     },
 
+    // `ARC_SQL_READER` names no reader, or names DuckDB's parse and the DuckDB arc runs
+    // cannot give it. The message names the variable and what it takes.
+    #[error("{0}")]
+    SqlReader(String),
+
     #[error("step '{step}' failed (exit code {code}):\n{stderr}")]
     StepFailed {
         step: String,
