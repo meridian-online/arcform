@@ -1172,6 +1172,11 @@ mod extension_tests {
         assert_eq!(toks("$$ a ' b $$ x"), vec![string(" a ' b "), word("x")]);
         assert_eq!(toks("$t$ $$ $t$ x"), vec![string(" $$ "), word("x")]);
         assert_eq!(toks("$$ open"), vec![string(" open")]);
+        // `$1` is a parameter, so `$1a$` opens no string: a tag cannot start with a digit.
+        assert_eq!(
+            toks("$1a$ x"),
+            vec![Tok::Other('$'), Tok::Other('1'), word("a$"), word("x")]
+        );
         assert_eq!(
             toks("$1 $name x"),
             vec![
