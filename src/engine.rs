@@ -1727,7 +1727,9 @@ mod extension_tests {
         );
         // A string DuckDB runs as SQL, with its escapes read.
         assert_eq!(
-            scan(r"FROM query('FROM ENABLE_PEG_PARSER()'); FROM query(E'FROM enable\x5fpeg_parser()');"),
+            scan(
+                r"FROM query('FROM ENABLE_PEG_PARSER()'); FROM query(E'FROM enable\x5fpeg_parser()');"
+            ),
             vec![switch("enable_peg_parser"); 2]
         );
         // In a comment, inside a longer name, and the function that switches back.
