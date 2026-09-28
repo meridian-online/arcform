@@ -448,6 +448,95 @@ fn next_model_number(models_dir: &Path) -> u32 {
     max + 1
 }
 
+// ------------------------------------------------------------ the catalogue
+
+/// The long name of the filter operation. The one place the name is written, so
+/// renaming the operation is a change to this line alone.
+const FILTER_ROWS: &str = "filter-rows";
+
+/// One SQL operation arc holds: what it is called, what it does, what it is
+/// applied to, and what it takes — described so that it can be recorded as a
+/// step by name. The catalogue holds the description and nothing that runs.
+pub(crate) struct Operation {
+    /// The operation's identity: lower case, hyphenated, the verb first.
+    pub(crate) long_name: &'static str,
+    /// One line saying what the operation does.
+    pub(crate) summary: &'static str,
+    /// What the operation is applied to, and how many.
+    applied_to: AppliedTo,
+    /// The operation's arguments as a JSON Schema.
+    parameters: fn() -> serde_json::Value,
+}
+
+/// What an operation is applied to: a kind of node and how many of that kind.
+struct AppliedTo {
+    kind: &'static str,
+    count: u32,
+}
+
+/// Every operation arc holds, in the order `arc operation list` prints them.
+const CATALOGUE: &[Operation] = &[Operation {
+    long_name: FILTER_ROWS,
+    summary: "Keeps the rows of one table for which a SQL condition holds.",
+    applied_to: AppliedTo {
+        kind: "table",
+        count: 1,
+    },
+    parameters: filter_rows_parameters,
+}];
+
+/// The `parameters` schema of [`FILTER_ROWS`]: one required string, `where`.
+/// Closed to any other key, as an operator's `with:` schema is.
+fn filter_rows_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "where": {
+                "type": "string",
+                "description": "A SQL condition; the rows for which it holds are kept."
+            }
+        },
+        "required": ["where"],
+    })
+}
+
+/// Every operation arc holds, in catalogue order.
+pub(crate) fn operations() -> &'static [Operation] {
+    CATALOGUE
+}
+
+/// The operation called `long_name`, or `None` when arc holds none by that name.
+/// The match is exact: a long name is an identity, not a search term.
+pub(crate) fn operation(long_name: &str) -> Option<&'static Operation> {
+    CATALOGUE.iter().find(|op| op.long_name == long_name)
+}
+
+impl Operation {
+    /// The listing entry: the long name and the one line saying what it does.
+    pub(crate) fn listing(&self) -> serde_json::Value {
+        serde_json::json!({
+            "long_name": self.long_name,
+            "summary": self.summary,
+        })
+    }
+
+    /// The full description: the listing entry, what the operation is applied
+    /// to, and a `parameters` JSON Schema of what it takes.
+    pub(crate) fn description(&self) -> serde_json::Value {
+        serde_json::json!({
+            "long_name": self.long_name,
+            "summary": self.summary,
+            "applied_to": {
+                "kind": self.applied_to.kind,
+                "count": self.applied_to.count,
+            },
+            "parameters": (self.parameters)(),
+        })
+    }
+}
+
 // --------------------------------------------------------------------- tests
 
 #[cfg(test)]

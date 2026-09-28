@@ -114,12 +114,36 @@ pub enum Commands {
         cmd: RegistryCmd,
     },
 
+    /// List the SQL operations arc holds, and describe what one takes.
+    Operation {
+        #[command(subcommand)]
+        cmd: OperationCmd,
+    },
+
     /// Serve a Model Context Protocol server over stdio, for AI-agent and editor
     /// integration. Federates the `finetype` CLI as tools (infer / profile / taxonomy
     /// / validate / generate) and adds `protocol_run` (run a Protocol, return its
     /// Protocol+Run contract) and `operator_describe` (an operator's `with:` schema).
     #[cfg(feature = "mcp")]
     Mcp,
+}
+
+/// The operation-catalogue verbs. Long names come from `arc operation list`.
+#[derive(Subcommand)]
+pub enum OperationCmd {
+    /// Print the long name of each operation arc holds, with one line saying
+    /// what it does.
+    List {
+        /// Print a JSON array of `long_name` and `summary` instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print what an operation takes, as JSON: its long name, what it is
+    /// applied to, and a JSON Schema of its parameters.
+    Describe {
+        /// The operation's long name, as listed by `arc operation list`.
+        long_name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -533,9 +557,51 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Commands::History { cmd } => dispatch_history(cmd),
         Commands::Run { force, params } => run_pipeline(force, &params),
         Commands::Registry { cmd } => dispatch_registry(cmd, verbose),
+        Commands::Operation { cmd } => dispatch_operation(cmd, &mut std::io::stdout()),
         #[cfg(feature = "mcp")]
         Commands::Mcp => crate::mcp::serve(),
     }
+}
+
+/// Execute an `arc operation` verb. Neither verb reads a protocol or opens a
+/// database: the answer comes from the catalogue arc holds.
+fn dispatch_operation(cmd: OperationCmd, out: &mut impl Write) -> Result<()> {
+    match cmd {
+        OperationCmd::List { json } => operation_list(json, out),
+        OperationCmd::Describe { long_name } => operation_describe(&long_name, out),
+    }
+}
+
+/// Execute `arc operation list`: each long name with the one line saying what
+/// the operation does, or the same as a JSON array of `long_name` and `summary`.
+fn operation_list(json: bool, out: &mut impl Write) -> Result<()> {
+    let operations = crate::record::operations();
+    if json {
+        let entries: Vec<serde_json::Value> = operations.iter().map(|op| op.listing()).collect();
+        writeln!(out, "{:#}", serde_json::Value::Array(entries))?;
+        return Ok(());
+    }
+    let width = operations
+        .iter()
+        .map(|op| op.long_name.len())
+        .max()
+        .unwrap_or(0);
+    for op in operations {
+        writeln!(out, "{:<width$}  {}", op.long_name, op.summary)?;
+    }
+    Ok(())
+}
+
+/// Execute `arc operation describe`: the operation's description as JSON. An
+/// operation arc does not hold is refused with nothing written to `out`.
+fn operation_describe(long_name: &str, out: &mut impl Write) -> Result<()> {
+    let Some(op) = crate::record::operation(long_name) else {
+        return Err(Error::Io(std::io::Error::other(format!(
+            "no operation called `{long_name}` — `arc operation list` prints the operations arc holds"
+        ))));
+    };
+    writeln!(out, "{:#}", op.description())?;
+    Ok(())
 }
 
 fn dispatch_history(cmd: HistoryCmd) -> Result<()> {
