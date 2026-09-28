@@ -297,16 +297,19 @@ ARM_SOURCE = (
     "        | Expr::Other { a, .. } => a,\n"  # 22
     "        #[cfg(unix)]\n"  # 23
     "        Expr::Unix => 5,\n"  # 24
-    "        _ => 0,\n"  # 25
-    "    };\n"  # 26
-    "    let y = if x > 0 { 1 } else { 2 };\n"  # 27
-    "    x + y\n"  # 28
-    "}\n"  # 29
-    "macro_rules! twice {\n"  # 30
-    "    ($e:expr) => {\n"  # 31
-    "        $e + $e\n"  # 32
-    "    };\n"  # 33
-    "}\n"  # 34
+    "        Expr::X => 6, Expr::Y => 7,\n"  # 25
+    "        Expr::Sum(a, b) => a\n"  # 26
+    "            + b,\n"  # 27
+    "        _ => 0,\n"  # 28
+    "    };\n"  # 29
+    "    let y = if x > 0 { 1 } else { 2 };\n"  # 30
+    "    x + y\n"  # 31
+    "}\n"  # 32
+    "macro_rules! twice {\n"  # 33
+    "    ($e:expr) => {\n"  # 34
+    "        $e + $e\n"  # 35
+    "    };\n"  # 36
+    "}\n"  # 37
 )
 
 
@@ -327,7 +330,9 @@ def _() -> None:
         21: (21, 22, False, False),  # an or-pattern of struct patterns, from its first
         # 22: from its second line the arm cannot be told from one opening with a
         # leading `|`, and is left.  23 and 24: an arm under an attribute is left.
-        25: (25, 25, False, True),  # the outer match's last arm
+        # 25: two arms on one line cannot be cut out by whole lines, and are left.
+        26: (26, 27, False, False),  # a body over two lines with no bracket around it
+        28: (28, 28, False, True),  # the outer match's last arm
     }
     for i in range(len(lines)):
         arm = mc.arm_at(lines, masks, i)
@@ -375,11 +380,11 @@ def _() -> None:
 def _() -> None:
     # The last arm: in a match that compiles, every value reaching it already
     # matches it, so widening it changes nothing and deleting it cannot compile.
-    got = mc.generate("src/x.rs", ARM_SOURCE, {12, 25})
+    got = mc.generate("src/x.rs", ARM_SOURCE, {12, 28})
     check("no arm mutant on a last arm", not [m for m in got if m.operator.startswith("ARM_")], got)
-    got = mc.generate("src/x.rs", ARM_SOURCE, {3, 4, 5, 8, 17, 18, 19, 27, 28})
+    got = mc.generate("src/x.rs", ARM_SOURCE, {3, 4, 5, 8, 17, 18, 19, 27, 30, 31})
     check("no arm mutant on a body line", not [m for m in got if m.operator.startswith("ARM_")], got)
-    got = mc.generate("src/x.rs", ARM_SOURCE, {31})
+    got = mc.generate("src/x.rs", ARM_SOURCE, {34})
     check("no arm mutant in a macro_rules!", not [m for m in got if m.operator.startswith("ARM_")], got)
 
 
@@ -387,7 +392,7 @@ def _() -> None:
 def _() -> None:
     # The candidates a change outside any match head produces are the six older
     # operators' and nothing else, in the same order.
-    changed = {0, 3, 4, 5, 8, 17, 19, 27, 28}
+    changed = {0, 3, 4, 5, 8, 17, 19, 27, 30, 31}
     full = [m.key for m in mc.generate("src/x.rs", ARM_SOURCE, changed)]
     saved = mc.OPERATORS
     mc.OPERATORS = [op for op in saved if op not in (mc.op_arm_delete, mc.op_arm_widen)]
