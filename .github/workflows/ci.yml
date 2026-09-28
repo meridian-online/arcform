@@ -79,7 +79,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # Two commits deep, so the DuckDB preview step below can diff this commit against
+      # its first parent: the base branch's tip for a pull request's merge commit, and
+      # the commit before for a push.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.94"
@@ -155,6 +160,31 @@ jobs:
 
       - name: test
         run: cargo test --workspace
+
+      # The reader in src/duckdb_lineage.rs asks a DuckDB 2.0 build for its parse of a
+      # step, and DUCKDB_VERSION above is a 1.x release, so its tests that start DuckDB
+      # are #[ignore]d and the step above reports them as ignored. This step downloads
+      # the 2.0 preview and runs them when this commit changes the reader or this
+      # workflow; the tests that read from captured answers ran above either way. The
+      # preview's address names no version and the build behind it moves, so a change
+      # elsewhere does not run them. The step prints the version it downloaded, and
+      # each test prints the version it asked.
+      - name: test (DuckDB lineage reader, on the DuckDB 2.0 preview)
+        run: |
+          set -euo pipefail
+          changed=$(git diff --name-only HEAD^1 HEAD -- src/duckdb_lineage.rs .github/workflows/ci.yml)
+          if [ -z "$changed" ]; then
+            echo "src/duckdb_lineage.rs and ci.yml are unchanged; the preview tests do not run."
+            exit 0
+          fi
+          dir="$RUNNER_TEMP/duckdb-preview"
+          mkdir -p "$dir"
+          curl -fsSL -o "$dir/cli.tar.gz" \
+            https://artifacts.duckdb.org/v2.0-cyanoptera/duckdb-cli-linux-amd64.tar.gz
+          tar -xzf "$dir/cli.tar.gz" -C "$dir"
+          "$dir/duckdb" --version
+          ARC_DUCKDB_PREVIEW_BIN="$dir/duckdb" \
+            cargo test --workspace --lib duckdb_lineage -- --include-ignored --nocapture
 
       # `uv` — and unlike the subtoken extension, it is cheap enough to belong on
       # the routine gate. `tests/uv_operator.rs` proves three of its four properties
