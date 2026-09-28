@@ -1284,6 +1284,7 @@ mod extension_tests {
     #[test]
     fn scan_skips_what_is_not_an_install_statement() {
         assert_eq!(scan("SELECT t.install FROM community;"), vec![]);
+        assert_eq!(scan("SELECT t.install x FROM community;"), vec![]);
         assert_eq!(scan("SELECT install FROM community;"), vec![]);
         assert_eq!(scan(r#"SELECT "install" x FROM community;"#), vec![]);
         assert_eq!(scan("INSTALL x FROM; INSTALL; INSTALL"), vec![]);
