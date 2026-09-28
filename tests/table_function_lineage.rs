@@ -103,17 +103,11 @@ fn glob_lifts_the_pattern_in_the_contract_not_a_table_named_glob() {
     assert!(find(&assets, "glob").is_none(), "no table named glob");
 }
 
-// End to end: an extension table function taking table arguments, and a plain
-// table reference, are unaffected — both still show up under their own name.
+// End to end: a plain table reference still shows up under its own name. (An
+// extension table function called with table arguments no longer does — see
+// `tests/unread_table_function.rs`.)
 #[test]
-fn extension_function_and_plain_table_are_unaffected_end_to_end() {
-    let sql = r#"CREATE OR REPLACE TABLE model AS SELECT * FROM mlpack_random_forest_train("X", "Y", "params", "model");"#;
-    let (_, assets) = run_step(sql);
-    assert!(
-        find(&assets, "mlpack_random_forest_train").is_some(),
-        "extension TVF name should still be recorded, got {assets:?}"
-    );
-
+fn plain_table_is_unaffected_end_to_end() {
     let sql = "CREATE OR REPLACE TABLE c AS SELECT * FROM customers;";
     let (_, assets) = run_step(sql);
     assert!(
