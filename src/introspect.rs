@@ -443,7 +443,18 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
                     }
                 }
                 CopySource::Query(query) => {
+                    // COPY (SELECT …) TO 'file' — the query reads its tables and the
+                    // COPY produces the file, the same two facts `COPY <table> TO
+                    // 'file'` records above, with the target classified the same way.
+                    // The parser refuses `COPY (query) FROM`, so a query source is
+                    // always a `TO`.
                     extract_inputs_from_query(query, assets);
+                    if let CopyTarget::File { filename } = target {
+                        assets.record_output(
+                            filename.clone(),
+                            copy_to_target_kind(options.as_slice()),
+                        );
+                    }
                 }
             }
         }
