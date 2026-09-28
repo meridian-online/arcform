@@ -193,11 +193,12 @@ untouched — the PIVOT/UNPIVOT, COPY, `INSTALL`/`FORCE INSTALL`, `PRAGMA` and
 `SET VARIABLE` grammars are gated behind `DuckDbDialect | GenericDialect`; the
 lambda colon syntax behind `DuckDbDialect` alone (see the gating rationale
 above) — checked directly against `PostgreSqlDialect` for additions 4 through 7:
-it refuses every one of the new forms exactly as it did before this fork touched
-them (`INSTALL`/`FORCE INSTALL` and the multi-/named-argument `PRAGMA` form
-were never reachable on that dialect to begin with; the empty-string `COPY`
-option and `SET VARIABLE` each hit the same parse error, at the same token,
-as on the unforked grammar). The crate's inline unit tests pass (the
+it refuses every one of the new forms, as it did on the unforked grammar.
+`INSTALL`/`FORCE INSTALL` were never reachable on that dialect; the empty-string
+`COPY` option and `SET VARIABLE` hit the same parse error at the same token as
+before; the multi-/named-argument `PRAGMA` form is still refused, with a
+different message (`Expected: ), found: ,` before, `Expected: pragma value,
+found: 'docs'` after). The crate's inline unit tests pass (the
 pre-existing `ast::visitor::tests::overflow` test overflows the stack in a standalone
 debug build on upstream `0.55.0` too — unrelated).
 
