@@ -133,7 +133,10 @@ fn restoring_a_chart_writes_that_chart_alone_and_can_be_undone() {
 
     assert_eq!(restored, CHART_A);
     assert_eq!(fs::read_to_string(&f.a).unwrap(), CHART_A);
-    assert_eq!(fs::read(f.dir.join(MANIFEST_FILENAME)).unwrap(), spec_before);
+    assert_eq!(
+        fs::read(f.dir.join(MANIFEST_FILENAME)).unwrap(),
+        spec_before
+    );
     assert_eq!(fs::read(&f.b).unwrap(), b_before);
 
     // The text the restore replaced is the newest entry of the chart's own
@@ -222,7 +225,11 @@ fn the_bound_holds_per_file() {
 
     let a = texts_for_file(&f.history, &f.a);
     assert_eq!(a.len(), HISTORY_MAX_ENTRIES);
-    assert_eq!(a.first().map(String::as_str), Some("a: 1\n"), "oldest pruned");
+    assert_eq!(
+        a.first().map(String::as_str),
+        Some("a: 1\n"),
+        "oldest pruned"
+    );
     assert_eq!(a.last().map(String::as_str), Some("a: one more\n"));
     assert_eq!(texts_for_file(&f.history, &f.b), vec!["b: 0\n", "b: 1\n"]);
 }
