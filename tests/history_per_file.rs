@@ -230,7 +230,13 @@ fn the_bound_holds_per_file() {
 #[test]
 fn a_path_naming_a_directory_or_no_file_is_refused() {
     let f = setup();
-    for path in [f.dir.clone(), f.dir.join("panels").join("..")] {
+    // The empty path is the one a directory check alone would let through:
+    // it names no file, and it is not a directory either.
+    for path in [
+        f.dir.clone(),
+        f.dir.join("panels").join(".."),
+        PathBuf::new(),
+    ] {
         let refused = f.history.record_save_for_file(&path, SPEC).unwrap_err();
         assert!(
             matches!(&refused, Error::FileRead { path: p, .. } if *p == path),
