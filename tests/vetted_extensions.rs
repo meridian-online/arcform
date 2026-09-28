@@ -601,6 +601,18 @@ fn arc_refuses_an_install_exactly_where_duckdb_would_run_it() {
         "SELECT $1$;\n.print$1$; @@;",
         "SELECT 1;\u{b}\n.print '\n@@;",
         "SELECT 1; /*\n*/\n.print '\n@@;",
+        "SELECT 1 /*xx;\n.print */; @@;",
+        "SELECT 'x;;\n.print'; @@;",
+        "SELECT 1; SELECT 2 AS x$\n.print '\n@@;",
+        // The pre-pass's dollar tags: no digit first, and digits after.
+        "/* $1$ */ \u{200b}@@;",
+        "/* $a1$ ' $a1$ */ \u{200b}@@;",
+        // The CLI hands over what it holds at the end of the file, and a last \x03 line
+        // drops it.
+        "@@",
+        "@@\n\u{3}",
+        // A NUL joins the next line on, and does not end a statement there.
+        "SELECT 1;;\0x\n.print '\n@@;",
         // A batch the CLI ends inside a comment its scanner reads as open.
         ".bail off\nSELECT 1 /* /* */ ;\n@@; -- */",
         // A NUL byte drops the rest of the chunk the CLI read it in.
@@ -611,6 +623,8 @@ fn arc_refuses_an_install_exactly_where_duckdb_would_run_it() {
     // The first chunk ends at byte 99, so `@@` starts the second and is kept.
     ran.push(format!("SELECT 1; \0{}@@;", "x".repeat(88)));
     ran.push(format!("SELECT 1; \0{}@@;", "x".repeat(87)));
+    // A line longer than a chunk is still one line, so its `.` at byte 99 is SQL.
+    ran.push(format!("SELECT 1;{}.print '\n@@;", " ".repeat(90)));
     let names = [
         "INSTALL anofox_forecast FROM @@;",
         "INSTALL anofox_forecast\r\nFROM @@;",

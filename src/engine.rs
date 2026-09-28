@@ -698,39 +698,32 @@ enum ExtensionSql {
 /// more whenever 100 bytes are not left, less one byte for the NUL `fgets` writes.
 ///
 /// The `\r` DuckDB drops before each `\n` is kept: every rule after this one reads a `\r` as
-/// it reads a space.
+/// it reads a space. So is a last line the CLI would not return because a NUL left it empty:
+/// an empty line is no SQL.
 fn cli_lines(bytes: &[u8]) -> Vec<(Vec<u8>, usize)> {
     let mut lines = Vec::new();
-    let mut pos = 0;
-    let mut file_line = 1;
-    while pos < bytes.len() {
-        let starts_on = file_line;
-        let mut line = Vec::new();
-        let mut size = 100;
-        let ended = loop {
+    let mut line = Vec::new();
+    let mut size = 100;
+    let mut starts_on = 1;
+    for (index, physical) in bytes.split_inclusive(|&b| b == b'\n').enumerate() {
+        let mut at = 0;
+        // Each pass reads one chunk of at least one byte, so a pass per byte is enough.
+        for _ in 0..physical.len() {
             while line.len() + 100 > size {
                 size = size * 2 + 100;
             }
-            let room = bytes[pos..].iter().take(size - line.len() - 1);
-            let chunk = room.len() - room.skip_while(|&&b| b != b'\n').skip(1).count();
-            let chunk = &bytes[pos..pos + chunk];
-            pos += chunk.len();
-            file_line += chunk.iter().filter(|&&b| b == b'\n').count();
-            line.extend(chunk.iter().take_while(|&&b| b != 0));
+            let take = (size - line.len() - 1).min(physical.len() - at);
+            line.extend(physical[at..at + take].iter().take_while(|&&b| b != 0));
+            at += take;
             if line.last() == Some(&b'\n') {
-                break true;
+                line.pop();
+                lines.push((std::mem::take(&mut line), starts_on));
+                size = 100;
+                starts_on = index + 2;
             }
-            if pos == bytes.len() {
-                break false;
-            }
-        };
-        if ended {
-            line.pop();
-        } else if line.is_empty() {
-            break;
         }
-        lines.push((line, starts_on));
     }
+    lines.push((line, starts_on));
     lines
 }
 
@@ -860,9 +853,9 @@ fn cli_batches(bytes: &[u8]) -> Vec<(Vec<u8>, Vec<usize>)> {
             lines.clear();
         }
     }
-    if !all_whitespace(&sql) {
-        batches.push((sql, lines));
-    }
+    // The CLI hands over what is left unless it is only spaces and comments, which hold no
+    // statement to find.
+    batches.push((sql, lines));
     batches
 }
 
@@ -891,7 +884,7 @@ fn unicode_space_len(q: &[u8]) -> Option<usize> {
 /// DuckDB repeats the pass until it replaces nothing; one pass leaves nothing for a second,
 /// because a space opens nothing and a unicode space after a `$` is read as part of a tag.
 fn strip_unicode_spaces(q: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(q.len());
+    let mut out = Vec::new();
     let mut pos = 0;
     while pos < q.len() {
         let rest = &q[pos..];
@@ -945,9 +938,9 @@ fn scan_extension_sql(file: &[u8]) -> Vec<(ExtensionSql, usize)> {
     for (batch, lines) in cli_batches(file) {
         let batch = strip_unicode_spaces(&batch);
         let toks = lex_sql(&String::from_utf8_lossy(&batch));
+        // A batch holds one `\n` between each two of its lines, and nothing else adds one.
         for (finding, line) in scan_tokens(&toks) {
-            let file_line = lines.get(line - 1).or(lines.last()).copied();
-            found.push((finding, file_line.unwrap_or(1)));
+            found.push((finding, lines[line - 1]));
         }
     }
     found
@@ -1701,6 +1694,19 @@ mod extension_tests {
                     ExtensionSql::Setting("custom_extension_repository".into()),
                     4
                 )
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_gives_a_finding_the_file_line_of_its_batch_line() {
+        assert_eq!(
+            scan_extension_sql(
+                b"SELECT 1;\n\nINSTALL a\nFROM community; INSTALL\nb FROM community;"
+            ),
+            vec![
+                (install("a", InstallFrom::Community), 3),
+                (install("b", InstallFrom::Community), 4)
             ]
         );
     }
