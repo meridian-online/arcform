@@ -1662,6 +1662,25 @@ mod tests {
         }
     }
 
+    /// The reader hands DuckDB the step inside a string literal. The `duckdb` on `PATH`
+    /// reads it back: a quote, a `;`, a backslash, a comment and a line that would be a
+    /// command to the DuckDB shell come back as the text sent.
+    #[test]
+    fn duckdb_reads_the_step_back_as_the_text_sent() {
+        let text = "it's; a \\ b\n-- not a comment\n.quit\n''";
+        let duckdb = Process {
+            program: OsStr::new("duckdb"),
+        };
+        let (answers, stderr) = duckdb
+            .run(&format!("SELECT {} AS s;\n", literal(text)))
+            .expect("the duckdb on PATH runs");
+        assert_eq!(
+            answers.first().map(|rows| &rows[0]["s"]),
+            Some(&Value::from(text)),
+            "DuckDB reads the literal back as the text sent; stderr: {stderr}"
+        );
+    }
+
     #[test]
     fn a_duckdb_that_cannot_be_run_is_named() {
         let refusal =
