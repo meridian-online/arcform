@@ -492,12 +492,30 @@ struct Comparison {
 
 /// The comparisons a filter's condition offers, in the order they are offered.
 const COMPARISONS: &[Comparison] = &[
-    Comparison { word: "is", sign: "=" },
-    Comparison { word: "is not", sign: "!=" },
-    Comparison { word: "over", sign: ">" },
-    Comparison { word: "under", sign: "<" },
-    Comparison { word: "between", sign: "between" },
-    Comparison { word: "is null", sign: "is null" },
+    Comparison {
+        word: "is",
+        sign: "=",
+    },
+    Comparison {
+        word: "is not",
+        sign: "!=",
+    },
+    Comparison {
+        word: "over",
+        sign: ">",
+    },
+    Comparison {
+        word: "under",
+        sign: "<",
+    },
+    Comparison {
+        word: "between",
+        sign: "between",
+    },
+    Comparison {
+        word: "is null",
+        sign: "is null",
+    },
 ];
 
 /// Every operation arc holds, in the order `arc operation list` prints them.

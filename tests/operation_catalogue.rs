@@ -173,13 +173,17 @@ fn describe_applies_the_filter_to_a_table_then_a_column_of_it_each_with_a_senten
             (
                 e["name"].as_str().unwrap_or("<no name>"),
                 e["kind"].as_str().unwrap_or("<no kind>"),
-                e.get("of").map(|of| of.as_str().unwrap_or("<not a string>")),
+                e.get("of")
+                    .map(|of| of.as_str().unwrap_or("<not a string>")),
             )
         })
         .collect();
     assert_eq!(
         entries,
-        [("table", "table", None), ("column", "column", Some("table"))],
+        [
+            ("table", "table", None),
+            ("column", "column", Some("table"))
+        ],
         "`{FILTER_ROWS}` is applied to a table, then a column of that table:\n{description}"
     );
     for entry in applied_to {
@@ -200,7 +204,10 @@ fn describe_applies_the_filter_to_a_table_then_a_column_of_it_each_with_a_senten
         } else {
             &["description", "kind", "name"]
         };
-        assert_eq!(keys, expected, "an entry holds a key the shape does not name:\n{entry}");
+        assert_eq!(
+            keys, expected,
+            "an entry holds a key the shape does not name:\n{entry}"
+        );
     }
 }
 
