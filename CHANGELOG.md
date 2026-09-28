@@ -609,6 +609,10 @@ Rationale for each change is recorded in the project's design notes and commit h
 - **Vocabulary: "assets" not "asset registry"** for within-pipeline data declarations, freeing
   "registry" for the user-facing pipeline catalogue.
 
+### Fixed
+
+- **A frozen operator script is written under another name and renamed into place, so a reader of it opens the whole script and not an empty one.** `materialize_frozen_script` wrote the script with `std::fs::write`, which truncates the file and then writes it, and a caller that found the script already holding its bytes returned the path without waiting for a writer. A second caller that opened the path between the truncate and the write read an empty file: two runs of `arc` on one machine that use the same operator could meet it, and so could two threads of `cargo test`, where `operator::tests::umap_project_invocation_materialises_the_frozen_script_and_names_it` failed with `left: ""` on some runs and not others. The write now goes through the temp-file-and-rename helper the spec editor uses: a file named for the process and a sequence number in the script's own directory, flushed and renamed over the script. A reader opens the whole old script or the whole new one, and a reader that already had the old one open keeps reading it. A script whose bytes on disk are those asked for is still not written again, and the path returned is the one returned before. After a write the script's directory holds the script and no file under the temp name.
+
 ## [0.1.0] - 2026-03-31
 
 ### Added

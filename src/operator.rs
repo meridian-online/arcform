@@ -570,14 +570,181 @@ fn materialize_frozen_script(name: &str, version: &str, bytes: &str) -> Result<P
     std::fs::create_dir_all(&dir)
         .map_err(|e| fetch_failed(format!("{}: cache dir {}: {}", name, dir.display(), e)))?;
     let path = dir.join(format!("{}.py", name));
-    let needs_write = std::fs::read_to_string(&path)
-        .map(|s| s != bytes)
-        .unwrap_or(true);
-    if needs_write {
-        std::fs::write(&path, bytes)
-            .map_err(|e| fetch_failed(format!("{}: write {}: {}", name, path.display(), e)))?;
-    }
+    write_script_if_changed(&path, bytes)
+        .map_err(|e| fetch_failed(format!("{}: write {}: {}", name, path.display(), e)))?;
     Ok(path)
+}
+
+/// Put `bytes` at `path` unless the file there already holds exactly them.
+///
+/// The cache directory is shared — by every run of `arc` on the machine that uses the
+/// operator, and by the threads of one test binary — and a caller that finds the
+/// script already there reads it without taking any lock. So the write goes through
+/// [`crate::edit::write_atomic`]: a temp file named for the writer, beside the target,
+/// renamed over it. A reader then opens the whole old script or the whole new one. It
+/// cannot open the file empty, as it could between the truncate and the write of
+/// `std::fs::write`, and a reader that already has the old script open keeps reading
+/// the old bytes, since the rename gives the path a new file instead of changing the
+/// one it had.
+fn write_script_if_changed(path: &Path, bytes: &str) -> Result<()> {
+    let up_to_date = std::fs::read_to_string(path)
+        .map(|on_disk| on_disk == bytes)
+        .unwrap_or(false);
+    if !up_to_date {
+        crate::edit::write_atomic(path, bytes.as_bytes())?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod frozen_script_write_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Two scripts of different bytes and the same length, each big enough that a write
+    /// in place is a window a reader can land in rather than a single instruction.
+    fn script(fill: u8) -> String {
+        format!("# {}\n", char::from(fill)).repeat(128 * 1024)
+    }
+
+    /// The directory `materialize_frozen_script` made for a test's own operator name,
+    /// removed when the test ends. The two tests that go through `materialize_frozen_script`
+    /// itself, and so through the real temp directory, use a name of their own so that
+    /// no other test's cache is written.
+    struct CacheDir(PathBuf);
+
+    impl Drop for CacheDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A reader that opens the script's path while a writer is replacing it reads the
+    /// whole script — the one before the write or the one after — and reads neither an
+    /// empty file nor part of one.
+    ///
+    /// The reader spins on `std::fs::read` for as long as the writer swaps between two
+    /// scripts, and every read has to be one of the two in full. With the write made in
+    /// place (`std::fs::write`), a read that lands between the truncate and the write
+    /// returns `""`, and one that lands inside the write returns part of the script.
+    ///
+    /// The writer is `materialize_frozen_script`, not the function under it, so the write
+    /// made in place is caught wherever in the two it is made.
+    #[test]
+    fn a_reader_of_a_script_being_replaced_reads_the_whole_of_one_version() {
+        let name = format!("frozen_write_probe_reader_{}", std::process::id());
+        let (a, b) = (script(b'a'), script(b'b'));
+        let path = materialize_frozen_script(&name, "0", &a).unwrap();
+        let _cleanup = CacheDir(path.parent().unwrap().to_path_buf());
+
+        let writing = AtomicBool::new(true);
+        let torn = std::thread::scope(|s| {
+            let reader = s.spawn(|| {
+                let mut torn = Vec::new();
+                while writing.load(Ordering::Acquire) {
+                    let seen = std::fs::read(&path).expect("the script is there to read");
+                    if seen != a.as_bytes() && seen != b.as_bytes() {
+                        torn.push(seen.len());
+                    }
+                }
+                torn
+            });
+            for i in 0..200 {
+                let written =
+                    materialize_frozen_script(&name, "0", if i % 2 == 0 { &b } else { &a })
+                        .unwrap();
+                assert_eq!(
+                    written, path,
+                    "the path handed back is the same one each time"
+                );
+            }
+            writing.store(false, Ordering::Release);
+            reader.join().unwrap()
+        });
+        assert!(
+            torn.is_empty(),
+            "a reader read {} times a script that was neither version in full; lengths \
+             seen: {:?}, against {} in each version",
+            torn.len(),
+            &torn[..torn.len().min(8)],
+            a.len()
+        );
+    }
+
+    /// A write of different bytes gives the path a different file. A reader that had the
+    /// old file open still reads the old bytes whole, and a reader that opens the path
+    /// after reads the new ones.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_of_different_bytes_gives_the_path_a_new_file_and_leaves_the_old_one_whole() {
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+
+        let name = format!("frozen_write_probe_inode_{}", std::process::id());
+        let (old, new) = (script(b'o'), script(b'n'));
+        let path = materialize_frozen_script(&name, "0", &old).unwrap();
+        let _cleanup = CacheDir(path.parent().unwrap().to_path_buf());
+        let mut held = std::fs::File::open(&path).unwrap();
+        let old_inode = held.metadata().unwrap().ino();
+
+        materialize_frozen_script(&name, "0", &new).unwrap();
+
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().ino(),
+            old_inode,
+            "the path names a different file after a write of different bytes"
+        );
+        let mut still_old = String::new();
+        held.read_to_string(&mut still_old).unwrap();
+        assert_eq!(
+            still_old, old,
+            "a reader that had the old file open reads the old bytes whole"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), new);
+    }
+
+    /// A script whose bytes on disk are those asked for is left as it is: not written
+    /// again, so its modification time and its file are the ones it had.
+    #[test]
+    fn a_script_already_holding_the_bytes_is_not_written_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("op.py");
+        write_script_if_changed(&path, "print('x')\n").unwrap();
+        // An hour back, so a rewrite is a visible change and not a tie on the clock's grain.
+        let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(hour_ago)).unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        write_script_if_changed(&path, "print('x')\n").unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "a script already holding the bytes keeps its modification time"
+        );
+    }
+
+    /// After a write the directory holds the script and no other file — none left
+    /// under the name the write went through. Checked after the first write and after a
+    /// write over a script of other bytes.
+    #[test]
+    fn a_write_leaves_the_script_and_no_file_under_another_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("op.py");
+        for bytes in ["print(1)\n", "print(2)\n"] {
+            write_script_if_changed(&path, bytes).unwrap();
+            let names: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                names,
+                ["op.py"],
+                "the directory holds the script and no file under another name"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
