@@ -1,0 +1,52 @@
+# Vetted community extensions
+
+A Protocol's SQL may install a DuckDB community extension when the extension is on this list. `arc run` reads the SQL of every step and hook before the first one runs, and refuses the Protocol when a statement installs a community extension that is not on it.
+
+The list arc enforces is `src/vetted_extensions.json`, compiled into the `arc` binary. This page shows the same list, and a test fails when the two differ.
+
+## The list
+
+Each extension below has a permissive licence, a build the community registry serves for `linux_amd64` and `osx_arm64`, and a statement that ran it on data and checked the result. The entries were taken from the community registry's descriptors at commit `80bed7b173cd`, and their builds were probed on 2026-09-27.
+
+| extension | licence | repository | DuckDB version | what was run |
+|---|---|---|---|---|
+| `dta` | MIT | `codedthinking/duckdb-dta` | v1.5.5 | read a Stata file; write one and read it back |
+| `h3` | Apache-2.0 | `isaacbrodsky/h3-duckdb` | v1.5.5 | the hexagonal cell for a point |
+| `http_client` | MIT | `query-farm/httpclient` | v1.5.5 | an HTTP GET returning status and body |
+| `mlpack` | MIT | `eddelbuettel/duckdb-mlpack` | v1.5.5 | train a random forest, store it and score new rows; a logistic regression; k-means |
+| `rapidfuzz` | MIT | `query-farm/rapidfuzz` | v1.5.5 | a token-sort ratio between two strings |
+| `stats_duck` | Apache-2.0 | `KoliStat/the-stats-duck` | v1.5.5 | a two-sample t-test |
+| `stochastic` | Apache-2.0 | `query-farm/stochastic` | v1.5.5 | the normal distribution at its known points |
+| `subtoken` | MIT | `meridian-online/subtoken` | v1.5.5 | embed text and rank by cosine similarity |
+| `textplot` | Apache-2.0 | `query-farm/textplot` | v1.5.5 | a text plot from SQL |
+| `us_address_standardizer` | MIT | `ericmanning/duckdb-address-standardizer` | v1.5.5 | a US address parsed into its parts |
+| `webbed` | MIT | `teaguesterling/duckdb_webbed` | v1.5.5 | parse XML into rows; write rows as XML |
+| `zipfs` | MIT | `isaacbrodsky/duckdb-zipfs` | v1.5.5 | read a file inside a zip archive |
+
+## What `arc run` refuses
+
+- `INSTALL <name> FROM community`, when `<name>` is not on the list.
+- `INSTALL <name> FROM '<address>'`, whatever the name: a URL or a directory.
+- `INSTALL <name> FROM <repository>`, for a repository other than `core` and `community`, such as `core_nightly`.
+- `INSTALL '<path>'`, whose name is itself a file or an address. DuckDB reads a name holding a `.`, a `/` or a `\` that way.
+- A statement that names the setting `custom_extension_repository` or `autoinstall_extension_repository`. After `SET custom_extension_repository = '/tmp/ext'`, a bare `INSTALL mlpack;` fetches from `/tmp/ext`, and the second setting does the same for an extension DuckDB installs on its own when a function needs one.
+
+`FORCE INSTALL` is checked as `INSTALL` is, in any letter case, and so is an `INSTALL` that follows `EXPLAIN ANALYZE`, which DuckDB runs. Text inside a `--` comment, a `/* */` comment or a string is not read as SQL. A step whose SQL arc cannot otherwise parse is checked too.
+
+The refusal names the step or hook, the file and line, and what the statement installs. No variable lifts it.
+
+## What it does not check
+
+- `INSTALL <name>` with no `FROM`, and `INSTALL <name> FROM core`. These install from DuckDB's own repository.
+- `LOAD`. SQL does not say where a loaded extension was installed from.
+- A `command:` step, and anything a step runs outside its SQL. **This check is not a sandbox.** arc does not sandbox a Protocol: a `command:` step can start a DuckDB of its own and install what it likes, and running a Protocol you did not write is running a shell script you did not read. What the check gives is that a Protocol's SQL cannot install an extension off this list without arc saying so.
+- A SQL file that is not there when the run starts, such as one an earlier `command:` step writes.
+- A DuckDB CLI dot command in a SQL file, such as `.read` or `.shell`.
+
+## The DuckDB version
+
+Each entry names the DuckDB version its build was probed for and its statement was run on. When a step installs an extension on the list and the engine reports a version the entry does not name, `arc run` prints one warning naming the extension, the engine's version and the entry's, and the run goes ahead.
+
+## Adding an extension
+
+An extension joins the list with a permissive licence, a build the registry serves for the DuckDB version the entry names on both platforms above, and a statement run on data whose result was checked. Add the entry to `src/vetted_extensions.json` and the row to this page in the same change.

@@ -257,6 +257,8 @@ Rationale for each change is recorded in the project's design notes and commit h
   accepts it and reddens — and, running everywhere and needing nothing, a check that
   its own comparison predicate still tells two vectors apart.
 
+- **`arc run` refuses a Protocol whose SQL installs a DuckDB community extension off the vetted list.** arc holds a list of vetted community extensions in `src/vetted_extensions.json`, shown in `docs/VETTED_EXTENSIONS.md`, and before a step runs it reads the SQL of every step and hook. It refuses `INSTALL <name> FROM community` for a name not on the list, an `INSTALL` from an address or from a repository other than `core` and `community`, an `INSTALL` whose name is a path, and a statement naming `custom_extension_repository` or `autoinstall_extension_repository`; the message names the step or hook, the file and line, and what was installed. `FORCE INSTALL`, any letter case, and an `INSTALL` after `EXPLAIN ANALYZE` are read as `INSTALL` is; comments and strings are not read as SQL; a step arc's parser cannot read is checked too. `INSTALL` from `core`, and `LOAD`, are not checked, no variable lifts the refusal, and the check confines nothing a `command:` step does. A vetted extension on an engine version its entry does not name draws one warning and the run goes ahead. `install_from_a_url_that_does_not_resolve` now holds that arc parses the statement, since the run is refused before a step.
+
 ### Added
 
 - **`datapackage_describe@1.1.0` passes declared column types to finetype through a

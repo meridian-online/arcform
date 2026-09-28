@@ -17,7 +17,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use sqlparser::ast::{CopyOption, Statement, Value};
+use sqlparser::ast::{CopyOption, InstallRepository, Statement, Value};
 use sqlparser::dialect::{DuckDbDialect, PostgreSqlDialect};
 use sqlparser::parser::Parser;
 
@@ -136,10 +136,8 @@ fn read_contract(project: &std::path::Path) -> serde_json::Value {
 /// `first_stmt` followed by `CREATE TABLE b AS SELECT * FROM a;`, asserting
 /// `first_stmt` parsed (no opaque warning) and `b`/`a` are wired in the run's
 /// own contract — regardless of whether `first_stmt` itself succeeds at
-/// runtime. (`install_from_a_url_that_does_not_resolve` below is exactly that
-/// case: the network call fails, but the graph is unaffected, because arc
-/// discovers lineage from the parsed SQL, never from what the engine does
-/// with it.)
+/// runtime, because arc discovers lineage from the parsed SQL, never from what
+/// the engine does with it.
 fn assert_wired(label: &str, first_stmt: &str) -> Run {
     let run = run_transform(
         label,
@@ -175,12 +173,27 @@ fn install_from_core() {
     assert_wired("install_from_core", "INSTALL httpfs FROM core;");
 }
 
+/// `arc run` refuses a Protocol that installs from an address before a step runs, and
+/// `tests/vetted_extensions.rs` holds that refusal. What this holds is that arc parses the
+/// statement, address and all, rather than reading the step as opaque.
 #[test]
 fn install_from_a_url_that_does_not_resolve() {
-    assert_wired(
-        "install_from_a_url_that_does_not_resolve",
-        "INSTALL x FROM 'https://example.org/ext';",
-    );
+    match parse_one("INSTALL x FROM 'https://example.org/ext';") {
+        Statement::Install {
+            extension_name,
+            force,
+            repository,
+        } => {
+            assert_eq!(extension_name.value, "x");
+            assert!(!force, "INSTALL … FROM '<url>' is not FORCE");
+            assert_eq!(
+                repository,
+                Some(InstallRepository::Url("https://example.org/ext".into())),
+                "the address is the repository"
+            );
+        }
+        other => panic!("expected INSTALL, got {other:?}"),
+    }
 }
 
 #[test]

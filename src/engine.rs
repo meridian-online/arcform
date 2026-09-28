@@ -1040,3 +1040,490 @@ mod tests {
         assert!(info.version.is_none());
     }
 }
+
+#[cfg(test)]
+mod extension_tests {
+    use super::*;
+
+    fn word(text: &str) -> Tok {
+        Tok::Word {
+            text: text.to_string(),
+            quoted: false,
+        }
+    }
+
+    fn quoted(text: &str) -> Tok {
+        Tok::Word {
+            text: text.to_string(),
+            quoted: true,
+        }
+    }
+
+    fn string(text: &str) -> Tok {
+        Tok::Str(text.to_string())
+    }
+
+    /// The tokens of `sql`, without their lines.
+    fn toks(sql: &str) -> Vec<Tok> {
+        lex_sql(sql).into_iter().map(|(tok, _)| tok).collect()
+    }
+
+    /// The findings of `sql`, without their lines.
+    fn scan(sql: &str) -> Vec<ExtensionSql> {
+        scan_extension_sql(sql)
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect()
+    }
+
+    fn install(name: &str, from: InstallFrom) -> ExtensionSql {
+        ExtensionSql::Install {
+            name: name.to_string(),
+            from,
+        }
+    }
+
+    // ---- the lexer, rule by rule ----
+
+    #[test]
+    fn lex_splits_words_strings_and_punctuation() {
+        assert_eq!(
+            toks("INSTALL x FROM 'a';"),
+            vec![
+                word("INSTALL"),
+                word("x"),
+                word("FROM"),
+                string("a"),
+                Tok::Other(';')
+            ]
+        );
+        assert_eq!(
+            toks("1 - 2 / _a é"),
+            vec![
+                Tok::Other('1'),
+                Tok::Other('-'),
+                Tok::Other('2'),
+                Tok::Other('/'),
+                word("_a"),
+                word("é")
+            ]
+        );
+        assert_eq!(toks("a$$b c1"), vec![word("a$$b"), word("c1")]);
+    }
+
+    #[test]
+    fn lex_drops_a_line_comment_to_the_end_of_its_line() {
+        assert_eq!(
+            lex_sql("-- INSTALL a\nINSTALL b"),
+            vec![(word("INSTALL"), 2), (word("b"), 2)]
+        );
+    }
+
+    #[test]
+    fn lex_nests_block_comments_as_duckdb_does() {
+        assert_eq!(
+            toks("/* /* */ INSTALL a; */ INSTALL b"),
+            vec![word("INSTALL"), word("b")]
+        );
+        assert_eq!(toks("/* a */ x /* b */"), vec![word("x")]);
+        assert_eq!(lex_sql("/*\n\n*/ x"), vec![(word("x"), 3)]);
+        assert_eq!(toks("/* open /* INSTALL a */ INSTALL b"), Vec::<Tok>::new());
+    }
+
+    #[test]
+    fn lex_reads_a_doubled_quote_as_one_and_a_backslash_as_itself() {
+        assert_eq!(toks("'it''s' x"), vec![string("it's"), word("x")]);
+        assert_eq!(toks(r"'a\' x"), vec![string(r"a\"), word("x")]);
+        assert_eq!(toks("'open"), vec![string("open")]);
+        assert_eq!(toks(r#""a""b" c"#), vec![quoted(r#"a"b"#), word("c")]);
+    }
+
+    #[test]
+    fn lex_honours_a_backslash_only_inside_an_e_string() {
+        assert_eq!(toks(r"E'a\'b' x"), vec![string("a'b"), word("x")]);
+        assert_eq!(toks(r"e'a\'b' x"), vec![string("a'b"), word("x")]);
+        assert_eq!(toks("E'a''b'"), vec![string("a'b")]);
+        assert_eq!(toks("e x"), vec![word("e"), word("x")]);
+        assert_eq!(
+            toks(r"ex'a\' x"),
+            vec![word("ex"), string(r"a\"), word("x")]
+        );
+        assert_eq!(
+            lex_sql("E'\\\n' x"),
+            vec![(string("\n"), 1), (word("x"), 2)]
+        );
+    }
+
+    #[test]
+    fn lex_ends_a_bit_or_hex_string_at_its_first_quote() {
+        assert_eq!(toks("X'ab''cd'"), vec![string("ab"), string("cd")]);
+        assert_eq!(toks("x'ab''cd'"), vec![string("ab"), string("cd")]);
+        assert_eq!(toks("B'01''10'"), vec![string("01"), string("10")]);
+        assert_eq!(toks("b'01''10'"), vec![string("01"), string("10")]);
+    }
+
+    #[test]
+    fn lex_reads_dollar_quoted_strings() {
+        assert_eq!(toks("$$ a ' b $$ x"), vec![string(" a ' b "), word("x")]);
+        assert_eq!(toks("$t$ $$ $t$ x"), vec![string(" $$ "), word("x")]);
+        assert_eq!(toks("$$ open"), vec![string(" open")]);
+        assert_eq!(
+            toks("$1 $name x"),
+            vec![
+                Tok::Other('$'),
+                Tok::Other('1'),
+                Tok::Other('$'),
+                word("name"),
+                word("x")
+            ]
+        );
+        assert_eq!(
+            lex_sql("$$\n\n$$ x"),
+            vec![(string("\n\n"), 1), (word("x"), 3)]
+        );
+    }
+
+    #[test]
+    fn lex_counts_lines_inside_a_string() {
+        assert_eq!(
+            lex_sql("'a\nb' x\ny"),
+            vec![(string("a\nb"), 1), (word("x"), 2), (word("y"), 3)]
+        );
+    }
+
+    // ---- what the scan finds ----
+
+    #[test]
+    fn scan_reads_where_each_install_fetches_from() {
+        assert_eq!(
+            scan("INSTALL mlpack FROM community;"),
+            vec![install("mlpack", InstallFrom::Community)]
+        );
+        assert_eq!(
+            scan("INSTALL spatial FROM core; INSTALL excel; INSTALL x VERSION 'v1';"),
+            vec![
+                install("spatial", InstallFrom::Core),
+                install("excel", InstallFrom::Core),
+                install("x", InstallFrom::Core)
+            ]
+        );
+        assert_eq!(
+            scan("INSTALL mlpack FROM core_nightly;"),
+            vec![install("mlpack", InstallFrom::Alias("core_nightly".into()))]
+        );
+        assert_eq!(
+            scan("INSTALL mlpack FROM 'https://example.org/ext';"),
+            vec![install(
+                "mlpack",
+                InstallFrom::Address("https://example.org/ext".into())
+            )]
+        );
+    }
+
+    #[test]
+    fn scan_compares_a_repository_as_written() {
+        assert_eq!(
+            scan("INSTALL mlpack FROM Community;"),
+            vec![install("mlpack", InstallFrom::Alias("Community".into()))]
+        );
+        assert_eq!(
+            scan(r#"INSTALL mlpack FROM "community";"#),
+            vec![install("mlpack", InstallFrom::Community)]
+        );
+        assert_eq!(
+            scan("INSTALL mlpack FROM 'community';"),
+            vec![install("mlpack", InstallFrom::Address("community".into()))]
+        );
+    }
+
+    #[test]
+    fn scan_lowercases_a_name_and_reads_force_and_any_case() {
+        assert_eq!(
+            scan("force install ANOFOX_forecast from community;"),
+            vec![install("anofox_forecast", InstallFrom::Community)]
+        );
+        assert_eq!(
+            scan(r#"INSTALL "MLPACK" FROM community; INSTALL 'Rapidfuzz' FROM community;"#),
+            vec![
+                install("mlpack", InstallFrom::Community),
+                install("rapidfuzz", InstallFrom::Community)
+            ]
+        );
+        assert_eq!(
+            scan(r#"INSTALL "from" FROM community;"#),
+            vec![install("from", InstallFrom::Community)]
+        );
+    }
+
+    #[test]
+    fn scan_finds_an_install_after_explain_analyze() {
+        assert_eq!(
+            scan("EXPLAIN ANALYZE INSTALL anofox_forecast FROM community;"),
+            vec![install("anofox_forecast", InstallFrom::Community)]
+        );
+    }
+
+    #[test]
+    fn scan_reads_a_name_holding_a_path_character_as_a_path() {
+        assert_eq!(
+            scan("INSTALL '/tmp/ext/mlpack.duckdb_extension';"),
+            vec![ExtensionSql::InstallPath(
+                "/tmp/ext/mlpack.duckdb_extension".into()
+            )]
+        );
+        assert_eq!(
+            scan(r#"INSTALL 'a.b'; INSTALL 'c\d'; INSTALL "e/f" FROM community;"#),
+            vec![
+                ExtensionSql::InstallPath("a.b".into()),
+                ExtensionSql::InstallPath(r"c\d".into()),
+                ExtensionSql::InstallPath("e/f".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_skips_what_is_not_an_install_statement() {
+        assert_eq!(scan("SELECT t.install FROM community;"), vec![]);
+        assert_eq!(scan("SELECT install FROM community;"), vec![]);
+        assert_eq!(scan(r#"SELECT "install" x FROM community;"#), vec![]);
+        assert_eq!(scan("INSTALL x FROM; INSTALL; INSTALL"), vec![]);
+        assert_eq!(scan("LOAD mlpack; LOAD '/tmp/x.duckdb_extension';"), vec![]);
+        assert_eq!(
+            scan(
+                "-- INSTALL a FROM community;\n/* INSTALL b FROM community; */ SELECT 'INSTALL c FROM community';"
+            ),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn scan_finds_a_repository_setting_in_any_form() {
+        assert_eq!(
+            scan("SET custom_extension_repository = '/tmp/ext'; INSTALL mlpack;"),
+            vec![
+                ExtensionSql::Setting("custom_extension_repository".into()),
+                install("mlpack", InstallFrom::Core)
+            ]
+        );
+        assert_eq!(
+            scan(
+                r#"PRAGMA Autoinstall_Extension_Repository='x'; SET GLOBAL "custom_extension_repository" TO 'y';"#
+            ),
+            vec![
+                ExtensionSql::Setting("autoinstall_extension_repository".into()),
+                ExtensionSql::Setting("custom_extension_repository".into())
+            ]
+        );
+        assert_eq!(
+            scan("SELECT current_setting('custom_extension_repository');"),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn scan_gives_each_finding_its_line() {
+        assert_eq!(
+            scan_extension_sql(
+                "SELECT 1;\n\nINSTALL a FROM community;\nSET custom_extension_repository = 'x';"
+            ),
+            vec![
+                (install("a", InstallFrom::Community), 3),
+                (
+                    ExtensionSql::Setting("custom_extension_repository".into()),
+                    4
+                )
+            ]
+        );
+    }
+
+    // ---- the check a run makes ----
+
+    /// Each `(place, sql)` written to a file of its own in `dir`.
+    fn sources(dir: &Path, files: &[(&str, &str)]) -> Vec<ProtocolSql> {
+        files
+            .iter()
+            .enumerate()
+            .map(|(i, (place, sql))| {
+                let file = format!("s{i}.sql");
+                std::fs::write(dir.join(&file), sql).unwrap();
+                ProtocolSql {
+                    place: place.to_string(),
+                    path: dir.join(&file),
+                    file,
+                }
+            })
+            .collect()
+    }
+
+    fn v(s: &str) -> semver::Version {
+        semver::Version::parse(s).unwrap()
+    }
+
+    fn refusals(result: Result<Vec<String>>) -> Vec<String> {
+        match result {
+            Err(Error::ExtensionRefused { refusals }) => refusals,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_list_arc_holds_names_each_extension_once() {
+        let names: Vec<&str> = vetted_extensions()
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "a name appears twice: {names:?}");
+        assert!(names.contains(&"mlpack"), "{names:?}");
+        assert!(!names.contains(&"anofox_forecast"), "{names:?}");
+        assert!(
+            vetted_extensions()
+                .iter()
+                .all(|e| !e.duckdb_versions.is_empty()),
+            "every entry names a DuckDB version"
+        );
+    }
+
+    #[test]
+    fn check_refuses_each_unvetted_install_with_its_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql = sources(
+            dir.path(),
+            &[
+                ("step 'a'", "INSTALL anofox_forecast FROM community;"),
+                (
+                    "hook on_init 'h'",
+                    "SELECT 1;\nINSTALL mlpack FROM core_nightly;\nINSTALL mlpack FROM 'https://x.org/e';",
+                ),
+                (
+                    "step 'b'",
+                    "INSTALL '/tmp/m.duckdb_extension';\nSET custom_extension_repository = '/tmp';",
+                ),
+            ],
+        );
+        assert_eq!(
+            refusals(check_extension_installs(&sql, Some(&v("1.5.5")))),
+            vec![
+                "step 'a' (s0.sql, line 1) installs anofox_forecast from the community registry, and anofox_forecast is not on the vetted list",
+                "hook on_init 'h' (s1.sql, line 2) installs mlpack from the repository core_nightly; a community extension is installed FROM community",
+                "hook on_init 'h' (s1.sql, line 3) installs mlpack from the address 'https://x.org/e'",
+                "step 'b' (s2.sql, line 1) installs the extension at '/tmp/m.duckdb_extension'",
+                "step 'b' (s2.sql, line 2) names the setting custom_extension_repository, which moves where DuckDB installs an extension from",
+            ]
+        );
+    }
+
+    #[test]
+    fn check_refuses_whatever_else_the_protocol_installs() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql = sources(
+            dir.path(),
+            &[
+                ("step 'a'", "INSTALL mlpack FROM community;"),
+                ("step 'b'", "INSTALL anofox_forecast FROM community;"),
+            ],
+        );
+        assert_eq!(
+            refusals(check_extension_installs(&sql, Some(&v("1.5.4")))).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn check_passes_core_installs_and_a_missing_file_without_a_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sql = sources(
+            dir.path(),
+            &[(
+                "step 'a'",
+                "INSTALL spatial FROM core; INSTALL excel; LOAD mlpack;",
+            )],
+        );
+        sql.push(ProtocolSql {
+            place: "step 'later'".into(),
+            file: "later.sql".into(),
+            path: dir.path().join("later.sql"),
+        });
+        assert_eq!(
+            check_extension_installs(&sql, Some(&v("1.5.4"))).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn check_warns_once_per_vetted_extension_on_a_version_its_entry_does_not_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql = sources(
+            dir.path(),
+            &[
+                ("step 'a'", "INSTALL mlpack FROM community; LOAD mlpack;"),
+                ("step 'b'", "FORCE INSTALL mlpack FROM community;"),
+                ("step 'c'", "INSTALL h3 FROM community;"),
+            ],
+        );
+        assert_eq!(
+            check_extension_installs(&sql, Some(&v("1.5.4"))).unwrap(),
+            vec![
+                format!(
+                    "mlpack is vetted on DuckDB v1.5.5, and this engine is DuckDB v1.5.4; running it anyway ({VETTED_EXTENSIONS_DOC})"
+                ),
+                format!(
+                    "h3 is vetted on DuckDB v1.5.5, and this engine is DuckDB v1.5.4; running it anyway ({VETTED_EXTENSIONS_DOC})"
+                ),
+            ]
+        );
+        assert_eq!(
+            check_extension_installs(&sql, Some(&v("1.5.5"))).unwrap(),
+            Vec::<String>::new(),
+            "an engine the entry names draws no warning"
+        );
+        assert_eq!(
+            check_extension_installs(&sql[..1], None).unwrap(),
+            vec![format!(
+                "mlpack is vetted on DuckDB v1.5.5, and arc could not read this engine's version; running it anyway ({VETTED_EXTENSIONS_DOC})"
+            )]
+        );
+    }
+
+    #[test]
+    fn the_refusal_lists_each_line_and_names_the_page() {
+        let message = Error::ExtensionRefused {
+            refusals: vec!["step 'a' one".into(), "step 'b' two".into()],
+        }
+        .to_string();
+        assert!(
+            message.contains("\n  step 'a' one\n  step 'b' two\n"),
+            "{message}"
+        );
+        assert!(message.contains("docs/VETTED_EXTENSIONS.md"), "{message}");
+        assert!(message.contains("no step was run"), "{message}");
+    }
+
+    #[test]
+    fn protocol_sql_lists_the_sql_steps_then_the_sql_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("arcform.yaml"),
+            "name: p\nsteps:\n  - name: one\n    sql: a.sql\n  - name: two\n    command: echo\n  - name: three\n    sql: c.sql\nhooks:\n  on_init:\n    name: i\n    sql: i.sql\n  on_success:\n    name: s\n    command: echo\n  on_failure:\n    name: f\n    sql: f.sql\n  on_exit:\n    name: x\n    sql: x.sql\n",
+        )
+        .unwrap();
+        let manifest = Manifest::load(dir.path()).unwrap();
+        let listed: Vec<(String, String, PathBuf)> = protocol_sql(&manifest, dir.path())
+            .into_iter()
+            .map(|s| (s.place, s.file, s.path))
+            .collect();
+        let at = |f: &str| dir.path().join(f);
+        assert_eq!(
+            listed,
+            vec![
+                ("step 'one'".into(), "a.sql".into(), at("a.sql")),
+                ("step 'three'".into(), "c.sql".into(), at("c.sql")),
+                ("hook on_init 'i'".into(), "i.sql".into(), at("i.sql")),
+                ("hook on_failure 'f'".into(), "f.sql".into(), at("f.sql")),
+                ("hook on_exit 'x'".into(), "x.sql".into(), at("x.sql")),
+            ]
+        );
+    }
+}

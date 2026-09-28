@@ -20,7 +20,7 @@ Arcform is a Rust-based workflow engine built for data analysts who want the pow
 
 ## Execution model
 
-Arcform runs your steps on your machine, as you. There is no sandbox, no container and no allowlist — **running a Protocol you did not write is running a shell script you did not read.** This is deliberate; the table names the fields it covers.
+Arcform runs your steps on your machine, as you. There is no sandbox and no container — **running a Protocol you did not write is running a shell script you did not read.** This is deliberate; the table names the fields it covers.
 
 | Field | How Arcform runs it |
 | --- | --- |
@@ -42,6 +42,8 @@ Arcform runs SQL through the DuckDB CLI, and finds it in this order:
 The version preflight and the SQL steps run the same executable. A `command:` step that calls `duckdb` by name still gets the one on `PATH`; Arcform does not rewrite commands.
 
 Arcform is tested on DuckDB `>=1.2, <2`, and a run with a SQL step on any other version is refused before a step runs. A Protocol's `engine_version:` narrows that range and cannot widen it: `">=1.6"` refuses 1.5 as well, and `">=1.2"` still refuses 2.0. Set `ARC_ALLOW_UNTESTED_ENGINE=1` to run on an engine outside Arcform's range at your own risk; the run prints a warning naming the version and the range, and a Protocol's own `engine_version:` still applies. A development build such as `1.6.0-dev` is outside the range. When Arcform cannot read the engine's version it warns and runs.
+
+A Protocol's SQL may install a DuckDB community extension only when the extension is on the [vetted list](docs/VETTED_EXTENSIONS.md). Before a step runs, Arcform reads the SQL of every step and hook and refuses a Protocol that installs a community extension off that list, or installs one from an address or another repository. It reads SQL and confines nothing: a `command:` step can run a DuckDB of its own.
 
 ---
 
