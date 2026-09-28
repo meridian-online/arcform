@@ -92,15 +92,113 @@ this is additive, not a replacement.
     colon-form parse canonicalizes to the arrow form on round-trip; there is no
     field recording which syntax the source used.
 
+### 4. `INSTALL … FROM <repository>` and `FORCE INSTALL`
+
+DuckDB's `INSTALL` accepts an optional repository clause and a `FORCE` prefix
+that re-downloads an extension already on disk; upstream only parses the bare
+form:
+
+```sql
+INSTALL httpfs FROM core;
+INSTALL mlpack FROM community;
+INSTALL x FROM 'https://example.org/ext';
+FORCE INSTALL spatial;
+```
+
+- `ast/mod.rs`: `Statement::Install` gains `force: bool` and
+  `repository: Option<InstallRepository>`; new `InstallRepository` enum
+  (`Alias(Ident)` for a repository name, `Url(String)` for a custom URL) with
+  its `Display` impl.
+- `ast/spans.rs`: the `Statement::Install` arm updated for the new fields
+  (`{ extension_name, .. }`).
+- `parser/mod.rs`:
+  - `parse_statement`: a new `Keyword::FORCE` arm, gated to
+    `DuckDbDialect | GenericDialect` and claimed only when the next keyword is
+    `INSTALL` — `FORCE` is also used, unrelated, by MySQL index hints.
+  - `parse_install` takes a `force: bool` and, after the extension name, an
+    optional `FROM <repository>`.
+  - new `parse_install_repository`: a leading quoted string parses as
+    `InstallRepository::Url`, anything else as `InstallRepository::Alias`.
+
+### 5. Empty `QUOTE`/`ESCAPE`/`DELIMITER` in DuckDB `COPY`
+
+Postgres's `COPY` requires `QUOTE`/`ESCAPE`/`DELIMITER` to be exactly one
+character; DuckDB additionally accepts the empty string, disabling the option:
+
+```sql
+COPY tbl TO 'out.csv' (HEADER false, QUOTE '');
+COPY tbl TO 'out.csv' (HEADER false, ESCAPE '');
+COPY tbl TO 'out.csv' (HEADER false, DELIMITER '');
+```
+
+- `ast/mod.rs`: `CopyOption::Quote`/`Escape`/`Delimiter` change from `char` to
+  `Option<char>` (`None` = the empty-string case), with matching `Display` arms.
+- `parser/mod.rs`: new `parse_copy_option_char`, used by those three arms of
+  `parse_copy_option` in place of `parse_literal_char` — the same one-character
+  check, plus an empty-string exception gated to `DuckDbDialect | GenericDialect`.
+  `parse_literal_char` itself is unchanged and still backs the Postgres-only
+  legacy `COPY … WITH (...)` options, which stay one-character-only on every
+  dialect.
+
+### 6. DuckDB `PRAGMA` as a function call
+
+DuckDB's `PRAGMA` also accepts a function-call argument list — several
+positional values and/or named ones — where upstream only parses zero or one:
+
+```sql
+PRAGMA create_fts_index('docs', 'order_id', 'body');
+PRAGMA create_fts_index('docs', 'order_id', 'body', overwrite = 1);
+```
+
+- `ast/mod.rs`: `Statement::Pragma` gains `args: Vec<FunctionArg>`, empty for
+  every pre-existing form (which stay on `value`/`is_eq`, untouched); its
+  `Display` arm renders `args` when non-empty and otherwise falls back to the
+  original `value`/`is_eq` rendering.
+- `parser/mod.rs` `parse_pragma`: the classic single-literal-value form is
+  tried first via `maybe_parse` (so it backtracks cleanly on a second or a
+  named argument) and, only past it, a `DuckDbDialect | GenericDialect`-gated
+  fallback parses the parenthesized list with the existing
+  `Parser::parse_function_args` — the same machinery an ordinary function
+  call's arguments already use, including DuckDB's `name = value` named-arg
+  syntax.
+
+### 7. DuckDB `SET VARIABLE <name> = <expr>`
+
+DuckDB's session variables are a distinct statement from `SET <config_option>
+= <value>`; upstream's `SET` parses `VARIABLE` as a plain object name and then
+fails on the name that follows it:
+
+```sql
+SET VARIABLE cutoff = DATE '2026-01-01';
+```
+
+- `keywords.rs`: new non-reserved `VARIABLE` keyword (inserted alphabetically
+  between `VARCHAR` and `VARIABLES`), kept out of every `RESERVED_FOR_*` list.
+- `ast/mod.rs`: `Statement::SetVariable` gains `is_variable: bool` (`false`
+  for every pre-existing `SET` form); its `Display` arm writes `SET VARIABLE `
+  instead of `SET ` when set.
+- `parser/mod.rs` `parse_set`: gated to `DuckDbDialect | GenericDialect`, a
+  leading `VARIABLE` keyword routes straight to `<name> = <expr>`, building a
+  `Statement::SetVariable` with `is_variable: true`. Any other dialect falls
+  through unclaimed, and `VARIABLE` there still parses as the plain object
+  name it always has.
+
 ## Fidelity
 
 All added forms round-trip: parse → `Display` → re-parse yields a structurally-equal
 AST (verified against the DuckDB dialect). The lambda colon form round-trips to the
 arrow form specifically (see above) rather than to itself — still structurally equal,
-since the AST is the same either way. Existing behaviour for all other dialects is
-untouched (the PIVOT/UNPIVOT and COPY grammars are gated behind
-`DuckDbDialect | GenericDialect`; the lambda colon syntax behind `DuckDbDialect` alone —
-see the gating rationale above), and the crate's inline unit tests pass (the
+since the AST is the same either way. Existing behaviour for every other dialect is
+untouched — the PIVOT/UNPIVOT, COPY, `INSTALL`/`FORCE INSTALL`, `PRAGMA` and
+`SET VARIABLE` grammars are gated behind `DuckDbDialect | GenericDialect`; the
+lambda colon syntax behind `DuckDbDialect` alone (see the gating rationale
+above) — checked directly against `PostgreSqlDialect` for additions 4 through 7:
+it refuses every one of the new forms, as it did on the unforked grammar.
+`INSTALL`/`FORCE INSTALL` were never reachable on that dialect; the empty-string
+`COPY` option and `SET VARIABLE` hit the same parse error at the same token as
+before; the multi-/named-argument `PRAGMA` form is still refused, with a
+different message (`Expected: ), found: ,` before, `Expected: pragma value,
+found: 'docs'` after). The crate's inline unit tests pass (the
 pre-existing `ast::visitor::tests::overflow` test overflows the stack in a standalone
 debug build on upstream `0.55.0` too — unrelated).
 

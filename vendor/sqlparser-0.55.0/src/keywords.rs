@@ -938,6 +938,11 @@ define_keywords!(
     VARBINARY,
     VARBIT,
     VARCHAR,
+    // Non-reserved, DuckDB `SET VARIABLE <name> = <expr>` only — see
+    // `Parser::parse_set`. Kept out of every `RESERVED_FOR_*` list, the same
+    // way this fork's `LAMBDA` keyword is, so it still parses as a plain
+    // identifier everywhere else (e.g. a column literally named `variable`).
+    VARIABLE,
     VARIABLES,
     VARYING,
     VAR_POP,

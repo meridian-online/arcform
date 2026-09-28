@@ -53,19 +53,15 @@ every morning:
 0 7 * * *  cd /path/to/examples/brewtrend && arc run >> brewtrend.log 2>&1
 ```
 
-## A note on the `trending.sql` warning
+## `trending.sql`'s lineage
 
-On each run you'll see:
-
-```
-warning: could not parse models/trending.sql ... found: PIVOT — treating as opaque step
-```
-
-This is expected. ArcForm introspects SQL (via sqlparser-rs) to auto-discover a
-step's inputs and outputs, but it doesn't yet understand some DuckDB-specific
-statements — here, `PIVOT` and `SET VARIABLE`. When it can't parse a file it
-degrades gracefully: the step is treated as **opaque** (run as-is, no auto-lineage)
-rather than failing. The step still executes correctly against DuckDB.
+`trending.sql` opens with `SET VARIABLE trend_threshold = CAST(getenv(…) AS
+INTEGER);` and later pivots `install_counts` on `days`. ArcForm's SQL
+introspection (a forked `sqlparser-rs` — see
+`vendor/sqlparser-0.55.0/MERIDIAN_PATCH.md`) parses both forms, so a run
+prints no `could not parse` warning for this file, and `categories`,
+`installs`, `measures` and `all_packages` show up in the asset graph with
+their real `produces`/`depends_on` wiring — not as one opaque step.
 
 ## Requirements
 

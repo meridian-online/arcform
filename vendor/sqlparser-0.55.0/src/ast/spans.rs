@@ -316,7 +316,7 @@ impl Spanned for Statement {
             } => table_name.span(),
             Statement::Query(query) => query.span(),
             Statement::Insert(insert) => insert.span(),
-            Statement::Install { extension_name } => extension_name.span,
+            Statement::Install { extension_name, .. } => extension_name.span,
             Statement::Load { extension_name } => extension_name.span,
             Statement::Directory {
                 overwrite: _,
