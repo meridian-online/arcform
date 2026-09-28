@@ -368,6 +368,18 @@ const EXTENSION_REPOSITORY_SETTINGS: [&str; 2] = [
     "autoinstall_extension_repository",
 ];
 
+/// What switches DuckDB to its second parser. The DuckDB CLI loads the `autocomplete`
+/// extension, whose parser replaces the default one once `allow_parser_override_extension` is
+/// `'fallback'` or `'strict'`, and `enable_peg_parser()` sets it to `'strict'`. That parser
+/// reads comments and strings by rules of its own: a block comment does not nest, and a
+/// backslash escapes nothing inside `E'…'`. arc reads SQL by the default parser's rules, so a
+/// statement naming either is refused, whatever value it sets. Everything before the switch
+/// is read by the default rules, the only ones in force until it runs.
+///
+/// A string naming either is refused too: `query('FROM enable_peg_parser()')` runs the SQL a
+/// string holds.
+const PARSER_SWITCHES: [&str; 2] = ["enable_peg_parser", "allow_parser_override_extension"];
+
 /// One community extension a Protocol may install from the community registry. The file
 /// also carries each entry's licence, repository and proof, which the page shows and the
 /// check does not read.
@@ -678,6 +690,8 @@ enum ExtensionSql {
     InstallPath(String),
     /// A setting in [`EXTENSION_REPOSITORY_SETTINGS`], named outside a comment or a string.
     Setting(String),
+    /// A name in [`PARSER_SWITCHES`], named outside a comment.
+    ParserSwitch(String),
 }
 
 // ---- A SQL file as DuckDB's CLI reads it ----
@@ -955,6 +969,19 @@ fn scan_extension_sql(file: &[u8]) -> Vec<(ExtensionSql, usize)> {
 fn scan_tokens(toks: &[(Tok, usize)]) -> Vec<(ExtensionSql, usize)> {
     let mut found = Vec::new();
     for (k, (tok, line)) in toks.iter().enumerate() {
+        let switch = match tok {
+            Tok::Word { text, .. } => PARSER_SWITCHES
+                .iter()
+                .find(|name| text.eq_ignore_ascii_case(name)),
+            Tok::Str(text) => {
+                let text = text.to_ascii_lowercase();
+                PARSER_SWITCHES.iter().find(|name| text.contains(*name))
+            }
+            Tok::Other(_) => None,
+        };
+        if let Some(name) = switch {
+            found.push((ExtensionSql::ParserSwitch(name.to_string()), *line));
+        }
         let Tok::Word { text, quoted } = tok else {
             continue;
         };
@@ -1056,8 +1083,8 @@ pub(crate) fn protocol_sql(manifest: &Manifest, dir: &Path) -> Vec<ProtocolSql> 
 ///
 /// Refused: `INSTALL <name> FROM community` for a name not on the list; an `INSTALL` from
 /// an address or from a repository other than `core` and `community`; an `INSTALL` whose
-/// name is a path or an address; and a statement naming a setting in
-/// [`EXTENSION_REPOSITORY_SETTINGS`]. An `INSTALL` from `core` is not checked, and neither
+/// name is a path or an address; a statement naming a setting in
+/// [`EXTENSION_REPOSITORY_SETTINGS`]; and a statement naming a name in [`PARSER_SWITCHES`]. An `INSTALL` from `core` is not checked, and neither
 /// is `LOAD`, because SQL does not say where a loaded extension was installed from. No
 /// variable lifts the refusal.
 ///
@@ -1110,6 +1137,9 @@ pub(crate) fn check_extension_installs(
                 }
                 ExtensionSql::Setting(setting) => format!(
                     "names the setting {setting}, which moves where DuckDB installs an extension from"
+                ),
+                ExtensionSql::ParserSwitch(name) => format!(
+                    "names {name}, which switches DuckDB to a second parser whose comments and strings arc does not read"
                 ),
             };
             refusals.push(format!(
@@ -1683,6 +1713,33 @@ mod extension_tests {
     }
 
     #[test]
+    fn scan_finds_a_parser_switch_in_any_form() {
+        let switch = |name: &str| ExtensionSql::ParserSwitch(name.into());
+        assert_eq!(
+            scan("CALL enable_peg_parser();\nFROM Enable_Peg_Parser();"),
+            vec![switch("enable_peg_parser"), switch("enable_peg_parser")]
+        );
+        assert_eq!(
+            scan(
+                r#"SET allow_parser_override_extension = 'fallback'; PRAGMA ALLOW_PARSER_OVERRIDE_EXTENSION='strict'; SET GLOBAL "allow_parser_override_extension" TO 'default';"#
+            ),
+            vec![switch("allow_parser_override_extension"); 3]
+        );
+        // A string DuckDB runs as SQL, with its escapes read.
+        assert_eq!(
+            scan(r"FROM query('FROM ENABLE_PEG_PARSER()'); FROM query(E'FROM enable\x5fpeg_parser()');"),
+            vec![switch("enable_peg_parser"); 2]
+        );
+        // In a comment, inside a longer name, and the function that switches back.
+        assert_eq!(
+            scan(
+                "-- CALL enable_peg_parser();\n/* SET allow_parser_override_extension = 'strict'; */ CALL disable_peg_parser(); SELECT my_enable_peg_parser;"
+            ),
+            vec![]
+        );
+    }
+
+    #[test]
     fn scan_gives_each_finding_its_line() {
         assert_eq!(
             scan_extension_sql(
@@ -1774,7 +1831,7 @@ mod extension_tests {
                 ),
                 (
                     "step 'b'",
-                    "INSTALL '/tmp/m.duckdb_extension';\nSET custom_extension_repository = '/tmp';",
+                    "INSTALL '/tmp/m.duckdb_extension';\nSET custom_extension_repository = '/tmp';\nCALL enable_peg_parser();",
                 ),
             ],
         );
@@ -1786,6 +1843,7 @@ mod extension_tests {
                 "hook on_init 'h' (s1.sql, line 3) installs mlpack from the address 'https://x.org/e'",
                 "step 'b' (s2.sql, line 1) installs the extension at '/tmp/m.duckdb_extension'",
                 "step 'b' (s2.sql, line 2) names the setting custom_extension_repository, which moves where DuckDB installs an extension from",
+                "step 'b' (s2.sql, line 3) names enable_peg_parser, which switches DuckDB to a second parser whose comments and strings arc does not read",
             ]
         );
     }
