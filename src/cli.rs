@@ -142,8 +142,8 @@ pub enum OperationCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Print what an operation takes, as JSON: its long name, what it is
-    /// applied to, and a JSON Schema of its parameters.
+    /// Print what an operation takes, as JSON: its long name, what it does,
+    /// what it is applied to, and a JSON Schema of its parameters.
     Describe {
         /// The operation's long name, as listed by `arc operation list`.
         long_name: String,
