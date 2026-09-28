@@ -2463,10 +2463,19 @@ pub enum Statement {
     Insert(Insert),
     /// ```sql
     /// INSTALL
+    /// FORCE INSTALL
+    /// INSTALL … FROM <repository>
     /// ```
     Install {
         /// Only for DuckDB
         extension_name: Ident,
+        /// `FORCE INSTALL` overwrites an already-installed extension instead
+        /// of leaving it in place. DuckDB only.
+        force: bool,
+        /// The `FROM <repository>` clause: a repository alias (`core`,
+        /// `community`, `core_nightly`, …) or a custom repository URL.
+        /// DuckDB only. See <https://duckdb.org/docs/stable/extensions/extension_repositories.html>.
+        repository: Option<InstallRepository>,
     },
     /// ```sql
     /// LOAD
@@ -2936,6 +2945,7 @@ pub enum Statement {
     /// ```sql
     /// SET <variable> = expression;
     /// SET (variable[, ...]) = (expression[, ...]);
+    /// SET VARIABLE <variable> = expression;  -- DuckDB only
     /// ```
     ///
     /// Note: this is not a standard SQL statement, but it is supported by at
@@ -2946,6 +2956,12 @@ pub enum Statement {
         hivevar: bool,
         variables: OneOrManyWithParens<ObjectName>,
         value: Vec<Expr>,
+        /// DuckDB's `SET VARIABLE <name> = <expr>` sets a session-scoped
+        /// named value read back with `getvariable(name)` — a distinct
+        /// statement from `SET <config_option> = <value>`, which configures
+        /// the engine itself, though both parse to this same variant. DuckDB
+        /// and Generic dialects only; `false` for every other `SET` form.
+        is_variable: bool,
     },
     /// ```sql
     /// SET TIME ZONE <value>
@@ -3491,11 +3507,23 @@ pub enum Statement {
     },
     /// ```sql
     /// PRAGMA <schema-name>.<pragma-name> = <pragma-value>
+    /// PRAGMA <schema-name>.<pragma-name>(<pragma-value>)
+    /// PRAGMA <schema-name>.<pragma-name>(<arg>[, <arg> ...])
     /// ```
     Pragma {
         name: ObjectName,
+        /// The classic single-value forms above (`= value`, `(value)`, or a
+        /// bare name) — untouched by the addition below, so every PRAGMA
+        /// that already parsed keeps the exact same fields it always had.
         value: Option<Value>,
         is_eq: bool,
+        /// DuckDB's PRAGMA is also a function call and accepts several
+        /// positional arguments and/or named ones (`overwrite = 1`), e.g.
+        /// `PRAGMA create_fts_index('docs', 'order_id', 'body', overwrite = 1)`.
+        /// Empty for the classic forms above, which stay on `value`/`is_eq`;
+        /// populated only when the parenthesized form holds more than one
+        /// argument or a named one. DuckDB/Generic dialects only.
+        args: Vec<FunctionArg>,
     },
     /// ```sql
     /// LOCK TABLES <table_name> [READ [LOCAL] | [LOW_PRIORITY] WRITE]
@@ -3897,7 +3925,18 @@ impl fmt::Display for Statement {
             Statement::Insert(insert) => write!(f, "{insert}"),
             Statement::Install {
                 extension_name: name,
-            } => write!(f, "INSTALL {name}"),
+                force,
+                repository,
+            } => {
+                if *force {
+                    write!(f, "FORCE ")?;
+                }
+                write!(f, "INSTALL {name}")?;
+                if let Some(repository) = repository {
+                    write!(f, " FROM {repository}")?;
+                }
+                Ok(())
+            }
 
             Statement::Load {
                 extension_name: name,
@@ -4658,8 +4697,12 @@ impl fmt::Display for Statement {
                 variables,
                 hivevar,
                 value,
+                is_variable,
             } => {
                 f.write_str("SET ")?;
+                if *is_variable {
+                    f.write_str("VARIABLE ")?;
+                }
                 if *local {
                     f.write_str("LOCAL ")?;
                 }
@@ -5249,9 +5292,16 @@ impl fmt::Display for Statement {
             } => {
                 write!(f, "CREATE TYPE {name} AS {representation}")
             }
-            Statement::Pragma { name, value, is_eq } => {
+            Statement::Pragma {
+                name,
+                value,
+                is_eq,
+                args,
+            } => {
                 write!(f, "PRAGMA {name}")?;
-                if value.is_some() {
+                if !args.is_empty() {
+                    write!(f, "({})", display_comma_separated(args))?;
+                } else if value.is_some() {
                     let val = value.as_ref().unwrap();
                     if *is_eq {
                         write!(f, " = {val}")?;
@@ -7244,15 +7294,26 @@ pub enum CopyOption {
     /// FREEZE \[ boolean \]
     Freeze(bool),
     /// DELIMITER 'delimiter_character'
-    Delimiter(char),
+    ///
+    /// DuckDB additionally accepts `DELIMITER ''`, disabling the delimiter;
+    /// `None` is that case, everywhere the empty string is otherwise refused
+    /// as "not exactly one character" (unchanged for every other dialect —
+    /// see `Parser::parse_copy_option_char`).
+    Delimiter(Option<char>),
     /// NULL 'null_string'
     Null(String),
     /// HEADER \[ boolean \]
     Header(bool),
     /// QUOTE 'quote_character'
-    Quote(char),
+    ///
+    /// DuckDB additionally accepts `QUOTE ''`, disabling quoting; `None` is
+    /// that case. See [`CopyOption::Delimiter`].
+    Quote(Option<char>),
     /// ESCAPE 'escape_character'
-    Escape(char),
+    ///
+    /// DuckDB additionally accepts `ESCAPE ''`, disabling escaping; `None` is
+    /// that case. See [`CopyOption::Delimiter`].
+    Escape(Option<char>),
     /// FORCE_QUOTE { ( column_name [, ...] ) | * }
     ForceQuote(Vec<Ident>),
     /// FORCE_NOT_NULL ( column_name [, ...] )
@@ -7280,12 +7341,15 @@ impl fmt::Display for CopyOption {
             Format(name) => write!(f, "FORMAT {name}"),
             Freeze(true) => write!(f, "FREEZE"),
             Freeze(false) => write!(f, "FREEZE FALSE"),
-            Delimiter(char) => write!(f, "DELIMITER '{char}'"),
+            Delimiter(Some(char)) => write!(f, "DELIMITER '{char}'"),
+            Delimiter(None) => write!(f, "DELIMITER ''"),
             Null(string) => write!(f, "NULL '{}'", value::escape_single_quote_string(string)),
             Header(true) => write!(f, "HEADER"),
             Header(false) => write!(f, "HEADER FALSE"),
-            Quote(char) => write!(f, "QUOTE '{char}'"),
-            Escape(char) => write!(f, "ESCAPE '{char}'"),
+            Quote(Some(char)) => write!(f, "QUOTE '{char}'"),
+            Quote(None) => write!(f, "QUOTE ''"),
+            Escape(Some(char)) => write!(f, "ESCAPE '{char}'"),
+            Escape(None) => write!(f, "ESCAPE ''"),
             ForceQuote(columns) => write!(f, "FORCE_QUOTE ({})", display_comma_separated(columns)),
             ForceNotNull(columns) => {
                 write!(f, "FORCE_NOT_NULL ({})", display_comma_separated(columns))
@@ -7294,6 +7358,30 @@ impl fmt::Display for CopyOption {
             Encoding(name) => write!(f, "ENCODING '{}'", value::escape_single_quote_string(name)),
             DuckDbOption { name, value: Some(value) } => write!(f, "{name} {value}"),
             DuckDbOption { name, value: None } => write!(f, "{name}"),
+        }
+    }
+}
+
+/// The `FROM <repository>` clause of an `INSTALL`/`FORCE INSTALL` (DuckDB
+/// only): a repository alias — `core`, `community`, `core_nightly`, or a
+/// custom name a `duckdb_repository` call registered — parsed as a bare
+/// identifier, or a repository URL, parsed as a string literal.
+/// See <https://duckdb.org/docs/stable/extensions/extension_repositories.html>.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum InstallRepository {
+    Alias(Ident),
+    Url(String),
+}
+
+impl fmt::Display for InstallRepository {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            InstallRepository::Alias(ident) => write!(f, "{ident}"),
+            InstallRepository::Url(url) => {
+                write!(f, "'{}'", value::escape_single_quote_string(url))
+            }
         }
     }
 }

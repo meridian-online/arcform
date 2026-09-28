@@ -605,7 +605,17 @@ impl<'a> Parser<'a> {
                 Keyword::RENAME => self.parse_rename(),
                 // `INSTALL` is duckdb specific https://duckdb.org/docs/extensions/overview
                 Keyword::INSTALL if dialect_of!(self is DuckDbDialect | GenericDialect) => {
-                    self.parse_install()
+                    self.parse_install(false)
+                }
+                // `FORCE INSTALL` — DuckDB's re-download variant. The `FORCE`
+                // keyword already exists for MySQL index hints, so this only
+                // claims it when it is immediately followed by `INSTALL`.
+                Keyword::FORCE
+                    if dialect_of!(self is DuckDbDialect | GenericDialect)
+                        && self.peek_keyword(Keyword::INSTALL) =>
+                {
+                    self.expect_keyword_is(Keyword::INSTALL)?;
+                    self.parse_install(true)
                 }
                 Keyword::LOAD => self.parse_load(),
                 // `OPTIMIZE` is clickhouse specific https://clickhouse.tech/docs/en/sql-reference/statements/optimize/
@@ -8505,14 +8515,14 @@ impl<'a> Parser<'a> {
                 self.parse_one_of_keywords(&[Keyword::TRUE, Keyword::FALSE]),
                 Some(Keyword::FALSE)
             )),
-            Some(Keyword::DELIMITER) => CopyOption::Delimiter(self.parse_literal_char()?),
+            Some(Keyword::DELIMITER) => CopyOption::Delimiter(self.parse_copy_option_char()?),
             Some(Keyword::NULL) => CopyOption::Null(self.parse_literal_string()?),
             Some(Keyword::HEADER) => CopyOption::Header(!matches!(
                 self.parse_one_of_keywords(&[Keyword::TRUE, Keyword::FALSE]),
                 Some(Keyword::FALSE)
             )),
-            Some(Keyword::QUOTE) => CopyOption::Quote(self.parse_literal_char()?),
-            Some(Keyword::ESCAPE) => CopyOption::Escape(self.parse_literal_char()?),
+            Some(Keyword::QUOTE) => CopyOption::Quote(self.parse_copy_option_char()?),
+            Some(Keyword::ESCAPE) => CopyOption::Escape(self.parse_copy_option_char()?),
             Some(Keyword::FORCE_QUOTE) => {
                 CopyOption::ForceQuote(self.parse_parenthesized_column_list(Mandatory, false)?)
             }
@@ -8618,6 +8628,28 @@ impl<'a> Parser<'a> {
             return parser_err!(format!("Expect a char, found {s:?}"), loc);
         }
         Ok(s.chars().next().unwrap())
+    }
+
+    /// The `DELIMITER`/`QUOTE`/`ESCAPE` value inside a `COPY … (option …)`
+    /// list: exactly one character on every dialect, matching
+    /// [`Self::parse_literal_char`] — except on DuckDB/Generic, which also
+    /// accept the empty string (`QUOTE ''`) to disable that option, returned
+    /// here as `None`. Every other dialect (PostgreSQL among them) keeps
+    /// refusing the empty string exactly as [`Self::parse_literal_char`]
+    /// always has.
+    fn parse_copy_option_char(&mut self) -> Result<Option<char>, ParserError> {
+        let s = self.parse_literal_string()?;
+        if s.is_empty() && dialect_of!(self is DuckDbDialect | GenericDialect) {
+            return Ok(None);
+        }
+        if s.len() != 1 {
+            let loc = self
+                .tokens
+                .get(self.index - 1)
+                .map_or(Location { line: 0, column: 0 }, |t| t.span.start);
+            return parser_err!(format!("Expect a char, found {s:?}"), loc);
+        }
+        Ok(Some(s.chars().next().unwrap()))
     }
 
     /// Parse a tab separated values in
@@ -11009,6 +11041,30 @@ impl<'a> Parser<'a> {
             return Ok(set_role_stmt);
         }
 
+        // DuckDB's `SET VARIABLE <name> = <expr>` sets a session-scoped named
+        // value read back with `getvariable(name)`, distinct from the
+        // `SET <config_option> = <value>` form below that configures the
+        // engine itself. `VARIABLE` is a non-reserved keyword (see
+        // `keywords.rs`), so on every other dialect this is unclaimed and
+        // `variables` below parses it as the plain object name it always
+        // has — `SET VARIABLE cutoff = 1` on PostgreSQL still fails the same
+        // way it did before this addition, at the next token instead of `=`
+        // or `TO` ("Expected: equals sign or TO").
+        if dialect_of!(self is DuckDbDialect | GenericDialect)
+            && self.parse_keyword(Keyword::VARIABLE)
+        {
+            let name = self.parse_identifier()?;
+            self.expect_token(&Token::Eq)?;
+            let value = self.parse_expr()?;
+            return Ok(Statement::SetVariable {
+                local: modifier == Some(Keyword::LOCAL),
+                hivevar: Some(Keyword::HIVEVAR) == modifier,
+                variables: OneOrManyWithParens::One(ObjectName::from(vec![name])),
+                value: vec![value],
+                is_variable: true,
+            });
+        }
+
         let variables = if self.parse_keywords(&[Keyword::TIME, Keyword::ZONE]) {
             OneOrManyWithParens::One(ObjectName::from(vec!["TIMEZONE".into()]))
         } else if self.dialect.supports_parenthesized_set_variables()
@@ -11076,6 +11132,7 @@ impl<'a> Parser<'a> {
                     hivevar: Some(Keyword::HIVEVAR) == modifier,
                     variables,
                     value: values,
+                    is_variable: false,
                 });
             }
         }
@@ -14363,36 +14420,87 @@ impl<'a> Parser<'a> {
     }
 
     // PRAGMA [schema-name '.'] pragma-name [('=' pragma-value) | '(' pragma-value ')']
+    // DuckDB additionally accepts a function-call argument list inside the
+    // parens: several positional values and/or `name = value` named ones,
+    // e.g. `PRAGMA create_fts_index('docs', 'order_id', 'body', overwrite = 1)`.
     pub fn parse_pragma(&mut self) -> Result<Statement, ParserError> {
         let name = self.parse_object_name(false)?;
         if self.consume_token(&Token::LParen) {
-            let value = self.parse_pragma_value()?;
-            self.expect_token(&Token::RParen)?;
-            Ok(Statement::Pragma {
-                name,
-                value: Some(value),
-                is_eq: false,
-            })
+            // The classic single-value form first — `maybe_parse` backtracks
+            // on any error, so a second argument (which trips the `RParen`
+            // check below since a comma sits there instead) or a named one
+            // (which `parse_pragma_value` doesn't accept at all) both fall
+            // through untouched, and every PRAGMA that already parsed this
+            // way keeps the exact same `value`/`is_eq` fields it always had.
+            if let Some(value) = self.maybe_parse(|parser| {
+                let value = parser.parse_pragma_value()?;
+                parser.expect_token(&Token::RParen)?;
+                Ok(value)
+            })? {
+                return Ok(Statement::Pragma {
+                    name,
+                    value: Some(value),
+                    is_eq: false,
+                    args: vec![],
+                });
+            }
+
+            if dialect_of!(self is DuckDbDialect | GenericDialect) {
+                let args = self.parse_comma_separated(Parser::parse_function_args)?;
+                self.expect_token(&Token::RParen)?;
+                return Ok(Statement::Pragma {
+                    name,
+                    value: None,
+                    is_eq: false,
+                    args,
+                });
+            }
+
+            self.expected("pragma value", self.peek_token())
         } else if self.consume_token(&Token::Eq) {
             Ok(Statement::Pragma {
                 name,
                 value: Some(self.parse_pragma_value()?),
                 is_eq: true,
+                args: vec![],
             })
         } else {
             Ok(Statement::Pragma {
                 name,
                 value: None,
                 is_eq: false,
+                args: vec![],
             })
         }
     }
 
-    /// `INSTALL [extension_name]`
-    pub fn parse_install(&mut self) -> Result<Statement, ParserError> {
+    /// `[FORCE] INSTALL extension_name [FROM repository]`
+    pub fn parse_install(&mut self, force: bool) -> Result<Statement, ParserError> {
         let extension_name = self.parse_identifier()?;
+        let repository = if self.parse_keyword(Keyword::FROM) {
+            Some(self.parse_install_repository()?)
+        } else {
+            None
+        };
 
-        Ok(Statement::Install { extension_name })
+        Ok(Statement::Install {
+            extension_name,
+            force,
+            repository,
+        })
+    }
+
+    /// The `<repository>` in `INSTALL … FROM <repository>`: a bare
+    /// identifier (`core`, `community`, a registered custom name), or a
+    /// quoted URL. A leading quote is the only signal that distinguishes
+    /// them, so peek rather than try one and backtrack.
+    fn parse_install_repository(&mut self) -> Result<InstallRepository, ParserError> {
+        match self.peek_token().token {
+            Token::SingleQuotedString(_) | Token::DoubleQuotedString(_) => {
+                Ok(InstallRepository::Url(self.parse_literal_string()?))
+            }
+            _ => Ok(InstallRepository::Alias(self.parse_identifier()?)),
+        }
     }
 
     /// Parse a SQL LOAD statement
