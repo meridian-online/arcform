@@ -255,6 +255,8 @@ Rationale for each change is recorded in the project's design notes and commit h
   accepts it and reddens — and, running everywhere and needing nothing, a check that
   its own comparison predicate still tells two vectors apart.
 
+- **A SQL step that calls a table function whose arguments arc does not read draws a warning, and the function's name is no longer recorded as a table.** A table-valued function called with a string or a quoted identifier among its arguments, other than the file readers, `glob` and the row-generators that the "table function is recorded by what it reads" entry in this section names, names tables, files or queries — `mlpack_random_forest_train("X", "Y", "params", "model")` reads three tables and writes one, `query('SELECT …')` reads whatever the query reads — and arc has no signature to say which. Until now such a call recorded the function's own name as a table, which is no table and gave the step's real inputs no staleness. It now records nothing under that name, and `arc run` prints one warning per function and step that names both and says `depends_on:` and `produces:` declare what the step reads and writes. A step that declares either, or that an `assets:` entry says produces something, draws no warning and reads and produces what it declared. A call with no string and no quoted identifier — `range(10)`, a table macro such as `recent()` — is unchanged: no warning, and the macro still records its own name. `query(...)` and `query_table(...)`, which that entry says record their own name, now draw the warning.
+
 ### Added
 
 - **`datapackage_describe@1.1.0` passes declared column types to finetype through a
