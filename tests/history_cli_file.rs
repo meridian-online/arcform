@@ -367,3 +367,63 @@ fn help_names_the_file_argument() {
         );
     }
 }
+
+// Refusals: an id one history holds is not found in another's, and a path
+// that does not exist is refused. Each exits nonzero with the reason on
+// stderr, and a refused restore writes nothing.
+#[test]
+fn what_a_history_does_not_hold_is_refused() {
+    let fx = setup();
+    let spec_before = fs::read(fx.dir.join(MANIFEST_FILENAME)).unwrap();
+    let a_before = fs::read(&fx.a).unwrap();
+    let spec_id = fx.spec_ids[0].as_str();
+    let a_id = fx.a_ids[0].as_str();
+
+    for args in [
+        &["history", "show", spec_id, "--file", "panels/a.yaml"][..],
+        &["history", "show", a_id],
+        &["history", "restore", spec_id, "--file", "panels/a.yaml"],
+        &["history", "restore", a_id],
+        &["history", "list", "--file", "missing/a.yaml"],
+        &["history", "list", "--dir", "missing"],
+    ] {
+        let out = fx.arc_in(&fx.dir, args);
+        assert_ne!(out.status.code(), Some(0), "arc {args:?} was not refused");
+        assert!(!out.stderr.is_empty(), "arc {args:?} gave no reason");
+    }
+    assert_eq!(
+        fs::read(fx.dir.join(MANIFEST_FILENAME)).unwrap(),
+        spec_before
+    );
+    assert_eq!(fs::read(&fx.a).unwrap(), a_before);
+}
+
+// A show whose text cannot be written fails rather than exiting as though it
+// printed: the pipe's reader is closed before arc writes a byte.
+#[test]
+fn show_to_a_closed_pipe_is_not_reported_done() {
+    let fx = setup();
+    for args in [
+        &[
+            "history",
+            "show",
+            fx.a_ids[0].as_str(),
+            "--file",
+            "panels/a.yaml",
+        ][..],
+        &["history", "show", fx.spec_ids[0].as_str()],
+    ] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let status = Command::new(env!("CARGO_BIN_EXE_arc"))
+            .current_dir(&fx.dir)
+            .env("ARCFORM_HISTORY_DIR", fx.history.root())
+            .env_remove("ARCFORM_VERBOSE")
+            .args(args)
+            .stdout(writer)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("spawn arc");
+        assert_ne!(status.code(), Some(0), "arc {args:?} exited zero");
+    }
+}
