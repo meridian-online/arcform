@@ -49,10 +49,9 @@ pub(crate) struct TableName {
 
 impl fmt::Display for TableName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for part in [&self.catalog, &self.schema].into_iter().flatten() {
-            write!(f, "{part}.")?;
-        }
-        f.write_str(&self.name)
+        let parts = [&self.catalog, &self.schema].into_iter().flatten();
+        let parts: Vec<&str> = parts.chain([&self.name]).map(String::as_str).collect();
+        f.write_str(&parts.join("."))
     }
 }
 
@@ -359,7 +358,10 @@ fn read_step_with(ask: &mut dyn Ask, sql: &str) -> Result<StepReading, Refusal> 
 /// The major version in `v2.0.0-alpha43569`.
 fn major(version: &str) -> Option<u64> {
     let version = version.strip_prefix('v').unwrap_or(version);
-    version.split('.').next()?.parse().ok()
+    version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse().ok())
 }
 
 /// One statement's text, and its tokens other than comments, their starts made
@@ -436,7 +438,8 @@ fn frame(piece: &Piece) -> Frame {
     } else if w.eat("set") {
         set(&mut w)
     } else if w.eat("force") {
-        (w.is(0, "install") || w.is(0, "checkpoint")).then(Frame::no_data)
+        // `FORCE INSTALL` and `FORCE CHECKPOINT`, the two statements that open with it.
+        Some(Frame::no_data())
     } else {
         NO_DATA.iter().any(|kw| w.is(0, kw)).then(Frame::no_data)
     };
@@ -488,15 +491,9 @@ fn create(w: &mut Words) -> Option<Frame> {
     w.eat_all(&["if", "not", "exists"]);
     let name = w.name()?;
     if w.is(0, "(") {
-        w.group()?;
+        w.group();
     }
-    let query = if w.eat("as") {
-        Some(w.rest().to_string())
-    } else if form == Form::CreateView {
-        return None;
-    } else {
-        None
-    };
+    let query = w.eat("as").then(|| w.rest().to_string());
     Some(Frame {
         form,
         reads: Vec::new(),
@@ -516,14 +513,14 @@ fn insert(w: &mut Words) -> Option<Frame> {
     }
     let name = w.name()?;
     if w.eat("as") {
-        w.ident()?;
+        let _alias = w.ident();
     }
     // A group opening with a query is the query; any other group lists columns.
     let opens_query = ["select", "with", "from", "values", "("]
         .iter()
         .any(|kw| w.is(1, kw));
     if w.is(0, "(") && !opens_query {
-        w.group()?;
+        w.group();
     }
     if w.eat("by") && !(w.eat("name") || w.eat("position")) {
         return None;
@@ -541,11 +538,11 @@ fn insert(w: &mut Words) -> Option<Frame> {
     })
 }
 
-/// `COPY (query) TO 'file'`, `COPY name [(cols)] TO 'file'`, `COPY name [(cols)] FROM
-/// 'file'`
+/// `COPY name [(cols)] TO 'file'`, `COPY name [(cols)] FROM 'file'`, `COPY (query) TO
+/// 'file'`. A target DuckDB takes as a bare name, `COPY t TO out`, is not framed.
 fn copy(w: &mut Words) -> Option<Frame> {
-    if w.is(0, "(") {
-        let inner = w.group()?;
+    let Some(name) = w.name() else {
+        let inner = w.group();
         if !w.eat("to") {
             return None;
         }
@@ -556,10 +553,10 @@ fn copy(w: &mut Words) -> Option<Frame> {
             produces: vec![Relation::File(file)],
             query: Some(w.text[inner].to_string()),
         });
-    }
-    let table = Relation::Table(w.name()?);
+    };
+    let table = Relation::Table(name);
     if w.is(0, "(") {
-        w.group()?;
+        w.group();
     }
     let (reads, produces) = if w.eat("to") {
         (table, Relation::File(w.string()?))
@@ -577,15 +574,18 @@ fn copy(w: &mut Words) -> Option<Frame> {
 }
 
 /// `PIVOT name|'file'|(query) ON …`. DuckDB gives no tree for a `PIVOT` whose columns
-/// it would have to read the data to know.
+/// it would have to read the data to know. A source that calls a function is not framed.
 fn pivot(w: &mut Words) -> Option<Frame> {
-    let (reads, query) = if w.is(0, "(") {
-        let inner = w.group()?;
-        (Vec::new(), Some(w.text[inner].to_string()))
+    let (reads, query) = if let Some(name) = w.name() {
+        if w.is(0, "(") {
+            return None;
+        }
+        (vec![Relation::Table(name)], None)
     } else if let Some(file) = w.string() {
         (vec![Relation::File(file)], None)
     } else {
-        (vec![Relation::Table(w.name()?)], None)
+        let inner = w.group();
+        (Vec::new(), Some(w.text[inner].to_string()))
     };
     Some(Frame {
         form: Form::Pivot,
@@ -601,7 +601,7 @@ fn set(w: &mut Words) -> Option<Frame> {
     if !w.eat("variable") {
         return Some(Frame::no_data());
     }
-    w.ident()?;
+    let _name = w.ident();
     if !(w.eat("=") || w.eat("to")) {
         return None;
     }
@@ -677,13 +677,12 @@ impl Words<'_> {
 
     /// A name, bare or double-quoted.
     fn ident(&mut self) -> Option<String> {
-        let word = self.word(0)?;
-        let name = if let Some(quoted) = word.strip_prefix('"').and_then(|w| w.strip_suffix('"')) {
-            quoted.replace("\"\"", "\"")
-        } else if word.starts_with(|c: char| c.is_alphabetic() || c == '_') {
-            word.to_string()
-        } else {
-            return None;
+        let name = match self.word(0) {
+            Some(word) if word.starts_with('"') => word[1..word.len() - 1].replace("\"\"", "\""),
+            Some(word) if word.starts_with(|c: char| c.is_alphabetic() || c == '_') => {
+                word.to_string()
+            }
+            _ => return None,
         };
         self.at += 1;
         Some(name)
@@ -693,47 +692,51 @@ impl Words<'_> {
     fn name(&mut self) -> Option<TableName> {
         let mut parts = vec![self.ident()?];
         while self.eat(".") {
-            parts.push(self.ident()?);
+            parts.extend(self.ident());
         }
-        let name = parts.pop()?;
-        let schema = parts.pop();
-        let catalog = parts.pop();
-        parts.is_empty().then_some(TableName {
+        let part = |p: &String| Some(p.clone());
+        let (catalog, schema, name) = match parts.as_slice() {
+            [name] => (None, None, name),
+            [schema, name] => (None, part(schema), name),
+            [catalog, schema, name] => (part(catalog), part(schema), name),
+            _ => return None,
+        };
+        Some(TableName {
             catalog,
             schema,
-            name,
+            name: name.clone(),
         })
     }
 
     /// A single-quoted string, without its quotes.
     fn string(&mut self) -> Option<String> {
-        let word = self.word(0)?;
-        let inner = word
-            .strip_prefix('\'')?
-            .strip_suffix('\'')?
-            .replace("''", "'");
+        let value = match self.word(0) {
+            Some(word) if word.starts_with('\'') => word[1..word.len() - 1].replace("''", "'"),
+            _ => return None,
+        };
         self.at += 1;
-        Some(inner)
+        Some(value)
     }
 
-    /// Steps past a parenthesised group and returns the range of text inside it.
-    fn group(&mut self) -> Option<Range<usize>> {
-        let open = self.tokens.get(self.at)?.start;
+    /// Steps past the parenthesised group at the cursor and returns the text inside it.
+    /// A frame is used only for a statement DuckDB parsed, where the group closes.
+    fn group(&mut self) -> Range<usize> {
+        let open = self.offset();
         let mut depth = 0usize;
         while let Some(token) = self.tokens.get(self.at) {
             self.at += 1;
             match token.word.as_str() {
                 "(" => depth += 1,
                 ")" => {
-                    depth -= 1;
+                    depth = depth.saturating_sub(1);
                     if depth == 0 {
-                        return Some(open + 1..token.start);
+                        return open + 1..token.start;
                     }
                 }
                 _ => {}
             }
         }
-        None
+        open + 1..self.text.len()
     }
 }
 
@@ -997,13 +1000,13 @@ mod tests {
     const RECORDED: &str = r##"{"version":"v2.0.0-alpha43569",
 "tokens":{
 "-- nothing but a comment\n":[{"start":0,"token_type":"COMMENT","word":"-- nothing but a comment\n"}],
-"COPY s.t (a) FROM 'in.csv' (HEADER);\nCOPY t TO 'it''s.csv';\nCOPY FROM DATABASE a TO b;":[{"start":0,"token_type":"KEYWORD","word":"COPY"},{"start":5,"token_type":"SCHEMA_NAME","word":"s"},{"start":6,"token_type":"NUMBER_LITERAL","word":"."},{"start":7,"token_type":"TABLE_NAME","word":"t"},{"start":9,"token_type":"OPERATOR","word":"("},{"start":10,"token_type":"IDENTIFIER","word":"a"},{"start":11,"token_type":"OPERATOR","word":")"},{"start":13,"token_type":"KEYWORD","word":"FROM"},{"start":18,"token_type":"STRING_LITERAL","word":"'in.csv'"},{"start":27,"token_type":"OPERATOR","word":"("},{"start":28,"token_type":"IDENTIFIER","word":"HEADER"},{"start":34,"token_type":"OPERATOR","word":")"},{"start":35,"token_type":"TERMINATOR","word":";"},{"start":37,"token_type":"KEYWORD","word":"COPY"},{"start":42,"token_type":"TABLE_NAME","word":"t"},{"start":44,"token_type":"KEYWORD","word":"TO"},{"start":47,"token_type":"STRING_LITERAL","word":"'it''s.csv'"},{"start":58,"token_type":"TERMINATOR","word":";"},{"start":60,"token_type":"KEYWORD","word":"COPY"},{"start":65,"token_type":"KEYWORD","word":"FROM"},{"start":70,"token_type":"KEYWORD","word":"DATABASE"},{"start":79,"token_type":"IDENTIFIER","word":"a"},{"start":81,"token_type":"KEYWORD","word":"TO"},{"start":84,"token_type":"IDENTIFIER","word":"b"},{"start":85,"token_type":"TERMINATOR","word":";"}],
+"COPY s.t (a) FROM 'in.csv' (HEADER);\nCOPY t TO 'it''s.csv';\nCOPY FROM DATABASE a TO b;\nCOPY (SELECT * FROM a) TO out_csv;\nCOPY t TO out_csv;":[{"start":0,"token_type":"KEYWORD","word":"COPY"},{"start":5,"token_type":"SCHEMA_NAME","word":"s"},{"start":6,"token_type":"NUMBER_LITERAL","word":"."},{"start":7,"token_type":"TABLE_NAME","word":"t"},{"start":9,"token_type":"OPERATOR","word":"("},{"start":10,"token_type":"IDENTIFIER","word":"a"},{"start":11,"token_type":"OPERATOR","word":")"},{"start":13,"token_type":"KEYWORD","word":"FROM"},{"start":18,"token_type":"STRING_LITERAL","word":"'in.csv'"},{"start":27,"token_type":"OPERATOR","word":"("},{"start":28,"token_type":"IDENTIFIER","word":"HEADER"},{"start":34,"token_type":"OPERATOR","word":")"},{"start":35,"token_type":"TERMINATOR","word":";"},{"start":37,"token_type":"KEYWORD","word":"COPY"},{"start":42,"token_type":"TABLE_NAME","word":"t"},{"start":44,"token_type":"KEYWORD","word":"TO"},{"start":47,"token_type":"STRING_LITERAL","word":"'it''s.csv'"},{"start":58,"token_type":"TERMINATOR","word":";"},{"start":60,"token_type":"KEYWORD","word":"COPY"},{"start":65,"token_type":"KEYWORD","word":"FROM"},{"start":70,"token_type":"KEYWORD","word":"DATABASE"},{"start":79,"token_type":"IDENTIFIER","word":"a"},{"start":81,"token_type":"KEYWORD","word":"TO"},{"start":84,"token_type":"IDENTIFIER","word":"b"},{"start":85,"token_type":"TERMINATOR","word":";"},{"start":87,"token_type":"KEYWORD","word":"COPY"},{"start":92,"token_type":"OPERATOR","word":"("},{"start":93,"token_type":"KEYWORD","word":"SELECT"},{"start":100,"token_type":"OPERATOR","word":"*"},{"start":102,"token_type":"KEYWORD","word":"FROM"},{"start":107,"token_type":"TABLE_NAME","word":"a"},{"start":108,"token_type":"OPERATOR","word":")"},{"start":110,"token_type":"KEYWORD","word":"TO"},{"start":113,"token_type":"IDENTIFIER","word":"out_csv"},{"start":120,"token_type":"TERMINATOR","word":";"},{"start":122,"token_type":"KEYWORD","word":"COPY"},{"start":127,"token_type":"TABLE_NAME","word":"t"},{"start":129,"token_type":"KEYWORD","word":"TO"},{"start":132,"token_type":"IDENTIFIER","word":"out_csv"},{"start":139,"token_type":"TERMINATOR","word":";"}],
 "CREATE OR REPLACE TEMP TABLE \"R \"\"x\"\"\" AS SELECT * FROM a;\nCREATE TABLE IF NOT EXISTS db.s.r2 (a INT);\nCREATE VIEW v (x) AS SELECT * FROM b;\nCREATE TEMPORARY VIEW w AS FROM c;\nCREATE MACRO m() AS 1;":[{"start":0,"token_type":"KEYWORD","word":"CREATE"},{"start":7,"token_type":"KEYWORD","word":"OR"},{"start":10,"token_type":"KEYWORD","word":"REPLACE"},{"start":18,"token_type":"KEYWORD","word":"TEMP"},{"start":23,"token_type":"KEYWORD","word":"TABLE"},{"start":29,"token_type":"IDENTIFIER","word":"\"R \"\"x\"\"\""},{"start":39,"token_type":"KEYWORD","word":"AS"},{"start":42,"token_type":"KEYWORD","word":"SELECT"},{"start":49,"token_type":"OPERATOR","word":"*"},{"start":51,"token_type":"KEYWORD","word":"FROM"},{"start":56,"token_type":"TABLE_NAME","word":"a"},{"start":57,"token_type":"TERMINATOR","word":";"},{"start":59,"token_type":"KEYWORD","word":"CREATE"},{"start":66,"token_type":"KEYWORD","word":"TABLE"},{"start":72,"token_type":"KEYWORD","word":"IF"},{"start":75,"token_type":"KEYWORD","word":"NOT"},{"start":79,"token_type":"KEYWORD","word":"EXISTS"},{"start":86,"token_type":"CATALOG_NAME","word":"db"},{"start":88,"token_type":"NUMBER_LITERAL","word":"."},{"start":89,"token_type":"SCHEMA_NAME","word":"s"},{"start":90,"token_type":"NUMBER_LITERAL","word":"."},{"start":91,"token_type":"IDENTIFIER","word":"r2"},{"start":94,"token_type":"OPERATOR","word":"("},{"start":95,"token_type":"IDENTIFIER","word":"a"},{"start":97,"token_type":"KEYWORD","word":"INT"},{"start":100,"token_type":"OPERATOR","word":")"},{"start":101,"token_type":"TERMINATOR","word":";"},{"start":103,"token_type":"KEYWORD","word":"CREATE"},{"start":110,"token_type":"KEYWORD","word":"VIEW"},{"start":115,"token_type":"IDENTIFIER","word":"v"},{"start":117,"token_type":"OPERATOR","word":"("},{"start":118,"token_type":"IDENTIFIER","word":"x"},{"start":119,"token_type":"OPERATOR","word":")"},{"start":121,"token_type":"KEYWORD","word":"AS"},{"start":124,"token_type":"KEYWORD","word":"SELECT"},{"start":131,"token_type":"OPERATOR","word":"*"},{"start":133,"token_type":"KEYWORD","word":"FROM"},{"start":138,"token_type":"TABLE_NAME","word":"b"},{"start":139,"token_type":"TERMINATOR","word":";"},{"start":141,"token_type":"KEYWORD","word":"CREATE"},{"start":148,"token_type":"KEYWORD","word":"TEMPORARY"},{"start":158,"token_type":"KEYWORD","word":"VIEW"},{"start":163,"token_type":"IDENTIFIER","word":"w"},{"start":165,"token_type":"KEYWORD","word":"AS"},{"start":168,"token_type":"KEYWORD","word":"FROM"},{"start":173,"token_type":"TABLE_NAME","word":"c"},{"start":174,"token_type":"TERMINATOR","word":";"},{"start":176,"token_type":"KEYWORD","word":"CREATE"},{"start":183,"token_type":"KEYWORD","word":"MACRO"},{"start":189,"token_type":"IDENTIFIER","word":"m"},{"start":190,"token_type":"OPERATOR","word":"("},{"start":191,"token_type":"OPERATOR","word":")"},{"start":193,"token_type":"KEYWORD","word":"AS"},{"start":196,"token_type":"NUMBER_LITERAL","word":"1"},{"start":197,"token_type":"TERMINATOR","word":";"}],
 "CREATE TABLE r AS SELECT * FROM a JOIN b USING (k) WHERE x IN (SELECT x FROM c);":[{"start":0,"token_type":"KEYWORD","word":"CREATE"},{"start":7,"token_type":"KEYWORD","word":"TABLE"},{"start":13,"token_type":"IDENTIFIER","word":"r"},{"start":15,"token_type":"KEYWORD","word":"AS"},{"start":18,"token_type":"KEYWORD","word":"SELECT"},{"start":25,"token_type":"OPERATOR","word":"*"},{"start":27,"token_type":"KEYWORD","word":"FROM"},{"start":32,"token_type":"TABLE_NAME","word":"a"},{"start":34,"token_type":"KEYWORD","word":"JOIN"},{"start":39,"token_type":"TABLE_NAME","word":"b"},{"start":41,"token_type":"KEYWORD","word":"USING"},{"start":47,"token_type":"OPERATOR","word":"("},{"start":48,"token_type":"COLUMN_NAME","word":"k"},{"start":49,"token_type":"OPERATOR","word":")"},{"start":51,"token_type":"KEYWORD","word":"WHERE"},{"start":57,"token_type":"COLUMN_NAME","word":"x"},{"start":59,"token_type":"KEYWORD","word":"IN"},{"start":62,"token_type":"OPERATOR","word":"("},{"start":63,"token_type":"KEYWORD","word":"SELECT"},{"start":70,"token_type":"COLUMN_NAME","word":"x"},{"start":72,"token_type":"KEYWORD","word":"FROM"},{"start":77,"token_type":"TABLE_NAME","word":"c"},{"start":78,"token_type":"OPERATOR","word":")"},{"start":79,"token_type":"TERMINATOR","word":";"}],
 "INSERT INTO s.t AS x (a, b) SELECT * FROM a ON CONFLICT DO NOTHING RETURNING *;\nINSERT OR IGNORE INTO t BY NAME SELECT * FROM b RETURNING (SELECT 1 FROM z);\nINSERT INTO t (SELECT * FROM c);\nINSERT INTO t DEFAULT VALUES;\nINSERT OR REPLACE INTO t BY POSITION VALUES (1);":[{"start":0,"token_type":"KEYWORD","word":"INSERT"},{"start":7,"token_type":"KEYWORD","word":"INTO"},{"start":12,"token_type":"SCHEMA_NAME","word":"s"},{"start":13,"token_type":"NUMBER_LITERAL","word":"."},{"start":14,"token_type":"TABLE_NAME","word":"t"},{"start":16,"token_type":"KEYWORD","word":"AS"},{"start":19,"token_type":"IDENTIFIER","word":"x"},{"start":21,"token_type":"OPERATOR","word":"("},{"start":22,"token_type":"IDENTIFIER","word":"a"},{"start":23,"token_type":"OPERATOR","word":","},{"start":25,"token_type":"IDENTIFIER","word":"b"},{"start":26,"token_type":"OPERATOR","word":")"},{"start":28,"token_type":"KEYWORD","word":"SELECT"},{"start":35,"token_type":"OPERATOR","word":"*"},{"start":37,"token_type":"KEYWORD","word":"FROM"},{"start":42,"token_type":"TABLE_NAME","word":"a"},{"start":44,"token_type":"KEYWORD","word":"ON"},{"start":47,"token_type":"KEYWORD","word":"CONFLICT"},{"start":56,"token_type":"KEYWORD","word":"DO"},{"start":59,"token_type":"KEYWORD","word":"NOTHING"},{"start":67,"token_type":"KEYWORD","word":"RETURNING"},{"start":77,"token_type":"OPERATOR","word":"*"},{"start":78,"token_type":"TERMINATOR","word":";"},{"start":80,"token_type":"KEYWORD","word":"INSERT"},{"start":87,"token_type":"KEYWORD","word":"OR"},{"start":90,"token_type":"KEYWORD","word":"IGNORE"},{"start":97,"token_type":"KEYWORD","word":"INTO"},{"start":102,"token_type":"TABLE_NAME","word":"t"},{"start":104,"token_type":"KEYWORD","word":"BY"},{"start":107,"token_type":"KEYWORD","word":"NAME"},{"start":112,"token_type":"KEYWORD","word":"SELECT"},{"start":119,"token_type":"OPERATOR","word":"*"},{"start":121,"token_type":"KEYWORD","word":"FROM"},{"start":126,"token_type":"TABLE_NAME","word":"b"},{"start":128,"token_type":"KEYWORD","word":"RETURNING"},{"start":138,"token_type":"OPERATOR","word":"("},{"start":139,"token_type":"KEYWORD","word":"SELECT"},{"start":146,"token_type":"NUMBER_LITERAL","word":"1"},{"start":148,"token_type":"KEYWORD","word":"FROM"},{"start":153,"token_type":"TABLE_NAME","word":"z"},{"start":154,"token_type":"OPERATOR","word":")"},{"start":155,"token_type":"TERMINATOR","word":";"},{"start":157,"token_type":"KEYWORD","word":"INSERT"},{"start":164,"token_type":"KEYWORD","word":"INTO"},{"start":169,"token_type":"TABLE_NAME","word":"t"},{"start":171,"token_type":"OPERATOR","word":"("},{"start":172,"token_type":"KEYWORD","word":"SELECT"},{"start":179,"token_type":"OPERATOR","word":"*"},{"start":181,"token_type":"KEYWORD","word":"FROM"},{"start":186,"token_type":"TABLE_NAME","word":"c"},{"start":187,"token_type":"OPERATOR","word":")"},{"start":188,"token_type":"TERMINATOR","word":";"},{"start":190,"token_type":"KEYWORD","word":"INSERT"},{"start":197,"token_type":"KEYWORD","word":"INTO"},{"start":202,"token_type":"TABLE_NAME","word":"t"},{"start":204,"token_type":"KEYWORD","word":"DEFAULT"},{"start":212,"token_type":"KEYWORD","word":"VALUES"},{"start":218,"token_type":"TERMINATOR","word":";"},{"start":220,"token_type":"KEYWORD","word":"INSERT"},{"start":227,"token_type":"KEYWORD","word":"OR"},{"start":230,"token_type":"KEYWORD","word":"REPLACE"},{"start":238,"token_type":"KEYWORD","word":"INTO"},{"start":243,"token_type":"TABLE_NAME","word":"t"},{"start":245,"token_type":"KEYWORD","word":"BY"},{"start":248,"token_type":"KEYWORD","word":"POSITION"},{"start":257,"token_type":"KEYWORD","word":"VALUES"},{"start":264,"token_type":"OPERATOR","word":"("},{"start":265,"token_type":"NUMBER_LITERAL","word":"1"},{"start":266,"token_type":"OPERATOR","word":")"},{"start":267,"token_type":"TERMINATOR","word":";"}],
 "INSERT INTO t SELECT * FROM a;\nCREATE VIEW v AS SELECT * FROM a;\nCOPY (SELECT * FROM a WHERE x > 1) TO 'out.csv' (HEADER);\nCOPY a TO 'out.csv' (HEADER);\nCOPY t FROM 'in.csv';":[{"start":0,"token_type":"KEYWORD","word":"INSERT"},{"start":7,"token_type":"KEYWORD","word":"INTO"},{"start":12,"token_type":"TABLE_NAME","word":"t"},{"start":14,"token_type":"KEYWORD","word":"SELECT"},{"start":21,"token_type":"OPERATOR","word":"*"},{"start":23,"token_type":"KEYWORD","word":"FROM"},{"start":28,"token_type":"TABLE_NAME","word":"a"},{"start":29,"token_type":"TERMINATOR","word":";"},{"start":31,"token_type":"KEYWORD","word":"CREATE"},{"start":38,"token_type":"KEYWORD","word":"VIEW"},{"start":43,"token_type":"IDENTIFIER","word":"v"},{"start":45,"token_type":"KEYWORD","word":"AS"},{"start":48,"token_type":"KEYWORD","word":"SELECT"},{"start":55,"token_type":"OPERATOR","word":"*"},{"start":57,"token_type":"KEYWORD","word":"FROM"},{"start":62,"token_type":"TABLE_NAME","word":"a"},{"start":63,"token_type":"TERMINATOR","word":";"},{"start":65,"token_type":"KEYWORD","word":"COPY"},{"start":70,"token_type":"OPERATOR","word":"("},{"start":71,"token_type":"KEYWORD","word":"SELECT"},{"start":78,"token_type":"OPERATOR","word":"*"},{"start":80,"token_type":"KEYWORD","word":"FROM"},{"start":85,"token_type":"TABLE_NAME","word":"a"},{"start":87,"token_type":"KEYWORD","word":"WHERE"},{"start":93,"token_type":"COLUMN_NAME","word":"x"},{"start":95,"token_type":"OPERATOR","word":">"},{"start":97,"token_type":"NUMBER_LITERAL","word":"1"},{"start":98,"token_type":"OPERATOR","word":")"},{"start":100,"token_type":"KEYWORD","word":"TO"},{"start":103,"token_type":"STRING_LITERAL","word":"'out.csv'"},{"start":113,"token_type":"OPERATOR","word":"("},{"start":114,"token_type":"IDENTIFIER","word":"HEADER"},{"start":120,"token_type":"OPERATOR","word":")"},{"start":121,"token_type":"TERMINATOR","word":";"},{"start":123,"token_type":"KEYWORD","word":"COPY"},{"start":128,"token_type":"TABLE_NAME","word":"a"},{"start":130,"token_type":"KEYWORD","word":"TO"},{"start":133,"token_type":"STRING_LITERAL","word":"'out.csv'"},{"start":143,"token_type":"OPERATOR","word":"("},{"start":144,"token_type":"IDENTIFIER","word":"HEADER"},{"start":150,"token_type":"OPERATOR","word":")"},{"start":151,"token_type":"TERMINATOR","word":";"},{"start":153,"token_type":"KEYWORD","word":"COPY"},{"start":158,"token_type":"TABLE_NAME","word":"t"},{"start":160,"token_type":"KEYWORD","word":"FROM"},{"start":165,"token_type":"STRING_LITERAL","word":"'in.csv'"},{"start":173,"token_type":"TERMINATOR","word":";"}],
 "INSTALL mlpack FROM community; LOAD mlpack; SET VARIABLE cutoff = DATE '2026-01-01'; PRAGMA threads = 4; CREATE TABLE r AS SELECT * FROM a;":[{"start":0,"token_type":"KEYWORD","word":"INSTALL"},{"start":8,"token_type":"IDENTIFIER","word":"mlpack"},{"start":15,"token_type":"KEYWORD","word":"FROM"},{"start":20,"token_type":"IDENTIFIER","word":"community"},{"start":29,"token_type":"TERMINATOR","word":";"},{"start":31,"token_type":"KEYWORD","word":"LOAD"},{"start":36,"token_type":"IDENTIFIER","word":"mlpack"},{"start":42,"token_type":"TERMINATOR","word":";"},{"start":44,"token_type":"KEYWORD","word":"SET"},{"start":48,"token_type":"KEYWORD","word":"VARIABLE"},{"start":57,"token_type":"IDENTIFIER","word":"cutoff"},{"start":64,"token_type":"OPERATOR","word":"="},{"start":66,"token_type":"TYPE_NAME","word":"DATE"},{"start":71,"token_type":"STRING_LITERAL","word":"'2026-01-01'"},{"start":83,"token_type":"TERMINATOR","word":";"},{"start":85,"token_type":"KEYWORD","word":"PRAGMA"},{"start":92,"token_type":"SETTING_NAME","word":"threads"},{"start":100,"token_type":"OPERATOR","word":"="},{"start":102,"token_type":"NUMBER_LITERAL","word":"4"},{"start":103,"token_type":"TERMINATOR","word":";"},{"start":105,"token_type":"KEYWORD","word":"CREATE"},{"start":112,"token_type":"KEYWORD","word":"TABLE"},{"start":118,"token_type":"IDENTIFIER","word":"r"},{"start":120,"token_type":"KEYWORD","word":"AS"},{"start":123,"token_type":"KEYWORD","word":"SELECT"},{"start":130,"token_type":"OPERATOR","word":"*"},{"start":132,"token_type":"KEYWORD","word":"FROM"},{"start":137,"token_type":"TABLE_NAME","word":"a"},{"start":138,"token_type":"TERMINATOR","word":";"}],
-"PIVOT (SELECT * FROM a) ON c USING sum(v);\nPIVOT 'p.csv' ON c USING sum(v);\nPIVOT_WIDER s.t ON c USING sum(v);\nUNPIVOT u ON a, b INTO NAME n VALUE v;":[{"start":0,"token_type":"KEYWORD","word":"PIVOT"},{"start":6,"token_type":"OPERATOR","word":"("},{"start":7,"token_type":"KEYWORD","word":"SELECT"},{"start":14,"token_type":"OPERATOR","word":"*"},{"start":16,"token_type":"KEYWORD","word":"FROM"},{"start":21,"token_type":"TABLE_NAME","word":"a"},{"start":22,"token_type":"OPERATOR","word":")"},{"start":24,"token_type":"KEYWORD","word":"ON"},{"start":27,"token_type":"COLUMN_NAME","word":"c"},{"start":29,"token_type":"KEYWORD","word":"USING"},{"start":35,"token_type":"SCALAR_FUNCTION","word":"sum"},{"start":38,"token_type":"OPERATOR","word":"("},{"start":39,"token_type":"COLUMN_NAME","word":"v"},{"start":40,"token_type":"OPERATOR","word":")"},{"start":41,"token_type":"TERMINATOR","word":";"},{"start":43,"token_type":"KEYWORD","word":"PIVOT"},{"start":49,"token_type":"TABLE_NAME","word":"'p.csv'"},{"start":57,"token_type":"KEYWORD","word":"ON"},{"start":60,"token_type":"COLUMN_NAME","word":"c"},{"start":62,"token_type":"KEYWORD","word":"USING"},{"start":68,"token_type":"SCALAR_FUNCTION","word":"sum"},{"start":71,"token_type":"OPERATOR","word":"("},{"start":72,"token_type":"COLUMN_NAME","word":"v"},{"start":73,"token_type":"OPERATOR","word":")"},{"start":74,"token_type":"TERMINATOR","word":";"},{"start":76,"token_type":"KEYWORD","word":"PIVOT_WIDER"},{"start":88,"token_type":"SCHEMA_NAME","word":"s"},{"start":89,"token_type":"NUMBER_LITERAL","word":"."},{"start":90,"token_type":"TABLE_NAME","word":"t"},{"start":92,"token_type":"KEYWORD","word":"ON"},{"start":95,"token_type":"COLUMN_NAME","word":"c"},{"start":97,"token_type":"KEYWORD","word":"USING"},{"start":103,"token_type":"SCALAR_FUNCTION","word":"sum"},{"start":106,"token_type":"OPERATOR","word":"("},{"start":107,"token_type":"COLUMN_NAME","word":"v"},{"start":108,"token_type":"OPERATOR","word":")"},{"start":109,"token_type":"TERMINATOR","word":";"},{"start":111,"token_type":"KEYWORD","word":"UNPIVOT"},{"start":119,"token_type":"TABLE_NAME","word":"u"},{"start":121,"token_type":"KEYWORD","word":"ON"},{"start":124,"token_type":"COLUMN_NAME","word":"a"},{"start":125,"token_type":"OPERATOR","word":","},{"start":127,"token_type":"COLUMN_NAME","word":"b"},{"start":129,"token_type":"KEYWORD","word":"INTO"},{"start":134,"token_type":"KEYWORD","word":"NAME"},{"start":139,"token_type":"IDENTIFIER","word":"n"},{"start":141,"token_type":"KEYWORD","word":"VALUE"},{"start":147,"token_type":"IDENTIFIER","word":"v"},{"start":148,"token_type":"TERMINATOR","word":";"}],
+"PIVOT (SELECT * FROM a) ON c USING sum(v);\nPIVOT 'p.csv' ON c USING sum(v);\nPIVOT_WIDER s.t ON c USING sum(v);\nUNPIVOT u ON a, b INTO NAME n VALUE v;\nPIVOT read_csv('p.csv') ON c USING sum(v);":[{"start":0,"token_type":"KEYWORD","word":"PIVOT"},{"start":6,"token_type":"OPERATOR","word":"("},{"start":7,"token_type":"KEYWORD","word":"SELECT"},{"start":14,"token_type":"OPERATOR","word":"*"},{"start":16,"token_type":"KEYWORD","word":"FROM"},{"start":21,"token_type":"TABLE_NAME","word":"a"},{"start":22,"token_type":"OPERATOR","word":")"},{"start":24,"token_type":"KEYWORD","word":"ON"},{"start":27,"token_type":"COLUMN_NAME","word":"c"},{"start":29,"token_type":"KEYWORD","word":"USING"},{"start":35,"token_type":"SCALAR_FUNCTION","word":"sum"},{"start":38,"token_type":"OPERATOR","word":"("},{"start":39,"token_type":"COLUMN_NAME","word":"v"},{"start":40,"token_type":"OPERATOR","word":")"},{"start":41,"token_type":"TERMINATOR","word":";"},{"start":43,"token_type":"KEYWORD","word":"PIVOT"},{"start":49,"token_type":"TABLE_NAME","word":"'p.csv'"},{"start":57,"token_type":"KEYWORD","word":"ON"},{"start":60,"token_type":"COLUMN_NAME","word":"c"},{"start":62,"token_type":"KEYWORD","word":"USING"},{"start":68,"token_type":"SCALAR_FUNCTION","word":"sum"},{"start":71,"token_type":"OPERATOR","word":"("},{"start":72,"token_type":"COLUMN_NAME","word":"v"},{"start":73,"token_type":"OPERATOR","word":")"},{"start":74,"token_type":"TERMINATOR","word":";"},{"start":76,"token_type":"KEYWORD","word":"PIVOT_WIDER"},{"start":88,"token_type":"SCHEMA_NAME","word":"s"},{"start":89,"token_type":"NUMBER_LITERAL","word":"."},{"start":90,"token_type":"TABLE_NAME","word":"t"},{"start":92,"token_type":"KEYWORD","word":"ON"},{"start":95,"token_type":"COLUMN_NAME","word":"c"},{"start":97,"token_type":"KEYWORD","word":"USING"},{"start":103,"token_type":"SCALAR_FUNCTION","word":"sum"},{"start":106,"token_type":"OPERATOR","word":"("},{"start":107,"token_type":"COLUMN_NAME","word":"v"},{"start":108,"token_type":"OPERATOR","word":")"},{"start":109,"token_type":"TERMINATOR","word":";"},{"start":111,"token_type":"KEYWORD","word":"UNPIVOT"},{"start":119,"token_type":"TABLE_NAME","word":"u"},{"start":121,"token_type":"KEYWORD","word":"ON"},{"start":124,"token_type":"COLUMN_NAME","word":"a"},{"start":125,"token_type":"OPERATOR","word":","},{"start":127,"token_type":"COLUMN_NAME","word":"b"},{"start":129,"token_type":"KEYWORD","word":"INTO"},{"start":134,"token_type":"KEYWORD","word":"NAME"},{"start":139,"token_type":"IDENTIFIER","word":"n"},{"start":141,"token_type":"KEYWORD","word":"VALUE"},{"start":147,"token_type":"IDENTIFIER","word":"v"},{"start":148,"token_type":"TERMINATOR","word":";"},{"start":150,"token_type":"KEYWORD","word":"PIVOT"},{"start":156,"token_type":"TABLE_FUNCTION","word":"read_csv"},{"start":164,"token_type":"OPERATOR","word":"("},{"start":165,"token_type":"STRING_LITERAL","word":"'p.csv'"},{"start":172,"token_type":"OPERATOR","word":")"},{"start":174,"token_type":"KEYWORD","word":"ON"},{"start":177,"token_type":"COLUMN_NAME","word":"c"},{"start":179,"token_type":"KEYWORD","word":"USING"},{"start":185,"token_type":"SCALAR_FUNCTION","word":"sum"},{"start":188,"token_type":"OPERATOR","word":"("},{"start":189,"token_type":"COLUMN_NAME","word":"v"},{"start":190,"token_type":"OPERATOR","word":")"},{"start":191,"token_type":"TERMINATOR","word":";"}],
 "SELECT 'a;b' AS s; -- c; d\nSELECT 2 /* ; */;":[{"start":0,"token_type":"KEYWORD","word":"SELECT"},{"start":7,"token_type":"STRING_LITERAL","word":"'a;b'"},{"start":13,"token_type":"KEYWORD","word":"AS"},{"start":16,"token_type":"IDENTIFIER","word":"s"},{"start":17,"token_type":"TERMINATOR","word":";"},{"start":19,"token_type":"COMMENT","word":"-- c; d\n"},{"start":27,"token_type":"KEYWORD","word":"SELECT"},{"start":34,"token_type":"NUMBER_LITERAL","word":"2"},{"start":36,"token_type":"COMMENT","word":"/* ; */"},{"start":43,"token_type":"TERMINATOR","word":";"}],
 "SELECT * EXCLUDE (a) FROM t ASOF LEFT JOIN u USING (k);\nSUMMARIZE t;\nPIVOT t ON c USING sum(v);":[{"start":0,"token_type":"KEYWORD","word":"SELECT"},{"start":7,"token_type":"OPERATOR","word":"*"},{"start":9,"token_type":"KEYWORD","word":"EXCLUDE"},{"start":17,"token_type":"OPERATOR","word":"("},{"start":18,"token_type":"IDENTIFIER","word":"a"},{"start":19,"token_type":"OPERATOR","word":")"},{"start":21,"token_type":"KEYWORD","word":"FROM"},{"start":26,"token_type":"TABLE_NAME","word":"t"},{"start":28,"token_type":"KEYWORD","word":"ASOF"},{"start":33,"token_type":"KEYWORD","word":"LEFT"},{"start":38,"token_type":"KEYWORD","word":"JOIN"},{"start":43,"token_type":"TABLE_NAME","word":"u"},{"start":45,"token_type":"KEYWORD","word":"USING"},{"start":51,"token_type":"OPERATOR","word":"("},{"start":52,"token_type":"COLUMN_NAME","word":"k"},{"start":53,"token_type":"OPERATOR","word":")"},{"start":54,"token_type":"TERMINATOR","word":";"},{"start":56,"token_type":"KEYWORD","word":"SUMMARIZE"},{"start":66,"token_type":"TABLE_NAME","word":"t"},{"start":67,"token_type":"TERMINATOR","word":";"},{"start":69,"token_type":"KEYWORD","word":"PIVOT"},{"start":75,"token_type":"TABLE_NAME","word":"t"},{"start":77,"token_type":"KEYWORD","word":"ON"},{"start":80,"token_type":"COLUMN_NAME","word":"c"},{"start":82,"token_type":"KEYWORD","word":"USING"},{"start":88,"token_type":"SCALAR_FUNCTION","word":"sum"},{"start":91,"token_type":"OPERATOR","word":"("},{"start":92,"token_type":"COLUMN_NAME","word":"v"},{"start":93,"token_type":"OPERATOR","word":")"},{"start":94,"token_type":"TERMINATOR","word":";"}],
 "SELECT * FROM a; /* trailing */\nSELECT * FROM b":[{"start":0,"token_type":"KEYWORD","word":"SELECT"},{"start":7,"token_type":"OPERATOR","word":"*"},{"start":9,"token_type":"KEYWORD","word":"FROM"},{"start":14,"token_type":"TABLE_NAME","word":"a"},{"start":15,"token_type":"TERMINATOR","word":";"},{"start":17,"token_type":"COMMENT","word":"/* trailing */"},{"start":32,"token_type":"KEYWORD","word":"SELECT"},{"start":39,"token_type":"OPERATOR","word":"*"},{"start":41,"token_type":"KEYWORD","word":"FROM"},{"start":46,"token_type":"IDENTIFIER","word":"b"}],
@@ -1016,11 +1019,13 @@ mod tests {
 "trees":{
 "(SELECT * FROM c)":{"error":false,"statements":[{"named_param_map":[],"node":{"aggregate_handling":"STANDARD_HANDLING","cte_map":{"map":[]},"from_table":{"alias":"","at_clause":null,"catalog_name":"","column_name_alias":[],"qualified_name":{"path":["c"]},"query_location":15,"query_location_length":1,"sample":null,"schema_name":"","table_name":"c","type":"BASE_TABLE"},"group_expressions":[],"group_sets":[],"having":null,"modifiers":[],"qualify":null,"sample":null,"select_list":[{"alias":"","class":"STAR","columns":false,"exclude_list":[],"expr":null,"qualified_exclude_list":[],"query_location":8,"query_location_length":1,"relation_name":"","rename_list":[],"replace_list":[],"type":"STAR"}],"type":"SELECT_NODE","where_clause":null}}]},
 "COPY (SELECT * FROM a WHERE x > 1) TO 'out.csv' (HEADER)":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
+"COPY (SELECT * FROM a) TO out_csv":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
 "COPY FROM DATABASE a TO b":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
 "COPY a TO 'out.csv' (HEADER)":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
 "COPY s.t (a) FROM 'in.csv' (HEADER)":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
 "COPY t FROM 'in.csv'":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
 "COPY t TO 'it''s.csv'":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
+"COPY t TO out_csv":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
 "CREATE MACRO m() AS 1":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
 "CREATE OR REPLACE TEMP TABLE \"R \"\"x\"\"\" AS SELECT * FROM a":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
 "CREATE TABL r AS SELECT 1":{"error":true,"error_message":"syntax error at or near \"TABL\"","error_subtype":"SYNTAX_ERROR","error_type":"parser","location":"[7,4]","position":"7"},
@@ -1044,6 +1049,7 @@ mod tests {
 "LOAD mlpack":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
 "PIVOT 'p.csv' ON c USING sum(v)":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
 "PIVOT (SELECT * FROM a) ON c USING sum(v)":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
+"PIVOT read_csv('p.csv') ON c USING sum(v)":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
 "PIVOT t ON c USING sum(v)":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
 "PIVOT_WIDER s.t ON c USING sum(v)":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
 "PRAGMA threads = 4":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
@@ -1490,7 +1496,9 @@ mod tests {
             ask,
             "COPY s.t (a) FROM 'in.csv' (HEADER);\n\
              COPY t TO 'it''s.csv';\n\
-             COPY FROM DATABASE a TO b;",
+             COPY FROM DATABASE a TO b;\n\
+             COPY (SELECT * FROM a) TO out_csv;\n\
+             COPY t TO out_csv;",
         );
         let shapes: Vec<_> = s.iter().map(shape).collect();
         assert_eq!(
@@ -1499,8 +1507,11 @@ mod tests {
                 expect(Form::Copy, &["file 'in.csv'"], &["s.t"]),
                 expect(Form::Copy, &["t"], &["file 'it's.csv'"]),
                 expect(Form::Unread("COPY".to_string()), &[], &[]),
+                expect(Form::Unread("COPY".to_string()), &[], &[]),
+                expect(Form::Unread("COPY".to_string()), &[], &[]),
             ],
-            "COPY reads or writes the file its string names; COPY FROM DATABASE is unread"
+            "COPY reads or writes the file its string names; COPY FROM DATABASE, and a COPY \
+             to a bare name, are unread"
         );
     }
 
@@ -1510,7 +1521,8 @@ mod tests {
             "PIVOT (SELECT * FROM a) ON c USING sum(v);\n\
              PIVOT 'p.csv' ON c USING sum(v);\n\
              PIVOT_WIDER s.t ON c USING sum(v);\n\
-             UNPIVOT u ON a, b INTO NAME n VALUE v;",
+             UNPIVOT u ON a, b INTO NAME n VALUE v;\n\
+             PIVOT read_csv('p.csv') ON c USING sum(v);",
         );
         let shapes: Vec<_> = s.iter().map(shape).collect();
         assert_eq!(
@@ -1520,8 +1532,10 @@ mod tests {
                 expect(Form::Pivot, &["file 'p.csv'"], &[]),
                 expect(Form::Pivot, &["s.t"], &[]),
                 expect(Form::Query, &["u"], &[]),
+                expect(Form::Unread("PIVOT".to_string()), &[], &[]),
             ],
-            "a PIVOT reads its query, file or table; DuckDB gives UNPIVOT a tree"
+            "a PIVOT reads its query, file or table; DuckDB gives UNPIVOT a tree; a PIVOT of \
+             a function call is unread"
         );
     }
 
@@ -1686,15 +1700,42 @@ mod tests {
         let refusal =
             read_step(OsStr::new("/nonexistent/duckdb"), "SELECT 1;").expect_err("no such program");
         assert!(
-            matches!(&refusal, Refusal::NotRun { program, .. } if program == "/nonexistent/duckdb"),
-            "the refusal names the program: {refusal:?}"
+            matches!(&refusal, Refusal::NotRun { program, reason }
+                if program == "/nonexistent/duckdb" && reason.contains("No such file")),
+            "the refusal names the program and why it did not run: {refusal:?}"
+        );
+    }
+
+    /// A program that runs and prints no version is not a DuckDB.
+    #[test]
+    fn a_program_that_gives_no_version_is_refused() {
+        let refusal = read_step(OsStr::new("true"), "SELECT 1;").expect_err("not a DuckDB");
+        assert!(
+            matches!(&refusal, Refusal::NotRun { reason, .. } if reason.contains("gave no version")),
+            "the refusal says no version came back: {refusal:?}"
+        );
+    }
+
+    /// A node DuckDB gives no name is neither a read nor a call.
+    #[test]
+    fn a_node_without_a_name_is_no_read_and_no_call() {
+        let tree = serde_json::json!([
+            {"type": "BASE_TABLE", "table_name": ""},
+            {"type": "TABLE_FUNCTION", "function": {"arguments": []}},
+        ]);
+        let found = walk(&tree, "");
+        assert!(
+            found.reads.is_empty() && found.calls.is_empty(),
+            "a nameless table or function is not read: {:?} {:?}",
+            found.reads,
+            found.calls
         );
     }
 
     /// Answers made by hand, for what the preview does not answer when asked well.
     struct Scripted {
         tokens: Result<Vec<Token>, String>,
-        trees: Vec<Value>,
+        trees: Result<Vec<Value>, Refusal>,
     }
 
     impl Ask for Scripted {
@@ -1710,7 +1751,7 @@ mod tests {
         }
 
         fn trees(&mut self, _: &[String]) -> Result<Vec<Value>, Refusal> {
-            Ok(self.trees.clone())
+            self.trees.clone()
         }
     }
 
@@ -1725,21 +1766,25 @@ mod tests {
     #[test]
     fn an_answer_the_reader_cannot_read_refuses_the_step() {
         let tree = serde_json::json!({"error": false, "statements": []});
+        let other =
+            serde_json::json!({"error": true, "error_type": "binder", "error_message": "m"});
+        let failed = Refusal::Unreadable("no trees: m".to_string());
+        let x = || Ok(vec![token(0, "x")]);
         let cases = [
-            (Err("Catalog Error".to_string()), vec![], "Catalog Error"),
-            (Ok(vec![token(9, "x")]), vec![], "byte 9"),
             (
-                Ok(vec![token(0, "x")]),
-                vec![tree.clone(), tree],
-                "2 answers for 1 texts",
+                Err("Catalog Error".to_string()),
+                Ok(vec![]),
+                "Catalog Error",
             ),
+            (Ok(vec![token(9, "x")]), Ok(vec![]), "byte 9"),
             (
-                Ok(vec![token(0, "x")]),
-                vec![
-                    serde_json::json!({"error": true, "error_type": "binder", "error_message": "m"}),
-                ],
-                "binder: m",
+                Ok(vec![token(9, "x"), token(10, ";")]),
+                Ok(vec![]),
+                "byte 9",
             ),
+            (x(), Ok(vec![tree.clone(), tree]), "2 answers for 1 texts"),
+            (x(), Ok(vec![other]), "binder: m"),
+            (x(), Err(failed), "no trees: m"),
         ];
         for (tokens, trees, reason) in cases {
             let refusal = read_step_with(&mut Scripted { tokens, trees }, "x")
