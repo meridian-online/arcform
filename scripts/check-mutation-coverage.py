@@ -56,7 +56,9 @@ The operators, and the failure each is modelled on:
   ARM_WIDEN                  one arm's pattern widened to `_`, its guard kept.  A
                              shipped build's guard, written against `Some(_)`,
                              passed the suite widened, because no test's `None`
-                             made the guard true.
+                             made the guard true.  A pattern that opens with a
+                             string, char or raw-string literal is widened from
+                             the literal on: `"b" if loud` becomes `_ if loud`.
                              Both work on an arm whose head — pattern, guard and
                              `=>` — the diff changed, and neither touches the last
                              arm of a match; the comment above `op_arm_delete`
@@ -118,6 +120,9 @@ that the compiler refuses has tested nothing: deleting an arm can leave a match
 that is not exhaustive, and widening a pattern can drop a binding the arm uses.
 It is counted on a line of its own and listed, and it neither counts as killed
 nor fails the job.  The other operators still count a compiler refusal as a kill.
+Those two reasons are the refusals meant here.  An arm is found from its first
+token, a leading string, char or raw-string literal included, so a literal-led
+arm's widening is not refused over text the gate itself built.
 
 Exit codes: 0 clean · 1 at least one UNPINNED or UNPROBED survivor, or under
 --strict an UNREACHED one · 2 usage · 3 the harness could not run (no baseline,

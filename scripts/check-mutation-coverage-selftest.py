@@ -437,11 +437,13 @@ LITERAL_ARM_SOURCE = (
     "    };\n"  # 13
     "    let b = match c {\n"  # 14
     "        'x' if loud => 1,\n"  # 15
-    "        'a'..='z' => 2,\n"  # 16
-    "        _ => 0,\n"  # 17
-    "    };\n"  # 18
-    "    a + b\n"  # 19
-    "}\n"  # 20
+    "        /* a comment\n"  # 16
+    "           over two lines */ 'y' => 9,\n"  # 17
+    "        'a'..='z' => 2,\n"  # 18
+    "        _ => 0,\n"  # 19
+    "    };\n"  # 20
+    "    a + b\n"  # 21
+    "}\n"  # 22
 )
 
 
@@ -463,8 +465,9 @@ def _() -> None:
         11: (11, 'b"j"', False, False),
         12: (12, "_", False, True),
         15: (15, "'x'", True, False),  # a guarded char literal
-        16: (16, "'a'..='z'", False, False),  # a char range
-        17: (17, "_", False, True),
+        17: (17, "'y'", False, False),  # after a comment over two lines
+        18: (18, "'a'..='z'", False, False),  # a char range
+        19: (19, "_", False, True),
     }
     for i in range(len(lines)):
         arm = mc.arm_at(lines, masks, i)
@@ -483,7 +486,8 @@ def _() -> None:
         9: "        _ if loud => 7,\n",
         11: "        _ => 8,\n",
         15: "        _ if loud => 1,\n",
-        16: "        _ => 2,\n",
+        17: "           over two lines */ _ => 9,\n",
+        18: "        _ => 2,\n",
     }
     check("every arm but the last two is widened", sorted(widened) == sorted(after), sorted(widened))
     for start, want in after.items():
