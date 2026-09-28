@@ -8,7 +8,10 @@ use owo_colors::OwoColorize;
 use crate::asset::{AssetGraph, StepAssets};
 use crate::asset_kind::AssetKind;
 use crate::contract;
-use crate::engine::{ALLOW_UNTESTED_ENGINE_ENV, Engine, SUPPORTED_ENGINE_RANGE};
+use crate::engine::{
+    ALLOW_UNTESTED_ENGINE_ENV, Engine, SUPPORTED_ENGINE_RANGE, check_extension_installs,
+    protocol_sql,
+};
 use crate::error::{Error, Result};
 use crate::manifest::{Manifest, Param, RetryPolicy};
 use crate::operator;
@@ -193,6 +196,11 @@ pub fn run_with_params(
             manifest.engine_version.as_deref(),
             allow_untested,
         )? {
+            eprintln!("{} {}", "warning:".yellow(), warning);
+        }
+        // Before anything is initialised, so a refused Protocol leaves no run behind.
+        let sql = protocol_sql(&manifest, dir);
+        for warning in check_extension_installs(&sql, info.version.as_ref())? {
             eprintln!("{} {}", "warning:".yellow(), warning);
         }
     }

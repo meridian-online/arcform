@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
+use crate::manifest::Manifest;
 
 /// Information about the detected engine, returned by preflight.
 #[derive(Debug, Clone)]
@@ -344,6 +346,445 @@ pub fn parse_version_output(output: &str) -> Option<semver::Version> {
         }
     }
     None
+}
+
+// ---- The community extensions a Protocol's SQL installs ----
+
+/// The community extensions a Protocol's SQL may install, as arc holds them. The page
+/// [`VETTED_EXTENSIONS_DOC`] is the same list for a person, and a test fails when the two
+/// differ.
+const VETTED_EXTENSIONS_JSON: &str = include_str!("vetted_extensions.json");
+
+/// The page every refusal and warning about an extension points to.
+pub(crate) const VETTED_EXTENSIONS_DOC: &str =
+    "https://github.com/meridian-online/arcform/blob/main/docs/VETTED_EXTENSIONS.md";
+
+/// Settings that move where DuckDB fetches an extension from without an `INSTALL` naming
+/// the address. After `SET custom_extension_repository = '/tmp/ext'` a bare
+/// `INSTALL mlpack;` resolves under `/tmp/ext`, and `autoinstall_extension_repository` does
+/// the same for an extension DuckDB installs on its own when a function needs one.
+const EXTENSION_REPOSITORY_SETTINGS: [&str; 2] = [
+    "custom_extension_repository",
+    "autoinstall_extension_repository",
+];
+
+/// One community extension a Protocol may install from the community registry. The file
+/// also carries each entry's licence, repository and proof, which the page shows and the
+/// check does not read.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct VettedExtension {
+    pub(crate) name: String,
+    /// The DuckDB versions its build was probed for and its proof was run on, as DuckDB
+    /// prints them: `v1.5.5`.
+    pub(crate) duckdb_versions: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct VettedList {
+    extensions: Vec<VettedExtension>,
+}
+
+/// The vetted list arc holds, read once from the file compiled into the binary.
+pub(crate) fn vetted_extensions() -> &'static [VettedExtension] {
+    static LIST: OnceLock<Vec<VettedExtension>> = OnceLock::new();
+    LIST.get_or_init(|| {
+        serde_json::from_str::<VettedList>(VETTED_EXTENSIONS_JSON)
+            .expect("src/vetted_extensions.json is a valid vetted list")
+            .extensions
+    })
+}
+
+/// A token of DuckDB SQL, as much of one as the extension check reads.
+#[derive(Debug, Clone, PartialEq)]
+enum Tok {
+    /// A keyword or an identifier; `quoted` for a `"double-quoted"` one, kept as written.
+    Word { text: String, quoted: bool },
+    /// A string constant: `'…'`, `E'…'`, `X'…'`, `$$…$$` or `$tag$…$tag$`.
+    Str(String),
+    /// Any other character outside a comment: `;`, an operator, a digit, a parenthesis.
+    Other(char),
+}
+
+/// How a quoted run treats a quote or a backslash inside it.
+#[derive(Clone, Copy, PartialEq)]
+enum Escapes {
+    /// `''` is one quote: `'…'` and `"…"`.
+    Doubled,
+    /// `''` and a backslash both escape: `E'…'`.
+    Backslash,
+    /// The first quote ends it: `X'…'` and `B'…'`.
+    None,
+}
+
+fn is_ident_start(ch: char) -> bool {
+    ch.is_alphabetic() || ch == '_' || !ch.is_ascii()
+}
+
+fn is_ident_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_' || ch == '$' || !ch.is_ascii()
+}
+
+/// Read a quoted run that starts just after its opening `quote`, returning its text and the
+/// index after its closing quote, or the end of the input when it has none.
+fn read_quoted(
+    c: &[char],
+    mut i: usize,
+    quote: char,
+    escapes: Escapes,
+    line: &mut usize,
+) -> (String, usize) {
+    let mut text = String::new();
+    while i < c.len() {
+        let ch = c[i];
+        if escapes == Escapes::Backslash && ch == '\\' {
+            if let Some(&next) = c.get(i + 1) {
+                *line += usize::from(next == '\n');
+                text.push(next);
+            }
+            i += 2;
+            continue;
+        }
+        if ch == quote {
+            if escapes != Escapes::None && c.get(i + 1) == Some(&quote) {
+                text.push(quote);
+                i += 2;
+                continue;
+            }
+            return (text, i + 1);
+        }
+        *line += usize::from(ch == '\n');
+        text.push(ch);
+        i += 1;
+    }
+    (text, c.len())
+}
+
+/// The length of the `$tag$` or `$$` that opens a dollar-quoted string at `i`, if one does.
+/// A `$` followed by a digit is a parameter, and a `$` inside an identifier is part of it.
+fn dollar_tag_len(c: &[char], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    if c.get(j).is_some_and(|&ch| is_ident_start(ch)) {
+        while c.get(j).is_some_and(|&ch| is_ident_char(ch) && ch != '$') {
+            j += 1;
+        }
+    }
+    (c.get(j) == Some(&'$')).then_some(j + 1 - i)
+}
+
+/// Split DuckDB SQL into tokens, each with the line it starts on, and drop the comments.
+///
+/// Each rule follows DuckDB's own scanner, as measured on DuckDB v1.5.5: a `/* */` comment
+/// nests; `''` is a quote inside `'…'`; a backslash escapes only inside `E'…'`; `$$…$$` and
+/// `$tag$…$tag$` are string constants. Text left open at the end of the input runs to the
+/// end, where DuckDB refuses the statement rather than running it.
+fn lex_sql(sql: &str) -> Vec<(Tok, usize)> {
+    let c: Vec<char> = sql.chars().collect();
+    let n = c.len();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut line = 1;
+    while i < n {
+        let ch = c[i];
+        let at = line;
+        if ch == '\n' {
+            line += 1;
+            i += 1;
+        } else if ch.is_whitespace() {
+            i += 1;
+        } else if ch == '-' && c.get(i + 1) == Some(&'-') {
+            while i < n && c[i] != '\n' {
+                i += 1;
+            }
+        } else if ch == '/' && c.get(i + 1) == Some(&'*') {
+            let mut depth = 0usize;
+            while i < n {
+                if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    i += 2;
+                } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    line += usize::from(c[i] == '\n');
+                    i += 1;
+                }
+            }
+        } else if ch == '\'' || ch == '"' {
+            let (text, next) = read_quoted(&c, i + 1, ch, Escapes::Doubled, &mut line);
+            out.push((
+                if ch == '"' {
+                    Tok::Word { text, quoted: true }
+                } else {
+                    Tok::Str(text)
+                },
+                at,
+            ));
+            i = next;
+        } else if let Some(tag_len) = (ch == '$').then(|| dollar_tag_len(&c, i)).flatten() {
+            let tag = &c[i..i + tag_len];
+            let body = i + tag_len;
+            let close = (body..n).find(|&k| c[k..].starts_with(tag));
+            let end = close.unwrap_or(n);
+            line += c[body..end].iter().filter(|&&ch| ch == '\n').count();
+            out.push((Tok::Str(c[body..end].iter().collect()), at));
+            i = close.map_or(n, |k| k + tag_len);
+        } else if is_ident_start(ch) {
+            let start = i;
+            while i < n && is_ident_char(c[i]) {
+                i += 1;
+            }
+            let text: String = c[start..i].iter().collect();
+            let prefixed = match text.as_str() {
+                "e" | "E" => Some(Escapes::Backslash),
+                "x" | "X" | "b" | "B" => Some(Escapes::None),
+                _ => None,
+            };
+            match prefixed {
+                Some(escapes) if c.get(i) == Some(&'\'') => {
+                    let (text, next) = read_quoted(&c, i + 1, '\'', escapes, &mut line);
+                    out.push((Tok::Str(text), at));
+                    i = next;
+                }
+                _ => out.push((
+                    Tok::Word {
+                        text,
+                        quoted: false,
+                    },
+                    at,
+                )),
+            }
+        } else {
+            out.push((Tok::Other(ch), at));
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Where one `INSTALL` asks DuckDB to fetch an extension from.
+#[derive(Debug, Clone, PartialEq)]
+enum InstallFrom {
+    /// DuckDB's own repository: no `FROM`, or `FROM core`.
+    Core,
+    /// `FROM community`.
+    Community,
+    /// A repository alias other than `core` and `community`, such as `core_nightly`.
+    Alias(String),
+    /// `FROM '<directory or address>'`.
+    Address(String),
+}
+
+/// One thing a Protocol's SQL says about where DuckDB installs an extension from.
+#[derive(Debug, Clone, PartialEq)]
+enum ExtensionSql {
+    /// `[FORCE] INSTALL <name> [FROM <repository>]`, the name lower-cased as DuckDB does.
+    Install { name: String, from: InstallFrom },
+    /// `INSTALL '<path>'`: a name DuckDB reads as a file or an address, because it holds
+    /// a `.`, a `/` or a `\`.
+    InstallPath(String),
+    /// A setting in [`EXTENSION_REPOSITORY_SETTINGS`], named outside a comment or a string.
+    Setting(String),
+}
+
+/// Every place in `sql` that says where DuckDB installs an extension from, each with its
+/// line.
+///
+/// `INSTALL` is looked for anywhere in a statement and not only at its start, because
+/// DuckDB runs one that follows `EXPLAIN ANALYZE`. A repository alias is compared as
+/// written, because DuckDB refuses `FROM Community` as an unknown repository.
+fn scan_extension_sql(sql: &str) -> Vec<(ExtensionSql, usize)> {
+    let toks = lex_sql(sql);
+    let mut found = Vec::new();
+    for (k, (tok, line)) in toks.iter().enumerate() {
+        let Tok::Word { text, quoted } = tok else {
+            continue;
+        };
+        if let Some(setting) = EXTENSION_REPOSITORY_SETTINGS
+            .iter()
+            .find(|s| text.eq_ignore_ascii_case(s))
+        {
+            found.push((ExtensionSql::Setting(setting.to_string()), *line));
+            continue;
+        }
+        // `t.install` is a column, not a statement.
+        if *quoted
+            || !text.eq_ignore_ascii_case("install")
+            || k > 0 && toks[k - 1].0 == Tok::Other('.')
+        {
+            continue;
+        }
+        let name = match toks.get(k + 1) {
+            Some((Tok::Word { text, quoted }, _))
+                if *quoted || !text.eq_ignore_ascii_case("from") =>
+            {
+                text
+            }
+            Some((Tok::Str(text), _)) => text,
+            _ => continue,
+        };
+        if name.contains(['.', '/', '\\']) {
+            found.push((ExtensionSql::InstallPath(name.clone()), *line));
+            continue;
+        }
+        let from = match (toks.get(k + 2), toks.get(k + 3)) {
+            (
+                Some((
+                    Tok::Word {
+                        text: kw,
+                        quoted: false,
+                    },
+                    _,
+                )),
+                Some((repo, _)),
+            ) if kw.eq_ignore_ascii_case("from") => {
+                match repo {
+                    Tok::Word { text, .. } if text == "core" => InstallFrom::Core,
+                    Tok::Word { text, .. } if text == "community" => InstallFrom::Community,
+                    Tok::Word { text, .. } => InstallFrom::Alias(text.clone()),
+                    Tok::Str(address) => InstallFrom::Address(address.clone()),
+                    // `INSTALL x FROM;` does not parse, and DuckDB runs nothing of it.
+                    Tok::Other(_) => continue,
+                }
+            }
+            _ => InstallFrom::Core,
+        };
+        let name = name.to_lowercase();
+        found.push((ExtensionSql::Install { name, from }, *line));
+    }
+    found
+}
+
+/// One SQL file a Protocol runs, and the step or hook that runs it.
+pub(crate) struct ProtocolSql {
+    /// `step 'load'`, or `hook on_init 'setup'`.
+    pub(crate) place: String,
+    /// The file as the manifest names it.
+    pub(crate) file: String,
+    pub(crate) path: PathBuf,
+}
+
+/// Every SQL file a Protocol's steps and hooks run: the steps in order, then the hooks.
+pub(crate) fn protocol_sql(manifest: &Manifest, dir: &Path) -> Vec<ProtocolSql> {
+    let hooks = [
+        ("on_init", &manifest.hooks.on_init),
+        ("on_success", &manifest.hooks.on_success),
+        ("on_failure", &manifest.hooks.on_failure),
+        ("on_exit", &manifest.hooks.on_exit),
+    ];
+    let steps = manifest
+        .steps
+        .iter()
+        .map(|step| (format!("step '{}'", step.name), step));
+    let hooks = hooks.into_iter().filter_map(|(slot, hook)| {
+        hook.as_ref()
+            .map(|step| (format!("hook {slot} '{}'", step.name), step))
+    });
+    steps
+        .chain(hooks)
+        .filter_map(|(place, step)| {
+            step.sql.as_ref().map(|file| ProtocolSql {
+                place,
+                file: file.clone(),
+                path: dir.join(file),
+            })
+        })
+        .collect()
+}
+
+/// Refuse a Protocol whose SQL installs a DuckDB extension off the vetted list, before a
+/// step runs; otherwise return one warning for each vetted extension it installs whose
+/// entry does not name the engine's version.
+///
+/// Refused: `INSTALL <name> FROM community` for a name not on the list; an `INSTALL` from
+/// an address or from a repository other than `core` and `community`; an `INSTALL` whose
+/// name is a path or an address; and a statement naming a setting in
+/// [`EXTENSION_REPOSITORY_SETTINGS`]. An `INSTALL` from `core` is not checked, and neither
+/// is `LOAD`, because SQL does not say where a loaded extension was installed from. No
+/// variable lifts the refusal.
+///
+/// It reads each file as it is before the run, and it is not a boundary: a `command:` step
+/// can start a DuckDB of its own and install what it likes.
+pub(crate) fn check_extension_installs(
+    sql: &[ProtocolSql],
+    engine_version: Option<&semver::Version>,
+) -> Result<Vec<String>> {
+    let vetted = vetted_extensions();
+    let mut refusals = Vec::new();
+    let mut installed: Vec<&VettedExtension> = Vec::new();
+    for source in sql {
+        // A file that is not there before the run is left to the step that runs it.
+        let Ok(bytes) = std::fs::read(&source.path) else {
+            continue;
+        };
+        for (found, line) in scan_extension_sql(&String::from_utf8_lossy(&bytes)) {
+            let why = match found {
+                ExtensionSql::Install {
+                    from: InstallFrom::Core,
+                    ..
+                } => continue,
+                ExtensionSql::Install {
+                    name,
+                    from: InstallFrom::Community,
+                } => match vetted.iter().find(|entry| entry.name == name) {
+                    Some(entry) => {
+                        if !installed.iter().any(|seen| seen.name == entry.name) {
+                            installed.push(entry);
+                        }
+                        continue;
+                    }
+                    None => format!(
+                        "installs {name} from the community registry, and {name} is not on the vetted list"
+                    ),
+                },
+                ExtensionSql::Install {
+                    name,
+                    from: InstallFrom::Alias(repository),
+                } => format!(
+                    "installs {name} from the repository {repository}; a community extension is installed FROM community"
+                ),
+                ExtensionSql::Install {
+                    name,
+                    from: InstallFrom::Address(address),
+                } => format!("installs {name} from the address '{address}'"),
+                ExtensionSql::InstallPath(path) => {
+                    format!("installs the extension at '{path}'")
+                }
+                ExtensionSql::Setting(setting) => format!(
+                    "names the setting {setting}, which moves where DuckDB installs an extension from"
+                ),
+            };
+            refusals.push(format!(
+                "{} ({}, line {line}) {why}",
+                source.place, source.file
+            ));
+        }
+    }
+    if !refusals.is_empty() {
+        return Err(Error::ExtensionRefused { refusals });
+    }
+    let engine = engine_version.map(|v| format!("v{v}"));
+    Ok(installed
+        .into_iter()
+        .filter(|entry| {
+            !engine
+                .as_ref()
+                .is_some_and(|v| entry.duckdb_versions.contains(v))
+        })
+        .map(|entry| {
+            let vetted_on = entry.duckdb_versions.join(", ");
+            let engine = engine.as_deref().map_or_else(
+                || "arc could not read this engine's version".to_string(),
+                |v| format!("this engine is DuckDB {v}"),
+            );
+            format!(
+                "{} is vetted on DuckDB {vetted_on}, and {engine}; running it anyway ({VETTED_EXTENSIONS_DOC})",
+                entry.name
+            )
+        })
+        .collect())
 }
 
 #[cfg(test)]

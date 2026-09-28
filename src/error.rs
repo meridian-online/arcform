@@ -96,6 +96,17 @@ pub enum Error {
         override_var: &'static str,
     },
 
+    // A Protocol's SQL installs a DuckDB extension from somewhere arc has not vetted. One
+    // line per statement found, so a Protocol with three is put right in one pass.
+    #[error(
+        "this Protocol's SQL installs a DuckDB extension arc has not vetted, so no step was run:\n{}\n\
+         A step or hook may install a community extension on the vetted list, FROM community. \
+         The list, and what this check does not read, are at {}",
+        indented(refusals),
+        crate::engine::VETTED_EXTENSIONS_DOC
+    )]
+    ExtensionRefused { refusals: Vec<String> },
+
     #[error("step '{step}' failed (exit code {code}):\n{stderr}")]
     StepFailed {
         step: String,
@@ -218,6 +229,15 @@ impl Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Each line on its own line, indented, for a message that lists several.
+fn indented(lines: &[String]) -> String {
+    lines
+        .iter()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 #[cfg(test)]
 mod format_tests {
