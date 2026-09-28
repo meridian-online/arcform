@@ -918,6 +918,7 @@ class Arm:
     guard: tuple[int, int] | None  # the `i` of the guard's `if`, when it has one
     end: int  # the line the arm ends; no code follows it on that line
     pattern: str  # the pattern's text, whitespace collapsed
+    last: bool  # the match's closing brace follows it
 
 
 def _code_after(lines, masks, line: int, col: int):
@@ -1120,6 +1121,7 @@ def arm_at(lines: list[str], masks: list[list[bool]], i: int) -> Arm | None:
     rest = _first_code(lines, masks, end[0], end[1] + 1)
     if rest is not None and rest[0] == end[0]:
         return None  # something else shares the arm's last line
+    last = rest is not None and lines[rest[0]][rest[1]] == "}"
     head_stop = guard or arrow
     pattern = "".join(
         lines[j][
@@ -1134,19 +1136,18 @@ def arm_at(lines: list[str], masks: list[list[bool]], i: int) -> Arm | None:
         guard=guard,
         end=end[0],
         pattern=" ".join(pattern.split()),
+        last=last,
     )
 
 
-def _catches_everything(arm: Arm) -> bool:
-    """`_` or a lone binding, with no guard: the arm every value reaches."""
-    if arm.guard is not None:
-        return False
-    if arm.pattern == "_":
-        return True
-    return (
-        re.fullmatch(r"(ref\s+)?(mut\s+)?[a-z_][A-Za-z0-9_]*", arm.pattern) is not None
-        and arm.pattern not in ("true", "false")
-    )
+# Neither arm operator touches the last arm of a match, and the reason is
+# exhaustiveness rather than cost.  In a match that compiles, a value reaching the
+# last arm is one no earlier arm took, and some unguarded arm matches it — which
+# can only be the last one.  So an unguarded last arm already matches every value
+# that reaches it: widening it changes nothing, and deleting it leaves the match
+# not exhaustive.  A guarded last arm is reached by no value at all, since the
+# unguarded arm that covers each value sits above it.  This is the arm that is
+# usually `_ => …`.
 
 
 def op_arm_delete(lines, masks, i, path, fn) -> list[Mutant]:
@@ -1156,15 +1157,11 @@ def op_arm_delete(lines, masks, i, path, fn) -> list[Mutant]:
     by its own arm, where the suite stays green when the arm is gone because every
     value it catches is also caught, differently, by the arm after it.
 
-    Not generated for an unguarded `_` or lone binding: deleting the arm that
-    catches everything either leaves the match non-exhaustive or deletes an arm
-    nothing reaches, and neither says anything about the tests.
-
     The probe is a copy of the arm's own pattern and guard, placed in front of it,
     whose body panics — so it fires exactly when a test takes this arm.
     """
     arm = arm_at(lines, masks, i)
-    if arm is None or _catches_everything(arm):
+    if arm is None or arm.last:
         return []
     aj, ap = arm.arrow
     head = "".join(lines[arm.start : aj]) + lines[aj][:ap]
@@ -1197,7 +1194,7 @@ def op_arm_widen(lines, masks, i, path, fn) -> list[Mutant]:
     the match reaches this arm at all — the values a widened pattern would take.
     """
     arm = arm_at(lines, masks, i)
-    if arm is None or _catches_everything(arm) or arm.pattern == "_":
+    if arm is None or arm.last or arm.pattern == "_":
         return []
     aj, ap = arm.arrow
     guard = ""
