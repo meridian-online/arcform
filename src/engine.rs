@@ -424,8 +424,99 @@ fn is_ident_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_' || ch == '$' || !ch.is_ascii()
 }
 
+/// The characters DuckDB's scanner skips between tokens: space, tab, `\n`, `\r` and form
+/// feed. A vertical tab is not one of them, and neither is any character above ASCII: DuckDB
+/// reads those as part of a word, after its parser has replaced the few in
+/// [`unicode_space_len`] with a space.
+fn is_scanner_space(ch: char) -> bool {
+    matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{c}')
+}
+
+/// Count the `\n` in `c[from..to]`, the one line end every reader here counts.
+fn newlines(c: &[char], from: usize, to: usize) -> usize {
+    c[from..to].iter().filter(|&&ch| ch == '\n').count()
+}
+
+/// Where a `'…'` string goes on after its closing quote at `j - 1`, if it does: DuckDB
+/// reads `'anofox_'` and `'forecast'` as one string when all that separates them is
+/// whitespace holding a `\n` or a `\r`, and `--` comments. The spaces and comments before
+/// that line end are its own line's; after it, each comment has to end at a line end.
+fn quote_continues(c: &[char], mut j: usize) -> Option<usize> {
+    let comment_end = |j: usize| {
+        (j + 2..c.len())
+            .find(|&k| matches!(c[k], '\n' | '\r'))
+            .unwrap_or(c.len())
+    };
+    loop {
+        match c.get(j) {
+            Some(' ' | '\t' | '\u{c}') => j += 1,
+            Some('-') if c.get(j + 1) == Some(&'-') => j = comment_end(j),
+            Some('\n' | '\r') => break,
+            _ => return None,
+        }
+    }
+    loop {
+        match c.get(j) {
+            Some(&ch) if is_scanner_space(ch) => j += 1,
+            Some('-') if c.get(j + 1) == Some(&'-') => j = comment_end(j) + 1,
+            Some('\'') => return Some(j + 1),
+            _ => return None,
+        }
+    }
+}
+
+/// The character a backslash escape in an `E'…'` string stands for, as DuckDB's scanner
+/// decodes it, and how many characters after the backslash the escape spans: `\b`, `\f`,
+/// `\n`, `\r` and `\t`; one to three octal digits; `\x` and one or two hex digits; `\u` and
+/// four hex digits, or `\U` and eight. Any other character stands for itself, and a
+/// backslash at the end of the input for a backslash.
+fn e_escape(c: &[char], at: usize) -> (char, usize) {
+    let digits = |from: usize, radix: u32, most: usize| {
+        c.get(from..)
+            .unwrap_or_default()
+            .iter()
+            .take(most)
+            .take_while(|ch| ch.is_digit(radix))
+            .count()
+    };
+    let value = |from: usize, len: usize, radix: u32| {
+        c[from..from + len]
+            .iter()
+            .fold(0u32, |v, ch| v * radix + ch.to_digit(radix).unwrap_or(0))
+    };
+    let byte = |v: u32| char::from((v & 0xff) as u8);
+    let Some(&ch) = c.get(at) else {
+        return ('\\', 0);
+    };
+    match (ch, digits(at + 1, 16, 8)) {
+        ('0'..='7', _) => {
+            let len = digits(at, 8, 3);
+            (byte(value(at, len, 8)), len)
+        }
+        ('x', 1..) => {
+            let len = digits(at + 1, 16, 2);
+            (byte(value(at + 1, len, 16)), len + 1)
+        }
+        ('u', 4..) => (
+            char::from_u32(value(at + 1, 4, 16)).unwrap_or('\u{fffd}'),
+            5,
+        ),
+        ('U', 8) => (
+            char::from_u32(value(at + 1, 8, 16)).unwrap_or('\u{fffd}'),
+            9,
+        ),
+        ('b', _) => ('\u{8}', 1),
+        ('f', _) => ('\u{c}', 1),
+        ('n', _) => ('\n', 1),
+        ('r', _) => ('\r', 1),
+        ('t', _) => ('\t', 1),
+        (other, _) => (other, 1),
+    }
+}
+
 /// Read a quoted run from `*i`, just after its opening `quote`, to its closing quote or the
-/// end of the input, and leave `*i` after it.
+/// end of the input, and leave `*i` after it. A `'…'` run goes on where
+/// [`quote_continues`] finds the next.
 fn read_quoted(
     c: &[char],
     i: &mut usize,
@@ -437,11 +528,10 @@ fn read_quoted(
     while *i < c.len() {
         let ch = c[*i];
         if escapes == Escapes::Backslash && ch == '\\' {
-            if let Some(&next) = c.get(*i + 1) {
-                *line += usize::from(next == '\n');
-                text.push(next);
-            }
-            *i += 2;
+            let (decoded, len) = e_escape(c, *i + 1);
+            *line += newlines(c, *i + 1, *i + 1 + len);
+            text.push(decoded);
+            *i += 1 + len;
             continue;
         }
         if ch == quote {
@@ -451,7 +541,12 @@ fn read_quoted(
                 continue;
             }
             *i += 1;
-            return text;
+            let Some(next) = (quote == '\'').then(|| quote_continues(c, *i)).flatten() else {
+                return text;
+            };
+            *line += newlines(c, *i, next);
+            *i = next;
+            continue;
         }
         *line += usize::from(ch == '\n');
         text.push(ch);
@@ -474,10 +569,13 @@ fn dollar_tag_len(c: &[char], i: usize) -> Option<usize> {
 
 /// Split DuckDB SQL into tokens, each with the line it starts on, and drop the comments.
 ///
-/// Each rule follows DuckDB's own scanner, as measured on DuckDB v1.5.5: a `/* */` comment
-/// nests; `''` is a quote inside `'…'`; a backslash escapes only inside `E'…'`; `$$…$$` and
-/// `$tag$…$tag$` are string constants. Text left open at the end of the input runs to the
-/// end, where DuckDB refuses the statement rather than running it.
+/// `sql` is one batch, as [`cli_batches`] cuts it and [`strip_unicode_spaces`] leaves it.
+/// Each rule is DuckDB's own scanner's, `third_party/libpg_query/scan.l` in DuckDB v1.5.5:
+/// the characters in [`is_scanner_space`] are skipped; a `--` comment ends at `\n` or `\r`;
+/// a `/* */` comment nests; `''` is a quote inside `'…'`; a backslash escapes only inside
+/// `E'…'`; `$$…$$` and `$tag$…$tag$` are string constants; two `'…'` strings with a line
+/// end between them are one. Text left open at the end of the input runs to the end, where
+/// DuckDB refuses the statement rather than running it.
 ///
 /// Every branch consumes the characters it matched before it calls a helper or loops, so the
 /// scan advances on each pass whatever a helper returns: a lexer that can stall would hang
@@ -491,14 +589,12 @@ fn lex_sql(sql: &str) -> Vec<(Tok, usize)> {
     while i < n {
         let ch = c[i];
         let at = line;
-        if ch == '\n' {
-            line += 1;
-            i += 1;
-        } else if ch.is_whitespace() {
+        if is_scanner_space(ch) {
+            line += usize::from(ch == '\n');
             i += 1;
         } else if ch == '-' && c.get(i + 1) == Some(&'-') {
             i += 2;
-            while i < n && c[i] != '\n' {
+            while i < n && !matches!(c[i], '\n' | '\r') {
                 i += 1;
             }
         } else if ch == '/' && c.get(i + 1) == Some(&'*') {
@@ -594,14 +690,286 @@ enum ExtensionSql {
     Setting(String),
 }
 
-/// Every place in `sql` that says where DuckDB installs an extension from, each with its
-/// line.
+// ---- A SQL file as DuckDB's CLI reads it ----
+//
+// `arc run` hands a SQL step to `duckdb <db> -f <file>`. What reaches DuckDB's scanner is not
+// the file: the CLI reads it a line at a time, skips some lines, and hands the parser one
+// batch of lines at a time; the parser then replaces some unicode spaces before its scanner
+// runs. Each function below copies one of those steps from DuckDB v1.5.5's source, and
+// v1.5.4's is the same: `tools/shell/shell.cpp` for the CLI, `src/parser/parser.cpp` for the
+// pre-pass. A step is copied as far as it changes which text DuckDB reads as SQL, and no
+// further.
+
+/// The lines DuckDB's CLI reads from a file, each with the file line it starts on, as
+/// `local_getline` reads them with `fgets`: a line ends at `\n`, and a NUL byte ends what the
+/// line keeps of the `fgets` chunk it is in. The rest of that chunk is dropped, and the next
+/// chunk joins the line, which for a short line is the next line of the file. A chunk holds
+/// the room left in a buffer that starts at 100 bytes and grows to twice its size and 100
+/// more whenever 100 bytes are not left, less one byte for the NUL `fgets` writes.
+///
+/// The `\r` DuckDB drops before each `\n` is kept: every rule after this one reads a `\r` as
+/// it reads a space.
+fn cli_lines(bytes: &[u8]) -> Vec<(Vec<u8>, usize)> {
+    let mut lines = Vec::new();
+    let mut pos = 0;
+    let mut file_line = 1;
+    while pos < bytes.len() {
+        let starts_on = file_line;
+        let mut line = Vec::new();
+        let mut size = 100;
+        let ended = loop {
+            while line.len() + 100 > size {
+                size = size * 2 + 100;
+            }
+            let room = bytes[pos..].iter().take(size - line.len() - 1);
+            let chunk = room.len() - room.skip_while(|&&b| b != b'\n').skip(1).count();
+            let chunk = &bytes[pos..pos + chunk];
+            pos += chunk.len();
+            file_line += chunk.iter().filter(|&&b| b == b'\n').count();
+            line.extend(chunk.iter().take_while(|&&b| b != 0));
+            if line.last() == Some(&b'\n') {
+                break true;
+            }
+            if pos == bytes.len() {
+                break false;
+            }
+        };
+        if ended {
+            line.pop();
+        } else if line.is_empty() {
+            break;
+        }
+        lines.push((line, starts_on));
+    }
+    lines
+}
+
+/// A space to the CLI's own tests of a line: DuckDB's `CharacterIsSpace`, which unlike its
+/// scanner counts a vertical tab.
+fn is_cli_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
+}
+
+/// Whether `z` holds only spaces and comments, as the CLI's `_all_whitespace` reads it: a
+/// `/* */` comment does not nest, and one left open is not whitespace; a `--` comment runs
+/// to `\n`.
+fn all_whitespace(z: &[u8]) -> bool {
+    let mut i = 0;
+    while let Some(&b) = z.get(i) {
+        i = match (b, z.get(i + 1)) {
+            _ if is_cli_space(b) => i + 1,
+            (b'/', Some(b'*')) => match z[i + 2..].windows(2).position(|w| w == b"*/") {
+                Some(k) => i + 2 + k + 2,
+                None => return false,
+            },
+            (b'-', Some(b'-')) => match z[i..].iter().position(|&b| b == b'\n') {
+                Some(k) => i + k,
+                None => return true,
+            },
+            _ => return false,
+        };
+    }
+    true
+}
+
+/// A byte DuckDB allows in a dollar-quote tag: a letter, `_`, or a byte above ASCII, and a
+/// digit anywhere but first. The CLI, the parser's pre-pass and the scanner agree on it.
+fn is_tag_byte(b: u8, first: bool) -> bool {
+    b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 || !first && b.is_ascii_digit()
+}
+
+/// Whether the CLI hands the lines it holds to the parser now, as its `SQLIsComplete` reads
+/// them: when they end in a `;` outside a string or comment. This is not the scanner's
+/// reading: a `/* */` comment does not nest, a backslash escapes nothing, a `--` comment runs
+/// to `\n` alone, and a `$tag$` opens anywhere, inside a word too. Each difference moves
+/// where a batch ends, and so which lines after it are read as SQL.
+fn sql_is_complete(z: &[u8]) -> bool {
+    let mut semicolon = false;
+    let mut i = 0;
+    while let Some(&b) = z.get(i) {
+        let rest = &z[i + 1..];
+        // Where what opens at `i` ends, and whether it is `;`; `None` for a space or a
+        // comment, which leaves the state as it was.
+        let (end, token) = match b {
+            b';' => (i + 1, Some(true)),
+            b' ' | b'\r' | b'\t' | b'\n' | b'\x0c' => (i + 1, None),
+            b'/' if rest.first() == Some(&b'*') => {
+                match rest[1..].windows(2).position(|w| w == b"*/") {
+                    Some(k) => (i + 2 + k + 2, None),
+                    None => return false,
+                }
+            }
+            b'-' if rest.first() == Some(&b'-') => match rest.iter().position(|&b| b == b'\n') {
+                Some(k) => (i + 1 + k, None),
+                None => return semicolon,
+            },
+            b'$' => {
+                let tag = rest
+                    .iter()
+                    .enumerate()
+                    .take_while(|&(k, &b)| is_tag_byte(b, k == 0))
+                    .count();
+                if rest.get(tag) == Some(&b'$') {
+                    let delim = [b"$", &rest[..tag], b"$"].concat();
+                    let body = i + tag + 2;
+                    match (body..z.len()).find(|&k| z[k..].starts_with(&delim)) {
+                        Some(k) => (k + delim.len(), None),
+                        None => return false,
+                    }
+                } else {
+                    (i + 1, Some(false))
+                }
+            }
+            b'\'' | b'"' => match rest.iter().position(|&q| q == b) {
+                Some(k) => (i + 1 + k + 1, None),
+                None => return false,
+            },
+            _ => (i + 1, Some(false)),
+        };
+        if let Some(is_semicolon) = token {
+            semicolon = is_semicolon;
+        }
+        i = end;
+    }
+    semicolon
+}
+
+/// The batches of SQL DuckDB's CLI hands its parser from a file, each with the file line
+/// each of its lines starts on, as the CLI's `ProcessInput` cuts them. A line whose first
+/// byte is `\x03` drops the lines held so far. A line starting with `.` or `#` while no line
+/// is held is a dot command or a comment, and is not SQL, whatever quote or comment it opens.
+/// Any other line is held, and the lines held go to the parser together once a line holding
+/// a `;` completes them by [`sql_is_complete`], or at the end of the file. Lines that hold
+/// only spaces and comments are dropped.
+///
+/// A dot command can itself run SQL or a program, such as `.read` and `.shell`; what it runs
+/// is not read here.
+fn cli_batches(bytes: &[u8]) -> Vec<(Vec<u8>, Vec<usize>)> {
+    let mut batches = Vec::new();
+    let mut sql = Vec::new();
+    let mut lines = Vec::new();
+    for (line, starts_on) in cli_lines(bytes) {
+        if line.first() == Some(&0x03) {
+            sql.clear();
+            lines.clear();
+            continue;
+        }
+        if sql.is_empty() && matches!(line.first(), Some(b'.' | b'#')) {
+            continue;
+        }
+        let prior = sql.len();
+        if !sql.is_empty() {
+            sql.push(b'\n');
+        }
+        sql.extend_from_slice(&line);
+        lines.push(starts_on);
+        if sql[prior..].contains(&b';') && sql_is_complete(&sql) {
+            batches.push((std::mem::take(&mut sql), std::mem::take(&mut lines)));
+        } else if all_whitespace(&sql) {
+            sql.clear();
+            lines.clear();
+        }
+    }
+    if !all_whitespace(&sql) {
+        batches.push((sql, lines));
+    }
+    batches
+}
+
+/// The length of the unicode space DuckDB's parser replaces with a space at the start of
+/// `q`, if one is there: U+00A0, U+2000 to U+200B, U+202F, U+205F, U+2060, U+3000, and
+/// U+FEFF, the byte-order mark some editors write at the start of a file.
+fn unicode_space_len(q: &[u8]) -> Option<usize> {
+    match q {
+        [0xC2, 0xA0, ..] => Some(2),
+        [0xE2, 0x80, 0x80..=0x8B | 0xAF, ..]
+        | [0xE2, 0x81, 0x9F | 0xA0, ..]
+        | [0xE3, 0x80, 0x80, ..]
+        | [0xEF, 0xBB, 0xBF, ..] => Some(3),
+        _ => None,
+    }
+}
+
+/// A batch as DuckDB's scanner receives it: each unicode space in [`unicode_space_len`]
+/// replaced with a space, as the parser's `StripUnicodeSpaces` pre-pass does, except inside
+/// what the pre-pass reads as a string or a comment. That is not the scanner's reading: a
+/// `'` or `"` opens a string until the next of the same quote, a `$` and a tag open a
+/// dollar-quoted string, a `--` comment ends at `\n` or `\r`, and `/* */` is not a comment.
+/// So a `'` inside a block comment opens a string for the pre-pass, and a U+200B after it
+/// stays, to be read by the scanner as part of a word.
+///
+/// DuckDB repeats the pass until it replaces nothing; one pass leaves nothing for a second,
+/// because a space opens nothing and a unicode space after a `$` is read as part of a tag.
+fn strip_unicode_spaces(q: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(q.len());
+    let mut pos = 0;
+    while pos < q.len() {
+        let rest = &q[pos..];
+        if let Some(len) = unicode_space_len(rest) {
+            out.push(b' ');
+            pos += len;
+            continue;
+        }
+        let end = match rest {
+            [quote @ (b'\'' | b'"'), tail @ ..] => tail
+                .iter()
+                .position(|b| b == quote)
+                .map_or(q.len(), |k| pos + k + 2),
+            [b'-', b'-', ..] => rest
+                .iter()
+                .position(|&b| b == b'\n' || b == b'\r')
+                .map_or(q.len(), |k| pos + k),
+            [b'$', next, ..] if *next == b'$' || is_tag_byte(*next, true) => {
+                let tag = rest[1..]
+                    .iter()
+                    .take_while(|&&b| is_tag_byte(b, false))
+                    .count();
+                let close = pos + 1 + tag;
+                match q.get(close) {
+                    // The search for the closing tag starts at the opening tag's last `$`,
+                    // and ends on the closing tag's last `$`, which is read again.
+                    Some(b'$') => {
+                        let delim = [b"$", &q[pos + 1..close], b"$"].concat();
+                        (close..q.len())
+                            .find(|&k| q[k..].starts_with(&delim))
+                            .map_or(q.len(), |k| k + delim.len() - 1)
+                    }
+                    // Not a tag: read on from the byte that ended it.
+                    Some(_) => close,
+                    None => q.len(),
+                }
+            }
+            _ => pos + 1,
+        };
+        out.extend_from_slice(&q[pos..end]);
+        pos = end;
+    }
+    out
+}
+
+/// Every place in a SQL file that says where DuckDB installs an extension from, each with
+/// the file line it is on. The file is read as DuckDB's CLI reads it: [`cli_batches`], then
+/// [`strip_unicode_spaces`], then [`lex_sql`], each batch alone.
+fn scan_extension_sql(file: &[u8]) -> Vec<(ExtensionSql, usize)> {
+    let mut found = Vec::new();
+    for (batch, lines) in cli_batches(file) {
+        let batch = strip_unicode_spaces(&batch);
+        let toks = lex_sql(&String::from_utf8_lossy(&batch));
+        for (finding, line) in scan_tokens(&toks) {
+            let file_line = lines.get(line - 1).or(lines.last()).copied();
+            found.push((finding, file_line.unwrap_or(1)));
+        }
+    }
+    found
+}
+
+/// Every place in one batch's tokens that says where DuckDB installs an extension from, each
+/// with its line in the batch.
 ///
 /// `INSTALL` is looked for anywhere in a statement and not only at its start, because
 /// DuckDB runs one that follows `EXPLAIN ANALYZE`. A repository alias is compared as
 /// written, because DuckDB refuses `FROM Community` as an unknown repository.
-fn scan_extension_sql(sql: &str) -> Vec<(ExtensionSql, usize)> {
-    let toks = lex_sql(sql);
+fn scan_tokens(toks: &[(Tok, usize)]) -> Vec<(ExtensionSql, usize)> {
     let mut found = Vec::new();
     for (k, (tok, line)) in toks.iter().enumerate() {
         let Tok::Word { text, quoted } = tok else {
@@ -724,7 +1092,7 @@ pub(crate) fn check_extension_installs(
         let Ok(bytes) = std::fs::read(&source.path) else {
             continue;
         };
-        for (found, line) in scan_extension_sql(&String::from_utf8_lossy(&bytes)) {
+        for (found, line) in scan_extension_sql(&bytes) {
             let why = match found {
                 ExtensionSql::Install {
                     from: InstallFrom::Core,
@@ -1075,7 +1443,7 @@ mod extension_tests {
 
     /// The findings of `sql`, without their lines.
     fn scan(sql: &str) -> Vec<ExtensionSql> {
-        scan_extension_sql(sql)
+        scan_extension_sql(sql.as_bytes())
             .into_iter()
             .map(|(f, _)| f)
             .collect()
@@ -1335,7 +1703,7 @@ mod extension_tests {
     fn scan_gives_each_finding_its_line() {
         assert_eq!(
             scan_extension_sql(
-                "SELECT 1;\n\nINSTALL a FROM community;\nSET custom_extension_repository = 'x';"
+                b"SELECT 1;\n\nINSTALL a FROM community;\nSET custom_extension_repository = 'x';"
             ),
             vec![
                 (install("a", InstallFrom::Community), 3),
