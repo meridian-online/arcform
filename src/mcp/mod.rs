@@ -2,8 +2,9 @@
 //!
 //! This is the entry point that subsumes the FineType MCP server's role: instead of a
 //! separate `finetype mcp` process, `arc mcp` federates the `finetype` CLI as a set of
-//! tools and adds two of its own — one that runs a Protocol and returns the live
-//! Protocol+Run contract, one that emits an operator's `with:` JSON Schema.
+//! tools and adds ones of its own — one that runs a Protocol and returns the live
+//! Protocol+Run contract, one that emits an operator's `with:` JSON Schema, and one
+//! that lists the SQL operations arc holds and describes what one takes.
 //!
 //! # Transport
 //!
@@ -24,7 +25,7 @@
 //! # Tools
 //!
 //! Five federate the `finetype` CLI behind a minimum-version gate (see [`finetype`]);
-//! two are native to `arc` (see [`hero`]).
+//! the rest are native to `arc` (see [`hero`]).
 
 mod finetype;
 mod hero;
@@ -45,7 +46,8 @@ const INSTRUCTIONS: &str = "arc — a local-first data-pipeline engine, exposed 
     Tools: infer / profile / taxonomy / validate / generate federate the FineType CLI \
     (semantic type inference over tabular data); protocol_run runs an arc Protocol and \
     returns its live Protocol+Run contract; operator_describe emits an operator's `with:` \
-    JSON Schema for authoring.";
+    JSON Schema for authoring; operation_describe lists the SQL operations arc holds and, \
+    given an operation's long name, describes what it takes.";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool result shapes
@@ -105,7 +107,7 @@ pub(crate) struct ToolDef {
 }
 
 /// Every tool this server registers: the five FineType-federating proxies followed by
-/// the two native tools.
+/// the tools native to `arc`.
 fn tools() -> Vec<ToolDef> {
     let mut all = finetype::tools();
     all.extend(hero::tools());
@@ -302,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_registers_all_seven_tools() {
+    fn tools_list_registers_all_eight_tools() {
         let listed = tools_list();
         let names: Vec<&str> = listed["tools"]
             .as_array()
@@ -318,13 +320,14 @@ mod tests {
             "generate",
             "protocol_run",
             "operator_describe",
+            "operation_describe",
         ] {
             assert!(
                 names.contains(&expected),
                 "missing tool `{expected}` in {names:?}"
             );
         }
-        assert_eq!(names.len(), 7, "unexpected tool set: {names:?}");
+        assert_eq!(names.len(), 8, "unexpected tool set: {names:?}");
         // Every tool advertises an object input schema.
         for tool in listed["tools"].as_array().unwrap() {
             assert!(tool["description"].is_string());
@@ -357,6 +360,47 @@ mod tests {
             .expect("operator_describe is registered");
         assert_eq!(result["isError"], false);
         assert!(result["structuredContent"]["operators"].is_array());
+    }
+
+    #[test]
+    fn operation_describe_reachable_through_tools_call() {
+        let listed = tools_call(&json!({ "name": "operation_describe", "arguments": {} }))
+            .expect("operation_describe is registered");
+        assert_eq!(listed["isError"], false);
+        assert!(listed["structuredContent"]["operations"].is_array());
+
+        let described = tools_call(&json!({
+            "name": "operation_describe",
+            "arguments": { "operation": "filter-rows" },
+        }))
+        .expect("operation_describe is registered");
+        assert_eq!(described["isError"], false);
+        assert_eq!(described["structuredContent"]["long_name"], "filter-rows");
+    }
+
+    #[test]
+    fn operation_describe_unknown_operation_is_an_iserror_result_naming_it() {
+        let result = tools_call(&json!({
+            "name": "operation_describe",
+            "arguments": { "operation": "nope" },
+        }))
+        .expect("an unknown operation is a result, not a protocol error");
+        assert_eq!(result["isError"], true);
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("`nope`")
+        );
+    }
+
+    #[test]
+    fn initialize_instructions_name_every_native_tool() {
+        let result = initialize_result(&Value::Null);
+        let instructions = result["instructions"].as_str().expect("instructions");
+        for tool in ["protocol_run", "operator_describe", "operation_describe"] {
+            assert!(instructions.contains(tool), "instructions omit `{tool}`");
+        }
     }
 
     #[test]

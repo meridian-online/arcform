@@ -127,7 +127,8 @@ pub enum Commands {
     /// Serve a Model Context Protocol server over stdio, for AI-agent and editor
     /// integration. Federates the `finetype` CLI as tools (infer / profile / taxonomy
     /// / validate / generate) and adds `protocol_run` (run a Protocol, return its
-    /// Protocol+Run contract) and `operator_describe` (an operator's `with:` schema).
+    /// Protocol+Run contract), `operator_describe` (an operator's `with:` schema) and
+    /// `operation_describe` (the SQL operations arc holds, and what one takes).
     #[cfg(feature = "mcp")]
     Mcp,
 }
