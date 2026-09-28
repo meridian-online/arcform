@@ -31,7 +31,13 @@ Each extension below has a permissive licence, a build the community registry se
 - `INSTALL '<path>'`, whose name is itself a file or an address. DuckDB reads a name holding a `.`, a `/` or a `\` that way.
 - A statement that names the setting `custom_extension_repository` or `autoinstall_extension_repository`. After `SET custom_extension_repository = '/tmp/ext'`, a bare `INSTALL mlpack;` fetches from `/tmp/ext`, and the second setting does the same for an extension DuckDB installs on its own when a function needs one.
 
-`FORCE INSTALL` is checked as `INSTALL` is, in any letter case, and so is an `INSTALL` that follows `EXPLAIN ANALYZE`, which DuckDB runs. Text inside a `--` comment, a `/* */` comment or a string is not read as SQL. A step whose SQL arc cannot otherwise parse is checked too.
+`FORCE INSTALL` is checked as `INSTALL` is, in any letter case, and so is an `INSTALL` that follows `EXPLAIN ANALYZE`, which DuckDB runs. A step whose SQL arc cannot otherwise parse is checked too.
+
+arc reads a SQL file as the DuckDB CLI reads a file given with `-f`, which is how `arc run` runs a step. The rules are copied from DuckDB v1.5.5's source, which is the same as v1.5.4's:
+
+- The CLI's lines and the batches it hands the parser. A line starting with `.` or `#` while no statement is open is a dot command or a comment, and is not SQL, whatever quote or comment it holds. A line starting with the byte `0x03` drops the lines held before it. A NUL byte drops the rest of the chunk the CLI read it in.
+- The parser's pre-pass, which reads a byte-order mark, a zero-width space (U+200B) and the other unicode spaces it knows as a space, except inside what it reads as a string or a comment.
+- The scanner's rules. A `--` comment ends at a line feed or a carriage return, a `/* */` comment nests, and two strings with a line end between them are one string. Text inside a comment or a string is not SQL.
 
 The refusal names the step or hook, the file and line, and what the statement installs. No variable lifts it.
 
@@ -39,9 +45,10 @@ The refusal names the step or hook, the file and line, and what the statement in
 
 - `INSTALL <name>` with no `FROM`, and `INSTALL <name> FROM core`. These install from DuckDB's own repository.
 - `LOAD`. SQL does not say where a loaded extension was installed from.
-- A `command:` step, and anything a step runs outside its SQL. **This check is not a sandbox.** arc does not sandbox a Protocol: a `command:` step can start a DuckDB of its own and install what it likes, and running a Protocol you did not write is running a shell script you did not read. What the check gives is that a Protocol's SQL cannot install an extension off this list without arc saying so.
+- A `command:` step, and anything a step runs outside its SQL. **This check is not a sandbox.** arc does not sandbox a Protocol: a `command:` step can start a DuckDB of its own and install what it likes, and running a Protocol you did not write is running a shell script you did not read. What the check gives is that the SQL DuckDB reads from a Protocol's SQL files cannot install an extension off this list without arc saying so.
 - A SQL file that is not there when the run starts, such as one an earlier `command:` step writes.
-- A DuckDB CLI dot command in a SQL file, such as `.read` or `.shell`.
+- What a DuckDB CLI dot command in a SQL file runs, such as the file `.read` names or the program `.shell` starts. arc skips the dot command's line, as DuckDB does.
+- A DuckDB version other than v1.5.4 and v1.5.5. The CLI's rules above were read from those two, and another version's were not compared.
 
 ## The DuckDB version
 
