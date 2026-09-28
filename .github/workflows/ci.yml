@@ -163,18 +163,21 @@ jobs:
 
       # The reader in src/duckdb_lineage.rs asks a DuckDB 2.0 build for its parse of a
       # step, and DUCKDB_VERSION above is a 1.x release, so its tests that start DuckDB
-      # are #[ignore]d and the step above reports them as ignored. This step downloads
-      # the 2.0 preview and runs them when this commit changes the reader or this
-      # workflow; the tests that read from captured answers ran above either way. The
-      # preview's address names no version and the build behind it moves, so a change
-      # elsewhere does not run them. The step prints the version it downloaded, and
-      # each test prints the version it asked.
+      # are #[ignore]d and the step above reports them as ignored, as are the tests of
+      # `arc run` with ARC_SQL_READER=duckdb in tests/duckdb_reader_switch.rs. This step
+      # downloads the 2.0 preview and runs both when this commit changes the reader, the
+      # rules src/introspect.rs applies to what it reads, those tests or this workflow;
+      # the tests that read from captured answers ran above either way. The preview's
+      # address names no version and the build behind it moves, so a change elsewhere
+      # does not run them. The step prints the version it downloaded, and each lib test
+      # prints the version it asked.
       - name: test (DuckDB lineage reader, on the DuckDB 2.0 preview)
         run: |
           set -euo pipefail
-          changed=$(git diff --name-only HEAD^1 HEAD -- src/duckdb_lineage.rs .github/workflows/ci.yml)
+          watched="src/duckdb_lineage.rs src/introspect.rs tests/duckdb_reader_switch.rs .github/workflows/ci.yml"
+          changed=$(git diff --name-only HEAD^1 HEAD -- $watched)
           if [ -z "$changed" ]; then
-            echo "src/duckdb_lineage.rs and ci.yml are unchanged; the preview tests do not run."
+            echo "$watched are unchanged; the preview tests do not run."
             exit 0
           fi
           dir="$RUNNER_TEMP/duckdb-preview"
@@ -185,6 +188,8 @@ jobs:
           "$dir/duckdb" --version
           ARC_DUCKDB_PREVIEW_BIN="$dir/duckdb" \
             cargo test --workspace --lib duckdb_lineage -- --include-ignored --nocapture
+          ARC_DUCKDB_PREVIEW_BIN="$dir/duckdb" \
+            cargo test --workspace --test duckdb_reader_switch -- --include-ignored
 
       # `uv` — and unlike the subtoken extension, it is cheap enough to belong on
       # the routine gate. `tests/uv_operator.rs` proves three of its four properties

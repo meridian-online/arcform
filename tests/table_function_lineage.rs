@@ -16,14 +16,26 @@ use std::process::Command;
 /// Run one `sql:` step's text on a throwaway project and return (stdout, the run's
 /// `assets` array from its one JSON contract).
 fn run_step(sql: &str) -> (String, Vec<serde_json::Value>) {
+    run_steps(&[("s", sql)])
+}
+
+/// Run several `sql:` steps, in the order given, on a throwaway project — each `(name,
+/// text)` pair is a step named `name` whose SQL is `name.sql` — and return (stdout, the
+/// run's `assets` array from its one JSON contract).
+fn run_steps(steps: &[(&str, &str)]) -> (String, Vec<serde_json::Value>) {
     let arc = env!("CARGO_BIN_EXE_arc");
     let workspace = tempfile::tempdir().unwrap();
-    std::fs::write(
-        workspace.path().join("arcform.yaml"),
-        "name: lineage_probe\nengine: duckdb\ndb: probe.db\nsteps:\n  - name: s\n    sql: s.sql\n",
-    )
-    .unwrap();
-    std::fs::write(workspace.path().join("s.sql"), sql).unwrap();
+    let mut manifest = String::from("name: lineage_probe\nengine: duckdb\ndb: probe.db\nsteps:\n");
+    for (name, sql) in steps {
+        manifest.push_str(&format!("  - name: {name}\n    sql: {name}.sql\n"));
+        std::fs::write(workspace.path().join(format!("{name}.sql")), sql).unwrap();
+    }
+    std::fs::write(workspace.path().join("arcform.yaml"), manifest).unwrap();
+    let sql = steps
+        .iter()
+        .map(|(_, sql)| *sql)
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let run = Command::new(arc)
         .current_dir(workspace.path())
@@ -113,5 +125,66 @@ fn plain_table_is_unaffected_end_to_end() {
     assert!(
         find(&assets, "customers").is_some(),
         "plain table reference unaffected"
+    );
+}
+
+// A table that carries a row-generator's or a catalog function's name, read with no
+// parentheses, is a table: the name only means "no table behind me" when it is called
+// (`range(3)`). Each name is made as a table by one step and read by the next, and the
+// printed graph and the contract both hold it as a table the second step reads.
+#[test]
+fn a_table_named_for_a_generator_is_recorded_as_a_table_the_step_reads() {
+    for name in [
+        "range",
+        "generate_series",
+        "duckdb_functions",
+        "duckdb_tables",
+        "duckdb_secrets",
+    ] {
+        let make = format!("CREATE TABLE {name} AS SELECT 1 AS n;");
+        let read = format!("CREATE TABLE r AS SELECT * FROM {name};");
+        let (stdout, assets) = run_steps(&[("make", &make), ("read", &read)]);
+
+        let asset = find(&assets, name)
+            .unwrap_or_else(|| panic!("{name} should be a recorded asset, got {assets:?}"));
+        assert_eq!(asset["kind"], "table", "{name} is a table, got {asset}");
+        assert_eq!(asset["produced_by"], "make", "{name}: {asset}");
+        assert_eq!(
+            asset["consumed_by"],
+            serde_json::json!(["read"]),
+            "{name} is read by the second step, got {asset}"
+        );
+        assert!(
+            // `[table]` alone when the run could not execute, `[table, 1 row]` when it did.
+            stdout.contains(&format!("{name} [table")),
+            "printed graph should hold {name} as a table, got:\n{stdout}"
+        );
+    }
+}
+
+// A function named `read_` something that arc does not know as a reader is not a
+// reader: its argument is not recorded as a file. arc knows a fixed list of readers
+// (`read_parquet`, `read_csv`, `read_xlsx`, …); a name's `read_` prefix is not on it.
+#[test]
+fn an_unknown_read_function_records_no_file_for_its_argument() {
+    let sql = "CREATE TABLE r AS SELECT * FROM read_widget('x.dat');";
+    let (_, assets) = run_step(sql);
+
+    assert!(
+        find(&assets, "x.dat").is_none(),
+        "x.dat is an argument to a function arc does not know as a reader, got {assets:?}"
+    );
+    assert!(
+        assets.iter().all(|a| a["kind"] != "file"),
+        "no file should be recorded, got {assets:?}"
+    );
+    assert!(
+        find(&assets, "read_widget").is_none(),
+        "no table named read_widget"
+    );
+    assert_eq!(
+        find(&assets, "r").expect("the step's own table")["produced_by"],
+        "s",
+        "the statement parsed and its lineage was recorded, got {assets:?}"
     );
 }

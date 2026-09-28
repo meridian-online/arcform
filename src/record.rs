@@ -448,6 +448,175 @@ fn next_model_number(models_dir: &Path) -> u32 {
     max + 1
 }
 
+// ------------------------------------------------------------ the catalogue
+
+/// The long name of the filter operation. The one place the name is written, so
+/// renaming the operation is a change to this line alone.
+const FILTER_ROWS: &str = "filter-rows";
+
+/// One SQL operation arc holds: what it is called, what it does, what it is
+/// applied to, and what it takes — described so that it can be recorded as a
+/// step by name. The catalogue holds the description and nothing that runs.
+pub(crate) struct Operation {
+    /// The operation's identity: lower case, hyphenated, the verb first.
+    pub(crate) long_name: &'static str,
+    /// One sentence saying what the operation does.
+    pub(crate) summary: &'static str,
+    /// Each thing the operation is applied to, in the order a caller names them.
+    applied_to: &'static [AppliedTo],
+    /// The operation's arguments as a JSON Schema.
+    parameters: fn() -> serde_json::Value,
+}
+
+/// One thing an operation is applied to. It is supplied by where the operation
+/// is asked from — the node in view, the column under a cursor — and is not an
+/// argument, so it is absent from the `parameters` schema.
+struct AppliedTo {
+    /// The entry's name, unique within the operation.
+    name: &'static str,
+    /// What kind of thing it is: `table` or `column`.
+    kind: &'static str,
+    /// The `name` of an earlier entry this one belongs to: a column is a column
+    /// of a table. `None` for an entry that stands alone.
+    of: Option<&'static str>,
+    /// One sentence saying what the entry is to the operation.
+    description: &'static str,
+}
+
+/// A comparison a condition offers by word, with the SQL it is written as.
+/// Offered, not enforced: a condition is any SQL condition.
+struct Comparison {
+    word: &'static str,
+    sign: &'static str,
+}
+
+/// The comparisons a filter's condition offers, in the order they are offered.
+const COMPARISONS: &[Comparison] = &[
+    Comparison {
+        word: "is",
+        sign: "=",
+    },
+    Comparison {
+        word: "is not",
+        sign: "!=",
+    },
+    Comparison {
+        word: "over",
+        sign: ">",
+    },
+    Comparison {
+        word: "under",
+        sign: "<",
+    },
+    Comparison {
+        word: "between",
+        sign: "between",
+    },
+    Comparison {
+        word: "is null",
+        sign: "is null",
+    },
+];
+
+/// Every operation arc holds, in the order `arc operation list` prints them.
+const CATALOGUE: &[Operation] = &[Operation {
+    long_name: FILTER_ROWS,
+    summary: "Keeps the rows of a table for which a SQL condition holds.",
+    applied_to: &[
+        AppliedTo {
+            name: "table",
+            kind: "table",
+            of: None,
+            description: "The table whose rows are kept.",
+        },
+        AppliedTo {
+            name: "column",
+            kind: "column",
+            of: Some("table"),
+            description: "The column the condition is on; the condition may name others.",
+        },
+    ],
+    parameters: filter_rows_parameters,
+}];
+
+/// The `parameters` schema of [`FILTER_ROWS`]: one required string, `where`.
+/// Closed to any other key, as an operator's `with:` schema is.
+///
+/// `where` is annotated rather than constrained. `x-kind` says what the value
+/// is, and `x-comparisons` lists the comparisons offered by word; a JSON Schema
+/// reader that does not know a key passes over it. The condition is recorded as
+/// written, so the schema holds no `enum` and no `pattern` that would hold it
+/// to the column or to the comparisons listed.
+fn filter_rows_parameters() -> serde_json::Value {
+    let comparisons: Vec<serde_json::Value> = COMPARISONS
+        .iter()
+        .map(|c| serde_json::json!({ "word": c.word, "sign": c.sign }))
+        .collect();
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "where": {
+                "type": "string",
+                "description": "Rows for which the condition holds are kept. \
+                    The condition is any SQL condition on the table, recorded as written; \
+                    the comparisons listed are the ones offered by word, not a limit.",
+                "x-kind": "condition",
+                "x-comparisons": comparisons,
+            }
+        },
+        "required": ["where"],
+    })
+}
+
+/// Every operation arc holds, in catalogue order.
+pub(crate) fn operations() -> &'static [Operation] {
+    CATALOGUE
+}
+
+/// The operation called `long_name`, or `None` when arc holds none by that name.
+/// The match is exact: a long name is an identity, not a search term.
+pub(crate) fn operation(long_name: &str) -> Option<&'static Operation> {
+    CATALOGUE.iter().find(|op| op.long_name == long_name)
+}
+
+impl Operation {
+    /// The listing entry: the long name and the one line saying what it does.
+    pub(crate) fn listing(&self) -> serde_json::Value {
+        serde_json::json!({
+            "long_name": self.long_name,
+            "summary": self.summary,
+        })
+    }
+
+    /// The full description: the listing entry, the list of what the operation
+    /// is applied to, and a `parameters` JSON Schema of what it takes.
+    pub(crate) fn description(&self) -> serde_json::Value {
+        serde_json::json!({
+            "long_name": self.long_name,
+            "summary": self.summary,
+            "applied_to": self.applied_to.iter().map(AppliedTo::description).collect::<Vec<_>>(),
+            "parameters": (self.parameters)(),
+        })
+    }
+}
+
+impl AppliedTo {
+    /// The entry as the description prints it; `of` only where it is set.
+    fn description(&self) -> serde_json::Value {
+        let mut entry = serde_json::json!({
+            "name": self.name,
+            "kind": self.kind,
+        });
+        if let Some(of) = self.of {
+            entry["of"] = of.into();
+        }
+        entry["description"] = self.description.into();
+        entry
+    }
+}
+
 // --------------------------------------------------------------------- tests
 
 #[cfg(test)]
@@ -593,5 +762,218 @@ mod tests {
         assert!(!model.exists(), "the orphan model is removed");
         assert!(bystander.exists(), "the bystander survives");
         assert!(models.exists(), "a non-empty directory is left standing");
+    }
+
+    // ------------------------------------------------------- the catalogue
+
+    /// `text` is one sentence: it opens with a capital, ends at its one full
+    /// stop, and holds no line break. The panel prints it on its own line.
+    fn is_one_sentence(text: &str) -> bool {
+        let Some(body) = text.strip_suffix('.') else {
+            return false;
+        };
+        text.chars().next().is_some_and(char::is_uppercase)
+            && !text.contains('\n')
+            && !body.contains(['.', '?', '!'])
+    }
+
+    #[test]
+    fn the_sentence_check_refuses_what_is_not_one_sentence() {
+        assert!(is_one_sentence("The table whose rows are kept."));
+        for not_one in [
+            "",
+            "the table.",
+            "The table",
+            "The table. The rows.",
+            "The table\nwhose rows.",
+            "Is it? Yes.",
+        ] {
+            assert!(
+                !is_one_sentence(not_one),
+                "{not_one:?} was read as one sentence"
+            );
+        }
+    }
+
+    #[test]
+    fn every_long_name_is_lower_case_hyphenated_and_appears_once() {
+        let mut seen = std::collections::BTreeSet::new();
+        for op in operations() {
+            assert!(
+                !op.long_name.is_empty()
+                    && op
+                        .long_name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '-'),
+                "`{}` is not a lower case, hyphenated long name",
+                op.long_name
+            );
+            assert!(
+                seen.insert(op.long_name),
+                "`{}` is held twice, so a lookup could not tell them apart",
+                op.long_name
+            );
+            assert!(
+                is_one_sentence(op.summary),
+                "`{}` has no one-sentence summary: {:?}",
+                op.long_name,
+                op.summary
+            );
+        }
+    }
+
+    // Every operation's `applied_to` is read the same way by a caller: each
+    // entry named once, a kind the caller can supply, a sentence to print, and
+    // an `of` that points back at an earlier entry of a kind that holds it.
+    #[test]
+    fn every_applied_to_entry_is_named_once_and_its_of_names_an_earlier_table() {
+        for op in operations() {
+            assert!(
+                !op.applied_to.is_empty(),
+                "`{}` is applied to nothing",
+                op.long_name
+            );
+            let mut earlier: Vec<&AppliedTo> = Vec::new();
+            for entry in op.applied_to {
+                assert!(
+                    ["table", "column"].contains(&entry.kind),
+                    "`{}`: `{}` has kind `{}`, which no caller supplies",
+                    op.long_name,
+                    entry.name,
+                    entry.kind
+                );
+                assert!(
+                    earlier.iter().all(|e| e.name != entry.name),
+                    "`{}`: `{}` is named twice",
+                    op.long_name,
+                    entry.name
+                );
+                assert!(
+                    is_one_sentence(entry.description),
+                    "`{}`: `{}` has no one-sentence description: {:?}",
+                    op.long_name,
+                    entry.name,
+                    entry.description
+                );
+                match (entry.kind, entry.of) {
+                    ("column", Some(of)) => assert!(
+                        earlier.iter().any(|e| e.name == of && e.kind == "table"),
+                        "`{}`: `{}` is `of` `{of}`, which is no earlier table",
+                        op.long_name,
+                        entry.name
+                    ),
+                    ("column", None) => panic!(
+                        "`{}`: the column `{}` does not say which table it is of",
+                        op.long_name, entry.name
+                    ),
+                    (_, Some(of)) => panic!(
+                        "`{}`: the {} `{}` is `of` `{of}`, and only a column belongs to another entry",
+                        op.long_name, entry.kind, entry.name
+                    ),
+                    (_, None) => {}
+                }
+                earlier.push(entry);
+            }
+        }
+    }
+
+    #[test]
+    fn an_operation_is_found_by_its_exact_long_name_and_no_other_spelling() {
+        assert_eq!(
+            operation(FILTER_ROWS).map(|op| op.long_name),
+            Some(FILTER_ROWS)
+        );
+        for near_miss in ["", "Filter-Rows", "filter", "filter-rows ", "filter_rows"] {
+            assert!(
+                operation(near_miss).is_none(),
+                "`{near_miss}` was found as if it were `{FILTER_ROWS}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_description_extends_the_listing_with_what_it_is_applied_to_and_its_schema() {
+        let op = operation(FILTER_ROWS).expect("the filter is held");
+        let listing = op.listing();
+        let description = op.description();
+
+        assert_eq!(listing["long_name"], FILTER_ROWS);
+        assert_eq!(description["long_name"], listing["long_name"]);
+        assert_eq!(description["summary"], listing["summary"]);
+        assert_eq!(listing["summary"], op.summary);
+        assert_eq!(
+            description["applied_to"],
+            serde_json::json!([
+                {
+                    "name": "table",
+                    "kind": "table",
+                    "description": op.applied_to[0].description,
+                },
+                {
+                    "name": "column",
+                    "kind": "column",
+                    "of": "table",
+                    "description": op.applied_to[1].description,
+                },
+            ]),
+            "the filter is applied to a table, then a column of that table"
+        );
+        assert_eq!(description["parameters"], filter_rows_parameters());
+    }
+
+    #[test]
+    fn the_filter_takes_one_required_condition_and_no_other_key() {
+        let schema = filter_rows_parameters();
+        let where_ = &schema["properties"]["where"];
+
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["where"]),
+            "`where` is the one required parameter"
+        );
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::json!(false),
+            "the schema is closed to any other key"
+        );
+        assert_eq!(
+            schema["properties"].as_object().map(|p| p.len()),
+            Some(1),
+            "`where` is the one parameter; the column is not an argument"
+        );
+        assert_eq!(where_["type"], "string", "`where` is a string");
+        assert_eq!(
+            where_["x-kind"], "condition",
+            "`where` does not say its value is a condition"
+        );
+        assert!(
+            where_["description"]
+                .as_str()
+                .is_some_and(|d| is_one_sentence(d.split_inclusive(". ").next().unwrap().trim())),
+            "`where` has no description whose first sentence the panel can print: {where_}"
+        );
+        for constraint in ["enum", "pattern"] {
+            assert!(
+                where_.get(constraint).is_none(),
+                "`where` holds `{constraint}`, which would hold the condition to it: {where_}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_condition_offers_six_comparisons_by_word_and_sign_in_order() {
+        let schema = filter_rows_parameters();
+        assert_eq!(
+            schema["properties"]["where"]["x-comparisons"],
+            serde_json::json!([
+                { "word": "is", "sign": "=" },
+                { "word": "is not", "sign": "!=" },
+                { "word": "over", "sign": ">" },
+                { "word": "under", "sign": "<" },
+                { "word": "between", "sign": "between" },
+                { "word": "is null", "sign": "is null" },
+            ]),
+            "the comparisons offered, in order, as a word and a sign"
+        );
     }
 }

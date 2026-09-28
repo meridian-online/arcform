@@ -204,6 +204,9 @@ pub fn run_with_params(
             eprintln!("{} {}", "warning:".yellow(), warning);
         }
     }
+    // Which reader takes a SQL step's reads and produces. Refused here, before a step
+    // runs, rather than as a warning on each step the reader cannot read.
+    crate::introspect::check_reader(manifest.has_sql_steps()).map_err(Error::SqlReader)?;
 
     if manifest.steps.is_empty() {
         println!("{}", "No steps defined.".dimmed());
