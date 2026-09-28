@@ -156,7 +156,7 @@ fn entry_line(history: &LocalHistory, dir: &Path, id: &str) -> String {
     )
 }
 
-// AC1: the file's two entries, oldest first, and no entry of the spec's or of
+// List: the file's two entries, oldest first, and no entry of the spec's or of
 // the other chart's; the restore hint names the file it was listed for.
 #[test]
 fn list_given_a_file_prints_that_files_entries_and_none_of_the_protocols() {
@@ -216,7 +216,7 @@ fn a_relative_file_is_read_from_the_protocol_directory() {
     );
 }
 
-// AC2: each entry's exact text, and nothing else on stdout.
+// Show: each entry's exact text, and nothing else on stdout.
 #[test]
 fn show_given_a_file_prints_that_entrys_text() {
     let fx = setup();
@@ -226,7 +226,7 @@ fn show_given_a_file_prints_that_entrys_text() {
     }
 }
 
-// AC3: the entry's text lands in panels/a.yaml, the spec and the other chart
+// Restore: the entry's text lands in panels/a.yaml, the spec and the other chart
 // are byte-identical, the command exits zero, and the text it replaced is
 // checkpointed in a's history rather than the spec's.
 #[test]
@@ -265,7 +265,7 @@ fn restore_given_a_file_writes_that_file_and_leaves_the_spec_alone() {
     assert_eq!(fx.history.entries(&fx.dir).unwrap().len(), 2);
 }
 
-// AC4: with no `--file`, the listing is the spec's entries in the format the
+// No file: the listing is the spec's entries in the format the
 // command has always printed, show prints the spec's text, and restore writes
 // the spec, leaves the chart files byte-identical and reports as before.
 #[test]
@@ -304,7 +304,7 @@ fn with_no_file_the_verbs_print_and_write_what_they_did() {
     assert_eq!(fx.history.entries_for_file(&fx.a).unwrap().len(), 2);
 }
 
-// AC4, the empty case: a Protocol with no history names the spec, as before.
+// No file, no history: a Protocol with no history names the spec, as before.
 #[test]
 fn with_no_file_and_no_history_the_listing_names_the_spec() {
     let fx = setup();
@@ -324,7 +324,7 @@ fn with_no_file_and_no_history_the_listing_names_the_spec() {
     );
 }
 
-// AC4, the note: a restored spec that does not load is still said out loud,
+// The note: a restored spec that does not load is still said out loud,
 // with no file given and with the spec given as the file; a chart is not
 // asked to load as a spec (the restore test above pins that side).
 #[test]
@@ -350,7 +350,7 @@ fn a_restored_spec_that_does_not_load_is_noted() {
     );
 }
 
-// AC5: `arc history --help` names the file argument, and each verb's help
+// Help: `arc history --help` names the file argument, and each verb's help
 // lists it as an option it takes.
 #[test]
 fn help_names_the_file_argument() {
