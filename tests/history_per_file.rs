@@ -368,17 +368,29 @@ fn a_restore_whose_checkpoint_cannot_be_recorded_writes_nothing() {
 }
 
 #[test]
-fn the_directory_restore_still_refuses_a_missing_directory_by_name() {
+fn the_directory_calls_still_refuse_a_missing_directory_by_name() {
     let f = setup();
     let missing = f.dir.join("missing");
-    let refused = f
-        .history
-        .restore(&missing, "1700000000000-000-save")
-        .unwrap_err();
-    assert!(
-        matches!(&refused, Error::FileRead { path, .. } if *path == missing),
-        "{refused}"
-    );
+    let id = "1700000000000-000-save";
+    let refusals = [
+        (
+            "record_save",
+            f.history.record_save(&missing, SPEC).map(drop),
+        ),
+        (
+            "record_checkpoint",
+            f.history.record_checkpoint(&missing, SPEC).map(drop),
+        ),
+        ("restore", f.history.restore(&missing, id).map(drop)),
+    ];
+    for (call, result) in refusals {
+        let refused = result.expect_err(call);
+        assert!(
+            matches!(&refused, Error::FileRead { path, .. } if *path == missing),
+            "{call}: {refused}"
+        );
+    }
+    assert!(!f.history.root().exists());
 }
 
 #[test]
