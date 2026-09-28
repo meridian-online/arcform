@@ -947,16 +947,14 @@ fn arg(entry: &Value, text: &str) -> Arg {
         };
     }
     // DuckDB binds `name = value` in a table function's arguments as a named parameter.
-    if expression["type"] == "COMPARE_EQUAL" {
-        if let [Value::String(name)] = expression["left"]["column_names"]
-            .as_array()
-            .map_or(&[][..], Vec::as_slice)
-        {
-            return Arg {
-                name: Some(name.clone()),
-                value: arg_value(&expression["right"], text),
-            };
-        }
+    let left = expression["left"]["column_names"].as_array();
+    if expression["type"] == "COMPARE_EQUAL"
+        && let Some([Value::String(name)]) = left.map(Vec::as_slice)
+    {
+        return Arg {
+            name: Some(name.clone()),
+            value: arg_value(&expression["right"], text),
+        };
     }
     Arg {
         name: None,
