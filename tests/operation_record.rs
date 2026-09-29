@@ -338,11 +338,28 @@ fn the_terminal_refuses_an_argument_it_cannot_read_with_the_directory_untouched(
 
 #[test]
 fn a_condition_holding_a_terminator_is_refused_with_the_directory_untouched() {
-    let protocol = Protocol::new();
-    let before = protocol.files();
-    let out = protocol.record_filter("amount > 100; DROP TABLE orders");
-    refused(&out, &["`where`", "`;`", "amount > 100; DROP TABLE orders"]);
-    assert_eq!(protocol.files(), before, "the directory changed");
+    // The plain terminator, and the two forms round one admitted because its
+    // hand-written splitter read an `E'...'` backslash escape and a `--` comment
+    // ended by a carriage return differently from DuckDB. Each carries a
+    // top-level `;` DuckDB acts on, so `arc run` would drop `orders`; each is
+    // refused instead, the directory untouched, and the message names the
+    // condition. The lower-case `e'...'` is the same string literal.
+    for condition in [
+        "amount > 100; DROP TABLE orders",
+        r"note = E'\'' ; DROP TABLE orders ; --'",
+        r"note = e'\'' ; DROP TABLE orders ; --'",
+        "amount > 100 --\r; DROP TABLE orders",
+    ] {
+        let protocol = Protocol::new();
+        let before = protocol.files();
+        let out = protocol.record_filter(condition);
+        refused(&out, &["`where`", "`;`", condition]);
+        assert_eq!(
+            protocol.files(),
+            before,
+            "{condition:?}: the directory changed"
+        );
+    }
 }
 
 #[test]
@@ -478,6 +495,31 @@ mod mcp {
                 json!({
                     "operation": "filter-rows", "on": "orders", "name": "big_orders",
                     "arguments": { "where": "amount > 100; DROP TABLE orders" },
+                }),
+                vec!["`;`"],
+            ),
+            // The two forms round one admitted, refused over MCP as well as from
+            // the terminal: an `E'...'` backslash escape and a `--` comment ended
+            // by a carriage return. An MCP-only agent is the one operation_record
+            // most guards, since it is the tool that writes a Protocol.
+            (
+                json!({
+                    "operation": "filter-rows", "on": "orders", "name": "big_orders",
+                    "arguments": { "where": r"note = E'\'' ; DROP TABLE orders ; --'" },
+                }),
+                vec!["`;`"],
+            ),
+            (
+                json!({
+                    "operation": "filter-rows", "on": "orders", "name": "big_orders",
+                    "arguments": { "where": r"note = e'\'' ; DROP TABLE orders ; --'" },
+                }),
+                vec!["`;`"],
+            ),
+            (
+                json!({
+                    "operation": "filter-rows", "on": "orders", "name": "big_orders",
+                    "arguments": { "where": "amount > 100 --\r; DROP TABLE orders" },
                 }),
                 vec!["`;`"],
             ),

@@ -602,14 +602,35 @@ fn filter_rows_sql(recording: &Recording) -> String {
     format!(
         "CREATE OR REPLACE TABLE {} AS\nSELECT *\nFROM {}\nWHERE {};\n",
         quote_ident(recording.name),
-        recording.on,
+        from_ident(recording.on),
         recording.text("where"),
     )
 }
 
-/// `name` as a double-quoted SQL identifier, a `"` inside it doubled.
+/// `name` as a double-quoted SQL identifier, a `"` inside it doubled. The step's
+/// own name is always quoted, so a name arc admits that would otherwise read as
+/// SQL — [`valid_step_name`] admits a `"` — cannot break out of the statement.
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// A table name for the `FROM` clause. A name of only ASCII letters, digits and
+/// underscores that does not open with a digit is written bare — a plain
+/// `orders` unchanged, folded by DuckDB as it always was, so `FROM orders` reads
+/// the same, and brightfield's `to_pushdown_sql` writes the same line. Any other
+/// name — one a step could only have made under quotes, holding a space, a `"`
+/// or a `;` — is quoted through [`quote_ident`], so a table the protocol makes
+/// cannot break out of the `FROM` into SQL of its own, the same class as the
+/// condition's terminator.
+fn from_ident(name: &str) -> String {
+    let bare = !name.is_empty()
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if bare {
+        name.to_string()
+    } else {
+        quote_ident(name)
+    }
 }
 
 /// Every operation arc holds, in catalogue order.
@@ -676,9 +697,10 @@ impl AppliedTo {
 ///
 /// Refused, with the protocol's directory untouched: an operation arc does not
 /// hold; arguments the operation's `parameters` do not admit, whether one is
-/// missing, one is not taken or one is of the wrong type; a condition holding a
-/// statement terminator outside a string or a comment; and a table no step of
-/// the protocol makes. Each refusal's message names what was wrong.
+/// missing, one is not taken or one is of the wrong type; a condition DuckDB's
+/// own parser reads as more than one statement (see [`one_statement`]); and a
+/// table no step of the protocol makes. Each refusal's message names what was
+/// wrong.
 pub(crate) fn record_operation(
     dir: &Path,
     long_name: &str,
@@ -789,24 +811,80 @@ fn is_of_type(value: &serde_json::Value, ty: &str) -> bool {
 /// statement and begin another: refused. Every other condition is recorded as
 /// written, whether or not it parses.
 ///
-/// The split is the one a step's statements are rendered by. It is run over the
-/// condition with a `;` on a line after it, so that the last range, ending at
-/// that `;` or swallowed with it, always runs past the condition's end: a range
-/// that ends inside the condition ended at a terminator of the condition's own.
-/// Split alone, a condition ending in a comment that ends in `;`, such as
-/// `a > 1 -- ;`, would end its last range on that `;` too.
+/// The terminator is found by DuckDB's own parser, not a lexer of arc's own:
+/// the condition is put in the `WHERE` of a probe `SELECT` and handed to
+/// [`duckdb_statement_count`], which asks DuckDB to split the text into
+/// statements without binding or running any of them. So a `;` inside a string
+/// or a comment — however DuckDB reads that string or comment, `E'\''`
+/// backslash escapes and a `--` comment ended by a carriage return included —
+/// stays inside the one statement, and a `;` that ends the statement makes the
+/// probe parse as two. The check therefore agrees with the DuckDB that
+/// `arc run` shells out to by construction, rather than tracking it by hand.
+///
+/// A condition DuckDB cannot parse at all (`duckdb_statement_count` is `0`) is
+/// one statement's worth of text and is recorded as written: whether it is a
+/// condition at all, rather than something a bind would reject such as
+/// `amount > 100 UNION ALL SELECT * FROM orders`, waits for a later parse that
+/// binds the condition to the table it filters. A condition ending in a bare
+/// `;` with nothing after it, such as `amount > 100;`, parses as a single
+/// statement and is recorded: the trailing terminator adds no second statement,
+/// so nothing is smuggled in.
 fn one_statement(key: &str, condition: &str) -> Result<()> {
-    let probe = format!("{condition}\n;");
-    let terminated = crate::introspect::statement_byte_ranges(&probe)
-        .iter()
-        .any(|&(_, end)| end <= condition.len());
-    if terminated {
+    let probe = format!("SELECT 1 WHERE {condition}");
+    if duckdb_statement_count(&probe) > 1 {
         return Err(refused(format!(
             "the condition `{key}` holds a `;` outside a string or a comment, which would end \
              the step's statement and begin another: {condition}"
         )));
     }
     Ok(())
+}
+
+/// The number of SQL statements DuckDB parses in `sql`, or `0` when DuckDB
+/// cannot parse it (a parse error, or a string DuckDB's C API cannot take
+/// because it holds a NUL). It asks DuckDB's own parser through the `duckdb`
+/// crate arc already links, on a fresh in-memory database that binds and runs
+/// nothing: `duckdb_extract_statements` splits a query into statements, and this
+/// reads only the count it returns. No extracted statement is prepared, bound or
+/// executed, so a condition carrying `DROP TABLE orders` after a `;` is counted,
+/// never run, by this check. A parse error and a single statement are one
+/// return, `usize`, and not an `Option`: the caller records for both a `0` and a
+/// `1` and refuses only a count above one, so a type that told them apart would
+/// carry a distinction no caller could act on.
+fn duckdb_statement_count(sql: &str) -> usize {
+    use duckdb::ffi;
+    // A NUL byte cannot reach DuckDB's C API; such a string does not parse, and
+    // its `;`, if any, could not have ended a C string, so it is one statement's
+    // worth of text and the caller records it.
+    let Ok(query) = std::ffi::CString::new(sql) else {
+        return 0;
+    };
+    // SAFETY: `db` and `con` are null until DuckDB fills them and are checked
+    // for success before use; each is destroyed exactly once, in reverse order
+    // of creation, before returning. The connection is in-memory, and the only
+    // call made on it is `duckdb_extract_statements`, which parses the query and
+    // does not prepare, bind or execute any statement in it.
+    unsafe {
+        let mut db: ffi::duckdb_database = std::ptr::null_mut();
+        if ffi::duckdb_open(std::ptr::null(), &mut db) != ffi::DuckDBSuccess {
+            ffi::duckdb_close(&mut db);
+            return 0;
+        }
+        let mut con: ffi::duckdb_connection = std::ptr::null_mut();
+        if ffi::duckdb_connect(db, &mut con) != ffi::DuckDBSuccess {
+            ffi::duckdb_disconnect(&mut con);
+            ffi::duckdb_close(&mut db);
+            return 0;
+        }
+        let mut extracted: ffi::duckdb_extracted_statements = std::ptr::null_mut();
+        // `duckdb_extract_statements` returns 0 on a parse error, else the
+        // number of statements it split the query into.
+        let count = ffi::duckdb_extract_statements(con, query.as_ptr(), &mut extracted);
+        ffi::duckdb_destroy_extracted(&mut extracted);
+        ffi::duckdb_disconnect(&mut con);
+        ffi::duckdb_close(&mut db);
+        count as usize
+    }
 }
 
 /// Whether a step of the protocol at `dir` makes the table `on`, as `arc run`
@@ -1243,43 +1321,106 @@ mod tests {
                 },
             })
         });
+        // The same text — a `;` before a second, parseable statement — passes as
+        // a plain `label` and is refused as a `where`, because only the value
+        // annotated `x-kind: condition` is held to one statement.
         assert!(
-            op.admit(&arguments(serde_json::json!({ "label": "a; b" })))
-                .is_ok()
+            op.admit(&arguments(
+                serde_json::json!({ "label": "a > 1; DROP TABLE t" })
+            ))
+            .is_ok()
         );
         assert!(
-            op.admit(&arguments(serde_json::json!({ "where": "a; b" })))
-                .is_err()
+            op.admit(&arguments(
+                serde_json::json!({ "where": "a > 1; DROP TABLE t" })
+            ))
+            .is_err()
         );
     }
 
     #[test]
-    fn a_terminator_is_found_wherever_it_ends_a_statement() {
+    fn a_terminator_is_found_where_duckdb_ends_a_statement() {
+        // Refused: DuckDB parses a second statement, so the `;` is a real
+        // terminator — a `;` outside every string and comment with more SQL
+        // after it. This is what would make the recorded step more than the
+        // operation.
         for condition in [
-            "a > 1;",
-            ";",
-            "a > 1 ; ",
-            "/* x */ ;",
-            "a > 1;;",
-            "a;\nb",
-            "a > 1; /*",
+            "a > 1; DROP TABLE orders",
+            "a > 1;\nDROP TABLE orders", // a newline does not hide the terminator
+            "1 = 1; SELECT 42",
         ] {
             assert!(
                 one_statement("where", condition).is_err(),
                 "{condition:?} was admitted"
             );
         }
+        // Recorded: DuckDB parses one statement, or cannot parse the probe at
+        // all. A `;` inside a string or a comment stays there, whatever DuckDB's
+        // own rule for where that string or comment ends; a bare trailing `;`
+        // adds no second statement; an unparseable condition carries no
+        // terminator DuckDB acts on. Whether such a condition binds is a later
+        // parse's to judge.
         for condition in [
             "a = ';'",
             "a > 1 -- ;",
             "a > 1 /* ; */",
             "\"a;b\" > 1",
             "$$;$$ = a",
-            "a = 'b;",
+            "a = 'b;",   // unterminated string: a parse error, recorded as written
+            "a > 1;",    // bare trailing terminator: one statement, nothing after
+            "a > 1;;",   // ... and an empty statement after it is still nothing
+            "a > 1; /*", // trailing unterminated comment: no second statement
+            "amount > 100 UNION ALL SELECT * FROM orders", // one statement; a bind is a later parse's
         ] {
             assert!(
                 one_statement("where", condition).is_ok(),
                 "{condition:?} was refused"
+            );
+        }
+    }
+
+    #[test]
+    fn quote_ident_doubles_an_embedded_quote() {
+        // The step's name is always quoted, even a plain one, so the model's
+        // CREATE line reads `CREATE OR REPLACE TABLE "big_orders" AS`.
+        assert_eq!(quote_ident("big_orders"), "\"big_orders\"");
+        // A `"` in the name — `valid_step_name` admits one — is doubled, so the
+        // CREATE parses. Removing the doubling reddens this (the mutation that
+        // survived round one); a bare `"a"b"` would not parse as one identifier.
+        assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn the_from_table_is_quoted_only_when_a_bare_name_would_not_carry_it() {
+        // A plain identifier is written bare, so the model's line reads
+        // `FROM orders` and DuckDB folds the reference as it did before.
+        assert_eq!(from_ident("orders"), "orders");
+        assert_eq!(from_ident("big_orders"), "big_orders");
+        // A name a step could only have made quoted is quoted here, each `"`
+        // doubled, so it cannot break out of the `FROM`. Writing it bare — the
+        // round-one behaviour — reddens each of these.
+        assert_eq!(from_ident("weird; drop"), "\"weird; drop\"");
+        assert_eq!(from_ident("a\"b"), "\"a\"\"b\"");
+        assert_eq!(from_ident("has space"), "\"has space\"");
+        assert_eq!(from_ident("1st"), "\"1st\"");
+    }
+
+    /// The two inputs round one admitted, because its `statement_byte_ranges`
+    /// splitter read a string escape and a comment end differently from DuckDB.
+    /// DuckDB's own parser ends the `E'\''` string at the escaped-then-closed
+    /// quote and the `--` comment at the carriage return, so each carries a
+    /// top-level `;` and a second statement, and each is refused. The lower-case
+    /// `e'...'` is the same string literal.
+    #[test]
+    fn the_forms_a_hand_written_splitter_missed_are_refused() {
+        for condition in [
+            r"note = E'\'' ; DROP TABLE orders ; --'",
+            r"note = e'\'' ; DROP TABLE orders ; --'",
+            "amount > 100 --\r; DROP TABLE orders",
+        ] {
+            assert!(
+                one_statement("where", condition).is_err(),
+                "{condition:?} was admitted"
             );
         }
     }
