@@ -1720,7 +1720,8 @@ mod tests {
 
     // A call with no string and no quoted identifier names nothing arc could be missing:
     // it is not listed as unread. `recent()` and `recent(days := 7)` (a table macro)
-    // keep recording their own name; `range(10)` records nothing, as before.
+    // keep recording their own name; `range(10)` records nothing, as before. A call on a
+    // subquery records what the subquery reads instead; see the tests for it below.
     #[test]
     fn test_table_function_with_no_string_or_quoted_identifier_is_not_unread() {
         for (sql, records) in [
@@ -1979,14 +1980,15 @@ mod tests {
         assert_eq!(from.kinds.get("in.csv"), Some(&AssetKind::File));
     }
 
-    // A table function called with no string and no quoted identifier — a table macro
-    // such as `recent()` — keeps recording its name. One called with a string or a
-    // quoted identifier records nothing under its name; see the `unread` tests above.
+    // A table function called with no string, no quoted identifier and no subquery — a
+    // table macro such as `recent()` — keeps recording its name. One called with a string
+    // or a quoted identifier records nothing under its name; see the `unread` tests
+    // above. One called on a subquery records the tables the subquery reads.
     #[test]
     fn test_non_file_table_function_unchanged() {
         // A table macro (an extension-supplied table function that is neither a file
-        // reader nor a row-generator, called with no string and no quoted identifier)
-        // still records its own name — it may read tables named in its own definition,
+        // reader nor a row-generator, called with no string, no quoted identifier and no
+        // subquery) still records its own name — it may read tables named in its own definition,
         // which this layer cannot see, so the name is the only handle lineage has on it.
         let sql = "SELECT * FROM recent();";
         let assets = extract_assets(sql).unwrap();
