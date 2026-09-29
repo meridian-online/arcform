@@ -576,6 +576,18 @@ fn each_step_or_hook_draws_one_warning_naming_each_line() {
         "{warning}"
     );
 
+    // Two shapes in one statement, the call on the later line.
+    let one_statement = Protocol::steps(&[(
+        "s",
+        "SELECT '~/.duckdbrc'\nUNION ALL FROM query(getvariable('q'));\n",
+    )])
+    .run(VETTED_ON);
+    let warning = one_statement.assert_warned_once("one statement", &["s.sql"]);
+    assert!(
+        warning.contains(".duckdbrc on line 1, query() on line 2"),
+        "{warning}"
+    );
+
     let two_steps = Protocol::steps(&[
         ("a", "IMPORT DATABASE 'imp';\n"),
         ("b", "FROM query(getvariable('q'));\n"),

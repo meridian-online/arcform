@@ -692,8 +692,8 @@ enum InstallFrom {
 }
 
 /// One place where a step's SQL can run SQL that is not in its file, which the check does not
-/// read for an extension that SQL installs.
-#[derive(Debug, Clone, PartialEq)]
+/// read for an extension that SQL installs. Ordered as the warning names two on one line.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum RunTimeSql {
     /// A function in [`RUNS_SQL`], by the name arc prints, called on anything but one string
     /// literal, or on a literal whose text makes such a call.
@@ -1118,9 +1118,10 @@ fn serialized_calls(json: &str) -> bool {
 }
 
 /// The warning for one step or hook whose SQL holds places in [`scan_run_time_sql`], naming
-/// each by its line, in line order.
+/// each by its line, in line order, and each shape a line holds once. The scan gives a batch's
+/// calls before its other shapes, and one line can hold a shape twice with another between.
 fn run_time_warning(source: &ProtocolSql, mut shapes: Vec<(RunTimeSql, usize)>) -> String {
-    shapes.sort_by_key(|(_, line)| *line);
+    shapes.sort_by_key(|(shape, line)| (*line, shape.clone()));
     shapes.dedup();
     let places: Vec<String> = shapes
         .iter()
@@ -2130,6 +2131,17 @@ mod extension_tests {
                     "IMPORT DATABASE 'imp';\nFROM query(getvariable('q')) UNION ALL FROM query(getvariable('r'));\nCOPY (SELECT 1) TO '~/.duckdbrc';",
                 ),
                 ("step 'b'", "SELECT 1;"),
+                // One batch: the scan gives its call first, and its `.duckdbrc` on an earlier
+                // line after it.
+                (
+                    "step 'c'",
+                    "SELECT '~/.duckdbrc'\nUNION ALL FROM query(getvariable('q'));",
+                ),
+                // One line holding a shape twice with another between.
+                (
+                    "step 'd'",
+                    "IMPORT DATABASE 'a'; SELECT '.duckdbrc'; IMPORT DATABASE 'b';",
+                ),
                 (
                     "hook on_exit 'h'",
                     "INSTALL mlpack FROM community;\nPRAGMA import_database('imp');",
@@ -2149,7 +2161,13 @@ mod extension_tests {
                     "step 'a' (s0.sql) can run or write SQL that is not in its file: IMPORT DATABASE on line 1, query() on line 2, .duckdbrc on line 3{tail}"
                 ),
                 format!(
-                    "hook on_exit 'h' (s2.sql) can run or write SQL that is not in its file: IMPORT DATABASE on line 2{tail}"
+                    "step 'c' (s2.sql) can run or write SQL that is not in its file: .duckdbrc on line 1, query() on line 2{tail}"
+                ),
+                format!(
+                    "step 'd' (s3.sql) can run or write SQL that is not in its file: IMPORT DATABASE on line 1, .duckdbrc on line 1{tail}"
+                ),
+                format!(
+                    "hook on_exit 'h' (s4.sql) can run or write SQL that is not in its file: IMPORT DATABASE on line 2{tail}"
                 ),
             ]
         );
