@@ -246,6 +246,64 @@ fn arc_run_runs_the_recorded_step_and_keeps_the_rows_the_condition_holds_for() {
     );
 }
 
+/// Why the record-time check refuses a condition DuckDB cannot parse whole,
+/// rather than admitting it as round two did: `arc run` hands a step's file to
+/// the `duckdb` CLI's `-f`, which runs each statement it can read before it
+/// reaches the one it cannot. So a step whose recorded file held a runnable,
+/// `;`-terminated prefix and an unparseable tail — the shape of
+/// `where = amount > 100; DROP TABLE orders; zzz` — would run the prefix,
+/// dropping a table, and only then fail. This characterises `arc run`; it is not
+/// a guard on an arc line, so `a_probe_duckdb_cannot_parse_at_all_is_refused`
+/// and the record-time tests below hold the fix. Here a step arc cannot fully
+/// parse is run opaque, its file handed to DuckDB whole.
+#[test]
+fn arc_run_runs_a_valid_prefix_before_an_unparseable_tail() {
+    let protocol = Protocol::new();
+    std::fs::write(
+        protocol.dir.join("models/02_incremental.sql"),
+        // Makes `victim`, drops it, records that the drop ran, then meets `zzz`.
+        "CREATE OR REPLACE TABLE victim AS SELECT 1;\n\
+         DROP TABLE victim;\n\
+         CREATE OR REPLACE TABLE the_drop_ran AS SELECT 1;\n\
+         zzz\n",
+    )
+    .unwrap();
+    let manifest = protocol.read("arcform.yaml");
+    std::fs::write(
+        protocol.dir.join("arcform.yaml"),
+        format!("{manifest}  - name: incremental\n    sql: models/02_incremental.sql\n"),
+    )
+    .unwrap();
+
+    let out = protocol.arc(&["run"]);
+    assert!(
+        !out.status.success(),
+        "the run should fail on the unparseable tail:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    let tables: Vec<String> = db
+        .prepare("SELECT table_name FROM information_schema.tables")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    // The statement after the DROP ran, so the DROP ran, and `victim` is gone:
+    // the CLI executed the whole prefix before the tail errored — the hazard the
+    // record-time check now blocks by refusing the condition that writes it.
+    assert!(
+        tables.iter().any(|t| t == "the_drop_ran"),
+        "the statement after the DROP did not run; tables: {tables:?}"
+    );
+    assert!(
+        !tables.iter().any(|t| t == "victim"),
+        "the DROP did not run before the tail errored; tables: {tables:?}"
+    );
+}
+
 // ----------------------------------------------------------------- refuse
 
 #[test]
@@ -363,11 +421,37 @@ fn a_condition_holding_a_terminator_is_refused_with_the_directory_untouched() {
 }
 
 #[test]
+fn a_condition_duckdb_cannot_parse_whole_is_refused_with_the_directory_untouched() {
+    // A runnable, `;`-terminated prefix followed by an unparseable tail: a bare
+    // word, and a `.` dot-command. DuckDB parses neither probe as a whole, so
+    // the record-time check counts each `0`. But `arc run` hands the step's file
+    // to the `duckdb` CLI, which runs the DROP before it reaches the tail it
+    // cannot read (see `arc_run_runs_a_valid_prefix_before_an_unparseable_tail`),
+    // so each is refused at record time instead, the directory untouched, and
+    // the message names the argument. Round two recorded both.
+    for condition in [
+        "amount > 100; DROP TABLE orders; zzz",
+        "amount > 100; DROP TABLE orders;\n.print done",
+    ] {
+        let protocol = Protocol::new();
+        let before = protocol.files();
+        let out = protocol.record_filter(condition);
+        refused(&out, &["`where`", condition]);
+        assert_eq!(
+            protocol.files(),
+            before,
+            "{condition:?}: the directory changed"
+        );
+    }
+}
+
+#[test]
 fn any_other_condition_is_recorded_as_written() {
     for condition in [
-        "note = 'a;b'",
-        "amount > 100 and note like 'a%'",
-        "amount > 100 /* ; */",
+        "note = 'a;b'",                    // a `;` inside a string
+        "amount > 100 and note like 'a%'", // a compound condition
+        "amount > 100 /* ; */",            // a `;` inside a block comment
+        "amount > 100;",                   // a bare trailing `;`: one statement, nothing after
     ] {
         let protocol = Protocol::new();
         ok(&protocol.record_filter(condition), condition);
@@ -522,6 +606,24 @@ mod mcp {
                     "arguments": { "where": "amount > 100 --\r; DROP TABLE orders" },
                 }),
                 vec!["`;`"],
+            ),
+            // A runnable, `;`-terminated prefix with an unparseable tail: a bare
+            // word, and a `.` dot-command. DuckDB parses neither probe whole, so
+            // the check counts each 0; `arc run` would still run the DROP. Both
+            // are refused over MCP as from the terminal; round two recorded both.
+            (
+                json!({
+                    "operation": "filter-rows", "on": "orders", "name": "big_orders",
+                    "arguments": { "where": "amount > 100; DROP TABLE orders; zzz" },
+                }),
+                vec!["`where`"],
+            ),
+            (
+                json!({
+                    "operation": "filter-rows", "on": "orders", "name": "big_orders",
+                    "arguments": { "where": "amount > 100; DROP TABLE orders;\n.print done" },
+                }),
+                vec!["`where`"],
             ),
             (
                 json!({

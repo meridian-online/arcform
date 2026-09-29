@@ -806,38 +806,47 @@ fn is_of_type(value: &serde_json::Value, ty: &str) -> bool {
     }
 }
 
-/// A condition goes into the step's `WHERE` as written, so a statement
-/// terminator in it outside a string or a comment would end the operation's
-/// statement and begin another: refused. Every other condition is recorded as
-/// written, whether or not it parses.
-///
-/// The terminator is found by DuckDB's own parser, not a lexer of arc's own:
-/// the condition is put in the `WHERE` of a probe `SELECT` and handed to
+/// A condition goes into the step's `WHERE` verbatim, so arc records it only
+/// when DuckDB reads `SELECT 1 WHERE <condition>` as exactly one statement. The
+/// condition is put in the `WHERE` of that probe and handed to
 /// [`duckdb_statement_count`], which asks DuckDB to split the text into
-/// statements without binding or running any of them. So a `;` inside a string
-/// or a comment — however DuckDB reads that string or comment, `E'\''`
-/// backslash escapes and a `--` comment ended by a carriage return included —
-/// stays inside the one statement, and a `;` that ends the statement makes the
-/// probe parse as two. The check therefore agrees with the DuckDB that
-/// `arc run` shells out to by construction, rather than tracking it by hand.
+/// statements without binding or running any of them. The two other outcomes
+/// are refused at record time, the directory untouched:
 ///
-/// A condition DuckDB cannot parse at all (`duckdb_statement_count` is `0`) is
-/// one statement's worth of text and is recorded as written: whether it is a
-/// condition at all, rather than something a bind would reject such as
-/// `amount > 100 UNION ALL SELECT * FROM orders`, waits for a later parse that
-/// binds the condition to the table it filters. A condition ending in a bare
-/// `;` with nothing after it, such as `amount > 100;`, parses as a single
-/// statement and is recorded: the trailing terminator adds no second statement,
-/// so nothing is smuggled in.
+/// * DuckDB reads more than one statement — a `;` outside every string and
+///   comment, with SQL after it, such as `amount > 100; DROP TABLE orders` —
+///   which would make the recorded step do more than the operation.
+/// * DuckDB cannot parse the probe at all (`duckdb_statement_count` is `0`).
+///   `arc run` hands the recorded file to the `duckdb` CLI's `-f`, which runs
+///   each statement it can read before it reaches the part it cannot, so a
+///   runnable `;`-terminated prefix followed by an unparseable tail —
+///   `amount > 100; DROP TABLE orders; zzz`, or the same closing with a `.`
+///   dot-command — would still drop `orders` on a run
+///   (`arc_run_runs_a_valid_prefix_before_an_unparseable_tail` in
+///   `tests/operation_record.rs` shows the run doing exactly that). arc will
+///   not record a condition it cannot confirm is a single statement.
+///
+/// Because DuckDB's own parser draws the line, however it reads a string or a
+/// comment — `E'\''` backslash escapes and a `--` comment ended by a carriage
+/// return included — a `;` inside one stays in the one statement. A condition
+/// ending in a bare `;` with nothing after it, such as `amount > 100;`, is a
+/// single statement and is recorded. Whether a condition also binds to the
+/// table it filters, rather than only parsing as one statement, is a later
+/// parse's to judge, so `amount > 100 UNION ALL SELECT * FROM orders` — one
+/// statement — is recorded as written.
 fn one_statement(key: &str, condition: &str) -> Result<()> {
     let probe = format!("SELECT 1 WHERE {condition}");
-    if duckdb_statement_count(&probe) > 1 {
-        return Err(refused(format!(
+    match duckdb_statement_count(&probe) {
+        1 => Ok(()),
+        0 => Err(refused(format!(
+            "the condition `{key}` is not one SQL statement DuckDB can parse, so arc cannot \
+             record it as one: {condition}"
+        ))),
+        _ => Err(refused(format!(
             "the condition `{key}` holds a `;` outside a string or a comment, which would end \
              the step's statement and begin another: {condition}"
-        )));
+        ))),
     }
-    Ok(())
 }
 
 /// The number of SQL statements DuckDB parses in `sql`, or `0` when DuckDB
@@ -847,15 +856,14 @@ fn one_statement(key: &str, condition: &str) -> Result<()> {
 /// nothing: `duckdb_extract_statements` splits a query into statements, and this
 /// reads only the count it returns. No extracted statement is prepared, bound or
 /// executed, so a condition carrying `DROP TABLE orders` after a `;` is counted,
-/// never run, by this check. A parse error and a single statement are one
-/// return, `usize`, and not an `Option`: the caller records for both a `0` and a
-/// `1` and refuses only a count above one, so a type that told them apart would
-/// carry a distinction no caller could act on.
+/// never run, by this check. A parse error and a statement count share one
+/// return, `usize`: [`one_statement`] admits only a `1` and refuses both a `0`
+/// and a count above one, with a distinct message for each, so the two need not
+/// be told apart by the type.
 fn duckdb_statement_count(sql: &str) -> usize {
     use duckdb::ffi;
-    // A NUL byte cannot reach DuckDB's C API; such a string does not parse, and
-    // its `;`, if any, could not have ended a C string, so it is one statement's
-    // worth of text and the caller records it.
+    // A NUL byte cannot reach DuckDB's C API, so such a string cannot be parsed
+    // into statements here; it counts `0`, which the caller refuses.
     let Ok(query) = std::ffi::CString::new(sql) else {
         return 0;
     };
@@ -1354,27 +1362,49 @@ mod tests {
                 "{condition:?} was admitted"
             );
         }
-        // Recorded: DuckDB parses one statement, or cannot parse the probe at
-        // all. A `;` inside a string or a comment stays there, whatever DuckDB's
-        // own rule for where that string or comment ends; a bare trailing `;`
-        // adds no second statement; an unparseable condition carries no
-        // terminator DuckDB acts on. Whether such a condition binds is a later
-        // parse's to judge.
+        // Recorded: DuckDB parses exactly one statement. A `;` inside a string
+        // or a comment stays there, whatever DuckDB's own rule for where that
+        // string or comment ends; a bare trailing `;`, and an empty statement
+        // after it, add no second statement. Whether such a condition binds is a
+        // later parse's to judge.
         for condition in [
             "a = ';'",
             "a > 1 -- ;",
             "a > 1 /* ; */",
             "\"a;b\" > 1",
             "$$;$$ = a",
-            "a = 'b;",   // unterminated string: a parse error, recorded as written
-            "a > 1;",    // bare trailing terminator: one statement, nothing after
-            "a > 1;;",   // ... and an empty statement after it is still nothing
-            "a > 1; /*", // trailing unterminated comment: no second statement
+            "a > 1;",  // bare trailing terminator: one statement, nothing after
+            "a > 1;;", // ... and an empty statement after it is still nothing
             "amount > 100 UNION ALL SELECT * FROM orders", // one statement; a bind is a later parse's
         ] {
             assert!(
                 one_statement("where", condition).is_ok(),
                 "{condition:?} was refused"
+            );
+        }
+    }
+
+    /// A probe DuckDB cannot parse at all counts `0`, and is refused, not
+    /// recorded. `arc run` runs the statements the `duckdb` CLI can read in a
+    /// step's file before it reaches the one it cannot, so a runnable
+    /// `;`-terminated prefix with an unparseable tail — a bare word, or a `.`
+    /// dot-command — would drop a table on a run though the probe as a whole
+    /// does not parse. Round two read a `0` as one statement's worth of text and
+    /// admitted these; round three refuses them, since arc cannot confirm they
+    /// are one statement.
+    #[test]
+    fn a_probe_duckdb_cannot_parse_at_all_is_refused() {
+        for condition in [
+            "amount > 100; DROP TABLE orders; zzz", // runnable DROP, unparseable word after
+            "amount > 100; DROP TABLE orders;\n.print done", // ... a `.` dot-command after
+            "a = 'b;",                              // an unterminated string
+            "a > 1; /*", // a runnable prefix, then an unterminated block comment
+        ] {
+            let refusal = one_statement("where", condition);
+            assert!(refusal.is_err(), "{condition:?} was admitted");
+            assert!(
+                refusal.unwrap_err().to_string().contains("`where`"),
+                "{condition:?}: the refusal does not name the argument"
             );
         }
     }
