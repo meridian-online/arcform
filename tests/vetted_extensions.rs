@@ -138,6 +138,13 @@ impl Protocol {
     /// `arc run <args>` on a fake engine that logs each call's arguments and then runs
     /// `body`, a piece of shell.
     fn run_on(&self, body: &str, args: &[&str]) -> Outcome {
+        self.arc_on(body, &[&["run"], args].concat())
+    }
+
+    /// `arc <args>` in the Protocol's directory, on a fake engine that logs each call's
+    /// arguments and then runs `body`, a piece of shell, with arc's local history kept
+    /// under the test's own directory.
+    fn arc_on(&self, body: &str, args: &[&str]) -> Outcome {
         let engine = self.root.path().join("duckdb");
         let log = self.root.path().join("duckdb.log");
         let _ = fs::remove_file(&log);
@@ -152,12 +159,12 @@ impl Protocol {
         fs::set_permissions(&engine, fs::Permissions::from_mode(0o755)).unwrap();
         let out = Command::new(env!("CARGO_BIN_EXE_arc"))
             .current_dir(self.project())
-            .arg("run")
             .args(args)
             .env("ARC_DUCKDB_BIN", &engine)
+            .env("ARCFORM_HISTORY_DIR", self.root.path().join("history"))
             .env_remove("ARC_ALLOW_UNTESTED_ENGINE")
             .output()
-            .expect("spawn arc run");
+            .expect("spawn arc");
         Outcome {
             code: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -770,16 +777,20 @@ const PLATFORM: &str = "linux_amd64";
 /// The step every Protocol below runs first.
 const INSTALLS_MLPACK: &str = "INSTALL mlpack FROM community; LOAD mlpack;\n";
 
-/// What the fake engine does with an `INSTALL mlpack FROM community`.
+/// What the fake engine does with an `INSTALL mlpack FROM community`, and with the
+/// `FORCE INSTALL mlpack FROM community; LOAD mlpack;` of `arc upgrade`.
 #[derive(Clone, Copy)]
 enum Registry {
-    /// Copies the served build in when mlpack is not installed, as DuckDB fetches it, and
-    /// names the installed file.
+    /// Copies the served build in, as DuckDB fetches it, and names the installed file: an
+    /// `INSTALL` when mlpack is not installed, and a `FORCE INSTALL` whether or not it is.
     Serves,
     /// Exits 1, as DuckDB does when the registry serves nothing for the name.
     Fails,
     /// Exits 0 and names no installed file.
     NamesNoFile,
+    /// Installs as [`Registry::Serves`] does, and then refuses the `LOAD` of a
+    /// `FORCE INSTALL`, as DuckDB does a file whose signature it does not accept.
+    LoadFails,
 }
 
 /// A Protocol whose SQL installs mlpack, on a fake DuckDB v1.5.5 that keeps its extensions
@@ -872,24 +883,44 @@ impl Pinned {
     }
 
     fn run(&self, registry: Registry, args: &[&str]) -> Outcome {
+        self.arc(registry, &[&["run"], args].concat())
+    }
+
+    /// `arc upgrade <name>` in the Protocol's directory.
+    fn upgrade(&self, registry: Registry, name: &str) -> Outcome {
+        self.arc(registry, &["upgrade", name])
+    }
+
+    /// `arc <args>` on the fake DuckDB, whose registry does as `registry` says.
+    fn arc(&self, registry: Registry, args: &[&str]) -> Outcome {
         let installed = self.installed();
         let dir = installed.parent().unwrap().display().to_string();
         let file = installed.display();
-        let install = match registry {
-            Registry::Serves => format!(
-                "mkdir -p '{dir}'; [ -f '{file}' ] || cp '{}' '{file}'; echo 'arc-answer:{file}'",
-                self.served().display()
+        let served = self.served().display().to_string();
+        let fetch = format!("mkdir -p '{dir}'; cp '{served}' '{file}'");
+        let answer = format!("echo 'arc-answer:{file}'");
+        let failed = "echo 'HTTP Error: Failed to download extension' >&2; exit 1";
+        let (install, force) = match registry {
+            Registry::Serves | Registry::LoadFails => (
+                format!("[ -f '{file}' ] || {{ {fetch}; }}; {answer}"),
+                match registry {
+                    Registry::LoadFails => format!(
+                        "{fetch}; echo 'IO Error: Extension \"{file}\" could not be loaded because its signature is either missing or invalid' >&2; exit 1"
+                    ),
+                    _ => format!("{fetch}; {answer}"),
+                },
             ),
-            Registry::Fails => "echo 'HTTP Error: Failed to download extension' >&2; exit 1".into(),
-            Registry::NamesNoFile => ":".into(),
+            Registry::Fails => (failed.to_string(), failed.to_string()),
+            Registry::NamesNoFile => (":".to_string(), ":".to_string()),
         };
-        self.protocol.run_on(
+        self.protocol.arc_on(
             &format!(
                 "case \"$1\" in\n\
                  --version) echo 'v1.5.5 (fake) 0000000000' ;;\n\
                  -noheader) case \"$4\" in\n\
                  *pragma_platform*) echo 'arc-answer:{PLATFORM}' ;;\n\
                  'INSTALL mlpack FROM community;'*) {install} ;;\n\
+                 'FORCE INSTALL mlpack FROM community; LOAD mlpack;'*) {force} ;;\n\
                  esac ;;\n\
                  esac\n"
             ),
@@ -929,14 +960,16 @@ impl Outcome {
             .collect()
     }
 
-    /// The engine calls with the SQL arc sent in place of each `-c` call's text: `platform`
-    /// or `install mlpack`.
+    /// The engine calls with the SQL arc sent in place of each `-c` call's text: `platform`,
+    /// `install mlpack`, or `force install and load mlpack`.
     fn calls(&self) -> Vec<String> {
         self.engine_calls
             .iter()
             .map(|call| {
                 if call.contains("pragma_platform") {
                     "platform".to_string()
+                } else if call.contains("FORCE INSTALL mlpack FROM community; LOAD mlpack;") {
+                    "force install and load mlpack".to_string()
                 } else if call.contains("INSTALL mlpack FROM community") {
                     "install mlpack".to_string()
                 } else if let Some(sql) = call.split(" -f ").nth(1) {
@@ -1010,7 +1043,7 @@ fn a_pinned_extension_not_installed_is_installed_and_compared_before_any_step_or
         vec!["--version", "platform", "install mlpack"],
         "no step or hook reached the engine"
     );
-    for needle in ["mlpack", OTHER_PIN, &pin] {
+    for needle in ["mlpack", OTHER_PIN, &pin, "`arc upgrade mlpack`"] {
         assert!(
             run.stderr.contains(needle),
             "the refusal should name {needle:?}:\n{}",
@@ -1079,6 +1112,11 @@ fn a_pinned_extension_duckdb_cannot_install_or_name_is_refused_and_not_warned() 
             "{}",
             run.stderr
         );
+        assert!(
+            !run.stderr.contains("is not the build"),
+            "there was no installed file to compare, so the refusal says none differs:\n{}",
+            run.stderr
+        );
         assert_eq!(
             run.mlpack_warnings(),
             Vec::<&str>::new(),
@@ -1115,11 +1153,13 @@ fn an_extension_with_no_pin_for_this_engine_warns_once_and_runs() {
         assert_eq!(run.code, Some(0), "[{label}] {}", run.stderr);
         let warnings = run.mlpack_warnings();
         assert_eq!(warnings.len(), 1, "[{label}] one warning:\n{}", run.stderr);
-        assert!(
-            warnings[0].contains("extensions: key of arcform.yaml"),
-            "[{label}] {}",
-            warnings[0]
-        );
+        for needle in ["extensions: key of arcform.yaml", "`arc upgrade mlpack`"] {
+            assert!(
+                warnings[0].contains(needle),
+                "[{label}] the warning should name {needle:?}: {}",
+                warnings[0]
+            );
+        }
         assert_eq!(run.started(), vec!["s.sql"], "[{label}]");
         assert!(
             !run.calls().contains(&"install mlpack".to_string()),
@@ -1385,6 +1425,290 @@ fn the_real_duckdb_answers_the_pin_check_from_the_file_it_holds() {
         );
     }
     assert!(!marked, "on_init did not run");
+}
+
+// ---- arc upgrade ----
+
+/// A pin for mlpack on another platform, which no file here hashes to.
+const OSX_PIN: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+/// A pin for h3, which no Protocol here installs.
+const H3_PIN: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+/// The one SQL step every Protocol below runs, under a comment the author wrote.
+const ONE_STEP: &str = "# the author's note\nsteps:\n  - name: s\n    sql: models/s.sql\n";
+
+impl Outcome {
+    fn assert_upgrade_refused(&self, label: &str, pinned: &Pinned, manifest: &[u8]) {
+        assert_ne!(self.code, Some(0), "[{label}] arc upgrade should refuse");
+        assert!(
+            self.stderr.contains("mlpack"),
+            "[{label}] the refusal should name mlpack:\n{}",
+            self.stderr
+        );
+        assert_eq!(
+            pinned.manifest(),
+            manifest,
+            "[{label}] arcform.yaml is as it was"
+        );
+    }
+}
+
+impl Pinned {
+    /// The local-history entries of this Protocol's spec, as `arc history list` prints
+    /// them: id and kind.
+    fn history(&self) -> Vec<(String, String)> {
+        let list = self.protocol.arc_on("", &["history", "list"]);
+        assert_eq!(list.code, Some(0), "{}", list.stderr);
+        list.stdout
+            .lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                let id = words.next()?;
+                let kind = words.next()?;
+                id.chars()
+                    .next()?
+                    .is_ascii_digit()
+                    .then(|| (id.to_string(), kind.to_string()))
+            })
+            .collect()
+    }
+}
+
+#[test]
+fn arc_upgrade_writes_a_first_pin_for_the_build_the_registry_serves() {
+    let pinned = Pinned::new(ONE_STEP, "");
+    let before = pinned.manifest();
+
+    let up = pinned.upgrade(Registry::Serves, "mlpack");
+    assert_eq!(up.code, Some(0), "{}", up.stderr);
+    let pin = served_pin();
+    assert_eq!(
+        sha256(&pinned.installed()),
+        pin,
+        "DuckDB installed the build the registry serves"
+    );
+    let mut expected = before.clone();
+    expected.extend_from_slice(
+        format!("extensions:\n  mlpack:\n    v1.5.5:\n      {PLATFORM}: {pin}\n").as_bytes(),
+    );
+    assert_eq!(
+        String::from_utf8(pinned.manifest()).unwrap(),
+        String::from_utf8(expected).unwrap(),
+        "the pin is added after the last line, and each byte before it is as it was"
+    );
+    for needle in ["mlpack", "v1.5.5", PLATFORM, &pin] {
+        assert!(
+            up.stdout.contains(needle),
+            "the output should name {needle:?}:\n{}",
+            up.stdout
+        );
+    }
+    assert_eq!(
+        up.calls(),
+        vec!["--version", "platform", "force install and load mlpack"]
+    );
+
+    let checkpoints: Vec<String> = pinned
+        .history()
+        .into_iter()
+        .filter(|(_, kind)| kind == "checkpoint")
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(checkpoints.len(), 1, "{:?}", pinned.history());
+    let shown = pinned
+        .protocol
+        .arc_on("", &["history", "show", &checkpoints[0]]);
+    assert_eq!(shown.code, Some(0), "{}", shown.stderr);
+    assert_eq!(
+        shown.stdout.as_bytes(),
+        before,
+        "the checkpoint holds the file as it was"
+    );
+
+    pinned.assert_next_run_is_pinned("after a first pin");
+}
+
+impl Pinned {
+    /// The next `arc run` checks the pin `arc upgrade` wrote, runs the step with no warning
+    /// naming mlpack, and leaves `arcform.yaml` as `arc upgrade` left it.
+    fn assert_next_run_is_pinned(&self, label: &str) {
+        let manifest = self.manifest();
+        let run = self.run(Registry::Serves, &[]);
+        assert_eq!(run.code, Some(0), "[{label}] {}", run.stderr);
+        assert_eq!(run.started(), vec!["s.sql"], "[{label}]");
+        assert_eq!(run.mlpack_warnings(), Vec::<&str>::new(), "[{label}]");
+        assert_eq!(
+            run.calls(),
+            vec!["--version", "platform", "install mlpack", "s.sql"],
+            "[{label}] arc run checked the pin"
+        );
+        assert_eq!(
+            self.manifest(),
+            manifest,
+            "[{label}] arcform.yaml is as arc upgrade left it"
+        );
+    }
+}
+
+#[test]
+fn arc_upgrade_replaces_one_pin_and_keeps_every_other_byte() {
+    let extensions = format!(
+        "extensions:\n  # the builds this Protocol was run on\n  mlpack:\n    v1.5.5:\n      osx_arm64: {OSX_PIN}\n      {PLATFORM}: {OTHER_PIN}  # the build before\n  h3:\n    v1.5.5:\n      {PLATFORM}: {H3_PIN}\n"
+    );
+    let pinned = Pinned::new(ONE_STEP, &extensions);
+    let before = String::from_utf8(pinned.manifest()).unwrap();
+    assert_eq!(before.matches(OTHER_PIN).count(), 1);
+
+    let up = pinned.upgrade(Registry::Serves, "mlpack");
+    assert_eq!(up.code, Some(0), "{}", up.stderr);
+    let pin = served_pin();
+    assert_eq!(
+        String::from_utf8(pinned.manifest()).unwrap(),
+        before.replace(OTHER_PIN, &pin),
+        "the one hash is replaced, and each other byte is as it was"
+    );
+    for needle in [OTHER_PIN, &pin] {
+        assert!(
+            up.stdout.contains(needle),
+            "the output should name the hash replaced and the hash written, {needle:?}:\n{}",
+            up.stdout
+        );
+    }
+
+    pinned.assert_next_run_is_pinned("after a replaced pin");
+}
+
+#[test]
+fn arc_upgrade_pins_the_served_build_and_not_a_changed_file() {
+    let pinned = Pinned::new(ONE_STEP, "");
+    let up = pinned.upgrade(Registry::Serves, "mlpack");
+    assert_eq!(up.code, Some(0), "{}", up.stderr);
+    let pinned_manifest = pinned.manifest();
+
+    let mut bytes = fs::read(pinned.installed()).unwrap();
+    bytes[0] ^= 1;
+    fs::write(pinned.installed(), &bytes).unwrap();
+    let changed = sha256(&pinned.installed());
+    let refused = pinned.run(Registry::Serves, &[]);
+    assert_eq!(refused.code, Some(1), "{}", refused.stderr);
+    assert!(refused.stderr.contains(&changed), "{}", refused.stderr);
+
+    let up = pinned.upgrade(Registry::Serves, "mlpack");
+    assert_eq!(up.code, Some(0), "{}", up.stderr);
+    let pin = served_pin();
+    assert_eq!(
+        sha256(&pinned.installed()),
+        pin,
+        "the served build is installed over the changed file"
+    );
+    let manifest = String::from_utf8(pinned.manifest()).unwrap();
+    assert!(
+        manifest.contains(&format!("{PLATFORM}: {pin}\n")) && !manifest.contains(&changed),
+        "the pin is the served build's:\n{manifest}"
+    );
+    assert_eq!(pinned.manifest(), pinned_manifest);
+    pinned.assert_next_run_is_pinned("after the changed file");
+}
+
+#[test]
+fn arc_upgrade_refuses_a_name_off_the_vetted_list_before_asking_duckdb() {
+    let pinned = Pinned::new(ONE_STEP, "");
+    let manifest = pinned.manifest();
+    // A community extension off the list, a core extension, and one built into DuckDB.
+    for name in ["anofox_forecast", "excel", "json"] {
+        let up = pinned.upgrade(Registry::Serves, name);
+        assert_eq!(up.code, Some(1), "[{name}] {}", up.stderr);
+        for needle in [name, "vetted list", PAGE] {
+            assert!(
+                up.stderr.contains(needle),
+                "[{name}] the refusal should name {needle:?}:\n{}",
+                up.stderr
+            );
+        }
+        assert_eq!(
+            up.engine_calls,
+            Vec::<String>::new(),
+            "[{name}] DuckDB is asked nothing"
+        );
+        assert_eq!(
+            pinned.manifest(),
+            manifest,
+            "[{name}] arcform.yaml is as it was"
+        );
+    }
+    assert!(
+        pinned.history().is_empty(),
+        "no checkpoint, since nothing was written"
+    );
+}
+
+#[test]
+fn arc_upgrade_refuses_when_duckdb_cannot_install_load_or_answer() {
+    let pinned = Pinned::step(OTHER_PIN);
+    let manifest = pinned.manifest();
+
+    for (label, registry, reason) in [
+        (
+            "install fails",
+            Registry::Fails,
+            Some("HTTP Error: Failed to download extension"),
+        ),
+        (
+            "load fails",
+            Registry::LoadFails,
+            Some("could not be loaded because its signature is either missing or invalid"),
+        ),
+        ("names no file", Registry::NamesNoFile, None),
+    ] {
+        let up = pinned.upgrade(registry, "mlpack");
+        up.assert_upgrade_refused(label, &pinned, &manifest);
+        if let Some(reason) = reason {
+            assert!(
+                up.stderr.contains(reason),
+                "[{label}] the refusal should carry DuckDB's own reason:\n{}",
+                up.stderr
+            );
+        }
+    }
+
+    for (label, body, calls) in [
+        (
+            "no version",
+            "case \"$1\" in --version) echo 'duckdb (fake)' ;; esac\n",
+            vec!["--version"],
+        ),
+        (
+            "no platform",
+            "case \"$1\" in\n\
+             --version) echo 'v1.5.5 (fake) 0000000000' ;;\n\
+             -noheader) echo 'Catalog Error: no pragma_platform here' >&2; exit 1 ;;\n\
+             esac\n",
+            vec!["--version", "platform"],
+        ),
+    ] {
+        let up = pinned.protocol.arc_on(body, &["upgrade", "mlpack"]);
+        up.assert_upgrade_refused(label, &pinned, &manifest);
+        assert_eq!(up.calls(), calls, "[{label}] nothing is installed");
+    }
+    assert!(
+        pinned.history().is_empty(),
+        "no checkpoint, since nothing was written"
+    );
+}
+
+#[test]
+fn arc_help_lists_upgrade() {
+    let out = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .arg("--help")
+        .output()
+        .expect("spawn arc --help");
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        help.lines()
+            .any(|line| line.trim_start().starts_with("upgrade ")),
+        "{help}"
+    );
 }
 
 // ---- the page and the list ----

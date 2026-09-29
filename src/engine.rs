@@ -2390,7 +2390,7 @@ mod extension_tests {
         assert_eq!(
             refused,
             vec![format!(
-                "mlpack on DuckDB v1.5.5, linux_amd64: pinned {PIN_A}, and the installed file {} hashes to {hash}",
+                "mlpack on DuckDB v1.5.5, linux_amd64: pinned {PIN_A}, and the installed file {} hashes to {hash}; `arc upgrade mlpack` installs the build the community registry serves and pins it",
                 path.display()
             )]
         );
@@ -2470,8 +2470,9 @@ mod extension_tests {
     #[test]
     fn an_extension_with_no_pin_for_this_version_and_platform_warns_once_and_asks_only_what_it_needs()
      {
-        let tail =
-            format!(", so arc runs whichever build DuckDB installs ({VETTED_EXTENSIONS_DOC})");
+        let tail = format!(
+            ", so arc runs whichever build DuckDB installs; `arc upgrade mlpack` pins the build the community registry serves ({VETTED_EXTENSIONS_DOC})"
+        );
         // (label, pins, version, the warning's place, the calls DuckDB receives)
         type Case = (
             &'static str,
