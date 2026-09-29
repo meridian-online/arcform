@@ -1014,6 +1014,7 @@ fn a_changed_installed_file_refuses_a_fresh_run_and_a_forced_one_before_on_init(
         "steps:\n  - name: s\n    sql: models/s.sql\nhooks:\n  on_init:\n    name: mark\n    command: touch init_ran\n",
         &pin_yaml("v1.5.5", PLATFORM, &pin),
     );
+    pinned.install();
     let first = pinned.run(Registry::Serves, &[]);
     assert_eq!(first.code, Some(0), "{}", first.stderr);
     assert_eq!(first.started(), vec!["s.sql"]);
