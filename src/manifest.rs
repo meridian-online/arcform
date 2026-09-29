@@ -832,4 +832,46 @@ assets:
             ev
         );
     }
+
+    const PIN: &str = "e097b5dfe9ba6de62b87791857cf7f173049f3dc3ec4ad5b32deeca0d3fddacc";
+
+    #[test]
+    fn extensions_reads_a_pin_per_extension_version_and_platform() {
+        let manifest = Manifest::from_yaml_str(&format!(
+            "name: p\nengine_version: \">=1.5\"\nextensions:\n  mlpack:\n    v1.5.5:\n      linux_amd64: {PIN}\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            manifest.extensions["mlpack"]["v1.5.5"]["linux_amd64"], PIN,
+            "{:?}",
+            manifest.extensions
+        );
+    }
+
+    #[test]
+    fn a_pin_that_is_not_a_sha256_is_refused_naming_its_path() {
+        for bad in [
+            &PIN[1..],
+            &PIN.to_uppercase(),
+            &format!("{}g", &PIN[1..]),
+            "sha256:e097",
+        ] {
+            let err = Manifest::from_yaml_str(&format!(
+                "name: p\nextensions:\n  mlpack:\n    v1.5.5:\n      linux_amd64: '{bad}'\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("extensions.mlpack.v1.5.5.linux_amd64")
+                    && err.contains("not a SHA-256"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_manifest_with_no_pin_writes_no_extensions_key() {
+        let yaml = serde_yaml::to_string(&Manifest::new_project("p")).unwrap();
+        assert!(!yaml.contains("extensions"), "{yaml}");
+    }
 }

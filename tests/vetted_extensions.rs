@@ -395,10 +395,12 @@ fn a_vetted_extension_on_a_version_its_entry_does_not_name_warns_once_and_runs()
         ("b", "FORCE INSTALL mlpack FROM community; LOAD mlpack;\n"),
     ])
     .run("1.5.4");
+    // The warning about the version the entry names; the one about a missing pin is
+    // another's.
     let warnings: Vec<&str> = run
         .stderr
         .lines()
-        .filter(|l| l.contains("warning:") && l.contains("mlpack"))
+        .filter(|l| l.contains("warning:") && l.contains("mlpack") && !l.contains("no pin"))
         .collect();
     assert_eq!(warnings.len(), 1, "one warning:\n{}", run.stderr);
     for needle in ["mlpack", "v1.5.4", "v1.5.5"] {

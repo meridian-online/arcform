@@ -2194,6 +2194,332 @@ mod extension_tests {
     }
 
     #[test]
+    fn scan_finds_the_extension_directory_setting_in_any_form() {
+        assert_eq!(
+            scan(
+                r#"SET extension_directory = 'ext'; SET GLOBAL "Extension_Directory" TO 'x'; PRAGMA extension_directory='y';"#
+            ),
+            vec![ExtensionSql::Setting("extension_directory".into()); 3]
+        );
+        assert_eq!(
+            scan("SELECT current_setting('extension_directory');"),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn check_refuses_the_extension_directory_setting_saying_what_it_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql = sources(
+            dir.path(),
+            &[("step 'a'", "SELECT 1;\nSET extension_directory = 'ext';")],
+        );
+        assert_eq!(
+            refusals(check_extension_installs(&sql, Some(&v("1.5.5")))),
+            vec![
+                "step 'a' (s0.sql, line 2) names the setting extension_directory, which moves where DuckDB keeps the extensions it installs"
+            ]
+        );
+    }
+
+    #[test]
+    fn check_lists_each_vetted_community_install_once_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql = sources(
+            dir.path(),
+            &[
+                ("step 'a'", "INSTALL onager FROM community; INSTALL excel;"),
+                (
+                    "step 'b'",
+                    "FORCE INSTALL mlpack FROM community; INSTALL onager FROM community;",
+                ),
+                (
+                    "hook on_exit 'h'",
+                    "LOAD finetype; INSTALL spatial FROM core;",
+                ),
+            ],
+        );
+        assert_eq!(
+            check_extension_installs(&sql, Some(&v("1.5.5")))
+                .unwrap()
+                .installed,
+            vec!["onager".to_string(), "mlpack".to_string()]
+        );
+    }
+
+    // ---- the pins ----
+
+    const PIN_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// `extensions:` holding each `(name, version, platform, pin)`.
+    fn pins(entries: &[(&str, &str, &str, &str)]) -> ExtensionPins {
+        let mut pins = ExtensionPins::new();
+        for (name, version, platform, pin) in entries {
+            pins.entry(name.to_string())
+                .or_default()
+                .entry(version.to_string())
+                .or_default()
+                .insert(platform.to_string(), pin.to_string());
+        }
+        pins
+    }
+
+    /// A file holding `bytes`, and its SHA-256.
+    fn installed_file(dir: &Path, name: &str, bytes: &[u8]) -> (PathBuf, String) {
+        let path = dir.join(format!("{name}.duckdb_extension"));
+        std::fs::write(&path, bytes).unwrap();
+        let hash = crate::fetch_cache::hash_file(&path).unwrap();
+        (path, hash)
+    }
+
+    fn calls(engine: &mock::MockEngine) -> Vec<String> {
+        engine
+            .calls
+            .borrow()
+            .iter()
+            .map(|c| match c {
+                mock::MockCall::Platform => "platform".to_string(),
+                mock::MockCall::Install { name } => format!("install {name}"),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    fn pin_refusals(result: Result<(Vec<PinnedExtension>, Vec<String>)>) -> Vec<String> {
+        match result {
+            Err(Error::ExtensionPinRefused { refusals }) => refusals,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pin_equal_to_the_installed_file_passes_and_is_kept_for_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, hash) = installed_file(dir.path(), "mlpack", b"build one");
+        let engine = mock::MockEngine::new();
+        engine.set_install("mlpack", Ok(Some(path.clone())));
+        let (pinned, warnings) = check_extension_pins(
+            &engine,
+            &["mlpack".into()],
+            &pins(&[("mlpack", "v1.5.5", "linux_amd64", &hash)]),
+            Some(&v("1.5.5")),
+        )
+        .unwrap();
+        assert_eq!(warnings, Vec::<String>::new());
+        assert_eq!(
+            pinned,
+            vec![PinnedExtension {
+                name: "mlpack".into(),
+                version: "v1.5.5".into(),
+                platform: "linux_amd64".into(),
+                pin: hash,
+                path,
+            }]
+        );
+        assert_eq!(calls(&engine), vec!["platform", "install mlpack"]);
+    }
+
+    #[test]
+    fn a_pin_that_differs_is_refused_naming_each_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, hash) = installed_file(dir.path(), "mlpack", b"build two");
+        let engine = mock::MockEngine::new();
+        engine.set_install("mlpack", Ok(Some(path.clone())));
+        let refused = pin_refusals(check_extension_pins(
+            &engine,
+            &["mlpack".into()],
+            &pins(&[("mlpack", "v1.5.5", "linux_amd64", PIN_A)]),
+            Some(&v("1.5.5")),
+        ));
+        assert_eq!(
+            refused,
+            vec![format!(
+                "mlpack on DuckDB v1.5.5, linux_amd64: pinned {PIN_A}, and the installed file {} hashes to {hash}",
+                path.display()
+            )]
+        );
+    }
+
+    #[test]
+    fn an_install_that_fails_or_names_no_file_is_refused_and_not_warned() {
+        let pinned = pins(&[("mlpack", "v1.5.5", "linux_amd64", PIN_A)]);
+        let engine = mock::MockEngine::new();
+        engine.set_install("mlpack", Err("HTTP 404".into()));
+        let failed = pin_refusals(check_extension_pins(
+            &engine,
+            &["mlpack".into()],
+            &pinned,
+            Some(&v("1.5.5")),
+        ));
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert!(
+            failed[0]
+                .starts_with("mlpack on DuckDB v1.5.5, linux_amd64: arc could not install mlpack")
+                && failed[0].contains("HTTP 404"),
+            "{failed:?}"
+        );
+
+        let engine = mock::MockEngine::new();
+        engine.set_install("mlpack", Ok(None));
+        let no_file = pin_refusals(check_extension_pins(
+            &engine,
+            &["mlpack".into()],
+            &pinned,
+            Some(&v("1.5.5")),
+        ));
+        assert_eq!(
+            no_file,
+            vec![
+                "mlpack on DuckDB v1.5.5, linux_amd64: DuckDB named no installed file for mlpack after installing it"
+            ]
+        );
+
+        let engine = mock::MockEngine::new();
+        engine.set_install(
+            "mlpack",
+            Ok(Some(PathBuf::from("/nonexistent/mlpack.duckdb_extension"))),
+        );
+        let unreadable = pin_refusals(check_extension_pins(
+            &engine,
+            &["mlpack".into()],
+            &pinned,
+            Some(&v("1.5.5")),
+        ));
+        assert!(
+            unreadable[0]
+                .contains("could not read the installed file /nonexistent/mlpack.duckdb_extension"),
+            "{unreadable:?}"
+        );
+    }
+
+    #[test]
+    fn a_platform_duckdb_cannot_report_refuses_each_extension_with_a_pin() {
+        let engine = mock::MockEngine::new();
+        *engine.platform.borrow_mut() = None;
+        let refused = pin_refusals(check_extension_pins(
+            &engine,
+            &["mlpack".into(), "onager".into()],
+            &pins(&[("mlpack", "v1.5.5", "linux_amd64", PIN_A)]),
+            Some(&v("1.5.5")),
+        ));
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            refused[0]
+                .starts_with("mlpack has a pin for DuckDB v1.5.5, and arc could not choose it"),
+            "{refused:?}"
+        );
+        assert_eq!(calls(&engine), vec!["platform"]);
+    }
+
+    #[test]
+    fn an_extension_with_no_pin_for_this_version_and_platform_warns_once_and_asks_only_what_it_needs()
+     {
+        let tail =
+            format!(", so arc runs whichever build DuckDB installs ({VETTED_EXTENSIONS_DOC})");
+        // (label, pins, version, the warning's place, the calls DuckDB receives)
+        let cases: [(
+            &str,
+            ExtensionPins,
+            Option<semver::Version>,
+            &str,
+            Vec<&str>,
+        ); 4] = [
+            (
+                "no key",
+                pins(&[]),
+                Some(v("1.5.5")),
+                "for DuckDB v1.5.5",
+                vec![],
+            ),
+            (
+                "another version",
+                pins(&[("mlpack", "v1.5.4", "linux_amd64", PIN_A)]),
+                Some(v("1.5.5")),
+                "for DuckDB v1.5.5",
+                vec![],
+            ),
+            (
+                "another platform",
+                pins(&[("mlpack", "v1.5.5", "osx_arm64", PIN_A)]),
+                Some(v("1.5.5")),
+                "for DuckDB v1.5.5 on linux_amd64",
+                vec!["platform"],
+            ),
+            (
+                "no version",
+                pins(&[("mlpack", "v1.5.5", "linux_amd64", PIN_A)]),
+                None,
+                "arc could not read this engine's DuckDB version to choose one",
+                vec![],
+            ),
+        ];
+        for (label, pins, version, place, asked) in cases {
+            let engine = mock::MockEngine::new();
+            let (pinned, warnings) =
+                check_extension_pins(&engine, &["mlpack".into()], &pins, version.as_ref()).unwrap();
+            assert!(pinned.is_empty(), "[{label}]");
+            assert_eq!(
+                warnings,
+                vec![format!(
+                    "mlpack has no pin under the extensions: key of arcform.yaml ({place}){tail}"
+                )],
+                "[{label}]"
+            );
+            assert_eq!(calls(&engine), asked, "[{label}]");
+        }
+    }
+
+    #[test]
+    fn a_pin_for_an_extension_the_sql_does_not_install_is_neither_installed_nor_compared() {
+        let engine = mock::MockEngine::new();
+        let (pinned, warnings) = check_extension_pins(
+            &engine,
+            &[],
+            &pins(&[("mlpack", "v1.5.5", "linux_amd64", PIN_A)]),
+            Some(&v("1.5.5")),
+        )
+        .unwrap();
+        assert!(pinned.is_empty() && warnings.is_empty());
+        assert_eq!(calls(&engine), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_end_of_the_run_fails_on_a_file_that_changed_and_passes_one_that_did_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, hash) = installed_file(dir.path(), "mlpack", b"build one");
+        let (other, other_hash) = installed_file(dir.path(), "onager", b"build one");
+        let pinned = vec![
+            PinnedExtension {
+                name: "mlpack".into(),
+                version: "v1.5.5".into(),
+                platform: "linux_amd64".into(),
+                pin: hash.clone(),
+                path: path.clone(),
+            },
+            PinnedExtension {
+                name: "onager".into(),
+                version: "v1.5.5".into(),
+                platform: "linux_amd64".into(),
+                pin: other_hash,
+                path: other,
+            },
+        ];
+        recheck_extension_pins(&pinned).unwrap();
+        std::fs::write(&path, b"build one!").unwrap();
+        let found = crate::fetch_cache::hash_file(&path).unwrap();
+        match recheck_extension_pins(&pinned) {
+            Err(Error::ExtensionChanged { changes }) => assert_eq!(
+                changes,
+                vec![format!(
+                    "mlpack on DuckDB v1.5.5, linux_amd64: pinned {hash}, and when the run ended {} hashed to {found}",
+                    path.display()
+                )]
+            ),
+            other => panic!("expected the run to fail, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn scan_finds_a_parser_switch_in_any_form() {
         let switch = |name: &str| ExtensionSql::ParserSwitch(name.into());
         assert_eq!(
