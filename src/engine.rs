@@ -2417,13 +2417,14 @@ mod extension_tests {
         let tail =
             format!(", so arc runs whichever build DuckDB installs ({VETTED_EXTENSIONS_DOC})");
         // (label, pins, version, the warning's place, the calls DuckDB receives)
-        let cases: [(
-            &str,
+        type Case = (
+            &'static str,
             ExtensionPins,
             Option<semver::Version>,
-            &str,
-            Vec<&str>,
-        ); 4] = [
+            &'static str,
+            Vec<&'static str>,
+        );
+        let cases: [Case; 4] = [
             (
                 "no key",
                 pins(&[]),
