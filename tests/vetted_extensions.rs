@@ -850,8 +850,7 @@ impl Pinned {
 
     /// The `outcome` of each run the Protocol's database records, oldest first.
     fn recorded_outcomes(&self) -> Vec<Option<String>> {
-        let conn =
-            duckdb::Connection::open(self.protocol.project().join("pinned.duckdb")).unwrap();
+        let conn = duckdb::Connection::open(self.protocol.project().join("pinned.duckdb")).unwrap();
         let mut stmt = conn
             .prepare("SELECT outcome FROM _arcform_runs ORDER BY rowid")
             .unwrap();
