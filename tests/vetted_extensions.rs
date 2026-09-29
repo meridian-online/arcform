@@ -170,6 +170,17 @@ fn an_unvetted_community_install_is_refused_before_a_step_runs() {
 }
 
 #[test]
+fn an_extension_the_registry_serves_and_the_list_leaves_out_is_refused_by_name() {
+    let run = Protocol::steps(&[("s", "INSTALL read_stat FROM community;\n")]).run(VETTED_ON);
+    run.assert_refused("read_stat");
+    assert!(
+        run.stderr.contains("read_stat is not on the vetted list"),
+        "the refusal should name read_stat:\n{}",
+        run.stderr
+    );
+}
+
+#[test]
 fn any_letter_case_and_force_install_are_refused_as_install_is() {
     for sql in [
         "install anofox_forecast from community;",
@@ -318,6 +329,16 @@ fn a_vetted_community_install_starts_its_step() {
     let run =
         Protocol::steps(&[("s", "INSTALL mlpack FROM community; LOAD mlpack;\n")]).run(VETTED_ON);
     run.assert_not_refused("vetted", &["s.sql"]);
+}
+
+#[test]
+fn each_extension_the_proofs_added_starts_its_step() {
+    for name in ["finetype", "minijinja", "onager", "splink_udfs"] {
+        let sql = format!("INSTALL {name} FROM community; LOAD {name};\n");
+        Protocol::steps(&[("s", &sql)])
+            .run(VETTED_ON)
+            .assert_not_refused(name, &["s.sql"]);
+    }
 }
 
 #[test]
@@ -480,8 +501,8 @@ fn held_entries() -> Vec<Entry> {
 fn the_page_and_the_list_arc_holds_are_the_same_list() {
     let page = page_entries();
     let held = held_entries();
-    assert_eq!(page.len(), 12, "twelve rows on the page: {page:?}");
-    assert_eq!(held.len(), 12, "twelve entries arc holds: {held:?}");
+    assert_eq!(page.len(), 16, "sixteen rows on the page: {page:?}");
+    assert_eq!(held.len(), 16, "sixteen entries arc holds: {held:?}");
     let page: BTreeSet<Entry> = page.into_iter().collect();
     let held: BTreeSet<Entry> = held.into_iter().collect();
     assert_eq!(
@@ -507,15 +528,51 @@ fn every_extension_on_the_page_is_one_arc_lets_a_step_install() {
         .assert_not_refused("every page row", &["s.sql"]);
 }
 
+/// Each entry whose licence is not permissive, as a message naming the extension. A licence
+/// written as names joined by ` OR ` is permissive when each name is one of the permissive ones.
+fn licence_refusals(entries: &[(&str, &str)]) -> Vec<String> {
+    const PERMISSIVE: [&str; 5] = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC"];
+    entries
+        .iter()
+        .filter(|(_, licence)| !licence.split(" OR ").all(|name| PERMISSIVE.contains(&name)))
+        .map(|(name, licence)| {
+            format!("{name} states {licence}, which is not a permissive licence")
+        })
+        .collect()
+}
+
 #[test]
 fn every_licence_on_the_list_is_permissive() {
-    const PERMISSIVE: [&str; 5] = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC"];
-    for (name, licence, ..) in held_entries() {
-        assert!(
-            PERMISSIVE.contains(&licence.as_str()),
-            "{name} states {licence}, which is not a permissive licence"
-        );
-    }
+    let held = held_entries();
+    let entries: Vec<(&str, &str)> = held
+        .iter()
+        .map(|(name, licence, ..)| (name.as_str(), licence.as_str()))
+        .collect();
+    assert_eq!(licence_refusals(&entries), Vec::<String>::new());
+}
+
+#[test]
+fn a_licence_of_names_joined_by_or_is_permissive_when_each_name_is() {
+    assert_eq!(
+        licence_refusals(&[
+            ("onager", "MIT OR Apache-2.0"),
+            ("swapped", "Apache-2.0 OR MIT"),
+            ("plain", "BSD-3-Clause"),
+        ]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        licence_refusals(&[
+            ("source_available", "BSL-1.1"),
+            ("one_bad_name", "MIT OR BSL-1.1"),
+            ("none_stated", ""),
+        ]),
+        vec![
+            "source_available states BSL-1.1, which is not a permissive licence".to_string(),
+            "one_bad_name states MIT OR BSL-1.1, which is not a permissive licence".to_string(),
+            "none_stated states , which is not a permissive licence".to_string(),
+        ]
+    );
 }
 
 // ---- arc reads a SQL file as DuckDB does ----
