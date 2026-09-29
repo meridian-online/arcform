@@ -738,10 +738,8 @@ impl Operation {
                 }
             }
         }
-        for required in schema["required"].as_array().into_iter().flatten() {
-            let Some(required) = required.as_str() else {
-                continue;
-            };
+        let required = schema["required"].as_array().into_iter().flatten();
+        for required in required.filter_map(serde_json::Value::as_str) {
             if !arguments.contains_key(required) {
                 return Err(refused(format!(
                     "`{}` needs the argument `{required}`, and none was given",
@@ -789,12 +787,19 @@ fn is_of_type(value: &serde_json::Value, ty: &str) -> bool {
 /// A condition goes into the step's `WHERE` as written, so a statement
 /// terminator in it outside a string or a comment would end the operation's
 /// statement and begin another: refused. Every other condition is recorded as
-/// written, whether or not it parses. The split is the one a step's statements
-/// are rendered by, whose ranges each end at their own terminator.
+/// written, whether or not it parses.
+///
+/// The split is the one a step's statements are rendered by. It is run over the
+/// condition with a `;` on a line after it, so that the last range, ending at
+/// that `;` or swallowed with it, always runs past the condition's end: a range
+/// that ends inside the condition ended at a terminator of the condition's own.
+/// Split alone, a condition ending in a comment that ends in `;`, such as
+/// `a > 1 -- ;`, would end its last range on that `;` too.
 fn one_statement(key: &str, condition: &str) -> Result<()> {
-    let terminated = crate::introspect::statement_byte_ranges(condition)
+    let probe = format!("{condition}\n;");
+    let terminated = crate::introspect::statement_byte_ranges(&probe)
         .iter()
-        .any(|&(_, end)| condition.as_bytes()[..end].ends_with(b";"));
+        .any(|&(_, end)| end <= condition.len());
     if terminated {
         return Err(refused(format!(
             "the condition `{key}` holds a `;` outside a string or a comment, which would end \
@@ -1190,5 +1195,134 @@ mod tests {
             ]),
             "the comparisons offered, in order, as a word and a sign"
         );
+    }
+
+    // ------------------------------------------------- recording an operation
+
+    /// An operation with the given `parameters`, whose SQL is its `where`.
+    fn operation_taking(parameters: fn() -> serde_json::Value) -> Operation {
+        Operation {
+            long_name: "test-op",
+            summary: "A test operation.",
+            applied_to: &[],
+            parameters,
+            sql: |recording| recording.text("where").to_string(),
+        }
+    }
+
+    fn arguments(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        value.as_object().expect("an object").clone()
+    }
+
+    #[test]
+    fn an_open_schema_admits_an_argument_it_does_not_name() {
+        let op = operation_taking(
+            || serde_json::json!({ "type": "object", "properties": { "a": { "type": "string" } } }),
+        );
+        assert!(op.admit(&arguments(serde_json::json!({ "b": 1 }))).is_ok());
+    }
+
+    #[test]
+    fn a_value_of_the_wrong_type_is_refused_naming_the_argument_and_its_type() {
+        let op = operation(FILTER_ROWS).unwrap();
+        let err = op
+            .admit(&arguments(serde_json::json!({ "where": 100 })))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`where`") && err.contains("string"), "{err}");
+    }
+
+    #[test]
+    fn only_a_value_annotated_as_a_condition_is_held_to_one_statement() {
+        let op = operation_taking(|| {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "label": { "type": "string" },
+                    "where": { "type": "string", "x-kind": "condition" },
+                },
+            })
+        });
+        assert!(
+            op.admit(&arguments(serde_json::json!({ "label": "a; b" })))
+                .is_ok()
+        );
+        assert!(
+            op.admit(&arguments(serde_json::json!({ "where": "a; b" })))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_terminator_is_found_wherever_it_ends_a_statement() {
+        for condition in [
+            "a > 1;",
+            ";",
+            "a > 1 ; ",
+            "/* x */ ;",
+            "a > 1;;",
+            "a;\nb",
+            "a > 1; /*",
+        ] {
+            assert!(
+                one_statement("where", condition).is_err(),
+                "{condition:?} was admitted"
+            );
+        }
+        for condition in [
+            "a = ';'",
+            "a > 1 -- ;",
+            "a > 1 /* ; */",
+            "\"a;b\" > 1",
+            "$$;$$ = a",
+            "a = 'b;",
+        ] {
+            assert!(
+                one_statement("where", condition).is_ok(),
+                "{condition:?} was refused"
+            );
+        }
+    }
+
+    #[test]
+    fn each_json_schema_type_admits_its_own_values_only() {
+        let values = [
+            ("string", serde_json::json!("a")),
+            ("boolean", serde_json::json!(true)),
+            ("integer", serde_json::json!(3)),
+            ("number", serde_json::json!(2.5)),
+            ("array", serde_json::json!([])),
+            ("object", serde_json::json!({})),
+            ("null", serde_json::Value::Null),
+        ];
+        for (ty, _) in &values {
+            for (other, value) in &values {
+                let admitted = is_of_type(value, ty);
+                let expected = ty == other || (*ty == "number" && *other == "integer");
+                assert_eq!(admitted, expected, "{value} as a {ty}");
+            }
+        }
+        assert!(is_of_type(&serde_json::json!(u64::MAX), "integer"));
+        assert!(is_of_type(&serde_json::json!("a"), "no-such-type"));
+    }
+
+    #[test]
+    fn the_table_is_one_a_step_makes_in_any_case_and_not_a_file_it_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("models")).unwrap();
+        std::fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            "name: shop\nsteps:\n  - name: orders\n    sql: models/orders.sql\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models/orders.sql"),
+            "CREATE TABLE orders AS SELECT 1 AS id;\nCOPY orders TO 'build/orders.csv';\n",
+        )
+        .unwrap();
+        assert!(made_by_a_step(dir.path(), "orders").is_ok());
+        assert!(made_by_a_step(dir.path(), "ORDERS").is_ok());
+        let err = made_by_a_step(dir.path(), "build/orders.csv").unwrap_err();
+        assert!(err.to_string().contains("`build/orders.csv`"), "{err}");
     }
 }

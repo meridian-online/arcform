@@ -260,9 +260,8 @@ fn operation_record(args: &Value) -> ToolResult {
         }
     };
     let history = crate::history::LocalHistory::open_default().map_err(|e| e.to_string())?;
-    let model =
-        crate::record::record_operation(&dir, operation, on, name, &arguments, &history)
-            .map_err(|e| e.to_string())?;
+    let model = crate::record::record_operation(&dir, operation, on, name, &arguments, &history)
+        .map_err(|e| e.to_string())?;
     Ok(ToolOutput::json(json!({
         "step": name,
         "model": model.display().to_string(),
@@ -419,6 +418,47 @@ mod tests {
         let err = operation_describe(&json!({ "operation": ["filter-rows"] })).unwrap_err();
         assert!(err.contains("must be a string"), "message: {err}");
         assert!(err.contains("[\"filter-rows\"]"), "message: {err}");
+    }
+
+    #[test]
+    fn operation_record_refuses_a_request_missing_a_key_or_of_the_wrong_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = json!({
+            "dir": dir.path().to_str().unwrap(),
+            "operation": "filter-rows",
+            "on": "orders",
+            "name": "big_orders",
+            "arguments": { "where": "amount > 100" },
+        });
+        let refusals = [
+            ("operation", Value::Null, "`operation` is required"),
+            ("on", json!(null), "`on` is required"),
+            (
+                "name",
+                json!(["big_orders"]),
+                "`name` must be a string, not [\"big_orders\"]",
+            ),
+            (
+                "arguments",
+                json!("where=amount > 100"),
+                "`arguments` must be an object",
+            ),
+        ];
+        for (key, value, message) in refusals {
+            let mut args = request.clone();
+            if value.is_null() && key == "operation" {
+                args.as_object_mut().unwrap().remove(key);
+            } else {
+                args[key] = value;
+            }
+            let err = operation_record(&args).unwrap_err();
+            assert!(err.contains(message), "{key}: {err}");
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "a refused request wrote into the directory"
+        );
     }
 
     #[test]

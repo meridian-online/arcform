@@ -723,8 +723,7 @@ fn operation_record(
     history: &LocalHistory,
     out: &mut impl Write,
 ) -> Result<()> {
-    let model =
-        crate::record::record_operation(dir, long_name, on, name, arguments, history)?;
+    let model = crate::record::record_operation(dir, long_name, on, name, arguments, history)?;
     writeln!(
         out,
         "recorded step {name} as {} in {} — `arc run` runs it",
@@ -746,7 +745,10 @@ fn operation_arguments(args: &[String]) -> Result<serde_json::Map<String, serde_
             ))));
         };
         if arguments
-            .insert(key.to_string(), serde_json::Value::String(value.to_string()))
+            .insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            )
             .is_some()
         {
             return Err(Error::Io(std::io::Error::other(format!(
@@ -1470,5 +1472,62 @@ mod tests {
     fn operation_describe_reports_a_failed_write() {
         let err = operation_describe("filter-rows", &mut FailingWriter).unwrap_err();
         assert!(err.to_string().contains("stdout is closed"), "{err}");
+    }
+
+    #[test]
+    fn operation_record_reports_a_failed_write() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("shop");
+        std::fs::create_dir_all(dir.join("models")).unwrap();
+        std::fs::write(
+            dir.join("arcform.yaml"),
+            "name: shop\nsteps:\n  - name: orders\n    sql: models/orders.sql\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("models/orders.sql"),
+            "CREATE TABLE orders AS SELECT 1 AS amount;\n",
+        )
+        .unwrap();
+        let arguments = operation_arguments(&["where=amount > 0".to_string()]).unwrap();
+        let history = LocalHistory::at_root(root.path().join("history"));
+        let err = operation_record(
+            &dir,
+            "filter-rows",
+            "orders",
+            "big",
+            &arguments,
+            &history,
+            &mut FailingWriter,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("stdout is closed"), "{err}");
+    }
+
+    #[test]
+    fn operation_arguments_split_each_at_its_first_equals_sign() {
+        let arguments =
+            operation_arguments(&["where=region = 'north'".to_string(), "label=".to_string()])
+                .unwrap();
+        assert_eq!(
+            serde_json::Value::Object(arguments),
+            serde_json::json!({ "where": "region = 'north'", "label": "" })
+        );
+    }
+
+    #[test]
+    fn operation_arguments_refuse_an_entry_without_a_value_and_a_repeated_key() {
+        let err = operation_arguments(&["where".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("`--arg where` must be KEY=VALUE"),
+            "{err}"
+        );
+        let err = operation_arguments(&["where=a > 1".to_string(), "where=b > 1".to_string()])
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`--arg where` is given more than once"),
+            "{err}"
+        );
     }
 }
