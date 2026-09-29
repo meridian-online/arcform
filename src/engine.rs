@@ -380,6 +380,17 @@ const EXTENSION_REPOSITORY_SETTINGS: [&str; 2] = [
 /// string holds.
 const PARSER_SWITCHES: [&str; 2] = ["enable_peg_parser", "allow_parser_override_extension"];
 
+/// The functions that run SQL held in their argument: `query()` a `SELECT` in a string, and
+/// `json_execute_serialized_sql()` one serialized as JSON. A step can assemble that argument
+/// while it runs, as `'FROM enable_' || 'peg_parser()'`, and arc reads only its text.
+const RUNS_SQL: [&str; 2] = ["query", "json_execute_serialized_sql"];
+
+/// The words after which a name is one a statement declares or writes to, and a column list
+/// can follow it: `CREATE TABLE query (a INT)` makes a table called `query`. DuckDB takes no
+/// call there: `CREATE TABLE query(getvariable('q'))` does not parse.
+const NAMED_BEFORE_A_COLUMN_LIST: [&str; 6] =
+    ["table", "view", "into", "exists", "with", "recursive"];
+
 /// One community extension a Protocol may install from the community registry. The file
 /// also carries each entry's licence, repository and proof, which the page shows and the
 /// check does not read.
@@ -680,7 +691,33 @@ enum InstallFrom {
     Address(String),
 }
 
-/// One thing a Protocol's SQL says about where DuckDB installs an extension from.
+/// One place where a step's SQL can run SQL that is not in its file, which the check does not
+/// read for an extension that SQL installs.
+#[derive(Debug, Clone, PartialEq)]
+enum RunTimeSql {
+    /// A function in [`RUNS_SQL`], by the name arc prints, called on anything but one string
+    /// literal, or on a literal whose text makes such a call.
+    Call(&'static str),
+    /// `IMPORT DATABASE`, or `import_database`: runs the SQL files of a directory, which a
+    /// step can write with `COPY`.
+    ImportDatabase,
+    /// A string or a quoted name holding `.duckdbrc`, the file the DuckDB CLI runs before
+    /// each step's file.
+    Duckdbrc,
+}
+
+impl std::fmt::Display for RunTimeSql {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunTimeSql::Call(name) => write!(f, "{name}()"),
+            RunTimeSql::ImportDatabase => f.write_str("IMPORT DATABASE"),
+            RunTimeSql::Duckdbrc => f.write_str(".duckdbrc"),
+        }
+    }
+}
+
+/// One thing a Protocol's SQL says about where DuckDB installs an extension from, or a place
+/// where it runs SQL the check does not read.
 #[derive(Debug, Clone, PartialEq)]
 enum ExtensionSql {
     /// `[FORCE] INSTALL <name> [FROM <repository>]`, the name lower-cased as DuckDB does.
@@ -692,6 +729,8 @@ enum ExtensionSql {
     Setting(String),
     /// A name in [`PARSER_SWITCHES`], named outside a comment.
     ParserSwitch(String),
+    /// SQL the step builds or writes while it runs, which draws a warning and not a refusal.
+    RunTime(RunTimeSql),
 }
 
 // ---- A SQL file as DuckDB's CLI reads it ----
@@ -944,20 +983,155 @@ fn strip_unicode_spaces(q: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Every place in a SQL file that says where DuckDB installs an extension from, each with
-/// the file line it is on. The file is read as DuckDB's CLI reads it: [`cli_batches`], then
-/// [`strip_unicode_spaces`], then [`lex_sql`], each batch alone.
+/// Every place in a SQL file that says where DuckDB installs an extension from, and every
+/// place where it runs SQL that is not in the file, each with the file line it is on. The
+/// file is read as DuckDB's CLI reads it: [`cli_batches`], then [`strip_unicode_spaces`],
+/// then [`lex_sql`], each batch alone.
 fn scan_extension_sql(file: &[u8]) -> Vec<(ExtensionSql, usize)> {
     let mut found = Vec::new();
     for (batch, lines) in cli_batches(file) {
         let batch = strip_unicode_spaces(&batch);
         let toks = lex_sql(&String::from_utf8_lossy(&batch));
+        let run_time = scan_run_time_sql(&toks)
+            .into_iter()
+            .map(|(shape, line)| (ExtensionSql::RunTime(shape), line));
         // A batch holds one `\n` between each two of its lines, and nothing else adds one.
-        for (finding, line) in scan_tokens(&toks) {
+        for (finding, line) in scan_tokens(&toks).into_iter().chain(run_time) {
             found.push((finding, lines[line - 1]));
         }
     }
     found
+}
+
+/// Every place in one batch's tokens where the SQL that runs is not in the file, each with
+/// its line in the batch: a call in [`unread_calls`]; `IMPORT DATABASE` or `import_database`,
+/// in any letter case and whatever follows; and a string or a quoted name whose text holds
+/// `.duckdbrc` in any letter case, since macOS's default file system does not tell
+/// `.DuckDBrc` from `.duckdbrc`. `import_database` is one word to [`lex_sql`], as `_` is a
+/// word character, so `PRAGMA import_database('imp')` is looked for by its own name.
+///
+/// These are shapes, not a boundary: a path to `.duckdbrc` assembled from pieces, and a step
+/// that writes over a later step's SQL file, are not among them.
+fn scan_run_time_sql(toks: &[(Tok, usize)]) -> Vec<(RunTimeSql, usize)> {
+    let mut found: Vec<(RunTimeSql, usize)> = unread_calls(toks)
+        .into_iter()
+        .map(|(name, line)| (RunTimeSql::Call(name), line))
+        .collect();
+    for (k, (tok, line)) in toks.iter().enumerate() {
+        let shape = match (tok, toks.get(k + 1).map(|(next, _)| next)) {
+            (Tok::Word { text, .. }, Some(Tok::Word { text: next, .. }))
+                if text.eq_ignore_ascii_case("import") && next.eq_ignore_ascii_case("database") =>
+            {
+                RunTimeSql::ImportDatabase
+            }
+            (Tok::Word { text, .. }, _) if text.eq_ignore_ascii_case("import_database") => {
+                RunTimeSql::ImportDatabase
+            }
+            (Tok::Word { text, quoted: true } | Tok::Str(text), _)
+                if text.to_lowercase().contains(".duckdbrc") =>
+            {
+                RunTimeSql::Duckdbrc
+            }
+            _ => continue,
+        };
+        found.push((shape, *line));
+    }
+    found
+}
+
+/// Each call in `toks` to a function in [`RUNS_SQL`] whose argument arc does not read, by the
+/// function's name, with the line of the call. The name is read in any letter case, quoted or
+/// not and after a schema, as DuckDB runs `FROM "query"('SELECT 1')` and
+/// `FROM system.main.query('SELECT 1')`; a name a column list follows is not a call.
+fn unread_calls(toks: &[(Tok, usize)]) -> Vec<(&'static str, usize)> {
+    let mut found = Vec::new();
+    for (k, (tok, line)) in toks.iter().enumerate() {
+        let Tok::Word { text, .. } = tok else {
+            continue;
+        };
+        let Some(name) = RUNS_SQL
+            .into_iter()
+            .find(|name| text.eq_ignore_ascii_case(name))
+        else {
+            continue;
+        };
+        let [(Tok::Other('('), _), argument @ ..] = &toks[k + 1..] else {
+            continue;
+        };
+        if names_a_table(&toks[..k]) || reads_argument(name, argument) {
+            continue;
+        }
+        found.push((name, *line));
+    }
+    found
+}
+
+/// Whether the name after `before` is one a statement declares or writes to: after a word in
+/// [`NAMED_BEFORE_A_COLUMN_LIST`], read past a schema such as `main.`.
+fn names_a_table(before: &[(Tok, usize)]) -> bool {
+    let mut before = before;
+    while let [rest @ .., (Tok::Word { .. }, _), (Tok::Other('.'), _)] = before {
+        before = rest;
+    }
+    matches!(
+        before.last(),
+        Some((Tok::Word { text, .. }, _))
+            if NAMED_BEFORE_A_COLUMN_LIST.iter().any(|word| text.eq_ignore_ascii_case(word))
+    )
+}
+
+/// Whether arc reads the SQL a call to `name` runs, from the tokens after its `(`: one string
+/// literal and the `)`, whose text makes no call arc does not read. `query()` runs the literal
+/// as SQL, which DuckDB's parser reads after its unicode-space pass; the serialized SQL
+/// `json_execute_serialized_sql()` runs is read by [`serialized_calls`].
+fn reads_argument(name: &str, argument: &[(Tok, usize)]) -> bool {
+    let [(Tok::Str(literal), _), (Tok::Other(')'), _), ..] = argument else {
+        return false;
+    };
+    if name == "query" {
+        let literal = strip_unicode_spaces(literal.as_bytes());
+        unread_calls(&lex_sql(&String::from_utf8_lossy(&literal))).is_empty()
+    } else {
+        !serialized_calls(literal)
+    }
+}
+
+/// Whether SQL serialized as JSON, as `json_execute_serialized_sql()` takes it, calls a
+/// function in [`RUNS_SQL`]: an object whose `function_name` is one, at any depth. DuckDB
+/// runs `query('SELECT ' || '42')` from its serialized form. Text arc cannot read as JSON is
+/// read as making such a call.
+fn serialized_calls(json: &str) -> bool {
+    fn calls(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+                key == "function_name"
+                    && value
+                        .as_str()
+                        .is_some_and(|name| RUNS_SQL.iter().any(|f| name.eq_ignore_ascii_case(f)))
+                    || calls(value)
+            }),
+            serde_json::Value::Array(items) => items.iter().any(calls),
+            _ => false,
+        }
+    }
+    serde_json::from_str(json).map_or(true, |value| calls(&value))
+}
+
+/// The warning for one step or hook whose SQL holds places in [`scan_run_time_sql`], naming
+/// each by its line, in line order.
+fn run_time_warning(source: &ProtocolSql, mut shapes: Vec<(RunTimeSql, usize)>) -> String {
+    shapes.sort_by_key(|(_, line)| *line);
+    shapes.dedup();
+    let places: Vec<String> = shapes
+        .iter()
+        .map(|(shape, line)| format!("{shape} on line {line}"))
+        .collect();
+    format!(
+        "{} ({}) can run or write SQL that is not in its file: {}. arc does not read the SQL a step builds or writes while it runs, for an extension that SQL installs; running it anyway ({VETTED_EXTENSIONS_DOC})",
+        source.place,
+        source.file,
+        places.join(", ")
+    )
 }
 
 /// Every place in one batch's tokens that says where DuckDB installs an extension from, each
@@ -1079,7 +1253,8 @@ pub(crate) fn protocol_sql(manifest: &Manifest, dir: &Path) -> Vec<ProtocolSql> 
 
 /// Refuse a Protocol whose SQL installs a DuckDB extension off the vetted list, before a
 /// step runs; otherwise return one warning for each vetted extension it installs whose
-/// entry does not name the engine's version.
+/// entry does not name the engine's version, and one for each step or hook whose SQL can run
+/// or write SQL that is not in its file, as [`scan_run_time_sql`] finds it.
 ///
 /// Refused: `INSTALL <name> FROM community` for a name not on the list; an `INSTALL` from
 /// an address or from a repository other than `core` and `community`; an `INSTALL` whose
@@ -1097,13 +1272,19 @@ pub(crate) fn check_extension_installs(
     let vetted = vetted_extensions();
     let mut refusals = Vec::new();
     let mut installed: Vec<&VettedExtension> = Vec::new();
+    let mut unread = Vec::new();
     for source in sql {
         // A file that is not there before the run is left to the step that runs it.
         let Ok(bytes) = std::fs::read(&source.path) else {
             continue;
         };
+        let mut shapes = Vec::new();
         for (found, line) in scan_extension_sql(&bytes) {
             let why = match found {
+                ExtensionSql::RunTime(shape) => {
+                    shapes.push((shape, line));
+                    continue;
+                }
                 ExtensionSql::Install {
                     from: InstallFrom::Core,
                     ..
@@ -1147,6 +1328,9 @@ pub(crate) fn check_extension_installs(
                 source.place, source.file
             ));
         }
+        if !shapes.is_empty() {
+            unread.push((source, shapes));
+        }
     }
     if !refusals.is_empty() {
         return Err(Error::ExtensionRefused { refusals });
@@ -1170,6 +1354,11 @@ pub(crate) fn check_extension_installs(
                 entry.name
             )
         })
+        .chain(
+            unread
+                .into_iter()
+                .map(|(source, shapes)| run_time_warning(source, shapes)),
+        )
         .collect())
 }
 
