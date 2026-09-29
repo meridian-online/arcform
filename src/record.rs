@@ -466,6 +466,30 @@ pub(crate) struct Operation {
     applied_to: &'static [AppliedTo],
     /// The operation's arguments as a JSON Schema.
     parameters: fn() -> serde_json::Value,
+    /// The step's SQL, written from a recording whose arguments `parameters`
+    /// has already admitted.
+    sql: fn(&Recording) -> String,
+}
+
+/// What an operation's SQL is written from: the new step's name, which is also
+/// the name of the table the step makes; the table the operation is applied to,
+/// as given; and the operation's arguments.
+pub(crate) struct Recording<'a> {
+    name: &'a str,
+    on: &'a str,
+    arguments: &'a serde_json::Map<String, serde_json::Value>,
+}
+
+impl Recording<'_> {
+    /// The string argument `key`, or `""` when it is absent. The arguments are
+    /// checked against the operation's `parameters` before its SQL is written, so
+    /// a required string is present by then.
+    fn text(&self, key: &str) -> &str {
+        self.arguments
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    }
 }
 
 /// One thing an operation is applied to. It is supplied by where the operation
@@ -537,6 +561,7 @@ const CATALOGUE: &[Operation] = &[Operation {
         },
     ],
     parameters: filter_rows_parameters,
+    sql: filter_rows_sql,
 }];
 
 /// The `parameters` schema of [`FILTER_ROWS`]: one required string, `where`.
@@ -568,6 +593,23 @@ fn filter_rows_parameters() -> serde_json::Value {
         },
         "required": ["where"],
     })
+}
+
+/// The SQL step of [`FILTER_ROWS`]: a table named for the step, holding the rows
+/// of the table it is applied to for which the condition holds. The table read
+/// and the condition are written as given.
+fn filter_rows_sql(recording: &Recording) -> String {
+    format!(
+        "CREATE OR REPLACE TABLE {} AS\nSELECT *\nFROM {}\nWHERE {};\n",
+        quote_ident(recording.name),
+        recording.on,
+        recording.text("where"),
+    )
+}
+
+/// `name` as a double-quoted SQL identifier, a `"` inside it doubled.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// Every operation arc holds, in catalogue order.
@@ -615,6 +657,179 @@ impl AppliedTo {
         entry["description"] = self.description.into();
         entry
     }
+}
+
+// ------------------------------------------------- recording an operation
+
+/// Record the operation called `long_name`, applied to the table `on`, as a new
+/// step named `name` at the end of the protocol at `dir`, and return the model's
+/// path relative to `dir`.
+///
+/// The operation's SQL is written from its catalogue entry, so a caller names no
+/// operation and no argument of its own: the command line and `arc mcp` hand
+/// over what they were given, and an operation added to the catalogue is
+/// recorded through both with no edit to either. The model's first line is the
+/// long name and the table, ` on ` between them, and nothing else, so the same
+/// request writes the same bytes whoever sends it. The step is recorded through
+/// [`record_step_with_history`](crate::history::record_step_with_history), so
+/// each recording is a version of the protocol, and it runs nothing.
+///
+/// Refused, with the protocol's directory untouched: an operation arc does not
+/// hold; arguments the operation's `parameters` do not admit, whether one is
+/// missing, one is not taken or one is of the wrong type; a condition holding a
+/// statement terminator outside a string or a comment; and a table no step of
+/// the protocol makes. Each refusal's message names what was wrong.
+pub(crate) fn record_operation(
+    dir: &Path,
+    long_name: &str,
+    on: &str,
+    name: &str,
+    arguments: &serde_json::Map<String, serde_json::Value>,
+    history: &crate::history::LocalHistory,
+) -> Result<PathBuf> {
+    let Some(op) = operation(long_name) else {
+        let held: Vec<&str> = CATALOGUE.iter().map(|op| op.long_name).collect();
+        return Err(refused(format!(
+            "no operation called `{long_name}`; the operations arc holds are {}",
+            held.join(", ")
+        )));
+    };
+    op.admit(arguments)?;
+    made_by_a_step(dir, on)?;
+
+    let step = RecordedStep {
+        name: name.to_string(),
+        sql: (op.sql)(&Recording {
+            name,
+            on,
+            arguments,
+        }),
+        provenance: format!("{} on {on}", op.long_name),
+    };
+    let (sql_rel, _) = crate::history::record_step_with_history(dir, &step, history)?;
+    Ok(sql_rel)
+}
+
+impl Operation {
+    /// Whether `arguments` are what the operation's `parameters` schema admits:
+    /// each required argument present, no argument the schema does not name when
+    /// it is closed, and each value of the type the schema gives it. A value
+    /// annotated `x-kind: condition` is also checked as a condition.
+    fn admit(&self, arguments: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+        let schema = (self.parameters)();
+        let empty = serde_json::Map::new();
+        let properties = schema["properties"].as_object().unwrap_or(&empty);
+        let taken = || {
+            properties
+                .keys()
+                .map(|key| format!("`{key}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        if schema["additionalProperties"] == serde_json::Value::Bool(false) {
+            for key in arguments.keys() {
+                if !properties.contains_key(key) {
+                    return Err(refused(format!(
+                        "`{}` takes no argument `{key}`; it takes {}",
+                        self.long_name,
+                        taken()
+                    )));
+                }
+            }
+        }
+        for required in schema["required"].as_array().into_iter().flatten() {
+            let Some(required) = required.as_str() else {
+                continue;
+            };
+            if !arguments.contains_key(required) {
+                return Err(refused(format!(
+                    "`{}` needs the argument `{required}`, and none was given",
+                    self.long_name
+                )));
+            }
+        }
+        for (key, value) in arguments {
+            let Some(property) = properties.get(key) else {
+                continue;
+            };
+            if let Some(ty) = property["type"].as_str()
+                && !is_of_type(value, ty)
+            {
+                return Err(refused(format!(
+                    "the argument `{key}` of `{}` is a {ty}, not {value}",
+                    self.long_name
+                )));
+            }
+            if property["x-kind"] == "condition"
+                && let Some(condition) = value.as_str()
+            {
+                one_statement(key, condition)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether `value` is of the JSON Schema type `ty`. A type the schema language
+/// does not name admits any value.
+fn is_of_type(value: &serde_json::Value, ty: &str) -> bool {
+    match ty {
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "number" => value.is_number(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        "null" => value.is_null(),
+        _ => true,
+    }
+}
+
+/// A condition goes into the step's `WHERE` as written, so a statement
+/// terminator in it outside a string or a comment would end the operation's
+/// statement and begin another: refused. Every other condition is recorded as
+/// written, whether or not it parses. The split is the one a step's statements
+/// are rendered by, whose ranges each end at their own terminator.
+fn one_statement(key: &str, condition: &str) -> Result<()> {
+    let terminated = crate::introspect::statement_byte_ranges(condition)
+        .iter()
+        .any(|&(_, end)| condition.as_bytes()[..end].ends_with(b";"));
+    if terminated {
+        return Err(refused(format!(
+            "the condition `{key}` holds a `;` outside a string or a comment, which would end \
+             the step's statement and begin another: {condition}"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether a step of the protocol at `dir` makes the table `on`, as `arc run`
+/// reads what each step makes. A table name matches in any case, as DuckDB's
+/// does; a file a step writes is not a table.
+fn made_by_a_step(dir: &Path, on: &str) -> Result<()> {
+    let manifest = Manifest::load(dir)?;
+    let graph = crate::asset::AssetGraph::build(&manifest, dir);
+    let wanted = on.to_lowercase();
+    let made = graph.steps.values().any(|assets| {
+        assets.produces.contains(&wanted)
+            && assets.declared_kind.get(&wanted) == Some(&crate::asset_kind::AssetKind::Table)
+    });
+    if !made {
+        return Err(refused(format!(
+            "no step of the protocol makes a table called `{on}`; an operation is applied to \
+             a table a step makes"
+        )));
+    }
+    Ok(())
+}
+
+/// A request to record an operation that is refused before anything is written.
+fn refused(message: String) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message,
+    ))
 }
 
 // --------------------------------------------------------------------- tests

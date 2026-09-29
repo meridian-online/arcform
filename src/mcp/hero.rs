@@ -9,6 +9,9 @@
 //! - `operation_describe` lists the SQL operations arc holds, or describes one by its
 //!   long name: the same JSON `arc operation list --json` and `arc operation describe`
 //!   print, both read from the catalogue in `record`.
+//! - `operation_record` records an operation as a new step of a Protocol, through
+//!   the same record path `arc operation record` takes, so the same request writes
+//!   the same bytes from either.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -21,12 +24,17 @@ use super::{ToolDef, ToolOutput, ToolResult};
 // protocol_run
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn protocol_run(args: &Value) -> ToolResult {
-    let dir = match args.get("dir").and_then(Value::as_str) {
-        Some(dir) => PathBuf::from(dir),
+/// The Protocol's directory: `dir` when given, else the server's working directory.
+fn protocol_dir(args: &Value) -> std::result::Result<PathBuf, String> {
+    match args.get("dir").and_then(Value::as_str) {
+        Some(dir) => Ok(PathBuf::from(dir)),
         None => std::env::current_dir()
-            .map_err(|e| format!("no `dir` given and the current directory is unavailable: {e}"))?,
-    };
+            .map_err(|e| format!("no `dir` given and the current directory is unavailable: {e}")),
+    }
+}
+
+fn protocol_run(args: &Value) -> ToolResult {
+    let dir = protocol_dir(args)?;
     let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
     let cli_params = parse_params(args.get("params"))?;
 
@@ -226,6 +234,64 @@ fn operation_describe_schema() -> Value {
     })
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// operation_record
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Record an operation as a new step at the end of a Protocol.
+///
+/// The request is handed to the record path `arc operation record` takes, which
+/// writes the step's SQL from the operation's catalogue entry; nothing here names
+/// an operation or an argument. `arguments` is an object, absent when the
+/// operation takes none. A refusal is an error result naming what was wrong, with
+/// the Protocol's directory untouched.
+fn operation_record(args: &Value) -> ToolResult {
+    let dir = protocol_dir(args)?;
+    let operation = required_string(args, "operation")?;
+    let on = required_string(args, "on")?;
+    let name = required_string(args, "name")?;
+    let arguments = match args.get("arguments") {
+        None | Some(Value::Null) => serde_json::Map::new(),
+        Some(Value::Object(arguments)) => arguments.clone(),
+        Some(other) => {
+            return Err(format!(
+                "`arguments` must be an object of the operation's arguments, not {other}"
+            ));
+        }
+    };
+    let history = crate::history::LocalHistory::open_default().map_err(|e| e.to_string())?;
+    let model =
+        crate::record::record_operation(&dir, operation, on, name, &arguments, &history)
+            .map_err(|e| e.to_string())?;
+    Ok(ToolOutput::json(json!({
+        "step": name,
+        "model": model.display().to_string(),
+    })))
+}
+
+/// The string `key` of a tool's arguments, refused by name when absent or not a string.
+fn required_string<'a>(args: &'a Value, key: &str) -> std::result::Result<&'a str, String> {
+    match args.get(key) {
+        Some(Value::String(value)) => Ok(value),
+        None | Some(Value::Null) => Err(format!("`{key}` is required")),
+        Some(other) => Err(format!("`{key}` must be a string, not {other}")),
+    }
+}
+
+fn operation_record_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "operation": { "type": "string", "description": "The operation's long name (e.g. filter-rows), as operation_describe lists them." },
+            "on": { "type": "string", "description": "The table the operation is applied to: one a step of the Protocol makes." },
+            "name": { "type": "string", "description": "The new step's name, which is also the name of the table it makes." },
+            "arguments": { "type": "object", "description": "The operation's arguments, as the `parameters` JSON Schema operation_describe returns for it describes them." },
+            "dir": { "type": "string", "description": "Protocol directory (where arcform.yaml lives). Defaults to the current directory." }
+        },
+        "required": ["operation", "on", "name"]
+    })
+}
+
 /// The tools native to `arc`.
 pub(super) fn tools() -> Vec<ToolDef> {
     vec![
@@ -246,6 +312,12 @@ pub(super) fn tools() -> Vec<ToolDef> {
             description: "List the SQL operations arc holds when called with no operation — or describe one operation (what it does, what it is applied to, and the JSON Schema of what it takes) by its long name.",
             input_schema: operation_describe_schema,
             handler: operation_describe,
+        },
+        ToolDef {
+            name: "operation_record",
+            description: "Record an SQL operation as a new step at the end of a Protocol, from its long name, the table it is applied to, the step's name and its arguments. Writes a generated model and the step naming it; runs nothing.",
+            input_schema: operation_record_schema,
+            handler: operation_record,
         },
     ]
 }

@@ -47,7 +47,8 @@ const INSTRUCTIONS: &str = "arc — a local-first data-pipeline engine, exposed 
     (semantic type inference over tabular data); protocol_run runs an arc Protocol and \
     returns its live Protocol+Run contract; operator_describe emits an operator's `with:` \
     JSON Schema for authoring; operation_describe lists the SQL operations arc holds and, \
-    given an operation's long name, describes what it takes.";
+    given an operation's long name, describes what it takes; operation_record records an \
+    operation as a new step of a Protocol.";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool result shapes
@@ -304,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_registers_all_eight_tools() {
+    fn tools_list_registers_all_nine_tools() {
         let listed = tools_list();
         let names: Vec<&str> = listed["tools"]
             .as_array()
@@ -321,13 +322,14 @@ mod tests {
             "protocol_run",
             "operator_describe",
             "operation_describe",
+            "operation_record",
         ] {
             assert!(
                 names.contains(&expected),
                 "missing tool `{expected}` in {names:?}"
             );
         }
-        assert_eq!(names.len(), 8, "unexpected tool set: {names:?}");
+        assert_eq!(names.len(), 9, "unexpected tool set: {names:?}");
         // Every tool advertises an object input schema.
         for tool in listed["tools"].as_array().unwrap() {
             assert!(tool["description"].is_string());
