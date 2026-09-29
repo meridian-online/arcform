@@ -310,6 +310,33 @@ fn a_request_the_operation_does_not_admit_is_refused_with_the_directory_untouche
 }
 
 #[test]
+fn the_terminal_refuses_an_argument_it_cannot_read_with_the_directory_untouched() {
+    let cases: [(&[&str], &str); 2] = [
+        (&["--arg", "where"], "`--arg where` must be KEY=VALUE"),
+        (
+            &["--arg", "where=amount > 100", "--arg", "where=amount > 200"],
+            "`--arg where` is given more than once",
+        ),
+    ];
+    for (args, named) in cases {
+        let protocol = Protocol::new();
+        let before = protocol.files();
+        let mut argv = vec![
+            "operation",
+            "record",
+            "filter-rows",
+            "--on",
+            "orders",
+            "--name",
+            "big_orders",
+        ];
+        argv.extend_from_slice(args);
+        refused(&protocol.arc(&argv), &[named]);
+        assert_eq!(protocol.files(), before, "{args:?}: the directory changed");
+    }
+}
+
+#[test]
 fn a_condition_holding_a_terminator_is_refused_with_the_directory_untouched() {
     let protocol = Protocol::new();
     let before = protocol.files();

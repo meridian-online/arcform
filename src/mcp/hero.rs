@@ -24,17 +24,12 @@ use super::{ToolDef, ToolOutput, ToolResult};
 // protocol_run
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The Protocol's directory: `dir` when given, else the server's working directory.
-fn protocol_dir(args: &Value) -> std::result::Result<PathBuf, String> {
-    match args.get("dir").and_then(Value::as_str) {
-        Some(dir) => Ok(PathBuf::from(dir)),
-        None => std::env::current_dir()
-            .map_err(|e| format!("no `dir` given and the current directory is unavailable: {e}")),
-    }
-}
-
 fn protocol_run(args: &Value) -> ToolResult {
-    let dir = protocol_dir(args)?;
+    let dir = match args.get("dir").and_then(Value::as_str) {
+        Some(dir) => PathBuf::from(dir),
+        None => std::env::current_dir()
+            .map_err(|e| format!("no `dir` given and the current directory is unavailable: {e}"))?,
+    };
     let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
     let cli_params = parse_params(args.get("params"))?;
 
@@ -242,11 +237,12 @@ fn operation_describe_schema() -> Value {
 ///
 /// The request is handed to the record path `arc operation record` takes, which
 /// writes the step's SQL from the operation's catalogue entry; nothing here names
-/// an operation or an argument. `arguments` is an object, absent when the
+/// an operation or an argument. `dir` defaults to `.`, the server's working
+/// directory, as `--dir` does. `arguments` is an object, absent when the
 /// operation takes none. A refusal is an error result naming what was wrong, with
 /// the Protocol's directory untouched.
 fn operation_record(args: &Value) -> ToolResult {
-    let dir = protocol_dir(args)?;
+    let dir = PathBuf::from(args.get("dir").and_then(Value::as_str).unwrap_or("."));
     let operation = required_string(args, "operation")?;
     let on = required_string(args, "on")?;
     let name = required_string(args, "name")?;
