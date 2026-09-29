@@ -23,8 +23,9 @@ use std::process::{Command, Output};
 
 use serde_json::{Value, json};
 
-/// The long name the catalogue holds its one operation under.
+/// The long names the catalogue holds its operations under.
 const FILTER_ROWS: &str = "filter-rows";
+const SORT_ROWS: &str = "sort-rows";
 
 /// Run the real `arc` binary with `args`, in a directory that holds no protocol.
 fn arc(args: &[&str]) -> Output {
@@ -141,6 +142,130 @@ fn the_text_listing_and_the_json_listing_say_the_same_thing() {
         description_after(line_opening_with(&text, FILTER_ROWS), FILTER_ROWS),
         summary,
         "the two listings disagree about what `{FILTER_ROWS}` does"
+    );
+}
+
+#[test]
+fn list_prints_sort_rows_beside_filter_rows_each_with_a_sentence() {
+    let text = arc_ok(&["operation", "list"]);
+    for op in [FILTER_ROWS, SORT_ROWS] {
+        let line = line_opening_with(&text, op);
+        assert!(
+            !description_after(line, op).is_empty(),
+            "`{op}` has no description on its line:\n{text}"
+        );
+    }
+
+    let listing = arc_json(&["operation", "list", "--json"]);
+    let entries = listing.as_array().expect("the listing is a JSON array");
+    for op in [FILTER_ROWS, SORT_ROWS] {
+        let entry = entries
+            .iter()
+            .find(|e| e["long_name"] == op)
+            .unwrap_or_else(|| panic!("no entry holds `{op}`:\n{listing}"));
+        assert!(
+            entry["summary"]
+                .as_str()
+                .is_some_and(|s| !s.trim().is_empty()),
+            "the entry for `{op}` has no summary:\n{entry}"
+        );
+    }
+}
+
+#[test]
+fn describe_sort_rows_returns_the_ordered_shape() {
+    let description = arc_json(&["operation", "describe", SORT_ROWS]);
+
+    assert_eq!(description["long_name"], SORT_ROWS);
+    assert!(
+        description["summary"].as_str().is_some_and(is_one_sentence),
+        "the summary is not one sentence saying what the operation does:\n{description}"
+    );
+
+    // Applied to a table, then a column of that table, each with a sentence.
+    let applied_to = description["applied_to"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`applied_to` is not a list:\n{description}"));
+    let entries: Vec<(&str, &str, Option<&str>)> = applied_to
+        .iter()
+        .map(|e| {
+            (
+                e["name"].as_str().unwrap_or("<no name>"),
+                e["kind"].as_str().unwrap_or("<no kind>"),
+                e.get("of")
+                    .map(|of| of.as_str().unwrap_or("<not a string>")),
+            )
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            ("table", "table", None),
+            ("column", "column", Some("table"))
+        ],
+        "`{SORT_ROWS}` is applied to a table, then a column of that table:\n{description}"
+    );
+    for entry in applied_to {
+        assert!(
+            entry["description"].as_str().is_some_and(is_one_sentence),
+            "`{}` has no one-sentence description:\n{entry}",
+            entry["name"]
+        );
+    }
+
+    // Parameters: closed, one required string `order_by`, holding exactly the
+    // four keys the shape names — no `title`, `enum` or `pattern`.
+    let schema = &description["parameters"];
+    assert_eq!(schema["type"], "object");
+    assert_eq!(
+        schema["required"],
+        json!(["order_by"]),
+        "`order_by` is the one required parameter"
+    );
+    assert_eq!(
+        schema["additionalProperties"],
+        Value::Bool(false),
+        "the schema must be closed to any other key"
+    );
+    let properties = schema["properties"]
+        .as_object()
+        .expect("`properties` is an object");
+    assert_eq!(
+        properties.keys().collect::<Vec<_>>(),
+        ["order_by"],
+        "`order_by` is the one parameter the schema declares"
+    );
+    let order_by = &properties["order_by"];
+    assert_eq!(order_by["type"], "string");
+    assert_eq!(
+        order_by["x-kind"], "order",
+        "`order_by` does not say its value is an order:\n{order_by}"
+    );
+    assert_eq!(
+        order_by["x-directions"],
+        json!([
+            { "word": "ascending", "sign": "asc" },
+            { "word": "descending", "sign": "desc" },
+        ]),
+        "the directions offered, in order, as a word and a sign"
+    );
+    assert!(
+        order_by["description"]
+            .as_str()
+            .is_some_and(|d| !d.trim().is_empty()),
+        "`order_by` has no description:\n{order_by}"
+    );
+    let mut keys: Vec<&str> = order_by
+        .as_object()
+        .expect("`order_by` is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["description", "type", "x-directions", "x-kind"],
+        "`order_by` holds a key the shape does not name:\n{order_by}"
     );
 }
 

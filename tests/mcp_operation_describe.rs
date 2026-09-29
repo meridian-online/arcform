@@ -201,6 +201,27 @@ fn called_with_filter_rows_it_returns_what_arc_operation_describe_prints() {
 }
 
 #[test]
+fn called_with_sort_rows_it_returns_what_arc_operation_describe_prints() {
+    let from_cli = arc_json(&["operation", "describe", "sort-rows"]);
+    let responses = mcp_session(&[call_operation_describe(
+        1,
+        json!({ "operation": "sort-rows" }),
+    )]);
+    let result = &response_to(&responses, 1)["result"];
+    assert_eq!(result["isError"], false, "result: {result}");
+    assert_eq!(
+        result["structuredContent"], from_cli,
+        "the tool's description is not the command line's"
+    );
+    // A description of the sort, carrying its `order_by` order annotation.
+    assert_eq!(result["structuredContent"]["long_name"], "sort-rows");
+    assert_eq!(
+        result["structuredContent"]["parameters"]["properties"]["order_by"]["x-kind"],
+        "order"
+    );
+}
+
+#[test]
 fn an_operation_arc_does_not_hold_is_an_error_result_naming_it_and_the_server_keeps_answering() {
     let responses = mcp_session(&[
         call_operation_describe(1, json!({ "operation": "no-such-operation" })),
