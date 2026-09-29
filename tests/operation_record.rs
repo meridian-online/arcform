@@ -43,10 +43,10 @@ SELECT * FROM (VALUES (1, 50, 'a;b'), (2, 150, 'abc'), (3, 300, 'xyz'), (4, 100,
     AS t(id, amount, note);
 ";
 
-/// What AC1's request appends to `arcform.yaml`.
+/// What recording `filter-rows` on `orders` as `big_orders` appends to `arcform.yaml`.
 const APPENDED_STEP: &str = "  - name: big_orders\n    sql: models/02_big_orders.sql\n";
 
-/// The model AC1's request writes, byte for byte.
+/// The model that recording writes, byte for byte.
 const BIG_ORDERS_MODEL: &str = "\
 -- generated: filter-rows on orders
 CREATE OR REPLACE TABLE \"big_orders\" AS
