@@ -23,15 +23,20 @@ one asserted on, one called and not asserted on, one never called.  The second
 repeats that shape with a token swap rather than a guard, because a token swap is
 tiered by `_statement_probe` and a guard is not: with only the first crate here,
 `op_token_swap` could be deleted and the probe could stop emitting its `panic!`,
-both with this file green.  The third puts the mutated line in the middle of a
-method chain, where the probe cannot compile, which is the case that has to reach
-UNPROBED rather than the blocking tier.
+both with this file green.  The third puts the mutated line in a struct literal's
+field, where no probe compiles, which is the case that has to reach UNPROBED
+rather than the blocking tier.  The fourth repeats the first's shape for the arm
+operators, with one match per function, and adds an arm whose deletion and
+widening the compiler refuses.  The fifth has guarded arms led by a string and a
+char literal, whose widenings have to compile and survive, where a widening that
+kept the literal was refused and set aside.
 
 This is the layer that pins the verdict path: that a caught mutation exits 0, that
 a survivor the tests execute exits 1, that a survivor nothing executes is
 separated from it rather than listed beside it, that a survivor nothing measured
 is separated from BOTH, that a ruling moves a survivor out of the failing tier,
-and that a red baseline is a setup error rather than a pass.  Nothing short of
+that an arm mutation the compiler refuses is set aside rather than killed, and
+that a red baseline is a setup error rather than a pass.  Nothing short of
 running the real thing distinguishes those.
 
 Exit 0 all cases passed · 1 at least one failed · 3 the harness could not run.
@@ -214,12 +219,21 @@ ALL_OPERATORS_SOURCE = (
     "    m.entry(a).or_insert(b);\n"  # 8
     "    Some(hashed)\n"  # 9
     "}\n"  # 10
+    "pub fn arms(v: Option<u8>, loud: bool) -> u8 {\n"  # 11
+    "    match v {\n"  # 12
+    "        Some(_) if loud => 2,\n"  # 13
+    "        Some(n) => n,\n"  # 14
+    "        None => 0,\n"  # 15
+    "    }\n"  # 16
+    "}\n"  # 17
 )
 
 # The operator names `generate` is expected to emit for ALL_OPERATORS_SOURCE.
 # Written out rather than derived from OPERATORS so that deleting an operator
 # reddens this instead of quietly shrinking both sides of the comparison.
 EXPECTED_OPERATORS = {
+    "ARM_DELETE",
+    "ARM_WIDEN",
     "BOOL_LIT_FLIP",
     "CALL_DEFAULT",
     "CMP_FLIP",
@@ -237,7 +251,7 @@ EXPECTED_OPERATORS = {
 def _() -> None:
     # The gate's own defect, one level in: four of its operators had no case here
     # at all, so `op_token_swap` could be deleted outright with this file green.
-    got = mc.generate("src/x.rs", ALL_OPERATORS_SOURCE, set(range(11)))
+    got = mc.generate("src/x.rs", ALL_OPERATORS_SOURCE, set(range(18)))
     emitted = {m.operator for m in got}
     check("no operator missing", EXPECTED_OPERATORS <= emitted, sorted(EXPECTED_OPERATORS - emitted))
     check("no operator unexpected", emitted <= EXPECTED_OPERATORS, sorted(emitted - EXPECTED_OPERATORS))
@@ -248,7 +262,7 @@ def _() -> None:
     # The claim in the module docstring, pinned.  A mutant with no probe is
     # reported unmeasured, and an unmeasured survivor used to print under a
     # header asserting the tests execute its line.
-    got = mc.generate("src/x.rs", ALL_OPERATORS_SOURCE, set(range(11)))
+    got = mc.generate("src/x.rs", ALL_OPERATORS_SOURCE, set(range(18)))
     check("some mutants to check", len(got) >= len(EXPECTED_OPERATORS), len(got))
     for m in got:
         check(f"{m.operator} has a probe", m.probe is not None, m.one_line_before())
@@ -256,6 +270,235 @@ def _() -> None:
             f"{m.operator}'s probe panics",
             mc.PROBE_MESSAGE in (m.probe or ""),
             (m.operator, m.probe),
+        )
+
+
+ARM_SOURCE = (
+    "pub fn shapes(e: Expr, n: Option<u8>) -> u8 {\n"  # 0
+    "    let x = match e {\n"  # 1
+    "        Expr::Value(v) => matches!(\n"  # 2
+    "            v,\n"  # 3
+    "            Value::A(_)\n"  # 4
+    "                | Value::B(_)\n"  # 5
+    "        ) as u8,\n"  # 6
+    "        Expr::Block(b) if b.ok() => {\n"  # 7
+    "            b.len()\n"  # 8
+    "        }\n"  # 9
+    "        Expr::Nested(inner) => match inner {\n"  # 10
+    "            Some(_) => 1,\n"  # 11
+    "            None => 2,\n"  # 12
+    "        },\n"  # 13
+    "        Expr::One\n"  # 14
+    "        | Expr::Two => 3,\n"  # 15
+    "        Expr::Cond(c) => if c {\n"  # 16
+    "            1\n"  # 17
+    "        } else {\n"  # 18
+    "            2\n"  # 19
+    "        }\n"  # 20
+    "        Expr::Pair { a, .. }\n"  # 21
+    "        | Expr::Other { a, .. } => a,\n"  # 22
+    "        #[cfg(unix)]\n"  # 23
+    "        Expr::Unix => 5,\n"  # 24
+    "        Expr::X => 6, Expr::Y => 7,\n"  # 25
+    "        Expr::Sum(a, b) => a\n"  # 26
+    "            + b,\n"  # 27
+    "        _ => 0,\n"  # 28
+    "    };\n"  # 29
+    "    let y = if x > 0 { 1 } else { 2 };\n"  # 30
+    "    x + y\n"  # 31
+    "}\n"  # 32
+    "macro_rules! twice {\n"  # 33
+    "    ($e:expr) => {\n"  # 34
+    "        $e + $e\n"  # 35
+    "    };\n"  # 36
+    "}\n"  # 37
+    "pub fn waits(rx: Rx, tick: Tick) -> u8 {\n"  # 38
+    "    select! {\n"  # 39
+    "        v = rx => v,\n"  # 40
+    "        _ = tick => 0,\n"  # 41
+    "    }\n"  # 42
+    "}\n"  # 43
+)
+
+
+@case("an arm is found by its head, and spans its whole body")
+def _() -> None:
+    lines = ARM_SOURCE.splitlines(keepends=True)
+    masks = mc.masks_for(lines)
+    # (line the scan starts from) -> (start, end, has a guard, last), or None
+    expected = {
+        2: (2, 6, False, False),  # a body that is a multi-line macro call
+        7: (7, 9, True, False),  # a guarded arm with a block body and no comma
+        10: (10, 13, False, False),  # an arm whose body is a match of its own
+        11: (11, 11, False, False),  # an arm of that inner match
+        12: (12, 12, False, True),  # ... and its last arm
+        14: (14, 15, False, False),  # an or-pattern over two lines, from its first
+        15: (14, 15, False, False),  # ... and from its second
+        16: (16, 20, False, False),  # an `if … else` body with no comma after it
+        21: (21, 22, False, False),  # an or-pattern of struct patterns, from its first
+        # 22: from its second line the arm cannot be told from one opening with a
+        # leading `|`, and is left.  23 and 24: an arm under an attribute is left.
+        # 25: two arms on one line cannot be cut out by whole lines, and are left.
+        # 34, 40 and 41: a macro's rules and arms are not a match's.
+        26: (26, 27, False, False),  # a body over two lines with no bracket around it
+        28: (28, 28, False, True),  # the outer match's last arm
+    }
+    for i in range(len(lines)):
+        arm = mc.arm_at(lines, masks, i)
+        got = None if arm is None else (arm.start, arm.end, arm.guard is not None, arm.last)
+        want = expected.get(i)
+        check(f"line {i}", got == want, f"got {got}, want {want}: {lines[i]!r}")
+
+
+@case("ARM_DELETE and ARM_WIDEN rewrite the arm they name, and keep the guard")
+def _() -> None:
+    lines = ARM_SOURCE.splitlines(keepends=True)
+    listed = mc.generate("src/x.rs", ARM_SOURCE, {7, 14, 15})
+    got = {(m.operator, m.start): m for m in listed}
+    delete = got.get(("ARM_DELETE", 7))
+    check("the guarded arm is deleted", delete is not None, sorted(got))
+    check("the whole arm, block and all", delete.before == "".join(lines[7:10]), delete.before)
+    check("and nothing is put back", delete.after == "", delete.after)
+    check(
+        "its probe is the arm's own head, taken first",
+        delete.probe
+        == f'        Expr::Block(b) if b.ok() => panic!("{mc.PROBE_MESSAGE}"),\n' + delete.before,
+        delete.probe,
+    )
+    widen = got.get(("ARM_WIDEN", 7))
+    check("the guarded arm is widened", widen is not None, sorted(got))
+    check("its pattern goes and its guard stays", widen.after == "        _ if b.ok() => {\n", widen.after)
+    check(
+        "its probe fires when the match reaches the arm",
+        widen.probe == f'        _ => panic!("{mc.PROBE_MESSAGE}"),\n' + lines[7],
+        widen.probe,
+    )
+    widen = got.get(("ARM_WIDEN", 14))
+    check("a two-line or-pattern is widened", widen is not None, sorted(got))
+    check("to one `_`", widen.after == "        _ => 3,\n", widen.after)
+    check("from both of its lines", widen.before == "".join(lines[14:16]), widen.before)
+    check(
+        "and two changed lines in one head make one mutant each, not two",
+        sorted((m.operator, m.start) for m in listed if m.start == 14)
+        == [("ARM_DELETE", 14), ("ARM_WIDEN", 14)],
+        [(m.operator, m.start) for m in listed],
+    )
+
+
+@case("the last arm of a match, a body line, and a macro's arms are not arms to mutate")
+def _() -> None:
+    # The last arm: in a match that compiles, every value reaching it already
+    # matches it, so widening it changes nothing and deleting it cannot compile.
+    got = mc.generate("src/x.rs", ARM_SOURCE, {12, 28})
+    check("no arm mutant on a last arm", not [m for m in got if m.operator.startswith("ARM_")], got)
+    got = mc.generate("src/x.rs", ARM_SOURCE, {3, 4, 5, 8, 17, 18, 19, 27, 30, 31})
+    check("no arm mutant on a body line", not [m for m in got if m.operator.startswith("ARM_")], got)
+    got = mc.generate("src/x.rs", ARM_SOURCE, {34})
+    check("no arm mutant in a macro_rules!", not [m for m in got if m.operator.startswith("ARM_")], got)
+    # `select!` separates its arms with commas as a match does, so nothing but the
+    # check that the enclosing brace is a match's tells the two apart.
+    got = mc.generate("src/x.rs", ARM_SOURCE, {40, 41})
+    check("no arm mutant in a select!", not [m for m in got if m.operator.startswith("ARM_")], got)
+
+
+@case("a diff that changes no arm lists what it listed without the arm operators")
+def _() -> None:
+    # The candidates a change outside any match head produces are the six older
+    # operators' and nothing else, in the same order.
+    changed = {0, 3, 4, 5, 8, 17, 19, 27, 30, 31}
+    full = [m.key for m in mc.generate("src/x.rs", ARM_SOURCE, changed)]
+    saved = mc.OPERATORS
+    mc.OPERATORS = [op for op in saved if op not in (mc.op_arm_delete, mc.op_arm_widen)]
+    try:
+        older = [m.key for m in mc.generate("src/x.rs", ARM_SOURCE, changed)]
+    finally:
+        mc.OPERATORS = saved
+    check("some candidates to compare", older, older)
+    check("the same list", full == older, (full, older))
+
+
+# Arms whose pattern begins with a literal.  The code mask hides a literal as it
+# hides a comment, and an arm finder that read its start through the mask began
+# these arms after the literal, so their widening kept it: `"b" _ if loud`.
+LITERAL_ARM_SOURCE = (
+    "pub fn level(k: &str, c: char, loud: bool) -> u8 {\n"  # 0
+    "    let a = match k {\n"  # 1
+    '        "a" => 1,\n'  # 2
+    '        "b" if loud => 2,\n'  # 3
+    '        r"c" if loud => 3,\n'  # 4
+    '        r#"d"# => 4,\n'  # 5
+    "        // a comment above an arm\n"  # 6
+    '        "e" | "f" => 5,\n'  # 7
+    '        /* inline */ "g" => 6,\n'  # 8
+    '        "h"\n'  # 9
+    '        | "i" if loud => 7,\n'  # 10
+    '        b"j" => 8,\n'  # 11
+    "        _ => 0,\n"  # 12
+    "    };\n"  # 13
+    "    let b = match c {\n"  # 14
+    "        'x' if loud => 1,\n"  # 15
+    "        /* a comment\n"  # 16
+    "           over two lines */ 'y' => 9,\n"  # 17
+    "        'a'..='z' => 2,\n"  # 18
+    "        _ => 0,\n"  # 19
+    "    };\n"  # 20
+    "    a + b\n"  # 21
+    "}\n"  # 22
+)
+
+
+@case("an arm whose pattern begins with a literal starts at the literal, and widens to `_`")
+def _() -> None:
+    lines = LITERAL_ARM_SOURCE.splitlines(keepends=True)
+    masks = mc.masks_for(lines)
+    # (line the scan starts from) -> (start, pattern, has a guard, last), or None
+    expected = {
+        2: (2, '"a"', False, False),
+        3: (3, '"b"', True, False),  # a guarded string literal
+        4: (4, 'r"c"', True, False),  # a guarded raw string
+        5: (5, 'r#"d"#', False, False),
+        7: (7, '"e" | "f"', False, False),  # below a comment, which is not the arm
+        8: (8, '"g"', False, False),  # after a comment on its own line
+        # 9: a line holding only a literal holds no code to start a scan from; the
+        # arm is found from the next line of its head.
+        10: (9, '"h" | "i"', True, False),  # an or-pattern whose first line is a literal
+        11: (11, 'b"j"', False, False),
+        12: (12, "_", False, True),
+        15: (15, "'x'", True, False),  # a guarded char literal
+        17: (17, "'y'", False, False),  # after a comment over two lines
+        18: (18, "'a'..='z'", False, False),  # a char range
+        19: (19, "_", False, True),
+    }
+    for i in range(len(lines)):
+        arm = mc.arm_at(lines, masks, i)
+        got = None if arm is None else (arm.start, arm.pattern, arm.guard is not None, arm.last)
+        want = expected.get(i)
+        check(f"line {i}", got == want, f"got {got}, want {want}: {lines[i]!r}")
+    listed = mc.generate("src/x.rs", LITERAL_ARM_SOURCE, set(range(len(lines))))
+    widened = {m.start: m for m in listed if m.operator == "ARM_WIDEN"}
+    after = {
+        2: "        _ => 1,\n",
+        3: "        _ if loud => 2,\n",
+        4: "        _ if loud => 3,\n",
+        5: "        _ => 4,\n",
+        7: "        _ => 5,\n",
+        8: "        /* inline */ _ => 6,\n",
+        9: "        _ if loud => 7,\n",
+        11: "        _ => 8,\n",
+        15: "        _ if loud => 1,\n",
+        17: "           over two lines */ _ => 9,\n",
+        18: "        _ => 2,\n",
+    }
+    check("every arm but the last two is widened", sorted(widened) == sorted(after), sorted(widened))
+    for start, want in after.items():
+        m = widened.get(start)
+        if m is None:
+            continue
+        check(f"line {start} widens to `_`, its guard kept", m.after == want, m.after)
+        check(
+            f"line {start}'s probe is a `_` arm in front of it",
+            m.probe == want.split("_")[0] + f'_ => panic!("{mc.PROBE_MESSAGE}"),\n' + m.before,
+            m.probe,
         )
 
 
@@ -776,6 +1019,7 @@ TIER_HEADINGS = {
     "UNREACHED": "UNREACHED",
     "UNPROBED": "UNPROBED",
     "RULED EQUIVALENT": "EQUIVALENT",
+    "SET ASIDE": "SET ASIDE",
     "NOT CHECKED": "NOT CHECKED",
 }
 
@@ -809,6 +1053,23 @@ def tier_of_operator(output: str, function: str, operator: str) -> str:
             if line.startswith(prefix + " "):
                 current = name
         if needle in line:
+            found = current
+    return found
+
+
+def tier_at(output: str, where: str, operator: str) -> str:
+    """Which section the mutant at `path:line` from one operator landed in.
+
+    A function with two arms can carry two ARM_DELETE mutants that land in
+    different sections, so neither the function nor the operator names one.
+    """
+    current = "KILLED"
+    found = "KILLED"
+    for line in output.splitlines():
+        for prefix, name in TIER_HEADINGS.items():
+            if line.startswith(prefix + " "):
+                current = name
+        if line.strip().startswith(f"{where}  fn ") and f"[{operator}]" in line:
             found = current
     return found
 
@@ -965,6 +1226,166 @@ mod tests {
     }
 }
 """
+
+
+# Two functions with one match between them, differing only in what the tests
+# check.  In each, the first arm's deletion and widening compile; the second
+# arm's do not — deleting it leaves `Some(_)` uncovered when `loud` is false, and
+# widening it drops the `n` its body returns — and the last arm is left alone.
+CRATE_MATCH_ARMS = """pub fn arm_pinned(v: Option<u8>, loud: bool) -> u8 {
+    match v {
+        Some(_) if loud => 200,
+        Some(n) => n,
+        None => 0,
+    }
+}
+
+pub fn arm_unpinned(v: Option<u8>, loud: bool) -> u8 {
+    match v {
+        Some(_) if loud => 200,
+        Some(n) => n,
+        None => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arm_pinned_is_asserted_on() {
+        assert_eq!(arm_pinned(Some(7), true), 200);
+        assert_eq!(arm_pinned(Some(7), false), 7);
+        assert_eq!(arm_pinned(None, true), 0);
+    }
+
+    #[test]
+    fn arm_unpinned_is_called_and_never_asserted_on() {
+        let _ = arm_unpinned(Some(7), true);
+        let _ = arm_unpinned(Some(7), false);
+        let _ = arm_unpinned(None, true);
+    }
+}
+"""
+
+
+@case("END TO END: a deleted or widened arm survives unpinned, dies pinned, and a refusal is set aside")
+def _() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        build_fixture_crate(root, CRATE_MATCH_ARMS)
+        code, listing = run_gate(root, "--quiet", "--list-only")
+        check("list-only exits 0", code == 0, listing[-2000:])
+        for where in ("src/lib.rs:3", "src/lib.rs:11"):
+            for operator in ("ARM_DELETE", "ARM_WIDEN"):
+                check(
+                    f"{operator} listed at {where}",
+                    any(
+                        ln.strip().startswith(where + " fn ") and f"[{operator}]" in ln
+                        for ln in listing.splitlines()
+                    ),
+                    listing,
+                )
+        check("the widening keeps the guard", "+ _ if loud => 200," in listing, listing)
+        check(
+            "the last arm is not listed",
+            not any(
+                ln.strip().startswith(("src/lib.rs:5 ", "src/lib.rs:13 ")) and "[ARM_" in ln
+                for ln in listing.splitlines()
+            ),
+            listing,
+        )
+        code, out = run_gate(root, "--quiet")
+        check("exit 1", code == 1, f"exit {code}\n{out[-3000:]}")
+        for operator in ("ARM_DELETE", "ARM_WIDEN"):
+            check(
+                f"{operator} on the asserted-on arm is killed",
+                tier_at(out, "src/lib.rs:3", operator) == "KILLED",
+                out[-4000:],
+            )
+            check(
+                f"{operator} on the arm the tests take and do not check is UNPINNED",
+                tier_at(out, "src/lib.rs:11", operator) == "UNPINNED",
+                out[-4000:],
+            )
+            for where in ("src/lib.rs:4", "src/lib.rs:12"):
+                check(
+                    f"{operator} at {where}, which the compiler refuses, is set aside",
+                    tier_at(out, where, operator) == "SET ASIDE",
+                    out[-4000:],
+                )
+        check("and the report counts the four", "set aside       4 " in out, out[:1500])
+
+
+# A guarded arm led by a string literal and one led by a char literal, each
+# asserted on for every value the tests pass, and each widened to `_ if loud`
+# with the suite still green: no test passes a loud value outside the pattern.
+# Every other arm mutation here is killed, and none is refused.
+CRATE_LITERAL_ARMS = """pub fn str_arm(k: &str, loud: bool) -> u8 {
+    match k {
+        "a" => 1,
+        "b" if loud => 2,
+        _ => 0,
+    }
+}
+
+pub fn char_arm(c: char, loud: bool) -> u8 {
+    match c {
+        'a' => 1,
+        'b' if loud => 3,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_arm_is_asserted_on_and_no_quiet_value_reaches_a_guard() {
+        assert_eq!(str_arm("a", true), 1);
+        assert_eq!(str_arm("b", true), 2);
+        assert_eq!(str_arm("b", false), 0);
+        assert_eq!(str_arm("z", false), 0);
+        assert_eq!(char_arm('a', true), 1);
+        assert_eq!(char_arm('b', true), 3);
+        assert_eq!(char_arm('b', false), 0);
+        assert_eq!(char_arm('z', false), 0);
+    }
+}
+"""
+
+
+@case("END TO END: a guarded arm led by a string or char literal is widened and reported UNPINNED")
+def _() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        build_fixture_crate(root, CRATE_LITERAL_ARMS)
+        code, listing = run_gate(root, "--quiet", "--list-only")
+        check("list-only exits 0", code == 0, listing[-2000:])
+        for where, rewrite in (("src/lib.rs:4", "_ if loud => 2,"), ("src/lib.rs:12", "_ if loud => 3,")):
+            rows = listing.splitlines()
+            at = [
+                k
+                for k, ln in enumerate(rows)
+                if ln.strip().startswith(where + " fn ") and "[ARM_WIDEN]" in ln
+            ]
+            check(f"ARM_WIDEN listed at {where}", len(at) == 1, listing)
+            check(
+                f"the widening at {where} drops the literal and keeps the guard",
+                at and rows[at[0] + 2].strip() == "+ " + rewrite,
+                listing,
+            )
+        code, out = run_gate(root, "--quiet")
+        check("exit 1", code == 1, f"exit {code}\n{out[-3000:]}")
+        for where in ("src/lib.rs:4", "src/lib.rs:12"):
+            check(
+                f"the widening at {where} is UNPINNED",
+                tier_at(out, where, "ARM_WIDEN") == "UNPINNED",
+                out[-4000:],
+            )
+        check("nothing is set aside", "set aside       0 " in out, out[:1500])
+        check("and the other eight are killed", "killed          8\n" in out, out[:1500])
 
 
 @case("END TO END: a token swap is generated, run, and tiered by its own probe")
