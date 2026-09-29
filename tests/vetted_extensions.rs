@@ -60,6 +60,20 @@ impl Outcome {
         );
     }
 
+    /// The stderr lines holding [`UNREAD`]: the warnings about SQL a step builds or writes.
+    fn unread_warnings(&self) -> Vec<&str> {
+        self.stderr.lines().filter(|l| l.contains(UNREAD)).collect()
+    }
+
+    /// Assert the run started `started` without a refusal and printed one warning about SQL a
+    /// step builds or writes, and return it.
+    fn assert_warned_once(&self, label: &str, started: &[&str]) -> &str {
+        self.assert_not_refused(label, started);
+        let warnings = self.unread_warnings();
+        assert_eq!(warnings.len(), 1, "[{label}] one warning:\n{}", self.stderr);
+        warnings[0]
+    }
+
     fn assert_not_refused(&self, label: &str, started: &[&str]) {
         assert!(
             !self.stderr.contains("vetted"),
@@ -140,6 +154,13 @@ impl Protocol {
 
 /// The version every entry on the list names today, so a run on it draws no warning.
 const VETTED_ON: &str = "1.5.5";
+
+/// What each warning about SQL a step builds or writes while it runs holds, and no other
+/// message arc prints.
+const UNREAD: &str = "does not read the SQL";
+
+/// The page every refusal and warning about an extension points to.
+const PAGE: &str = "https://github.com/meridian-online/arcform/blob/main/docs/VETTED_EXTENSIONS.md";
 
 // ---- what is refused ----
 
@@ -429,6 +450,254 @@ fn a_protocol_with_no_install_prints_what_it_printed_before() {
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(run.stderr, "", "nothing on stderr");
     assert_eq!(run.stdout, BEFORE_STDOUT);
+}
+
+// ---- SQL a step builds or writes while it runs ----
+
+#[test]
+fn a_call_that_runs_sql_arc_does_not_read_warns_and_runs_the_step() {
+    let run = Protocol::steps(&[(
+        "s",
+        "SELECT 1;\nFROM query('FROM enable_' || 'peg_parser()');\n",
+    )])
+    .run(VETTED_ON);
+    let warning = run.assert_warned_once("assembled", &["s.sql"]);
+    for needle in ["step 's'", "models/s.sql", "line 2", "query()", PAGE] {
+        assert!(
+            warning.contains(needle),
+            "the warning should name {needle:?}: {warning}"
+        );
+    }
+    for (sql, named) in [
+        ("FROM query(getvariable('q'));", "query() on line 1"),
+        (
+            "FROM json_execute_serialized_sql(json_serialize_sql('FROM enable_' || 'peg_parser()'));",
+            "json_execute_serialized_sql() on line 1",
+        ),
+        // A call held in the literal another call runs is read as one in the file, and the
+        // warning names the line of the call in the file.
+        (
+            "SET VARIABLE q = 'FROM enable_' || 'peg_parser()'; FROM query('FROM query(getvariable(''q''))');",
+            "query() on line 1",
+        ),
+        (
+            "SET VARIABLE q = 'FROM enable_' || 'peg_parser()'; FROM query($$FROM query(getvariable('q'))$$);",
+            "query() on line 1",
+        ),
+        (
+            "SELECT 1;\nFROM query('SELECT 1\nUNION ALL\nFROM query(getvariable(''q''))');",
+            "query() on line 2",
+        ),
+    ] {
+        let run = Protocol::steps(&[("s", sql)]).run(VETTED_ON);
+        let warning = run.assert_warned_once(sql, &["s.sql"]);
+        assert!(
+            warning.contains(named),
+            "[{sql}] the warning should name {named:?}: {warning}"
+        );
+    }
+}
+
+#[test]
+fn a_call_on_one_string_and_a_name_that_is_not_a_call_draw_no_warning() {
+    for sql in [
+        "FROM query('SELECT 42');",
+        "FROM QUERY($$SELECT 42$$);",
+        "SELECT query FROM log;",
+        "CREATE TABLE query (a INT);",
+    ] {
+        let run = Protocol::steps(&[("s", sql)]).run(VETTED_ON);
+        run.assert_not_refused(sql, &["s.sql"]);
+        assert_eq!(run.unread_warnings(), Vec::<&str>::new(), "[{sql}]");
+    }
+}
+
+#[test]
+fn importing_a_database_warns_and_runs_the_step() {
+    for sql in [
+        "IMPORT DATABASE 'imp';",
+        "import database 'imp';",
+        "PRAGMA import_database('imp');",
+    ] {
+        let run = Protocol::steps(&[("s", &format!("SELECT 1;\n{sql}\n"))]).run(VETTED_ON);
+        let warning = run.assert_warned_once(sql, &["s.sql"]);
+        for needle in ["step 's'", "models/s.sql", "IMPORT DATABASE on line 2"] {
+            assert!(
+                warning.contains(needle),
+                "[{sql}] the warning should name {needle:?}: {warning}"
+            );
+        }
+    }
+}
+
+#[test]
+fn naming_duckdbrc_warns_and_runs_every_step() {
+    for sql in [
+        "COPY (SELECT 'SELECT 1;') TO '~/.duckdbrc' (HEADER false, QUOTE '');",
+        "COPY (SELECT 'SELECT 1;') TO \"~/.duckdbrc\" (HEADER false, QUOTE '');",
+        "SELECT '/Users/me/.DuckDBrc';",
+    ] {
+        let run = Protocol::steps(&[
+            ("write", &format!("SELECT 1;\n{sql}\n")),
+            ("after", "SELECT 1;\n"),
+        ])
+        .run(VETTED_ON);
+        let warning = run.assert_warned_once(sql, &["write.sql", "after.sql"]);
+        for needle in ["step 'write'", "models/write.sql", ".duckdbrc on line 2"] {
+            assert!(
+                warning.contains(needle),
+                "[{sql}] the warning should name {needle:?}: {warning}"
+            );
+        }
+    }
+}
+
+#[test]
+fn each_step_or_hook_draws_one_warning_naming_each_line() {
+    let one_shape = Protocol::steps(&[(
+        "s",
+        "FROM query(getvariable('q'));\nSELECT 1;\nFROM query(getvariable('r'));\n",
+    )])
+    .run(VETTED_ON);
+    let warning = one_shape.assert_warned_once("one shape", &["s.sql"]);
+    assert!(
+        warning.contains("query() on line 1, query() on line 3"),
+        "{warning}"
+    );
+
+    let two_shapes = Protocol::steps(&[(
+        "s",
+        "IMPORT DATABASE 'imp';\nFROM query(getvariable('q'));\n",
+    )])
+    .run(VETTED_ON);
+    let warning = two_shapes.assert_warned_once("two shapes", &["s.sql"]);
+    assert!(
+        warning.contains("IMPORT DATABASE on line 1, query() on line 2"),
+        "{warning}"
+    );
+
+    // Two shapes in one statement, the call on the later line.
+    let one_statement = Protocol::steps(&[(
+        "s",
+        "SELECT '~/.duckdbrc'\nUNION ALL FROM query(getvariable('q'));\n",
+    )])
+    .run(VETTED_ON);
+    let warning = one_statement.assert_warned_once("one statement", &["s.sql"]);
+    assert!(
+        warning.contains(".duckdbrc on line 1, query() on line 2"),
+        "{warning}"
+    );
+
+    let two_steps = Protocol::steps(&[
+        ("a", "IMPORT DATABASE 'imp';\n"),
+        ("b", "FROM query(getvariable('q'));\n"),
+    ])
+    .run(VETTED_ON);
+    two_steps.assert_not_refused("two steps", &["a.sql", "b.sql"]);
+    let warnings = two_steps.unread_warnings();
+    assert_eq!(warnings.len(), 2, "{}", two_steps.stderr);
+    assert!(
+        warnings[0].contains("step 'a' (models/a.sql)"),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings[1].contains("step 'b' (models/b.sql)"),
+        "{warnings:?}"
+    );
+
+    let hook = Protocol::with(
+        "name: vetted\nsteps:\n  - name: s\n    sql: models/s.sql\nhooks:\n  on_init:\n    name: setup\n    sql: models/setup.sql\n",
+        &[
+            ("models/s.sql".into(), "SELECT 1;\n"),
+            ("models/setup.sql".into(), "IMPORT DATABASE 'imp';\n"),
+        ],
+    )
+    .run(VETTED_ON);
+    assert_eq!(hook.code, Some(0), "{}", hook.stderr);
+    let warnings = hook.unread_warnings();
+    assert_eq!(warnings.len(), 1, "{}", hook.stderr);
+    assert!(
+        warnings[0].contains("hook on_init 'setup' (models/setup.sql)"),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn a_shape_inside_a_comment_or_a_string_draws_no_warning() {
+    for sql in [
+        "-- IMPORT DATABASE 'imp';\nSELECT 1;",
+        "/* FROM query(getvariable('q')); */ SELECT 1;",
+        "SELECT 'IMPORT DATABASE imp';",
+    ] {
+        let run = Protocol::steps(&[("s", sql)]).run(VETTED_ON);
+        run.assert_not_refused(sql, &["s.sql"]);
+        assert_eq!(run.unread_warnings(), Vec::<&str>::new(), "[{sql}]");
+    }
+}
+
+/// What `arc run` printed on stderr for [`a_refused_protocol_prints_what_it_printed_before`]'s
+/// Protocol on 90c8260, byte for byte: recorded by running that commit's binary on the same
+/// fake engine.
+const REFUSED_BEFORE_STDERR: &str = "error: this Protocol's SQL installs a DuckDB extension arc has not vetted, so no step was run:\n  \
+step 's' (models/s.sql, line 2) installs anofox_forecast from the community registry, and anofox_forecast is not on the vetted list\n\
+A step or hook may install a community extension on the vetted list, FROM community. The list, and what this check does not read, are at https://github.com/meridian-online/arcform/blob/main/docs/VETTED_EXTENSIONS.md\n";
+
+#[test]
+fn a_refused_protocol_prints_what_it_printed_before() {
+    let run = Protocol::steps(&[(
+        "s",
+        "IMPORT DATABASE 'imp';\nINSTALL anofox_forecast FROM community;\n",
+    )])
+    .run(VETTED_ON);
+    run.assert_refused("import and install");
+    assert!(run.stderr.contains("anofox_forecast"), "{}", run.stderr);
+    assert_eq!(run.stderr, REFUSED_BEFORE_STDERR);
+}
+
+/// What `arc run` printed for [`a_protocol_with_none_of_the_shapes_prints_what_it_printed_before`]'s
+/// Protocol on 90c8260, byte for byte: recorded by running that commit's binary on the same
+/// fake engine. The first warning is lineage's, on `query('SELECT 42')`, whose arguments arc
+/// does not read for what the step reads and writes.
+const NO_SHAPE_BEFORE_STDOUT: &str = "\u{1b}[2m[hook]\u{1b}[0m \u{1b}[1msetup\u{1b}[0m ...\n\
+[1/3] \u{1b}[1mload\u{1b}[0m ...\n\
+[2/3] \u{1b}[1mask\u{1b}[0m ...\n\
+[3/3] \u{1b}[1mexport\u{1b}[0m ...\n\
+\n\
+Asset graph (3 nodes):\n\
+\x20\x20a [table]\n\
+\x20\x20\x20\x20\x20\x20produced by  load\n\
+\x20\x20\x20\x20\x20\x20feeds        export\n\
+\x20\x20b [table]\n\
+\x20\x20\x20\x20\x20\x20produced by  ask\n\
+\x20\x20out.csv [file]\n\
+\x20\x20\x20\x20\x20\x20produced by  export\n\
+\n\
+\u{1b}[32m✓\u{1b}[39m 3/3 steps succeeded.\n\
+";
+const NO_SHAPE_BEFORE_STDERR: &str = "\u{1b}[33mwarning:\u{1b}[39m step 'ask' calls the table function 'query', whose arguments arc does not read, so what the step reads and writes is unknown — `depends_on:` and `produces:` declare what the step reads and writes\n\
+\u{1b}[33mwarning:\u{1b}[39m step 'export' succeeded but does not appear to have produced: out.csv — arc will keep re-running this step until its own work (or the manifest's produces:) matches\n";
+
+#[test]
+fn a_protocol_with_none_of_the_shapes_prints_what_it_printed_before() {
+    let protocol = Protocol::with(
+        "name: vetted\nsteps:\n  - name: load\n    sql: models/load.sql\n  - name: ask\n    sql: models/ask.sql\n  - name: export\n    sql: models/export.sql\nhooks:\n  on_init:\n    name: setup\n    sql: models/setup.sql\n",
+        &[
+            (
+                "models/load.sql".into(),
+                "CREATE TABLE a AS SELECT 1 AS x;\n",
+            ),
+            (
+                "models/ask.sql".into(),
+                "CREATE TABLE b AS FROM query('SELECT 42');\n",
+            ),
+            ("models/export.sql".into(), "COPY a TO 'out.csv';\n"),
+            ("models/setup.sql".into(), "SELECT 1;\n"),
+        ],
+    );
+    let run = protocol.run(VETTED_ON);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.stdout, NO_SHAPE_BEFORE_STDOUT);
+    assert_eq!(run.stderr, NO_SHAPE_BEFORE_STDERR);
 }
 
 // ---- the page and the list ----
@@ -791,6 +1060,111 @@ fn arc_refuses_an_install_exactly_where_duckdb_would_run_it() {
         if fetched != read {
             disagreements.push(format!(
                 "{case:?}: DuckDB fetched {fetched:?}; arc refused {read:?}"
+            ));
+        }
+    }
+    // SQL a step builds or writes while it runs, which DuckDB runs and arc warns on and does
+    // not refuse. Each route is its step files, with what the probe reads after each.
+    let serialized = Command::new("duckdb")
+        .args(["-init", "/dev/null", "-noheader", "-list", "-c"])
+        .arg("SELECT json_serialize_sql('FROM query(''FROM enable_'' || ''peg_parser()'')')")
+        .output()
+        .expect("the DuckDB CLI on PATH");
+    let serialized = String::from_utf8_lossy(&serialized.stdout)
+        .trim()
+        .replace('\'', "''");
+    let routes: Vec<(&str, Vec<String>, &[&str])> = vec![
+        (
+            "query() on an assembled string",
+            vec!["FROM query('FROM enable_' || 'peg_parser()');\n/* /* */ @@; -- */".into()],
+            &["1"],
+        ),
+        (
+            "query() serialized as JSON, on an assembled string",
+            vec![format!(
+                "FROM json_execute_serialized_sql('{serialized}');\n/* /* */ @@; -- */"
+            )],
+            &["1"],
+        ),
+        (
+            "IMPORT DATABASE of files the step wrote",
+            vec!["EXPORT DATABASE 'imp';\nCOPY (SELECT '@@;') TO 'imp/schema.sql' (HEADER false, QUOTE '');\nIMPORT DATABASE 'imp';".into()],
+            &["1"],
+        ),
+        // The second file runs the startup file the first wrote, as the CLI runs it before
+        // each file it is given.
+        (
+            "a written ~/.duckdbrc",
+            vec![
+                "COPY (SELECT '@@;') TO '~/.duckdbrc' (HEADER false, QUOTE '');".into(),
+                "SELECT 1;".into(),
+            ],
+            &["0", "1"],
+        ),
+    ];
+    for (label, files, probes) in routes {
+        // A directory of the route's own is its working directory, so `imp` lands there,
+        // and its home, so the `.duckdbrc` it writes is read by no other case. The probe
+        // runs with `-init /dev/null`, so it reads what the files did and runs no startup
+        // file of its own.
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join("route.duckdb");
+        let duckdb = |args: &[&std::ffi::OsStr]| {
+            Command::new("duckdb")
+                .args(args)
+                .current_dir(home.path())
+                .env("HOME", home.path())
+                .output()
+                .expect("the DuckDB CLI on PATH")
+        };
+        let mut read = Vec::new();
+        for (i, file) in files.iter().enumerate() {
+            let path = home.path().join(format!("s{i}.sql"));
+            fs::write(&path, file.replace("@@", "CREATE TABLE probe AS SELECT 1")).unwrap();
+            duckdb(&[db.as_os_str(), "-f".as_ref(), path.as_os_str()]);
+            let probe = duckdb(&[
+                db.as_os_str(),
+                "-init".as_ref(),
+                "/dev/null".as_ref(),
+                "-csv".as_ref(),
+                "-noheader".as_ref(),
+                "-c".as_ref(),
+                "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'probe'".as_ref(),
+            ]);
+            read.push(String::from_utf8_lossy(&probe.stdout).trim().to_string());
+        }
+        if read != probes {
+            disagreements.push(format!(
+                "{label}: DuckDB's probe read {read:?} after each file, and {probes:?} was measured"
+            ));
+        }
+        let steps: Vec<(String, String)> = files
+            .iter()
+            .enumerate()
+            .map(|(i, file)| {
+                (
+                    format!("s{i}"),
+                    file.replace("@@", "INSTALL anofox_forecast FROM community"),
+                )
+            })
+            .collect();
+        let steps: Vec<(&str, &str)> = steps
+            .iter()
+            .map(|(name, sql)| (name.as_str(), sql.as_str()))
+            .collect();
+        let run = Protocol::steps(&steps).run(VETTED_ON);
+        let started: Vec<String> = (0..files.len()).map(|i| format!("s{i}.sql")).collect();
+        let warned = run
+            .unread_warnings()
+            .iter()
+            .any(|warning| warning.contains("step 's0' (models/s0.sql)"));
+        let refused = run.stderr.contains("arc has not vetted");
+        if run.code != Some(0) || run.started() != started || !warned || refused {
+            disagreements.push(format!(
+                "{label}: DuckDB ran it; arc exited {:?}, started {:?}, warned: {warned}, refused: {refused}\n{}",
+                run.code,
+                run.started(),
+                run.stderr
             ));
         }
     }
