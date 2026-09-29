@@ -1,6 +1,6 @@
 # Vetted community extensions
 
-A Protocol's SQL may install a DuckDB community extension when the extension is on this list. `arc run` reads the SQL of every step and hook before the first one runs, and refuses the Protocol when a statement installs a community extension that is not on it.
+A Protocol's SQL may install a DuckDB community extension when the extension is on this list. `arc run` reads the SQL of every step and hook before the first one runs, and refuses the Protocol when a statement installs a community extension that is not on it. The list says which extensions a Protocol may install, and a Protocol's own `arcform.yaml` pins which build of each: see [The build each extension is](#the-build-each-extension-is).
 
 The list arc enforces is `src/vetted_extensions.json`, compiled into the `arc` binary. This page shows the same list, and a test fails when the two differ.
 
@@ -34,6 +34,7 @@ Each extension below has a permissive licence, a build the community registry se
 - `INSTALL <name> FROM <repository>`, for a repository other than `core` and `community`, such as `core_nightly`.
 - `INSTALL '<path>'`, whose name is itself a file or an address. DuckDB reads a name holding a `.`, a `/` or a `\` that way.
 - A statement that names the setting `custom_extension_repository` or `autoinstall_extension_repository`. After `SET custom_extension_repository = '/tmp/ext'`, a bare `INSTALL mlpack;` fetches from `/tmp/ext`, and the second setting does the same for an extension DuckDB installs on its own when a function needs one.
+- A statement that names the setting `extension_directory`. It moves where DuckDB keeps the extensions it installs, so a step that sets it installs a file where the check of each pinned extension does not read it, and where a second DuckDB does not find it.
 - A statement that names `enable_peg_parser` or `allow_parser_override_extension`, in any form and whatever value it sets, and a string that names either. These switch DuckDB to its second parser: the DuckDB CLI loads the `autocomplete` extension, whose parser replaces the default one once `allow_parser_override_extension` is `'fallback'` or `'strict'`, as `CALL enable_peg_parser();` sets it. That parser does not nest `/* */` comments and applies no backslash escape inside `E'…'`, so after the switch DuckDB runs statements that the default parser's rules, the ones arc reads by, place inside a comment or a string. A string is refused as well because `query('FROM enable_peg_parser()')` runs the SQL the string holds.
 
 `FORCE INSTALL` is checked as `INSTALL` is, in any letter case, and so is an `INSTALL` that follows `EXPLAIN ANALYZE`, which DuckDB runs. A step whose SQL arc cannot otherwise parse is checked too.
@@ -50,6 +51,7 @@ The refusal names the step or hook, the file and line, and what the statement in
 
 - `INSTALL <name>` with no `FROM`, and `INSTALL <name> FROM core`. These install from DuckDB's own repository.
 - `LOAD`. SQL does not say where a loaded extension was installed from.
+- The build of an extension installed from `core`, or loaded without an `INSTALL … FROM community` in the Protocol's SQL. The pin check below covers the community extensions the SQL installs.
 - A `command:` step, and anything a step runs outside its SQL. **This check is not a sandbox.** arc does not sandbox a Protocol: a `command:` step can start a DuckDB of its own and install what it likes, and running a Protocol you did not write is running a shell script you did not read.
 - SQL a step builds or writes while it runs, and SQL held in a database it reads. arc reads the text of a Protocol's SQL files, not what that text computes or what a database holds, so it refuses none of these. On three shapes, read by the rules above, `arc run` prints one warning for the step or hook, naming its file and the line of each, and runs the step:
   - `query()` or `json_execute_serialized_sql()` called on anything but one string literal, or on a literal whose SQL makes such a call, in any letter case, quoted, or after a schema such as `main.`. These run a `SELECT` held in a string the step can assemble, such as `'FROM enable_' || 'peg_parser()'`, which switches the parser for the statements after it. A table's name followed by its column list, as in `CREATE TABLE query (a INT)`, is not a call.
@@ -65,6 +67,29 @@ The refusal names the step or hook, the file and line, and what the statement in
 ## The DuckDB version
 
 Each entry names the DuckDB version its build was probed for and its statement was run on. When a step installs an extension on the list and the engine reports a version the entry does not name, `arc run` prints one warning naming the extension, the engine's version and the entry's, and the run goes ahead.
+
+## The build each extension is
+
+A Protocol pins the build of each community extension it installs under the `extensions:` key of `arcform.yaml`, beside `engine_version:`: the extension's name, then the DuckDB version as DuckDB prints it, then the platform as `PRAGMA platform` prints it, then the SHA-256 of the installed file as 64 lower-case hex digits.
+
+```yaml
+engine_version: ">=1.5"
+extensions:
+  mlpack:
+    v1.5.5:
+      linux_amd64: <the SHA-256 of the file DuckDB v1.5.5 installs on linux_amd64>
+      osx_arm64: <the SHA-256 of the file DuckDB v1.5.5 installs on osx_arm64>
+```
+
+A manifest whose pin is not 64 lower-case hex digits is refused when it loads, and the message names the pin's place, such as `extensions.mlpack.v1.5.5.linux_amd64`.
+
+- **Before any step or hook runs**, `arc run` installs each extension that a step's or hook's SQL installs `FROM community` and that has a pin for the engine's DuckDB version and platform. It runs `INSTALL <name> FROM community` on the DuckDB the steps run on, with no Protocol database and no `LOAD`, so the extension's code does not run in the check; on a machine that does not hold the extension yet, the install fetches it. arc then hashes the file DuckDB names as the extension's `install_path` in `duckdb_extensions()`, and refuses the run with exit 1 when that hash differs from the pin, when the install fails, or when DuckDB names no installed file. The refusal names the extension, the DuckDB version, the platform, the pin, the hash found and the file. The check runs whether or not the steps are fresh, and under `--force`.
+- **An extension with no pin** for the engine's DuckDB version and platform draws one warning naming the extension and the `extensions:` key of `arcform.yaml`, and the run goes ahead with whichever build DuckDB installs. A pin for another DuckDB version or another platform alone is no pin for this one. When arc cannot read the engine's version it cannot choose a pin, and each extension is unpinned. A pin for an extension the Protocol's SQL does not install is neither installed nor compared.
+- **`arc run` does not write a pin**, and does not write `arcform.yaml`. An author writes each pin into the `extensions:` key: the SHA-256 of the file that `SELECT install_path FROM duckdb_extensions() WHERE extension_name = 'mlpack'` names, on the DuckDB version and platform the pin is for. A run record holds the SHA-256 of the manifest it ran from, and so of its pins.
+- **When the run ends**, after the last step and the `on_exit` hook, and after a failed `on_init`, arc hashes each file it checked before the run again, and fails the run with exit 2 when one differs from its pin, naming the extension, the pin and the hash found; the run record gives an outcome other than `success`, and a run that failed already keeps its own error and prints this one beside it. A step can replace a pinned file during the run with `FORCE INSTALL <name> FROM community`, with `UPDATE EXTENSIONS`, or with a `command:` that writes to it. arc finds the change when the run ends, and the steps after the one that replaced the file may have loaded it by then.
+- **An arc older than this change runs a pinned Protocol without checking it.** It reads a manifest holding `extensions:` and ignores the key.
+
+A `~/.duckdbrc` that sets `extension_directory` lies outside the Protocol. The check starts DuckDB as a step's DuckDB is started, so that file moves the directory the check reads and the directory a step installs to together.
 
 ## Adding an extension
 
