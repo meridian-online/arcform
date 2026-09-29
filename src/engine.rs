@@ -209,6 +209,12 @@ impl DuckDbProgram {
     }
 }
 
+/// Whether `name` is one arc writes into an `INSTALL` as it is: ASCII letters, digits and
+/// `_`, and not empty.
+fn is_plain_extension_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 /// What arc prints before each value it asks DuckDB for, so a line a `~/.duckdbrc` prints
 /// is not read as the answer.
 const ANSWER_MARK: &str = "arc-answer:";
@@ -385,7 +391,7 @@ impl Engine for DuckDbEngine {
     fn install_community_extension(&self, name: &str) -> Result<Option<PathBuf>> {
         // The name comes from the vetted list, whose names are plain identifiers; one that
         // is not is refused rather than written into SQL.
-        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        if !is_plain_extension_name(name) {
             return Err(Error::EngineQuery {
                 what: format!("install {name}"),
                 reason: "arc installs an extension by a plain name alone".to_string(),
@@ -2836,6 +2842,34 @@ mod extension_tests {
         match result {
             Err(Error::ExtensionRefused { refusals }) => refusals,
             other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_plain_extension_name_is_letters_digits_and_underscores() {
+        for name in ["mlpack", "splink_udfs", "h3", "us_address_standardizer"] {
+            assert!(is_plain_extension_name(name), "{name}");
+        }
+        for name in ["", "x'y", "a.b", "a b", "a;b", "a-b", "ä"] {
+            assert!(!is_plain_extension_name(name), "{name:?}");
+        }
+        for entry in vetted_extensions() {
+            assert!(
+                is_plain_extension_name(&entry.name),
+                "{} on the vetted list is not a plain name",
+                entry.name
+            );
+        }
+    }
+
+    #[test]
+    fn duckdb_is_not_started_to_install_a_name_that_is_not_plain() {
+        match DuckDbEngine.install_community_extension("x'; SELECT 1; --") {
+            Err(Error::EngineQuery { what, reason }) => {
+                assert!(what.contains("x'; SELECT 1; --"), "{what}");
+                assert_eq!(reason, "arc installs an extension by a plain name alone");
+            }
+            other => panic!("expected the name to be refused, got {other:?}"),
         }
     }
 

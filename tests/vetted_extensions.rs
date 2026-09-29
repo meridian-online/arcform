@@ -1114,6 +1114,27 @@ fn an_extension_with_no_pin_for_this_engine_warns_once_and_runs() {
 }
 
 #[test]
+fn a_platform_duckdb_will_not_report_refuses_the_run_with_duckdbs_own_message() {
+    let pinned = Pinned::step(&served_pin());
+    let run = pinned.protocol.run_on(
+        "case \"$1\" in\n\
+         --version) echo 'v1.5.5 (fake) 0000000000' ;;\n\
+         -noheader) echo 'Catalog Error: no pragma_platform here' >&2; exit 1 ;;\n\
+         esac\n",
+        &[],
+    );
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
+    for needle in ["mlpack", "Catalog Error: no pragma_platform here"] {
+        assert!(
+            run.stderr.contains(needle),
+            "the refusal should name {needle:?}:\n{}",
+            run.stderr
+        );
+    }
+    assert!(run.started().is_empty(), "no step ran");
+}
+
+#[test]
 fn a_step_that_replaces_a_pinned_file_fails_the_run_when_it_ends() {
     let pin = served_pin();
     let pinned = Pinned::step(&pin);
