@@ -107,6 +107,33 @@ pub enum Error {
     )]
     ExtensionRefused { refusals: Vec<String> },
 
+    // A community extension the Protocol's SQL installs is not the build `arcform.yaml`
+    // pins for this DuckDB and platform, or arc could not install it to compare. Checked
+    // before any step or hook runs, so nothing ran; one line per extension.
+    #[error(
+        "an extension this Protocol installs is not the build its arcform.yaml pins, so no step or hook was run:\n{}\n\
+         A pin sits under the extensions: key of arcform.yaml; an author who accepts the build found replaces its pin there. \
+         See {}",
+        indented(refusals),
+        crate::engine::VETTED_EXTENSIONS_DOC
+    )]
+    ExtensionPinRefused { refusals: Vec<String> },
+
+    // A pinned extension's file differs from its pin when the run ends: a step replaced
+    // it, and steps after that one may have loaded it.
+    #[error(
+        "an extension this Protocol installs changed during the run, so the run failed:\n{}\n\
+         A step that runs FORCE INSTALL, UPDATE EXTENSIONS or a command can replace an installed extension, \
+         and steps after it may have loaded the file. See {}",
+        indented(changes),
+        crate::engine::VETTED_EXTENSIONS_DOC
+    )]
+    ExtensionChanged { changes: Vec<String> },
+
+    // DuckDB, asked by arc itself rather than by a step, did not answer.
+    #[error("DuckDB could not {what}: {reason}")]
+    EngineQuery { what: String, reason: String },
+
     // `ARC_SQL_READER` names no reader, or names DuckDB's parse and the DuckDB arc runs
     // cannot give it. The message names the variable and what it takes.
     #[error("{0}")]
@@ -227,7 +254,8 @@ impl Error {
             | Error::Precondition { .. }
             | Error::ToolPrecondition { .. }
             | Error::StepTimeout { .. }
-            | Error::PipelineTimeout { .. } => 2,
+            | Error::PipelineTimeout { .. }
+            | Error::ExtensionChanged { .. } => 2,
             _ => 1,
         }
     }
@@ -398,6 +426,9 @@ mod exit_code_tests {
                 override_var: "ARC_ALLOW_UNTESTED_ENGINE",
             },
             Error::StateBackend("locked".into()),
+            Error::ExtensionPinRefused {
+                refusals: vec!["mlpack".into()],
+            },
         ] {
             assert_eq!(e.exit_code(), 1, "expected 'cannot run' (1) for {e:?}");
         }
@@ -425,6 +456,9 @@ mod exit_code_tests {
             Error::PipelineTimeout {
                 step: "s".into(),
                 elapsed_sec: 3.0,
+            },
+            Error::ExtensionChanged {
+                changes: vec!["mlpack".into()],
             },
         ] {
             assert_eq!(e.exit_code(), 2, "expected 'found a problem' (2) for {e:?}");

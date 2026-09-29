@@ -637,6 +637,7 @@ mod tests {
             name: "test".to_string(),
             engine: "duckdb".to_string(),
             engine_version: None,
+            extensions: Default::default(),
             db: None,
             params: indexmap::IndexMap::new(),
             dotenv: Vec::new(),

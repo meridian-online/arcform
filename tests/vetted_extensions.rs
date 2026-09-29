@@ -2,12 +2,17 @@
 //! vetted list, before a step runs, and names what it found; `docs/VETTED_EXTENSIONS.md`
 //! is the list for a person, and `src/vetted_extensions.json` is the list arc holds.
 //!
+//! It also checks each community extension a Protocol installs against the SHA-256 its
+//! `arcform.yaml` pins under `extensions:`, before any step or hook runs and again when the
+//! run ends.
+//!
 //! Every Protocol here runs on a fake engine: a shell script that reports a chosen version
 //! and appends each call's arguments to a log, so "no step ran" and "the step started" are
-//! read off the engine's own record. The check reads SQL text and never asks the engine
-//! anything but its version, so a fake one decides nothing the tests read. One test runs
-//! the real DuckDB CLI instead, to hold arc's idea of what is a comment or a string to
-//! DuckDB's own.
+//! read off the engine's own record. The vetted-list check reads SQL text and asks the
+//! engine its version alone; for the pin check the fake engine answers arc's platform and
+//! install calls as the DuckDB CLI does, from files under the test's own directory. Two
+//! tests run the real DuckDB CLI instead: one holds arc's idea of what is a comment or a
+//! string to DuckDB's own, and one holds the pin check's calls to what DuckDB answers.
 #![cfg(unix)]
 
 use std::collections::BTreeSet;
@@ -122,13 +127,24 @@ impl Protocol {
 
     /// `arc run` on a fake engine that reports `version`.
     fn run(&self, version: &str) -> Outcome {
+        self.run_on(
+            &format!(
+                "if [ \"$1\" = \"--version\" ]; then echo 'v{version} (fake) 0000000000'; fi\n"
+            ),
+            &[],
+        )
+    }
+
+    /// `arc run <args>` on a fake engine that logs each call's arguments and then runs
+    /// `body`, a piece of shell.
+    fn run_on(&self, body: &str, args: &[&str]) -> Outcome {
         let engine = self.root.path().join("duckdb");
         let log = self.root.path().join("duckdb.log");
         let _ = fs::remove_file(&log);
         fs::write(
             &engine,
             format!(
-                "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$1\" = \"--version\" ]; then echo 'v{version} (fake) 0000000000'; fi\nexit 0\n",
+                "#!/bin/sh\necho \"$*\" >> '{}'\n{body}exit 0\n",
                 log.display()
             ),
         )
@@ -137,6 +153,7 @@ impl Protocol {
         let out = Command::new(env!("CARGO_BIN_EXE_arc"))
             .current_dir(self.project())
             .arg("run")
+            .args(args)
             .env("ARC_DUCKDB_BIN", &engine)
             .env_remove("ARC_ALLOW_UNTESTED_ENGINE")
             .output()
@@ -260,6 +277,32 @@ fn a_repository_setting_and_an_install_by_path_are_refused_by_name() {
             run.stderr
         );
     }
+}
+
+#[test]
+fn the_extension_directory_setting_is_refused_as_a_repository_setting_is() {
+    for sql in [
+        "SET extension_directory = 'ext';\n",
+        "SET custom_extension_repository = 'ext';\n",
+    ] {
+        let run = Protocol::steps(&[("s", sql)]).run(VETTED_ON);
+        run.assert_refused(sql);
+        let setting = sql[4..].split(' ').next().unwrap();
+        for needle in ["step 's'", "models/s.sql, line 1", setting] {
+            assert!(
+                run.stderr.contains(needle),
+                "{sql}: the refusal should name {needle:?}:\n{}",
+                run.stderr
+            );
+        }
+    }
+    let run = Protocol::steps(&[("s", "SET extension_directory = 'ext';\n")]).run(VETTED_ON);
+    assert!(
+        run.stderr
+            .contains("moves where DuckDB keeps the extensions it installs"),
+        "{}",
+        run.stderr
+    );
 }
 
 #[test]
@@ -395,10 +438,12 @@ fn a_vetted_extension_on_a_version_its_entry_does_not_name_warns_once_and_runs()
         ("b", "FORCE INSTALL mlpack FROM community; LOAD mlpack;\n"),
     ])
     .run("1.5.4");
+    // The warning about the version the entry names; the one about a missing pin is
+    // another's.
     let warnings: Vec<&str> = run
         .stderr
         .lines()
-        .filter(|l| l.contains("warning:") && l.contains("mlpack"))
+        .filter(|l| l.contains("warning:") && l.contains("mlpack") && !l.contains("no pin"))
         .collect();
     assert_eq!(warnings.len(), 1, "one warning:\n{}", run.stderr);
     for needle in ["mlpack", "v1.5.4", "v1.5.5"] {
@@ -450,6 +495,23 @@ fn a_protocol_with_no_install_prints_what_it_printed_before() {
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(run.stderr, "", "nothing on stderr");
     assert_eq!(run.stdout, BEFORE_STDOUT);
+    // The calls the engine received on 68a1fa2, recorded by running that commit's binary on
+    // the same fake engine: no call arc makes for a pin.
+    let root = protocol.root.path().display().to_string();
+    let calls: Vec<String> = run
+        .engine_calls
+        .iter()
+        .map(|call| call.replace(&root, "ROOT"))
+        .collect();
+    assert_eq!(
+        calls,
+        vec![
+            "--version",
+            "ROOT/project/vetted.duckdb -f ROOT/project/models/setup.sql",
+            "ROOT/project/vetted.duckdb -f ROOT/project/models/load.sql",
+            "ROOT/project/vetted.duckdb -f ROOT/project/models/transform.sql",
+        ]
+    );
 }
 
 // ---- SQL a step builds or writes while it runs ----
@@ -698,6 +760,631 @@ fn a_protocol_with_none_of_the_shapes_prints_what_it_printed_before() {
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(run.stdout, NO_SHAPE_BEFORE_STDOUT);
     assert_eq!(run.stderr, NO_SHAPE_BEFORE_STDERR);
+}
+
+// ---- the build each pinned extension is ----
+
+/// The platform the fake engine reports.
+const PLATFORM: &str = "linux_amd64";
+
+/// The step every Protocol below runs first.
+const INSTALLS_MLPACK: &str = "INSTALL mlpack FROM community; LOAD mlpack;\n";
+
+/// What the fake engine does with an `INSTALL mlpack FROM community`.
+#[derive(Clone, Copy)]
+enum Registry {
+    /// Copies the served build in when mlpack is not installed, as DuckDB fetches it, and
+    /// names the installed file.
+    Serves,
+    /// Exits 1, as DuckDB does when the registry serves nothing for the name.
+    Fails,
+    /// Exits 0 and names no installed file.
+    NamesNoFile,
+}
+
+/// A Protocol whose SQL installs mlpack, on a fake DuckDB v1.5.5 that keeps its extensions
+/// in `<root>/extensions/v1.5.5/linux_amd64` and answers arc's platform and install calls
+/// as the DuckDB CLI does, each value after `arc-answer:`.
+struct Pinned {
+    protocol: Protocol,
+}
+
+impl Pinned {
+    /// `arcform.yaml` holding the steps and hooks in `yaml`, then `extensions`, with
+    /// `models/s.sql` installing mlpack and `models/setup.sql` selecting 1.
+    fn new(yaml: &str, extensions: &str) -> Self {
+        let protocol = Protocol::with(
+            &format!("name: pinned\n{yaml}{extensions}"),
+            &[
+                ("models/s.sql".into(), INSTALLS_MLPACK),
+                ("models/setup.sql".into(), "SELECT 1;\n"),
+            ],
+        );
+        fs::create_dir_all(protocol.root.path().join("registry")).unwrap();
+        fs::write(
+            protocol
+                .root
+                .path()
+                .join("registry/mlpack.duckdb_extension"),
+            SERVED,
+        )
+        .unwrap();
+        Pinned { protocol }
+    }
+
+    /// Replace `arcform.yaml`, for a manifest that names a path under this Protocol's root.
+    fn write_manifest(&self, yaml: &str) {
+        fs::write(self.protocol.project().join("arcform.yaml"), yaml).unwrap();
+    }
+
+    /// One SQL step installing mlpack, pinned to `pin` for v1.5.5 on [`PLATFORM`].
+    fn step(pin: &str) -> Self {
+        Self::new(
+            "steps:\n  - name: s\n    sql: models/s.sql\n",
+            &pin_yaml("v1.5.5", PLATFORM, pin),
+        )
+    }
+
+    fn installed(&self) -> PathBuf {
+        self.protocol.root.path().join(format!(
+            "extensions/v1.5.5/{PLATFORM}/mlpack.duckdb_extension"
+        ))
+    }
+
+    fn served(&self) -> PathBuf {
+        self.protocol
+            .root
+            .path()
+            .join("registry/mlpack.duckdb_extension")
+    }
+
+    /// Put the served build where DuckDB keeps it, as an earlier install would.
+    fn install(&self) {
+        fs::create_dir_all(self.installed().parent().unwrap()).unwrap();
+        fs::copy(self.served(), self.installed()).unwrap();
+    }
+
+    fn manifest(&self) -> Vec<u8> {
+        fs::read(self.protocol.project().join("arcform.yaml")).unwrap()
+    }
+
+    /// The `outcome` of each run the Protocol's database records, oldest first.
+    fn recorded_outcomes(&self) -> Vec<Option<String>> {
+        let conn = duckdb::Connection::open(self.protocol.project().join("pinned.duckdb")).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT outcome FROM _arcform_runs ORDER BY rowid")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// The files under `build/.arcform/runs/`.
+    fn run_records(&self) -> BTreeSet<String> {
+        fs::read_dir(self.protocol.project().join("build/.arcform/runs"))
+            .map(|entries| {
+                entries
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn run(&self, registry: Registry, args: &[&str]) -> Outcome {
+        let installed = self.installed();
+        let dir = installed.parent().unwrap().display().to_string();
+        let file = installed.display();
+        let install = match registry {
+            Registry::Serves => format!(
+                "mkdir -p '{dir}'; [ -f '{file}' ] || cp '{}' '{file}'; echo 'arc-answer:{file}'",
+                self.served().display()
+            ),
+            Registry::Fails => "echo 'HTTP Error: Failed to download extension' >&2; exit 1".into(),
+            Registry::NamesNoFile => ":".into(),
+        };
+        self.protocol.run_on(
+            &format!(
+                "case \"$1\" in\n\
+                 --version) echo 'v1.5.5 (fake) 0000000000' ;;\n\
+                 -noheader) case \"$4\" in\n\
+                 *pragma_platform*) echo 'arc-answer:{PLATFORM}' ;;\n\
+                 'INSTALL mlpack FROM community;'*) {install} ;;\n\
+                 esac ;;\n\
+                 esac\n"
+            ),
+            args,
+        )
+    }
+}
+
+/// `extensions:` pinning mlpack to `pin` for `version` on `platform`.
+fn pin_yaml(version: &str, platform: &str, pin: &str) -> String {
+    format!("extensions:\n  mlpack:\n    {version}:\n      {platform}: {pin}\n")
+}
+
+fn sha256(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
+}
+
+/// The build the fake registry serves.
+const SERVED: &[u8] = b"the build the registry serves";
+
+/// The SHA-256 of [`SERVED`].
+fn served_pin() -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(SERVED))
+}
+
+/// A pin no file here hashes to.
+const OTHER_PIN: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+impl Outcome {
+    /// The warnings naming mlpack.
+    fn mlpack_warnings(&self) -> Vec<&str> {
+        self.stderr
+            .lines()
+            .filter(|l| l.contains("warning:") && l.contains("mlpack"))
+            .collect()
+    }
+
+    /// The engine calls with the SQL arc sent in place of each `-c` call's text: `platform`
+    /// or `install mlpack`.
+    fn calls(&self) -> Vec<String> {
+        self.engine_calls
+            .iter()
+            .map(|call| {
+                if call.contains("pragma_platform") {
+                    "platform".to_string()
+                } else if call.contains("INSTALL mlpack FROM community") {
+                    "install mlpack".to_string()
+                } else if let Some(sql) = call.split(" -f ").nth(1) {
+                    sql.rsplit('/').next().unwrap().to_string()
+                } else {
+                    call.clone()
+                }
+            })
+            .collect()
+    }
+}
+
+#[test]
+fn a_pinned_extension_equal_to_its_pin_runs_and_changes_nothing() {
+    let pinned = Pinned::step(&served_pin());
+    pinned.install();
+    let manifest = pinned.manifest();
+    let file = fs::read(pinned.installed()).unwrap();
+    for (label, ran) in [
+        ("first run", "1/1 steps succeeded"),
+        ("fresh run", "1 skipped (fresh)"),
+    ] {
+        let run = pinned.run(Registry::Serves, &[]);
+        assert_eq!(run.code, Some(0), "[{label}] {}", run.stderr);
+        assert!(run.stdout.contains(ran), "[{label}] {}", run.stdout);
+        assert_eq!(run.mlpack_warnings(), Vec::<&str>::new(), "[{label}]");
+        assert_eq!(
+            pinned.manifest(),
+            manifest,
+            "[{label}] arcform.yaml is as it was"
+        );
+        assert_eq!(
+            fs::read(pinned.installed()).unwrap(),
+            file,
+            "[{label}] the installed file is as it was"
+        );
+    }
+}
+
+#[test]
+fn a_pinned_extension_not_installed_is_installed_and_compared_before_any_step_or_hook() {
+    let yaml = "steps:\n  - name: s\n    sql: models/s.sql\nhooks:\n  on_init:\n    name: setup\n    sql: models/setup.sql\n";
+    let pin = served_pin();
+
+    let equal = Pinned::new(yaml, &pin_yaml("v1.5.5", PLATFORM, &pin));
+    assert!(!equal.installed().exists());
+    let run = equal.run(Registry::Serves, &[]);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(
+        run.calls(),
+        vec![
+            "--version",
+            "platform",
+            "install mlpack",
+            "setup.sql",
+            "s.sql"
+        ],
+        "the install comes before the on_init hook and the step"
+    );
+    assert_eq!(
+        sha256(&equal.installed()),
+        pin,
+        "arc installed the served build"
+    );
+
+    let differs = Pinned::new(yaml, &pin_yaml("v1.5.5", PLATFORM, OTHER_PIN));
+    let run = differs.run(Registry::Serves, &[]);
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
+    assert_eq!(
+        run.calls(),
+        vec!["--version", "platform", "install mlpack"],
+        "no step or hook reached the engine"
+    );
+    for needle in ["mlpack", OTHER_PIN, &pin] {
+        assert!(
+            run.stderr.contains(needle),
+            "the refusal should name {needle:?}:\n{}",
+            run.stderr
+        );
+    }
+}
+
+#[test]
+fn a_changed_installed_file_refuses_a_fresh_run_and_a_forced_one_before_on_init() {
+    let pin = served_pin();
+    let pinned = Pinned::new(
+        "steps:\n  - name: s\n    sql: models/s.sql\nhooks:\n  on_init:\n    name: mark\n    command: touch init_ran\n",
+        &pin_yaml("v1.5.5", PLATFORM, &pin),
+    );
+    pinned.install();
+    let first = pinned.run(Registry::Serves, &[]);
+    assert_eq!(first.code, Some(0), "{}", first.stderr);
+    assert_eq!(first.started(), vec!["s.sql"]);
+    let marker = pinned.protocol.project().join("init_ran");
+    fs::remove_file(&marker).expect("the first run ran on_init");
+    let records = pinned.run_records();
+    assert!(!records.is_empty(), "the first run left a record");
+    let manifest = pinned.manifest();
+
+    let mut bytes = fs::read(pinned.installed()).unwrap();
+    bytes[0] ^= 1;
+    fs::write(pinned.installed(), &bytes).unwrap();
+    let found = sha256(&pinned.installed());
+
+    for args in [&[][..], &["--force"][..]] {
+        let run = pinned.run(Registry::Serves, args);
+        assert_eq!(run.code, Some(1), "{args:?}: {}", run.stderr);
+        let installed = pinned.installed().display().to_string();
+        for needle in ["mlpack", "v1.5.5", PLATFORM, &pin, &found, &installed] {
+            assert!(
+                run.stderr.contains(needle),
+                "{args:?}: the refusal should name {needle:?}:\n{}",
+                run.stderr
+            );
+        }
+        assert!(!marker.exists(), "{args:?}: on_init did not run");
+        assert!(run.started().is_empty(), "{args:?}: no step ran");
+        assert_eq!(
+            pinned.run_records(),
+            records,
+            "{args:?}: no run record added"
+        );
+        assert_eq!(
+            pinned.manifest(),
+            manifest,
+            "{args:?}: arcform.yaml is as it was"
+        );
+    }
+}
+
+#[test]
+fn a_pinned_extension_duckdb_cannot_install_or_name_is_refused_and_not_warned() {
+    for registry in [Registry::Fails, Registry::NamesNoFile] {
+        let pinned = Pinned::step(OTHER_PIN);
+        let run = pinned.run(registry, &[]);
+        assert_eq!(run.code, Some(1), "{}", run.stderr);
+        assert!(run.stderr.contains("mlpack"), "{}", run.stderr);
+        assert!(
+            run.stderr.contains("no step or hook was run"),
+            "{}",
+            run.stderr
+        );
+        assert_eq!(
+            run.mlpack_warnings(),
+            Vec::<&str>::new(),
+            "no warning instead"
+        );
+        assert!(run.started().is_empty(), "no step ran");
+        if matches!(registry, Registry::Fails) {
+            assert!(
+                run.stderr
+                    .contains("HTTP Error: Failed to download extension"),
+                "the refusal should carry DuckDB's own reason:\n{}",
+                run.stderr
+            );
+        }
+    }
+}
+
+#[test]
+fn an_extension_with_no_pin_for_this_engine_warns_once_and_runs() {
+    for (label, extensions) in [
+        ("no extensions: key", String::new()),
+        (
+            "another version alone",
+            pin_yaml("v1.5.4", PLATFORM, OTHER_PIN),
+        ),
+        (
+            "another platform alone",
+            pin_yaml("v1.5.5", "osx_arm64", OTHER_PIN),
+        ),
+    ] {
+        let pinned = Pinned::new("steps:\n  - name: s\n    sql: models/s.sql\n", &extensions);
+        let manifest = pinned.manifest();
+        let run = pinned.run(Registry::Serves, &[]);
+        assert_eq!(run.code, Some(0), "[{label}] {}", run.stderr);
+        let warnings = run.mlpack_warnings();
+        assert_eq!(warnings.len(), 1, "[{label}] one warning:\n{}", run.stderr);
+        assert!(
+            warnings[0].contains("extensions: key of arcform.yaml"),
+            "[{label}] {}",
+            warnings[0]
+        );
+        assert_eq!(run.started(), vec!["s.sql"], "[{label}]");
+        assert!(
+            !run.calls().contains(&"install mlpack".to_string()),
+            "[{label}] arc installs nothing it has no pin for"
+        );
+        assert_eq!(
+            pinned.manifest(),
+            manifest,
+            "[{label}] arcform.yaml is as it was"
+        );
+    }
+}
+
+#[test]
+fn a_platform_duckdb_will_not_report_refuses_the_run_with_duckdbs_own_message() {
+    let pinned = Pinned::step(&served_pin());
+    let run = pinned.protocol.run_on(
+        "case \"$1\" in\n\
+         --version) echo 'v1.5.5 (fake) 0000000000' ;;\n\
+         -noheader) echo 'Catalog Error: no pragma_platform here' >&2; exit 1 ;;\n\
+         esac\n",
+        &[],
+    );
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
+    for needle in ["mlpack", "Catalog Error: no pragma_platform here"] {
+        assert!(
+            run.stderr.contains(needle),
+            "the refusal should name {needle:?}:\n{}",
+            run.stderr
+        );
+    }
+    assert!(run.started().is_empty(), "no step ran");
+}
+
+#[test]
+fn a_step_that_replaces_a_pinned_file_fails_the_run_when_it_ends() {
+    let pin = served_pin();
+    let pinned = Pinned::step(&pin);
+    pinned.install();
+    let replace = |exit: &str| {
+        format!(
+            "name: pinned\nsteps:\n  - name: s\n    sql: models/s.sql\n  - name: replace\n    command: \"printf x >> '{}'{exit}\"\n{}",
+            pinned.installed().display(),
+            pin_yaml("v1.5.5", PLATFORM, &pin)
+        )
+    };
+    pinned.write_manifest(&replace(""));
+    let manifest = pinned.manifest();
+    let run = pinned.run(Registry::Serves, &[]);
+    assert_eq!(run.code, Some(2), "{}\n{}", run.stdout, run.stderr);
+    assert!(
+        run.stdout.contains("[2/2]"),
+        "both steps ran:\n{}",
+        run.stdout
+    );
+    let found = sha256(&pinned.installed());
+    for needle in ["mlpack", "changed during the run", &pin, &found] {
+        assert!(
+            run.stderr.contains(needle),
+            "the failure should name {needle:?}:\n{}",
+            run.stderr
+        );
+    }
+    let records = pinned.run_records();
+    let contract = records
+        .iter()
+        .find(|name| name.ends_with(".json"))
+        .expect("the run wrote its contract");
+    let contract: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            pinned
+                .protocol
+                .project()
+                .join("build/.arcform/runs")
+                .join(contract),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let outcome = contract["run"]["outcome"].as_str().expect("an outcome");
+    assert_eq!(outcome, "partial", "{contract}");
+    assert_eq!(
+        pinned.recorded_outcomes(),
+        vec![Some(outcome.to_string())],
+        "the Protocol's database records the outcome the contract gives"
+    );
+    assert_eq!(pinned.manifest(), manifest, "arcform.yaml is as it was");
+
+    // A run that failed already keeps its own error, and prints this one beside it.
+    fs::copy(pinned.served(), pinned.installed()).unwrap();
+    pinned.write_manifest(&replace("; exit 3"));
+    let run = pinned.run(Registry::Serves, &[]);
+    assert_eq!(run.code, Some(2), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("step 'replace' failed"),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("changed during the run"),
+        "{}",
+        run.stderr
+    );
+    assert_eq!(
+        pinned.recorded_outcomes()[1].as_deref(),
+        Some("failed"),
+        "the Protocol's database keeps the failed run's own outcome"
+    );
+
+    // An on_init hook that replaces the file and then fails ends the run before any step,
+    // and the file is still hashed again, beside the hook's own error.
+    fs::copy(pinned.served(), pinned.installed()).unwrap();
+    pinned.write_manifest(&format!(
+        "name: pinned\nsteps:\n  - name: s\n    sql: models/s.sql\nhooks:\n  on_init:\n    name: replace\n    command: \"printf x >> '{}'; exit 3\"\n{}",
+        pinned.installed().display(),
+        pin_yaml("v1.5.5", PLATFORM, &pin)
+    ));
+    let run = pinned.run(Registry::Serves, &[]);
+    assert_eq!(run.code, Some(2), "{}", run.stderr);
+    assert!(run.started().is_empty(), "no step ran");
+    let found = sha256(&pinned.installed());
+    for needle in [
+        "on_init hook 'replace' failed",
+        "changed during the run",
+        &pin,
+        &found,
+    ] {
+        assert!(
+            run.stderr.contains(needle),
+            "a failed on_init should name {needle:?}:\n{}",
+            run.stderr
+        );
+    }
+}
+
+/// What `arc init p` wrote into `arcform.yaml` on 68a1fa2, byte for byte: recorded by
+/// running that commit's binary.
+const INIT_BEFORE: &str = "name: p\nengine: duckdb\nengine_version: '>=1.0'\ndb: p.duckdb\nparams: {}\ndotenv: []\ntimeout_sec: null\ndefaults: null\nhooks:\n  on_init: null\n  on_success: null\n  on_failure: null\n  on_exit: null\nsteps: []\nassets: {}\n";
+
+#[test]
+fn arc_init_writes_the_manifest_it_wrote_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .current_dir(dir.path())
+        .args(["init", "p"])
+        .output()
+        .expect("spawn arc init");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("p/arcform.yaml")).unwrap(),
+        INIT_BEFORE
+    );
+}
+
+/// The real DuckDB CLI answers arc's platform and install calls, offline: a DuckDB that
+/// holds an extension's file installs nothing over it and names it. The home directory is
+/// the test's own, so DuckDB keeps its extensions there and reads no `~/.duckdbrc`, and the
+/// file planted there is not an extension, so the step installs it and does not load it.
+#[test]
+fn the_real_duckdb_answers_the_pin_check_from_the_file_it_holds() {
+    let home = tempfile::tempdir().unwrap();
+    let ask = |args: &[&str]| {
+        let out = Command::new("duckdb")
+            .args(args)
+            .env("HOME", home.path())
+            .output()
+            .expect("the DuckDB CLI on PATH");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let version = ask(&["--version"])
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    let platform = ask(&[
+        "-noheader",
+        "-list",
+        "-c",
+        "SELECT platform FROM pragma_platform();",
+    ]);
+    let installed = home.path().join(format!(
+        ".duckdb/extensions/{version}/{platform}/mlpack.duckdb_extension"
+    ));
+    fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    fs::write(&installed, b"not an extension").unwrap();
+    let pin = sha256(&installed);
+
+    let run = |pin: &str| {
+        let protocol = Protocol::with(
+            &format!(
+                "name: real\nsteps:\n  - name: s\n    sql: models/s.sql\nhooks:\n  on_init:\n    name: mark\n    command: touch init_ran\n{}",
+                pin_yaml(&version, &platform, pin)
+            ),
+            &[("models/s.sql".into(), "INSTALL mlpack FROM community;\n")],
+        );
+        let out = Command::new(env!("CARGO_BIN_EXE_arc"))
+            .current_dir(protocol.project())
+            .arg("run")
+            .env("HOME", home.path())
+            .env_remove("ARC_DUCKDB_BIN")
+            .env_remove("ARC_ALLOW_UNTESTED_ENGINE")
+            .output()
+            .expect("spawn arc run");
+        let marked = protocol.project().join("init_ran").exists();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            marked,
+        )
+    };
+
+    let (code, stderr, marked) = run(&pin);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!stderr.contains("no pin"), "{stderr}");
+    assert!(marked, "on_init ran");
+    assert_eq!(sha256(&installed), pin, "the file is as it was");
+
+    let (code, stderr, marked) = run(OTHER_PIN);
+    assert_eq!(code, Some(1), "{stderr}");
+    let path = installed.display().to_string();
+    for needle in [
+        "mlpack",
+        version.as_str(),
+        platform.as_str(),
+        OTHER_PIN,
+        &pin,
+        &path,
+    ] {
+        assert!(
+            stderr.contains(needle),
+            "the refusal should name {needle:?}:\n{stderr}"
+        );
+    }
+    assert!(!marked, "on_init did not run");
+
+    // A `~/.duckdbrc` that prints a line puts it on stdout ahead of arc's answer, and arc
+    // does not take it for the platform, which would leave the pin unchosen and the
+    // extension run unchecked.
+    fs::write(
+        home.path().join(".duckdbrc"),
+        ".print a line a duckdbrc prints\n",
+    )
+    .unwrap();
+    let (code, stderr, marked) = run(OTHER_PIN);
+    assert_eq!(
+        code,
+        Some(1),
+        "a line ~/.duckdbrc printed was read as the answer:\n{stderr}"
+    );
+    for needle in [OTHER_PIN, &pin, &path] {
+        assert!(
+            stderr.contains(needle),
+            "the refusal should name {needle:?}:\n{stderr}"
+        );
+    }
+    assert!(!marked, "on_init did not run");
 }
 
 // ---- the page and the list ----
