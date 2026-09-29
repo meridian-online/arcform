@@ -11,10 +11,14 @@ Each extension below has a permissive licence, a build the community registry se
 | extension | licence | repository | DuckDB version | what was run |
 |---|---|---|---|---|
 | `dta` | MIT | `codedthinking/duckdb-dta` | v1.5.5 | read a Stata file; write one and read it back |
+| `finetype` | MIT | `meridian-online/finetype` | v1.5.5 | the semantic type of a column and of a value is inferred from what it holds |
 | `h3` | Apache-2.0 | `isaacbrodsky/h3-duckdb` | v1.5.5 | the hexagonal cell for a point |
 | `http_client` | MIT | `query-farm/httpclient` | v1.5.5 | an HTTP GET returning status and body |
+| `minijinja` | Apache-2.0 | `query-farm/minijinja` | v1.5.5 | a template is rendered once for each row and once over all of them |
 | `mlpack` | MIT | `eddelbuettel/duckdb-mlpack` | v1.5.5 | train a random forest, store it and score new rows; a logistic regression; k-means |
+| `onager` | MIT OR Apache-2.0 | `CogitatorTech/onager` | v1.5.5 | shortest paths and components from an edge table |
 | `rapidfuzz` | MIT | `query-farm/rapidfuzz` | v1.5.5 | a token-sort ratio between two strings |
+| `splink_udfs` | MIT | `moj-analytical-services/splink_udfs` | v1.5.5 | names are blocked by the soundex of the surname and compared without diacritics |
 | `stats_duck` | Apache-2.0 | `KoliStat/the-stats-duck` | v1.5.5 | a two-sample t-test |
 | `stochastic` | Apache-2.0 | `query-farm/stochastic` | v1.5.5 | the normal distribution at its known points |
 | `subtoken` | MIT | `meridian-online/subtoken` | v1.5.5 | embed text and rank by cosine similarity |

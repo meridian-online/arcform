@@ -11,6 +11,13 @@
       "proof": "read a Stata file; write one and read it back"
     },
     {
+      "name": "finetype",
+      "licence": "MIT",
+      "repository": "meridian-online/finetype",
+      "duckdb_versions": ["v1.5.5"],
+      "proof": "the semantic type of a column and of a value is inferred from what it holds"
+    },
+    {
       "name": "h3",
       "licence": "Apache-2.0",
       "repository": "isaacbrodsky/h3-duckdb",
@@ -25,6 +32,13 @@
       "proof": "an HTTP GET returning status and body"
     },
     {
+      "name": "minijinja",
+      "licence": "Apache-2.0",
+      "repository": "query-farm/minijinja",
+      "duckdb_versions": ["v1.5.5"],
+      "proof": "a template is rendered once for each row and once over all of them"
+    },
+    {
       "name": "mlpack",
       "licence": "MIT",
       "repository": "eddelbuettel/duckdb-mlpack",
@@ -32,11 +46,25 @@
       "proof": "train a random forest, store it and score new rows; a logistic regression; k-means"
     },
     {
+      "name": "onager",
+      "licence": "MIT OR Apache-2.0",
+      "repository": "CogitatorTech/onager",
+      "duckdb_versions": ["v1.5.5"],
+      "proof": "shortest paths and components from an edge table"
+    },
+    {
       "name": "rapidfuzz",
       "licence": "MIT",
       "repository": "query-farm/rapidfuzz",
       "duckdb_versions": ["v1.5.5"],
       "proof": "a token-sort ratio between two strings"
+    },
+    {
+      "name": "splink_udfs",
+      "licence": "MIT",
+      "repository": "moj-analytical-services/splink_udfs",
+      "duckdb_versions": ["v1.5.5"],
+      "proof": "names are blocked by the soundex of the surname and compared without diacritics"
     },
     {
       "name": "stats_duck",
