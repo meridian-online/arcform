@@ -454,6 +454,11 @@ fn next_model_number(models_dir: &Path) -> u32 {
 /// renaming the operation is a change to this line alone.
 const FILTER_ROWS: &str = "filter-rows";
 
+/// The long name of the sort operation. The one place the name is written, as
+/// [`FILTER_ROWS`] is. The operation is called `sort-rows` though its argument's
+/// field reads `order by`: the verb comes first, the clause is what it writes.
+const SORT_ROWS: &str = "sort-rows";
+
 /// One SQL operation arc holds: what it is called, what it does, what it is
 /// applied to, and what it takes — described so that it can be recorded as a
 /// step by name. The catalogue holds the description and nothing that runs.
@@ -542,27 +547,63 @@ const COMPARISONS: &[Comparison] = &[
     },
 ];
 
+/// The directions a sort's order offers by word, in the order they are offered.
+/// A direction is a word and the SQL keyword it is written as, the shape a
+/// [`Comparison`] has; offered, not enforced, since an order is any SQL clause.
+const DIRECTIONS: &[Comparison] = &[
+    Comparison {
+        word: "ascending",
+        sign: "asc",
+    },
+    Comparison {
+        word: "descending",
+        sign: "desc",
+    },
+];
+
 /// Every operation arc holds, in the order `arc operation list` prints them.
-const CATALOGUE: &[Operation] = &[Operation {
-    long_name: FILTER_ROWS,
-    summary: "Keeps the rows of a table for which a SQL condition holds.",
-    applied_to: &[
-        AppliedTo {
-            name: "table",
-            kind: "table",
-            of: None,
-            description: "The table whose rows are kept.",
-        },
-        AppliedTo {
-            name: "column",
-            kind: "column",
-            of: Some("table"),
-            description: "The column the condition is on; the condition may name others.",
-        },
-    ],
-    parameters: filter_rows_parameters,
-    sql: filter_rows_sql,
-}];
+const CATALOGUE: &[Operation] = &[
+    Operation {
+        long_name: FILTER_ROWS,
+        summary: "Keeps the rows of a table for which a SQL condition holds.",
+        applied_to: &[
+            AppliedTo {
+                name: "table",
+                kind: "table",
+                of: None,
+                description: "The table whose rows are kept.",
+            },
+            AppliedTo {
+                name: "column",
+                kind: "column",
+                of: Some("table"),
+                description: "The column the condition is on; the condition may name others.",
+            },
+        ],
+        parameters: filter_rows_parameters,
+        sql: filter_rows_sql,
+    },
+    Operation {
+        long_name: SORT_ROWS,
+        summary: "Orders the rows of a table by a SQL `ORDER BY` clause.",
+        applied_to: &[
+            AppliedTo {
+                name: "table",
+                kind: "table",
+                of: None,
+                description: "The table whose rows are ordered.",
+            },
+            AppliedTo {
+                name: "column",
+                kind: "column",
+                of: Some("table"),
+                description: "The column the order is by; the order may name others.",
+            },
+        ],
+        parameters: sort_rows_parameters,
+        sql: sort_rows_sql,
+    },
+];
 
 /// The `parameters` schema of [`FILTER_ROWS`]: one required string, `where`.
 /// Closed to any other key, as an operator's `with:` schema is.
@@ -604,6 +645,50 @@ fn filter_rows_sql(recording: &Recording) -> String {
         quote_ident(recording.name),
         from_ident(recording.on),
         recording.text("where"),
+    )
+}
+
+/// The `parameters` schema of [`SORT_ROWS`]: one required string, `order_by`.
+/// Closed to any other key, as [`filter_rows_parameters`] is.
+///
+/// `order_by` is annotated rather than constrained, and named by its key with no
+/// `title`, the way `where` is. `x-kind` says the value is an order, and
+/// `x-directions` lists the directions offered by word; a JSON Schema reader that
+/// does not know a key passes over it. The order is recorded as written, so the
+/// schema holds no `enum` and no `pattern` that would hold it to a column or to
+/// the directions listed.
+fn sort_rows_parameters() -> serde_json::Value {
+    let directions: Vec<serde_json::Value> = DIRECTIONS
+        .iter()
+        .map(|d| serde_json::json!({ "word": d.word, "sign": d.sign }))
+        .collect();
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "order_by": {
+                "type": "string",
+                "description": "The rows are put in the order this SQL `ORDER BY` clause gives, \
+                    recorded as written; the order may name several columns, each with a direction. \
+                    The directions listed are the ones offered by word, not a limit.",
+                "x-kind": "order",
+                "x-directions": directions,
+            }
+        },
+        "required": ["order_by"],
+    })
+}
+
+/// The SQL step of [`SORT_ROWS`]: a table named for the step, holding the rows of
+/// the table it is applied to in the order the clause gives. The table read and
+/// the order are written as given, as [`filter_rows_sql`]'s condition is.
+fn sort_rows_sql(recording: &Recording) -> String {
+    format!(
+        "CREATE OR REPLACE TABLE {} AS\nSELECT *\nFROM {}\nORDER BY {};\n",
+        quote_ident(recording.name),
+        from_ident(recording.on),
+        recording.text("order_by"),
     )
 }
 
@@ -697,10 +782,10 @@ impl AppliedTo {
 ///
 /// Refused, with the protocol's directory untouched: an operation arc does not
 /// hold; arguments the operation's `parameters` do not admit, whether one is
-/// missing, one is not taken or one is of the wrong type; a condition DuckDB's
-/// own parser reads as more than one statement (see [`one_statement`]); and a
-/// table no step of the protocol makes. Each refusal's message names what was
-/// wrong.
+/// missing, one is not taken or one is of the wrong type; a condition or an order
+/// DuckDB's own parser reads as more than one statement, or cannot parse at all
+/// (see [`one_statement`]); and a table no step of the protocol makes. Each
+/// refusal's message names what was wrong.
 pub(crate) fn record_operation(
     dir: &Path,
     long_name: &str,
@@ -736,7 +821,8 @@ impl Operation {
     /// Whether `arguments` are what the operation's `parameters` schema admits:
     /// each required argument present, no argument the schema does not name when
     /// it is closed, and each value of the type the schema gives it. A value
-    /// annotated `x-kind: condition` is also checked as a condition.
+    /// annotated with a clause `x-kind` — a `condition` or an `order` — is also
+    /// checked as that clause, through [`one_statement`].
     fn admit(&self, arguments: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
         let schema = (self.parameters)();
         let empty = serde_json::Map::new();
@@ -781,10 +867,10 @@ impl Operation {
                     self.long_name
                 )));
             }
-            if property["x-kind"] == "condition"
-                && let Some(condition) = value.as_str()
+            if let Some(clause) = Clause::of(&property["x-kind"])
+                && let Some(text) = value.as_str()
             {
-                one_statement(key, condition)?;
+                one_statement(key, clause, text)?;
             }
         }
         Ok(())
@@ -806,16 +892,48 @@ fn is_of_type(value: &serde_json::Value, ty: &str) -> bool {
     }
 }
 
-/// A condition goes into the step's `WHERE` verbatim, so arc records it only
-/// when DuckDB reads `SELECT 1 WHERE <condition>` as exactly one statement. The
-/// condition is put in the `WHERE` of that probe and handed to
-/// [`duckdb_statement_count`], which asks DuckDB to split the text into
-/// statements without binding or running any of them. The two other outcomes
-/// are refused at record time, the directory untouched:
+/// The SQL clause an annotated argument is written into, which fixes both the
+/// probe [`one_statement`] parses it inside and the word a refusal calls it by.
+/// `filter-rows`' `where` is a `WHERE` condition; `sort-rows`' `order_by` is an
+/// `ORDER BY` order. A value whose `x-kind` names neither has no clause and is
+/// not parse-checked.
+struct Clause {
+    /// The SQL keyword the value follows in the one-statement probe.
+    keyword: &'static str,
+    /// What a refusal calls the value.
+    noun: &'static str,
+}
+
+impl Clause {
+    /// The clause a value carrying this `x-kind` is written into, or `None` when
+    /// the annotation names no clause arc parse-checks.
+    fn of(x_kind: &serde_json::Value) -> Option<Clause> {
+        match x_kind.as_str() {
+            Some("condition") => Some(Clause {
+                keyword: "WHERE",
+                noun: "condition",
+            }),
+            Some("order") => Some(Clause {
+                keyword: "ORDER BY",
+                noun: "order",
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// A clause goes into the step's SQL verbatim, so arc records it only when DuckDB
+/// reads `SELECT 1 <clause> <value>` as exactly one statement — `SELECT 1 WHERE
+/// amount > 100` for a `filter-rows` condition, `SELECT 1 ORDER BY amount desc`
+/// for a `sort-rows` order. The value is put after `clause.keyword` in that probe
+/// and handed to [`duckdb_statement_count`], which asks DuckDB to split the text
+/// into statements without binding or running any of them. The two other
+/// outcomes are refused at record time, the directory untouched:
 ///
 /// * DuckDB reads more than one statement — a `;` outside every string and
-///   comment, with SQL after it, such as `amount > 100; DROP TABLE orders` —
-///   which would make the recorded step do more than the operation.
+///   comment, with SQL after it, such as `amount > 100; DROP TABLE orders` or
+///   `amount desc; DROP TABLE orders` — which would make the recorded step do
+///   more than the operation.
 /// * DuckDB cannot parse the probe at all (`duckdb_statement_count` is `0`).
 ///   `arc run` hands the recorded file to the `duckdb` CLI's `-f`, which runs
 ///   each statement it can read before it reaches the part it cannot, so a
@@ -824,27 +942,29 @@ fn is_of_type(value: &serde_json::Value, ty: &str) -> bool {
 ///   dot-command — would still drop `orders` on a run
 ///   (`arc_run_runs_a_valid_prefix_before_an_unparseable_tail` in
 ///   `tests/operation_record.rs` shows the run doing exactly that). arc will
-///   not record a condition it cannot confirm is a single statement.
+///   not record a value it cannot confirm is a single statement.
 ///
 /// Because DuckDB's own parser draws the line, however it reads a string or a
 /// comment — `E'\''` backslash escapes and a `--` comment ended by a carriage
-/// return included — a `;` inside one stays in the one statement. A condition
-/// ending in a bare `;` with nothing after it, such as `amount > 100;`, is a
-/// single statement and is recorded. Whether a condition also binds to the
-/// table it filters, rather than only parsing as one statement, is a later
-/// parse's to judge, so `amount > 100 UNION ALL SELECT * FROM orders` — one
-/// statement — is recorded as written.
-fn one_statement(key: &str, condition: &str) -> Result<()> {
-    let probe = format!("SELECT 1 WHERE {condition}");
+/// return included — a `;` inside one stays in the one statement. A value ending
+/// in a bare `;` with nothing after it, such as `amount > 100;`, is a single
+/// statement and is recorded. Whether a value also binds to the table, rather
+/// than only parsing as one statement, is a later parse's to judge, so
+/// `amount > 100 UNION ALL SELECT * FROM orders` and `amount desc LIMIT 1` — each
+/// one statement — are recorded as written.
+fn one_statement(key: &str, clause: Clause, value: &str) -> Result<()> {
+    let probe = format!("SELECT 1 {} {value}", clause.keyword);
     match duckdb_statement_count(&probe) {
         1 => Ok(()),
         0 => Err(refused(format!(
-            "the condition `{key}` is not one SQL statement DuckDB can parse, so arc cannot \
-             record it as one: {condition}"
+            "the {} `{key}` is not one SQL statement DuckDB can parse, so arc cannot \
+             record it as one: {value}",
+            clause.noun
         ))),
         _ => Err(refused(format!(
-            "the condition `{key}` holds a `;` outside a string or a comment, which would end \
-             the step's statement and begin another: {condition}"
+            "the {} `{key}` holds a `;` outside a string or a comment, which would end \
+             the step's statement and begin another: {value}",
+            clause.noun
         ))),
     }
 }
@@ -1283,6 +1403,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_sort_takes_one_required_order_and_no_other_key() {
+        let schema = sort_rows_parameters();
+        let order_by = &schema["properties"]["order_by"];
+
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["order_by"]),
+            "`order_by` is the one required parameter"
+        );
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::json!(false),
+            "the schema is closed to any other key"
+        );
+        assert_eq!(
+            schema["properties"].as_object().map(|p| p.len()),
+            Some(1),
+            "`order_by` is the one parameter; the column is not an argument"
+        );
+        assert_eq!(order_by["type"], "string", "`order_by` is a string");
+        assert_eq!(
+            order_by["x-kind"], "order",
+            "`order_by` does not say its value is an order"
+        );
+        assert!(
+            order_by["description"]
+                .as_str()
+                .is_some_and(|d| !d.trim().is_empty()),
+            "`order_by` has no description: {order_by}"
+        );
+        // Described by its key, recorded as written: no `title`, and nothing that
+        // would hold the order to a column or to the directions listed.
+        for absent in ["title", "enum", "pattern", "x-comparisons"] {
+            assert!(
+                order_by.get(absent).is_none(),
+                "`order_by` holds `{absent}`, which it must not: {order_by}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_order_offers_two_directions_by_word_and_sign_in_order() {
+        let schema = sort_rows_parameters();
+        assert_eq!(
+            schema["properties"]["order_by"]["x-directions"],
+            serde_json::json!([
+                { "word": "ascending", "sign": "asc" },
+                { "word": "descending", "sign": "desc" },
+            ]),
+            "the directions offered, in order, as a word and a sign"
+        );
+    }
+
     // ------------------------------------------------- recording an operation
 
     /// An operation with the given `parameters`, whose SQL is its `where`.
@@ -1298,6 +1472,36 @@ mod tests {
 
     fn arguments(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
         value.as_object().expect("an object").clone()
+    }
+
+    /// The two clauses arc parse-checks, named as [`Clause::of`] names them, for
+    /// the [`one_statement`] tests that call it directly.
+    const WHERE: Clause = Clause {
+        keyword: "WHERE",
+        noun: "condition",
+    };
+    const ORDER_BY: Clause = Clause {
+        keyword: "ORDER BY",
+        noun: "order",
+    };
+
+    #[test]
+    fn a_clause_is_chosen_by_x_kind_and_only_for_the_two_arc_checks() {
+        let condition = Clause::of(&serde_json::json!("condition")).expect("condition is a clause");
+        assert_eq!((condition.keyword, condition.noun), ("WHERE", "condition"));
+        let order = Clause::of(&serde_json::json!("order")).expect("order is a clause");
+        assert_eq!((order.keyword, order.noun), ("ORDER BY", "order"));
+        // Any other annotation names no clause, so its value is not parse-checked;
+        // this is also what pins the two arms above from being widened to a `_`
+        // that would answer every x-kind.
+        for other in [
+            serde_json::json!("sort"),
+            serde_json::json!(""),
+            serde_json::json!(null),
+            serde_json::json!(1),
+        ] {
+            assert!(Clause::of(&other).is_none(), "{other} was read as a clause");
+        }
     }
 
     #[test]
@@ -1358,7 +1562,7 @@ mod tests {
             "1 = 1; SELECT 42",
         ] {
             assert!(
-                one_statement("where", condition).is_err(),
+                one_statement("where", WHERE, condition).is_err(),
                 "{condition:?} was admitted"
             );
         }
@@ -1378,7 +1582,7 @@ mod tests {
             "amount > 100 UNION ALL SELECT * FROM orders", // one statement; a bind is a later parse's
         ] {
             assert!(
-                one_statement("where", condition).is_ok(),
+                one_statement("where", WHERE, condition).is_ok(),
                 "{condition:?} was refused"
             );
         }
@@ -1400,11 +1604,19 @@ mod tests {
             "a = 'b;",                              // an unterminated string
             "a > 1; /*", // a runnable prefix, then an unterminated block comment
         ] {
-            let refusal = one_statement("where", condition);
+            let refusal = one_statement("where", WHERE, condition);
             assert!(refusal.is_err(), "{condition:?} was admitted");
+            let message = refusal.unwrap_err().to_string();
             assert!(
-                refusal.unwrap_err().to_string().contains("`where`"),
+                message.contains("`where`"),
                 "{condition:?}: the refusal does not name the argument"
+            );
+            // The count-0 message, distinct from the more-than-one-statement one:
+            // deleting the `0` arm would route these through the `;` message and
+            // redden here, not just leave them refused.
+            assert!(
+                message.contains("is not one SQL statement DuckDB can parse"),
+                "{condition:?}: the refusal is not the cannot-parse one: {message}"
             );
         }
     }
@@ -1449,10 +1661,53 @@ mod tests {
             "amount > 100 --\r; DROP TABLE orders",
         ] {
             assert!(
-                one_statement("where", condition).is_err(),
+                one_statement("where", WHERE, condition).is_err(),
                 "{condition:?} was admitted"
             );
         }
+    }
+
+    /// An order is held to one statement by the `ORDER BY` probe, not the `WHERE`
+    /// one: `amount desc` parses after `ORDER BY` and would not after `WHERE`, so
+    /// the clause is what admits it. A refusal calls it an order and names its
+    /// argument, and the two refusals are told apart by their wording.
+    #[test]
+    fn an_order_is_held_to_one_statement_by_its_own_probe_and_named_an_order() {
+        // Recorded: DuckDB parses `SELECT 1 ORDER BY <order>` as one statement,
+        // including a multi-column order and one carrying a `;` inside a comment
+        // or a trailing `LIMIT` a later parse would judge.
+        for order in [
+            "amount desc",
+            "region, amount desc",
+            "amount desc LIMIT 1",
+            "amount desc /* ; */",
+            "note = 'a;b', amount desc",
+        ] {
+            assert!(
+                one_statement("order_by", ORDER_BY, order).is_ok(),
+                "{order:?} was refused"
+            );
+        }
+
+        // Refused as more than one statement — a real terminator.
+        let two = one_statement("order_by", ORDER_BY, "amount desc; DROP TABLE orders")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            two.contains("the order `order_by`") && two.contains("`;`"),
+            "a terminator refusal names the order and the `;`: {two}"
+        );
+
+        // Refused as a probe DuckDB cannot parse whole (count 0), with the message
+        // distinct from the terminator one so its arm is pinned.
+        let zero = one_statement("order_by", ORDER_BY, "amount desc; DROP TABLE orders; zzz")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            zero.contains("the order `order_by`")
+                && zero.contains("is not one SQL statement DuckDB can parse"),
+            "a cannot-parse refusal names the order and says it cannot parse: {zero}"
+        );
     }
 
     #[test]

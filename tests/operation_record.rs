@@ -55,6 +55,18 @@ FROM orders
 WHERE amount > 100;
 ";
 
+/// What recording `sort-rows` on `orders` as `by_amount` appends to `arcform.yaml`.
+const APPENDED_SORT_STEP: &str = "  - name: by_amount\n    sql: models/02_by_amount.sql\n";
+
+/// The model recording `sort-rows` on `orders` as `by_amount` writes, byte for byte.
+const BY_AMOUNT_MODEL: &str = "\
+-- generated: sort-rows on orders
+CREATE OR REPLACE TABLE \"by_amount\" AS
+SELECT *
+FROM orders
+ORDER BY amount desc;
+";
+
 /// A Protocol as it stands before anything is recorded, and a history store of
 /// its own beside it, outside the Protocol's directory.
 struct Protocol {
@@ -100,6 +112,23 @@ impl Protocol {
             "orders",
             "--name",
             "big_orders",
+            "--arg",
+            &arg,
+        ])
+    }
+
+    /// `arc operation record sort-rows --on orders --name by_amount` with
+    /// `order_by` set to `order`.
+    fn record_sort(&self, order: &str) -> Output {
+        let arg = format!("order_by={order}");
+        self.arc(&[
+            "operation",
+            "record",
+            "sort-rows",
+            "--on",
+            "orders",
+            "--name",
+            "by_amount",
             "--arg",
             &arg,
         ])
@@ -246,6 +275,86 @@ fn arc_run_runs_the_recorded_step_and_keeps_the_rows_the_condition_holds_for() {
     );
 }
 
+#[test]
+fn record_sort_writes_the_ordered_model_and_appends_one_step() {
+    let protocol = Protocol::new();
+    let before = protocol.files();
+
+    let out = protocol.record_sort("amount desc");
+    ok(&out, "arc operation record sort-rows");
+
+    assert_eq!(protocol.read("models/02_by_amount.sql"), BY_AMOUNT_MODEL);
+    assert_eq!(
+        protocol.read("models/02_by_amount.sql").lines().next(),
+        Some("-- generated: sort-rows on orders"),
+        "the first line names the operation and the table and nothing else"
+    );
+    assert_eq!(
+        protocol.read("arcform.yaml"),
+        format!("{MANIFEST}{APPENDED_SORT_STEP}"),
+        "the step is appended and every other byte of arcform.yaml is kept"
+    );
+
+    // Recording runs nothing: the one file the directory gained is the model, and
+    // every file it held is as it was, arcform.yaml apart.
+    let mut after = protocol.files();
+    let model = after
+        .remove(Path::new("models/02_by_amount.sql"))
+        .expect("the model was written");
+    assert_eq!(model, BY_AMOUNT_MODEL.as_bytes());
+    after.remove(Path::new("arcform.yaml"));
+    let mut untouched = before;
+    untouched.remove(Path::new("arcform.yaml"));
+    assert_eq!(
+        after.keys().collect::<Vec<_>>(),
+        untouched.keys().collect::<Vec<_>>(),
+        "recording added or removed a file other than the model"
+    );
+    assert_eq!(after, untouched, "recording changed a file it did not own");
+}
+
+#[test]
+fn arc_run_puts_the_rows_in_the_order_the_sort_stored() {
+    let protocol = Protocol::new();
+    ok(
+        &protocol.record_sort("amount desc"),
+        "arc operation record sort-rows",
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+
+    // `orders` holds amounts 50, 150, 300, 100 at ids 1, 2, 3, 4, so descending
+    // amount is ids 3, 2, 4, 1. Read with no ORDER BY and `preserve_insertion_order`
+    // at its default, so what comes back is the order the step stored.
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    let ids: Vec<i32> = db
+        .prepare("SELECT id FROM by_amount")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        ids,
+        [3, 2, 4, 1],
+        "by_amount holds every row of orders once, in descending order of amount"
+    );
+}
+
+#[test]
+fn a_multi_column_order_is_recorded_as_written() {
+    let protocol = Protocol::new();
+    ok(
+        &protocol.record_sort("region, amount desc"),
+        "arc operation record sort-rows",
+    );
+    let model = protocol.read("models/02_by_amount.sql");
+    assert_eq!(
+        model.lines().last(),
+        Some("ORDER BY region, amount desc;"),
+        "the order is recorded as written:\n{model}"
+    );
+}
+
 /// Why the record-time check refuses a condition DuckDB cannot parse whole,
 /// rather than admitting it as round two did: `arc run` hands a step's file to
 /// the `duckdb` CLI's `-f`, which runs each statement it can read before it
@@ -332,7 +441,7 @@ fn a_request_the_operation_does_not_admit_is_refused_with_the_directory_untouche
         (
             "an operation arc does not hold",
             &[
-                "sort-rows",
+                "no-such-operation",
                 "--on",
                 "orders",
                 "--name",
@@ -340,7 +449,7 @@ fn a_request_the_operation_does_not_admit_is_refused_with_the_directory_untouche
                 "--arg",
                 "where=amount > 100",
             ],
-            &["`sort-rows`", "filter-rows"],
+            &["`no-such-operation`", "filter-rows"],
         ),
         (
             "a table no step makes",
@@ -464,6 +573,62 @@ fn any_other_condition_is_recorded_as_written() {
     }
 }
 
+#[test]
+fn an_order_that_is_not_one_statement_is_refused_with_the_directory_untouched() {
+    // A real terminator, a runnable prefix with an unparseable tail (a bare word,
+    // and a `.` dot-command), and the two forms a hand-written splitter missed —
+    // an `E'...'` escape and a `--` comment ended by a carriage return — each
+    // carries a top-level `;` DuckDB acts on under the `ORDER BY` probe, so
+    // `arc run` would drop `orders`; each is refused, the directory untouched, and
+    // the message names `order_by`. The lower-case `e'...'` is the same literal.
+    for order in [
+        "amount desc; DROP TABLE orders",
+        "amount desc; DROP TABLE orders; zzz",
+        "amount desc; DROP TABLE orders;\n.print done",
+        r"note = E'\'' ; DROP TABLE orders ; --'",
+        r"note = e'\'' ; DROP TABLE orders ; --'",
+        "amount desc --\r; DROP TABLE orders",
+    ] {
+        let protocol = Protocol::new();
+        let before = protocol.files();
+        let out = protocol.record_sort(order);
+        refused(&out, &["`order_by`"]);
+        assert_eq!(protocol.files(), before, "{order:?}: the directory changed");
+    }
+}
+
+#[test]
+fn a_sort_missing_its_order_or_given_a_where_is_refused_with_the_directory_untouched() {
+    // No `order_by` names the missing required argument; a `where` names the
+    // argument sort-rows does not take. Each is refused, the directory untouched.
+    let cases: [(&[&str], &str); 2] = [
+        (
+            &["sort-rows", "--on", "orders", "--name", "by_amount"],
+            "`order_by`",
+        ),
+        (
+            &[
+                "sort-rows",
+                "--on",
+                "orders",
+                "--name",
+                "by_amount",
+                "--arg",
+                "where=amount > 100",
+            ],
+            "`where`",
+        ),
+    ];
+    for (args, named) in cases {
+        let protocol = Protocol::new();
+        let before = protocol.files();
+        let mut argv = vec!["operation", "record"];
+        argv.extend_from_slice(args);
+        refused(&protocol.arc(&argv), &[named]);
+        assert_eq!(protocol.files(), before, "{args:?}: the directory changed");
+    }
+}
+
 // --------------------------------------------------------------------- mcp
 
 #[cfg(feature = "mcp")]
@@ -555,6 +720,77 @@ mod mcp {
     }
 
     #[test]
+    fn the_tool_records_a_sort_as_the_terminal_does() {
+        let terminal = Protocol::new();
+        let agent = Protocol::new();
+        ok(
+            &terminal.record_sort("amount desc"),
+            "arc operation record sort-rows",
+        );
+
+        let result = call_operation_record(
+            &agent.dir,
+            &agent.history,
+            json!({
+                "operation": "sort-rows",
+                "on": "orders",
+                "name": "by_amount",
+                "arguments": { "order_by": "amount desc" },
+            }),
+        );
+        assert_ne!(
+            result["isError"],
+            true,
+            "the call failed: {}",
+            text(&result)
+        );
+        assert_eq!(result["structuredContent"]["step"], "by_amount");
+        assert_eq!(
+            result["structuredContent"]["model"],
+            "models/02_by_amount.sql"
+        );
+
+        assert_eq!(
+            agent.files(),
+            terminal.files(),
+            "the Protocol the agent recorded into differs from the one the terminal did"
+        );
+        assert_eq!(agent.read("models/02_by_amount.sql"), BY_AMOUNT_MODEL);
+    }
+
+    #[test]
+    fn the_tool_refuses_an_order_the_terminal_refuses_with_the_directory_untouched() {
+        for order in [
+            "amount desc; DROP TABLE orders",
+            "amount desc; DROP TABLE orders; zzz",
+            "amount desc; DROP TABLE orders;\n.print done",
+            r"note = E'\'' ; DROP TABLE orders ; --'",
+            r"note = e'\'' ; DROP TABLE orders ; --'",
+            "amount desc --\r; DROP TABLE orders",
+        ] {
+            let protocol = Protocol::new();
+            let before = protocol.files();
+            let mut arguments = json!({
+                "operation": "sort-rows", "on": "orders", "name": "by_amount",
+                "arguments": { "order_by": order },
+            });
+            arguments["dir"] = json!(protocol.dir.to_str().unwrap());
+            let result = call_operation_record(
+                protocol.history.parent().unwrap(),
+                &protocol.history,
+                arguments.clone(),
+            );
+            assert_eq!(result["isError"], true, "{order:?} was not refused");
+            assert!(
+                text(&result).contains("`order_by`"),
+                "the refusal of {order:?} does not name order_by: {}",
+                text(&result)
+            );
+            assert_eq!(protocol.files(), before, "{order:?}: the directory changed");
+        }
+    }
+
+    #[test]
     fn the_tool_refuses_what_the_terminal_refuses_with_the_directory_untouched() {
         let cases = [
             (
@@ -570,10 +806,10 @@ mod mcp {
             ),
             (
                 json!({
-                    "operation": "sort-rows", "on": "orders", "name": "big_orders",
+                    "operation": "no-such-operation", "on": "orders", "name": "big_orders",
                     "arguments": { "where": "amount > 100" },
                 }),
-                vec!["`sort-rows`"],
+                vec!["`no-such-operation`"],
             ),
             (
                 json!({
