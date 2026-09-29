@@ -118,7 +118,8 @@ pub enum Commands {
         cmd: RegistryCmd,
     },
 
-    /// List the SQL operations arc holds, and describe what one takes.
+    /// List the SQL operations arc holds, describe what one takes, and record
+    /// one as a step of a protocol.
     Operation {
         #[command(subcommand)]
         cmd: OperationCmd,
@@ -127,8 +128,9 @@ pub enum Commands {
     /// Serve a Model Context Protocol server over stdio, for AI-agent and editor
     /// integration. Federates the `finetype` CLI as tools (infer / profile / taxonomy
     /// / validate / generate) and adds `protocol_run` (run a Protocol, return its
-    /// Protocol+Run contract), `operator_describe` (an operator's `with:` schema) and
-    /// `operation_describe` (the SQL operations arc holds, and what one takes).
+    /// Protocol+Run contract), `operator_describe` (an operator's `with:` schema),
+    /// `operation_describe` (the SQL operations arc holds, and what one takes) and
+    /// `operation_record` (record an operation as a step of a Protocol).
     #[cfg(feature = "mcp")]
     Mcp,
 }
@@ -148,6 +150,30 @@ pub enum OperationCmd {
     Describe {
         /// The operation's long name, as listed by `arc operation list`.
         long_name: String,
+    },
+    /// Record an operation as a new step at the end of a protocol: a generated
+    /// model under `models/` and a step in arcform.yaml naming it. Runs nothing;
+    /// `arc run` runs the step.
+    Record {
+        /// The operation's long name, as listed by `arc operation list`.
+        long_name: String,
+
+        /// The table the operation is applied to, one a step of the protocol makes.
+        #[arg(long)]
+        on: String,
+
+        /// The new step's name, which is also the name of the table it makes.
+        #[arg(long)]
+        name: String,
+
+        /// An argument of the operation (repeatable), as `arc operation describe`
+        /// lists them. Format: KEY=VALUE.
+        #[arg(long = "arg", value_name = "KEY=VALUE")]
+        args: Vec<String>,
+
+        /// Protocol directory (where arcform.yaml lives).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
     },
 }
 
@@ -631,12 +657,24 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     }
 }
 
-/// Execute an `arc operation` verb. Neither verb reads a protocol or opens a
-/// database: the answer comes from the catalogue arc holds.
+/// Execute an `arc operation` verb. `list` and `describe` read no protocol and
+/// open no database: the answer comes from the catalogue arc holds. `record`
+/// writes a step into a protocol and opens no database either.
 fn dispatch_operation(cmd: OperationCmd, out: &mut impl Write) -> Result<()> {
     match cmd {
         OperationCmd::List { json } => operation_list(json, out),
         OperationCmd::Describe { long_name } => operation_describe(&long_name, out),
+        OperationCmd::Record {
+            long_name,
+            on,
+            name,
+            args,
+            dir,
+        } => {
+            let arguments = operation_arguments(&args)?;
+            let history = LocalHistory::open_default()?;
+            operation_record(&dir, &long_name, &on, &name, &arguments, &history, out)
+        }
     }
 }
 
@@ -670,6 +708,55 @@ fn operation_describe(long_name: &str, out: &mut impl Write) -> Result<()> {
     };
     writeln!(out, "{:#}", op.description())?;
     Ok(())
+}
+
+/// Execute `arc operation record`: hand the request to the record path, which
+/// writes the step's SQL from the operation's catalogue entry. Nothing here
+/// names an operation or an argument. A refusal is the error, with nothing
+/// written to the protocol or to `out`.
+fn operation_record(
+    dir: &Path,
+    long_name: &str,
+    on: &str,
+    name: &str,
+    arguments: &serde_json::Map<String, serde_json::Value>,
+    history: &LocalHistory,
+    out: &mut impl Write,
+) -> Result<()> {
+    let model = crate::record::record_operation(dir, long_name, on, name, arguments, history)?;
+    writeln!(
+        out,
+        "recorded step {name} as {} in {} — `arc run` runs it",
+        model.display(),
+        dir.join(crate::spec::MANIFEST_FILENAME).display()
+    )?;
+    Ok(())
+}
+
+/// The `--arg KEY=VALUE` values as the operation's arguments, each a string.
+/// An entry without `=` is refused, and so is a key given twice, rather than
+/// one value silently winning.
+fn operation_arguments(args: &[String]) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let mut arguments = serde_json::Map::new();
+    for entry in args {
+        let Some((key, value)) = entry.split_once('=') else {
+            return Err(Error::Io(std::io::Error::other(format!(
+                "`--arg {entry}` must be KEY=VALUE"
+            ))));
+        };
+        if arguments
+            .insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            )
+            .is_some()
+        {
+            return Err(Error::Io(std::io::Error::other(format!(
+                "`--arg {key}` is given more than once"
+            ))));
+        }
+    }
+    Ok(arguments)
 }
 
 fn dispatch_history(cmd: HistoryCmd) -> Result<()> {
@@ -1385,5 +1472,62 @@ mod tests {
     fn operation_describe_reports_a_failed_write() {
         let err = operation_describe("filter-rows", &mut FailingWriter).unwrap_err();
         assert!(err.to_string().contains("stdout is closed"), "{err}");
+    }
+
+    #[test]
+    fn operation_record_reports_a_failed_write() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("shop");
+        std::fs::create_dir_all(dir.join("models")).unwrap();
+        std::fs::write(
+            dir.join("arcform.yaml"),
+            "name: shop\nsteps:\n  - name: orders\n    sql: models/orders.sql\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("models/orders.sql"),
+            "CREATE TABLE orders AS SELECT 1 AS amount;\n",
+        )
+        .unwrap();
+        let arguments = operation_arguments(&["where=amount > 0".to_string()]).unwrap();
+        let history = LocalHistory::at_root(root.path().join("history"));
+        let err = operation_record(
+            &dir,
+            "filter-rows",
+            "orders",
+            "big",
+            &arguments,
+            &history,
+            &mut FailingWriter,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("stdout is closed"), "{err}");
+    }
+
+    #[test]
+    fn operation_arguments_split_each_at_its_first_equals_sign() {
+        let arguments =
+            operation_arguments(&["where=region = 'north'".to_string(), "label=".to_string()])
+                .unwrap();
+        assert_eq!(
+            serde_json::Value::Object(arguments),
+            serde_json::json!({ "where": "region = 'north'", "label": "" })
+        );
+    }
+
+    #[test]
+    fn operation_arguments_refuse_an_entry_without_a_value_and_a_repeated_key() {
+        let err = operation_arguments(&["where".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("`--arg where` must be KEY=VALUE"),
+            "{err}"
+        );
+        let err = operation_arguments(&["where=a > 1".to_string(), "where=b > 1".to_string()])
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`--arg where` is given more than once"),
+            "{err}"
+        );
     }
 }

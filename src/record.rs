@@ -466,6 +466,30 @@ pub(crate) struct Operation {
     applied_to: &'static [AppliedTo],
     /// The operation's arguments as a JSON Schema.
     parameters: fn() -> serde_json::Value,
+    /// The step's SQL, written from a recording whose arguments `parameters`
+    /// has already admitted.
+    sql: fn(&Recording) -> String,
+}
+
+/// What an operation's SQL is written from: the new step's name, which is also
+/// the name of the table the step makes; the table the operation is applied to,
+/// as given; and the operation's arguments.
+pub(crate) struct Recording<'a> {
+    name: &'a str,
+    on: &'a str,
+    arguments: &'a serde_json::Map<String, serde_json::Value>,
+}
+
+impl Recording<'_> {
+    /// The string argument `key`, or `""` when it is absent. The arguments are
+    /// checked against the operation's `parameters` before its SQL is written, so
+    /// a required string is present by then.
+    fn text(&self, key: &str) -> &str {
+        self.arguments
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    }
 }
 
 /// One thing an operation is applied to. It is supplied by where the operation
@@ -537,6 +561,7 @@ const CATALOGUE: &[Operation] = &[Operation {
         },
     ],
     parameters: filter_rows_parameters,
+    sql: filter_rows_sql,
 }];
 
 /// The `parameters` schema of [`FILTER_ROWS`]: one required string, `where`.
@@ -568,6 +593,44 @@ fn filter_rows_parameters() -> serde_json::Value {
         },
         "required": ["where"],
     })
+}
+
+/// The SQL step of [`FILTER_ROWS`]: a table named for the step, holding the rows
+/// of the table it is applied to for which the condition holds. The table read
+/// and the condition are written as given.
+fn filter_rows_sql(recording: &Recording) -> String {
+    format!(
+        "CREATE OR REPLACE TABLE {} AS\nSELECT *\nFROM {}\nWHERE {};\n",
+        quote_ident(recording.name),
+        from_ident(recording.on),
+        recording.text("where"),
+    )
+}
+
+/// `name` as a double-quoted SQL identifier, a `"` inside it doubled. The step's
+/// own name is always quoted, so a name arc admits that would otherwise read as
+/// SQL — [`valid_step_name`] admits a `"` — cannot break out of the statement.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// A table name for the `FROM` clause. A name of only ASCII letters, digits and
+/// underscores that does not open with a digit is written bare — a plain
+/// `orders` unchanged, folded by DuckDB as it always was, so `FROM orders` reads
+/// the same, and brightfield's `to_pushdown_sql` writes the same line. Any other
+/// name — one a step could only have made under quotes, holding a space, a `"`
+/// or a `;` — is quoted through [`quote_ident`], so a table the protocol makes
+/// cannot break out of the `FROM` into SQL of its own, the same class as the
+/// condition's terminator.
+fn from_ident(name: &str) -> String {
+    let bare = !name.is_empty()
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if bare {
+        name.to_string()
+    } else {
+        quote_ident(name)
+    }
 }
 
 /// Every operation arc holds, in catalogue order.
@@ -615,6 +678,249 @@ impl AppliedTo {
         entry["description"] = self.description.into();
         entry
     }
+}
+
+// ------------------------------------------------- recording an operation
+
+/// Record the operation called `long_name`, applied to the table `on`, as a new
+/// step named `name` at the end of the protocol at `dir`, and return the model's
+/// path relative to `dir`.
+///
+/// The operation's SQL is written from its catalogue entry, so a caller names no
+/// operation and no argument of its own: the command line and `arc mcp` hand
+/// over what they were given, and an operation added to the catalogue is
+/// recorded through both with no edit to either. The model's first line is the
+/// long name and the table, ` on ` between them, and nothing else, so the same
+/// request writes the same bytes whoever sends it. The step is recorded through
+/// [`record_step_with_history`](crate::history::record_step_with_history), so
+/// each recording is a version of the protocol, and it runs nothing.
+///
+/// Refused, with the protocol's directory untouched: an operation arc does not
+/// hold; arguments the operation's `parameters` do not admit, whether one is
+/// missing, one is not taken or one is of the wrong type; a condition DuckDB's
+/// own parser reads as more than one statement (see [`one_statement`]); and a
+/// table no step of the protocol makes. Each refusal's message names what was
+/// wrong.
+pub(crate) fn record_operation(
+    dir: &Path,
+    long_name: &str,
+    on: &str,
+    name: &str,
+    arguments: &serde_json::Map<String, serde_json::Value>,
+    history: &crate::history::LocalHistory,
+) -> Result<PathBuf> {
+    let Some(op) = operation(long_name) else {
+        let held: Vec<&str> = CATALOGUE.iter().map(|op| op.long_name).collect();
+        return Err(refused(format!(
+            "no operation called `{long_name}`; the operations arc holds are {}",
+            held.join(", ")
+        )));
+    };
+    op.admit(arguments)?;
+    made_by_a_step(dir, on)?;
+
+    let step = RecordedStep {
+        name: name.to_string(),
+        sql: (op.sql)(&Recording {
+            name,
+            on,
+            arguments,
+        }),
+        provenance: format!("{} on {on}", op.long_name),
+    };
+    let (sql_rel, _) = crate::history::record_step_with_history(dir, &step, history)?;
+    Ok(sql_rel)
+}
+
+impl Operation {
+    /// Whether `arguments` are what the operation's `parameters` schema admits:
+    /// each required argument present, no argument the schema does not name when
+    /// it is closed, and each value of the type the schema gives it. A value
+    /// annotated `x-kind: condition` is also checked as a condition.
+    fn admit(&self, arguments: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+        let schema = (self.parameters)();
+        let empty = serde_json::Map::new();
+        let properties = schema["properties"].as_object().unwrap_or(&empty);
+        let taken = || {
+            properties
+                .keys()
+                .map(|key| format!("`{key}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        if schema["additionalProperties"] == serde_json::Value::Bool(false) {
+            for key in arguments.keys() {
+                if !properties.contains_key(key) {
+                    return Err(refused(format!(
+                        "`{}` takes no argument `{key}`; it takes {}",
+                        self.long_name,
+                        taken()
+                    )));
+                }
+            }
+        }
+        let required = schema["required"].as_array().into_iter().flatten();
+        for required in required.filter_map(serde_json::Value::as_str) {
+            if !arguments.contains_key(required) {
+                return Err(refused(format!(
+                    "`{}` needs the argument `{required}`, and none was given",
+                    self.long_name
+                )));
+            }
+        }
+        for (key, value) in arguments {
+            let Some(property) = properties.get(key) else {
+                continue;
+            };
+            if let Some(ty) = property["type"].as_str()
+                && !is_of_type(value, ty)
+            {
+                return Err(refused(format!(
+                    "the argument `{key}` of `{}` is a {ty}, not {value}",
+                    self.long_name
+                )));
+            }
+            if property["x-kind"] == "condition"
+                && let Some(condition) = value.as_str()
+            {
+                one_statement(key, condition)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether `value` is of the JSON Schema type `ty`. A type the schema language
+/// does not name admits any value.
+fn is_of_type(value: &serde_json::Value, ty: &str) -> bool {
+    match ty {
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "number" => value.is_number(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        "null" => value.is_null(),
+        _ => true,
+    }
+}
+
+/// A condition goes into the step's `WHERE` verbatim, so arc records it only
+/// when DuckDB reads `SELECT 1 WHERE <condition>` as exactly one statement. The
+/// condition is put in the `WHERE` of that probe and handed to
+/// [`duckdb_statement_count`], which asks DuckDB to split the text into
+/// statements without binding or running any of them. The two other outcomes
+/// are refused at record time, the directory untouched:
+///
+/// * DuckDB reads more than one statement — a `;` outside every string and
+///   comment, with SQL after it, such as `amount > 100; DROP TABLE orders` —
+///   which would make the recorded step do more than the operation.
+/// * DuckDB cannot parse the probe at all (`duckdb_statement_count` is `0`).
+///   `arc run` hands the recorded file to the `duckdb` CLI's `-f`, which runs
+///   each statement it can read before it reaches the part it cannot, so a
+///   runnable `;`-terminated prefix followed by an unparseable tail —
+///   `amount > 100; DROP TABLE orders; zzz`, or the same closing with a `.`
+///   dot-command — would still drop `orders` on a run
+///   (`arc_run_runs_a_valid_prefix_before_an_unparseable_tail` in
+///   `tests/operation_record.rs` shows the run doing exactly that). arc will
+///   not record a condition it cannot confirm is a single statement.
+///
+/// Because DuckDB's own parser draws the line, however it reads a string or a
+/// comment — `E'\''` backslash escapes and a `--` comment ended by a carriage
+/// return included — a `;` inside one stays in the one statement. A condition
+/// ending in a bare `;` with nothing after it, such as `amount > 100;`, is a
+/// single statement and is recorded. Whether a condition also binds to the
+/// table it filters, rather than only parsing as one statement, is a later
+/// parse's to judge, so `amount > 100 UNION ALL SELECT * FROM orders` — one
+/// statement — is recorded as written.
+fn one_statement(key: &str, condition: &str) -> Result<()> {
+    let probe = format!("SELECT 1 WHERE {condition}");
+    match duckdb_statement_count(&probe) {
+        1 => Ok(()),
+        0 => Err(refused(format!(
+            "the condition `{key}` is not one SQL statement DuckDB can parse, so arc cannot \
+             record it as one: {condition}"
+        ))),
+        _ => Err(refused(format!(
+            "the condition `{key}` holds a `;` outside a string or a comment, which would end \
+             the step's statement and begin another: {condition}"
+        ))),
+    }
+}
+
+/// The number of SQL statements DuckDB parses in `sql`, or `0` when DuckDB
+/// cannot parse it (a parse error, or a string DuckDB's C API cannot take
+/// because it holds a NUL). It asks DuckDB's own parser through the `duckdb`
+/// crate arc already links, on a fresh in-memory database that binds and runs
+/// nothing: `duckdb_extract_statements` splits a query into statements, and this
+/// reads only the count it returns. No extracted statement is prepared, bound or
+/// executed, so a condition carrying `DROP TABLE orders` after a `;` is counted,
+/// never run, by this check. A parse error and a statement count share one
+/// return, `usize`: [`one_statement`] admits only a `1` and refuses both a `0`
+/// and a count above one, with a distinct message for each, so the two need not
+/// be told apart by the type.
+fn duckdb_statement_count(sql: &str) -> usize {
+    use duckdb::ffi;
+    // A NUL byte cannot reach DuckDB's C API, so such a string cannot be parsed
+    // into statements here; it counts `0`, which the caller refuses.
+    let Ok(query) = std::ffi::CString::new(sql) else {
+        return 0;
+    };
+    // SAFETY: `db` and `con` are null until DuckDB fills them and are checked
+    // for success before use; each is destroyed exactly once, in reverse order
+    // of creation, before returning. The connection is in-memory, and the only
+    // call made on it is `duckdb_extract_statements`, which parses the query and
+    // does not prepare, bind or execute any statement in it.
+    unsafe {
+        let mut db: ffi::duckdb_database = std::ptr::null_mut();
+        if ffi::duckdb_open(std::ptr::null(), &mut db) != ffi::DuckDBSuccess {
+            ffi::duckdb_close(&mut db);
+            return 0;
+        }
+        let mut con: ffi::duckdb_connection = std::ptr::null_mut();
+        if ffi::duckdb_connect(db, &mut con) != ffi::DuckDBSuccess {
+            ffi::duckdb_disconnect(&mut con);
+            ffi::duckdb_close(&mut db);
+            return 0;
+        }
+        let mut extracted: ffi::duckdb_extracted_statements = std::ptr::null_mut();
+        // `duckdb_extract_statements` returns 0 on a parse error, else the
+        // number of statements it split the query into.
+        let count = ffi::duckdb_extract_statements(con, query.as_ptr(), &mut extracted);
+        ffi::duckdb_destroy_extracted(&mut extracted);
+        ffi::duckdb_disconnect(&mut con);
+        ffi::duckdb_close(&mut db);
+        count as usize
+    }
+}
+
+/// Whether a step of the protocol at `dir` makes the table `on`, as `arc run`
+/// reads what each step makes. A table name matches in any case, as DuckDB's
+/// does; a file a step writes is not a table.
+fn made_by_a_step(dir: &Path, on: &str) -> Result<()> {
+    let manifest = Manifest::load(dir)?;
+    let graph = crate::asset::AssetGraph::build(&manifest, dir);
+    let wanted = on.to_lowercase();
+    let made = graph.steps.values().any(|assets| {
+        assets.produces.contains(&wanted)
+            && assets.declared_kind.get(&wanted) == Some(&crate::asset_kind::AssetKind::Table)
+    });
+    if !made {
+        return Err(refused(format!(
+            "no step of the protocol makes a table called `{on}`; an operation is applied to \
+             a table a step makes"
+        )));
+    }
+    Ok(())
+}
+
+/// A request to record an operation that is refused before anything is written.
+fn refused(message: String) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message,
+    ))
 }
 
 // --------------------------------------------------------------------- tests
@@ -975,5 +1281,219 @@ mod tests {
             ]),
             "the comparisons offered, in order, as a word and a sign"
         );
+    }
+
+    // ------------------------------------------------- recording an operation
+
+    /// An operation with the given `parameters`, whose SQL is its `where`.
+    fn operation_taking(parameters: fn() -> serde_json::Value) -> Operation {
+        Operation {
+            long_name: "test-op",
+            summary: "A test operation.",
+            applied_to: &[],
+            parameters,
+            sql: |recording| recording.text("where").to_string(),
+        }
+    }
+
+    fn arguments(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        value.as_object().expect("an object").clone()
+    }
+
+    #[test]
+    fn an_open_schema_admits_an_argument_it_does_not_name() {
+        let op = operation_taking(
+            || serde_json::json!({ "type": "object", "properties": { "a": { "type": "string" } } }),
+        );
+        assert!(op.admit(&arguments(serde_json::json!({ "b": 1 }))).is_ok());
+    }
+
+    #[test]
+    fn a_value_of_the_wrong_type_is_refused_naming_the_argument_and_its_type() {
+        let op = operation(FILTER_ROWS).unwrap();
+        let err = op
+            .admit(&arguments(serde_json::json!({ "where": 100 })))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`where`") && err.contains("string"), "{err}");
+    }
+
+    #[test]
+    fn only_a_value_annotated_as_a_condition_is_held_to_one_statement() {
+        let op = operation_taking(|| {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "label": { "type": "string" },
+                    "where": { "type": "string", "x-kind": "condition" },
+                },
+            })
+        });
+        // The same text — a `;` before a second, parseable statement — passes as
+        // a plain `label` and is refused as a `where`, because only the value
+        // annotated `x-kind: condition` is held to one statement.
+        assert!(
+            op.admit(&arguments(
+                serde_json::json!({ "label": "a > 1; DROP TABLE t" })
+            ))
+            .is_ok()
+        );
+        assert!(
+            op.admit(&arguments(
+                serde_json::json!({ "where": "a > 1; DROP TABLE t" })
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_terminator_is_found_where_duckdb_ends_a_statement() {
+        // Refused: DuckDB parses a second statement, so the `;` is a real
+        // terminator — a `;` outside every string and comment with more SQL
+        // after it. This is what would make the recorded step more than the
+        // operation.
+        for condition in [
+            "a > 1; DROP TABLE orders",
+            "a > 1;\nDROP TABLE orders", // a newline does not hide the terminator
+            "1 = 1; SELECT 42",
+        ] {
+            assert!(
+                one_statement("where", condition).is_err(),
+                "{condition:?} was admitted"
+            );
+        }
+        // Recorded: DuckDB parses exactly one statement. A `;` inside a string
+        // or a comment stays there, whatever DuckDB's own rule for where that
+        // string or comment ends; a bare trailing `;`, and an empty statement
+        // after it, add no second statement. Whether such a condition binds is a
+        // later parse's to judge.
+        for condition in [
+            "a = ';'",
+            "a > 1 -- ;",
+            "a > 1 /* ; */",
+            "\"a;b\" > 1",
+            "$$;$$ = a",
+            "a > 1;",  // bare trailing terminator: one statement, nothing after
+            "a > 1;;", // ... and an empty statement after it is still nothing
+            "amount > 100 UNION ALL SELECT * FROM orders", // one statement; a bind is a later parse's
+        ] {
+            assert!(
+                one_statement("where", condition).is_ok(),
+                "{condition:?} was refused"
+            );
+        }
+    }
+
+    /// A probe DuckDB cannot parse at all counts `0`, and is refused, not
+    /// recorded. `arc run` runs the statements the `duckdb` CLI can read in a
+    /// step's file before it reaches the one it cannot, so a runnable
+    /// `;`-terminated prefix with an unparseable tail — a bare word, or a `.`
+    /// dot-command — would drop a table on a run though the probe as a whole
+    /// does not parse. Round two read a `0` as one statement's worth of text and
+    /// admitted these; round three refuses them, since arc cannot confirm they
+    /// are one statement.
+    #[test]
+    fn a_probe_duckdb_cannot_parse_at_all_is_refused() {
+        for condition in [
+            "amount > 100; DROP TABLE orders; zzz", // runnable DROP, unparseable word after
+            "amount > 100; DROP TABLE orders;\n.print done", // ... a `.` dot-command after
+            "a = 'b;",                              // an unterminated string
+            "a > 1; /*", // a runnable prefix, then an unterminated block comment
+        ] {
+            let refusal = one_statement("where", condition);
+            assert!(refusal.is_err(), "{condition:?} was admitted");
+            assert!(
+                refusal.unwrap_err().to_string().contains("`where`"),
+                "{condition:?}: the refusal does not name the argument"
+            );
+        }
+    }
+
+    #[test]
+    fn quote_ident_doubles_an_embedded_quote() {
+        // The step's name is always quoted, even a plain one, so the model's
+        // CREATE line reads `CREATE OR REPLACE TABLE "big_orders" AS`.
+        assert_eq!(quote_ident("big_orders"), "\"big_orders\"");
+        // A `"` in the name — `valid_step_name` admits one — is doubled, so the
+        // CREATE parses. Removing the doubling reddens this (the mutation that
+        // survived round one); a bare `"a"b"` would not parse as one identifier.
+        assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn the_from_table_is_quoted_only_when_a_bare_name_would_not_carry_it() {
+        // A plain identifier is written bare, so the model's line reads
+        // `FROM orders` and DuckDB folds the reference as it did before.
+        assert_eq!(from_ident("orders"), "orders");
+        assert_eq!(from_ident("big_orders"), "big_orders");
+        // A name a step could only have made quoted is quoted here, each `"`
+        // doubled, so it cannot break out of the `FROM`. Writing it bare — the
+        // round-one behaviour — reddens each of these.
+        assert_eq!(from_ident("weird; drop"), "\"weird; drop\"");
+        assert_eq!(from_ident("a\"b"), "\"a\"\"b\"");
+        assert_eq!(from_ident("has space"), "\"has space\"");
+        assert_eq!(from_ident("1st"), "\"1st\"");
+    }
+
+    /// The two inputs round one admitted, because its `statement_byte_ranges`
+    /// splitter read a string escape and a comment end differently from DuckDB.
+    /// DuckDB's own parser ends the `E'\''` string at the escaped-then-closed
+    /// quote and the `--` comment at the carriage return, so each carries a
+    /// top-level `;` and a second statement, and each is refused. The lower-case
+    /// `e'...'` is the same string literal.
+    #[test]
+    fn the_forms_a_hand_written_splitter_missed_are_refused() {
+        for condition in [
+            r"note = E'\'' ; DROP TABLE orders ; --'",
+            r"note = e'\'' ; DROP TABLE orders ; --'",
+            "amount > 100 --\r; DROP TABLE orders",
+        ] {
+            assert!(
+                one_statement("where", condition).is_err(),
+                "{condition:?} was admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn each_json_schema_type_admits_its_own_values_only() {
+        let values = [
+            ("string", serde_json::json!("a")),
+            ("boolean", serde_json::json!(true)),
+            ("integer", serde_json::json!(3)),
+            ("number", serde_json::json!(2.5)),
+            ("array", serde_json::json!([])),
+            ("object", serde_json::json!({})),
+            ("null", serde_json::Value::Null),
+        ];
+        for (ty, _) in &values {
+            for (other, value) in &values {
+                let admitted = is_of_type(value, ty);
+                let expected = ty == other || (*ty == "number" && *other == "integer");
+                assert_eq!(admitted, expected, "{value} as a {ty}");
+            }
+        }
+        assert!(is_of_type(&serde_json::json!(u64::MAX), "integer"));
+        assert!(is_of_type(&serde_json::json!("a"), "no-such-type"));
+    }
+
+    #[test]
+    fn the_table_is_one_a_step_makes_in_any_case_and_not_a_file_it_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("models")).unwrap();
+        std::fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            "name: shop\nsteps:\n  - name: orders\n    sql: models/orders.sql\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models/orders.sql"),
+            "CREATE TABLE orders AS SELECT 1 AS id;\nCOPY orders TO 'build/orders.csv';\n",
+        )
+        .unwrap();
+        assert!(made_by_a_step(dir.path(), "orders").is_ok());
+        assert!(made_by_a_step(dir.path(), "ORDERS").is_ok());
+        let err = made_by_a_step(dir.path(), "build/orders.csv").unwrap_err();
+        assert!(err.to_string().contains("`build/orders.csv`"), "{err}");
     }
 }
