@@ -356,6 +356,7 @@ fn create_spec_serialises_directly_and_the_result_runs() {
         name: "fresh".into(),
         engine: "duckdb".into(),
         engine_version: None,
+        extensions: Default::default(),
         db: None,
         params: Default::default(),
         dotenv: Vec::new(),

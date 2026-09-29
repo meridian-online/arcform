@@ -10,7 +10,7 @@ use crate::asset_kind::AssetKind;
 use crate::contract;
 use crate::engine::{
     ALLOW_UNTESTED_ENGINE_ENV, Engine, SUPPORTED_ENGINE_RANGE, check_extension_installs,
-    protocol_sql,
+    check_extension_pins, protocol_sql, recheck_extension_pins,
 };
 use crate::error::{Error, Result};
 use crate::manifest::{Manifest, Param, RetryPolicy};
@@ -186,6 +186,10 @@ pub fn run_with_params(
 ) -> Result<()> {
     let manifest = Manifest::load(dir)?;
 
+    // The pinned extensions the check before the run installed and found equal to their
+    // pins, hashed again when the run ends.
+    let mut pinned = Vec::new();
+
     // If there are SQL steps, verify the engine is available and check its version.
     if manifest.has_sql_steps() {
         let info = engine.preflight()?;
@@ -200,9 +204,23 @@ pub fn run_with_params(
         }
         // Before anything is initialised, so a refused Protocol leaves no run behind.
         let sql = protocol_sql(&manifest, dir);
-        for warning in check_extension_installs(&sql, info.version.as_ref())? {
+        let installs = check_extension_installs(&sql, info.version.as_ref())?;
+        for warning in installs.warnings {
             eprintln!("{} {}", "warning:".yellow(), warning);
         }
+        // After the refusal above, so a refused Protocol installs nothing, and before the
+        // state backend and the staleness check, so a run whose steps are fresh is checked
+        // as one whose steps run.
+        let (found, warnings) = check_extension_pins(
+            engine,
+            &installs.installed,
+            &manifest.extensions,
+            info.version.as_ref(),
+        )?;
+        for warning in warnings {
+            eprintln!("{} {}", "warning:".yellow(), warning);
+        }
+        pinned = found;
     }
     // Which reader takes a SQL step's reads and produces. Refused here, before a step
     // runs, rather than as a warning on each step the reader cannot read.
@@ -321,6 +339,9 @@ pub fn run_with_params(
             }
 
             let _ = state.finish_run(&run_id, executed, "init_failed", total_retries);
+            if let Err(changed) = recheck_extension_pins(&pinned) {
+                eprintln!("{} {}", "error:".red(), changed);
+            }
             return Err(e);
         }
     }
@@ -723,6 +744,19 @@ pub fn run_with_params(
             );
         }
     }
+
+    // --- Each pinned extension, hashed again ---
+    // After the last step and hook: a step can replace a pinned file with `FORCE INSTALL`,
+    // `UPDATE EXTENSIONS` or a command. A run that failed already keeps its own error and
+    // prints this one beside it.
+    let step_loop_result = match (step_loop_result, recheck_extension_pins(&pinned)) {
+        (result, Ok(())) => result,
+        (Ok(()), Err(changed)) => Err(changed),
+        (Err(e), Err(changed)) => {
+            eprintln!("{} {}", "error:".red(), changed);
+            Err(e)
+        }
+    };
 
     // --- Finalize the live Protocol+Run contract ---
     // Assemble the full contract (assets, per-table row counts, steps), write it to
@@ -6640,7 +6674,7 @@ steps:
             .filter_map(|c| match c {
                 MockCall::Sql { sql_content, .. } => Some(sql_content.clone()),
                 MockCall::Command { command, .. } => Some(command.clone()),
-                MockCall::Preflight => None,
+                MockCall::Preflight | MockCall::Platform | MockCall::Install { .. } => None,
             })
             .collect()
     }

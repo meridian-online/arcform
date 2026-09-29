@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -86,6 +86,16 @@ pub trait Engine {
     /// Check that the engine CLI is available and return information about it.
     /// Returns EngineInfo with the detected version (or None if unparseable).
     fn preflight(&self) -> Result<EngineInfo>;
+
+    /// The platform the DuckDB the steps run on installs extensions for, as
+    /// `PRAGMA platform` prints it: `linux_amd64`.
+    fn extension_platform(&self) -> Result<String>;
+
+    /// Install the community extension `name` on the DuckDB the steps run on, without
+    /// loading it, and return the file DuckDB names as its `install_path` in
+    /// `duckdb_extensions()`, or `None` when it names none. On a DuckDB that holds the
+    /// extension already, DuckDB leaves the file as it is.
+    fn install_community_extension(&self, name: &str) -> Result<Option<PathBuf>>;
 }
 
 /// Wait for a child process with an optional timeout.
@@ -197,6 +207,37 @@ impl DuckDbProgram {
             DuckDbProgram::SearchPath => Command::new("duckdb"),
         }
     }
+}
+
+/// What arc prints before each value it asks DuckDB for, so a line a `~/.duckdbrc` prints
+/// is not read as the answer.
+const ANSWER_MARK: &str = "arc-answer:";
+
+/// Run `sql` on an in-memory DuckDB, as a step's DuckDB is started and with no Protocol
+/// database, and return each value it printed after [`ANSWER_MARK`]. `what` names the
+/// question in the error when DuckDB exits non-zero.
+fn ask_duckdb(sql: &str, what: &str) -> Result<Vec<String>> {
+    let output = duckdb_program()?
+        .command()
+        .args(["-noheader", "-list", "-c", sql])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| Error::EngineQuery {
+            what: what.to_string(),
+            reason: e.to_string(),
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::EngineQuery {
+            what: what.to_string(),
+            reason: format!("it exited with {}: {}", output.status, stderr.trim()),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix(ANSWER_MARK))
+        .map(str::to_string)
+        .collect())
 }
 
 /// DuckDB CLI engine implementation. It resolves its executable on every call through
@@ -327,6 +368,38 @@ impl Engine for DuckDbEngine {
             }),
         }
     }
+
+    fn extension_platform(&self) -> Result<String> {
+        let what = "report its platform";
+        let sql = format!("SELECT '{ANSWER_MARK}' || platform FROM pragma_platform();");
+        ask_duckdb(&sql, what)?
+            .into_iter()
+            .next()
+            .filter(|platform| !platform.is_empty())
+            .ok_or_else(|| Error::EngineQuery {
+                what: what.to_string(),
+                reason: "it printed no platform".to_string(),
+            })
+    }
+
+    fn install_community_extension(&self, name: &str) -> Result<Option<PathBuf>> {
+        // The name comes from the vetted list, whose names are plain identifiers; one that
+        // is not is refused rather than written into SQL.
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return Err(Error::EngineQuery {
+                what: format!("install {name}"),
+                reason: "arc installs an extension by a plain name alone".to_string(),
+            });
+        }
+        let sql = format!(
+            "INSTALL {name} FROM community; SELECT '{ANSWER_MARK}' || install_path FROM duckdb_extensions() WHERE extension_name = '{name}' AND installed;"
+        );
+        let answers = ask_duckdb(&sql, &format!("install {name} from the community registry"))?;
+        Ok(answers
+            .into_iter()
+            .find(|path| !path.is_empty())
+            .map(PathBuf::from))
+    }
 }
 
 /// Parse a version string from engine CLI output.
@@ -367,6 +440,11 @@ const EXTENSION_REPOSITORY_SETTINGS: [&str; 2] = [
     "custom_extension_repository",
     "autoinstall_extension_repository",
 ];
+
+/// The setting that moves where DuckDB keeps the extensions it installs. A step that sets it
+/// installs to a directory the check of each pinned extension does not read, and a second
+/// DuckDB does not find the file there.
+const EXTENSION_DIRECTORY_SETTING: &str = "extension_directory";
 
 /// What switches DuckDB to its second parser. The DuckDB CLI loads the `autocomplete`
 /// extension, whose parser replaces the default one once `allow_parser_override_extension` is
@@ -725,7 +803,8 @@ enum ExtensionSql {
     /// `INSTALL '<path>'`: a name DuckDB reads as a file or an address, because it holds
     /// a `.`, a `/` or a `\`.
     InstallPath(String),
-    /// A setting in [`EXTENSION_REPOSITORY_SETTINGS`], named outside a comment or a string.
+    /// A setting in [`EXTENSION_REPOSITORY_SETTINGS`], or [`EXTENSION_DIRECTORY_SETTING`],
+    /// named outside a comment or a string.
     Setting(String),
     /// A name in [`PARSER_SWITCHES`], named outside a comment.
     ParserSwitch(String),
@@ -1162,6 +1241,7 @@ fn scan_tokens(toks: &[(Tok, usize)]) -> Vec<(ExtensionSql, usize)> {
         };
         if let Some(setting) = EXTENSION_REPOSITORY_SETTINGS
             .iter()
+            .chain([&EXTENSION_DIRECTORY_SETTING])
             .find(|s| text.eq_ignore_ascii_case(s))
         {
             found.push((ExtensionSql::Setting(setting.to_string()), *line));
@@ -1252,15 +1332,27 @@ pub(crate) fn protocol_sql(manifest: &Manifest, dir: &Path) -> Vec<ProtocolSql> 
         .collect()
 }
 
+/// What [`check_extension_installs`] found in a Protocol it did not refuse.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ExtensionInstalls {
+    /// One warning for each vetted extension whose entry does not name the engine's
+    /// version, then one for each step or hook whose SQL can run or write SQL that is not
+    /// in its file.
+    pub(crate) warnings: Vec<String>,
+    /// Each vetted extension the SQL installs `FROM community`, once, in the order the
+    /// Protocol first installs it.
+    pub(crate) installed: Vec<String>,
+}
+
 /// Refuse a Protocol whose SQL installs a DuckDB extension off the vetted list, before a
-/// step runs; otherwise return one warning for each vetted extension it installs whose
-/// entry does not name the engine's version, and one for each step or hook whose SQL can run
-/// or write SQL that is not in its file, as [`scan_run_time_sql`] finds it.
+/// step runs; otherwise return the vetted community extensions it installs, one warning
+/// for each whose entry does not name the engine's version, and one for each step or hook
+/// whose SQL can run or write SQL that is not in its file, as [`scan_run_time_sql`] finds it.
 ///
 /// Refused: `INSTALL <name> FROM community` for a name not on the list; an `INSTALL` from
 /// an address or from a repository other than `core` and `community`; an `INSTALL` whose
 /// name is a path or an address; a statement naming a setting in
-/// [`EXTENSION_REPOSITORY_SETTINGS`]; and a statement naming a name in [`PARSER_SWITCHES`]. An `INSTALL` from `core` is not checked, and neither
+/// [`EXTENSION_REPOSITORY_SETTINGS`] or [`EXTENSION_DIRECTORY_SETTING`]; and a statement naming a name in [`PARSER_SWITCHES`]. An `INSTALL` from `core` is not checked, and neither
 /// is `LOAD`, because SQL does not say where a loaded extension was installed from. No
 /// variable lifts the refusal.
 ///
@@ -1269,7 +1361,7 @@ pub(crate) fn protocol_sql(manifest: &Manifest, dir: &Path) -> Vec<ProtocolSql> 
 pub(crate) fn check_extension_installs(
     sql: &[ProtocolSql],
     engine_version: Option<&semver::Version>,
-) -> Result<Vec<String>> {
+) -> Result<ExtensionInstalls> {
     let vetted = vetted_extensions();
     let mut refusals = Vec::new();
     let mut installed: Vec<&VettedExtension> = Vec::new();
@@ -1317,6 +1409,11 @@ pub(crate) fn check_extension_installs(
                 ExtensionSql::InstallPath(path) => {
                     format!("installs the extension at '{path}'")
                 }
+                ExtensionSql::Setting(setting) if setting == EXTENSION_DIRECTORY_SETTING => {
+                    format!(
+                        "names the setting {setting}, which moves where DuckDB keeps the extensions it installs"
+                    )
+                }
                 ExtensionSql::Setting(setting) => format!(
                     "names the setting {setting}, which moves where DuckDB installs an extension from"
                 ),
@@ -1337,7 +1434,8 @@ pub(crate) fn check_extension_installs(
         return Err(Error::ExtensionRefused { refusals });
     }
     let engine = engine_version.map(|v| format!("v{v}"));
-    Ok(installed
+    let names = installed.iter().map(|entry| entry.name.clone()).collect();
+    let warnings = installed
         .into_iter()
         .filter(|entry| {
             !engine
@@ -1360,7 +1458,155 @@ pub(crate) fn check_extension_installs(
                 .into_iter()
                 .map(|(source, shapes)| run_time_warning(source, shapes)),
         )
-        .collect())
+        .collect();
+    Ok(ExtensionInstalls {
+        warnings,
+        installed: names,
+    })
+}
+
+/// A community extension the check before the run installed and found equal to its pin,
+/// which [`recheck_extension_pins`] hashes again when the run ends.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PinnedExtension {
+    pub(crate) name: String,
+    /// The DuckDB version the pin is for, as DuckDB prints it: `v1.5.5`.
+    pub(crate) version: String,
+    pub(crate) platform: String,
+    pub(crate) pin: String,
+    /// The file DuckDB named as the extension's `install_path`.
+    pub(crate) path: PathBuf,
+}
+
+/// The pins under a manifest's `extensions:` key: name, DuckDB version, platform, SHA-256.
+pub(crate) type ExtensionPins = BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>>;
+
+/// Before any step or hook runs: install each community extension in `installed` that
+/// `pins` pins for the engine's DuckDB version and platform, on the DuckDB the steps run on,
+/// and refuse the run when the installed file's SHA-256 differs from its pin, when the
+/// install fails, or when DuckDB names no installed file. Return the extensions it found
+/// equal to their pins, and one warning for each extension in `installed` with no pin for
+/// this version and platform.
+///
+/// DuckDB is asked its platform only when an extension in `installed` has a pin for the
+/// engine's version, so a Protocol with no pin makes the engine calls it made before pins.
+/// With no engine version, no pin can be chosen, and each extension is unpinned.
+pub(crate) fn check_extension_pins(
+    engine: &dyn Engine,
+    installed: &[String],
+    pins: &ExtensionPins,
+    engine_version: Option<&semver::Version>,
+) -> Result<(Vec<PinnedExtension>, Vec<String>)> {
+    let version = engine_version.map(|v| format!("v{v}"));
+    let for_version = |name: &String| {
+        version
+            .as_ref()
+            .and_then(|v| pins.get(name)?.get(v))
+            .filter(|platforms| !platforms.is_empty())
+    };
+    let mut refusals = Vec::new();
+    let platform = if installed.iter().any(|name| for_version(name).is_some()) {
+        match engine.extension_platform() {
+            Ok(platform) => Some(platform),
+            Err(e) => {
+                for name in installed.iter().filter(|name| for_version(name).is_some()) {
+                    refusals.push(format!(
+                        "{name} has a pin for DuckDB {}, and arc could not choose it: {e}",
+                        version.as_deref().unwrap_or_default()
+                    ));
+                }
+                return Err(Error::ExtensionPinRefused { refusals });
+            }
+        }
+    } else {
+        None
+    };
+    let mut pinned = Vec::new();
+    let mut warnings = Vec::new();
+    for name in installed {
+        let pin = for_version(name)
+            .zip(platform.as_ref())
+            .and_then(|(platforms, platform)| platforms.get(platform));
+        let (Some(version), Some(platform), Some(pin)) = (&version, &platform, pin) else {
+            let place = match (&version, &platform) {
+                (None, _) => {
+                    "arc could not read this engine's DuckDB version to choose one".to_string()
+                }
+                (Some(v), None) => format!("for DuckDB {v}"),
+                (Some(v), Some(p)) => format!("for DuckDB {v} on {p}"),
+            };
+            warnings.push(format!(
+                "{name} has no pin under the extensions: key of arcform.yaml ({place}), so arc runs whichever build DuckDB installs ({VETTED_EXTENSIONS_DOC})"
+            ));
+            continue;
+        };
+        let at = format!("{name} on DuckDB {version}, {platform}");
+        let path = match engine.install_community_extension(name) {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                refusals.push(format!(
+                    "{at}: DuckDB named no installed file for {name} after installing it"
+                ));
+                continue;
+            }
+            Err(e) => {
+                refusals.push(format!(
+                    "{at}: arc could not install {name} to compare it with its pin: {e}"
+                ));
+                continue;
+            }
+        };
+        match crate::fetch_cache::hash_file(&path) {
+            Ok(found) if found == *pin => pinned.push(PinnedExtension {
+                name: name.clone(),
+                version: version.clone(),
+                platform: platform.clone(),
+                pin: pin.clone(),
+                path,
+            }),
+            Ok(found) => refusals.push(format!(
+                "{at}: pinned {pin}, and the installed file {} hashes to {found}",
+                path.display()
+            )),
+            Err(e) => refusals.push(format!(
+                "{at}: arc could not read the installed file {}: {e}",
+                path.display()
+            )),
+        }
+    }
+    if !refusals.is_empty() {
+        return Err(Error::ExtensionPinRefused { refusals });
+    }
+    Ok((pinned, warnings))
+}
+
+/// When the run ends: hash each file [`check_extension_pins`] found equal to its pin
+/// again, and fail the run when one differs, because a step replaced it.
+pub(crate) fn recheck_extension_pins(pinned: &[PinnedExtension]) -> Result<()> {
+    let changes: Vec<String> = pinned
+        .iter()
+        .filter_map(|ext| {
+            let at = format!("{} on DuckDB {}, {}", ext.name, ext.version, ext.platform);
+            match crate::fetch_cache::hash_file(&ext.path) {
+                Ok(found) if found == ext.pin => None,
+                Ok(found) => Some(format!(
+                    "{at}: pinned {}, and when the run ended {} hashed to {found}",
+                    ext.pin,
+                    ext.path.display()
+                )),
+                Err(e) => Some(format!(
+                    "{at}: pinned {}, and when the run ended {} could not be read: {e}",
+                    ext.pin,
+                    ext.path.display()
+                )),
+            }
+        })
+        .collect();
+    if changes.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::ExtensionChanged { changes })
+    }
 }
 
 #[cfg(test)]
@@ -1388,6 +1634,11 @@ pub mod mock {
         pub simulated_stdout: RefCell<Option<String>>,
         /// If true, return StepTimeout when timeout is Some(_).
         pub timeout_should_fire: RefCell<bool>,
+        /// The platform `extension_platform` reports; `None` makes it fail.
+        pub platform: RefCell<Option<String>>,
+        /// What `install_community_extension` answers for each name: the installed file,
+        /// no file, or a failure's reason. A name not here names no file.
+        pub installs: RefCell<HashMap<String, std::result::Result<Option<PathBuf>, String>>>,
     }
 
     #[derive(Debug, Clone)]
@@ -1403,6 +1654,10 @@ pub mod mock {
             capture_stdout: bool,
         },
         Preflight,
+        Platform,
+        Install {
+            name: String,
+        },
     }
 
     impl MockEngine {
@@ -1416,7 +1671,18 @@ pub mod mock {
                 version: RefCell::new(Some(semver::Version::new(1, 5, 4))),
                 simulated_stdout: RefCell::new(None),
                 timeout_should_fire: RefCell::new(false),
+                platform: RefCell::new(Some("linux_amd64".to_string())),
+                installs: RefCell::new(HashMap::new()),
             }
+        }
+
+        /// Set what `install_community_extension` answers for `name`.
+        pub fn set_install(
+            &self,
+            name: &str,
+            answer: std::result::Result<Option<PathBuf>, String>,
+        ) {
+            self.installs.borrow_mut().insert(name.to_string(), answer);
         }
 
         /// Set simulated stdout for command steps with capture_stdout=true.
@@ -1559,6 +1825,31 @@ pub mod mock {
             Ok(EngineInfo {
                 version: self.version.borrow().clone(),
             })
+        }
+
+        fn extension_platform(&self) -> Result<String> {
+            self.calls.borrow_mut().push(MockCall::Platform);
+            self.platform
+                .borrow()
+                .clone()
+                .ok_or_else(|| Error::EngineQuery {
+                    what: "report its platform".to_string(),
+                    reason: "the mock was told to fail".to_string(),
+                })
+        }
+
+        fn install_community_extension(&self, name: &str) -> Result<Option<PathBuf>> {
+            self.calls.borrow_mut().push(MockCall::Install {
+                name: name.to_string(),
+            });
+            match self.installs.borrow().get(name) {
+                None => Ok(None),
+                Some(Ok(path)) => Ok(path.clone()),
+                Some(Err(reason)) => Err(Error::EngineQuery {
+                    what: format!("install {name} from the community registry"),
+                    reason: reason.clone(),
+                }),
+            }
         }
     }
 }
@@ -2152,7 +2443,9 @@ mod extension_tests {
             ". arc does not read the SQL a step builds or writes while it runs, for an extension that SQL installs; running it anyway ({VETTED_EXTENSIONS_DOC})"
         );
         assert_eq!(
-            check_extension_installs(&sql, Some(&v("1.5.4"))).unwrap(),
+            check_extension_installs(&sql, Some(&v("1.5.4")))
+                .unwrap()
+                .warnings,
             vec![
                 format!(
                     "mlpack is vetted on DuckDB v1.5.5, and this engine is DuckDB v1.5.4; running it anyway ({VETTED_EXTENSIONS_DOC})"
@@ -2212,7 +2505,7 @@ mod extension_tests {
         semver::Version::parse(s).unwrap()
     }
 
-    fn refusals(result: Result<Vec<String>>) -> Vec<String> {
+    fn refusals(result: Result<ExtensionInstalls>) -> Vec<String> {
         match result {
             Err(Error::ExtensionRefused { refusals }) => refusals,
             other => panic!("expected a refusal, got {other:?}"),
@@ -2301,7 +2594,9 @@ mod extension_tests {
             path: dir.path().join("later.sql"),
         });
         assert_eq!(
-            check_extension_installs(&sql, Some(&v("1.5.4"))).unwrap(),
+            check_extension_installs(&sql, Some(&v("1.5.4")))
+                .unwrap()
+                .warnings,
             Vec::<String>::new()
         );
     }
@@ -2318,7 +2613,9 @@ mod extension_tests {
             ],
         );
         assert_eq!(
-            check_extension_installs(&sql, Some(&v("1.5.4"))).unwrap(),
+            check_extension_installs(&sql, Some(&v("1.5.4")))
+                .unwrap()
+                .warnings,
             vec![
                 format!(
                     "mlpack is vetted on DuckDB v1.5.5, and this engine is DuckDB v1.5.4; running it anyway ({VETTED_EXTENSIONS_DOC})"
@@ -2329,12 +2626,14 @@ mod extension_tests {
             ]
         );
         assert_eq!(
-            check_extension_installs(&sql, Some(&v("1.5.5"))).unwrap(),
+            check_extension_installs(&sql, Some(&v("1.5.5")))
+                .unwrap()
+                .warnings,
             Vec::<String>::new(),
             "an engine the entry names draws no warning"
         );
         assert_eq!(
-            check_extension_installs(&sql[..1], None).unwrap(),
+            check_extension_installs(&sql[..1], None).unwrap().warnings,
             vec![format!(
                 "mlpack is vetted on DuckDB v1.5.5, and arc could not read this engine's version; running it anyway ({VETTED_EXTENSIONS_DOC})"
             )]

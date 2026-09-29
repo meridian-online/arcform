@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
@@ -58,6 +59,15 @@ pub struct Manifest {
     /// Optional — omitting skips version check. Uses Cargo-style syntax.
     #[serde(default)]
     pub engine_version: Option<String>,
+
+    /// The build of each community extension the Protocol's SQL installs: extension name,
+    /// then the DuckDB version as DuckDB prints it (`v1.5.5`), then the platform as
+    /// `PRAGMA platform` prints it (`linux_amd64`), then the SHA-256 of the installed file
+    /// as 64 lower-case hex digits. `arc run` installs each one the SQL installs and has a
+    /// pin for, before any step or hook runs, and refuses a run on which the file differs.
+    /// `arc run` never writes this key.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extensions: BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>>,
 
     /// Path to the database file, relative to the manifest directory.
     /// Defaults to `<name>.duckdb` if not specified.
@@ -307,6 +317,23 @@ impl Manifest {
             )));
         }
 
+        // A pin is compared with a file's SHA-256, so one that cannot be a SHA-256 is refused
+        // here rather than read as a changed build on every run.
+        for (name, versions) in &self.extensions {
+            for (version, platforms) in versions {
+                for (platform, pin) in platforms {
+                    if pin.len() != 64
+                        || !pin.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                    {
+                        return Err(Error::ManifestValidation(format!(
+                            "extensions.{name}.{version}.{platform} is '{pin}', which is not a SHA-256: \
+                             a pin is 64 lower-case hex digits"
+                        )));
+                    }
+                }
+            }
+        }
+
         let mut seen_names = std::collections::HashSet::new();
         for (i, step) in self.steps.iter().enumerate() {
             // Check for empty step names.
@@ -478,6 +505,7 @@ impl Manifest {
             name: name.to_string(),
             engine: "duckdb".to_string(),
             engine_version: Some(">=1.0".to_string()),
+            extensions: BTreeMap::new(),
             db: Some(format!("{}.duckdb", name)),
             params: IndexMap::new(),
             dotenv: Vec::new(),
@@ -548,6 +576,7 @@ mod tests {
             name: name.to_string(),
             engine: "duckdb".to_string(),
             engine_version: None,
+            extensions: BTreeMap::new(),
             db: None,
             params: IndexMap::new(),
             dotenv: Vec::new(),

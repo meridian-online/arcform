@@ -441,6 +441,7 @@ fn a_spec_grown_by_recording_runs_under_the_bare_binary() {
         name: "grown".into(),
         engine: "duckdb".into(),
         engine_version: None,
+        extensions: Default::default(),
         db: None,
         params: Default::default(),
         dotenv: Vec::new(),
