@@ -49,6 +49,20 @@ The operators, and the failure each is modelled on:
                              operator.
   FN_BODY_DEFAULT            the whole-body replacement, kept because a function
                              the suite never calls at all should still be named.
+  ARM_DELETE                 one arm of a `match` deleted, so the values it took
+                             fall to the arms below it.  A shipped build added an
+                             arm for a new variant, and the suite passed with the
+                             arm gone.
+  ARM_WIDEN                  one arm's pattern widened to `_`, its guard kept.  A
+                             shipped build's guard, written against `Some(_)`,
+                             passed the suite widened, because no test's `None`
+                             made the guard true.  A pattern that opens with a
+                             string, char or raw-string literal is widened from
+                             the literal on: `"b" if loud` becomes `_ if loud`.
+                             Both work on an arm whose head — pattern, guard and
+                             `=>` — the diff changed, and neither touches the last
+                             arm of a match; the comment above `op_arm_delete`
+                             says why.
 
 FOUR TIERS IN THE REPORT, and the split is the point.  A real codebase produces
 surviving mutations that are *equivalent* — the code cannot be reached in
@@ -81,7 +95,7 @@ one, what that probe answered:
               date.  Keyed on the mutation's content, not its line number, so
               editing the file above it does not silently unrule it.
 
-Each of the six entries in OPERATORS attaches a probe to every mutant it emits,
+Each entry in OPERATORS attaches a probe to every mutant it emits,
 so UNPROBED means a probe was built and could not be run — never that none was
 offered.  The probe splits the "unreachable in production" half of the
 equivalent-mutant problem automatically and cannot split the "observable only in
@@ -100,6 +114,15 @@ never executed — so the survivor has a reason to exist that was established.
 UNPROBED has no measurement behind it at all.  A survivor with no evidence either
 way is not safer than one with evidence against it, and the registry is where a
 survivor goes when a person has decided it cannot change behaviour.
+
+SET ASIDE is not a tier of survivors.  A mutation from ARM_DELETE or ARM_WIDEN
+that the compiler refuses has tested nothing: deleting an arm can leave a match
+that is not exhaustive, and widening a pattern can drop a binding the arm uses.
+It is counted on a line of its own and listed, and it neither counts as killed
+nor fails the job.  The other operators still count a compiler refusal as a kill.
+Those two reasons are the refusals meant here.  An arm is found from its first
+token, a leading string, char or raw-string literal included, so a literal-led
+arm's widening is not refused over text the gate itself built.
 
 Exit codes: 0 clean · 1 at least one UNPINNED or UNPROBED survivor, or under
 --strict an UNREACHED one · 2 usage · 3 the harness could not run (no baseline,
@@ -389,7 +412,7 @@ class Mutant:
         return " ".join(self.before.split())
 
     def one_line_after(self) -> str:
-        return " ".join(self.after.split())
+        return " ".join(self.after.split()) or "(deleted)"
 
 
 def mutation_key(path: str, function: str, operator: str, before: str, after: str) -> str:
@@ -904,6 +927,353 @@ def op_fn_body_default(lines, masks, i, path, fn) -> list[Mutant]:
     ]
 
 
+# How many lines an arm's pattern and guard may span before its `=>`.
+ARM_HEAD_LINES = 8
+
+
+@dataclass
+class Arm:
+    """One arm of a `match`, located by its text.  Positions are 0-based."""
+
+    start: int  # the line the arm begins; nothing but indentation precedes it
+    indent: str
+    arrow: tuple[int, int]  # the `=` of the arm's `=>`
+    guard: tuple[int, int] | None  # the `i` of the guard's `if`, when it has one
+    end: int  # the line the arm ends; no code follows it on that line
+    pattern: str  # the pattern's text, whitespace collapsed
+    last: bool  # the match's closing brace follows it
+
+
+def _code_after(lines, masks, line: int, col: int):
+    """Code characters from (line, col) onward, skipping whitespace."""
+    for j in range(line, len(lines)):
+        for pos in range(col if j == line else 0, len(lines[j])):
+            if pos < len(masks[j]) and masks[j][pos] and not lines[j][pos].isspace():
+                yield j, pos, lines[j][pos]
+
+
+def _code_before(lines, masks, line: int, col: int):
+    """Code characters strictly before (line, col), nearest first."""
+    for j in range(line, -1, -1):
+        for pos in range(min(col, len(lines[j])) if j == line else len(lines[j]), 0, -1):
+            p = pos - 1
+            if p < len(masks[j]) and masks[j][p] and not lines[j][p].isspace():
+                yield j, p, lines[j][p]
+
+
+def _first_code(lines, masks, line: int, col: int) -> tuple[int, int] | None:
+    return next(((j, p) for j, p, _ in _code_after(lines, masks, line, col)), None)
+
+
+def _first_token(lines, line: int, col: int) -> tuple[int, int] | None:
+    """The first character from (line, col) on that is not whitespace or comment.
+
+    Unlike `_first_code`, this stops at a string, char or raw-string literal.  The
+    code mask hides a literal and a comment alike, so an arm whose pattern opens
+    with `"b"` was taken to begin after the literal, and its widening came out as
+    `"b" _ if …`, which the compiler refuses.  (line, col) has to sit outside any
+    literal or comment, as the position after a code character does.
+    """
+    j, p = line, col
+    while j < len(lines):
+        text = lines[j]
+        if p >= len(text):
+            j, p = j + 1, 0
+        elif text[p].isspace():
+            p += 1
+        elif text.startswith("//", p):
+            p = len(text)
+        elif text.startswith("/*", p):
+            # Unnested, as `code_mask` reads a block comment.
+            close = text.find("*/", p + 2)
+            while close == -1:
+                j += 1
+                if j >= len(lines):
+                    return None
+                text = lines[j]
+                close = text.find("*/")
+            p = close + 2
+        else:
+            return j, p
+    return None
+
+
+def _is_word(ch: str) -> bool:
+    return ch.isalnum() or ch == "_"
+
+
+def _opens_a_match(lines, masks, line: int, col: int) -> bool:
+    """Is the `{` at (line, col) the body of a `match`?
+
+    Reads back from the brace to the start of the expression it belongs to — the
+    nearest `;`, `,`, brace or unmatched bracket at depth 0 — and looks for the
+    keyword.  `macro_rules!` and `select!` bodies have arms with `=>` too, and
+    their braces are not a match's.
+    """
+    depth = 0
+    stop = (max(0, line - 4), 0)
+    for j, p, ch in _code_before(lines, masks, line, col):
+        if j < line - 4:
+            break
+        if ch in ")]":
+            depth += 1
+        elif ch in "([":
+            if depth == 0:
+                stop = (j, p + 1)
+                break
+            depth -= 1
+        elif depth == 0 and ch in ";,{}":
+            stop = (j, p + 1)
+            break
+    text = []
+    for j in range(stop[0], line + 1):
+        lo = stop[1] if j == stop[0] else 0
+        hi = col if j == line else len(lines[j])
+        text.append(
+            "".join(lines[j][p] if p < len(masks[j]) and masks[j][p] else " " for p in range(lo, hi))
+        )
+    return re.search(r"\bmatch\b", " ".join(text)) is not None
+
+
+def arm_at(lines: list[str], masks: list[list[bool]], i: int) -> Arm | None:
+    """The `match` arm whose head — pattern, guard and `=>` — holds line `i`.
+
+    None unless the arm has lines of its own: it begins a line, it ends one, and
+    it sits directly inside a `match`.  An arm sharing a line with another arm or
+    with the match's closing brace cannot be cut out by whole lines, and is left.
+    """
+    first = _first_code(lines, masks, i, 0)
+    if first is None or first[0] != i:
+        return None
+    # Forward to the `=>`, at the depth line `i` starts at.  A `,` or `;` first
+    # means line `i` is in a body, not a head; so does closing a bracket it
+    # did not open.
+    depth = 0
+    arrow = None
+    for j, p, ch in _code_after(lines, masks, i, 0):
+        if j >= i + ARM_HEAD_LINES:
+            return None
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif depth == 0 and ch in ",;":
+            return None
+        elif (
+            depth == 0
+            and ch == "="
+            and lines[j][p + 1 : p + 2] == ">"
+            and masks[j][p + 1]
+        ):
+            arrow = (j, p)
+            break
+    if arrow is None:
+        return None
+    # Back to where the arm begins: the previous arm's `,` or closing `}`, or
+    # the match's own `{`.
+    depth = 0
+    boundary = None
+    for j, p, ch in _code_before(lines, masks, i, first[1]):
+        if j < i - ARM_HEAD_LINES:
+            return None
+        if ch in ")]":
+            depth += 1
+        elif ch in "([":
+            if depth == 0:
+                return None
+            depth -= 1
+        elif ch == "}":
+            if depth == 0:
+                boundary = (j, p)
+                break
+            depth += 1
+        elif ch == "{":
+            if depth == 0:
+                boundary = (j, p)
+                break
+            depth -= 1
+        elif depth == 0 and ch == ",":
+            boundary = (j, p)
+            break
+        elif depth == 0 and ch == ";":
+            return None
+    if boundary is None:
+        return None
+    start = _first_token(lines, boundary[0], boundary[1] + 1)
+    if start is None or start[0] == boundary[0]:
+        return None
+    if lines[start[0]][start[1]] in "|#":
+        return None  # a leading `|` or an attribute: not a shape cut cleanly here
+    # The brace the arm sits directly inside has to be a match's.
+    depth = 0
+    opener = None
+    for j, p, ch in _code_before(lines, masks, start[0], start[1]):
+        if ch in ")]}":
+            depth += 1
+        elif ch in "([{":
+            if depth == 0:
+                opener = (j, p, ch)
+                break
+            depth -= 1
+    if opener is None or opener[2] != "{" or not _opens_a_match(lines, masks, opener[0], opener[1]):
+        return None
+    # The guard: the keyword `if` at depth 0 in the head.
+    guard = None
+    depth = 0
+    for j, p, ch in _code_after(lines, masks, start[0], start[1]):
+        if (j, p) == arrow:
+            break
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif (
+            depth == 0
+            and lines[j].startswith("if", p)
+            and (p == 0 or not _is_word(lines[j][p - 1]))
+            and not _is_word(lines[j][p + 2 : p + 3] or " ")
+        ):
+            guard = (j, p)
+            break
+    # Forward from the `=>` to the arm's end: a `,` at depth 0, or a block that
+    # closes and is not continued by `else`, `.` or `?`, or the match's own `}`.
+    depth = 0
+    end = None
+    last = None
+    for j, p, ch in _code_after(lines, masks, arrow[0], arrow[1] + 2):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth < 0:
+                end = last
+                break
+            if depth == 0 and ch == "}":
+                following = _first_code(lines, masks, j, p + 1)
+                if following is None:
+                    end = (j, p)
+                    break
+                nj, np_ = following
+                nxt = lines[nj][np_]
+                if nxt == ",":
+                    end = following
+                    break
+                if nxt in ".?" or (
+                    lines[nj].startswith("else", np_)
+                    and not _is_word(lines[nj][np_ + 4 : np_ + 5] or " ")
+                ):
+                    last = (j, p)
+                    continue
+                end = (j, p)
+                break
+        elif depth == 0 and ch == ",":
+            end = (j, p)
+            break
+        last = (j, p)
+    if end is None:
+        return None
+    rest = _first_code(lines, masks, end[0], end[1] + 1)
+    if rest is not None and rest[0] == end[0]:
+        return None  # something else shares the arm's last line
+    last = rest is not None and lines[rest[0]][rest[1]] == "}"
+    head_stop = guard or arrow
+    pattern = "".join(
+        lines[j][
+            (start[1] if j == start[0] else 0) : (head_stop[1] if j == head_stop[0] else len(lines[j]))
+        ]
+        for j in range(start[0], head_stop[0] + 1)
+    )
+    return Arm(
+        start=start[0],
+        indent=lines[start[0]][: start[1]],
+        arrow=arrow,
+        guard=guard,
+        end=end[0],
+        pattern=" ".join(pattern.split()),
+        last=last,
+    )
+
+
+# Neither arm operator touches the last arm of a match, and the reason is
+# exhaustiveness rather than cost.  In a match that compiles, a value reaching the
+# last arm is one no earlier arm took, and some unguarded arm matches it — which
+# can only be the last one.  So an unguarded last arm already matches every value
+# that reaches it: widening it changes nothing, and deleting it leaves the match
+# not exhaustive.  A guarded last arm is reached by no value at all, since the
+# unguarded arm that covers each value sits above it.  This is the arm that is
+# usually `_ => …`.
+
+
+def op_arm_delete(lines, masks, i, path, fn) -> list[Mutant]:
+    """Delete one arm of a `match`, so its values fall to the arms below it.
+
+    Modelled on arms that shipped with no test taking them: a new variant handled
+    by its own arm, where the suite stays green when the arm is gone because every
+    value it catches is also caught, differently, by the arm after it.
+
+    The probe is a copy of the arm's own pattern and guard, placed in front of it,
+    whose body panics — so it fires exactly when a test takes this arm.
+    """
+    arm = arm_at(lines, masks, i)
+    if arm is None or arm.last:
+        return []
+    aj, ap = arm.arrow
+    head = "".join(lines[arm.start : aj]) + lines[aj][:ap]
+    before = "".join(lines[arm.start : arm.end + 1])
+    return [
+        Mutant(
+            path=path,
+            start=arm.start,
+            end=arm.end,
+            operator="ARM_DELETE",
+            before=before,
+            after="",
+            probe=f'{head}=> panic!("{PROBE_MESSAGE}"),\n{before}',
+            function=fn,
+        )
+    ]
+
+
+def op_arm_widen(lines, masks, i, path, fn) -> list[Mutant]:
+    """Widen one arm's pattern to `_`, keeping its guard where it has one.
+
+    Modelled on the arm `Some(_) if reads_no_table(&fn_name)`: widened to
+    `_ if reads_no_table(..)` it left the suite green, because no test's `None`
+    made the guard true, so nothing held the pattern half of the arm.
+
+    A pattern whose binding the guard or body uses stops compiling once widened;
+    the compiler's refusal is set aside by `classify`, not counted as a kill.
+
+    The probe is a `_ => panic!(..)` arm in front of this one, which fires when
+    the match reaches this arm at all — the values a widened pattern would take.
+    """
+    arm = arm_at(lines, masks, i)
+    if arm is None or arm.last or arm.pattern == "_":
+        return []
+    aj, ap = arm.arrow
+    guard = ""
+    if arm.guard is not None:
+        gj, gp = arm.guard
+        guard = "".join(lines[j][(gp if j == gj else 0) :] for j in range(gj, aj)) + (
+            lines[aj][(gp if aj == gj else 0) : ap]
+        )
+    before = "".join(lines[arm.start : aj + 1])
+    return [
+        Mutant(
+            path=path,
+            start=arm.start,
+            end=aj,
+            operator="ARM_WIDEN",
+            before=before,
+            after=f"{arm.indent}_ {guard}{lines[aj][ap:]}",
+            probe=f'{arm.indent}_ => panic!("{PROBE_MESSAGE}"),\n{before}',
+            function=fn,
+        )
+    ]
+
+
 # Every operator's span must stay inside the item its first line belongs to.
 # Nothing re-checks it downstream: a filter that did was removed after a planted
 # failure proved no operator can reach the case, and a check nothing can redden
@@ -917,7 +1287,15 @@ OPERATORS = [
     op_entry_overwrite,
     op_token_swap,
     op_fn_body_default,
+    op_arm_delete,
+    op_arm_widen,
 ]
+
+# Operators whose mutation the compiler may refuse for a reason that is no test's
+# doing: a deleted arm can leave a match that is not exhaustive, and a widened
+# pattern can drop a binding the arm uses.  `classify` sets such a refusal aside
+# rather than counting it as a kill.
+SET_ASIDE_WHEN_REFUSED = {"ARM_DELETE", "ARM_WIDEN"}
 
 
 def generate(path: str, source: str, changed: set[int]) -> list[Mutant]:
@@ -1297,10 +1675,12 @@ def prioritise(mutants: list[Mutant]) -> list[Mutant]:
 # --------------------------------------------------------------------------- #
 
 
-def classify(run: SuiteRun) -> tuple[str, str]:
+def classify(run: SuiteRun, operator: str = "") -> tuple[str, str]:
     if run.timed_out:
         return "KILLED", "the suite timed out"
     if run.compile_error:
+        if operator in SET_ASIDE_WHEN_REFUSED:
+            return "SET ASIDE", "rejected by the compiler"
         return "KILLED", "rejected by the compiler"
     if run.exit_code != 0:
         names = ", ".join(run.failing_tests[:4]) or "unnamed"
@@ -1330,7 +1710,7 @@ def evaluate(
             run = run_suite(tree.root, command, timeout)
         finally:
             tree.restore()
-        mutant.verdict, mutant.detail = classify(run)
+        mutant.verdict, mutant.detail = classify(run, mutant.operator)
         if verbose:
             print(
                 f"  [{index + 1}/{min(len(mutants), max_mutants)}] "
@@ -1410,9 +1790,12 @@ def report(
     unreached: list[Mutant] = []
     unprobed: list[Mutant] = []
     equivalent: list[Mutant] = []
+    set_aside: list[Mutant] = []
     killed = 0
     for m in mutants:
-        if m.verdict != "SURVIVED":
+        if m.verdict == "SET ASIDE":
+            set_aside.append(m)
+        elif m.verdict != "SURVIVED":
             killed += 1
         elif m.key in rulings:
             equivalent.append(m)
@@ -1440,6 +1823,7 @@ def report(
     print(f"  unreached       {len(unreached)}")
     print(f"  unprobed        {len(unprobed)}")
     print(f"  ruled equiv.    {len(equivalent)}")
+    print(f"  set aside       {len(set_aside)} (the compiler refused them)")
     if skipped:
         print(f"not checked       {len(skipped)} (budget exhausted)")
     if deleted:
@@ -1498,6 +1882,17 @@ def report(
         equivalent,
         "Listed so the ruling stays visible and can be argued with, not hidden.",
     )
+    if set_aside:
+        print()
+        print("-" * 78)
+        print(f"SET ASIDE — the compiler refused these, so they say nothing of the tests ({len(set_aside)})")
+        print("A deleted arm can leave a match that is not exhaustive, and a widened pattern")
+        print("can drop a binding the arm uses.  Not counted as killed; they do not fail the job.")
+        print("-" * 78)
+        for m in set_aside:
+            print(f"  {m.path}:{m.start + 1}  fn {m.function}  [{m.operator}]")
+            print(f"    -  {m.one_line_before()[:150]}")
+            print(f"    +  {m.one_line_after()[:150]}")
     if skipped:
         print()
         print("-" * 78)
@@ -1580,7 +1975,7 @@ def run_fixtures(root: Path, spec: Path, ref: str, timeout: int, verbose: bool) 
                 run = run_suite(root, command, timeout)
             finally:
                 tree.restore()
-            got, detail = classify(run)
+            got, detail = classify(run, fx["operator"])
             if verbose:
                 print(f"    {fx['id']}: {detail}")
         ok = got == expected
