@@ -100,6 +100,9 @@ pub(crate) enum ArgValue {
     Identifier(String),
     /// A list, `['a.json', 'b.json']`, or a `COPY` option's parenthesised values.
     List(Vec<ArgValue>),
+    /// A parenthesised query, `(SELECT src, dst FROM edges)`: what it reads is among the
+    /// statement's reads, and its strings are its own.
+    Query,
     /// Any other expression, as written. `quotes` is whether it holds a string or a
     /// double-quoted name at any depth: `lower('X')` and `"Q" + 1` do, `1 + 2` does not.
     Expression { text: String, quotes: bool },
@@ -1113,6 +1116,9 @@ fn arg_value(expression: &Value, text: &str) -> ArgValue {
             Some([Value::String(name)]) => ArgValue::Identifier(name.clone()),
             _ => other(),
         },
+        // `(SELECT src, dst FROM edges)`. `IN (SELECT …)` and `EXISTS (SELECT …)` are
+        // other subquery types, and expressions.
+        (Some("SUBQUERY"), _) if expression["subquery_type"] == "SCALAR" => ArgValue::Query,
         // `['a.json', 'b.json']` is DuckDB's `list_value` of its elements.
         (Some("FUNCTION"), _)
             if expression["function_name"] == "list_value"

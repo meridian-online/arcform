@@ -418,7 +418,8 @@ fn duckdb_call(call: &TableCall) -> FunctionCall {
             ArgValue::String(_) | ArgValue::QuotedIdentifier(_) => true,
             ArgValue::List(items) => items.iter().any(names_something),
             ArgValue::Expression { quotes, .. } => *quotes,
-            ArgValue::Number(_) | ArgValue::Identifier(_) => false,
+            // A query's strings are its own: they name nothing the call reads.
+            ArgValue::Query | ArgValue::Number(_) | ArgValue::Identifier(_) => false,
         }
     }
     let mut unnamed_paths = Vec::new();
@@ -429,6 +430,10 @@ fn duckdb_call(call: &TableCall) -> FunctionCall {
         function: call.function.to_lowercase(),
         paths: unnamed_paths,
         names_something: call.args.iter().any(|arg| names_something(&arg.value)),
+        reads_a_query: call
+            .args
+            .iter()
+            .any(|arg| matches!(arg.value, ArgValue::Query)),
     }
 }
 
@@ -444,6 +449,10 @@ struct FunctionCall {
     /// (`"X"`, `'x.parquet'`, `'SELECT …'`). A call with neither (`recent()`,
     /// `range(10)`, `f(days := 7)`) names nothing arc could be missing.
     names_something: bool,
+    /// Whether any argument, named or not, is a parenthesised query:
+    /// `summary((SELECT src, dst FROM edges))`. The reader has read that query's tables
+    /// as the statement's own, so the call's name is not one.
+    reads_a_query: bool,
 }
 
 /// What a table function call reads, by the same rules whichever reader found it.
@@ -467,6 +476,10 @@ fn record_table_call(call: &FunctionCall, assets: &mut SqlAssets) {
         // that says which. The call records no input — the function's own name is not a
         // table — and is reported as unread instead.
         assets.unread_table_functions.insert(call.function.clone());
+    } else if call.reads_a_query {
+        // A function called on a query (`onager_pth_dijkstra((SELECT src, dst, w FROM
+        // edges))`): the query's tables are what the call reads, and the reader has
+        // recorded them. The function's own name is not a table.
     } else {
         // A table macro (`recent()`), or a function called with numbers and bare names
         // only: record the name itself as the input, as before.
@@ -802,8 +815,12 @@ fn extract_inputs_from_table_factor(factor: &TableFactor, assets: &mut SqlAssets
             match args {
                 Some(table_args) => {
                     let mut paths = Vec::new();
+                    let mut reads_a_query = false;
                     for arg in &table_args.args {
-                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg {
+                        if let Some(query) = query_argument(arg) {
+                            extract_inputs_from_query(query, assets);
+                            reads_a_query = true;
+                        } else if let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg {
                             path_literals(expr, &mut paths);
                         }
                     }
@@ -811,6 +828,7 @@ fn extract_inputs_from_table_factor(factor: &TableFactor, assets: &mut SqlAssets
                         function: fn_name,
                         paths,
                         names_something: args_name_something(table_args),
+                        reads_a_query,
                     };
                     record_table_call(&call, assets);
                 }
@@ -899,8 +917,19 @@ fn reads_no_table(fn_name: &str) -> bool {
 /// identifier, at any depth — the two forms in which a DuckDB call names a table, a file
 /// or a query (`"X"`, `'x.parquet'`, `'SELECT …'`). A call with neither
 /// (`recent()`, `range(10)`, `f(days := 7)`) names nothing arc could be missing.
+///
+/// A query among the arguments (see [`query_argument`]) is not walked: its strings are
+/// its own (`WHERE kind = 'road'`), and its tables are read, not named.
 fn args_name_something(table_args: &TableFunctionArgs) -> bool {
-    visit_expressions(table_args, |expr| {
+    table_args
+        .args
+        .iter()
+        .filter(|arg| query_argument(arg).is_none())
+        .any(arg_names_something)
+}
+
+fn arg_names_something(arg: &FunctionArg) -> bool {
+    visit_expressions(arg, |expr| {
         let names = match expr {
             Expr::Value(v) => matches!(
                 v.value,
@@ -921,6 +950,32 @@ fn args_name_something(table_args: &TableFunctionArgs) -> bool {
         }
     })
     .is_break()
+}
+
+/// The query an argument is, when it is one: `(SELECT src, dst FROM edges)`, named or
+/// not, and with any parentheses around it. A query nested deeper in an argument's
+/// expression is not one: arc's own reader reads a select's `FROM` and its joins, and
+/// not the subqueries an expression holds.
+fn query_argument(arg: &FunctionArg) -> Option<&sqlparser::ast::Query> {
+    fn query(expr: &Expr) -> Option<&sqlparser::ast::Query> {
+        match expr {
+            Expr::Subquery(query) => Some(query),
+            Expr::Nested(inner) => query(inner),
+            _ => None,
+        }
+    }
+    match arg {
+        FunctionArg::Named {
+            arg: FunctionArgExpr::Expr(expr),
+            ..
+        }
+        | FunctionArg::ExprNamed {
+            arg: FunctionArgExpr::Expr(expr),
+            ..
+        }
+        | FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => query(expr),
+        _ => None,
+    }
 }
 
 /// The filesystem-path string literals of a file-reader argument expression.
