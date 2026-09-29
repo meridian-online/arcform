@@ -1959,7 +1959,219 @@ mod extension_tests {
         );
     }
 
+    // ---- SQL a step builds or writes while it runs ----
+
+    /// The places in `sql` where it runs or writes SQL that is not in the file, with their
+    /// lines.
+    fn run_time(sql: &str) -> Vec<(RunTimeSql, usize)> {
+        scan_extension_sql(sql.as_bytes())
+            .into_iter()
+            .filter_map(|(found, line)| match found {
+                ExtensionSql::RunTime(shape) => Some((shape, line)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn run_time_reads_a_call_on_anything_but_one_string() {
+        let call = |name| vec![(RunTimeSql::Call(name), 1)];
+        for sql in [
+            "FROM query(getvariable('q'));",
+            "FROM query('SELECT ' || '42');",
+            "FROM query();",
+            "FROM query('SELECT 1', 'x');",
+            "FROM main.query(getvariable('q'));",
+            "FROM system.main.query(getvariable('q'));",
+            "FROM \"query\"(getvariable('q'));",
+            "FROM Query ( getvariable('q') );",
+            "FROM t, main.query(getvariable('q'));",
+        ] {
+            assert_eq!(run_time(sql), call("query"), "{sql}");
+        }
+        assert_eq!(
+            run_time("FROM json_execute_serialized_sql(json_serialize_sql('SELECT 1'));"),
+            call("json_execute_serialized_sql")
+        );
+        for sql in [
+            "FROM query('SELECT 42');",
+            "FROM query(E'SELECT 42');",
+            "FROM query($t$SELECT 42$t$);",
+            "FROM query('SELECT '\n'42');",
+            "SELECT query FROM log;",
+            "SELECT count(query) FROM log;",
+        ] {
+            assert_eq!(run_time(sql), vec![], "{sql}");
+        }
+    }
+
+    #[test]
+    fn run_time_reads_the_calls_a_literal_query_runs_as_calls_in_the_file() {
+        for sql in [
+            "FROM query('FROM query(getvariable(''q''))');",
+            "FROM query($$FROM query(getvariable('q'))$$);",
+            "FROM query('FROM query(''FROM query(getvariable(''''q''''))'')');",
+            // DuckDB reads a zero-width space in the literal as a space, as in a file.
+            "FROM query('FROM\u{200b}query(getvariable(''q''))');",
+        ] {
+            assert_eq!(run_time(sql), vec![(RunTimeSql::Call("query"), 1)], "{sql}");
+        }
+        // The line is the call's in the file, not the line inside the literal.
+        assert_eq!(
+            run_time(
+                "SELECT 1;\nFROM query('SELECT 1\n\nUNION ALL FROM query(getvariable(''q''))');"
+            ),
+            vec![(RunTimeSql::Call("query"), 2)]
+        );
+        assert_eq!(run_time("FROM query('FROM query(''SELECT 42'')');"), vec![]);
+    }
+
+    #[test]
+    fn run_time_reads_the_calls_serialized_sql_makes() {
+        let json = |name: &str| {
+            format!(
+                r#"{{"statements":[{{"node":{{"from_table":{{"function":{{"class":"FUNCTION","function_name":"{name}","children":[]}}}}}}}}]}}"#
+            )
+        };
+        // A serialized call to either function, in any letter case and escaped, and text that
+        // is not JSON.
+        for literal in [
+            json("query"),
+            json("QUERY"),
+            json("json_execute_serialized_sql"),
+            json(r"query"),
+            "not json".to_string(),
+        ] {
+            let sql = format!("FROM json_execute_serialized_sql('{literal}');");
+            assert_eq!(
+                run_time(&sql),
+                vec![(RunTimeSql::Call("json_execute_serialized_sql"), 1)],
+                "{sql}"
+            );
+        }
+        // Serialized SQL that calls another function, or none, and a name that is not a
+        // function's.
+        for literal in [
+            json("abs"),
+            r#"{"statements":[]}"#.to_string(),
+            r#"{"alias":"query"}"#.to_string(),
+        ] {
+            let sql = format!("FROM json_execute_serialized_sql('{literal}');");
+            assert_eq!(run_time(&sql), vec![], "{sql}");
+        }
+        // `query()` runs its literal as SQL, not JSON.
+        assert_eq!(
+            run_time(&format!("FROM query('{}');", json("query"))),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn run_time_reads_a_name_a_column_list_follows_as_no_call() {
+        for sql in [
+            "CREATE TABLE query (a INT);",
+            "CREATE TABLE main.query (a INT);",
+            "CREATE TABLE IF NOT EXISTS query (a INT);",
+            "INSERT INTO query (a) VALUES (1);",
+            "CREATE VIEW query (a) AS SELECT 1;",
+            "WITH query (a) AS (SELECT 1) FROM query;",
+            "WITH RECURSIVE query (a) AS (SELECT 1) FROM query;",
+            "CREATE TABLE json_execute_serialized_sql (a INT);",
+        ] {
+            assert_eq!(run_time(sql), vec![], "{sql}");
+        }
+    }
+
+    #[test]
+    fn run_time_reads_importing_a_database_and_naming_duckdbrc() {
+        for sql in [
+            "IMPORT DATABASE 'imp';",
+            "import Database 'imp';",
+            "PRAGMA import_database('imp');",
+            "PRAGMA IMPORT_DATABASE('imp');",
+            "PRAGMA \"import_database\"('imp');",
+        ] {
+            assert_eq!(
+                run_time(sql),
+                vec![(RunTimeSql::ImportDatabase, 1)],
+                "{sql}"
+            );
+        }
+        for sql in [
+            "COPY t TO '~/.duckdbrc';",
+            "COPY t TO \"~/.duckdbrc\";",
+            "SELECT '/Users/me/.DuckDBrc';",
+            "SELECT $$.duckdbrc$$;",
+        ] {
+            assert_eq!(run_time(sql), vec![(RunTimeSql::Duckdbrc, 1)], "{sql}");
+        }
+        for sql in [
+            "EXPORT DATABASE 'imp';",
+            "DETACH DATABASE lib;",
+            "SELECT 'IMPORT DATABASE imp';",
+            "-- IMPORT DATABASE 'imp';",
+            "SELECT '~/.duck' || 'dbrc';",
+            "SELECT duckdbrc FROM t;",
+        ] {
+            assert_eq!(run_time(sql), vec![], "{sql}");
+        }
+    }
+
     // ---- the check a run makes ----
+
+    #[test]
+    fn check_warns_once_per_file_naming_each_line_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql = sources(
+            dir.path(),
+            &[
+                (
+                    "step 'a'",
+                    "IMPORT DATABASE 'imp';\nFROM query(getvariable('q')) UNION ALL FROM query(getvariable('r'));\nCOPY (SELECT 1) TO '~/.duckdbrc';",
+                ),
+                ("step 'b'", "SELECT 1;"),
+                (
+                    "hook on_exit 'h'",
+                    "INSTALL mlpack FROM community;\nPRAGMA import_database('imp');",
+                ),
+            ],
+        );
+        let tail = format!(
+            ". arc does not read the SQL a step builds or writes while it runs, for an extension that SQL installs; running it anyway ({VETTED_EXTENSIONS_DOC})"
+        );
+        assert_eq!(
+            check_extension_installs(&sql, Some(&v("1.5.4"))).unwrap(),
+            vec![
+                format!(
+                    "mlpack is vetted on DuckDB v1.5.5, and this engine is DuckDB v1.5.4; running it anyway ({VETTED_EXTENSIONS_DOC})"
+                ),
+                format!(
+                    "step 'a' (s0.sql) can run or write SQL that is not in its file: IMPORT DATABASE on line 1, query() on line 2, .duckdbrc on line 3{tail}"
+                ),
+                format!(
+                    "hook on_exit 'h' (s2.sql) can run or write SQL that is not in its file: IMPORT DATABASE on line 2{tail}"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn check_refuses_a_protocol_whatever_it_builds_at_run_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql = sources(
+            dir.path(),
+            &[
+                ("step 'a'", "IMPORT DATABASE 'imp';"),
+                ("step 'b'", "INSTALL anofox_forecast FROM community;"),
+            ],
+        );
+        assert_eq!(
+            refusals(check_extension_installs(&sql, Some(&v("1.5.5")))),
+            vec![
+                "step 'b' (s1.sql, line 1) installs anofox_forecast from the community registry, and anofox_forecast is not on the vetted list"
+            ]
+        );
+    }
 
     /// Each `(place, sql)` written to a file of its own in `dir`.
     fn sources(dir: &Path, files: &[(&str, &str)]) -> Vec<ProtocolSql> {
