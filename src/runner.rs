@@ -5314,6 +5314,16 @@ steps:
         let contract: Contract = serde_json::from_str(&raw).unwrap();
 
         assert_eq!(contract.run.outcome, "partial", "s1 succeeded, s2 failed");
+        // The state backend keeps the failed step's own outcome: a recheck of pinned
+        // extensions that passes does not write the contract's outcome over it.
+        assert_eq!(
+            state.runs.borrow()[0]
+                .1
+                .as_ref()
+                .map(|(_, outcome)| outcome.as_str()),
+            Some("failed"),
+            "the run table's outcome for a failed run"
+        );
         let s1 = contract.steps.iter().find(|s| s.name == "s1").unwrap();
         let s2 = contract.steps.iter().find(|s| s.name == "s2").unwrap();
         assert_eq!(s1.status.state, "success");
