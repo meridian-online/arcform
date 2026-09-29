@@ -1,0 +1,91 @@
+{
+  "registry_commit": "80bed7b173cd",
+  "probed": "2026-09-27",
+  "platforms": ["linux_amd64", "osx_arm64"],
+  "extensions": [
+    {
+      "name": "dta",
+      "licence": "MIT",
+      "repository": "codedthinking/duckdb-dta",
+      "duckdb_versions": ["v1.5.5"],
+      "proof": "read a Stata file; write one and read it back"
+    },
+    {
+      "name": "h3",
+      "licence": "Apache-2.0",
+      "repository": "isaacbrodsky/h3-duckdb",
+      "duckdb_versions": ["v1.5.5"],
+      "proof": "the hexagonal cell for a point"
+    },
+    {
+      "name": "http_client",
+      "licence": "MIT",
+      "repository": "query-farm/httpclient",
+      "duckdb_versions": ["v1.5.5"],
+      "proof": "an HTTP GET returning status and body"
+    },
+    {
+      "name": "mlpack",
+      "licence": "MIT",
+      "repository": "eddelbuettel/duckdb-mlpack",
+      "duckdb_versions": ["v1.5.5"],
+      "proof": "train a random forest, store it and score new rows; a logistic regression; k-means"
+    },
+    {
+      "name": "rapidfuzz",
+      "licence": "MIT",
+      "repository": "query-farm/rapidfuzz",
+      "duckdb_versions": ["v1.5.5"],
+      "proof": "a token-sort ratio between two strings"
+    },
+    {
+      "name": "stats_duck",
+      "licence": "Apache-2.0",
+      "repository": "KoliStat/the-stats-duck",
+      "duckdb_versions": ["v1.5.5"],
+      "proof": "a two-sample t-test"
+    },
+    {
+      "name": "stochastic",
+      "licence": "Apache-2.0",
+      "repository": "query-farm/stochastic",
+      "duckdb_versions": ["v1.5.5"],
+      "proof": "the normal distribution at its known points"
+    },
+    {
+      "name": "subtoken",
+      "licence": "MIT",
+      "repository": "meridian-online/subtoken",
+      "duckdb_versions": ["v1.5.5"],
+      "proof": "embed text and rank by cosine similarity"
+    },
+    {
+      "name": "textplot",
+      "licence": "Apache-2.0",
+      "repository": "query-farm/textplot",
+      "duckdb_versions": ["v1.5.5"],
+      "proof": "a text plot from SQL"
+    },
+    {
+      "name": "us_address_standardizer",
+      "licence": "MIT",
+      "repository": "ericmanning/duckdb-address-standardizer",
+      "duckdb_versions": ["v1.5.5"],
+      "proof": "a US address parsed into its parts"
+    },
+    {
+      "name": "webbed",
+      "licence": "MIT",
+      "repository": "teaguesterling/duckdb_webbed",
+      "duckdb_versions": ["v1.5.5"],
+      "proof": "parse XML into rows; write rows as XML"
+    },
+    {
+      "name": "zipfs",
+      "licence": "MIT",
+      "repository": "isaacbrodsky/duckdb-zipfs",
+      "duckdb_versions": ["v1.5.5"],
+      "proof": "read a file inside a zip archive"
+    }
+  ]
+}
