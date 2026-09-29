@@ -1,4 +1,4 @@
-//! The two MCP tools native to `arc` — the ones that make `arc mcp` more than a
+//! The MCP tools native to `arc` — the ones that make `arc mcp` more than a
 //! FineType proxy.
 //!
 //! - `protocol_run` runs a Protocol and returns its live **Protocol+Run contract**
@@ -6,6 +6,9 @@
 //!   per-step outcome, the same JSON `arc run` writes under `build/.arcform/runs/`.
 //! - `operator_describe` emits an operator's `with:` JSON Schema (or lists the
 //!   catalog) so an agent or authoring UI can build and check a `with:` block.
+//! - `operation_describe` lists the SQL operations arc holds, or describes one by its
+//!   long name: the same JSON `arc operation list --json` and `arc operation describe`
+//!   print, both read from the catalogue in `record`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -179,7 +182,51 @@ fn operator_describe_schema() -> Value {
     })
 }
 
-/// The two native tools.
+// ─────────────────────────────────────────────────────────────────────────────
+// operation_describe
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// List the operations arc holds, or describe the one named by `operation`.
+///
+/// The answer is the catalogue's own: the listing is what `arc operation list
+/// --json` prints, under one key, and a description is what `arc operation
+/// describe` prints. Nothing here builds a description of its own. An
+/// `operation` that is not a string is refused rather than read as absent, so a
+/// client that sends the wrong type is told so and does not get a listing back.
+fn operation_describe(args: &Value) -> ToolResult {
+    match args.get("operation") {
+        None | Some(Value::Null) => {
+            let operations: Vec<Value> = crate::record::operations()
+                .iter()
+                .map(|op| op.listing())
+                .collect();
+            Ok(ToolOutput::json(json!({ "operations": operations })))
+        }
+        Some(Value::String(name)) => match crate::record::operation(name) {
+            Some(op) => Ok(ToolOutput::json(op.description())),
+            None => Err(format!(
+                "no operation called `{name}` — call operation_describe with no arguments to list the operations arc holds"
+            )),
+        },
+        Some(other) => Err(format!(
+            "`operation` must be a string, the long name of an operation, not {other} — call operation_describe with no arguments to list the operations arc holds"
+        )),
+    }
+}
+
+fn operation_describe_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "operation": {
+                "type": "string",
+                "description": "An operation's long name (e.g. filter-rows). Omit to list every operation arc holds."
+            }
+        }
+    })
+}
+
+/// The tools native to `arc`.
 pub(super) fn tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
@@ -193,6 +240,12 @@ pub(super) fn tools() -> Vec<ToolDef> {
             description: "Emit an operator's `with:` JSON Schema for authoring — or list the operator catalog when called with no operator.",
             input_schema: operator_describe_schema,
             handler: operator_describe,
+        },
+        ToolDef {
+            name: "operation_describe",
+            description: "List the SQL operations arc holds when called with no operation — or describe one operation (what it does, what it is applied to, and the JSON Schema of what it takes) by its long name.",
+            input_schema: operation_describe_schema,
+            handler: operation_describe,
         },
     ]
 }
@@ -236,6 +289,64 @@ mod tests {
     fn operator_describe_unknown_operator_errors() {
         let err = operator_describe(&json!({ "operator": "nope" })).unwrap_err();
         assert!(err.contains("unknown operator"), "message: {err}");
+    }
+
+    #[test]
+    fn operation_describe_lists_each_operation_under_one_key() {
+        for args in [json!({}), json!({ "operation": null })] {
+            let result = operation_describe(&args).expect("listing succeeds");
+            let listed = result.structured.as_ref().expect("a structured listing");
+            let object = listed.as_object().expect("the listing is an object");
+            assert_eq!(object.len(), 1, "one key only: {listed}");
+            let entries = object["operations"]
+                .as_array()
+                .expect("an array of entries");
+            assert!(!entries.is_empty(), "the catalogue holds an operation");
+            for entry in entries {
+                let keys: Vec<&str> = entry
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                assert_eq!(keys, ["long_name", "summary"], "entry: {entry}");
+            }
+            let long_names: Vec<&str> = entries
+                .iter()
+                .filter_map(|e| e["long_name"].as_str())
+                .collect();
+            assert!(
+                long_names.contains(&"filter-rows"),
+                "listed: {long_names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn operation_describe_returns_the_catalogues_description() {
+        let result =
+            operation_describe(&json!({ "operation": "filter-rows" })).expect("describe succeeds");
+        let described = result.structured.expect("a structured description");
+        assert_eq!(described["long_name"], "filter-rows");
+        assert!(described["applied_to"].is_array(), "described: {described}");
+        assert_eq!(described["parameters"]["required"], json!(["where"]));
+        // The text an MCP client shows is the same document.
+        let from_text: Value = serde_json::from_str(&result.text).expect("text is JSON");
+        assert_eq!(from_text, described);
+    }
+
+    #[test]
+    fn operation_describe_unknown_operation_errors_naming_it() {
+        let err = operation_describe(&json!({ "operation": "nope" })).unwrap_err();
+        assert!(err.contains("`nope`"), "message: {err}");
+        assert!(err.contains("no operation called"), "message: {err}");
+    }
+
+    #[test]
+    fn operation_describe_refuses_an_operation_that_is_not_a_string() {
+        let err = operation_describe(&json!({ "operation": ["filter-rows"] })).unwrap_err();
+        assert!(err.contains("must be a string"), "message: {err}");
+        assert!(err.contains("[\"filter-rows\"]"), "message: {err}");
     }
 
     #[test]
