@@ -1070,6 +1070,31 @@ mod tests {
     }
 
     #[test]
+    fn a_table_function_called_on_a_subquery_is_read_by_the_same_rules_under_either_reader() {
+        let cases: [(&str, &[&str], &[&str]); 3] = [
+            (recorded_steps::SUBQUERY_CALL, &["edges"], &[]),
+            // A string inside the subquery is the subquery's own.
+            (recorded_steps::SUBQUERY_WITH_STRING, &["edges"], &[]),
+            // A string beside it still names something arc does not read.
+            (
+                recorded_steps::SUBQUERY_BESIDE_STRING,
+                &["train"],
+                &["my_ext_fit"],
+            ),
+        ];
+        for (sql, reads, unread) in cases {
+            let by_duckdb = read_by_duckdb(sql);
+            assert_eq!(by_duckdb, read_by_sqlparser(sql), "{sql}");
+            assert_eq!(by_duckdb[0].inputs, set(reads), "reads of {sql}");
+            assert_eq!(
+                by_duckdb[0].unread_table_functions,
+                set(unread),
+                "unread functions of {sql}"
+            );
+        }
+    }
+
+    #[test]
     fn a_copy_is_read_by_the_same_rules_under_either_reader() {
         for (sql, file, kind) in [
             (recorded_steps::COPY_QUERY, "out.csv", AssetKind::File),
@@ -1727,6 +1752,104 @@ mod tests {
                     .into_iter()
                     .collect::<BTreeSet<_>>(),
                 "{sql}: inputs"
+            );
+        }
+    }
+
+    // A table function called on a subquery reads the tables the subquery reads, and its
+    // own name is not one — whether the function is an extension's, DuckDB's own, or a
+    // row generator. The subquery may be named, parenthesised again, or nest another in
+    // its `FROM`.
+    #[test]
+    fn test_table_function_called_on_a_subquery_reads_the_subquerys_tables() {
+        for (sql, reads) in [
+            (
+                "CREATE TABLE paths AS SELECT * FROM onager_pth_dijkstra((SELECT src, dst, w FROM edges));",
+                &["edges"][..],
+            ),
+            (
+                "CREATE TABLE r AS SELECT * FROM onager_pth_dijkstra((SELECT src, dst, w FROM (SELECT * FROM edges) e));",
+                &["edges"],
+            ),
+            (
+                "CREATE TABLE r AS SELECT * FROM summary((SELECT e.src FROM edges e JOIN nodes n ON n.id = e.src));",
+                &["edges", "nodes"],
+            ),
+            (
+                "CREATE TABLE r AS SELECT * FROM range((SELECT count(*) FROM edges));",
+                &["edges"],
+            ),
+            (
+                "CREATE TABLE r AS SELECT * FROM my_ext_scan(source := (SELECT src FROM edges));",
+                &["edges"],
+            ),
+            (
+                "CREATE TABLE r AS SELECT * FROM my_ext_scan(((SELECT src FROM edges)));",
+                &["edges"],
+            ),
+        ] {
+            let assets = extract_assets(sql).unwrap();
+            assert_eq!(assets.inputs, set(reads), "{sql}: the subquery's tables");
+            assert!(
+                assets.unread_table_functions.is_empty(),
+                "{sql}: the call is read, got {:?}",
+                assets.unread_table_functions
+            );
+            assert_eq!(assets.outputs.len(), 1, "{sql}: the target is produced");
+        }
+    }
+
+    // The statement that showed the defect: two extension functions called on subqueries
+    // and joined.
+    #[test]
+    fn test_two_table_functions_called_on_subqueries_and_joined_read_the_table() {
+        let sql = "CREATE TEMP TABLE result AS \
+            SELECT d.node_id, CASE WHEN isinf(d.distance) THEN NULL ELSE d.distance END AS distance, c.component \
+            FROM onager_pth_dijkstra((SELECT src, dst, w FROM edges), directed := false, source := 0) d \
+            JOIN onager_cmm_components((SELECT src, dst FROM edges)) c USING (node_id);";
+        let assets = extract_assets(sql).unwrap();
+        assert_eq!(assets.inputs, set(&["edges"]));
+        assert_eq!(assets.outputs, set(&["result"]));
+        assert!(assets.unread_table_functions.is_empty());
+    }
+
+    // A string, or a quoted identifier, inside the subquery is the subquery's own: it
+    // names nothing the call reads, so it does not send the call to the unread arm.
+    #[test]
+    fn test_a_string_inside_a_subquery_argument_does_not_make_the_call_unread() {
+        for sql in [
+            "CREATE TABLE r AS SELECT * FROM summary((SELECT src, dst FROM edges WHERE kind = 'road'));",
+            r#"CREATE TABLE r AS SELECT * FROM summary((SELECT "src" FROM edges));"#,
+        ] {
+            let assets = extract_assets(sql).unwrap();
+            assert_eq!(assets.inputs, set(&["edges"]), "{sql}");
+            assert!(
+                assets.unread_table_functions.is_empty(),
+                "{sql}: not unread, got {:?}",
+                assets.unread_table_functions
+            );
+        }
+    }
+
+    // A string or a quoted identifier beside the subquery still names something arc does
+    // not read: the call keeps the warning, and the subquery's tables are still read.
+    #[test]
+    fn test_a_string_beside_a_subquery_argument_keeps_the_call_unread() {
+        for sql in [
+            "CREATE TABLE m AS SELECT * FROM my_ext_fit((SELECT x, y FROM train), 'model');",
+            r#"CREATE TABLE m AS SELECT * FROM my_ext_fit((SELECT x, y FROM train), "model");"#,
+            "CREATE TABLE m AS SELECT * FROM my_ext_fit((SELECT x, y FROM train), target := 'model');",
+        ] {
+            let assets = extract_assets(sql).unwrap();
+            assert_eq!(
+                assets.inputs,
+                set(&["train"]),
+                "{sql}: no read named for the call"
+            );
+            assert_eq!(
+                assets.unread_table_functions,
+                set(&["my_ext_fit"]),
+                "{sql}: the call is listed for the warning"
             );
         }
     }
