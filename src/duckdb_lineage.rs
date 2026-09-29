@@ -1116,9 +1116,9 @@ fn arg_value(expression: &Value, text: &str) -> ArgValue {
             Some([Value::String(name)]) => ArgValue::Identifier(name.clone()),
             _ => other(),
         },
-        // `(SELECT src, dst FROM edges)`. `IN (SELECT …)` and `EXISTS (SELECT …)` are
-        // other subquery types, and expressions.
-        (Some("SUBQUERY"), _) if expression["subquery_type"] == "SCALAR" => ArgValue::Query,
+        // `(SELECT src, dst FROM edges)`. Only a subquery holds a `subquery_type`, and
+        // `IN (SELECT …)` and `EXISTS (SELECT …)` hold another: they are expressions.
+        _ if expression["subquery_type"] == "SCALAR" => ArgValue::Query,
         // `['a.json', 'b.json']` is DuckDB's `list_value` of its elements.
         (Some("FUNCTION"), _)
             if expression["function_name"] == "list_value"
