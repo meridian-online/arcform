@@ -848,6 +848,19 @@ impl Pinned {
         fs::read(self.protocol.project().join("arcform.yaml")).unwrap()
     }
 
+    /// The `outcome` of each run the Protocol's database records, oldest first.
+    fn recorded_outcomes(&self) -> Vec<Option<String>> {
+        let conn =
+            duckdb::Connection::open(self.protocol.project().join("pinned.duckdb")).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT outcome FROM _arcform_runs ORDER BY rowid")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
     /// The files under `build/.arcform/runs/`.
     fn run_records(&self) -> BTreeSet<String> {
         fs::read_dir(self.protocol.project().join("build/.arcform/runs"))
@@ -1073,6 +1086,14 @@ fn a_pinned_extension_duckdb_cannot_install_or_name_is_refused_and_not_warned() 
             "no warning instead"
         );
         assert!(run.started().is_empty(), "no step ran");
+        if matches!(registry, Registry::Fails) {
+            assert!(
+                run.stderr
+                    .contains("HTTP Error: Failed to download extension"),
+                "the refusal should carry DuckDB's own reason:\n{}",
+                run.stderr
+            );
+        }
     }
 }
 
@@ -1180,7 +1201,12 @@ fn a_step_that_replaces_a_pinned_file_fails_the_run_when_it_ends() {
     )
     .unwrap();
     let outcome = contract["run"]["outcome"].as_str().expect("an outcome");
-    assert_ne!(outcome, "success", "{contract}");
+    assert_eq!(outcome, "partial", "{contract}");
+    assert_eq!(
+        pinned.recorded_outcomes(),
+        vec![Some(outcome.to_string())],
+        "the Protocol's database records the outcome the contract gives"
+    );
     assert_eq!(pinned.manifest(), manifest, "arcform.yaml is as it was");
 
     // A run that failed already keeps its own error, and prints this one beside it.
@@ -1198,6 +1224,36 @@ fn a_step_that_replaces_a_pinned_file_fails_the_run_when_it_ends() {
         "{}",
         run.stderr
     );
+    assert_eq!(
+        pinned.recorded_outcomes()[1].as_deref(),
+        Some("failed"),
+        "the Protocol's database keeps the failed run's own outcome"
+    );
+
+    // An on_init hook that replaces the file and then fails ends the run before any step,
+    // and the file is still hashed again, beside the hook's own error.
+    fs::copy(pinned.served(), pinned.installed()).unwrap();
+    pinned.write_manifest(&format!(
+        "name: pinned\nsteps:\n  - name: s\n    sql: models/s.sql\nhooks:\n  on_init:\n    name: replace\n    command: \"printf x >> '{}'; exit 3\"\n{}",
+        pinned.installed().display(),
+        pin_yaml("v1.5.5", PLATFORM, &pin)
+    ));
+    let run = pinned.run(Registry::Serves, &[]);
+    assert_eq!(run.code, Some(2), "{}", run.stderr);
+    assert!(run.started().is_empty(), "no step ran");
+    let found = sha256(&pinned.installed());
+    for needle in [
+        "on_init hook 'replace' failed",
+        "changed during the run",
+        &pin,
+        &found,
+    ] {
+        assert!(
+            run.stderr.contains(needle),
+            "a failed on_init should name {needle:?}:\n{}",
+            run.stderr
+        );
+    }
 }
 
 /// What `arc init p` wrote into `arcform.yaml` on 68a1fa2, byte for byte: recorded by
@@ -1302,6 +1358,28 @@ fn the_real_duckdb_answers_the_pin_check_from_the_file_it_holds() {
         &pin,
         &path,
     ] {
+        assert!(
+            stderr.contains(needle),
+            "the refusal should name {needle:?}:\n{stderr}"
+        );
+    }
+    assert!(!marked, "on_init did not run");
+
+    // A `~/.duckdbrc` that prints a line puts it on stdout ahead of arc's answer, and arc
+    // does not take it for the platform, which would leave the pin unchosen and the
+    // extension run unchecked.
+    fs::write(
+        home.path().join(".duckdbrc"),
+        ".print a line a duckdbrc prints\n",
+    )
+    .unwrap();
+    let (code, stderr, marked) = run(OTHER_PIN);
+    assert_eq!(
+        code,
+        Some(1),
+        "a line ~/.duckdbrc printed was read as the answer:\n{stderr}"
+    );
+    for needle in [OTHER_PIN, &pin, &path] {
         assert!(
             stderr.contains(needle),
             "the refusal should name {needle:?}:\n{stderr}"

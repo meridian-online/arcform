@@ -749,14 +749,15 @@ pub fn run_with_params(
     // After the last step and hook: a step can replace a pinned file with `FORCE INSTALL`,
     // `UPDATE EXTENSIONS` or a command. A run that failed already keeps its own error and
     // prints this one beside it.
-    let step_loop_result = match (step_loop_result, recheck_extension_pins(&pinned)) {
-        (result, Ok(())) => result,
-        (Ok(()), Err(changed)) => Err(changed),
-        (Err(e), Err(changed)) => {
-            eprintln!("{} {}", "error:".red(), changed);
-            Err(e)
-        }
-    };
+    let (step_loop_result, changed_after_success) =
+        match (step_loop_result, recheck_extension_pins(&pinned)) {
+            (result, Ok(())) => (result, false),
+            (Ok(()), Err(changed)) => (Err(changed), true),
+            (Err(e), Err(changed)) => {
+                eprintln!("{} {}", "error:".red(), changed);
+                (Err(e), false)
+            }
+        };
 
     // --- Finalize the live Protocol+Run contract ---
     // Assemble the full contract (assets, per-table row counts, steps), write it to
@@ -769,6 +770,11 @@ pub fn run_with_params(
         Err(_) if succeeded > 0 => "partial",
         Err(_) => "error",
     };
+    // The step loop recorded `success` in the state backend before the recheck, so a run
+    // the recheck failed records the outcome its contract gives in its place.
+    if changed_after_success {
+        let _ = state.finish_run(&run_id, executed, outcome, total_retries);
+    }
     let run_contract = contract::build_contract(contract::ContractInputs {
         manifest: &manifest,
         dir,
