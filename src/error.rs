@@ -66,6 +66,11 @@ pub enum Error {
     #[error("history: no entry '{id}' for this spec (see `arc history list`)")]
     HistoryEntryNotFound { id: String },
 
+    // A word that cannot be the way arc was reached: not one word arc can keep
+    // in an entry's file name, or one of arc's own ways spelt by a caller.
+    #[error("history: {way:?} cannot name the way arc was reached: {detail}")]
+    HistoryWay { way: String, detail: String },
+
     #[error("engine '{engine}' not found on PATH or not executable")]
     EngineNotFound { engine: String },
 
@@ -442,6 +447,19 @@ mod format_tests {
         assert!(s.starts_with("history:"), "family prefix: {:?}", s);
         assert!(s.contains("1700000000000-000-save"));
         assert!(s.contains("arc history list"));
+    }
+
+    #[test]
+    fn history_way_names_the_word_and_why_on_one_line() {
+        let e = Error::HistoryWay {
+            way: "a\nb".into(),
+            detail: "'\\n' is not an ASCII letter, a digit, `-` or `_`".into(),
+        };
+        let s = e.to_string();
+        assert!(!s.contains('\n'), "Display must be single-line: {:?}", s);
+        assert!(s.starts_with("history:"), "family prefix: {:?}", s);
+        assert!(s.contains(r#""a\nb""#), "the word, escaped: {:?}", s);
+        assert!(s.contains("is not an ASCII letter"), "why: {:?}", s);
     }
 
     #[test]

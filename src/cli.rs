@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::manifest::Manifest;
 use crate::registry::transport::GitTarballTransport;
 use crate::registry::{RunOptions, cache_root};
-use crate::spec::{HistoryKind, LocalHistory, PathPart, SpecEdit};
+use crate::spec::{HistoryKind, HistoryWay, LocalHistory, PathPart, SpecEdit};
 use crate::state::DuckDbStateBackend;
 
 /// Default index URL — points to the (future) meridian-online/registry repo.
@@ -488,7 +488,9 @@ fn history_file(dir: &Path, file: &Path) -> PathBuf {
 /// given `file` of that one file, oldest first (the newest lands beside the
 /// prompt), with the retention policy printed under the entries it governs —
 /// a user should never have to hunt for the rules deciding what this command
-/// shows.
+/// shows. Each state's line ends with the way arc was reached when it was
+/// written, or `not recorded` for a state written without one; last, so the
+/// columns before it stand where they always have.
 pub fn history_list(
     dir: &Path,
     file: Option<&Path>,
@@ -519,11 +521,15 @@ pub fn history_list(
         for entry in &entries {
             writeln!(
                 out,
-                "{}  {:<10}  {}  {:>7} bytes",
+                "{}  {:<10}  {}  {:>7} bytes  {}",
                 entry.id,
                 kind_word(entry.kind),
                 humantime::format_rfc3339_seconds(entry.at),
                 entry.bytes,
+                entry
+                    .way
+                    .as_ref()
+                    .map_or("not recorded", HistoryWay::as_str),
             )?;
         }
         writeln!(
@@ -736,6 +742,15 @@ pub fn upgrade_extension(
     Ok(())
 }
 
+/// The local-history store as every verb of the command line opens it: the
+/// conventional root, reached by [`HistoryWay::TERMINAL`]. Every version a
+/// verb writes — `create-protocol`'s first save, `edit-protocol`'s and
+/// `upgrade`'s checkpoint and save, a recording's two, and the checkpoint a
+/// restore takes — carries the way from here, so none can name another.
+fn open_history() -> Result<LocalHistory> {
+    Ok(LocalHistory::open_default()?.reached_by(HistoryWay::TERMINAL))
+}
+
 /// Dispatch CLI commands.
 pub fn dispatch(cli: Cli) -> Result<()> {
     let verbose = cli.verbose || std::env::var_os(VERBOSE_ENV).is_some();
@@ -752,14 +767,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             name,
             engine,
             db,
-        } => create_protocol(&dir, name, engine, db, &LocalHistory::open_default()?),
-        Commands::EditProtocol { dir, op } => {
-            edit_protocol(&dir, op, &LocalHistory::open_default()?)
-        }
+        } => create_protocol(&dir, name, engine, db, &open_history()?),
+        Commands::EditProtocol { dir, op } => edit_protocol(&dir, op, &open_history()?),
         Commands::History { cmd } => dispatch_history(cmd),
         Commands::Run { force, params } => run_pipeline(force, &params),
         Commands::Upgrade { name, dir } => {
-            upgrade_extension(&dir, &name, &DuckDbEngine, &LocalHistory::open_default()?)
+            upgrade_extension(&dir, &name, &DuckDbEngine, &open_history()?)
         }
         Commands::Registry { cmd } => dispatch_registry(cmd, verbose),
         Commands::Operation { cmd } => dispatch_operation(cmd, &mut std::io::stdout()),
@@ -783,7 +796,7 @@ fn dispatch_operation(cmd: OperationCmd, out: &mut impl Write) -> Result<()> {
             dir,
         } => {
             let arguments = operation_arguments(&args)?;
-            let history = LocalHistory::open_default()?;
+            let history = open_history()?;
             operation_record(&dir, &long_name, &on, &name, &arguments, &history, out)
         }
     }
@@ -872,7 +885,7 @@ fn operation_arguments(args: &[String]) -> Result<serde_json::Map<String, serde_
 }
 
 fn dispatch_history(cmd: HistoryCmd) -> Result<()> {
-    let history = LocalHistory::open_default()?;
+    let history = open_history()?;
     let mut stdout = std::io::stdout();
     match cmd {
         HistoryCmd::List { dir, file } => {

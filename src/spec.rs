@@ -93,6 +93,9 @@
 //!   path — a chart file beside the spec, say — listed, bounded and restored
 //!   apart from every other file's, the spec's included
 //! - [`HistoryEntry`], [`HistoryKind`] — one recorded state; save vs checkpoint
+//! - [`HistoryWay`] — the way arc was reached when an entry was written:
+//!   `terminal`, `mcp`, or a caller's own word; a handle carries one through
+//!   [`LocalHistory::reached_by`] and every entry it records names it
 //! - [`edit_spec_with_history`] — [`edit_spec`] on the checkpointed road: the
 //!   replaced bytes are snapshotted first, and no checkpoint means no write
 //! - [`record_step_with_history`] — [`record_step`], same discipline
@@ -182,7 +185,7 @@ pub use crate::edit::{
 };
 pub use crate::error::{Error, Result};
 pub use crate::history::{
-    HISTORY_MAX_ENTRIES, HISTORY_MERGE_WINDOW, HistoryEntry, HistoryKind, LocalHistory,
+    HISTORY_MAX_ENTRIES, HISTORY_MERGE_WINDOW, HistoryEntry, HistoryKind, HistoryWay, LocalHistory,
     edit_spec_with_history, record_step_with_history,
 };
 pub use crate::manifest::{
