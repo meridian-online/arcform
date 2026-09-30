@@ -4134,6 +4134,12 @@ impl Operator for ArchiveExtract {
 /// The resolve script, pinned into the binary. `@1` == these exact bytes.
 const RESOLVE_PY: &str = include_str!("../operators/splink_resolve/resolve.py");
 
+/// The script cache directory `materialize_frozen_script` builds for this operator.
+/// Test-only, for the same reason [`UMAP_PROJECT_CACHE_DIR`] is: production never
+/// spells the path, and a test traps it to drive the cache's two failure paths.
+#[cfg(test)]
+const SPLINK_RESOLVE_CACHE_DIR: &str = "arcform-op-splink_resolve-1.0.0";
+
 struct SplinkResolve;
 
 #[derive(Deserialize)]
@@ -4252,6 +4258,12 @@ fn splink_resolve_invocation(cfg: &SplinkResolveConfig, dir: &Path) -> Result<Ve
 
 /// The GLEIF-fetch script, pinned into the binary. `@1` == these exact bytes.
 const GLEIF_RA_FETCH_PY: &str = include_str!("../operators/gleif_ra_fetch/fetch_gleif_ra.py");
+
+/// The script cache directory `materialize_frozen_script` builds for this operator.
+/// Test-only, for the same reason [`UMAP_PROJECT_CACHE_DIR`] is: production never
+/// spells the path, and a test traps it to drive the cache's two failure paths.
+#[cfg(test)]
+const GLEIF_RA_FETCH_CACHE_DIR: &str = "arcform-op-gleif_ra_fetch-1.0.0";
 
 struct GleifRaFetch;
 
@@ -7001,8 +7013,8 @@ mod tests {
     /// ever stops biting — because the cache path is spelled differently — the child's
     /// `expect_err` fires and this goes red; it cannot go quietly green.
     ///
-    /// Neither child reaches `uv`: the `?` short-circuits before the spawn, which is
-    /// why this runs on a CI machine that has none.
+    /// No child reaches `uv`: the `?` short-circuits before the spawn, which is why
+    /// this runs on a CI machine that has none.
     #[test]
     fn a_script_cache_that_cannot_be_written_stops_the_step() {
         // The child half: TMPDIR is already trapped, so materialising must fail. Which
@@ -7039,6 +7051,27 @@ mod tests {
                         TEXT_EMBED_CACHE_DIR,
                     )
                 }
+                "splink_resolve" => {
+                    let with: Value = serde_yaml::from_str(
+                        "edgar: edgar.parquet\ngleif: gleif.parquet\nout: out.parquet",
+                    )
+                    .unwrap();
+                    (
+                        SplinkResolve
+                            .run(&with, &ctx)
+                            .expect_err("a script cache that cannot be written must stop the step"),
+                        SPLINK_RESOLVE_CACHE_DIR,
+                    )
+                }
+                "gleif_ra_fetch" => {
+                    let with: Value = serde_yaml::from_str("ra: RA000665\nout: out.csv").unwrap();
+                    (
+                        GleifRaFetch
+                            .run(&with, &ctx)
+                            .expect_err("a script cache that cannot be written must stop the step"),
+                        GLEIF_RA_FETCH_CACHE_DIR,
+                    )
+                }
                 other => panic!("no operator called `{other}` to drive"),
             };
             let msg = err.to_string();
@@ -7065,6 +7098,16 @@ mod tests {
         for (operator, cache_dir, script) in [
             ("umap_project", UMAP_PROJECT_CACHE_DIR, "umap_project.py"),
             ("text_embed", TEXT_EMBED_CACHE_DIR, "text_embed.py"),
+            (
+                "splink_resolve",
+                SPLINK_RESOLVE_CACHE_DIR,
+                "splink_resolve.py",
+            ),
+            (
+                "gleif_ra_fetch",
+                GLEIF_RA_FETCH_CACHE_DIR,
+                "gleif_ra_fetch.py",
+            ),
         ] {
             let block_the_directory = tempfile::tempdir().unwrap();
             std::fs::write(block_the_directory.path().join(cache_dir), b"in the way").unwrap();
