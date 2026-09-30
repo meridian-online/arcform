@@ -6333,7 +6333,9 @@ mod tests {
                 panic!("the refusal must be ManifestValidation, which is not retried: {err:?}");
             };
             assert!(
-                said.contains(&format!("`neighbors: {asked}` is above 47, one below the 48 rows of in.parquet")),
+                said.contains(&format!(
+                    "`neighbors: {asked}` is above 47, one below the 48 rows of in.parquet"
+                )),
                 "the refusal names the value, the bound, the row count and the input: {said}"
             );
         }
