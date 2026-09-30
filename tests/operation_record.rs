@@ -744,6 +744,21 @@ mod mcp {
             "models/02_big_orders.sql"
         );
 
+        // No file under either Protocol's directory names a way, in its name
+        // or in its bytes: the way is kept in the history alone.
+        for (protocol, name) in [(&terminal, "terminal"), (&agent, "agent")] {
+            for (path, bytes) in protocol.files() {
+                let text = String::from_utf8_lossy(&bytes);
+                for way in ["terminal", "mcp"] {
+                    assert!(
+                        !path.to_string_lossy().contains(way) && !text.contains(way),
+                        "{name}'s {} names the way `{way}`:\n{text}",
+                        path.display()
+                    );
+                }
+            }
+        }
+
         assert_eq!(
             agent.files(),
             terminal.files(),
@@ -780,20 +795,6 @@ mod mcp {
                 terminal.arc(&["history", "show", terminal_id]).stdout,
                 "the version {agent_id} holds other bytes than {terminal_id}"
             );
-        }
-
-        // And no file under either Protocol's directory names a way.
-        for (protocol, name) in [(&terminal, "terminal"), (&agent, "agent")] {
-            for (path, bytes) in protocol.files() {
-                let text = String::from_utf8_lossy(&bytes);
-                for way in ["terminal", "mcp"] {
-                    assert!(
-                        !text.contains(way),
-                        "{name}'s {} names the way `{way}`:\n{text}",
-                        path.display()
-                    );
-                }
-            }
         }
     }
 

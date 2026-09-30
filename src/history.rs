@@ -700,9 +700,12 @@ fn entry_id(millis: u64, seq: u32, kind: HistoryKind) -> String {
     format!("{millis:013}-{seq:03}-{}", kind.tag())
 }
 
+/// An entry id's parts: its millis, its sequence number and its kind.
+type IdParts = (u64, u32, HistoryKind);
+
 /// The reverse of [`entry_id`]. Anything that does not parse is not an entry
 /// id.
-fn parse_id(id: &str) -> Option<(u64, u32, HistoryKind)> {
+fn parse_id(id: &str) -> Option<IdParts> {
     let mut parts = id.splitn(3, '-');
     let millis = parts.next()?.parse().ok()?;
     let seq = parts.next()?.parse().ok()?;
@@ -714,7 +717,7 @@ fn parse_id(id: &str) -> Option<(u64, u32, HistoryKind)> {
 /// entry that names no way — the one shape an arc before ways wrote — and
 /// `<id>.<way>` for one that does. A way holds no `.`, so the first `.` is the
 /// split, and a stem whose id or way does not parse is not an entry.
-fn parse_stem(stem: &str) -> Option<(&str, (u64, u32, HistoryKind), Option<HistoryWay>)> {
+fn parse_stem(stem: &str) -> Option<(&str, IdParts, Option<HistoryWay>)> {
     let (id, way) = match stem.split_once('.') {
         None => (stem, None),
         Some((id, word)) => (id, Some(HistoryWay::stored(word)?)),
