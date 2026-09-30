@@ -459,16 +459,19 @@ const FILTER_ROWS: &str = "filter-rows";
 /// field reads `order by`: the verb comes first, the clause is what it writes.
 const SORT_ROWS: &str = "sort-rows";
 
-/// One SQL operation arc holds: what it is called, what it does, what it is
-/// applied to, and what it takes — described so that it can be recorded as a
+/// One SQL operation arc holds: what it is called, what it does, what it reads
+/// and writes, and what it takes — described so that it can be recorded as a
 /// step by name. The catalogue holds the description and nothing that runs.
 pub(crate) struct Operation {
     /// The operation's identity: lower case, hyphenated, the verb first.
     pub(crate) long_name: &'static str,
     /// One sentence saying what the operation does.
     pub(crate) summary: &'static str,
-    /// Each thing the operation is applied to, in the order a caller names them.
-    applied_to: &'static [AppliedTo],
+    /// Each thing the operation reads, in the order a caller names them: a
+    /// table first.
+    reads: &'static [Role],
+    /// Each thing the operation's step writes.
+    writes: &'static [Role],
     /// The operation's arguments as a JSON Schema.
     parameters: fn() -> serde_json::Value,
     /// The step's SQL, written from a recording whose arguments `parameters`
@@ -497,19 +500,32 @@ impl Recording<'_> {
     }
 }
 
-/// One thing an operation is applied to. It is supplied by where the operation
-/// is asked from — the node in view, the column under a cursor — and is not an
-/// argument, so it is absent from the `parameters` schema.
-struct AppliedTo {
-    /// The entry's name, unique within the operation.
-    name: &'static str,
-    /// What kind of thing it is: `table` or `column`.
-    kind: &'static str,
-    /// The `name` of an earlier entry this one belongs to: a column is a column
-    /// of a table. `None` for an entry that stands alone.
-    of: Option<&'static str>,
-    /// One sentence saying what the entry is to the operation.
-    description: &'static str,
+/// One thing a step reads or writes, named by the role it plays. An operation
+/// and an operator describe what they read and write in this one shape.
+///
+/// A role is not an argument, so it is absent from the `parameters` schema. An
+/// operation's is supplied by where the operation is asked from — the node in
+/// view, the column under a cursor; an operator's is a key of its `with:` block,
+/// taken out of `parameters` and described here instead.
+pub(crate) struct Role {
+    /// The role's name, unique among what the step reads, and among what it
+    /// writes. An operator's is the `with:` key it is set under.
+    pub(crate) name: &'static str,
+    /// What kind of thing fills it: `table`, `file`, `directory` or `pattern`,
+    /// the kinds of asset arc records; `column`; or `any`, for a role whose kind
+    /// each value decides by how its name is written.
+    pub(crate) kind: &'static str,
+    /// Whether it is filled by a list of values rather than by one.
+    pub(crate) list: bool,
+    /// Whether a step cannot be recorded without it.
+    pub(crate) required: bool,
+    /// The `name` of an earlier role this one belongs to: a column is a column
+    /// of a table. Set on a `column` role alone.
+    pub(crate) of: Option<&'static str>,
+    /// The fewest values a list takes. Set on a list alone.
+    pub(crate) min_items: Option<u64>,
+    /// One sentence saying what the role is to the step.
+    pub(crate) description: &'static str,
 }
 
 /// A comparison a condition offers by word, with the SQL it is written as.
@@ -561,45 +577,75 @@ const DIRECTIONS: &[Comparison] = &[
     },
 ];
 
+/// What an operation's step writes: the one table it makes, which the step's
+/// name names.
+const STEP_TABLE: Role = Role {
+    name: "out",
+    kind: "table",
+    list: false,
+    required: true,
+    of: None,
+    min_items: None,
+    description: "The table the step makes, which the step's name names.",
+};
+
 /// Every operation arc holds, in the order `arc operation list` prints them.
+///
+/// An operation reads a table, then the column it is asked from. The column is
+/// not required: `arc operation record` records a step from the table and the
+/// arguments alone.
 const CATALOGUE: &[Operation] = &[
     Operation {
         long_name: FILTER_ROWS,
         summary: "Keeps the rows of a table for which a SQL condition holds.",
-        applied_to: &[
-            AppliedTo {
+        reads: &[
+            Role {
                 name: "table",
                 kind: "table",
+                list: false,
+                required: true,
                 of: None,
+                min_items: None,
                 description: "The table whose rows are kept.",
             },
-            AppliedTo {
+            Role {
                 name: "column",
                 kind: "column",
+                list: false,
+                required: false,
                 of: Some("table"),
+                min_items: None,
                 description: "The column the condition is on; the condition may name others.",
             },
         ],
+        writes: &[STEP_TABLE],
         parameters: filter_rows_parameters,
         sql: filter_rows_sql,
     },
     Operation {
         long_name: SORT_ROWS,
         summary: "Orders the rows of a table by a SQL `ORDER BY` clause.",
-        applied_to: &[
-            AppliedTo {
+        reads: &[
+            Role {
                 name: "table",
                 kind: "table",
+                list: false,
+                required: true,
                 of: None,
+                min_items: None,
                 description: "The table whose rows are ordered.",
             },
-            AppliedTo {
+            Role {
                 name: "column",
                 kind: "column",
+                list: false,
+                required: false,
                 of: Some("table"),
+                min_items: None,
                 description: "The column the order is by; the order may name others.",
             },
         ],
+        writes: &[STEP_TABLE],
         parameters: sort_rows_parameters,
         sql: sort_rows_sql,
     },
@@ -738,31 +784,67 @@ impl Operation {
         })
     }
 
-    /// The full description: the listing entry, the list of what the operation
-    /// is applied to, and a `parameters` JSON Schema of what it takes.
+    /// The full description: the listing entry, what the operation reads and
+    /// writes, and a `parameters` JSON Schema of what it takes.
     pub(crate) fn description(&self) -> serde_json::Value {
-        serde_json::json!({
-            "long_name": self.long_name,
-            "summary": self.summary,
-            "applied_to": self.applied_to.iter().map(AppliedTo::description).collect::<Vec<_>>(),
-            "parameters": (self.parameters)(),
-        })
+        description(
+            self.long_name,
+            self.summary,
+            self.reads,
+            self.writes,
+            (self.parameters)(),
+        )
     }
 }
 
-impl AppliedTo {
-    /// The entry as the description prints it; `of` only where it is set.
-    fn description(&self) -> serde_json::Value {
+impl Role {
+    /// The entry as a description prints it; `of` and `min_items` only where
+    /// they are set.
+    fn entry(&self) -> serde_json::Value {
         let mut entry = serde_json::json!({
             "name": self.name,
             "kind": self.kind,
+            "list": self.list,
+            "required": self.required,
+            "description": self.description,
         });
         if let Some(of) = self.of {
             entry["of"] = of.into();
         }
-        entry["description"] = self.description.into();
+        if let Some(min_items) = self.min_items {
+            entry["min_items"] = min_items.into();
+        }
         entry
     }
+}
+
+/// A description in the one shape an operation and an operator share: the
+/// name, one sentence saying what it does, what its step reads and writes by
+/// role, and a `parameters` JSON Schema of what it takes besides.
+pub(crate) fn description(
+    long_name: &str,
+    summary: &str,
+    reads: &[Role],
+    writes: &[Role],
+    parameters: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "long_name": long_name,
+        "summary": summary,
+        "reads": reads.iter().map(Role::entry).collect::<Vec<_>>(),
+        "writes": writes.iter().map(Role::entry).collect::<Vec<_>>(),
+        "parameters": parameters,
+    })
+}
+
+/// The description of the operation or the operator called `name`, or `None`
+/// when this build holds neither. The one lookup `arc operation describe` and
+/// `arc mcp`'s `operation_describe` both make, so the two ways of asking cannot
+/// differ: the operation catalogue first, then the operator catalog.
+pub(crate) fn describe(name: &str) -> Option<serde_json::Value> {
+    operation(name)
+        .map(Operation::description)
+        .or_else(|| crate::operator::description(name))
 }
 
 // ------------------------------------------------- recording an operation
@@ -1248,58 +1330,137 @@ mod tests {
         }
     }
 
-    // Every operation's `applied_to` is read the same way by a caller: each
-    // entry named once, a kind the caller can supply, a sentence to print, and
-    // an `of` that points back at an earlier entry of a kind that holds it.
+    /// The name of every operation and every operator this build describes.
+    fn described_names() -> Vec<&'static str> {
+        operations()
+            .iter()
+            .map(|op| op.long_name)
+            .chain(crate::operator::catalog_names())
+            .collect()
+    }
+
+    /// The kinds a role may be of: the four kinds of asset arc records, a column,
+    /// and `any`, for a role whose kind each value decides.
+    const ROLE_KINDS: [&str; 6] = ["table", "file", "directory", "pattern", "column", "any"];
+
+    // Every description, of an operation or of an operator, is read the same way
+    // by a caller: the same five keys, and each role in `reads` and `writes` named
+    // once, of a kind arc knows, with a sentence to print, an `of` that points back
+    // at an earlier read that holds columns, and `min_items` on a list alone. An
+    // operation reads a table first; an operator may read nothing.
     #[test]
-    fn every_applied_to_entry_is_named_once_and_its_of_names_an_earlier_table() {
+    fn every_description_names_each_role_once_in_the_one_shape() {
+        for name in described_names() {
+            let description =
+                describe(name).unwrap_or_else(|| panic!("`{name}` is held but has no description"));
+            let mut keys: Vec<&str> = description
+                .as_object()
+                .expect("a description is an object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                ["long_name", "parameters", "reads", "summary", "writes"],
+                "`{name}`: the description holds a key the shape does not name:\n{description}"
+            );
+            assert_eq!(description["long_name"], name, "`{name}`: {description}");
+            assert!(
+                description["summary"].as_str().is_some_and(is_one_sentence),
+                "`{name}` has no one-sentence summary: {}",
+                description["summary"]
+            );
+            assert_eq!(
+                description["parameters"]["type"], "object",
+                "`{name}`: `parameters` is not an object schema"
+            );
+
+            let reads = description["reads"].as_array().expect("`reads` is a list");
+            let writes = description["writes"]
+                .as_array()
+                .expect("`writes` is a list");
+            if operation(name).is_some() {
+                assert_eq!(
+                    reads.first().map(|r| &r["kind"]),
+                    Some(&serde_json::json!("table")),
+                    "`{name}` is an operation and does not read a table first"
+                );
+            }
+            for (direction, roles) in [("reads", reads), ("writes", writes)] {
+                let mut seen: Vec<&str> = Vec::new();
+                for role in roles {
+                    let role_name = role["name"].as_str().expect("a role has a name");
+                    let kind = role["kind"].as_str().expect("a role has a kind");
+                    let list = role["list"].as_bool().expect("`list` is a boolean");
+                    assert!(
+                        role["required"].is_boolean(),
+                        "`{name}` {direction} `{role_name}`: `required` is not a boolean"
+                    );
+                    assert!(
+                        ROLE_KINDS.contains(&kind),
+                        "`{name}` {direction} `{role_name}` has kind `{kind}`, which arc does not know"
+                    );
+                    assert!(
+                        !seen.contains(&role_name),
+                        "`{name}` {direction} `{role_name}` twice"
+                    );
+                    assert!(
+                        role["description"].as_str().is_some_and(is_one_sentence),
+                        "`{name}` {direction} `{role_name}`, which has no one-sentence description: {}",
+                        role["description"]
+                    );
+                    let mut expected = vec!["description", "kind", "list", "name", "required"];
+                    if kind == "column" {
+                        expected.push("of");
+                    }
+                    if list {
+                        expected.push("min_items");
+                    }
+                    expected.sort_unstable();
+                    let mut held: Vec<&str> = role
+                        .as_object()
+                        .expect("a role is an object")
+                        .keys()
+                        .map(String::as_str)
+                        .collect();
+                    held.sort_unstable();
+                    assert_eq!(
+                        held, expected,
+                        "`{name}` {direction} `{role_name}`: `of` belongs on a column alone and \
+                         `min_items` on a list alone:\n{role}"
+                    );
+                    if kind == "column" {
+                        let of = role["of"].as_str().expect("`of` is a string");
+                        assert!(
+                            reads
+                                .iter()
+                                .take_while(|r| *r != role)
+                                .any(|r| r["name"] == of
+                                    && ["table", "file"]
+                                        .contains(&r["kind"].as_str().unwrap_or(""))),
+                            "`{name}` {direction} the column `{role_name}` `of` `{of}`, which is no \
+                             earlier read of a table or a file"
+                        );
+                    }
+                    seen.push(role_name);
+                }
+            }
+        }
+    }
+
+    // One lookup answers for both catalogues, so a name held in both would be
+    // answered as the operation and the operator would never be described.
+    #[test]
+    fn no_operation_is_called_what_an_operator_is_called() {
         for op in operations() {
             assert!(
-                !op.applied_to.is_empty(),
-                "`{}` is applied to nothing",
+                !crate::operator::catalog_names().contains(&op.long_name)
+                    && crate::operator::with_schema(op.long_name).is_none(),
+                "`{}` is the long name of an operation and the name of an operator, so \
+                 describing it can answer for only one of them",
                 op.long_name
             );
-            let mut earlier: Vec<&AppliedTo> = Vec::new();
-            for entry in op.applied_to {
-                assert!(
-                    ["table", "column"].contains(&entry.kind),
-                    "`{}`: `{}` has kind `{}`, which no caller supplies",
-                    op.long_name,
-                    entry.name,
-                    entry.kind
-                );
-                assert!(
-                    earlier.iter().all(|e| e.name != entry.name),
-                    "`{}`: `{}` is named twice",
-                    op.long_name,
-                    entry.name
-                );
-                assert!(
-                    is_one_sentence(entry.description),
-                    "`{}`: `{}` has no one-sentence description: {:?}",
-                    op.long_name,
-                    entry.name,
-                    entry.description
-                );
-                match (entry.kind, entry.of) {
-                    ("column", Some(of)) => assert!(
-                        earlier.iter().any(|e| e.name == of && e.kind == "table"),
-                        "`{}`: `{}` is `of` `{of}`, which is no earlier table",
-                        op.long_name,
-                        entry.name
-                    ),
-                    ("column", None) => panic!(
-                        "`{}`: the column `{}` does not say which table it is of",
-                        op.long_name, entry.name
-                    ),
-                    (_, Some(of)) => panic!(
-                        "`{}`: the {} `{}` is `of` `{of}`, and only a column belongs to another entry",
-                        op.long_name, entry.kind, entry.name
-                    ),
-                    (_, None) => {}
-                }
-                earlier.push(entry);
-            }
         }
     }
 
@@ -1318,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn a_description_extends_the_listing_with_what_it_is_applied_to_and_its_schema() {
+    fn a_description_extends_the_listing_with_what_it_reads_and_writes_and_its_schema() {
         let op = operation(FILTER_ROWS).expect("the filter is held");
         let listing = op.listing();
         let description = op.description();
@@ -1328,23 +1489,41 @@ mod tests {
         assert_eq!(description["summary"], listing["summary"]);
         assert_eq!(listing["summary"], op.summary);
         assert_eq!(
-            description["applied_to"],
+            description["reads"],
             serde_json::json!([
                 {
                     "name": "table",
                     "kind": "table",
-                    "description": op.applied_to[0].description,
+                    "list": false,
+                    "required": true,
+                    "description": op.reads[0].description,
                 },
                 {
                     "name": "column",
                     "kind": "column",
+                    "list": false,
+                    "required": false,
                     "of": "table",
-                    "description": op.applied_to[1].description,
+                    "description": op.reads[1].description,
                 },
             ]),
-            "the filter is applied to a table, then a column of that table"
+            "the filter reads a table, then a column of that table"
+        );
+        assert_eq!(
+            description["writes"],
+            serde_json::json!([
+                {
+                    "name": "out",
+                    "kind": "table",
+                    "list": false,
+                    "required": true,
+                    "description": STEP_TABLE.description,
+                },
+            ]),
+            "the filter writes the one table its step makes"
         );
         assert_eq!(description["parameters"], filter_rows_parameters());
+        assert_eq!(describe(FILTER_ROWS), Some(description));
     }
 
     #[test]
@@ -1464,7 +1643,8 @@ mod tests {
         Operation {
             long_name: "test-op",
             summary: "A test operation.",
-            applied_to: &[],
+            reads: &[],
+            writes: &[],
             parameters,
             sql: |recording| recording.text("where").to_string(),
         }

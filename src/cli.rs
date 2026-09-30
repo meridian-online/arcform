@@ -163,10 +163,11 @@ pub enum OperationCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Print what an operation takes, as JSON: its long name, what it does,
-    /// what it is applied to, and a JSON Schema of its parameters.
+    /// Print what an operation or an operator takes, as JSON: its name, what it
+    /// does, what its step reads and writes, and a JSON Schema of its parameters.
     Describe {
-        /// The operation's long name, as listed by `arc operation list`.
+        /// The operation's long name, as listed by `arc operation list`, or an
+        /// operator's name, as a step's `op:` names it.
         long_name: String,
     },
     /// Record an operation as a new step at the end of a protocol: a generated
@@ -808,15 +809,16 @@ fn operation_list(json: bool, out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
-/// Execute `arc operation describe`: the operation's description as JSON. An
-/// operation arc does not hold is refused with nothing written to `out`.
-fn operation_describe(long_name: &str, out: &mut impl Write) -> Result<()> {
-    let Some(op) = crate::record::operation(long_name) else {
+/// Execute `arc operation describe`: the description of the operation or the
+/// operator called `name`, as JSON. A name the build holds neither of is refused
+/// with nothing written to `out`.
+fn operation_describe(name: &str, out: &mut impl Write) -> Result<()> {
+    let Some(description) = crate::record::describe(name) else {
         return Err(Error::Io(std::io::Error::other(format!(
-            "no operation called `{long_name}` — `arc operation list` prints the operations arc holds"
+            "no operation or operator called `{name}` — `arc operation list` prints the operations arc holds"
         ))));
     };
-    writeln!(out, "{:#}", op.description())?;
+    writeln!(out, "{description:#}")?;
     Ok(())
 }
 
