@@ -360,6 +360,11 @@ fn a_way_a_caller_names_is_on_every_entry_its_calls_record() {
         Some(app.clone()),
         "the entry a checkpoint returns"
     );
+    assert_eq!(
+        history.entries(&dir).unwrap(),
+        [saved.clone(), checkpoint],
+        "the entries the calls return are the entries the store lists, time and size included"
+    );
 
     // The file on disk is SPEC, so each road checkpoints it and saves after.
     edit_spec_with_history(&dir, &[rename_edit("renamed")], &history).unwrap();
