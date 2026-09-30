@@ -61,8 +61,9 @@ pub enum Commands {
         #[arg(long)]
         engine: Option<String>,
 
-        /// Database file path, relative to the protocol directory
-        /// (default: `<name>.duckdb`).
+        /// Database file path, relative to the protocol directory. Written to
+        /// `arcform.yaml` as `db:` only when passed; without it the database is
+        /// `<name>.duckdb` beside the manifest.
         #[arg(long)]
         db: Option<String>,
     },
@@ -1000,7 +1001,16 @@ mod tests {
 
         assert_eq!(manifest.name, "analytics");
         assert_eq!(manifest.engine, "duckdb");
-        assert_eq!(manifest.db, Some("analytics.duckdb".to_string()));
+        assert_eq!(manifest.db, None, "arc init writes no db: line");
+        assert!(
+            !content.lines().any(|l| l.starts_with("db")),
+            "arc init writes no db: line:\n{content}"
+        );
+        assert_eq!(
+            manifest.db_path(&base.path().join("analytics")),
+            base.path().join("analytics/analytics.duckdb"),
+            "and its database is still <name>.duckdb beside the manifest"
+        );
         assert!(manifest.steps.is_empty());
     }
 
@@ -1334,6 +1344,15 @@ mod tests {
         assert_eq!(m.name, "notes");
         assert!(m.steps.is_empty());
 
+        // No --db: the file carries no db line, and the database is still
+        // <name>.duckdb beside the manifest.
+        let text = fs::read_to_string(dir.join("arcform.yaml")).unwrap();
+        assert!(
+            !text.lines().any(|l| l.starts_with("db")),
+            "no db line without --db:\n{text}"
+        );
+        assert_eq!(m.db_path(&dir), dir.join("notes.duckdb"));
+
         let err = create_protocol(&dir, None, None, None, &history).unwrap_err();
         assert!(
             err.to_string().contains("already exists"),
@@ -1359,6 +1378,11 @@ mod tests {
         assert_eq!(m.name, "tides");
         assert_eq!(m.engine, "sqlite3");
         assert_eq!(m.db.as_deref(), Some("state/tides.db"));
+        let text = fs::read_to_string(dir.join("arcform.yaml")).unwrap();
+        assert!(
+            text.lines().any(|l| l == "db: state/tides.db"),
+            "--db writes the line:\n{text}"
+        );
     }
 
     // A directory with no usable file name needs --name.

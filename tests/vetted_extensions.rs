@@ -1304,9 +1304,10 @@ fn a_step_that_replaces_a_pinned_file_fails_the_run_when_it_ends() {
     }
 }
 
-/// What `arc init p` wrote into `arcform.yaml` on 68a1fa2, byte for byte: recorded by
-/// running that commit's binary.
-const INIT_BEFORE: &str = "name: p\nengine: duckdb\nengine_version: '>=1.0'\ndb: p.duckdb\nparams: {}\ndotenv: []\ntimeout_sec: null\ndefaults: null\nhooks:\n  on_init: null\n  on_success: null\n  on_failure: null\n  on_exit: null\nsteps: []\nassets: {}\n";
+/// What `arc init p` wrote into `arcform.yaml` on 68a1fa2, byte for byte, with the
+/// `db: p.duckdb` line taken out: recorded by running that commit's binary. `arc init`
+/// names no database now, and every other byte is the one that commit wrote.
+const INIT_BEFORE: &str = "name: p\nengine: duckdb\nengine_version: '>=1.0'\nparams: {}\ndotenv: []\ntimeout_sec: null\ndefaults: null\nhooks:\n  on_init: null\n  on_success: null\n  on_failure: null\n  on_exit: null\nsteps: []\nassets: {}\n";
 
 #[test]
 fn arc_init_writes_the_manifest_it_wrote_before() {

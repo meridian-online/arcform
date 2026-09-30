@@ -286,3 +286,124 @@ fn create_refuses_an_existing_spec_and_an_invalid_manifest() {
         "a refused create leaves nothing behind"
     );
 }
+
+// ------------------------------------------------- where the database lives
+
+/// The lines of an `arcform.yaml` that begin `db`, the way an author reading the file
+/// sees them.
+fn db_lines(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join(MANIFEST_FILENAME))
+        .unwrap()
+        .lines()
+        .filter(|l| l.starts_with("db"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The first step of a Protocol, as `edit-protocol replace steps` takes it.
+const FIRST_STEP: &str =
+    "\n  - name: gather\n    command: \"echo sun,4 > field.csv\"\n    produces: [field_csv]";
+
+/// `create-protocol` names a database in the manifest it writes only when `--db` names
+/// one. A manifest with none still runs against `<name>.duckdb` beside it, and one with a
+/// path runs against that path and builds no other.
+#[test]
+fn create_protocol_writes_db_only_when_asked_and_run_builds_it_where_it_says() {
+    let base = tempfile::tempdir().expect("tempdir");
+
+    // No --db: no line, and the first run builds `<name>.duckdb` beside the manifest.
+    arc_ok(base.path(), &["create-protocol", "fieldbook"]);
+    let unnamed = base.path().join("fieldbook");
+    assert_eq!(db_lines(&unnamed), Vec::<String>::new(), "no db line");
+    assert!(
+        !unnamed.join("fieldbook.duckdb").exists(),
+        "creating a Protocol builds no database"
+    );
+    arc_ok(
+        base.path(),
+        &[
+            "edit-protocol",
+            "--dir",
+            "fieldbook",
+            "replace",
+            "steps",
+            FIRST_STEP,
+        ],
+    );
+    assert_eq!(db_lines(&unnamed), Vec::<String>::new(), "still no db line");
+    arc_ok(&unnamed, &["run"]);
+    assert!(
+        unnamed.join("fieldbook.duckdb").is_file(),
+        "a manifest with no db builds <name>.duckdb beside it"
+    );
+
+    // --db: the line is written, and the run builds that file and not `<name>.duckdb`.
+    arc_ok(
+        base.path(),
+        &["create-protocol", "kept", "--db", "work.duckdb"],
+    );
+    let named = base.path().join("kept");
+    assert_eq!(db_lines(&named), vec!["db: work.duckdb"]);
+    arc_ok(
+        base.path(),
+        &[
+            "edit-protocol",
+            "--dir",
+            "kept",
+            "replace",
+            "steps",
+            FIRST_STEP,
+        ],
+    );
+    arc_ok(&named, &["run"]);
+    assert!(named.join("work.duckdb").is_file(), "the named database");
+    assert!(
+        !named.join("kept.duckdb").exists(),
+        "and not the default beside it"
+    );
+}
+
+/// A manifest an earlier arc wrote, carrying `db: null`, loads with its database unset,
+/// and one carrying a path loads with that path. `edit-protocol` on either leaves the
+/// `db` line, and every byte above the key it edits, as it was.
+#[test]
+fn edit_protocol_leaves_a_db_line_as_it_was_and_the_protocol_runs_where_it_says() {
+    // (the db line, the file a run builds, the file it must not build)
+    let cases = [
+        ("db: null", "p.duckdb", "kept.duckdb"),
+        ("db: kept.duckdb", "kept.duckdb", "p.duckdb"),
+    ];
+    for (db_line, built, not_built) in cases {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let head = format!(
+            "# Written by an earlier arc.\nname: p\nengine: duckdb\nengine_version: '>=1.0'\n{db_line}\nparams: {{}}\ndotenv: []\n"
+        );
+        let original = format!("{head}steps: []\nassets: {{}}\n");
+        std::fs::write(dir.path().join(MANIFEST_FILENAME), &original).unwrap();
+
+        arc_ok(
+            dir.path(),
+            &["edit-protocol", "replace", "steps", FIRST_STEP],
+        );
+
+        let edited = std::fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+        assert!(
+            edited.starts_with(&head),
+            "{db_line}: every byte above the edited key is as it was:\n{edited}"
+        );
+        assert!(
+            edited.contains("name: gather"),
+            "the edit applied:\n{edited}"
+        );
+
+        arc_ok(dir.path(), &["run"]);
+        assert!(
+            dir.path().join(built).is_file(),
+            "{db_line}: builds {built}"
+        );
+        assert!(
+            !dir.path().join(not_built).exists(),
+            "{db_line}: builds no {not_built}"
+        );
+    }
+}

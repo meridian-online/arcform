@@ -70,8 +70,11 @@ pub struct Manifest {
     pub extensions: BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>>,
 
     /// Path to the database file, relative to the manifest directory.
-    /// Defaults to `<name>.duckdb` if not specified.
-    #[serde(default)]
+    /// Defaults to `<name>.duckdb` if not specified. An unset value is left out of a
+    /// manifest arc writes: `arc create-protocol` writes this key only when `--db`
+    /// names a path, and `arc init` and `arc init --from-descriptor` write none. A
+    /// manifest carrying `db: null` still loads with it unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub db: Option<String>,
 
     /// Named runtime parameters with optional defaults.
@@ -499,14 +502,16 @@ impl Manifest {
         Ok(())
     }
 
-    /// Generate a default manifest for a new project.
+    /// Generate a default manifest for a new project. It names no database: `db` is
+    /// unset, so the manifest is written without the key and resolves to
+    /// `<name>.duckdb` beside it; a caller with a path sets `db` after.
     pub(crate) fn new_project(name: &str) -> Self {
         Manifest {
             name: name.to_string(),
             engine: "duckdb".to_string(),
             engine_version: Some(">=1.0".to_string()),
             extensions: BTreeMap::new(),
-            db: Some(format!("{}.duckdb", name)),
+            db: None,
             params: IndexMap::new(),
             dotenv: Vec::new(),
             timeout_sec: None,
@@ -594,7 +599,12 @@ mod tests {
         let m = Manifest::new_project("test-pipeline");
         assert_eq!(m.name, "test-pipeline");
         assert_eq!(m.engine, "duckdb");
-        assert_eq!(m.db, Some("test-pipeline.duckdb".to_string()));
+        assert_eq!(m.db, None, "a new project names no database");
+        assert_eq!(
+            m.db_path(Path::new("/tmp/project")),
+            PathBuf::from("/tmp/project/test-pipeline.duckdb"),
+            "and its database is still <name>.duckdb beside the manifest"
+        );
         assert!(m.steps.is_empty());
         assert!(m.assets.is_empty());
     }
@@ -873,5 +883,52 @@ assets:
     fn a_manifest_with_no_pin_writes_no_extensions_key() {
         let yaml = serde_yaml::to_string(&Manifest::new_project("p")).unwrap();
         assert!(!yaml.contains("extensions"), "{yaml}");
+    }
+
+    /// The lines of `yaml` that begin `db`, the way an author reading the file sees them.
+    fn db_lines(yaml: &str) -> Vec<&str> {
+        yaml.lines().filter(|l| l.starts_with("db")).collect()
+    }
+
+    #[test]
+    fn a_manifest_with_no_db_is_written_without_the_key() {
+        let mut m = Manifest::new_project("p");
+        assert_eq!(m.db, None);
+        let yaml = serde_yaml::to_string(&m).unwrap();
+        assert_eq!(db_lines(&yaml), Vec::<&str>::new(), "no db line: {yaml}");
+
+        // Every other unset optional key is written as it was: this change is one key.
+        assert!(yaml.contains("timeout_sec: null\n"), "{yaml}");
+        assert!(yaml.contains("defaults: null\n"), "{yaml}");
+
+        m.db = Some("work.duckdb".to_string());
+        let yaml = serde_yaml::to_string(&m).unwrap();
+        assert_eq!(db_lines(&yaml), vec!["db: work.duckdb"], "{yaml}");
+    }
+
+    #[test]
+    fn a_manifest_written_with_db_null_or_a_path_loads_as_written() {
+        let head = "name: p\nengine: duckdb\nengine_version: '>=1.0'\n";
+        let tail = "params: {}\ndotenv: []\nsteps: []\nassets: {}\n";
+
+        // Written by an arc before the key was left out, or by hand: `db: null` is unset.
+        let unset = Manifest::from_yaml_str(&format!("{head}db: null\n{tail}")).unwrap();
+        assert_eq!(unset.db, None);
+        assert_eq!(
+            unset.db_path(Path::new("/tmp/project")),
+            PathBuf::from("/tmp/project/p.duckdb")
+        );
+
+        // No key at all reads the same way.
+        let absent = Manifest::from_yaml_str(&format!("{head}{tail}")).unwrap();
+        assert_eq!(absent.db, None);
+
+        // An explicit path is that path, and its resolution follows it.
+        let named = Manifest::from_yaml_str(&format!("{head}db: state/p.db\n{tail}")).unwrap();
+        assert_eq!(named.db.as_deref(), Some("state/p.db"));
+        assert_eq!(
+            named.db_path(Path::new("/tmp/project")),
+            PathBuf::from("/tmp/project/state/p.db")
+        );
     }
 }
