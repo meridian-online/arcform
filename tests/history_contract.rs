@@ -165,6 +165,53 @@ fn a_refused_edit_touches_neither_the_file_nor_the_history() {
     );
 }
 
+// No checkpoint, no write, when it is the checkpoint's own snapshot that
+// cannot be written: the spec's place in the store takes no new file, so the
+// entry fails to land and the edit is refused with the spec as it was.
+#[cfg(unix)]
+#[test]
+fn an_edit_whose_checkpoint_cannot_be_written_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_tmp, dir, history) = setup();
+    history.record_save(&dir, "name: earlier\n").unwrap();
+    let entries_before = history.entries(&dir).unwrap();
+    let key_dirs: Vec<PathBuf> = fs::read_dir(history.root())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    let [key_dir] = key_dirs.as_slice() else {
+        panic!("one key directory, found {key_dirs:?}");
+    };
+
+    // Reads stay allowed; creating the entry's temp file does not.
+    fs::set_permissions(key_dir, fs::Permissions::from_mode(0o555)).unwrap();
+    // Root ignores permission bits, so the failure cannot be staged there —
+    // probe, and stand down rather than mis-assert.
+    let probe = key_dir.join(".probe");
+    if fs::write(&probe, b"x").is_ok() {
+        let _ = fs::remove_file(&probe);
+        fs::set_permissions(key_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let result = edit_spec_with_history(&dir, &[rename_edit("renamed")], &history);
+    let checkpoint = history.record_checkpoint(&dir, "name: other\n");
+    fs::set_permissions(key_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(result.is_err(), "the edit must be refused, got {result:?}");
+    assert!(
+        checkpoint.is_err(),
+        "the checkpoint must fail, got {checkpoint:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join(MANIFEST_FILENAME)).unwrap(),
+        SPEC,
+        "the spec is as it was"
+    );
+    assert_eq!(history.entries(&dir).unwrap(), entries_before);
+}
+
 #[test]
 fn a_machine_save_cannot_fold_away_a_just_checkpointed_state() {
     // A save entry records the current state; a machine edit follows within
