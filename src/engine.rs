@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, Step};
 
 /// Information about the detected engine, returned by preflight.
 #[derive(Debug, Clone)]
@@ -472,10 +472,17 @@ const EXTENSION_REPOSITORY_SETTINGS: [&str; 2] = [
     "autoinstall_extension_repository",
 ];
 
-/// The setting that moves where DuckDB keeps the extensions it installs. A step that sets it
-/// installs to a directory the check of each pinned extension does not read, and a second
-/// DuckDB does not find the file there.
-const EXTENSION_DIRECTORY_SETTING: &str = "extension_directory";
+/// The settings that move where DuckDB keeps and finds the extensions it installs:
+/// `extension_directory`, the list `extension_directories`, and `home_directory`, under which
+/// DuckDB keeps them when neither of the others is set. A step that sets one installs to a
+/// directory the check of each pinned extension does not read, and a second DuckDB does not
+/// find the file there. DuckDB v1.5.5's `duckdb_settings()` lists these three and no other
+/// that moves it, and a test holds the list to what the DuckDB CLI it runs lists.
+const EXTENSION_DIRECTORY_SETTINGS: [&str; 3] = [
+    "extension_directory",
+    "extension_directories",
+    "home_directory",
+];
 
 /// What switches DuckDB to its second parser. The DuckDB CLI loads the `autocomplete`
 /// extension, whose parser replaces the default one once `allow_parser_override_extension` is
@@ -834,7 +841,7 @@ enum ExtensionSql {
     /// `INSTALL '<path>'`: a name DuckDB reads as a file or an address, because it holds
     /// a `.`, a `/` or a `\`.
     InstallPath(String),
-    /// A setting in [`EXTENSION_REPOSITORY_SETTINGS`], or [`EXTENSION_DIRECTORY_SETTING`],
+    /// A setting in [`EXTENSION_REPOSITORY_SETTINGS`] or [`EXTENSION_DIRECTORY_SETTINGS`],
     /// named outside a comment or a string.
     Setting(String),
     /// A name in [`PARSER_SWITCHES`], named outside a comment.
@@ -1120,8 +1127,9 @@ fn scan_extension_sql(file: &[u8]) -> Vec<(ExtensionSql, usize)> {
 /// `.DuckDBrc` from `.duckdbrc`. `import_database` is one word to [`lex_sql`], as `_` is a
 /// word character, so `PRAGMA import_database('imp')` is looked for by its own name.
 ///
-/// These are shapes, not a boundary: a path to `.duckdbrc` assembled from pieces, and a step
-/// that writes over a later step's SQL file, are not among them.
+/// These are shapes, not a boundary: a path to `.duckdbrc` assembled from pieces is not among
+/// them. A step that writes over a later step's or hook's SQL file is not a shape either: that
+/// file is read again just before it runs, by [`ExtensionRecheck::check`].
 fn scan_run_time_sql(toks: &[(Tok, usize)]) -> Vec<(RunTimeSql, usize)> {
     let mut found: Vec<(RunTimeSql, usize)> = unread_calls(toks)
         .into_iter()
@@ -1272,7 +1280,7 @@ fn scan_tokens(toks: &[(Tok, usize)]) -> Vec<(ExtensionSql, usize)> {
         };
         if let Some(setting) = EXTENSION_REPOSITORY_SETTINGS
             .iter()
-            .chain([&EXTENSION_DIRECTORY_SETTING])
+            .chain(&EXTENSION_DIRECTORY_SETTINGS)
             .find(|s| text.eq_ignore_ascii_case(s))
         {
             found.push((ExtensionSql::Setting(setting.to_string()), *line));
@@ -1330,9 +1338,38 @@ fn scan_tokens(toks: &[(Tok, usize)]) -> Vec<(ExtensionSql, usize)> {
 pub(crate) struct ProtocolSql {
     /// `step 'load'`, or `hook on_init 'setup'`.
     pub(crate) place: String,
+    /// The step's name, or `None` for a hook: what `ARC_FAILED_STEP` names when the check
+    /// just before it runs refuses it.
+    pub(crate) step: Option<String>,
     /// The file as the manifest names it.
     pub(crate) file: String,
     pub(crate) path: PathBuf,
+}
+
+impl ProtocolSql {
+    /// The SQL file `step` runs, or `None` when it runs a command or an operator.
+    pub(crate) fn step(step: &Step, dir: &Path) -> Option<Self> {
+        Self::new(
+            format!("step '{}'", step.name),
+            Some(step.name.clone()),
+            step,
+            dir,
+        )
+    }
+
+    /// The SQL file the hook in `slot` runs, or `None` when it runs a command.
+    pub(crate) fn hook(slot: &str, hook: &Step, dir: &Path) -> Option<Self> {
+        Self::new(format!("hook {slot} '{}'", hook.name), None, hook, dir)
+    }
+
+    fn new(place: String, name: Option<String>, step: &Step, dir: &Path) -> Option<Self> {
+        step.sql.as_ref().map(|file| ProtocolSql {
+            place,
+            step: name,
+            file: file.clone(),
+            path: dir.join(file),
+        })
+    }
 }
 
 /// Every SQL file a Protocol's steps and hooks run: the steps in order, then the hooks.
@@ -1346,21 +1383,11 @@ pub(crate) fn protocol_sql(manifest: &Manifest, dir: &Path) -> Vec<ProtocolSql> 
     let steps = manifest
         .steps
         .iter()
-        .map(|step| (format!("step '{}'", step.name), step));
-    let hooks = hooks.into_iter().filter_map(|(slot, hook)| {
-        hook.as_ref()
-            .map(|step| (format!("hook {slot} '{}'", step.name), step))
-    });
-    steps
-        .chain(hooks)
-        .filter_map(|(place, step)| {
-            step.sql.as_ref().map(|file| ProtocolSql {
-                place,
-                file: file.clone(),
-                path: dir.join(file),
-            })
-        })
-        .collect()
+        .filter_map(|step| ProtocolSql::step(step, dir));
+    let hooks = hooks
+        .into_iter()
+        .filter_map(|(slot, hook)| ProtocolSql::hook(slot, hook.as_ref()?, dir));
+    steps.chain(hooks).collect()
 }
 
 /// What [`check_extension_installs`] found in a Protocol it did not refuse.
@@ -1370,9 +1397,86 @@ pub(crate) struct ExtensionInstalls {
     /// version, then one for each step or hook whose SQL can run or write SQL that is not
     /// in its file.
     pub(crate) warnings: Vec<String>,
-    /// Each vetted extension the SQL installs `FROM community`, once, in the order the
-    /// Protocol first installs it.
+    /// Each vetted community extension the SQL installs `FROM community`, once, in the order
+    /// the Protocol first installs it.
     pub(crate) installed: Vec<String>,
+}
+
+/// What the check reads in one SQL file: a line for each statement it refuses, each vetted
+/// community extension the file installs `FROM community`, once, in the order the file first
+/// installs it, and each place the file runs SQL that is not in it.
+struct FileCheck {
+    refusals: Vec<String>,
+    installed: Vec<&'static VettedExtension>,
+    shapes: Vec<(RunTimeSql, usize)>,
+}
+
+/// Check the SQL file `source` runs, holding `bytes`, as [`check_extension_installs`] checks
+/// each file.
+fn check_file(source: &ProtocolSql, bytes: &[u8]) -> FileCheck {
+    let vetted = vetted_extensions();
+    let mut found = FileCheck {
+        refusals: Vec::new(),
+        installed: Vec::new(),
+        shapes: Vec::new(),
+    };
+    for (finding, line) in scan_extension_sql(bytes) {
+        let why = match finding {
+            ExtensionSql::RunTime(shape) => {
+                found.shapes.push((shape, line));
+                continue;
+            }
+            ExtensionSql::Install {
+                from: InstallFrom::Core,
+                ..
+            } => continue,
+            ExtensionSql::Install {
+                name,
+                from: InstallFrom::Community,
+            } => match vetted.iter().find(|entry| entry.name == name) {
+                Some(entry) => {
+                    if !found.installed.iter().any(|seen| seen.name == entry.name) {
+                        found.installed.push(entry);
+                    }
+                    continue;
+                }
+                None => format!(
+                    "installs {name} from the community registry, and {name} is not on the vetted list"
+                ),
+            },
+            ExtensionSql::Install {
+                name,
+                from: InstallFrom::Alias(repository),
+            } => format!(
+                "installs {name} from the repository {repository}; a community extension is installed FROM community"
+            ),
+            ExtensionSql::Install {
+                name,
+                from: InstallFrom::Address(address),
+            } => format!("installs {name} from the address '{address}'"),
+            ExtensionSql::InstallPath(path) => {
+                format!("installs the extension at '{path}'")
+            }
+            ExtensionSql::Setting(setting)
+                if EXTENSION_DIRECTORY_SETTINGS.contains(&setting.as_str()) =>
+            {
+                format!(
+                    "names the setting {setting}, which moves where DuckDB keeps the extensions it installs"
+                )
+            }
+            ExtensionSql::Setting(setting) => format!(
+                "names the setting {setting}, which moves where DuckDB installs an extension from"
+            ),
+            ExtensionSql::ParserSwitch(name) => format!(
+                "names {name}, which switches DuckDB to a second parser whose comments and strings arc does not read"
+            ),
+        };
+        found.refusals.push(format!(
+            "{} ({}, line {line}) {why}",
+            source.place, source.file
+        ));
+    }
+    found
 }
 
 /// Refuse a Protocol whose SQL installs a DuckDB extension off the vetted list, before a
@@ -1383,82 +1487,38 @@ pub(crate) struct ExtensionInstalls {
 /// Refused: `INSTALL <name> FROM community` for a name not on the list; an `INSTALL` from
 /// an address or from a repository other than `core` and `community`; an `INSTALL` whose
 /// name is a path or an address; a statement naming a setting in
-/// [`EXTENSION_REPOSITORY_SETTINGS`] or [`EXTENSION_DIRECTORY_SETTING`]; and a statement naming a name in [`PARSER_SWITCHES`]. An `INSTALL` from `core` is not checked, and neither
+/// [`EXTENSION_REPOSITORY_SETTINGS`] or [`EXTENSION_DIRECTORY_SETTINGS`]; and a statement
+/// naming a name in [`PARSER_SWITCHES`]. An `INSTALL` from `core` is not checked, and neither
 /// is `LOAD`, because SQL does not say where a loaded extension was installed from. No
 /// variable lifts the refusal.
 ///
-/// It reads each file as it is before the run, and it is not a boundary: a `command:` step
-/// can start a DuckDB of its own and install what it likes.
+/// It reads each file as it is before the run, and [`ExtensionRecheck::check`] reads each
+/// step's and hook's file again, and checks it again, just before it runs. Neither is a
+/// boundary: a `command:` step can start a DuckDB
+/// of its own and install what it likes, and a process an earlier step leaves running can
+/// write a file after the check just before it runs has read it.
 pub(crate) fn check_extension_installs(
     sql: &[ProtocolSql],
     engine_version: Option<&semver::Version>,
 ) -> Result<ExtensionInstalls> {
-    let vetted = vetted_extensions();
     let mut refusals = Vec::new();
     let mut installed: Vec<&VettedExtension> = Vec::new();
     let mut unread = Vec::new();
     for source in sql {
-        // A file that is not there before the run is left to the step that runs it.
+        // A file that is not there before the run is checked just before the step or hook
+        // that runs it.
         let Ok(bytes) = std::fs::read(&source.path) else {
             continue;
         };
-        let mut shapes = Vec::new();
-        for (found, line) in scan_extension_sql(&bytes) {
-            let why = match found {
-                ExtensionSql::RunTime(shape) => {
-                    shapes.push((shape, line));
-                    continue;
-                }
-                ExtensionSql::Install {
-                    from: InstallFrom::Core,
-                    ..
-                } => continue,
-                ExtensionSql::Install {
-                    name,
-                    from: InstallFrom::Community,
-                } => match vetted.iter().find(|entry| entry.name == name) {
-                    Some(entry) => {
-                        if !installed.iter().any(|seen| seen.name == entry.name) {
-                            installed.push(entry);
-                        }
-                        continue;
-                    }
-                    None => format!(
-                        "installs {name} from the community registry, and {name} is not on the vetted list"
-                    ),
-                },
-                ExtensionSql::Install {
-                    name,
-                    from: InstallFrom::Alias(repository),
-                } => format!(
-                    "installs {name} from the repository {repository}; a community extension is installed FROM community"
-                ),
-                ExtensionSql::Install {
-                    name,
-                    from: InstallFrom::Address(address),
-                } => format!("installs {name} from the address '{address}'"),
-                ExtensionSql::InstallPath(path) => {
-                    format!("installs the extension at '{path}'")
-                }
-                ExtensionSql::Setting(setting) if setting == EXTENSION_DIRECTORY_SETTING => {
-                    format!(
-                        "names the setting {setting}, which moves where DuckDB keeps the extensions it installs"
-                    )
-                }
-                ExtensionSql::Setting(setting) => format!(
-                    "names the setting {setting}, which moves where DuckDB installs an extension from"
-                ),
-                ExtensionSql::ParserSwitch(name) => format!(
-                    "names {name}, which switches DuckDB to a second parser whose comments and strings arc does not read"
-                ),
-            };
-            refusals.push(format!(
-                "{} ({}, line {line}) {why}",
-                source.place, source.file
-            ));
+        let found = check_file(source, &bytes);
+        refusals.extend(found.refusals);
+        for entry in found.installed {
+            if !installed.iter().any(|seen| seen.name == entry.name) {
+                installed.push(entry);
+            }
         }
-        if !shapes.is_empty() {
-            unread.push((source, shapes));
+        if !found.shapes.is_empty() {
+            unread.push((source, found.shapes));
         }
     }
     if !refusals.is_empty() {
@@ -1478,6 +1538,103 @@ pub(crate) fn check_extension_installs(
         warnings,
         installed: names,
     })
+}
+
+/// The check of each SQL step's and hook's file just before it runs, for a file a step
+/// earlier in the run wrote over or wrote where there was none. It holds what the checks
+/// before the run found, and what each check since has found, so a file that has not changed
+/// since the check before the run read it draws nothing: it holds no statement that check
+/// refused, each extension it installs has been compared with its pin, and each warning it
+/// draws has been printed.
+#[derive(Default)]
+pub(crate) struct ExtensionRecheck {
+    /// Each vetted community extension a check has found.
+    installed: Vec<String>,
+    /// Each pinned extension a check installed and found equal to its pin.
+    pinned: Vec<PinnedExtension>,
+    /// Each warning printed so far.
+    warned: HashSet<String>,
+    pins: ExtensionPins,
+    engine_version: Option<semver::Version>,
+}
+
+impl ExtensionRecheck {
+    /// From what the checks before the run found: the vetted extensions
+    /// [`check_extension_installs`] found, the extensions [`check_extension_pins`] found equal
+    /// to their pins, and each warning the two printed.
+    pub(crate) fn new(
+        installs: ExtensionInstalls,
+        pinned: Vec<PinnedExtension>,
+        pin_warnings: Vec<String>,
+        pins: &ExtensionPins,
+        engine_version: Option<&semver::Version>,
+    ) -> Self {
+        ExtensionRecheck {
+            installed: installs.installed,
+            pinned,
+            warned: installs.warnings.into_iter().chain(pin_warnings).collect(),
+            pins: pins.clone(),
+            engine_version: engine_version.cloned(),
+        }
+    }
+
+    /// Each pinned extension a check found equal to its pin, before the run or just before a
+    /// step or hook ran, which [`recheck_extension_pins`] hashes again when the run ends.
+    pub(crate) fn pinned(&self) -> &[PinnedExtension] {
+        &self.pinned
+    }
+
+    /// Just before the step or hook `source` names runs: read its file again, refuse it on
+    /// what [`check_extension_installs`] refuses in a file, and check each vetted community
+    /// extension it installs that no check has found against its pin, as
+    /// [`check_extension_pins`] does. Returns each warning those two give that the run has not
+    /// printed. A file arc cannot read is left to the engine, which reads it next.
+    pub(crate) fn check(
+        &mut self,
+        engine: &dyn Engine,
+        source: &ProtocolSql,
+    ) -> Result<Vec<String>> {
+        let Ok(bytes) = std::fs::read(&source.path) else {
+            return Ok(Vec::new());
+        };
+        let found = check_file(source, &bytes);
+        if !found.refusals.is_empty() {
+            return Err(Error::ExtensionRefusedBeforeItRan {
+                place: source.place.clone(),
+                step: source.step.clone(),
+                refusals: found.refusals,
+            });
+        }
+        let new: Vec<&VettedExtension> = found
+            .installed
+            .into_iter()
+            .filter(|entry| !self.installed.contains(&entry.name))
+            .collect();
+        let names: Vec<String> = new.iter().map(|entry| entry.name.clone()).collect();
+        let (pinned, pin_warnings) =
+            check_extension_pins(engine, &names, &self.pins, self.engine_version.as_ref())
+                .map_err(|e| match e {
+                    Error::ExtensionPinRefused { refusals } => {
+                        Error::ExtensionPinRefusedBeforeItRan {
+                            place: source.place.clone(),
+                            step: source.step.clone(),
+                            refusals,
+                        }
+                    }
+                    e => e,
+                })?;
+        let unread = (!found.shapes.is_empty()).then(|| run_time_warning(source, found.shapes));
+        let warnings = new
+            .into_iter()
+            .filter_map(|entry| unvetted_version_warning(entry, self.engine_version.as_ref()))
+            .chain(unread)
+            .chain(pin_warnings)
+            .filter(|warning| self.warned.insert(warning.clone()))
+            .collect();
+        self.installed.extend(names);
+        self.pinned.extend(pinned);
+        Ok(warnings)
+    }
 }
 
 /// The warning for a vetted extension whose entry does not name `engine_version`, or `None`
@@ -2868,6 +3025,7 @@ mod extension_tests {
                 std::fs::write(dir.join(&file), sql).unwrap();
                 ProtocolSql {
                     place: place.to_string(),
+                    step: None,
                     path: dir.join(&file),
                     file,
                 }
@@ -2992,6 +3150,7 @@ mod extension_tests {
         );
         sql.push(ProtocolSql {
             place: "step 'later'".into(),
+            step: Some("later".into()),
             file: "later.sql".into(),
             path: dir.path().join("later.sql"),
         });

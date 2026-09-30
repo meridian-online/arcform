@@ -9,8 +9,8 @@ use crate::asset::{AssetGraph, StepAssets};
 use crate::asset_kind::AssetKind;
 use crate::contract;
 use crate::engine::{
-    ALLOW_UNTESTED_ENGINE_ENV, Engine, SUPPORTED_ENGINE_RANGE, check_extension_installs,
-    check_extension_pins, protocol_sql, recheck_extension_pins,
+    ALLOW_UNTESTED_ENGINE_ENV, Engine, ExtensionRecheck, ProtocolSql, SUPPORTED_ENGINE_RANGE,
+    check_extension_installs, check_extension_pins, protocol_sql, recheck_extension_pins,
 };
 use crate::error::{Error, Result};
 use crate::manifest::{Manifest, Param, RetryPolicy};
@@ -86,24 +86,56 @@ pub fn backoff_duration(policy: &RetryPolicy, attempt: u32) -> Duration {
     Duration::from_secs_f64(secs)
 }
 
-/// Execute a lifecycle hook step.
+/// Execute the lifecycle hook in `slot`.
 ///
-/// Hooks use the Engine's execute paths (SQL or command) with the given env vars.
+/// Hooks use the Engine's execute paths (SQL or command) with the given env vars. A SQL
+/// hook's file is checked again just before it runs, as a SQL step's is.
 /// Returns Ok on success, Err on failure.
 fn execute_hook(
+    slot: &str,
     hook: &crate::manifest::Step,
     engine: &dyn Engine,
+    extensions: &mut ExtensionRecheck,
     db_path: &Path,
     dir: &Path,
     env: &HashMap<String, String>,
 ) -> Result<()> {
-    if let Some(ref sql) = hook.sql {
-        let sql_path = dir.join(sql);
-        engine.execute_sql(db_path, &sql_path, env, None)?;
+    if let Some(source) = ProtocolSql::hook(slot, hook, dir) {
+        check_again(extensions, engine, &source)?;
+        engine.execute_sql(db_path, &source.path, env, None)?;
     } else if let Some(ref command) = hook.command {
         engine.execute_command(command, env, false, None)?;
     }
     Ok(())
+}
+
+/// Check a SQL step's or hook's file again just before it runs, and print each warning the
+/// check gives that the run has not printed.
+fn check_again(
+    extensions: &mut ExtensionRecheck,
+    engine: &dyn Engine,
+    source: &ProtocolSql,
+) -> Result<()> {
+    for warning in extensions.check(engine, source)? {
+        eprintln!("{} {}", "warning:".yellow(), warning);
+    }
+    Ok(())
+}
+
+/// Report the hook in `slot` that failed where its failure leaves the run's result as it is:
+/// a warning, or an error when the check just before it ran refused it.
+fn report_hook_failure(slot: &str, hook: &crate::manifest::Step, e: &Error) {
+    if e.refused_before_it_ran() {
+        eprintln!("{} {}", "error:".red(), e);
+    } else {
+        eprintln!(
+            "{} {} hook '{}' failed: {}",
+            "warning:".yellow(),
+            slot,
+            hook.name,
+            e
+        );
+    }
 }
 
 /// Run a pipeline with no CLI parameter overrides.
@@ -186,9 +218,10 @@ pub fn run_with_params(
 ) -> Result<()> {
     let manifest = Manifest::load(dir)?;
 
-    // The pinned extensions the check before the run installed and found equal to their
-    // pins, hashed again when the run ends.
-    let mut pinned = Vec::new();
+    // What the checks before the run read and found, for the check of each SQL step's and
+    // hook's file just before it runs; and the pinned extensions each check installed and
+    // found equal to their pins, hashed again when the run ends.
+    let mut extensions = ExtensionRecheck::default();
 
     // If there are SQL steps, verify the engine is available and check its version.
     if manifest.has_sql_steps() {
@@ -205,7 +238,7 @@ pub fn run_with_params(
         // Before anything is initialised, so a refused Protocol leaves no run behind.
         let sql = protocol_sql(&manifest, dir);
         let installs = check_extension_installs(&sql, info.version.as_ref())?;
-        for warning in installs.warnings {
+        for warning in &installs.warnings {
             eprintln!("{} {}", "warning:".yellow(), warning);
         }
         // After the refusal above, so a refused Protocol installs nothing, and before the
@@ -217,10 +250,16 @@ pub fn run_with_params(
             &manifest.extensions,
             info.version.as_ref(),
         )?;
-        for warning in warnings {
+        for warning in &warnings {
             eprintln!("{} {}", "warning:".yellow(), warning);
         }
-        pinned = found;
+        extensions = ExtensionRecheck::new(
+            installs,
+            found,
+            warnings,
+            &manifest.extensions,
+            info.version.as_ref(),
+        );
     }
     // Which reader takes a SQL step's reads and produces. Refused here, before a step
     // runs, rather than as a warning on each step the reader cannot read.
@@ -313,7 +352,15 @@ pub fn run_with_params(
     if let Some(ref init_hook) = manifest.hooks.on_init {
         init_attempted = true;
         println!("{} {} ...", "[hook]".dimmed(), init_hook.name.bold());
-        if let Err(e) = execute_hook(init_hook, engine, &db_path, dir, &env_map) {
+        if let Err(e) = execute_hook(
+            "on_init",
+            init_hook,
+            engine,
+            &mut extensions,
+            &db_path,
+            dir,
+            &env_map,
+        ) {
             // on_init failure is fatal — no steps execute.
             // But on_exit still runs.
             eprintln!(
@@ -328,18 +375,21 @@ pub fn run_with_params(
                 let mut exit_env = env_map.clone();
                 exit_env.insert("ARC_PIPELINE_STATUS".to_string(), "init_failed".to_string());
                 println!("{} {} ...", "[hook]".dimmed(), exit_hook.name.bold());
-                if let Err(exit_err) = execute_hook(exit_hook, engine, &db_path, dir, &exit_env) {
-                    eprintln!(
-                        "{} on_exit hook '{}' failed: {}",
-                        "warning:".yellow(),
-                        exit_hook.name,
-                        exit_err
-                    );
+                if let Err(exit_err) = execute_hook(
+                    "on_exit",
+                    exit_hook,
+                    engine,
+                    &mut extensions,
+                    &db_path,
+                    dir,
+                    &exit_env,
+                ) {
+                    report_hook_failure("on_exit", exit_hook, &exit_err);
                 }
             }
 
             let _ = state.finish_run(&run_id, executed, "init_failed", total_retries);
-            if let Err(changed) = recheck_extension_pins(&pinned) {
+            if let Err(changed) = recheck_extension_pins(extensions.pinned()) {
                 eprintln!("{} {}", "error:".red(), changed);
             }
             return Err(e);
@@ -466,9 +516,12 @@ pub fn run_with_params(
                     }
                 };
 
-                let result = if let Some(ref sql) = step.sql {
-                    let sql_path = dir.join(sql);
-                    engine.execute_sql(&db_path, &sql_path, &env_map, step_timeout)
+                let result = if let Some(source) = ProtocolSql::step(step, dir) {
+                    // Before each attempt: a step earlier in the run, or an earlier attempt of
+                    // this one, can have written over the file since a check read it.
+                    check_again(&mut extensions, engine, &source).and_then(|()| {
+                        engine.execute_sql(&db_path, &source.path, &env_map, step_timeout)
+                    })
                 } else if let Some(ref op_ref) = step.op {
                     match operator::resolve(op_ref) {
                         Ok(op) => {
@@ -604,7 +657,8 @@ pub fn run_with_params(
                         // Continue to next attempt if retries remain.
                     }
                     Err(e) => {
-                        // Non-retryable errors (StepExecution, etc.) — halt immediately.
+                        // Non-retryable errors (StepExecution, a refusal by the check just
+                        // before the step runs, etc.) — halt immediately.
                         let _ = state.record_step(&step.name, &sql_hash, "", StepStatus::Failed);
                         let _ = state.finish_run(&run_id, executed, "error", total_retries);
                         stream.step(&step.name, "failed");
@@ -649,21 +703,34 @@ pub fn run_with_params(
     })();
 
     // --- Lifecycle hooks: on_success / on_failure / on_exit ---
-    // Hooks run outside the pipeline timeout boundary.
+    // Hooks run outside the pipeline timeout boundary. A hook that fails leaves the run's
+    // result as it is, except one the check just before it runs refuses: that fails a run
+    // that had succeeded.
+    let mut step_loop_result = step_loop_result;
+    // The step loop recorded `success` in the state backend already.
+    let mut refused_after_success = false;
 
     match &step_loop_result {
         Ok(()) => {
             // --- on_success hook ---
             if let Some(ref success_hook) = manifest.hooks.on_success {
                 println!("{} {} ...", "[hook]".dimmed(), success_hook.name.bold());
-                if let Err(e) = execute_hook(success_hook, engine, &db_path, dir, &env_map) {
-                    // Non-fatal: report but keep Ok result.
-                    eprintln!(
-                        "{} on_success hook '{}' failed: {}",
-                        "warning:".yellow(),
-                        success_hook.name,
-                        e
-                    );
+                if let Err(e) = execute_hook(
+                    "on_success",
+                    success_hook,
+                    engine,
+                    &mut extensions,
+                    &db_path,
+                    dir,
+                    &env_map,
+                ) {
+                    if e.refused_before_it_ran() {
+                        step_loop_result = Err(e);
+                        refused_after_success = true;
+                    } else {
+                        // Non-fatal: report but keep Ok result.
+                        report_hook_failure("on_success", success_hook, &e);
+                    }
                 }
             }
         }
@@ -685,20 +752,30 @@ pub fn run_with_params(
                         failure_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
                         failure_env.insert("ARC_EXIT_CODE".to_string(), "timeout".to_string());
                     }
+                    Error::ExtensionRefusedBeforeItRan {
+                        step: Some(step), ..
+                    }
+                    | Error::ExtensionPinRefusedBeforeItRan {
+                        step: Some(step), ..
+                    } => {
+                        failure_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
+                        failure_env.insert("ARC_EXIT_CODE".to_string(), "refused".to_string());
+                    }
                     _ => {}
                 }
 
                 println!("{} {} ...", "[hook]".dimmed(), failure_hook.name.bold());
-                if let Err(hook_err) =
-                    execute_hook(failure_hook, engine, &db_path, dir, &failure_env)
-                {
+                if let Err(hook_err) = execute_hook(
+                    "on_failure",
+                    failure_hook,
+                    engine,
+                    &mut extensions,
+                    &db_path,
+                    dir,
+                    &failure_env,
+                ) {
                     // Non-fatal: report but keep original error.
-                    eprintln!(
-                        "{} on_failure hook '{}' failed: {}",
-                        "warning:".yellow(),
-                        failure_hook.name,
-                        hook_err
-                    );
+                    report_hook_failure("on_failure", failure_hook, &hook_err);
                 }
             }
         }
@@ -729,19 +806,36 @@ pub fn run_with_params(
                         exit_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
                         exit_env.insert("ARC_EXIT_CODE".to_string(), "timeout".to_string());
                     }
+                    Error::ExtensionRefusedBeforeItRan {
+                        step: Some(step), ..
+                    }
+                    | Error::ExtensionPinRefusedBeforeItRan {
+                        step: Some(step), ..
+                    } => {
+                        exit_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
+                        exit_env.insert("ARC_EXIT_CODE".to_string(), "refused".to_string());
+                    }
                     _ => {}
                 }
             }
         }
 
         println!("{} {} ...", "[hook]".dimmed(), exit_hook.name.bold());
-        if let Err(exit_err) = execute_hook(exit_hook, engine, &db_path, dir, &exit_env) {
-            eprintln!(
-                "{} on_exit hook '{}' failed: {}",
-                "warning:".yellow(),
-                exit_hook.name,
-                exit_err
-            );
+        if let Err(exit_err) = execute_hook(
+            "on_exit",
+            exit_hook,
+            engine,
+            &mut extensions,
+            &db_path,
+            dir,
+            &exit_env,
+        ) {
+            if exit_err.refused_before_it_ran() && step_loop_result.is_ok() {
+                step_loop_result = Err(exit_err);
+                refused_after_success = true;
+            } else {
+                report_hook_failure("on_exit", exit_hook, &exit_err);
+            }
         }
     }
 
@@ -749,15 +843,17 @@ pub fn run_with_params(
     // After the last step and hook: a step can replace a pinned file with `FORCE INSTALL`,
     // `UPDATE EXTENSIONS` or a command. A run that failed already keeps its own error and
     // prints this one beside it.
-    let (step_loop_result, changed_after_success) =
-        match (step_loop_result, recheck_extension_pins(&pinned)) {
-            (result, Ok(())) => (result, false),
-            (Ok(()), Err(changed)) => (Err(changed), true),
-            (Err(e), Err(changed)) => {
-                eprintln!("{} {}", "error:".red(), changed);
-                (Err(e), false)
-            }
-        };
+    let (step_loop_result, changed_after_success) = match (
+        step_loop_result,
+        recheck_extension_pins(extensions.pinned()),
+    ) {
+        (result, Ok(())) => (result, false),
+        (Ok(()), Err(changed)) => (Err(changed), true),
+        (Err(e), Err(changed)) => {
+            eprintln!("{} {}", "error:".red(), changed);
+            (Err(e), false)
+        }
+    };
 
     // --- Finalize the live Protocol+Run contract ---
     // Assemble the full contract (assets, per-table row counts, steps), write it to
@@ -770,9 +866,10 @@ pub fn run_with_params(
         Err(_) if succeeded > 0 => "partial",
         Err(_) => "error",
     };
-    // The step loop recorded `success` in the state backend before the recheck, so a run
-    // the recheck failed records the outcome its contract gives in its place.
-    if changed_after_success {
+    // The step loop recorded `success` in the state backend before the recheck and the hooks,
+    // so a run the recheck or a refused hook failed records the outcome its contract gives in
+    // its place.
+    if changed_after_success || refused_after_success {
         let _ = state.finish_run(&run_id, executed, outcome, total_retries);
     }
     let run_contract = contract::build_contract(contract::ContractInputs {
