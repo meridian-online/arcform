@@ -1400,9 +1400,6 @@ pub(crate) struct ExtensionInstalls {
     /// Each vetted community extension the SQL installs `FROM community`, once, in the order
     /// the Protocol first installs it.
     pub(crate) installed: Vec<String>,
-    /// Each file the check read, with the SHA-256 of what it read, or `None` when it was not
-    /// there: what [`ExtensionRecheck`] compares each file with just before it runs.
-    pub(crate) read: Vec<(PathBuf, Option<String>)>,
 }
 
 /// What the check reads in one SQL file: a line for each statement it refuses, each vetted
@@ -1496,8 +1493,8 @@ fn check_file(source: &ProtocolSql, bytes: &[u8]) -> FileCheck {
 /// variable lifts the refusal.
 ///
 /// It reads each file as it is before the run, and [`ExtensionRecheck::check`] reads each
-/// step's and hook's file again just before it runs, and checks it again when it differs or
-/// was not there before the run. Neither is a boundary: a `command:` step can start a DuckDB
+/// step's and hook's file again, and checks it again, just before it runs. Neither is a
+/// boundary: a `command:` step can start a DuckDB
 /// of its own and install what it likes, and a process an earlier step leaves running can
 /// write a file after the check just before it runs has read it.
 pub(crate) fn check_extension_installs(
@@ -1507,18 +1504,12 @@ pub(crate) fn check_extension_installs(
     let mut refusals = Vec::new();
     let mut installed: Vec<&VettedExtension> = Vec::new();
     let mut unread = Vec::new();
-    let mut read = Vec::new();
     for source in sql {
         // A file that is not there before the run is checked just before the step or hook
         // that runs it.
         let Ok(bytes) = std::fs::read(&source.path) else {
-            read.push((source.path.clone(), None));
             continue;
         };
-        read.push((
-            source.path.clone(),
-            Some(crate::state::content_hash(&bytes)),
-        ));
         let found = check_file(source, &bytes);
         refusals.extend(found.refusals);
         for entry in found.installed {
@@ -1546,19 +1537,17 @@ pub(crate) fn check_extension_installs(
     Ok(ExtensionInstalls {
         warnings,
         installed: names,
-        read,
     })
 }
 
 /// The check of each SQL step's and hook's file just before it runs, for a file a step
 /// earlier in the run wrote over or wrote where there was none. It holds what the checks
-/// before the run read and found, and what each check since has, so a file that has not
-/// changed since a check read it draws nothing and makes no call to the engine, and a warning
-/// prints once.
+/// before the run found, and what each check since has found, so a file that has not changed
+/// since the check before the run read it draws nothing: it holds no statement that check
+/// refused, each extension it installs has been compared with its pin, and each warning it
+/// draws has been printed.
 #[derive(Default)]
 pub(crate) struct ExtensionRecheck {
-    /// Each file's SHA-256 as a check last read it, or `None` when it was not there.
-    read: HashMap<PathBuf, Option<String>>,
     /// Each vetted community extension a check has found.
     installed: Vec<String>,
     /// Each pinned extension a check installed and found equal to its pin.
@@ -1570,8 +1559,8 @@ pub(crate) struct ExtensionRecheck {
 }
 
 impl ExtensionRecheck {
-    /// From what the checks before the run found: the files and the vetted extensions
-    /// [`check_extension_installs`] read, the extensions [`check_extension_pins`] found equal
+    /// From what the checks before the run found: the vetted extensions
+    /// [`check_extension_installs`] found, the extensions [`check_extension_pins`] found equal
     /// to their pins, and each warning the two printed.
     pub(crate) fn new(
         installs: ExtensionInstalls,
@@ -1581,7 +1570,6 @@ impl ExtensionRecheck {
         engine_version: Option<&semver::Version>,
     ) -> Self {
         ExtensionRecheck {
-            read: installs.read.into_iter().collect(),
             installed: installs.installed,
             pinned,
             warned: installs.warnings.into_iter().chain(pin_warnings).collect(),
@@ -1596,9 +1584,8 @@ impl ExtensionRecheck {
         &self.pinned
     }
 
-    /// Just before the step or hook `source` names runs: read its file again, and when it
-    /// differs from the file a check last read, or was not there, refuse it on what
-    /// [`check_extension_installs`] refuses in a file, and check each vetted community
+    /// Just before the step or hook `source` names runs: read its file again, refuse it on
+    /// what [`check_extension_installs`] refuses in a file, and check each vetted community
     /// extension it installs that no check has found against its pin, as
     /// [`check_extension_pins`] does. Returns each warning those two give that the run has not
     /// printed. A file arc cannot read is left to the engine, which reads it next.
@@ -1610,10 +1597,6 @@ impl ExtensionRecheck {
         let Ok(bytes) = std::fs::read(&source.path) else {
             return Ok(Vec::new());
         };
-        let hash = crate::state::content_hash(&bytes);
-        if self.read.get(&source.path) == Some(&Some(hash.clone())) {
-            return Ok(Vec::new());
-        }
         let found = check_file(source, &bytes);
         if !found.refusals.is_empty() {
             return Err(Error::ExtensionRefusedBeforeItRan {
@@ -1650,7 +1633,6 @@ impl ExtensionRecheck {
             .collect();
         self.installed.extend(names);
         self.pinned.extend(pinned);
-        self.read.insert(source.path.clone(), Some(hash));
         Ok(warnings)
     }
 }
