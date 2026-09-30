@@ -1433,6 +1433,125 @@ fn the_real_duckdb_answers_the_pin_check_from_the_file_it_holds() {
     assert!(!marked, "on_init did not run");
 }
 
+// ---- each SQL file, read again just before it runs ----
+
+/// Hooks running SQL in each slot a run that succeeds reaches: `on_init`, `on_success` and
+/// `on_exit`, each in `models/<slot>.sql`, which selects 1.
+const SQL_HOOKS: &str = "hooks:\n  on_init:\n    name: setup\n    sql: models/on_init.sql\n  on_success:\n    name: notify\n    sql: models/on_success.sql\n  on_exit:\n    name: cleanup\n    sql: models/on_exit.sql\n";
+
+/// `models/<slot>.sql` for each hook in [`SQL_HOOKS`].
+fn sql_hook_files() -> Vec<(String, &'static str)> {
+    ["on_init", "on_success", "on_exit"]
+        .into_iter()
+        .map(|slot| (format!("models/{slot}.sql"), "SELECT 1;\n"))
+        .collect()
+}
+
+/// One SQL step per `(name, sql)`, each in `models/<name>.sql`, and the hooks in
+/// [`SQL_HOOKS`].
+fn steps_and_sql_hooks(steps: &[(&str, &str)]) -> Protocol {
+    let mut yaml = String::from("name: vetted\nsteps:\n");
+    for (name, _) in steps {
+        yaml.push_str(&format!("  - name: {name}\n    sql: models/{name}.sql\n"));
+    }
+    yaml.push_str(SQL_HOOKS);
+    let mut files: Vec<(String, &str)> = steps
+        .iter()
+        .map(|(name, sql)| (format!("models/{name}.sql"), *sql))
+        .collect();
+    files.extend(sql_hook_files());
+    Protocol::with(&yaml, &files)
+}
+
+/// What `arc run` printed to stderr for each Protocol in
+/// [`a_protocol_whose_steps_rewrite_no_sql_file_prints_what_it_printed_before`] on 20698d9,
+/// the commit the check just before each step or hook runs was added to, byte for byte:
+/// recorded by running that commit's binary on the same fake engine.
+const NO_REWRITE_BEFORE_STDERR: [&str; 3] = [
+    "",
+    "\u{1b}[33mwarning:\u{1b}[39m mlpack is vetted on DuckDB v1.5.5, and this engine is DuckDB v1.5.4; running it anyway (https://github.com/meridian-online/arcform/blob/main/docs/VETTED_EXTENSIONS.md)\n\
+\u{1b}[33mwarning:\u{1b}[39m mlpack has no pin under the extensions: key of arcform.yaml (for DuckDB v1.5.4), so arc runs whichever build DuckDB installs; `arc upgrade mlpack` pins the build the community registry serves (https://github.com/meridian-online/arcform/blob/main/docs/VETTED_EXTENSIONS.md)\n",
+    "\u{1b}[33mwarning:\u{1b}[39m step 'b' (models/b.sql) can run or write SQL that is not in its file: IMPORT DATABASE on line 1. arc does not read the SQL a step builds or writes while it runs, for an extension that SQL installs; running it anyway (https://github.com/meridian-online/arcform/blob/main/docs/VETTED_EXTENSIONS.md)\n\
+\u{1b}[33mwarning:\u{1b}[39m could not parse models/b.sql: sql parser error: Expected: an SQL statement, found: IMPORT at Line: 1, Column: 1 — treating as opaque step\n",
+];
+
+/// The calls the engine received for the pinned Protocol in
+/// [`a_protocol_whose_steps_rewrite_no_sql_file_prints_what_it_printed_before`] on 20698d9,
+/// recorded as [`NO_REWRITE_BEFORE_STDERR`] was.
+const NO_REWRITE_BEFORE_CALLS: [&str; 8] = [
+    "--version",
+    "platform",
+    "install mlpack",
+    "on_init.sql",
+    "s.sql",
+    "t.sql",
+    "on_success.sql",
+    "on_exit.sql",
+];
+
+#[test]
+fn a_protocol_whose_steps_rewrite_no_sql_file_prints_what_it_printed_before() {
+    for (i, (label, protocol, version)) in [
+        (
+            "no extension",
+            steps_and_sql_hooks(&[
+                ("a", "CREATE TABLE ta AS SELECT 1;\n"),
+                ("b", "SELECT 1;\n"),
+            ]),
+            VETTED_ON,
+        ),
+        (
+            "a vetted extension on a version its entry does not name",
+            steps_and_sql_hooks(&[
+                ("a", "INSTALL mlpack FROM community;\n"),
+                ("b", "FORCE INSTALL mlpack FROM community; LOAD mlpack;\n"),
+            ]),
+            "1.5.4",
+        ),
+        (
+            "IMPORT DATABASE",
+            steps_and_sql_hooks(&[("a", "SELECT 1;\n"), ("b", "IMPORT DATABASE 'imp';\n")]),
+            VETTED_ON,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let run = protocol.run(version);
+        assert_eq!(run.code, Some(0), "[{label}] {}", run.stderr);
+        assert_eq!(
+            run.started(),
+            vec![
+                "on_init.sql",
+                "a.sql",
+                "b.sql",
+                "on_success.sql",
+                "on_exit.sql"
+            ],
+            "[{label}]"
+        );
+        assert_eq!(run.stderr, NO_REWRITE_BEFORE_STDERR[i], "[{label}]");
+    }
+
+    let pinned = Pinned::new(
+        &format!(
+            "steps:\n  - name: s\n    sql: models/s.sql\n  - name: t\n    sql: models/t.sql\n{SQL_HOOKS}"
+        ),
+        &pin_yaml("v1.5.5", PLATFORM, &served_pin()),
+    );
+    fs::write(
+        pinned.protocol.project().join("models/t.sql"),
+        INSTALLS_MLPACK,
+    )
+    .unwrap();
+    for (path, sql) in sql_hook_files() {
+        fs::write(pinned.protocol.project().join(path), sql).unwrap();
+    }
+    let run = pinned.run(Registry::Serves, &[]);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.calls(), NO_REWRITE_BEFORE_CALLS);
+}
+
 // ---- arc upgrade ----
 
 /// A pin for mlpack on another platform, which no file here hashes to.

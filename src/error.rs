@@ -119,6 +119,41 @@ pub enum Error {
     )]
     ExtensionPinRefused { refusals: Vec<String> },
 
+    // A step's or hook's SQL file, read again just before it ran, installs a DuckDB extension
+    // from somewhere arc has not vetted: a step earlier in the run wrote over the file after
+    // the check before the run read it, or wrote it where there was none. A step refused here
+    // is a step that fails, so the message does not say that no step ran: the steps before it
+    // ran and their tables stay, and it and the steps after it do not run. `step` is `None`
+    // for a hook.
+    #[error(
+        "{place} was refused and did not run: its SQL file, read again just before it ran, installs a DuckDB extension arc has not vetted:\n{}\n\
+         A step or hook may install a community extension on the vetted list, FROM community. \
+         The list, and what this check does not read, are at {}",
+        indented(refusals),
+        crate::engine::VETTED_EXTENSIONS_DOC
+    )]
+    ExtensionRefusedBeforeItRan {
+        place: String,
+        step: Option<String>,
+        refusals: Vec<String>,
+    },
+
+    // A community extension that a step's or hook's SQL file installs, first found when the
+    // file was read again just before it ran, is not the build `arcform.yaml` pins for this
+    // DuckDB and platform, or arc could not install it to compare. Refused as
+    // `ExtensionRefusedBeforeItRan` is.
+    #[error(
+        "{place} was refused and did not run: arc could not confirm that each extension its SQL file, read again just before it ran, installs is the build its arcform.yaml pins:\n{}\n\
+         A pin sits under the extensions: key of arcform.yaml. See {}",
+        indented(refusals),
+        crate::engine::VETTED_EXTENSIONS_DOC
+    )]
+    ExtensionPinRefusedBeforeItRan {
+        place: String,
+        step: Option<String>,
+        refusals: Vec<String>,
+    },
+
     // `arc upgrade` was asked to pin an extension that is not on the vetted list. Refused
     // before DuckDB is asked anything.
     #[error(
@@ -268,9 +303,20 @@ impl Error {
             | Error::ToolPrecondition { .. }
             | Error::StepTimeout { .. }
             | Error::PipelineTimeout { .. }
-            | Error::ExtensionChanged { .. } => 2,
+            | Error::ExtensionChanged { .. }
+            | Error::ExtensionRefusedBeforeItRan { .. }
+            | Error::ExtensionPinRefusedBeforeItRan { .. } => 2,
             _ => 1,
         }
+    }
+
+    /// Whether the check just before a step or hook runs refused it.
+    pub(crate) fn refused_before_it_ran(&self) -> bool {
+        matches!(
+            self,
+            Error::ExtensionRefusedBeforeItRan { .. }
+                | Error::ExtensionPinRefusedBeforeItRan { .. }
+        )
     }
 }
 
@@ -472,6 +518,16 @@ mod exit_code_tests {
             },
             Error::ExtensionChanged {
                 changes: vec!["mlpack".into()],
+            },
+            Error::ExtensionRefusedBeforeItRan {
+                place: "step 's'".into(),
+                step: Some("s".into()),
+                refusals: vec!["anofox_forecast".into()],
+            },
+            Error::ExtensionPinRefusedBeforeItRan {
+                place: "hook on_success 'h'".into(),
+                step: None,
+                refusals: vec!["mlpack".into()],
             },
         ] {
             assert_eq!(e.exit_code(), 2, "expected 'found a problem' (2) for {e:?}");
