@@ -673,8 +673,8 @@ fn described(op_name: &str) -> Option<&'static Described> {
 /// the form a `with:` block is written from.
 pub(crate) fn description(op_name: &str) -> Option<serde_json::Value> {
     catalog().into_iter().find(|op| op.name() == op_name)?;
-    let described = described(op_name)?;
-    let schema = with_schema(op_name)?;
+    // Both tables answer for every catalog operator, as the tests below hold them to.
+    let (described, schema) = described(op_name).zip(with_schema(op_name))?;
     let roles = |keys: &[RoleKey]| -> Vec<crate::record::Role> {
         keys.iter().map(|k| resolved_role(k, &schema)).collect()
     };
