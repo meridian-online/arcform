@@ -1675,9 +1675,8 @@ pub mod mock {
         pub timeout_should_fire: RefCell<bool>,
         /// The platform `extension_platform` reports; `None` makes it fail.
         pub platform: RefCell<Option<String>>,
-        /// What `install_community_extension` and `force_install_community_extension`
-        /// answer for each name: the installed file, no file, or a failure's reason. A name
-        /// not here names no file.
+        /// What `install_community_extension` answers for each name: the installed file,
+        /// no file, or a failure's reason. A name not here names no file.
         pub installs: RefCell<HashMap<String, std::result::Result<Option<PathBuf>, String>>>,
     }
 
@@ -1696,9 +1695,6 @@ pub mod mock {
         Preflight,
         Platform,
         Install {
-            name: String,
-        },
-        ForceInstall {
             name: String,
         },
     }
@@ -1885,19 +1881,6 @@ pub mod mock {
             self.calls.borrow_mut().push(MockCall::Install {
                 name: name.to_string(),
             });
-            self.install_answer(name)
-        }
-
-        fn force_install_community_extension(&self, name: &str) -> Result<Option<PathBuf>> {
-            self.calls.borrow_mut().push(MockCall::ForceInstall {
-                name: name.to_string(),
-            });
-            self.install_answer(name)
-        }
-    }
-
-    impl MockEngine {
-        fn install_answer(&self, name: &str) -> Result<Option<PathBuf>> {
             match self.installs.borrow().get(name) {
                 None => Ok(None),
                 Some(Ok(path)) => Ok(path.clone()),
@@ -1906,6 +1889,13 @@ pub mod mock {
                     reason: reason.clone(),
                 }),
             }
+        }
+
+        /// `arc run` never force-installs, so a call here fails the test that made it.
+        /// `arc upgrade`, the one caller, is tested on a fake DuckDB in
+        /// `tests/vetted_extensions.rs`.
+        fn force_install_community_extension(&self, name: &str) -> Result<Option<PathBuf>> {
+            panic!("the mock engine was asked to force-install {name}, which arc run never does")
         }
     }
 }
