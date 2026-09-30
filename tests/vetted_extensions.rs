@@ -1608,6 +1608,11 @@ fn arc_upgrade_pins_the_served_build_and_not_a_changed_file() {
         pin,
         "the served build is installed over the changed file"
     );
+    assert!(
+        up.stdout.contains(&format!("pinned {pin} already")) && !up.stdout.contains("replaced"),
+        "the pin held the served build's hash, so arc upgrade says so and replaces nothing:\n{}",
+        up.stdout
+    );
     let manifest = String::from_utf8(pinned.manifest()).unwrap();
     assert!(
         manifest.contains(&format!("{PLATFORM}: {pin}\n")) && !manifest.contains(&changed),

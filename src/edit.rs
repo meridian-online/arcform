@@ -575,9 +575,13 @@ fn block_pair(key: &str, value: &str) -> String {
 /// [`SpecEdit::Add`] for each missing key, the outermost first, each a bare `key:` but the
 /// last. Under a flow mapping (`{ … }`) the missing keys go in as one flow value instead,
 /// since a bare key inside braces takes no block child. Every key present keeps its bytes.
-pub(crate) fn scalar_edits(text: &str, keys: &[&str], value: &str) -> Result<Vec<SpecEdit>> {
-    let doc = parse(text)?;
+/// Text that does not parse as YAML has no key this can read, so it gets the `Add` of
+/// each key, and applying those refuses it with the parser's reason.
+pub(crate) fn scalar_edits(text: &str, keys: &[&str], value: &str) -> Vec<SpecEdit> {
     let path = |n: usize| -> Vec<PathPart> { keys[..n].iter().map(|&k| k.into()).collect() };
+    let Ok(doc) = parse(text) else {
+        return block_adds(keys, 0, value);
+    };
     let present = (1..=keys.len())
         .rev()
         .find(|&n| doc.query_exists(&route_of(&path(n))))
@@ -585,20 +589,20 @@ pub(crate) fn scalar_edits(text: &str, keys: &[&str], value: &str) -> Result<Vec
     if present == keys.len() {
         // A bare `key:` is replaced right after its colon, so its value brings the space.
         let bare = matches!(doc.query_exact(&route_of(&path(present))), Ok(None));
-        return Ok(vec![SpecEdit::Replace {
+        return vec![SpecEdit::Replace {
             path: path(present),
             value: if bare {
                 format!(" {value}")
             } else {
                 value.to_string()
             },
-        }]);
+        }];
     }
-    let under_flow = present > 0
-        && matches!(
-            doc.query_exact(&route_of(&path(present))),
-            Ok(Some(feature)) if feature.kind() == yamlpath::FeatureKind::FlowMapping
-        );
+    // With no key present this asks of the document's root, a block mapping in a spec.
+    let under_flow = matches!(
+        doc.query_exact(&route_of(&path(present))),
+        Ok(Some(feature)) if feature.kind() == yamlpath::FeatureKind::FlowMapping
+    );
     if under_flow {
         let value = keys[present + 1..]
             .iter()
@@ -606,15 +610,21 @@ pub(crate) fn scalar_edits(text: &str, keys: &[&str], value: &str) -> Result<Vec
             .fold(value.to_string(), |inner, key| {
                 format!("{{{key}: {inner}}}")
             });
-        return Ok(vec![SpecEdit::Add {
+        return vec![SpecEdit::Add {
             path: path(present),
             key: keys[present].to_string(),
             value,
-        }]);
+        }];
     }
-    Ok((present..keys.len())
+    block_adds(keys, present, value)
+}
+
+/// One [`SpecEdit::Add`] for each of `keys` from `from` on, each a bare `key:` in the one
+/// before it, and the last holding `value`.
+fn block_adds(keys: &[&str], from: usize, value: &str) -> Vec<SpecEdit> {
+    (from..keys.len())
         .map(|n| SpecEdit::Add {
-            path: path(n),
+            path: keys[..n].iter().map(|&k| k.into()).collect(),
             key: keys[n].to_string(),
             value: if n + 1 == keys.len() {
                 value.to_string()
@@ -622,7 +632,7 @@ pub(crate) fn scalar_edits(text: &str, keys: &[&str], value: &str) -> Result<Vec
                 String::new()
             },
         })
-        .collect())
+        .collect()
 }
 
 /// `Append`: insert `item` after the last item of the sequence at `path`.
@@ -1125,7 +1135,7 @@ steps:
 
     /// `text` with the mlpack pin set to [`PIN`], through the spec gate.
     fn set_pin(text: &str) -> String {
-        let edits = scalar_edits(text, &PIN_KEYS, PIN).unwrap();
+        let edits = scalar_edits(text, &PIN_KEYS, PIN);
         apply_edits(text, &edits).unwrap().text().to_string()
     }
 
@@ -1164,7 +1174,7 @@ steps:
         let before = format!(
             "name: p\nextensions:\n  mlpack:\n    v1.5.5:\n      linux_amd64: '{OTHER}'  # the old build\n"
         );
-        let edits = scalar_edits(&before, &PIN_KEYS, PIN).unwrap();
+        let edits = scalar_edits(&before, &PIN_KEYS, PIN);
         assert_eq!(
             edits,
             vec![SpecEdit::Replace {
@@ -1176,8 +1186,29 @@ steps:
 
         // A bare key's value lands after its colon, and brings the space.
         let bare = "a:\n  b:\n";
-        let edits = scalar_edits(bare, &["a", "b"], "x").unwrap();
+        let edits = scalar_edits(bare, &["a", "b"], "x");
         assert_eq!(apply_yaml_edits(bare, &edits).unwrap(), "a:\n  b: x\n");
+    }
+
+    #[test]
+    fn scalar_edits_on_text_that_does_not_parse_add_each_key_and_are_refused() {
+        let broken = "name: p\nsteps: [\n";
+        assert_eq!(
+            scalar_edits(broken, &["a", "b"], "x"),
+            vec![
+                SpecEdit::Add {
+                    path: vec![],
+                    key: "a".to_string(),
+                    value: String::new()
+                },
+                SpecEdit::Add {
+                    path: p(&["a"]),
+                    key: "b".to_string(),
+                    value: "x".to_string()
+                },
+            ]
+        );
+        assert!(apply_edits(broken, &scalar_edits(broken, &PIN_KEYS, PIN)).is_err());
     }
 
     #[test]

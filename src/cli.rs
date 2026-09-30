@@ -656,7 +656,6 @@ pub fn upgrade_extension(
     name: &str,
     engine: &dyn Engine,
     history: &LocalHistory,
-    out: &mut impl Write,
 ) -> Result<()> {
     let manifest = Manifest::load(dir)?;
     let entry = crate::engine::vetted_extensions()
@@ -711,31 +710,27 @@ pub fn upgrade_extension(
         .and_then(|versions| versions.get(&version))
         .and_then(|platforms| platforms.get(&platform));
     if old == Some(&hash) {
-        writeln!(
-            out,
+        println!(
             "{at}: pinned {hash} already, the build the community registry serves; {} is unchanged",
             spec.display()
-        )?;
+        );
         return Ok(());
     }
     let text = fs::read_to_string(&spec).map_err(|e| Error::FileRead {
         path: spec.clone(),
         source: e,
     })?;
-    let edits =
-        crate::edit::scalar_edits(&text, &["extensions", name, &version, &platform], &hash)?;
+    let edits = crate::edit::scalar_edits(&text, &["extensions", name, &version, &platform], &hash);
     crate::spec::edit_spec_with_history(dir, &edits, history)?;
     match old {
-        Some(old) => writeln!(
-            out,
+        Some(old) => println!(
             "{at}: replaced the pin {old} with {hash}, the build the community registry serves, in {}",
             spec.display()
-        )?,
-        None => writeln!(
-            out,
+        ),
+        None => println!(
             "{at}: pinned {hash}, the build the community registry serves, in {}",
             spec.display()
-        )?,
+        ),
     }
     Ok(())
 }
@@ -762,13 +757,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Commands::History { cmd } => dispatch_history(cmd),
         Commands::Run { force, params } => run_pipeline(force, &params),
-        Commands::Upgrade { name, dir } => upgrade_extension(
-            &dir,
-            &name,
-            &DuckDbEngine,
-            &LocalHistory::open_default()?,
-            &mut std::io::stdout(),
-        ),
+        Commands::Upgrade { name, dir } => {
+            upgrade_extension(&dir, &name, &DuckDbEngine, &LocalHistory::open_default()?)
+        }
         Commands::Registry { cmd } => dispatch_registry(cmd, verbose),
         Commands::Operation { cmd } => dispatch_operation(cmd, &mut std::io::stdout()),
         #[cfg(feature = "mcp")]
