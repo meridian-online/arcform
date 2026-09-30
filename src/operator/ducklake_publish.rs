@@ -67,6 +67,7 @@ const NAME: &str = "ducklake_publish";
 const LAKE: &str = "arc_publish_lake";
 
 #[derive(Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(deny_unknown_fields)]
 pub(super) struct DucklakePublishConfig {
     /// The built Parquet to publish, relative to the manifest directory. Declared as
@@ -91,6 +92,7 @@ pub(super) struct DucklakePublishConfig {
 /// A DuckDB secret whose values come from the environment. The manifest names the
 /// variables and never holds a value.
 #[derive(Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 #[serde(deny_unknown_fields)]
 struct CredentialConfig {
     /// The DuckDB secret `TYPE`: `s3`, `r2`, `gcs`, `postgres`, …
