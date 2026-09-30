@@ -1,5 +1,6 @@
 //! `arc mcp`'s `operation_describe` tool: the operations arc holds, and what one
-//! takes, asked of the real `arc mcp` server over stdio.
+//! of them or one of arc's operators takes, asked of the real `arc mcp` server
+//! over stdio.
 //!
 //! An agent that reaches arc only over MCP, such as an editor or a hosted
 //! assistant with no shell, asks the same two questions `arc operation list` and
@@ -7,9 +8,10 @@
 //! both and compare the answers:
 //!
 //!   1. **list** — no argument returns the array `arc operation list --json`
-//!      prints, under one key;
-//!   2. **describe** — a long name returns the object `arc operation describe`
-//!      prints for it;
+//!      prints, under one key, which holds operations alone;
+//!   2. **describe** — an operation's long name or an operator's name returns
+//!      the object `arc operation describe` prints for it, and `operator_describe`
+//!      still returns an operator's `with:` schema whole;
 //!   3. **refuse** — an operation arc does not hold is an error result naming it,
 //!      and the server answers the request after it;
 //!   4. **advertise** — `tools/list` holds the tool, and both `arc mcp --help` and
@@ -218,6 +220,91 @@ fn called_with_sort_rows_it_returns_what_arc_operation_describe_prints() {
     assert_eq!(
         result["structuredContent"]["parameters"]["properties"]["order_by"]["x-kind"],
         "order"
+    );
+}
+
+/// The operators this build holds, as `operator_describe` lists them.
+fn operator_names() -> Vec<String> {
+    let responses = mcp_session(&[json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "operator_describe", "arguments": {} },
+    })]);
+    let listed = &response_to(&responses, 1)["result"]["structuredContent"]["operators"];
+    let names: Vec<String> = listed
+        .as_array()
+        .unwrap_or_else(|| panic!("operator_describe lists no operators: {listed}"))
+        .iter()
+        .map(|n| n.as_str().expect("an operator name").to_string())
+        .collect();
+    assert!(
+        names.len() >= 12,
+        "the build holds the twelve operators `cli` brings, and lists {names:?}"
+    );
+    names
+}
+
+#[test]
+fn called_with_each_operator_and_operation_it_returns_what_arc_operation_describe_prints() {
+    let names: Vec<String> = operator_names()
+        .into_iter()
+        .chain(["filter-rows".to_string(), "sort-rows".to_string()])
+        .collect();
+    let requests: Vec<Value> = names
+        .iter()
+        .zip(1..)
+        .map(|(name, id)| call_operation_describe(id, json!({ "operation": name })))
+        .collect();
+    let responses = mcp_session(&requests);
+    for (name, id) in names.iter().zip(1..) {
+        let from_cli = arc_json(&["operation", "describe", name]);
+        let result = &response_to(&responses, id)["result"];
+        assert_eq!(result["isError"], false, "`{name}`: {result}");
+        assert_eq!(
+            result["structuredContent"], from_cli,
+            "`{name}`: the tool's description is not the command line's"
+        );
+    }
+}
+
+#[test]
+fn called_with_no_argument_it_lists_no_operator() {
+    let operators = operator_names();
+    let responses = mcp_session(&[call_operation_describe(1, json!({}))]);
+    let listed = &response_to(&responses, 1)["result"]["structuredContent"]["operations"];
+    let names: Vec<&str> = listed
+        .as_array()
+        .unwrap_or_else(|| panic!("no listing: {listed}"))
+        .iter()
+        .filter_map(|e| e["long_name"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["filter-rows", "sort-rows"],
+        "the listing holds the operations alone, not the operators {operators:?}"
+    );
+}
+
+#[test]
+fn operator_describe_still_returns_the_with_schema_whole_its_roles_included() {
+    let responses = mcp_session(&[json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "operator_describe", "arguments": { "operator": "splink_resolve" } },
+    })]);
+    let schema = &response_to(&responses, 1)["result"]["structuredContent"];
+    assert_eq!(
+        schema["required"],
+        json!(["edgar", "gleif", "out"]),
+        "operator_describe is the form a `with:` block is written from, roles and all: {schema}"
+    );
+    for key in ["edgar", "gleif", "out", "sample"] {
+        assert!(
+            schema["properties"].get(key).is_some(),
+            "operator_describe dropped `{key}` from splink_resolve's schema: {schema}"
+        );
+    }
+    assert!(
+        schema.get("reads").is_none() && schema.get("writes").is_none(),
+        "operator_describe returns the schema, not the description: {schema}"
     );
 }
 

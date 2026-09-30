@@ -47,8 +47,8 @@ const INSTRUCTIONS: &str = "arc — a local-first data-pipeline engine, exposed 
     (semantic type inference over tabular data); protocol_run runs an arc Protocol and \
     returns its live Protocol+Run contract; operator_describe emits an operator's `with:` \
     JSON Schema for authoring; operation_describe lists the SQL operations arc holds and, \
-    given an operation's long name, describes what it takes; operation_record records an \
-    operation as a new step of a Protocol.";
+    given an operation's long name or an operator's name, describes what its step reads, \
+    writes and takes; operation_record records an operation as a new step of a Protocol.";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool result shapes

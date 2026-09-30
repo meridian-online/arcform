@@ -6,9 +6,10 @@
 //!   per-step outcome, the same JSON `arc run` writes under `build/.arcform/runs/`.
 //! - `operator_describe` emits an operator's `with:` JSON Schema (or lists the
 //!   catalog) so an agent or authoring UI can build and check a `with:` block.
-//! - `operation_describe` lists the SQL operations arc holds, or describes one by its
-//!   long name: the same JSON `arc operation list --json` and `arc operation describe`
-//!   print, both read from the catalogue in `record`.
+//! - `operation_describe` lists the SQL operations arc holds, or describes an
+//!   operation or an operator by its name: the same JSON `arc operation list --json`
+//!   and `arc operation describe` print, both read through the one lookup in
+//!   `record`.
 //! - `operation_record` records an operation as a new step of a Protocol, through
 //!   the same record path `arc operation record` takes, so the same request writes
 //!   the same bytes from either.
@@ -189,13 +190,15 @@ fn operator_describe_schema() -> Value {
 // operation_describe
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// List the operations arc holds, or describe the one named by `operation`.
+/// List the operations arc holds, or describe the operation or the operator named
+/// by `operation`.
 ///
 /// The answer is the catalogue's own: the listing is what `arc operation list
 /// --json` prints, under one key, and a description is what `arc operation
-/// describe` prints. Nothing here builds a description of its own. An
-/// `operation` that is not a string is refused rather than read as absent, so a
-/// client that sends the wrong type is told so and does not get a listing back.
+/// describe` prints, found through the same lookup. Nothing here builds a
+/// description of its own. The listing holds operations alone. An `operation` that
+/// is not a string is refused rather than read as absent, so a client that sends
+/// the wrong type is told so and does not get a listing back.
 fn operation_describe(args: &Value) -> ToolResult {
     match args.get("operation") {
         None | Some(Value::Null) => {
@@ -205,10 +208,10 @@ fn operation_describe(args: &Value) -> ToolResult {
                 .collect();
             Ok(ToolOutput::json(json!({ "operations": operations })))
         }
-        Some(Value::String(name)) => match crate::record::operation(name) {
-            Some(op) => Ok(ToolOutput::json(op.description())),
+        Some(Value::String(name)) => match crate::record::describe(name) {
+            Some(description) => Ok(ToolOutput::json(description)),
             None => Err(format!(
-                "no operation called `{name}` — call operation_describe with no arguments to list the operations arc holds"
+                "no operation or operator called `{name}` — call operation_describe with no arguments to list the operations arc holds"
             )),
         },
         Some(other) => Err(format!(
@@ -223,7 +226,7 @@ fn operation_describe_schema() -> Value {
         "properties": {
             "operation": {
                 "type": "string",
-                "description": "An operation's long name (e.g. filter-rows). Omit to list every operation arc holds."
+                "description": "An operation's long name (e.g. filter-rows) or an operator's name (e.g. splink_resolve). Omit to list every operation arc holds."
             }
         }
     })
@@ -304,7 +307,7 @@ pub(super) fn tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "operation_describe",
-            description: "List the SQL operations arc holds when called with no operation — or describe one operation (what it does, what it is applied to, and the JSON Schema of what it takes) by its long name.",
+            description: "List the SQL operations arc holds when called with no operation — or describe one operation or operator (what it does, what its step reads and writes by role, and the JSON Schema of what it takes) by its name.",
             input_schema: operation_describe_schema,
             handler: operation_describe,
         },
@@ -395,7 +398,12 @@ mod tests {
             operation_describe(&json!({ "operation": "filter-rows" })).expect("describe succeeds");
         let described = result.structured.expect("a structured description");
         assert_eq!(described["long_name"], "filter-rows");
-        assert!(described["applied_to"].is_array(), "described: {described}");
+        assert!(described["reads"].is_array(), "described: {described}");
+        assert!(described["writes"].is_array(), "described: {described}");
+        assert!(
+            described.get("applied_to").is_none(),
+            "described: {described}"
+        );
         assert_eq!(described["parameters"]["required"], json!(["where"]));
         // The text an MCP client shows is the same document.
         let from_text: Value = serde_json::from_str(&result.text).expect("text is JSON");
@@ -406,7 +414,10 @@ mod tests {
     fn operation_describe_unknown_operation_errors_naming_it() {
         let err = operation_describe(&json!({ "operation": "nope" })).unwrap_err();
         assert!(err.contains("`nope`"), "message: {err}");
-        assert!(err.contains("no operation called"), "message: {err}");
+        assert!(
+            err.contains("no operation or operator called"),
+            "message: {err}"
+        );
     }
 
     #[test]

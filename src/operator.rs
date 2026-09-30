@@ -197,8 +197,8 @@ pub fn assets_for(op_ref: &str, with: Option<&Value>) -> Result<OpAssets> {
 ///
 /// `opendal_fetch` appears only when the `opendal` feature is on (it is only in the
 /// catalog then). Used by the `arc mcp` `operator_describe` tool to enumerate the
-/// operators an authoring UI can pick from.
-#[cfg(feature = "mcp")]
+/// operators an authoring UI can pick from, and by the tests that walk every one.
+#[cfg(any(feature = "mcp", test))]
 pub(crate) fn catalog_names() -> Vec<&'static str> {
     catalog().into_iter().map(|o| o.name()).collect()
 }
@@ -212,8 +212,12 @@ pub(crate) fn catalog_names() -> Vec<&'static str> {
 /// each operator's typed `serde` deserialize (see its `…Config::parse`) remains the
 /// load-time validator, and this schema is hand-kept in step with it (the
 /// `every_catalog_operator_has_a_with_schema` test fails if a new operator is added
-/// without one).
-#[cfg(feature = "mcp")]
+/// without one). [`description`] reads it too, for each role's `required` and
+/// `min_items` and for the `parameters` left once the roles are taken out.
+///
+/// It answers for a name whatever the build holds: `opendal_fetch` has a schema in a
+/// build without `opendal`. Whether the build holds an operator is [`catalog`]'s
+/// answer.
 pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
     use serde_json::json;
 
@@ -389,7 +393,336 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
     Some(schema)
 }
 
-#[cfg(all(test, feature = "mcp"))]
+/// One `with:` key an operator's step reads or writes through: the key, what kind of
+/// thing its value names, the key of the read a column belongs to, and one sentence.
+/// Whether it is a list, whether it is required and a list's fewest values are read
+/// from the key's entry in [`with_schema`], so they are stated once.
+struct RoleKey {
+    key: &'static str,
+    kind: &'static str,
+    of: Option<&'static str>,
+    description: &'static str,
+}
+
+/// What an operator's description says beyond its `with:` schema: one sentence
+/// saying what it does, and the keys its step reads and writes through.
+struct Described {
+    name: &'static str,
+    summary: &'static str,
+    reads: &'static [RoleKey],
+    writes: &'static [RoleKey],
+}
+
+/// A role whose value names an asset of `kind`, the way the operator's `assets()`
+/// records it.
+const fn role(key: &'static str, kind: &'static str, description: &'static str) -> RoleKey {
+    RoleKey {
+        key,
+        kind,
+        of: None,
+        description,
+    }
+}
+
+/// A role whose value names a column, or a list of columns, of the read `of`.
+const fn column_of(key: &'static str, of: &'static str, description: &'static str) -> RoleKey {
+    RoleKey {
+        key,
+        kind: "column",
+        of: Some(of),
+        description,
+    }
+}
+
+/// The summary and the roles of each operator in the catalog. A role is a `with:` key its `assets()` records a read or a
+/// produced asset from, with that asset's kind, or a key naming columns of one; a
+/// path the step uses that `assets()` does not record stays in `parameters`:
+/// `finetype_validate`'s `extension`, `uv`'s `script` and `ducklake_publish`'s
+/// `catalog`. `archive_extract` records `dest` as the directory when `members` is
+/// empty and as each file under it when `members` names them, so `dest` is one
+/// `directory` role. `uv` takes each name's kind from how it is written, so its roles
+/// are `any`.
+const DESCRIBED: &[Described] = &[
+    Described {
+        name: "parquet_export",
+        summary: "Writes a table of the pipeline's database to a Parquet file.",
+        reads: &[role(
+            "input",
+            "table",
+            "The table or view in the pipeline's database to export.",
+        )],
+        writes: &[role(
+            "dest",
+            "file",
+            "The Parquet file written, relative to the protocol directory.",
+        )],
+    },
+    Described {
+        name: "http_fetch",
+        summary: "Downloads the file at one HTTP or HTTPS address.",
+        reads: &[],
+        writes: &[role(
+            "out",
+            "file",
+            "The file the download is written to, relative to the protocol directory.",
+        )],
+    },
+    Described {
+        name: "opendal_fetch",
+        summary: "Copies one object from a storage backend, such as S3 or HTTPS, to a file.",
+        reads: &[],
+        writes: &[role(
+            "to",
+            "file",
+            "The file the object is written to, relative to the protocol directory.",
+        )],
+    },
+    Described {
+        name: "html_link_discover",
+        summary: "Fetches an index page and lists the links on it that match a pattern, one address per line.",
+        reads: &[],
+        writes: &[role(
+            "out",
+            "file",
+            "The file the matching addresses are written to, one per line.",
+        )],
+    },
+    Described {
+        name: "archive_extract",
+        summary: "Extracts members of a zip archive into a directory.",
+        reads: &[role(
+            "archive",
+            "file",
+            "The zip archive to extract, relative to the protocol directory.",
+        )],
+        writes: &[role(
+            "dest",
+            "directory",
+            "The directory the members are extracted into, recorded as each file under it when `members` names them.",
+        )],
+    },
+    Described {
+        name: "datapackage_describe",
+        summary: "Writes a Data Package descriptor for a Parquet file, its columns typed by FineType and overlaid with curated overrides.",
+        reads: &[
+            role(
+                "parquet",
+                "file",
+                "The Parquet file whose columns FineType types.",
+            ),
+            role(
+                "overrides",
+                "file",
+                "The curated descriptor sidecar, in JSON, overlaid onto FineType's descriptor.",
+            ),
+            role(
+                "nominations",
+                "file",
+                "The declared column types FineType takes as given instead of inferring them.",
+            ),
+        ],
+        writes: &[role(
+            "out",
+            "file",
+            "The Data Package descriptor written, in JSON.",
+        )],
+    },
+    Described {
+        name: "finetype_validate",
+        summary: "Checks a Parquet file against a JSON Schema contract with FineType, failing the step on any rejected row.",
+        reads: &[
+            role("parquet", "file", "The Parquet file to check."),
+            role(
+                "schema",
+                "file",
+                "The JSON Schema contract the file is checked against.",
+            ),
+        ],
+        writes: &[],
+    },
+    Described {
+        name: "splink_resolve",
+        summary: "Matches EDGAR entities to GLEIF entities with Splink and writes the resolved crosswalk.",
+        reads: &[
+            role(
+                "edgar",
+                "file",
+                "The EDGAR entity Parquet file, the crosswalk's left side.",
+            ),
+            role(
+                "gleif",
+                "file",
+                "The GLEIF golden-copy Parquet file, the crosswalk's right side.",
+            ),
+        ],
+        writes: &[role(
+            "out",
+            "file",
+            "The Parquet file the resolved crosswalk is written to.",
+        )],
+    },
+    Described {
+        name: "gleif_ra_fetch",
+        summary: "Pages through GLEIF's entities for one registration authority and writes them to a CSV file.",
+        reads: &[],
+        writes: &[role(
+            "out",
+            "file",
+            "The CSV file the entities are written to, relative to the protocol directory.",
+        )],
+    },
+    Described {
+        name: "umap_project",
+        summary: "Places each row of a Parquet file on a two-dimensional map with UMAP, from the numeric columns it names.",
+        reads: &[
+            role(
+                "input",
+                "file",
+                "The Parquet file holding the columns to project.",
+            ),
+            column_of(
+                "columns",
+                "input",
+                "The numeric columns of `input` to reduce, in order.",
+            ),
+            role(
+                "fit",
+                "file",
+                "The fit an earlier run kept, read back so the rows it holds keep their places.",
+            ),
+        ],
+        writes: &[
+            role(
+                "out",
+                "file",
+                "The Parquet file written, every input column plus each row's place on the map.",
+            ),
+            role(
+                "fit",
+                "file",
+                "The fit this run keeps, so a later run places appended rows into the same layout.",
+            ),
+        ],
+    },
+    Described {
+        name: "text_embed",
+        summary: "Writes a vector for the text in one column of a Parquet file, with a DuckDB embedding extension.",
+        reads: &[
+            role("input", "file", "The Parquet file holding the corpus."),
+            column_of(
+                "text_column",
+                "input",
+                "The column of `input` whose text is embedded.",
+            ),
+            role(
+                "extension",
+                "file",
+                "The loadable embedding extension, which holds the model's weights.",
+            ),
+            role(
+                "model",
+                "directory",
+                "A model directory the extension is checked against, never read for weights.",
+            ),
+        ],
+        writes: &[role(
+            "out",
+            "file",
+            "The Parquet file written, every input column plus the vector column.",
+        )],
+    },
+    Described {
+        name: "uv",
+        summary: "Runs a Python script pinned by its digest with uv.",
+        reads: &[role(
+            "reads",
+            "any",
+            "What the script consumes, each name's kind read from how it is written.",
+        )],
+        writes: &[role(
+            "produces",
+            "any",
+            "What the script writes, each name's kind read from how it is written.",
+        )],
+    },
+    Described {
+        name: "ducklake_publish",
+        summary: "Publishes a Parquet file as the rows of a table in a DuckLake catalog, as one snapshot.",
+        reads: &[role(
+            "file",
+            "file",
+            "The built Parquet file to publish, of which a byte-for-byte copy is registered.",
+        )],
+        writes: &[],
+    },
+];
+
+/// The summary and the roles of the operator called `op_name`, or `None` for a name
+/// [`DESCRIBED`] does not hold.
+fn described(op_name: &str) -> Option<&'static Described> {
+    DESCRIBED.iter().find(|d| d.name == op_name)
+}
+
+/// The description `arc operation describe` prints for the operator called
+/// `op_name`, in the shape it prints for an operation, or `None` when this build's
+/// catalog does not hold it.
+///
+/// Its roles are the `with:` keys [`described`] names; `parameters` is the operator's
+/// [`with_schema`] with those keys taken out of `properties` and `required` and
+/// nothing else changed. `arc mcp`'s `operator_describe` returns the schema whole,
+/// the form a `with:` block is written from.
+pub(crate) fn description(op_name: &str) -> Option<serde_json::Value> {
+    catalog().into_iter().find(|op| op.name() == op_name)?;
+    // Both tables answer for every catalog operator, as the tests below hold them to.
+    let (described, schema) = described(op_name).zip(with_schema(op_name))?;
+    let roles = |keys: &[RoleKey]| -> Vec<crate::record::Role> {
+        keys.iter().map(|k| resolved_role(k, &schema)).collect()
+    };
+    let reads = roles(described.reads);
+    let writes = roles(described.writes);
+
+    let mut parameters = schema.clone();
+    let is_role = |key: &str| {
+        described
+            .reads
+            .iter()
+            .chain(described.writes)
+            .any(|r| r.key == key)
+    };
+    if let Some(properties) = parameters["properties"].as_object_mut() {
+        properties.retain(|key, _| !is_role(key));
+    }
+    if let Some(required) = parameters["required"].as_array_mut() {
+        required.retain(|key| !key.as_str().is_some_and(is_role));
+    }
+    Some(crate::record::description(
+        op_name,
+        described.summary,
+        &reads,
+        &writes,
+        parameters,
+    ))
+}
+
+/// `key` as a role, its `list`, `required` and `min_items` read from its entry in
+/// the operator's `with:` schema.
+fn resolved_role(key: &RoleKey, schema: &serde_json::Value) -> crate::record::Role {
+    let entry = &schema["properties"][key.key];
+    let list = entry["type"] == "array";
+    crate::record::Role {
+        name: key.key,
+        kind: key.kind,
+        list,
+        required: schema["required"]
+            .as_array()
+            .is_some_and(|required| required.iter().any(|k| k == key.key)),
+        of: key.of,
+        min_items: list.then(|| entry["minItems"].as_u64().unwrap_or(0)),
+        description: key.description,
+    }
+}
+
+#[cfg(test)]
 mod with_schema_tests {
     use super::*;
 
@@ -923,6 +1256,261 @@ mod with_schema_tests {
         fail_on(
             &faults,
             "a schema's `required` disagrees with what its configuration admits",
+        );
+    }
+
+    // ── Each description holds to its schema and to what its step records ─────────
+    //
+    // An operator's description names the `with:` keys its step reads and writes
+    // through, and takes them out of its `with:` schema to leave `parameters`. The
+    // roles are written by hand beside `with_schema`, so these tests read them against
+    // the two things that know: the schema, and `assets()` run on manifests the
+    // configuration admits.
+
+    /// The word a description uses for an asset of `kind`.
+    fn kind_word(kind: crate::asset_kind::AssetKind) -> &'static str {
+        use crate::asset_kind::AssetKind;
+        match kind {
+            AssetKind::File => "file",
+            AssetKind::Directory => "directory",
+            AssetKind::Pattern => "pattern",
+            AssetKind::Table => "table",
+        }
+    }
+
+    /// The names of the roles in `description[direction]`, with each role's kind.
+    fn roles_of<'d>(description: &'d Json, direction: &str) -> Vec<(&'d str, &'d str)> {
+        description[direction]
+            .as_array()
+            .unwrap_or_else(|| panic!("`{direction}` is not a list: {description}"))
+            .iter()
+            .map(|r| {
+                (
+                    r["name"].as_str().expect("a role has a name"),
+                    r["kind"].as_str().expect("a role has a kind"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_catalog_operator_is_described_and_every_description_names_one() {
+        for op in catalog_names() {
+            assert!(
+                description(op).is_some(),
+                "operator `{op}` is in the catalogue but has no description — add it to DESCRIBED"
+            );
+        }
+        for described in DESCRIBED {
+            assert!(
+                with_schema(described.name).is_some(),
+                "DESCRIBED holds `{}`, which is no operator",
+                described.name
+            );
+        }
+        assert!(
+            description("does_not_exist").is_none(),
+            "a name no operator has is described"
+        );
+    }
+
+    /// `parameters` is the `with:` schema with the role keys taken out of
+    /// `properties` and `required`, and nothing else changed; each role is a key the
+    /// schema describes, and its `list`, `required` and `min_items` are what the
+    /// schema says of that key.
+    #[test]
+    fn every_operators_parameters_are_its_with_schema_less_its_roles() {
+        let mut faults = Vec::new();
+        for op in catalog_names() {
+            let schema = with_schema(op).expect("every catalogue operator has a schema");
+            let described = description(op).expect("every catalogue operator is described");
+            let parameters = &described["parameters"];
+            let roles: BTreeSet<&str> = roles_of(&described, "reads")
+                .into_iter()
+                .chain(roles_of(&described, "writes"))
+                .map(|(name, _)| name)
+                .collect();
+
+            let declared = required(&schema);
+            for direction in ["reads", "writes"] {
+                for role in described[direction].as_array().expect("a list") {
+                    let name = role["name"].as_str().expect("a name");
+                    let Some(entry) = schema["properties"].get(name) else {
+                        faults.push(format!(
+                            "{op}: {direction} `{name}`, which its `with:` schema does not describe"
+                        ));
+                        continue;
+                    };
+                    let list = entry["type"] == "array";
+                    let expected = (
+                        list,
+                        declared.contains(name),
+                        list.then(|| entry["minItems"].as_u64().unwrap_or(0)),
+                    );
+                    let stated = (
+                        role["list"].as_bool().unwrap_or(!list),
+                        role["required"].as_bool().unwrap_or(!expected.1),
+                        role["min_items"].as_u64(),
+                    );
+                    if stated != expected {
+                        faults.push(format!(
+                            "{op}: {direction} `{name}` states (list, required, min_items) \
+                             {stated:?}, and its `with:` schema says {expected:?}"
+                        ));
+                    }
+                }
+            }
+
+            let mut rebuilt = schema.clone();
+            rebuilt["properties"]
+                .as_object_mut()
+                .expect("a schema has properties")
+                .retain(|key, _| !roles.contains(key.as_str()));
+            rebuilt["required"]
+                .as_array_mut()
+                .expect("a schema has required")
+                .retain(|key| !roles.contains(key.as_str().unwrap_or_default()));
+            if *parameters != rebuilt {
+                faults.push(format!(
+                    "{op}: `parameters` is not its `with:` schema less the roles {roles:?}:\n  \
+                     parameters: {parameters}\n  expected:   {rebuilt}"
+                ));
+            }
+        }
+        fail_on(
+            &faults,
+            "an operator's `parameters` or roles disagree with its `with:` schema",
+        );
+    }
+
+    #[test]
+    fn umap_projects_parameters_keep_neighbors_whole_and_its_bound_names_a_read() {
+        let described = description("umap_project").expect("umap_project is described");
+        let properties = described["parameters"]["properties"]
+            .as_object()
+            .expect("`parameters` has properties");
+        for role in ["input", "columns", "out", "fit"] {
+            assert!(
+                !properties.contains_key(role),
+                "`{role}` is a role and stays in `parameters`: {properties:?}"
+            );
+        }
+        let schema = with_schema("umap_project").expect("umap_project has a schema");
+        assert_eq!(
+            properties["neighbors"], schema["properties"]["neighbors"],
+            "`neighbors` must reach `parameters` whole, its `default` and `x-at-most` with it"
+        );
+        let rows_of = properties["neighbors"]["x-at-most"]["rows_of"]
+            .as_str()
+            .expect("`x-at-most` names the key whose rows bound it");
+        assert!(
+            roles_of(&described, "reads").contains(&(rows_of, "file")),
+            "`x-at-most` counts the rows of `{rows_of}`, which is no file the step reads"
+        );
+
+        let described = description("splink_resolve").expect("splink_resolve is described");
+        for role in ["edgar", "gleif", "out"] {
+            assert!(
+                described["parameters"]["properties"].get(role).is_none()
+                    && !described["parameters"]["required"]
+                        .as_array()
+                        .expect("`required` is a list")
+                        .contains(&json!(role)),
+                "`{role}` is a role and stays in splink_resolve's `parameters`: {described}"
+            );
+        }
+    }
+
+    /// Every name `assets()` records comes from a key the description lists in the
+    /// same direction, with the kind the role states or any kind for `any`; and every
+    /// role other than a column is one `assets()` records from when it is set. Read on
+    /// every manifest built from the schema's keys at their probe values that manifest
+    /// load admits, so each optional role is read set and unset, and `archive_extract`
+    /// with `members` and with `pattern`. A file recorded under the directory a
+    /// `directory` role names counts as that role: `archive_extract`'s `dest` with
+    /// `members` set.
+    #[test]
+    fn every_operators_roles_are_the_keys_its_assets_record_from() {
+        let mut faults = Vec::new();
+        for op in catalog_names() {
+            let schema = with_schema(op).expect("every catalogue operator has a schema");
+            let described = description(op).expect("every catalogue operator is described");
+            let keys = properties(&schema);
+            let role_keys: BTreeSet<&str> = roles_of(&described, "reads")
+                .into_iter()
+                .chain(roles_of(&described, "writes"))
+                .map(|(name, _)| name)
+                .collect();
+            let manifest = |mask: u32| -> Json {
+                keys.iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask & (1 << i) != 0)
+                    .map(|(_, (k, p))| ((*k).clone(), probe(k, p)))
+                    .collect::<serde_json::Map<_, _>>()
+                    .into()
+            };
+            let mut every_role_set = false;
+            for mask in 0..1u32 << keys.len() {
+                let with = manifest(mask);
+                let yaml: Value = serde_yaml::to_value(&with).expect("JSON converts to YAML");
+                let Ok(assets) = resolve(op).expect("in the catalogue").assets(&yaml) else {
+                    continue;
+                };
+                every_role_set |= role_keys.iter().all(|k| with.get(*k).is_some());
+                for (direction, recorded) in
+                    [("reads", &assets.reads), ("writes", &assets.produces)]
+                {
+                    let roles = roles_of(&described, direction);
+                    let from = |name: &str, role: &str, role_kind: &str| -> bool {
+                        let kind = kind_word(assets.kinds[name]);
+                        let kind_holds = role_kind == "any" || role_kind == kind;
+                        match &with[role] {
+                            Json::String(value) => {
+                                (name == value && kind_holds)
+                                    || (role_kind == "directory"
+                                        && kind == "file"
+                                        && name.starts_with(&format!(
+                                            "{}/",
+                                            value.trim_end_matches('/')
+                                        )))
+                            }
+                            Json::Array(values) => kind_holds && values.iter().any(|v| v == name),
+                            _ => false,
+                        }
+                    };
+                    for name in recorded {
+                        if !roles.iter().any(|(role, kind)| from(name, role, kind)) {
+                            faults.push(format!(
+                                "{op}: `assets()` records `{name}` ({}) as {direction}, from no \
+                                 key the description lists in `{direction}` with that kind; \
+                                 manifest {with}",
+                                kind_word(assets.kinds[name])
+                            ));
+                        }
+                    }
+                    for (role, kind) in &roles {
+                        if *kind == "column" || with.get(*role).is_none() {
+                            continue;
+                        }
+                        if !recorded.iter().any(|name| from(name, role, kind)) {
+                            faults.push(format!(
+                                "{op}: `{role}` is listed in `{direction}`, and `assets()` \
+                                 records nothing from it as {direction}; manifest {with}"
+                            ));
+                        }
+                    }
+                }
+            }
+            if !every_role_set {
+                faults.push(format!(
+                    "{op}: no manifest the configuration admits sets every role {role_keys:?}, \
+                     so an optional role was never read against `assets()`"
+                ));
+            }
+        }
+        fail_on(
+            &faults,
+            "an operator's roles disagree with what its `assets()` records",
         );
     }
 
@@ -7228,7 +7816,6 @@ mod tests {
     /// outright, left the whole workspace green — and this schema is what `arc mcp`'s
     /// `operator_describe` emits, so an authoring client would offer a metric set
     /// that the operator's own validation then refuses.
-    #[cfg(feature = "mcp")]
     #[test]
     fn umap_project_schema_enum_is_the_metrics_constant() {
         let schema = with_schema("umap_project").expect("umap_project has a with: schema");
@@ -7249,7 +7836,6 @@ mod tests {
     /// copy of the rule, and in the description, which editor completion and
     /// `operator_describe` show a person. Both say the bound applies to the default as
     /// well, so an unset value on a table of 10 rows reads as 9, not 15.
-    #[cfg(feature = "mcp")]
     #[test]
     fn umap_project_schema_states_the_neighbors_bound_and_the_default_rule() {
         let schema = with_schema("umap_project").expect("umap_project has a with: schema");
