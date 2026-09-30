@@ -12,6 +12,7 @@
 //! the SQL step shells out to, because CI's `mcp` step runs this suite after `uv` is
 //! installed.
 
+#[allow(dead_code)]
 mod common;
 
 use std::path::{Path, PathBuf};
