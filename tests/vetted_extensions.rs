@@ -891,8 +891,14 @@ impl Pinned {
         self.arc(registry, &["upgrade", name])
     }
 
-    /// `arc <args>` on the fake DuckDB, whose registry does as `registry` says.
+    /// `arc <args>` on the fake DuckDB v1.5.5, whose registry does as `registry` says.
     fn arc(&self, registry: Registry, args: &[&str]) -> Outcome {
+        self.arc_on_version(registry, "1.5.5", args)
+    }
+
+    /// `arc <args>` on a fake DuckDB that reports `version`, keeping its extensions where
+    /// [`Pinned::installed`] says whatever the version.
+    fn arc_on_version(&self, registry: Registry, version: &str, args: &[&str]) -> Outcome {
         let installed = self.installed();
         let dir = installed.parent().unwrap().display().to_string();
         let file = installed.display();
@@ -916,7 +922,7 @@ impl Pinned {
         self.protocol.arc_on(
             &format!(
                 "case \"$1\" in\n\
-                 --version) echo 'v1.5.5 (fake) 0000000000' ;;\n\
+                 --version) echo 'v{version} (fake) 0000000000' ;;\n\
                  -noheader) case \"$4\" in\n\
                  *pragma_platform*) echo 'arc-answer:{PLATFORM}' ;;\n\
                  'INSTALL mlpack FROM community;'*) {install} ;;\n\
@@ -1695,6 +1701,78 @@ fn arc_upgrade_refuses_when_duckdb_cannot_install_load_or_answer() {
         pinned.history().is_empty(),
         "no checkpoint, since nothing was written"
     );
+}
+
+#[test]
+fn arc_upgrade_checks_the_engine_version_as_arc_run_does() {
+    // On the version the entry names, arc upgrade prints no warning.
+    let pinned = Pinned::new(ONE_STEP, "");
+    let up = pinned.upgrade(Registry::Serves, "mlpack");
+    assert_eq!(up.code, Some(0), "{}", up.stderr);
+    assert!(!up.stderr.contains("warning:"), "{}", up.stderr);
+
+    // On a version inside arc's range that the entry does not name, it prints the warning
+    // arc run prints, and pins the build for that version.
+    let pinned = Pinned::new(ONE_STEP, "");
+    let up = pinned.arc_on_version(Registry::Serves, "1.5.4", &["upgrade", "mlpack"]);
+    assert_eq!(up.code, Some(0), "{}", up.stderr);
+    let warnings: Vec<&str> = up
+        .stderr
+        .lines()
+        .filter(|l| l.contains("warning:"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "one warning:\n{}", up.stderr);
+    for needle in [
+        "mlpack is vetted on DuckDB v1.5.5",
+        "this engine is DuckDB v1.5.4",
+    ] {
+        assert!(
+            warnings[0].contains(needle),
+            "the warning should name {needle:?}: {}",
+            warnings[0]
+        );
+    }
+    let manifest = String::from_utf8(pinned.manifest()).unwrap();
+    assert!(
+        manifest.ends_with(&format!(
+            "extensions:\n  mlpack:\n    v1.5.4:\n      {PLATFORM}: {}\n",
+            served_pin()
+        )),
+        "{manifest}"
+    );
+
+    // Outside arc's range, or outside the manifest's own engine_version:, it is refused
+    // before DuckDB installs anything, and arcform.yaml is as it was.
+    for (label, yaml, version, needle) in [
+        (
+            "outside arc's range",
+            ONE_STEP.to_string(),
+            "2.0.0",
+            ">=1.2, <2",
+        ),
+        (
+            "outside the manifest's",
+            format!("engine_version: '>=1.6'\n{ONE_STEP}"),
+            "1.5.5",
+            ">=1.6",
+        ),
+    ] {
+        let pinned = Pinned::new(&yaml, "");
+        let manifest = pinned.manifest();
+        let up = pinned.arc_on_version(Registry::Serves, version, &["upgrade", "mlpack"]);
+        assert_eq!(up.code, Some(1), "[{label}] {}", up.stderr);
+        assert!(
+            up.stderr.contains(needle),
+            "[{label}] the refusal should name {needle:?}:\n{}",
+            up.stderr
+        );
+        assert_eq!(up.calls(), vec!["--version"], "[{label}] nothing installed");
+        assert_eq!(
+            pinned.manifest(),
+            manifest,
+            "[{label}] arcform.yaml is as it was"
+        );
+    }
 }
 
 #[test]
