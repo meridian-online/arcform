@@ -239,16 +239,16 @@ const FROZEN_DERIVES: [(&str, &str, &[&str]); 20] = [
         "HistoryKind",
         &["Debug", "Clone", "Copy", "PartialEq", "Eq"],
     ),
-    (
-        "history.rs",
-        "HistoryEntry",
-        &["Debug", "Clone", "PartialEq", "Eq"],
-    ),
     // A way is a value a caller passes and compares, like the kind; not
     // `Copy`, because a caller's own word is owned text.
     (
         "history.rs",
         "HistoryWay",
+        &["Debug", "Clone", "PartialEq", "Eq"],
+    ),
+    (
+        "history.rs",
+        "HistoryEntry",
         &["Debug", "Clone", "PartialEq", "Eq"],
     ),
     ("history.rs", "LocalHistory", &["Debug", "Clone"]),
@@ -1046,7 +1046,6 @@ fn exported_modules_declare_only_contracted_items() {
             // the store, so every recording call keeps its signature and a
             // checkpoint and the save after it cannot name different ways.
             "reached_by",
-            "way",
             "root",
             "record_save",
             "record_checkpoint",

@@ -2029,20 +2029,21 @@ impl Outcome {
 
 impl Pinned {
     /// The local-history entries of this Protocol's spec, as `arc history list` prints
-    /// them: id and kind.
-    fn history(&self) -> Vec<(String, String)> {
+    /// them: id, kind, and the way arc was reached, which ends the line.
+    fn history(&self) -> Vec<(String, String, String)> {
         let list = self.protocol.arc_on("", &["history", "list"]);
         assert_eq!(list.code, Some(0), "{}", list.stderr);
         list.stdout
             .lines()
             .filter_map(|line| {
-                let mut words = line.split_whitespace();
+                let (head, way) = line.split_once(" bytes  ")?;
+                let mut words = head.split_whitespace();
                 let id = words.next()?;
                 let kind = words.next()?;
                 id.chars()
                     .next()?
                     .is_ascii_digit()
-                    .then(|| (id.to_string(), kind.to_string()))
+                    .then(|| (id.to_string(), kind.to_string(), way.to_string()))
             })
             .collect()
     }
@@ -2082,11 +2083,15 @@ fn arc_upgrade_writes_a_first_pin_for_the_build_the_registry_serves() {
         vec!["--version", "platform", "force install and load mlpack"]
     );
 
-    let checkpoints: Vec<String> = pinned
-        .history()
+    let history = pinned.history();
+    assert!(
+        history.iter().all(|(_, _, way)| way == "terminal"),
+        "each version `arc upgrade` writes names the terminal: {history:?}"
+    );
+    let checkpoints: Vec<String> = history
         .into_iter()
-        .filter(|(_, kind)| kind == "checkpoint")
-        .map(|(id, _)| id)
+        .filter(|(_, kind, _)| kind == "checkpoint")
+        .map(|(id, ..)| id)
         .collect();
     assert_eq!(checkpoints.len(), 1, "{:?}", pinned.history());
     let shown = pinned

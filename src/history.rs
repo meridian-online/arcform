@@ -310,11 +310,6 @@ impl LocalHistory {
         }
     }
 
-    /// The way every entry this handle records carries, if it names one.
-    pub fn way(&self) -> Option<&HistoryWay> {
-        self.way.as_ref()
-    }
-
     /// Where this store keeps its entries.
     pub fn root(&self) -> &Path {
         &self.root
@@ -791,15 +786,11 @@ fn read_entry(key_dir: &Path, id: &str) -> Result<String> {
     read_at(key_dir, &entry)
 }
 
-/// The bytes `entry` recorded under `key_dir`.
+/// The bytes `entry` recorded under `key_dir`. The entry was listed, so a
+/// file gone by now is a failed read, named by its path.
 fn read_at(key_dir: &Path, entry: &HistoryEntry) -> Result<String> {
-    match std::fs::read_to_string(entry_path(key_dir, entry)) {
-        Ok(text) => Ok(text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::HistoryEntryNotFound {
-            id: entry.id.clone(),
-        }),
-        Err(e) => Err(e.into()),
-    }
+    let path = entry_path(key_dir, entry);
+    std::fs::read_to_string(&path).map_err(|e| Error::FileRead { path, source: e })
 }
 
 /// Enforce [`HISTORY_MAX_ENTRIES`]: remove the oldest entries beyond the
@@ -1022,6 +1013,78 @@ mod tests {
         for bad in ["", "x", "123-000", "123-000-commit", "../123-000-save"] {
             assert_eq!(parse_id(bad), None, "{bad:?} must not parse");
         }
+    }
+
+    #[test]
+    fn an_entry_file_names_its_way_after_its_id_and_an_earlier_arcs_names_none() {
+        let entry = |way| HistoryEntry {
+            id: "1700000000123-007-save".to_string(),
+            kind: HistoryKind::Save,
+            way,
+            at: UNIX_EPOCH,
+            bytes: 0,
+        };
+        let key_dir = Path::new("/store/key");
+        assert_eq!(
+            entry_path(key_dir, &entry(None)),
+            key_dir.join("1700000000123-007-save.yaml")
+        );
+        assert_eq!(
+            entry_path(key_dir, &entry(Some(HistoryWay::MCP))),
+            key_dir.join("1700000000123-007-save.mcp.yaml")
+        );
+
+        let parts = (1_700_000_000_123, 7, HistoryKind::Save);
+        assert_eq!(
+            parse_stem("1700000000123-007-save"),
+            Some(("1700000000123-007-save", parts, None))
+        );
+        assert_eq!(
+            parse_stem("1700000000123-007-save.my-App_2"),
+            Some((
+                "1700000000123-007-save",
+                parts,
+                Some(HistoryWay::new("my-App_2").unwrap())
+            ))
+        );
+        assert_eq!(
+            parse_stem("1700000000123-007-save.terminal"),
+            Some(("1700000000123-007-save", parts, Some(HistoryWay::TERMINAL))),
+            "arc's own words are read back as arc's own"
+        );
+        for bad in [
+            "1700000000123-007-save.",
+            "1700000000123-007-save.a b",
+            "1700000000123-007-save.a.b",
+            "1700000000123-007-commit.app",
+            "x.app",
+        ] {
+            assert_eq!(parse_stem(bad), None, "{bad:?} is not an entry");
+        }
+    }
+
+    #[test]
+    fn a_merged_save_keeps_the_way_of_the_state_that_replaced_it() {
+        let (tmp, history) = store();
+        let dir = protocol(&tmp);
+        let app = history.clone().reached_by(HistoryWay::new("app").unwrap());
+        let terminal = history.reached_by(HistoryWay::TERMINAL);
+        app.record(&dir, "a\n", HistoryKind::Save, at(T0), true)
+            .unwrap();
+        terminal
+            .record(&dir, "b\n", HistoryKind::Save, at(T0 + 5), true)
+            .unwrap();
+        let entries = terminal.entries(&dir).unwrap();
+        assert_eq!(entries.len(), 1, "the saves merged: {entries:?}");
+        assert_eq!(entries[0].way, Some(HistoryWay::TERMINAL));
+        assert_eq!(terminal.read(&dir, &entries[0].id).unwrap(), "b\n");
+
+        // A state identical to the newest entry is not recorded again, whatever
+        // way records it.
+        let again = app
+            .record(&dir, "b\n", HistoryKind::Checkpoint, at(T0 + 60), false)
+            .unwrap();
+        assert_eq!(again, None);
     }
 
     #[test]
