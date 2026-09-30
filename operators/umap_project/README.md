@@ -22,7 +22,7 @@ input column plus `projection_x` and `projection_y` as `DOUBLE`.
     # reach this script's own `uv run` invocation carrying the exact value set here —
     # see "What each knob is proven to do" below for what that does and does not cover:
     metric: euclidean # forwarded to UMAP's `metric=` — euclidean or cosine, per umap-learn's own docs
-    neighbors: 15     # UMAP's `n_neighbors=`, CLAMPED to one below the row count — see "The neighbours clamp" below
+    neighbors: 15     # UMAP's `n_neighbors=`, at most one below the input's row count; arc run REFUSES a value above that — see "The neighbours bound" below
     min_dist: 0.1     # forwarded to UMAP's `min_dist=` — how tightly points may pack, in [0, 1), per umap-learn's own docs
 ```
 
@@ -81,36 +81,25 @@ changes. Both are false for `neighbors:` — see below — and a residual guaran
 does not hold is worse than no guarantee, because it is the one a reader relies on
 precisely when they have been told to trust nothing else.
 
-## The neighbours clamp
+## The neighbours bound
 
-**`neighbors:` stops working above one below the input's row count, the run still
-succeeds, and nothing prints.** `clamp_neighbors` in `umap_project.py` is
-`max(2, min(requested, n_rows - 1))`, and UMAP is given the clamped value. The clamp is
-there because UMAP raises when `n_neighbors` reaches the row count, and a small table
-landing on a map beats a small table landing on a traceback.
+**`arc run` refuses a `neighbors:` above one below the input's row count.** When the step runs, after the steps before it, arc counts the rows of the Parquet `input:` names and refuses a set value above the bound before the script starts and before the output's or the fit's directory is created, naming the value, the bound, the row count and the input:
 
-Measured end to end through `arc run` on a real 48-row input with a real `uv` and
-`umap-learn`: `neighbors: 47`, `100` and `200` all produce `sha256 29e51cc98b16974f`
-and `fit_id cae3df77263a1dff` — byte-identical maps — while `neighbors: 40` on the same
-input moves the bytes. The step's stdout prints rows, features, metric, seed and
-`fit_id`, and never `k`.
+```
+error: invalid manifest: umap_project: `neighbors: 60` is above 47, one below the 48 rows of build/in.parquet — …
+```
 
-**This is arcform's deviation, not umap-learn's**, which is why umap-learn's
-documentation for `n_neighbors` does not describe what happens above the boundary, and
-why this file no longer sends you there. `projection_fit_id` is computed from the
-clamped `k` rather than from the value the manifest set, so two manifests that differ
-only above the boundary produce the same fingerprint — which is correct, since they
-produce the same fit.
+The refusal is not retried, no later step runs, and `arc run` exits 1, as it does for a value below 2. It is a refusal at run rather than at load because the manifest cannot know the row count: an earlier step may write the input. An input arc cannot read is not refused here; the script reads it next and fails naming it.
 
-**Nothing refuses `neighbors:` above the boundary.** The authoring schema declares
-`"minimum": 2` and no maximum, and `validate()` bounds it only below. Refusing at load
-is impossible — the manifest cannot know the row count — and refusing at run needs a
-mechanism this repository has not decided on yet. Until then this is disclosed rather
-than prevented, in three places that stay in step: here, in `clamp_neighbors`'s own
-docstring, and in the `neighbors` description the authoring schema emits, which is what
-an editor and `arc mcp`'s `operator_describe` show and which no edit to this file
-reaches. `umap_project_schema_discloses_the_neighbors_clamp` reddens if that third one
-loses the disclosure.
+**An unset `neighbors:` takes 15 or the bound, whichever is smaller**, and is never refused for the row count. On a 10-row input it is 9.
+
+**The script's clamp stays, as a second guard.** `clamp_neighbors` in `umap_project.py` is `max(2, min(requested, n_rows - 1))`, and UMAP is given the clamped value. Through `arc run` it now changes only an unset value on a table of 15 rows or fewer, which is the rule above; run on its own, outside arc, the script still clamps any value above the bound without a word. The clamp is there because UMAP raises when `n_neighbors` reaches the row count, and a small table landing on a map beats a small table landing on a traceback.
+
+Why a value above the bound is refused rather than clamped: measured end to end through `arc run` on a real 48-row input with a real `uv` and `umap-learn`, before the refusal, `neighbors: 47`, `100` and `200` all produced `sha256 29e51cc98b16974f` and `fit_id cae3df77263a1dff` — byte-identical maps — while `neighbors: 40` on the same input moved the bytes, and each run exited 0. The step's stdout prints rows, features, metric, seed and `fit_id`, and never `k`.
+
+**The bound is arcform's, not umap-learn's**, which is why umap-learn's documentation for `n_neighbors` does not describe it, and why this file does not send you there. `projection_fit_id` is computed from the clamped `k` rather than from the value the manifest set, so an unset value on a 10-row input and `neighbors: 9` produce the same fingerprint — which is correct, since they produce the same fit.
+
+**The authoring schema states the bound for a program as well as a person.** `neighbors` carries `"minimum": 2`, `"default": 15` and `"x-at-most": {"rows_of": "input", "minus": 1, "bounds_default": true}`: `rows_of` names the `with:` key whose Parquet is counted, `minus` what is taken off its row count, and `bounds_default` that the bound applies to the default as well, so a form can show *47 at most* on a 48-row table without its own copy of the rule. Its description, which an editor and `arc mcp`'s `operator_describe` show and which no edit to this file reaches, says the same. `umap_project_schema_states_the_neighbors_bound_and_the_default_rule` reddens if either loses it.
 
 ## What counts as a column it can project
 
@@ -139,6 +128,7 @@ way: a point with no number has no position on a map.
 What is decidable from the manifest alone is refused at load rather than an hour into
 a run — an empty `columns:`, a column named twice, `neighbors` below 2, a `min_dist`
 outside `[0, 1)`, a `metric` this operator does not pass to UMAP.
+What needs the input's row count, a `neighbors` above one below it, is refused when the step runs, before the script starts: see "The neighbours bound" above.
 
 ## It does not scale your columns, and that is deliberate
 

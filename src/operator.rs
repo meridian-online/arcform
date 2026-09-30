@@ -331,7 +331,7 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
                 "columns": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "The numeric columns to reduce, in order. A numeric scalar contributes one feature; a list/array of numerics — a vector column — contributes one per element. There is no text column and no model: to map text, write a vector column from it first (text_embed, or a SQL step calling the DuckDB embedding extension)." },
                 "out": { "type": "string", "description": "Parquet to write — every input column plus projection_x and projection_y as DOUBLE, and projection_fit_id (VARCHAR, same value on every row) fingerprinting the exact numbers and knobs this fit consumed." },
                 "fit": { "type": "string", "description": "Where the fitted projection is kept between runs, and the field that makes the map hold still when rows are appended. Declared as an asset this step both READS and PRODUCES: the first run writes it, every later run reads it back, and rows the fit already holds come back with the same coordinates while appended rows are placed into that layout instead of starting a new one. Omit it and every run refits the whole input, so appending one row moves every point. Two consequences worth knowing before you set it: deleting the file marks the step stale and refits, which is how you ask for a new layout on purpose; and moving neighbors, min_dist or metric while a fit exists is REFUSED naming the mismatch, because those knobs are part of what the fit is." },
-                "neighbors": { "type": "integer", "minimum": 2, "description": "UMAP n_neighbors: low reads local structure, high reads global. Defaults to the script's 15 when omitted. CLAMPED to one below the input's row count: above that the value stops changing the fit and the run still succeeds, so a larger number here is not an error and is not an effect either. That clamp is arcform's, not umap-learn's, so umap-learn's documentation for n_neighbors does not describe what happens above the boundary." },
+                "neighbors": { "type": "integer", "minimum": 2, "default": 15, "x-at-most": { "rows_of": "input", "minus": 1, "bounds_default": true }, "description": "UMAP n_neighbors: low reads local structure, high reads global. At most one below the input's row count: arc run counts the rows of the Parquet `input` names when the step runs, and refuses a value above that bound before the script starts, naming the value and the row count. An unset value takes 15 or that bound, whichever is smaller. x-at-most states the bound for a program: rows_of names the with: key whose Parquet is counted, minus what is taken off its row count, and bounds_default that the bound applies to the default as well. The bound is arcform's, not umap-learn's, so umap-learn's documentation for n_neighbors does not describe it." },
                 "min_dist": { "type": "number", "minimum": 0, "exclusiveMaximum": 1, "description": "UMAP min_dist: how tightly points may pack. Defaults to the script's 0.1 when omitted." },
                 "metric": { "type": "string", "enum": UMAP_METRICS, "description": "How the distance between two rows is measured. Defaults to the script's euclidean when omitted, which is the reading an arbitrary feature matrix wants; cosine is the reading an L2-normalised vector column wants. Nothing here scales your columns — under euclidean a wider-spread column dominates the layout, which is a decision for the SQL step that selects them." }
             }),
@@ -3551,6 +3551,63 @@ impl UmapProjectConfig {
         }
         Ok(())
     }
+
+    /// Refuse a `neighbors:` above one below the input's row count, when the step
+    /// runs and before anything is written.
+    ///
+    /// Not part of [`Self::validate`], because the manifest cannot know the row count:
+    /// an earlier step may write the input. So the input is counted here, after every
+    /// step before this one has run, and the refusal comes ahead of
+    /// [`umap_project_invocation`], which creates the output's directory and the
+    /// fit's. Above the bound the script would clamp the value and draw the same map
+    /// as the bound itself, exiting 0; refusing is what makes the value mean what it
+    /// says. The script keeps its clamp as a second guard, for an unset value on a
+    /// small table and for a run of the script outside arc.
+    ///
+    /// Only a value the manifest SET is counted against: an unset one takes the
+    /// script's 15 or the bound, whichever is smaller, which is the rule the schema
+    /// states. And an input that cannot be read is not refused here — the script
+    /// reads it next and fails naming it.
+    ///
+    /// `ManifestValidation`, so the runner halts on it without a retry and `arc run`
+    /// exits 1, as it does for a `neighbors:` below 2.
+    fn refuse_neighbors_past_the_input(&self, dir: &Path) -> Result<()> {
+        let Some(asked) = self.neighbors else {
+            return Ok(());
+        };
+        let Some(rows) = parquet_row_count(&dir.join(&self.input)) else {
+            return Ok(());
+        };
+        let bound = rows.saturating_sub(1);
+        if asked > bound {
+            return Err(Error::ManifestValidation(format!(
+                "umap_project: `neighbors: {}` is above {}, one below the {} rows of {} \
+                 — UMAP cannot place a point against more rows than there are besides \
+                 it. Set `neighbors:` to {} or less, or leave it unset to take 15 or {}, \
+                 whichever is smaller",
+                asked, bound, rows, self.input, bound, bound
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The number of rows in the Parquet at `path`, read in process, or `None` when it
+/// cannot be read. It counts what `umap_project.py` counts: every row `read_parquet`
+/// returns for the same path.
+fn parquet_row_count(path: &Path) -> Option<u64> {
+    let conn = duckdb::Connection::open_in_memory().ok()?;
+    let rows: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT count(*) FROM read_parquet('{}')",
+                sql_lit(&path.display().to_string())
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    u64::try_from(rows).ok()
 }
 
 /// Build umap_project.py's argv tail (everything after the script path). One
@@ -3646,6 +3703,7 @@ impl Operator for UmapProject {
     fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
         let cfg = UmapProjectConfig::parse(with)?;
         cfg.validate()?;
+        cfg.refuse_neighbors_past_the_input(ctx.dir)?;
         let args = umap_project_invocation(&cfg, ctx.dir)?;
         run_process("uv", &args, ctx, OutputMode::Capture, "umap_project")
     }
@@ -6177,32 +6235,131 @@ mod tests {
         );
     }
 
-    /// The `neighbors` description an authoring client is shown must disclose the
-    /// clamp.
-    ///
-    /// It is the one place a manifest author meets this knob without reading the
-    /// operator's README — editor completion and `operator_describe` show these
-    /// strings and nothing else — so a README edit does not discharge it. Above
-    /// `rows - 1` the value stops changing the fit and the run still exits 0, which
-    /// is the shape of defect this operator is least able to afford: a confident
-    /// picture that is not true.
+    /// The `neighbors` schema states the bound the input's row count sets, twice: as
+    /// `x-at-most`, which a program reads to work the bound out on a table without a
+    /// copy of the rule, and in the description, which editor completion and
+    /// `operator_describe` show a person. Both say the bound applies to the default as
+    /// well, so an unset value on a table of 10 rows reads as 9, not 15.
     #[cfg(feature = "mcp")]
     #[test]
-    fn umap_project_schema_discloses_the_neighbors_clamp() {
+    fn umap_project_schema_states_the_neighbors_bound_and_the_default_rule() {
         let schema = with_schema("umap_project").expect("umap_project has a with: schema");
-        let described = schema["properties"]["neighbors"]["description"]
+        let neighbors = &schema["properties"]["neighbors"];
+        assert_eq!(
+            neighbors["minimum"], 2,
+            "the lower bound is UMAP's: {neighbors}"
+        );
+        assert_eq!(
+            neighbors["default"], 15,
+            "the default is the script's DEFAULT_NEIGHBORS: {neighbors}"
+        );
+        assert_eq!(
+            neighbors["x-at-most"],
+            serde_json::json!({ "rows_of": "input", "minus": 1, "bounds_default": true }),
+            "the bound is a rule on the row count of the Parquet `input` names, and it \
+             bounds the default: {neighbors}"
+        );
+        let described = neighbors["description"]
             .as_str()
             .expect("neighbors carries a description");
-        assert!(
-            described.contains("clamp"),
-            "the neighbors description must name the clamp — an authoring client \
-             shows this string and never the README: {described}"
+        for said in [
+            "one below the input's row count",
+            "refuses a value above that bound",
+            "An unset value takes 15 or that bound, whichever is smaller",
+        ] {
+            assert!(
+                described.contains(said),
+                "the neighbors description must say {said:?} — an authoring client \
+                 shows this string and never the README: {described}"
+            );
+        }
+    }
+
+    /// A Parquet of `rows` rows at `dir/name`, written by DuckDB in process.
+    fn parquet_of_rows(dir: &Path, name: &str, rows: u64) -> PathBuf {
+        let path = dir.join(name);
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT range AS id, range * 0.5 AS x FROM range({rows})) TO '{}' \
+             (FORMAT parquet);",
+            sql_lit(&path.display().to_string())
+        ))
+        .unwrap();
+        path
+    }
+
+    fn umap_config_with_neighbors(neighbors: Option<u64>) -> UmapProjectConfig {
+        UmapProjectConfig {
+            input: "in.parquet".to_string(),
+            columns: vec!["x".to_string()],
+            out: "maps/out.parquet".to_string(),
+            fit: Some("maps/fit.umap".to_string()),
+            neighbors,
+            min_dist: None,
+            metric: None,
+        }
+    }
+
+    #[test]
+    fn parquet_row_count_counts_every_row_and_reads_none_from_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            parquet_row_count(&parquet_of_rows(dir.path(), "in.parquet", 48)),
+            Some(48)
         );
-        assert!(
-            described.contains("row count"),
-            "and must say what it is clamped TO, or the disclosure is unactionable: \
-             {described}"
+        assert_eq!(
+            parquet_row_count(&parquet_of_rows(dir.path(), "empty.parquet", 0)),
+            Some(0)
         );
+        assert_eq!(parquet_row_count(&dir.path().join("absent.parquet")), None);
+    }
+
+    /// The bound is one below the row count, exactly: on 48 rows 47 runs and 48 is
+    /// refused, naming the value, the bound, the row count and the input.
+    #[test]
+    fn umap_project_refuses_neighbors_above_one_below_the_input_row_count() {
+        let dir = tempfile::tempdir().unwrap();
+        parquet_of_rows(dir.path(), "in.parquet", 48);
+
+        umap_config_with_neighbors(Some(47))
+            .refuse_neighbors_past_the_input(dir.path())
+            .expect("47 is one below 48 rows, the bound itself, and runs");
+
+        for asked in [48, 60] {
+            let err = umap_config_with_neighbors(Some(asked))
+                .refuse_neighbors_past_the_input(dir.path())
+                .expect_err("a neighbors above one below the row count must be refused");
+            let Error::ManifestValidation(said) = &err else {
+                panic!("the refusal must be ManifestValidation, which is not retried: {err:?}");
+            };
+            assert!(
+                said.contains(&format!(
+                    "`neighbors: {asked}` is above 47, one below the 48 rows of in.parquet"
+                )),
+                "the refusal names the value, the bound, the row count and the input: {said}"
+            );
+        }
+        assert!(
+            !dir.path().join("maps").exists(),
+            "the refusal writes nothing"
+        );
+    }
+
+    /// An unset `neighbors` is not counted against the input: on 10 rows it runs, and
+    /// the script's clamp gives it 9. And an input that cannot be read is left to the
+    /// script, which fails naming it.
+    #[test]
+    fn umap_project_leaves_an_unset_neighbors_and_an_unreadable_input_to_the_script() {
+        let dir = tempfile::tempdir().unwrap();
+        parquet_of_rows(dir.path(), "in.parquet", 10);
+        umap_config_with_neighbors(None)
+            .refuse_neighbors_past_the_input(dir.path())
+            .expect("an unset neighbors is never refused for the row count");
+
+        let absent = tempfile::tempdir().unwrap();
+        umap_config_with_neighbors(Some(200))
+            .refuse_neighbors_past_the_input(absent.path())
+            .expect("an input arc cannot read is the script's to refuse, not this check's");
     }
 
     // ── text_embed ───────────────────────────────────────────────────────────
