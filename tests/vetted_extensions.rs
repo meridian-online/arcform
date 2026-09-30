@@ -899,6 +899,12 @@ impl Pinned {
     /// `arc <args>` on a fake DuckDB that reports `version`, keeping its extensions where
     /// [`Pinned::installed`] says whatever the version.
     fn arc_on_version(&self, registry: Registry, version: &str, args: &[&str]) -> Outcome {
+        self.protocol
+            .arc_on(&self.fake_engine(registry, version), args)
+    }
+
+    /// The fake DuckDB that [`Pinned::arc_on_version`] runs arc on, as a piece of shell.
+    fn fake_engine(&self, registry: Registry, version: &str) -> String {
         let installed = self.installed();
         let dir = installed.parent().unwrap().display().to_string();
         let file = installed.display();
@@ -919,18 +925,15 @@ impl Pinned {
             Registry::Fails => (failed.to_string(), failed.to_string()),
             Registry::NamesNoFile => (":".to_string(), ":".to_string()),
         };
-        self.protocol.arc_on(
-            &format!(
-                "case \"$1\" in\n\
-                 --version) echo 'v{version} (fake) 0000000000' ;;\n\
-                 -noheader) case \"$4\" in\n\
-                 *pragma_platform*) echo 'arc-answer:{PLATFORM}' ;;\n\
-                 'INSTALL mlpack FROM community;'*) {install} ;;\n\
-                 'FORCE INSTALL mlpack FROM community; LOAD mlpack;'*) {force} ;;\n\
-                 esac ;;\n\
-                 esac\n"
-            ),
-            args,
+        format!(
+            "case \"$1\" in\n\
+             --version) echo 'v{version} (fake) 0000000000' ;;\n\
+             -noheader) case \"$4\" in\n\
+             *pragma_platform*) echo 'arc-answer:{PLATFORM}' ;;\n\
+             'INSTALL mlpack FROM community;'*) {install} ;;\n\
+             'FORCE INSTALL mlpack FROM community; LOAD mlpack;'*) {force} ;;\n\
+             esac ;;\n\
+             esac\n"
         )
     }
 }
@@ -1550,6 +1553,354 @@ fn a_protocol_whose_steps_rewrite_no_sql_file_prints_what_it_printed_before() {
     let run = pinned.run(Registry::Serves, &[]);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(run.calls(), NO_REWRITE_BEFORE_CALLS);
+}
+
+/// What a step writes over another step's or hook's file in the tests below: it makes the
+/// table `marker`, then installs an extension off the vetted list.
+const MARKS_AND_INSTALLS: &str =
+    "CREATE TABLE marker AS SELECT 1; INSTALL anofox_forecast FROM community;";
+
+/// A statement writing `sql` over the file at `path`, as a step would: `COPY` writes the text as
+/// given and then a line feed.
+fn writes_over(path: &str, sql: &str) -> String {
+    format!(
+        "COPY (SELECT '{}') TO '{path}' (HEADER false, QUOTE '');\n",
+        sql.replace('\'', "''")
+    )
+}
+
+/// An `on_failure` hook writing `ARC_FAILED_STEP` and `ARC_EXIT_CODE` to `failed_step.txt`.
+const REPORTS_FAILED_STEP: &str = "hooks:\n  on_failure:\n    name: report\n    command: 'echo \"$ARC_FAILED_STEP $ARC_EXIT_CODE\" > failed_step.txt'\n";
+
+/// Steps `a`, `b` and `c`, and the hook in [`REPORTS_FAILED_STEP`]: `a` makes the table `ta` and
+/// then writes `b_after` over `b`'s file, which holds `b_before` when the run begins, or is not
+/// there when that is `None`; `c` makes the table `tc`.
+fn a_writes_over_b(b_before: Option<&str>, b_after: &str) -> Protocol {
+    let a = format!(
+        "CREATE TABLE ta AS SELECT 1;\n{}",
+        writes_over("models/b.sql", b_after)
+    );
+    let mut files = vec![
+        ("models/a.sql".to_string(), a.as_str()),
+        ("models/c.sql".to_string(), "CREATE TABLE tc AS SELECT 1;\n"),
+    ];
+    if let Some(b) = b_before {
+        files.push(("models/b.sql".to_string(), b));
+    }
+    Protocol::with(
+        &format!(
+            "name: vetted\nsteps:\n  - name: a\n    sql: models/a.sql\n  - name: b\n    sql: models/b.sql\n  - name: c\n    sql: models/c.sql\n{REPORTS_FAILED_STEP}"
+        ),
+        &files,
+    )
+}
+
+impl Protocol {
+    /// `arc run` on the DuckDB CLI on PATH, with a home directory of its own under the test's
+    /// directory, so no `~/.duckdbrc` is read and no extension this machine holds is found.
+    fn run_on_duckdb(&self) -> Outcome {
+        let home = self.root.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_arc"))
+            .current_dir(self.project())
+            .arg("run")
+            .env_remove("ARC_DUCKDB_BIN")
+            .env_remove("ARC_ALLOW_UNTESTED_ENGINE")
+            .env("HOME", &home)
+            .env("ARCFORM_HISTORY_DIR", self.root.path().join("history"))
+            .env("ARCFORM_FETCH_CACHE", "off")
+            .output()
+            .expect("spawn arc");
+        Outcome {
+            code: out.status.code(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            engine_calls: Vec::new(),
+        }
+    }
+
+    /// The tables in the Protocol's database other than arc's own, by name.
+    fn tables(&self) -> Vec<String> {
+        let conn = duckdb::Connection::open(self.project().join("vetted.duckdb")).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT table_name FROM information_schema.tables \
+                 WHERE table_name NOT LIKE '\\_arcform%' ESCAPE '\\' ORDER BY table_name",
+            )
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// What the hook in [`REPORTS_FAILED_STEP`] wrote, or `None` when it did not run.
+    fn failed_step(&self) -> Option<String> {
+        fs::read_to_string(self.project().join("failed_step.txt"))
+            .ok()
+            .map(|s| s.trim_end().to_string())
+    }
+}
+
+impl Outcome {
+    /// Assert the run was refused just before the step `b` ran, as a step that fails: exit 2,
+    /// and a message naming `b`, its file and each of `names`, which does not say that no step
+    /// ran.
+    fn assert_refused_before_b(&self, label: &str, names: &[&str]) {
+        assert_eq!(self.code, Some(2), "[{label}] {}", self.stderr);
+        for needle in ["step 'b'", "models/b.sql", "was refused and did not run"]
+            .iter()
+            .chain(names)
+        {
+            assert!(
+                self.stderr.contains(needle),
+                "[{label}] the refusal should name {needle:?}:\n{}",
+                self.stderr
+            );
+        }
+        assert!(
+            !self.stderr.contains("no step"),
+            "[{label}] a step ran, and the refusal says none did:\n{}",
+            self.stderr
+        );
+    }
+}
+
+#[test]
+fn a_step_that_writes_over_a_later_steps_file_is_refused_just_before_that_step_runs() {
+    for (label, b_after, names) in [
+        (
+            "an extension off the list",
+            MARKS_AND_INSTALLS,
+            &["models/b.sql, line 1", "anofox_forecast"][..],
+        ),
+        (
+            "SET home_directory",
+            "SET home_directory = 'alt';",
+            &["names the setting home_directory,"],
+        ),
+        (
+            "SET extension_directories",
+            "SET extension_directories = ['alt'];",
+            &["names the setting extension_directories,"],
+        ),
+        (
+            "PRAGMA home_directory",
+            "PRAGMA home_directory = 'alt';",
+            &["names the setting home_directory,"],
+        ),
+        (
+            "SET GLOBAL extension_directories",
+            "SET GLOBAL extension_directories = ['alt'];",
+            &["names the setting extension_directories,"],
+        ),
+    ] {
+        let protocol = a_writes_over_b(Some("SELECT 1;\n"), b_after);
+        let run = protocol.run_on_duckdb();
+        run.assert_refused_before_b(label, names);
+        assert_eq!(
+            protocol.failed_step().as_deref(),
+            Some("b refused"),
+            "[{label}] on_failure reads b in ARC_FAILED_STEP"
+        );
+        assert_eq!(
+            protocol.tables(),
+            vec!["ta"],
+            "[{label}] a's table stays, and neither b nor c ran"
+        );
+    }
+}
+
+#[test]
+fn a_file_written_where_there_was_none_is_checked_just_before_its_step_runs() {
+    let protocol = a_writes_over_b(None, MARKS_AND_INSTALLS);
+    let run = protocol.run_on_duckdb();
+    run.assert_refused_before_b("b absent", &["anofox_forecast"]);
+    assert_eq!(protocol.failed_step().as_deref(), Some("b refused"));
+    assert_eq!(protocol.tables(), vec!["ta"]);
+
+    // A pinned extension first found in such a file is checked against its pin there.
+    let pinned = Pinned::new(
+        "steps:\n  - name: a\n    sql: models/a.sql\n  - name: b\n    sql: models/b.sql\n",
+        &pin_yaml("v1.5.5", PLATFORM, OTHER_PIN),
+    );
+    let project = pinned.protocol.project();
+    fs::write(project.join("models/a.sql"), "SELECT 1;\n").unwrap();
+    let b = project.join("models/b.sql");
+    assert!(!b.exists());
+    let writes_b = format!(
+        "case \"$3\" in */models/a.sql) printf 'INSTALL mlpack FROM community;\\n' > '{}' ;; esac\n",
+        b.display()
+    );
+    let run = pinned.protocol.arc_on(
+        &format!(
+            "{writes_b}{}",
+            pinned.fake_engine(Registry::Serves, "1.5.5")
+        ),
+        &["run"],
+    );
+    assert_eq!(run.code, Some(2), "{}", run.stderr);
+    assert_eq!(
+        run.calls(),
+        vec!["--version", "a.sql", "platform", "install mlpack"],
+        "mlpack was compared with its pin after a ran, and b did not reach the engine"
+    );
+    for needle in ["step 'b'", "mlpack", OTHER_PIN, &served_pin()] {
+        assert!(
+            run.stderr.contains(needle),
+            "the refusal should name {needle:?}:\n{}",
+            run.stderr
+        );
+    }
+    assert!(!run.stderr.contains("no step"), "{}", run.stderr);
+}
+
+#[test]
+fn a_step_that_writes_over_a_later_steps_file_with_nothing_refused_runs_it() {
+    let protocol = a_writes_over_b(Some("SELECT 1;\n"), "CREATE TABLE marker AS SELECT 1;");
+    let run = protocol.run_on_duckdb();
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(protocol.tables(), vec!["marker", "ta", "tc"]);
+    assert_eq!(protocol.failed_step(), None);
+}
+
+#[test]
+fn a_sql_hook_whose_file_a_step_writes_over_is_refused_just_before_it_runs() {
+    for slot in ["on_success", "on_exit"] {
+        let a = format!(
+            "CREATE TABLE ta AS SELECT 1;\n{}",
+            writes_over("models/notify.sql", MARKS_AND_INSTALLS)
+        );
+        let protocol = Protocol::with(
+            &format!(
+                "name: vetted\nsteps:\n  - name: a\n    sql: models/a.sql\nhooks:\n  {slot}:\n    name: notify\n    sql: models/notify.sql\n"
+            ),
+            &[
+                ("models/a.sql".into(), &a),
+                ("models/notify.sql".into(), "SELECT 1;\n"),
+            ],
+        );
+        let run = protocol.run_on_duckdb();
+        assert_eq!(run.code, Some(2), "[{slot}] {}", run.stderr);
+        for needle in [
+            &format!("hook {slot} 'notify'"),
+            "models/notify.sql",
+            "anofox_forecast",
+        ] {
+            assert!(
+                run.stderr.contains(needle),
+                "[{slot}] the refusal should name {needle:?}:\n{}",
+                run.stderr
+            );
+        }
+        assert_eq!(
+            protocol.tables(),
+            vec!["ta"],
+            "[{slot}] the hook did not run"
+        );
+    }
+}
+
+#[test]
+fn a_retry_is_refused_when_the_attempt_before_it_wrote_over_its_file() {
+    let s = format!(
+        "{}SELECT error('the first attempt fails');\n",
+        writes_over("models/s.sql", MARKS_AND_INSTALLS)
+    );
+    let protocol = Protocol::with(
+        "name: vetted\nsteps:\n  - name: s\n    sql: models/s.sql\n    retry: {max_attempts: 2, backoff_sec: 0}\n",
+        &[("models/s.sql".into(), &s)],
+    );
+    let run = protocol.run_on_duckdb();
+    assert_eq!(run.code, Some(2), "{}", run.stderr);
+    for needle in [
+        "[retry 2/2",
+        "step 's' was refused and did not run",
+        "models/s.sql, line 1",
+        "anofox_forecast",
+    ] {
+        assert!(
+            run.stderr.contains(needle),
+            "the second attempt should be refused, naming {needle:?}:\n{}",
+            run.stderr
+        );
+    }
+    assert_eq!(protocol.tables(), Vec::<String>::new());
+}
+
+#[test]
+fn each_setting_that_moves_where_duckdb_keeps_extensions_is_refused_before_a_step_runs() {
+    for (sql, setting) in [
+        ("SET extension_directory = 'ext';", "extension_directory"),
+        ("SET home_directory = 'alt';", "home_directory"),
+        (
+            "SET extension_directories = ['alt'];",
+            "extension_directories",
+        ),
+        ("PRAGMA home_directory = 'alt';", "home_directory"),
+        (
+            "SET GLOBAL extension_directories = ['alt'];",
+            "extension_directories",
+        ),
+    ] {
+        let run = Protocol::steps(&[("s", &format!("{sql}\n"))]).run(VETTED_ON);
+        run.assert_refused(sql);
+        for needle in [
+            "step 's'",
+            "models/s.sql, line 1",
+            &format!("names the setting {setting}, which moves where DuckDB keeps"),
+        ] {
+            assert!(
+                run.stderr.contains(needle),
+                "[{sql}] the refusal should name {needle:?}:\n{}",
+                run.stderr
+            );
+        }
+    }
+}
+
+/// DuckDB can add a setting that moves where it keeps or finds extensions. This asks the DuckDB
+/// CLI the tests run for each one it lists, and fails naming each that arc does not refuse.
+#[test]
+fn every_setting_duckdb_lists_that_moves_where_it_keeps_extensions_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+    let out = Command::new("duckdb")
+        .args([
+            "-noheader",
+            "-list",
+            "-c",
+            "SELECT name FROM duckdb_settings() \
+             WHERE name LIKE '%extension_director%' OR name = 'home_directory' ORDER BY name;",
+        ])
+        .env("HOME", home.path())
+        .output()
+        .expect("the DuckDB CLI on PATH");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let listed: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+    assert!(
+        listed.iter().any(|name| name == "extension_directory"),
+        "DuckDB should list extension_directory: {listed:?}"
+    );
+    let not_refused: Vec<&String> = listed
+        .iter()
+        .filter(|name| {
+            let run = Protocol::steps(&[("s", &format!("SET {name} = 'alt';\n"))]).run(VETTED_ON);
+            !(run.code == Some(1) && run.stderr.contains(&format!("names the setting {name},")))
+        })
+        .collect();
+    assert!(
+        not_refused.is_empty(),
+        "DuckDB lists these settings, which move where it keeps or finds extensions, and arc does not refuse them: {not_refused:?}"
+    );
 }
 
 // ---- arc upgrade ----
