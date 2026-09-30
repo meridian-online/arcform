@@ -10,8 +10,8 @@
 //!      a repository rolls back to any recorded state, and the rollback is
 //!      itself reversible because restore checkpoints what it replaces;
 //!   4. **bounded by the stated policy** — entries past the bound prune
-//!      oldest-first, and an identical or rapid-repeat save does not flood
-//!      the store;
+//!      oldest-first, whether or not their file names a way, and an identical
+//!      or rapid-repeat save does not flood the store;
 //!   5. **the way arc was reached** — a way a caller names is on every entry
 //!      its handle records, through each recording call, and `arc history
 //!      list` prints it; a handle that names none records entries that say
@@ -300,6 +300,130 @@ fn the_store_is_bounded_by_the_stated_policy() {
         history.read(&dir, &entries[0].id).unwrap(),
         "name: v5\nsteps: []\n",
         "the oldest entries were pruned first"
+    );
+}
+
+/// The entry files in the one key directory `history`'s store holds, sorted
+/// by name: every `.yaml` file there, and not the `spec-path` marker beside
+/// them. Panics when the store holds anything but one key directory.
+fn entry_files(history: &LocalHistory) -> Vec<String> {
+    let key_dirs: Vec<PathBuf> = fs::read_dir(history.root())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    let [key_dir] = key_dirs.as_slice() else {
+        panic!("one key directory, found {key_dirs:?}");
+    };
+    let mut names: Vec<String> = fs::read_dir(key_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".yaml"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Record `HISTORY_MAX_ENTRIES + 10` distinct states for the spec in `dir`
+/// through `history`, as checkpoints so none merges into the one before, and
+/// return each entry's id in the order recorded.
+fn record_past_the_bound(history: &LocalHistory, dir: &Path) -> Vec<String> {
+    (0..HISTORY_MAX_ENTRIES + 10)
+        .map(|n| {
+            history
+                .record_checkpoint(dir, &format!("name: v{n}\nsteps: []\n"))
+                .unwrap()
+                .expect("a state no entry holds is recorded")
+                .id
+        })
+        .collect()
+}
+
+// Every entry a handle that names a way records carries the way in its file
+// name, and prune removes an entry by that name. Past the bound the store
+// holds exactly the newest `HISTORY_MAX_ENTRIES` — listed and on disk — and the
+// ten oldest are gone from both, for each way arc itself is reached by and for
+// a caller's own.
+#[test]
+fn the_bound_holds_for_a_store_whose_entries_name_a_way() {
+    let ways = [
+        HistoryWay::TERMINAL,
+        HistoryWay::MCP,
+        HistoryWay::new("app").unwrap(),
+    ];
+    for way in ways {
+        let (_tmp, dir, history) = setup();
+        let history = history.reached_by(way.clone());
+        let recorded = record_past_the_bound(&history, &dir);
+        let kept = &recorded[10..];
+
+        let listed: Vec<String> = history
+            .entries(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(
+            listed,
+            kept,
+            "{}: the list holds the newest {HISTORY_MAX_ENTRIES}, oldest first",
+            way.as_str()
+        );
+
+        let mut on_disk: Vec<String> = kept
+            .iter()
+            .map(|id| format!("{id}.{}.yaml", way.as_str()))
+            .collect();
+        on_disk.sort();
+        assert_eq!(
+            entry_files(&history),
+            on_disk,
+            "{}: the key directory holds exactly the kept entries' files, and none of the pruned",
+            way.as_str()
+        );
+    }
+}
+
+// A store older entries wrote without a way and newer ones wrote with one:
+// prune removes each entry by the name it has, so the ten oldest, which name no
+// way, go and the bound holds over a directory of both kinds of file name.
+#[test]
+fn the_bound_holds_when_the_oldest_entries_name_no_way() {
+    let (_tmp, dir, history) = setup();
+    let mut recorded: Vec<String> = (0..10)
+        .map(|n| {
+            history
+                .record_checkpoint(&dir, &format!("name: earlier{n}\nsteps: []\n"))
+                .unwrap()
+                .expect("recorded")
+                .id
+        })
+        .collect();
+    let history = history.reached_by(HistoryWay::TERMINAL);
+    recorded.extend((0..HISTORY_MAX_ENTRIES).map(|n| {
+        history
+            .record_checkpoint(&dir, &format!("name: v{n}\nsteps: []\n"))
+            .unwrap()
+            .expect("recorded")
+            .id
+    }));
+    let kept = &recorded[10..];
+
+    let listed: Vec<String> = history
+        .entries(&dir)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+    assert_eq!(listed, kept, "the ten that named no way were the oldest");
+    let mut on_disk: Vec<String> = kept
+        .iter()
+        .map(|id| format!("{id}.terminal.yaml"))
+        .collect();
+    on_disk.sort();
+    assert_eq!(
+        entry_files(&history),
+        on_disk,
+        "no file of a pruned entry is left in the key directory"
     );
 }
 

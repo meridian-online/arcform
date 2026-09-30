@@ -14,7 +14,9 @@
 //!   5. **help** — `arc history --help` and each verb's help name `--file`;
 //!   6. **the way** — each version a verb of the command line writes lists as
 //!      `terminal`; a version an earlier arc wrote lists as `not recorded` and
-//!      is shown and restored by the id that arc printed.
+//!      is shown and restored by the id that arc printed;
+//!   7. **the bound** — past `HISTORY_MAX_ENTRIES` versions written by the
+//!      command line, the list and the key directory hold exactly that many.
 //!
 //! The history is recorded through the library, which is the write path a
 //! tool saving a chart file takes, and read back through the binary alone.
@@ -23,7 +25,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use arc::spec::{HistoryKind, HistoryWay, LocalHistory, MANIFEST_FILENAME};
+use arc::spec::{HISTORY_MAX_ENTRIES, HistoryKind, HistoryWay, LocalHistory, MANIFEST_FILENAME};
 
 const SPEC_V1: &str = "name: fixture\nsteps: []\n";
 const SPEC_V2: &str = "name: fixture-renamed\nsteps: []\n";
@@ -583,5 +585,76 @@ fn a_version_an_earlier_arc_wrote_says_not_recorded_and_keeps_its_id() {
     assert_eq!(
         fs::read_to_string(dir.join(MANIFEST_FILENAME)).unwrap(),
         SPEC_NOW
+    );
+}
+
+// The bound, through the command line: every `edit-protocol` writes its
+// versions as `terminal`, and past `HISTORY_MAX_ENTRIES` of them `arc history
+// list` prints exactly that many and the store's key directory holds exactly
+// that many entry files, the first version `create-protocol` saved gone from
+// both. The spec is changed by hand before each edit so that edit's checkpoint
+// is of a state no entry holds and is recorded rather than skipped as a
+// duplicate, and the save after it follows a checkpoint and so does not merge:
+// each edit writes two versions, and the loop writes more than the bound.
+#[test]
+fn the_bound_holds_for_the_versions_the_command_line_writes() {
+    const EDITS: usize = HISTORY_MAX_ENTRIES / 2 + 5;
+    assert!(
+        1 + 2 * EDITS > HISTORY_MAX_ENTRIES,
+        "the loop below must write more versions than the bound keeps"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("history");
+    let proto = tmp.path().join("fresh");
+    let spec = proto.join(MANIFEST_FILENAME);
+
+    arc_ok(&store, tmp.path(), &["create-protocol", "fresh"]);
+    let first = listed(&arc_ok(&store, &proto, &["history", "list"]));
+    let [(first_id, _, _)] = first.as_slice() else {
+        panic!("create-protocol saves one version: {first:?}");
+    };
+    for n in 0..EDITS {
+        let text = fs::read_to_string(&spec).unwrap();
+        fs::write(&spec, format!("{text}# changed by hand {n}\n")).unwrap();
+        arc_ok(
+            &store,
+            &proto,
+            &["edit-protocol", "replace", "name", &format!("renamed{n}")],
+        );
+    }
+
+    let entries = listed(&arc_ok(&store, &proto, &["history", "list"]));
+    assert_eq!(entries.len(), HISTORY_MAX_ENTRIES, "{entries:?}");
+    assert!(
+        entries.iter().all(|(_, _, way)| way == "terminal"),
+        "{entries:?}"
+    );
+    assert!(
+        entries.iter().all(|(id, _, _)| id != first_id),
+        "the oldest version was pruned: {entries:?}"
+    );
+
+    let key_dirs: Vec<PathBuf> = fs::read_dir(&store)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    let [key_dir] = key_dirs.as_slice() else {
+        panic!("one key directory, found {key_dirs:?}");
+    };
+    let mut on_disk: Vec<String> = fs::read_dir(key_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".yaml"))
+        .collect();
+    on_disk.sort();
+    let mut listed_files: Vec<String> = entries
+        .iter()
+        .map(|(id, _, _)| format!("{id}.terminal.yaml"))
+        .collect();
+    listed_files.sort();
+    assert_eq!(
+        on_disk, listed_files,
+        "the key directory holds one file for each version listed and no other"
     );
 }

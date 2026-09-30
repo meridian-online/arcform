@@ -11,7 +11,8 @@
 //!      existed, is read by the file calls given the directory's
 //!      `arcform.yaml`;
 //!   4. **the bound is per file** — one file reaching the bound prunes its own
-//!      oldest entry and none of another file's.
+//!      oldest entry and none of another file's, whether or not the entries'
+//!      file names carry a way.
 //!
 //! Nothing here needs the `arc` binary, so the file runs with the `cli`
 //! feature off: `cargo test --no-default-features --test history_per_file`.
@@ -20,7 +21,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use arc::spec::{
-    Error, HISTORY_MAX_ENTRIES, HistoryEntry, HistoryKind, LocalHistory, MANIFEST_FILENAME, Result,
+    Error, HISTORY_MAX_ENTRIES, HistoryEntry, HistoryKind, HistoryWay, LocalHistory,
+    MANIFEST_FILENAME, Result,
 };
 use sha2::{Digest, Sha256};
 
@@ -232,6 +234,95 @@ fn the_bound_holds_per_file() {
     );
     assert_eq!(a.last().map(String::as_str), Some("a: one more\n"));
     assert_eq!(texts_for_file(&f.history, &f.b), vec!["b: 0\n", "b: 1\n"]);
+}
+
+/// The entry files in `file`'s key directory, sorted by name: every `.yaml`
+/// file there, and not the `spec-path` marker beside them. The key directory
+/// is the one in `history`'s store whose `spec-path` names `file`.
+fn entry_files_for_file(history: &LocalHistory, file: &Path) -> Vec<String> {
+    let canonical = fs::canonicalize(file).unwrap();
+    let key_dirs: Vec<PathBuf> = fs::read_dir(history.root())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|dir| {
+            fs::read_to_string(dir.join("spec-path"))
+                .is_ok_and(|named| named.trim_end() == canonical.display().to_string())
+        })
+        .collect();
+    let [key_dir] = key_dirs.as_slice() else {
+        panic!("one key directory for {file:?}, found {key_dirs:?}");
+    };
+    let mut names: Vec<String> = fs::read_dir(key_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".yaml"))
+        .collect();
+    names.sort();
+    names
+}
+
+// The bound per file, for a store whose entries name a way: one file recorded
+// `HISTORY_MAX_ENTRIES + 10` times through a handle that names a way lists and
+// holds on disk exactly the newest `HISTORY_MAX_ENTRIES`, and another file's two
+// entries are neither listed nor removed with them. Prune removes an entry by the
+// name its way is part of.
+#[test]
+fn the_bound_holds_per_file_for_entries_that_name_a_way() {
+    let ways = [
+        HistoryWay::TERMINAL,
+        HistoryWay::MCP,
+        HistoryWay::new("app").unwrap(),
+    ];
+    for way in ways {
+        let f = setup();
+        let history = f.history.clone().reached_by(way.clone());
+        let recorded: Vec<String> = (0..HISTORY_MAX_ENTRIES + 10)
+            .map(|i| {
+                history
+                    .record_checkpoint_for_file(&f.a, &format!("a: {i}\n"))
+                    .unwrap()
+                    .expect("recorded")
+                    .id
+            })
+            .collect();
+        for i in 0..2 {
+            history
+                .record_checkpoint_for_file(&f.b, &format!("b: {i}\n"))
+                .unwrap()
+                .expect("recorded");
+        }
+        let kept = &recorded[10..];
+
+        let listed: Vec<String> = history
+            .entries_for_file(&f.a)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(
+            listed,
+            kept,
+            "{}: the list holds the newest {HISTORY_MAX_ENTRIES}, oldest first",
+            way.as_str()
+        );
+        let mut on_disk: Vec<String> = kept
+            .iter()
+            .map(|id| format!("{id}.{}.yaml", way.as_str()))
+            .collect();
+        on_disk.sort();
+        assert_eq!(
+            entry_files_for_file(&history, &f.a),
+            on_disk,
+            "{}: the key directory holds exactly the kept entries' files, and none of the pruned",
+            way.as_str()
+        );
+        assert_eq!(
+            entry_files_for_file(&history, &f.b).len(),
+            2,
+            "{}: the other file's entries are untouched",
+            way.as_str()
+        );
+    }
 }
 
 #[test]
