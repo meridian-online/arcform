@@ -599,10 +599,12 @@ fn a_version_an_earlier_arc_wrote_says_not_recorded_and_keeps_its_id() {
 #[test]
 fn the_bound_holds_for_the_versions_the_command_line_writes() {
     const EDITS: usize = HISTORY_MAX_ENTRIES / 2 + 5;
-    assert!(
-        1 + 2 * EDITS > HISTORY_MAX_ENTRIES,
-        "the loop below must write more versions than the bound keeps"
-    );
+    const {
+        assert!(
+            1 + 2 * EDITS > HISTORY_MAX_ENTRIES,
+            "the loop below must write more versions than the bound keeps"
+        )
+    };
 
     let tmp = tempfile::tempdir().unwrap();
     let store = tmp.path().join("history");
