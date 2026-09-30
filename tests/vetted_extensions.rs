@@ -1634,6 +1634,18 @@ impl Protocol {
             .collect()
     }
 
+    /// The `outcome` of each run the Protocol's database records, oldest first.
+    fn recorded_outcomes(&self) -> Vec<Option<String>> {
+        let conn = duckdb::Connection::open(self.project().join("vetted.duckdb")).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT outcome FROM _arcform_runs ORDER BY rowid")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
     /// What the hook in [`REPORTS_FAILED_STEP`] wrote, or `None` when it did not run.
     fn failed_step(&self) -> Option<String> {
         fs::read_to_string(self.project().join("failed_step.txt"))
@@ -1798,7 +1810,92 @@ fn a_sql_hook_whose_file_a_step_writes_over_is_refused_just_before_it_runs() {
             vec!["ta"],
             "[{slot}] the hook did not run"
         );
+        assert_eq!(
+            protocol.recorded_outcomes(),
+            vec![Some("partial".to_string())],
+            "[{slot}] the run records the outcome of a run that failed"
+        );
     }
+}
+
+impl Outcome {
+    /// The one stderr line holding `text`.
+    fn line_with(&self, text: &str) -> &str {
+        let lines: Vec<&str> = self.stderr.lines().filter(|l| l.contains(text)).collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "one line holding {text:?}:\n{}",
+            self.stderr
+        );
+        lines[0]
+    }
+}
+
+#[test]
+fn a_refused_hook_of_a_run_that_failed_prints_its_refusal_beside_the_runs_error() {
+    for slot in ["on_failure", "on_exit"] {
+        let a = format!(
+            "CREATE TABLE ta AS SELECT 1;\n{}SELECT error('step a fails');\n",
+            writes_over("models/report.sql", MARKS_AND_INSTALLS)
+        );
+        let protocol = Protocol::with(
+            &format!(
+                "name: vetted\nsteps:\n  - name: a\n    sql: models/a.sql\nhooks:\n  {slot}:\n    name: report\n    sql: models/report.sql\n"
+            ),
+            &[
+                ("models/a.sql".into(), &a),
+                ("models/report.sql".into(), "SELECT 1;\n"),
+            ],
+        );
+        let run = protocol.run_on_duckdb();
+        assert_eq!(run.code, Some(2), "[{slot}] {}", run.stderr);
+        assert!(
+            run.stderr.contains("step 'a' failed"),
+            "[{slot}] the run keeps its own error:\n{}",
+            run.stderr
+        );
+        let refusal = run.line_with(&format!("hook {slot} 'report' was refused and did not run"));
+        assert!(
+            refusal.contains("error:") && !refusal.contains("warning:"),
+            "[{slot}] the refusal is printed as an error: {refusal}"
+        );
+        assert!(
+            run.stderr.contains("anofox_forecast"),
+            "[{slot}] {}",
+            run.stderr
+        );
+        assert_eq!(
+            protocol.tables(),
+            vec!["ta"],
+            "[{slot}] the hook did not run"
+        );
+    }
+}
+
+#[test]
+fn a_hook_that_fails_on_its_own_warns_and_leaves_a_run_that_succeeded_at_exit_0() {
+    let protocol = Protocol::with(
+        "name: vetted\nsteps:\n  - name: a\n    sql: models/a.sql\nhooks:\n  on_success:\n    name: notify\n    sql: models/notify.sql\n",
+        &[
+            ("models/a.sql".into(), "CREATE TABLE ta AS SELECT 1;\n"),
+            (
+                "models/notify.sql".into(),
+                "SELECT error('the hook fails');\n",
+            ),
+        ],
+    );
+    let run = protocol.run_on_duckdb();
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let warning = run.line_with("on_success hook 'notify' failed");
+    assert!(
+        warning.contains("warning:") && !warning.contains("error:"),
+        "a hook that fails on its own draws a warning: {warning}"
+    );
+    assert_eq!(
+        protocol.recorded_outcomes(),
+        vec![Some("success".to_string())]
+    );
 }
 
 #[test]
