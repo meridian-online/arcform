@@ -465,6 +465,960 @@ mod with_schema_tests {
             "`metadata` must stay optional — an export declaring none must remain valid"
         );
     }
+
+    // ── Each schema holds to what its operator reads ──────────────────────────────
+    //
+    // `with_schema` is written by hand, and the typed deserialize stays the gate, so
+    // nothing but these tests keeps the two in step. Each one reads the configuration
+    // by running it: the fields a derive asks serde for, and whether `assets_for` — the
+    // `parse`, then `validate()`, then pattern compile that manifest load runs — admits
+    // a manifest built from the schema's own values. The four frozen-script operators
+    // are held to the script as well, read out of the file their argv names.
+
+    use std::cell::RefCell;
+    use std::collections::BTreeSet;
+
+    use serde::de::{DeserializeSeed, MapAccess, Visitor};
+    use serde_json::{Value as Json, json};
+
+    /// The fields a configuration's derive asks serde for, at each struct it
+    /// deserializes, by path: `""` for the `with:` block, `"credential"` for a struct
+    /// inside it.
+    ///
+    /// Read from the derive rather than the source: a derived `Deserialize` hands
+    /// `deserialize_struct` the names it accepts, renames applied, which are the keys
+    /// `deny_unknown_fields` admits. The recorder answers every field with a
+    /// placeholder of the type asked for, so the derive carries on into a nested struct
+    /// and names its fields too. A struct inside a sequence or a map is not reached,
+    /// because no element is produced; no configuration has one, and [`schema_objects`]
+    /// refuses a schema that would need it.
+    fn configuration_fields<T: serde::de::DeserializeOwned>() -> BTreeMap<String, BTreeSet<String>>
+    {
+        let found = RefCell::new(BTreeMap::new());
+        let recorder = FieldRecorder {
+            path: String::new(),
+            found: &found,
+        };
+        if let Err(e) = T::deserialize(recorder) {
+            panic!(
+                "recording the fields of {}: {e}",
+                std::any::type_name::<T>()
+            );
+        }
+        found.into_inner()
+    }
+
+    /// Each catalogue operator's configuration struct, recorded. An operator missing
+    /// here fails the test that asks for it, so a new one cannot pass unread.
+    fn configuration_fields_of(op: &str) -> BTreeMap<String, BTreeSet<String>> {
+        match op {
+            "parquet_export" => configuration_fields::<ParquetExportConfig>(),
+            #[cfg(feature = "http-fetch")]
+            "http_fetch" => configuration_fields::<HttpFetchConfig>(),
+            #[cfg(feature = "opendal")]
+            "opendal_fetch" => configuration_fields::<OpendalFetchConfig>(),
+            #[cfg(feature = "http-fetch")]
+            "html_link_discover" => configuration_fields::<HtmlLinkDiscoverConfig>(),
+            "archive_extract" => configuration_fields::<ArchiveExtractConfig>(),
+            "datapackage_describe" => configuration_fields::<DatapackageDescribeConfig>(),
+            "finetype_validate" => configuration_fields::<FinetypeValidateConfig>(),
+            "splink_resolve" => configuration_fields::<SplinkResolveConfig>(),
+            "gleif_ra_fetch" => configuration_fields::<GleifRaFetchConfig>(),
+            "umap_project" => configuration_fields::<UmapProjectConfig>(),
+            "text_embed" => configuration_fields::<TextEmbedConfig>(),
+            "uv" => configuration_fields::<UvConfig>(),
+            "ducklake_publish" => configuration_fields::<ducklake_publish::DucklakePublishConfig>(),
+            other => panic!(
+                "operator `{other}` is in the catalogue, but configuration_fields_of does \
+                 not name its configuration struct — add it there"
+            ),
+        }
+    }
+
+    struct FieldRecorder<'a> {
+        path: String,
+        found: &'a RefCell<BTreeMap<String, BTreeSet<String>>>,
+    }
+
+    macro_rules! placeholder {
+        ($($method:ident => $visit:ident($($value:expr)?)),* $(,)?) => {$(
+            fn $method<V: Visitor<'de>>(self, visitor: V) -> std::result::Result<V::Value, Self::Error> {
+                visitor.$visit($($value)?)
+            }
+        )*};
+    }
+
+    impl<'de> serde::Deserializer<'de> for FieldRecorder<'_> {
+        type Error = serde::de::value::Error;
+
+        fn deserialize_any<V: Visitor<'de>>(
+            self,
+            _: V,
+        ) -> std::result::Result<V::Value, Self::Error> {
+            Err(serde::de::Error::custom(format!(
+                "`{}` has a type the field recorder has no placeholder for",
+                self.path
+            )))
+        }
+
+        placeholder! {
+            deserialize_bool => visit_bool(false),
+            deserialize_u8 => visit_u64(0),
+            deserialize_u16 => visit_u64(0),
+            deserialize_u32 => visit_u64(0),
+            deserialize_u64 => visit_u64(0),
+            deserialize_i8 => visit_u64(0),
+            deserialize_i16 => visit_u64(0),
+            deserialize_i32 => visit_u64(0),
+            deserialize_i64 => visit_u64(0),
+            deserialize_f32 => visit_f64(0.0),
+            deserialize_f64 => visit_f64(0.0),
+            deserialize_str => visit_str(""),
+            deserialize_string => visit_str(""),
+            deserialize_unit => visit_unit(),
+            deserialize_seq => visit_seq(serde::de::value::SeqDeserializer::new(std::iter::empty::<u8>())),
+            deserialize_map => visit_map(serde::de::value::MapDeserializer::new(std::iter::empty::<(u8, u8)>())),
+        }
+
+        fn deserialize_option<V: Visitor<'de>>(
+            self,
+            visitor: V,
+        ) -> std::result::Result<V::Value, Self::Error> {
+            visitor.visit_some(self)
+        }
+
+        fn deserialize_newtype_struct<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            visitor: V,
+        ) -> std::result::Result<V::Value, Self::Error> {
+            visitor.visit_newtype_struct(self)
+        }
+
+        fn deserialize_struct<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            fields: &'static [&'static str],
+            visitor: V,
+        ) -> std::result::Result<V::Value, Self::Error> {
+            self.found.borrow_mut().insert(
+                self.path.clone(),
+                fields.iter().map(|f| f.to_string()).collect(),
+            );
+            visitor.visit_map(StructFields {
+                path: self.path,
+                fields: fields.iter(),
+                current: "",
+                found: self.found,
+            })
+        }
+
+        serde::forward_to_deserialize_any! {
+            i128 u128 char bytes byte_buf unit_struct tuple tuple_struct enum identifier ignored_any
+        }
+    }
+
+    struct StructFields<'a> {
+        path: String,
+        fields: std::slice::Iter<'static, &'static str>,
+        current: &'static str,
+        found: &'a RefCell<BTreeMap<String, BTreeSet<String>>>,
+    }
+
+    impl<'de> MapAccess<'de> for StructFields<'_> {
+        type Error = serde::de::value::Error;
+
+        fn next_key_seed<K: DeserializeSeed<'de>>(
+            &mut self,
+            seed: K,
+        ) -> std::result::Result<Option<K::Value>, Self::Error> {
+            let Some(field) = self.fields.next() else {
+                return Ok(None);
+            };
+            self.current = field;
+            seed.deserialize(serde::de::value::BorrowedStrDeserializer::new(field))
+                .map(Some)
+        }
+
+        fn next_value_seed<V: DeserializeSeed<'de>>(
+            &mut self,
+            seed: V,
+        ) -> std::result::Result<V::Value, Self::Error> {
+            seed.deserialize(FieldRecorder {
+                path: joined(&self.path, self.current),
+                found: self.found,
+            })
+        }
+    }
+
+    fn joined(path: &str, key: &str) -> String {
+        if path.is_empty() {
+            key.to_string()
+        } else {
+            format!("{path}.{key}")
+        }
+    }
+
+    /// Each object a `with:` schema describes, by the path its keys are read at: `""`
+    /// for the block, and the path of every property that is an object with
+    /// `properties` of its own.
+    fn schema_objects(schema: &Json) -> BTreeMap<String, &Json> {
+        fn walk<'s>(path: String, object: &'s Json, out: &mut BTreeMap<String, &'s Json>) {
+            for (key, prop) in properties(object) {
+                for nested in ["items", "additionalProperties"] {
+                    assert!(
+                        prop[nested].get("properties").is_none(),
+                        "`{}` describes an object inside its `{nested}`, which the \
+                         field recorder does not reach — extend it before relying on \
+                         this check there",
+                        joined(&path, key)
+                    );
+                }
+                if prop.get("properties").is_some() {
+                    walk(joined(&path, key), prop, out);
+                }
+            }
+            out.insert(path, object);
+        }
+        let mut out = BTreeMap::new();
+        walk(String::new(), schema, &mut out);
+        out
+    }
+
+    fn properties(object: &Json) -> Vec<(&String, &Json)> {
+        object["properties"]
+            .as_object()
+            .map(|p| p.iter().collect())
+            .unwrap_or_default()
+    }
+
+    fn required(object: &Json) -> BTreeSet<String> {
+        object["required"]
+            .as_array()
+            .map(|r| {
+                r.iter()
+                    .filter_map(|k| k.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A value `prop` admits, built from the schema alone: the last `enum` entry, a
+    /// number inside its bounds, two items for an array, every property for an object.
+    /// Each string carries `key`, so the script check can find in the argv where a
+    /// key's value went, and is an identifier, which the configurations that check a
+    /// name (`credential.type`, `table`) admit. A string with a `pattern` takes the
+    /// first candidate the pattern matches.
+    fn probe(key: &str, prop: &Json) -> Json {
+        if let Some(values) = prop["enum"].as_array() {
+            return values
+                .last()
+                .cloned()
+                .expect("an empty enum admits nothing");
+        }
+        match prop["type"].as_str() {
+            Some("string") => {
+                let candidates = [
+                    format!("probe_{key}"),
+                    "a".repeat(64),
+                    format!("probe_{key}==1.0"),
+                ];
+                let Some(pattern) = prop["pattern"].as_str() else {
+                    return json!(candidates[0]);
+                };
+                let pattern = regex::Regex::new(pattern).expect("a schema pattern compiles");
+                let hit = candidates.iter().find(|c| pattern.is_match(c));
+                json!(hit.unwrap_or_else(|| panic!(
+                    "no probe value for `{key}` matches its pattern {pattern} — add a candidate to probe()"
+                )))
+            }
+            Some("integer") => json!(prop["minimum"].as_i64().map_or(1, |m| m + 1)),
+            Some("number") => {
+                let low = prop["minimum"].as_f64().unwrap_or(0.0);
+                let high = prop["exclusiveMaximum"]
+                    .as_f64()
+                    .or(prop["maximum"].as_f64())
+                    .unwrap_or(low + 1.0);
+                json!((low + high) / 2.0)
+            }
+            Some("boolean") => json!(true),
+            Some("array") => json!([
+                probe(&format!("{key}_0"), &prop["items"]),
+                probe(&format!("{key}_1"), &prop["items"]),
+            ]),
+            Some("object") => match prop.get("properties") {
+                Some(_) => properties(prop)
+                    .into_iter()
+                    .map(|(k, p)| (k.clone(), probe(k, p)))
+                    .collect::<serde_json::Map<_, _>>()
+                    .into(),
+                None => json!({
+                    format!("probe_{key}"): probe(&format!("{key}_value"), &prop["additionalProperties"])
+                }),
+            },
+            other => panic!("`{key}` has schema type {other:?}, which probe() cannot build"),
+        }
+    }
+
+    /// `full` with the object at `path` replaced by `object`.
+    fn with_object_at(full: &Json, path: &str, object: Json) -> Json {
+        if path.is_empty() {
+            return object;
+        }
+        let mut out = full.clone();
+        let pointer = format!("/{}", path.replace('.', "/"));
+        *out.pointer_mut(&pointer)
+            .expect("the path is in the manifest") = object;
+        out
+    }
+
+    /// `full` with the key `key` of the object at `path` set to `value`.
+    fn with_key_at(full: &Json, path: &str, key: &str, value: Json) -> Json {
+        let mut object = if path.is_empty() {
+            full.clone()
+        } else {
+            full.pointer(&format!("/{}", path.replace('.', "/")))
+                .expect("the path is in the manifest")
+                .clone()
+        };
+        object[key] = value;
+        with_object_at(full, path, object)
+    }
+
+    /// Whether manifest load admits `with` for `op`: the typed deserialize, then
+    /// `validate()` where there is one, then the pattern compile, as `assets_for` runs
+    /// them.
+    fn admits(op: &str, with: &Json) -> std::result::Result<(), String> {
+        let with: Value = serde_yaml::to_value(with).expect("a JSON value converts to YAML");
+        assets_for(op, Some(&with))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    fn fail_on(faults: &[String], what: &str) {
+        assert!(faults.is_empty(), "{what}:\n  {}", faults.join("\n  "));
+    }
+
+    /// A key the schema names is one the configuration reads, and the reverse, at
+    /// every object the schema describes; and a schema closed with
+    /// `additionalProperties: false` is closed in the configuration too.
+    #[test]
+    fn every_operators_schema_names_the_keys_its_configuration_reads() {
+        let mut faults = Vec::new();
+        for op in catalog_names() {
+            let schema = with_schema(op).expect("every catalogue operator has a schema");
+            let objects = schema_objects(&schema);
+            let fields = configuration_fields_of(op);
+            let paths: BTreeSet<&String> = objects.keys().chain(fields.keys()).collect();
+            for path in paths {
+                let named: BTreeSet<String> = objects
+                    .get(path)
+                    .map(|o| properties(o).into_iter().map(|(k, _)| k.clone()).collect())
+                    .unwrap_or_default();
+                let read = fields.get(path).cloned().unwrap_or_default();
+                for key in named.difference(&read) {
+                    faults.push(format!(
+                        "{op}: the schema names `{}`, which the configuration refuses as an unknown key",
+                        joined(path, key)
+                    ));
+                }
+                for key in read.difference(&named) {
+                    faults.push(format!(
+                        "{op}: the configuration reads `{}`, which the schema does not name",
+                        joined(path, key)
+                    ));
+                }
+            }
+
+            let full = probe("", &schema);
+            if admits(op, &full).is_err() {
+                // Every probe would be refused whatever it held, so there is nothing to
+                // read closure from; the type test says why the manifest is refused.
+                continue;
+            }
+            for (path, object) in &objects {
+                let closed = object["additionalProperties"] == json!(false);
+                let stray = with_key_at(&full, path, "probe_unknown_key", json!("probe"));
+                let refused = admits(op, &stray).is_err();
+                if closed != refused {
+                    faults.push(format!(
+                        "{op}: the schema's object at `{path}` is {}, but the configuration {} a key it does not read",
+                        if closed { "closed" } else { "open" },
+                        if refused { "refuses" } else { "admits" },
+                    ));
+                }
+            }
+        }
+        fail_on(
+            &faults,
+            "a schema names a key its configuration does not read, or the reverse",
+        );
+    }
+
+    /// A key is in the schema's `required` exactly when every manifest the
+    /// configuration admits holds it. Read by building every subset of an object's
+    /// keys at their probe values and asking manifest load which it admits: removing
+    /// one key from a full manifest is not the same question, since `text_embed`
+    /// refuses `model` without `model_release`, and neither is the required keys
+    /// alone, since `archive_extract` wants `members` or `pattern`.
+    #[test]
+    fn every_operators_schema_requires_the_keys_every_admitted_manifest_holds() {
+        let mut faults = Vec::new();
+        for op in catalog_names() {
+            let schema = with_schema(op).expect("every catalogue operator has a schema");
+            let full = probe("", &schema);
+            for (path, object) in schema_objects(&schema) {
+                let keys = properties(object);
+                assert!(
+                    keys.len() < 16,
+                    "{op}: `{path}` has too many keys to enumerate"
+                );
+                let declared = required(object);
+                for key in &declared {
+                    if !keys.iter().any(|(k, _)| *k == key) {
+                        faults.push(format!(
+                            "{op}: the schema requires `{}`, which it does not describe",
+                            joined(&path, key)
+                        ));
+                    }
+                }
+                let subset = |mask: u32| -> Json {
+                    keys.iter()
+                        .enumerate()
+                        .filter(|(i, _)| mask & (1 << i) != 0)
+                        .map(|(_, (k, p))| ((*k).clone(), probe(k, p)))
+                        .collect::<serde_json::Map<_, _>>()
+                        .into()
+                };
+                let admitted: Vec<u32> = (0..1u32 << keys.len())
+                    .filter(|&mask| admits(op, &with_object_at(&full, &path, subset(mask))).is_ok())
+                    .collect();
+                if admitted.is_empty() {
+                    faults.push(format!(
+                        "{op}: no manifest built from the schema's keys at `{path}` is admitted, so \
+                         which keys are required cannot be read; the full manifest is refused: {}",
+                        admits(op, &full).err().unwrap_or_default()
+                    ));
+                    continue;
+                }
+                for (i, (key, _)) in keys.iter().enumerate() {
+                    let omitted_by = admitted.iter().find(|&&mask| mask & (1 << i) == 0);
+                    match (omitted_by, declared.contains(*key)) {
+                        (None, false) => faults.push(format!(
+                            "{op}: every manifest the configuration admits holds `{}`, but the \
+                             schema does not list it in `required`",
+                            joined(&path, key)
+                        )),
+                        (Some(&mask), true) => faults.push(format!(
+                            "{op}: the schema requires `{}`, but the configuration admits a manifest \
+                             without it: {}",
+                            joined(&path, key),
+                            subset(mask)
+                        )),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        fail_on(
+            &faults,
+            "a schema's `required` disagrees with what its configuration admits",
+        );
+    }
+
+    const JSON_TYPES: [&str; 6] = ["string", "integer", "number", "boolean", "array", "object"];
+
+    fn generic_value(json_type: &str) -> Json {
+        match json_type {
+            "string" => json!("probe"),
+            "integer" => json!(3),
+            "number" => json!(0.5),
+            "boolean" => json!(true),
+            "array" => json!(["probe"]),
+            _ => json!({ "probe": "probe" }),
+        }
+    }
+
+    /// Whether a schema typed `declared` admits a value of `json_type`: an integer is a
+    /// number too.
+    fn schema_admits(declared: &str, json_type: &str) -> bool {
+        declared == json_type || (declared == "number" && json_type == "integer")
+    }
+
+    /// A key's schema type is the type its configuration admits it as. A manifest of
+    /// every key at a value of its schema type is admitted; when it is not, the key at
+    /// fault is found by giving it a value of each other type in turn. And a value of a
+    /// type the schema does not admit is refused, inside a manifest that is otherwise
+    /// admitted. A `null` is not probed: YAML writes an unset optional value that way,
+    /// and serde reads it as unset.
+    #[test]
+    fn every_operators_schema_types_agree_with_what_its_configuration_admits() {
+        let mut faults = Vec::new();
+        for op in catalog_names() {
+            let schema = with_schema(op).expect("every catalogue operator has a schema");
+            let full = probe("", &schema);
+            let full_admitted = admits(op, &full);
+            if let Err(e) = &full_admitted {
+                faults.push(format!(
+                    "{op}: a manifest holding every key the schema names, each at a value of its \
+                     schema type, is refused: {e}"
+                ));
+            }
+            for (path, object) in schema_objects(&schema) {
+                for (key, prop) in properties(object) {
+                    let declared = prop["type"].as_str().unwrap_or_else(|| {
+                        panic!("{op}: `{}` has no schema type", joined(&path, key))
+                    });
+                    let at = |value: Json| with_key_at(&full, &path, key, value);
+                    if full_admitted.is_ok() {
+                        for json_type in JSON_TYPES.iter().filter(|t| !schema_admits(declared, t)) {
+                            if admits(op, &at(generic_value(json_type))).is_ok() {
+                                faults.push(format!(
+                                    "{op}: the schema types `{}` as {declared}, but the configuration \
+                                     also admits it as {json_type} ({})",
+                                    joined(&path, key),
+                                    generic_value(json_type)
+                                ));
+                            }
+                        }
+                    } else {
+                        let admitted_as: Vec<&str> = JSON_TYPES
+                            .into_iter()
+                            .filter(|t| admits(op, &at(generic_value(t))).is_ok())
+                            .collect();
+                        if !admitted_as.is_empty() {
+                            faults.push(format!(
+                                "{op}: the configuration refuses `{}` as the schema's {declared} ({}) \
+                                 and admits it as {}",
+                                joined(&path, key),
+                                probe(key, prop),
+                                admitted_as.join(" or ")
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        fail_on(
+            &faults,
+            "a schema's type for a key disagrees with what its configuration admits",
+        );
+    }
+
+    /// The operators that run a frozen Python script.
+    const SCRIPT_OPERATORS: [&str; 4] = [
+        "splink_resolve",
+        "gleif_ra_fetch",
+        "umap_project",
+        "text_embed",
+    ];
+
+    /// Options a frozen script declares that no `with:` key reaches, each with the
+    /// reason arc never passes it. Every run through arc takes the script's default for
+    /// these, so none is a value an analyst could set and not see.
+    const OPTIONS_ARC_NEVER_PASSES: &[(&str, &str, &str)] = &[(
+        "gleif_ra_fetch",
+        "--max-pages",
+        "a smoke-test lever only: production always does a full, guarded, unbounded \
+         pull, so every run through arc takes the script's default of no cap",
+    )];
+
+    /// The argv a frozen-script operator's `run` hands `uv` for `with`, built by the
+    /// function `run` calls, without spawning `uv`.
+    fn script_invocation(op: &str, with: &Value, dir: &Path) -> Result<Vec<String>> {
+        match op {
+            "splink_resolve" => splink_resolve_invocation(&SplinkResolveConfig::parse(with)?, dir),
+            "gleif_ra_fetch" => gleif_ra_fetch_invocation(&GleifRaFetchConfig::parse(with)?, dir),
+            "umap_project" => {
+                let cfg = UmapProjectConfig::parse(with)?;
+                cfg.validate()?;
+                umap_project_invocation(&cfg, dir)
+            }
+            "text_embed" => {
+                let cfg = TextEmbedConfig::parse(with)?;
+                cfg.validate()?;
+                // The extension and the model are declared inputs the invocation
+                // refuses to go without, so put them where the manifest says.
+                std::fs::write(dir.join(&cfg.extension), b"").unwrap();
+                if let Some(model) = &cfg.model {
+                    let model = dir.join(model);
+                    std::fs::create_dir_all(&model).unwrap();
+                    for part in MODEL_PARTS {
+                        std::fs::write(model.join(part), b"").unwrap();
+                    }
+                }
+                text_embed_invocation(&cfg, dir)
+            }
+            other => panic!("`{other}` is not a frozen-script operator"),
+        }
+    }
+
+    /// One `add_argument(...)` call in a Python source.
+    #[derive(Debug)]
+    struct ScriptOption {
+        flags: Vec<String>,
+        required: bool,
+        type_name: Option<String>,
+        action: Option<String>,
+    }
+
+    /// Every `add_argument(...)` call in a Python source, found past comments and
+    /// string literals, so a call that is only mentioned is not read as one.
+    fn script_options(source: &str) -> Vec<ScriptOption> {
+        let s = source.as_bytes();
+        let mut options = Vec::new();
+        let mut i = 0;
+        while i < s.len() {
+            match s[i] {
+                b'#' => i = skip_comment(s, i),
+                b'"' | b'\'' => i = skip_string(s, i),
+                c if c.is_ascii_alphabetic() || c == b'_' => {
+                    let start = i;
+                    while i < s.len() && (s[i].is_ascii_alphanumeric() || s[i] == b'_') {
+                        i += 1;
+                    }
+                    let mut open = i;
+                    while open < s.len() && s[open].is_ascii_whitespace() {
+                        open += 1;
+                    }
+                    if &source[start..i] == "add_argument" && s.get(open) == Some(&b'(') {
+                        let (arguments, end) = call_arguments(source, open);
+                        options.push(script_option(&arguments));
+                        i = end;
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+        options
+    }
+
+    fn skip_comment(s: &[u8], mut i: usize) -> usize {
+        while i < s.len() && s[i] != b'\n' {
+            i += 1;
+        }
+        i
+    }
+
+    /// The index just past the string literal whose opening quote is at `i`.
+    fn skip_string(s: &[u8], i: usize) -> usize {
+        let quote = s[i];
+        let triple = s.get(i..i + 3) == Some(&[quote; 3][..]);
+        let mut j = if triple { i + 3 } else { i + 1 };
+        while j < s.len() {
+            if s[j] == b'\\' {
+                j += 2;
+            } else if triple && s.get(j..j + 3) == Some(&[quote; 3][..]) {
+                return j + 3;
+            } else if !triple && s[j] == quote {
+                return j + 1;
+            } else {
+                j += 1;
+            }
+        }
+        s.len()
+    }
+
+    /// The top-level arguments of the call whose `(` is at `open`, and the index just
+    /// past its `)`.
+    fn call_arguments(source: &str, open: usize) -> (Vec<&str>, usize) {
+        let s = source.as_bytes();
+        let mut arguments = Vec::new();
+        let mut depth = 0;
+        let mut start = open + 1;
+        let mut i = open + 1;
+        while i < s.len() {
+            match s[i] {
+                b'#' => i = skip_comment(s, i),
+                b'"' | b'\'' => i = skip_string(s, i),
+                b'(' | b'[' | b'{' => {
+                    depth += 1;
+                    i += 1;
+                }
+                b')' if depth == 0 => {
+                    arguments.push(source[start..i].trim());
+                    arguments.retain(|a| !a.is_empty());
+                    return (arguments, i + 1);
+                }
+                b')' | b']' | b'}' => {
+                    depth -= 1;
+                    i += 1;
+                }
+                b',' if depth == 0 => {
+                    arguments.push(source[start..i].trim());
+                    start = i + 1;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        panic!("an add_argument call at byte {open} never closes")
+    }
+
+    fn script_option(arguments: &[&str]) -> ScriptOption {
+        let mut option = ScriptOption {
+            flags: Vec::new(),
+            required: false,
+            type_name: None,
+            action: None,
+        };
+        for argument in arguments {
+            let keyword = argument.find('=').filter(|&at| {
+                let name = argument[..at].trim();
+                !name.is_empty()
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && !argument[at + 1..].starts_with('=')
+            });
+            match keyword {
+                None => option
+                    .flags
+                    .push(string_literal(argument).unwrap_or_else(|| argument.to_string())),
+                Some(at) => {
+                    let value = argument[at + 1..].trim();
+                    match argument[..at].trim() {
+                        "required" => option.required = value == "True",
+                        "type" => option.type_name = Some(value.to_string()),
+                        "action" => option.action = string_literal(value),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        option
+    }
+
+    fn string_literal(text: &str) -> Option<String> {
+        let text = text
+            .trim()
+            .trim_start_matches(|c: char| "rRbBuUfF".contains(c));
+        ["\"\"\"", "'''", "\"", "'"].iter().find_map(|quote| {
+            text.strip_prefix(quote)
+                .and_then(|t| t.strip_suffix(quote))
+                .map(String::from)
+        })
+    }
+
+    /// The schema type an option's values arrive as, and its items' type for an
+    /// option that collects a list.
+    fn argparse_schema_type(
+        option: &ScriptOption,
+    ) -> std::result::Result<(&'static str, Option<&'static str>), String> {
+        let scalar = match option.type_name.as_deref() {
+            None | Some("str") => "string",
+            Some("int") => "integer",
+            Some("float") => "number",
+            Some(other) => return Err(format!("argparse type `{other}`")),
+        };
+        match option.action.as_deref() {
+            None | Some("store") => Ok((scalar, None)),
+            Some("append") | Some("extend") => Ok(("array", Some(scalar))),
+            Some("store_true") | Some("store_false") => Ok(("boolean", None)),
+            Some(other) => Err(format!("argparse action `{other}`")),
+        }
+    }
+
+    /// The strings a key's probe value reaches the argv as.
+    fn rendered(value: &Json) -> Vec<String> {
+        match value {
+            Json::String(s) => vec![s.clone()],
+            Json::Number(n) => vec![n.to_string()],
+            Json::Bool(b) => vec![b.to_string()],
+            Json::Array(items) => items.iter().flat_map(rendered).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether an argv value carries a probe: as given, or as a path under the
+    /// protocol directory.
+    fn carries(argument: &str, probe: &str) -> bool {
+        argument == probe || Path::new(argument).ends_with(probe)
+    }
+
+    /// `add_argument` calls are read past comments and strings: a call that is only
+    /// mentioned is not an option.
+    #[test]
+    fn script_options_reads_calls_not_mentions() {
+        let source = r#"
+"""Mentions ap.add_argument("--in-docstring") in prose."""
+# ap.add_argument("--commented-out")
+HELP = 'ap.add_argument("--in-a-string")'
+ap.add_argument("--real", required=True, type=int, help="a (parenthesised) note, with commas")
+ap.add_argument(
+    "--listed",
+    action="append",
+    help=("two " "parts"),
+)
+"#;
+        let options = script_options(source);
+        let flags: Vec<&str> = options.iter().map(|o| o.flags[0].as_str()).collect();
+        assert_eq!(flags, ["--real", "--listed"]);
+        assert!(options[0].required && options[0].type_name.as_deref() == Some("int"));
+        assert_eq!(options[1].action.as_deref(), Some("append"));
+    }
+
+    /// Each frozen script reads the options its operator's schema reaches, and no
+    /// other: every option the script declares is reached by a key, or is on
+    /// [`OPTIONS_ARC_NEVER_PASSES`]; every key reaches the script as an option in the
+    /// argv `run` builds; an option the script marks `required=True` comes from a key
+    /// the schema requires; and an option's argparse type is its key's schema type.
+    ///
+    /// The options are read from the script file the argv names, which is the one `uv`
+    /// runs. A key is matched to its option by where its probe value lands in that
+    /// argv, so a key renamed on its way to the script (`columns` reaches
+    /// `umap_project.py` as one `--column` per entry) needs no table here. A key is
+    /// found by the value it carries, so a flag that carries none would need this
+    /// check extended; no key reaches one.
+    #[test]
+    fn every_frozen_scripts_options_agree_with_its_operators_schema() {
+        let catalogue = catalog_names();
+        let mut faults = Vec::new();
+        for (op, flag, _) in OPTIONS_ARC_NEVER_PASSES {
+            if !SCRIPT_OPERATORS.contains(op) {
+                faults.push(format!("the list of options arc never passes names {op}'s {flag}, and {op} runs no frozen script"));
+            }
+        }
+        for op in SCRIPT_OPERATORS {
+            assert!(catalogue.contains(&op), "`{op}` is not in the catalogue");
+            let schema = with_schema(op).expect("every catalogue operator has a schema");
+            let schema_required = required(&schema);
+            let full = probe("", &schema);
+            let with: Value = serde_yaml::to_value(&full).expect("a JSON value converts to YAML");
+            let dir = tempfile::tempdir().unwrap();
+            let argv = match script_invocation(op, &with, dir.path()) {
+                Ok(argv) => argv,
+                Err(e) => {
+                    faults.push(format!(
+                        "{op}: a manifest of every schema key is refused: {e}"
+                    ));
+                    continue;
+                }
+            };
+            let [run, script_flag, script, tail @ ..] = argv.as_slice() else {
+                faults.push(format!(
+                    "{op}: the argv is too short to name a script: {argv:?}"
+                ));
+                continue;
+            };
+            if (run.as_str(), script_flag.as_str()) != ("run", "--script") {
+                faults.push(format!("{op}: the argv does not run a script: {argv:?}"));
+                continue;
+            }
+            let source = std::fs::read_to_string(script).unwrap_or_else(|e| {
+                panic!("{op}: reading the script the argv names, {script}: {e}")
+            });
+
+            // What the argv passes: each option, with every value that follows it.
+            let mut passed: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+            let mut current = None;
+            for argument in tail {
+                if argument.starts_with("--") {
+                    passed.entry(argument.as_str()).or_default();
+                    current = Some(argument.as_str());
+                } else if let Some(option) = current {
+                    passed.get_mut(option).unwrap().push(argument.as_str());
+                } else {
+                    faults.push(format!(
+                        "{op}: the argv passes {argument:?} ahead of any option"
+                    ));
+                }
+            }
+
+            // Which option each key's value reached.
+            let mut key_of: BTreeMap<&str, &str> = BTreeMap::new();
+            let mut seen = BTreeSet::new();
+            for (key, _) in properties(&schema) {
+                let values = rendered(&full[key]);
+                if values.is_empty() || !values.iter().all(|v| seen.insert(v.clone())) {
+                    faults.push(format!(
+                        "{op}: `{key}`'s probe value {} cannot be told apart in the argv",
+                        full[key]
+                    ));
+                    continue;
+                }
+                let reached = passed
+                    .iter()
+                    .find(|(_, given)| values.iter().all(|v| given.iter().any(|a| carries(a, v))));
+                match reached {
+                    Some((option, _)) => {
+                        key_of.insert(option, key);
+                    }
+                    None => faults.push(format!(
+                        "{op}: the schema's `{key}` reaches the script as no option — a manifest \
+                         setting it to {} builds the argv {tail:?}",
+                        full[key]
+                    )),
+                }
+            }
+
+            let never: BTreeSet<&str> = OPTIONS_ARC_NEVER_PASSES
+                .iter()
+                .filter(|(o, _, _)| *o == op)
+                .map(|(_, flag, _)| *flag)
+                .collect();
+            let declared = script_options(&source);
+            for option in &declared {
+                let name = option.flags.join("/");
+                let passed_as = option
+                    .flags
+                    .iter()
+                    .find(|f| passed.contains_key(f.as_str()));
+                let Some(flag) = passed_as else {
+                    if !option.flags.iter().any(|f| never.contains(f.as_str())) {
+                        faults.push(format!(
+                            "{op}: the script reads {name}, which no schema key reaches and which \
+                             is not on the list of options arc never passes"
+                        ));
+                    }
+                    continue;
+                };
+                if never.contains(flag.as_str()) {
+                    faults.push(format!(
+                        "{op}: {flag} is on the list of options arc never passes, but arc passes it"
+                    ));
+                }
+                let Some(&key) = key_of.get(flag.as_str()) else {
+                    continue;
+                };
+                if option.required && !schema_required.contains(key) {
+                    faults.push(format!(
+                        "{op}: the script marks {flag} required=True, but the schema does not require `{key}`"
+                    ));
+                }
+                let prop = &schema["properties"][key];
+                let schema_type = (prop["type"].as_str(), prop["items"]["type"].as_str());
+                match argparse_schema_type(option) {
+                    Ok((t, items)) if (Some(t), items) == schema_type => {}
+                    Ok((t, items)) => faults.push(format!(
+                        "{op}: the script reads {flag} as {t}{}, but the schema types `{key}` as {}{}",
+                        items.map(|i| format!(" of {i}")).unwrap_or_default(),
+                        schema_type.0.unwrap_or("nothing"),
+                        schema_type.1.map(|i| format!(" of {i}")).unwrap_or_default(),
+                    )),
+                    Err(what) => faults.push(format!(
+                        "{op}: the script reads {flag} with {what}, which this check cannot match to a schema type"
+                    )),
+                }
+            }
+            for flag in passed.keys() {
+                if !declared.iter().any(|o| o.flags.iter().any(|f| f == flag)) {
+                    faults.push(format!(
+                        "{op}: arc passes {flag}, which the script does not declare"
+                    ));
+                }
+            }
+            for flag in &never {
+                if !declared.iter().any(|o| o.flags.iter().any(|f| f == flag)) {
+                    faults.push(format!(
+                        "{op}: the list of options arc never passes names {flag}, which the script does not declare"
+                    ));
+                }
+            }
+        }
+        fail_on(
+            &faults,
+            "a frozen script and its operator's schema disagree",
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3250,25 +4204,30 @@ impl Operator for SplinkResolve {
 
     fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
         let cfg = SplinkResolveConfig::parse(with)?;
-        let edgar = ctx.dir.join(&cfg.edgar);
-        let gleif = ctx.dir.join(&cfg.gleif);
         let out = ctx.dir.join(&cfg.out);
         if let Some(parent) = out.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
 
-        let script = materialize_frozen_script("splink_resolve", "1.0.0", RESOLVE_PY)?;
-        let extra = splink_resolve_args(
-            &edgar.display().to_string(),
-            &gleif.display().to_string(),
-            &out.display().to_string(),
-            cfg.sample,
-        );
-        let args = uv_run_args(&script.to_string_lossy(), &extra);
+        let args = splink_resolve_invocation(&cfg, ctx.dir)?;
         // Inherit: stream resolve.py's coverage/hero-ticker tables live and honour the
         // step timeout (a 4 h job that overruns is killed, not left hanging).
         run_process("uv", &args, ctx, OutputMode::Inherit, "splink_resolve")
     }
+}
+
+/// The full argv `run` hands `uv`: materialise the frozen script and build its
+/// arguments. Split out of [`Operator::run`], as [`umap_project_invocation`] is, so a
+/// test reads the argv the script is really given without spawning `uv`.
+fn splink_resolve_invocation(cfg: &SplinkResolveConfig, dir: &Path) -> Result<Vec<String>> {
+    let script = materialize_frozen_script("splink_resolve", "1.0.0", RESOLVE_PY)?;
+    let extra = splink_resolve_args(
+        &dir.join(&cfg.edgar).display().to_string(),
+        &dir.join(&cfg.gleif).display().to_string(),
+        &dir.join(&cfg.out).display().to_string(),
+        cfg.sample,
+    );
+    Ok(uv_run_args(&script.to_string_lossy(), &extra))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3344,26 +4303,33 @@ impl Operator for GleifRaFetch {
             let _ = std::fs::create_dir_all(parent);
         }
 
-        let script = materialize_frozen_script("gleif_ra_fetch", "1.0.0", GLEIF_RA_FETCH_PY)?;
-        let mut extra = vec![
-            "--ra".to_string(),
-            cfg.ra.clone(),
-            "--out".to_string(),
-            out.display().to_string(),
-        ];
-        // `--max-pages` is intentionally NOT surfaced in config — it is a smoke-test
-        // lever only. Production always does a full, guarded, unbounded pull.
-        if let Some(ps) = cfg.page_size {
-            extra.push("--page-size".to_string());
-            extra.push(ps.to_string());
-        }
-        if let Some(ref ua) = cfg.user_agent {
-            extra.push("--user-agent".to_string());
-            extra.push(ua.clone());
-        }
-        let args = uv_run_args(&script.to_string_lossy(), &extra);
+        let args = gleif_ra_fetch_invocation(&cfg, ctx.dir)?;
         run_process("uv", &args, ctx, OutputMode::Capture, "gleif_ra_fetch")
     }
+}
+
+/// The full argv `run` hands `uv`: materialise the frozen script and build its
+/// arguments. Split out of [`Operator::run`], as [`umap_project_invocation`] is, so a
+/// test reads the argv the script is really given without spawning `uv`.
+fn gleif_ra_fetch_invocation(cfg: &GleifRaFetchConfig, dir: &Path) -> Result<Vec<String>> {
+    let script = materialize_frozen_script("gleif_ra_fetch", "1.0.0", GLEIF_RA_FETCH_PY)?;
+    let mut extra = vec![
+        "--ra".to_string(),
+        cfg.ra.clone(),
+        "--out".to_string(),
+        dir.join(&cfg.out).display().to_string(),
+    ];
+    // `--max-pages` is intentionally NOT surfaced in config — it is a smoke-test
+    // lever only. Production always does a full, guarded, unbounded pull.
+    if let Some(ps) = cfg.page_size {
+        extra.push("--page-size".to_string());
+        extra.push(ps.to_string());
+    }
+    if let Some(ref ua) = cfg.user_agent {
+        extra.push("--user-agent".to_string());
+        extra.push(ua.clone());
+    }
+    Ok(uv_run_args(&script.to_string_lossy(), &extra))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

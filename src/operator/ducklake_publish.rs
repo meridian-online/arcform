@@ -68,7 +68,7 @@ const LAKE: &str = "arc_publish_lake";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DucklakePublishConfig {
+pub(super) struct DucklakePublishConfig {
     /// The built Parquet to publish, relative to the manifest directory. Declared as
     /// a read, so the step runs after whatever produces it and re-runs when it is
     /// rebuilt.
