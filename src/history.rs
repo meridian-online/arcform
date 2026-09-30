@@ -1067,6 +1067,23 @@ mod tests {
     }
 
     #[test]
+    fn a_store_that_cannot_be_listed_is_not_reported_as_a_missing_entry() {
+        let (tmp, history) = store();
+        let dir = protocol(&tmp);
+        let (key_dir, _) = history.key_dir(&dir).unwrap();
+        std::fs::create_dir_all(key_dir.parent().unwrap()).unwrap();
+        // The spec's place in the store is a file, so its entries cannot be
+        // listed; a lookup by id says that, not that the id names nothing.
+        std::fs::write(&key_dir, "not a directory\n").unwrap();
+        for err in [
+            history.read(&dir, "1700000000000-000-save").unwrap_err(),
+            history.restore(&dir, "1700000000000-000-save").unwrap_err(),
+        ] {
+            assert!(matches!(err, Error::Io(_)), "{err}");
+        }
+    }
+
+    #[test]
     fn a_merged_save_keeps_the_way_of_the_state_that_replaced_it() {
         let (tmp, history) = store();
         let dir = protocol(&tmp);
