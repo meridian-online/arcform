@@ -2222,16 +2222,18 @@ ap.add_argument("--nowhere", default=NOWHERE)
                 let (taken, from) = match (left_out.passed.get(option), script_option) {
                     (Some(values), _) => (
                         argv_value(script_option, values),
-                        format!("arc passes {option} {values:?}"),
+                        format!("arc passing {option} {values:?}"),
                     ),
                     (None, Some(script_option)) => {
                         match script_default(script_option, &left_out.source) {
                             Ok(taken) => (
                                 taken,
-                                format!(
-                                    "the script's {option} default={}",
-                                    script_option.default.as_deref().unwrap_or("unset")
-                                ),
+                                match &script_option.default {
+                                    Some(text) => format!("the script's {option} default={text}"),
+                                    None => {
+                                        format!("the script's {option}, which gives no default=")
+                                    }
+                                },
                             ),
                             Err(e) => {
                                 faults.push(format!(
