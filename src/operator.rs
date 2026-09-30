@@ -1259,6 +1259,261 @@ mod with_schema_tests {
         );
     }
 
+    // ── Each description holds to its schema and to what its step records ─────────
+    //
+    // An operator's description names the `with:` keys its step reads and writes
+    // through, and takes them out of its `with:` schema to leave `parameters`. The
+    // roles are written by hand beside `with_schema`, so these tests read them against
+    // the two things that know: the schema, and `assets()` run on manifests the
+    // configuration admits.
+
+    /// The word a description uses for an asset of `kind`.
+    fn kind_word(kind: crate::asset_kind::AssetKind) -> &'static str {
+        use crate::asset_kind::AssetKind;
+        match kind {
+            AssetKind::File => "file",
+            AssetKind::Directory => "directory",
+            AssetKind::Pattern => "pattern",
+            AssetKind::Table => "table",
+        }
+    }
+
+    /// The names of the roles in `description[direction]`, with each role's kind.
+    fn roles_of<'d>(description: &'d Json, direction: &str) -> Vec<(&'d str, &'d str)> {
+        description[direction]
+            .as_array()
+            .unwrap_or_else(|| panic!("`{direction}` is not a list: {description}"))
+            .iter()
+            .map(|r| {
+                (
+                    r["name"].as_str().expect("a role has a name"),
+                    r["kind"].as_str().expect("a role has a kind"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_catalog_operator_is_described_and_every_description_names_one() {
+        for op in catalog_names() {
+            assert!(
+                description(op).is_some(),
+                "operator `{op}` is in the catalogue but has no description — add it to DESCRIBED"
+            );
+        }
+        for described in DESCRIBED {
+            assert!(
+                with_schema(described.name).is_some(),
+                "DESCRIBED holds `{}`, which is no operator",
+                described.name
+            );
+        }
+        assert!(
+            description("does_not_exist").is_none(),
+            "a name no operator has is described"
+        );
+    }
+
+    /// `parameters` is the `with:` schema with the role keys taken out of
+    /// `properties` and `required`, and nothing else changed; each role is a key the
+    /// schema describes, and its `list`, `required` and `min_items` are what the
+    /// schema says of that key.
+    #[test]
+    fn every_operators_parameters_are_its_with_schema_less_its_roles() {
+        let mut faults = Vec::new();
+        for op in catalog_names() {
+            let schema = with_schema(op).expect("every catalogue operator has a schema");
+            let described = description(op).expect("every catalogue operator is described");
+            let parameters = &described["parameters"];
+            let roles: BTreeSet<&str> = roles_of(&described, "reads")
+                .into_iter()
+                .chain(roles_of(&described, "writes"))
+                .map(|(name, _)| name)
+                .collect();
+
+            let declared = required(&schema);
+            for direction in ["reads", "writes"] {
+                for role in described[direction].as_array().expect("a list") {
+                    let name = role["name"].as_str().expect("a name");
+                    let Some(entry) = schema["properties"].get(name) else {
+                        faults.push(format!(
+                            "{op}: {direction} `{name}`, which its `with:` schema does not describe"
+                        ));
+                        continue;
+                    };
+                    let list = entry["type"] == "array";
+                    let expected = (
+                        list,
+                        declared.contains(name),
+                        list.then(|| entry["minItems"].as_u64().unwrap_or(0)),
+                    );
+                    let stated = (
+                        role["list"].as_bool().unwrap_or(!list),
+                        role["required"].as_bool().unwrap_or(!expected.1),
+                        role["min_items"].as_u64(),
+                    );
+                    if stated != expected {
+                        faults.push(format!(
+                            "{op}: {direction} `{name}` states (list, required, min_items) \
+                             {stated:?}, and its `with:` schema says {expected:?}"
+                        ));
+                    }
+                }
+            }
+
+            let mut rebuilt = schema.clone();
+            rebuilt["properties"]
+                .as_object_mut()
+                .expect("a schema has properties")
+                .retain(|key, _| !roles.contains(key.as_str()));
+            rebuilt["required"]
+                .as_array_mut()
+                .expect("a schema has required")
+                .retain(|key| !roles.contains(key.as_str().unwrap_or_default()));
+            if *parameters != rebuilt {
+                faults.push(format!(
+                    "{op}: `parameters` is not its `with:` schema less the roles {roles:?}:\n  \
+                     parameters: {parameters}\n  expected:   {rebuilt}"
+                ));
+            }
+        }
+        fail_on(
+            &faults,
+            "an operator's `parameters` or roles disagree with its `with:` schema",
+        );
+    }
+
+    #[test]
+    fn umap_projects_parameters_keep_neighbors_whole_and_its_bound_names_a_read() {
+        let described = description("umap_project").expect("umap_project is described");
+        let properties = described["parameters"]["properties"]
+            .as_object()
+            .expect("`parameters` has properties");
+        for role in ["input", "columns", "out", "fit"] {
+            assert!(
+                !properties.contains_key(role),
+                "`{role}` is a role and stays in `parameters`: {properties:?}"
+            );
+        }
+        let schema = with_schema("umap_project").expect("umap_project has a schema");
+        assert_eq!(
+            properties["neighbors"], schema["properties"]["neighbors"],
+            "`neighbors` must reach `parameters` whole, its `default` and `x-at-most` with it"
+        );
+        let rows_of = properties["neighbors"]["x-at-most"]["rows_of"]
+            .as_str()
+            .expect("`x-at-most` names the key whose rows bound it");
+        assert!(
+            roles_of(&described, "reads").contains(&(rows_of, "file")),
+            "`x-at-most` counts the rows of `{rows_of}`, which is no file the step reads"
+        );
+
+        let described = description("splink_resolve").expect("splink_resolve is described");
+        for role in ["edgar", "gleif", "out"] {
+            assert!(
+                described["parameters"]["properties"].get(role).is_none()
+                    && !described["parameters"]["required"]
+                        .as_array()
+                        .expect("`required` is a list")
+                        .contains(&json!(role)),
+                "`{role}` is a role and stays in splink_resolve's `parameters`: {described}"
+            );
+        }
+    }
+
+    /// Every name `assets()` records comes from a key the description lists in the
+    /// same direction, with the kind the role states or any kind for `any`; and every
+    /// role other than a column is one `assets()` records from when it is set. Read on
+    /// every manifest built from the schema's keys at their probe values that manifest
+    /// load admits, so each optional role is read set and unset, and `archive_extract`
+    /// with `members` and with `pattern`. A file recorded under the directory a
+    /// `directory` role names counts as that role: `archive_extract`'s `dest` with
+    /// `members` set.
+    #[test]
+    fn every_operators_roles_are_the_keys_its_assets_record_from() {
+        let mut faults = Vec::new();
+        for op in catalog_names() {
+            let schema = with_schema(op).expect("every catalogue operator has a schema");
+            let described = description(op).expect("every catalogue operator is described");
+            let keys = properties(&schema);
+            let role_keys: BTreeSet<&str> = roles_of(&described, "reads")
+                .into_iter()
+                .chain(roles_of(&described, "writes"))
+                .map(|(name, _)| name)
+                .collect();
+            let manifest = |mask: u32| -> Json {
+                keys.iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask & (1 << i) != 0)
+                    .map(|(_, (k, p))| ((*k).clone(), probe(k, p)))
+                    .collect::<serde_json::Map<_, _>>()
+                    .into()
+            };
+            let mut every_role_set = false;
+            for mask in 0..1u32 << keys.len() {
+                let with = manifest(mask);
+                let yaml: Value = serde_yaml::to_value(&with).expect("JSON converts to YAML");
+                let Ok(assets) = resolve(op).expect("in the catalogue").assets(&yaml) else {
+                    continue;
+                };
+                every_role_set |= role_keys.iter().all(|k| with.get(*k).is_some());
+                for (direction, recorded) in
+                    [("reads", &assets.reads), ("writes", &assets.produces)]
+                {
+                    let roles = roles_of(&described, direction);
+                    let from = |name: &str, role: &str, role_kind: &str| -> bool {
+                        let kind = kind_word(assets.kinds[name]);
+                        let kind_holds = role_kind == "any" || role_kind == kind;
+                        match &with[role] {
+                            Json::String(value) => {
+                                (name == value && kind_holds)
+                                    || (role_kind == "directory"
+                                        && kind == "file"
+                                        && name.starts_with(&format!(
+                                            "{}/",
+                                            value.trim_end_matches('/')
+                                        )))
+                            }
+                            Json::Array(values) => kind_holds && values.iter().any(|v| v == name),
+                            _ => false,
+                        }
+                    };
+                    for name in recorded {
+                        if !roles.iter().any(|(role, kind)| from(name, role, kind)) {
+                            faults.push(format!(
+                                "{op}: `assets()` records `{name}` ({}) as {direction}, from no \
+                                 key the description lists in `{direction}` with that kind; \
+                                 manifest {with}",
+                                kind_word(assets.kinds[name])
+                            ));
+                        }
+                    }
+                    for (role, kind) in &roles {
+                        if *kind == "column" || with.get(*role).is_none() {
+                            continue;
+                        }
+                        if !recorded.iter().any(|name| from(name, role, kind)) {
+                            faults.push(format!(
+                                "{op}: `{role}` is listed in `{direction}`, and `assets()` \
+                                 records nothing from it as {direction}; manifest {with}"
+                            ));
+                        }
+                    }
+                }
+            }
+            if !every_role_set {
+                faults.push(format!(
+                    "{op}: no manifest the configuration admits sets every role {role_keys:?}, \
+                     so an optional role was never read against `assets()`"
+                ));
+            }
+        }
+        fail_on(
+            &faults,
+            "an operator's roles disagree with what its `assets()` records",
+        );
+    }
+
     const JSON_TYPES: [&str; 6] = ["string", "integer", "number", "boolean", "array", "object"];
 
     fn generic_value(json_type: &str) -> Json {
