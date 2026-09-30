@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 
 /// Every type, constant and function `arc::spec` re-exports, and the module that
 /// owns it. An `impl` on any of these names may only appear in its owning file.
-const EXPORTED: [(&str, &str); 33] = [
+const EXPORTED: [(&str, &str); 34] = [
     ("Manifest", "manifest.rs"),
     ("Step", "manifest.rs"),
     ("Param", "manifest.rs"),
@@ -82,6 +82,9 @@ const EXPORTED: [(&str, &str); 33] = [
     ("LocalHistory", "history.rs"),
     ("HistoryEntry", "history.rs"),
     ("HistoryKind", "history.rs"),
+    // The way arc was reached when an entry was written: arc's two words are
+    // values of this type, and a library caller names its own as one.
+    ("HistoryWay", "history.rs"),
     ("HISTORY_MAX_ENTRIES", "history.rs"),
     ("HISTORY_MERGE_WINDOW", "history.rs"),
     ("edit_spec_with_history", "history.rs"),
@@ -147,7 +150,7 @@ const MODULE_FILES: [&str; 32] = [
 /// `src/spec.rs`: editing an existing spec goes through the write path, which splices
 /// original bytes and never re-serialises. This freeze keeps any change to that
 /// arrangement a deliberate, version-visible act instead of a silent drift.
-const FROZEN_DERIVES: [(&str, &str, &[&str]); 19] = [
+const FROZEN_DERIVES: [(&str, &str, &[&str]); 20] = [
     (
         "manifest.rs",
         "Param",
@@ -235,6 +238,13 @@ const FROZEN_DERIVES: [(&str, &str, &[&str]); 19] = [
         "history.rs",
         "HistoryKind",
         &["Debug", "Clone", "Copy", "PartialEq", "Eq"],
+    ),
+    // A way is a value a caller passes and compares, like the kind; not
+    // `Copy`, because a caller's own word is owned text.
+    (
+        "history.rs",
+        "HistoryWay",
+        &["Debug", "Clone", "PartialEq", "Eq"],
     ),
     (
         "history.rs",
@@ -1008,8 +1018,16 @@ fn exported_modules_declare_only_contracted_items() {
             "LocalHistory",
             "HistoryEntry",
             "HistoryKind",
+            "HistoryWay",
             "HISTORY_MAX_ENTRIES",
             "HISTORY_MERGE_WINDOW",
+            // The way: arc's two words, the one constructor a caller's own
+            // word passes through — which refuses what cannot be stored, and
+            // arc's own words spelt by a caller — and the word to print.
+            "TERMINAL",
+            "MCP",
+            "new",
+            "as_str",
             // Re-exported entry points: the store handle's surface and the
             // checkpointed roads. The internals — the key hash, the entry
             // naming, the debounce mechanics — are private: the contract is
@@ -1024,6 +1042,10 @@ fn exported_modules_declare_only_contracted_items() {
             // added on a whim would fail here.
             "open_default",
             "at_root",
+            // The way travels on the handle, set once where a process opens
+            // the store, so every recording call keeps its signature and a
+            // checkpoint and the save after it cannot name different ways.
+            "reached_by",
             "root",
             "record_save",
             "record_checkpoint",

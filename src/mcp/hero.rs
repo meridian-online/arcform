@@ -258,13 +258,23 @@ fn operation_record(args: &Value) -> ToolResult {
             ));
         }
     };
-    let history = crate::history::LocalHistory::open_default().map_err(|e| e.to_string())?;
+    let history = open_history()?;
     let model = crate::record::record_operation(&dir, operation, on, name, &arguments, &history)
         .map_err(|e| e.to_string())?;
     Ok(ToolOutput::json(json!({
         "step": name,
         "model": model.display().to_string(),
     })))
+}
+
+/// The local-history store as a tool of `arc mcp` opens it: the conventional
+/// root, reached by [`HistoryWay::MCP`](crate::history::HistoryWay::MCP). A tool
+/// that writes a version opens the store here, so every version `arc mcp`
+/// writes names `mcp` and none can name another.
+fn open_history() -> Result<crate::history::LocalHistory, String> {
+    crate::history::LocalHistory::open_default()
+        .map(|history| history.reached_by(crate::history::HistoryWay::MCP))
+        .map_err(|e| e.to_string())
 }
 
 /// The string `key` of a tool's arguments, refused by name when absent or not a string.

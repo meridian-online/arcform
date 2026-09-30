@@ -8,7 +8,10 @@
 //!      in the Protocol's directory changes, so nothing ran;
 //!   2. **run** — `arc run` then runs the step, and its table holds the rows the
 //!      condition keeps and no other;
-//!   3. **mcp** — the same request sent to `arc mcp` writes the same bytes;
+//!   3. **mcp** — the same request sent to `arc mcp` writes the same bytes,
+//!      and the two versions it records name `mcp` where the terminal's name
+//!      `terminal`; the way is in the history alone, and no file of the
+//!      Protocol names it;
 //!   4. **refuse** — no `where`, an argument the operation does not take, an
 //!      operation arc does not hold, a condition holding a `;` outside a string or
 //!      a comment, and a table no step makes are each refused with the directory
@@ -138,6 +141,26 @@ impl Protocol {
         std::fs::read_to_string(self.dir.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
     }
 
+    /// The versions `arc history list` prints for this Protocol: each line's
+    /// id, kind and the words after its size, which are the way.
+    fn versions(&self) -> Vec<(String, String, String)> {
+        let out = self.arc(&["history", "list"]);
+        ok(&out, "arc history list");
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let (head, way) = line.split_once(" bytes  ")?;
+                let mut words = head.split_whitespace();
+                Some((
+                    words.next()?.to_string(),
+                    words.next()?.to_string(),
+                    way.to_string(),
+                ))
+            })
+            .collect()
+    }
+
     /// Every file under the Protocol's directory, by path relative to it, with
     /// its bytes.
     fn files(&self) -> BTreeMap<PathBuf, Vec<u8>> {
@@ -230,6 +253,8 @@ fn record_writes_one_generated_model_and_appends_one_step() {
     assert_eq!(after, untouched, "recording changed a file it did not own");
 }
 
+// One recording in a Protocol whose history is empty lists two versions: the
+// state it replaced and the state it wrote, each naming the terminal.
 #[test]
 fn each_recording_is_a_version_of_the_protocol() {
     let protocol = Protocol::new();
@@ -238,12 +263,20 @@ fn each_recording_is_a_version_of_the_protocol() {
         "arc operation record",
     );
 
-    let out = protocol.arc(&["history", "list"]);
-    ok(&out, "arc history list");
-    let listed = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        listed.contains("-checkpoint ") && listed.contains("-save "),
-        "the state the recording replaced and the state it wrote are listed:\n{listed}"
+    let versions = protocol.versions();
+    let seen: Vec<(&str, &str)> = versions
+        .iter()
+        .map(|(_, kind, way)| (kind.as_str(), way.as_str()))
+        .collect();
+    assert_eq!(
+        seen,
+        [("checkpoint", "terminal"), ("save", "terminal")],
+        "the state the recording replaced and the state it wrote: {versions:?}"
+    );
+    assert_eq!(
+        protocol.arc(&["history", "show", &versions[0].0]).stdout,
+        MANIFEST.as_bytes(),
+        "the checkpoint is the Protocol as it was"
     );
 }
 
@@ -711,12 +744,58 @@ mod mcp {
             "models/02_big_orders.sql"
         );
 
+        // No file under either Protocol's directory names a way, in its name
+        // or in its bytes: the way is kept in the history alone.
+        for (protocol, name) in [(&terminal, "terminal"), (&agent, "agent")] {
+            for (path, bytes) in protocol.files() {
+                let text = String::from_utf8_lossy(&bytes);
+                for way in ["terminal", "mcp"] {
+                    assert!(
+                        !path.to_string_lossy().contains(way) && !text.contains(way),
+                        "{name}'s {} names the way `{way}`:\n{text}",
+                        path.display()
+                    );
+                }
+            }
+        }
+
         assert_eq!(
             agent.files(),
             terminal.files(),
             "the Protocol the agent recorded into differs from the one the terminal did"
         );
         assert_eq!(agent.read("models/02_big_orders.sql"), BIG_ORDERS_MODEL);
+
+        // The way differs in the history alone: the same versions, the same
+        // bytes in each, and a different way beside them.
+        let (by_terminal, by_agent) = (terminal.versions(), agent.versions());
+        let kinds_and_ways = |versions: &[(String, String, String)]| -> Vec<(String, String)> {
+            versions
+                .iter()
+                .map(|(_, kind, way)| (kind.clone(), way.clone()))
+                .collect()
+        };
+        assert_eq!(
+            kinds_and_ways(&by_terminal),
+            [
+                ("checkpoint".to_string(), "terminal".to_string()),
+                ("save".to_string(), "terminal".to_string())
+            ]
+        );
+        assert_eq!(
+            kinds_and_ways(&by_agent),
+            [
+                ("checkpoint".to_string(), "mcp".to_string()),
+                ("save".to_string(), "mcp".to_string())
+            ]
+        );
+        for ((terminal_id, ..), (agent_id, ..)) in by_terminal.iter().zip(&by_agent) {
+            assert_eq!(
+                agent.arc(&["history", "show", agent_id]).stdout,
+                terminal.arc(&["history", "show", terminal_id]).stdout,
+                "the version {agent_id} holds other bytes than {terminal_id}"
+            );
+        }
     }
 
     #[test]

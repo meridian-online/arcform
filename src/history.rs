@@ -47,9 +47,11 @@
 //! Inside the root, each file gets a directory keyed by a hash of its
 //! canonical path, holding a `spec-path` file (the path in the clear, for a
 //! human inspecting the store) and one snapshot file per entry, named
-//! `<millis>-<seq>-<kind>.yaml`. Entries are whole snapshots, not deltas: a
-//! spec is small, and a restore that needs no reconstruction is a restore
-//! that cannot compound errors.
+//! `<millis>-<seq>-<kind>.<way>.yaml` — or `<millis>-<seq>-<kind>.yaml` for an
+//! entry that names no way, which is every entry an arc before ways wrote.
+//! The entry's id is the name up to its first `.` either way. Entries are
+//! whole snapshots, not deltas: a spec is small, and a restore that needs no
+//! reconstruction is a restore that cannot compound errors.
 //!
 //! **The snapshot is the spec file, and only the spec file.** A protocol's
 //! generated SQL under `models/` is not snapshotted here, and that is a
@@ -59,6 +61,24 @@
 //! [`amend_step_sql`](crate::record::amend_step_sql)), so the manifest — the
 //! authored artifact — is what the net keeps. Versioning the whole working
 //! tree is the third tier's job, not this one's.
+//!
+//! # The way arc was reached
+//!
+//! Every entry records, beside its kind and its time, the way arc was reached
+//! when it was written — a [`HistoryWay`]: [`HistoryWay::TERMINAL`] for a
+//! version the `arc` command line writes, [`HistoryWay::MCP`] for one a tool
+//! of `arc mcp` writes, or a word a library caller names for itself with
+//! [`HistoryWay::new`]. The way is the store handle's, set once where a
+//! process opens the store ([`LocalHistory::reached_by`]), so a checkpoint
+//! and the save after it, and the checkpoint a restore takes, carry the way
+//! of the call that wrote them. An entry written by a handle that names no
+//! way — and every entry an arc before ways wrote — has none, and says so.
+//!
+//! The way is kept in the store and nowhere else: the protocol directory
+//! holds the same bytes whichever way wrote them, because a way written into
+//! a step's file would be a changed step that runs again. It is kept in the
+//! entry's file name, so the snapshot and its way land in one atomic write
+//! and no reader sees one without the other.
 //!
 //! # A file's own history
 //!
@@ -93,6 +113,7 @@
 //! The same policy is printed by `arc history list`, so it lives where a
 //! user managing entries will actually meet it.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -117,6 +138,10 @@ const HISTORY_DIR_ENV: &str = "ARCFORM_HISTORY_DIR";
 
 /// The file inside each per-spec directory naming the spec it snapshots.
 const SPEC_PATH_FILE: &str = "spec-path";
+
+/// The longest word a way may be. A way is a word, not a path or a sentence,
+/// and it is part of every entry's file name.
+const WAY_MAX_LEN: usize = 32;
 
 // ------------------------------------------------------------------ the values
 
@@ -149,15 +174,97 @@ impl HistoryKind {
     }
 }
 
+/// The way arc was reached when an entry was written: [`TERMINAL`] for the
+/// `arc` command line, [`MCP`] for `arc mcp`, or a caller's own word named
+/// with [`new`] — `app`, say. A store handle carries one
+/// ([`LocalHistory::reached_by`]) and every entry it records carries it too.
+///
+/// A way is one word of ASCII letters, digits, `-` and `_`, at most 32 of
+/// them; anything else cannot be constructed, so it cannot reach the store.
+/// Plain data, like the other history values.
+///
+/// [`TERMINAL`]: HistoryWay::TERMINAL
+/// [`MCP`]: HistoryWay::MCP
+/// [`new`]: HistoryWay::new
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryWay(Cow<'static, str>);
+
+impl HistoryWay {
+    /// The `arc` command line: every version a verb of `arc` writes.
+    pub const TERMINAL: HistoryWay = HistoryWay(Cow::Borrowed("terminal"));
+
+    /// `arc mcp`: every version one of its tools writes.
+    pub const MCP: HistoryWay = HistoryWay(Cow::Borrowed("mcp"));
+
+    /// A caller's own way, named by `word`. Refused with
+    /// [`Error::HistoryWay`] when `word` is empty, longer than 32 characters,
+    /// or holds a character other than an ASCII letter, a digit, `-` or `_`;
+    /// and when it spells one of arc's own ways in any case, so an entry a
+    /// caller records cannot read as arc's own unless the caller passes
+    /// [`TERMINAL`](Self::TERMINAL) or [`MCP`](Self::MCP) to mean it.
+    pub fn new(word: &str) -> Result<Self> {
+        let refuse = |detail: String| Error::HistoryWay {
+            way: word.to_string(),
+            detail,
+        };
+        if let Some(fault) = word_fault(word) {
+            return Err(refuse(fault));
+        }
+        for (own, name) in [(Self::TERMINAL, "TERMINAL"), (Self::MCP, "MCP")] {
+            if own.as_str().eq_ignore_ascii_case(word) {
+                return Err(refuse(format!(
+                    "`{}` is arc's own way; pass `HistoryWay::{name}` to mean it",
+                    own.as_str()
+                )));
+            }
+        }
+        Ok(HistoryWay(Cow::Owned(word.to_string())))
+    }
+
+    /// The way as the word `arc history list` prints.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// A way read back from an entry's file name: any word a way may be, arc's
+    /// own included.
+    fn stored(word: &str) -> Option<Self> {
+        word_fault(word)
+            .is_none()
+            .then(|| HistoryWay(Cow::Owned(word.to_string())))
+    }
+}
+
+/// Why `word` cannot be a way, or `None` when it can.
+fn word_fault(word: &str) -> Option<String> {
+    if word.is_empty() {
+        return Some("a way is one word, and this is empty".to_string());
+    }
+    if let Some(c) = word
+        .chars()
+        .find(|c| !c.is_ascii_alphanumeric() && *c != '-' && *c != '_')
+    {
+        return Some(format!("{c:?} is not an ASCII letter, a digit, `-` or `_`"));
+    }
+    if word.len() > WAY_MAX_LEN {
+        return Some(format!("a way is at most {WAY_MAX_LEN} characters"));
+    }
+    None
+}
+
 /// One recorded state of a spec. Plain data: the id addresses the entry in
-/// [`LocalHistory::read`] and [`LocalHistory::restore`], and doubles as the
-/// snapshot's file stem for anyone inspecting the store directly.
+/// [`LocalHistory::read`] and [`LocalHistory::restore`], and begins the
+/// snapshot's file name for anyone inspecting the store directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryEntry {
     /// `<millis>-<seq>-<kind>` — sortable, and stable once recorded.
     pub id: String,
     /// Save entry or machine-edit checkpoint.
     pub kind: HistoryKind,
+    /// The way arc was reached when the entry was written, or `None` for an
+    /// entry written by a handle that named none — which is every entry an
+    /// arc before ways wrote.
+    pub way: Option<HistoryWay>,
     /// When the entry was recorded.
     pub at: SystemTime,
     /// The snapshot's size in bytes.
@@ -171,6 +278,7 @@ pub struct HistoryEntry {
 #[derive(Debug, Clone)]
 pub struct LocalHistory {
     root: PathBuf,
+    way: Option<HistoryWay>,
 }
 
 impl LocalHistory {
@@ -182,9 +290,24 @@ impl LocalHistory {
         resolve_root(std::env::var_os(HISTORY_DIR_ENV), dirs::home_dir()).map(Self::at_root)
     }
 
-    /// The store rooted at `root`, created lazily on first record.
+    /// The store rooted at `root`, created lazily on first record. The handle
+    /// names no way until [`reached_by`](Self::reached_by) gives it one.
     pub fn at_root(root: impl Into<PathBuf>) -> Self {
-        LocalHistory { root: root.into() }
+        LocalHistory {
+            root: root.into(),
+            way: None,
+        }
+    }
+
+    /// This store, recording every entry it writes from here on as reached by
+    /// `way` — a save, a checkpoint, the checkpoint a restore takes, and both
+    /// entries of a checkpointed road. Set once where a process opens the
+    /// store: the way is how arc was reached, not what the call does.
+    pub fn reached_by(self, way: HistoryWay) -> Self {
+        LocalHistory {
+            way: Some(way),
+            ..self
+        }
     }
 
     /// Where this store keeps its entries.
@@ -365,9 +488,9 @@ impl LocalHistory {
         let newest = existing.last();
 
         // The newest entry already records exactly this state: nothing new
-        // to keep, whatever the kind.
+        // to keep, whatever the kind and whatever the way.
         if let Some(newest) = newest
-            && read_entry(&key_dir, &newest.id)? == text
+            && read_at(&key_dir, newest)? == text
         {
             return Ok(None);
         }
@@ -385,29 +508,31 @@ impl LocalHistory {
                         .duration_since(n.at)
                         .is_ok_and(|gap| gap <= HISTORY_MERGE_WINDOW)
             })
-            .map(|n| n.id.clone());
+            .cloned();
 
         let now_millis = now
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
         let (millis, seq) = next_stamp(newest, now_millis);
-        let id = entry_id(millis, seq, kind);
+        let entry = HistoryEntry {
+            id: entry_id(millis, seq, kind),
+            kind,
+            way: self.way.clone(),
+            at: UNIX_EPOCH + Duration::from_millis(millis),
+            bytes: text.len() as u64,
+        };
 
         // Write the new entry before removing anything, so no moment holds
-        // fewer recorded states than before.
-        write_atomic(&entry_path(&key_dir, &id), text.as_bytes())?;
+        // fewer recorded states than before. A merged save keeps the way of
+        // the state that replaced the one it merged into.
+        write_atomic(&entry_path(&key_dir, &entry), text.as_bytes())?;
         if let Some(old) = merge_into {
             let _ = std::fs::remove_file(entry_path(&key_dir, &old));
         }
         prune(&key_dir)?;
 
-        Ok(Some(HistoryEntry {
-            id,
-            kind,
-            at: UNIX_EPOCH + Duration::from_millis(millis),
-            bytes: text.len() as u64,
-        }))
+        Ok(Some(entry))
     }
 
     /// The key of the spec in `dir`: its `arcform.yaml` under the canonical
@@ -469,7 +594,7 @@ impl LocalHistory {
 /// The whole spec write path with the middle history tier engaged: apply
 /// `edits` to `<dir>/arcform.yaml`, gate the result through the loader,
 /// checkpoint the bytes being replaced, write atomically, and record the
-/// after-image as a save entry.
+/// after-image as a save entry. Both entries carry `history`'s way.
 ///
 /// The order is the contract. A refusal — an edit that does not apply, or a
 /// result that will not load — happens **before** anything is written *or
@@ -512,7 +637,7 @@ pub fn edit_spec_with_history(
 /// engaged: the manifest as it stands is checkpointed **before** the
 /// promotion writes anything — no checkpoint, no write — and the promoted
 /// manifest is recorded as a save entry afterwards (best-effort, exactly as
-/// in [`edit_spec_with_history`]).
+/// in [`edit_spec_with_history`]). Both entries carry `history`'s way.
 ///
 /// A promotion the record path refuses leaves the protocol untouched as
 /// ever; the checkpoint of the untouched state may remain, which is
@@ -575,10 +700,12 @@ fn entry_id(millis: u64, seq: u32, kind: HistoryKind) -> String {
     format!("{millis:013}-{seq:03}-{}", kind.tag())
 }
 
+/// An entry id's parts: its millis, its sequence number and its kind.
+type IdParts = (u64, u32, HistoryKind);
+
 /// The reverse of [`entry_id`]. Anything that does not parse is not an entry
-/// id — which also keeps a path-shaped "id" from ever reaching the
-/// filesystem.
-fn parse_id(id: &str) -> Option<(u64, u32, HistoryKind)> {
+/// id.
+fn parse_id(id: &str) -> Option<IdParts> {
     let mut parts = id.splitn(3, '-');
     let millis = parts.next()?.parse().ok()?;
     let seq = parts.next()?.parse().ok()?;
@@ -586,8 +713,24 @@ fn parse_id(id: &str) -> Option<(u64, u32, HistoryKind)> {
     Some((millis, seq, kind))
 }
 
-fn entry_path(key_dir: &Path, id: &str) -> PathBuf {
-    key_dir.join(format!("{id}.yaml"))
+/// An entry file's stem as its id, the id's parts, and its way: `<id>` for an
+/// entry that names no way — the one shape an arc before ways wrote — and
+/// `<id>.<way>` for one that does. A way holds no `.`, so the first `.` is the
+/// split, and a stem whose id or way does not parse is not an entry.
+fn parse_stem(stem: &str) -> Option<(&str, IdParts, Option<HistoryWay>)> {
+    let (id, way) = match stem.split_once('.') {
+        None => (stem, None),
+        Some((id, word)) => (id, Some(HistoryWay::stored(word)?)),
+    };
+    Some((id, parse_id(id)?, way))
+}
+
+/// Where `entry`'s snapshot lives: its id, then its way when it names one.
+fn entry_path(key_dir: &Path, entry: &HistoryEntry) -> PathBuf {
+    match &entry.way {
+        None => key_dir.join(format!("{}.yaml", entry.id)),
+        Some(way) => key_dir.join(format!("{}.{}.yaml", entry.id, way.as_str())),
+    }
 }
 
 /// The next `(millis, seq)` stamp: strictly after the newest entry even when
@@ -615,15 +758,16 @@ fn entries_in(key_dir: &Path) -> Result<Vec<HistoryEntry>> {
         let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".yaml")) else {
             continue;
         };
-        let Some((millis, seq, kind)) = parse_id(stem) else {
+        let Some((id, (millis, seq, kind), way)) = parse_stem(stem) else {
             continue;
         };
         found.push((
             millis,
             seq,
             HistoryEntry {
-                id: stem.to_string(),
+                id: id.to_string(),
                 kind,
+                way,
                 at: UNIX_EPOCH + Duration::from_millis(millis),
                 bytes: entry.metadata()?.len(),
             },
@@ -633,17 +777,23 @@ fn entries_in(key_dir: &Path) -> Result<Vec<HistoryEntry>> {
     Ok(found.into_iter().map(|(_, _, entry)| entry).collect())
 }
 
+/// The bytes entry `id` recorded under `key_dir`. The id is looked up among
+/// the entries listed there, whatever way each names, so an id an earlier arc
+/// printed and an id this one prints are found alike — and a path-shaped "id"
+/// never reaches the filesystem.
 fn read_entry(key_dir: &Path, id: &str) -> Result<String> {
-    if parse_id(id).is_none() {
-        return Err(Error::HistoryEntryNotFound { id: id.to_string() });
-    }
-    match std::fs::read_to_string(entry_path(key_dir, id)) {
-        Ok(text) => Ok(text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(Error::HistoryEntryNotFound { id: id.to_string() })
-        }
-        Err(e) => Err(e.into()),
-    }
+    let entry = entries_in(key_dir)?
+        .into_iter()
+        .find(|entry| entry.id == id)
+        .ok_or_else(|| Error::HistoryEntryNotFound { id: id.to_string() })?;
+    read_at(key_dir, &entry)
+}
+
+/// The bytes `entry` recorded under `key_dir`. The entry was listed, so a
+/// file gone by now is a failed read, named by its path.
+fn read_at(key_dir: &Path, entry: &HistoryEntry) -> Result<String> {
+    let path = entry_path(key_dir, entry);
+    std::fs::read_to_string(&path).map_err(|e| Error::FileRead { path, source: e })
 }
 
 /// Enforce [`HISTORY_MAX_ENTRIES`]: remove the oldest entries beyond the
@@ -652,7 +802,7 @@ fn prune(key_dir: &Path) -> Result<()> {
     let entries = entries_in(key_dir)?;
     if entries.len() > HISTORY_MAX_ENTRIES {
         for entry in &entries[..entries.len() - HISTORY_MAX_ENTRIES] {
-            let _ = std::fs::remove_file(entry_path(key_dir, &entry.id));
+            let _ = std::fs::remove_file(entry_path(key_dir, entry));
         }
     }
     Ok(())
@@ -866,6 +1016,95 @@ mod tests {
         for bad in ["", "x", "123-000", "123-000-commit", "../123-000-save"] {
             assert_eq!(parse_id(bad), None, "{bad:?} must not parse");
         }
+    }
+
+    #[test]
+    fn an_entry_file_names_its_way_after_its_id_and_an_earlier_arcs_names_none() {
+        let entry = |way| HistoryEntry {
+            id: "1700000000123-007-save".to_string(),
+            kind: HistoryKind::Save,
+            way,
+            at: UNIX_EPOCH,
+            bytes: 0,
+        };
+        let key_dir = Path::new("/store/key");
+        assert_eq!(
+            entry_path(key_dir, &entry(None)),
+            key_dir.join("1700000000123-007-save.yaml")
+        );
+        assert_eq!(
+            entry_path(key_dir, &entry(Some(HistoryWay::MCP))),
+            key_dir.join("1700000000123-007-save.mcp.yaml")
+        );
+
+        let parts = (1_700_000_000_123, 7, HistoryKind::Save);
+        assert_eq!(
+            parse_stem("1700000000123-007-save"),
+            Some(("1700000000123-007-save", parts, None))
+        );
+        assert_eq!(
+            parse_stem("1700000000123-007-save.my-App_2"),
+            Some((
+                "1700000000123-007-save",
+                parts,
+                Some(HistoryWay::new("my-App_2").unwrap())
+            ))
+        );
+        assert_eq!(
+            parse_stem("1700000000123-007-save.terminal"),
+            Some(("1700000000123-007-save", parts, Some(HistoryWay::TERMINAL))),
+            "arc's own words are read back as arc's own"
+        );
+        for bad in [
+            "1700000000123-007-save.",
+            "1700000000123-007-save.a b",
+            "1700000000123-007-save.a.b",
+            "1700000000123-007-commit.app",
+            "x.app",
+        ] {
+            assert_eq!(parse_stem(bad), None, "{bad:?} is not an entry");
+        }
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_listed_is_not_reported_as_a_missing_entry() {
+        let (tmp, history) = store();
+        let dir = protocol(&tmp);
+        let (key_dir, _) = history.key_dir(&dir).unwrap();
+        std::fs::create_dir_all(key_dir.parent().unwrap()).unwrap();
+        // The spec's place in the store is a file, so its entries cannot be
+        // listed; a lookup by id says that, not that the id names nothing.
+        std::fs::write(&key_dir, "not a directory\n").unwrap();
+        for err in [
+            history.read(&dir, "1700000000000-000-save").unwrap_err(),
+            history.restore(&dir, "1700000000000-000-save").unwrap_err(),
+        ] {
+            assert!(matches!(err, Error::Io(_)), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_merged_save_keeps_the_way_of_the_state_that_replaced_it() {
+        let (tmp, history) = store();
+        let dir = protocol(&tmp);
+        let app = history.clone().reached_by(HistoryWay::new("app").unwrap());
+        let terminal = history.reached_by(HistoryWay::TERMINAL);
+        app.record(&dir, "a\n", HistoryKind::Save, at(T0), true)
+            .unwrap();
+        terminal
+            .record(&dir, "b\n", HistoryKind::Save, at(T0 + 5), true)
+            .unwrap();
+        let entries = terminal.entries(&dir).unwrap();
+        assert_eq!(entries.len(), 1, "the saves merged: {entries:?}");
+        assert_eq!(entries[0].way, Some(HistoryWay::TERMINAL));
+        assert_eq!(terminal.read(&dir, &entries[0].id).unwrap(), "b\n");
+
+        // A state identical to the newest entry is not recorded again, whatever
+        // way records it.
+        let again = app
+            .record(&dir, "b\n", HistoryKind::Checkpoint, at(T0 + 60), false)
+            .unwrap();
+        assert_eq!(again, None);
     }
 
     #[test]

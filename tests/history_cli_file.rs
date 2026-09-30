@@ -11,7 +11,10 @@
 //!      that file alone, leaves `arcform.yaml` byte-identical and exits zero;
 //!   4. **no file** — `list`, `show` and `restore` without `--file` print and
 //!      write what they did before `--file` existed;
-//!   5. **help** — `arc history --help` and each verb's help name `--file`.
+//!   5. **help** — `arc history --help` and each verb's help name `--file`;
+//!   6. **the way** — each version a verb of the command line writes lists as
+//!      `terminal`; a version an earlier arc wrote lists as `not recorded` and
+//!      is shown and restored by the id that arc printed.
 //!
 //! The history is recorded through the library, which is the write path a
 //! tool saving a chart file takes, and read back through the binary alone.
@@ -20,7 +23,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use arc::spec::{HistoryKind, LocalHistory, MANIFEST_FILENAME};
+use arc::spec::{HistoryKind, HistoryWay, LocalHistory, MANIFEST_FILENAME};
 
 const SPEC_V1: &str = "name: fixture\nsteps: []\n";
 const SPEC_V2: &str = "name: fixture-renamed\nsteps: []\n";
@@ -85,31 +88,47 @@ fn setup() -> Fixture {
     }
 }
 
+/// Run the real `arc` binary with `args` in `cwd`, against the history store
+/// at `store` and never the developer's `~/.arcform`.
+fn arc(store: &Path, cwd: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_arc"))
+        .current_dir(cwd)
+        .env("ARCFORM_HISTORY_DIR", store)
+        .env_remove("ARCFORM_VERBOSE")
+        .args(args)
+        .output()
+        .expect("spawn arc")
+}
+
+/// [`arc`], demanding exit code zero; stdout.
+fn arc_ok(store: &Path, cwd: &Path, args: &[&str]) -> String {
+    let out = arc(store, cwd, args);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "arc {args:?} did not exit zero:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
 impl Fixture {
     /// Run the real `arc` binary with `args` in `cwd`, against this fixture's
-    /// history store and never the developer's `~/.arcform`.
+    /// history store.
     fn arc_in(&self, cwd: &Path, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_arc"))
-            .current_dir(cwd)
-            .env("ARCFORM_HISTORY_DIR", self.history.root())
-            .env_remove("ARCFORM_VERBOSE")
-            .args(args)
-            .output()
-            .expect("spawn arc")
+        arc(self.history.root(), cwd, args)
     }
 
     /// Run `arc` in the Protocol's directory, demand exit code zero, and
     /// return stdout.
     fn arc_ok(&self, args: &[&str]) -> String {
-        let out = self.arc_in(&self.dir, args);
-        assert_eq!(
-            out.status.code(),
-            Some(0),
-            "arc {args:?} did not exit zero:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8(out.stdout).unwrap()
+        arc_ok(self.history.root(), &self.dir, args)
+    }
+
+    /// [`arc_ok`](Self::arc_ok) in `cwd`.
+    fn arc_ok_in(&self, cwd: &Path, args: &[&str]) -> String {
+        arc_ok(self.history.root(), cwd, args)
     }
 
     /// Every recorded id the fixture knows, for telling which of them a
@@ -134,8 +153,8 @@ fn listed_ids<'a>(stdout: &str, known: &[&'a str]) -> Vec<&'a str> {
         .collect()
 }
 
-/// One entry line exactly as `arc history list` has printed it since the
-/// command existed.
+/// One entry line exactly as `arc history list` prints it: the four columns it
+/// has printed since the command existed, then the way.
 fn entry_line(history: &LocalHistory, dir: &Path, id: &str) -> String {
     let entry = history
         .entries(dir)
@@ -148,12 +167,33 @@ fn entry_line(history: &LocalHistory, dir: &Path, id: &str) -> String {
         HistoryKind::Checkpoint => "checkpoint",
     };
     format!(
-        "{}  {:<10}  {}  {:>7} bytes",
+        "{}  {:<10}  {}  {:>7} bytes  {}",
         entry.id,
         kind,
         humantime::format_rfc3339_seconds(entry.at),
-        entry.bytes
+        entry.bytes,
+        entry
+            .way
+            .as_ref()
+            .map_or("not recorded", HistoryWay::as_str)
     )
+}
+
+/// Each entry line of a listing as its id, its kind and the words after its
+/// size, which are the way.
+fn listed(stdout: &str) -> Vec<(String, String, String)> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let (head, way) = line.split_once(" bytes  ")?;
+            let mut words = head.split_whitespace();
+            Some((
+                words.next()?.to_string(),
+                words.next()?.to_string(),
+                way.to_string(),
+            ))
+        })
+        .collect()
 }
 
 // List: the file's two entries, oldest first, and no entry of the spec's or of
@@ -426,4 +466,122 @@ fn show_to_a_closed_pipe_is_not_reported_done() {
             .expect("spawn arc");
         assert_ne!(status.code(), Some(0), "arc {args:?} exited zero");
     }
+}
+
+// ------------------------------------------------------------------ the way
+
+// Every version a verb of the command line writes names `terminal`:
+// `create-protocol`'s first save, `edit-protocol`'s checkpoint and save, and
+// the checkpoint `history restore` takes of the state it replaces. The spec is
+// changed by hand before each machine write, so each checkpoint is of a state
+// no entry holds yet and is not skipped as a duplicate.
+#[test]
+fn every_version_the_command_line_writes_names_terminal() {
+    let fx = setup();
+    let proto = fx.root.join("fresh");
+    let spec = proto.join(MANIFEST_FILENAME);
+    let by_hand = |note: &str| {
+        let text = fs::read_to_string(&spec).unwrap();
+        fs::write(&spec, format!("{text}# {note}\n")).unwrap();
+    };
+
+    fx.arc_ok_in(&fx.root, &["create-protocol", "fresh"]);
+    by_hand("changed by hand");
+    fx.arc_ok_in(&proto, &["edit-protocol", "replace", "name", "renamed"]);
+    let first = listed(&fx.arc_ok_in(&proto, &["history", "list"]))[0]
+        .0
+        .clone();
+    by_hand("changed by hand again");
+    fx.arc_ok_in(&proto, &["history", "restore", &first]);
+
+    let entries = listed(&fx.arc_ok_in(&proto, &["history", "list"]));
+    let kinds: Vec<&str> = entries.iter().map(|(_, kind, _)| kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        ["save", "checkpoint", "save", "checkpoint"],
+        "create's save, edit's checkpoint and save, restore's checkpoint: {entries:?}"
+    );
+    for (id, kind, way) in &entries {
+        assert_eq!(way, "terminal", "the {kind} {id}");
+    }
+}
+
+// A version an earlier arc wrote — `<millis>-<seq>-<kind>.yaml` with nothing
+// beside it — lists with `not recorded` where the way would be, and is shown
+// and restored by the id that arc printed; an id this arc prints is shown and
+// restored alike.
+#[test]
+fn a_version_an_earlier_arc_wrote_says_not_recorded_and_keeps_its_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("protocol");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(MANIFEST_FILENAME), SPEC_NOW).unwrap();
+    let history = LocalHistory::at_root(tmp.path().join("history"))
+        .reached_by(HistoryWay::new("app").unwrap());
+    history.record_save(&dir, SPEC_V2).unwrap().unwrap();
+
+    // The spec's directory in the store is the one the entry above made, and
+    // the earlier arc's two entries go in it by hand, named as it named them.
+    let key_dirs: Vec<PathBuf> = fs::read_dir(history.root())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(key_dirs.len(), 1, "{key_dirs:?}");
+    let older = "name: older\nsteps: []\n";
+    fs::write(key_dirs[0].join("1600000000000-000-save.yaml"), SPEC_V1).unwrap();
+    fs::write(key_dirs[0].join("1600000000000-001-checkpoint.yaml"), older).unwrap();
+
+    let arc_ok = |args: &[&str]| arc_ok(history.root(), &dir, args);
+    let entries = listed(&arc_ok(&["history", "list"]));
+    let printed_new = entries[2].0.clone();
+    assert_eq!(
+        entries,
+        [
+            (
+                "1600000000000-000-save".into(),
+                "save".into(),
+                "not recorded".into()
+            ),
+            (
+                "1600000000000-001-checkpoint".into(),
+                "checkpoint".into(),
+                "not recorded".into()
+            ),
+            (printed_new.clone(), "save".into(), "app".into()),
+        ]
+    );
+
+    // The earlier arc's ids.
+    assert_eq!(
+        arc_ok(&["history", "show", "1600000000000-000-save"]),
+        SPEC_V1
+    );
+    assert_eq!(
+        arc_ok(&["history", "show", "1600000000000-001-checkpoint"]),
+        older
+    );
+    arc_ok(&["history", "restore", "1600000000000-000-save"]);
+    assert_eq!(
+        fs::read_to_string(dir.join(MANIFEST_FILENAME)).unwrap(),
+        SPEC_V1
+    );
+
+    // The ids this arc prints: the caller's save, and the checkpoint the
+    // restore above took, which the command line wrote.
+    let entries = listed(&arc_ok(&["history", "list"]));
+    assert_eq!(entries.len(), 4, "{entries:?}");
+    let (printed_checkpoint, kind, way) = entries[3].clone();
+    assert_eq!((kind.as_str(), way.as_str()), ("checkpoint", "terminal"));
+    assert_eq!(arc_ok(&["history", "show", &printed_new]), SPEC_V2);
+    arc_ok(&["history", "restore", &printed_new]);
+    assert_eq!(
+        fs::read_to_string(dir.join(MANIFEST_FILENAME)).unwrap(),
+        SPEC_V2
+    );
+    assert_eq!(arc_ok(&["history", "show", &printed_checkpoint]), SPEC_NOW);
+    arc_ok(&["history", "restore", &printed_checkpoint]);
+    assert_eq!(
+        fs::read_to_string(dir.join(MANIFEST_FILENAME)).unwrap(),
+        SPEC_NOW
+    );
 }

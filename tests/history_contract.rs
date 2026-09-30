@@ -11,14 +11,20 @@
 //!      itself reversible because restore checkpoints what it replaces;
 //!   4. **bounded by the stated policy** — entries past the bound prune
 //!      oldest-first, and an identical or rapid-repeat save does not flood
-//!      the store.
+//!      the store;
+//!   5. **the way arc was reached** — a way a caller names is on every entry
+//!      its handle records, through each recording call, and `arc history
+//!      list` prints it; a handle that names none records entries that say
+//!      so; and a way arc cannot store, or one of arc's own words spelt by a
+//!      caller, is refused before anything is written.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use arc::spec::{
-    Error, HISTORY_MAX_ENTRIES, HistoryKind, LocalHistory, MANIFEST_FILENAME, RecordedStep,
-    SpecEdit, edit_spec_with_history, record_step_with_history,
+    Error, HISTORY_MAX_ENTRIES, HistoryKind, HistoryWay, LocalHistory, MANIFEST_FILENAME,
+    RecordedStep, SpecEdit, edit_spec_with_history, record_step_with_history,
 };
 
 const SPEC: &str = "\
@@ -159,6 +165,53 @@ fn a_refused_edit_touches_neither_the_file_nor_the_history() {
     );
 }
 
+// No checkpoint, no write, when it is the checkpoint's own snapshot that
+// cannot be written: the spec's place in the store takes no new file, so the
+// entry fails to land and the edit is refused with the spec as it was.
+#[cfg(unix)]
+#[test]
+fn an_edit_whose_checkpoint_cannot_be_written_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_tmp, dir, history) = setup();
+    history.record_save(&dir, "name: earlier\n").unwrap();
+    let entries_before = history.entries(&dir).unwrap();
+    let key_dirs: Vec<PathBuf> = fs::read_dir(history.root())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    let [key_dir] = key_dirs.as_slice() else {
+        panic!("one key directory, found {key_dirs:?}");
+    };
+
+    // Reads stay allowed; creating the entry's temp file does not.
+    fs::set_permissions(key_dir, fs::Permissions::from_mode(0o555)).unwrap();
+    // Root ignores permission bits, so the failure cannot be staged there —
+    // probe, and stand down rather than mis-assert.
+    let probe = key_dir.join(".probe");
+    if fs::write(&probe, b"x").is_ok() {
+        let _ = fs::remove_file(&probe);
+        fs::set_permissions(key_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let result = edit_spec_with_history(&dir, &[rename_edit("renamed")], &history);
+    let checkpoint = history.record_checkpoint(&dir, "name: other\n");
+    fs::set_permissions(key_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(result.is_err(), "the edit must be refused, got {result:?}");
+    assert!(
+        checkpoint.is_err(),
+        "the checkpoint must fail, got {checkpoint:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join(MANIFEST_FILENAME)).unwrap(),
+        SPEC,
+        "the spec is as it was"
+    );
+    assert_eq!(history.entries(&dir).unwrap(), entries_before);
+}
+
 #[test]
 fn a_machine_save_cannot_fold_away_a_just_checkpointed_state() {
     // A save entry records the current state; a machine edit follows within
@@ -296,4 +349,237 @@ fn a_recorded_step_checkpoints_the_manifest_first() {
         "the pre-promotion manifest is the checkpoint"
     );
     assert_eq!(entries.last().unwrap().kind, HistoryKind::Save);
+}
+
+// ------------------------------------------------------------------ the way
+
+/// `arc history list` for the spec in `dir`, run by the real binary against
+/// `history`'s store: each entry line's id and the words after its size.
+fn listed_ways(history: &LocalHistory, dir: &Path) -> Vec<(String, String)> {
+    let out = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .current_dir(dir)
+        .env("ARCFORM_HISTORY_DIR", history.root())
+        .args(["history", "list"])
+        .output()
+        .expect("spawn arc");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            let (head, way) = line.split_once(" bytes  ")?;
+            Some((head.split_whitespace().next()?.to_string(), way.to_string()))
+        })
+        .collect()
+}
+
+fn rename_edit(to: &str) -> SpecEdit {
+    SpecEdit::Replace {
+        path: vec!["name".into()],
+        value: to.to_string(),
+    }
+}
+
+// A caller names `app` once, on the handle, and every call that records
+// through it — a save, a checkpoint, both checkpointed roads, the calls on a
+// file and a restore — writes entries naming `app`: on the entry the call
+// returns, in `entries`, and in the list the command line prints.
+#[test]
+fn a_way_a_caller_names_is_on_every_entry_its_calls_record() {
+    let (tmp, dir, history) = setup();
+    let app = HistoryWay::new("app").unwrap();
+    assert_eq!(app.as_str(), "app");
+    let history = history.reached_by(app.clone());
+
+    let saved = history.record_save(&dir, "name: a\n").unwrap().unwrap();
+    assert_eq!(saved.way, Some(app.clone()), "the entry a save returns");
+    let checkpoint = history
+        .record_checkpoint(&dir, "name: b\n")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        checkpoint.way,
+        Some(app.clone()),
+        "the entry a checkpoint returns"
+    );
+    assert_eq!(
+        history.entries(&dir).unwrap(),
+        [saved.clone(), checkpoint],
+        "the entries the calls return are the entries the store lists, time and size included"
+    );
+
+    // The file on disk is SPEC, so each road checkpoints it and saves after.
+    edit_spec_with_history(&dir, &[rename_edit("renamed")], &history).unwrap();
+    fs::write(dir.join(MANIFEST_FILENAME), SPEC).unwrap();
+    let step = RecordedStep {
+        name: "derived".to_string(),
+        sql: "SELECT 1 AS x".to_string(),
+        provenance: "history contract test".to_string(),
+    };
+    record_step_with_history(&dir, &step, &history).unwrap();
+    // A restore checkpoints what it replaces, through the same handle; the
+    // file changes by hand first, so the state replaced is not the newest
+    // entry's and is not skipped as a duplicate.
+    fs::write(dir.join(MANIFEST_FILENAME), "name: by-hand\n").unwrap();
+    history.restore(&dir, &saved.id).unwrap();
+
+    let kinds: Vec<HistoryKind> = history
+        .entries(&dir)
+        .unwrap()
+        .iter()
+        .map(|e| e.kind)
+        .collect();
+    use HistoryKind::{Checkpoint, Save};
+    assert_eq!(
+        kinds,
+        [
+            Save, Checkpoint, Checkpoint, Save, Checkpoint, Save, Checkpoint
+        ],
+        "a save, a checkpoint, two for each road and the restore's checkpoint"
+    );
+    for entry in history.entries(&dir).unwrap() {
+        assert_eq!(entry.way, Some(app.clone()), "{entry:?} in `entries`");
+    }
+    let listed = listed_ways(&history, &dir);
+    assert_eq!(listed.len(), 7, "{listed:?}");
+    for (id, way) in &listed {
+        assert_eq!(way, "app", "`arc history list` prints the way for {id}");
+    }
+
+    // The calls on a file carry the handle's way too.
+    let chart = tmp.path().join("protocol").join("chart.yaml");
+    let on_file = history
+        .record_save_for_file(&chart, "mark: dot\n")
+        .unwrap()
+        .unwrap();
+    assert_eq!(on_file.way, Some(app.clone()));
+    let on_file = history
+        .record_checkpoint_for_file(&chart, "mark: bar\n")
+        .unwrap()
+        .unwrap();
+    assert_eq!(on_file.way, Some(app.clone()));
+    for entry in history.entries_for_file(&chart).unwrap() {
+        assert_eq!(
+            entry.way,
+            Some(app.clone()),
+            "{entry:?} in `entries_for_file`"
+        );
+    }
+}
+
+// A handle that names no way writes entries that name none, and the list says
+// so rather than printing a way nobody recorded.
+#[test]
+fn a_handle_that_names_no_way_records_entries_that_say_so() {
+    let (_tmp, dir, history) = setup();
+    let saved = history.record_save(&dir, SPEC).unwrap().unwrap();
+    assert_eq!(saved.way, None);
+    assert_eq!(history.entries(&dir).unwrap()[0].way, None);
+    assert_eq!(
+        listed_ways(&history, &dir),
+        [(saved.id, "not recorded".to_string())]
+    );
+}
+
+// A word that is not one arc can keep — empty, too long, or holding anything
+// but an ASCII letter, a digit, `-` or `_` — cannot be made into a way, so a
+// caller's recording stops before it starts: the file and the history are as
+// they were, and the refusal names the word and why.
+#[test]
+fn a_way_that_cannot_be_stored_is_refused_before_anything_is_written() {
+    let (tmp, dir, history) = setup();
+    history.record_save(&dir, SPEC).unwrap();
+    let entries_before = history.entries(&dir).unwrap();
+    let store_before = files_under(history.root());
+    let too_long = "a".repeat(33);
+
+    let refused: [(&str, &str); 11] = [
+        ("", "empty"),
+        (" ", "' ' is not an ASCII letter"),
+        ("my app", "' ' is not an ASCII letter"),
+        ("a/b", "'/' is not an ASCII letter"),
+        ("../app", "'.' is not an ASCII letter"),
+        ("a.b", "'.' is not an ASCII letter"),
+        ("app\n", "'\\n' is not an ASCII letter"),
+        ("caf\u{e9}", "'\u{e9}' is not an ASCII letter"),
+        ("a:b", "':' is not an ASCII letter"),
+        ("app*", "'*' is not an ASCII letter"),
+        (too_long.as_str(), "at most 32 characters"),
+    ];
+    for (word, why) in refused {
+        let attempt = || -> arc::spec::Result<()> {
+            let way = HistoryWay::new(word)?;
+            edit_spec_with_history(
+                &dir,
+                &[rename_edit("renamed")],
+                &history.clone().reached_by(way),
+            )?;
+            Ok(())
+        };
+        match attempt().unwrap_err() {
+            Error::HistoryWay { way, detail } => {
+                assert_eq!(way, word, "the refusal names the word it was given");
+                assert!(detail.contains(why), "{word:?}: {detail:?} names {why:?}");
+            }
+            other => panic!("{word:?} was refused as something else: {other}"),
+        }
+        assert_eq!(
+            fs::read_to_string(dir.join(MANIFEST_FILENAME)).unwrap(),
+            SPEC,
+            "{word:?} changed the file"
+        );
+        assert_eq!(history.entries(&dir).unwrap(), entries_before, "{word:?}");
+        assert_eq!(files_under(history.root()), store_before, "{word:?}");
+    }
+    assert_eq!(
+        files_under(&tmp.path().join("protocol")),
+        [MANIFEST_FILENAME]
+    );
+}
+
+// Every word of ASCII letters, digits, `-` and `_`, one to 32 of them, is a
+// way, and it is kept as it was given.
+#[test]
+fn a_word_of_letters_digits_hyphens_and_underscores_is_a_way() {
+    let longest = "b".repeat(32);
+    for word in ["app", "A", "7", "-", "_", "my-App_2", longest.as_str()] {
+        let way = HistoryWay::new(word).unwrap_or_else(|e| panic!("{word:?}: {e}"));
+        assert_eq!(way.as_str(), word);
+    }
+}
+
+// `terminal` and `mcp` are arc's. A caller spelling either, in any case, is
+// refused and told which value means it; the value itself records that way.
+#[test]
+fn arcs_own_ways_are_a_callers_only_by_the_value_that_means_them() {
+    assert_eq!(HistoryWay::TERMINAL.as_str(), "terminal");
+    assert_eq!(HistoryWay::MCP.as_str(), "mcp");
+    for (word, value) in [
+        ("terminal", "HistoryWay::TERMINAL"),
+        ("Terminal", "HistoryWay::TERMINAL"),
+        ("TERMINAL", "HistoryWay::TERMINAL"),
+        ("mcp", "HistoryWay::MCP"),
+        ("MCP", "HistoryWay::MCP"),
+        ("Mcp", "HistoryWay::MCP"),
+    ] {
+        match HistoryWay::new(word).unwrap_err() {
+            Error::HistoryWay { way, detail } => {
+                assert_eq!(way, word);
+                assert!(detail.contains(value), "{word:?}: {detail:?} names {value}");
+                assert!(detail.contains("arc's own way"), "{detail:?}");
+            }
+            other => panic!("{word:?} was refused as something else: {other}"),
+        }
+    }
+
+    let (_tmp, dir, history) = setup();
+    let history = history.reached_by(HistoryWay::MCP);
+    let entry = history.record_save(&dir, SPEC).unwrap().unwrap();
+    assert_eq!(entry.way, Some(HistoryWay::MCP));
+    assert_eq!(listed_ways(&history, &dir), [(entry.id, "mcp".to_string())]);
 }
