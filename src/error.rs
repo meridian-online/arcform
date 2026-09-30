@@ -109,15 +109,28 @@ pub enum Error {
 
     // A community extension the Protocol's SQL installs is not the build `arcform.yaml`
     // pins for this DuckDB and platform, or arc could not install it to compare. Checked
-    // before any step or hook runs, so nothing ran; one line per extension.
+    // before any step or hook runs, so nothing ran; one line per extension, and each line
+    // says which of the two it was, so the first line claims neither.
     #[error(
-        "an extension this Protocol installs is not the build its arcform.yaml pins, so no step or hook was run:\n{}\n\
-         A pin sits under the extensions: key of arcform.yaml; an author who accepts the build found replaces its pin there. \
-         See {}",
+        "arc could not confirm that each extension this Protocol installs is the build its arcform.yaml pins, so no step or hook was run:\n{}\n\
+         A pin sits under the extensions: key of arcform.yaml. See {}",
         indented(refusals),
         crate::engine::VETTED_EXTENSIONS_DOC
     )]
     ExtensionPinRefused { refusals: Vec<String> },
+
+    // `arc upgrade` was asked to pin an extension that is not on the vetted list. Refused
+    // before DuckDB is asked anything.
+    #[error(
+        "arc upgrade pins a community extension on the vetted list, and {name} is not on it, so arcform.yaml was not changed. The list is at {}",
+        crate::engine::VETTED_EXTENSIONS_DOC
+    )]
+    ExtensionNotVetted { name: String },
+
+    // `arc upgrade` could not find the build to pin: DuckDB's version or platform, the
+    // install, the load, or the installed file. Nothing was written.
+    #[error("arc could not pin {name}, so arcform.yaml was not changed: {reason}")]
+    ExtensionUpgradeFailed { name: String, reason: String },
 
     // A pinned extension's file differs from its pin when the run ends: a step replaced
     // it, and steps after that one may have loaded it.

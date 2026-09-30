@@ -138,7 +138,9 @@ pub enum SpecEdit {
     /// is empty). Block mappings gain a line after their last entry, indented
     /// like their other keys; flow mappings (`{ … }`) gain a `, key: value`
     /// before the closing brace; a bare `key:` with no value gains its first
-    /// child. Refused if the target is not a mapping.
+    /// child. An empty `value` in a block mapping or at the root writes a bare
+    /// `key:`, with no space after the colon, for a later `Add` to give its
+    /// first child. Refused if the target is not a mapping.
     Add {
         path: Vec<PathPart>,
         key: String,
@@ -503,7 +505,7 @@ fn add_key(text: &str, path: &[PathPart], key: &str, value: &str) -> Result<Stri
         if !text.is_empty() && !text.ends_with('\n') {
             entry.push('\n');
         }
-        entry.push_str(&format!("{key}: {value}\n"));
+        entry.push_str(&format!("{}\n", block_pair(key, value)));
         return Ok(splice(text, text.len(), text.len(), &entry));
     }
 
@@ -519,7 +521,7 @@ fn add_key(text: &str, path: &[PathPart], key: &str, value: &str) -> Result<Stri
             let ls = line_start(text, anchor);
             let indent = " ".repeat(indent_of(text, ls) + 2);
             let at = line_end(text, ls);
-            let mut entry = format!("{indent}{key}: {value}\n");
+            let mut entry = format!("{indent}{}\n", block_pair(key, value));
             if at == text.len() && !text.ends_with('\n') {
                 entry.insert(0, '\n');
             }
@@ -544,7 +546,7 @@ fn add_key(text: &str, path: &[PathPart], key: &str, value: &str) -> Result<Stri
                 let (start, end) = element_span_at(text, &doc, path)?;
                 let first_key = feature.location.byte_span.0;
                 let child_indent = block_child_indent(text, start, end, first_key);
-                let mut entry = format!("{}{key}: {value}\n", " ".repeat(child_indent));
+                let mut entry = format!("{}{}\n", " ".repeat(child_indent), block_pair(key, value));
                 if end == text.len() && !text.ends_with('\n') {
                     entry.insert(0, '\n');
                 }
@@ -556,6 +558,81 @@ fn add_key(text: &str, path: &[PathPart], key: &str, value: &str) -> Result<Stri
             )),
         },
     }
+}
+
+/// `key: value` on a line of its own, or a bare `key:` when `value` is empty, so no line
+/// `Add` writes ends in a space.
+fn block_pair(key: &str, value: &str) -> String {
+    if value.is_empty() {
+        format!("{key}:")
+    } else {
+        format!("{key}: {value}")
+    }
+}
+
+/// The edits that make the scalar at the mapping keys `keys`, from the root, hold `value`:
+/// a [`SpecEdit::Replace`] when the last key is present, and otherwise one
+/// [`SpecEdit::Add`] for each missing key, the outermost first, each a bare `key:` but the
+/// last. Under a flow mapping (`{ … }`) the missing keys go in as one flow value instead,
+/// since a bare key inside braces takes no block child. Every key present keeps its bytes.
+/// Text that does not parse as YAML has no key this can read, so it gets the `Add` of
+/// each key, and applying those refuses it with the parser's reason.
+pub(crate) fn scalar_edits(text: &str, keys: &[&str], value: &str) -> Vec<SpecEdit> {
+    let path = |n: usize| -> Vec<PathPart> { keys[..n].iter().map(|&k| k.into()).collect() };
+    let Ok(doc) = parse(text) else {
+        return block_adds(keys, 0, value);
+    };
+    let present = (1..=keys.len())
+        .rev()
+        .find(|&n| doc.query_exists(&route_of(&path(n))))
+        .unwrap_or(0);
+    if present == keys.len() {
+        // A bare `key:` is replaced right after its colon, so its value brings the space.
+        let bare = matches!(doc.query_exact(&route_of(&path(present))), Ok(None));
+        return vec![SpecEdit::Replace {
+            path: path(present),
+            value: if bare {
+                format!(" {value}")
+            } else {
+                value.to_string()
+            },
+        }];
+    }
+    // With no key present this asks of the document's root, a block mapping in a spec.
+    let under_flow = matches!(
+        doc.query_exact(&route_of(&path(present))),
+        Ok(Some(feature)) if feature.kind() == yamlpath::FeatureKind::FlowMapping
+    );
+    if under_flow {
+        let value = keys[present + 1..]
+            .iter()
+            .rev()
+            .fold(value.to_string(), |inner, key| {
+                format!("{{{key}: {inner}}}")
+            });
+        return vec![SpecEdit::Add {
+            path: path(present),
+            key: keys[present].to_string(),
+            value,
+        }];
+    }
+    block_adds(keys, present, value)
+}
+
+/// One [`SpecEdit::Add`] for each of `keys` from `from` on, each a bare `key:` in the one
+/// before it, and the last holding `value`.
+fn block_adds(keys: &[&str], from: usize, value: &str) -> Vec<SpecEdit> {
+    (from..keys.len())
+        .map(|n| SpecEdit::Add {
+            path: keys[..n].iter().map(|&k| k.into()).collect(),
+            key: keys[n].to_string(),
+            value: if n + 1 == keys.len() {
+                value.to_string()
+            } else {
+                String::new()
+            },
+        })
+        .collect()
 }
 
 /// `Append`: insert `item` after the last item of the sequence at `path`.
@@ -1049,6 +1126,105 @@ steps:
         let unterminated = "name: fixture\nsteps:\n  - name: only\n    command: \"true\"";
         let out = apply_edits(unterminated, &[]).unwrap();
         assert_eq!(out.text(), format!("{unterminated}\n"));
+    }
+
+    /// The keys of a pin, as `arc upgrade` writes one.
+    const PIN_KEYS: [&str; 4] = ["extensions", "mlpack", "v1.5.5", "linux_amd64"];
+    const PIN: &str = "1d98039edd0bf1547fb8daf8f8fbce54a239759f169025cc8db9e4fda7388cb8";
+    const OTHER: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    /// `text` with the mlpack pin set to [`PIN`], through the spec gate.
+    fn set_pin(text: &str) -> String {
+        let edits = scalar_edits(text, &PIN_KEYS, PIN);
+        apply_edits(text, &edits).unwrap().text().to_string()
+    }
+
+    #[test]
+    fn scalar_edits_add_each_missing_key_as_a_block_with_no_trailing_space() {
+        let before = "name: p\n# the last line\n";
+        assert_eq!(
+            set_pin(before),
+            format!("{before}extensions:\n  mlpack:\n    v1.5.5:\n      linux_amd64: {PIN}\n")
+        );
+
+        // The new key joins its siblings at their indent, four here, and each key below
+        // it sits two deeper than its parent.
+        let before = format!(
+            "name: p\nextensions:\n    h3:\n        v1.5.5:\n            linux_amd64: {OTHER}\nsteps: []\n"
+        );
+        assert_eq!(
+            set_pin(&before),
+            before.replace(
+                "steps: []",
+                &format!("    mlpack:\n      v1.5.5:\n        linux_amd64: {PIN}\nsteps: []")
+            )
+        );
+
+        // A pin for another platform alone gains one line beside it.
+        let before =
+            format!("name: p\nextensions:\n  mlpack:\n    v1.5.5:\n      osx_arm64: {OTHER}\n");
+        assert_eq!(
+            set_pin(&before),
+            format!("{before}      linux_amd64: {PIN}\n")
+        );
+    }
+
+    #[test]
+    fn scalar_edits_replace_a_present_value_and_keep_its_comment() {
+        let before = format!(
+            "name: p\nextensions:\n  mlpack:\n    v1.5.5:\n      linux_amd64: '{OTHER}'  # the old build\n"
+        );
+        let edits = scalar_edits(&before, &PIN_KEYS, PIN);
+        assert_eq!(
+            edits,
+            vec![SpecEdit::Replace {
+                path: p(&PIN_KEYS),
+                value: PIN.to_string()
+            }]
+        );
+        assert_eq!(set_pin(&before), before.replace(&format!("'{OTHER}'"), PIN));
+
+        // A bare key's value lands after its colon, and brings the space.
+        let bare = "a:\n  b:\n";
+        let edits = scalar_edits(bare, &["a", "b"], "x");
+        assert_eq!(apply_yaml_edits(bare, &edits).unwrap(), "a:\n  b: x\n");
+    }
+
+    #[test]
+    fn scalar_edits_on_text_that_does_not_parse_add_each_key_and_are_refused() {
+        let broken = "name: p\nsteps: [\n";
+        assert_eq!(
+            scalar_edits(broken, &["a", "b"], "x"),
+            vec![
+                SpecEdit::Add {
+                    path: vec![],
+                    key: "a".to_string(),
+                    value: String::new()
+                },
+                SpecEdit::Add {
+                    path: p(&["a"]),
+                    key: "b".to_string(),
+                    value: "x".to_string()
+                },
+            ]
+        );
+        assert!(apply_edits(broken, &scalar_edits(broken, &PIN_KEYS, PIN)).is_err());
+    }
+
+    #[test]
+    fn scalar_edits_add_the_missing_keys_to_a_flow_mapping_as_one_flow_value() {
+        let before = format!("name: p\nextensions: {{h3: {{v1.5.5: {{linux_amd64: {OTHER}}}}}}}\n");
+        assert_eq!(
+            set_pin(&before),
+            format!(
+                "name: p\nextensions: {{h3: {{v1.5.5: {{linux_amd64: {OTHER}}}}}, mlpack: {{v1.5.5: {{linux_amd64: {PIN}}}}}}}\n"
+            )
+        );
+        let empty = "name: p\nextensions: {}\n";
+        assert_eq!(
+            set_pin(empty),
+            format!("name: p\nextensions: {{mlpack: {{v1.5.5: {{linux_amd64: {PIN}}}}}}}\n")
+        );
     }
 
     #[test]

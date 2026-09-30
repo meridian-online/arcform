@@ -96,6 +96,13 @@ pub trait Engine {
     /// `duckdb_extensions()`, or `None` when it names none. On a DuckDB that holds the
     /// extension already, DuckDB leaves the file as it is.
     fn install_community_extension(&self, name: &str) -> Result<Option<PathBuf>>;
+
+    /// Install the build of the community extension `name` that the community registry
+    /// serves, over any file DuckDB holds for it, on the DuckDB the steps run on; then load
+    /// it, and return the file DuckDB names as its `install_path`, or `None` when it names
+    /// none. DuckDB checks an extension's signature when it loads it, so a file returned is
+    /// one DuckDB loads.
+    fn force_install_community_extension(&self, name: &str) -> Result<Option<PathBuf>>;
 }
 
 /// Wait for a child process with an optional timeout.
@@ -389,23 +396,41 @@ impl Engine for DuckDbEngine {
     }
 
     fn install_community_extension(&self, name: &str) -> Result<Option<PathBuf>> {
-        // The name comes from the vetted list, whose names are plain identifiers; one that
-        // is not is refused rather than written into SQL.
-        if !is_plain_extension_name(name) {
-            return Err(Error::EngineQuery {
-                what: format!("install {name}"),
-                reason: "arc installs an extension by a plain name alone".to_string(),
-            });
-        }
-        let sql = format!(
-            "INSTALL {name} FROM community; SELECT '{ANSWER_MARK}' || install_path FROM duckdb_extensions() WHERE extension_name = '{name}' AND installed;"
-        );
-        let answers = ask_duckdb(&sql, &format!("install {name} from the community registry"))?;
-        Ok(answers
-            .into_iter()
-            .find(|path| !path.is_empty())
-            .map(PathBuf::from))
+        install_and_name(
+            name,
+            &format!("INSTALL {name} FROM community;"),
+            &format!("install {name} from the community registry"),
+        )
     }
+
+    fn force_install_community_extension(&self, name: &str) -> Result<Option<PathBuf>> {
+        install_and_name(
+            name,
+            &format!("FORCE INSTALL {name} FROM community; LOAD {name};"),
+            &format!("install and load the build of {name} the community registry serves"),
+        )
+    }
+}
+
+/// Run `install`, SQL that installs the extension `name`, and return the file DuckDB then
+/// names as its `install_path`, or `None` when it names none. `what` names the question in
+/// the error when DuckDB exits non-zero.
+fn install_and_name(name: &str, install: &str, what: &str) -> Result<Option<PathBuf>> {
+    // The name comes from the vetted list, whose names are plain identifiers; one that is
+    // not is refused rather than written into SQL.
+    if !is_plain_extension_name(name) {
+        return Err(Error::EngineQuery {
+            what: format!("install {name}"),
+            reason: "arc installs an extension by a plain name alone".to_string(),
+        });
+    }
+    let sql = format!(
+        "{install} SELECT '{ANSWER_MARK}' || install_path FROM duckdb_extensions() WHERE extension_name = '{name}' AND installed;"
+    );
+    Ok(ask_duckdb(&sql, what)?
+        .into_iter()
+        .find(|path| !path.is_empty())
+        .map(PathBuf::from))
 }
 
 /// Parse a version string from engine CLI output.
@@ -1439,26 +1464,10 @@ pub(crate) fn check_extension_installs(
     if !refusals.is_empty() {
         return Err(Error::ExtensionRefused { refusals });
     }
-    let engine = engine_version.map(|v| format!("v{v}"));
     let names = installed.iter().map(|entry| entry.name.clone()).collect();
     let warnings = installed
         .into_iter()
-        .filter(|entry| {
-            !engine
-                .as_ref()
-                .is_some_and(|v| entry.duckdb_versions.contains(v))
-        })
-        .map(|entry| {
-            let vetted_on = entry.duckdb_versions.join(", ");
-            let engine = engine.as_deref().map_or_else(
-                || "arc could not read this engine's version".to_string(),
-                |v| format!("this engine is DuckDB {v}"),
-            );
-            format!(
-                "{} is vetted on DuckDB {vetted_on}, and {engine}; running it anyway ({VETTED_EXTENSIONS_DOC})",
-                entry.name
-            )
-        })
+        .filter_map(|entry| unvetted_version_warning(entry, engine_version))
         .chain(
             unread
                 .into_iter()
@@ -1469,6 +1478,30 @@ pub(crate) fn check_extension_installs(
         warnings,
         installed: names,
     })
+}
+
+/// The warning for a vetted extension whose entry does not name `engine_version`, or `None`
+/// when it names it. `arc run` and `arc upgrade` print it and go ahead.
+pub(crate) fn unvetted_version_warning(
+    entry: &VettedExtension,
+    engine_version: Option<&semver::Version>,
+) -> Option<String> {
+    let engine = engine_version.map(|v| format!("v{v}"));
+    if engine
+        .as_ref()
+        .is_some_and(|v| entry.duckdb_versions.contains(v))
+    {
+        return None;
+    }
+    let vetted_on = entry.duckdb_versions.join(", ");
+    let engine = engine.as_deref().map_or_else(
+        || "arc could not read this engine's version".to_string(),
+        |v| format!("this engine is DuckDB {v}"),
+    );
+    Some(format!(
+        "{} is vetted on DuckDB {vetted_on}, and {engine}; running it anyway ({VETTED_EXTENSIONS_DOC})",
+        entry.name
+    ))
 }
 
 /// A community extension the check before the run installed and found equal to its pin,
@@ -1542,7 +1575,7 @@ pub(crate) fn check_extension_pins(
                 (Some(v), Some(p)) => format!("for DuckDB {v} on {p}"),
             };
             warnings.push(format!(
-                "{name} has no pin under the extensions: key of arcform.yaml ({place}), so arc runs whichever build DuckDB installs ({VETTED_EXTENSIONS_DOC})"
+                "{name} has no pin under the extensions: key of arcform.yaml ({place}), so arc runs whichever build DuckDB installs; `arc upgrade {name}` pins the build the community registry serves ({VETTED_EXTENSIONS_DOC})"
             ));
             continue;
         };
@@ -1571,7 +1604,7 @@ pub(crate) fn check_extension_pins(
                 path,
             }),
             Ok(found) => refusals.push(format!(
-                "{at}: pinned {pin}, and the installed file {} hashes to {found}",
+                "{at}: pinned {pin}, and the installed file {} hashes to {found}; `arc upgrade {name}` installs the build the community registry serves and pins it",
                 path.display()
             )),
             Err(e) => refusals.push(format!(
@@ -1856,6 +1889,13 @@ pub mod mock {
                     reason: reason.clone(),
                 }),
             }
+        }
+
+        /// `arc run` never force-installs, so a call here fails the test that made it.
+        /// `arc upgrade`, the one caller, is tested on a fake DuckDB in
+        /// `tests/vetted_extensions.rs`.
+        fn force_install_community_extension(&self, name: &str) -> Result<Option<PathBuf>> {
+            panic!("the mock engine was asked to force-install {name}, which arc run never does")
         }
     }
 }
@@ -2340,7 +2380,7 @@ mod extension_tests {
         assert_eq!(
             refused,
             vec![format!(
-                "mlpack on DuckDB v1.5.5, linux_amd64: pinned {PIN_A}, and the installed file {} hashes to {hash}",
+                "mlpack on DuckDB v1.5.5, linux_amd64: pinned {PIN_A}, and the installed file {} hashes to {hash}; `arc upgrade mlpack` installs the build the community registry serves and pins it",
                 path.display()
             )]
         );
@@ -2420,8 +2460,9 @@ mod extension_tests {
     #[test]
     fn an_extension_with_no_pin_for_this_version_and_platform_warns_once_and_asks_only_what_it_needs()
      {
-        let tail =
-            format!(", so arc runs whichever build DuckDB installs ({VETTED_EXTENSIONS_DOC})");
+        let tail = format!(
+            ", so arc runs whichever build DuckDB installs; `arc upgrade mlpack` pins the build the community registry serves ({VETTED_EXTENSIONS_DOC})"
+        );
         // (label, pins, version, the warning's place, the calls DuckDB receives)
         type Case = (
             &'static str,

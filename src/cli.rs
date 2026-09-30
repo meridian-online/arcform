@@ -3,8 +3,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
+use owo_colors::OwoColorize;
 
-use crate::engine::DuckDbEngine;
+use crate::engine::{ALLOW_UNTESTED_ENGINE_ENV, DuckDbEngine, Engine};
 use crate::error::{Error, Result};
 use crate::manifest::Manifest;
 use crate::registry::transport::GitTarballTransport;
@@ -112,6 +113,23 @@ pub enum Commands {
         #[arg(long = "param", value_name = "KEY=VALUE")]
         params: Vec<String>,
     },
+
+    /// Pin the build of a community extension on the vetted list that the community
+    /// registry serves, for this machine's DuckDB version and platform. arc installs that
+    /// build over any file DuckDB holds for the extension, loads it, and writes the
+    /// installed file's SHA-256 under the `extensions:` key of arcform.yaml, replacing the
+    /// pin there was for this version and platform. Every other byte of the file is kept,
+    /// and the file as it was is a checkpoint in `arc history`. A Protocol that runs on
+    /// several platforms is upgraded on each.
+    Upgrade {
+        /// The extension, as the vetted list names it: `mlpack`.
+        name: String,
+
+        /// Protocol directory (where arcform.yaml lives).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+
     /// Discover, fetch, and run curated registry pipelines.
     Registry {
         #[command(subcommand)]
@@ -628,6 +646,95 @@ pub fn run_pipeline(force: bool, raw_params: &[String]) -> Result<()> {
     crate::runner::run_with_params(&cwd, &engine, &state, force, &cli_params)
 }
 
+/// Execute `arc upgrade <name>`: refuse a name off the vetted list before DuckDB is asked
+/// anything, check the engine's version as `arc run` does, install and load the build of
+/// `name` the community registry serves, and write its SHA-256 as the pin for this DuckDB
+/// version and platform through the checkpointed write path. Each refusal comes before the
+/// write, so arcform.yaml is as it was; a pin that holds the hash already is not rewritten.
+pub fn upgrade_extension(
+    dir: &Path,
+    name: &str,
+    engine: &dyn Engine,
+    history: &LocalHistory,
+) -> Result<()> {
+    let manifest = Manifest::load(dir)?;
+    let entry = crate::engine::vetted_extensions()
+        .iter()
+        .find(|entry| entry.name == name)
+        .ok_or_else(|| Error::ExtensionNotVetted {
+            name: name.to_string(),
+        })?;
+    let failed = |reason: String| Error::ExtensionUpgradeFailed {
+        name: name.to_string(),
+        reason,
+    };
+    let Some(found) = engine.preflight()?.version else {
+        return Err(failed(
+            "arc could not read this engine's DuckDB version, which a pin is for".to_string(),
+        ));
+    };
+    let allow_untested = std::env::var_os(ALLOW_UNTESTED_ENGINE_ENV).is_some_and(|v| !v.is_empty());
+    let warnings = crate::runner::check_engine_version(
+        Some(&found),
+        manifest.engine_version.as_deref(),
+        allow_untested,
+    )?;
+    let vetted_on = crate::engine::unvetted_version_warning(entry, Some(&found));
+    for warning in warnings.iter().chain(vetted_on.iter()) {
+        eprintln!("{} {}", "warning:".yellow(), warning);
+    }
+    let platform = engine
+        .extension_platform()
+        .map_err(|e| failed(e.to_string()))?;
+    let path = engine
+        .force_install_community_extension(name)
+        .map_err(|e| failed(e.to_string()))?
+        .ok_or_else(|| {
+            failed(format!(
+                "DuckDB named no installed file for {name} after installing it"
+            ))
+        })?;
+    let hash = crate::fetch_cache::hash_file(&path).map_err(|e| {
+        failed(format!(
+            "arc could not read the installed file {}: {e}",
+            path.display()
+        ))
+    })?;
+
+    let version = format!("v{found}");
+    let at = format!("{name} on DuckDB {version}, {platform}");
+    let spec = dir.join(crate::spec::MANIFEST_FILENAME);
+    let old = manifest
+        .extensions
+        .get(name)
+        .and_then(|versions| versions.get(&version))
+        .and_then(|platforms| platforms.get(&platform));
+    if old == Some(&hash) {
+        println!(
+            "{at}: pinned {hash} already, the build the community registry serves; {} is unchanged",
+            spec.display()
+        );
+        return Ok(());
+    }
+    let text = fs::read_to_string(&spec).map_err(|e| Error::FileRead {
+        path: spec.clone(),
+        source: e,
+    })?;
+    let edits = crate::edit::scalar_edits(&text, &["extensions", name, &version, &platform], &hash);
+    crate::spec::edit_spec_with_history(dir, &edits, history)?;
+    match old {
+        Some(old) => println!(
+            "{at}: replaced the pin {old} with {hash}, the build the community registry serves, in {}",
+            spec.display()
+        ),
+        None => println!(
+            "{at}: pinned {hash}, the build the community registry serves, in {}",
+            spec.display()
+        ),
+    }
+    Ok(())
+}
+
 /// Dispatch CLI commands.
 pub fn dispatch(cli: Cli) -> Result<()> {
     let verbose = cli.verbose || std::env::var_os(VERBOSE_ENV).is_some();
@@ -650,6 +757,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Commands::History { cmd } => dispatch_history(cmd),
         Commands::Run { force, params } => run_pipeline(force, &params),
+        Commands::Upgrade { name, dir } => {
+            upgrade_extension(&dir, &name, &DuckDbEngine, &LocalHistory::open_default()?)
+        }
         Commands::Registry { cmd } => dispatch_registry(cmd, verbose),
         Commands::Operation { cmd } => dispatch_operation(cmd, &mut std::io::stdout()),
         #[cfg(feature = "mcp")]
