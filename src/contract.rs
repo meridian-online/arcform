@@ -341,9 +341,8 @@ pub struct StepsEngine {
 
 /// What the run records of the DuckDB its SQL steps ran on, from `report`, its answer when
 /// asked about `names`: an entry for each name, in order, whatever the answer holds of it,
-/// with the SHA-256 of the file DuckDB names hashed now. With no answer each value is absent.
-pub fn steps_engine(report: Option<crate::engine::EngineReport>, names: &[String]) -> StepsEngine {
-    let report = report.unwrap_or_default();
+/// with the SHA-256 of the file DuckDB names hashed now.
+pub fn steps_engine(report: crate::engine::EngineReport, names: &[String]) -> StepsEngine {
     let extensions = names
         .iter()
         .map(|name| {

@@ -888,10 +888,7 @@ pub fn run_with_params(
     // names the build each extension the SQL installs was when the run ended. A question it
     // does not answer leaves each value absent: recording refuses no run and prints nothing.
     let steps_engine = manifest.has_sql_steps().then(|| {
-        contract::steps_engine(
-            engine.report(extensions.recorded()).ok(),
-            extensions.recorded(),
-        )
+        contract::steps_engine(engine.report(extensions.recorded()), extensions.recorded())
     });
     let run_contract = contract::build_contract(contract::ContractInputs {
         manifest: &manifest,

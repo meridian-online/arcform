@@ -106,8 +106,9 @@ pub trait Engine {
 
     /// What the DuckDB the steps run on reports of itself, and of each extension in
     /// `extensions` that `duckdb_extensions()` lists, for the run record. It installs and
-    /// loads nothing.
-    fn report(&self, extensions: &[String]) -> Result<EngineReport>;
+    /// loads nothing. A question DuckDB does not answer gives a report with each value absent,
+    /// since recording refuses no run.
+    fn report(&self, extensions: &[String]) -> EngineReport;
 }
 
 /// What the DuckDB the steps run on reports, as [`Engine::report`] asks it. Each value is
@@ -472,7 +473,7 @@ impl Engine for DuckDbEngine {
         )
     }
 
-    fn report(&self, extensions: &[String]) -> Result<EngineReport> {
+    fn report(&self, extensions: &[String]) -> EngineReport {
         let mut sql = format!(
             "SELECT '{ANSWER_MARK}version' || chr(9) || version(); \
              SELECT '{ANSWER_MARK}platform' || chr(9) || platform FROM pragma_platform();"
@@ -487,11 +488,12 @@ impl Engine for DuckDbEngine {
                 names.join(", ")
             ));
         }
-        let answers = ask_duckdb(
+        ask_duckdb(
             &sql,
             "report its version, its platform and the extensions it holds",
-        )?;
-        Ok(read_report(&answers))
+        )
+        .map(|answers| read_report(&answers))
+        .unwrap_or_default()
     }
 }
 
@@ -1953,9 +1955,9 @@ pub mod mock {
         /// What `install_community_extension` answers for each name: the installed file,
         /// no file, or a failure's reason. A name not here names no file.
         pub installs: RefCell<HashMap<String, std::result::Result<Option<PathBuf>, String>>>,
-        /// What `report` answers; `None` makes it fail. Asking it is not one of `calls`,
-        /// which the tests in `runner.rs` count; `reported` holds what each ask named.
-        pub report: RefCell<Option<EngineReport>>,
+        /// What `report` answers. Asking it is not one of `calls`, which the tests in
+        /// `runner.rs` count; `reported` holds what each ask named.
+        pub report: RefCell<EngineReport>,
         /// The extensions each call of `report` asked about, in order.
         pub reported: RefCell<Vec<Vec<String>>>,
     }
@@ -1992,7 +1994,7 @@ pub mod mock {
                 timeout_should_fire: RefCell::new(false),
                 platform: RefCell::new(Some("linux_amd64".to_string())),
                 installs: RefCell::new(HashMap::new()),
-                report: RefCell::new(Some(EngineReport::default())),
+                report: RefCell::new(EngineReport::default()),
                 reported: RefCell::new(Vec::new()),
             }
         }
@@ -2180,16 +2182,9 @@ pub mod mock {
             panic!("the mock engine was asked to force-install {name}, which arc run never does")
         }
 
-        fn report(&self, extensions: &[String]) -> Result<EngineReport> {
+        fn report(&self, extensions: &[String]) -> EngineReport {
             self.reported.borrow_mut().push(extensions.to_vec());
-            self.report
-                .borrow()
-                .clone()
-                .ok_or_else(|| Error::EngineQuery {
-                    what: "report its version, its platform and the extensions it holds"
-                        .to_string(),
-                    reason: "the mock was told to fail".to_string(),
-                })
+            self.report.borrow().clone()
         }
     }
 }
