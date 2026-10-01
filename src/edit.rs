@@ -2118,6 +2118,32 @@ steps:
         assert_eq!(out, "vconcat: 1\n");
     }
 
+    /// Text the parser reads and the loader refuses, a key written twice, is
+    /// refused with the loader's reason before a line moves.
+    #[test]
+    fn a_nest_or_lift_of_text_the_loader_refuses_is_refused_with_its_reason() {
+        for (text, edit) in [
+            (
+                "plot: 1\nplot: 2\nwidth: 3\n",
+                nest(&[], &["width"], "vconcat"),
+            ),
+            (
+                "plot: 1\nplot: 2\nvconcat:\n  - width: 3\n",
+                lift(&[], "vconcat"),
+            ),
+        ] {
+            match apply_yaml_edits(text, &[edit]) {
+                Err(Error::EditTarget { detail, .. }) => {
+                    assert!(
+                        detail.contains("the text does not load as YAML"),
+                        "{detail}"
+                    )
+                }
+                other => panic!("expected EditTarget, got {other:?}"),
+            }
+        }
+    }
+
     /// A new key YAML reads as a comment leaves text that loads, to a sequence
     /// at the root rather than the mapping the nest describes; the edit is
     /// refused rather than returned.
