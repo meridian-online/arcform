@@ -3428,6 +3428,12 @@ impl Operator for HttpFetch {
 struct OpendalFetch;
 
 #[cfg(feature = "opendal")]
+#[allow(dead_code)]
+fn probe_len_zero(v: &[u8]) -> bool {
+    v.len() == 0
+}
+
+#[cfg(feature = "opendal")]
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug))]
 #[serde(deny_unknown_fields)]
