@@ -346,12 +346,14 @@ fn ignore_list_text(dir: &Path, db: Option<&str>) -> String {
 fn path_inside(dir: &Path, db: &str) -> Option<String> {
     let relative = if Path::new(db).is_absolute() {
         let db = Path::new(db);
+        // What is left of `db` after its prefix is a tail of a `&str`, so it is text.
         db.strip_prefix(dir)
             .ok()
             .or_else(|| db.strip_prefix(dir.canonicalize().ok()?).ok())?
-            .to_str()?
+            .to_string_lossy()
+            .into_owned()
     } else {
-        db
+        db.to_string()
     };
     let mut parts: Vec<String> = Vec::new();
     for segment in relative.split('/') {
@@ -1355,6 +1357,11 @@ steps:
             inside("build//w.duckdb").as_deref(),
             Some("build/w.duckdb"),
             "an empty segment is no segment"
+        );
+        assert_eq!(
+            inside("a/b\nc.duckdb"),
+            None,
+            "a segment a line of the list cannot carry is not named, and does not name its parent"
         );
         assert_eq!(inside("../w.duckdb"), None, "outside the directory");
         assert_eq!(
