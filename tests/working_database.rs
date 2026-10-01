@@ -17,6 +17,9 @@ use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
 
+// This file reads `arc run`'s output with two of the shared helpers and drives the
+// binary itself, so the helpers that spawn `arc run` go unused here.
+#[allow(dead_code)]
 mod common;
 use common::{step_outcome, strip_ansi};
 
@@ -439,4 +442,36 @@ fn almanac_runs_to_its_report_with_no_database_in_its_directory() {
     );
     assert_eq!(databases_under(&dir), Vec::<PathBuf>::new(), "{stdout}");
     assert!(expected_db(&fx.db_root(), &dir, "almanac").is_file());
+}
+
+// A run refused before its first step writes nothing in arc's data folder and runs
+// nothing: a `name:` that would put the database outside its keyed directory, and a
+// `protocol-path` file arc cannot write, each refuse the run with what to look at.
+#[test]
+fn a_run_arc_cannot_place_in_the_data_folder_is_refused_before_any_step() {
+    let fx = Fixture::new();
+    let step = "steps:\n  - name: mark\n    command: \"touch ran\"\n";
+
+    let escaping = fx.protocol("escaping", &format!("name: ../shared\n{step}"), &[]);
+    let out = fx.arc(&escaping, &["run"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a name that leaves its keyed directory"
+    );
+    assert!(stderr.contains("'../shared'"), "{stderr}");
+    assert!(!escaping.join("ran").exists(), "no step ran");
+    assert!(!fx.db_root().exists(), "nothing in the data folder");
+
+    let blocked = fx.protocol("blocked", &format!("name: blocked\n{step}"), &[]);
+    let marker = expected_db(&fx.db_root(), &blocked, "blocked")
+        .parent()
+        .unwrap()
+        .join("protocol-path");
+    std::fs::create_dir_all(&marker).unwrap();
+    let out = fx.arc(&blocked, &["run"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "a protocol-path arc cannot write");
+    assert!(stderr.contains(&marker.display().to_string()), "{stderr}");
+    assert!(!blocked.join("ran").exists(), "no step ran");
 }

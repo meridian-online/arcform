@@ -3814,6 +3814,33 @@ steps:
         );
     }
 
+    // The run resolves its own database before anything initialises, and a resolution
+    // that fails refuses the run: a `name:` that would leave its keyed directory in arc's
+    // data folder reaches no engine and records no run.
+    #[test]
+    fn a_database_the_run_cannot_resolve_refuses_it_before_any_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: a/b\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        let err = run(dir.path(), &engine, &state, false).unwrap_err();
+        assert!(
+            matches!(&err, Error::DbNameNotAFileName { name } if name == "a/b"),
+            "{err:?}"
+        );
+        assert!(
+            !engine
+                .calls
+                .borrow()
+                .iter()
+                .any(|c| matches!(c, MockCall::Sql { .. })),
+            "no step reached the engine"
+        );
+        assert!(state.runs.borrow().is_empty(), "no run was recorded");
+    }
+
     // Backwards compatibility — existing manifests work identically.
     #[test]
     fn test_param_backwards_compat_no_params() {

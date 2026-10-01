@@ -47,7 +47,15 @@ pub(crate) fn default_path(name: &str, dir: &Path) -> Result<PathBuf> {
 
 /// The database of the Protocol named `name` in `dir`, under the data folder `root`:
 /// `<root>/<key>/<name>.duckdb`, the key made from `dir`'s canonical path.
+/// Refused when `name` is not a plain file name — one holding a `/`, or `.` or `..` —
+/// because the database would then leave the directory keyed to `dir`, where two
+/// Protocols could share it.
 fn path_under(root: &Path, name: &str, dir: &Path) -> Result<PathBuf> {
+    if Path::new(name).file_name() != Some(std::ffi::OsStr::new(name)) {
+        return Err(Error::DbNameNotAFileName {
+            name: name.to_string(),
+        });
+    }
     let canonical = canonical_dir(dir)?;
     Ok(root
         .join(path_key(&canonical))
@@ -79,14 +87,17 @@ pub(crate) fn mark(db_path: &Path, dir: &Path) -> Result<()> {
     let Some(key_dir) = db_path.parent() else {
         return Ok(());
     };
-    std::fs::create_dir_all(key_dir)?;
+    let refused = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| Error::DbFolderWrite { path, source }
+    };
+    std::fs::create_dir_all(key_dir).map_err(refused(key_dir))?;
     let marker = key_dir.join(PROTOCOL_PATH_FILE);
     let text = format!("{}\n", dir.display());
     if std::fs::read_to_string(&marker).is_ok_and(|old| old == text) {
         return Ok(());
     }
-    std::fs::write(&marker, text)?;
-    Ok(())
+    std::fs::write(&marker, text).map_err(refused(&marker))
 }
 
 /// `$ARCFORM_DB_DIR` when set and non-empty, else `~/.arcform/db`.
@@ -158,6 +169,36 @@ mod tests {
 
         let other = path_under(root.path(), "p", &b).unwrap();
         assert_ne!(direct, other, "one name in two directories, two databases");
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_plain_file_name_is_refused_naming_it() {
+        let root = tempfile::tempdir().unwrap();
+        let protocol = tempfile::tempdir().unwrap();
+        for name in ["../shared", "a/b", "..", ".", "a/"] {
+            let err = path_under(root.path(), name, protocol.path()).unwrap_err();
+            assert!(
+                matches!(&err, Error::DbNameNotAFileName { name: n } if n == name),
+                "{name}: {err:?}"
+            );
+        }
+        assert!(path_under(root.path(), "tides.v2", protocol.path()).is_ok());
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_written_is_refused_naming_it() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("k").join(PROTOCOL_PATH_FILE);
+        std::fs::create_dir_all(&marker).unwrap();
+        let err = mark(
+            &root.path().join("k").join("p.duckdb"),
+            Path::new("/work/p"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::DbFolderWrite { path, .. } if *path == marker),
+            "{err:?}"
+        );
     }
 
     #[test]

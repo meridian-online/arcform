@@ -72,6 +72,23 @@ pub enum Error {
     )]
     DbRootMissing,
 
+    // A Protocol that names no `db:` keeps `<name>.duckdb` in a directory keyed to it in
+    // arc's data folder; a name that is not a plain file name would put the database
+    // outside that directory, where another Protocol could reach it.
+    #[error(
+        "database: name '{name}' is not a plain file name, so arc cannot keep its database \
+         in the data folder (give the Protocol a name with no '/', or name a db: in arcform.yaml)"
+    )]
+    DbNameNotAFileName { name: String },
+
+    // Writing in arc's data folder failed: the directory keyed to a Protocol, or the
+    // `protocol-path` file that names the Protocol in it.
+    #[error("database: could not write {path} in arc's data folder: {source}")]
+    DbFolderWrite {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
     #[error("history: no entry '{id}' for this spec (see `arc history list`)")]
     HistoryEntryNotFound { id: String },
 
@@ -444,6 +461,31 @@ mod format_tests {
             "remediation env var must appear: {:?}",
             s
         );
+    }
+
+    #[test]
+    fn db_name_not_a_file_name_names_the_name_and_both_remedies() {
+        let s = Error::DbNameNotAFileName {
+            name: "../shared".into(),
+        }
+        .to_string();
+        assert!(!s.contains('\n'), "Display must be single-line: {:?}", s);
+        assert!(s.starts_with("database:"), "family prefix: {:?}", s);
+        assert!(s.contains("'../shared'"), "the name: {:?}", s);
+        assert!(s.contains("db:"), "the db: remedy: {:?}", s);
+    }
+
+    #[test]
+    fn db_folder_write_names_the_path_and_the_cause() {
+        let s = Error::DbFolderWrite {
+            path: PathBuf::from("/data/k/protocol-path"),
+            source: std::io::Error::other("Is a directory"),
+        }
+        .to_string();
+        assert!(!s.contains('\n'), "Display must be single-line: {:?}", s);
+        assert!(s.starts_with("database:"), "family prefix: {:?}", s);
+        assert!(s.contains("/data/k/protocol-path"), "the path: {:?}", s);
+        assert!(s.contains("Is a directory"), "the cause: {:?}", s);
     }
 
     #[test]
