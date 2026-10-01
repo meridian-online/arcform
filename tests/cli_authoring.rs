@@ -783,7 +783,7 @@ fn author_and_run(path: Option<&OsStr>) -> Outcome {
 /// A `PATH` that holds the tools an `arc run` of a command step needs and no `git`.
 #[cfg(unix)]
 fn path_without_git() -> PathBuf {
-    let bin = std::env::temp_dir().join("arc-cli-authoring-no-git-bin");
+    let bin = std::env::temp_dir().join("arc-cli-authoring-no-git");
     std::fs::create_dir_all(&bin).unwrap();
     let on_path = std::env::split_paths(&std::env::var_os("PATH").unwrap()).collect::<Vec<_>>();
     for tool in ["sh", "duckdb"] {
