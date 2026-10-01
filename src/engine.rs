@@ -3372,4 +3372,116 @@ mod extension_tests {
             ]
         );
     }
+
+    // ---- what the run record names ----
+
+    #[test]
+    fn the_report_reads_each_tagged_answer_and_skips_the_rest() {
+        let answers: Vec<String> = [
+            "version\tv1.5.4",
+            "platform\tlinux_amd64",
+            "extension\tmlpack\tcommunity\tv1.5.5\t/x/mlpack.duckdb_extension",
+            // DuckDB gives no repository and no version for a file with no `.info` beside it,
+            // and a tab in the path stays in it.
+            "extension\thttpfs\t\t\t/x/a\tb/httpfs.duckdb_extension",
+            "extension\tjson\tcore\tv1.5.4\t",
+            // Too few fields, an answer to another question, and a tag arc does not ask for.
+            "extension\tshort\tcore",
+            "linux_amd64",
+            "other\tvalue",
+        ]
+        .map(String::from)
+        .to_vec();
+        let report = read_report(&answers);
+        assert_eq!(report.version.as_deref(), Some("v1.5.4"));
+        assert_eq!(report.platform.as_deref(), Some("linux_amd64"));
+        let expected: HashMap<String, ReportedExtension> = [
+            (
+                "mlpack",
+                ReportedExtension {
+                    path: Some("/x/mlpack.duckdb_extension".into()),
+                    repository: Some("community".into()),
+                    version: Some("v1.5.5".into()),
+                },
+            ),
+            (
+                "httpfs",
+                ReportedExtension {
+                    path: Some("/x/a\tb/httpfs.duckdb_extension".into()),
+                    repository: None,
+                    version: None,
+                },
+            ),
+            (
+                "json",
+                ReportedExtension {
+                    path: None,
+                    repository: Some("core".into()),
+                    version: Some("v1.5.4".into()),
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(name, ext)| (name.to_string(), ext))
+        .collect();
+        assert_eq!(report.extensions, expected);
+
+        let empty = ["version\t", "platform\t"].map(String::from).to_vec();
+        assert_eq!(read_report(&empty), EngineReport::default());
+    }
+
+    #[test]
+    fn the_scan_records_each_install_by_name_once_in_the_order_the_protocol_first_installs_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql = sources(
+            dir.path(),
+            &[
+                (
+                    "step 'a'",
+                    "INSTALL httpfs; INSTALL mlpack FROM community; INSTALL httpfs FROM core;",
+                ),
+                (
+                    "step 'b'",
+                    "FORCE INSTALL mlpack FROM community; INSTALL spatial; LOAD json;",
+                ),
+            ],
+        );
+        let installs = check_extension_installs(&sql, Some(&v("1.5.5"))).unwrap();
+        assert_eq!(installs.recorded, vec!["httpfs", "mlpack", "spatial"]);
+        assert_eq!(installs.installed, vec!["mlpack"]);
+    }
+
+    #[test]
+    fn the_check_before_a_file_runs_records_what_it_installs_that_no_check_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = sources(dir.path(), &[("step 'a'", "INSTALL httpfs;")]);
+        let installs = check_extension_installs(&before, Some(&v("1.5.5"))).unwrap();
+        let mut recheck = ExtensionRecheck::new(
+            installs,
+            Vec::new(),
+            Vec::new(),
+            &ExtensionPins::new(),
+            Some(&v("1.5.5")),
+        );
+        assert_eq!(recheck.recorded(), ["httpfs"]);
+        let engine = mock::MockEngine::new();
+
+        // A file the check refuses ran nothing, and adds nothing.
+        let refused = sources(
+            dir.path(),
+            &[("step 'b'", "INSTALL excel; INSTALL nope FROM community;")],
+        );
+        assert!(recheck.check(&engine, &refused[0]).is_err());
+        assert_eq!(recheck.recorded(), ["httpfs"]);
+
+        let passed = sources(
+            dir.path(),
+            &[(
+                "step 'c'",
+                "INSTALL httpfs; INSTALL excel; INSTALL mlpack FROM community;",
+            )],
+        );
+        recheck.check(&engine, &passed[0]).unwrap();
+        assert_eq!(recheck.recorded(), ["httpfs", "excel", "mlpack"]);
+    }
 }

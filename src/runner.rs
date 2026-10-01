@@ -7548,4 +7548,108 @@ steps:
             );
         }
     }
+
+    // ---- What the record says of the DuckDB the steps ran on ----
+
+    /// The contract the one run in `dir` wrote.
+    fn only_contract(dir: &Path) -> crate::contract::Contract {
+        let runs = dir.join("build/.arcform/runs");
+        let json = fs::read_dir(&runs)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|x| x == "json"))
+            .expect("the run wrote its contract");
+        serde_json::from_str(&fs::read_to_string(json).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn the_record_names_what_the_duckdb_the_steps_ran_on_reports() {
+        use crate::contract::ExtensionEntry;
+        use crate::engine::{EngineReport, ReportedExtension};
+
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(
+            dir.path(),
+            "name: rec\ndb: rec.duckdb\nsteps:\n  - name: s\n    sql: models/s.sql\nhooks:\n  on_exit:\n    name: bye\n    sql: models/bye.sql\n",
+            &[
+                (
+                    "models/s.sql",
+                    "INSTALL httpfs;\nCREATE TABLE t AS SELECT 1;\n",
+                ),
+                ("models/bye.sql", "INSTALL spatial FROM core;\n"),
+            ],
+        );
+        let file = dir.path().join("httpfs.duckdb_extension");
+        fs::write(&file, b"a build").unwrap();
+        let hash = crate::fetch_cache::hash_file(&file).unwrap();
+        let engine = MockEngine::new();
+        *engine.report.borrow_mut() = EngineReport {
+            version: Some("v1.5.3".into()),
+            platform: Some("linux_arm64".into()),
+            extensions: [(
+                "httpfs".to_string(),
+                ReportedExtension {
+                    path: Some(file),
+                    repository: Some("core".into()),
+                    version: Some("827222f".into()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        assert_eq!(
+            *engine.reported.borrow(),
+            vec![vec!["httpfs".to_string(), "spatial".to_string()]],
+            "asked once, about each extension the SQL installs"
+        );
+        let contract = only_contract(dir.path());
+        let engine_info = &contract.run.engine;
+        assert_eq!(engine_info.arc, env!("CARGO_PKG_VERSION"));
+        assert_eq!(engine_info.duckdb_cli.as_deref(), Some("v1.5.3"));
+        assert_eq!(engine_info.platform.as_deref(), Some("linux_arm64"));
+        assert_eq!(
+            engine_info.extensions,
+            Some(vec![
+                ExtensionEntry {
+                    name: "httpfs".into(),
+                    repository: Some("core".into()),
+                    version: Some("827222f".into()),
+                    sha256: Some(hash),
+                },
+                ExtensionEntry {
+                    name: "spatial".into(),
+                    repository: None,
+                    version: None,
+                    sha256: None,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn a_protocol_with_no_sql_asks_duckdb_nothing_and_records_neither() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(
+            dir.path(),
+            "name: rec\ndb: rec.duckdb\nsteps:\n  - name: c\n    command: echo hi\n",
+            &[],
+        );
+        let engine = MockEngine::new();
+        *engine.report.borrow_mut() = crate::engine::EngineReport {
+            version: Some("v1.5.3".into()),
+            platform: Some("linux_arm64".into()),
+            extensions: HashMap::new(),
+        };
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        assert!(engine.reported.borrow().is_empty(), "DuckDB was not asked");
+        let engine_info = only_contract(dir.path()).run.engine;
+        assert_eq!(engine_info.duckdb_cli, None);
+        assert_eq!(engine_info.platform, None);
+        assert_eq!(engine_info.extensions, None);
+    }
 }

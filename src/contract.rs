@@ -1126,4 +1126,175 @@ steps:
         assert_eq!(by_key["api_token"].source, "default");
         assert_eq!(by_key["api_token"].value, REDACTED);
     }
+
+    /// A run record as `arc run` wrote it before the record named the DuckDB the SQL steps ran
+    /// on: written by the commit before that change, on a fake engine, with the Protocol's
+    /// directory replaced.
+    const RECORD_BEFORE_STEPS_ENGINE: &str = r#"{
+  "contract_version": "b4/1",
+  "run": {
+    "run_id": "20261001-225417-11c7d1ec",
+    "attempt_id": "20261001-225417-11c7d1ec",
+    "protocol": {
+      "name": "old",
+      "manifest_sha256": "9b163d9bd65fce144ee2b33a1beecd27dddf5ef41b1ba67ad52897555c9bd20a",
+      "dir": "/home/analyst/old"
+    },
+    "engine": {
+      "arc": "0.1.0",
+      "duckdb": "v1.5.4"
+    },
+    "params": [],
+    "started_at": "2026-10-01T22:54:17Z",
+    "finished_at": "2026-10-01T22:54:17Z",
+    "outcome": "success"
+  },
+  "assets": [
+    {
+      "id": "table:a",
+      "kind": "table",
+      "name": "a",
+      "path": null,
+      "bytes": null,
+      "row_count": null,
+      "content_hash": null,
+      "produced_by": "load",
+      "consumed_by": []
+    }
+  ],
+  "steps": [
+    {
+      "name": "load",
+      "kind": "sql",
+      "op_ref": null,
+      "resolved_with": null,
+      "sql": {
+        "model_path": "models/load.sql",
+        "sql_text": "INSTALL mlpack FROM community;\nCREATE TABLE a AS SELECT 1 AS x;\n",
+        "sql_hash": "4e3de9a8f1cfc449abbbd0844c79f0d44590cc08f392ec0c2e2e2112549e9375",
+        "statements": [
+          {
+            "produces": [],
+            "reads": [],
+            "byte_range": [
+              0,
+              30
+            ]
+          },
+          {
+            "produces": [
+              "a"
+            ],
+            "reads": [],
+            "byte_range": [
+              31,
+              63
+            ]
+          }
+        ]
+      },
+      "status": {
+        "state": "success",
+        "skip_reason": null
+      },
+      "attempts": 1,
+      "duration_sec": 0.040102817,
+      "retry": null,
+      "timeout_sec": null,
+      "io": {
+        "stdout_path": null,
+        "stderr_path": null
+      },
+      "ingress_meta": null,
+      "report": null,
+      "narrative": {
+        "label": null,
+        "stage": null,
+        "doc": null
+      }
+    }
+  ]
+}"#;
+
+    #[test]
+    fn a_record_written_before_the_steps_engine_fields_reads_with_each_absent() {
+        assert_eq!(CONTRACT_VERSION, "b4/1");
+        let contract: Contract = serde_json::from_str(RECORD_BEFORE_STEPS_ENGINE)
+            .expect("a record in the shape arc wrote before reads into Contract");
+        assert_eq!(contract.contract_version, CONTRACT_VERSION);
+        let engine = &contract.run.engine;
+        assert_eq!(engine.duckdb.as_deref(), Some("v1.5.4"));
+        assert_eq!(engine.duckdb_cli, None);
+        assert_eq!(engine.platform, None);
+        assert_eq!(engine.extensions, None);
+    }
+
+    #[test]
+    fn the_steps_engine_names_each_extension_asked_about_with_what_duckdb_reported() {
+        use crate::engine::{EngineReport, ReportedExtension};
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mlpack.duckdb_extension");
+        std::fs::write(&file, b"a build").unwrap();
+        let hash = crate::fetch_cache::hash_file(&file).unwrap();
+        let reported = |path: Option<PathBuf>, repository: &str, version: &str| ReportedExtension {
+            path,
+            repository: Some(repository.to_string()),
+            version: Some(version.to_string()),
+        };
+        let report = EngineReport {
+            version: Some("v1.5.3".into()),
+            platform: Some("osx_arm64".into()),
+            extensions: [
+                ("mlpack", reported(Some(file), "community", "v1.5.5")),
+                // A path arc cannot read: one that is not there, and a directory.
+                (
+                    "httpfs",
+                    reported(Some(dir.path().join("gone")), "core", "827222f"),
+                ),
+                ("json", reported(Some(dir.path().into()), "core", "v1.5.3")),
+                // DuckDB names no file.
+                ("excel", reported(None, "core", "v1.5.3")),
+            ]
+            .into_iter()
+            .map(|(name, ext)| (name.to_string(), ext))
+            .collect(),
+        };
+        let names: Vec<String> = ["mlpack", "httpfs", "json", "excel", "spatial"]
+            .map(String::from)
+            .to_vec();
+        let entry =
+            |name: &str, repository: Option<&str>, version: Option<&str>, sha256: Option<&str>| {
+                ExtensionEntry {
+                    name: name.to_string(),
+                    repository: repository.map(String::from),
+                    version: version.map(String::from),
+                    sha256: sha256.map(String::from),
+                }
+            };
+        assert_eq!(
+            steps_engine(report, &names),
+            StepsEngine {
+                duckdb_cli: Some("v1.5.3".into()),
+                platform: Some("osx_arm64".into()),
+                extensions: vec![
+                    entry("mlpack", Some("community"), Some("v1.5.5"), Some(&hash)),
+                    entry("httpfs", Some("core"), Some("827222f"), None),
+                    entry("json", Some("core"), Some("v1.5.3"), None),
+                    entry("excel", Some("core"), Some("v1.5.3"), None),
+                    // DuckDB lists nothing for it.
+                    entry("spatial", None, None, None),
+                ],
+            }
+        );
+
+        // DuckDB could not be asked.
+        assert_eq!(
+            steps_engine(EngineReport::default(), &names[..1]),
+            StepsEngine {
+                duckdb_cli: None,
+                platform: None,
+                extensions: vec![entry("mlpack", None, None, None)],
+            }
+        );
+    }
 }
