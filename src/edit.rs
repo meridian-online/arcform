@@ -1344,7 +1344,7 @@ steps:
     #[test]
     fn the_ignore_list_names_a_database_only_where_it_is_inside_the_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
+        let d = &dir.path().canonicalize().unwrap();
         let inside = |db: &str| path_inside(d, db);
 
         assert_eq!(inside("work.duckdb").as_deref(), Some("work.duckdb"));
@@ -1374,12 +1374,20 @@ steps:
             Some("w.duckdb"),
             "an absolute path under the directory is inside it"
         );
-        let canonical = d.canonicalize().unwrap().join("build/w.duckdb");
-        assert_eq!(
-            inside(canonical.to_str().unwrap()).as_deref(),
-            Some("build/w.duckdb"),
-            "and so is one under its canonical form"
-        );
+
+        // A directory reached through a link: the run's database path is the real one.
+        #[cfg(unix)]
+        {
+            let real = d.join("real");
+            std::fs::create_dir(&real).unwrap();
+            let link = d.join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert_eq!(
+                path_inside(&link, real.join("build/w.duckdb").to_str().unwrap()).as_deref(),
+                Some("build/w.duckdb"),
+                "an absolute path under the directory's real location is inside it"
+            );
+        }
     }
 
     #[test]
