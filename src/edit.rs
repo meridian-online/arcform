@@ -170,6 +170,34 @@ pub enum SpecEdit {
         from: usize,
         to: usize,
     },
+
+    /// Move the entries `keys` of the block mapping at `path` (the document's
+    /// root when `path` is empty) under a new key `under`, as the one mapping
+    /// of a new block sequence: `plot:` and `width:` at the root become
+    /// `vconcat:` over `  - plot:` and `    width:`. The moved lines keep their
+    /// order, their comments and their blank lines, and each gains the
+    /// indentation that puts it under the new entry; a flush comment header
+    /// above the first moved key becomes the new entry's header. `under` takes
+    /// the place of the first moved entry, and an entry `keys` does not name
+    /// that sat between two moved ones follows it. Refused when `path` is not a
+    /// block mapping, when `keys` is empty, repeats a key or names one the
+    /// mapping does not hold, and when the mapping already holds `under`.
+    /// [`SpecEdit::Lift`] is the inverse.
+    Nest {
+        path: Vec<PathPart>,
+        keys: Vec<String>,
+        under: String,
+    },
+
+    /// Put the one mapping of the block sequence at `key`, in the mapping at
+    /// `path`, in `key`'s place, and take `key` out: the inverse of
+    /// [`SpecEdit::Nest`]. The mapping's lines move to `key`'s column with
+    /// their comments and blank lines. Refused unless `key` holds a block
+    /// sequence of exactly one item, and that item is a block mapping whose
+    /// first key shares the dash's line and whose keys the mapping at `path`
+    /// does not already hold. A second item would be lost, so `Delete` it
+    /// first.
+    Lift { path: Vec<PathPart>, key: String },
 }
 
 /// The result of applying edits: candidate bytes that have already passed the
@@ -455,6 +483,8 @@ fn apply_one(text: &str, edit: &SpecEdit) -> Result<String> {
         SpecEdit::Append { path, item } => append_item(text, path, item),
         SpecEdit::Delete { path } => delete_element(text, path),
         SpecEdit::Reorder { path, from, to } => reorder_items(text, path, *from, *to),
+        SpecEdit::Nest { path, keys, under } => nest_entries(text, path, keys, under),
+        SpecEdit::Lift { path, key } => lift_entry(text, path, key),
     }
 }
 
@@ -889,6 +919,411 @@ fn reorder_items(text: &str, path: &[PathPart], from: usize, to: usize) -> Resul
         block.insert(0, '\n');
     }
     Ok(splice(&removed, target, target, &block))
+}
+
+/// `Nest`: move the entries `keys` of the block mapping at `path` under `under`,
+/// as the one mapping of a new block sequence.
+fn nest_entries(text: &str, path: &[PathPart], keys: &[String], under: &str) -> Result<String> {
+    let owned = with_final_newline(text);
+    let text: &str = &owned;
+    if keys.is_empty() {
+        return Err(target_err(path, "the nest names no key to move"));
+    }
+    let doc = parse(text)?;
+    require_block_mapping(&doc, path, "nest the entries of")?;
+    if doc.query_exists(&route_of(&child(path, under))) {
+        return Err(target_err(
+            path,
+            format!("the mapping already holds `{under}`"),
+        ));
+    }
+    let mut anchors = Vec::with_capacity(keys.len());
+    for (i, key) in keys.iter().enumerate() {
+        if keys[..i].contains(key) {
+            return Err(target_err(path, format!("the nest names `{key}` twice")));
+        }
+        let key_path = child(path, key.as_str());
+        let pair = doc
+            .query_pretty(&route_of(&key_path))
+            .map_err(|e| target_err(&key_path, e))?;
+        anchors.push(pair.location.byte_span.0);
+    }
+    anchors.sort_unstable();
+
+    let expected = described(text, path, |mapping| {
+        let mut moved = serde_yaml::Mapping::new();
+        for key in keys {
+            let value = mapping
+                .remove(key.as_str())
+                .ok_or_else(|| target_err(path, format!("the loaded mapping holds no `{key}`")))?;
+            moved.insert(key.as_str().into(), value);
+        }
+        mapping.insert(
+            under.into(),
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(moved)]),
+        );
+        Ok(())
+    })?;
+
+    // The first moved key's line: `plot:` at the mapping's column, or `- plot:`
+    // when the mapping is a sequence item opening on its dash's line.
+    let first = anchors[0];
+    let first_line = line_start(text, first);
+    let column = first - first_line;
+    let prefix = &text[first_line..first];
+    let on_dash = !prefix.bytes().all(|b| b == b' ');
+    if on_dash && !prefix.split_whitespace().all(|w| w == "-") {
+        return Err(target_err(
+            path,
+            "the first key to nest shares its line with something other than a sequence dash",
+        ));
+    }
+
+    // Each moved entry's extent: its flush header, its key's line and the lines
+    // of its value. On a dash's line the header above belongs to the item, not
+    // to its first key, so it stays.
+    let mut chunks: Vec<(usize, usize)> = Vec::with_capacity(anchors.len());
+    for (i, &anchor) in anchors.iter().enumerate() {
+        let line = line_start(text, anchor);
+        let start = if i == 0 && on_dash {
+            line
+        } else {
+            with_flush_header(text, line)
+        };
+        let start = chunks.last().map_or(start, |&(_, end)| start.max(end));
+        chunks.push((start, entry_lines(text, anchor).1));
+    }
+
+    let mut out = String::with_capacity(2 * text.len());
+    out.push_str(&text[..chunks[0].0]);
+    out.push_str(prefix);
+    out.push_str(under);
+    out.push_str(":\n");
+    out.push_str(&indented(&text[chunks[0].0..first_line], 2));
+    out.push_str(&" ".repeat(column + 2));
+    out.push_str("- ");
+    out.push_str(&text[first..line_end(text, first)]);
+
+    // Between two moved entries, what precedes the first entry the nest does not
+    // name moves with them; that entry, with its header, and the rest of the gap
+    // stay, after the new key.
+    let mut stays = String::new();
+    let mut at = line_end(text, first);
+    for (i, &(start, end)) in chunks.iter().enumerate() {
+        if i > 0 {
+            let split = first_content_line(text, at, start)
+                .map_or(start, |line| with_flush_header(text, line).max(at));
+            out.push_str(&indented(&text[at..split], 4));
+            stays.push_str(&text[split..start]);
+        }
+        out.push_str(&indented(&text[at.max(start)..end], 4));
+        at = end;
+    }
+    out.push_str(&stays);
+    out.push_str(&text[at..]);
+
+    require_loads_as(path, &out, &expected)?;
+    Ok(out)
+}
+
+/// `Lift`: put the one mapping of the block sequence at `key` in `key`'s place.
+fn lift_entry(text: &str, path: &[PathPart], key: &str) -> Result<String> {
+    let owned = with_final_newline(text);
+    let text: &str = &owned;
+    let doc = parse(text)?;
+    require_block_mapping(&doc, path, "lift into")?;
+    let key_path = child(path, key);
+    let sequence = doc
+        .query_exact(&route_of(&key_path))
+        .map_err(|e| target_err(&key_path, e))?
+        .ok_or_else(|| target_err(&key_path, "the key holds no sequence to lift from"))?;
+    if sequence.kind() != yamlpath::FeatureKind::BlockSequence {
+        return Err(target_err(
+            &key_path,
+            format!(
+                "cannot lift out of a {:?}; the key must hold a block sequence",
+                sequence.kind()
+            ),
+        ));
+    }
+    let items = item_count(&doc, &key_path)?;
+    if items != 1 {
+        return Err(target_err(
+            &key_path,
+            format!(
+                "the sequence holds {items} items and a lift takes the only one; \
+                 Delete the others first"
+            ),
+        ));
+    }
+    let item_path = child(&key_path, 0);
+    let item = doc
+        .query_exact(&route_of(&item_path))
+        .map_err(|e| target_err(&item_path, e))?
+        .ok_or_else(|| target_err(&item_path, "the item is empty"))?;
+    if item.kind() != yamlpath::FeatureKind::BlockMapping {
+        return Err(target_err(
+            &item_path,
+            format!(
+                "cannot lift a {:?}; the item must be a block mapping",
+                item.kind()
+            ),
+        ));
+    }
+    let first = item.location.byte_span.0;
+    let first_line = line_start(text, first);
+    if text[first_line..first].trim() != "-" {
+        return Err(target_err(
+            &item_path,
+            "the item's first key does not share the dash's line",
+        ));
+    }
+
+    let anchor = doc
+        .query_pretty(&route_of(&key_path))
+        .map_err(|e| target_err(&key_path, e))?
+        .location
+        .byte_span
+        .0;
+    let key_line = line_start(text, anchor);
+    let column = anchor - key_line;
+    let key_end = doc
+        .query_key_only(&route_of(&key_path))
+        .map_err(|e| target_err(&key_path, e))?
+        .location
+        .byte_span
+        .1;
+    // What follows `key:` on its line: nothing, or a comment kept on a line of
+    // its own where the key's line was.
+    let after = text[key_end..line_end(text, key_line)].trim();
+    let trailing = after.strip_prefix(':').map(str::trim);
+    let comment = match trailing {
+        Some("") => None,
+        Some(c) if c.starts_with('#') => Some(c),
+        _ => {
+            return Err(target_err(
+                &key_path,
+                "the key's line carries more than the key and a comment",
+            ));
+        }
+    };
+
+    let expected = described(text, path, |mapping| {
+        let lifted = match mapping.remove(key) {
+            Some(serde_yaml::Value::Sequence(mut items)) if items.len() == 1 => items.remove(0),
+            _ => {
+                return Err(target_err(
+                    &key_path,
+                    "the loaded key holds no sequence of one item",
+                ));
+            }
+        };
+        let serde_yaml::Value::Mapping(lifted) = lifted else {
+            return Err(target_err(&item_path, "the loaded item is not a mapping"));
+        };
+        for (k, v) in lifted {
+            if mapping.contains_key(&k) {
+                return Err(target_err(
+                    path,
+                    format!("the mapping already holds `{}`", key_display(&k)),
+                ));
+            }
+            mapping.insert(k, v);
+        }
+        Ok(())
+    })?;
+
+    let (_, end) = entry_lines(text, anchor);
+    let dash_column = indent_of(text, first_line);
+    let item_column = first - first_line;
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..key_line]);
+    if let Some(comment) = comment {
+        out.push_str(&" ".repeat(indent_of(text, key_line)));
+        out.push_str(comment);
+        out.push('\n');
+    }
+    out.push_str(&dedented(
+        &text[line_end(text, key_line)..first_line],
+        dash_column.saturating_sub(column),
+    ));
+    out.push_str(&text[key_line..anchor]);
+    out.push_str(&text[first..line_end(text, first)]);
+    out.push_str(&dedented(
+        &text[line_end(text, first)..end],
+        item_column - column,
+    ));
+    out.push_str(&text[end..]);
+
+    require_loads_as(path, &out, &expected)?;
+    Ok(out)
+}
+
+/// `path` with one more part on the end.
+fn child(path: &[PathPart], part: impl Into<PathPart>) -> Vec<PathPart> {
+    let mut out = path.to_vec();
+    out.push(part.into());
+    out
+}
+
+/// `text` ending in `\n`, so a line moved from the end of the document is a
+/// whole line wherever it lands; the splice adds that newline to its result
+/// regardless.
+fn with_final_newline(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.is_empty() || text.ends_with('\n') {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        std::borrow::Cow::Owned(format!("{text}\n"))
+    }
+}
+
+fn require_block_mapping(doc: &yamlpath::Document, path: &[PathPart], verb: &str) -> Result<()> {
+    match doc
+        .query_exact(&route_of(path))
+        .map_err(|e| target_err(path, e))?
+    {
+        Some(feature) if feature.kind() == yamlpath::FeatureKind::BlockMapping => Ok(()),
+        Some(feature) => Err(target_err(
+            path,
+            format!(
+                "cannot {verb} a {:?}; the target must be a block mapping",
+                feature.kind()
+            ),
+        )),
+        None => Err(target_err(
+            path,
+            "the key has no value; the target must be a block mapping",
+        )),
+    }
+}
+
+/// What `text` loads to once `reshape` has changed the mapping at `path`: the
+/// document a moving edit describes, built from the loaded value and not from
+/// the text, so [`require_loads_as`] can hold the splice to it.
+fn described(
+    text: &str,
+    path: &[PathPart],
+    reshape: impl FnOnce(&mut serde_yaml::Mapping) -> Result<()>,
+) -> Result<serde_yaml::Value> {
+    let mut value = load_value(path, text)?;
+    let mapping = path
+        .iter()
+        .try_fold(&mut value, |value, part| match part {
+            PathPart::Key(k) => value.get_mut(k.as_str()),
+            PathPart::Index(i) => value.get_mut(*i),
+        })
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .ok_or_else(|| target_err(path, "the loaded document holds no mapping here"))?;
+    reshape(mapping)?;
+    Ok(value)
+}
+
+/// Refuse `out` unless it loads to `expected`. Nest and Lift move lines whose
+/// extents are read from the text; this is what makes a layout those readings
+/// do not cover a refusal rather than a document that means something else.
+fn require_loads_as(path: &[PathPart], out: &str, expected: &serde_yaml::Value) -> Result<()> {
+    if load_value(path, out)? != *expected {
+        return Err(target_err(
+            path,
+            "the edited text does not load to the mapping the edit describes",
+        ));
+    }
+    Ok(())
+}
+
+fn load_value(path: &[PathPart], text: &str) -> Result<serde_yaml::Value> {
+    serde_yaml::from_str(text)
+        .map_err(|e| target_err(path, format!("the text does not load as YAML: {e}")))
+}
+
+/// A mapping key as a refusal names it: a string as written, anything else as
+/// YAML would print it.
+fn key_display(key: &serde_yaml::Value) -> String {
+    match key {
+        serde_yaml::Value::String(s) => s.clone(),
+        other => serde_yaml::to_string(other)
+            .map(|s| s.trim_end().to_string())
+            .unwrap_or_default(),
+    }
+}
+
+/// The text extent of the mapping entry whose key starts at `anchor`: the key's
+/// line and every line of its value. Unlike [`element_lines`] it measures from
+/// the key's own column, so the first key of a sequence item (`- plot:`) does
+/// not take its siblings with it. A `-` line at that column continues the
+/// entry, since a block sequence may sit at its key's indentation; a blank
+/// line, or a comment no deeper than the key, belongs to the entry only when
+/// more of its value follows.
+fn entry_lines(text: &str, anchor: usize) -> (usize, usize) {
+    let start = line_start(text, anchor);
+    let column = anchor - start;
+    let mut end = line_end(text, start);
+    loop {
+        let mut probe = end;
+        while probe < text.len()
+            && (line_is_blank(text, probe) || is_comment_within(text, probe, column))
+        {
+            probe = line_end(text, probe);
+        }
+        if probe >= text.len() || !continues_entry(text, probe, column) {
+            break;
+        }
+        end = line_end(text, probe);
+    }
+    (start, end)
+}
+
+fn is_comment_within(text: &str, line: usize, column: usize) -> bool {
+    text[line..line_end(text, line)]
+        .trim_start()
+        .starts_with('#')
+        && indent_of(text, line) <= column
+}
+
+fn continues_entry(text: &str, line: usize, column: usize) -> bool {
+    let indent = indent_of(text, line);
+    let body = text[line + indent..line_end(text, line)].trim_end();
+    indent > column || (indent == column && (body == "-" || body.starts_with("- ")))
+}
+
+/// The first line in `[from, to)` holding something other than a comment.
+fn first_content_line(text: &str, from: usize, to: usize) -> Option<usize> {
+    let mut at = from;
+    while at < to {
+        let body = text[at..line_end(text, at)].trim();
+        if !body.is_empty() && !body.starts_with('#') {
+            return Some(at);
+        }
+        at = line_end(text, at);
+    }
+    None
+}
+
+/// `block` with `by` spaces before each line that holds anything; an empty line
+/// stays empty, so no line gains trailing whitespace.
+fn indented(block: &str, by: usize) -> String {
+    let pad = " ".repeat(by);
+    block
+        .split_inclusive('\n')
+        .map(|line| {
+            if line.trim_end_matches(['\n', '\r']).is_empty() {
+                line.to_string()
+            } else {
+                format!("{pad}{line}")
+            }
+        })
+        .collect()
+}
+
+/// `block` with up to `by` leading spaces taken off each line.
+fn dedented(block: &str, by: usize) -> String {
+    block
+        .split_inclusive('\n')
+        .map(|line| {
+            let n = line.bytes().take(by).take_while(|b| *b == b' ').count();
+            &line[n..]
+        })
+        .collect()
 }
 
 /// The full text extent of the element at `path` — anchor line through its last
