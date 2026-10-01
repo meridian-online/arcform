@@ -271,6 +271,119 @@ pub fn create_spec(dir: &Path, manifest: &Manifest) -> Result<ValidatedSpec> {
     Ok(ValidatedSpec { text, manifest })
 }
 
+// ------------------------------------------------------------- the ignore list
+
+/// The ignore list's file name, written beside `arcform.yaml`.
+pub(crate) const IGNORE_FILENAME: &str = ".gitignore";
+
+/// What [`write_ignore_list`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum IgnoreList {
+    /// The list was written.
+    Written,
+    /// An entry named `.gitignore` was there already, and is as it was.
+    Kept,
+}
+
+/// Write the ignore list beside `arcform.yaml` in `dir`, for the verbs that make a
+/// Protocol directory. It names what arc knows without reading the Protocol: the run
+/// records and tool stamps under `build/.arcform/`, and, when `db` — the manifest's
+/// `db:` value — puts the database inside `dir`, that file and its write-ahead log.
+/// What a step writes is the author's, and the list does not guess it.
+///
+/// An entry named `.gitignore` already in `dir` is left as it is: `create-protocol`
+/// makes a directory that may exist, and the author may have written the list first.
+/// `create_new` is the existence check and the creation in one call, so a list that
+/// appears between a look and a write is not overwritten, and a dangling symlink of
+/// that name is kept rather than written through. This looks for no repository and
+/// runs no `git`.
+pub(crate) fn write_ignore_list(dir: &Path, db: Option<&str>) -> Result<IgnoreList> {
+    use std::io::Write;
+
+    let path = dir.join(IGNORE_FILENAME);
+    let named = |e: std::io::Error| {
+        Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("{}: {e}", path.display()),
+        ))
+    };
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(IgnoreList::Kept),
+        Err(e) => return Err(named(e)),
+    };
+    if let Err(e) = file.write_all(ignore_list_text(dir, db).as_bytes()) {
+        // A half-written list would be read as the author's on the next run.
+        let _ = std::fs::remove_file(&path);
+        return Err(named(e));
+    }
+    Ok(IgnoreList::Written)
+}
+
+/// The text of the ignore list, anchored at the directory it sits in.
+fn ignore_list_text(dir: &Path, db: Option<&str>) -> String {
+    let mut text = String::from(
+        "# Written by `arc`: what a run records belongs to the machine that ran it.\n\
+         /build/.arcform/\n",
+    );
+    if let Some(db) = db.and_then(|db| path_inside(dir, db)) {
+        text.push_str("# The database this Protocol names, and its write-ahead log.\n");
+        text.push_str(&format!("/{db}\n/{db}.wal\n"));
+    }
+    text
+}
+
+/// `db`, as a run joins it to `dir`, written the way an ignore list in `dir` reads a
+/// path: relative, `/`-separated, with the characters the list gives a meaning
+/// escaped. `None` when it names a place outside `dir`, or holds a character a line of
+/// the list cannot carry. A relative path is resolved lexically, so `./a/../w.duckdb`
+/// is `w.duckdb` and `../w.duckdb` is outside; an absolute one is inside only when it
+/// sits under `dir`, which is looked for as `dir` is written and then as it resolves.
+fn path_inside(dir: &Path, db: &str) -> Option<String> {
+    let relative = if Path::new(db).is_absolute() {
+        let db = Path::new(db);
+        // What is left of `db` after its prefix is a tail of a `&str`, so it is text.
+        db.strip_prefix(dir)
+            .ok()
+            .or_else(|| db.strip_prefix(dir.canonicalize().ok()?).ok())?
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        db.to_string()
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for segment in relative.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            part => parts.push(escape_ignore_pattern(part)?),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// One path component, with each character the ignore list reads as a pattern
+/// escaped. `None` for a control character: a newline ends the line it would be on.
+fn escape_ignore_pattern(part: &str) -> Option<String> {
+    let mut out = String::new();
+    for c in part.chars() {
+        if c.is_control() {
+            return None;
+        }
+        if matches!(c, '\\' | '*' | '?' | '[' | ' ') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    Some(out)
+}
+
 // ------------------------------------------------------------------- splicing
 
 /// Apply every edit in order, each to the text the previous one left, then
@@ -1224,6 +1337,138 @@ steps:
         assert_eq!(
             set_pin(empty),
             format!("name: p\nextensions: {{mlpack: {{v1.5.5: {{linux_amd64: {PIN}}}}}}}\n")
+        );
+    }
+
+    #[test]
+    fn the_ignore_list_names_a_database_only_where_it_is_inside_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = &dir.path().canonicalize().unwrap();
+        let inside = |db: &str| path_inside(d, db);
+
+        assert_eq!(inside("work.duckdb").as_deref(), Some("work.duckdb"));
+        assert_eq!(inside("build/w.duckdb").as_deref(), Some("build/w.duckdb"));
+        assert_eq!(
+            inside("./a/../build/w.duckdb").as_deref(),
+            Some("build/w.duckdb"),
+            "resolved the way a run joins it, then written the way the list reads it"
+        );
+        assert_eq!(
+            inside("build//w.duckdb").as_deref(),
+            Some("build/w.duckdb"),
+            "an empty segment is no segment"
+        );
+        assert_eq!(
+            inside("a/b\nc.duckdb"),
+            None,
+            "a segment a line of the list cannot carry is not named, and does not name its parent"
+        );
+        assert_eq!(inside("../w.duckdb"), None, "outside the directory");
+        assert_eq!(
+            inside("a/../../w.duckdb"),
+            None,
+            "outside, by way of a child"
+        );
+        assert_eq!(
+            inside("/elsewhere/w.duckdb"),
+            None,
+            "absolute, not under it"
+        );
+        assert_eq!(inside(""), None);
+        assert_eq!(inside("."), None, "the directory itself is not a file");
+
+        let under = d.join("w.duckdb");
+        assert_eq!(
+            inside(under.to_str().unwrap()).as_deref(),
+            Some("w.duckdb"),
+            "an absolute path under the directory is inside it"
+        );
+
+        // A directory that cannot be resolved names no absolute database: the lexical
+        // look fails, and there is no real location to look under.
+        assert_eq!(path_inside(&d.join("missing"), "/elsewhere/w.duckdb"), None);
+
+        // A directory reached through a link: the run's database path is the real one.
+        #[cfg(unix)]
+        {
+            let real = d.join("real");
+            std::fs::create_dir(&real).unwrap();
+            let link = d.join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert_eq!(
+                path_inside(&link, real.join("build/w.duckdb").to_str().unwrap()).as_deref(),
+                Some("build/w.duckdb"),
+                "an absolute path under the directory's real location is inside it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_character_the_list_reads_as_a_pattern_is_escaped_and_a_newline_is_refused() {
+        assert_eq!(
+            escape_ignore_pattern("a b[1]*?\\c").as_deref(),
+            Some("a\\ b\\[1]\\*\\?\\\\c")
+        );
+        assert_eq!(
+            escape_ignore_pattern("plain.duckdb").as_deref(),
+            Some("plain.duckdb")
+        );
+        assert_eq!(escape_ignore_pattern("two\nlines"), None);
+    }
+
+    #[test]
+    fn the_ignore_list_text_is_anchored_and_names_the_database_and_its_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let none = "# Written by `arc`: what a run records belongs to the machine that ran it.\n\
+                    /build/.arcform/\n";
+        assert_eq!(ignore_list_text(dir.path(), None), none);
+        assert_eq!(
+            ignore_list_text(dir.path(), Some("../out.duckdb")),
+            none,
+            "a database outside the directory is not named"
+        );
+        assert_eq!(
+            ignore_list_text(dir.path(), Some("build/w.duckdb")),
+            format!(
+                "{none}# The database this Protocol names, and its write-ahead log.\n\
+                 /build/w.duckdb\n/build/w.duckdb.wal\n"
+            )
+        );
+    }
+
+    #[test]
+    fn the_ignore_list_is_written_once_and_a_list_already_there_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(IGNORE_FILENAME);
+
+        assert_eq!(
+            write_ignore_list(dir.path(), None).unwrap(),
+            IgnoreList::Written
+        );
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, ignore_list_text(dir.path(), None));
+
+        std::fs::write(&path, "theirs").unwrap();
+        assert_eq!(
+            write_ignore_list(dir.path(), None).unwrap(),
+            IgnoreList::Kept
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs");
+    }
+
+    #[test]
+    fn create_spec_writes_the_spec_and_no_ignore_list() {
+        let dir = tempfile::tempdir().unwrap();
+        create_spec(dir.path(), &Manifest::new_project("p")).unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [MANIFEST_FILENAME],
+            "the list is the verbs' to write, and the library path is as it was"
         );
     }
 

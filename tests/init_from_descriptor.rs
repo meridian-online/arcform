@@ -266,3 +266,38 @@ fn the_generated_manifest_names_no_database_and_run_builds_it_in_arcs_data_folde
         "it builds <name>.duckdb in one keyed directory of the data folder: {built:?}"
     );
 }
+
+/// What `arc init` writes when no `--db` puts a database inside the directory: the list
+/// `arc create-protocol` writes, which `tests/cli_authoring.rs` asks `git` to read.
+const IGNORE_LIST: &str = "# Written by `arc`: what a run records belongs to the machine that ran it.\n/build/.arcform/\n";
+
+/// `--from-descriptor` writes the same ignore list `arc init` does, beside the manifest
+/// it generates, and the lines it prints naming what it made name the list.
+#[test]
+fn the_generated_protocol_carries_the_ignore_list_and_the_summary_names_it() {
+    let workspace = tempfile::tempdir().unwrap();
+    let init = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .current_dir(workspace.path())
+        .args(["init", "assemble_demo", "--from-descriptor"])
+        .arg(fixtures_dir().join("signups.datapackage.json"))
+        .output()
+        .expect("spawn arc init");
+    assert!(
+        init.status.success(),
+        "arc init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let project = workspace.path().join("assemble_demo");
+    assert_eq!(
+        std::fs::read_to_string(project.join(".gitignore")).unwrap(),
+        IGNORE_LIST
+    );
+    let stdout = String::from_utf8_lossy(&init.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.trim_start().starts_with(".gitignore")),
+        "the summary names the list among what it made:\n{stdout}"
+    );
+}
