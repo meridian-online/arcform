@@ -318,9 +318,12 @@ fn an_explicit_db_stays_where_it_says_and_a_command_step_opens_it_by_its_relativ
         "1",
         "the command step opened the database the SQL step built"
     );
+    // arc resolves `db:` against the directory it runs in, which the operating system
+    // reports with every link resolved: on macOS the temporary directory sits under
+    // `/var`, a link to `/private/var`.
     assert_eq!(
         Path::new(&std::fs::read_to_string(p.join("told.txt")).unwrap()),
-        p.join("build/glob_read.db"),
+        p.canonicalize().unwrap().join("build/glob_read.db"),
         "ARC_DB_PATH names the db: file"
     );
     assert!(

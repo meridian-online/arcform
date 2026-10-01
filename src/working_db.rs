@@ -51,7 +51,19 @@ pub(crate) struct Located {
 
 /// The database of the Protocol named `name` in `dir`, in the data folder.
 pub(crate) fn locate(name: &str, dir: &Path) -> Result<Located> {
-    let root = resolve_root(std::env::var_os(DB_DIR_ENV), dirs::home_dir())?;
+    locate_with(std::env::var_os(DB_DIR_ENV), dirs::home_dir(), name, dir)
+}
+
+/// [`locate`], with the variable and the home directory passed in as [`resolve_root`]
+/// takes them, so a test can drive the case where there is neither: on Linux an unset
+/// `HOME` does not give it, because the home directory falls back to the passwd entry.
+fn locate_with(
+    env: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+    name: &str,
+    dir: &Path,
+) -> Result<Located> {
+    let root = resolve_root(env, home)?;
     path_under(&root, name, dir)
 }
 
@@ -150,6 +162,21 @@ mod tests {
     }
 
     #[test]
+    fn with_neither_a_variable_nor_a_home_directory_no_database_is_located() {
+        let protocol = tempfile::tempdir().unwrap();
+        match locate_with(None, None, "p", protocol.path()) {
+            Err(Error::DbRootMissing) => {}
+            Ok(located) => panic!(
+                "with no data folder the database was placed at {}, relative to wherever arc runs",
+                located.path.display()
+            ),
+            Err(other) => panic!("refused, but not for the missing data folder: {other:?}"),
+        }
+        let located = locate_with(Some("/data/arc-db".into()), None, "p", protocol.path()).unwrap();
+        assert!(located.path.starts_with("/data/arc-db"), "{located:?}");
+    }
+
+    #[test]
     fn the_database_is_the_protocols_name_under_a_key_of_its_canonical_directory() {
         let root = tempfile::tempdir().unwrap();
         let protocol = tempfile::tempdir().unwrap();
@@ -215,6 +242,41 @@ mod tests {
         assert!(
             matches!(&err, Error::DbFolderWrite { path, .. } if *path == marker),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_key_directory_that_cannot_be_made_is_refused_naming_it() {
+        let root = tempfile::tempdir().unwrap();
+        let key_dir = root.path().join("k");
+        std::fs::write(&key_dir, "a file where the key directory goes").unwrap();
+        let err = mark(&key_dir.join("p.duckdb"), Path::new("/work/p")).unwrap_err();
+        assert!(
+            matches!(&err, Error::DbFolderWrite { path, .. } if *path == key_dir),
+            "the refusal names the key directory {}: {err:?}",
+            key_dir.display()
+        );
+    }
+
+    #[test]
+    fn a_marker_that_already_names_the_directory_is_not_rewritten() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("k").join("p.duckdb");
+        mark(&db, Path::new("/work/p")).unwrap();
+        let marker = root.path().join("k").join(PROTOCOL_PATH_FILE);
+        let then = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+
+        mark(&db, Path::new("/work/p")).unwrap();
+        assert_eq!(
+            std::fs::metadata(&marker).unwrap().modified().unwrap(),
+            then,
+            "a marker that already names the directory was written again"
         );
     }
 
