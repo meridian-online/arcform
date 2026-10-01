@@ -609,6 +609,52 @@ fn a_database_inside_the_directory_is_not_staged_and_one_outside_is_not_named() 
     );
 }
 
+/// The directory DuckDB spills to beside a database `--db` puts inside the directory,
+/// `<database>.tmp`, is named in the list: a run killed while spilling leaves files in
+/// it, and `git add --all` would stage them.
+#[test]
+fn the_spill_directory_beside_a_database_inside_the_directory_is_not_staged() {
+    // The control: a spill file in a directory with no list is staged. Without it the
+    // assertions below could pass for a reason that is not arc's list.
+    let control = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(control.path().join("w.duckdb.tmp")).unwrap();
+    std::fs::write(
+        control
+            .path()
+            .join("w.duckdb.tmp/duckdb_temp_storage_0.tmp"),
+        b"spill",
+    )
+    .unwrap();
+    assert_eq!(
+        staged_by_add_all(control.path()),
+        ["w.duckdb.tmp/duckdb_temp_storage_0.tmp"],
+        "this git stages a spill file nothing ignores"
+    );
+
+    for db in ["w.duckdb", "build/w.duckdb", "my work.duckdb"] {
+        let base = tempfile::tempdir().expect("tempdir");
+        arc_ok(base.path(), &["create-protocol", "kept", "--db", db]);
+        let proto = base.path().join("kept");
+
+        let list = std::fs::read_to_string(proto.join(".gitignore")).unwrap();
+        if db == "w.duckdb" {
+            assert!(
+                list.lines().any(|l| l == "/w.duckdb.tmp/"),
+                "the list names the spill directory:\n{list}"
+            );
+        }
+        let spill = proto.join(format!("{db}.tmp"));
+        std::fs::create_dir_all(&spill).unwrap();
+        std::fs::write(spill.join("duckdb_temp_storage_0.tmp"), b"spill").unwrap();
+
+        assert_eq!(
+            staged_by_add_all(&proto),
+            [".gitignore", "arcform.yaml"],
+            "{db}: staged something of the spill directory"
+        );
+    }
+}
+
 /// `arc init` writes the same list the other verb does, and the lines it prints naming
 /// what it made name it.
 #[test]
