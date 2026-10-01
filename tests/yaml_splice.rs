@@ -175,3 +175,274 @@ fn edit_spec_refuses_a_chart_file_and_leaves_it_untouched() {
         "a refused edit writes nothing"
     );
 }
+
+// ------------------------------------------------------------- nest and lift
+
+/// A chart as brightfield writes one before its legend moves: the plot's keys
+/// at the document's root beside `meta:` and `data:`, a comment at the head of
+/// the file, one inside the `plot:` list and one at the end of a line of it.
+const FLAT_CHART: &str = "\
+# Weekly tonnage through each port, one line per port.
+meta:
+  title: Port throughput
+data:
+  flows:
+    file: data/flows.parquet
+plot:
+  # One line per port; the bars come later.
+  - mark: lineY
+    data: { from: flows }
+    x: week
+    y: tonnes   # summed per week upstream
+yScale: linear
+height: 240
+";
+
+/// The same chart once `plot:`, `yScale:` and `height:` sit in the first entry
+/// of a `vconcat:`, written out by hand: the oracle the nest is compared with.
+const NESTED_CHART: &str = "\
+# Weekly tonnage through each port, one line per port.
+meta:
+  title: Port throughput
+data:
+  flows:
+    file: data/flows.parquet
+vconcat:
+  - plot:
+      # One line per port; the bars come later.
+      - mark: lineY
+        data: { from: flows }
+        x: week
+        y: tonnes   # summed per week upstream
+    yScale: linear
+    height: 240
+";
+
+const FLAT_COMMENTS: [&str; 3] = [
+    "# Weekly tonnage through each port, one line per port.",
+    "# One line per port; the bars come later.",
+    "# summed per week upstream",
+];
+
+fn nest_plot(path: Vec<arc::spec::PathPart>) -> SpecEdit {
+    SpecEdit::Nest {
+        path,
+        keys: vec!["plot".into(), "yScale".into(), "height".into()],
+        under: "vconcat".into(),
+    }
+}
+
+fn lift_vconcat(path: Vec<arc::spec::PathPart>) -> SpecEdit {
+    SpecEdit::Lift {
+        path,
+        key: "vconcat".into(),
+    }
+}
+
+fn load(text: &str) -> serde_yaml::Value {
+    serde_yaml::from_str(text).expect("the text loads as YAML")
+}
+
+/// Nesting the plot's three keys at the root puts their lines, in their order,
+/// under the first entry of a new `vconcat:`, keeps each of the three comments,
+/// leaves `meta:` and `data:` as they were, and loads to the mapping the edit
+/// describes: the root with those three keys replaced by a `vconcat:` holding
+/// one mapping of them.
+#[test]
+fn nesting_the_plots_keys_at_the_root_moves_their_lines_and_keeps_their_comments() {
+    let out = apply_yaml_edits(FLAT_CHART, &[nest_plot(vec![])]).expect("the nest applies");
+
+    assert_eq!(
+        out, NESTED_CHART,
+        "the moved lines sit under the entry in their order"
+    );
+    for comment in FLAT_COMMENTS {
+        assert_eq!(
+            out.matches(comment).count(),
+            1,
+            "the comment {comment:?} is kept, once"
+        );
+    }
+    let untouched =
+        "meta:\n  title: Port throughput\ndata:\n  flows:\n    file: data/flows.parquet\n";
+    assert!(
+        FLAT_CHART.contains(untouched) && out.contains(untouched),
+        "`meta:` and `data:` keep their bytes"
+    );
+
+    let described = load(
+        "meta: {title: Port throughput}
+data: {flows: {file: data/flows.parquet}}
+vconcat:
+  - plot: [{mark: lineY, data: {from: flows}, x: week, y: tonnes}]
+    yScale: linear
+    height: 240
+",
+    );
+    assert_eq!(
+        load(&out),
+        described,
+        "the text loads to the nested mapping"
+    );
+}
+
+/// A chart whose second `hconcat:` entry is the plot to nest, with a comment
+/// heading that entry, one inside its `plot:` list and one at a line's end.
+const HCONCAT_CHART: &str = "\
+hconcat:
+  - plot:
+      - mark: barY
+        x: port
+    width: 320
+  # The weekly lines, beside the bars.
+  - plot:
+      # One line per port.
+      - mark: lineY
+        x: week   # ISO weeks
+    yScale: linear
+    height: 240
+";
+
+const HCONCAT_NESTED: &str = "\
+hconcat:
+  - plot:
+      - mark: barY
+        x: port
+    width: 320
+  # The weekly lines, beside the bars.
+  - vconcat:
+      - plot:
+          # One line per port.
+          - mark: lineY
+            x: week   # ISO weeks
+        yScale: linear
+        height: 240
+";
+
+/// The same nest on an entry of a sequence: `hconcat[1]` stays a mapping, now
+/// holding only `vconcat:`, whose first entry is the mapping the entry was,
+/// with its comments; the comment heading the entry stays above it, and the
+/// first entry is untouched.
+#[test]
+fn nesting_an_hconcat_entry_leaves_it_a_mapping_whose_vconcat_holds_what_it_was() {
+    let out = apply_yaml_edits(
+        HCONCAT_CHART,
+        &[nest_plot(vec!["hconcat".into(), 1.into()])],
+    )
+    .expect("the nest applies");
+
+    assert_eq!(out, HCONCAT_NESTED);
+
+    let before = load(HCONCAT_CHART);
+    let after = load(&out);
+    assert_eq!(
+        after["hconcat"][0], before["hconcat"][0],
+        "the first entry is untouched"
+    );
+    let entry = after["hconcat"][1]
+        .as_mapping()
+        .expect("the entry is still a mapping");
+    assert_eq!(entry.len(), 1, "the entry holds only `vconcat:`");
+    assert_eq!(
+        after["hconcat"][1]["vconcat"],
+        serde_yaml::Value::Sequence(vec![before["hconcat"][1].clone()]),
+        "`vconcat:`'s one entry is the mapping the entry was"
+    );
+    for comment in [
+        "# The weekly lines, beside the bars.",
+        "# One line per port.",
+        "# ISO weeks",
+    ] {
+        assert_eq!(out.matches(comment).count(), 1, "{comment:?} is kept, once");
+    }
+}
+
+/// Lifting `vconcat:`'s first entry back into its place, on the text each nest
+/// returned, gives back the text the nest started from: it loads to the same
+/// document and holds each comment it started with, byte for byte.
+#[test]
+fn lifting_the_nested_entry_returns_the_text_the_nest_started_from() {
+    let lifted = apply_yaml_edits(NESTED_CHART, &[lift_vconcat(vec![])]).expect("the lift applies");
+    assert_eq!(lifted, FLAT_CHART);
+    assert_eq!(load(&lifted), load(FLAT_CHART));
+    for comment in FLAT_COMMENTS {
+        assert!(lifted.contains(comment), "{comment:?} is kept");
+    }
+
+    let nested = apply_yaml_edits(
+        HCONCAT_CHART,
+        &[nest_plot(vec!["hconcat".into(), 1.into()])],
+    )
+    .expect("the nest applies");
+    let lifted = apply_yaml_edits(&nested, &[lift_vconcat(vec!["hconcat".into(), 1.into()])])
+        .expect("the lift applies");
+    assert_eq!(lifted, HCONCAT_CHART);
+    assert_eq!(load(&lifted), load(HCONCAT_CHART));
+}
+
+/// The legend the caller appends after the nest is a second entry, which a
+/// lift would drop; the lift refuses rather than lose it, and lifts once the
+/// entry is deleted in the same batch.
+#[test]
+fn a_lift_refuses_a_sequence_of_two_and_lifts_once_the_second_is_deleted() {
+    let legend = SpecEdit::Append {
+        path: vec!["vconcat".into()],
+        item: "  - legend: color\n".into(),
+    };
+    let with_legend =
+        apply_yaml_edits(FLAT_CHART, &[nest_plot(vec![]), legend]).expect("nest, then append");
+
+    let err = apply_yaml_edits(&with_legend, &[lift_vconcat(vec![])])
+        .expect_err("a lift of one item out of two is refused");
+    match err {
+        Error::EditTarget { path, detail } => {
+            assert_eq!(path, "vconcat");
+            assert!(
+                detail.contains("holds 2 items"),
+                "the reason says why: {detail}"
+            );
+        }
+        other => panic!("expected the splice's refusal, got: {other}"),
+    }
+
+    let delete = SpecEdit::Delete {
+        path: vec!["vconcat".into(), 1.into()],
+    };
+    let lifted = apply_yaml_edits(&with_legend, &[delete, lift_vconcat(vec![])])
+        .expect("delete the legend, then lift");
+    assert_eq!(lifted, FLAT_CHART);
+}
+
+/// A nest whose path names no element, and one whose new key the mapping
+/// already holds, each return no text and a reason naming where.
+#[test]
+fn a_nest_with_no_target_or_a_held_key_is_refused_with_a_reason() {
+    for (path, shown) in [
+        (vec!["chart".into()], "chart"),
+        (vec!["hconcat".into(), 5.into()], "hconcat[5]"),
+    ] {
+        let err = apply_yaml_edits(HCONCAT_CHART, &[nest_plot(path)])
+            .expect_err("the path names no element");
+        match err {
+            Error::EditTarget { path, .. } => assert_eq!(path, shown),
+            other => panic!("expected the splice's refusal naming the path, got: {other}"),
+        }
+    }
+
+    let held = SpecEdit::Nest {
+        path: vec![],
+        keys: vec!["plot".into(), "yScale".into(), "height".into()],
+        under: "data".into(),
+    };
+    let err = apply_yaml_edits(FLAT_CHART, &[held]).expect_err("the root already holds `data:`");
+    match err {
+        Error::EditTarget { path, detail } => {
+            assert_eq!(path, "(root)");
+            assert!(
+                detail.contains("already holds `data`"),
+                "the reason names the key: {detail}"
+            );
+        }
+        other => panic!("expected the splice's refusal, got: {other}"),
+    }
+}
