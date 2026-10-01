@@ -508,8 +508,8 @@ impl Manifest {
     }
 
     /// Generate a default manifest for a new project. It names no database: `db` is
-    /// unset, so the manifest is written without the key and resolves to
-    /// `<name>.duckdb` beside it; a caller with a path sets `db` after.
+    /// unset, so the manifest is written without the key and its database is
+    /// `<name>.duckdb` in arc's data folder; a caller with a path sets `db` after.
     pub(crate) fn new_project(name: &str) -> Self {
         Manifest {
             name: name.to_string(),
