@@ -449,12 +449,16 @@ const MODEL_STEP: &str = "\n  - name: generate\n    command: \"mkdir -p models &
 /// `git` in `dir`, with the developer's own configuration out of reach. A global
 /// ignore file that names `*.duckdb` would make a database look as though arc's list
 /// had excluded it, and a test that passed for that reason would pass whatever arc wrote.
+///
+/// The home is an empty directory made for this call. `git` reads a global ignore file
+/// from `$XDG_CONFIG_HOME/git/ignore` whatever `GIT_CONFIG_GLOBAL` says, so a directory
+/// that outlived the call could carry one into the next.
 fn git(dir: &Path, args: &[&str]) -> String {
-    let home = std::env::temp_dir().join("arc-cli-authoring-git-home");
+    let home = tempfile::tempdir().expect("tempdir");
     let out = Command::new("git")
         .current_dir(dir)
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", &home)
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -655,6 +659,40 @@ fn the_spill_directory_beside_a_database_inside_the_directory_is_not_staged() {
     }
 }
 
+/// A `--db` segment holding a control character is a path the list cannot name: a newline
+/// ends the line it would be on, and `git` reads a pattern ending in a carriage return
+/// without it. Nothing is written for such a database, so `git add --all` stages it.
+/// A tab and a carriage return are control characters the unit case in `src/edit.rs`
+/// does not reach, and a rule narrowed to a newline would write a pattern for each.
+#[cfg(unix)]
+#[test]
+fn a_database_whose_path_holds_a_control_character_is_not_named_in_the_list() {
+    for (case, db) in [
+        ("a `--db` segment holding a tab", "build/w\t.duckdb"),
+        (
+            "a `--db` segment ending in a carriage return",
+            "build/w.duckdb\r",
+        ),
+    ] {
+        let base = tempfile::tempdir().expect("tempdir");
+        arc_ok(base.path(), &["create-protocol", "kept", "--db", db]);
+        let proto = base.path().join("kept");
+
+        assert_eq!(
+            std::fs::read_to_string(proto.join(".gitignore")).unwrap(),
+            IGNORE_LIST,
+            "{case} is not named in the list"
+        );
+        std::fs::create_dir_all(proto.join("build")).unwrap();
+        std::fs::write(proto.join(db), b"db").unwrap();
+        let staged = staged_by_add_all(&proto);
+        assert!(
+            staged.contains(&db.to_string()),
+            "{case}: the database it names is staged: {staged:?}"
+        );
+    }
+}
+
 /// `arc init` writes the same list the other verb does, and the lines it prints naming
 /// what it made name it.
 #[test]
@@ -831,16 +869,18 @@ fn author_and_run(path: Option<&OsStr>) -> Outcome {
     }
 }
 
-/// A `PATH` that holds the tools an `arc run` of a command step needs and no `git`.
+/// A directory to use as `PATH` that holds the tools an `arc run` of a command step needs
+/// and no `git`, made for this call and removed when it drops. A directory that outlived
+/// its run would put whatever that run left in it on the next run's `PATH`: a `git` link
+/// from a mutation check, or a `duckdb` link into a scratch directory that is gone.
 #[cfg(unix)]
-fn path_without_git() -> PathBuf {
-    let bin = std::env::temp_dir().join("arc-cli-authoring-no-git");
-    std::fs::create_dir_all(&bin).unwrap();
+fn path_without_git() -> tempfile::TempDir {
+    let bin = tempfile::tempdir().expect("tempdir");
     let on_path = std::env::split_paths(&std::env::var_os("PATH").unwrap()).collect::<Vec<_>>();
     for tool in ["sh", "duckdb"] {
         if let Some(found) = on_path.iter().map(|d| d.join(tool)).find(|p| p.is_file()) {
-            // Another test may be linking the same name at the same moment.
-            let _ = std::os::unix::fs::symlink(found, bin.join(tool));
+            std::os::unix::fs::symlink(found, bin.path().join(tool))
+                .expect("link a tool into the PATH built for this test");
         }
     }
     bin
@@ -863,12 +903,12 @@ fn create_init_and_run_give_the_same_result_with_no_git_on_path() {
     };
     assert!(finds_git(None), "the ordinary PATH has a git");
     assert!(
-        !finds_git(Some(bin.as_os_str())),
+        !finds_git(Some(bin.path().as_os_str())),
         "the PATH built for this test has none, or the comparison below compares a run with itself"
     );
 
     let with_git = author_and_run(None);
-    let without_git = author_and_run(Some(bin.as_os_str()));
+    let without_git = author_and_run(Some(bin.path().as_os_str()));
     assert!(with_git.run_records > 0, "the run wrote records");
     assert_eq!(with_git, without_git);
     assert!(
