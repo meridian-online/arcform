@@ -1104,16 +1104,15 @@ fn lift_entry(text: &str, path: &[PathPart], key: &str) -> Result<String> {
         .and_then(|m| m.get(key))
         .and_then(|s| s.get(0))
         .and_then(serde_yaml::Value::as_mapping);
-    if let (Some(mapping), Some(lifted)) = (mapping, lifted) {
-        if let Some(held) = lifted
+    if let (Some(mapping), Some(lifted)) = (mapping, lifted)
+        && let Some(held) = lifted
             .keys()
             .find(|k| k.as_str() != Some(key) && mapping.contains_key(*k))
-        {
-            return Err(target_err(
-                path,
-                format!("the mapping already holds `{}`", key_display(held)),
-            ));
-        }
+    {
+        return Err(target_err(
+            path,
+            format!("the mapping already holds `{}`", key_display(held)),
+        ));
     }
 
     let anchor = doc
