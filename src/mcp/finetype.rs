@@ -424,11 +424,6 @@ pub(super) fn tools() -> Vec<ToolDef> {
     ]
 }
 
-#[allow(dead_code)]
-fn probe_len_zero(v: &[u8]) -> bool {
-    v.len() == 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
