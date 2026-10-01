@@ -201,38 +201,8 @@ pub fn record_step(dir: &Path, step: &RecordedStep) -> Result<(PathBuf, Validate
         }],
     )?;
 
-    // The reloaded document is the arbiter: the splice must read back as
-    // exactly one new step carrying exactly the asked-for name and file. The
-    // name gate above refuses the smuggling constructions it can name; this
-    // equality check refuses the ones it cannot — any name that parses but
-    // records something other than itself.
-    let last = validated.manifest().steps.last();
-    let faithful = validated.manifest().steps.len() == steps_before + 1
-        && last.is_some_and(|last| {
-            last.name == step.name && last.sql.as_deref() == Some(sql_cited.as_str())
-        });
-    if !faithful {
-        return Err(Error::EditTarget {
-            path: "(name)".to_string(),
-            detail: format!(
-                "the step name {:?} does not record faithfully — spliced into the manifest \
-                 it reads back as something other than itself; use a plain single-line name",
-                step.name
-            ),
-        });
-    }
-    // The description is held to the same test: what reads back is what was
-    // given, or nothing is written.
-    if last.and_then(|last| last.description.as_deref()) != step.description.as_deref() {
-        return Err(Error::EditTarget {
-            path: "(description)".to_string(),
-            detail: format!(
-                "the description {:?} does not record faithfully — spliced into the manifest \
-                 it reads back as something other than itself",
-                step.description.as_deref().unwrap_or_default()
-            ),
-        });
-    }
+    // The reloaded document is the arbiter: see [`reads_back`].
+    reads_back(validated.manifest(), steps_before, step, &sql_cited)?;
 
     // Both writes are now committed to. The checkpoint seam fires before the
     // first byte changes on disk.
@@ -434,6 +404,45 @@ fn one_line(provenance: &str) -> Result<()> {
             detail: "the provenance note must be a single line — it becomes the generated \
                      file's marker header"
                 .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Whether `manifest`, reloaded from the spliced text, carries exactly the step
+/// that was asked for: one step more than the `steps_before` it had, the last
+/// of them named `step.name`, citing `sql_cited` and carrying `step.description`.
+/// The name and description gates refuse the constructions they can name; this
+/// refuses the ones they cannot — any value that parses but records something
+/// other than itself.
+fn reads_back(
+    manifest: &Manifest,
+    steps_before: usize,
+    step: &RecordedStep,
+    sql_cited: &str,
+) -> Result<()> {
+    let last = manifest.steps.last();
+    let faithful = manifest.steps.len() == steps_before + 1
+        && last
+            .is_some_and(|last| last.name == step.name && last.sql.as_deref() == Some(sql_cited));
+    if !faithful {
+        return Err(Error::EditTarget {
+            path: "(name)".to_string(),
+            detail: format!(
+                "the step name {:?} does not record faithfully — spliced into the manifest \
+                 it reads back as something other than itself; use a plain single-line name",
+                step.name
+            ),
+        });
+    }
+    if last.and_then(|last| last.description.as_deref()) != step.description.as_deref() {
+        return Err(Error::EditTarget {
+            path: "(description)".to_string(),
+            detail: format!(
+                "the description {:?} does not record faithfully — spliced into the manifest \
+                 it reads back as something other than itself",
+                step.description.as_deref().unwrap_or_default()
+            ),
         });
     }
     Ok(())
@@ -1294,6 +1303,100 @@ mod tests {
         );
         let terminated = model_contents("v", "SELECT 1\n");
         assert_eq!(terminated, "-- generated: v\nSELECT 1\n");
+    }
+
+    /// The read-back check holds each part of the recorded step on its own: a
+    /// manifest that differs from the request in any one of them is refused,
+    /// naming the part, and one that matches is not. No input reaches these
+    /// refusals through `record_step` today, because the name and description
+    /// gates refuse first, so the check is driven here with manifests built to
+    /// disagree.
+    #[test]
+    fn reads_back_refuses_a_manifest_that_differs_from_the_request_in_any_part() {
+        let manifest = |steps: &str| {
+            Manifest::from_yaml_str(&format!("name: shop\nsteps:\n{steps}"))
+                .expect("the manifest loads")
+        };
+        let first = "  - name: orders\n    sql: models/01_orders.sql\n";
+        let step = RecordedStep {
+            name: "big".to_string(),
+            sql: "SELECT 1;".to_string(),
+            provenance: "test".to_string(),
+            description: Some("Keep the big ones".to_string()),
+        };
+        let sql = "models/02_big.sql";
+        let recorded =
+            "  - name: big\n    sql: models/02_big.sql\n    description: Keep the big ones\n";
+        assert!(
+            reads_back(&manifest(&format!("{first}{recorded}")), 1, &step, sql).is_ok(),
+            "the manifest that carries exactly the request is refused"
+        );
+
+        for (what, steps, expected) in [
+            (
+                "another name",
+                format!(
+                    "{first}  - name: small\n    sql: models/02_big.sql\n    description: Keep the big ones\n"
+                ),
+                "(name)",
+            ),
+            (
+                "another file",
+                format!(
+                    "{first}  - name: big\n    sql: models/03_big.sql\n    description: Keep the big ones\n"
+                ),
+                "(name)",
+            ),
+            (
+                "two new steps",
+                format!("{first}  - name: extra\n    sql: models/09_extra.sql\n{recorded}"),
+                "(name)",
+            ),
+            ("no new step", first.to_string(), "(name)"),
+            (
+                "another description",
+                format!(
+                    "{first}  - name: big\n    sql: models/02_big.sql\n    description: Keep the small ones\n"
+                ),
+                "(description)",
+            ),
+            (
+                "no description",
+                format!("{first}  - name: big\n    sql: models/02_big.sql\n"),
+                "(description)",
+            ),
+        ] {
+            match reads_back(&manifest(&steps), 1, &step, sql) {
+                Err(Error::EditTarget { path, .. }) => assert_eq!(path, expected, "{what}"),
+                other => panic!("{what}: expected the {expected} refusal, got {other:?}"),
+            }
+        }
+
+        let undescribed = RecordedStep {
+            description: None,
+            ..step.clone()
+        };
+        assert!(
+            reads_back(
+                &manifest(&format!(
+                    "{first}  - name: big\n    sql: models/02_big.sql\n"
+                )),
+                1,
+                &undescribed,
+                sql
+            )
+            .is_ok(),
+            "a step asked for with no description is refused when it reads back with none"
+        );
+        match reads_back(
+            &manifest(&format!("{first}{recorded}")),
+            1,
+            &undescribed,
+            sql,
+        ) {
+            Err(Error::EditTarget { path, .. }) => assert_eq!(path, "(description)"),
+            other => panic!("a description nobody asked for: got {other:?}"),
+        }
     }
 
     #[test]
