@@ -100,6 +100,13 @@ pub struct RecordedStep {
     /// after the marker. Refused if it spans lines, because the marker header
     /// is one line by contract.
     pub provenance: String,
+
+    /// The step's `description:` — one line saying what it does and why — or
+    /// `None` for a step with none, which is spliced exactly as before the field
+    /// existed. Written after `sql:`, as a plain scalar where that reads back as
+    /// exactly itself and single-quoted where it would not. Refused if it is
+    /// empty, spans lines or holds another control character.
+    pub description: Option<String>,
 }
 
 /// Promote an exploration into the protocol at `dir`: write its SQL as a new
@@ -108,7 +115,8 @@ pub struct RecordedStep {
 /// The generated model lands at `models/NN_<name>.sql`, where `NN` continues
 /// the highest number-prefixed model already present (a hand-authored,
 /// unnumbered model neither collides nor moves). The spliced step carries
-/// `name:` and `sql:` and nothing else — inputs and outputs are discovered
+/// `name:` and `sql:`, then `description:` when the step has one, and nothing
+/// else — inputs and outputs are discovered
 /// from the SQL itself at load, exactly as they are for a hand-written step,
 /// so the recorded step is indistinguishable in shape from one typed in an
 /// editor.
@@ -129,13 +137,18 @@ pub struct RecordedStep {
 /// YAML indicator — or, as the structural backstop, any name the reloaded
 /// document does not read back verbatim), when `steps` is missing or empty
 /// (an empty protocol has nothing to explore, so it has nothing to record
-/// against), or when the provenance note spans lines;
+/// against), when the provenance note spans lines, or when the description
+/// is empty, spans lines, holds another control character or does not read
+/// back verbatim;
 /// [`Error::GeneratedSqlExists`] when the model path is already occupied; the
 /// loader's own error when the spliced result would not load — a duplicate
 /// step name, most commonly.
 pub fn record_step(dir: &Path, step: &RecordedStep) -> Result<(PathBuf, ValidatedSpec)> {
     valid_step_name(&step.name)?;
     one_line(&step.provenance)?;
+    if let Some(description) = &step.description {
+        valid_description(description)?;
+    }
 
     let manifest_path = dir.join(MANIFEST_FILENAME);
     if !manifest_path.exists() {
@@ -168,10 +181,16 @@ pub fn record_step(dir: &Path, step: &RecordedStep) -> Result<(PathBuf, Validate
     // own convention.
     let steps_path = vec![PathPart::Key("steps".to_string())];
     let indent = sequence_item_indent(&original, &steps_path)?;
-    let item = format!(
+    let mut item = format!(
         "{indent}- name: {}\n{indent}  sql: {sql_cited}\n",
         step.name
     );
+    if let Some(description) = &step.description {
+        item.push_str(&format!(
+            "{indent}  description: {}\n",
+            description_scalar(description)
+        ));
+    }
     let validated = apply_edits(
         &original,
         &[SpecEdit::Append {
@@ -185,8 +204,9 @@ pub fn record_step(dir: &Path, step: &RecordedStep) -> Result<(PathBuf, Validate
     // name gate above refuses the smuggling constructions it can name; this
     // equality check refuses the ones it cannot — any name that parses but
     // records something other than itself.
+    let last = validated.manifest().steps.last();
     let faithful = validated.manifest().steps.len() == steps_before + 1
-        && validated.manifest().steps.last().is_some_and(|last| {
+        && last.is_some_and(|last| {
             last.name == step.name && last.sql.as_deref() == Some(sql_cited.as_str())
         });
     if !faithful {
@@ -196,6 +216,18 @@ pub fn record_step(dir: &Path, step: &RecordedStep) -> Result<(PathBuf, Validate
                 "the step name {:?} does not record faithfully — spliced into the manifest \
                  it reads back as something other than itself; use a plain single-line name",
                 step.name
+            ),
+        });
+    }
+    // The description is held to the same test: what reads back is what was
+    // given, or nothing is written.
+    if last.and_then(|last| last.description.as_deref()) != step.description.as_deref() {
+        return Err(Error::EditTarget {
+            path: "(description)".to_string(),
+            detail: format!(
+                "the description {:?} does not record faithfully — spliced into the manifest \
+                 it reads back as something other than itself",
+                step.description.as_deref().unwrap_or_default()
             ),
         });
     }
@@ -403,6 +435,56 @@ fn one_line(provenance: &str) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Refuse a description that is not one line of text: empty or blank, holding
+/// a line break — which YAML also reads in `\u{85}`, `\u{2028}` and
+/// `\u{2029}` — or holding another control character. Each refusal names why.
+fn valid_description(description: &str) -> Result<()> {
+    let refuse = |detail: String| {
+        Err(Error::EditTarget {
+            path: "(description)".to_string(),
+            detail,
+        })
+    };
+    if description.trim().is_empty() {
+        return refuse(
+            "the description is empty — give one line saying what the step does and why, \
+             or leave it out"
+                .to_string(),
+        );
+    }
+    if description
+        .chars()
+        .any(|c| matches!(c, '\n' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}'))
+    {
+        return refuse(format!(
+            "the description {description:?} spans lines — a step's description is one line"
+        ));
+    }
+    if description.chars().any(char::is_control) {
+        return refuse(format!(
+            "the description {description:?} contains a control character — a step's \
+             description is one line of text"
+        ));
+    }
+    Ok(())
+}
+
+/// `description` as the YAML scalar a step's `description:` is written with: the
+/// text itself where YAML reads it back as exactly that string, and otherwise
+/// single-quoted, its own `'` doubled — so a `:`, a `#`, a quote, a leading
+/// indicator, surrounding spaces or a word YAML reads as another type (`true`,
+/// `~`, `12`) read back as written.
+fn description_scalar(description: &str) -> String {
+    let plain = serde_yaml::from_str::<serde_yaml::Value>(&format!("d: {description}\n"))
+        .ok()
+        .and_then(|doc| doc.get("d").cloned());
+    if plain == Some(serde_yaml::Value::String(description.to_string())) {
+        description.to_string()
+    } else {
+        format!("'{}'", description.replace('\'', "''"))
+    }
 }
 
 /// The step name, made safe for a filename: anything outside `[A-Za-z0-9_-]`
@@ -850,15 +932,18 @@ pub(crate) fn describe(name: &str) -> Option<serde_json::Value> {
 // ------------------------------------------------- recording an operation
 
 /// Record the operation called `long_name`, applied to the table `on`, as a new
-/// step named `name` at the end of the protocol at `dir`, and return the model's
-/// path relative to `dir`.
+/// step named `name` at the end of the protocol at `dir`, with `description` as
+/// its `description:` when one is given, and return the model's path relative
+/// to `dir`.
 ///
 /// The operation's SQL is written from its catalogue entry, so a caller names no
 /// operation and no argument of its own: the command line and `arc mcp` hand
 /// over what they were given, and an operation added to the catalogue is
 /// recorded through both with no edit to either. The model's first line is the
 /// long name and the table, ` on ` between them, and nothing else, so the same
-/// request writes the same bytes whoever sends it. The step is recorded through
+/// request writes the same bytes whoever sends it; a description is the caller's
+/// own words, written on the step as given, so it too is the same whoever sends
+/// it. The step is recorded through
 /// [`record_step_with_history`](crate::history::record_step_with_history), so
 /// each recording is a version of the protocol, and it runs nothing.
 ///
@@ -866,7 +951,8 @@ pub(crate) fn describe(name: &str) -> Option<serde_json::Value> {
 /// hold; arguments the operation's `parameters` do not admit, whether one is
 /// missing, one is not taken or one is of the wrong type; a condition or an order
 /// DuckDB's own parser reads as more than one statement, or cannot parse at all
-/// (see [`one_statement`]); and a table no step of the protocol makes. Each
+/// (see [`one_statement`]); a table no step of the protocol makes; and a
+/// description that is empty or spans lines (see [`record_step`]). Each
 /// refusal's message names what was wrong.
 pub(crate) fn record_operation(
     dir: &Path,
@@ -874,6 +960,7 @@ pub(crate) fn record_operation(
     on: &str,
     name: &str,
     arguments: &serde_json::Map<String, serde_json::Value>,
+    description: Option<&str>,
     history: &crate::history::LocalHistory,
 ) -> Result<PathBuf> {
     let Some(op) = operation(long_name) else {
@@ -894,6 +981,7 @@ pub(crate) fn record_operation(
             arguments,
         }),
         provenance: format!("{} on {on}", op.long_name),
+        description: description.map(str::to_string),
     };
     let (sql_rel, _) = crate::history::record_step_with_history(dir, &step, history)?;
     Ok(sql_rel)

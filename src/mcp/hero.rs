@@ -242,7 +242,8 @@ fn operation_describe_schema() -> Value {
 /// writes the step's SQL from the operation's catalogue entry; nothing here names
 /// an operation or an argument. `dir` defaults to `.`, the server's working
 /// directory, as `--dir` does. `arguments` is an object, absent when the
-/// operation takes none. A refusal is an error result naming what was wrong, with
+/// operation takes none. `description` is a string, absent for a step with none,
+/// as `--description` is. A refusal is an error result naming what was wrong, with
 /// the Protocol's directory untouched.
 fn operation_record(args: &Value) -> ToolResult {
     let dir = PathBuf::from(args.get("dir").and_then(Value::as_str).unwrap_or("."));
@@ -258,9 +259,22 @@ fn operation_record(args: &Value) -> ToolResult {
             ));
         }
     };
+    let description = match args.get("description") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(description)) => Some(description.as_str()),
+        Some(other) => return Err(format!("`description` must be a string, not {other}")),
+    };
     let history = open_history()?;
-    let model = crate::record::record_operation(&dir, operation, on, name, &arguments, &history)
-        .map_err(|e| e.to_string())?;
+    let model = crate::record::record_operation(
+        &dir,
+        operation,
+        on,
+        name,
+        &arguments,
+        description,
+        &history,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(ToolOutput::json(json!({
         "step": name,
         "model": model.display().to_string(),
@@ -294,6 +308,7 @@ fn operation_record_schema() -> Value {
             "on": { "type": "string", "description": "The table the operation is applied to: one a step of the Protocol makes." },
             "name": { "type": "string", "description": "The new step's name, which is also the name of the table it makes." },
             "arguments": { "type": "object", "description": "The operation's arguments, as the `parameters` JSON Schema operation_describe returns for it describes them." },
+            "description": { "type": "string", "description": "One line saying what the step does and why, written on the step for the person who reads the Protocol next." },
             "dir": { "type": "string", "description": "Protocol directory (where arcform.yaml lives). Defaults to the current directory." }
         },
         "required": ["operation", "on", "name"]

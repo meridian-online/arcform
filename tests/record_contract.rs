@@ -69,6 +69,7 @@ fn tide_capture() -> RecordedStep {
               SELECT * FROM read_csv('data/tides.csv') WHERE port = 'dover';"
             .to_string(),
         provenance: "grid filter on tide_table (port = 'dover')".to_string(),
+        description: None,
     }
 }
 
@@ -133,6 +134,7 @@ fn a_second_recording_takes_the_next_number() {
               SELECT * FROM dover_tides WHERE tide_m > 5.5;"
             .to_string(),
         provenance: "grid filter on dover_tides (tide_m > 5.5)".to_string(),
+        description: None,
     };
     let (sql_rel, validated) = record_step(dir.path(), &second).expect("second records");
     assert_eq!(sql_rel, Path::new("models").join("02_spring_tides.sql"));
@@ -169,6 +171,7 @@ fn a_refused_promotion_leaves_manifest_and_models_untouched() {
         name: "show".to_string(), // already a step in the corpus
         sql: "SELECT 1;".to_string(),
         provenance: "duplicate".to_string(),
+        description: None,
     };
     match record_step(dir.path(), &duplicate) {
         Err(Error::ManifestValidation(msg)) => {
@@ -455,6 +458,7 @@ fn a_spec_grown_by_recording_runs_under_the_bare_binary() {
     manifest.steps.push(Step {
         name: "fetch".into(),
         sql: None,
+        description: None,
         command: Some(
             "printf 'day,port,tide_m\\n1,dover,5.1\\n2,hobart,1.4\\n3,dover,5.9\\n' > tides.csv"
                 .into(),
@@ -477,6 +481,7 @@ fn a_spec_grown_by_recording_runs_under_the_bare_binary() {
             name: "tides".into(),
             sql: "CREATE OR REPLACE TABLE tides AS SELECT * FROM read_csv('tides.csv');".into(),
             provenance: "table load of tides.csv".into(),
+            description: None,
         },
     )
     .expect("first promotion records");
@@ -492,6 +497,7 @@ fn a_spec_grown_by_recording_runs_under_the_bare_binary() {
                   (FORMAT CSV, HEADER);"
                 .into(),
             provenance: "grid filter on tides (port = 'dover')".into(),
+            description: None,
         },
     )
     .expect("second promotion records");

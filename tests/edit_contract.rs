@@ -370,6 +370,7 @@ fn create_spec_serialises_directly_and_the_result_runs() {
     manifest.steps.push(Step {
         name: "hello".into(),
         sql: None,
+        description: None,
         command: Some("printf 'hello\\n' > out.txt".into()),
         op: None,
         with: None,

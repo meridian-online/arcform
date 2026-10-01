@@ -193,6 +193,12 @@ pub enum OperationCmd {
         #[arg(long = "arg", value_name = "KEY=VALUE")]
         args: Vec<String>,
 
+        /// One line saying what the step does and why, for whoever reads the
+        /// protocol next. Written on the step as `description:`; without it the
+        /// step carries none.
+        #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
+        description: Option<String>,
+
         /// Protocol directory (where arcform.yaml lives).
         #[arg(long, default_value = ".")]
         dir: PathBuf,
@@ -804,11 +810,21 @@ fn dispatch_operation(cmd: OperationCmd, out: &mut impl Write) -> Result<()> {
             on,
             name,
             args,
+            description,
             dir,
         } => {
             let arguments = operation_arguments(&args)?;
             let history = open_history()?;
-            operation_record(&dir, &long_name, &on, &name, &arguments, &history, out)
+            operation_record(
+                &dir,
+                &long_name,
+                &on,
+                &name,
+                &arguments,
+                description.as_deref(),
+                &history,
+                out,
+            )
         }
     }
 }
@@ -856,10 +872,12 @@ fn operation_record(
     on: &str,
     name: &str,
     arguments: &serde_json::Map<String, serde_json::Value>,
+    description: Option<&str>,
     history: &LocalHistory,
     out: &mut impl Write,
 ) -> Result<()> {
-    let model = crate::record::record_operation(dir, long_name, on, name, arguments, history)?;
+    let model =
+        crate::record::record_operation(dir, long_name, on, name, arguments, description, history)?;
     writeln!(
         out,
         "recorded step {name} as {} in {} — `arc run` runs it",
@@ -1668,6 +1686,7 @@ mod tests {
             "orders",
             "big",
             &arguments,
+            None,
             &history,
             &mut FailingWriter,
         )

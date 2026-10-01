@@ -550,6 +550,7 @@ mod tests {
         Step {
             name: name.to_string(),
             sql: Some(sql.to_string()),
+            description: None,
             command: None,
             produces: vec![],
             depends_on: vec![],
@@ -572,6 +573,7 @@ mod tests {
         Step {
             name: name.to_string(),
             sql: None,
+            description: None,
             command: Some(command.to_string()),
             produces: produces.into_iter().map(String::from).collect(),
             depends_on: depends_on.into_iter().map(String::from).collect(),
@@ -589,6 +591,7 @@ mod tests {
         Step {
             name: name.to_string(),
             sql: None,
+            description: None,
             command: Some(command.to_string()),
             produces: vec![],
             depends_on: vec![],
@@ -606,6 +609,7 @@ mod tests {
         Step {
             name: name.to_string(),
             sql: None,
+            description: None,
             command: None,
             produces: vec![],
             depends_on: vec![],
