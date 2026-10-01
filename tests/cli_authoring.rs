@@ -20,7 +20,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use arc::spec::{MANIFEST_FILENAME, SpecEdit, apply_edits};
+use arc::spec::{MANIFEST_FILENAME, Manifest, SpecEdit, apply_edits};
 
 /// Run the real `arc` binary with `args` in `dir`. The spawned binary gets a
 /// test-scoped local-history root and data folder: authoring commands record
@@ -831,4 +831,151 @@ fn create_init_and_run_give_the_same_result_with_no_git_on_path() {
         "both lists were written: {:?}",
         with_git.files.keys().collect::<Vec<_>>()
     );
+}
+
+// ------------------------------------------------- a description is kept
+
+/// A Protocol whose first step carries no description and whose other three
+/// each carry one: plain, single-quoted with a comment after it, and
+/// double-quoted holding its own quotes.
+const DESCRIBED: &str = "\
+# A shop's orders, and what is made from them.
+name: shop
+engine: duckdb
+db: shop.duckdb
+
+steps:
+  - name: orders
+    sql: models/01_orders.sql
+  - name: big_orders
+    sql: models/02_big_orders.sql
+    description: Every order worth chasing
+  - name: by_amount
+    sql: models/03_by_amount.sql
+    description: 'Sorted: biggest first' # for the weekly call
+  - name: tally
+    sql: models/04_tally.sql
+    description: \"Counted, \\\"as\\\" the books count\"
+";
+
+/// The three description lines of [`DESCRIBED`], byte for byte.
+const DESCRIPTION_LINES: [&str; 3] = [
+    "    description: Every order worth chasing\n",
+    "    description: 'Sorted: biggest first' # for the weekly call\n",
+    "    description: \"Counted, \\\"as\\\" the books count\"\n",
+];
+
+/// [`DESCRIBED`] in a fresh directory, with a model for each step.
+fn described_copy() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join(MANIFEST_FILENAME), DESCRIBED).unwrap();
+    std::fs::create_dir_all(dir.path().join("models")).unwrap();
+    for (file, table) in [
+        ("01_orders", "orders"),
+        ("02_big_orders", "big_orders"),
+        ("03_by_amount", "by_amount"),
+        ("04_tally", "tally"),
+        ("05_extra", "extra"),
+    ] {
+        std::fs::write(
+            dir.path().join(format!("models/{file}.sql")),
+            format!("CREATE OR REPLACE TABLE {table} AS SELECT 1 AS n;\n"),
+        )
+        .unwrap();
+    }
+    dir
+}
+
+/// Each step's name and description, as the loader reads them.
+fn descriptions(dir: &Path) -> BTreeMap<String, Option<String>> {
+    Manifest::load(dir)
+        .expect("the Protocol loads")
+        .steps
+        .into_iter()
+        .map(|step| (step.name, step.description))
+        .collect()
+}
+
+/// Each of `arc edit-protocol`'s verbs, aimed at something other than a
+/// description, keeps every description line byte for byte, and each step reads
+/// back with the description it had.
+#[test]
+fn each_edit_protocol_verb_keeps_every_description_byte_for_byte() {
+    let read_back = descriptions(described_copy().path());
+    assert_eq!(read_back["orders"], None);
+    assert_eq!(
+        read_back["big_orders"].as_deref(),
+        Some("Every order worth chasing")
+    );
+    assert_eq!(
+        read_back["by_amount"].as_deref(),
+        Some("Sorted: biggest first")
+    );
+    assert_eq!(
+        read_back["tally"].as_deref(),
+        Some("Counted, \"as\" the books count")
+    );
+
+    let append = "  - name: extra\n    sql: models/05_extra.sql\n";
+    for (verb, args) in [
+        ("replace", vec!["replace", "name", "till"]),
+        ("rewrite", vec!["rewrite", "db", "shop", "till"]),
+        ("add", vec!["add", "steps[1]", "timeout_sec", "30"]),
+        ("append", vec!["append", "steps", append]),
+        ("delete", vec!["delete", "steps[0]"]),
+        ("reorder", vec!["reorder", "steps", "1", "3"]),
+    ] {
+        let dir = described_copy();
+        let mut argv = vec!["edit-protocol", "--dir", "."];
+        argv.extend(&args);
+        arc_ok(dir.path(), &argv);
+
+        let after = std::fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap();
+        assert_ne!(after, DESCRIBED, "{verb}: the edit changed nothing");
+        for line in DESCRIPTION_LINES {
+            assert_eq!(
+                after.matches(line).count(),
+                1,
+                "{verb}: the description line {line:?} is not kept byte for byte:\n{after}"
+            );
+        }
+        let mut expected = read_back.clone();
+        if verb == "delete" {
+            expected.remove("orders");
+        }
+        if verb == "append" {
+            expected.insert("extra".to_string(), None);
+        }
+        assert_eq!(
+            descriptions(dir.path()),
+            expected,
+            "{verb}: a step reads back with another description than it had"
+        );
+    }
+}
+
+/// `arc edit-protocol add` gives a step without a description one, with no verb
+/// of its own: the key is added to the step's mapping and reads back as the
+/// step's description.
+#[test]
+fn edit_protocol_add_gives_a_step_a_description() {
+    let dir = described_copy();
+    arc_ok(
+        dir.path(),
+        &[
+            "edit-protocol",
+            "--dir",
+            ".",
+            "add",
+            "steps[0]",
+            "description",
+            "Every order, one row each",
+        ],
+    );
+    let mut expected = descriptions(described_copy().path());
+    expected.insert(
+        "orders".to_string(),
+        Some("Every order, one row each".to_string()),
+    );
+    assert_eq!(descriptions(dir.path()), expected);
 }

@@ -12,7 +12,12 @@
 //!      and the two versions it records name `mcp` where the terminal's name
 //!      `terminal`; the way is in the history alone, and no file of the
 //!      Protocol names it;
-//!   4. **refuse** — no `where`, an argument the operation does not take, an
+//!   4. **describe** — `--description`, and the tool's `description`, write
+//!      one line after `sql:` on the step, the same bytes both ways; the model
+//!      is as it is without one; a description that is empty or spans lines is
+//!      refused with the directory untouched; and a Protocol runs to the same
+//!      tables with its descriptions as without them;
+//!   5. **refuse** — no `where`, an argument the operation does not take, an
 //!      operation arc does not hold, a condition holding a `;` outside a string or
 //!      a comment, and a table no step makes are each refused with the directory
 //!      untouched and a message naming the fault; a `;` inside a string or a
@@ -48,6 +53,13 @@ SELECT * FROM (VALUES (1, 50, 'a;b'), (2, 150, 'abc'), (3, 300, 'xyz'), (4, 100,
 
 /// What recording `filter-rows` on `orders` as `big_orders` appends to `arcform.yaml`.
 const APPENDED_STEP: &str = "  - name: big_orders\n    sql: models/02_big_orders.sql\n";
+
+/// What recording the same step with the description [`WORTH_CHASING`] appends:
+/// the step [`APPENDED_STEP`] is, and the description on the line after `sql:`.
+const APPENDED_DESCRIBED_STEP: &str = "  - name: big_orders\n    sql: models/02_big_orders.sql\n    description: Keep the orders worth chasing\n";
+
+/// The description recorded on `big_orders`.
+const WORTH_CHASING: &str = "Keep the orders worth chasing";
 
 /// The model that recording writes, byte for byte.
 const BIG_ORDERS_MODEL: &str = "\
@@ -117,6 +129,24 @@ impl Protocol {
             "big_orders",
             "--arg",
             &arg,
+        ])
+    }
+
+    /// [`Protocol::record_filter`] with `--description` set to `description`.
+    fn record_filter_described(&self, condition: &str, description: &str) -> Output {
+        let arg = format!("where={condition}");
+        self.arc(&[
+            "operation",
+            "record",
+            "filter-rows",
+            "--on",
+            "orders",
+            "--name",
+            "big_orders",
+            "--arg",
+            &arg,
+            "--description",
+            description,
         ])
     }
 
@@ -251,6 +281,134 @@ fn record_writes_one_generated_model_and_appends_one_step() {
         "recording added or removed a file other than the model"
     );
     assert_eq!(after, untouched, "recording changed a file it did not own");
+}
+
+// ------------------------------------------------------------- description
+
+#[test]
+fn record_with_a_description_writes_it_after_sql_and_the_model_as_without_one() {
+    let protocol = Protocol::new();
+    ok(
+        &protocol.record_filter_described("amount > 100", WORTH_CHASING),
+        "arc operation record --description",
+    );
+
+    assert_eq!(
+        protocol.read("arcform.yaml"),
+        format!("{MANIFEST}{APPENDED_DESCRIBED_STEP}"),
+        "the description is the line after sql:, at the step's indentation, and every \
+         other byte of arcform.yaml is kept"
+    );
+    assert_eq!(
+        protocol.read("models/02_big_orders.sql"),
+        BIG_ORDERS_MODEL,
+        "a description is on the step and not in the model"
+    );
+    let manifest = arc::spec::Manifest::load(&protocol.dir).expect("the Protocol loads");
+    let step = manifest.steps.last().unwrap();
+    assert_eq!(step.name, "big_orders");
+    assert_eq!(step.description.as_deref(), Some(WORTH_CHASING));
+    assert_eq!(
+        manifest.steps[0].description, None,
+        "a step written without a description reads back without one"
+    );
+}
+
+#[test]
+fn a_description_that_is_empty_or_spans_lines_is_refused_with_the_directory_untouched() {
+    for (description, reason) in [
+        ("", "is empty"),
+        ("  ", "is empty"),
+        ("Keep the orders\nworth chasing", "spans lines"),
+        ("Keep the orders\r\nworth chasing", "spans lines"),
+    ] {
+        let protocol = Protocol::new();
+        let before = protocol.files();
+        refused(
+            &protocol.record_filter_described("amount > 100", description),
+            &["description", reason],
+        );
+        assert_eq!(
+            protocol.files(),
+            before,
+            "{description:?}: the directory changed"
+        );
+    }
+}
+
+// A description is read and never run: the Protocol runs to the same tables with
+// its descriptions as with those lines taken out.
+#[test]
+fn a_protocol_carrying_descriptions_runs_to_the_tables_it_runs_to_without_them() {
+    let described = Protocol::new();
+    ok(
+        &described.record_filter_described("amount > 100", WORTH_CHASING),
+        "arc operation record --description",
+    );
+    let manifest = described.read("arcform.yaml").replacen(
+        "    sql: models/01_orders.sql\n",
+        "    sql: models/01_orders.sql\n    description: 'Every order: one row each'\n",
+        1,
+    );
+    std::fs::write(described.dir.join("arcform.yaml"), &manifest).unwrap();
+    assert_eq!(manifest.matches("description:").count(), 2, "{manifest}");
+
+    let bare = Protocol::new();
+    for (path, bytes) in described.files() {
+        std::fs::write(bare.dir.join(path), bytes).unwrap();
+    }
+    let without: String = manifest
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("description:"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_eq!(without, format!("{MANIFEST}{APPENDED_STEP}"));
+    std::fs::write(bare.dir.join("arcform.yaml"), without).unwrap();
+
+    ok(&described.arc(&["run"]), "arc run, with descriptions");
+    ok(&bare.arc(&["run"]), "arc run, without them");
+
+    // The Protocol's tables, and not the ones arc keeps its own run records in.
+    let tables = |protocol: &Protocol| -> Vec<(String, Vec<String>)> {
+        let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open");
+        let names: Vec<String> = db
+            .prepare(
+                "SELECT table_name FROM information_schema.tables \
+                 WHERE table_name NOT LIKE '\\_arcform\\_%' ESCAPE '\\' ORDER BY table_name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        names
+            .into_iter()
+            .map(|name| {
+                let rows: Vec<String> = db
+                    .prepare(&format!(
+                        "SELECT t::VARCHAR FROM \"{name}\" AS t ORDER BY 1"
+                    ))
+                    .unwrap()
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                (name, rows)
+            })
+            .collect()
+    };
+    let (with_them, without_them) = (tables(&described), tables(&bare));
+    assert_eq!(
+        with_them
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["big_orders", "orders"]
+    );
+    assert_eq!(
+        with_them, without_them,
+        "the Protocol ran to other tables with its descriptions than without them"
+    );
 }
 
 // One recording in a Protocol whose history is empty lists two versions: the
@@ -707,6 +865,30 @@ mod mcp {
         response["result"].clone()
     }
 
+    /// The tools `arc mcp` lists, from one `tools/list` request.
+    fn list_tools() -> Vec<Value> {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_arc"))
+            .arg("mcp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn arc mcp");
+        {
+            let mut stdin = child.stdin.take().expect("stdin is piped");
+            let request = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+            writeln!(stdin, "{request}").expect("write the request");
+        }
+        let out = child.wait_with_output().expect("wait for arc mcp");
+        let stdout = String::from_utf8(out.stdout).expect("stdout is UTF-8");
+        let response: Value = serde_json::from_str(stdout.lines().next().expect("a response"))
+            .expect("the response is JSON");
+        response["result"]["tools"]
+            .as_array()
+            .expect("tools/list returns a list of tools")
+            .clone()
+    }
+
     /// The text of a tool result.
     fn text(result: &Value) -> &str {
         result["content"][0]["text"].as_str().unwrap_or_default()
@@ -794,6 +976,116 @@ mod mcp {
                 agent.arc(&["history", "show", agent_id]).stdout,
                 terminal.arc(&["history", "show", terminal_id]).stdout,
                 "the version {agent_id} holds other bytes than {terminal_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tool_writes_the_description_the_terminal_writes() {
+        let terminal = Protocol::new();
+        let agent = Protocol::new();
+        ok(
+            &terminal.record_filter_described("amount > 100", WORTH_CHASING),
+            "arc operation record --description",
+        );
+
+        let result = call_operation_record(
+            &agent.dir,
+            &agent.history,
+            json!({
+                "operation": "filter-rows",
+                "on": "orders",
+                "name": "big_orders",
+                "arguments": { "where": "amount > 100" },
+                "description": WORTH_CHASING,
+            }),
+        );
+        assert_ne!(
+            result["isError"],
+            true,
+            "the call failed: {}",
+            text(&result)
+        );
+        assert_eq!(
+            agent.files(),
+            terminal.files(),
+            "the Protocol the agent recorded into differs from the one the terminal did"
+        );
+        assert_eq!(
+            agent.read("arcform.yaml"),
+            format!("{MANIFEST}{APPENDED_DESCRIBED_STEP}")
+        );
+        assert_eq!(agent.read("models/02_big_orders.sql"), BIG_ORDERS_MODEL);
+    }
+
+    #[test]
+    fn the_tool_says_what_a_description_is_and_does_not_require_one() {
+        let tools = list_tools();
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "operation_record")
+            .expect("operation_record is listed");
+        let schema = &tool["inputSchema"];
+        let description = &schema["properties"]["description"];
+        assert_eq!(description["type"], "string", "schema: {schema}");
+        let says = description["description"].as_str().unwrap_or_default();
+        assert!(
+            says.ends_with('.') && says.matches(". ").count() == 0 && says.len() > 20,
+            "the field's description is not one sentence: {says:?}"
+        );
+        assert!(
+            says.contains("what the step does") && says.contains("why"),
+            "the field's description does not say what to put there: {says:?}"
+        );
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("the schema lists what it requires")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            required,
+            ["operation", "on", "name"],
+            "a description is never required"
+        );
+    }
+
+    #[test]
+    fn the_tool_refuses_a_description_the_terminal_refuses_with_the_directory_untouched() {
+        for (description, named) in [
+            (json!(""), vec!["description", "is empty"]),
+            (
+                json!("Keep the orders\nworth chasing"),
+                vec!["description", "spans lines"],
+            ),
+            (json!(5), vec!["`description`", "string"]),
+        ] {
+            let protocol = Protocol::new();
+            let before = protocol.files();
+            let result = call_operation_record(
+                protocol.history.parent().unwrap(),
+                &protocol.history,
+                json!({
+                    "operation": "filter-rows",
+                    "on": "orders",
+                    "name": "big_orders",
+                    "arguments": { "where": "amount > 100" },
+                    "description": description,
+                    "dir": protocol.dir.to_str().unwrap(),
+                }),
+            );
+            assert_eq!(result["isError"], true, "{description} was not refused");
+            for name in &named {
+                assert!(
+                    text(&result).contains(name),
+                    "the refusal of {description} does not name {name}: {}",
+                    text(&result)
+                );
+            }
+            assert_eq!(
+                protocol.files(),
+                before,
+                "{description}: the directory changed"
             );
         }
     }
