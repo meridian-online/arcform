@@ -460,6 +460,7 @@ fn a_recorded_step_checkpoints_the_manifest_first() {
         name: "derived".to_string(),
         sql: "SELECT 1 AS x".to_string(),
         provenance: "history contract test".to_string(),
+        description: None,
     };
     let (sql_rel, validated) = record_step_with_history(&dir, &step, &history).unwrap();
     assert!(dir.join(&sql_rel).exists());
@@ -544,6 +545,7 @@ fn a_way_a_caller_names_is_on_every_entry_its_calls_record() {
         name: "derived".to_string(),
         sql: "SELECT 1 AS x".to_string(),
         provenance: "history contract test".to_string(),
+        description: None,
     };
     record_step_with_history(&dir, &step, &history).unwrap();
     // A restore checkpoints what it replaces, through the same handle; the

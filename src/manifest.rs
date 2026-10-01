@@ -126,6 +126,15 @@ pub struct Step {
     #[serde(default)]
     pub sql: Option<String>,
 
+    /// What the step does and why, in one line of its author's or its agent's
+    /// words, for whoever reads the Protocol next. It is read and written and
+    /// never run: a step runs the same with or without one. `arc operation
+    /// record --description` and `arc mcp`'s `operation_record` write it, and
+    /// refuse one that is empty or spans lines. Left out of a manifest
+    /// serialised from this struct when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
     /// Raw shell command string. Mutually exclusive with `sql`/`op`.
     #[serde(default)]
     pub command: Option<String>,
@@ -213,6 +222,7 @@ impl Step {
         Step {
             name: name.to_string(),
             sql: None,
+            description: None,
             command: None,
             op: None,
             with: None,
@@ -551,6 +561,7 @@ mod tests {
         Step {
             name: name.to_string(),
             sql: Some(sql.to_string()),
+            description: None,
             command: None,
             produces: vec![],
             depends_on: vec![],
@@ -568,6 +579,7 @@ mod tests {
         Step {
             name: name.to_string(),
             sql: None,
+            description: None,
             command: Some(command.to_string()),
             produces: vec![],
             depends_on: vec![],
@@ -662,6 +674,7 @@ mod tests {
             vec![Step {
                 name: "bad".to_string(),
                 sql: Some("a.sql".to_string()),
+                description: None,
                 command: Some("echo hi".to_string()),
                 produces: vec![],
                 depends_on: vec![],
@@ -685,6 +698,7 @@ mod tests {
             vec![Step {
                 name: "bad".to_string(),
                 sql: None,
+                description: None,
                 command: None,
                 produces: vec![],
                 depends_on: vec![],

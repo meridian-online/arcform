@@ -45,10 +45,12 @@
 //! # Refusal discipline
 //!
 //! Every refusal leaves the protocol directory untouched, byte for byte. The
-//! step name and provenance note are gated first — both are spliced into
-//! durable text verbatim, so a value that would not read back as itself
-//! (a newline, a `#`, a `:`) is refused before anything else happens, and the
-//! reloaded document is checked to carry exactly the step that was asked for.
+//! step name, provenance note and description are gated first — each is
+//! spliced into durable text, so a name or note that would not read back as
+//! itself (a newline, a `#`, a `:`), and a description that is empty or spans
+//! lines, is refused before anything else happens, and the reloaded document
+//! is checked to carry exactly the step that was asked for, its description
+//! included.
 //! The manifest splice is applied and gated **in memory first**; the generated
 //! model is written only where no file exists; the manifest write is atomic;
 //! and if a write fails partway, the just-written model — and `models/`
@@ -100,6 +102,13 @@ pub struct RecordedStep {
     /// after the marker. Refused if it spans lines, because the marker header
     /// is one line by contract.
     pub provenance: String,
+
+    /// The step's `description:` — one line saying what it does and why — or
+    /// `None` for a step with none, which is spliced exactly as before the field
+    /// existed. Written after `sql:`, as a plain scalar where that reads back as
+    /// exactly itself and single-quoted where it would not. Refused if it is
+    /// empty, spans lines or holds another control character.
+    pub description: Option<String>,
 }
 
 /// Promote an exploration into the protocol at `dir`: write its SQL as a new
@@ -108,7 +117,8 @@ pub struct RecordedStep {
 /// The generated model lands at `models/NN_<name>.sql`, where `NN` continues
 /// the highest number-prefixed model already present (a hand-authored,
 /// unnumbered model neither collides nor moves). The spliced step carries
-/// `name:` and `sql:` and nothing else — inputs and outputs are discovered
+/// `name:` and `sql:`, then `description:` when the step has one, and nothing
+/// else — inputs and outputs are discovered
 /// from the SQL itself at load, exactly as they are for a hand-written step,
 /// so the recorded step is indistinguishable in shape from one typed in an
 /// editor.
@@ -129,14 +139,26 @@ pub struct RecordedStep {
 /// YAML indicator — or, as the structural backstop, any name the reloaded
 /// document does not read back verbatim), when `steps` is missing or empty
 /// (an empty protocol has nothing to explore, so it has nothing to record
-/// against), or when the provenance note spans lines;
+/// against), when the provenance note spans lines, or when the description
+/// is empty, spans lines, holds another control character or does not read
+/// back verbatim;
 /// [`Error::GeneratedSqlExists`] when the model path is already occupied; the
 /// loader's own error when the spliced result would not load — a duplicate
 /// step name, most commonly.
 pub fn record_step(dir: &Path, step: &RecordedStep) -> Result<(PathBuf, ValidatedSpec)> {
     valid_step_name(&step.name)?;
     one_line(&step.provenance)?;
+    if let Some(description) = &step.description {
+        valid_description(description)?;
+    }
+    record_gated(dir, step)
+}
 
+/// [`record_step`] past its gates on the name, the provenance note and the
+/// description: the splice, the read-back check and the writes. The gates
+/// refuse every value they can name, so a test reaches the read-back check
+/// only by calling this with a value they would have refused.
+fn record_gated(dir: &Path, step: &RecordedStep) -> Result<(PathBuf, ValidatedSpec)> {
     let manifest_path = dir.join(MANIFEST_FILENAME);
     if !manifest_path.exists() {
         return Err(Error::ManifestNotFound);
@@ -168,10 +190,16 @@ pub fn record_step(dir: &Path, step: &RecordedStep) -> Result<(PathBuf, Validate
     // own convention.
     let steps_path = vec![PathPart::Key("steps".to_string())];
     let indent = sequence_item_indent(&original, &steps_path)?;
-    let item = format!(
+    let mut item = format!(
         "{indent}- name: {}\n{indent}  sql: {sql_cited}\n",
         step.name
     );
+    if let Some(description) = &step.description {
+        item.push_str(&format!(
+            "{indent}  description: {}\n",
+            description_scalar(description)
+        ));
+    }
     let validated = apply_edits(
         &original,
         &[SpecEdit::Append {
@@ -180,25 +208,8 @@ pub fn record_step(dir: &Path, step: &RecordedStep) -> Result<(PathBuf, Validate
         }],
     )?;
 
-    // The reloaded document is the arbiter: the splice must read back as
-    // exactly one new step carrying exactly the asked-for name and file. The
-    // name gate above refuses the smuggling constructions it can name; this
-    // equality check refuses the ones it cannot — any name that parses but
-    // records something other than itself.
-    let faithful = validated.manifest().steps.len() == steps_before + 1
-        && validated.manifest().steps.last().is_some_and(|last| {
-            last.name == step.name && last.sql.as_deref() == Some(sql_cited.as_str())
-        });
-    if !faithful {
-        return Err(Error::EditTarget {
-            path: "(name)".to_string(),
-            detail: format!(
-                "the step name {:?} does not record faithfully — spliced into the manifest \
-                 it reads back as something other than itself; use a plain single-line name",
-                step.name
-            ),
-        });
-    }
+    // The reloaded document is the arbiter: see [`reads_back`].
+    reads_back(validated.manifest(), steps_before, step, &sql_cited)?;
 
     // Both writes are now committed to. The checkpoint seam fires before the
     // first byte changes on disk.
@@ -403,6 +414,95 @@ fn one_line(provenance: &str) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Whether `manifest`, reloaded from the spliced text, carries exactly the step
+/// that was asked for: one step more than the `steps_before` it had, the last
+/// of them named `step.name`, citing `sql_cited` and carrying `step.description`.
+/// The name and description gates refuse the constructions they can name; this
+/// refuses the ones they cannot — any value that parses but records something
+/// other than itself.
+fn reads_back(
+    manifest: &Manifest,
+    steps_before: usize,
+    step: &RecordedStep,
+    sql_cited: &str,
+) -> Result<()> {
+    let last = manifest.steps.last();
+    let faithful = manifest.steps.len() == steps_before + 1
+        && last
+            .is_some_and(|last| last.name == step.name && last.sql.as_deref() == Some(sql_cited));
+    if !faithful {
+        return Err(Error::EditTarget {
+            path: "(name)".to_string(),
+            detail: format!(
+                "the step name {:?} does not record faithfully — spliced into the manifest \
+                 it reads back as something other than itself; use a plain single-line name",
+                step.name
+            ),
+        });
+    }
+    if last.and_then(|last| last.description.as_deref()) != step.description.as_deref() {
+        return Err(Error::EditTarget {
+            path: "(description)".to_string(),
+            detail: format!(
+                "the description {:?} does not record faithfully — spliced into the manifest \
+                 it reads back as something other than itself",
+                step.description.as_deref().unwrap_or_default()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Refuse a description that is not one line of text: empty or blank, holding
+/// a line break — which YAML also reads in `\u{85}`, `\u{2028}` and
+/// `\u{2029}` — or holding another control character. Each refusal names why.
+fn valid_description(description: &str) -> Result<()> {
+    let refuse = |detail: String| {
+        Err(Error::EditTarget {
+            path: "(description)".to_string(),
+            detail,
+        })
+    };
+    if description.trim().is_empty() {
+        return refuse(
+            "the description is empty — give one line saying what the step does and why, \
+             or leave it out"
+                .to_string(),
+        );
+    }
+    if description
+        .chars()
+        .any(|c| matches!(c, '\n' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}'))
+    {
+        return refuse(format!(
+            "the description {description:?} spans lines — a step's description is one line"
+        ));
+    }
+    if description.chars().any(char::is_control) {
+        return refuse(format!(
+            "the description {description:?} contains a control character — a step's \
+             description is one line of text"
+        ));
+    }
+    Ok(())
+}
+
+/// `description` as the YAML scalar a step's `description:` is written with: the
+/// text itself where YAML reads it back as exactly that string, and otherwise
+/// single-quoted, its own `'` doubled — so a `:`, a `#`, a quote, a leading
+/// indicator, surrounding spaces or a word YAML reads as another type (`true`,
+/// `~`, `12`) read back as written.
+fn description_scalar(description: &str) -> String {
+    let plain = serde_yaml::from_str::<serde_yaml::Value>(&format!("d: {description}\n"))
+        .ok()
+        .and_then(|doc| doc.get("d").cloned());
+    if plain == Some(serde_yaml::Value::String(description.to_string())) {
+        description.to_string()
+    } else {
+        format!("'{}'", description.replace('\'', "''"))
+    }
 }
 
 /// The step name, made safe for a filename: anything outside `[A-Za-z0-9_-]`
@@ -849,16 +949,35 @@ pub(crate) fn describe(name: &str) -> Option<serde_json::Value> {
 
 // ------------------------------------------------- recording an operation
 
-/// Record the operation called `long_name`, applied to the table `on`, as a new
-/// step named `name` at the end of the protocol at `dir`, and return the model's
-/// path relative to `dir`.
+/// What a caller asks [`record_operation`] to record. The command line and `arc
+/// mcp` each build one from what they were given and hand it over unchanged.
+#[derive(Clone, Copy)]
+pub(crate) struct OperationRequest<'a> {
+    /// The operation's long name, as `arc operation list` lists it.
+    pub(crate) long_name: &'a str,
+    /// The table the operation is applied to.
+    pub(crate) on: &'a str,
+    /// The new step's name, which is also the name of the table it makes.
+    pub(crate) name: &'a str,
+    /// The operation's arguments.
+    pub(crate) arguments: &'a serde_json::Map<String, serde_json::Value>,
+    /// The step's `description:`, or `None` for a step with none.
+    pub(crate) description: Option<&'a str>,
+}
+
+/// Record the operation `request.long_name`, applied to the table `request.on`,
+/// as a new step named `request.name` at the end of the protocol at `dir`, with
+/// `request.description` as its `description:` when one is given, and return
+/// the model's path relative to `dir`.
 ///
 /// The operation's SQL is written from its catalogue entry, so a caller names no
 /// operation and no argument of its own: the command line and `arc mcp` hand
 /// over what they were given, and an operation added to the catalogue is
 /// recorded through both with no edit to either. The model's first line is the
 /// long name and the table, ` on ` between them, and nothing else, so the same
-/// request writes the same bytes whoever sends it. The step is recorded through
+/// request writes the same bytes whoever sends it; a description is the caller's
+/// own words, written on the step as given, so it too is the same whoever sends
+/// it. The step is recorded through
 /// [`record_step_with_history`](crate::history::record_step_with_history), so
 /// each recording is a version of the protocol, and it runs nothing.
 ///
@@ -866,16 +985,21 @@ pub(crate) fn describe(name: &str) -> Option<serde_json::Value> {
 /// hold; arguments the operation's `parameters` do not admit, whether one is
 /// missing, one is not taken or one is of the wrong type; a condition or an order
 /// DuckDB's own parser reads as more than one statement, or cannot parse at all
-/// (see [`one_statement`]); and a table no step of the protocol makes. Each
+/// (see [`one_statement`]); a table no step of the protocol makes; and a
+/// description that is empty or spans lines (see [`record_step`]). Each
 /// refusal's message names what was wrong.
 pub(crate) fn record_operation(
     dir: &Path,
-    long_name: &str,
-    on: &str,
-    name: &str,
-    arguments: &serde_json::Map<String, serde_json::Value>,
+    request: &OperationRequest,
     history: &crate::history::LocalHistory,
 ) -> Result<PathBuf> {
+    let OperationRequest {
+        long_name,
+        on,
+        name,
+        arguments,
+        description,
+    } = *request;
     let Some(op) = operation(long_name) else {
         let held: Vec<&str> = CATALOGUE.iter().map(|op| op.long_name).collect();
         return Err(refused(format!(
@@ -894,6 +1018,7 @@ pub(crate) fn record_operation(
             arguments,
         }),
         provenance: format!("{} on {on}", op.long_name),
+        description: description.map(str::to_string),
     };
     let (sql_rel, _) = crate::history::record_step_with_history(dir, &step, history)?;
     Ok(sql_rel)
@@ -1185,6 +1310,144 @@ mod tests {
         );
         let terminated = model_contents("v", "SELECT 1\n");
         assert_eq!(terminated, "-- generated: v\nSELECT 1\n");
+    }
+
+    /// The read-back check holds each part of the recorded step on its own: a
+    /// manifest that differs from the request in any one of them is refused,
+    /// naming the part, and one that matches is not. No input reaches these
+    /// refusals through `record_step` today, because the name and description
+    /// gates refuse first, so the check is driven here with manifests built to
+    /// disagree.
+    #[test]
+    fn reads_back_refuses_a_manifest_that_differs_from_the_request_in_any_part() {
+        let manifest = |steps: &str| {
+            Manifest::from_yaml_str(&format!("name: shop\nsteps:\n{steps}"))
+                .expect("the manifest loads")
+        };
+        let first = "  - name: orders\n    sql: models/01_orders.sql\n";
+        let step = RecordedStep {
+            name: "big".to_string(),
+            sql: "SELECT 1;".to_string(),
+            provenance: "test".to_string(),
+            description: Some("Keep the big ones".to_string()),
+        };
+        let sql = "models/02_big.sql";
+        let recorded =
+            "  - name: big\n    sql: models/02_big.sql\n    description: Keep the big ones\n";
+        assert!(
+            reads_back(&manifest(&format!("{first}{recorded}")), 1, &step, sql).is_ok(),
+            "the manifest that carries exactly the request is refused"
+        );
+
+        for (what, steps, expected) in [
+            (
+                "another name",
+                format!(
+                    "{first}  - name: small\n    sql: models/02_big.sql\n    description: Keep the big ones\n"
+                ),
+                "(name)",
+            ),
+            (
+                "another file",
+                format!(
+                    "{first}  - name: big\n    sql: models/03_big.sql\n    description: Keep the big ones\n"
+                ),
+                "(name)",
+            ),
+            (
+                "two new steps",
+                format!("{first}  - name: extra\n    sql: models/09_extra.sql\n{recorded}"),
+                "(name)",
+            ),
+            ("no new step", first.to_string(), "(name)"),
+            (
+                "another description",
+                format!(
+                    "{first}  - name: big\n    sql: models/02_big.sql\n    description: Keep the small ones\n"
+                ),
+                "(description)",
+            ),
+            (
+                "no description",
+                format!("{first}  - name: big\n    sql: models/02_big.sql\n"),
+                "(description)",
+            ),
+        ] {
+            match reads_back(&manifest(&steps), 1, &step, sql) {
+                Err(Error::EditTarget { path, .. }) => assert_eq!(path, expected, "{what}"),
+                other => panic!("{what}: expected the {expected} refusal, got {other:?}"),
+            }
+        }
+
+        let undescribed = RecordedStep {
+            description: None,
+            ..step.clone()
+        };
+        assert!(
+            reads_back(
+                &manifest(&format!(
+                    "{first}  - name: big\n    sql: models/02_big.sql\n"
+                )),
+                1,
+                &undescribed,
+                sql
+            )
+            .is_ok(),
+            "a step asked for with no description is refused when it reads back with none"
+        );
+        match reads_back(
+            &manifest(&format!("{first}{recorded}")),
+            1,
+            &undescribed,
+            sql,
+        ) {
+            Err(Error::EditTarget { path, .. }) => assert_eq!(path, "(description)"),
+            other => panic!("a description nobody asked for: got {other:?}"),
+        }
+    }
+
+    /// The read-back check is wired into the record path: a name or a
+    /// description the gates would have refused, handed straight to the splice,
+    /// reads back as something else and is refused by the check, naming the
+    /// part, with the directory untouched.
+    #[test]
+    fn past_the_gates_a_step_that_does_not_read_back_is_refused_with_the_directory_untouched() {
+        for (what, name, description, expected) in [
+            ("a name holding ` #`", "big # draft", None, "(name)"),
+            (
+                "a description that spans lines",
+                "big",
+                Some("Keep the big ones\n      and no others"),
+                "(description)",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let manifest = dir.path().join(MANIFEST_FILENAME);
+            std::fs::write(
+                &manifest,
+                "name: shop\nsteps:\n  - name: orders\n    sql: models/01_orders.sql\n",
+            )
+            .unwrap();
+            let step = RecordedStep {
+                name: name.to_string(),
+                sql: "SELECT 1;".to_string(),
+                provenance: "test".to_string(),
+                description: description.map(str::to_string),
+            };
+            match record_gated(dir.path(), &step) {
+                Err(Error::EditTarget { path, .. }) => assert_eq!(path, expected, "{what}"),
+                other => panic!("{what}: expected the {expected} refusal, got {other:?}"),
+            }
+            assert_eq!(
+                std::fs::read_to_string(&manifest).unwrap(),
+                "name: shop\nsteps:\n  - name: orders\n    sql: models/01_orders.sql\n",
+                "{what}: the manifest changed"
+            );
+            assert!(
+                !dir.path().join("models").exists(),
+                "{what}: a model was written"
+            );
+        }
     }
 
     #[test]

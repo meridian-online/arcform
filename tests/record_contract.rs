@@ -69,6 +69,7 @@ fn tide_capture() -> RecordedStep {
               SELECT * FROM read_csv('data/tides.csv') WHERE port = 'dover';"
             .to_string(),
         provenance: "grid filter on tide_table (port = 'dover')".to_string(),
+        description: None,
     }
 }
 
@@ -133,6 +134,7 @@ fn a_second_recording_takes_the_next_number() {
               SELECT * FROM dover_tides WHERE tide_m > 5.5;"
             .to_string(),
         provenance: "grid filter on dover_tides (tide_m > 5.5)".to_string(),
+        description: None,
     };
     let (sql_rel, validated) = record_step(dir.path(), &second).expect("second records");
     assert_eq!(sql_rel, Path::new("models").join("02_spring_tides.sql"));
@@ -169,6 +171,7 @@ fn a_refused_promotion_leaves_manifest_and_models_untouched() {
         name: "show".to_string(), // already a step in the corpus
         sql: "SELECT 1;".to_string(),
         provenance: "duplicate".to_string(),
+        description: None,
     };
     match record_step(dir.path(), &duplicate) {
         Err(Error::ManifestValidation(msg)) => {
@@ -239,6 +242,123 @@ fn a_multi_line_provenance_is_refused_before_anything_happens() {
     match record_step(dir.path(), &capture) {
         Err(Error::EditTarget { path, .. }) => assert_eq!(path, "(provenance)"),
         other => panic!("expected EditTarget, got {other:?}"),
+    }
+}
+
+// ------------------------------------------------------------ the description
+
+/// A description is written as the line after `sql:`, at the step's own
+/// indentation, and the loader reads it back as exactly the text given. A plain
+/// sentence is written plain. Each other entry is one YAML would read as
+/// something else if written plain — a `:`, a `#`, a quote, a leading
+/// indicator, surrounding spaces, a word YAML reads as another type — and each
+/// is quoted so it reads back verbatim.
+#[test]
+fn a_description_is_written_after_sql_and_reads_back_verbatim() {
+    let plain = "Keep the orders worth chasing";
+    let dir = corpus_copy();
+    let mut capture = tide_capture();
+    capture.description = Some(plain.to_string());
+    record_step(dir.path(), &capture).expect("records");
+    let item = "  - name: dover_tides\n    sql: models/01_dover_tides.sql\n    \
+                description: Keep the orders worth chasing\n";
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap(),
+        corpus().replacen("\n# fin —", &format!("{item}\n# fin —"), 1),
+        "the description is the line after sql:, at the step's indentation, and nothing \
+         else changed"
+    );
+
+    for description in [
+        plain,
+        "Tides: the high ones",
+        "Dover only # for now",
+        "#1 by height",
+        "It's Dover's tides",
+        "'quoted' at the start",
+        "\"quoted\" at the start",
+        "ends with a quote'",
+        "a back\\slash",
+        "- a leading dash",
+        "? a leading question mark",
+        "[bracketed]",
+        "{braced}",
+        "*starred",
+        "&anchored",
+        "!tagged",
+        "|piped",
+        ">folded",
+        "%percent",
+        "@at",
+        "`backtick",
+        ", comma",
+        " padded on both sides ",
+        "true",
+        "null",
+        "~",
+        "12",
+        "1.5",
+        "Δ height, in metres — ünïcode",
+    ] {
+        let dir = corpus_copy();
+        let mut capture = tide_capture();
+        capture.description = Some(description.to_string());
+        record_step(dir.path(), &capture)
+            .unwrap_or_else(|e| panic!("{description:?} was refused: {e}"));
+        let reloaded = Manifest::load(dir.path()).expect("the grown spec loads");
+        let last = reloaded.steps.last().unwrap();
+        assert_eq!(
+            last.description.as_deref(),
+            Some(description),
+            "the description {description:?} does not read back as itself"
+        );
+        assert_eq!(last.name, "dover_tides");
+        assert_eq!(last.sql.as_deref(), Some("models/01_dover_tides.sql"));
+    }
+}
+
+/// A description that is empty, or that is more than one line, is refused
+/// naming why, before anything is written: the manifest is byte-identical and
+/// no model appears. YAML reads `\u{85}`, `\u{2028}` and `\u{2029}` as line
+/// breaks too, so each is refused as spanning lines.
+#[test]
+fn a_description_that_is_empty_or_spans_lines_is_refused_before_anything_happens() {
+    for (description, reason) in [
+        ("", "is empty"),
+        ("   ", "is empty"),
+        ("line one\nline two", "spans lines"),
+        ("line one\r\nline two", "spans lines"),
+        ("line one\rline two", "spans lines"),
+        ("trailing break\n", "spans lines"),
+        ("line one\u{85}line two", "spans lines"),
+        ("line one\u{2028}line two", "spans lines"),
+        ("line one\u{2029}line two", "spans lines"),
+        ("a\ttab", "control character"),
+        ("a bell\u{7}", "control character"),
+    ] {
+        let dir = corpus_copy();
+        let before = std::fs::read(dir.path().join(MANIFEST_FILENAME)).unwrap();
+        let mut capture = tide_capture();
+        capture.description = Some(description.to_string());
+        match record_step(dir.path(), &capture) {
+            Err(Error::EditTarget { path, detail }) => {
+                assert_eq!(path, "(description)", "{description:?}");
+                assert!(
+                    detail.contains(reason),
+                    "the refusal of {description:?} does not say it {reason}: {detail}"
+                );
+            }
+            other => panic!("{description:?}: expected EditTarget, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join(MANIFEST_FILENAME)).unwrap(),
+            before,
+            "{description:?}: the manifest changed"
+        );
+        assert!(
+            !dir.path().join("models").exists(),
+            "{description:?}: a model was written"
+        );
     }
 }
 
@@ -455,6 +575,7 @@ fn a_spec_grown_by_recording_runs_under_the_bare_binary() {
     manifest.steps.push(Step {
         name: "fetch".into(),
         sql: None,
+        description: None,
         command: Some(
             "printf 'day,port,tide_m\\n1,dover,5.1\\n2,hobart,1.4\\n3,dover,5.9\\n' > tides.csv"
                 .into(),
@@ -477,6 +598,7 @@ fn a_spec_grown_by_recording_runs_under_the_bare_binary() {
             name: "tides".into(),
             sql: "CREATE OR REPLACE TABLE tides AS SELECT * FROM read_csv('tides.csv');".into(),
             provenance: "table load of tides.csv".into(),
+            description: None,
         },
     )
     .expect("first promotion records");
@@ -492,6 +614,7 @@ fn a_spec_grown_by_recording_runs_under_the_bare_binary() {
                   (FORMAT CSV, HEADER);"
                 .into(),
             provenance: "grid filter on tides (port = 'dover')".into(),
+            description: None,
         },
     )
     .expect("second promotion records");
