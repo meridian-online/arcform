@@ -272,7 +272,7 @@ fn the_generated_manifest_names_no_database_and_run_builds_it_in_arcs_data_folde
 /// it out, and a test that passed for that reason would pass whatever arc wrote. The
 /// same helper `tests/cli_authoring.rs` uses to ask what `git add --all` stages.
 fn git(dir: &Path, args: &[&str]) -> String {
-    let home = std::env::temp_dir().join("arc-init-from-descriptor-git-home");
+    let home = std::env::temp_dir().join("arc-descriptor-git-home");
     let out = Command::new("git")
         .current_dir(dir)
         .env("HOME", &home)
