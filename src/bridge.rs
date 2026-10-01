@@ -335,8 +335,14 @@ pub fn init_from_descriptor_at(name: &str, descriptor_path: &Path, base: &Path) 
     // it describes the inputs; it is never executed.
     std::fs::write(project_dir.join("datapackage.json"), &bytes)?;
 
-    // The same ignore list `arc init` writes, for the manifest this tree holds.
-    crate::edit::write_ignore_list(&project_dir, generated.manifest.db.as_deref())?;
+    // The ignore list `arc init` writes, for the manifest this tree holds, and naming
+    // each database copied in above: source data stays out of git with the Protocol.
+    let copied: Vec<&str> = generated
+        .db_sources
+        .iter()
+        .map(|(_, dest)| dest.as_str())
+        .collect();
+    crate::edit::write_ignore_list(&project_dir, generated.manifest.db.as_deref(), &copied)?;
 
     // Summary.
     let n_load = generated
@@ -360,7 +366,7 @@ pub fn init_from_descriptor_at(name: &str, descriptor_path: &Path, base: &Path) 
     }
     println!("  datapackage.json   (companion descriptor, not executed)");
     println!(
-        "  {}   (names arc's run records)",
+        "  {}   (names arc's run records; each database copied in is kept out of git)",
         crate::edit::IGNORE_FILENAME
     );
     if !generated.review_comments.is_empty() {

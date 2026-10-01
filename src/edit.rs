@@ -287,8 +287,10 @@ pub(crate) enum IgnoreList {
 
 /// Write the ignore list beside `arcform.yaml` in `dir`, for the verbs that make a
 /// Protocol directory. It names what arc knows without reading the Protocol: the run
-/// records and tool stamps under `build/.arcform/`, and, when `db` — the manifest's
-/// `db:` value — puts the database inside `dir`, that file and its write-ahead log.
+/// records and tool stamps under `build/.arcform/`; when `db` — the manifest's `db:`
+/// value — puts the database inside `dir`, that file, its write-ahead log and the
+/// directory DuckDB spills to beside it; and each database in `copied` — the ones
+/// `arc init --from-descriptor` copied into `dir` — with its write-ahead log.
 /// What a step writes is the author's, and the list does not guess it.
 ///
 /// An entry named `.gitignore` already in `dir` is left as it is: `create-protocol`
@@ -297,7 +299,11 @@ pub(crate) enum IgnoreList {
 /// appears between a look and a write is not overwritten, and a dangling symlink of
 /// that name is kept rather than written through. This looks for no repository and
 /// runs no `git`.
-pub(crate) fn write_ignore_list(dir: &Path, db: Option<&str>) -> Result<IgnoreList> {
+pub(crate) fn write_ignore_list(
+    dir: &Path,
+    db: Option<&str>,
+    copied: &[&str],
+) -> Result<IgnoreList> {
     use std::io::Write;
 
     let path = dir.join(IGNORE_FILENAME);
@@ -316,7 +322,7 @@ pub(crate) fn write_ignore_list(dir: &Path, db: Option<&str>) -> Result<IgnoreLi
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(IgnoreList::Kept),
         Err(e) => return Err(named(e)),
     };
-    if let Err(e) = file.write_all(ignore_list_text(dir, db).as_bytes()) {
+    if let Err(e) = file.write_all(ignore_list_text(dir, db, copied).as_bytes()) {
         // A half-written list would be read as the author's on the next run.
         let _ = std::fs::remove_file(&path);
         return Err(named(e));
@@ -324,15 +330,35 @@ pub(crate) fn write_ignore_list(dir: &Path, db: Option<&str>) -> Result<IgnoreLi
     Ok(IgnoreList::Written)
 }
 
-/// The text of the ignore list, anchored at the directory it sits in.
-fn ignore_list_text(dir: &Path, db: Option<&str>) -> String {
+/// The text of the ignore list, anchored at the directory it sits in. DuckDB spills a
+/// query that outgrows memory to `<database>.tmp/` beside the database, and a run
+/// killed while spilling leaves files in it, so the database `db` names has that
+/// directory listed with it. A database in `copied` was brought here by
+/// `arc init --from-descriptor` and is listed with its log alone.
+fn ignore_list_text(dir: &Path, db: Option<&str>, copied: &[&str]) -> String {
     let mut text = String::from(
         "# Written by `arc`: what a run records belongs to the machine that ran it.\n\
          /build/.arcform/\n",
     );
     if let Some(db) = db.and_then(|db| path_inside(dir, db)) {
-        text.push_str("# The database this Protocol names, and its write-ahead log.\n");
-        text.push_str(&format!("/{db}\n/{db}.wal\n"));
+        text.push_str(
+            "# The database this Protocol names, its write-ahead log, and the directory \
+             DuckDB spills to beside it.\n",
+        );
+        text.push_str(&format!("/{db}\n/{db}.wal\n/{db}.tmp/\n"));
+    }
+    let copied: Vec<String> = copied
+        .iter()
+        .filter_map(|db| path_inside(dir, db))
+        .collect();
+    if !copied.is_empty() {
+        text.push_str(
+            "# Each database `arc init --from-descriptor` copied in, and its write-ahead log. \
+             A clone does not hold them: bring each to it another way.\n",
+        );
+        for db in copied {
+            text.push_str(&format!("/{db}\n/{db}.wal\n"));
+        }
     }
     text
 }
@@ -1417,22 +1443,50 @@ steps:
     }
 
     #[test]
-    fn the_ignore_list_text_is_anchored_and_names_the_database_and_its_log() {
+    fn the_ignore_list_text_is_anchored_and_names_the_database_its_log_and_its_spill_directory() {
         let dir = tempfile::tempdir().unwrap();
         let none = "# Written by `arc`: what a run records belongs to the machine that ran it.\n\
                     /build/.arcform/\n";
-        assert_eq!(ignore_list_text(dir.path(), None), none);
+        assert_eq!(ignore_list_text(dir.path(), None, &[]), none);
         assert_eq!(
-            ignore_list_text(dir.path(), Some("../out.duckdb")),
+            ignore_list_text(dir.path(), Some("../out.duckdb"), &[]),
             none,
             "a database outside the directory is not named"
         );
         assert_eq!(
-            ignore_list_text(dir.path(), Some("build/w.duckdb")),
+            ignore_list_text(dir.path(), Some("build/w.duckdb"), &[]),
             format!(
-                "{none}# The database this Protocol names, and its write-ahead log.\n\
-                 /build/w.duckdb\n/build/w.duckdb.wal\n"
+                "{none}# The database this Protocol names, its write-ahead log, and the directory \
+                 DuckDB spills to beside it.\n\
+                 /build/w.duckdb\n/build/w.duckdb.wal\n/build/w.duckdb.tmp/\n"
             )
+        );
+    }
+
+    #[test]
+    fn each_database_copied_in_is_named_with_its_log_and_with_no_spill_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let none = "# Written by `arc`: what a run records belongs to the machine that ran it.\n\
+                    /build/.arcform/\n";
+        let copied = "# Each database `arc init --from-descriptor` copied in, and its write-ahead \
+                      log. A clone does not hold them: bring each to it another way.\n";
+        assert_eq!(
+            ignore_list_text(dir.path(), None, &["signups.duckdb", "my logs.duckdb"]),
+            format!(
+                "{none}{copied}/signups.duckdb\n/signups.duckdb.wal\n\
+                 /my\\ logs.duckdb\n/my\\ logs.duckdb.wal\n"
+            ),
+            "each copied database is named with its log, escaped as the list reads it"
+        );
+        assert_eq!(
+            ignore_list_text(dir.path(), Some("w.duckdb"), &["signups.duckdb"]),
+            format!(
+                "{none}# The database this Protocol names, its write-ahead log, and the directory \
+                 DuckDB spills to beside it.\n\
+                 /w.duckdb\n/w.duckdb.wal\n/w.duckdb.tmp/\n\
+                 {copied}/signups.duckdb\n/signups.duckdb.wal\n"
+            ),
+            "the manifest's database and a copied one are each named"
         );
     }
 
@@ -1442,15 +1496,15 @@ steps:
         let path = dir.path().join(IGNORE_FILENAME);
 
         assert_eq!(
-            write_ignore_list(dir.path(), None).unwrap(),
+            write_ignore_list(dir.path(), None, &[]).unwrap(),
             IgnoreList::Written
         );
         let written = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(written, ignore_list_text(dir.path(), None));
+        assert_eq!(written, ignore_list_text(dir.path(), None, &[]));
 
         std::fs::write(&path, "theirs").unwrap();
         assert_eq!(
-            write_ignore_list(dir.path(), None).unwrap(),
+            write_ignore_list(dir.path(), None, &[]).unwrap(),
             IgnoreList::Kept
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs");

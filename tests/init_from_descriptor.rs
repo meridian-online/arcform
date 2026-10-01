@@ -267,14 +267,67 @@ fn the_generated_manifest_names_no_database_and_run_builds_it_in_arcs_data_folde
     );
 }
 
-/// What `arc init` writes when no `--db` puts a database inside the directory: the list
-/// `arc create-protocol` writes, which `tests/cli_authoring.rs` asks `git` to read.
-const IGNORE_LIST: &str = "# Written by `arc`: what a run records belongs to the machine that ran it.\n/build/.arcform/\n";
+/// `git` in `dir`, with the developer's own configuration out of reach: a global ignore
+/// file that names `*.duckdb` would make a database look as though arc's list had kept
+/// it out, and a test that passed for that reason would pass whatever arc wrote. The
+/// same helper `tests/cli_authoring.rs` uses to ask what `git add --all` stages.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let home = std::env::temp_dir().join("arc-descriptor-git-home");
+    let out = Command::new("git")
+        .current_dir(dir)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &home)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(args)
+        .output()
+        .expect("spawn git: these tests read what `git add --all` stages");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
 
-/// `--from-descriptor` writes the same ignore list `arc init` does, beside the manifest
-/// it generates, and the lines it prints naming what it made name the list.
+/// The paths `git add --all` has staged in `dir` (a repository is made there if there
+/// is none), sorted.
+fn staged_by_add_all(dir: &Path) -> Vec<String> {
+    git(dir, &["init", "-q"]);
+    git(dir, &["add", "--all"]);
+    let listing = git(dir, &["ls-files", "--cached", "-z"]);
+    let mut paths: Vec<String> = listing
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// What the generated Protocol holds that git is meant to take: the manifest, the
+/// models, the companion descriptor and the list itself.
+const SHARED_FILES: [&str; 6] = [
+    ".gitignore",
+    "arcform.yaml",
+    "datapackage.json",
+    "models/fk_logins_accounts.sql",
+    "models/load_accounts.sql",
+    "models/load_logins.sql",
+];
+
+/// The lines of an ignore list that name something, with its comments left out.
+fn patterns(list: &str) -> Vec<&str> {
+    list.lines().filter(|l| !l.starts_with('#')).collect()
+}
+
+/// `--from-descriptor` copies the database the descriptor names into the directory and
+/// keeps it out of git: after a run, `git add --all` stages the manifest, the models
+/// and the descriptor, and the list names the database and its write-ahead log. The
+/// lines it prints naming what it made name the list and say the database is kept out.
 #[test]
-fn the_generated_protocol_carries_the_ignore_list_and_the_summary_names_it() {
+fn the_copied_database_is_kept_out_of_git_and_the_summary_says_so() {
     let workspace = tempfile::tempdir().unwrap();
     let init = Command::new(env!("CARGO_BIN_EXE_arc"))
         .current_dir(workspace.path())
@@ -289,15 +342,148 @@ fn the_generated_protocol_carries_the_ignore_list_and_the_summary_names_it() {
     );
 
     let project = workspace.path().join("assemble_demo");
+    let list = std::fs::read_to_string(project.join(".gitignore")).unwrap();
     assert_eq!(
-        std::fs::read_to_string(project.join(".gitignore")).unwrap(),
-        IGNORE_LIST
+        patterns(&list),
+        ["/build/.arcform/", "/signups.duckdb", "/signups.duckdb.wal"],
+        "the list names the run records and the copied database with its log:\n{list}"
     );
     let stdout = String::from_utf8_lossy(&init.stdout);
+    let summary = stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with(".gitignore"))
+        .unwrap_or_else(|| panic!("the summary names the list among what it made:\n{stdout}"));
     assert!(
-        stdout
-            .lines()
-            .any(|l| l.trim_start().starts_with(".gitignore")),
-        "the summary names the list among what it made:\n{stdout}"
+        summary.contains("kept out of git"),
+        "the line naming the list says the copied database is kept out of git: {summary}"
+    );
+
+    // The control: the same database in a directory with no list is staged. Without it
+    // the assertions below could pass for a reason that is not arc's list.
+    let control = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        fixtures_dir().join("signups.duckdb"),
+        control.path().join("signups.duckdb"),
+    )
+    .unwrap();
+    assert_eq!(
+        staged_by_add_all(control.path()),
+        ["signups.duckdb"],
+        "this git stages a database nothing ignores"
+    );
+
+    let run = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .current_dir(&project)
+        .env("ARCFORM_DB_DIR", std::env::temp_dir().join("arc-tests-db"))
+        .arg("run")
+        .output()
+        .expect("spawn arc run");
+    assert!(
+        run.status.success(),
+        "arc run failed:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    // The log exists only while DuckDB has writes to replay; put one there so the check
+    // is on a file that is.
+    std::fs::write(project.join("signups.duckdb.wal"), b"wal").unwrap();
+    assert!(project.join("signups.duckdb").is_file());
+
+    assert_eq!(
+        staged_by_add_all(&project),
+        SHARED_FILES,
+        "the Protocol is staged, and no database it copied in nor that database's log is"
+    );
+}
+
+/// Each database a descriptor names is copied in and kept out of git, not the first
+/// alone: two databases give two names in the list and two files git does not stage.
+#[test]
+fn each_database_a_descriptor_names_is_kept_out_of_git() {
+    let workspace = tempfile::tempdir().unwrap();
+    let source = workspace.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    for db in ["signups.duckdb", "second logins.duckdb"] {
+        std::fs::copy(fixtures_dir().join("signups.duckdb"), source.join(db)).unwrap();
+    }
+    let descriptor = std::fs::read_to_string(fixtures_dir().join("signups.datapackage.json"))
+        .unwrap()
+        .replace("signups.duckdb#logins", "second logins.duckdb#logins");
+    assert!(descriptor.contains("second logins.duckdb#logins"));
+    std::fs::write(source.join("datapackage.json"), descriptor).unwrap();
+
+    let init = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .current_dir(workspace.path())
+        .args(["init", "two_dbs", "--from-descriptor"])
+        .arg(source.join("datapackage.json"))
+        .output()
+        .expect("spawn arc init");
+    assert!(
+        init.status.success(),
+        "arc init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let project = workspace.path().join("two_dbs");
+    for db in ["signups.duckdb", "second logins.duckdb"] {
+        assert!(project.join(db).is_file(), "{db}: copied in");
+        std::fs::write(project.join(format!("{db}.wal")), b"wal").unwrap();
+    }
+    let list = std::fs::read_to_string(project.join(".gitignore")).unwrap();
+    assert_eq!(
+        patterns(&list),
+        [
+            "/build/.arcform/",
+            "/signups.duckdb",
+            "/signups.duckdb.wal",
+            "/second\\ logins.duckdb",
+            "/second\\ logins.duckdb.wal"
+        ],
+        "the list names each copied database with its log:\n{list}"
+    );
+    assert_eq!(
+        staged_by_add_all(&project),
+        SHARED_FILES,
+        "neither database nor either log is staged"
+    );
+}
+
+/// A copy of the directory that does not hold the database — a clone, since git does
+/// not take it — fails `arc run` with a non-zero exit and a message naming the file.
+#[test]
+fn a_run_where_the_copied_database_is_missing_fails_naming_the_file() {
+    let workspace = tempfile::tempdir().unwrap();
+    let init = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .current_dir(workspace.path())
+        .args(["init", "clone_of_demo", "--from-descriptor"])
+        .arg(fixtures_dir().join("signups.datapackage.json"))
+        .output()
+        .expect("spawn arc init");
+    assert!(
+        init.status.success(),
+        "arc init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let project = workspace.path().join("clone_of_demo");
+    std::fs::remove_file(project.join("signups.duckdb")).unwrap();
+
+    let run = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .current_dir(&project)
+        .env("ARCFORM_DB_DIR", std::env::temp_dir().join("arc-tests-db"))
+        .arg("run")
+        .output()
+        .expect("spawn arc run");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        matches!(run.status.code(), Some(code) if code != 0),
+        "arc run exits non-zero without the database, got {:?}:\n{stderr}",
+        run.status.code()
+    );
+    assert!(
+        stderr.contains("signups.duckdb"),
+        "the message names the missing file:\n{stderr}"
+    );
+    assert!(
+        !project.join("signups.duckdb").exists(),
+        "the run did not make a database in the file's place"
     );
 }
