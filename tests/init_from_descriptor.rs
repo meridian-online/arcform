@@ -97,6 +97,7 @@ fn generates_and_runs_a_protocol_from_a_descriptor() {
     // --- arc run on the GENERATED project -----------------------------------
     let run = Command::new(arc)
         .current_dir(&project)
+        .env("ARCFORM_DB_DIR", std::env::temp_dir().join("arc-tests-db"))
         .arg("run")
         .output()
         .expect("spawn arc run");
@@ -206,9 +207,10 @@ assets: {}
 "#;
 
 /// The manifest `--from-descriptor` generates names no database, its bytes are otherwise
-/// what they were, and `arc run` on it still builds `<name>.duckdb` beside the manifest.
+/// what they were, and `arc run` on it builds `<name>.duckdb` in arc's data folder rather
+/// than beside the manifest.
 #[test]
-fn the_generated_manifest_names_no_database_and_run_builds_one_beside_it() {
+fn the_generated_manifest_names_no_database_and_run_builds_it_in_arcs_data_folder() {
     let arc = env!("CARGO_BIN_EXE_arc");
     let workspace = tempfile::tempdir().unwrap();
     let descriptor = fixtures_dir().join("signups.datapackage.json");
@@ -237,8 +239,10 @@ fn the_generated_manifest_names_no_database_and_run_builds_one_beside_it() {
         "generating a Protocol builds no database of its own name"
     );
 
+    let data = workspace.path().join("db");
     let run = Command::new(arc)
         .current_dir(&project)
+        .env("ARCFORM_DB_DIR", &data)
         .arg("run")
         .output()
         .expect("spawn arc run");
@@ -250,7 +254,15 @@ fn the_generated_manifest_names_no_database_and_run_builds_one_beside_it() {
         String::from_utf8_lossy(&run.stderr)
     );
     assert!(
-        project.join("assemble_demo.duckdb").is_file(),
-        "a manifest with no db builds <name>.duckdb beside it"
+        !project.join("assemble_demo.duckdb").exists(),
+        "a manifest with no db builds no <name>.duckdb beside it"
+    );
+    let built: Vec<_> = std::fs::read_dir(&data)
+        .unwrap()
+        .map(|key| key.unwrap().path().join("assemble_demo.duckdb"))
+        .collect();
+    assert!(
+        built.len() == 1 && built[0].is_file(),
+        "it builds <name>.duckdb in one keyed directory of the data folder: {built:?}"
     );
 }

@@ -75,6 +75,7 @@ fn staged_protocol() -> tempfile::TempDir {
 fn arc_run_with_env(project: &Path, env: &HashMap<&str, &str>) -> (Option<i32>, String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_arc"))
         .current_dir(project)
+        .env("ARCFORM_DB_DIR", std::env::temp_dir().join("arc-tests-db"))
         .arg("run")
         .envs(env)
         .output()

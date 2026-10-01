@@ -65,6 +65,7 @@ fn set_rows(project: &Path, rows: u32) {
 fn arc(project: &Path, args: &[&str], env: &[(&str, &str)]) -> (Option<i32>, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_arc"));
     cmd.current_dir(project)
+        .env("ARCFORM_DB_DIR", std::env::temp_dir().join("arc-tests-db"))
         .arg("run")
         .args(args)
         .env_remove("ARC_TEST_PUBLISH_KEY_ID")

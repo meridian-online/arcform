@@ -43,6 +43,7 @@ pub fn step_outcome(stdout: &str, step: &str) -> String {
 pub fn arc_run_raw(project: &Path) -> (Option<i32>, String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_arc"))
         .current_dir(project)
+        .env("ARCFORM_DB_DIR", std::env::temp_dir().join("arc-tests-db"))
         .arg("run")
         .output()
         .expect("spawn arc run");

@@ -96,6 +96,7 @@ fn bin_dir(project: &Path, stand_in: Option<&Path>) -> PathBuf {
 fn arc_run(project: &Path, path: &Path) -> (Option<i32>, String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_arc"))
         .current_dir(project)
+        .env("ARCFORM_DB_DIR", std::env::temp_dir().join("arc-tests-db"))
         .env("PATH", path)
         .arg("run")
         .output()
@@ -289,6 +290,7 @@ fn operator_describe_states_the_neighbors_bound_over_arc_mcp() {
     let dir = tempfile::tempdir().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_arc"))
         .current_dir(dir.path())
+        .env("ARCFORM_DB_DIR", std::env::temp_dir().join("arc-tests-db"))
         .arg("mcp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -49,6 +49,7 @@ fn run_step(declarations: &str, sql: &str) -> Run {
 
     let run = Command::new(arc)
         .current_dir(workspace.path())
+        .env("ARCFORM_DB_DIR", std::env::temp_dir().join("arc-tests-db"))
         .arg("run")
         .output()
         .expect("spawn arc run");

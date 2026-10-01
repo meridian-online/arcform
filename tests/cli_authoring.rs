@@ -21,15 +21,20 @@ use std::process::{Command, Output};
 use arc::spec::{MANIFEST_FILENAME, SpecEdit, apply_edits};
 
 /// Run the real `arc` binary with `args` in `dir`. The spawned binary gets a
-/// test-scoped local-history root: authoring commands record history as they
-/// do in production, but a test run must never write into the developer's
-/// real `~/.arcform`.
+/// test-scoped local-history root and data folder: authoring commands record
+/// history, and a run of a Protocol that names no `db:` keeps its database, as
+/// they do in production, but a test run must never write into the
+/// developer's real `~/.arcform`.
 fn arc_cmd(dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_arc"))
         .current_dir(dir)
         .env(
             "ARCFORM_HISTORY_DIR",
             std::env::temp_dir().join("arc-cli-authoring-history"),
+        )
+        .env(
+            "ARCFORM_DB_DIR",
+            std::env::temp_dir().join("arc-cli-authoring-db"),
         )
         .args(args)
         .output()
@@ -305,13 +310,14 @@ const FIRST_STEP: &str =
     "\n  - name: gather\n    command: \"echo sun,4 > field.csv\"\n    produces: [field_csv]";
 
 /// `create-protocol` names a database in the manifest it writes only when `--db` names
-/// one. A manifest with none still runs against `<name>.duckdb` beside it, and one with a
-/// path runs against that path and builds no other.
+/// one. A manifest with none runs with no `<name>.duckdb` beside it — its database is in
+/// arc's data folder, which `tests/working_database.rs` pins — and one with a path runs
+/// against that path and builds no other.
 #[test]
 fn create_protocol_writes_db_only_when_asked_and_run_builds_it_where_it_says() {
     let base = tempfile::tempdir().expect("tempdir");
 
-    // No --db: no line, and the first run builds `<name>.duckdb` beside the manifest.
+    // No --db: no line, and the first run builds no `<name>.duckdb` beside the manifest.
     arc_ok(base.path(), &["create-protocol", "fieldbook"]);
     let unnamed = base.path().join("fieldbook");
     assert_eq!(db_lines(&unnamed), Vec::<String>::new(), "no db line");
@@ -333,8 +339,8 @@ fn create_protocol_writes_db_only_when_asked_and_run_builds_it_where_it_says() {
     assert_eq!(db_lines(&unnamed), Vec::<String>::new(), "still no db line");
     arc_ok(&unnamed, &["run"]);
     assert!(
-        unnamed.join("fieldbook.duckdb").is_file(),
-        "a manifest with no db builds <name>.duckdb beside it"
+        !unnamed.join("fieldbook.duckdb").exists(),
+        "a manifest with no db builds no <name>.duckdb beside it"
     );
 
     // --db: the line is written, and the run builds that file and not `<name>.duckdb`.
@@ -368,10 +374,15 @@ fn create_protocol_writes_db_only_when_asked_and_run_builds_it_where_it_says() {
 /// `db` line, and every byte above the key it edits, as it was.
 #[test]
 fn edit_protocol_leaves_a_db_line_as_it_was_and_the_protocol_runs_where_it_says() {
-    // (the db line, the file a run builds, the file it must not build)
+    // (the db line, the file a run builds beside the manifest, the file it must not
+    // build there). `db: null` is unset, so its database is in arc's data folder.
     let cases = [
-        ("db: null", "p.duckdb", "kept.duckdb"),
-        ("db: kept.duckdb", "kept.duckdb", "p.duckdb"),
+        ("db: null", None, ["p.duckdb", "kept.duckdb"]),
+        (
+            "db: kept.duckdb",
+            Some("kept.duckdb"),
+            ["p.duckdb", "p.duckdb"],
+        ),
     ];
     for (db_line, built, not_built) in cases {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -397,13 +408,17 @@ fn edit_protocol_leaves_a_db_line_as_it_was_and_the_protocol_runs_where_it_says(
         );
 
         arc_ok(dir.path(), &["run"]);
-        assert!(
-            dir.path().join(built).is_file(),
-            "{db_line}: builds {built}"
-        );
-        assert!(
-            !dir.path().join(not_built).exists(),
-            "{db_line}: builds no {not_built}"
-        );
+        if let Some(built) = built {
+            assert!(
+                dir.path().join(built).is_file(),
+                "{db_line}: builds {built}"
+            );
+        }
+        for not_built in not_built {
+            assert!(
+                !dir.path().join(not_built).exists(),
+                "{db_line}: builds no {not_built}"
+            );
+        }
     }
 }

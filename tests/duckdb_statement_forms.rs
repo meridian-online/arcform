@@ -89,6 +89,7 @@ fn run_project(label: &str, load_source_sql: &str, transform_sql: &str) -> Run {
 
     let output = Command::new(arc)
         .current_dir(&project)
+        .env("ARCFORM_DB_DIR", std::env::temp_dir().join("arc-tests-db"))
         .arg("run")
         .output()
         .unwrap_or_else(|e| panic!("[{label}] spawn arc run: {e}"));

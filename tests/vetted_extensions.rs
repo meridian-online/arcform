@@ -98,7 +98,7 @@ impl Outcome {
 impl Protocol {
     /// One SQL step per `(name, sql)`, each in `models/<name>.sql`.
     fn steps(steps: &[(&str, &str)]) -> Self {
-        let mut yaml = String::from("name: vetted\nsteps:\n");
+        let mut yaml = String::from("name: vetted\ndb: vetted.duckdb\nsteps:\n");
         for (name, _) in steps {
             yaml.push_str(&format!("  - name: {name}\n    sql: models/{name}.sql\n"));
         }
@@ -109,7 +109,11 @@ impl Protocol {
         Self::with(&yaml, &files)
     }
 
-    /// `arcform.yaml` holding `yaml`, and each `(path, text)` beside it.
+    /// `arcform.yaml` holding `yaml`, and each `(path, text)` beside it. Every manifest in
+    /// this file names its `db:` beside it, the file it ran on before arc kept the
+    /// database of a Protocol that names none in its data folder, so the output and the
+    /// engine calls pinned below as an earlier commit recorded them still hold; where a
+    /// Protocol's database lives is `tests/working_database.rs`'s.
     fn with(yaml: &str, files: &[(String, &str)]) -> Self {
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join("project");
@@ -162,6 +166,7 @@ impl Protocol {
             .args(args)
             .env("ARC_DUCKDB_BIN", &engine)
             .env("ARCFORM_HISTORY_DIR", self.root.path().join("history"))
+            .env("ARCFORM_DB_DIR", self.root.path().join("db"))
             .env_remove("ARC_ALLOW_UNTESTED_ENGINE")
             .output()
             .expect("spawn arc");
@@ -340,7 +345,7 @@ fn a_parser_switch_is_refused_by_name() {
 #[test]
 fn a_hook_is_read_as_a_step_is() {
     let protocol = Protocol::with(
-        "name: vetted\nsteps:\n  - name: s\n    sql: models/s.sql\nhooks:\n  on_init:\n    name: setup\n    sql: models/setup.sql\n",
+        "name: vetted\ndb: vetted.duckdb\nsteps:\n  - name: s\n    sql: models/s.sql\nhooks:\n  on_init:\n    name: setup\n    sql: models/setup.sql\n",
         &[
             ("models/s.sql".into(), "SELECT 1;\n"),
             (
@@ -485,7 +490,7 @@ Asset graph (2 nodes):\n\
 #[test]
 fn a_protocol_with_no_install_prints_what_it_printed_before() {
     let protocol = Protocol::with(
-        "name: vetted\nsteps:\n  - name: load\n    sql: models/load.sql\n  - name: transform\n    sql: models/transform.sql\n  - name: announce\n    command: echo hi\nhooks:\n  on_init:\n    name: setup\n    sql: models/setup.sql\n",
+        "name: vetted\ndb: vetted.duckdb\nsteps:\n  - name: load\n    sql: models/load.sql\n  - name: transform\n    sql: models/transform.sql\n  - name: announce\n    command: echo hi\nhooks:\n  on_init:\n    name: setup\n    sql: models/setup.sql\n",
         &[
             (
                 "models/load.sql".into(),
@@ -675,7 +680,7 @@ fn each_step_or_hook_draws_one_warning_naming_each_line() {
     );
 
     let hook = Protocol::with(
-        "name: vetted\nsteps:\n  - name: s\n    sql: models/s.sql\nhooks:\n  on_init:\n    name: setup\n    sql: models/setup.sql\n",
+        "name: vetted\ndb: vetted.duckdb\nsteps:\n  - name: s\n    sql: models/s.sql\nhooks:\n  on_init:\n    name: setup\n    sql: models/setup.sql\n",
         &[
             ("models/s.sql".into(), "SELECT 1;\n"),
             ("models/setup.sql".into(), "IMPORT DATABASE 'imp';\n"),
@@ -749,7 +754,7 @@ const NO_SHAPE_BEFORE_STDERR: &str = "\u{1b}[33mwarning:\u{1b}[39m step 'ask' ca
 #[test]
 fn a_protocol_with_none_of_the_shapes_prints_what_it_printed_before() {
     let protocol = Protocol::with(
-        "name: vetted\nsteps:\n  - name: load\n    sql: models/load.sql\n  - name: ask\n    sql: models/ask.sql\n  - name: export\n    sql: models/export.sql\nhooks:\n  on_init:\n    name: setup\n    sql: models/setup.sql\n",
+        "name: vetted\ndb: vetted.duckdb\nsteps:\n  - name: load\n    sql: models/load.sql\n  - name: ask\n    sql: models/ask.sql\n  - name: export\n    sql: models/export.sql\nhooks:\n  on_init:\n    name: setup\n    sql: models/setup.sql\n",
         &[
             (
                 "models/load.sql".into(),
@@ -805,7 +810,7 @@ impl Pinned {
     /// `models/s.sql` installing mlpack and `models/setup.sql` selecting 1.
     fn new(yaml: &str, extensions: &str) -> Self {
         let protocol = Protocol::with(
-            &format!("name: pinned\n{yaml}{extensions}"),
+            &format!("name: pinned\ndb: pinned.duckdb\n{yaml}{extensions}"),
             &[
                 ("models/s.sql".into(), INSTALLS_MLPACK),
                 ("models/setup.sql".into(), "SELECT 1;\n"),
@@ -1210,7 +1215,7 @@ fn a_step_that_replaces_a_pinned_file_fails_the_run_when_it_ends() {
     pinned.install();
     let replace = |exit: &str| {
         format!(
-            "name: pinned\nsteps:\n  - name: s\n    sql: models/s.sql\n  - name: replace\n    command: \"printf x >> '{}'{exit}\"\n{}",
+            "name: pinned\ndb: pinned.duckdb\nsteps:\n  - name: s\n    sql: models/s.sql\n  - name: replace\n    command: \"printf x >> '{}'{exit}\"\n{}",
             pinned.installed().display(),
             pin_yaml("v1.5.5", PLATFORM, &pin)
         )
@@ -1282,7 +1287,7 @@ fn a_step_that_replaces_a_pinned_file_fails_the_run_when_it_ends() {
     // and the file is still hashed again, beside the hook's own error.
     fs::copy(pinned.served(), pinned.installed()).unwrap();
     pinned.write_manifest(&format!(
-        "name: pinned\nsteps:\n  - name: s\n    sql: models/s.sql\nhooks:\n  on_init:\n    name: replace\n    command: \"printf x >> '{}'; exit 3\"\n{}",
+        "name: pinned\ndb: pinned.duckdb\nsteps:\n  - name: s\n    sql: models/s.sql\nhooks:\n  on_init:\n    name: replace\n    command: \"printf x >> '{}'; exit 3\"\n{}",
         pinned.installed().display(),
         pin_yaml("v1.5.5", PLATFORM, &pin)
     ));
@@ -1378,6 +1383,7 @@ fn the_real_duckdb_answers_the_pin_check_from_the_file_it_holds() {
             .current_dir(protocol.project())
             .arg("run")
             .env("HOME", home.path())
+            .env("ARCFORM_DB_DIR", protocol.root.path().join("db"))
             .env_remove("ARC_DUCKDB_BIN")
             .env_remove("ARC_ALLOW_UNTESTED_ENGINE")
             .output()
@@ -1454,7 +1460,7 @@ fn sql_hook_files() -> Vec<(String, &'static str)> {
 /// One SQL step per `(name, sql)`, each in `models/<name>.sql`, and the hooks in
 /// [`SQL_HOOKS`].
 fn steps_and_sql_hooks(steps: &[(&str, &str)]) -> Protocol {
-    let mut yaml = String::from("name: vetted\nsteps:\n");
+    let mut yaml = String::from("name: vetted\ndb: vetted.duckdb\nsteps:\n");
     for (name, _) in steps {
         yaml.push_str(&format!("  - name: {name}\n    sql: models/{name}.sql\n"));
     }
@@ -1590,7 +1596,7 @@ fn a_writes_over_b(b_before: Option<&str>, b_after: &str) -> Protocol {
     }
     Protocol::with(
         &format!(
-            "name: vetted\nsteps:\n  - name: a\n    sql: models/a.sql\n  - name: b\n    sql: models/b.sql\n  - name: c\n    sql: models/c.sql\n{REPORTS_FAILED_STEP}"
+            "name: vetted\ndb: vetted.duckdb\nsteps:\n  - name: a\n    sql: models/a.sql\n  - name: b\n    sql: models/b.sql\n  - name: c\n    sql: models/c.sql\n{REPORTS_FAILED_STEP}"
         ),
         &files,
     )
@@ -1609,6 +1615,7 @@ impl Protocol {
             .env_remove("ARC_ALLOW_UNTESTED_ENGINE")
             .env("HOME", &home)
             .env("ARCFORM_HISTORY_DIR", self.root.path().join("history"))
+            .env("ARCFORM_DB_DIR", self.root.path().join("db"))
             .env("ARCFORM_FETCH_CACHE", "off")
             .output()
             .expect("spawn arc");
@@ -1786,7 +1793,7 @@ fn a_sql_hook_whose_file_a_step_writes_over_is_refused_just_before_it_runs() {
         );
         let protocol = Protocol::with(
             &format!(
-                "name: vetted\nsteps:\n  - name: a\n    sql: models/a.sql\nhooks:\n  {slot}:\n    name: notify\n    sql: models/notify.sql\n"
+                "name: vetted\ndb: vetted.duckdb\nsteps:\n  - name: a\n    sql: models/a.sql\nhooks:\n  {slot}:\n    name: notify\n    sql: models/notify.sql\n"
             ),
             &[
                 ("models/a.sql".into(), &a),
@@ -1842,7 +1849,7 @@ fn a_refused_hook_of_a_run_that_failed_prints_its_refusal_beside_the_runs_error(
         );
         let protocol = Protocol::with(
             &format!(
-                "name: vetted\nsteps:\n  - name: a\n    sql: models/a.sql\nhooks:\n  {slot}:\n    name: report\n    sql: models/report.sql\n"
+                "name: vetted\ndb: vetted.duckdb\nsteps:\n  - name: a\n    sql: models/a.sql\nhooks:\n  {slot}:\n    name: report\n    sql: models/report.sql\n"
             ),
             &[
                 ("models/a.sql".into(), &a),
@@ -1877,7 +1884,7 @@ fn a_refused_hook_of_a_run_that_failed_prints_its_refusal_beside_the_runs_error(
 #[test]
 fn a_hook_that_fails_on_its_own_warns_and_leaves_a_run_that_succeeded_at_exit_0() {
     let protocol = Protocol::with(
-        "name: vetted\nsteps:\n  - name: a\n    sql: models/a.sql\nhooks:\n  on_success:\n    name: notify\n    sql: models/notify.sql\n",
+        "name: vetted\ndb: vetted.duckdb\nsteps:\n  - name: a\n    sql: models/a.sql\nhooks:\n  on_success:\n    name: notify\n    sql: models/notify.sql\n",
         &[
             ("models/a.sql".into(), "CREATE TABLE ta AS SELECT 1;\n"),
             (
@@ -1906,7 +1913,7 @@ fn a_retry_is_refused_when_the_attempt_before_it_wrote_over_its_file() {
         writes_over("models/s.sql", MARKS_AND_INSTALLS)
     );
     let protocol = Protocol::with(
-        "name: vetted\nsteps:\n  - name: s\n    sql: models/s.sql\n    retry: {max_attempts: 2, backoff_sec: 0}\n",
+        "name: vetted\ndb: vetted.duckdb\nsteps:\n  - name: s\n    sql: models/s.sql\n    retry: {max_attempts: 2, backoff_sec: 0}\n",
         &[("models/s.sql".into(), &s)],
     );
     let run = protocol.run_on_duckdb();

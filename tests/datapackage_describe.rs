@@ -161,6 +161,7 @@ fn run_arc_with_fake_finetype(project: &Path, finetype_bin: &Path) -> std::proce
     let isolated_path = std::env::join_paths([finetype_bin.to_path_buf(), duckdb_dir()]).unwrap();
     Command::new(env!("CARGO_BIN_EXE_arc"))
         .current_dir(project)
+        .env("ARCFORM_DB_DIR", std::env::temp_dir().join("arc-tests-db"))
         .arg("run")
         .env("PATH", isolated_path)
         .output()

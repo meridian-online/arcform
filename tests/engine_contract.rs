@@ -49,6 +49,17 @@ impl Fixture {
         self.root.path().join("project")
     }
 
+    /// The project's database: it names no `db:`, so arc keeps `<name>.duckdb` in the
+    /// one keyed directory of the data folder `arc_run` points it at.
+    fn database(&self) -> PathBuf {
+        let keys: Vec<PathBuf> = fs::read_dir(self.root.path().join("db"))
+            .unwrap()
+            .map(|key| key.unwrap().path())
+            .collect();
+        assert_eq!(keys.len(), 1, "one Protocol, one keyed directory: {keys:?}");
+        keys[0].join(format!("{NAME}.duckdb"))
+    }
+
     /// A directory, created empty, to stand in for a search path with no DuckDB on it.
     fn dir(&self, name: &str) -> PathBuf {
         let d = self.root.path().join(name);
@@ -75,7 +86,7 @@ impl Fixture {
 
     /// `(steps_executed, outcome)` of every row in the run record.
     fn run_records(&self) -> Vec<(i64, String)> {
-        let conn = duckdb::Connection::open(self.project().join(format!("{NAME}.duckdb"))).unwrap();
+        let conn = duckdb::Connection::open(self.database()).unwrap();
         let mut stmt = conn
             .prepare("SELECT steps_executed, outcome FROM _arcform_runs")
             .unwrap();
@@ -121,7 +132,9 @@ struct Run<'a> {
 /// `arc run` in `project`, returning (exit code, stderr).
 fn arc_run(project: &Path, how: Run) -> (Option<i32>, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_arc"));
+    // The project names no `db:`, so its database is in the data folder beside it.
     cmd.current_dir(project)
+        .env("ARCFORM_DB_DIR", project.with_file_name("db"))
         .arg("run")
         .env("PATH", how.path)
         .env_remove(BIN_ENV)
@@ -208,7 +221,7 @@ fn a_told_real_duckdb_writes_the_table_with_no_duckdb_on_the_search_path() {
     assert_eq!(code, Some(0), "told real duckdb must run:\n{stderr}");
 
     assert_eq!(fx.run_records(), vec![(1, "success".to_string())]);
-    let conn = duckdb::Connection::open(fx.project().join(format!("{NAME}.duckdb"))).unwrap();
+    let conn = duckdb::Connection::open(fx.database()).unwrap();
     let answer: i64 = conn
         .query_row("SELECT answer FROM told", [], |r| r.get(0))
         .unwrap();
