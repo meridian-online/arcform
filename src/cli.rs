@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use owo_colors::OwoColorize;
 
+use crate::edit::{IGNORE_FILENAME, IgnoreList, write_ignore_list};
 use crate::engine::{ALLOW_UNTESTED_ENGINE_ENV, DuckDbEngine, Engine};
 use crate::error::{Error, Result};
 use crate::manifest::Manifest;
@@ -379,10 +380,17 @@ pub fn create_protocol(
     // replaces nothing, must not fail on the safety net's account.
     let _ = history.record_save(dir, validated.text());
 
+    // Written after the spec, so a refused or invalid manifest leaves nothing beside
+    // it, and an ignore list the author wrote first is kept.
+    let ignore = write_ignore_list(dir, manifest.db.as_deref())?;
+
     println!(
         "created {} — author steps with `arc edit-protocol`",
         dir.join(crate::spec::MANIFEST_FILENAME).display()
     );
+    if ignore == IgnoreList::Written {
+        println!("created {}", dir.join(IGNORE_FILENAME).display());
+    }
     Ok(())
 }
 
@@ -632,11 +640,13 @@ pub fn init_at(name: &str, base: &std::path::Path) -> Result<()> {
     let manifest = Manifest::new_project(name);
     let yaml = serde_yaml::to_string(&manifest).expect("failed to serialize manifest");
     fs::write(project_dir.join("arcform.yaml"), yaml)?;
+    write_ignore_list(&project_dir, manifest.db.as_deref())?;
 
     println!("Initialized project '{}' with:", name);
     println!("  arcform.yaml");
     println!("  models/");
     println!("  sources/");
+    println!("  {IGNORE_FILENAME}");
     println!();
     println!("For a complete, runnable example — SQL + command steps, preconditions,");
     println!("retries, and parameters — see examples/brewtrend in the arcform repo.");

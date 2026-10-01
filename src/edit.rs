@@ -271,6 +271,120 @@ pub fn create_spec(dir: &Path, manifest: &Manifest) -> Result<ValidatedSpec> {
     Ok(ValidatedSpec { text, manifest })
 }
 
+// ------------------------------------------------------------- the ignore list
+
+/// The ignore list's file name, written beside `arcform.yaml`.
+pub(crate) const IGNORE_FILENAME: &str = ".gitignore";
+
+/// What [`write_ignore_list`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum IgnoreList {
+    /// The list was written.
+    Written,
+    /// An entry named `.gitignore` was there already, and is as it was.
+    Kept,
+}
+
+/// Write the ignore list beside `arcform.yaml` in `dir`, for the verbs that make a
+/// Protocol directory. It names what arc knows without reading the Protocol: the run
+/// records and tool stamps under `build/.arcform/`, and, when `db` — the manifest's
+/// `db:` value — puts the database inside `dir`, that file and its write-ahead log.
+/// What a step writes is the author's, and the list does not guess it.
+///
+/// An entry named `.gitignore` already in `dir` is left as it is: `create-protocol`
+/// makes a directory that may exist, and the author may have written the list first.
+/// `create_new` is the existence check and the creation in one call, so a list that
+/// appears between a look and a write is not overwritten, and a dangling symlink of
+/// that name is kept rather than written through. This looks for no repository and
+/// runs no `git`.
+pub(crate) fn write_ignore_list(dir: &Path, db: Option<&str>) -> Result<IgnoreList> {
+    use std::io::Write;
+
+    let path = dir.join(IGNORE_FILENAME);
+    let named = |e: std::io::Error| {
+        Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("{}: {e}", path.display()),
+        ))
+    };
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(IgnoreList::Kept),
+        Err(e) => return Err(named(e)),
+    };
+    if let Err(e) = file.write_all(ignore_list_text(dir, db).as_bytes()) {
+        // A half-written list would be read as the author's on the next run.
+        let _ = std::fs::remove_file(&path);
+        return Err(named(e));
+    }
+    Ok(IgnoreList::Written)
+}
+
+/// The text of the ignore list, anchored at the directory it sits in.
+fn ignore_list_text(dir: &Path, db: Option<&str>) -> String {
+    let mut text = String::from(
+        "# Written by `arc`: what a run records belongs to the machine that ran it.\n\
+         /build/.arcform/\n",
+    );
+    if let Some(db) = db.and_then(|db| path_inside(dir, db)) {
+        text.push_str("# The database this Protocol names, and its write-ahead log.\n");
+        text.push_str(&format!("/{db}\n/{db}.wal\n"));
+    }
+    text
+}
+
+/// `db`, as a run joins it to `dir`, written the way an ignore list in `dir` reads a
+/// path: relative, `/`-separated, with the characters the list gives a meaning
+/// escaped. `None` when it names a place outside `dir`, or holds a character a line of
+/// the list cannot carry. A relative path is resolved lexically, so `./a/../w.duckdb`
+/// is `w.duckdb` and `../w.duckdb` is outside; an absolute one is inside only when it
+/// sits under `dir`.
+fn path_inside(dir: &Path, db: &str) -> Option<String> {
+    use std::path::Component;
+
+    let db = Path::new(db);
+    let relative = if db.is_absolute() {
+        db.strip_prefix(dir)
+            .ok()
+            .or_else(|| db.strip_prefix(dir.canonicalize().ok()?).ok())?
+            .to_path_buf()
+    } else {
+        db.to_path_buf()
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => parts.push(escape_ignore_pattern(part.to_str()?)?),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop()?;
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// One path component, with each character the ignore list reads as a pattern
+/// escaped. `None` for a control character: a newline ends the line it would be on.
+fn escape_ignore_pattern(part: &str) -> Option<String> {
+    let mut out = String::with_capacity(part.len());
+    for c in part.chars() {
+        if c.is_control() {
+            return None;
+        }
+        if matches!(c, '\\' | '*' | '?' | '[' | ' ') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    Some(out)
+}
+
 // ------------------------------------------------------------------- splicing
 
 /// Apply every edit in order, each to the text the previous one left, then

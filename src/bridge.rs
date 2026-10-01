@@ -335,6 +335,9 @@ pub fn init_from_descriptor_at(name: &str, descriptor_path: &Path, base: &Path) 
     // it describes the inputs; it is never executed.
     std::fs::write(project_dir.join("datapackage.json"), &bytes)?;
 
+    // The same ignore list `arc init` writes, for the manifest this tree holds.
+    crate::edit::write_ignore_list(&project_dir, generated.manifest.db.as_deref())?;
+
     // Summary.
     let n_load = generated
         .manifest
@@ -356,6 +359,10 @@ pub fn init_from_descriptor_at(name: &str, descriptor_path: &Path, base: &Path) 
         println!("  {dest}   (copied in)");
     }
     println!("  datapackage.json   (companion descriptor, not executed)");
+    println!(
+        "  {}   (names arc's run records)",
+        crate::edit::IGNORE_FILENAME
+    );
     if !generated.review_comments.is_empty() {
         println!(
             "  {} foreign key(s) surfaced for review (see arcform.yaml comments)",
