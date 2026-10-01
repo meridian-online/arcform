@@ -47,6 +47,14 @@
 //! boundaries — tree-sitter attaches an inter-item comment to the *preceding*
 //! item's node, which is exactly the wrong owner for a section header.
 //!
+//! [`SpecEdit::Nest`] and [`SpecEdit::Lift`] move whole mapping entries by the
+//! same rule: a moved key takes its flush header, every line of its value and
+//! the comments among them, and the header of the first key moved under a new
+//! sequence becomes the header of that sequence's item. Because those extents
+//! are read from the text, both edits are also held to the document they
+//! describe — the loaded original with the entries moved — and a result that
+//! loads to anything else is refused.
+//!
 //! # Creating is not editing
 //!
 //! A spec authored from scratch has no prior authorship to protect, so
@@ -929,6 +937,9 @@ fn nest_entries(text: &str, path: &[PathPart], keys: &[String], under: &str) -> 
     if keys.is_empty() {
         return Err(target_err(path, "the nest names no key to move"));
     }
+    if under.is_empty() {
+        return Err(target_err(path, "the nest names no key to move them under"));
+    }
     let doc = parse(text)?;
     require_block_mapping(&doc, path, "nest the entries of")?;
     if doc.query_exists(&route_of(&child(path, under))) {
@@ -958,8 +969,11 @@ fn nest_entries(text: &str, path: &[PathPart], keys: &[String], under: &str) -> 
                 .ok_or_else(|| target_err(path, format!("the loaded mapping holds no `{key}`")))?;
             moved.insert(key.as_str().into(), value);
         }
+        // `under` is written as given, as `Add` writes its key, so the key it
+        // describes is what YAML reads that text as.
+        let under = serde_yaml::from_str(under).unwrap_or_else(|_| under.into());
         mapping.insert(
-            under.into(),
+            under,
             serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(moved)]),
         );
         Ok(())
@@ -1973,5 +1987,138 @@ steps:
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(entries, [MANIFEST_FILENAME], "no temp files left behind");
+    }
+
+    fn nest(path: &[&str], keys: &[&str], under: &str) -> SpecEdit {
+        SpecEdit::Nest {
+            path: p(path),
+            keys: keys.iter().map(|k| k.to_string()).collect(),
+            under: under.to_string(),
+        }
+    }
+
+    fn lift(path: &[&str], key: &str) -> SpecEdit {
+        SpecEdit::Lift {
+            path: p(path),
+            key: key.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_nest_of_keys_that_are_not_adjacent_leaves_the_key_between_after_the_new_one() {
+        let text = "plot: 1\n# about data\ndata: 2\nwidth: 3\n";
+        let out = apply_yaml_edits(text, &[nest(&[], &["plot", "width"], "vconcat")]).unwrap();
+        assert_eq!(
+            out,
+            "vconcat:\n  - plot: 1\n    width: 3\n# about data\ndata: 2\n"
+        );
+    }
+
+    #[test]
+    fn a_flush_header_above_the_first_moved_key_heads_the_new_entry_and_lifts_back() {
+        let text = "meta: 1\n# the plot\nplot:\n  - mark: x\nwidth: 3\n";
+        let nested = apply_yaml_edits(text, &[nest(&[], &["plot", "width"], "vconcat")]).unwrap();
+        assert_eq!(
+            nested,
+            "meta: 1\nvconcat:\n  # the plot\n  - plot:\n      - mark: x\n    width: 3\n"
+        );
+        let lifted = apply_yaml_edits(&nested, &[lift(&[], "vconcat")]).unwrap();
+        assert_eq!(lifted, text);
+    }
+
+    #[test]
+    fn a_sequence_at_its_keys_indentation_moves_with_the_key() {
+        let text = "plot:\n- mark: x\n  # deeper\n- mark: y\nwidth: 3\n";
+        let out = apply_yaml_edits(text, &[nest(&[], &["plot"], "vconcat")]).unwrap();
+        assert_eq!(
+            out,
+            "vconcat:\n  - plot:\n    - mark: x\n      # deeper\n    - mark: y\nwidth: 3\n"
+        );
+        let lifted = apply_yaml_edits(&out, &[lift(&[], "vconcat")]).unwrap();
+        assert_eq!(lifted, text);
+    }
+
+    #[test]
+    fn a_lift_keeps_a_comment_on_the_keys_line_and_lifts_an_indentless_sequence() {
+        let text = "vconcat:   # the stack\n- plot: 1\n  width: 3\n";
+        let out = apply_yaml_edits(text, &[lift(&[], "vconcat")]).unwrap();
+        assert_eq!(out, "# the stack\nplot: 1\nwidth: 3\n");
+    }
+
+    #[test]
+    fn a_nest_refuses_an_empty_list_a_repeat_a_missing_key_and_a_flow_mapping() {
+        let text = "plot: 1\nwidth: 3\nflow: {a: 1}\n";
+        for (edit, says) in [
+            (nest(&[], &[], "vconcat"), "names no key"),
+            (nest(&[], &["plot", "plot"], "vconcat"), "`plot` twice"),
+            (nest(&[], &["plot"], ""), "names no key to move them under"),
+            (nest(&["flow"], &["a"], "vconcat"), "FlowMapping"),
+        ] {
+            match apply_yaml_edits(text, &[edit]) {
+                Err(Error::EditTarget { detail, .. }) => {
+                    assert!(detail.contains(says), "{says:?} in {detail}")
+                }
+                other => panic!("expected EditTarget, got {other:?}"),
+            }
+        }
+        match apply_yaml_edits(text, &[nest(&[], &["plot", "height"], "vconcat")]) {
+            Err(Error::EditTarget { path, .. }) => assert_eq!(path, "height"),
+            other => panic!("expected EditTarget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_lift_refuses_what_it_cannot_put_back_whole() {
+        for (text, says) in [
+            ("vconcat: 1\n", "Scalar"),
+            ("vconcat:\n  - 1\n", "Scalar"),
+            (
+                "vconcat:\n  -\n    plot: 1\n",
+                "does not share the dash's line",
+            ),
+            ("plot: 0\nvconcat:\n  - plot: 1\n", "already holds `plot`"),
+            ("vconcat: &a\n  - plot: 1\n", "more than the key"),
+        ] {
+            match apply_yaml_edits(text, &[lift(&[], "vconcat")]) {
+                Err(Error::EditTarget { detail, .. }) => {
+                    assert!(detail.contains(says), "{text:?}: {says:?} in {detail}")
+                }
+                other => panic!("{text:?}: expected EditTarget, got {other:?}"),
+            }
+        }
+    }
+
+    /// A new key YAML reads as a comment leaves text that loads, to a sequence
+    /// at the root rather than the mapping the nest describes; the edit is
+    /// refused rather than returned.
+    #[test]
+    fn a_nest_whose_text_loads_to_another_document_is_refused() {
+        let text = "plot: 1\nwidth: 3\n";
+        match apply_yaml_edits(text, &[nest(&[], &["plot", "width"], "#stack")]) {
+            Err(Error::EditTarget { detail, .. }) => assert!(
+                detail.contains("does not load to the mapping the edit describes"),
+                "{detail}"
+            ),
+            other => panic!("expected EditTarget, got {other:?}"),
+        }
+    }
+
+    /// An explicit key's value sits on a `:` line the text reading does not
+    /// take with the key; the moved text does not load, and is refused.
+    #[test]
+    fn a_nest_of_an_explicit_key_is_refused() {
+        let text = "? plot\n: [a]\nwidth: 3\n";
+        match apply_yaml_edits(text, &[nest(&[], &["plot"], "vconcat")]) {
+            Err(Error::EditTarget { detail, .. }) => {
+                assert!(detail.contains("does not load"), "{detail}")
+            }
+            other => panic!("expected EditTarget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_new_key_is_written_as_given_and_compared_as_yaml_reads_it() {
+        let out = apply_yaml_edits("plot: 1\n", &[nest(&[], &["plot"], "1")]).unwrap();
+        assert_eq!(out, "1:\n  - plot: 1\n");
     }
 }
