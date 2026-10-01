@@ -39,8 +39,18 @@ pub(crate) const DB_PATH_ENV: &str = "ARC_DB_PATH";
 /// The file beside a database in the data folder that names its Protocol directory.
 const PROTOCOL_PATH_FILE: &str = "protocol-path";
 
+/// A database in the data folder, and the Protocol directory it is keyed to.
+#[derive(Debug)]
+pub(crate) struct Located {
+    /// `<root>/<key>/<name>.duckdb`.
+    pub(crate) path: PathBuf,
+    /// The canonical Protocol directory the key is made from, which
+    /// [`mark`] names beside the database.
+    pub(crate) protocol_dir: PathBuf,
+}
+
 /// The database of the Protocol named `name` in `dir`, in the data folder.
-pub(crate) fn default_path(name: &str, dir: &Path) -> Result<PathBuf> {
+pub(crate) fn locate(name: &str, dir: &Path) -> Result<Located> {
     let root = resolve_root(std::env::var_os(DB_DIR_ENV), dirs::home_dir())?;
     path_under(&root, name, dir)
 }
@@ -50,21 +60,24 @@ pub(crate) fn default_path(name: &str, dir: &Path) -> Result<PathBuf> {
 /// Refused when `name` is not a plain file name — one holding a `/`, or `.` or `..` —
 /// because the database would then leave the directory keyed to `dir`, where two
 /// Protocols could share it.
-fn path_under(root: &Path, name: &str, dir: &Path) -> Result<PathBuf> {
+fn path_under(root: &Path, name: &str, dir: &Path) -> Result<Located> {
     if Path::new(name).file_name() != Some(std::ffi::OsStr::new(name)) {
         return Err(Error::DbNameNotAFileName {
             name: name.to_string(),
         });
     }
     let canonical = canonical_dir(dir)?;
-    Ok(root
-        .join(path_key(&canonical))
-        .join(format!("{name}.duckdb")))
+    Ok(Located {
+        path: root
+            .join(path_key(&canonical))
+            .join(format!("{name}.duckdb")),
+        protocol_dir: canonical,
+    })
 }
 
 /// `dir` with every link and `..` resolved, so one directory reached by two spellings
 /// has one key.
-pub(crate) fn canonical_dir(dir: &Path) -> Result<PathBuf> {
+fn canonical_dir(dir: &Path) -> Result<PathBuf> {
     dir.canonicalize().map_err(|e| Error::FileRead {
         path: dir.to_path_buf(),
         source: e,
@@ -140,9 +153,11 @@ mod tests {
     fn the_database_is_the_protocols_name_under_a_key_of_its_canonical_directory() {
         let root = tempfile::tempdir().unwrap();
         let protocol = tempfile::tempdir().unwrap();
-        let path = path_under(root.path(), "tides", protocol.path()).unwrap();
+        let located = path_under(root.path(), "tides", protocol.path()).unwrap();
+        let path = located.path;
 
         let canonical = protocol.path().canonicalize().unwrap();
+        assert_eq!(located.protocol_dir, canonical);
         assert_eq!(
             path,
             root.path().join(path_key(&canonical)).join("tides.duckdb")
@@ -163,11 +178,13 @@ mod tests {
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
 
-        let direct = path_under(root.path(), "p", &a).unwrap();
-        let roundabout = path_under(root.path(), "p", &b.join("..").join("a")).unwrap();
+        let direct = path_under(root.path(), "p", &a).unwrap().path;
+        let roundabout = path_under(root.path(), "p", &b.join("..").join("a"))
+            .unwrap()
+            .path;
         assert_eq!(direct, roundabout);
 
-        let other = path_under(root.path(), "p", &b).unwrap();
+        let other = path_under(root.path(), "p", &b).unwrap().path;
         assert_ne!(direct, other, "one name in two directories, two databases");
     }
 

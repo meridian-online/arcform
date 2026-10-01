@@ -296,7 +296,7 @@ impl Manifest {
     pub(crate) fn db_path(&self, manifest_dir: &Path) -> Result<PathBuf> {
         match &self.db {
             Some(db) => Ok(manifest_dir.join(db)),
-            None => crate::working_db::default_path(&self.name, manifest_dir),
+            None => crate::working_db::locate(&self.name, manifest_dir).map(|db| db.path),
         }
     }
 
@@ -626,7 +626,9 @@ mod tests {
         let path = m.db_path(dir.path()).unwrap();
         assert_eq!(
             path,
-            crate::working_db::default_path("my-proj", dir.path()).unwrap()
+            crate::working_db::locate("my-proj", dir.path())
+                .unwrap()
+                .path
         );
         assert!(
             !path.starts_with(dir.path().canonicalize().unwrap()),
@@ -935,7 +937,7 @@ assets:
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
             unset.db_path(dir.path()).unwrap(),
-            crate::working_db::default_path("p", dir.path()).unwrap()
+            crate::working_db::locate("p", dir.path()).unwrap().path
         );
 
         // No key at all reads the same way.
