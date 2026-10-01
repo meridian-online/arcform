@@ -76,12 +76,42 @@ pub struct ProtocolInfo {
 }
 
 /// The engine versions that executed the run.
+///
+/// `duckdb_cli`, `platform` and `extensions` are what the DuckDB the SQL steps ran on reports
+/// when the run ends, and are `null` for a Protocol with no SQL step or hook, which asks it
+/// nothing. They were added under `b4/1` rather than a new tag, and a record written before
+/// them reads with each absent.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EngineInfo {
     /// `arc` binary version.
     pub arc: String,
-    /// DuckDB version (`SELECT version()`), if reachable.
+    /// The version of the DuckDB library `arc` is linked with (`SELECT version()`), if
+    /// reachable. The SQL steps run on the DuckDB CLI, which `duckdb_cli` names.
     pub duckdb: Option<String>,
+    /// The version the DuckDB CLI the SQL steps ran on reports (`SELECT version()`), which
+    /// differs from `duckdb` when `ARC_DUCKDB_BIN` or the search path gives the steps
+    /// another DuckDB.
+    pub duckdb_cli: Option<String>,
+    /// The platform that DuckDB reports (`PRAGMA platform`): `linux_amd64`.
+    pub platform: Option<String>,
+    /// Each extension the Protocol's SQL installs by name, from DuckDB's own repository or
+    /// `FROM community`, in the order the run first found it.
+    pub extensions: Option<Vec<ExtensionEntry>>,
+}
+
+/// An extension a run's SQL installs, as the DuckDB the steps ran on reports it when the run
+/// ends. Each value is `null` where DuckDB gives none or arc could not ask it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionEntry {
+    pub name: String,
+    /// The repository DuckDB reports it was installed from (`installed_from`): `core`,
+    /// `community`.
+    pub repository: Option<String>,
+    /// The version DuckDB reports for it (`extension_version`).
+    pub version: Option<String>,
+    /// The SHA-256 of the file DuckDB names as its `install_path`; `null` when DuckDB names
+    /// none or arc cannot read the file it names.
+    pub sha256: Option<String>,
 }
 
 /// A resolved parameter and where its value came from.
@@ -300,6 +330,40 @@ pub struct StepOutcome {
     pub report: Option<serde_json::Value>,
 }
 
+/// What a run records of the DuckDB its SQL steps ran on: [`EngineInfo`]'s `duckdb_cli`,
+/// `platform` and `extensions`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepsEngine {
+    pub duckdb_cli: Option<String>,
+    pub platform: Option<String>,
+    pub extensions: Vec<ExtensionEntry>,
+}
+
+/// What the run records of the DuckDB its SQL steps ran on, from `report`, its answer when
+/// asked about `names`: an entry for each name, in order, whatever the answer holds of it,
+/// with the SHA-256 of the file DuckDB names hashed now.
+pub fn steps_engine(report: crate::engine::EngineReport, names: &[String]) -> StepsEngine {
+    let extensions = names
+        .iter()
+        .map(|name| {
+            let reported = report.extensions.get(name).cloned().unwrap_or_default();
+            ExtensionEntry {
+                name: name.clone(),
+                repository: reported.repository,
+                version: reported.version,
+                sha256: reported
+                    .path
+                    .and_then(|path| crate::fetch_cache::hash_file(&path).ok()),
+            }
+        })
+        .collect();
+    StepsEngine {
+        duckdb_cli: report.version,
+        platform: report.platform,
+        extensions,
+    }
+}
+
 /// Inputs to [`build_contract`] — grouped to keep the call site readable.
 pub struct ContractInputs<'a> {
     pub manifest: &'a Manifest,
@@ -313,6 +377,9 @@ pub struct ContractInputs<'a> {
     pub params: Vec<ParamEntry>,
     /// Per-step terminal outcome, keyed by step name.
     pub step_outcomes: &'a HashMap<String, StepOutcome>,
+    /// What the DuckDB the SQL steps ran on reported; `None` for a Protocol with no SQL step
+    /// or hook.
+    pub steps_engine: Option<StepsEngine>,
 }
 
 /// Assemble the full contract from the run's manifest, asset graph, and outcomes.
@@ -345,9 +412,18 @@ pub fn build_contract(inp: ContractInputs) -> Contract {
                 manifest_sha256: manifest_sha256(inp.dir),
                 dir: inp.dir.display().to_string(),
             },
-            engine: EngineInfo {
-                arc: env!("CARGO_PKG_VERSION").to_string(),
-                duckdb: duckdb_version,
+            engine: {
+                let (duckdb_cli, platform, extensions) = match inp.steps_engine {
+                    Some(e) => (e.duckdb_cli, e.platform, Some(e.extensions)),
+                    None => (None, None, None),
+                };
+                EngineInfo {
+                    arc: env!("CARGO_PKG_VERSION").to_string(),
+                    duckdb: duckdb_version,
+                    duckdb_cli,
+                    platform,
+                    extensions,
+                }
             },
             params: inp.params,
             started_at: Some(inp.started_at.to_string()),
@@ -1049,5 +1125,176 @@ steps:
         assert_eq!(by_key["mode"].value, "dotenv-mode");
         assert_eq!(by_key["api_token"].source, "default");
         assert_eq!(by_key["api_token"].value, REDACTED);
+    }
+
+    /// A run record as `arc run` wrote it before the record named the DuckDB the SQL steps ran
+    /// on: written by the commit before that change, on a fake engine, with the Protocol's
+    /// directory replaced.
+    const RECORD_BEFORE_STEPS_ENGINE: &str = r#"{
+  "contract_version": "b4/1",
+  "run": {
+    "run_id": "20261001-225417-11c7d1ec",
+    "attempt_id": "20261001-225417-11c7d1ec",
+    "protocol": {
+      "name": "old",
+      "manifest_sha256": "9b163d9bd65fce144ee2b33a1beecd27dddf5ef41b1ba67ad52897555c9bd20a",
+      "dir": "/home/analyst/old"
+    },
+    "engine": {
+      "arc": "0.1.0",
+      "duckdb": "v1.5.4"
+    },
+    "params": [],
+    "started_at": "2026-10-01T22:54:17Z",
+    "finished_at": "2026-10-01T22:54:17Z",
+    "outcome": "success"
+  },
+  "assets": [
+    {
+      "id": "table:a",
+      "kind": "table",
+      "name": "a",
+      "path": null,
+      "bytes": null,
+      "row_count": null,
+      "content_hash": null,
+      "produced_by": "load",
+      "consumed_by": []
+    }
+  ],
+  "steps": [
+    {
+      "name": "load",
+      "kind": "sql",
+      "op_ref": null,
+      "resolved_with": null,
+      "sql": {
+        "model_path": "models/load.sql",
+        "sql_text": "INSTALL mlpack FROM community;\nCREATE TABLE a AS SELECT 1 AS x;\n",
+        "sql_hash": "4e3de9a8f1cfc449abbbd0844c79f0d44590cc08f392ec0c2e2e2112549e9375",
+        "statements": [
+          {
+            "produces": [],
+            "reads": [],
+            "byte_range": [
+              0,
+              30
+            ]
+          },
+          {
+            "produces": [
+              "a"
+            ],
+            "reads": [],
+            "byte_range": [
+              31,
+              63
+            ]
+          }
+        ]
+      },
+      "status": {
+        "state": "success",
+        "skip_reason": null
+      },
+      "attempts": 1,
+      "duration_sec": 0.040102817,
+      "retry": null,
+      "timeout_sec": null,
+      "io": {
+        "stdout_path": null,
+        "stderr_path": null
+      },
+      "ingress_meta": null,
+      "report": null,
+      "narrative": {
+        "label": null,
+        "stage": null,
+        "doc": null
+      }
+    }
+  ]
+}"#;
+
+    #[test]
+    fn a_record_written_before_the_steps_engine_fields_reads_with_each_absent() {
+        assert_eq!(CONTRACT_VERSION, "b4/1");
+        let contract: Contract = serde_json::from_str(RECORD_BEFORE_STEPS_ENGINE)
+            .expect("a record in the shape arc wrote before reads into Contract");
+        assert_eq!(contract.contract_version, CONTRACT_VERSION);
+        let engine = &contract.run.engine;
+        assert_eq!(engine.duckdb.as_deref(), Some("v1.5.4"));
+        assert_eq!(engine.duckdb_cli, None);
+        assert_eq!(engine.platform, None);
+        assert_eq!(engine.extensions, None);
+    }
+
+    #[test]
+    fn the_steps_engine_names_each_extension_asked_about_with_what_duckdb_reported() {
+        use crate::engine::{EngineReport, ReportedExtension};
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mlpack.duckdb_extension");
+        std::fs::write(&file, b"a build").unwrap();
+        let hash = crate::fetch_cache::hash_file(&file).unwrap();
+        let reported = |path: Option<PathBuf>, repository: &str, version: &str| ReportedExtension {
+            path,
+            repository: Some(repository.to_string()),
+            version: Some(version.to_string()),
+        };
+        let report = EngineReport {
+            version: Some("v1.5.3".into()),
+            platform: Some("osx_arm64".into()),
+            extensions: [
+                ("mlpack", reported(Some(file), "community", "v1.5.5")),
+                // A path arc cannot read: one that is not there, and a directory.
+                (
+                    "httpfs",
+                    reported(Some(dir.path().join("gone")), "core", "827222f"),
+                ),
+                ("json", reported(Some(dir.path().into()), "core", "v1.5.3")),
+                // DuckDB names no file.
+                ("excel", reported(None, "core", "v1.5.3")),
+            ]
+            .into_iter()
+            .map(|(name, ext)| (name.to_string(), ext))
+            .collect(),
+        };
+        let names: Vec<String> = ["mlpack", "httpfs", "json", "excel", "spatial"]
+            .map(String::from)
+            .to_vec();
+        let entry =
+            |name: &str, repository: Option<&str>, version: Option<&str>, sha256: Option<&str>| {
+                ExtensionEntry {
+                    name: name.to_string(),
+                    repository: repository.map(String::from),
+                    version: version.map(String::from),
+                    sha256: sha256.map(String::from),
+                }
+            };
+        assert_eq!(
+            steps_engine(report, &names),
+            StepsEngine {
+                duckdb_cli: Some("v1.5.3".into()),
+                platform: Some("osx_arm64".into()),
+                extensions: vec![
+                    entry("mlpack", Some("community"), Some("v1.5.5"), Some(&hash)),
+                    entry("httpfs", Some("core"), Some("827222f"), None),
+                    entry("json", Some("core"), Some("v1.5.3"), None),
+                    entry("excel", Some("core"), Some("v1.5.3"), None),
+                    // DuckDB lists nothing for it.
+                    entry("spatial", None, None, None),
+                ],
+            }
+        );
+
+        // DuckDB could not be asked.
+        assert_eq!(
+            steps_engine(EngineReport::default(), &names[..1]),
+            StepsEngine {
+                duckdb_cli: None,
+                platform: None,
+                extensions: vec![entry("mlpack", None, None, None)],
+            }
+        );
     }
 }

@@ -93,10 +93,38 @@ A manifest whose pin is not 64 lower-case hex digits is refused when it loads, a
 
 - **Before any step or hook runs**, `arc run` installs each extension that a step's or hook's SQL installs `FROM community` and that has a pin for the engine's DuckDB version and platform. It runs `INSTALL <name> FROM community` on the DuckDB the steps run on, with no Protocol database and no `LOAD`, so the extension's code does not run in the check; on a machine that does not hold the extension yet, the install fetches it. arc then hashes the file DuckDB names as the extension's `install_path` in `duckdb_extensions()`, and refuses the run with exit 1 when that hash differs from the pin, when the install fails, or when DuckDB names no installed file. The refusal names the extension, the DuckDB version, the platform, the pin, the hash found and the file, and for a hash that differs names `arc upgrade <name>`; a refusal because the install failed or named no file says so and does not say the file differs. The check runs whether or not the steps are fresh, and under `--force`.
 - **Just before a step or hook runs**, an extension on the list that its file, read again, installs `FROM community`, and that no check in the run has found, is checked as above: installed and compared when it has a pin, with the step or hook refused with exit 2 when the hash differs, as [Each file, read again](#each-file-read-again) says.
-- **An extension with no pin** for the engine's DuckDB version and platform draws one warning naming the extension, the `extensions:` key of `arcform.yaml` and `arc upgrade <name>`, and the run goes ahead with whichever build DuckDB installs. A pin for another DuckDB version or another platform alone is no pin for this one. When arc cannot read the engine's version it cannot choose a pin, and each extension is unpinned. A pin for an extension the Protocol's SQL does not install is neither installed nor compared.
-- **`arc run` does not write a pin**, and does not write `arcform.yaml`; `arc upgrade <name>` does, as [Writing a pin](#writing-a-pin) says. A run record holds the SHA-256 of the manifest it ran from, and so of its pins.
+- **An extension with no pin** for the engine's DuckDB version and platform draws one warning naming the extension, the `extensions:` key of `arcform.yaml` and `arc upgrade <name>`, and the run goes ahead with whichever build DuckDB installs, and its run record names that build's hash, as [What a run records](#what-a-run-records) says. A pin for another DuckDB version or another platform alone is no pin for this one. When arc cannot read the engine's version it cannot choose a pin, and each extension is unpinned. A pin for an extension the Protocol's SQL does not install is neither installed nor compared.
+- **`arc run` does not write a pin**, and does not write `arcform.yaml`; `arc upgrade <name>` does, as [Writing a pin](#writing-a-pin) says. A run record holds the SHA-256 of the manifest it ran from, and so of its pins, and the hash of each extension the run's SQL installs, as [What a run records](#what-a-run-records) says.
 - **When the run ends**, after the last step and the `on_exit` hook, and after a failed `on_init`, arc hashes each file it checked before the run, or just before a step or hook ran, again, and fails the run with exit 2 when one differs from its pin, naming the extension, the pin and the hash found; the run record gives an outcome other than `success`, and a run that failed already keeps its own error and prints this one beside it. A step can replace a pinned file during the run with `FORCE INSTALL <name> FROM community`, with `UPDATE EXTENSIONS`, or with a `command:` that writes to it. arc finds the change when the run ends, and the steps after the one that replaced the file may have loaded it by then.
 - **An arc older than this change runs a pinned Protocol without checking it.** It reads a manifest holding `extensions:` and ignores the key.
+
+## What a run records
+
+A run record is the JSON file `arc run` writes under `build/.arcform/runs/`. When the last step and hook have run, and after the pinned files are hashed again, `arc run` asks the DuckDB the steps ran on once, with no Protocol database, for its version, its platform, and what `duckdb_extensions()` gives for each extension the Protocol's SQL installs by name, from DuckDB's own repository or `FROM community`. The question installs and loads nothing. The record's `run.engine` gives:
+
+- **`duckdb_cli`**, the version that DuckDB reports for itself (`SELECT version()`): the DuckDB the steps ran on, which `ARC_DUCKDB_BIN` or the search path chose.
+- **`platform`**, the platform it reports (`PRAGMA platform`): `linux_amd64`.
+- **`extensions`**, one entry for each extension the SQL installs by name, in the order the run first found it: its `name`, the `repository` DuckDB reports it was installed from (`installed_from`: `core`, `community`), the `version` DuckDB reports for it (`extension_version`), and the `sha256` of the file DuckDB names as its `install_path`, hashed by arc.
+- **`duckdb`**, as before: the version of the DuckDB library `arc` itself is linked with, which reads the run's database to measure its tables. It is not the DuckDB the steps ran on, and the two differ when `ARC_DUCKDB_BIN` or the search path gives the steps another version.
+
+```json
+"engine": {
+  "arc": "0.1.0",
+  "duckdb": "v1.5.5",
+  "duckdb_cli": "v1.5.4",
+  "platform": "linux_amd64",
+  "extensions": [
+    { "name": "mlpack", "repository": "community", "version": "v1.5.4", "sha256": "<64 hex digits>" },
+    { "name": "httpfs", "repository": "core", "version": "827222f", "sha256": "<64 hex digits>" }
+  ]
+}
+```
+
+- **It records them with or without a pin.** In a run that succeeds, a pinned extension's hash is its pin. When a step replaced a pinned file, the run fails when it ends and the record gives the hash of the file DuckDB names then. An extension with no pin records the hash of whichever build DuckDB installed, so two runs of one Protocol say whether the build changed between them.
+- **Recording refuses no run.** A value DuckDB does not give is `null`: the repository and the version of a file DuckDB holds no install record for, and the hash when DuckDB names no installed file or names one arc cannot read. When DuckDB cannot be asked, `duckdb_cli` and `platform` are `null` and each extension is named with no hash. In none of these does the run's outcome, exit code or output change, and arc prints nothing for it.
+- **A Protocol with no SQL step or hook asks DuckDB nothing**, and `duckdb_cli`, `platform` and `extensions` are `null`. A record written before these keys were added reads with each absent.
+- **An extension built into the DuckDB CLI**, such as `json`, has no file until an `INSTALL` names it: DuckDB reports `(BUILT-IN)` as its `install_path`, and the record gives no hash. After `INSTALL json`, DuckDB fetches a file and names it, and the record gives that file's hash, while the code that runs is still the one linked into the CLI.
+- **The record names what the SQL installs by name.** An extension a step only `LOAD`s, and one DuckDB loads on its own, is not named, since arc's check reads no `LOAD`.
 
 ## Writing a pin
 
