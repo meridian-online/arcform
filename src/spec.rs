@@ -30,6 +30,12 @@
 //! the Protocol gate stays on [`apply_edits`] and [`edit_spec`]: text that is not a
 //! spec is refused there as before.
 //!
+//! Two edits move lines rather than replace them. [`SpecEdit::Nest`] puts entries of
+//! a mapping under a new key, as the one mapping of a new sequence, re-indenting the
+//! lines it moves, and [`SpecEdit::Lift`] puts them back; the comments among those
+//! lines move with them. A chart that wraps its plot in a `vconcat:` to put a legend
+//! below it keeps the notes its author wrote inside the plot.
+//!
 //! **Do not round-trip a spec through `serde` yourself.** The exported types derive
 //! `serde::Serialize` because generated-manifest emission ([`create_spec`], and
 //! `arc`'s own `arc init` scaffolding) serialises into a place that has no manifest
