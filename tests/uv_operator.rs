@@ -133,6 +133,7 @@ fn arc_run_stubbed(project: &Path) -> (Option<i32>, String, String) {
     );
     let out = Command::new(env!("CARGO_BIN_EXE_arc"))
         .current_dir(project)
+        .env("ARCFORM_DB_DIR", std::env::temp_dir().join("arc-tests-db"))
         .env("PATH", path)
         .arg("run")
         .output()

@@ -278,8 +278,7 @@ pub fn handle_run(
 
     let engine = DuckDbEngine;
     let manifest = crate::manifest::Manifest::load(&cache)?;
-    let db_path = manifest.db_path(&cache);
-    let state = DuckDbStateBackend::new(&db_path);
+    let state = DuckDbStateBackend::for_protocol(&manifest, &cache)?;
     crate::runner::run_with_params(&cache, &engine, &state, force, &cli_params)
 }
 

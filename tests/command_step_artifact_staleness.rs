@@ -264,3 +264,77 @@ fn a_command_step_whose_produces_names_no_file_says_so_when_it_runs() {
     );
     assert!(!stderr.contains(NOTE), "and stays quiet:\n{stderr}");
 }
+
+/// `MANIFEST` with a `command:` step after `load` that opens the database by the
+/// relative path `db:` names, and one that writes down the path `ARC_DB_PATH` gives it.
+const PEEK_MANIFEST: &str = r#"name: glob_read
+engine: duckdb
+db: build/glob_read.db
+steps:
+  - name: fetch
+    command: "mkdir -p build/src && printf 'lei,name\nA,Alpha\n' > build/src/data.csv"
+    produces: [src_raw]
+    preconditions:
+      - modified_after: { path: build/src, period: 24h }
+  - name: load
+    sql: models/load.sql
+    depends_on: [src_raw]
+  - name: peek
+    command: "duckdb build/glob_read.db -noheader -list -c 'SELECT count(*) FROM t' > peek.txt"
+  - name: told
+    command: "printf '%s' \"$ARC_DB_PATH\" > told.txt"
+"#;
+
+// An explicit `db:` stays where its author wrote it: the database is the file `db:`
+// names, a `command:` step opens it by that relative path, `ARC_DB_PATH` names the same
+// file, and nothing is written in arc's data folder.
+#[test]
+fn an_explicit_db_stays_where_it_says_and_a_command_step_opens_it_by_its_relative_path() {
+    let dir = project();
+    let p = dir.path();
+    std::fs::write(p.join("arcform.yaml"), PEEK_MANIFEST).unwrap();
+    let data = tempfile::tempdir().unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .current_dir(p)
+        .arg("run")
+        .env("ARCFORM_DB_DIR", data.path())
+        .output()
+        .expect("spawn arc run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "arc run:\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        p.join("build/glob_read.db").is_file(),
+        "the database db: names"
+    );
+    assert_eq!(table_rows(p), 1);
+    assert_eq!(
+        std::fs::read_to_string(p.join("peek.txt")).unwrap().trim(),
+        "1",
+        "the command step opened the database the SQL step built"
+    );
+    // arc resolves `db:` against the directory it runs in, which the operating system
+    // reports with every link resolved: on macOS the temporary directory sits under
+    // `/var`, a link to `/private/var`.
+    assert_eq!(
+        Path::new(&std::fs::read_to_string(p.join("told.txt")).unwrap()),
+        p.canonicalize().unwrap().join("build/glob_read.db"),
+        "ARC_DB_PATH names the db: file"
+    );
+    assert!(
+        !common::strip_ansi(&stdout)
+            .lines()
+            .any(|l| l.starts_with("database:")),
+        "a Protocol that names its db: is not told where it is:\n{stdout}"
+    );
+    assert_eq!(
+        std::fs::read_dir(data.path()).unwrap().count(),
+        0,
+        "nothing in arc's data folder"
+    );
+}

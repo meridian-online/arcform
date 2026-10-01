@@ -67,6 +67,7 @@ fn a_model_using_lambda_colon_syntax_keeps_its_assets_in_the_graph() {
 
     let run = Command::new(arc)
         .current_dir(&project)
+        .env("ARCFORM_DB_DIR", std::env::temp_dir().join("arc-tests-db"))
         .arg("run")
         .output()
         .expect("spawn arc run");

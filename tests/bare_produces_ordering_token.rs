@@ -43,6 +43,7 @@ fn project(manifest: &str, model: &str) -> tempfile::TempDir {
 fn arc_run(project: &Path) -> Output {
     let out = Command::new(env!("CARGO_BIN_EXE_arc"))
         .current_dir(project)
+        .env("ARCFORM_DB_DIR", std::env::temp_dir().join("arc-tests-db"))
         .arg("run")
         .output()
         .expect("spawn arc run");

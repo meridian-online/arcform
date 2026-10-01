@@ -35,9 +35,9 @@ fn protocol_run(args: &Value) -> ToolResult {
     let cli_params = parse_params(args.get("params"))?;
 
     let manifest = crate::manifest::Manifest::load(&dir).map_err(|e| e.to_string())?;
-    let db_path = manifest.db_path(&dir);
     let engine = crate::engine::DuckDbEngine;
-    let state = crate::state::DuckDbStateBackend::new(&db_path);
+    let state = crate::state::DuckDbStateBackend::for_protocol(&manifest, &dir)
+        .map_err(|e| e.to_string())?;
 
     // The contract is written to `<dir>/build/.arcform/runs/<run_id>.json` at run end
     // (on success and failure alike). Snapshot the directory, run, then read the file
@@ -498,10 +498,12 @@ mod tests {
     fn protocol_run_returns_the_b4_protocol_and_run_contract() {
         let dir = tempfile::tempdir().unwrap();
         // A minimal Protocol: one no-op command step (executes via `sh -c`), which is
-        // enough for the runner to build and write a contract.
+        // enough for the runner to build and write a contract. It names its `db:` so
+        // the run's database stays in the test's directory: in-process, a test cannot
+        // point `ARCFORM_DB_DIR` at a directory of its own.
         std::fs::write(
             dir.path().join("arcform.yaml"),
-            "name: mcp_smoke\nsteps:\n  - name: noop\n    command: \"true\"\n",
+            "name: mcp_smoke\ndb: mcp_smoke.duckdb\nsteps:\n  - name: noop\n    command: \"true\"\n",
         )
         .unwrap();
 

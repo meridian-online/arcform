@@ -39,6 +39,7 @@ fn run_steps(steps: &[(&str, &str)]) -> (String, Vec<serde_json::Value>) {
 
     let run = Command::new(arc)
         .current_dir(workspace.path())
+        .env("ARCFORM_DB_DIR", std::env::temp_dir().join("arc-tests-db"))
         .arg("run")
         .output()
         .expect("spawn arc run");

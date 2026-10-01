@@ -69,8 +69,10 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extensions: BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>>,
 
-    /// Path to the database file, relative to the manifest directory.
-    /// Defaults to `<name>.duckdb` if not specified. An unset value is left out of a
+    /// Path to the database file, relative to the manifest directory. When unset the
+    /// database is `<name>.duckdb` in arc's data folder, `$ARCFORM_DB_DIR` or
+    /// `~/.arcform/db`, under a key made from the Protocol directory's canonical path,
+    /// so the directory carries no database. An unset value is left out of a
     /// manifest arc writes: `arc create-protocol` writes this key only when `--db`
     /// names a path, and `arc init` and `arc init --from-descriptor` write none. A
     /// manifest carrying `db: null` still loads with it unset.
@@ -286,13 +288,16 @@ impl Manifest {
         Ok(manifest)
     }
 
-    /// Resolve the database file path relative to the manifest directory.
-    pub(crate) fn db_path(&self, manifest_dir: &Path) -> PathBuf {
-        let db = self
-            .db
-            .clone()
-            .unwrap_or_else(|| format!("{}.duckdb", self.name));
-        manifest_dir.join(db)
+    /// Where this Protocol's working database is: `db:` relative to the manifest
+    /// directory when the manifest names one, else `<name>.duckdb` in arc's data folder
+    /// under a key made from the directory's canonical path (see [`crate::working_db`]).
+    /// Refused when the directory cannot be canonicalised or the data folder cannot be
+    /// resolved. It reads the filesystem and writes nothing.
+    pub(crate) fn db_path(&self, manifest_dir: &Path) -> Result<PathBuf> {
+        match &self.db {
+            Some(db) => Ok(manifest_dir.join(db)),
+            None => crate::working_db::locate(&self.name, manifest_dir).map(|db| db.path),
+        }
     }
 
     /// Validate manifest constraints.
@@ -503,8 +508,8 @@ impl Manifest {
     }
 
     /// Generate a default manifest for a new project. It names no database: `db` is
-    /// unset, so the manifest is written without the key and resolves to
-    /// `<name>.duckdb` beside it; a caller with a path sets `db` after.
+    /// unset, so the manifest is written without the key and its database is
+    /// `<name>.duckdb` in arc's data folder; a caller with a path sets `db` after.
     pub(crate) fn new_project(name: &str) -> Self {
         Manifest {
             name: name.to_string(),
@@ -600,21 +605,36 @@ mod tests {
         assert_eq!(m.name, "test-pipeline");
         assert_eq!(m.engine, "duckdb");
         assert_eq!(m.db, None, "a new project names no database");
-        assert_eq!(
-            m.db_path(Path::new("/tmp/project")),
-            PathBuf::from("/tmp/project/test-pipeline.duckdb"),
-            "and its database is still <name>.duckdb beside the manifest"
+        let dir = tempfile::tempdir().unwrap();
+        let path = m.db_path(dir.path()).unwrap();
+        assert!(
+            !path.starts_with(dir.path().canonicalize().unwrap()),
+            "and its database is not beside the manifest: {}",
+            path.display()
         );
+        assert!(path.ends_with("test-pipeline.duckdb"), "{}", path.display());
         assert!(m.steps.is_empty());
         assert!(m.assets.is_empty());
     }
 
-    // Database path defaults to <name>.duckdb.
+    // With no db: the database is <name>.duckdb in arc's data folder, keyed to the
+    // directory — the resolution `working_db` makes, not a path beside the manifest.
     #[test]
     fn test_db_path_default() {
         let m = test_manifest("my-proj", vec![]);
-        let path = m.db_path(Path::new("/tmp/project"));
-        assert_eq!(path, PathBuf::from("/tmp/project/my-proj.duckdb"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = m.db_path(dir.path()).unwrap();
+        assert_eq!(
+            path,
+            crate::working_db::locate("my-proj", dir.path())
+                .unwrap()
+                .path
+        );
+        assert!(
+            !path.starts_with(dir.path().canonicalize().unwrap()),
+            "{}",
+            path.display()
+        );
     }
 
     // Explicit db field overrides the default path.
@@ -622,7 +642,7 @@ mod tests {
     fn test_db_path_explicit() {
         let mut m = test_manifest("my-proj", vec![]);
         m.db = Some("custom.duckdb".to_string());
-        let path = m.db_path(Path::new("/tmp/project"));
+        let path = m.db_path(Path::new("/tmp/project")).unwrap();
         assert_eq!(path, PathBuf::from("/tmp/project/custom.duckdb"));
     }
 
@@ -914,9 +934,10 @@ assets:
         // Written by an arc before the key was left out, or by hand: `db: null` is unset.
         let unset = Manifest::from_yaml_str(&format!("{head}db: null\n{tail}")).unwrap();
         assert_eq!(unset.db, None);
+        let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            unset.db_path(Path::new("/tmp/project")),
-            PathBuf::from("/tmp/project/p.duckdb")
+            unset.db_path(dir.path()).unwrap(),
+            crate::working_db::locate("p", dir.path()).unwrap().path
         );
 
         // No key at all reads the same way.
@@ -927,7 +948,7 @@ assets:
         let named = Manifest::from_yaml_str(&format!("{head}db: state/p.db\n{tail}")).unwrap();
         assert_eq!(named.db.as_deref(), Some("state/p.db"));
         assert_eq!(
-            named.db_path(Path::new("/tmp/project")),
+            named.db_path(Path::new("/tmp/project")).unwrap(),
             PathBuf::from("/tmp/project/state/p.db")
         );
     }

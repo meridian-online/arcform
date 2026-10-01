@@ -95,7 +95,7 @@ const EXPORTED: [(&str, &str); 34] = [
 
 /// Every module file in the crate. Frozen so a new one cannot be added without
 /// passing under the checks below.
-const MODULE_FILES: [&str; 32] = [
+const MODULE_FILES: [&str; 33] = [
     "asset.rs",
     "asset_kind.rs",
     "bridge.rs",
@@ -136,6 +136,10 @@ const MODULE_FILES: [&str; 32] = [
     "runner.rs",
     "spec.rs",
     "state.rs",
+    // Where a Protocol that names no `db:` keeps its working database: arc's data
+    // folder, keyed to the Protocol directory. Private to the crate — the folder is a
+    // run-time facility, as the fetch cache is, not a schema.
+    "working_db.rs",
 ];
 
 /// The derives on each exported schema type, frozen. A derive on an exported type is

@@ -178,12 +178,31 @@ pub trait StateBackend {
 /// conflicts with CLI-based step execution.
 pub struct DuckDbStateBackend {
     db_path: std::path::PathBuf,
+    /// The canonical Protocol directory, when the database is in arc's data folder:
+    /// [`init`](StateBackend::init) names it in the clear beside the database.
+    protocol_dir: Option<std::path::PathBuf>,
 }
 
 impl DuckDbStateBackend {
     pub fn new(db_path: &Path) -> Self {
         DuckDbStateBackend {
             db_path: db_path.to_path_buf(),
+            protocol_dir: None,
+        }
+    }
+
+    /// The state backend of the Protocol `manifest` in `dir`, on the database
+    /// [`Manifest::db_path`](crate::manifest::Manifest::db_path) resolves: the one
+    /// `db:` names, or one in arc's data folder, located once with the directory it is
+    /// keyed to. Nothing is written until [`init`](StateBackend::init), so a run refused
+    /// before it leaves nothing in arc's data folder.
+    pub(crate) fn for_protocol(manifest: &crate::manifest::Manifest, dir: &Path) -> Result<Self> {
+        match manifest.db {
+            Some(_) => manifest.db_path(dir).map(|path| Self::new(&path)),
+            None => crate::working_db::locate(&manifest.name, dir).map(|db| DuckDbStateBackend {
+                db_path: db.path,
+                protocol_dir: Some(db.protocol_dir),
+            }),
         }
     }
 
@@ -203,6 +222,9 @@ impl DuckDbStateBackend {
 
 impl StateBackend for DuckDbStateBackend {
     fn init(&self) -> Result<()> {
+        if let Some(dir) = &self.protocol_dir {
+            crate::working_db::mark(&self.db_path, dir)?;
+        }
         let conn = self.open()?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS _arcform_state (

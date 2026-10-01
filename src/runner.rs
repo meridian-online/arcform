@@ -274,6 +274,19 @@ pub fn run_with_params(
     let dotenv_vars = load_dotenv_files(dir, &manifest.dotenv);
     let mut env_map = resolve_params(&manifest.params, &dotenv_vars, cli_params)?;
 
+    // Where the run's database is, resolved before anything is initialised. With no `db:`
+    // it is in arc's data folder rather than beside the manifest, so the run says where
+    // once; and every `command:` step and hook reads it from `ARC_DB_PATH`, so one that
+    // runs the DuckDB CLI by hand opens the database the SQL steps ran on.
+    let db_path = manifest.db_path(dir)?;
+    if manifest.db.is_none() {
+        println!("{} {}", "database:".dimmed(), db_path.display());
+    }
+    env_map.insert(
+        crate::working_db::DB_PATH_ENV.to_string(),
+        db_path.display().to_string(),
+    );
+
     // Initialise the state backend (creates tables if needed).
     state.init()?;
 
@@ -316,7 +329,6 @@ pub fn run_with_params(
         &env_map,
     )?;
 
-    let db_path = manifest.db_path(dir);
     // The shared fetch cache, resolved once for the run and handed to every operator
     // step. `None` when `$ARCFORM_FETCH_CACHE` says `off` or there is no home
     // directory to put it in — a run without one behaves as every run did before the
@@ -3802,6 +3814,33 @@ steps:
         );
     }
 
+    // The run resolves its own database before anything initialises, and a resolution
+    // that fails refuses the run: a `name:` that would leave its keyed directory in arc's
+    // data folder reaches no engine and records no run.
+    #[test]
+    fn a_database_the_run_cannot_resolve_refuses_it_before_any_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: a/b\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        let err = run(dir.path(), &engine, &state, false).unwrap_err();
+        assert!(
+            matches!(&err, Error::DbNameNotAFileName { name } if name == "a/b"),
+            "{err:?}"
+        );
+        assert!(
+            !engine
+                .calls
+                .borrow()
+                .iter()
+                .any(|c| matches!(c, MockCall::Sql { .. })),
+            "no step reached the engine"
+        );
+        assert!(state.runs.borrow().is_empty(), "no run was recorded");
+    }
+
     // Backwards compatibility — existing manifests work identically.
     #[test]
     fn test_param_backwards_compat_no_params() {
@@ -3818,7 +3857,14 @@ steps:
         let sql_call = calls.iter().find(|c| matches!(c, MockCall::Sql { .. }));
         match sql_call {
             Some(MockCall::Sql { env, .. }) => {
-                assert!(env.is_empty(), "backwards-compat: env map should be empty");
+                // No parameter reaches the step; the one variable arc sets on every
+                // run is where the database is.
+                let keys: Vec<&String> = env.keys().collect();
+                assert_eq!(
+                    keys,
+                    vec!["ARC_DB_PATH"],
+                    "backwards-compat: no ARC_PARAM_ variable without params"
+                );
             }
             _ => panic!("expected SQL call"),
         }
@@ -5806,11 +5852,13 @@ steps:
     #[test]
     fn test_parquet_export_bare_dest_forces_rerun_on_truncate_delete_restore() {
         let dir = tempfile::tempdir().unwrap();
-        let yaml = "name: test\nsteps:\n  - name: export\n    op: parquet_export\n    with:\n      input: customers\n      dest: registrant.avro\n";
+        let yaml = "name: test\ndb: test.duckdb\nsteps:\n  - name: export\n    op: parquet_export\n    with:\n      input: customers\n      dest: registrant.avro\n";
         setup_project(dir.path(), yaml, &[]);
 
         // Seed the real DuckDB file `parquet_export` opens with the table it reads —
         // op: steps run for real, so this has to be a real table, not a mocked one.
+        // `db:` names it, so the run opens the file seeded here rather than one in
+        // arc's data folder.
         {
             let db_path = dir.path().join("test.duckdb");
             let conn = duckdb::Connection::open(&db_path).unwrap();

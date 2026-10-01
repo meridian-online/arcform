@@ -42,6 +42,7 @@ fn corpus_copy() -> tempfile::TempDir {
 fn arc_run(dir: &Path) {
     let run = Command::new(env!("CARGO_BIN_EXE_arc"))
         .current_dir(dir)
+        .env("ARCFORM_DB_DIR", std::env::temp_dir().join("arc-tests-db"))
         .arg("run")
         .output()
         .expect("spawn arc run");

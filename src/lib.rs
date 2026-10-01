@@ -56,6 +56,7 @@ mod record;
 mod registry;
 mod runner;
 mod state;
+mod working_db;
 
 pub mod spec;
 
