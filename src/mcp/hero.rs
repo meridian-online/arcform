@@ -35,9 +35,9 @@ fn protocol_run(args: &Value) -> ToolResult {
     let cli_params = parse_params(args.get("params"))?;
 
     let manifest = crate::manifest::Manifest::load(&dir).map_err(|e| e.to_string())?;
-    let db_path = manifest.db_path(&dir);
     let engine = crate::engine::DuckDbEngine;
-    let state = crate::state::DuckDbStateBackend::new(&db_path);
+    let state = crate::state::DuckDbStateBackend::for_protocol(&manifest, &dir)
+        .map_err(|e| e.to_string())?;
 
     // The contract is written to `<dir>/build/.arcform/runs/<run_id>.json` at run end
     // (on success and failure alike). Snapshot the directory, run, then read the file

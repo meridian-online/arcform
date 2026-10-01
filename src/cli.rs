@@ -63,7 +63,8 @@ pub enum Commands {
 
         /// Database file path, relative to the protocol directory. Written to
         /// `arcform.yaml` as `db:` only when passed; without it the database is
-        /// `<name>.duckdb` beside the manifest.
+        /// `<name>.duckdb` in arc's data folder (`$ARCFORM_DB_DIR`, else
+        /// `~/.arcform/db`), keyed to the protocol directory, and not in the directory.
         #[arg(long)]
         db: Option<String>,
     },
@@ -648,9 +649,8 @@ pub fn run_pipeline(force: bool, raw_params: &[String]) -> Result<()> {
     let cli_params = crate::runner::parse_params(raw_params)?;
     let cwd = std::env::current_dir()?;
     let manifest = Manifest::load(&cwd)?;
-    let db_path = manifest.db_path(&cwd);
     let engine = DuckDbEngine;
-    let state = DuckDbStateBackend::new(&db_path);
+    let state = DuckDbStateBackend::for_protocol(&manifest, &cwd)?;
     crate::runner::run_with_params(&cwd, &engine, &state, force, &cli_params)
 }
 
@@ -1006,11 +1006,13 @@ mod tests {
             !content.lines().any(|l| l.starts_with("db")),
             "arc init writes no db: line:\n{content}"
         );
-        assert_eq!(
-            manifest.db_path(&base.path().join("analytics")),
-            base.path().join("analytics/analytics.duckdb"),
-            "and its database is still <name>.duckdb beside the manifest"
+        let db = manifest.db_path(&base.path().join("analytics")).unwrap();
+        assert!(
+            !db.starts_with(base.path().canonicalize().unwrap()),
+            "and its database is not beside the manifest: {}",
+            db.display()
         );
+        assert!(db.ends_with("analytics.duckdb"), "{}", db.display());
         assert!(manifest.steps.is_empty());
     }
 
@@ -1344,14 +1346,20 @@ mod tests {
         assert_eq!(m.name, "notes");
         assert!(m.steps.is_empty());
 
-        // No --db: the file carries no db line, and the database is still
-        // <name>.duckdb beside the manifest.
+        // No --db: the file carries no db line, and the database is <name>.duckdb in
+        // arc's data folder rather than beside the manifest.
         let text = fs::read_to_string(dir.join("arcform.yaml")).unwrap();
         assert!(
             !text.lines().any(|l| l.starts_with("db")),
             "no db line without --db:\n{text}"
         );
-        assert_eq!(m.db_path(&dir), dir.join("notes.duckdb"));
+        let db = m.db_path(&dir).unwrap();
+        assert!(
+            !db.starts_with(dir.canonicalize().unwrap()),
+            "{}",
+            db.display()
+        );
+        assert!(db.ends_with("notes.duckdb"), "{}", db.display());
 
         let err = create_protocol(&dir, None, None, None, &history).unwrap_err();
         assert!(

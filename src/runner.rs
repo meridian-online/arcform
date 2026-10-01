@@ -274,6 +274,19 @@ pub fn run_with_params(
     let dotenv_vars = load_dotenv_files(dir, &manifest.dotenv);
     let mut env_map = resolve_params(&manifest.params, &dotenv_vars, cli_params)?;
 
+    // Where the run's database is, resolved before anything is initialised. With no `db:`
+    // it is in arc's data folder rather than beside the manifest, so the run says where
+    // once; and every `command:` step and hook reads it from `ARC_DB_PATH`, so one that
+    // runs the DuckDB CLI by hand opens the database the SQL steps ran on.
+    let db_path = manifest.db_path(dir)?;
+    if manifest.db.is_none() {
+        println!("{} {}", "database:".dimmed(), db_path.display());
+    }
+    env_map.insert(
+        crate::working_db::DB_PATH_ENV.to_string(),
+        db_path.display().to_string(),
+    );
+
     // Initialise the state backend (creates tables if needed).
     state.init()?;
 
@@ -316,7 +329,6 @@ pub fn run_with_params(
         &env_map,
     )?;
 
-    let db_path = manifest.db_path(dir);
     // The shared fetch cache, resolved once for the run and handed to every operator
     // step. `None` when `$ARCFORM_FETCH_CACHE` says `off` or there is no home
     // directory to put it in — a run without one behaves as every run did before the

@@ -63,6 +63,15 @@ pub enum Error {
     )]
     HistoryRootMissing,
 
+    // A Protocol that names no `db:` keeps its database in arc's data folder, and that
+    // cannot be resolved: no $ARCFORM_DB_DIR and no home directory. The remedy is the
+    // env var, or a `db:` line, so the message names both.
+    #[error(
+        "database: no data folder for a Protocol that names no db: (set ARCFORM_DB_DIR \
+         to a writable directory, ensure a home directory exists, or name a db: in arcform.yaml)"
+    )]
+    DbRootMissing,
+
     #[error("history: no entry '{id}' for this spec (see `arc history list`)")]
     HistoryEntryNotFound { id: String },
 
@@ -435,6 +444,15 @@ mod format_tests {
             "remediation env var must appear: {:?}",
             s
         );
+    }
+
+    #[test]
+    fn db_root_missing_names_the_env_var_and_the_db_line() {
+        let s = Error::DbRootMissing.to_string();
+        assert!(!s.contains('\n'), "Display must be single-line: {:?}", s);
+        assert!(s.starts_with("database:"), "family prefix: {:?}", s);
+        assert!(s.contains("ARCFORM_DB_DIR"), "remediation env var: {:?}", s);
+        assert!(s.contains("db:"), "the other remedy, a db: line: {:?}", s);
     }
 
     #[test]
