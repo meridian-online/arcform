@@ -103,6 +103,67 @@ pub trait Engine {
     /// none. DuckDB checks an extension's signature when it loads it, so a file returned is
     /// one DuckDB loads.
     fn force_install_community_extension(&self, name: &str) -> Result<Option<PathBuf>>;
+
+    /// What the DuckDB the steps run on reports of itself, and of each extension in
+    /// `extensions` that `duckdb_extensions()` lists, for the run record. It installs and
+    /// loads nothing.
+    fn report(&self, extensions: &[String]) -> Result<EngineReport>;
+}
+
+/// What the DuckDB the steps run on reports, as [`Engine::report`] asks it. Each value is
+/// `None` where DuckDB gives none.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EngineReport {
+    /// `SELECT version()`: `v1.5.5`.
+    pub version: Option<String>,
+    /// `PRAGMA platform`: `linux_amd64`.
+    pub platform: Option<String>,
+    /// What `duckdb_extensions()` gives for each extension asked about that it lists, by name.
+    pub extensions: HashMap<String, ReportedExtension>,
+}
+
+/// What `duckdb_extensions()` gives for one extension.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReportedExtension {
+    /// `install_path`: the installed file, or `(BUILT-IN)` for an extension linked into
+    /// DuckDB that no `INSTALL` has fetched a file for.
+    pub path: Option<PathBuf>,
+    /// `installed_from`: `core`, `community`, or the address it was installed from.
+    pub repository: Option<String>,
+    /// `extension_version`.
+    pub version: Option<String>,
+}
+
+/// Read the lines [`DuckDbEngine::report`]'s question prints after [`ANSWER_MARK`]: each a tag,
+/// then its values, separated by tabs. A line with a tag it does not know is skipped.
+fn read_report(answers: &[String]) -> EngineReport {
+    let given = |value: &str| (!value.is_empty()).then(|| value.to_string());
+    let mut report = EngineReport::default();
+    for answer in answers {
+        match answer.split_once('\t') {
+            Some(("version", version)) => report.version = given(version),
+            Some(("platform", platform)) => report.platform = given(platform),
+            Some(("extension", fields)) => {
+                // The path last, so a tab in it stays in it.
+                let mut fields = fields.splitn(4, '\t');
+                let (Some(name), Some(repository), Some(version), Some(path)) =
+                    (fields.next(), fields.next(), fields.next(), fields.next())
+                else {
+                    continue;
+                };
+                report.extensions.insert(
+                    name.to_string(),
+                    ReportedExtension {
+                        path: given(path).map(PathBuf::from),
+                        repository: given(repository),
+                        version: given(version),
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+    report
 }
 
 /// Wait for a child process with an optional timeout.
@@ -409,6 +470,28 @@ impl Engine for DuckDbEngine {
             &format!("FORCE INSTALL {name} FROM community; LOAD {name};"),
             &format!("install and load the build of {name} the community registry serves"),
         )
+    }
+
+    fn report(&self, extensions: &[String]) -> Result<EngineReport> {
+        let mut sql = format!(
+            "SELECT '{ANSWER_MARK}version' || chr(9) || version(); \
+             SELECT '{ANSWER_MARK}platform' || chr(9) || platform FROM pragma_platform();"
+        );
+        if !extensions.is_empty() {
+            let names: Vec<String> = extensions
+                .iter()
+                .map(|name| format!("'{}'", name.replace('\'', "''")))
+                .collect();
+            sql.push_str(&format!(
+                " SELECT '{ANSWER_MARK}extension' || chr(9) || extension_name || chr(9) || coalesce(installed_from, '') || chr(9) || coalesce(extension_version, '') || chr(9) || coalesce(install_path, '') FROM duckdb_extensions() WHERE extension_name IN ({});",
+                names.join(", ")
+            ));
+        }
+        let answers = ask_duckdb(
+            &sql,
+            "report its version, its platform and the extensions it holds",
+        )?;
+        Ok(read_report(&answers))
     }
 }
 
@@ -1400,15 +1483,30 @@ pub(crate) struct ExtensionInstalls {
     /// Each vetted community extension the SQL installs `FROM community`, once, in the order
     /// the Protocol first installs it.
     pub(crate) installed: Vec<String>,
+    /// Each extension the SQL installs by name, from DuckDB's own repository or `FROM
+    /// community`, once, in the order the Protocol first installs it: what the run record
+    /// names.
+    pub(crate) recorded: Vec<String>,
 }
 
 /// What the check reads in one SQL file: a line for each statement it refuses, each vetted
 /// community extension the file installs `FROM community`, once, in the order the file first
-/// installs it, and each place the file runs SQL that is not in it.
+/// installs it, each extension it installs by name from DuckDB's own repository or `FROM
+/// community`, likewise, and each place the file runs SQL that is not in it.
 struct FileCheck {
     refusals: Vec<String>,
     installed: Vec<&'static VettedExtension>,
+    recorded: Vec<String>,
     shapes: Vec<(RunTimeSql, usize)>,
+}
+
+/// Add each name in `names` that `list` does not hold to its end, in order.
+fn add_new(list: &mut Vec<String>, names: impl IntoIterator<Item = String>) {
+    for name in names {
+        if !list.contains(&name) {
+            list.push(name);
+        }
+    }
 }
 
 /// Check the SQL file `source` runs, holding `bytes`, as [`check_extension_installs`] checks
@@ -1418,6 +1516,7 @@ fn check_file(source: &ProtocolSql, bytes: &[u8]) -> FileCheck {
     let mut found = FileCheck {
         refusals: Vec::new(),
         installed: Vec::new(),
+        recorded: Vec::new(),
         shapes: Vec::new(),
     };
     for (finding, line) in scan_extension_sql(bytes) {
@@ -1427,9 +1526,12 @@ fn check_file(source: &ProtocolSql, bytes: &[u8]) -> FileCheck {
                 continue;
             }
             ExtensionSql::Install {
+                name,
                 from: InstallFrom::Core,
-                ..
-            } => continue,
+            } => {
+                add_new(&mut found.recorded, [name]);
+                continue;
+            }
             ExtensionSql::Install {
                 name,
                 from: InstallFrom::Community,
@@ -1438,6 +1540,7 @@ fn check_file(source: &ProtocolSql, bytes: &[u8]) -> FileCheck {
                     if !found.installed.iter().any(|seen| seen.name == entry.name) {
                         found.installed.push(entry);
                     }
+                    add_new(&mut found.recorded, [name]);
                     continue;
                 }
                 None => format!(
@@ -1503,6 +1606,7 @@ pub(crate) fn check_extension_installs(
 ) -> Result<ExtensionInstalls> {
     let mut refusals = Vec::new();
     let mut installed: Vec<&VettedExtension> = Vec::new();
+    let mut recorded = Vec::new();
     let mut unread = Vec::new();
     for source in sql {
         // A file that is not there before the run is checked just before the step or hook
@@ -1517,6 +1621,7 @@ pub(crate) fn check_extension_installs(
                 installed.push(entry);
             }
         }
+        add_new(&mut recorded, found.recorded);
         if !found.shapes.is_empty() {
             unread.push((source, found.shapes));
         }
@@ -1537,6 +1642,7 @@ pub(crate) fn check_extension_installs(
     Ok(ExtensionInstalls {
         warnings,
         installed: names,
+        recorded,
     })
 }
 
@@ -1550,6 +1656,9 @@ pub(crate) fn check_extension_installs(
 pub(crate) struct ExtensionRecheck {
     /// Each vetted community extension a check has found.
     installed: Vec<String>,
+    /// Each extension a file a check passed installs by name, from DuckDB's own repository
+    /// or `FROM community`, once, in the order the run first found it.
+    recorded: Vec<String>,
     /// Each pinned extension a check installed and found equal to its pin.
     pinned: Vec<PinnedExtension>,
     /// Each warning printed so far.
@@ -1571,6 +1680,7 @@ impl ExtensionRecheck {
     ) -> Self {
         ExtensionRecheck {
             installed: installs.installed,
+            recorded: installs.recorded,
             pinned,
             warned: installs.warnings.into_iter().chain(pin_warnings).collect(),
             pins: pins.clone(),
@@ -1582,6 +1692,13 @@ impl ExtensionRecheck {
     /// step or hook ran, which [`recheck_extension_pins`] hashes again when the run ends.
     pub(crate) fn pinned(&self) -> &[PinnedExtension] {
         &self.pinned
+    }
+
+    /// Each extension a file a check passed installs by name, from DuckDB's own repository or
+    /// `FROM community`, once, in the order the run first found it: the extensions the run
+    /// record names.
+    pub(crate) fn recorded(&self) -> &[String] {
+        &self.recorded
     }
 
     /// Just before the step or hook `source` names runs: read its file again, refuse it on
@@ -1632,6 +1749,7 @@ impl ExtensionRecheck {
             .filter(|warning| self.warned.insert(warning.clone()))
             .collect();
         self.installed.extend(names);
+        add_new(&mut self.recorded, found.recorded);
         self.pinned.extend(pinned);
         Ok(warnings)
     }
@@ -1835,6 +1953,11 @@ pub mod mock {
         /// What `install_community_extension` answers for each name: the installed file,
         /// no file, or a failure's reason. A name not here names no file.
         pub installs: RefCell<HashMap<String, std::result::Result<Option<PathBuf>, String>>>,
+        /// What `report` answers; `None` makes it fail. Asking it is not one of `calls`,
+        /// which the tests in `runner.rs` count; `reported` holds what each ask named.
+        pub report: RefCell<Option<EngineReport>>,
+        /// The extensions each call of `report` asked about, in order.
+        pub reported: RefCell<Vec<Vec<String>>>,
     }
 
     #[derive(Debug, Clone)]
@@ -1869,6 +1992,8 @@ pub mod mock {
                 timeout_should_fire: RefCell::new(false),
                 platform: RefCell::new(Some("linux_amd64".to_string())),
                 installs: RefCell::new(HashMap::new()),
+                report: RefCell::new(Some(EngineReport::default())),
+                reported: RefCell::new(Vec::new()),
             }
         }
 
@@ -2053,6 +2178,18 @@ pub mod mock {
         /// `tests/vetted_extensions.rs`.
         fn force_install_community_extension(&self, name: &str) -> Result<Option<PathBuf>> {
             panic!("the mock engine was asked to force-install {name}, which arc run never does")
+        }
+
+        fn report(&self, extensions: &[String]) -> Result<EngineReport> {
+            self.reported.borrow_mut().push(extensions.to_vec());
+            self.report
+                .borrow()
+                .clone()
+                .ok_or_else(|| Error::EngineQuery {
+                    what: "report its version, its platform and the extensions it holds"
+                        .to_string(),
+                    reason: "the mock was told to fail".to_string(),
+                })
         }
     }
 }

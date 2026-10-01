@@ -76,12 +76,42 @@ pub struct ProtocolInfo {
 }
 
 /// The engine versions that executed the run.
+///
+/// `duckdb_cli`, `platform` and `extensions` are what the DuckDB the SQL steps ran on reports
+/// when the run ends, and are `null` for a Protocol with no SQL step or hook, which asks it
+/// nothing. They were added under `b4/1` rather than a new tag, and a record written before
+/// them reads with each absent.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EngineInfo {
     /// `arc` binary version.
     pub arc: String,
-    /// DuckDB version (`SELECT version()`), if reachable.
+    /// The version of the DuckDB library `arc` is linked with (`SELECT version()`), if
+    /// reachable. The SQL steps run on the DuckDB CLI, which `duckdb_cli` names.
     pub duckdb: Option<String>,
+    /// The version the DuckDB CLI the SQL steps ran on reports (`SELECT version()`), which
+    /// differs from `duckdb` when `ARC_DUCKDB_BIN` or the search path gives the steps
+    /// another DuckDB.
+    pub duckdb_cli: Option<String>,
+    /// The platform that DuckDB reports (`PRAGMA platform`): `linux_amd64`.
+    pub platform: Option<String>,
+    /// Each extension the Protocol's SQL installs by name, from DuckDB's own repository or
+    /// `FROM community`, in the order the run first found it.
+    pub extensions: Option<Vec<ExtensionEntry>>,
+}
+
+/// An extension a run's SQL installs, as the DuckDB the steps ran on reports it when the run
+/// ends. Each value is `null` where DuckDB gives none or arc could not ask it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionEntry {
+    pub name: String,
+    /// The repository DuckDB reports it was installed from (`installed_from`): `core`,
+    /// `community`.
+    pub repository: Option<String>,
+    /// The version DuckDB reports for it (`extension_version`).
+    pub version: Option<String>,
+    /// The SHA-256 of the file DuckDB names as its `install_path`; `null` when DuckDB names
+    /// none or arc cannot read the file it names.
+    pub sha256: Option<String>,
 }
 
 /// A resolved parameter and where its value came from.
@@ -300,6 +330,41 @@ pub struct StepOutcome {
     pub report: Option<serde_json::Value>,
 }
 
+/// What a run records of the DuckDB its SQL steps ran on: [`EngineInfo`]'s `duckdb_cli`,
+/// `platform` and `extensions`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepsEngine {
+    pub duckdb_cli: Option<String>,
+    pub platform: Option<String>,
+    pub extensions: Vec<ExtensionEntry>,
+}
+
+/// What the run records of the DuckDB its SQL steps ran on, from `report`, its answer when
+/// asked about `names`: an entry for each name, in order, whatever the answer holds of it,
+/// with the SHA-256 of the file DuckDB names hashed now. With no answer each value is absent.
+pub fn steps_engine(report: Option<crate::engine::EngineReport>, names: &[String]) -> StepsEngine {
+    let report = report.unwrap_or_default();
+    let extensions = names
+        .iter()
+        .map(|name| {
+            let reported = report.extensions.get(name).cloned().unwrap_or_default();
+            ExtensionEntry {
+                name: name.clone(),
+                repository: reported.repository,
+                version: reported.version,
+                sha256: reported
+                    .path
+                    .and_then(|path| crate::fetch_cache::hash_file(&path).ok()),
+            }
+        })
+        .collect();
+    StepsEngine {
+        duckdb_cli: report.version,
+        platform: report.platform,
+        extensions,
+    }
+}
+
 /// Inputs to [`build_contract`] — grouped to keep the call site readable.
 pub struct ContractInputs<'a> {
     pub manifest: &'a Manifest,
@@ -313,6 +378,9 @@ pub struct ContractInputs<'a> {
     pub params: Vec<ParamEntry>,
     /// Per-step terminal outcome, keyed by step name.
     pub step_outcomes: &'a HashMap<String, StepOutcome>,
+    /// What the DuckDB the SQL steps ran on reported; `None` for a Protocol with no SQL step
+    /// or hook.
+    pub steps_engine: Option<StepsEngine>,
 }
 
 /// Assemble the full contract from the run's manifest, asset graph, and outcomes.
@@ -345,9 +413,18 @@ pub fn build_contract(inp: ContractInputs) -> Contract {
                 manifest_sha256: manifest_sha256(inp.dir),
                 dir: inp.dir.display().to_string(),
             },
-            engine: EngineInfo {
-                arc: env!("CARGO_PKG_VERSION").to_string(),
-                duckdb: duckdb_version,
+            engine: {
+                let (duckdb_cli, platform, extensions) = match inp.steps_engine {
+                    Some(e) => (e.duckdb_cli, e.platform, Some(e.extensions)),
+                    None => (None, None, None),
+                };
+                EngineInfo {
+                    arc: env!("CARGO_PKG_VERSION").to_string(),
+                    duckdb: duckdb_version,
+                    duckdb_cli,
+                    platform,
+                    extensions,
+                }
             },
             params: inp.params,
             started_at: Some(inp.started_at.to_string()),

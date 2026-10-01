@@ -884,6 +884,15 @@ pub fn run_with_params(
     if changed_after_success || refused_after_success {
         let _ = state.finish_run(&run_id, executed, outcome, total_retries);
     }
+    // What the DuckDB the steps ran on reports, after the last step and hook, so the record
+    // names the build each extension the SQL installs was when the run ended. A question it
+    // does not answer leaves each value absent: recording refuses no run and prints nothing.
+    let steps_engine = manifest.has_sql_steps().then(|| {
+        contract::steps_engine(
+            engine.report(extensions.recorded()).ok(),
+            extensions.recorded(),
+        )
+    });
     let run_contract = contract::build_contract(contract::ContractInputs {
         manifest: &manifest,
         dir,
@@ -895,6 +904,7 @@ pub fn run_with_params(
         outcome,
         params: contract_params,
         step_outcomes: &step_outcomes,
+        steps_engine,
     });
     if let Err(e) = contract::write_contract(&runs_dir, &run_id, &run_contract) {
         eprintln!(
