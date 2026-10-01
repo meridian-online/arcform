@@ -49,8 +49,8 @@ spec-ac-id|(?i)[a-z]{2,6}[-_]ac[-_]?[0-9]+[a-z]?(?![0-9])
 spec-ac-id|(?i)(?<![A-Za-z0-9])ac[-_][0-9]+[a-z]?(?![0-9])
 
 # A card named by its title: six or more hyphen-joined words, each starting with
-# a letter. Six is a measured floor, not a comfortable margin: most titles run
-# eight or more, roughly one in eight runs six or seven. scripts/check-public-hygiene.sh
+# a letter. Six is the floor, and five words, one segment short of it, is the
+# case the innocent-strings fixture keeps below it. scripts/check-public-hygiene.sh
 # excludes vendored source from this one label, because upstream documentation
 # URLs carry runs of this shape that nobody here wrote.
 card-slug|(?i)(?<![A-Za-z0-9-])[a-z][a-z0-9]*(?:-[a-z][a-z0-9]*){5,}(?![A-Za-z0-9-])
@@ -65,10 +65,11 @@ vault-ledger-path|(?i)(?<![-_A-Za-z0-9/.])(?:decisions|cards|milestones|drafts|n
 # beside a small count ("choice 2 of 3") is left alone.
 planning-choice-id|(?i)(?<![A-Za-z0-9])choices?[ _-]?#?[0-9]{3,4}(?![0-9])
 
-# A spec named by its date and a slug. A bare date, a date range and a dated
-# file name carrying an extension are left alone: the slug must start with a
-# letter, run at least two words, and not be followed by `.ext` or `.*`.
-dated-spec-slug|(?<![-_A-Za-z0-9])20[0-9]{2}-[0-9]{2}-[0-9]{2}-[a-z][a-z0-9]*(?:-[a-z0-9]+)+(?![-_A-Za-z0-9]|\.[A-Za-z0-9*])
+# A spec named by its date and a slug, in lower case or with capitals. A bare
+# date, a date range and a dated file name carrying an extension are left alone:
+# the slug must start with a letter, run at least two words, and not be followed
+# by `.ext` or `.*`.
+dated-spec-slug|(?i)(?<![-_A-Za-z0-9])20[0-9]{2}-[0-9]{2}-[0-9]{2}-[a-z][a-z0-9]*(?:-[a-z0-9]+)+(?![-_A-Za-z0-9]|\.[A-Za-z0-9*])
 
 # A numbered finding of a review. Qualified by the review that raised it, it is
 # a pointer whatever follows. Unqualified, it is a pointer only when no word or

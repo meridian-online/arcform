@@ -69,8 +69,9 @@ run_gate() {
 # ---------------------------------------------------------------------------
 # The cases: "<label>|<text>", `^` removed and `\n` read as a line break. One
 # per rule line, in the order of the rules file, each chosen so that no other
-# line with the same label catches it; then the path rule; then the wrapped
-# cases, whose word and number sit on two lines.
+# line with the same label catches it, and a second dated spec name written with
+# capitals; then the path rule; then the wrapped cases, whose word and number
+# sit on two lines.
 # ---------------------------------------------------------------------------
 CASES=(
 	'private-decision-record|see deci^sion-12 for why'
@@ -91,6 +92,7 @@ CASES=(
 	'vault-ledger-path|under decisions/one-^two-three'
 	'planning-choice-id|per choi^ce 0012'
 	'dated-spec-slug|spec 2026-06-20-sur^vey-detection-and-load'
+	'dated-spec-slug|spec 2026-06-20-Sur^vey-Detection-And-Load'
 	'review-finding-ref|review-spec find^ing 3 covers it'
 	'review-finding-ref|as agreed (find^ing 7).'
 	'cross-repo-doc-path|see ../other/notes.m^d'
@@ -192,6 +194,57 @@ printf 'see scripts/guide.m^d\n' | tr -d '^' >"$r/doc.txt"
 run_gate "$r"
 [[ $rc -eq 0 ]] && res=ok || res=bad
 check "a path rooted in this repository is clean (got $rc)" "$res" "$r.out"
+
+# 7. Each place the gate skips a file or clears a hit, the allowlist's
+#    suppression in the wrapped pass and the path rule's scan among them. Every
+#    skipped file holds a string the gate reports in a plain file beside it, so
+#    a skip check cannot pass because its string stopped matching. One gate run;
+#    each skip check reads the report, above the summary, for its own file.
+r="$work/skips"
+new_repo "$r"
+mkdir -p "$r/vendor" "$r/docs/guide"
+slug='per fix-the-loader-^when-the-column-moves'
+oneline='per choi^ce 0012'
+wrapped='# consumes it as a library (choi^ce\n# 0012): the rest'
+doc_path='see guide/intro.m^d'
+printf '%b\n' "${slug//^/}" >"$r/slug.txt"
+printf '%b\n' "${slug//^/}" >"$r/vendor/upstream.txt"
+printf '%b\n' "${oneline//^/}" >"$r/line.txt"
+printf '\0\n%b\n' "${oneline//^/}" >"$r/bin-line.dat"
+printf '%b\n' "${wrapped//^/}" >"$r/wrap.txt"
+printf '\0\n%b\n' "${wrapped//^/}" >"$r/bin-wrap.dat"
+printf '%b\n' "${doc_path//^/}" >"$r/link.txt"
+printf '%b\n' "${doc_path//^/}" >"$r/docs/notes.txt"
+printf '%b\n' "${wrapped//^/}" >"$r/wrap-kept.txt"
+printf '%b\n' "${doc_path//^/}" >"$r/link-kept.txt"
+{
+	printf '%b\n' "${wrapped//^/}"
+	printf 'wrap-kept.txt | %s | quoted from an upstream changelog\n' "${oneline#per }"
+	printf 'link-kept.txt | %s | names a page of an upstream guide\n' "${doc_path#see }"
+} | tr -d '^' >"$r/scripts/public-hygiene-allowlist.txt"
+printf 'an introduction\n' >"$r/docs/guide/intro.md"
+run_gate "$r"
+[[ $rc -eq 1 ]] && res=ok || res=bad
+check "the skips repository exits 1 on its plain files (got $rc)" "$res" "$r.out"
+for plain in 'slug.txt:1: card-slug' 'line.txt:1: planning-choice-id' \
+	'wrap.txt:1: planning-choice-id' 'link.txt:1: cross-repo-doc-path'; do
+	grep -q "^$plain: " "$r.out" && res=ok || res=bad
+	check "the plain file is reported as $plain" "$res" "$r.out"
+done
+sed '/^check-public-hygiene: FAILED/,$d' "$r.out" >"$r.report"
+skipped() {
+	grep -qF -- "$1" "$r.report" && res=bad || res=ok
+	check "$2" "$res" "$r.out"
+}
+skipped 'vendor/upstream.txt' "card-slug skips vendored source: vendor/upstream.txt is not reported"
+skipped 'bin-line.dat' "the line scan skips a binary file: bin-line.dat is not reported"
+skipped 'bin-wrap.dat' "the wrapped pass skips a binary file: bin-wrap.dat is not reported"
+skipped 'public-hygiene-allowlist.txt:1:' "the wrapped pass skips the allowlist file: its line 1 is not reported"
+skipped 'wrap-kept.txt' "an allowlisted wrapped match is suppressed: wrap-kept.txt is not reported"
+skipped 'link-kept.txt' "an allowlisted path match is suppressed: link-kept.txt is not reported"
+skipped 'docs/notes.txt' "the path rule clears a path that resolves to a tracked file from the directory of the file that wrote it: docs/notes.txt is not reported"
+grep -q 'PATH_PATTERN in scripts/check-public-hygiene.sh' "$r.out" && res=ok || res=bad
+check "the failure message sends a path match to PATH_PATTERN in the gate" "$res" "$r.out"
 
 if [[ $failures -gt 0 ]]; then
 	echo "check-public-hygiene-selftest: $failures of $checks check(s) failed" >&2
