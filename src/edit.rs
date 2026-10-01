@@ -342,28 +342,25 @@ fn ignore_list_text(dir: &Path, db: Option<&str>) -> String {
 /// escaped. `None` when it names a place outside `dir`, or holds a character a line of
 /// the list cannot carry. A relative path is resolved lexically, so `./a/../w.duckdb`
 /// is `w.duckdb` and `../w.duckdb` is outside; an absolute one is inside only when it
-/// sits under `dir`.
+/// sits under `dir`, which is looked for as `dir` is written and then as it resolves.
 fn path_inside(dir: &Path, db: &str) -> Option<String> {
-    use std::path::Component;
-
-    let db = Path::new(db);
-    let relative = if db.is_absolute() {
+    let relative = if Path::new(db).is_absolute() {
+        let db = Path::new(db);
         db.strip_prefix(dir)
             .ok()
             .or_else(|| db.strip_prefix(dir.canonicalize().ok()?).ok())?
-            .to_path_buf()
+            .to_str()?
     } else {
-        db.to_path_buf()
+        db
     };
     let mut parts: Vec<String> = Vec::new();
-    for component in relative.components() {
-        match component {
-            Component::Normal(part) => parts.push(escape_ignore_pattern(part.to_str()?)?),
-            Component::CurDir => {}
-            Component::ParentDir => {
+    for segment in relative.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
                 parts.pop()?;
             }
-            Component::RootDir | Component::Prefix(_) => return None,
+            part => parts.push(escape_ignore_pattern(part)?),
         }
     }
     (!parts.is_empty()).then(|| parts.join("/"))
@@ -372,7 +369,7 @@ fn path_inside(dir: &Path, db: &str) -> Option<String> {
 /// One path component, with each character the ignore list reads as a pattern
 /// escaped. `None` for a control character: a newline ends the line it would be on.
 fn escape_ignore_pattern(part: &str) -> Option<String> {
-    let mut out = String::with_capacity(part.len());
+    let mut out = String::new();
     for c in part.chars() {
         if c.is_control() {
             return None;
@@ -1354,6 +1351,11 @@ steps:
             Some("build/w.duckdb"),
             "resolved the way a run joins it, then written the way the list reads it"
         );
+        assert_eq!(
+            inside("build//w.duckdb").as_deref(),
+            Some("build/w.duckdb"),
+            "an empty segment is no segment"
+        );
         assert_eq!(inside("../w.duckdb"), None, "outside the directory");
         assert_eq!(
             inside("a/../../w.duckdb"),
@@ -1374,6 +1376,10 @@ steps:
             Some("w.duckdb"),
             "an absolute path under the directory is inside it"
         );
+
+        // A directory that cannot be resolved names no absolute database: the lexical
+        // look fails, and there is no real location to look under.
+        assert_eq!(path_inside(&d.join("missing"), "/elsewhere/w.duckdb"), None);
 
         // A directory reached through a link: the run's database path is the real one.
         #[cfg(unix)]

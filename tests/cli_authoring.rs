@@ -491,9 +491,14 @@ fn staged_by_add_all(dir: &Path) -> Vec<String> {
 #[test]
 fn a_fresh_protocol_stages_the_manifest_and_not_arcs_run_records() {
     let base = tempfile::tempdir().expect("tempdir");
-    arc_ok(base.path(), &["create-protocol", "fieldbook"]);
+    let out = arc_ok(base.path(), &["create-protocol", "fieldbook"]);
     let proto = base.path().join("fieldbook");
 
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.lines().any(|l| l == "created fieldbook/.gitignore"),
+        "create-protocol says it made the list:\n{stdout}"
+    );
     assert_eq!(
         std::fs::read_to_string(proto.join(".gitignore")).unwrap(),
         IGNORE_LIST
