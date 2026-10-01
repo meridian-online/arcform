@@ -8,18 +8,21 @@ on:
 # Deliberately a workflow of its own rather than a job inside `ci`:
 #
 # * `ci` builds the crate, which links a system DuckDB and takes minutes. This
-#   gate needs no toolchain, no cache and no build — it is `git grep` over
-#   tracked files and finishes in seconds. It should be the first thing to go
-#   red, and it should still report when the Rust suite is queued or cancelled.
-# * A leaked private planning identifier must be reported on every pushed commit,
-#   independent of whether the build succeeds.
+#   gate needs no toolchain, no cache and no build — it is `git grep` and a
+#   perl pass over tracked files, and it finishes in seconds. It should be the
+#   first thing to go red, and it should still report when the Rust suite is
+#   queued or cancelled.
+# * A leaked private planning identifier must be reported on a push to `main`
+#   and on a pull request, independent of whether the build succeeds.
 jobs:
   planning-identifiers:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      # fetch-depth 1 is enough: the gate reads the tracked files of this one
-      # commit, never history.
+      # fetch-depth 1 is enough: the gate reads the content of the tracked text
+      # files at the checked-out commit, less the allowlist file and, for the
+      # `card-slug` rule, `vendor/**`; binary files, history, commit messages
+      # and pull-request text are outside it.
       - uses: actions/checkout@v4
 
       # The gate's own regression test runs FIRST. A hygiene gate fails silently
@@ -29,7 +32,10 @@ jobs:
       - name: hygiene gate self-test
         run: ./scripts/check-public-hygiene-selftest.sh
 
-      # No `working-directory`. The gate cd's to the repo root itself and scans
-      # every tracked file in the repository.
+      # No `working-directory`. The gate cd's to the repo root itself. It scans
+      # the content of the tracked text files at the checked-out commit, less
+      # the allowlist file, which no rule scans, and less `vendor/**`, which
+      # the `card-slug` rule skips; binary files, history, commit messages and
+      # pull-request text are outside it.
       - name: private planning identifiers
         run: ./scripts/check-public-hygiene.sh

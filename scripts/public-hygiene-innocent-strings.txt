@@ -53,7 +53,7 @@ Hex digests that contain the letters "ac"
     dep = "git+https://example.com/x?rev=hvac#4afea48"
 
 Words that merely start with a covered prefix
-----------------------------------------------
+---------------------------------------------
     decision-making is not a decision record
     documentation-2026 is a folder name
     multitask-42 is one word
@@ -66,11 +66,10 @@ Words that merely start with a covered prefix
     a mac-address-parsing-helper is one hyphenated identifier
 
 Kebab-case runs below the card-slug threshold
-----------------------------------------------
+---------------------------------------------
 Five hyphen-joined words is one segment short of the six the card-slug rule
 requires. Most real titles run eight or more, but roughly one in eight runs six
 or seven, so six is a floor with little room above it.
-
     alpha-bravo-charlie-delta-echo is a five-segment placeholder
     a form-n-cen-data-set is SEC filing vocabulary, not a card title
 
@@ -91,28 +90,66 @@ self-test builds, and the two have different directories at their roots. Only
 tree-INDEPENDENT cases belong here. The tree-dependent ones live in
 scripts/check-public-hygiene-selftest.sh, which states the repository it builds
 and so can say what "inside" means.
-
 A URL is tree-independent: every position a match could start at is preceded by
 `/`, `.` or `:`, all of which the pattern refuses.
-
     https://example.com/docs/guide.md
     https://raw.githubusercontent.com/example/repo/main/README.md
     see [the guide](https://example.com/handbook/getting-started.md)
-
 MIME types and module paths are what the rule would swallow if the `.md`
 requirement were ever dropped as "too narrow". It is not too narrow; it is the
 only thing standing between this rule and every slash in the tree.
-
     application/vnd.apache.parquet
     text/csv, application/json, image/svg+xml
     the std::collections module path, and serde/serde_json in prose
-
 An interpolated path has a variable name where its root segment should be, so
 nothing can be decided about where it points. These were not hypothetical: the
 first draft of the rule turned red on this repository's own self-test.
-
     : >"$d/scripts/guide.md"
     cp "$src/docs/guide.md" "${dest}/docs/guide.md"
     let p = format!("{dir}/notes.md");
     let q = format!("{}/notes.md", dir);
     path = os.path.join(base, "notes.md")
+
+TOML array-of-table headers, not vault wikilinks
+-------------------------------------------------
+    [[bin]]
+    [[test]]
+    [[bench]]
+    [[example]]
+
+Paths that are not the planning vault's ledger
+-----------------------------------------------
+    docs/notes/release-notes-draft
+    notes/two-words
+    examples/cards/front-door.yaml
+    https://example.org/decisions/
+    the gallery cards/rows split
+
+Unicode code points, not acceptance criteria
+--------------------------------------------
+A code point is written with a `+`, and the first Hangul syllable has the same
+four characters as a criterion number.
+    U+AC00 is the first Hangul syllable
+    the precomposed syllables run from U+AC00 to U+D7A3
+
+The word "choice" beside a small number
+---------------------------------------
+    the choice of 2 engines
+    pick choice 2 of 3 on the menu
+    a choice between 128 and 256 bits
+    when the choice
+    of 2 engines wraps across a line, the joined pair is still clean
+
+Dates that are not a spec name
+------------------------------
+    shipped on 2026-06-20 - see the changelog
+    the window 2026-06-20-2026-06-21 closed
+    the run is recorded in 2026-07-27-apple-m1-pro.json
+    2026-06-20T10:30:00Z
+
+The word "finding" beside a count
+---------------------------------
+    finding 2 matches
+    after finding 12 rows the scan stops
+    the loop keeps finding
+    3 rows per page when the line wraps

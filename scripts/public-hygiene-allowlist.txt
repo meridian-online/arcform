@@ -18,7 +18,7 @@
 # allowlist cannot rot into fake coverage.
 #
 # Before adding anything here, try to make the pattern in
-# scripts/check-public-hygiene.sh more precise instead, and add the innocent
+# scripts/public-hygiene-rules.txt more precise instead, and add the innocent
 # string to scripts/public-hygiene-innocent-strings.txt so the tightening stays
 # fixed. The allowlist is for genuine content that must stay, never for papering
 # over a bad regex.
