@@ -45,10 +45,12 @@
 //! # Refusal discipline
 //!
 //! Every refusal leaves the protocol directory untouched, byte for byte. The
-//! step name and provenance note are gated first — both are spliced into
-//! durable text verbatim, so a value that would not read back as itself
-//! (a newline, a `#`, a `:`) is refused before anything else happens, and the
-//! reloaded document is checked to carry exactly the step that was asked for.
+//! step name, provenance note and description are gated first — each is
+//! spliced into durable text, so a name or note that would not read back as
+//! itself (a newline, a `#`, a `:`), and a description that is empty or spans
+//! lines, is refused before anything else happens, and the reloaded document
+//! is checked to carry exactly the step that was asked for, its description
+//! included.
 //! The manifest splice is applied and gated **in memory first**; the generated
 //! model is written only where no file exists; the manifest write is atomic;
 //! and if a write fails partway, the just-written model — and `models/`
