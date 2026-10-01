@@ -158,6 +158,16 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # `default = ["cli"]` in Cargo.toml, so the step above compiles — and lints —
+      # none of src/mcp/ and none of the code behind `opendal`: a warning there
+      # would reach main with the clippy step green. The non-default features are the
+      # ones `[features]` defines that `default` does not reach through `cli` and
+      # `http-fetch`: `mcp` and `opendal`. This lints both at once, so the
+      # `opendal` dependency graph is resolved once. The default run above stays:
+      # it is the only one that lints the `cfg(not(feature = "opendal"))` code.
+      - name: clippy (mcp, opendal features)
+        run: cargo clippy --workspace --all-targets --features mcp,opendal -- -D warnings
+
       - name: test
         run: cargo test --workspace
 
