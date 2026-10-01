@@ -181,3 +181,5 @@ Built with [DuckDB](https://duckdb.org), [sqlparser-rs](https://github.com/sqlpa
 
 Pipeline model and step execution inspired by [Dagu](https://github.com/dagu-org/dagu). Asset-centric design influenced by [Dagster](https://dagster.io/)'s software-defined asset model. SQL-first approach informed by [SQLMesh](https://sqlmesh.com/) and [dbt](https://www.getdbt.com/). Local-remote parity pattern drawn from [nektos/act](https://github.com/nektos/act).
 
+
+blocked on task-42 today
