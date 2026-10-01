@@ -984,7 +984,7 @@ fn dispatch_registry(cmd: RegistryCmd, verbose: bool) -> Result<()> {
 mod tests {
     use super::*;
 
-    // `arc init` creates arcform.yaml, models/, sources/.
+    // `arc init` creates arcform.yaml, models/, sources/ and a .gitignore.
     #[test]
     fn test_init_creates_project_structure() {
         let base = tempfile::tempdir().unwrap();
@@ -997,6 +997,10 @@ mod tests {
         );
         assert!(project.join("models").is_dir(), "models/ should exist");
         assert!(project.join("sources").is_dir(), "sources/ should exist");
+        assert!(
+            project.join(IGNORE_FILENAME).is_file(),
+            "the ignore list should exist"
+        );
     }
 
     // Generated manifest has correct defaults.
