@@ -1342,6 +1342,116 @@ steps:
     }
 
     #[test]
+    fn the_ignore_list_names_a_database_only_where_it_is_inside_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let inside = |db: &str| path_inside(d, db);
+
+        assert_eq!(inside("work.duckdb").as_deref(), Some("work.duckdb"));
+        assert_eq!(inside("build/w.duckdb").as_deref(), Some("build/w.duckdb"));
+        assert_eq!(
+            inside("./a/../build/w.duckdb").as_deref(),
+            Some("build/w.duckdb"),
+            "resolved the way a run joins it, then written the way the list reads it"
+        );
+        assert_eq!(inside("../w.duckdb"), None, "outside the directory");
+        assert_eq!(
+            inside("a/../../w.duckdb"),
+            None,
+            "outside, by way of a child"
+        );
+        assert_eq!(
+            inside("/elsewhere/w.duckdb"),
+            None,
+            "absolute, not under it"
+        );
+        assert_eq!(inside(""), None);
+        assert_eq!(inside("."), None, "the directory itself is not a file");
+
+        let under = d.join("w.duckdb");
+        assert_eq!(
+            inside(under.to_str().unwrap()).as_deref(),
+            Some("w.duckdb"),
+            "an absolute path under the directory is inside it"
+        );
+        let canonical = d.canonicalize().unwrap().join("build/w.duckdb");
+        assert_eq!(
+            inside(canonical.to_str().unwrap()).as_deref(),
+            Some("build/w.duckdb"),
+            "and so is one under its canonical form"
+        );
+    }
+
+    #[test]
+    fn a_character_the_list_reads_as_a_pattern_is_escaped_and_a_newline_is_refused() {
+        assert_eq!(
+            escape_ignore_pattern("a b[1]*?\\c").as_deref(),
+            Some("a\\ b\\[1]\\*\\?\\\\c")
+        );
+        assert_eq!(
+            escape_ignore_pattern("plain.duckdb").as_deref(),
+            Some("plain.duckdb")
+        );
+        assert_eq!(escape_ignore_pattern("two\nlines"), None);
+    }
+
+    #[test]
+    fn the_ignore_list_text_is_anchored_and_names_the_database_and_its_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let none = "# Written by `arc`: what a run records belongs to the machine that ran it.\n\
+                    /build/.arcform/\n";
+        assert_eq!(ignore_list_text(dir.path(), None), none);
+        assert_eq!(
+            ignore_list_text(dir.path(), Some("../out.duckdb")),
+            none,
+            "a database outside the directory is not named"
+        );
+        assert_eq!(
+            ignore_list_text(dir.path(), Some("build/w.duckdb")),
+            format!(
+                "{none}# The database this Protocol names, and its write-ahead log.\n\
+                 /build/w.duckdb\n/build/w.duckdb.wal\n"
+            )
+        );
+    }
+
+    #[test]
+    fn the_ignore_list_is_written_once_and_a_list_already_there_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(IGNORE_FILENAME);
+
+        assert_eq!(
+            write_ignore_list(dir.path(), None).unwrap(),
+            IgnoreList::Written
+        );
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, ignore_list_text(dir.path(), None));
+
+        std::fs::write(&path, "theirs").unwrap();
+        assert_eq!(
+            write_ignore_list(dir.path(), None).unwrap(),
+            IgnoreList::Kept
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs");
+    }
+
+    #[test]
+    fn create_spec_writes_the_spec_and_no_ignore_list() {
+        let dir = tempfile::tempdir().unwrap();
+        create_spec(dir.path(), &Manifest::new_project("p")).unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [MANIFEST_FILENAME],
+            "the list is the verbs' to write, and the library path is as it was"
+        );
+    }
+
+    #[test]
     fn write_atomic_replaces_without_leaving_droppings() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(MANIFEST_FILENAME);
