@@ -151,7 +151,14 @@ pub fn record_step(dir: &Path, step: &RecordedStep) -> Result<(PathBuf, Validate
     if let Some(description) = &step.description {
         valid_description(description)?;
     }
+    record_gated(dir, step)
+}
 
+/// [`record_step`] past its gates on the name, the provenance note and the
+/// description: the splice, the read-back check and the writes. The gates
+/// refuse every value they can name, so a test reaches the read-back check
+/// only by calling this with a value they would have refused.
+fn record_gated(dir: &Path, step: &RecordedStep) -> Result<(PathBuf, ValidatedSpec)> {
     let manifest_path = dir.join(MANIFEST_FILENAME);
     if !manifest_path.exists() {
         return Err(Error::ManifestNotFound);
@@ -1396,6 +1403,50 @@ mod tests {
         ) {
             Err(Error::EditTarget { path, .. }) => assert_eq!(path, "(description)"),
             other => panic!("a description nobody asked for: got {other:?}"),
+        }
+    }
+
+    /// The read-back check is wired into the record path: a name or a
+    /// description the gates would have refused, handed straight to the splice,
+    /// reads back as something else and is refused by the check, naming the
+    /// part, with the directory untouched.
+    #[test]
+    fn past_the_gates_a_step_that_does_not_read_back_is_refused_with_the_directory_untouched() {
+        for (what, name, description, expected) in [
+            ("a name holding ` #`", "big # draft", None, "(name)"),
+            (
+                "a description that spans lines",
+                "big",
+                Some("Keep the big ones\n      and no others"),
+                "(description)",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let manifest = dir.path().join(MANIFEST_FILENAME);
+            std::fs::write(
+                &manifest,
+                "name: shop\nsteps:\n  - name: orders\n    sql: models/01_orders.sql\n",
+            )
+            .unwrap();
+            let step = RecordedStep {
+                name: name.to_string(),
+                sql: "SELECT 1;".to_string(),
+                provenance: "test".to_string(),
+                description: description.map(str::to_string),
+            };
+            match record_gated(dir.path(), &step) {
+                Err(Error::EditTarget { path, .. }) => assert_eq!(path, expected, "{what}"),
+                other => panic!("{what}: expected the {expected} refusal, got {other:?}"),
+            }
+            assert_eq!(
+                std::fs::read_to_string(&manifest).unwrap(),
+                "name: shop\nsteps:\n  - name: orders\n    sql: models/01_orders.sql\n",
+                "{what}: the manifest changed"
+            );
+            assert!(
+                !dir.path().join("models").exists(),
+                "{what}: a model was written"
+            );
         }
     }
 
