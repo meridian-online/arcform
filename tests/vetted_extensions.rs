@@ -508,12 +508,19 @@ fn a_protocol_with_no_install_prints_what_it_printed_before() {
     assert_eq!(run.stderr, "", "nothing on stderr");
     assert_eq!(run.stdout, BEFORE_STDOUT);
     // The calls the engine received on 68a1fa2, recorded by running that commit's binary on
-    // the same fake engine: no call arc makes for a pin.
+    // the same fake engine: no call arc makes for a pin. Then the question for the run record,
+    // after the last step, which arc asks since the record names the DuckDB the steps ran on.
     let root = protocol.root.path().display().to_string();
     let calls: Vec<String> = run
         .engine_calls
         .iter()
-        .map(|call| call.replace(&root, "ROOT"))
+        .map(|call| {
+            if is_report(call) {
+                "report".to_string()
+            } else {
+                call.replace(&root, "ROOT")
+            }
+        })
         .collect();
     assert_eq!(
         calls,
@@ -522,6 +529,7 @@ fn a_protocol_with_no_install_prints_what_it_printed_before() {
             "ROOT/project/vetted.duckdb -f ROOT/project/models/setup.sql",
             "ROOT/project/vetted.duckdb -f ROOT/project/models/load.sql",
             "ROOT/project/vetted.duckdb -f ROOT/project/models/transform.sql",
+            "report",
         ]
     );
 }
@@ -975,10 +983,13 @@ impl Outcome {
     }
 
     /// The engine calls with the SQL arc sent in place of each `-c` call's text: `platform`,
-    /// `install mlpack`, or `force install and load mlpack`.
+    /// `install mlpack`, or `force install and load mlpack`. The question for the run record
+    /// that [`is_report`] names is left out: it comes after the last step and hook, and
+    /// installs nothing.
     fn calls(&self) -> Vec<String> {
         self.engine_calls
             .iter()
+            .filter(|call| !is_report(call))
             .map(|call| {
                 if call.contains("pragma_platform") {
                     "platform".to_string()
@@ -2847,4 +2858,412 @@ fn arc_refuses_an_install_exactly_where_duckdb_would_run_it() {
         "arc and DuckDB disagree on what is SQL:\n{}",
         disagreements.join("\n")
     );
+}
+
+// ---- what the run record names of the DuckDB the steps ran on ----
+
+/// Whether `call` is the question `arc run` asks the DuckDB the steps ran on once the last step
+/// and hook have run, for the run record: its version, its platform and the extensions the
+/// SQL installs.
+fn is_report(call: &str) -> bool {
+    call.starts_with("-noheader -list -c ") && call.contains("version()")
+}
+
+impl Protocol {
+    /// The run record the one run of this Protocol wrote.
+    fn record(&self) -> serde_json::Value {
+        let runs = self.project().join("build/.arcform/runs");
+        let json = fs::read_dir(&runs)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|x| x == "json"))
+            .expect("the run wrote its record");
+        serde_json::from_slice(&fs::read(json).unwrap()).unwrap()
+    }
+}
+
+/// The install record DuckDB keeps beside an installed file, `<file>.info`, saying it was
+/// installed from `repository` at `version`. DuckDB writes it as tagged fields, each a 16-bit
+/// tag and then a value: 100 the install mode, 101 the address it fetched, 102 the
+/// repository's address, 103 the version; a string is a one-byte length and its bytes, and
+/// the record ends at the tag `0xffff`.
+fn install_record(name: &str, repository: &str, version: &str) -> Vec<u8> {
+    let field = |tag: u16, text: &str| {
+        assert!(text.len() < 128, "one byte holds the length");
+        let mut bytes = tag.to_le_bytes().to_vec();
+        bytes.push(text.len() as u8);
+        bytes.extend_from_slice(text.as_bytes());
+        bytes
+    };
+    let mut record = 100u16.to_le_bytes().to_vec();
+    record.push(1);
+    record.extend(field(
+        101,
+        &format!("{repository}/{name}.duckdb_extension.gz"),
+    ));
+    record.extend(field(102, repository));
+    record.extend(field(103, version));
+    record.extend([0xff, 0xff]);
+    record
+}
+
+/// The real DuckDB CLI, under a home directory of the test's own, names the files a Protocol's
+/// SQL installs, and the record holds each one's hash with the repository and version DuckDB
+/// reports. Offline: each file is planted where DuckDB keeps it, so the step's `INSTALL`
+/// finds it and installs nothing, and neither file is an extension, so nothing loads it.
+/// mlpack has the install record DuckDB writes beside a file it fetched, and httpfs has none,
+/// so DuckDB reports a repository and a version for the first and neither for the second.
+#[test]
+fn the_record_names_each_extension_the_sql_installs_as_the_real_duckdb_reports_it() {
+    let home = tempfile::tempdir().unwrap();
+    let ask = |args: &[&str]| {
+        let out = Command::new("duckdb")
+            .args(args)
+            .env("HOME", home.path())
+            .output()
+            .expect("the DuckDB CLI on PATH");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let version = ask(&["--version"])
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    let platform = ask(&[
+        "-noheader",
+        "-list",
+        "-c",
+        "SELECT platform FROM pragma_platform();",
+    ]);
+    let dir = home
+        .path()
+        .join(format!(".duckdb/extensions/{version}/{platform}"));
+    fs::create_dir_all(&dir).unwrap();
+    let mlpack = dir.join("mlpack.duckdb_extension");
+    let httpfs = dir.join("httpfs.duckdb_extension");
+    fs::write(&mlpack, b"not an extension").unwrap();
+    fs::write(&httpfs, b"not httpfs either").unwrap();
+    fs::write(
+        dir.join("mlpack.duckdb_extension.info"),
+        install_record(
+            "mlpack",
+            "http://community-extensions.duckdb.org",
+            "0123abc",
+        ),
+    )
+    .unwrap();
+    let (mlpack_hash, httpfs_hash) = (sha256(&mlpack), sha256(&httpfs));
+    let planted: BTreeSet<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+
+    // What DuckDB itself reports of each, which the record gives.
+    assert_eq!(
+        ask(&[
+            "-noheader",
+            "-list",
+            "-c",
+            "SELECT extension_name, installed_from, extension_version, install_path FROM duckdb_extensions() WHERE extension_name IN ('mlpack', 'httpfs') ORDER BY extension_name;",
+        ]),
+        format!(
+            "httpfs|||{}\nmlpack|community|0123abc|{}",
+            httpfs.display(),
+            mlpack.display()
+        )
+    );
+
+    let run = |yaml: &str, files: &[(String, &str)]| {
+        let protocol = Protocol::with(yaml, files);
+        let out = Command::new(env!("CARGO_BIN_EXE_arc"))
+            .current_dir(protocol.project())
+            .arg("run")
+            .env("HOME", home.path())
+            .env("ARCFORM_DB_DIR", protocol.root.path().join("db"))
+            .env_remove("ARC_DUCKDB_BIN")
+            .env_remove("ARC_ALLOW_UNTESTED_ENGINE")
+            .output()
+            .expect("spawn arc run");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            protocol.record(),
+        )
+    };
+    let installs = [(
+        "models/s.sql".to_string(),
+        "INSTALL mlpack FROM community;\nINSTALL httpfs;\n",
+    )];
+    for (label, pin) in [("pinned", Some(&mlpack_hash)), ("no pin", None)] {
+        let extensions = pin.map_or(String::new(), |pin| pin_yaml(&version, &platform, pin));
+        let (code, stderr, record) = run(
+            &format!("name: real\nsteps:\n  - name: s\n    sql: models/s.sql\n{extensions}"),
+            &installs,
+        );
+        assert_eq!(code, Some(0), "[{label}] {stderr}");
+        assert_eq!(
+            stderr.contains("mlpack has no pin"),
+            pin.is_none(),
+            "[{label}] the warning for an extension with no pin:\n{stderr}"
+        );
+        let engine = &record["run"]["engine"];
+        assert_eq!(engine["duckdb_cli"], version.as_str(), "[{label}]");
+        assert_eq!(engine["platform"], platform.as_str(), "[{label}]");
+        assert_eq!(
+            engine["extensions"],
+            serde_json::json!([
+                {
+                    "name": "mlpack",
+                    "repository": "community",
+                    "version": "0123abc",
+                    "sha256": mlpack_hash,
+                },
+                {
+                    "name": "httpfs",
+                    "repository": null,
+                    "version": null,
+                    "sha256": httpfs_hash,
+                },
+            ]),
+            "[{label}]"
+        );
+        if let Some(pin) = pin {
+            assert_eq!(
+                engine["extensions"][0]["sha256"],
+                pin.as_str(),
+                "the hash a pinned run records is its pin"
+            );
+        }
+        assert_eq!(
+            (sha256(&mlpack), sha256(&httpfs)),
+            (mlpack_hash.clone(), httpfs_hash.clone()),
+            "[{label}] the files are as they were"
+        );
+        let now: BTreeSet<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(now, planted, "[{label}] nothing was installed");
+    }
+
+    // SQL that installs nothing records the platform and the version, and no extension.
+    let (code, stderr, record) = run(
+        "name: real\nsteps:\n  - name: s\n    sql: models/s.sql\n",
+        &[("models/s.sql".to_string(), "SELECT 1;\n")],
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let engine = &record["run"]["engine"];
+    assert_eq!(engine["duckdb_cli"], version.as_str());
+    assert_eq!(engine["platform"], platform.as_str());
+    assert_eq!(engine["extensions"], serde_json::json!([]));
+
+    // A name holding a quote is asked about as a string. The hook that installs it does not
+    // run, and DuckDB lists nothing for it.
+    let (code, stderr, record) = run(
+        "name: real\nsteps:\n  - name: s\n    sql: models/s.sql\nhooks:\n  on_failure:\n    name: oops\n    sql: models/oops.sql\n",
+        &[
+            ("models/s.sql".to_string(), "SELECT 1;\n"),
+            ("models/oops.sql".to_string(), "INSTALL \"o'x\";\n"),
+        ],
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let engine = &record["run"]["engine"];
+    assert_eq!(engine["platform"], platform.as_str());
+    assert_eq!(
+        engine["extensions"],
+        serde_json::json!([
+            { "name": "o'x", "repository": null, "version": null, "sha256": null },
+        ])
+    );
+}
+
+/// A fake engine reporting DuckDB v1.5.3 that answers the question for the run record.
+const REPORTS_V153: &str = "case \"$1\" in\n\
+--version) echo 'v1.5.3 (fake) 0000000000' ;;\n\
+-noheader) case \"$4\" in *'version()'*) printf 'arc-answer:version\\tv1.5.3\\narc-answer:platform\\tfake_amd64\\n' ;; esac ;;\n\
+esac\n";
+
+#[test]
+fn the_record_gives_the_duckdb_the_steps_ran_on_beside_the_library_arc_is_linked_with() {
+    let linked: String = duckdb::Connection::open_in_memory()
+        .unwrap()
+        .query_row("SELECT version()", [], |r| r.get(0))
+        .unwrap();
+    assert_ne!(linked, "v1.5.3", "the fake engine is another DuckDB");
+
+    let protocol = Protocol::steps(&[("s", "CREATE TABLE t AS SELECT 1;\n")]);
+    let run = protocol.run_on(REPORTS_V153, &[]);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let calls: Vec<&str> = run
+        .engine_calls
+        .iter()
+        .map(|call| match call.as_str() {
+            "--version" => "--version",
+            call if is_report(call) => "report",
+            _ => "step",
+        })
+        .collect();
+    assert_eq!(calls, ["--version", "step", "report"], "asked once, last");
+    let engine = &protocol.record()["run"]["engine"];
+    assert_eq!(engine["arc"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(engine["duckdb"], linked.as_str());
+    assert_eq!(engine["duckdb_cli"], "v1.5.3");
+    assert_eq!(engine["platform"], "fake_amd64");
+    assert_eq!(engine["extensions"], serde_json::json!([]));
+
+    // A Protocol with no SQL step or hook asks DuckDB nothing, and its record gives neither.
+    let commands = Protocol::with(
+        "name: vetted\ndb: vetted.duckdb\nsteps:\n  - name: c\n    command: echo hi\n",
+        &[],
+    );
+    let run = commands.run_on(REPORTS_V153, &[]);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.engine_calls, Vec::<String>::new(), "no call");
+    let engine = &commands.record()["run"]["engine"];
+    for key in ["duckdb_cli", "platform", "extensions"] {
+        assert!(engine[key].is_null(), "{key}: {engine}");
+    }
+    assert_eq!(engine["arc"], env!("CARGO_PKG_VERSION"));
+}
+
+/// The Protocols in [`recording_what_duckdb_does_not_give_changes_nothing_about_the_run`]:
+/// step `s` installs mlpack from the community registry and httpfs from DuckDB's own
+/// repository, and then, in the second, step `f` fails.
+fn installs_two(fails: bool) -> Protocol {
+    let mut yaml =
+        String::from("name: rec\ndb: rec.duckdb\nsteps:\n  - name: s\n    sql: models/s.sql\n");
+    let mut files = vec![(
+        "models/s.sql".to_string(),
+        "INSTALL mlpack FROM community;\nINSTALL httpfs;\nCREATE TABLE t AS SELECT 1;\n",
+    )];
+    if fails {
+        yaml.push_str("  - name: f\n    sql: models/f.sql\n");
+        files.push(("models/f.sql".to_string(), "SELECT 1;\n"));
+    }
+    Protocol::with(&yaml, &files)
+}
+
+/// What `arc run` did for each Protocol [`installs_two`] makes, on be7226a, the commit before
+/// the run record named the DuckDB the steps ran on, byte for byte: the exit code, stdout,
+/// stderr and the record's outcome, recorded by running that commit's binary on the same fake
+/// engine.
+const RECORD_BEFORE: [(i32, &str, &str, &str); 2] = [
+    (
+        0,
+        "[1/1] \u{1b}[1ms\u{1b}[0m ...\n\
+\n\
+Asset graph (1 node):\n\
+\x20\x20t [table]\n\
+\x20\x20\x20\x20\x20\x20produced by  s\n\
+\n\
+\u{1b}[32m✓\u{1b}[39m 1/1 steps succeeded.\n",
+        "\u{1b}[33mwarning:\u{1b}[39m mlpack has no pin under the extensions: key of arcform.yaml (for DuckDB v1.5.5), so arc runs whichever build DuckDB installs; `arc upgrade mlpack` pins the build the community registry serves (https://github.com/meridian-online/arcform/blob/main/docs/VETTED_EXTENSIONS.md)\n",
+        "success",
+    ),
+    (
+        2,
+        "[1/2] \u{1b}[1ms\u{1b}[0m ...\n\
+[2/2] \u{1b}[1mf\u{1b}[0m ...\n\
+\n\
+Asset graph (1 node):\n\
+\x20\x20t [table]\n\
+\x20\x20\x20\x20\x20\x20produced by  s\n",
+        "\u{1b}[33mwarning:\u{1b}[39m mlpack has no pin under the extensions: key of arcform.yaml (for DuckDB v1.5.5), so arc runs whichever build DuckDB installs; `arc upgrade mlpack` pins the build the community registry serves (https://github.com/meridian-online/arcform/blob/main/docs/VETTED_EXTENSIONS.md)\n\
+Binder Error: f fails\n\
+error: step 'f' failed (exit code 1):\n\
+Binder Error: f fails\n\
+\n",
+        "partial",
+    ),
+];
+
+/// A record arc cannot take is an absent value: when DuckDB names no installed file, names a
+/// path arc cannot read, or cannot be asked, the record names each extension with no hash, and
+/// the run's exit code, stdout, stderr and outcome are what they were before the record named
+/// the DuckDB the steps ran on. A run DuckDB answers in full is held to the same bytes.
+#[test]
+fn recording_what_duckdb_does_not_give_changes_nothing_about_the_run() {
+    for (i, fails) in [false, true].into_iter().enumerate() {
+        let (code, stdout, stderr, outcome) = RECORD_BEFORE[i];
+        for arm in [
+            "answers in full",
+            "names no file",
+            "names a path arc cannot read",
+            "cannot be asked",
+        ] {
+            let label = format!(
+                "{} / {arm}",
+                if fails { "a step fails" } else { "succeeds" }
+            );
+            let protocol = installs_two(fails);
+            let root = protocol.root.path();
+            let (mlpack, httpfs) = (
+                root.join("mlpack.duckdb_extension"),
+                root.join("httpfs.duckdb_extension"),
+            );
+            fs::write(&mlpack, b"mlpack's build").unwrap();
+            fs::write(&httpfs, b"httpfs's build").unwrap();
+            let line = |name: &str, repository: &str, version: &str, path: &Path| {
+                format!(
+                    "arc-answer:extension\\t{name}\\t{repository}\\t{version}\\t{}\\n",
+                    path.display()
+                )
+            };
+            let answer = match arm {
+                "answers in full" => format!(
+                    "printf '{}{}'",
+                    line("mlpack", "community", "v1.5.5", &mlpack),
+                    line("httpfs", "core", "827222f", &httpfs)
+                ),
+                "names no file" => format!(
+                    "printf '{}'",
+                    line("mlpack", "community", "v1.5.5", Path::new(""))
+                ),
+                "names a path arc cannot read" => format!(
+                    "printf '{}{}'",
+                    line("mlpack", "community", "v1.5.5", &root.join("gone")),
+                    line("httpfs", "core", "827222f", root)
+                ),
+                _ => "echo 'Catalog Error: no duckdb_extensions here' >&2; exit 1".to_string(),
+            };
+            let run = protocol.run_on(
+                &format!(
+                    "case \"$1\" in\n\
+                     --version) echo 'v1.5.5 (fake) 0000000000' ;;\n\
+                     -noheader) case \"$4\" in *'version()'*) printf 'arc-answer:version\\tv1.5.5\\narc-answer:platform\\tlinux_amd64\\n'; {answer} ;; esac ;;\n\
+                     esac\n\
+                     case \"$3\" in */models/f.sql) echo 'Binder Error: f fails' >&2; exit 1 ;; esac\n"
+                ),
+                &[],
+            );
+            assert_eq!(run.code, Some(code), "[{label}] {}", run.stderr);
+            assert_eq!(run.stdout, stdout, "[{label}]");
+            assert_eq!(run.stderr, stderr, "[{label}]");
+            assert!(
+                run.engine_calls.iter().any(|call| is_report(call)),
+                "[{label}] DuckDB was asked"
+            );
+            let record = protocol.record();
+            assert_eq!(record["run"]["outcome"], outcome, "[{label}]");
+            let hashes = if arm == "answers in full" {
+                [
+                    serde_json::json!(sha256(&mlpack)),
+                    serde_json::json!(sha256(&httpfs)),
+                ]
+            } else {
+                [serde_json::Value::Null, serde_json::Value::Null]
+            };
+            let extensions = &record["run"]["engine"]["extensions"];
+            for (k, name) in ["mlpack", "httpfs"].into_iter().enumerate() {
+                assert_eq!(extensions[k]["name"], name, "[{label}] {extensions}");
+                assert_eq!(extensions[k]["sha256"], hashes[k], "[{label}] {name}");
+            }
+            assert_eq!(extensions.as_array().map(Vec::len), Some(2), "[{label}]");
+        }
+    }
 }
