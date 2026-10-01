@@ -388,7 +388,7 @@ pub fn create_protocol(
 
     // Written after the spec, so a refused or invalid manifest leaves nothing beside
     // it, and an ignore list the author wrote first is kept.
-    let ignore = write_ignore_list(dir, manifest.db.as_deref())?;
+    let ignore = write_ignore_list(dir, manifest.db.as_deref(), &[])?;
 
     println!(
         "created {} — author steps with `arc edit-protocol`",
@@ -646,7 +646,7 @@ pub fn init_at(name: &str, base: &std::path::Path) -> Result<()> {
     let manifest = Manifest::new_project(name);
     let yaml = serde_yaml::to_string(&manifest).expect("failed to serialize manifest");
     fs::write(project_dir.join("arcform.yaml"), yaml)?;
-    write_ignore_list(&project_dir, manifest.db.as_deref())?;
+    write_ignore_list(&project_dir, manifest.db.as_deref(), &[])?;
 
     println!("Initialized project '{}' with:", name);
     println!("  arcform.yaml");
