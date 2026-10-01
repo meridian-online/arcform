@@ -931,10 +931,26 @@ pub(crate) fn describe(name: &str) -> Option<serde_json::Value> {
 
 // ------------------------------------------------- recording an operation
 
-/// Record the operation called `long_name`, applied to the table `on`, as a new
-/// step named `name` at the end of the protocol at `dir`, with `description` as
-/// its `description:` when one is given, and return the model's path relative
-/// to `dir`.
+/// What a caller asks [`record_operation`] to record. The command line and `arc
+/// mcp` each build one from what they were given and hand it over unchanged.
+#[derive(Clone, Copy)]
+pub(crate) struct OperationRequest<'a> {
+    /// The operation's long name, as `arc operation list` lists it.
+    pub(crate) long_name: &'a str,
+    /// The table the operation is applied to.
+    pub(crate) on: &'a str,
+    /// The new step's name, which is also the name of the table it makes.
+    pub(crate) name: &'a str,
+    /// The operation's arguments.
+    pub(crate) arguments: &'a serde_json::Map<String, serde_json::Value>,
+    /// The step's `description:`, or `None` for a step with none.
+    pub(crate) description: Option<&'a str>,
+}
+
+/// Record the operation `request.long_name`, applied to the table `request.on`,
+/// as a new step named `request.name` at the end of the protocol at `dir`, with
+/// `request.description` as its `description:` when one is given, and return
+/// the model's path relative to `dir`.
 ///
 /// The operation's SQL is written from its catalogue entry, so a caller names no
 /// operation and no argument of its own: the command line and `arc mcp` hand
@@ -956,13 +972,16 @@ pub(crate) fn describe(name: &str) -> Option<serde_json::Value> {
 /// refusal's message names what was wrong.
 pub(crate) fn record_operation(
     dir: &Path,
-    long_name: &str,
-    on: &str,
-    name: &str,
-    arguments: &serde_json::Map<String, serde_json::Value>,
-    description: Option<&str>,
+    request: &OperationRequest,
     history: &crate::history::LocalHistory,
 ) -> Result<PathBuf> {
+    let OperationRequest {
+        long_name,
+        on,
+        name,
+        arguments,
+        description,
+    } = *request;
     let Some(op) = operation(long_name) else {
         let held: Vec<&str> = CATALOGUE.iter().map(|op| op.long_name).collect();
         return Err(refused(format!(

@@ -815,16 +815,14 @@ fn dispatch_operation(cmd: OperationCmd, out: &mut impl Write) -> Result<()> {
         } => {
             let arguments = operation_arguments(&args)?;
             let history = open_history()?;
-            operation_record(
-                &dir,
-                &long_name,
-                &on,
-                &name,
-                &arguments,
-                description.as_deref(),
-                &history,
-                out,
-            )
+            let request = crate::record::OperationRequest {
+                long_name: &long_name,
+                on: &on,
+                name: &name,
+                arguments: &arguments,
+                description: description.as_deref(),
+            };
+            operation_record(&dir, &request, &history, out)
         }
     }
 }
@@ -868,19 +866,15 @@ fn operation_describe(name: &str, out: &mut impl Write) -> Result<()> {
 /// written to the protocol or to `out`.
 fn operation_record(
     dir: &Path,
-    long_name: &str,
-    on: &str,
-    name: &str,
-    arguments: &serde_json::Map<String, serde_json::Value>,
-    description: Option<&str>,
+    request: &crate::record::OperationRequest,
     history: &LocalHistory,
     out: &mut impl Write,
 ) -> Result<()> {
-    let model =
-        crate::record::record_operation(dir, long_name, on, name, arguments, description, history)?;
+    let model = crate::record::record_operation(dir, request, history)?;
     writeln!(
         out,
-        "recorded step {name} as {} in {} — `arc run` runs it",
+        "recorded step {} as {} in {} — `arc run` runs it",
+        request.name,
         model.display(),
         dir.join(crate::spec::MANIFEST_FILENAME).display()
     )?;
@@ -1680,17 +1674,14 @@ mod tests {
         .unwrap();
         let arguments = operation_arguments(&["where=amount > 0".to_string()]).unwrap();
         let history = LocalHistory::at_root(root.path().join("history"));
-        let err = operation_record(
-            &dir,
-            "filter-rows",
-            "orders",
-            "big",
-            &arguments,
-            None,
-            &history,
-            &mut FailingWriter,
-        )
-        .unwrap_err();
+        let request = crate::record::OperationRequest {
+            long_name: "filter-rows",
+            on: "orders",
+            name: "big",
+            arguments: &arguments,
+            description: None,
+        };
+        let err = operation_record(&dir, &request, &history, &mut FailingWriter).unwrap_err();
         assert!(err.to_string().contains("stdout is closed"), "{err}");
     }
 

@@ -265,16 +265,15 @@ fn operation_record(args: &Value) -> ToolResult {
         Some(other) => return Err(format!("`description` must be a string, not {other}")),
     };
     let history = open_history()?;
-    let model = crate::record::record_operation(
-        &dir,
-        operation,
+    let request = crate::record::OperationRequest {
+        long_name: operation,
         on,
         name,
-        &arguments,
+        arguments: &arguments,
         description,
-        &history,
-    )
-    .map_err(|e| e.to_string())?;
+    };
+    let model =
+        crate::record::record_operation(&dir, &request, &history).map_err(|e| e.to_string())?;
     Ok(ToolOutput::json(json!({
         "step": name,
         "model": model.display().to_string(),
