@@ -146,7 +146,8 @@ pub enum Commands {
         cmd: OperationCmd,
     },
 
-    /// Read SQL as arc reads it: whether a statement is an operation arc holds.
+    /// Read SQL as arc reads it, and record a statement as a step: whether a
+    /// statement is an operation arc holds, and the step that records it.
     Sql {
         #[command(subcommand)]
         cmd: SqlCmd,
@@ -157,8 +158,9 @@ pub enum Commands {
     /// / validate / generate) and adds `protocol_run` (run a Protocol, return its
     /// Protocol+Run contract), `operator_describe` (an operator's `with:` schema),
     /// `operation_describe` (the SQL operations arc holds, and what one takes),
-    /// `operation_record` (record an operation as a step of a Protocol) and
-    /// `sql_recognise` (what arc reads a SQL statement as).
+    /// `operation_record` (record an operation as a step of a Protocol),
+    /// `sql_recognise` (what arc reads a SQL statement as) and `sql_record` (record
+    /// a SQL statement as a step of a Protocol).
     #[cfg(feature = "mcp")]
     Mcp,
 }
@@ -177,6 +179,36 @@ pub enum SqlCmd {
         /// One SQL statement, as typed.
         #[arg(allow_hyphen_values = true)]
         sql: String,
+    },
+    /// Record a SQL statement as a new step at the end of a protocol: a model
+    /// under `models/` and a step in arcform.yaml naming it. A statement `arc sql
+    /// recognise` reads as an operation is recorded as the step `arc operation
+    /// record` writes for it, a generated model. Any other statement DuckDB parses
+    /// is recorded as a SQL step whose model has no `-- generated:` line, so arc
+    /// does not rewrite it: where `CREATE OR REPLACE TABLE "<name>" AS` in front
+    /// of the statement is text DuckDB parses, as it is for a `SELECT`, that line
+    /// is the first line of the model and the statement as typed follows it, so
+    /// the step makes a table of its name when it runs; any other statement is
+    /// written as typed. Runs nothing; `arc run` runs the step.
+    Record {
+        /// One SQL statement, as typed.
+        #[arg(allow_hyphen_values = true)]
+        sql: String,
+
+        /// The new step's name, which is also the name of the table it makes
+        /// when the statement is a `SELECT` or a filter.
+        #[arg(long)]
+        name: String,
+
+        /// One line saying what the step does and why, for whoever reads the
+        /// protocol next. Written on the step as `description:`; without it the
+        /// step carries none.
+        #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
+        description: Option<String>,
+
+        /// Protocol directory (where arcform.yaml lives).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
     },
 }
 
@@ -854,8 +886,9 @@ fn dispatch_operation(cmd: OperationCmd, out: &mut impl Write) -> Result<()> {
 }
 
 /// Execute an `arc sql` verb. `recognise` prints what arc reads a statement as,
-/// read by DuckDB's parse alone: it reads no protocol and writes no file. A
-/// refusal is the error, with nothing written to `out`.
+/// read by DuckDB's parse alone: it reads no protocol and writes no file.
+/// `record` writes a step into a protocol, and runs nothing. A refusal is the
+/// error, with nothing written to `out`.
 fn dispatch_sql(cmd: SqlCmd, out: &mut impl Write) -> Result<()> {
     match cmd {
         SqlCmd::Recognise { sql } => {
@@ -863,7 +896,47 @@ fn dispatch_sql(cmd: SqlCmd, out: &mut impl Write) -> Result<()> {
             writeln!(out, "{reading:#}")?;
             Ok(())
         }
+        SqlCmd::Record {
+            sql,
+            name,
+            description,
+            dir,
+        } => {
+            let history = open_history()?;
+            let request = crate::record::SqlRequest {
+                sql: &sql,
+                name: &name,
+                description: description.as_deref(),
+            };
+            sql_record(&dir, &request, &history, out)
+        }
     }
+}
+
+/// Execute `arc sql record`: hand the request to the record path, which reads
+/// the statement as arc reads it and writes the step. The line says which it
+/// was recorded as, so a person who typed a filter sees that arc wrote the
+/// operation's step and not their text. A refusal is the error, with nothing
+/// written to the protocol or to `out`.
+fn sql_record(
+    dir: &Path,
+    request: &crate::record::SqlRequest,
+    history: &LocalHistory,
+    out: &mut impl Write,
+) -> Result<()> {
+    let recorded = crate::record::record_sql(dir, request, history)?;
+    let kind = match &recorded.operation {
+        Some((operation, on)) => format!("{operation} on {on}"),
+        None => "a SQL step".to_string(),
+    };
+    writeln!(
+        out,
+        "recorded step {} as {} in {}, as {kind} — `arc run` runs it",
+        request.name,
+        recorded.model.display(),
+        dir.join(crate::spec::MANIFEST_FILENAME).display()
+    )?;
+    Ok(())
 }
 
 /// Execute `arc operation list`: each long name with the one line saying what

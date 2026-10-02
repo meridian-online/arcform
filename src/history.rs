@@ -648,6 +648,27 @@ pub fn record_step_with_history(
     step: &RecordedStep,
     history: &LocalHistory,
 ) -> Result<(PathBuf, ValidatedSpec)> {
+    record_with_history(dir, history, || crate::record::record_step(dir, step))
+}
+
+/// [`record_step_with_history`] for [`record_sql_step`](crate::record::record_sql_step):
+/// the same checkpoint before the write and the same save after it, for a step
+/// whose model's bytes are given.
+pub(crate) fn record_sql_step_with_history(
+    dir: &Path,
+    step: &crate::record::SqlStep,
+    history: &LocalHistory,
+) -> Result<(PathBuf, ValidatedSpec)> {
+    record_with_history(dir, history, || crate::record::record_sql_step(dir, step))
+}
+
+/// The checkpoint, the promotion `record` makes and the save, in that order, as
+/// [`record_step_with_history`] describes them.
+fn record_with_history(
+    dir: &Path,
+    history: &LocalHistory,
+    record: impl FnOnce() -> Result<(PathBuf, ValidatedSpec)>,
+) -> Result<(PathBuf, ValidatedSpec)> {
     let path = dir.join(MANIFEST_FILENAME);
     if !path.exists() {
         return Err(Error::ManifestNotFound);
@@ -657,7 +678,7 @@ pub fn record_step_with_history(
         source: e,
     })?;
     history.record_checkpoint(dir, &original)?;
-    let (sql_rel, validated) = crate::record::record_step(dir, step)?;
+    let (sql_rel, validated) = record()?;
     // Merge disabled for the same reason as in `edit_spec_with_history`.
     let _ = history.record(
         dir,
