@@ -332,8 +332,15 @@ pub const DUCKDB_BIN_ENV: &str = "ARC_DUCKDB_BIN";
 
 /// The DuckDB versions arc is tested on. Enforced on every run with a SQL step, whether or
 /// not the manifest states an `engine_version:`; a manifest's constraint narrows this and
-/// never widens it.
-pub const SUPPORTED_ENGINE_RANGE: &str = ">=1.2, <2";
+/// never widens it. It starts at [`OLDEST_ENGINE`].
+pub const SUPPORTED_ENGINE_RANGE: &str = ">=1.3, <2";
+
+/// The oldest DuckDB arc accepts, where [`SUPPORTED_ENGINE_RANGE`] starts: the first release
+/// whose command line, run as arc runs a SQL step, exits non-zero when a statement in the
+/// step's file fails. arc learns that a step failed from that exit status and nothing else,
+/// and on 1.2.x it is 0, so a failed step would be recorded as passed and the steps after it
+/// would run.
+pub const OLDEST_ENGINE: &str = "1.3.0";
 
 /// Set to any non-empty value, lifts [`SUPPORTED_ENGINE_RANGE`] for a person who accepts
 /// an engine arc was not tested on. The run warns, and a manifest's own `engine_version:`

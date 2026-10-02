@@ -127,6 +127,21 @@ pub enum Error {
         override_var: &'static str,
     },
 
+    // Older than the oldest DuckDB arc accepts. Said apart from `UntestedEngine`, because
+    // what is wrong with an older engine is known rather than untested.
+    #[error(
+        "engine DuckDB {found} is older than {oldest}, the oldest DuckDB arc accepts ({range}): \
+         {oldest} is the first release whose command line exits non-zero when a statement in a \
+         SQL step fails, which is how arc learns that a step failed; upgrade DuckDB, or set \
+         {override_var}=1 to run on {found} at your own risk"
+    )]
+    EngineTooOld {
+        found: String,
+        oldest: &'static str,
+        range: &'static str,
+        override_var: &'static str,
+    },
+
     // A Protocol's SQL installs a DuckDB extension from somewhere arc has not vetted. One
     // line per statement found, so a Protocol with three is put right in one pass.
     #[error(
@@ -559,7 +574,13 @@ mod exit_code_tests {
             },
             Error::UntestedEngine {
                 found: "2.0.0".into(),
-                range: ">=1.2, <2",
+                range: crate::engine::SUPPORTED_ENGINE_RANGE,
+                override_var: "ARC_ALLOW_UNTESTED_ENGINE",
+            },
+            Error::EngineTooOld {
+                found: "1.2.0".into(),
+                oldest: crate::engine::OLDEST_ENGINE,
+                range: crate::engine::SUPPORTED_ENGINE_RANGE,
                 override_var: "ARC_ALLOW_UNTESTED_ENGINE",
             },
             Error::StateBackend("locked".into()),
