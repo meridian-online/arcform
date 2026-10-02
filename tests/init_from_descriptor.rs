@@ -269,14 +269,18 @@ fn the_generated_manifest_names_no_database_and_run_builds_it_in_arcs_data_folde
 
 /// `git` in `dir`, with the developer's own configuration out of reach: a global ignore
 /// file that names `*.duckdb` would make a database look as though arc's list had kept
-/// it out, and a test that passed for that reason would pass whatever arc wrote. The
-/// same helper `tests/cli_authoring.rs` uses to ask what `git add --all` stages.
+/// it out, and a test that passed for that reason would pass whatever arc wrote.
+///
+/// The home is an empty directory made for this call. `git` reads a global ignore file
+/// from `$XDG_CONFIG_HOME/git/ignore` whatever `GIT_CONFIG_GLOBAL` says, so a directory
+/// that outlived the call could carry one into the next. `tests/cli_authoring.rs` keeps
+/// a function of its own that does the same; the two files do not share one.
 fn git(dir: &Path, args: &[&str]) -> String {
-    let home = std::env::temp_dir().join("arc-descriptor-git-home");
+    let home = tempfile::tempdir().expect("tempdir");
     let out = Command::new("git")
         .current_dir(dir)
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", &home)
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
