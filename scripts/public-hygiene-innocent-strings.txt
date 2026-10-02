@@ -68,8 +68,7 @@ Words that merely start with a covered prefix
 Kebab-case runs below the card-slug threshold
 ---------------------------------------------
 Five hyphen-joined words is one segment short of the six the card-slug rule
-requires. Most real titles run eight or more, but roughly one in eight runs six
-or seven, so six is a floor with little room above it.
+requires, so these sit just below its floor.
     alpha-bravo-charlie-delta-echo is a five-segment placeholder
     a form-n-cen-data-set is SEC filing vocabulary, not a card title
 
@@ -145,6 +144,7 @@ Dates that are not a spec name
     shipped on 2026-06-20 - see the changelog
     the window 2026-06-20-2026-06-21 closed
     the run is recorded in 2026-07-27-apple-m1-pro.json
+    the run is recorded in 2026-07-27-Apple-M1-Pro.json
     2026-06-20T10:30:00Z
 
 The word "finding" beside a count

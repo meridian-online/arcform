@@ -473,8 +473,9 @@ if [[ $violations -gt 0 ]]; then
 	echo "appear in a public repo. Delete the pointer and, if it carried meaning, replace it"
 	echo "with the actual rationale in plain English."
 	echo
-	echo "If a match is genuinely legitimate, first make the pattern more precise in"
-	echo "$RULES_FILE and add the innocent string to"
+	echo "If a match is genuinely legitimate, first make the pattern more precise —"
+	echo "for $PATH_LABEL, PATH_PATTERN in scripts/check-public-hygiene.sh; for any"
+	echo "other label, its line in $RULES_FILE — and add the innocent string to"
 	echo "scripts/public-hygiene-innocent-strings.txt so it stays fixed. Only if that is"
 	echo "impossible, add a line to $ALLOWLIST in the form:"
 	echo
