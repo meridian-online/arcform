@@ -1264,6 +1264,7 @@ steps:
         assert_eq!(engine.duckdb_cli, None);
         assert_eq!(engine.platform, None);
         assert_eq!(engine.extensions, None);
+        assert_eq!(contract.run.protocol.possible_copies, Vec::new());
     }
 
     #[test]
