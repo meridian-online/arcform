@@ -12,7 +12,12 @@
 //!      `arcform.yaml`;
 //!   4. **the bound is per file** — one file reaching the bound prunes its own
 //!      oldest entry and none of another file's, whether or not the entries'
-//!      file names carry a way.
+//!      file names carry a way;
+//!   5. **a text never written to its file** — recorded as an unsaved entry,
+//!      it lists as a kind of its own and reads back byte for byte, leaves the
+//!      file as it was, never merges with a save either side of it, counts
+//!      toward the bound, and sits beside a file's saves and checkpoints
+//!      without changing how they list or restore.
 //!
 //! Nothing here needs the `arc` binary, so the file runs with the `cli`
 //! feature off: `cargo test --no-default-features --test history_per_file`.
@@ -21,8 +26,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use arc::spec::{
-    Error, HISTORY_MAX_ENTRIES, HistoryEntry, HistoryKind, HistoryWay, LocalHistory,
-    MANIFEST_FILENAME, Result,
+    Error, HISTORY_MAX_ENTRIES, HISTORY_MERGE_WINDOW, HistoryEntry, HistoryKind, HistoryWay,
+    LocalHistory, MANIFEST_FILENAME, Result,
 };
 use sha2::{Digest, Sha256};
 
@@ -346,6 +351,10 @@ fn a_path_naming_a_directory_or_no_file_is_refused_by_every_file_call() {
                 f.history.record_checkpoint_for_file(&path, SPEC).map(drop),
             ),
             (
+                "record_unsaved_for_file",
+                f.history.record_unsaved_for_file(&path, SPEC).map(drop),
+            ),
+            (
                 "entries_for_file",
                 f.history.entries_for_file(&path).map(drop),
             ),
@@ -515,4 +524,222 @@ fn the_file_calls_are_on_arc_spec_and_the_directory_calls_keep_their_signatures(
         (by_file.2)(&f.history, &manifest).unwrap(),
         (by_dir.2)(&f.history, &f.dir).unwrap()
     );
+}
+
+// ------------------------------------------------- a text never written to its file
+
+/// A text no file on disk holds: a trailing space, a line with no newline at
+/// its end, a carriage return and a character outside ASCII, so a read that
+/// trims, normalises or re-encodes it reads back something else.
+const UNSAVED: &str = "# chart a \r\nmark: dot\ntitle: Δ revenue";
+
+/// Each entry `file` lists as its kind and its text, oldest first.
+fn kinds_and_texts(history: &LocalHistory, file: &Path) -> Vec<(HistoryKind, String)> {
+    history
+        .entries_for_file(file)
+        .unwrap()
+        .iter()
+        .map(|e| (e.kind, history.read_for_file(file, &e.id).unwrap()))
+        .collect()
+}
+
+#[test]
+fn a_text_never_written_to_its_file_lists_as_unsaved_and_reads_back_byte_for_byte() {
+    let f = setup();
+    let recorded = f
+        .history
+        .record_unsaved_for_file(&f.a, UNSAVED)
+        .unwrap()
+        .expect("recorded");
+    assert_eq!(recorded.kind, HistoryKind::Unsaved);
+    assert_eq!(recorded.bytes, UNSAVED.len() as u64);
+
+    let entries = f.history.entries_for_file(&f.a).unwrap();
+    assert_eq!(entries, vec![recorded.clone()], "listed as it was returned");
+    let kind = entries[0].kind;
+    assert!(
+        kind != HistoryKind::Save && kind != HistoryKind::Checkpoint,
+        "an unsaved text lists as neither a save nor a checkpoint: {kind:?}"
+    );
+    assert_eq!(
+        f.history.read_for_file(&f.a, &recorded.id).unwrap(),
+        UNSAVED
+    );
+}
+
+#[test]
+fn recording_an_unsaved_text_leaves_its_file_as_it_was_and_creates_none() {
+    let f = setup();
+    f.history.record_unsaved_for_file(&f.a, UNSAVED).unwrap();
+    assert_eq!(fs::read(&f.a).unwrap(), CHART_A.as_bytes());
+
+    // A file never written at all keeps a history, and stays unwritten.
+    let never = f.dir.join("panels").join("never.yaml");
+    let recorded = f
+        .history
+        .record_unsaved_for_file(&never, UNSAVED)
+        .unwrap()
+        .expect("recorded");
+    assert!(!never.exists(), "recording created {never:?}");
+    assert_eq!(
+        f.history.read_for_file(&never, &recorded.id).unwrap(),
+        UNSAVED
+    );
+
+    let mut panels: Vec<String> = fs::read_dir(f.dir.join("panels"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    panels.sort();
+    assert_eq!(
+        panels,
+        ["a.yaml", "b.yaml"],
+        "nothing else lands beside them"
+    );
+    assert_eq!(fs::read(&f.b).unwrap(), CHART_B.as_bytes());
+}
+
+#[test]
+fn an_unsaved_text_and_a_save_either_side_of_it_are_entries_of_their_own() {
+    let f = setup();
+    f.history
+        .record_save_for_file(&f.a, "mark: lineY\n")
+        .unwrap();
+    f.history.record_unsaved_for_file(&f.a, UNSAVED).unwrap();
+    f.history
+        .record_save_for_file(&f.a, "mark: areaY\n")
+        .unwrap();
+
+    let entries = f.history.entries_for_file(&f.a).unwrap();
+    let span = entries[entries.len() - 1]
+        .at
+        .duration_since(entries[0].at)
+        .unwrap();
+    assert!(
+        span <= HISTORY_MERGE_WINDOW,
+        "the three were recorded {span:?} apart, outside the window this test is about"
+    );
+    assert_eq!(
+        kinds_and_texts(&f.history, &f.a),
+        vec![
+            (HistoryKind::Save, "mark: lineY\n".to_string()),
+            (HistoryKind::Unsaved, UNSAVED.to_string()),
+            (HistoryKind::Save, "mark: areaY\n".to_string()),
+        ],
+        "neither the unsaved text nor the save after it replaced the entry before it"
+    );
+}
+
+#[test]
+fn an_unsaved_text_identical_to_the_newest_entry_is_not_recorded_again() {
+    let f = setup();
+    f.history.record_save_for_file(&f.a, CHART_A).unwrap();
+    assert_eq!(
+        f.history.record_unsaved_for_file(&f.a, CHART_A).unwrap(),
+        None
+    );
+    f.history.record_unsaved_for_file(&f.a, UNSAVED).unwrap();
+    assert_eq!(
+        f.history.record_unsaved_for_file(&f.a, UNSAVED).unwrap(),
+        None
+    );
+    assert_eq!(
+        kinds_and_texts(&f.history, &f.a),
+        vec![
+            (HistoryKind::Save, CHART_A.to_string()),
+            (HistoryKind::Unsaved, UNSAVED.to_string()),
+        ]
+    );
+}
+
+#[test]
+fn an_unsaved_entry_counts_toward_the_bound_and_the_oldest_goes_whatever_its_kind() {
+    let f = setup();
+    f.history.record_save_for_file(&f.a, "save\n").unwrap();
+    f.history
+        .record_unsaved_for_file(&f.a, "unsaved\n")
+        .unwrap();
+    for i in 0..HISTORY_MAX_ENTRIES - 2 {
+        f.history
+            .record_checkpoint_for_file(&f.a, &format!("checkpoint {i}\n"))
+            .unwrap()
+            .expect("recorded");
+    }
+    assert_eq!(
+        f.history.entries_for_file(&f.a).unwrap().len(),
+        HISTORY_MAX_ENTRIES
+    );
+
+    // An unsaved text recorded at the bound prunes the oldest entry, a save.
+    f.history
+        .record_unsaved_for_file(&f.a, "unsaved past the bound\n")
+        .unwrap()
+        .expect("recorded");
+    let after = kinds_and_texts(&f.history, &f.a);
+    assert_eq!(after.len(), HISTORY_MAX_ENTRIES);
+    assert_eq!(after[0], (HistoryKind::Unsaved, "unsaved\n".to_string()));
+    assert_eq!(
+        after[HISTORY_MAX_ENTRIES - 1],
+        (HistoryKind::Unsaved, "unsaved past the bound\n".to_string())
+    );
+
+    // The next entry prunes the oldest again, an unsaved one this time.
+    f.history
+        .record_checkpoint_for_file(&f.a, "one more\n")
+        .unwrap()
+        .expect("recorded");
+    let after = kinds_and_texts(&f.history, &f.a);
+    assert_eq!(after.len(), HISTORY_MAX_ENTRIES);
+    assert_eq!(
+        after[0],
+        (HistoryKind::Checkpoint, "checkpoint 0\n".to_string())
+    );
+    assert_eq!(
+        after
+            .iter()
+            .filter(|(k, _)| *k == HistoryKind::Unsaved)
+            .count(),
+        1,
+        "the newest unsaved entry stays"
+    );
+}
+
+#[test]
+fn a_store_holding_an_unsaved_entry_lists_and_restores_its_saves_and_checkpoints() {
+    let f = setup();
+    let id = |e: Option<HistoryEntry>| e.expect("recorded").id;
+    let save = id(f
+        .history
+        .record_save_for_file(&f.a, "mark: lineY\n")
+        .unwrap());
+    let checkpoint = id(f
+        .history
+        .record_checkpoint_for_file(&f.a, "mark: areaY\n")
+        .unwrap());
+    let unsaved = id(f.history.record_unsaved_for_file(&f.a, UNSAVED).unwrap());
+
+    // A handle opened afresh on the same root reads the store from disk, so
+    // each kind is read back from its entry's file name.
+    let reopened = LocalHistory::at_root(f.history.root());
+    let listed: Vec<(String, HistoryKind)> = reopened
+        .entries_for_file(&f.a)
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.id, e.kind))
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            (save.clone(), HistoryKind::Save),
+            (checkpoint.clone(), HistoryKind::Checkpoint),
+            (unsaved.clone(), HistoryKind::Unsaved),
+        ]
+    );
+
+    for (id, text) in [(&save, "mark: lineY\n"), (&checkpoint, "mark: areaY\n")] {
+        assert_eq!(reopened.restore_for_file(&f.a, id).unwrap(), text);
+        assert_eq!(fs::read_to_string(&f.a).unwrap(), text, "{id} restored");
+    }
+    assert_eq!(reopened.restore_for_file(&f.a, &unsaved).unwrap(), UNSAVED);
+    assert_eq!(fs::read_to_string(&f.a).unwrap(), UNSAVED);
 }

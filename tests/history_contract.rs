@@ -589,6 +589,11 @@ fn a_way_a_caller_names_is_on_every_entry_its_calls_record() {
         .unwrap()
         .unwrap();
     assert_eq!(on_file.way, Some(app.clone()));
+    let on_file = history
+        .record_unsaved_for_file(&chart, "mark: tick\n")
+        .unwrap()
+        .unwrap();
+    assert_eq!(on_file.way, Some(app.clone()));
     for entry in history.entries_for_file(&chart).unwrap() {
         assert_eq!(
             entry.way,
