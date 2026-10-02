@@ -809,8 +809,8 @@ fn filter_rows_sql(recording: &Recording) -> String {
 /// The query a [`FILTER_ROWS`] step makes its table from: every column of the
 /// table `on`, and the rows for which `condition` holds. The table read and the
 /// condition are written as given. [`filter_rows_sql`] writes it into the step,
-/// and [`filter_rows_recognised`] reads a typed statement as the operation when
-/// DuckDB reads the two as one statement.
+/// and [`filter_rows_recognised`] asks DuckDB whether a typed statement reads
+/// as it.
 fn filter_rows_query(on: &str, condition: &str) -> String {
     format!("SELECT *\nFROM {}\nWHERE {condition}", from_ident(on))
 }
