@@ -210,13 +210,14 @@ fn read_report(answers: &[String]) -> EngineReport {
 /// cannot be given inside the quotes that hold it.
 ///
 /// The CLI runs none of them after a file that fails, so a failed step gives no answer. After
-/// one that passes they leave its exit code, stdout and stderr as the file left them: each
-/// setting a step can leave on that would print the question or its answer is turned off
-/// first; `.once` sends the answer to `answer` rather than to stdout or to a file the step's
-/// own `.output` names, for the one statement after it; and the last command is one that cannot
-/// fail, so the process exits 0 whether DuckDB answered or not, where a question DuckDB refused
-/// would have made it exit 1. A setting the step leaves that refuses the question prints
-/// DuckDB's refusal to stderr: `.safe_mode` refuses `.once`, and
+/// one that passes they leave its exit code, stdout and stderr as the file left them.
+/// `.bail off` comes first, so a question DuckDB refuses does not end the process with exit 1.
+/// `.timer off`, since a step's `.timer on` prints its `Run Time` line to stdout and not where
+/// `.once` sends the answer. `.mode list` and `.headers off`, so each line of the answer is a
+/// line [`read_loaded`] reads. And `.once` sends the answer to `answer` rather than to stdout or
+/// to a file the step's own `.output` names, for the one statement after it, with what a step's
+/// `.echo on` or `.changes on` prints of that statement. A setting the step leaves that refuses
+/// the question prints DuckDB's refusal to stderr: `.safe_mode` refuses `.once`, and
 /// `disabled_filesystems = 'LocalFileSystem'` refuses `duckdb_extensions()`. With `.once`
 /// refused the answer goes where the step's output goes, and holds no line: no header, and no
 /// row, since `.safe_mode` turns external access off.
@@ -231,14 +232,11 @@ fn loaded_question(answer: &Path) -> Option<Vec<String>> {
     let once = format!(".once '{answer}'");
     let commands = [
         ".bail off",
-        ".echo off",
         ".timer off",
-        ".changes off",
         ".mode list",
         ".headers off",
         &once,
         &question,
-        ".bail off",
     ];
     Some(
         commands
@@ -251,9 +249,10 @@ fn loaded_question(answer: &Path) -> Option<Vec<String>> {
 /// What [`loaded_question`] wrote: each extension DuckDB reported loaded, in the order it
 /// listed them.
 fn read_loaded(answer: &str) -> Vec<(String, ReportedExtension)> {
+    let tag = format!("{ANSWER_MARK}extension\t");
     answer
         .lines()
-        .filter_map(|line| line.strip_prefix(ANSWER_MARK)?.strip_prefix("extension\t"))
+        .filter_map(|line| line.strip_prefix(tag.as_str()))
         .filter_map(read_extension)
         .collect()
 }
@@ -3698,8 +3697,7 @@ mod extension_tests {
     }
 
     #[test]
-    fn the_question_writes_its_answer_to_the_file_it_is_given_and_ends_on_a_command_that_cannot_fail()
-     {
+    fn the_question_turns_bail_off_and_writes_its_answer_to_the_file_it_is_given() {
         let args = loaded_question(Path::new("/tmp/arc-loaded-1-0/loaded")).unwrap();
         let commands: Vec<&str> = args
             .chunks(2)
@@ -3708,13 +3706,14 @@ mod extension_tests {
                 pair[1].as_str()
             })
             .collect();
-        assert_eq!(commands[6], ".once '/tmp/arc-loaded-1-0/loaded'");
+        assert_eq!(commands.first(), Some(&".bail off"));
+        assert_eq!(commands[4], ".once '/tmp/arc-loaded-1-0/loaded'");
         assert!(
-            commands[7].starts_with(&format!("SELECT '{ANSWER_MARK}extension'")),
+            commands[5].starts_with(&format!("SELECT '{ANSWER_MARK}extension'")),
             "{}",
-            commands[7]
+            commands[5]
         );
-        assert_eq!(commands.last(), Some(&".bail off"));
+        assert_eq!(commands.len(), 6, "{commands:?}");
         // A path a dot command cannot be given in quotes is not asked about.
         assert_eq!(loaded_question(Path::new("/tmp/it's/loaded")), None);
     }

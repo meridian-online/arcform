@@ -38,7 +38,7 @@ struct Outcome {
 
 /// How the question arc asks after a SQL step's or hook's `-f <file>`, of the extensions the
 /// step's process loaded, starts in the line a fake engine logs.
-const LOADED_QUESTION_START: &str = " -c .bail off -c .echo off ";
+const LOADED_QUESTION_START: &str = " -c .bail off -c .timer off ";
 
 /// `call`, a line a fake engine logged, with the question arc asks after a SQL step's file left
 /// off: `<db> -f <sql file>`, as arc ran a step before it asked.
