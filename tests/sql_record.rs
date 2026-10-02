@@ -879,6 +879,21 @@ mod mcp {
     }
 
     #[test]
+    fn the_tool_takes_a_null_description_as_none() {
+        let terminal = Protocol::new();
+        ok(&terminal.record(BY_AMOUNT, "by_amount"), "arc sql record");
+        for arguments in [
+            json!({ "sql": BY_AMOUNT, "name": "by_amount", "description": null }),
+            json!({ "sql": BY_AMOUNT, "name": "by_amount" }),
+        ] {
+            let agent = Protocol::new();
+            let result = call(&agent, arguments);
+            assert_ne!(result["isError"], true, "{}", text(&result));
+            assert_eq!(agent.files(), terminal.files());
+        }
+    }
+
+    #[test]
     fn the_tool_refuses_what_the_command_refuses_with_the_directory_untouched() {
         for (what, arguments, named) in [
             (
@@ -907,6 +922,7 @@ mod mcp {
                 "spans lines",
             ),
             ("no name", json!({ "sql": BY_AMOUNT }), "`name` is required"),
+            ("no statement", json!({ "name": "x" }), "`sql` is required"),
             (
                 "a description that is not a string",
                 json!({ "sql": BY_AMOUNT, "name": "x", "description": 4 }),

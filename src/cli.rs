@@ -1807,6 +1807,36 @@ mod tests {
     }
 
     #[test]
+    fn sql_record_reports_a_failed_write_for_each_kind_of_recording() {
+        for sql in [
+            "SELECT * FROM orders WHERE amount > 0",
+            "SELECT amount FROM orders",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("shop");
+            std::fs::create_dir_all(dir.join("models")).unwrap();
+            std::fs::write(
+                dir.join("arcform.yaml"),
+                "name: shop\nsteps:\n  - name: orders\n    sql: models/orders.sql\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("models/orders.sql"),
+                "CREATE TABLE orders AS SELECT 1 AS amount;\n",
+            )
+            .unwrap();
+            let history = LocalHistory::at_root(root.path().join("history"));
+            let request = crate::record::SqlRequest {
+                sql,
+                name: "big",
+                description: None,
+            };
+            let err = sql_record(&dir, &request, &history, &mut FailingWriter).unwrap_err();
+            assert!(err.to_string().contains("stdout is closed"), "{sql}: {err}");
+        }
+    }
+
+    #[test]
     fn operation_arguments_split_each_at_its_first_equals_sign() {
         let arguments =
             operation_arguments(&["where=region = 'north'".to_string(), "label=".to_string()])
