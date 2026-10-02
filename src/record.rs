@@ -813,17 +813,17 @@ fn filter_rows_sql(recording: &Recording) -> String {
     format!(
         "CREATE OR REPLACE TABLE {} AS\n{};\n",
         quote_ident(recording.name),
-        filter_rows_query(recording.on, recording.text("where")),
+        filter_rows_query(&from_ident(recording.on), recording.text("where")),
     )
 }
 
 /// The query a [`FILTER_ROWS`] step makes its table from: every column of the
-/// table `on`, and the rows for which `condition` holds. The table read and the
-/// condition are written as given. [`filter_rows_sql`] writes it into the step,
-/// and [`filter_rows_recognised`] asks DuckDB whether a typed statement reads
-/// as it.
-fn filter_rows_query(on: &str, condition: &str) -> String {
-    format!("SELECT *\nFROM {}\nWHERE {condition}", from_ident(on))
+/// table `from`, written as [`from_ident`] writes a table, and the rows for which
+/// `condition` holds. The condition is written as given. [`filter_rows_sql`]
+/// writes it into the step, and [`filter_rows_recognised`] asks DuckDB whether a
+/// typed statement reads as it.
+fn filter_rows_query(from: &str, condition: &str) -> String {
+    format!("SELECT *\nFROM {from}\nWHERE {condition}")
 }
 
 /// The table and the arguments of [`FILTER_ROWS`] when `statement` is a filter
@@ -833,12 +833,12 @@ fn filter_rows_query(on: &str, condition: &str) -> String {
 /// parentheses. `None` when no condition is.
 ///
 /// The table is the one DuckDB's tree names, written back through
-/// [`from_ident`] as the step writes it, so a statement that reads a schema's
-/// table, an alias, a file named in single quotes or a table whose recorded step
-/// would not parse — `"order"`, written `FROM order` — is not read as the
-/// operation. A file is told apart by its text alone: DuckDB gives `FROM
-/// 'orders.csv'` the tree of a table called `orders.csv`, and its text opens
-/// with the quote at the location DuckDB gives.
+/// [`from_ident_on`] as the step writes it, so a statement that reads a schema's
+/// table, an alias or a file named in single quotes is not read as the
+/// operation, and one that reads `"order"` is, the step writing the name in
+/// quotes as the statement did. A file is told apart by its text alone: DuckDB
+/// gives `FROM 'orders.csv'` the tree of a table called `orders.csv`, and its
+/// text opens with the quote at the location DuckDB gives.
 ///
 /// The condition is not cut out of the tree, which says where a node starts and
 /// not where it ends, and holds no node for a parenthesis. It is each text
@@ -862,11 +862,12 @@ fn filter_rows_recognised(statement: &Statement) -> Option<Reading> {
         return None;
     }
     from["table_name"].as_str().and_then(|on| {
+        let from = from_ident_on(&statement.con, on);
         conditions(&statement.text)
             .find(|condition| {
                 let enclosed = format!("(\n{condition}\n)");
-                statement.reads_as(&filter_rows_query(on, &enclosed))
-                    && statement.reads_as(&filter_rows_query(on, condition))
+                statement.reads_as(&filter_rows_query(&from, &enclosed))
+                    && statement.reads_as(&filter_rows_query(&from, condition))
             })
             .map(|condition| {
                 let arguments = [("where".to_string(), condition.into())];
@@ -949,23 +950,54 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// A table name for the `FROM` clause. A name of only ASCII letters, digits and
-/// underscores that does not open with a digit is written bare — a plain
+/// A table name for the `FROM` clause, written as it is read. A name of only
+/// ASCII letters, digits and underscores that does not open with a digit, and
+/// that DuckDB reads bare as the table of that name, is written bare — a plain
 /// `orders` unchanged, folded by DuckDB as it always was, so `FROM orders` reads
-/// the same, and brightfield's `to_pushdown_sql` writes the same line. Any other
-/// name — one a step could only have made under quotes, holding a space, a `"`
-/// or a `;` — is quoted through [`quote_ident`], so a table the protocol makes
-/// cannot break out of the `FROM` into SQL of its own, the same class as the
-/// condition's terminator.
+/// the same, and brightfield's `to_pushdown_sql` writes the same line for it.
+/// Any other name is quoted through [`quote_ident`]: one a step could only have
+/// made under quotes, holding a space, a `"` or a `;`, so a table the protocol
+/// makes cannot break out of the `FROM` into SQL of its own, the same class as
+/// the condition's terminator; and one DuckDB does not read bare as a table, a
+/// reserved word such as `order`, which a step made under quotes and which
+/// `FROM order` would not parse.
+///
+/// DuckDB is asked, on an in-memory database opened once for the thread, rather
+/// than given a list of the words: a list copied into the source would stay as it
+/// was when DuckDB's own grows. A database that cannot be opened gives the quoted
+/// name, which DuckDB reads as the table whatever the name.
 fn from_ident(name: &str) -> String {
-    let bare = !name.is_empty()
+    thread_local! {
+        static READER: Option<duckdb::Connection> = duckdb::Connection::open_in_memory().ok();
+    }
+    READER.with(|con| match con {
+        Some(con) => from_ident_on(con, name),
+        None => quote_ident(name),
+    })
+}
+
+/// [`from_ident`] on a database already open, for a caller that writes more than
+/// one table in a row.
+fn from_ident_on(con: &duckdb::Connection, name: &str) -> String {
+    let plain = !name.is_empty()
         && !name.as_bytes()[0].is_ascii_digit()
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
-    if bare {
+    if plain && reads_bare_as_table(con, name) {
         name.to_string()
     } else {
         quote_ident(name)
     }
+}
+
+/// Whether DuckDB, asked on `con`, reads `FROM <name>` as a read of the table
+/// called `name`: it parses, and its tree names a base table of that name. A
+/// reserved word gives a parser error in place of a tree, and a word DuckDB
+/// parses as anything else gives a tree that names no such table.
+fn reads_bare_as_table(con: &duckdb::Connection, name: &str) -> bool {
+    tree(con, &format!("SELECT * FROM {name}")).is_some_and(|tree| {
+        let from = &tree["statements"][0]["node"]["from_table"];
+        from["type"] == "BASE_TABLE" && from["table_name"] == name
+    })
 }
 
 /// Every operation arc holds, in catalogue order.
@@ -2546,6 +2578,75 @@ mod tests {
         assert_eq!(from_ident("a\"b"), "\"a\"\"b\"");
         assert_eq!(from_ident("has space"), "\"has space\"");
         assert_eq!(from_ident("1st"), "\"1st\"");
+        // A reserved word is a name of only plain characters that DuckDB does not
+        // read bare as a table, so it is quoted, in either case. Writing it bare
+        // reddens each of these.
+        assert_eq!(from_ident("order"), "\"order\"");
+        assert_eq!(from_ident("ORDER"), "\"ORDER\"");
+        // A word DuckDB lists as a keyword and reads bare as a table is written
+        // as an ordinary name is. Quoting each keyword reddens each of these.
+        assert_eq!(from_ident("data"), "data");
+        assert_eq!(from_ident("Data"), "Data");
+    }
+
+    /// Each word `duckdb_keywords()` lists, as listed and in upper case, names a
+    /// table, and a filter and a sort recorded on it are steps DuckDB runs and
+    /// that read that table. The list is asked of the DuckDB arc is linked with,
+    /// so a word DuckDB adds is in it. A name written bare where DuckDB does not
+    /// read it bare reddens this, with the word and the step it wrote.
+    #[test]
+    fn a_filter_and_a_sort_on_a_table_named_with_each_keyword_duckdb_lists_read_that_table() {
+        let con = duckdb::Connection::open_in_memory().unwrap();
+        let listed: Vec<String> = con
+            .prepare("SELECT keyword_name FROM duckdb_keywords()")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|word| word.unwrap())
+            .collect();
+        for named in ["order", "data"] {
+            assert!(
+                listed.iter().any(|word| word == named),
+                "duckdb_keywords() lists no `{named}`, so this test reads no reserved word and no \
+                 word DuckDB reads bare"
+            );
+        }
+        let arguments = serde_json::json!({ "where": "amount > 1", "order_by": "amount" })
+            .as_object()
+            .unwrap()
+            .clone();
+        type Writes = fn(&Recording) -> String;
+        let operations: [(&str, Writes); 2] = [
+            ("filter-rows", filter_rows_sql),
+            ("sort-rows", sort_rows_sql),
+        ];
+        for word in listed
+            .iter()
+            .flat_map(|word| [word.clone(), word.to_uppercase()])
+        {
+            con.execute_batch(&format!(
+                "CREATE OR REPLACE TABLE \"{word}\" AS SELECT 7 AS amount, '{word}' AS marker"
+            ))
+            .unwrap_or_else(|e| panic!("DuckDB makes no table called {word:?}: {e}"));
+            for (operation, sql) in operations {
+                let step = sql(&Recording {
+                    name: "kept",
+                    on: &word,
+                    arguments: &arguments,
+                });
+                con.execute_batch(&step).unwrap_or_else(|e| {
+                    panic!("{operation} on a table named {word:?} does not run:\n{step}\n{e}")
+                });
+                let marker: String = con
+                    .query_row("SELECT marker FROM kept", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(
+                    marker, word,
+                    "{operation} on a table named {word:?} read another table:\n{step}"
+                );
+                con.execute_batch("DROP TABLE kept").unwrap();
+            }
+        }
     }
 
     /// The two inputs round one admitted, because its `statement_byte_ranges`

@@ -103,6 +103,18 @@ impl Protocol {
         }
     }
 
+    /// A Protocol whose one step makes the table `order` — a word DuckDB does not
+    /// read as a table name unless it is in quotes — holding the rows of `orders`.
+    fn making_order() -> Self {
+        let protocol = Self::new();
+        std::fs::write(
+            protocol.dir.join("models/01_orders.sql"),
+            ORDERS_SQL.replacen("TABLE orders", "TABLE \"order\"", 1),
+        )
+        .unwrap();
+        protocol
+    }
+
     /// Run the real `arc` binary with `args` in the Protocol's directory.
     fn arc(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_arc"))
@@ -289,6 +301,59 @@ fn a_filter_typed_as_sql_leaves_the_bytes_the_same_filter_recorded_by_name_leave
     assert!(
         !line.contains("SQL step"),
         "a filter is not recorded as a SQL step: {line}"
+    );
+}
+
+#[test]
+fn a_filter_of_a_table_named_with_a_reserved_word_leaves_the_bytes_the_same_filter_recorded_by_name_leaves()
+ {
+    let typed = Protocol::making_order();
+    let by_name = Protocol::making_order();
+    let out = typed.record("SELECT * FROM \"order\" WHERE amount > 100", "big_order");
+    ok(&out, "arc sql record");
+    ok(
+        &by_name.arc(&[
+            "operation",
+            "record",
+            "filter-rows",
+            "--on",
+            "order",
+            "--name",
+            "big_order",
+            "--arg",
+            "where=amount > 100",
+        ]),
+        "arc operation record",
+    );
+
+    assert_eq!(
+        typed.files(),
+        by_name.files(),
+        "the Protocol the statement was recorded into differs from the one the \
+         operation was recorded into"
+    );
+    assert_eq!(
+        typed.read("models/02_big_order.sql"),
+        "\
+-- generated: filter-rows on order
+CREATE OR REPLACE TABLE \"big_order\" AS
+SELECT *
+FROM \"order\"
+WHERE amount > 100;
+",
+        "the table is written in quotes, as DuckDB reads it"
+    );
+    let line = one_line(&out);
+    assert!(
+        line.contains("filter-rows") && !line.contains("SQL step"),
+        "a filter of a table named with a reserved word is recorded as the operation: {line}"
+    );
+
+    ok(&typed.arc(&["run"]), "arc run");
+    assert_eq!(
+        typed.rows("SELECT id, amount FROM big_order ORDER BY id"),
+        [(2, 150), (3, 300)],
+        "big_order holds the rows of order whose amount is over 100, and no other"
     );
 }
 
