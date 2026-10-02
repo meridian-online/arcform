@@ -580,11 +580,15 @@ pub(crate) struct Operation {
     /// The step's SQL, written from a recording whose arguments `parameters`
     /// has already admitted.
     sql: fn(&Recording) -> String,
-    /// How a SQL statement is read as the operation: the table it is applied to
-    /// and its arguments, or `None` when the statement is not it. `None` in place
-    /// of the reader for an operation no statement is read as yet.
-    recognised: Option<fn(&Statement) -> Option<(String, serde_json::Value)>>,
+    /// How a SQL statement is read as the operation, or `None` when the
+    /// statement is not it. `None` in place of the reader for an operation no
+    /// statement is read as yet.
+    recognised: Option<fn(&Statement) -> Option<Reading>>,
 }
+
+/// What a statement read as an operation is read to: the table the operation
+/// is applied to, and its arguments.
+type Reading = (String, serde_json::Value);
 
 /// What an operation's SQL is written from: the new step's name, which is also
 /// the name of the table the step makes; the table the operation is applied to,
@@ -833,20 +837,22 @@ fn filter_rows_query(on: &str, condition: &str) -> String {
 /// clause of its own — `amount > 100 ORDER BY amount DESC`, a `LIMIT`, a
 /// `QUALIFY`, a `WINDOW` — does not parse, where without them it would read as
 /// the statement it was cut from.
-fn filter_rows_recognised(statement: &Statement) -> Option<(String, serde_json::Value)> {
+fn filter_rows_recognised(statement: &Statement) -> Option<Reading> {
     let from = &statement.tree["statements"][0]["node"]["from_table"];
-    let Some(on) = from["table_name"].as_str() else {
-        return None;
-    };
     let written = from["query_location"]
         .as_u64()
         .and_then(|at| statement.text.as_bytes().get(at as usize));
     if written == Some(&b'\'') {
         return None;
     }
-    conditions(&statement.text)
-        .find(|condition| statement.reads_as(&filter_rows_query(on, &format!("(\n{condition}\n)"))))
-        .map(|condition| (on.to_string(), serde_json::json!({ "where": condition })))
+    from["table_name"].as_str().and_then(|on| {
+        conditions(&statement.text)
+            .find(|condition| {
+                let probe = format!("(\n{condition}\n)");
+                statement.reads_as(&filter_rows_query(on, &probe))
+            })
+            .map(|condition| (on.to_string(), serde_json::json!({ "where": condition })))
+    })
 }
 
 /// Each text a filter's condition can be in `text`: what follows each `where`,
@@ -2118,6 +2124,7 @@ mod tests {
             writes: &[],
             parameters,
             sql: |recording| recording.text("where").to_string(),
+            recognised: None,
         }
     }
 
