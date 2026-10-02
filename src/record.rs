@@ -2615,7 +2615,8 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-        let operations: [(&str, fn(&Recording) -> String); 2] = [
+        type Writes = fn(&Recording) -> String;
+        let operations: [(&str, Writes); 2] = [
             ("filter-rows", filter_rows_sql),
             ("sort-rows", sort_rows_sql),
         ];
