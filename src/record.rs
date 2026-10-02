@@ -818,7 +818,8 @@ fn filter_rows_query(on: &str, condition: &str) -> String {
 /// The table and the arguments of [`FILTER_ROWS`] when `statement` is a filter
 /// of a table: when DuckDB reads it as the query the operation's step writes,
 /// [`filter_rows_query`] of the table it reads and of some condition cut from
-/// its own text. `None` when no condition is.
+/// its own text, and reads it as the same query with that condition inside
+/// parentheses. `None` when no condition is.
 ///
 /// The table is the one DuckDB's tree names, written back through
 /// [`from_ident`] as the step writes it, so a statement that reads a schema's
@@ -833,10 +834,14 @@ fn filter_rows_query(on: &str, condition: &str) -> String {
 /// [`conditions`] offers, tried in turn, and the first DuckDB reads to the same
 /// statement is taken: so the condition is the text as typed, its parentheses,
 /// strings and comments kept, and DuckDB decides where a string or a comment
-/// ends. Each is tried inside parentheses, so a candidate that runs on into a
-/// clause of its own — `amount > 100 ORDER BY amount DESC`, a `LIMIT`, a
-/// `QUALIFY`, a `WINDOW` — does not parse, where without them it would read as
-/// the statement it was cut from.
+/// ends. Each is tried twice, and taken when DuckDB reads both queries as the
+/// statement. Inside parentheses, a candidate that runs on into a clause of its
+/// own — `amount > 100 ORDER BY amount DESC`, a `LIMIT`, a `QUALIFY`, a
+/// `WINDOW` — does not parse, where bare it would read as the statement it was
+/// cut from. Bare, as the step writes it, a candidate whose `)` would close the
+/// parentheses it is tried in — `amount > 100) ORDER BY (amount`, cut after a
+/// `where` in a comment — does not parse, where inside them the query would
+/// read as the statement, its `ORDER BY` included.
 fn filter_rows_recognised(statement: &Statement) -> Option<Reading> {
     let from = &statement.tree["statements"][0]["node"]["from_table"];
     let written = from["query_location"]
@@ -848,8 +853,9 @@ fn filter_rows_recognised(statement: &Statement) -> Option<Reading> {
     from["table_name"].as_str().and_then(|on| {
         conditions(&statement.text)
             .find(|condition| {
-                let probe = format!("(\n{condition}\n)");
-                statement.reads_as(&filter_rows_query(on, &probe))
+                let enclosed = format!("(\n{condition}\n)");
+                statement.reads_as(&filter_rows_query(on, &enclosed))
+                    && statement.reads_as(&filter_rows_query(on, condition))
             })
             .map(|condition| (on.to_string(), serde_json::json!({ "where": condition })))
     })

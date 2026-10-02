@@ -166,6 +166,11 @@ fn a_statement_that_is_not_a_filter_of_a_table_is_read_as_no_operation() {
         "SELECT * FROM orders WHERE amount > 100 WINDOW w AS (ORDER BY id)",
         // A table whose recorded step would not parse: `FROM order`.
         "SELECT * FROM \"order\" WHERE amount > 100",
+        // A filter with an order or a limit, its condition in parentheses that
+        // hold a comment ending in `where`, and a comment before a later `)`.
+        "SELECT * FROM orders WHERE ( -- where\namount > 100) ORDER BY (amount -- c\n)",
+        "SELECT * FROM orders\nWHERE ( -- keep the rows where\n  amount > 100\n) ORDER BY ( amount /* biggest last */ )",
+        "SELECT * FROM orders WHERE ( -- where\namount > 100) LIMIT (5 -- c\n)",
     ] {
         assert_eq!(recognise(sql), none(), "what {sql:?} is read as");
     }
