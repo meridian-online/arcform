@@ -146,14 +146,38 @@ pub enum Commands {
         cmd: OperationCmd,
     },
 
+    /// Read SQL as arc reads it: whether a statement is an operation arc holds.
+    Sql {
+        #[command(subcommand)]
+        cmd: SqlCmd,
+    },
+
     /// Serve a Model Context Protocol server over stdio, for AI-agent and editor
     /// integration. Federates the `finetype` CLI as tools (infer / profile / taxonomy
     /// / validate / generate) and adds `protocol_run` (run a Protocol, return its
     /// Protocol+Run contract), `operator_describe` (an operator's `with:` schema),
-    /// `operation_describe` (the SQL operations arc holds, and what one takes) and
-    /// `operation_record` (record an operation as a step of a Protocol).
+    /// `operation_describe` (the SQL operations arc holds, and what one takes),
+    /// `operation_record` (record an operation as a step of a Protocol) and
+    /// `sql_recognise` (what arc reads a SQL statement as).
     #[cfg(feature = "mcp")]
     Mcp,
+}
+
+/// The verbs that take SQL as it is typed.
+#[derive(Subcommand)]
+pub enum SqlCmd {
+    /// Print what arc reads a SQL statement as, as JSON: the operation arc holds
+    /// that it is, with `operation`, `on` and `arguments` as `arc operation record`
+    /// takes them, or `operation` `null` when it is none. `SELECT *` from one table
+    /// with a `WHERE` and no other clause is `filter-rows` on that table, its
+    /// condition as typed. The statement is read by the DuckDB library arc is
+    /// linked with, so no `duckdb` executable is needed. Reads no protocol, does
+    /// not run the statement, and writes no file.
+    Recognise {
+        /// One SQL statement, as typed.
+        #[arg(allow_hyphen_values = true)]
+        sql: String,
+    },
 }
 
 /// The operation-catalogue verbs. Long names come from `arc operation list`.
@@ -793,6 +817,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Commands::Registry { cmd } => dispatch_registry(cmd, verbose),
         Commands::Operation { cmd } => dispatch_operation(cmd, &mut std::io::stdout()),
+        Commands::Sql { cmd } => dispatch_sql(cmd, &mut std::io::stdout()),
         #[cfg(feature = "mcp")]
         Commands::Mcp => crate::mcp::serve(),
     }
@@ -800,7 +825,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
 /// Execute an `arc operation` verb. `list` and `describe` read no protocol and
 /// open no database: the answer comes from the catalogue arc holds. `record`
-/// writes a step into a protocol and opens no database either.
+/// writes a step into a protocol and opens no protocol's database: DuckDB parses
+/// its condition or its order on an empty in-memory one.
 fn dispatch_operation(cmd: OperationCmd, out: &mut impl Write) -> Result<()> {
     match cmd {
         OperationCmd::List { json } => operation_list(json, out),
@@ -823,6 +849,19 @@ fn dispatch_operation(cmd: OperationCmd, out: &mut impl Write) -> Result<()> {
                 description: description.as_deref(),
             };
             operation_record(&dir, &request, &history, out)
+        }
+    }
+}
+
+/// Execute an `arc sql` verb. `recognise` prints what arc reads a statement as,
+/// read by DuckDB's parse alone: it reads no protocol and writes no file. A
+/// refusal is the error, with nothing written to `out`.
+fn dispatch_sql(cmd: SqlCmd, out: &mut impl Write) -> Result<()> {
+    match cmd {
+        SqlCmd::Recognise { sql } => {
+            let reading = crate::record::recognise(&sql)?;
+            writeln!(out, "{reading:#}")?;
+            Ok(())
         }
     }
 }
@@ -1654,6 +1693,15 @@ mod tests {
     #[test]
     fn operation_describe_reports_a_failed_write() {
         let err = operation_describe("filter-rows", &mut FailingWriter).unwrap_err();
+        assert!(err.to_string().contains("stdout is closed"), "{err}");
+    }
+
+    #[test]
+    fn sql_recognise_reports_a_failed_write() {
+        let cmd = SqlCmd::Recognise {
+            sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+        };
+        let err = dispatch_sql(cmd, &mut FailingWriter).unwrap_err();
         assert!(err.to_string().contains("stdout is closed"), "{err}");
     }
 

@@ -14,9 +14,12 @@
 //!
 //! **Recording never runs anything.** What the person saw while exploring was
 //! a query; what they recorded is a promise; only `arc run` makes the promise
-//! true. This module writes files and returns — it opens no database, executes
-//! no SQL, and fabricates no run state. A freshly recorded step is a step that
-//! has never run, and any tool showing run state must say so.
+//! true. This module writes files and returns — it opens no protocol's
+//! database, runs none of a step's SQL, and fabricates no run state. The one
+//! database it opens is an empty in-memory one, on which DuckDB parses a value
+//! or a statement and runs none of it: see `duckdb_statement_count` and
+//! [`recognise`]. A freshly recorded step is a step that has never run, and any
+//! tool showing run state must say so.
 //!
 //! # Ownership: the marker is the license to regenerate
 //!
@@ -577,6 +580,10 @@ pub(crate) struct Operation {
     /// The step's SQL, written from a recording whose arguments `parameters`
     /// has already admitted.
     sql: fn(&Recording) -> String,
+    /// How a SQL statement is read as the operation: the table it is applied to
+    /// and its arguments, or `None` when the statement is not it. `None` in place
+    /// of the reader for an operation no statement is read as yet.
+    recognised: Option<fn(&Statement) -> Option<(String, serde_json::Value)>>,
 }
 
 /// What an operation's SQL is written from: the new step's name, which is also
@@ -721,6 +728,7 @@ const CATALOGUE: &[Operation] = &[
         writes: &[STEP_TABLE],
         parameters: filter_rows_parameters,
         sql: filter_rows_sql,
+        recognised: Some(filter_rows_recognised),
     },
     Operation {
         long_name: SORT_ROWS,
@@ -748,6 +756,7 @@ const CATALOGUE: &[Operation] = &[
         writes: &[STEP_TABLE],
         parameters: sort_rows_parameters,
         sql: sort_rows_sql,
+        recognised: None,
     },
 ];
 
@@ -783,15 +792,84 @@ fn filter_rows_parameters() -> serde_json::Value {
 }
 
 /// The SQL step of [`FILTER_ROWS`]: a table named for the step, holding the rows
-/// of the table it is applied to for which the condition holds. The table read
-/// and the condition are written as given.
+/// of the table it is applied to for which the condition holds, made by
+/// [`filter_rows_query`].
 fn filter_rows_sql(recording: &Recording) -> String {
     format!(
-        "CREATE OR REPLACE TABLE {} AS\nSELECT *\nFROM {}\nWHERE {};\n",
+        "CREATE OR REPLACE TABLE {} AS\n{};\n",
         quote_ident(recording.name),
-        from_ident(recording.on),
-        recording.text("where"),
+        filter_rows_query(recording.on, recording.text("where")),
     )
+}
+
+/// The query a [`FILTER_ROWS`] step makes its table from: every column of the
+/// table `on`, and the rows for which `condition` holds. The table read and the
+/// condition are written as given. [`filter_rows_sql`] writes it into the step,
+/// and [`filter_rows_recognised`] reads a typed statement as the operation when
+/// DuckDB reads the two as one statement.
+fn filter_rows_query(on: &str, condition: &str) -> String {
+    format!("SELECT *\nFROM {}\nWHERE {condition}", from_ident(on))
+}
+
+/// The table and the arguments of [`FILTER_ROWS`] when `statement` is a filter
+/// of a table: when DuckDB reads it as the query the operation's step writes,
+/// [`filter_rows_query`] of the table it reads and of some condition cut from
+/// its own text. `None` when no condition is.
+///
+/// The table is the one DuckDB's tree names, written back through
+/// [`from_ident`] as the step writes it, so a statement that reads a schema's
+/// table, an alias, a file named in single quotes or a table whose recorded step
+/// would not parse — `"order"`, written `FROM order` — is not read as the
+/// operation. A file is told apart by its text alone: DuckDB gives `FROM
+/// 'orders.csv'` the tree of a table called `orders.csv`, and its text opens
+/// with the quote at the location DuckDB gives.
+///
+/// The condition is not cut out of the tree, which says where a node starts and
+/// not where it ends, and holds no node for a parenthesis. It is each text
+/// [`conditions`] offers, tried in turn, and the first DuckDB reads to the same
+/// statement is taken: so the condition is the text as typed, its parentheses,
+/// strings and comments kept, and DuckDB decides where a string or a comment
+/// ends. Each is tried inside parentheses, so a candidate that runs on into a
+/// clause of its own — `amount > 100 ORDER BY amount DESC`, a `LIMIT`, a
+/// `QUALIFY`, a `WINDOW` — does not parse, where without them it would read as
+/// the statement it was cut from.
+fn filter_rows_recognised(statement: &Statement) -> Option<(String, serde_json::Value)> {
+    let from = &statement.tree["statements"][0]["node"]["from_table"];
+    let Some(on) = from["table_name"].as_str() else {
+        return None;
+    };
+    let written = from["query_location"]
+        .as_u64()
+        .and_then(|at| statement.text.as_bytes().get(at as usize));
+    if written == Some(&b'\'') {
+        return None;
+    }
+    conditions(&statement.text)
+        .find(|condition| statement.reads_as(&filter_rows_query(on, &format!("(\n{condition}\n)"))))
+        .map(|condition| (on.to_string(), serde_json::json!({ "where": condition })))
+}
+
+/// Each text a filter's condition can be in `text`: what follows each `where`,
+/// in any case, cut at each `;`, `-` and `/` in it and at its end, and trimmed;
+/// shortest first after each `where`, and each `where` in the order it is
+/// written. Most are not a condition — a `where` in a name, a string or a
+/// comment, a cut inside a string — and DuckDB, not this, says which is: see
+/// [`filter_rows_recognised`]. A cut at a `;`, a `--` or a `/*` leaves a
+/// statement's closing `;` and a comment after the condition out of it.
+fn conditions(text: &str) -> impl Iterator<Item = &str> {
+    let starts: Vec<usize> = text
+        .to_ascii_lowercase()
+        .match_indices("where")
+        .map(|(at, keyword)| at + keyword.len())
+        .collect();
+    starts.into_iter().flat_map(move |start| {
+        let after = &text[start..];
+        after
+            .match_indices([';', '-', '/'])
+            .map(|(cut, _)| cut)
+            .chain([after.len()])
+            .map(move |cut| after[..cut].trim())
+    })
 }
 
 /// The `parameters` schema of [`SORT_ROWS`]: one required string, `order_by`.
@@ -945,6 +1023,136 @@ pub(crate) fn describe(name: &str) -> Option<serde_json::Value> {
     operation(name)
         .map(Operation::description)
         .or_else(|| crate::operator::description(name))
+}
+
+// ------------------------------------------------ recognising a SQL statement
+
+/// What `sql`, one SQL statement, is read as: the operation arc holds that it
+/// is, as `operation`, `on` and `arguments` — the long name, the table the
+/// operation is applied to and its arguments, the three keys `arc mcp`'s
+/// `operation_record` takes under those names — or `operation` `null` when DuckDB
+/// parses the statement and arc reads it as none. `arc sql recognise` and `arc
+/// mcp`'s `sql_recognise` both answer from here, so the two cannot differ. Each
+/// operation in the catalogue says how a statement is read as it.
+///
+/// The reading is DuckDB's own parse, asked of the DuckDB library arc is linked
+/// with, so no `duckdb` executable is needed; it binds and runs nothing, and
+/// writes no file — see [`Statement`].
+///
+/// Refused: text DuckDB cannot parse as a statement, an empty text and a comment
+/// alone among it, and text DuckDB splits into more than one statement, each
+/// counted by [`duckdb_statement_count`]; and, from [`Statement::parse`], a
+/// DuckDB library that gives no tree.
+pub(crate) fn recognise(sql: &str) -> Result<serde_json::Value> {
+    match duckdb_statement_count(sql) {
+        1 => {}
+        0 => {
+            return Err(refused(
+                "DuckDB cannot parse the text as a SQL statement, so arc cannot read it as one"
+                    .to_string(),
+            ));
+        }
+        count => {
+            return Err(refused(format!(
+                "the text holds more than one statement: DuckDB splits it into {count}, and \
+                 arc reads one statement at a time"
+            )));
+        }
+    }
+    let statement = Statement::parse(sql)?;
+    for op in CATALOGUE {
+        let Some(recognised) = op.recognised else {
+            continue;
+        };
+        if let Some((on, arguments)) = recognised(&statement) {
+            return Ok(serde_json::json!({
+                "operation": op.long_name,
+                "on": on,
+                "arguments": arguments,
+            }));
+        }
+    }
+    Ok(serde_json::json!({ "operation": null }))
+}
+
+/// One SQL statement as typed and DuckDB's tree of it, with the connection the
+/// tree was asked on, so that a reader can ask for the tree of another text and
+/// compare the two.
+///
+/// A tree is `json_serialize_sql`'s, asked of the DuckDB library arc is linked
+/// with on a fresh in-memory database, which parses the text and binds and runs
+/// none of it. A `SELECT` gives its node. A statement DuckDB parses and does not
+/// serialize — each that is not a `SELECT` — gives an error in its place, and so
+/// does text it cannot parse; a tree with no node is read as no operation, so
+/// a reader needs no arm for either.
+struct Statement {
+    /// The statement as typed.
+    text: String,
+    /// DuckDB's tree of `text`.
+    tree: serde_json::Value,
+    /// `tree` with no `query_location`: what [`Statement::reads_as`] compares.
+    shape: serde_json::Value,
+    /// The in-memory database `tree` was asked on.
+    con: duckdb::Connection,
+}
+
+impl Statement {
+    /// `text` and DuckDB's tree of it. Refused when the library gives no tree,
+    /// as one with no `json_serialize_sql` does: reading no tree as no operation
+    /// would read each filter as a statement arc holds none of.
+    fn parse(text: &str) -> Result<Statement> {
+        let refused_by = |reason: String| {
+            Error::Io(std::io::Error::other(format!(
+                "the DuckDB library arc is linked with {reason}, so arc cannot read the statement"
+            )))
+        };
+        let con = duckdb::Connection::open_in_memory()
+            .map_err(|e| refused_by(format!("opened no in-memory database ({e})")))?;
+        let Some(tree) = tree(&con, text) else {
+            return Err(refused_by(
+                "gave no tree from `json_serialize_sql`".to_string(),
+            ));
+        };
+        Ok(Statement {
+            text: text.to_string(),
+            shape: unlocated(&tree),
+            tree,
+            con,
+        })
+    }
+
+    /// Whether DuckDB reads `text` as this statement: whether its tree equals
+    /// this one with each node's `query_location` left out, since a location
+    /// says where a node is written and not what it is. A text DuckDB cannot
+    /// parse, or does not serialize, gives an error in place of a tree, which
+    /// is not this statement's.
+    fn reads_as(&self, text: &str) -> bool {
+        tree(&self.con, text).is_some_and(|tree| unlocated(&tree) == self.shape)
+    }
+}
+
+/// DuckDB's tree of `text`, from `json_serialize_sql` on `con`, or `None` when
+/// the query fails or answers something other than JSON. The function takes a
+/// `VARCHAR` and refuses a parameter of no type, and answers DuckDB's `JSON`
+/// type, so each side is cast.
+fn tree(con: &duckdb::Connection, text: &str) -> Option<serde_json::Value> {
+    let query = "SELECT json_serialize_sql(?::VARCHAR)::VARCHAR";
+    con.query_row(query, [text], |row| row.get::<_, String>(0))
+    .ok()
+    .and_then(|tree| serde_json::from_str(&tree).ok())
+}
+
+/// `tree` with each `query_location` key left out, at every depth.
+fn unlocated(tree: &serde_json::Value) -> serde_json::Value {
+    match tree {
+        serde_json::Value::Object(node) => node
+            .iter()
+            .filter(|(key, _)| *key != "query_location")
+            .map(|(key, value)| (key.clone(), unlocated(value)))
+            .collect(),
+        serde_json::Value::Array(items) => items.iter().map(unlocated).collect(),
+        other => other.clone(),
+    }
 }
 
 // ------------------------------------------------- recording an operation
