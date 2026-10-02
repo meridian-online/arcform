@@ -1387,10 +1387,9 @@ pub(crate) fn record_sql_step(dir: &Path, step: &SqlStep) -> Result<(PathBuf, Va
 /// `WITH` and a statement that opens with `FROM` among them. A statement the line
 /// cannot go in front of — a `CREATE TABLE`, an `UPDATE`, a `DESCRIBE` — is
 /// written as typed, and what it makes, it makes itself. It is DuckDB's parse of
-/// the line and the statement together that decides, and not the kind of
-/// statement: DuckDB gives a tree for a `DESCRIBE` and no tree for a `SELECT` of
-/// a `PIVOT` with no `IN` list, and the line parses in front of the second and
-/// not the first.
+/// the line and the statement together that decides, and not whether DuckDB
+/// gives the statement a tree: it gives one for a `DESCRIBE`, which the line
+/// cannot go in front of.
 ///
 /// No `-- generated:` line is written: that line licenses [`amend_step_sql`] to
 /// rewrite a file, and the statement is the analyst's own text. So a statement
@@ -1839,6 +1838,73 @@ mod tests {
                 "{what}: a model was written"
             );
         }
+    }
+
+    #[test]
+    fn a_sql_step_gets_the_line_where_the_line_and_the_statement_parse() {
+        for (sql, expected) in [
+            // Each form of `SELECT`: bare, ended by a `;`, with a trailing comment,
+            // a `WITH`, and a statement that opens with `FROM`.
+            ("SELECT 1", "CREATE OR REPLACE TABLE \"t\" AS\nSELECT 1\n"),
+            ("SELECT 1;", "CREATE OR REPLACE TABLE \"t\" AS\nSELECT 1;\n"),
+            (
+                "SELECT 1 -- one",
+                "CREATE OR REPLACE TABLE \"t\" AS\nSELECT 1 -- one\n",
+            ),
+            (
+                "WITH x AS (SELECT 1) SELECT * FROM x",
+                "CREATE OR REPLACE TABLE \"t\" AS\nWITH x AS (SELECT 1) SELECT * FROM x\n",
+            ),
+            (
+                "FROM orders SELECT id",
+                "CREATE OR REPLACE TABLE \"t\" AS\nFROM orders SELECT id\n",
+            ),
+            // A final newline the statement has is the one it keeps.
+            ("SELECT 1\n", "CREATE OR REPLACE TABLE \"t\" AS\nSELECT 1\n"),
+            // A statement the line cannot go in front of is written as typed, with
+            // one final newline: DuckDB gives a tree for `DESCRIBE` and the line
+            // before it is a parser error.
+            (
+                "CREATE TABLE t2 AS SELECT 1",
+                "CREATE TABLE t2 AS SELECT 1\n",
+            ),
+            (
+                "UPDATE orders SET amount = 0",
+                "UPDATE orders SET amount = 0\n",
+            ),
+            ("DESCRIBE orders", "DESCRIBE orders\n"),
+            ("SHOW TABLES\n", "SHOW TABLES\n"),
+        ] {
+            assert_eq!(
+                sql_step_contents("t", sql).expect("the statement is recorded"),
+                expected,
+                "{sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_line_quotes_a_name_that_would_read_as_sql() {
+        assert_eq!(
+            sql_step_contents("a\"b c", "SELECT 1").unwrap(),
+            "CREATE OR REPLACE TABLE \"a\"\"b c\" AS\nSELECT 1\n"
+        );
+    }
+
+    #[test]
+    fn a_statement_written_as_typed_never_opens_with_the_generated_line() {
+        for sql in [
+            "-- generated: mine\nUPDATE orders SET amount = 0",
+            "  -- generated: mine\nDESCRIBE orders",
+        ] {
+            let refusal = sql_step_contents("t", sql)
+                .expect_err("refused")
+                .to_string();
+            assert!(refusal.contains("-- generated:"), "{sql:?}: {refusal}");
+        }
+        // A `SELECT`'s file opens with the line arc adds, so it never reads so.
+        let contents = sql_step_contents("t", "-- generated: mine\nSELECT 1").unwrap();
+        assert!(!sql_is_generated(&contents), "{contents:?}");
     }
 
     #[test]
