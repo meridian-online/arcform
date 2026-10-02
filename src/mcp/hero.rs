@@ -4,6 +4,8 @@
 //! - `protocol_run` runs a Protocol and returns its live **Protocol+Run contract**
 //!   (`contract_version` `b4/1`): the run's protocol, engine, params, assets and
 //!   per-step outcome, the same JSON `arc run` writes under `build/.arcform/runs/`.
+//!   A file beside `arcform.yaml` that may be a copy a synced drive set aside is named
+//!   in its `run.protocol.possible_copies`, with the warning `arc run` prints for it.
 //! - `operator_describe` emits an operator's `with:` JSON Schema (or lists the
 //!   catalog) so an agent or authoring UI can build and check a `with:` block.
 //! - `operation_describe` lists the SQL operations arc holds, or describes an
@@ -59,12 +61,20 @@ fn protocol_run(args: &Value) -> ToolResult {
                 .map_err(|e| format!("parsing run contract {}: {e}", path.display()))?;
             Ok(ToolOutput::json(contract))
         }
-        None => Err(match run_result {
-            Err(e) => format!("run failed before a contract was written: {e}"),
-            Ok(()) => {
-                "the run produced no contract (a protocol with no steps writes none)".to_string()
+        None => {
+            let mut message = match run_result {
+                Err(e) => format!("run failed before a contract was written: {e}"),
+                Ok(()) => "the run produced no contract (a protocol with no steps writes none)"
+                    .to_string(),
+            };
+            // The contract carries these in `run.protocol.possible_copies`; with none written,
+            // the result an agent receives is the one place left to name them.
+            for copy in crate::runner::possible_copies(&dir) {
+                message.push_str("\nwarning: ");
+                message.push_str(&copy.warning);
             }
-        }),
+            Err(message)
+        }
     }
 }
 
@@ -404,7 +414,7 @@ pub(super) fn tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "protocol_run",
-            description: "Run an arc Protocol and return its live Protocol+Run contract (protocol, engine, params, assets, per-step outcome).",
+            description: "Run an arc Protocol and return its live Protocol+Run contract (protocol, engine, params, assets, per-step outcome). A file beside arcform.yaml that may be a copy a synced drive set aside, which the run did not read, is named with its warning in run.protocol.possible_copies.",
             input_schema: protocol_run_schema,
             handler: protocol_run,
         },

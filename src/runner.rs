@@ -14,7 +14,7 @@ use crate::engine::{
     recheck_extension_pins,
 };
 use crate::error::{Error, Result};
-use crate::manifest::{Manifest, Param, RetryPolicy};
+use crate::manifest::{MANIFEST_FILENAME, Manifest, Param, RetryPolicy};
 use crate::operator;
 use crate::precondition;
 use crate::precondition::Precondition;
@@ -243,6 +243,45 @@ fn older_engine_risk(ver: &semver::Version) -> String {
     }
 }
 
+/// Each file beside the Protocol's file in `dir` whose name may be a copy a synced drive set
+/// aside, sorted by name, with the warning a run prints for it.
+///
+/// The rule is the name alone: a file whose name starts with `arcform`, ends with `.yaml` and
+/// is not `arcform.yaml`, matched in the case it is written in. That holds the name Dropbox
+/// gives a conflicted copy, `arcform (conflicted copy).yaml`, and the one OneDrive gives the
+/// copy it keeps, `arcform-LAPTOP.yaml`, and whatever name Google Drive gives its copy so long
+/// as it keeps the start of the file's name. A file kept there on purpose, `arcform-old.yaml`,
+/// has the same shape and is named too; arc does not open a file to tell the two apart. A
+/// directory arc cannot list names none, since the run reads only `arcform.yaml`.
+pub(crate) fn possible_copies(dir: &Path) -> Vec<contract::PossibleCopy> {
+    let stem = MANIFEST_FILENAME
+        .strip_suffix(".yaml")
+        .expect("MANIFEST_FILENAME ends with .yaml");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            name.starts_with(stem) && name.ends_with(".yaml") && name != MANIFEST_FILENAME
+        })
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| contract::PossibleCopy {
+            warning: format!(
+                "`{name}` sits beside {MANIFEST_FILENAME} and arc did not read it: it may be a \
+                 copy a synced drive such as Dropbox or OneDrive set aside when two people saved \
+                 the Protocol, and a step in it that {MANIFEST_FILENAME} lacks does not run"
+            ),
+            file: name,
+        })
+        .collect()
+}
+
 /// Run a pipeline with CLI parameter overrides.
 pub fn run_with_params(
     dir: &Path,
@@ -252,6 +291,12 @@ pub fn run_with_params(
     cli_params: &[(String, String)],
 ) -> Result<()> {
     let manifest = Manifest::load(dir)?;
+
+    // Before anything else is checked, so a run refused below still names the file.
+    let possible_copies = possible_copies(dir);
+    for copy in &possible_copies {
+        eprintln!("{} {}", "warning:".yellow(), copy.warning);
+    }
 
     // What the checks before the run read and found, for the check of each SQL step's and
     // hook's file just before it runs; and the pinned extensions each check installed and
@@ -949,6 +994,7 @@ pub fn run_with_params(
         params: contract_params,
         step_outcomes: &step_outcomes,
         steps_engine,
+        possible_copies,
     });
     if let Err(e) = contract::write_contract(&runs_dir, &run_id, &run_contract) {
         eprintln!(

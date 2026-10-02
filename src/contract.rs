@@ -73,6 +73,22 @@ pub struct ProtocolInfo {
     /// SHA-256 of the `arcform.yaml` bytes — pins the exact manifest this run used.
     pub manifest_sha256: Option<String>,
     pub dir: String,
+    /// Each other file beside `arcform.yaml` whose name may be a copy a synced drive set
+    /// aside, which the run did not read; empty when there is none. Added under `b4/1`, and
+    /// a record written before it reads with the list empty.
+    #[serde(default)]
+    pub possible_copies: Vec<PossibleCopy>,
+}
+
+/// A file beside the Protocol's file whose name says it may be a copy a synced drive set
+/// aside when two people saved the Protocol: one whose name starts with `arcform` and ends
+/// with `.yaml`. arc reads no such file; the run names it and runs `arcform.yaml` as it is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PossibleCopy {
+    /// The file's name, as it sits in the Protocol's directory.
+    pub file: String,
+    /// The warning the run printed for it on standard error.
+    pub warning: String,
 }
 
 /// The engine versions that executed the run.
@@ -398,6 +414,8 @@ pub struct ContractInputs<'a> {
     /// What the DuckDB the SQL steps ran on reported; `None` for a Protocol with no SQL step
     /// or hook.
     pub steps_engine: Option<StepsEngine>,
+    /// The files beside the Protocol's file the run named as possible copies and did not read.
+    pub possible_copies: Vec<PossibleCopy>,
 }
 
 /// Assemble the full contract from the run's manifest, asset graph, and outcomes.
@@ -429,6 +447,7 @@ pub fn build_contract(inp: ContractInputs) -> Contract {
                 name: inp.manifest.name.clone(),
                 manifest_sha256: manifest_sha256(inp.dir),
                 dir: inp.dir.display().to_string(),
+                possible_copies: inp.possible_copies,
             },
             engine: {
                 let (duckdb_cli, platform, extensions) = match inp.steps_engine {
