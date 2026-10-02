@@ -3,8 +3,10 @@
 //! This is the entry point that subsumes the FineType MCP server's role: instead of a
 //! separate `finetype mcp` process, `arc mcp` federates the `finetype` CLI as a set of
 //! tools and adds ones of its own — one that runs a Protocol and returns the live
-//! Protocol+Run contract, one that emits an operator's `with:` JSON Schema, and one
-//! that lists the SQL operations arc holds and describes what one takes.
+//! Protocol+Run contract, one that emits an operator's `with:` JSON Schema, one
+//! that lists the SQL operations arc holds and describes what one takes, one that
+//! records an operation as a step, and one that answers what a SQL statement is
+//! read as.
 //!
 //! # Transport
 //!
@@ -48,7 +50,9 @@ const INSTRUCTIONS: &str = "arc — a local-first data-pipeline engine, exposed 
     returns its live Protocol+Run contract; operator_describe emits an operator's `with:` \
     JSON Schema for authoring; operation_describe lists the SQL operations arc holds and, \
     given an operation's long name or an operator's name, describes what its step reads, \
-    writes and takes; operation_record records an operation as a new step of a Protocol.";
+    writes and takes; operation_record records an operation as a new step of a Protocol; \
+    sql_recognise answers what arc reads a SQL statement as: an operation it holds, with \
+    the table and the arguments operation_record takes, or none.";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool result shapes
@@ -305,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_registers_all_nine_tools() {
+    fn tools_list_registers_all_ten_tools() {
         let listed = tools_list();
         let names: Vec<&str> = listed["tools"]
             .as_array()
@@ -323,13 +327,14 @@ mod tests {
             "operator_describe",
             "operation_describe",
             "operation_record",
+            "sql_recognise",
         ] {
             assert!(
                 names.contains(&expected),
                 "missing tool `{expected}` in {names:?}"
             );
         }
-        assert_eq!(names.len(), 9, "unexpected tool set: {names:?}");
+        assert_eq!(names.len(), 10, "unexpected tool set: {names:?}");
         // Every tool advertises an object input schema.
         for tool in listed["tools"].as_array().unwrap() {
             assert!(tool["description"].is_string());
@@ -400,7 +405,13 @@ mod tests {
     fn initialize_instructions_name_every_native_tool() {
         let result = initialize_result(&Value::Null);
         let instructions = result["instructions"].as_str().expect("instructions");
-        for tool in ["protocol_run", "operator_describe", "operation_describe"] {
+        for tool in [
+            "protocol_run",
+            "operator_describe",
+            "operation_describe",
+            "operation_record",
+            "sql_recognise",
+        ] {
             assert!(instructions.contains(tool), "instructions omit `{tool}`");
         }
     }

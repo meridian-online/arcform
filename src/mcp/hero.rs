@@ -13,6 +13,8 @@
 //! - `operation_record` records an operation as a new step of a Protocol, through
 //!   the same record path `arc operation record` takes, so the same request writes
 //!   the same bytes from either.
+//! - `sql_recognise` answers what arc reads a SQL statement as: the object `arc sql
+//!   recognise` prints, both read through the one reader in `record`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -314,6 +316,30 @@ fn operation_record_schema() -> Value {
     })
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// sql_recognise
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What arc reads one SQL statement as: the object `arc sql recognise` prints,
+/// read through the same reader. Writes no file and runs nothing. Text DuckDB
+/// cannot parse as one statement is an error result naming what was wrong.
+fn sql_recognise(args: &Value) -> ToolResult {
+    let sql = required_string(args, "sql")?;
+    crate::record::recognise(sql)
+        .map(ToolOutput::json)
+        .map_err(|e| e.to_string())
+}
+
+fn sql_recognise_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "sql": { "type": "string", "description": "One SQL statement, as typed." }
+        },
+        "required": ["sql"]
+    })
+}
+
 /// The tools native to `arc`.
 pub(super) fn tools() -> Vec<ToolDef> {
     vec![
@@ -340,6 +366,12 @@ pub(super) fn tools() -> Vec<ToolDef> {
             description: "Record an SQL operation as a new step at the end of a Protocol, from its long name, the table it is applied to, the step's name and its arguments. Writes a generated model and the step naming it; runs nothing.",
             input_schema: operation_record_schema,
             handler: operation_record,
+        },
+        ToolDef {
+            name: "sql_recognise",
+            description: "Answer what arc reads one SQL statement as: the operation arc holds that it is, with `operation`, `on` and `arguments` as operation_record takes them, or `operation` null when it is none. Read from DuckDB's own parse; writes no file and runs nothing.",
+            input_schema: sql_recognise_schema,
+            handler: sql_recognise,
         },
     ]
 }
