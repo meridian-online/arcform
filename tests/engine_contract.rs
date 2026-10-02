@@ -19,7 +19,8 @@ use std::process::Command;
 
 const BIN_ENV: &str = "ARC_DUCKDB_BIN";
 const ALLOW_ENV: &str = "ARC_ALLOW_UNTESTED_ENGINE";
-const RANGE: &str = ">=1.2, <2";
+const RANGE: &str = ">=1.3, <2";
+const OLDEST: &str = "1.3.0";
 const NAME: &str = "engine_contract";
 
 /// A project directory plus somewhere to put engines and PATH directories.
@@ -30,18 +31,28 @@ struct Fixture {
 impl Fixture {
     /// A one-step project whose step is `sql`, with `engine_version:` when given.
     fn new(engine_version: Option<&str>, sql: &str) -> Self {
+        Self::with_steps(engine_version, &[sql])
+    }
+
+    /// A project of SQL steps `s1`, `s2`, … in the order given, each running its `sql`.
+    fn with_steps(engine_version: Option<&str>, sqls: &[&str]) -> Self {
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join("project");
         fs::create_dir_all(project.join("models")).unwrap();
         let constraint = engine_version
             .map(|v| format!("engine_version: \"{v}\"\n"))
             .unwrap_or_default();
+        let mut steps = String::new();
+        for (i, sql) in sqls.iter().enumerate() {
+            let step = format!("s{}", i + 1);
+            steps.push_str(&format!("  - name: {step}\n    sql: models/{step}.sql\n"));
+            fs::write(project.join(format!("models/{step}.sql")), sql).unwrap();
+        }
         fs::write(
             project.join("arcform.yaml"),
-            format!("name: {NAME}\n{constraint}steps:\n  - name: s1\n    sql: models/s1.sql\n"),
+            format!("name: {NAME}\n{constraint}steps:\n{steps}"),
         )
         .unwrap();
-        fs::write(project.join("models/s1.sql"), sql).unwrap();
         Fixture { root }
     }
 
@@ -381,6 +392,98 @@ fn an_engine_outside_the_range_is_refused_before_a_step_runs() {
     let (code, stderr, sql) = run_on_version(None, "1.5.4", false);
     assert_eq!(code, Some(0), "1.5.4 must run:\n{stderr}");
     assert_eq!(sql, 1);
+}
+
+// An engine older than the oldest release arc accepts is refused before a step runs, and
+// the message names the version found and the oldest release. With the override it runs,
+// and the warning says what that costs on the version found: a failed SQL step is reported
+// as passed.
+#[test]
+fn an_engine_older_than_the_oldest_release_is_refused_and_the_override_names_the_risk() {
+    let (code, stderr, sql) = run_on_version(None, "1.2.0", false);
+    assert_eq!(code, Some(1), "1.2.0 must be refused:\n{stderr}");
+    assert_eq!(sql, 0, "a step ran on 1.2.0");
+    for needle in ["DuckDB 1.2.0 is older than", OLDEST, ALLOW_ENV] {
+        assert!(stderr.contains(needle), "expected '{needle}':\n{stderr}");
+    }
+
+    let (code, stderr, sql) = run_on_version(None, "1.2.0", true);
+    assert_eq!(code, Some(0), "override must run 1.2.0:\n{stderr}");
+    assert_eq!(sql, 1);
+    let warning = stderr
+        .lines()
+        .find(|l| l.contains("warning:"))
+        .unwrap_or_else(|| panic!("no warning printed:\n{stderr}"));
+    assert!(
+        warning.contains("1.2.0") && warning.contains("reports the failed step as passed"),
+        "the warning must say a failed step is reported as passed on 1.2.0: {warning}"
+    );
+
+    let (code, stderr, sql) = run_on_version(None, OLDEST, false);
+    assert_eq!(code, Some(0), "{OLDEST} must run:\n{stderr}");
+    assert_eq!(sql, 1);
+    assert!(!stderr.contains("warning:"), "stderr: {stderr}");
+}
+
+// A manifest asking for a range that starts below the oldest release still loads, and runs
+// on an engine arc accepts; on an engine older than the oldest release, arc's own range
+// refuses it, not the manifest's.
+#[test]
+fn a_manifest_that_starts_below_the_oldest_release_loads_and_does_not_widen_the_range() {
+    let (code, stderr, sql) = run_on_version(Some(">=1.2"), "1.5.4", false);
+    assert_eq!(code, Some(0), ">=1.2 on 1.5.4 must run:\n{stderr}");
+    assert_eq!(sql, 1);
+
+    let (code, stderr, sql) = run_on_version(Some(">=1.2"), "1.2.0", false);
+    assert_eq!(code, Some(1), ">=1.2 on 1.2.0 must be refused:\n{stderr}");
+    assert_eq!(sql, 0, "a step ran on 1.2.0");
+    assert!(
+        stderr.contains("DuckDB 1.2.0 is older than") && stderr.contains(OLDEST),
+        "arc's range must be the refusal: {stderr}"
+    );
+}
+
+// On a real DuckDB, a run whose first SQL step's statement fails exits non-zero, records the
+// run as failed, and stops before the second step: arc reads a step's outcome from the
+// command line's exit status alone. The DuckDB is the one on PATH, handed to arc by
+// `ARC_DUCKDB_BIN`; put another release's directory first on PATH to run this on it.
+#[test]
+fn a_failed_statement_on_a_real_duckdb_fails_the_run_and_stops_it() {
+    let fx = Fixture::with_steps(
+        None,
+        &[
+            "CREATE TABLE first AS SELECT * FROM no_such_table;",
+            "CREATE TABLE second AS SELECT 2 AS x;",
+        ],
+    );
+    let empty = fx.dir("empty-path");
+    let real = real_duckdb();
+
+    let (code, stderr) = arc_run(
+        &fx.project(),
+        Run {
+            path: &empty,
+            told: Some(real.as_os_str()),
+            allow_untested: false,
+        },
+    );
+    assert_eq!(
+        code,
+        Some(2),
+        "a failed SQL step must fail the run:\n{stderr}"
+    );
+    assert!(stderr.contains("no_such_table"), "stderr: {stderr}");
+
+    assert_eq!(fx.run_records(), vec![(1, "failed".to_string())]);
+    let conn = duckdb::Connection::open(fx.database()).unwrap();
+    let second: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM information_schema.tables WHERE table_name = 'second'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(second, 0, "the second step ran after the first failed");
 }
 
 // A manifest's constraint narrows the range and does not replace it. `>=1.2`, the

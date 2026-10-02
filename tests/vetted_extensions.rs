@@ -2358,7 +2358,7 @@ fn arc_upgrade_checks_the_engine_version_as_arc_run_does() {
             "outside arc's range",
             ONE_STEP.to_string(),
             "2.0.0",
-            ">=1.2, <2",
+            ">=1.3, <2",
         ),
         (
             "outside the manifest's",
