@@ -248,10 +248,7 @@ fn help_says_what_the_verb_does() {
     assert!(out.status.success(), "arc sql recognise --help failed");
     let help = String::from_utf8(out.stdout).expect("UTF-8");
     let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
-    for says in [
-        "Print what arc reads a SQL statement as",
-        "writes no file",
-    ] {
+    for says in ["Print what arc reads a SQL statement as", "writes no file"] {
         assert!(
             flat.contains(says),
             "`arc sql recognise --help` does not say {says:?}:\n{help}"
@@ -323,7 +320,8 @@ mod mcp {
 
     #[test]
     fn the_tool_is_listed_with_a_schema_requiring_one_string() {
-        let responses = mcp_session(&[json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })]);
+        let responses =
+            mcp_session(&[json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })]);
         let tools = result_of(&responses, 1)["tools"]
             .as_array()
             .expect("tools/list returns an array");

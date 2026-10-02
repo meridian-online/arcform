@@ -1138,8 +1138,8 @@ impl Statement {
 fn tree(con: &duckdb::Connection, text: &str) -> Option<serde_json::Value> {
     let query = "SELECT json_serialize_sql(?::VARCHAR)::VARCHAR";
     con.query_row(query, [text], |row| row.get::<_, String>(0))
-    .ok()
-    .and_then(|tree| serde_json::from_str(&tree).ok())
+        .ok()
+        .and_then(|tree| serde_json::from_str(&tree).ok())
 }
 
 /// `tree` with each `query_location` key left out, at every depth.
