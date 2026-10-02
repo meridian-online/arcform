@@ -190,7 +190,7 @@ fn text_that_is_not_one_statement_is_refused() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             !out.status.success(),
-            "arc sql recognise {sql:?} exited 0; it is refused because the text {reason}"
+            "arc sql recognise {sql:?} exited 0, where it is refused with a message saying {reason:?}"
         );
         assert!(
             out.stdout.is_empty(),
@@ -199,7 +199,7 @@ fn text_that_is_not_one_statement_is_refused() {
         );
         assert!(
             stderr.contains(reason),
-            "arc sql recognise {sql:?}: stderr does not say the text {reason}:\n{stderr}"
+            "arc sql recognise {sql:?}: stderr does not say {reason:?}:\n{stderr}"
         );
     }
 }
