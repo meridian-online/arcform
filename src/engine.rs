@@ -63,12 +63,15 @@ pub trait Engine {
     /// Execute a SQL file against a database.
     /// `env` contains ARC_PARAM_ variables to inject into the child process environment.
     /// `timeout` is the maximum duration before the step is killed.
+    /// When the step passes, each extension DuckDB reports loaded in the step's own process
+    /// is added to `loaded`; a step that fails, or a process that gives no answer, adds none.
     fn execute_sql(
         &self,
         db_path: &Path,
         sql_path: &Path,
         env: &HashMap<String, String>,
         timeout: Option<Duration>,
+        loaded: &mut LoadedExtensions,
     ) -> Result<StepOutput>;
 
     /// Execute a raw shell command.
@@ -135,36 +138,150 @@ pub struct ReportedExtension {
     pub version: Option<String>,
 }
 
+/// The `install_path` `duckdb_extensions()` gives an extension linked into DuckDB that no
+/// `INSTALL` has fetched a file for.
+pub const BUILT_IN: &str = "(BUILT-IN)";
+
+/// Each extension DuckDB reported loaded in the process of a SQL step or hook that passed,
+/// once, in the order the run first found it, with what that process reported of it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LoadedExtensions(Vec<(String, ReportedExtension)>);
+
+impl LoadedExtensions {
+    /// Add each extension in `answer` the run has not found, keeping what the process that
+    /// first reported one gave for it.
+    pub fn add(&mut self, answer: Vec<(String, ReportedExtension)>) {
+        for (name, extension) in answer {
+            if !self.0.iter().any(|(found, _)| *found == name) {
+                self.0.push((name, extension));
+            }
+        }
+    }
+
+    /// Each extension found, in the order the run first found it.
+    pub fn iter(&self) -> impl Iterator<Item = &(String, ReportedExtension)> {
+        self.0.iter()
+    }
+}
+
+/// A value DuckDB answered, or `None` when it answered an empty one.
+fn given(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// One extension's answer after its tag: its name, `installed_from`, `extension_version` and
+/// `install_path`, separated by tabs, or `None` when it holds fewer.
+fn read_extension(fields: &str) -> Option<(String, ReportedExtension)> {
+    // The path last, so a tab in it stays in it.
+    let mut fields = fields.splitn(4, '\t');
+    let (Some(name), Some(repository), Some(version), Some(path)) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return None;
+    };
+    Some((
+        name.to_string(),
+        ReportedExtension {
+            path: given(path).map(PathBuf::from),
+            repository: given(repository),
+            version: given(version),
+        },
+    ))
+}
+
 /// Read the lines [`DuckDbEngine::report`]'s question prints after [`ANSWER_MARK`]: each a tag,
 /// then its values, separated by tabs. A line with a tag it does not know is skipped.
 fn read_report(answers: &[String]) -> EngineReport {
-    let given = |value: &str| (!value.is_empty()).then(|| value.to_string());
     let mut report = EngineReport::default();
     for answer in answers {
         match answer.split_once('\t') {
             Some(("version", version)) => report.version = given(version),
             Some(("platform", platform)) => report.platform = given(platform),
-            Some(("extension", fields)) => {
-                // The path last, so a tab in it stays in it.
-                let mut fields = fields.splitn(4, '\t');
-                let (Some(name), Some(repository), Some(version), Some(path)) =
-                    (fields.next(), fields.next(), fields.next(), fields.next())
-                else {
-                    continue;
-                };
-                report.extensions.insert(
-                    name.to_string(),
-                    ReportedExtension {
-                        path: given(path).map(PathBuf::from),
-                        repository: given(repository),
-                        version: given(version),
-                    },
-                );
-            }
+            Some(("extension", fields)) => report.extensions.extend(read_extension(fields)),
             _ => {}
         }
     }
     report
+}
+
+/// The arguments arc gives the DuckDB CLI after a SQL step's `-f <file>`, which ask DuckDB, in
+/// the step's own process and once the file has run, which extensions it loaded, and write the
+/// answer to `answer` and nowhere else. `None` when `answer` holds a `'`, which a dot command
+/// cannot be given inside the quotes that hold it.
+///
+/// The CLI runs none of them after a file that fails, so a failed step gives no answer. After
+/// one that passes they leave its exit code, stdout and stderr as the file left them.
+/// `.bail off` comes first, so a question DuckDB refuses does not end the process with exit 1.
+/// `.timer off`, since a step's `.timer on` prints its `Run Time` line to stdout and not where
+/// `.once` sends the answer. `.mode list` and `.headers off`, so each line of the answer is a
+/// line [`read_loaded`] reads. And `.once` sends the answer to `answer` rather than to stdout or
+/// to a file the step's own `.output` names, for the one statement after it, with what a step's
+/// `.echo on` or `.changes on` prints of that statement. A setting the step leaves that refuses
+/// the question prints DuckDB's refusal to stderr: `.safe_mode` refuses `.once`, and
+/// `disabled_filesystems = 'LocalFileSystem'` refuses `duckdb_extensions()`. With `.once`
+/// refused the answer goes where the step's output goes, and holds no line: no header, and no
+/// row, since `.safe_mode` turns external access off.
+fn loaded_question(answer: &Path) -> Option<Vec<String>> {
+    let answer = answer.to_str().filter(|path| !path.contains('\''))?;
+    // `system.main.`, so a macro named `duckdb_extensions` in the Protocol's database is not
+    // what answers; and no row once a step has turned external access off, where DuckDB
+    // refuses `duckdb_extensions()` itself.
+    let question = format!(
+        "SELECT '{ANSWER_MARK}extension' || chr(9) || extension_name || chr(9) || coalesce(installed_from, '') || chr(9) || coalesce(extension_version, '') || chr(9) || coalesce(install_path, '') FROM system.main.duckdb_extensions() WHERE loaded AND current_setting('enable_external_access')::BOOLEAN;"
+    );
+    let once = format!(".once '{answer}'");
+    let commands = [
+        ".bail off",
+        ".timer off",
+        ".mode list",
+        ".headers off",
+        &once,
+        &question,
+    ];
+    Some(
+        commands
+            .iter()
+            .flat_map(|command| ["-c".to_string(), command.to_string()])
+            .collect(),
+    )
+}
+
+/// What [`loaded_question`] wrote: each extension DuckDB reported loaded, in the order it
+/// listed them.
+fn read_loaded(answer: &str) -> Vec<(String, ReportedExtension)> {
+    let tag = format!("{ANSWER_MARK}extension\t");
+    answer
+        .lines()
+        .filter_map(|line| line.strip_prefix(tag.as_str()))
+        .filter_map(read_extension)
+        .collect()
+}
+
+/// A directory of arc's own, outside the Protocol's, that a SQL step's process writes its
+/// answer into, removed with everything in it when this is dropped.
+struct AnswerDir(PathBuf);
+
+impl AnswerDir {
+    /// A new, empty directory under the system's temporary directory, or `None` when arc cannot
+    /// make one. `create_dir` refuses a path that is there already, so the directory is one no
+    /// other process made, and two steps running at once in one arc each have their own.
+    fn new() -> Option<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("arc-loaded-{}-{n}", std::process::id()));
+        std::fs::create_dir(&dir).ok().map(|()| AnswerDir(dir))
+    }
+
+    /// The file the step's process writes its answer to.
+    fn file(&self) -> PathBuf {
+        self.0.join("loaded")
+    }
+}
+
+impl Drop for AnswerDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Wait for a child process with an optional timeout.
@@ -326,13 +443,21 @@ impl Engine for DuckDbEngine {
         sql_path: &Path,
         env: &HashMap<String, String>,
         timeout: Option<Duration>,
+        loaded: &mut LoadedExtensions,
     ) -> Result<StepOutput> {
         let step_name = sql_path.display().to_string();
+        // Removed when this returns, whichever way it returns.
+        let answer = AnswerDir::new();
+        let question = answer
+            .as_ref()
+            .and_then(|answer| loaded_question(&answer.file()))
+            .unwrap_or_default();
         let mut child = duckdb_program()?
             .command()
             .arg(db_path)
             .arg("-f")
             .arg(sql_path)
+            .args(question)
             .envs(env)
             .stdout(Stdio::inherit())
             .stderr(Stdio::piped())
@@ -352,6 +477,12 @@ impl Engine for DuckDbEngine {
                 code,
                 stderr,
             });
+        }
+        if let Some(answer) = answer {
+            // No file, or one arc cannot read, is no answer: recording refuses no step.
+            loaded.add(read_loaded(
+                &std::fs::read_to_string(answer.file()).unwrap_or_default(),
+            ));
         }
 
         Ok(StepOutput {
@@ -1487,7 +1618,7 @@ pub(crate) struct ExtensionInstalls {
     pub(crate) installed: Vec<String>,
     /// Each extension the SQL installs by name, from DuckDB's own repository or `FROM
     /// community`, once, in the order the Protocol first installs it: what the run record
-    /// names.
+    /// names first, before each other extension a step's process reports it loaded.
     pub(crate) recorded: Vec<String>,
 }
 
@@ -1663,6 +1794,9 @@ pub(crate) struct ExtensionRecheck {
     recorded: Vec<String>,
     /// Each pinned extension a check installed and found equal to its pin.
     pinned: Vec<PinnedExtension>,
+    /// Each extension DuckDB reported loaded in the process of a SQL step or hook that passed,
+    /// which the run record names after `recorded`.
+    loaded: LoadedExtensions,
     /// Each warning printed so far.
     warned: HashSet<String>,
     pins: ExtensionPins,
@@ -1684,6 +1818,7 @@ impl ExtensionRecheck {
             installed: installs.installed,
             recorded: installs.recorded,
             pinned,
+            loaded: LoadedExtensions::default(),
             warned: installs.warnings.into_iter().chain(pin_warnings).collect(),
             pins: pins.clone(),
             engine_version: engine_version.cloned(),
@@ -1698,9 +1833,20 @@ impl ExtensionRecheck {
 
     /// Each extension a file a check passed installs by name, from DuckDB's own repository or
     /// `FROM community`, once, in the order the run first found it: the extensions the run
-    /// record names.
+    /// record names first, before each other extension a step's process reports it loaded.
     pub(crate) fn recorded(&self) -> &[String] {
         &self.recorded
+    }
+
+    /// Each extension DuckDB reported loaded in the process of a SQL step or hook that passed:
+    /// the extensions the run record names after [`Self::recorded`].
+    pub(crate) fn loaded(&self) -> &LoadedExtensions {
+        &self.loaded
+    }
+
+    /// What a SQL step or hook adds each extension its process reported loaded to.
+    pub(crate) fn loaded_mut(&mut self) -> &mut LoadedExtensions {
+        &mut self.loaded
     }
 
     /// Just before the step or hook `source` names runs: read its file again, refuse it on
@@ -1960,6 +2106,9 @@ pub mod mock {
         pub report: RefCell<EngineReport>,
         /// The extensions each call of `report` asked about, in order.
         pub reported: RefCell<Vec<Vec<String>>>,
+        /// What a SQL step's or hook's process reports it loaded when the step passes, by the
+        /// file name of its SQL. A file not here reports nothing.
+        pub loads: RefCell<HashMap<String, Vec<(String, ReportedExtension)>>>,
     }
 
     #[derive(Debug, Clone)]
@@ -1996,6 +2145,7 @@ pub mod mock {
                 installs: RefCell::new(HashMap::new()),
                 report: RefCell::new(EngineReport::default()),
                 reported: RefCell::new(Vec::new()),
+                loads: RefCell::new(HashMap::new()),
             }
         }
 
@@ -2063,6 +2213,7 @@ pub mod mock {
             sql_path: &Path,
             env: &HashMap<String, String>,
             timeout: Option<Duration>,
+            loaded: &mut LoadedExtensions,
         ) -> Result<StepOutput> {
             let sql_content = fs::read_to_string(sql_path).map_err(|e| Error::FileRead {
                 path: sql_path.to_path_buf(),
@@ -2088,6 +2239,10 @@ pub mod mock {
                     code,
                     stderr,
                 });
+            }
+            let file = sql_path.file_name().unwrap().to_string_lossy();
+            if let Some(answer) = self.loads.borrow().get(file.as_ref()) {
+                loaded.add(answer.clone());
             }
 
             Ok(StepOutput {
@@ -3483,5 +3638,96 @@ mod extension_tests {
         );
         recheck.check(&engine, &passed[0]).unwrap();
         assert_eq!(recheck.recorded(), ["httpfs", "excel", "mlpack"]);
+    }
+
+    // ---- Which extensions a SQL step's own process loaded ----
+
+    fn reported(repository: &str, version: &str, path: &str) -> ReportedExtension {
+        ReportedExtension {
+            path: given(path).map(PathBuf::from),
+            repository: given(repository),
+            version: given(version),
+        }
+    }
+
+    #[test]
+    fn the_extensions_a_run_loaded_are_each_named_once_with_what_the_first_report_gave() {
+        let mut loaded = LoadedExtensions::default();
+        loaded.add(vec![
+            ("fts".into(), reported("core", "v1.5.5", "/a/fts")),
+            ("json".into(), reported("", "", BUILT_IN)),
+        ]);
+        loaded.add(vec![
+            ("httpfs".into(), reported("core", "v1.5.5", "/a/httpfs")),
+            ("fts".into(), reported("community", "0000000", "/b/fts")),
+        ]);
+        assert_eq!(
+            loaded.iter().cloned().collect::<Vec<_>>(),
+            vec![
+                ("fts".to_string(), reported("core", "v1.5.5", "/a/fts")),
+                ("json".to_string(), reported("", "", BUILT_IN)),
+                (
+                    "httpfs".to_string(),
+                    reported("core", "v1.5.5", "/a/httpfs")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_answer_a_steps_process_writes_is_read_in_order_and_nothing_else_is() {
+        let answer = "arc-answer:extension\tfts\tcore\tv1.5.5\t/x/fts.duckdb_extension\n\
+                      arc-answer:extension\tparquet\t\t\t(BUILT-IN)\n\
+                      extension\tunmarked\tcore\tv1\t/x/unmarked\n\
+                      arc-answer:version\tv1.5.5\n\
+                      arc-answer:extension\tshort\tcore\n\
+                      arc-answer:extension\thttpfs\t\t\t/x/a\tb\n";
+        assert_eq!(
+            read_loaded(answer),
+            vec![
+                (
+                    "fts".to_string(),
+                    reported("core", "v1.5.5", "/x/fts.duckdb_extension")
+                ),
+                ("parquet".to_string(), reported("", "", BUILT_IN)),
+                ("httpfs".to_string(), reported("", "", "/x/a\tb")),
+            ]
+        );
+        assert_eq!(read_loaded(""), Vec::new());
+    }
+
+    #[test]
+    fn the_question_turns_bail_off_and_writes_its_answer_to_the_file_it_is_given() {
+        let args = loaded_question(Path::new("/tmp/arc-loaded-1-0/loaded")).unwrap();
+        let commands: Vec<&str> = args
+            .chunks(2)
+            .map(|pair| {
+                assert_eq!(pair[0], "-c", "{args:?}");
+                pair[1].as_str()
+            })
+            .collect();
+        assert_eq!(commands.first(), Some(&".bail off"));
+        assert_eq!(commands[4], ".once '/tmp/arc-loaded-1-0/loaded'");
+        assert!(
+            commands[5].starts_with(&format!("SELECT '{ANSWER_MARK}extension'")),
+            "{}",
+            commands[5]
+        );
+        assert_eq!(commands.len(), 6, "{commands:?}");
+        // A path a dot command cannot be given in quotes is not asked about.
+        assert_eq!(loaded_question(Path::new("/tmp/it's/loaded")), None);
+    }
+
+    #[test]
+    fn each_answer_directory_is_new_and_is_removed_with_what_is_in_it() {
+        let first = AnswerDir::new().unwrap();
+        let second = AnswerDir::new().unwrap();
+        assert_ne!(first.file(), second.file());
+        std::fs::write(first.file(), "an answer").unwrap();
+        let dir = first.0.clone();
+        assert!(dir.starts_with(std::env::temp_dir()), "{}", dir.display());
+        drop(first);
+        assert!(!dir.exists(), "{} is removed", dir.display());
+        assert!(second.0.is_dir());
     }
 }

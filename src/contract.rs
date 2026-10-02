@@ -95,12 +95,16 @@ pub struct EngineInfo {
     /// The platform that DuckDB reports (`PRAGMA platform`): `linux_amd64`.
     pub platform: Option<String>,
     /// Each extension the Protocol's SQL installs by name, from DuckDB's own repository or
-    /// `FROM community`, in the order the run first found it.
+    /// `FROM community`, in the order the run first found it; then each other extension DuckDB
+    /// reported loaded in the process of a SQL step or hook that passed, one it loaded on its own
+    /// included, in the order the run first found it, except one built into DuckDB, whose
+    /// `install_path` reads `(BUILT-IN)`.
     pub extensions: Option<Vec<ExtensionEntry>>,
 }
 
 /// An extension a run's SQL installs, as the DuckDB the steps ran on reports it when the run
-/// ends. Each value is `null` where DuckDB gives none or arc could not ask it.
+/// ends; or one a SQL step's or hook's process loaded, as that process reported it. Each value
+/// is `null` where DuckDB gives none or arc could not ask it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExtensionEntry {
     pub name: String,
@@ -340,21 +344,35 @@ pub struct StepsEngine {
 }
 
 /// What the run records of the DuckDB its SQL steps ran on, from `report`, its answer when
-/// asked about `names`: an entry for each name, in order, whatever the answer holds of it,
-/// with the SHA-256 of the file DuckDB names hashed now.
-pub fn steps_engine(report: crate::engine::EngineReport, names: &[String]) -> StepsEngine {
-    let extensions = names
+/// asked about `names`: an entry for each name, in order, whatever the answer holds of it;
+/// then an entry for each extension in `loaded` that is not one of `names` and whose file
+/// DuckDB does not report as [`BUILT_IN`](crate::engine::BUILT_IN), with what the process that
+/// loaded it reported. Each entry has the SHA-256 of the file DuckDB names, hashed now.
+pub fn steps_engine(
+    report: crate::engine::EngineReport,
+    names: &[String],
+    loaded: &crate::engine::LoadedExtensions,
+) -> StepsEngine {
+    let built_in = Path::new(crate::engine::BUILT_IN);
+    let installed = names.iter().map(|name| {
+        let reported = report.extensions.get(name).cloned().unwrap_or_default();
+        (name, reported)
+    });
+    let loaded_only = loaded
         .iter()
-        .map(|name| {
-            let reported = report.extensions.get(name).cloned().unwrap_or_default();
-            ExtensionEntry {
-                name: name.clone(),
-                repository: reported.repository,
-                version: reported.version,
-                sha256: reported
-                    .path
-                    .and_then(|path| crate::fetch_cache::hash_file(&path).ok()),
-            }
+        .filter(|(name, reported)| {
+            !names.contains(name) && reported.path.as_deref() != Some(built_in)
+        })
+        .map(|(name, reported)| (name, reported.clone()));
+    let extensions = installed
+        .chain(loaded_only)
+        .map(|(name, reported)| ExtensionEntry {
+            name: name.clone(),
+            repository: reported.repository,
+            version: reported.version,
+            sha256: reported
+                .path
+                .and_then(|path| crate::fetch_cache::hash_file(&path).ok()),
         })
         .collect();
     StepsEngine {
@@ -1272,7 +1290,7 @@ steps:
                 }
             };
         assert_eq!(
-            steps_engine(report, &names),
+            steps_engine(report, &names, &Default::default()),
             StepsEngine {
                 duckdb_cli: Some("v1.5.3".into()),
                 platform: Some("osx_arm64".into()),
@@ -1289,12 +1307,81 @@ steps:
 
         // DuckDB could not be asked.
         assert_eq!(
-            steps_engine(EngineReport::default(), &names[..1]),
+            steps_engine(EngineReport::default(), &names[..1], &Default::default()),
             StepsEngine {
                 duckdb_cli: None,
                 platform: None,
                 extensions: vec![entry("mlpack", None, None, None)],
             }
+        );
+    }
+
+    #[test]
+    fn the_steps_engine_names_each_extension_a_step_loaded_after_the_ones_the_sql_installs() {
+        use crate::engine::{BUILT_IN, EngineReport, LoadedExtensions, ReportedExtension};
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str| {
+            let path = dir.path().join(format!("{name}.duckdb_extension"));
+            std::fs::write(&path, format!("{name}'s build")).unwrap();
+            let hash = crate::fetch_cache::hash_file(&path).unwrap();
+            (path, hash)
+        };
+        let (httpfs, httpfs_hash) = file("httpfs");
+        let (httpfs_loaded, _) = file("httpfs-loaded");
+        let (fts, fts_hash) = file("fts");
+        let (json, json_hash) = file("json");
+        let reported = |path: Option<PathBuf>, repository: &str, version: &str| ReportedExtension {
+            path,
+            repository: Some(repository.to_string()),
+            version: Some(version.to_string()),
+        };
+        let report = EngineReport {
+            version: Some("v1.5.5".into()),
+            platform: Some("linux_amd64".into()),
+            extensions: [(
+                "httpfs".to_string(),
+                reported(Some(httpfs), "core", "v1.5.5"),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let mut loaded = LoadedExtensions::default();
+        loaded.add(vec![
+            // The SQL installs it by name: its entry is the one the run gives when it ends.
+            (
+                "httpfs".into(),
+                reported(Some(httpfs_loaded), "community", "0000000"),
+            ),
+            ("fts".into(), reported(Some(fts), "core", "v1.5.5")),
+            // Built into DuckDB: covered by the version the record gives.
+            (
+                "parquet".into(),
+                reported(Some(PathBuf::from(BUILT_IN)), "", ""),
+            ),
+            // Built into DuckDB, and loaded from a file an earlier `INSTALL` fetched.
+            ("json".into(), reported(Some(json), "core", "v1.5.5")),
+            // DuckDB names no file.
+            ("excel".into(), reported(None, "core", "v1.5.5")),
+        ]);
+        let entry =
+            |name: &str, repository: Option<&str>, version: Option<&str>, sha256: Option<&str>| {
+                ExtensionEntry {
+                    name: name.to_string(),
+                    repository: repository.map(String::from),
+                    version: version.map(String::from),
+                    sha256: sha256.map(String::from),
+                }
+            };
+        let names = vec!["httpfs".to_string(), "spatial".to_string()];
+        assert_eq!(
+            steps_engine(report, &names, &loaded).extensions,
+            vec![
+                entry("httpfs", Some("core"), Some("v1.5.5"), Some(&httpfs_hash)),
+                entry("spatial", None, None, None),
+                entry("fts", Some("core"), Some("v1.5.5"), Some(&fts_hash)),
+                entry("json", Some("core"), Some("v1.5.5"), Some(&json_hash)),
+                entry("excel", Some("core"), Some("v1.5.5"), None),
+            ]
         );
     }
 }
