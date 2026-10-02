@@ -114,10 +114,17 @@ impl FakeEngine {
         self.calls().iter().filter(|c| *c == "--version").count()
     }
 
+    /// The calls that ran the step's file: `<db> -f <file>`, and the question arc asks after
+    /// it of the extensions the step loaded.
     fn sql_calls(&self) -> usize {
         self.calls()
             .iter()
-            .filter(|c| c.contains(" -f ") && c.ends_with("s1.sql"))
+            .filter_map(|c| c.split(" -f ").nth(1))
+            .filter(|rest| {
+                rest.split(' ')
+                    .next()
+                    .is_some_and(|f| f.ends_with("s1.sql"))
+            })
             .count()
     }
 }

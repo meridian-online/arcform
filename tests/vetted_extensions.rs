@@ -31,8 +31,22 @@ struct Outcome {
     code: Option<i32>,
     stdout: String,
     stderr: String,
-    /// One line per call the engine received: `--version`, or `<db> -f <sql file>`.
+    /// One line per call the engine received: `--version`, or `<db> -f <sql file>`, with the
+    /// question arc asks after a SQL step's file left off ([`without_loaded_question`]).
     engine_calls: Vec<String>,
+}
+
+/// How the question arc asks after a SQL step's or hook's `-f <file>`, of the extensions the
+/// step's process loaded, starts in the line a fake engine logs.
+const LOADED_QUESTION_START: &str = " -c .bail off -c .echo off ";
+
+/// `call`, a line a fake engine logged, with the question arc asks after a SQL step's file left
+/// off: `<db> -f <sql file>`, as arc ran a step before it asked.
+fn without_loaded_question(call: &str) -> String {
+    call.split(LOADED_QUESTION_START)
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 impl Outcome {
@@ -175,7 +189,7 @@ impl Protocol {
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             engine_calls: fs::read_to_string(&log)
-                .map(|s| s.lines().map(str::to_string).collect())
+                .map(|s| s.lines().map(without_loaded_question).collect())
                 .unwrap_or_default(),
         }
     }
