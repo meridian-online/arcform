@@ -9,8 +9,9 @@ use crate::asset::{AssetGraph, StepAssets};
 use crate::asset_kind::AssetKind;
 use crate::contract;
 use crate::engine::{
-    ALLOW_UNTESTED_ENGINE_ENV, Engine, ExtensionRecheck, ProtocolSql, SUPPORTED_ENGINE_RANGE,
-    check_extension_installs, check_extension_pins, protocol_sql, recheck_extension_pins,
+    ALLOW_UNTESTED_ENGINE_ENV, Engine, ExtensionRecheck, LoadedExtensions, ProtocolSql,
+    SUPPORTED_ENGINE_RANGE, check_extension_installs, check_extension_pins, protocol_sql,
+    recheck_extension_pins,
 };
 use crate::error::{Error, Result};
 use crate::manifest::{Manifest, Param, RetryPolicy};
@@ -96,13 +97,14 @@ fn execute_hook(
     hook: &crate::manifest::Step,
     engine: &dyn Engine,
     extensions: &mut ExtensionRecheck,
+    loaded: &mut LoadedExtensions,
     db_path: &Path,
     dir: &Path,
     env: &HashMap<String, String>,
 ) -> Result<()> {
     if let Some(source) = ProtocolSql::hook(slot, hook, dir) {
         check_again(extensions, engine, &source)?;
-        engine.execute_sql(db_path, &source.path, env, None)?;
+        engine.execute_sql(db_path, &source.path, env, None, loaded)?;
     } else if let Some(ref command) = hook.command {
         engine.execute_command(command, env, false, None)?;
     }
@@ -222,6 +224,8 @@ pub fn run_with_params(
     // hook's file just before it runs; and the pinned extensions each check installed and
     // found equal to their pins, hashed again when the run ends.
     let mut extensions = ExtensionRecheck::default();
+    // Each extension DuckDB reports loaded in the process of a SQL step or hook that passed.
+    let mut loaded = LoadedExtensions::default();
 
     // If there are SQL steps, verify the engine is available and check its version.
     if manifest.has_sql_steps() {
@@ -369,6 +373,7 @@ pub fn run_with_params(
             init_hook,
             engine,
             &mut extensions,
+            &mut loaded,
             &db_path,
             dir,
             &env_map,
@@ -392,6 +397,7 @@ pub fn run_with_params(
                     exit_hook,
                     engine,
                     &mut extensions,
+                    &mut loaded,
                     &db_path,
                     dir,
                     &exit_env,
@@ -532,7 +538,13 @@ pub fn run_with_params(
                     // Before each attempt: a step earlier in the run, or an earlier attempt of
                     // this one, can have written over the file since a check read it.
                     check_again(&mut extensions, engine, &source).and_then(|()| {
-                        engine.execute_sql(&db_path, &source.path, &env_map, step_timeout)
+                        engine.execute_sql(
+                            &db_path,
+                            &source.path,
+                            &env_map,
+                            step_timeout,
+                            &mut loaded,
+                        )
                     })
                 } else if let Some(ref op_ref) = step.op {
                     match operator::resolve(op_ref) {
@@ -732,6 +744,7 @@ pub fn run_with_params(
                     success_hook,
                     engine,
                     &mut extensions,
+                    &mut loaded,
                     &db_path,
                     dir,
                     &env_map,
@@ -782,6 +795,7 @@ pub fn run_with_params(
                     failure_hook,
                     engine,
                     &mut extensions,
+                    &mut loaded,
                     &db_path,
                     dir,
                     &failure_env,
@@ -838,6 +852,7 @@ pub fn run_with_params(
             exit_hook,
             engine,
             &mut extensions,
+            &mut loaded,
             &db_path,
             dir,
             &exit_env,
@@ -885,10 +900,16 @@ pub fn run_with_params(
         let _ = state.finish_run(&run_id, executed, outcome, total_retries);
     }
     // What the DuckDB the steps ran on reports, after the last step and hook, so the record
-    // names the build each extension the SQL installs was when the run ended. A question it
-    // does not answer leaves each value absent: recording refuses no run and prints nothing.
+    // names the build each extension the SQL installs was when the run ended; and each other
+    // extension a step's or hook's own process reported loaded, as that process reported it. A
+    // question DuckDB does not answer leaves each value absent: recording refuses no run and
+    // prints nothing.
     let steps_engine = manifest.has_sql_steps().then(|| {
-        contract::steps_engine(engine.report(extensions.recorded()), extensions.recorded())
+        contract::steps_engine(
+            engine.report(extensions.recorded()),
+            extensions.recorded(),
+            &loaded,
+        )
     });
     let run_contract = contract::build_contract(contract::ContractInputs {
         manifest: &manifest,
@@ -7651,5 +7672,76 @@ steps:
         assert_eq!(engine_info.duckdb_cli, None);
         assert_eq!(engine_info.platform, None);
         assert_eq!(engine_info.extensions, None);
+    }
+
+    #[test]
+    fn the_record_names_each_extension_a_sql_step_or_hook_loaded_once_after_the_installed_ones() {
+        use crate::contract::ExtensionEntry;
+        use crate::engine::{EngineReport, ReportedExtension};
+
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(
+            dir.path(),
+            "name: rec\ndb: rec.duckdb\nsteps:\n  - name: s\n    sql: models/s.sql\n  - name: t\n    sql: models/t.sql\n  - name: c\n    command: echo hi\nhooks:\n  on_exit:\n    name: bye\n    sql: models/bye.sql\n",
+            &[
+                ("models/s.sql", "INSTALL httpfs;\nLOAD fts;\n"),
+                ("models/t.sql", "SELECT stem('running', 'english');\n"),
+                ("models/bye.sql", "LOAD excel;\n"),
+            ],
+        );
+        let reported = |name: &str, version: &str| ReportedExtension {
+            path: None,
+            repository: Some(name.to_string()),
+            version: Some(version.to_string()),
+        };
+        let engine = MockEngine::new();
+        *engine.report.borrow_mut() = EngineReport {
+            version: Some("v1.5.5".into()),
+            platform: Some("linux_amd64".into()),
+            extensions: [("httpfs".to_string(), reported("core", "when the run ended"))]
+                .into_iter()
+                .collect(),
+        };
+        *engine.loads.borrow_mut() = [
+            (
+                "s.sql",
+                vec![
+                    ("httpfs".to_string(), reported("core", "in s")),
+                    ("fts".to_string(), reported("core", "in s")),
+                ],
+            ),
+            (
+                "t.sql",
+                vec![
+                    ("fts".to_string(), reported("core", "in t")),
+                    ("spatial".to_string(), reported("core", "in t")),
+                ],
+            ),
+            (
+                "bye.sql",
+                vec![("excel".to_string(), reported("core", "in bye"))],
+            ),
+        ]
+        .into_iter()
+        .map(|(file, answer)| (file.to_string(), answer))
+        .collect();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let entry = |name: &str, version: &str| ExtensionEntry {
+            name: name.into(),
+            repository: Some("core".into()),
+            version: Some(version.into()),
+            sha256: None,
+        };
+        assert_eq!(
+            only_contract(dir.path()).run.engine.extensions,
+            Some(vec![
+                entry("httpfs", "when the run ended"),
+                entry("fts", "in s"),
+                entry("spatial", "in t"),
+                entry("excel", "in bye"),
+            ])
+        );
     }
 }
