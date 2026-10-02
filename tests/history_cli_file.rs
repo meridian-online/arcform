@@ -16,7 +16,10 @@
 //!      `terminal`; a version an earlier arc wrote lists as `not recorded` and
 //!      is shown and restored by the id that arc printed;
 //!   7. **the bound** — past `HISTORY_MAX_ENTRIES` versions written by the
-//!      command line, the list and the key directory hold exactly that many.
+//!      command line, the list and the key directory hold exactly that many;
+//!   8. **a text never written to its file** — an unsaved entry lists under a
+//!      kind word of its own that fits the kind column, and restoring it
+//!      writes its text to the file.
 //!
 //! The history is recorded through the library, which is the write path a
 //! tool saving a chart file takes, and read back through the binary alone.
@@ -35,6 +38,7 @@ const A_V2: &str = "# chart a\nmark: areaY\n";
 const A_NOW: &str = "# chart a\nmark: dot\n";
 const B_V1: &str = "# chart b\nmark: barY\n";
 const B_NOW: &str = "# chart b\nmark: barX\n";
+const A_UNSAVED: &str = "# chart a\nmark: tickX\n";
 
 /// A Protocol directory with a spec and two chart files under `panels/`, a
 /// history store beside it, and two recorded versions each of the spec and of
@@ -167,6 +171,7 @@ fn entry_line(history: &LocalHistory, dir: &Path, id: &str) -> String {
     let kind = match entry.kind {
         HistoryKind::Save => "save",
         HistoryKind::Checkpoint => "checkpoint",
+        HistoryKind::Unsaved => "unsaved",
     };
     format!(
         "{}  {:<10}  {}  {:>7} bytes  {}",
@@ -658,5 +663,66 @@ fn the_bound_holds_for_the_versions_the_command_line_writes() {
     assert_eq!(
         on_disk, listed_files,
         "the key directory holds one file for each version listed and no other"
+    );
+}
+
+// An unsaved text: `arc history list --file` prints it under a kind word that
+// is neither of the other two, inside the ten-wide kind column every entry
+// line shares, and `arc history restore` writes its text to the file alone.
+#[test]
+fn an_unsaved_text_lists_under_a_word_of_its_own_and_restores_to_its_file() {
+    let fx = setup();
+    let unsaved = fx
+        .history
+        .record_unsaved_for_file(&fx.a, A_UNSAVED)
+        .unwrap()
+        .expect("recorded");
+    assert_eq!(fs::read_to_string(&fx.a).unwrap(), A_NOW, "recording wrote");
+
+    let stdout = fx.arc_ok(&["history", "list", "--file", "panels/a.yaml"]);
+    let kinds: Vec<(String, String)> = listed(&stdout)
+        .into_iter()
+        .map(|(id, kind, _)| (id, kind))
+        .collect();
+    assert_eq!(
+        kinds.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        [
+            fx.a_ids[0].as_str(),
+            fx.a_ids[1].as_str(),
+            unsaved.id.as_str()
+        ],
+        "{stdout}"
+    );
+    let word = kinds[2].1.as_str();
+    assert!(
+        word != "save" && word != "checkpoint" && word.len() <= 10,
+        "the unsaved entry's kind word is `{word}`:\n{stdout}"
+    );
+    assert_eq!(
+        kinds.iter().map(|(_, k)| k.as_str()).collect::<Vec<_>>(),
+        ["save", "checkpoint", word],
+        "{stdout}"
+    );
+
+    // Each entry line is its id, two spaces, the kind padded to ten, two
+    // spaces and the time: a kind word wider than the column, or of more than
+    // one word, moves the time off its column.
+    for line in stdout.lines().filter(|l| l.contains(" bytes  ")) {
+        let (_, rest) = line.split_once("  ").expect("an id then two spaces");
+        let (column, after) = rest.split_at(10);
+        assert!(
+            !column.trim_end().contains(' ')
+                && after.starts_with("  ")
+                && after[2..].starts_with(|c: char| c.is_ascii_digit()),
+            "the kind column does not stand in `{line}`"
+        );
+    }
+
+    fx.arc_ok(&["history", "restore", &unsaved.id, "--file", "panels/a.yaml"]);
+    assert_eq!(fs::read_to_string(&fx.a).unwrap(), A_UNSAVED);
+    assert_eq!(fs::read_to_string(&fx.b).unwrap(), B_NOW);
+    assert_eq!(
+        fs::read_to_string(fx.dir.join(MANIFEST_FILENAME)).unwrap(),
+        SPEC_NOW
     );
 }

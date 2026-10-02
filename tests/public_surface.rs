@@ -1060,6 +1060,9 @@ fn exported_modules_declare_only_contracted_items() {
             // a file beside the spec keeps a history of its own.
             "record_save_for_file",
             "record_checkpoint_for_file",
+            // A text never written to its file, recorded in the store alone;
+            // a call on a file with no directory twin.
+            "record_unsaved_for_file",
             "entries_for_file",
             "read_for_file",
             "restore_for_file",

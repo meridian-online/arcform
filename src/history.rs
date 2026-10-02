@@ -36,6 +36,19 @@
 //! callers that bring their own net; a tool surface should prefer the
 //! checkpointed roads.
 //!
+//! # A text never written to its file
+//!
+//! A save and a checkpoint each record a text that was on disk: the one just
+//! written, or the one about to be replaced. A caller can also hold a text
+//! that never reached its file — an editor's buffer that was never saved —
+//! and that text has nowhere on disk to be recovered from. A
+//! [`HistoryKind::Unsaved`] entry records it, through
+//! [`LocalHistory::record_unsaved_for_file`], keyed to the file it was meant
+//! for. Recording it writes nothing to that file and creates no file that
+//! does not exist: the store keeps the text and the file stays as it was.
+//! Restoring the entry writes the text to the file, with every restore's
+//! discipline. Why the caller holds such a text is the caller's affair.
+//!
 //! # Where the store lives
 //!
 //! `$ARCFORM_HISTORY_DIR` when set, else `~/.arcform/history` — never inside
@@ -93,7 +106,9 @@
 //! each other's entries, and a restore writes the one file it was given. The
 //! spec's key is the same either way: the calls that take a file, given a
 //! directory's `arcform.yaml`, read and write the history the calls that take
-//! the directory recorded.
+//! the directory recorded. [`LocalHistory::record_unsaved_for_file`] is a call
+//! on a file with no twin that takes a directory; given a directory's
+//! `arcform.yaml`, it records into that spec's history.
 //!
 //! # Retention policy
 //!
@@ -106,7 +121,9 @@
 //!   bound. The merge is for bursts from the *same source*: checkpoints
 //!   never merge, and the checkpointed roads record their after-images with
 //!   the merge disabled — a machine edit must never fold away the state it
-//!   just promised was recoverable.
+//!   just promised was recoverable. An unsaved entry never merges either way:
+//!   it is not replaced by a save after it, and it does not replace a save
+//!   before it.
 //! - A state identical to the newest entry is not recorded again, whatever
 //!   its kind.
 //!
@@ -145,9 +162,10 @@ const WAY_MAX_LEN: usize = 32;
 
 // ------------------------------------------------------------------ the values
 
-/// What an entry records: the after-image of a save, or the before-image a
-/// machine edit checkpoints. The kinds are related by presentation — one
-/// timeline, distinguishable entries — never by different stores.
+/// What an entry records: the after-image of a save, the before-image a
+/// machine edit checkpoints, or a text that was never written to its file.
+/// The kinds are related by presentation — one timeline, distinguishable
+/// entries — never by different stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryKind {
     /// The state as it was saved — recorded *after* the save boundary.
@@ -155,6 +173,9 @@ pub enum HistoryKind {
     /// The state a machine edit was about to replace — recorded *before*
     /// the write landed.
     Checkpoint,
+    /// A text that was never written to its file — recorded in the store
+    /// alone, with the file left as it was.
+    Unsaved,
 }
 
 impl HistoryKind {
@@ -162,6 +183,7 @@ impl HistoryKind {
         match self {
             HistoryKind::Save => "save",
             HistoryKind::Checkpoint => "checkpoint",
+            HistoryKind::Unsaved => "unsaved",
         }
     }
 
@@ -169,6 +191,7 @@ impl HistoryKind {
         match tag {
             "save" => Some(HistoryKind::Save),
             "checkpoint" => Some(HistoryKind::Checkpoint),
+            "unsaved" => Some(HistoryKind::Unsaved),
             _ => None,
         }
     }
@@ -259,7 +282,8 @@ fn word_fault(word: &str) -> Option<String> {
 pub struct HistoryEntry {
     /// `<millis>-<seq>-<kind>` — sortable, and stable once recorded.
     pub id: String,
-    /// Save entry or machine-edit checkpoint.
+    /// Save entry, machine-edit checkpoint, or a text never written to its
+    /// file.
     pub kind: HistoryKind,
     /// The way arc was reached when the entry was written, or `None` for an
     /// entry written by a handle that named none — which is every entry an
@@ -405,6 +429,27 @@ impl LocalHistory {
         )
     }
 
+    /// Record `text`, a text that was never written to the file at `file`,
+    /// as an unsaved entry in that file's history, keyed as
+    /// [`record_save_for_file`](Self::record_save_for_file) describes.
+    ///
+    /// The store alone is written: the file keeps its bytes, and a file that
+    /// does not exist is not created. The entry is never merged — a save
+    /// recorded moments later is an entry of its own, and so is this one
+    /// after a save — and it counts toward the file's bound like any other.
+    /// Only an exact duplicate of the newest entry is skipped (`Ok(None)`).
+    /// [`restore_for_file`](Self::restore_for_file) given its id writes the
+    /// text to the file.
+    pub fn record_unsaved_for_file(&self, file: &Path, text: &str) -> Result<Option<HistoryEntry>> {
+        self.record_keyed(
+            self.file_key(file)?,
+            text,
+            HistoryKind::Unsaved,
+            SystemTime::now(),
+            false,
+        )
+    }
+
     /// Every entry recorded for the file at `file`, oldest first — that
     /// file's entries and no other's.
     pub fn entries_for_file(&self, file: &Path) -> Result<Vec<HistoryEntry>> {
@@ -496,9 +541,9 @@ impl LocalHistory {
         }
 
         // The debounce: a save hard on the heels of the newest save merges
-        // into it — the newer state replaces the older entry. Checkpoints
-        // never merge, and a save never merges across an intervening
-        // checkpoint (the newest entry would not be a save).
+        // into it — the newer state replaces the older entry. Checkpoints and
+        // unsaved entries never merge, and a save never merges across an
+        // intervening one (the newest entry would not be a save).
         let merge_into = newest
             .filter(|n| {
                 merge

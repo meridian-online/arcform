@@ -98,7 +98,8 @@
 //!   has a `_for_file` twin that keeps one file's history under the file's own
 //!   path — a chart file beside the spec, say — listed, bounded and restored
 //!   apart from every other file's, the spec's included
-//! - [`HistoryEntry`], [`HistoryKind`] — one recorded state; save vs checkpoint
+//! - [`HistoryEntry`], [`HistoryKind`] — one recorded state: a save, a checkpoint,
+//!   or a text never written to its file
 //! - [`HistoryWay`] — the way arc was reached when an entry was written:
 //!   `terminal`, `mcp`, or a caller's own word; a handle carries one through
 //!   [`LocalHistory::reached_by`] and every entry it records names it

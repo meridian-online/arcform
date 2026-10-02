@@ -674,6 +674,7 @@ fn kind_word(kind: HistoryKind) -> &'static str {
     match kind {
         HistoryKind::Save => "save",
         HistoryKind::Checkpoint => "checkpoint",
+        HistoryKind::Unsaved => "unsaved",
     }
 }
 
