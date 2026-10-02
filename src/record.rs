@@ -932,8 +932,8 @@ fn sort_rows_parameters() -> serde_json::Value {
 }
 
 /// The SQL step of [`SORT_ROWS`]: a table named for the step, holding the rows of
-/// the table it is applied to in the order the clause gives. The table read and
-/// the order are written as given, as [`filter_rows_sql`]'s condition is.
+/// the table it is applied to in the order the clause gives. The table read is
+/// written as [`from_ident`] writes it, and the order as given.
 fn sort_rows_sql(recording: &Recording) -> String {
     format!(
         "CREATE OR REPLACE TABLE {} AS\nSELECT *\nFROM {}\nORDER BY {};\n",
