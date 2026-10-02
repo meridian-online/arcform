@@ -1619,7 +1619,7 @@ pub(crate) struct ExtensionInstalls {
     pub(crate) installed: Vec<String>,
     /// Each extension the SQL installs by name, from DuckDB's own repository or `FROM
     /// community`, once, in the order the Protocol first installs it: what the run record
-    /// names.
+    /// names first, before each other extension a step's process reports it loaded.
     pub(crate) recorded: Vec<String>,
 }
 
@@ -1830,7 +1830,7 @@ impl ExtensionRecheck {
 
     /// Each extension a file a check passed installs by name, from DuckDB's own repository or
     /// `FROM community`, once, in the order the run first found it: the extensions the run
-    /// record names.
+    /// record names first, before each other extension a step's process reports it loaded.
     pub(crate) fn recorded(&self) -> &[String] {
         &self.recorded
     }
