@@ -217,7 +217,9 @@ fn read_report(answers: &[String]) -> EngineReport {
 /// fail, so the process exits 0 whether DuckDB answered or not, where a question DuckDB refused
 /// would have made it exit 1. A setting the step leaves that refuses the question prints
 /// DuckDB's refusal to stderr: `.safe_mode` refuses `.once`, and
-/// `disabled_filesystems = 'LocalFileSystem'` refuses `duckdb_extensions()`.
+/// `disabled_filesystems = 'LocalFileSystem'` refuses `duckdb_extensions()`. With `.once`
+/// refused the answer goes where the step's output goes, and holds no line: no header, and no
+/// row, since `.safe_mode` turns external access off.
 fn loaded_question(answer: &Path) -> Option<Vec<String>> {
     let answer = answer.to_str().filter(|path| !path.contains('\''))?;
     // `system.main.`, so a macro named `duckdb_extensions` in the Protocol's database is not
@@ -233,6 +235,7 @@ fn loaded_question(answer: &Path) -> Option<Vec<String>> {
         ".timer off",
         ".changes off",
         ".mode list",
+        ".headers off",
         &once,
         &question,
         ".bail off",
@@ -3690,11 +3693,11 @@ mod extension_tests {
                 pair[1].as_str()
             })
             .collect();
-        assert_eq!(commands[5], ".once '/tmp/arc-loaded-1-0/loaded'");
+        assert_eq!(commands[6], ".once '/tmp/arc-loaded-1-0/loaded'");
         assert!(
-            commands[6].starts_with(&format!("SELECT '{ANSWER_MARK}extension'")),
+            commands[7].starts_with(&format!("SELECT '{ANSWER_MARK}extension'")),
             "{}",
-            commands[6]
+            commands[7]
         );
         assert_eq!(commands.last(), Some(&".bail off"));
         // A path a dot command cannot be given in quotes is not asked about.

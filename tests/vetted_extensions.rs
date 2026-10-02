@@ -3281,3 +3281,492 @@ fn recording_what_duckdb_does_not_give_changes_nothing_about_the_run() {
         }
     }
 }
+
+// ---- what a SQL step's own process loaded ----
+
+/// A home directory of the test's own for the real DuckDB CLI on PATH, holding a copy of the
+/// httpfs build that DuckDB has installed under the home this test was started with and nothing
+/// else, so a step that loads httpfs loads the copy, offline, and each other extension DuckDB
+/// loads is built into it. Beside it, a DuckDB that runs a SQL step as arc ran one before it
+/// asked the step's process which extensions it loaded: the database, `-f` and the file, and
+/// nothing after them.
+struct LoadedHome {
+    dir: tempfile::TempDir,
+    duckdb: PathBuf,
+    /// Where DuckDB keeps the extensions it installs, under this home.
+    keep: PathBuf,
+}
+
+impl LoadedHome {
+    fn new() -> Self {
+        let duckdb = std::env::var_os("PATH")
+            .and_then(|p| {
+                std::env::split_paths(&p)
+                    .map(|d| d.join("duckdb"))
+                    .find(|c| c.is_file())
+            })
+            .expect("these tests run the real DuckDB CLI, and found no `duckdb` on PATH");
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let ask = |home: Option<&Path>, sql: &str| {
+            let mut duckdb = Command::new(&duckdb);
+            duckdb.args(["-init", "/dev/null", "-noheader", "-list", "-c", sql]);
+            if let Some(home) = home {
+                duckdb.env("HOME", home);
+            }
+            let out = duckdb.output().expect("the DuckDB CLI on PATH");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let installed = PathBuf::from(ask(
+            None,
+            "SELECT install_path FROM duckdb_extensions() WHERE extension_name = 'httpfs' AND installed AND install_path <> '(BUILT-IN)';",
+        ));
+        assert!(
+            installed.is_file(),
+            "these tests copy the httpfs build the DuckDB on PATH has installed, and it has \
+             none: `duckdb -c 'INSTALL httpfs'` installs one, as CI's workflow does"
+        );
+        let version = ask(Some(&home), "SELECT version();");
+        let platform = ask(Some(&home), "SELECT platform FROM pragma_platform();");
+        let keep = home.join(format!(".duckdb/extensions/{version}/{platform}"));
+        fs::create_dir_all(&keep).unwrap();
+        fs::copy(&installed, keep.join("httpfs.duckdb_extension")).unwrap();
+        let info = PathBuf::from(format!("{}.info", installed.display()));
+        if info.is_file() {
+            fs::copy(&info, keep.join("httpfs.duckdb_extension.info")).unwrap();
+        }
+        let before = dir.path().join("duckdb-before");
+        fs::write(
+            &before,
+            format!(
+                "#!/bin/sh\nif [ \"$2\" = \"-f\" ]; then exec '{0}' \"$1\" -f \"$3\"; fi\nexec '{0}' \"$@\"\n",
+                duckdb.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&before, fs::Permissions::from_mode(0o755)).unwrap();
+        LoadedHome { dir, duckdb, keep }
+    }
+
+    fn home(&self) -> PathBuf {
+        self.dir.path().join("home")
+    }
+
+    /// The files under this home's extension directory, each with its SHA-256.
+    fn kept(&self) -> Vec<(String, String)> {
+        let mut kept: Vec<_> = fs::read_dir(&self.keep)
+            .unwrap()
+            .map(|e| {
+                let path = e.unwrap().path();
+                (
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    sha256(&path),
+                )
+            })
+            .collect();
+        kept.sort();
+        kept
+    }
+
+    /// The record's entry for httpfs, as DuckDB reports the copy under this home.
+    fn httpfs(&self) -> serde_json::Value {
+        let out = Command::new(&self.duckdb)
+            .args(["-init", "/dev/null", "-noheader", "-list", "-c"])
+            .arg("SELECT installed_from, extension_version FROM duckdb_extensions() WHERE extension_name = 'httpfs';")
+            .env("HOME", self.home())
+            .output()
+            .unwrap();
+        let answer = String::from_utf8_lossy(&out.stdout);
+        let (repository, version) = answer.trim().split_once('|').unwrap();
+        let given = |value: &str| (!value.is_empty()).then(|| value.to_string());
+        serde_json::json!({
+            "name": "httpfs",
+            "repository": given(repository),
+            "version": given(version),
+            "sha256": sha256(&self.keep.join("httpfs.duckdb_extension")),
+        })
+    }
+
+    /// `arc run` on `protocol` with this home, on the real DuckDB, or with `before` on the
+    /// DuckDB that runs a step as arc ran one before it asked what the step loaded. Each run
+    /// leaves the temporary directory arc is pointed at, one of the Protocol's own outside its
+    /// directory, empty, and installs nothing.
+    fn run(&self, protocol: &Protocol, before: bool) -> Outcome {
+        let kept = self.kept();
+        let tmp = protocol.root.path().join("tmp");
+        fs::create_dir_all(&tmp).unwrap();
+        let engine = if before {
+            self.dir.path().join("duckdb-before")
+        } else {
+            self.duckdb.clone()
+        };
+        let out = Command::new(env!("CARGO_BIN_EXE_arc"))
+            .current_dir(protocol.project())
+            .arg("run")
+            .env("HOME", self.home())
+            .env("TMPDIR", &tmp)
+            .env("ARC_DUCKDB_BIN", &engine)
+            .env("ARCFORM_HISTORY_DIR", protocol.root.path().join("history"))
+            .env("ARCFORM_DB_DIR", protocol.root.path().join("db"))
+            .env_remove("ARC_ALLOW_UNTESTED_ENGINE")
+            .output()
+            .expect("spawn arc run");
+        let left: Vec<_> = fs::read_dir(&tmp)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(
+            left,
+            Vec::<PathBuf>::new(),
+            "left in the temporary directory"
+        );
+        assert_eq!(self.kept(), kept, "nothing was installed");
+        let root = protocol.root.path().display().to_string();
+        let mask = |bytes: &[u8]| {
+            String::from_utf8_lossy(bytes)
+                .replace(&root, "ROOT")
+                .lines()
+                // `.timer on` prints how long each statement took, which differs run to run.
+                .map(|line| match line.split_once("Run Time (s): ") {
+                    Some((head, _)) => format!("{head}Run Time (s): …\n"),
+                    None => format!("{line}\n"),
+                })
+                .collect()
+        };
+        Outcome {
+            code: out.status.code(),
+            stdout: mask(&out.stdout),
+            stderr: mask(&out.stderr),
+            engine_calls: Vec::new(),
+        }
+    }
+}
+
+impl Protocol {
+    /// Each file under the Protocol's directory but the run records under `build/`, with what
+    /// it holds; a database by its name alone, since what it holds differs run to run.
+    fn files(&self) -> Vec<(String, String)> {
+        fn walk(dir: &Path, root: &Path, files: &mut Vec<(String, String)>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                let name = path.strip_prefix(root).unwrap().display().to_string();
+                if path.is_dir() {
+                    if name != "build" {
+                        walk(&path, root, files);
+                    }
+                } else if name.ends_with(".duckdb") {
+                    files.push((name, "a database".to_string()));
+                } else {
+                    files.push((
+                        name,
+                        String::from_utf8_lossy(&fs::read(&path).unwrap()).into_owned(),
+                    ));
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&self.project(), &self.project(), &mut files);
+        files.sort();
+        files
+    }
+
+    /// The record's outcome, its extensions, and each step's name and status.
+    fn recorded(&self) -> serde_json::Value {
+        let record = self.record();
+        let steps: Vec<_> = record["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| serde_json::json!([step["name"], step["status"]]))
+            .collect();
+        serde_json::json!({
+            "outcome": record["run"]["outcome"],
+            "extensions": record["run"]["engine"]["extensions"],
+            "steps": steps,
+        })
+    }
+}
+
+/// A Protocol whose one step is `sql`, or, with `hook`, whose one step is `SELECT 1;` and whose
+/// `on_exit` hook is `sql`.
+fn step_or_hook(sql: &str, hook: bool) -> Protocol {
+    if hook {
+        Protocol::with(
+            "name: loaded\ndb: loaded.duckdb\nsteps:\n  - name: s\n    sql: models/s.sql\nhooks:\n  on_exit:\n    name: bye\n    sql: models/bye.sql\n",
+            &[
+                ("models/s.sql".to_string(), "SELECT 1 AS one;\n"),
+                ("models/bye.sql".to_string(), sql),
+            ],
+        )
+    } else {
+        Protocol::with(
+            "name: loaded\ndb: loaded.duckdb\nsteps:\n  - name: s\n    sql: models/s.sql\n",
+            &[("models/s.sql".to_string(), sql)],
+        )
+    }
+}
+
+/// The real DuckDB names in the record each extension it loaded in a SQL step's or hook's own
+/// process, one it loaded on its own and one a `LOAD` named with no `INSTALL`, with the hash of
+/// the file it loaded and the repository and version it reports. An extension the SQL installs
+/// by name is named once, as it was before arc asked; one built into DuckDB is not named. Each
+/// Protocol runs again on a DuckDB that runs its steps as arc ran them before it asked, for
+/// what the record held then.
+#[test]
+fn the_record_names_each_extension_duckdb_loaded_in_a_sql_step_or_hook() {
+    let home = LoadedHome::new();
+    let httpfs = home.httpfs();
+    let none = serde_json::json!([]);
+    let named = serde_json::json!([httpfs]);
+    let cases = [
+        (
+            "loaded on its own",
+            "CREATE SECRET (TYPE s3, KEY_ID 'k', SECRET 's');\nCREATE TABLE t AS SELECT 1 AS one;\n",
+            false,
+            &named,
+            &none,
+        ),
+        (
+            "loaded on its own, in a hook",
+            "CREATE SECRET (TYPE s3, KEY_ID 'k', SECRET 's');\n",
+            true,
+            &named,
+            &none,
+        ),
+        (
+            "LOAD with no INSTALL",
+            "LOAD httpfs;\n",
+            false,
+            &named,
+            &none,
+        ),
+        (
+            "LOAD with no INSTALL, in a hook",
+            "LOAD httpfs;\n",
+            true,
+            &named,
+            &none,
+        ),
+        (
+            "installed by name and loaded",
+            "INSTALL httpfs;\nLOAD httpfs;\n",
+            false,
+            &named,
+            &named,
+        ),
+        (
+            "built in",
+            "SELECT '{\"a\": 1}'::JSON AS j, 'x' ILIKE 'X' AS i;\n",
+            false,
+            &none,
+            &none,
+        ),
+    ];
+    std::thread::scope(|scope| {
+        for (label, sql, hook, now, before) in cases {
+            for (engine, expected) in [("now", now), ("before", before)] {
+                let home = &home;
+                scope.spawn(move || {
+                    let protocol = step_or_hook(sql, hook);
+                    let run = home.run(&protocol, engine == "before");
+                    assert_eq!(run.code, Some(0), "[{label} / {engine}] {}", run.stderr);
+                    assert_eq!(
+                        &protocol.record()["run"]["engine"]["extensions"],
+                        expected,
+                        "[{label} / {engine}]"
+                    );
+                });
+            }
+        }
+    });
+}
+
+/// A SQL step or hook prints, exits and leaves files as it did before arc asked its process
+/// which extensions it loaded: run on the real DuckDB, and on one that runs it as arc ran it
+/// then, each Protocol gives the same exit code, stdout and stderr, the same files in its
+/// directory and in the file a step's `.output` names, and nothing left in the temporary
+/// directory.
+#[test]
+fn a_sql_step_or_hook_prints_and_exits_as_it_did_before_arc_asked_what_it_loaded() {
+    let home = LoadedHome::new();
+    let cases = [
+        ("passes", "LOAD httpfs;\nSELECT 42 AS answer;\n", 0),
+        (
+            "fails",
+            "LOAD httpfs;\nSELECT 42 AS answer;\nSELECT * FROM nope;\nSELECT 2;\n",
+            2,
+        ),
+        (
+            "ends in .exit",
+            "LOAD httpfs;\nSELECT 42 AS answer;\n.exit\n",
+            0,
+        ),
+        (
+            "leaves .echo on",
+            ".echo on\nLOAD httpfs;\nSELECT 42 AS answer;\n",
+            0,
+        ),
+        (
+            "leaves .output on",
+            ".output out.txt\nLOAD httpfs;\nSELECT 42 AS answer;\n",
+            0,
+        ),
+        (
+            "turns external access off",
+            "LOAD httpfs;\nSELECT 42 AS answer;\nSET enable_external_access = false;\n",
+            0,
+        ),
+        (
+            "leaves .changes on",
+            ".changes on\nLOAD httpfs;\nCREATE OR REPLACE TABLE t AS SELECT 1 AS a;\n",
+            0,
+        ),
+        (
+            "leaves .timer on",
+            ".timer on\nLOAD httpfs;\nSELECT 42 AS answer;\n",
+            0,
+        ),
+        (
+            "makes a macro named duckdb_extensions",
+            "CREATE OR REPLACE MACRO duckdb_extensions() AS TABLE SELECT 1 AS x;\nLOAD httpfs;\nSELECT 42 AS answer;\n",
+            0,
+        ),
+    ];
+    std::thread::scope(|scope| {
+        for (label, sql, code) in cases {
+            for hook in [false, true] {
+                let home = &home;
+                scope.spawn(move || {
+                    let label = format!("{label}{}", if hook { ", in a hook" } else { "" });
+                    let now = step_or_hook(sql, hook);
+                    let before = step_or_hook(sql, hook);
+                    let (ran, ran_before) = (home.run(&now, false), home.run(&before, true));
+                    // A failed hook leaves a run that succeeded at exit 0.
+                    let code = if hook { 0 } else { code };
+                    assert_eq!(
+                        ran_before.code,
+                        Some(code),
+                        "[{label}] {}",
+                        ran_before.stderr
+                    );
+                    assert_eq!(ran.code, ran_before.code, "[{label}] {}", ran.stderr);
+                    assert_eq!(ran.stdout, ran_before.stdout, "[{label}]");
+                    assert_eq!(ran.stderr, ran_before.stderr, "[{label}]");
+                    assert_eq!(now.files(), before.files(), "[{label}]");
+                });
+            }
+        }
+    });
+}
+
+/// Step `i` installs spatial by name, and step `s` loads httpfs.
+const INSTALLS_THEN_LOADS: &str = "name: loaded\ndb: loaded.duckdb\nsteps:\n  - name: i\n    sql: models/i.sql\n  - name: s\n    sql: models/s.sql\n";
+
+/// A step whose process gives no answer, and one that fails, record what they recorded before
+/// arc asked: the run's outcome and exit code are the same, a step that passed is recorded as
+/// passed, and the record names each extension the SQL installs by name, as it did then, and no
+/// extension the step loaded. Two settings that refuse the question print DuckDB's refusal to
+/// stderr, and nothing else changes.
+#[test]
+fn a_step_that_gives_no_answer_or_fails_is_recorded_as_it_was_before() {
+    let home = LoadedHome::new();
+    // An extension the first step installs by name. The file is not an extension and nothing
+    // loads it; DuckDB finds it where it keeps spatial and installs nothing.
+    fs::write(home.keep.join("spatial.duckdb_extension"), b"not spatial").unwrap();
+    let spatial = serde_json::json!([{
+        "name": "spatial",
+        "repository": null,
+        "version": null,
+        "sha256": sha256(&home.keep.join("spatial.duckdb_extension")),
+    }]);
+    let cases = [
+        (
+            "turns external access off",
+            "LOAD httpfs;\nSELECT 42 AS answer;\nSET enable_external_access = false;\n",
+            0,
+            "success",
+            None,
+        ),
+        (
+            "fails",
+            "LOAD httpfs;\nSELECT * FROM nope;\n",
+            2,
+            "partial",
+            None,
+        ),
+        (
+            "turns the local file system off",
+            "LOAD httpfs;\nSELECT 42 AS answer;\nSET disabled_filesystems = 'LocalFileSystem';\n",
+            0,
+            "success",
+            Some(
+                "Permission Error: File system LocalFileSystem has been disabled by configuration\n",
+            ),
+        ),
+        (
+            "leaves .safe_mode on",
+            "LOAD httpfs;\nSELECT 42 AS answer;\n.safe_mode\n",
+            0,
+            "success",
+            Some(".output/.once/.excel cannot be used in -safe mode\n"),
+        ),
+    ];
+    std::thread::scope(|scope| {
+        for (label, sql, code, outcome, refusal) in cases {
+            let (home, spatial) = (&home, &spatial);
+            scope.spawn(move || {
+                let protocol = || {
+                    Protocol::with(
+                        INSTALLS_THEN_LOADS,
+                        &[
+                            ("models/i.sql".to_string(), "INSTALL spatial;\n"),
+                            ("models/s.sql".to_string(), sql),
+                        ],
+                    )
+                };
+                let (now, before) = (protocol(), protocol());
+                let (ran, ran_before) = (home.run(&now, false), home.run(&before, true));
+                assert_eq!(
+                    ran_before.code,
+                    Some(code),
+                    "[{label}] {}",
+                    ran_before.stderr
+                );
+                assert_eq!(ran.code, ran_before.code, "[{label}] {}", ran.stderr);
+                assert_eq!(ran.stdout, ran_before.stdout, "[{label}]");
+                match refusal {
+                    None => assert_eq!(ran.stderr, ran_before.stderr, "[{label}]"),
+                    Some(refusal) => assert_eq!(
+                        ran.stderr.replacen(refusal, "", 1),
+                        ran_before.stderr,
+                        "[{label}] DuckDB's refusal, once, and nothing else: {}",
+                        ran.stderr
+                    ),
+                }
+                let recorded = now.recorded();
+                assert_eq!(recorded, before.recorded(), "[{label}]");
+                assert_eq!(recorded["outcome"], outcome, "[{label}]");
+                assert_eq!(&recorded["extensions"], spatial, "[{label}]");
+                let passed = serde_json::json!({ "state": "success", "skip_reason": null });
+                assert_eq!(
+                    recorded["steps"][0],
+                    serde_json::json!(["i", passed]),
+                    "[{label}]"
+                );
+                if code == 0 {
+                    assert_eq!(
+                        recorded["steps"][1],
+                        serde_json::json!(["s", passed]),
+                        "[{label}]"
+                    );
+                }
+            });
+        }
+    });
+}
