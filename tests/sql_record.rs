@@ -560,6 +560,16 @@ fn a_request_arc_cannot_record_is_refused_with_the_directory_untouched() {
             vec!["load_orders"],
         ),
         (
+            "a name YAML would read as a comment",
+            vec!["sql", "record", BY_AMOUNT, "--name", "by # amount"],
+            vec!["by # amount", "'#'"],
+        ),
+        (
+            "a name YAML would read as a mapping",
+            vec!["sql", "record", BY_AMOUNT, "--name", "by:amount"],
+            vec!["by:amount", "':'"],
+        ),
+        (
             "an empty description",
             vec![
                 "sql",
