@@ -143,6 +143,30 @@ fn the_condition_is_the_text_as_typed() {
 }
 
 #[test]
+fn a_filter_of_a_table_named_with_a_reserved_word_in_quotes_is_filter_rows() {
+    // `order` and `ORDER` are words DuckDB does not read as a table bare, so a
+    // filter of one is typed with the name in quotes, and is the operation whose
+    // step writes the name so.
+    for (sql, on) in [
+        ("SELECT * FROM \"order\" WHERE amount > 100", "order"),
+        ("SELECT * FROM \"ORDER\" WHERE amount > 100", "ORDER"),
+        ("FROM \"order\" WHERE amount > 100", "order"),
+    ] {
+        assert_eq!(
+            recognise(sql),
+            filter_rows(on, "amount > 100"),
+            "what {sql:?} is read as"
+        );
+    }
+    // `data` is read bare as a table, so the step writes it bare and a filter
+    // typed with it bare is the same operation.
+    assert_eq!(
+        recognise("SELECT * FROM data WHERE amount > 100"),
+        filter_rows("data", "amount > 100")
+    );
+}
+
+#[test]
 fn a_statement_that_is_not_a_filter_of_a_table_is_read_as_no_operation() {
     for sql in [
         // A column list, an order, a limit, `DISTINCT` and `EXCLUDE`.
@@ -164,8 +188,8 @@ fn a_statement_that_is_not_a_filter_of_a_table_is_read_as_no_operation() {
         "CREATE TABLE x AS SELECT 1",
         // A `WINDOW` clause, which DuckDB's tree does not show.
         "SELECT * FROM orders WHERE amount > 100 WINDOW w AS (ORDER BY id)",
-        // A table whose recorded step would not parse: `FROM order`.
-        "SELECT * FROM \"order\" WHERE amount > 100",
+        // A reserved word's table in a schema, which no step of the operation reads.
+        "SELECT * FROM main.\"order\" WHERE amount > 100",
         // A filter with an order or a limit, its condition in parentheses that
         // hold a comment ending in `where`, and a comment before a later `)`.
         "SELECT * FROM orders WHERE ( -- where\namount > 100) ORDER BY (amount -- c\n)",

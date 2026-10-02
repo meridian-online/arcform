@@ -105,6 +105,46 @@ impl Protocol {
         }
     }
 
+    /// A Protocol whose one step makes the table `table`, written in quotes, holding
+    /// the rows `orders` holds. The name is the caller's to choose from the words
+    /// DuckDB does and does not read as a table bare.
+    fn making(table: &str) -> Self {
+        let protocol = Self::new();
+        std::fs::write(
+            protocol.dir.join("models/01_orders.sql"),
+            ORDERS_SQL.replacen("TABLE orders", &format!("TABLE \"{table}\""), 1),
+        )
+        .unwrap();
+        protocol
+    }
+
+    /// `arc operation record <operation> --on <on> --name <name> --arg <arg>`.
+    fn record_on(&self, operation: &str, on: &str, name: &str, arg: &str) -> Output {
+        self.arc(&[
+            "operation",
+            "record",
+            operation,
+            "--on",
+            on,
+            "--name",
+            name,
+            "--arg",
+            arg,
+        ])
+    }
+
+    /// The `id` of each row of `table` in the database `arc run` made, in the
+    /// order a plain `SELECT` returns them.
+    fn ids(&self, table: &str) -> Vec<i32> {
+        let db = duckdb::Connection::open(self.dir.join("shop.duckdb")).expect("open shop.duckdb");
+        let mut statement = db.prepare(&format!("SELECT id FROM \"{table}\"")).unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
     /// Run the real `arc` binary with `args` in the Protocol's directory.
     fn arc(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_arc"))
@@ -529,6 +569,123 @@ fn arc_run_puts_the_rows_in_the_order_the_sort_stored() {
         [3, 2, 4, 1],
         "by_amount holds every row of orders once, in descending order of amount"
     );
+}
+
+// ------------------------------------------------- a table DuckDB does not read bare
+
+#[test]
+fn a_filter_recorded_on_a_table_named_with_a_reserved_word_is_written_with_the_name_in_quotes_and_runs()
+ {
+    let protocol = Protocol::making("order");
+    ok(
+        &protocol.record_on("filter-rows", "order", "big_order", "where=amount > 100"),
+        "arc operation record filter-rows",
+    );
+    assert_eq!(
+        protocol.read("models/02_big_order.sql"),
+        "\
+-- generated: filter-rows on order
+CREATE OR REPLACE TABLE \"big_order\" AS
+SELECT *
+FROM \"order\"
+WHERE amount > 100;
+",
+        "the table is written in quotes, as DuckDB reads it"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    let mut kept = protocol.ids("big_order");
+    kept.sort();
+    assert_eq!(protocol.ids("order"), [1, 2, 3, 4]);
+    assert_eq!(
+        kept,
+        [2, 3],
+        "big_order holds the rows of order whose amount is over 100, and no other"
+    );
+}
+
+#[test]
+fn a_sort_recorded_on_a_table_named_with_a_reserved_word_is_written_with_the_name_in_quotes_and_runs()
+ {
+    let protocol = Protocol::making("order");
+    ok(
+        &protocol.record_on("sort-rows", "order", "by_amount", "order_by=amount DESC"),
+        "arc operation record sort-rows",
+    );
+    assert_eq!(
+        protocol.read("models/02_by_amount.sql"),
+        "\
+-- generated: sort-rows on order
+CREATE OR REPLACE TABLE \"by_amount\" AS
+SELECT *
+FROM \"order\"
+ORDER BY amount DESC;
+",
+        "the table is written in quotes, as DuckDB reads it"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    assert_eq!(
+        protocol.ids("by_amount"),
+        [3, 2, 4, 1],
+        "by_amount holds each row of order, in descending order of amount"
+    );
+}
+
+#[test]
+fn a_table_named_with_a_reserved_word_in_capitals_is_quoted_as_it_was_asked_for() {
+    // `--on ORDER` finds the table `order` as `--on order` does, and the step
+    // writes the name as given, in quotes, which DuckDB reads case-blind.
+    let protocol = Protocol::making("order");
+    ok(
+        &protocol.record_on("filter-rows", "ORDER", "big_order", "where=amount > 100"),
+        "arc operation record filter-rows --on ORDER",
+    );
+    assert!(
+        protocol
+            .read("models/02_big_order.sql")
+            .contains("\nFROM \"ORDER\"\n"),
+        "the model is:\n{}",
+        protocol.read("models/02_big_order.sql")
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    let mut kept = protocol.ids("big_order");
+    kept.sort();
+    assert_eq!(kept, [2, 3]);
+}
+
+#[test]
+fn a_table_duckdb_reads_bare_is_written_bare() {
+    // `data` is a word DuckDB lists as a keyword and reads as a table bare, so the
+    // step is written as it is for any ordinary table, with no quotes.
+    let protocol = Protocol::making("data");
+    ok(
+        &protocol.record_on("filter-rows", "data", "big_data", "where=amount > 100"),
+        "arc operation record filter-rows",
+    );
+    assert_eq!(
+        protocol.read("models/02_big_data.sql"),
+        "\
+-- generated: filter-rows on data
+CREATE OR REPLACE TABLE \"big_data\" AS
+SELECT *
+FROM data
+WHERE amount > 100;
+"
+    );
+    ok(
+        &protocol.record_on("sort-rows", "data", "by_amount", "order_by=amount DESC"),
+        "arc operation record sort-rows",
+    );
+    assert!(
+        protocol
+            .read("models/03_by_amount.sql")
+            .contains("\nFROM data\n"),
+        "the sort's model is:\n{}",
+        protocol.read("models/03_by_amount.sql")
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    let mut kept = protocol.ids("big_data");
+    kept.sort();
+    assert_eq!(kept, [2, 3]);
 }
 
 #[test]
