@@ -9,9 +9,8 @@ use crate::asset::{AssetGraph, StepAssets};
 use crate::asset_kind::AssetKind;
 use crate::contract;
 use crate::engine::{
-    ALLOW_UNTESTED_ENGINE_ENV, Engine, ExtensionRecheck, LoadedExtensions, ProtocolSql,
-    SUPPORTED_ENGINE_RANGE, check_extension_installs, check_extension_pins, protocol_sql,
-    recheck_extension_pins,
+    ALLOW_UNTESTED_ENGINE_ENV, Engine, ExtensionRecheck, ProtocolSql, SUPPORTED_ENGINE_RANGE,
+    check_extension_installs, check_extension_pins, protocol_sql, recheck_extension_pins,
 };
 use crate::error::{Error, Result};
 use crate::manifest::{Manifest, Param, RetryPolicy};
@@ -97,14 +96,13 @@ fn execute_hook(
     hook: &crate::manifest::Step,
     engine: &dyn Engine,
     extensions: &mut ExtensionRecheck,
-    loaded: &mut LoadedExtensions,
     db_path: &Path,
     dir: &Path,
     env: &HashMap<String, String>,
 ) -> Result<()> {
     if let Some(source) = ProtocolSql::hook(slot, hook, dir) {
         check_again(extensions, engine, &source)?;
-        engine.execute_sql(db_path, &source.path, env, None, loaded)?;
+        engine.execute_sql(db_path, &source.path, env, None, extensions.loaded_mut())?;
     } else if let Some(ref command) = hook.command {
         engine.execute_command(command, env, false, None)?;
     }
@@ -224,8 +222,6 @@ pub fn run_with_params(
     // hook's file just before it runs; and the pinned extensions each check installed and
     // found equal to their pins, hashed again when the run ends.
     let mut extensions = ExtensionRecheck::default();
-    // Each extension DuckDB reports loaded in the process of a SQL step or hook that passed.
-    let mut loaded = LoadedExtensions::default();
 
     // If there are SQL steps, verify the engine is available and check its version.
     if manifest.has_sql_steps() {
@@ -373,7 +369,6 @@ pub fn run_with_params(
             init_hook,
             engine,
             &mut extensions,
-            &mut loaded,
             &db_path,
             dir,
             &env_map,
@@ -397,7 +392,6 @@ pub fn run_with_params(
                     exit_hook,
                     engine,
                     &mut extensions,
-                    &mut loaded,
                     &db_path,
                     dir,
                     &exit_env,
@@ -543,7 +537,7 @@ pub fn run_with_params(
                             &source.path,
                             &env_map,
                             step_timeout,
-                            &mut loaded,
+                            extensions.loaded_mut(),
                         )
                     })
                 } else if let Some(ref op_ref) = step.op {
@@ -744,7 +738,6 @@ pub fn run_with_params(
                     success_hook,
                     engine,
                     &mut extensions,
-                    &mut loaded,
                     &db_path,
                     dir,
                     &env_map,
@@ -795,7 +788,6 @@ pub fn run_with_params(
                     failure_hook,
                     engine,
                     &mut extensions,
-                    &mut loaded,
                     &db_path,
                     dir,
                     &failure_env,
@@ -852,7 +844,6 @@ pub fn run_with_params(
             exit_hook,
             engine,
             &mut extensions,
-            &mut loaded,
             &db_path,
             dir,
             &exit_env,
@@ -908,7 +899,7 @@ pub fn run_with_params(
         contract::steps_engine(
             engine.report(extensions.recorded()),
             extensions.recorded(),
-            &loaded,
+            extensions.loaded(),
         )
     });
     let run_contract = contract::build_contract(contract::ContractInputs {

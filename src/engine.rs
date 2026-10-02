@@ -1795,6 +1795,9 @@ pub(crate) struct ExtensionRecheck {
     recorded: Vec<String>,
     /// Each pinned extension a check installed and found equal to its pin.
     pinned: Vec<PinnedExtension>,
+    /// Each extension DuckDB reported loaded in the process of a SQL step or hook that passed,
+    /// which the run record names after `recorded`.
+    loaded: LoadedExtensions,
     /// Each warning printed so far.
     warned: HashSet<String>,
     pins: ExtensionPins,
@@ -1816,6 +1819,7 @@ impl ExtensionRecheck {
             installed: installs.installed,
             recorded: installs.recorded,
             pinned,
+            loaded: LoadedExtensions::default(),
             warned: installs.warnings.into_iter().chain(pin_warnings).collect(),
             pins: pins.clone(),
             engine_version: engine_version.cloned(),
@@ -1833,6 +1837,17 @@ impl ExtensionRecheck {
     /// record names first, before each other extension a step's process reports it loaded.
     pub(crate) fn recorded(&self) -> &[String] {
         &self.recorded
+    }
+
+    /// Each extension DuckDB reported loaded in the process of a SQL step or hook that passed:
+    /// the extensions the run record names after [`Self::recorded`].
+    pub(crate) fn loaded(&self) -> &LoadedExtensions {
+        &self.loaded
+    }
+
+    /// What a SQL step or hook adds each extension its process reported loaded to.
+    pub(crate) fn loaded_mut(&mut self) -> &mut LoadedExtensions {
+        &mut self.loaded
     }
 
     /// Just before the step or hook `source` names runs: read its file again, refuse it on
