@@ -15,6 +15,9 @@
 //!   the same bytes from either.
 //! - `sql_recognise` answers what arc reads a SQL statement as: the object `arc sql
 //!   recognise` prints, both read through the one reader in `record`.
+//! - `sql_record` records a SQL statement as a new step of a Protocol, through the
+//!   same record path `arc sql record` takes, so the same statement writes the same
+//!   bytes from either.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -340,6 +343,62 @@ fn sql_recognise_schema() -> Value {
     })
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// sql_record
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Record a SQL statement as a new step at the end of a Protocol.
+///
+/// The request is handed to the record path `arc sql record` takes, which reads
+/// the statement as `sql_recognise` does and writes the step; nothing here names
+/// an operation. `dir` defaults to `.`, the server's working directory, as
+/// `--dir` does, and `description` is absent for a step with none. The result
+/// names the step, the model, and under `operation` the long name of the
+/// operation the statement was recorded as, `null` for a SQL step, with the
+/// table it was applied to under `on`. A refusal is an error result naming what
+/// was wrong, with the Protocol's directory untouched.
+fn sql_record(args: &Value) -> ToolResult {
+    let dir = PathBuf::from(args.get("dir").and_then(Value::as_str).unwrap_or("."));
+    let sql = required_string(args, "sql")?;
+    let name = required_string(args, "name")?;
+    let description = match args.get("description") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(description)) => Some(description.as_str()),
+        Some(other) => return Err(format!("`description` must be a string, not {other}")),
+    };
+    let history = open_history()?;
+    let request = crate::record::SqlRequest {
+        sql,
+        name,
+        description,
+    };
+    let recorded =
+        crate::record::record_sql(&dir, &request, &history).map_err(|e| e.to_string())?;
+    let (operation, on) = match recorded.operation {
+        Some((operation, on)) => (json!(operation), json!(on)),
+        None => (Value::Null, Value::Null),
+    };
+    Ok(ToolOutput::json(json!({
+        "step": name,
+        "model": recorded.model.display().to_string(),
+        "operation": operation,
+        "on": on,
+    })))
+}
+
+fn sql_record_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "sql": { "type": "string", "description": "One SQL statement, as typed." },
+            "name": { "type": "string", "description": "The new step's name, which is also the name of the table it makes when the statement is a SELECT or a filter." },
+            "description": { "type": "string", "description": "One line saying what the step does and why, written on the step for the person who reads the Protocol next." },
+            "dir": { "type": "string", "description": "Protocol directory (where arcform.yaml lives). Defaults to the current directory." }
+        },
+        "required": ["sql", "name"]
+    })
+}
+
 /// The tools native to `arc`.
 pub(super) fn tools() -> Vec<ToolDef> {
     vec![
@@ -372,6 +431,12 @@ pub(super) fn tools() -> Vec<ToolDef> {
             description: "Answer what arc reads one SQL statement as: the operation arc holds that it is, with `operation`, `on` and `arguments` as operation_record takes them, or `operation` null when it is none. Read from DuckDB's own parse; writes no file and runs nothing.",
             input_schema: sql_recognise_schema,
             handler: sql_recognise,
+        },
+        ToolDef {
+            name: "sql_record",
+            description: "Record one SQL statement as a new step at the end of a Protocol. A statement sql_recognise reads as an operation is recorded as the step operation_record writes for it; any other statement DuckDB parses is recorded as a SQL step, whose model has no `-- generated:` line, so arc does not rewrite it: for a SELECT the model's first line is `CREATE OR REPLACE TABLE \"<name>\" AS` and the statement as typed follows it, so the step makes a table of its name when it runs. Writes the step; runs nothing.",
+            input_schema: sql_record_schema,
+            handler: sql_record,
         },
     ]
 }

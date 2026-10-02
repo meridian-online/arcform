@@ -162,6 +162,20 @@ pub fn record_step(dir: &Path, step: &RecordedStep) -> Result<(PathBuf, Validate
 /// refuse every value they can name, so a test reaches the read-back check
 /// only by calling this with a value they would have refused.
 fn record_gated(dir: &Path, step: &RecordedStep) -> Result<(PathBuf, ValidatedSpec)> {
+    write_recorded(dir, step, &model_contents(&step.provenance, &step.sql))
+}
+
+/// [`record_gated`]'s order — the splice applied and checked in memory, the
+/// model written where no file exists, the manifest written atomically, the
+/// model removed if that write fails — with the bytes of the model given as
+/// `contents`. Of `step` it reads the name and the description: its `sql` and
+/// `provenance` are not written, so a caller that writes other bytes than
+/// [`model_contents`] makes puts them in `contents` and leaves those two empty.
+fn write_recorded(
+    dir: &Path,
+    step: &RecordedStep,
+    contents: &str,
+) -> Result<(PathBuf, ValidatedSpec)> {
     let manifest_path = dir.join(MANIFEST_FILENAME);
     if !manifest_path.exists() {
         return Err(Error::ManifestNotFound);
@@ -220,10 +234,7 @@ fn record_gated(dir: &Path, step: &RecordedStep) -> Result<(PathBuf, ValidatedSp
 
     let models_dir_created = !models_abs.exists();
     std::fs::create_dir_all(&models_abs)?;
-    if let Err(e) = write_atomic(
-        &sql_abs,
-        model_contents(&step.provenance, &step.sql).as_bytes(),
-    ) {
+    if let Err(e) = write_atomic(&sql_abs, contents.as_bytes()) {
         remove_orphan_model(&sql_abs, &models_abs, models_dir_created);
         return Err(e);
     }
@@ -588,7 +599,7 @@ pub(crate) struct Operation {
 
 /// What a statement read as an operation is read to: the table the operation
 /// is applied to, and its arguments.
-type Reading = (String, serde_json::Value);
+type Reading = (String, serde_json::Map<String, serde_json::Value>);
 
 /// What an operation's SQL is written from: the new step's name, which is also
 /// the name of the table the step makes; the table the operation is applied to,
@@ -857,7 +868,10 @@ fn filter_rows_recognised(statement: &Statement) -> Option<Reading> {
                 statement.reads_as(&filter_rows_query(on, &enclosed))
                     && statement.reads_as(&filter_rows_query(on, condition))
             })
-            .map(|condition| (on.to_string(), serde_json::json!({ "where": condition })))
+            .map(|condition| {
+                let arguments = [("where".to_string(), condition.into())];
+                (on.to_string(), arguments.into_iter().collect())
+            })
     })
 }
 
@@ -1056,6 +1070,21 @@ pub(crate) fn describe(name: &str) -> Option<serde_json::Value> {
 /// counted by [`duckdb_statement_count`]; and, from [`Statement::parse`], a
 /// DuckDB library that gives no tree.
 pub(crate) fn recognise(sql: &str) -> Result<serde_json::Value> {
+    Ok(match read_as_operation(sql)? {
+        Some((operation, (on, arguments))) => serde_json::json!({
+            "operation": operation,
+            "on": on,
+            "arguments": arguments,
+        }),
+        None => serde_json::json!({ "operation": null }),
+    })
+}
+
+/// The operation `sql` is read as, by its long name, with the [`Reading`] —
+/// the table and the arguments — or `None` when it is read as none. The one
+/// reading [`recognise`] answers from and [`record_sql`] records on, refused as
+/// [`recognise`] describes.
+fn read_as_operation(sql: &str) -> Result<Option<(&'static str, Reading)>> {
     match duckdb_statement_count(sql) {
         1 => {}
         0 => {
@@ -1076,15 +1105,11 @@ pub(crate) fn recognise(sql: &str) -> Result<serde_json::Value> {
         let Some(recognised) = op.recognised else {
             continue;
         };
-        if let Some((on, arguments)) = recognised(&statement) {
-            return Ok(serde_json::json!({
-                "operation": op.long_name,
-                "on": on,
-                "arguments": arguments,
-            }));
+        if let Some(reading) = recognised(&statement) {
+            return Ok(Some((op.long_name, reading)));
         }
     }
-    Ok(serde_json::json!({ "operation": null }))
+    Ok(None)
 }
 
 /// One SQL statement as typed and DuckDB's tree of it, with the connection the
@@ -1242,6 +1267,151 @@ pub(crate) fn record_operation(
     };
     let (sql_rel, _) = crate::history::record_step_with_history(dir, &step, history)?;
     Ok(sql_rel)
+}
+
+// ------------------------------------------------- recording a SQL statement
+
+/// What a caller asks [`record_sql`] to record. The command line and `arc mcp`
+/// each build one from what they were given and hand it over unchanged.
+#[derive(Clone, Copy)]
+pub(crate) struct SqlRequest<'a> {
+    /// One SQL statement, as typed.
+    pub(crate) sql: &'a str,
+    /// The new step's name. It is also the name of the table the step makes,
+    /// for a statement read as an operation and for a `SELECT`.
+    pub(crate) name: &'a str,
+    /// The step's `description:`, or `None` for a step with none.
+    pub(crate) description: Option<&'a str>,
+}
+
+/// What [`record_sql`] recorded a statement as.
+pub(crate) struct SqlRecorded {
+    /// The model's path, relative to the protocol's directory.
+    pub(crate) model: PathBuf,
+    /// The operation the statement was recorded as and the table it was applied
+    /// to, or `None` when it was recorded as a SQL step.
+    pub(crate) operation: Option<(&'static str, String)>,
+}
+
+/// A step whose model's bytes are given: what [`record_sql_step`] writes.
+#[derive(Clone, Copy)]
+pub(crate) struct SqlStep<'a> {
+    /// The step's name, as [`RecordedStep::name`] is gated.
+    pub(crate) name: &'a str,
+    /// The step's `description:`, or `None` for a step with none.
+    pub(crate) description: Option<&'a str>,
+    /// The bytes of the model, written as given.
+    pub(crate) contents: &'a str,
+}
+
+/// Record the SQL statement `request.sql` as a new step named `request.name` at
+/// the end of the protocol at `dir`, with `request.description` as its
+/// `description:` when one is given, and say what it was recorded as.
+///
+/// A statement [`recognise`] reads as an operation is recorded by
+/// [`record_operation`], on the table and with the arguments of that reading, so
+/// it leaves the bytes the same request for that operation leaves, whichever way
+/// it was asked for. Any other statement DuckDB parses is recorded as a SQL step:
+/// a model of the bytes [`sql_step_contents`] makes, which carries no
+/// [`GENERATED_MARKER`], so [`amend_step_sql`] reads it as the analyst's own text
+/// and refuses to rewrite it. Either way the step is recorded through local
+/// history and nothing runs.
+///
+/// Refused, with the protocol's directory untouched: text DuckDB cannot parse and
+/// text it splits into more than one statement (see [`recognise`]); a statement
+/// read as an operation that [`record_operation`] refuses, a table no step makes
+/// among them; a step name or a description the record path refuses; and a
+/// statement [`sql_step_contents`] refuses. Each refusal's message names what was
+/// wrong.
+pub(crate) fn record_sql(
+    dir: &Path,
+    request: &SqlRequest,
+    history: &crate::history::LocalHistory,
+) -> Result<SqlRecorded> {
+    let SqlRequest {
+        sql,
+        name,
+        description,
+    } = *request;
+    if let Some((long_name, (on, arguments))) = read_as_operation(sql)? {
+        let operation = OperationRequest {
+            long_name,
+            on: &on,
+            name,
+            arguments: &arguments,
+            description,
+        };
+        let model = record_operation(dir, &operation, history)?;
+        return Ok(SqlRecorded {
+            model,
+            operation: Some((long_name, on)),
+        });
+    }
+    let contents = sql_step_contents(name, sql)?;
+    let step = SqlStep {
+        name,
+        description,
+        contents: &contents,
+    };
+    let (model, _) = crate::history::record_sql_step_with_history(dir, &step, history)?;
+    Ok(SqlRecorded {
+        model,
+        operation: None,
+    })
+}
+
+/// [`record_step`] for a model whose bytes are given: the same gates on the name
+/// and the description, the same order of writes, and no marker line.
+pub(crate) fn record_sql_step(dir: &Path, step: &SqlStep) -> Result<(PathBuf, ValidatedSpec)> {
+    valid_step_name(step.name)?;
+    if let Some(description) = step.description {
+        valid_description(description)?;
+    }
+    let recorded = RecordedStep {
+        name: step.name.to_string(),
+        sql: String::new(),
+        provenance: String::new(),
+        description: step.description.map(str::to_string),
+    };
+    write_recorded(dir, &recorded, step.contents)
+}
+
+/// The bytes of the model of a SQL step recorded from `sql`, one statement as
+/// typed, for the step `name`.
+///
+/// The statement is written as typed, then one final newline when it ends in
+/// none. Where `CREATE OR REPLACE TABLE "<name>" AS`, a line and a newline, in
+/// front of the statement is text DuckDB parses, the line is written first, so
+/// the step makes a table of the step's name when it runs: a bare `SELECT` runs
+/// and prints its rows and makes no table. That is each `SELECT` DuckDB reads, a
+/// `WITH` and a statement that opens with `FROM` among them. A statement the line
+/// cannot go in front of — a `CREATE TABLE`, an `UPDATE`, a `DESCRIBE` — is
+/// written as typed, and what it makes, it makes itself. It is DuckDB's parse of
+/// the line and the statement together that decides, and not whether DuckDB
+/// gives the statement a tree: it gives one for a `DESCRIBE`, which the line
+/// cannot go in front of.
+///
+/// No `-- generated:` line is written: that line licenses [`amend_step_sql`] to
+/// rewrite a file, and the statement is the analyst's own text. So a statement
+/// written as typed whose own first line opens with it is refused, since the file
+/// would read as one arc may rewrite.
+fn sql_step_contents(name: &str, sql: &str) -> Result<String> {
+    let tabled = format!("CREATE OR REPLACE TABLE {} AS\n{sql}", quote_ident(name));
+    let mut contents = if duckdb_statement_count(&tabled) == 1 {
+        tabled
+    } else {
+        sql.to_string()
+    };
+    if !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    if sql_is_generated(&contents) {
+        return Err(refused(format!(
+            "the statement opens with `{GENERATED_MARKER}`, the line that marks a file arc may \
+             rewrite, and arc does not write the analyst's own text under it; remove the line"
+        )));
+    }
+    Ok(contents)
 }
 
 impl Operation {
@@ -1668,6 +1838,73 @@ mod tests {
                 "{what}: a model was written"
             );
         }
+    }
+
+    #[test]
+    fn a_sql_step_gets_the_line_where_the_line_and_the_statement_parse() {
+        for (sql, expected) in [
+            // Each form of `SELECT`: bare, ended by a `;`, with a trailing comment,
+            // a `WITH`, and a statement that opens with `FROM`.
+            ("SELECT 1", "CREATE OR REPLACE TABLE \"t\" AS\nSELECT 1\n"),
+            ("SELECT 1;", "CREATE OR REPLACE TABLE \"t\" AS\nSELECT 1;\n"),
+            (
+                "SELECT 1 -- one",
+                "CREATE OR REPLACE TABLE \"t\" AS\nSELECT 1 -- one\n",
+            ),
+            (
+                "WITH x AS (SELECT 1) SELECT * FROM x",
+                "CREATE OR REPLACE TABLE \"t\" AS\nWITH x AS (SELECT 1) SELECT * FROM x\n",
+            ),
+            (
+                "FROM orders SELECT id",
+                "CREATE OR REPLACE TABLE \"t\" AS\nFROM orders SELECT id\n",
+            ),
+            // A final newline the statement has is the one it keeps.
+            ("SELECT 1\n", "CREATE OR REPLACE TABLE \"t\" AS\nSELECT 1\n"),
+            // A statement the line cannot go in front of is written as typed, with
+            // one final newline: DuckDB gives a tree for `DESCRIBE` and the line
+            // before it is a parser error.
+            (
+                "CREATE TABLE t2 AS SELECT 1",
+                "CREATE TABLE t2 AS SELECT 1\n",
+            ),
+            (
+                "UPDATE orders SET amount = 0",
+                "UPDATE orders SET amount = 0\n",
+            ),
+            ("DESCRIBE orders", "DESCRIBE orders\n"),
+            ("SHOW TABLES\n", "SHOW TABLES\n"),
+        ] {
+            assert_eq!(
+                sql_step_contents("t", sql).expect("the statement is recorded"),
+                expected,
+                "{sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_line_quotes_a_name_that_would_read_as_sql() {
+        assert_eq!(
+            sql_step_contents("a\"b c", "SELECT 1").unwrap(),
+            "CREATE OR REPLACE TABLE \"a\"\"b c\" AS\nSELECT 1\n"
+        );
+    }
+
+    #[test]
+    fn a_statement_written_as_typed_never_opens_with_the_generated_line() {
+        for sql in [
+            "-- generated: mine\nUPDATE orders SET amount = 0",
+            "  -- generated: mine\nDESCRIBE orders",
+        ] {
+            let refusal = sql_step_contents("t", sql)
+                .expect_err("refused")
+                .to_string();
+            assert!(refusal.contains("-- generated:"), "{sql:?}: {refusal}");
+        }
+        // A `SELECT`'s file opens with the line arc adds, so it never reads so.
+        let contents = sql_step_contents("t", "-- generated: mine\nSELECT 1").unwrap();
+        assert!(!sql_is_generated(&contents), "{contents:?}");
     }
 
     #[test]

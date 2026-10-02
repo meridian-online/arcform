@@ -52,7 +52,9 @@ const INSTRUCTIONS: &str = "arc — a local-first data-pipeline engine, exposed 
     given an operation's long name or an operator's name, describes what its step reads, \
     writes and takes; operation_record records an operation as a new step of a Protocol; \
     sql_recognise answers what arc reads a SQL statement as: an operation it holds, with \
-    the table and the arguments operation_record takes, or none.";
+    the table and the arguments operation_record takes, or none; sql_record records a \
+    SQL statement as a new step of a Protocol, as the operation it is read as or else as a \
+    SQL step, and runs nothing.";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool result shapes
@@ -309,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_registers_all_ten_tools() {
+    fn tools_list_registers_all_eleven_tools() {
         let listed = tools_list();
         let names: Vec<&str> = listed["tools"]
             .as_array()
@@ -328,13 +330,14 @@ mod tests {
             "operation_describe",
             "operation_record",
             "sql_recognise",
+            "sql_record",
         ] {
             assert!(
                 names.contains(&expected),
                 "missing tool `{expected}` in {names:?}"
             );
         }
-        assert_eq!(names.len(), 10, "unexpected tool set: {names:?}");
+        assert_eq!(names.len(), 11, "unexpected tool set: {names:?}");
         // Every tool advertises an object input schema.
         for tool in listed["tools"].as_array().unwrap() {
             assert!(tool["description"].is_string());
@@ -411,6 +414,7 @@ mod tests {
             "operation_describe",
             "operation_record",
             "sql_recognise",
+            "sql_record",
         ] {
             assert!(instructions.contains(tool), "instructions omit `{tool}`");
         }
