@@ -16,6 +16,7 @@
 //!      `my-arcform.yaml`, raises no line;
 //!   5. **an agent is told** — `arc mcp`'s `protocol_run` carries the same warning.
 
+#[allow(dead_code)]
 mod common;
 
 use std::path::Path;
