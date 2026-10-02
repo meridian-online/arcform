@@ -147,8 +147,15 @@ impl Protocol {
 
     /// Run the real `arc` binary with `args` in the Protocol's directory.
     fn arc(&self, args: &[&str]) -> Output {
+        self.arc_from(&self.dir, args)
+    }
+
+    /// Run the real `arc` binary with `args` in `cwd`, with this Protocol's
+    /// history store: the directory arc is run from is not this Protocol's, and
+    /// a `--dir` names it.
+    fn arc_from(&self, cwd: &Path, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_arc"))
-            .current_dir(&self.dir)
+            .current_dir(cwd)
             .env("ARCFORM_HISTORY_DIR", &self.history)
             .args(args)
             .output()
@@ -571,6 +578,58 @@ fn arc_run_puts_the_rows_in_the_order_the_sort_stored() {
     );
 }
 
+// ------------------------------------------------- the directory `--dir` names
+
+#[test]
+fn an_operation_recorded_with_dir_from_another_directory_leaves_the_bytes_it_leaves_run_inside_it()
+{
+    // `elsewhere` is a Protocol of its own, so a verb that reads the working
+    // directory in place of `--dir` records there and exits 0.
+    for (operation, name, arg) in [
+        ("filter-rows", "big_orders", "where=amount > 100"),
+        ("sort-rows", "by_amount", "order_by=amount desc"),
+    ] {
+        let inside = Protocol::new();
+        let named = Protocol::new();
+        let elsewhere = Protocol::new();
+        let elsewhere_before = elsewhere.files();
+        ok(
+            &inside.record_on(operation, "orders", name, arg),
+            "arc operation record",
+        );
+
+        let out = named.arc_from(
+            &elsewhere.dir,
+            &[
+                "operation",
+                "record",
+                operation,
+                "--on",
+                "orders",
+                "--name",
+                name,
+                "--arg",
+                arg,
+                "--dir",
+                named.dir.to_str().unwrap(),
+            ],
+        );
+        ok(&out, "arc operation record --dir");
+
+        assert_eq!(
+            named.files(),
+            inside.files(),
+            "{operation}: the Protocol --dir names differs from the one the same \
+             operation recorded inside it leaves"
+        );
+        assert_eq!(
+            elsewhere.files(),
+            elsewhere_before,
+            "{operation}: the directory arc was run from changed"
+        );
+    }
+}
+
 // ------------------------------------------------- a table DuckDB does not read bare
 
 #[test]
@@ -650,6 +709,66 @@ fn a_table_named_with_a_reserved_word_in_capitals_is_quoted_as_it_was_asked_for(
     let mut kept = protocol.ids("big_order");
     kept.sort();
     assert_eq!(kept, [2, 3]);
+}
+
+// `café` is not plain, since `é` is not an ASCII letter, yet DuckDB reads it bare as
+// a table of that name. It is what tells the plain-name test apart from DuckDB's
+// answer alone: a name that is not plain is quoted without DuckDB being asked.
+
+#[test]
+fn a_filter_recorded_on_a_table_whose_name_is_not_plain_is_written_with_the_name_in_quotes_and_runs()
+ {
+    let protocol = Protocol::making("café");
+    ok(
+        &protocol.record_on("filter-rows", "café", "big_orders", "where=amount > 100"),
+        "arc operation record filter-rows",
+    );
+    assert_eq!(
+        protocol.read("models/02_big_orders.sql"),
+        "\
+-- generated: filter-rows on café
+CREATE OR REPLACE TABLE \"big_orders\" AS
+SELECT *
+FROM \"café\"
+WHERE amount > 100;
+",
+        "the table café is written in quotes, since its name is not plain"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    let mut kept = protocol.ids("big_orders");
+    kept.sort();
+    assert_eq!(
+        kept,
+        [2, 3],
+        "big_orders holds the rows of café whose amount is over 100, and no other"
+    );
+}
+
+#[test]
+fn a_sort_recorded_on_a_table_whose_name_is_not_plain_is_written_with_the_name_in_quotes_and_runs()
+{
+    let protocol = Protocol::making("café");
+    ok(
+        &protocol.record_on("sort-rows", "café", "by_amount", "order_by=amount DESC"),
+        "arc operation record sort-rows",
+    );
+    assert_eq!(
+        protocol.read("models/02_by_amount.sql"),
+        "\
+-- generated: sort-rows on café
+CREATE OR REPLACE TABLE \"by_amount\" AS
+SELECT *
+FROM \"café\"
+ORDER BY amount DESC;
+",
+        "the table café is written in quotes, since its name is not plain"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    assert_eq!(
+        protocol.ids("by_amount"),
+        [3, 2, 4, 1],
+        "by_amount holds each row of café, in descending order of amount"
+    );
 }
 
 #[test]

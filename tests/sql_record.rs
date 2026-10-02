@@ -117,8 +117,15 @@ impl Protocol {
 
     /// Run the real `arc` binary with `args` in the Protocol's directory.
     fn arc(&self, args: &[&str]) -> Output {
+        self.arc_from(&self.dir, args)
+    }
+
+    /// Run the real `arc` binary with `args` in `cwd`, with this Protocol's
+    /// history store: the directory arc is run from is not this Protocol's, and
+    /// a `--dir` names it.
+    fn arc_from(&self, cwd: &Path, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_arc"))
-            .current_dir(&self.dir)
+            .current_dir(cwd)
             .env("ARCFORM_HISTORY_DIR", &self.history)
             .args(args)
             .output()
@@ -766,6 +773,46 @@ fn each_recording_is_a_version_of_the_protocol() {
     }
 }
 
+#[test]
+fn a_statement_recorded_with_dir_from_another_directory_leaves_the_bytes_it_leaves_run_inside_it() {
+    // Both kinds of step: a filter, recorded as the operation, and a statement
+    // recorded as a SQL step. `elsewhere` is a Protocol of its own, so a verb that
+    // reads the working directory in place of `--dir` records there and exits 0.
+    for (statement, name) in [(FILTER, "big_orders"), (BY_AMOUNT, "by_amount")] {
+        let inside = Protocol::new();
+        let named = Protocol::new();
+        let elsewhere = Protocol::new();
+        let elsewhere_before = elsewhere.files();
+        ok(&inside.record(statement, name), "arc sql record");
+
+        let out = named.arc_from(
+            &elsewhere.dir,
+            &[
+                "sql",
+                "record",
+                statement,
+                "--name",
+                name,
+                "--dir",
+                named.dir.to_str().unwrap(),
+            ],
+        );
+        ok(&out, "arc sql record --dir");
+
+        assert_eq!(
+            named.files(),
+            inside.files(),
+            "{name}: the Protocol --dir names differs from the one the same \
+             statement recorded inside it leaves"
+        );
+        assert_eq!(
+            elsewhere.files(),
+            elsewhere_before,
+            "{name}: the directory arc was run from changed"
+        );
+    }
+}
+
 // --------------------------------------------------------------------- mcp
 
 #[cfg(feature = "mcp")]
@@ -807,8 +854,14 @@ mod mcp {
     /// One `tools/call` of `sql_record` with `arguments`, started in `protocol`'s
     /// directory with no `dir`, as `protocol_run` is.
     fn call(protocol: &Protocol, arguments: Value) -> Value {
+        call_from(&protocol.dir, protocol, arguments)
+    }
+
+    /// [`call`] with the server started in `cwd`, which is not `protocol`'s
+    /// directory when `arguments` carries a `dir` naming it.
+    fn call_from(cwd: &Path, protocol: &Protocol, arguments: Value) -> Value {
         ask(
-            &protocol.dir,
+            cwd,
             &protocol.history,
             &json!({
                 "jsonrpc": "2.0",
@@ -941,6 +994,44 @@ mod mcp {
         );
         assert_ne!(result["isError"], true, "{}", text(&result));
         assert_eq!(agent.files(), terminal.files());
+    }
+
+    #[test]
+    fn the_tool_records_into_the_directory_dir_names_from_a_server_started_elsewhere() {
+        // `elsewhere` is a Protocol of its own, so a tool that reads the working
+        // directory in place of `dir` records there and reports success.
+        for (statement, name) in [(FILTER, "big_orders"), (BY_AMOUNT, "by_amount")] {
+            let inside = Protocol::new();
+            let named = Protocol::new();
+            let elsewhere = Protocol::new();
+            let elsewhere_before = elsewhere.files();
+            let started_inside = call(&inside, json!({ "sql": statement, "name": name }));
+            assert_ne!(
+                started_inside["isError"],
+                true,
+                "{name}: {}",
+                text(&started_inside)
+            );
+
+            let result = call_from(
+                &elsewhere.dir,
+                &named,
+                json!({ "sql": statement, "name": name, "dir": named.dir.to_str().unwrap() }),
+            );
+            assert_ne!(result["isError"], true, "{name}: {}", text(&result));
+
+            assert_eq!(
+                named.files(),
+                inside.files(),
+                "{name}: the Protocol `dir` names differs from the one the same call \
+                 leaves when the server is started inside it"
+            );
+            assert_eq!(
+                elsewhere.files(),
+                elsewhere_before,
+                "{name}: the server's own directory changed"
+            );
+        }
     }
 
     #[test]
