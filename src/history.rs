@@ -89,20 +89,21 @@
 //! log is the provenance that travels with the folder, through git, a drive
 //! or an archive; the snapshots are the safety net that stays on the machine.
 //!
-//! A line reads as a sentence and parses by one rule:
+//! A line is one JSON object, so a person reads it and any JSON reader parses
+//! it, the log as a whole being newline-delimited JSON:
 //!
 //! ```text
-//! 2026-10-03T07:15:02.123Z arcform.yaml save by terminal, version 1791011702123-0-save, step big_orders added
+//! {"at":"2026-10-03T07:15:02.123Z","file":"arcform.yaml","kind":"save","interface":"terminal","version":"1791011702123-000-save","step":"big_orders","change":"added"}
 //! ```
 //!
-//! — the time the version was recorded (RFC 3339, UTC, to the millisecond),
-//! the file's path inside the folder, the kind, `by` and the way (or `a way
-//! not recorded`), `version` and the id `arc history list` prints, and then
-//! what the version did to the steps: `step <name> added` when a verb that
-//! adds a step recorded it, else `no step named`. A path or step name holding
-//! anything but ASCII letters, digits, `.`, `_`, `-` and `/` is written as a
-//! JSON string. A line holds no contents of any file, so its length does not
-//! grow with the file's. The README states the same rule as a pattern.
+//! — `at`, the time the version was recorded (RFC 3339, UTC, to the
+//! millisecond); `file`, the file's path inside the folder, with `/` between
+//! its parts; `kind`, `save`, `checkpoint` or `unsaved`; `interface`, the way
+//! arc was reached, left out for a handle that names none; `version`, the id
+//! `arc history list` prints; and `step` with `change`, the step's name and
+//! `added`, when a verb that adds a step recorded the version, both left out
+//! otherwise. A line holds no contents of any file, so its length does not
+//! grow with the file's. The README names the same keys.
 //!
 //! A line is appended in one write, so a reader never sees half of one, and
 //! a log whose last line lacks its newline gains one first. The line is a
@@ -144,7 +145,7 @@
 //! [`LocalHistory::entries_for_file`], [`LocalHistory::read_for_file`] and
 //! [`LocalHistory::restore_for_file`]. Each file is keyed by its own
 //! canonical path, so two files in one directory never list, restore or prune
-//! each other's entries, and a restore writes the one file it was given. The
+//! each other's entries. The
 //! spec's key is the same either way: the calls that take a file, given a
 //! directory's `arcform.yaml`, read and write the history the calls that take
 //! the directory recorded. [`LocalHistory::record_unsaved_for_file`] is a call
@@ -254,6 +255,22 @@ enum StepNote<'a> {
     /// A verb that adds a step recorded the version, adding the step of this
     /// name.
     Added(&'a str),
+}
+
+/// A checkpoint's line in the folder's log, held until the write the
+/// checkpoint was taken for has landed.
+struct HeldLine {
+    /// The spec the checkpoint is of, whose folder's log takes the line.
+    spec_path: PathBuf,
+    entry: HistoryEntry,
+}
+
+impl HeldLine {
+    /// Append the line, now that the write has landed. Best-effort, as every
+    /// line is.
+    fn land(self) {
+        let _ = append_log_line(&self.spec_path, &self.entry, StepNote::Unnamed);
+    }
 }
 
 /// The way arc was reached when an entry was written: [`TERMINAL`] for the
@@ -529,7 +546,7 @@ impl LocalHistory {
     /// Roll the file at `file` back to the state entry `id` recorded, with
     /// [`restore`](Self::restore)'s discipline: the text being replaced is
     /// checkpointed in this file's history first, then the recorded bytes land
-    /// atomically at `file`. Nothing else in the directory is read or written.
+    /// atomically at `file`.
     pub fn restore_for_file(&self, file: &Path, id: &str) -> Result<String> {
         self.restore_keyed(self.file_key(file)?, file, id)
     }
@@ -542,25 +559,27 @@ impl LocalHistory {
     fn restore_keyed(&self, key: (PathBuf, PathBuf), target: &Path, id: &str) -> Result<String> {
         let text = read_entry(&key.0, id)?;
         let spec_path = key.1.clone();
-        let mut checkpoint = None;
+        let mut held = None;
         if target.exists() {
             let current = std::fs::read_to_string(target).map_err(|e| Error::FileRead {
                 path: target.to_path_buf(),
                 source: e,
             })?;
-            checkpoint = self.record_keyed(
-                key,
-                &current,
-                HistoryKind::Checkpoint,
-                SystemTime::now(),
-                false,
-                None,
-            )?;
+            held = self
+                .record_keyed(
+                    key,
+                    &current,
+                    HistoryKind::Checkpoint,
+                    SystemTime::now(),
+                    false,
+                    None,
+                )?
+                .map(|entry| HeldLine { spec_path, entry });
         }
         write_atomic(target, text.as_bytes())?;
         // The checkpoint's line lands with the write it was taken for.
-        if let Some(entry) = &checkpoint {
-            let _ = append_log_line(&spec_path, entry, StepNote::Unnamed);
+        if let Some(held) = held {
+            held.land();
         }
         Ok(text)
     }
@@ -578,11 +597,11 @@ impl LocalHistory {
         now: SystemTime,
         merge: bool,
     ) -> Result<Option<HistoryEntry>> {
-        self.record_noted(dir, text, kind, now, merge, StepNote::Unnamed)
+        self.record_noted(dir, text, kind, now, merge, Some(StepNote::Unnamed))
     }
 
-    /// [`record`](Self::record), with `note` as what the folder's log says
-    /// the version did to the steps.
+    /// [`record`](Self::record), with `line` as what the folder's log says the
+    /// version did to the steps, or `None` to hold the line for the caller.
     fn record_noted(
         &self,
         dir: &Path,
@@ -590,34 +609,30 @@ impl LocalHistory {
         kind: HistoryKind,
         now: SystemTime,
         merge: bool,
-        note: StepNote,
+        line: Option<StepNote>,
     ) -> Result<Option<HistoryEntry>> {
-        self.record_keyed(self.key_dir(dir)?, text, kind, now, merge, Some(note))
+        self.record_keyed(self.key_dir(dir)?, text, kind, now, merge, line)
     }
 
     /// Record `text` as a checkpoint for the spec in `dir`, as
     /// [`record_checkpoint`](Self::record_checkpoint) does, and hold its line
     /// in the folder's log: the checkpoint is taken before a write, and its
-    /// line lands with the write, through [`log_held`](Self::log_held). A write
-    /// refused after the checkpoint leaves the folder as it was, and the
-    /// checkpoint in the store alone.
-    fn checkpoint_held(&self, dir: &Path, text: &str) -> Result<Option<HistoryEntry>> {
-        self.record_keyed(
-            self.key_dir(dir)?,
+    /// line lands with the write, through [`HeldLine::land`]. A write refused
+    /// after the checkpoint leaves the folder as it was, and the checkpoint in
+    /// the store alone.
+    fn checkpoint_held(&self, dir: &Path, text: &str) -> Result<Option<HeldLine>> {
+        let entry = self.record_noted(
+            dir,
             text,
             HistoryKind::Checkpoint,
             SystemTime::now(),
             false,
             None,
-        )
-    }
-
-    /// Append the held line of `checkpoint`, a checkpoint of the spec in `dir`,
-    /// once the write it was taken for has landed. Best-effort, as every line is.
-    fn log_held(&self, dir: &Path, checkpoint: Option<&HistoryEntry>) {
-        if let (Some(entry), Ok((_, spec_path))) = (checkpoint, self.key_dir(dir)) {
-            let _ = append_log_line(&spec_path, entry, StepNote::Unnamed);
-        }
+        )?;
+        Ok(entry.map(|entry| HeldLine {
+            spec_path: dir.join(MANIFEST_FILENAME),
+            entry,
+        }))
     }
 
     /// Record one entry under `key`, the pair [`key_for`](Self::key_for)
@@ -780,9 +795,11 @@ pub fn edit_spec_with_history(
         source: e,
     })?;
     let validated = apply_edits(&original, edits)?;
-    let checkpoint = history.checkpoint_held(dir, &original)?;
+    let held = history.checkpoint_held(dir, &original)?;
     validated.write_to(dir)?;
-    history.log_held(dir, checkpoint.as_ref());
+    if let Some(held) = held {
+        held.land();
+    }
     // Merge disabled: when the checkpoint deduplicated against a save entry
     // recorded moments ago, a merging save here would replace that entry —
     // folding away the state this write just promised was recoverable.
@@ -846,9 +863,11 @@ fn record_with_history(
         path: path.clone(),
         source: e,
     })?;
-    let checkpoint = history.checkpoint_held(dir, &original)?;
+    let held = history.checkpoint_held(dir, &original)?;
     let (sql_rel, validated) = record()?;
-    history.log_held(dir, checkpoint.as_ref());
+    if let Some(held) = held {
+        held.land();
+    }
     // Merge disabled for the same reason as in `edit_spec_with_history`.
     let _ = history.record_noted(
         dir,
@@ -856,7 +875,7 @@ fn record_with_history(
         HistoryKind::Save,
         SystemTime::now(),
         false,
-        StepNote::Added(name),
+        Some(StepNote::Added(name)),
     );
     Ok((sql_rel, validated))
 }
@@ -960,38 +979,40 @@ fn append_log_line(file: &Path, entry: &HistoryEntry, note: StepNote) -> std::io
 }
 
 /// The log's line for `entry`, a version of the file named `name` inside its
-/// protocol folder, newline included, in the shape the module docs give.
+/// protocol folder: one JSON object with the keys the module docs give,
+/// newline included.
 fn log_line(name: &str, entry: &HistoryEntry, note: StepNote) -> String {
-    let steps = match note {
-        StepNote::Unnamed => "no step named".to_string(),
-        StepNote::Added(step) => format!("step {} added", log_word(step)),
-    };
-    format!(
-        "{} {} {} by {}, version {}, {steps}\n",
-        humantime::format_rfc3339_millis(entry.at),
-        log_word(name),
-        entry.kind.tag(),
-        entry
-            .way
-            .as_ref()
-            .map_or("a way not recorded", HistoryWay::as_str),
-        entry.id,
-    )
-}
-
-/// `word`, a path or a step's name, as a line of the log writes it: bare when
-/// it is ASCII letters, digits, `.`, `_`, `-` and `/` alone, else as a JSON
-/// string, so a space, a comma or a newline in it cannot move the words after.
-fn log_word(word: &str) -> String {
-    let bare = !word.is_empty()
-        && word
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'));
-    if bare {
-        word.to_string()
-    } else {
-        serde_json::Value::String(word.to_string()).to_string()
+    /// One line of the log. The fields serialise in this order, and a field
+    /// that is `None` is left out of the object.
+    #[derive(serde::Serialize)]
+    struct Line<'a> {
+        at: String,
+        file: &'a str,
+        kind: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        interface: Option<&'a str>,
+        version: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        step: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        change: Option<&'static str>,
     }
+    let (step, change) = match note {
+        StepNote::Unnamed => (None, None),
+        StepNote::Added(step) => (Some(step), Some("added")),
+    };
+    let line = Line {
+        at: humantime::format_rfc3339_millis(entry.at).to_string(),
+        file: name,
+        kind: entry.kind.tag(),
+        interface: entry.way.as_ref().map(HistoryWay::as_str),
+        version: &entry.id,
+        step,
+        change,
+    };
+    let mut text = serde_json::to_string(&line).expect("a line of strings serialises");
+    text.push('\n');
+    text
 }
 
 /// `$ARCFORM_HISTORY_DIR` when set and non-empty, else `~/.arcform/history`.
@@ -1427,22 +1448,5 @@ mod tests {
             "the snapshots are stored outside the protocol at /somewhere and never \
              promoted to git"
         ));
-    }
-
-    #[test]
-    fn a_word_in_the_log_is_bare_only_when_it_is_letters_digits_and_four_marks() {
-        for bare in ["arcform.yaml", "a.b", "a_b", "a-b", "a/b", "Step9"] {
-            assert_eq!(log_word(bare), bare);
-        }
-        for (word, written) in [
-            ("", r#""""#),
-            ("a b", r#""a b""#),
-            ("a,b", r#""a,b""#),
-            ("caf\u{e9}", "\"caf\u{e9}\""),
-            ("a\"b", r#""a\"b""#),
-            ("a\nb", r#""a\nb""#),
-        ] {
-            assert_eq!(log_word(word), written, "{word:?}");
-        }
     }
 }
