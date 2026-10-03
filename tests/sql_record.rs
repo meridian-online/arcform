@@ -245,6 +245,7 @@ fn log_without_times(bytes: &[u8]) -> Vec<u8> {
 }
 
 /// The way each line of the folder's log in `dir` names, in order.
+#[cfg(feature = "mcp")]
 fn ways_in_log(dir: &Path) -> Vec<String> {
     std::fs::read_to_string(dir.join(LOG))
         .unwrap()

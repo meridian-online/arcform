@@ -57,8 +57,8 @@
 //! precedents for this tier put them in user data, and the reasons hold here:
 //! the snapshots stay out of `git status`, out of diffs, out of archives, out
 //! of anything shared. Recording an entry writes nothing of a snapshot in the
-//! protocol directory; it appends one line to the folder's log, which
-//! [the next section](#the-log-in-the-protocols-folder) describes.
+//! protocol directory; it appends one line to the folder's log, which the
+//! next section describes.
 //!
 //! Inside the root, each file gets a directory keyed by a hash of its
 //! canonical path, holding a `spec-path` file (the path in the clear, for a
