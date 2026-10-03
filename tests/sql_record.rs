@@ -9,8 +9,9 @@
 //!      with no `-- generated:` line; for a `SELECT` the model's first line makes
 //!      the step's table and the statement as typed follows it, and a statement
 //!      the line cannot go in front of is written as typed;
-//!   3. **nothing runs** — recording changes `arcform.yaml` and adds the model,
-//!      and nothing else in the Protocol's directory;
+//!   3. **nothing runs** — recording changes `arcform.yaml`, adds the model and
+//!      appends to the folder's log, and changes nothing else in the Protocol's
+//!      directory;
 //!   4. **run** — `arc run` then makes the table each kind of step makes;
 //!   5. **refuse** — text DuckDB cannot parse, more than one statement, a filter of
 //!      a table no step makes, a name a step already has, a description that is
@@ -18,7 +19,8 @@
 //!      each refused with the directory untouched and a message naming the fault;
 //!   6. **describe and history** — `--description` is written on the step, and
 //!      each recording is a version of the Protocol that names the way it was
-//!      reached;
+//!      reached, and its save's line in the folder's log names the step it
+//!      added;
 //!   7. **mcp** — `sql_record` writes the bytes the command writes, and is
 //!      listed, described and refused as the command is.
 //!
@@ -191,7 +193,8 @@ impl Protocol {
     }
 
     /// Every file under the Protocol's directory, by path relative to it, with
-    /// its bytes.
+    /// its bytes, the folder's log's with each line's time, interface and version
+    /// left out.
     fn files(&self) -> BTreeMap<PathBuf, Vec<u8>> {
         fn walk(root: &Path, dir: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
             for entry in std::fs::read_dir(dir).unwrap().flatten() {
@@ -199,7 +202,10 @@ impl Protocol {
                 if path.is_dir() {
                     walk(root, &path, files);
                 } else {
-                    let bytes = std::fs::read(&path).unwrap();
+                    let mut bytes = std::fs::read(&path).unwrap();
+                    if path.file_name().is_some_and(|name| name == LOG) {
+                        bytes = log_without_times(&bytes);
+                    }
                     files.insert(path.strip_prefix(root).unwrap().to_path_buf(), bytes);
                 }
             }
@@ -219,6 +225,41 @@ impl Protocol {
             .map(Result::unwrap)
             .collect()
     }
+}
+
+/// The log a Protocol's folder holds, one line per version arc records.
+const LOG: &str = "arcform-log.txt";
+
+/// The folder's log with each line's time, interface and version id left out,
+/// which differ between two Protocols that record the same versions at other
+/// times or through another interface: what is left is each line's file, kind,
+/// step and change.
+fn log_without_times(bytes: &[u8]) -> Vec<u8> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(|line| {
+            let mut object: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(line).unwrap();
+            for key in ["at", "interface", "version"] {
+                object.remove(key);
+            }
+            format!("{}\n", serde_json::Value::Object(object))
+        })
+        .collect::<String>()
+        .into_bytes()
+}
+
+/// The interface each line of the folder's log in `dir` names, in order.
+#[cfg(feature = "mcp")]
+fn ways_in_log(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join(LOG))
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let object: serde_json::Value = serde_json::from_str(line).unwrap();
+            object["interface"].as_str().unwrap().to_string()
+        })
+        .collect()
 }
 
 fn ok(out: &Output, what: &str) {
@@ -428,7 +469,8 @@ fn a_select_is_recorded_as_a_sql_step_that_makes_its_table() {
         "a SQL step is not recorded as an operation: {line}"
     );
 
-    // Recording runs nothing: the one file the directory gained is the model, no
+    // Recording runs nothing: the files the directory gained are the model and the
+    // folder's log, no
     // database file is there, and every file it held is as it was, arcform.yaml
     // apart.
     let mut after = protocol.files();
@@ -444,6 +486,9 @@ fn a_select_is_recorded_as_a_sql_step_that_makes_its_table() {
         .expect("the model was written");
     assert_eq!(model, BY_AMOUNT_MODEL.as_bytes());
     after.remove(Path::new("arcform.yaml"));
+    after
+        .remove(Path::new(LOG))
+        .expect("the log names the versions recorded");
     let mut untouched = before;
     untouched.remove(Path::new("arcform.yaml"));
     assert_eq!(after, untouched, "recording changed a file it did not own");
@@ -457,6 +502,9 @@ fn a_filter_recording_runs_nothing_either() {
     let mut after = protocol.files();
     after.remove(Path::new("models/02_big_orders.sql"));
     after.remove(Path::new("arcform.yaml"));
+    after
+        .remove(Path::new(LOG))
+        .expect("the log names the versions recorded");
     let mut untouched = before;
     untouched.remove(Path::new("arcform.yaml"));
     assert_eq!(after, untouched, "recording changed a file it did not own");
@@ -770,6 +818,29 @@ fn each_recording_is_a_version_of_the_protocol() {
             MANIFEST.as_bytes(),
             "{name}: the checkpoint is the Protocol as it was"
         );
+        // The folder's log names the step the recording added, on the save's
+        // line, and no step on the checkpoint's.
+        let log = std::fs::read_to_string(protocol.dir.join(LOG)).unwrap();
+        let steps: Vec<(String, Option<String>, Option<String>)> = log
+            .lines()
+            .map(|line| {
+                let object: serde_json::Value = serde_json::from_str(line).unwrap();
+                let text = |key: &str| object.get(key).and_then(|v| v.as_str()).map(str::to_string);
+                (text("kind").unwrap(), text("step"), text("change"))
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                ("checkpoint".to_string(), None, None),
+                (
+                    "save".to_string(),
+                    Some(name.to_string()),
+                    Some("added".to_string())
+                ),
+            ],
+            "{name}: {log}"
+        );
     }
 }
 
@@ -948,13 +1019,29 @@ mod mcp {
             assert_eq!(recorded["operation"], operation, "{name}");
             assert_eq!(recorded["on"], on, "{name}");
 
+            // The spec and the model are the same bytes either way, and the
+            // folder's logs differ in the way alone.
+            let (mut by_agent, mut by_terminal) = (agent.files(), terminal.files());
+            let agent_log = by_agent.remove(Path::new(LOG)).expect("the agent's log");
+            let terminal_log = by_terminal
+                .remove(Path::new(LOG))
+                .expect("the terminal's log");
             assert_eq!(
-                agent.files(),
-                terminal.files(),
+                by_agent, by_terminal,
                 "{name}: the Protocol the agent recorded into differs from the terminal's"
             );
+            assert_eq!(
+                agent_log, terminal_log,
+                "{name}: the two logs differ in more than the way"
+            );
+            assert_eq!(ways_in_log(&agent.dir), ["mcp", "mcp"], "{name}");
+            assert_eq!(
+                ways_in_log(&terminal.dir),
+                ["terminal", "terminal"],
+                "{name}"
+            );
 
-            // The way differs in the history alone.
+            // The way differs in the history as in the log.
             let ways = |protocol: &Protocol| -> Vec<(String, String)> {
                 protocol
                     .versions()

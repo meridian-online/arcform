@@ -65,3 +65,16 @@ f29ea25d6fe30323	src/history.rs	restore_keyed	BOOL_LIT_FLIP	2026-09-28	flipping 
 f303175ccf225cc6	src/record.rs	duckdb_statement_count	CALL_DEFAULT	2026-09-29	Default::default() for the *const c_char path is the null pointer (a raw pointer's Default is null), and duckdb_open on a null path opens the same fresh in-memory database std::ptr::null() asks for, so the connection duckdb_extract_statements parses on and the count it returns are unchanged
 d914325dcc717949	src/record.rs	duckdb_statement_count	GUARD_FALSE	2026-09-29	the guarded branch closes the handle and returns 0 only when duckdb_open reports failure, and opening a fresh in-memory database does not fail in the test environment (only on allocation failure), so no test takes the branch and disabling it changes nothing the suite can observe
 399b32dff40142b9	src/record.rs	duckdb_statement_count	GUARD_FALSE	2026-09-29	the guarded branch disconnects, closes and returns 0 only when duckdb_connect reports failure, and connecting to a freshly opened in-memory database does not fail in the test environment, so no test takes the branch and disabling it changes nothing the suite can observe
+6070675cf7e6fe6b	src/history.rs	checkpoint_held	BOOL_LIT_FLIP	2026-10-03	flipping merge to true records the held checkpoint with the save debounce engaged, but record_keyed merges only when the new entry's kind is Save, and this call records a Checkpoint, so the flag is never read
+# THE `?`s OF THE FOLDER'S LOG AND OF THE HISTORY ROADS THAT FEED IT, AS ONE CLASS.
+# A `?` whose error the lines before it may already have ruled out. Each was run
+# on 2026-10-03 with an uncapped budget, and the disposition of each is here so the
+# class is read whole rather than one line at a time. Pinned by a test that
+# reddens: the key in `record_noted` (a missing directory), and the checkpoint in
+# `checkpoint_held`, `restore_keyed` and the two write roads (a store arc cannot
+# write to). Not mutable: the parent in `protocol_folder`, `open` and `metadata`
+# in `append_log_line`, whose types have no default. Ruled: the seek and the
+# one-byte read below, whose errors no test can stage. Both run inside
+# `len() > 0` just measured on the descriptor `open` returned.
+c148387c8e691b47	src/history.rs	append_log_line	TRY_DEFAULT	2026-10-03	the default 0 is discarded by the statement, and the cursor left at 0 where open put it would make the next read take the log's first byte, `{`, so a newline would go ahead of the line and the log would gain a blank line, but the seek is to len-1 of a regular file whose len was just measured above 0, and lseek to a non-negative offset does not fail, so the Err arm runs only if another process truncates the log to nothing between the two calls, which arc does not do and a test cannot stage
+66d540444324796a	src/history.rs	append_log_line	TRY_DEFAULT	2026-10-03	the default () would leave `last` at 0, which is not a newline, so a newline would go ahead of the line and the log would gain a blank line where the real code writes none, but the read takes the one byte at len-1 on a descriptor opened read(true) whose metadata has just reported len > 0, so it fails only if another process truncates the log between the two calls or the device fails, neither of which arc does or a test can stage
