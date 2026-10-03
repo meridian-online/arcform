@@ -107,26 +107,22 @@ The two libraries are designed to complement each other. FineType's JSON Schema 
 
 ## The log in a Protocol's folder
 
-Each version arc's local history records of `arcform.yaml`, or of a file beside it such as a chart file under `panels/`, adds one line to `arcform-log.txt` in the Protocol's folder. The snapshots themselves stay outside the Protocol, in `$ARCFORM_HISTORY_DIR` or `~/.arcform/history`, where `arc history` lists, shows and restores them on the machine that recorded them. The log goes with the folder, through git, a synced drive or an archive, and says which file was recorded, when, by which way and with which step. A line holds no contents of any file. The ignore list `arc create-protocol` and `arc init` write does not name the log, so `git add` stages it beside `arcform.yaml`, and `arc history list` ends by saying where it is.
+Each version arc's local history records of `arcform.yaml`, or of a file beside it such as a chart file under `panels/`, adds one line to `arcform-log.txt` in the Protocol's folder. The snapshots themselves stay outside the Protocol, in `$ARCFORM_HISTORY_DIR` or `~/.arcform/history`, where `arc history` lists, shows and restores them on the machine that recorded them. The log goes with the folder, through git, a synced drive or an archive, and says which file was recorded, when, through which interface and with which step. A line holds no contents of any file. The ignore list `arc create-protocol` and `arc init` write does not name the log, so `git add` stages it beside `arcform.yaml`, and `arc history list` ends by saying where it is.
 
-```text
-2026-10-03T07:15:02.123Z arcform.yaml save by terminal, version 1791011702123-0-save, step big_orders added
+Each line is one JSON object, so the log is newline-delimited JSON that any JSON reader parses line by line:
+
+```json
+{"at":"2026-10-03T07:15:02.123Z","file":"arcform.yaml","kind":"save","interface":"terminal","version":"1791011702123-000-save","step":"big_orders","change":"added"}
 ```
 
-A line reads as a sentence: at that time `arcform.yaml` was saved through the `arc` command line, as the version `arc history list` prints with that id, and the save added the step `big_orders`. Its words, in order, separated by single spaces:
+At that time `arcform.yaml` was saved through the `arc` command line, as the version `arc history list` prints with that id, and the save added the step `big_orders`. The keys:
 
-1. the time the version was recorded, RFC 3339 in UTC to the millisecond;
-2. the file's path inside the folder, with `/` between its parts;
-3. the kind: `save`, `checkpoint` or `unsaved`;
-4. `by` and the way arc was reached, then a comma: `terminal` for the `arc` command line, `mcp` for a tool of `arc mcp`, or the word the app or another library caller names for itself; a version recorded with no way says `a way not recorded`;
-5. `version` and the version's id, then a comma;
-6. what the version did to the steps: `step <name> added` when `arc operation record`, `arc sql record` or their `arc mcp` tools recorded it, and `no step named` for every other version.
-
-A path or a step name holding anything but ASCII letters, digits, `.`, `_`, `-` and `/` is written as a JSON string, quotes included, so `panels/q3 sales.yaml` is written `"panels/q3 sales.yaml"`. This pattern reads every line, and a quoted word decodes as JSON:
-
-```regex
-^(?P<time>\S+) (?P<file>"(?:[^"\\]|\\.)*"|[^"\s]\S*) (?P<kind>save|checkpoint|unsaved) by (?P<way>[^,]+), version (?P<id>[^,\s]+), (?:no step named|step (?P<step>"(?:[^"\\]|\\.)*"|[^"\s]\S*) added)$
-```
+- `at`: the time the version was recorded, RFC 3339 in UTC to the millisecond.
+- `file`: the file's path inside the folder, with `/` between its parts.
+- `kind`: `save`, `checkpoint` or `unsaved`.
+- `interface`: the way arc was reached, `terminal` for the `arc` command line, `mcp` for a tool of `arc mcp`, or the word the app or another library caller names for itself. A version recorded with no way has no `interface`.
+- `version`: the version's id, as `arc history list` prints it.
+- `step` and `change`: the step's name and `added`, when `arc operation record`, `arc sql record` or their `arc mcp` tools recorded the version. Every other version has neither.
 
 The folder of a file not named `arcform.yaml` is the nearest directory at or above it that holds one, so a Protocol has one log, and each line names its file. A line is appended in one write, so a reader never sees half of one. A checkpoint taken before a write gets its line when the write lands, just before the save's, so a write arc refuses leaves the folder as it was. A version arc does not record, because its text equals the newest one, gets no line. A line outlives its snapshot: pruning and the merging of quick saves remove snapshots and never lines, so a line's id finds a version only on a machine that still holds it. When arc cannot write a line, because the folder is read-only, the version is recorded all the same.
 

@@ -10,17 +10,18 @@
 //!      file, and a plain save names no step;
 //!   3. **no contents** — no line holds a byte of a file, and a line is as long
 //!      for a large file as for a small one;
-//!   4. **one rule** — every line reads back through the pattern the README
-//!      states, a path or step that is not plain is quoted, and a folder arc
-//!      cannot write to costs the line and not the version;
+//!   4. **one JSON object** — every line reads back through a JSON reader with
+//!      the keys the README names and no others, a path or step that is not
+//!      plain reads back as written, and a folder arc cannot write to costs the
+//!      line and not the version;
 //!   5. **git** — `git add --all` in a fresh Protocol stages the log beside
 //!      `arcform.yaml` and nothing a run records, and a folder that is no
 //!      repository gets its log with no `git` to run;
 //!   6. **the list** — `arc history list` ends by saying where the log is, for
 //!      the spec and for a file under `panels/`.
 //!
-//! The README is read for the pattern rather than the pattern being copied
-//! here, so a README that drifts from what arc writes fails these tests.
+//! The README is read for the keys rather than the keys being copied here, so
+//! a README that drifts from what arc writes fails these tests.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -94,7 +95,7 @@ impl Protocol {
         String::from_utf8(out.stdout).unwrap()
     }
 
-    /// The log's lines, each read by the README's rule.
+    /// The log's lines, each read by a JSON reader.
     fn lines(&self) -> Vec<Line> {
         let log = fs::read_to_string(self.dir.join(LOG_FILENAME)).expect("the folder's log");
         log.lines().map(Line::read).collect()
@@ -118,56 +119,90 @@ impl Protocol {
     }
 }
 
-/// One line of the log, read back into its parts.
+/// One line of the log, read back into its keys.
 #[derive(Debug, PartialEq)]
 struct Line {
-    time: String,
+    at: String,
     file: String,
     kind: String,
-    way: String,
-    id: String,
-    /// The step the line names, or `None` for `no step named`.
+    /// `None` for a version recorded by a handle that names no way.
+    interface: Option<String>,
+    version: String,
+    /// The step the line names, or `None` when no verb named one.
     step: Option<String>,
+    /// What was done to `step`, present exactly when `step` is.
+    change: Option<String>,
 }
 
 impl Line {
-    /// Read `line` by the pattern the README states, decoding a quoted word as
-    /// the README says to.
+    /// Read `line` as one JSON object, refusing a key the README does not name
+    /// and a value that is not a string.
     fn read(line: &str) -> Line {
-        let rule = regex::Regex::new(&readme_rule()).expect("the README's pattern compiles");
-        let caps = rule
-            .captures(line)
-            .unwrap_or_else(|| panic!("the README's pattern does not read {line:?}"));
-        let word = |name: &str| caps.name(name).map(|m| unquote(m.as_str()));
-        Line {
-            time: word("time").unwrap(),
-            file: word("file").unwrap(),
-            kind: word("kind").unwrap(),
-            way: word("way").unwrap(),
-            id: word("id").unwrap(),
-            step: word("step"),
+        let value: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("{line:?} is not one JSON value: {e}"));
+        let object = value
+            .as_object()
+            .unwrap_or_else(|| panic!("{line:?} is not a JSON object"));
+        let named = readme_keys();
+        for key in object.keys() {
+            assert!(
+                named.contains(key),
+                "{line:?} holds the key {key:?}, which the README does not name"
+            );
         }
+        let text = |key: &str| {
+            object.get(key).map(|value| {
+                value
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{key} is not a string in {line:?}"))
+                    .to_string()
+            })
+        };
+        let need = |key: &str| text(key).unwrap_or_else(|| panic!("{line:?} has no {key}"));
+        let read = Line {
+            at: need("at"),
+            file: need("file"),
+            kind: need("kind"),
+            interface: text("interface"),
+            version: need("version"),
+            step: text("step"),
+            change: text("change"),
+        };
+        assert_eq!(
+            read.step.is_some(),
+            read.change.is_some(),
+            "a step and its change come together: {line:?}"
+        );
+        read
     }
 }
 
-/// A word as the README says to read it: a JSON string decoded, else as written.
-fn unquote(word: &str) -> String {
-    if word.starts_with('"') {
-        serde_json::from_str(word).expect("a quoted word is a JSON string")
-    } else {
-        word.to_string()
-    }
-}
-
-/// The one pattern the README's `regex` block states.
-fn readme_rule() -> String {
+/// The object the README's `json` block shows, as written there.
+fn readme_object() -> String {
     let readme = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .expect("read the README");
     let (_, after) = readme
-        .split_once("```regex\n")
-        .expect("the README states the log's rule in a regex block");
-    let (rule, _) = after.split_once("\n```").expect("the block closes");
-    rule.trim().to_string()
+        .split_once("```json\n{\"at\"")
+        .expect("the README shows a line of the log in a json block");
+    let (rest, _) = after.split_once("\n```").expect("the block closes");
+    format!("{{\"at\"{rest}")
+}
+
+/// The keys the README names: those of the line its `json` block shows, each
+/// of which its list of keys names in backticks.
+fn readme_keys() -> Vec<String> {
+    let readme = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+        .expect("read the README");
+    let object: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&readme_object()).expect("the README's line is a JSON object");
+    let keys: Vec<String> = object.keys().cloned().collect();
+    for key in &keys {
+        assert!(
+            readme.contains(&format!("- `{key}`")) || readme.contains(&format!(" and `{key}`:")),
+            "the README's list of keys does not name {key:?}"
+        );
+    }
+    keys
 }
 
 /// The time `arc history` holds for `id`, as a line writes it.
@@ -233,12 +268,13 @@ fn an_operation_recorded_at_the_terminal_writes_its_checkpoint_and_its_save_nami
     let lines = protocol.lines();
     assert_eq!(lines.len(), 2, "{lines:?}");
     let expected = |(id, kind): &(String, String), step: Option<&str>| Line {
-        time: time_of(&history, &protocol.dir, id),
+        at: time_of(&history, &protocol.dir, id),
         file: MANIFEST_FILENAME.to_string(),
         kind: kind.clone(),
-        way: "terminal".to_string(),
-        id: id.clone(),
+        interface: Some("terminal".to_string()),
+        version: id.clone(),
         step: step.map(str::to_string),
+        change: step.map(|_| "added".to_string()),
     };
     assert_eq!(lines[0], expected(&versions[0], None), "the checkpoint");
     assert_eq!(
@@ -295,15 +331,20 @@ fn an_operation_recorded_through_arc_mcp_writes_lines_naming_mcp() {
     assert_eq!(
         lines
             .iter()
-            .map(|l| (l.kind.as_str(), l.way.as_str(), l.step.as_deref()))
+            .map(|l| (
+                l.kind.as_str(),
+                l.interface.as_deref(),
+                l.step.as_deref(),
+                l.change.as_deref()
+            ))
             .collect::<Vec<_>>(),
         [
-            ("checkpoint", "mcp", None),
-            ("save", "mcp", Some("big_orders"))
+            ("checkpoint", Some("mcp"), None, None),
+            ("save", Some("mcp"), Some("big_orders"), Some("added"))
         ]
     );
     assert_eq!(
-        lines.iter().map(|l| l.id.clone()).collect::<Vec<_>>(),
+        lines.iter().map(|l| l.version.clone()).collect::<Vec<_>>(),
         versions.into_iter().map(|(id, _)| id).collect::<Vec<_>>()
     );
 }
@@ -347,8 +388,8 @@ fn a_chart_files_versions_go_to_the_spec_folders_one_log_and_a_plain_save_names_
             (
                 l.file.as_str(),
                 l.kind.as_str(),
-                l.way.as_str(),
-                l.id.as_str(),
+                l.interface.as_deref(),
+                l.version.as_str(),
                 l.step.as_deref(),
             )
         })
@@ -356,20 +397,32 @@ fn a_chart_files_versions_go_to_the_spec_folders_one_log_and_a_plain_save_names_
     assert_eq!(
         summary,
         [
-            ("panels/sales.yaml", "save", "app", chart.id.as_str(), None),
-            ("trend.yaml", "save", "app", sibling.id.as_str(), None),
-            (MANIFEST_FILENAME, "save", "app", spec.id.as_str(), None),
+            (
+                "panels/sales.yaml",
+                "save",
+                Some("app"),
+                chart.id.as_str(),
+                None
+            ),
+            ("trend.yaml", "save", Some("app"), sibling.id.as_str(), None),
+            (
+                MANIFEST_FILENAME,
+                "save",
+                Some("app"),
+                spec.id.as_str(),
+                None
+            ),
             (
                 "panels/sales.yaml",
                 "unsaved",
-                "app",
+                Some("app"),
                 unsaved.id.as_str(),
                 None
             ),
             (
                 "trend.yaml",
                 "checkpoint",
-                "app",
+                Some("app"),
                 checkpoint.id.as_str(),
                 None
             ),
@@ -377,8 +430,9 @@ fn a_chart_files_versions_go_to_the_spec_folders_one_log_and_a_plain_save_names_
     );
     let log = fs::read_to_string(protocol.dir.join(LOG_FILENAME)).unwrap();
     assert!(
-        log.lines().all(|line| line.ends_with(", no step named")),
-        "a plain save says no step is named:\n{log}"
+        log.lines()
+            .all(|line| !line.contains("\"step\"") && !line.contains("\"change\"")),
+        "a plain save names no step:\n{log}"
     );
 }
 
@@ -468,7 +522,7 @@ fn an_edit_writes_the_line_of_its_checkpoint_once_the_edit_lands_and_then_its_sa
     assert_eq!(
         lines
             .iter()
-            .map(|l| (l.kind.as_str(), l.id.as_str(), l.step.as_deref()))
+            .map(|l| (l.kind.as_str(), l.version.as_str(), l.step.as_deref()))
             .collect::<Vec<_>>(),
         [
             ("checkpoint", ids[0].as_str(), None),
@@ -493,23 +547,42 @@ fn a_restore_writes_the_line_of_the_checkpoint_it_takes() {
     let lines = protocol.lines();
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert_eq!(
-        (lines[1].kind.as_str(), lines[1].id.as_str()),
+        (lines[1].kind.as_str(), lines[1].version.as_str()),
         ("checkpoint", entries[1].id.as_str()),
         "the restore's checkpoint of the text it replaced has its line"
     );
 }
 
-// --------------------------------------------------------------- one rule
+// ------------------------------------------------------- one JSON object
 
 #[test]
-fn a_path_or_step_that_is_not_plain_is_quoted_and_reads_back_by_the_readme_rule() {
+fn every_line_is_one_json_object_with_the_readme_keys_and_odd_names_read_back_as_written() {
+    // The README shows a line holding every key, and names each of them.
+    let shown: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&readme_object()).unwrap();
+    let mut keys: Vec<&str> = shown.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "at",
+            "change",
+            "file",
+            "interface",
+            "kind",
+            "step",
+            "version"
+        ]
+    );
+    Line::read(&readme_object());
+
     let protocol = Protocol::new();
     let history = protocol.history(HistoryWay::new("app").unwrap());
     fs::create_dir_all(protocol.dir.join("panels")).unwrap();
-    let spaced = protocol.dir.join("panels/q3 sales, by region.yaml");
+    let odd = protocol.dir.join("panels/q3 \"sales\", by region.yaml");
     let plain = protocol.dir.join("panels/q3_sales-v2.yaml");
     history
-        .record_save_for_file(&spaced, "mark: bar\n")
+        .record_save_for_file(&odd, "mark: bar\n")
         .unwrap()
         .unwrap();
     history
@@ -524,50 +597,48 @@ fn a_path_or_step_that_is_not_plain_is_quoted_and_reads_back_by_the_readme_rule(
     };
     record_step_with_history(&protocol.dir, &step, &history).unwrap();
 
+    // One object on each line of its own, nothing around it.
     let log = fs::read_to_string(protocol.dir.join(LOG_FILENAME)).unwrap();
-    let raw: Vec<&str> = log.lines().collect();
-    assert!(
-        raw[0].contains(" \"panels/q3 sales, by region.yaml\" save by app,"),
-        "{}",
-        raw[0]
-    );
-    assert!(
-        raw[1].contains(" panels/q3_sales-v2.yaml save by app,"),
-        "{}",
-        raw[1]
-    );
-    assert!(
-        raw[3].ends_with(", step \"café orders\" added"),
-        "{}",
-        raw[3]
-    );
+    assert_eq!(log.lines().count(), 4, "{log}");
+    for raw in log.lines() {
+        assert!(raw.starts_with("{\"at\":") && raw.ends_with('}'), "{raw}");
+    }
 
     let lines = protocol.lines();
-    assert_eq!(lines[0].file, "panels/q3 sales, by region.yaml");
+    assert_eq!(lines[0].file, "panels/q3 \"sales\", by region.yaml");
     assert_eq!(lines[1].file, "panels/q3_sales-v2.yaml");
     assert_eq!(
-        (lines[2].kind.as_str(), lines[2].step.as_deref()),
-        ("checkpoint", None)
+        (
+            lines[2].kind.as_str(),
+            lines[2].step.as_deref(),
+            lines[2].change.as_deref()
+        ),
+        ("checkpoint", None, None)
     );
     assert_eq!(
-        (lines[3].kind.as_str(), lines[3].step.as_deref()),
-        ("save", Some("café orders"))
+        (
+            lines[3].kind.as_str(),
+            lines[3].step.as_deref(),
+            lines[3].change.as_deref()
+        ),
+        ("save", Some("café orders"), Some("added"))
     );
 }
 
 #[test]
-fn a_version_recorded_by_a_handle_with_no_way_says_so_and_reads_back() {
+fn a_version_recorded_by_a_handle_with_no_way_has_no_interface_and_reads_back() {
     let protocol = Protocol::new();
     LocalHistory::at_root(&protocol.store)
         .record_save(&protocol.dir, MANIFEST)
         .unwrap()
         .unwrap();
     let log = fs::read_to_string(protocol.dir.join(LOG_FILENAME)).unwrap();
-    assert!(
-        log.contains(" save by a way not recorded, version "),
-        "{log}"
+    assert!(!log.contains("interface"), "{log}");
+    let lines = protocol.lines();
+    assert_eq!(
+        (lines[0].kind.as_str(), lines[0].interface.as_deref()),
+        ("save", None)
     );
-    assert_eq!(protocol.lines()[0].way, "a way not recorded");
 }
 
 #[test]

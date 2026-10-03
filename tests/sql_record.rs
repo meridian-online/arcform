@@ -18,7 +18,8 @@
 //!      each refused with the directory untouched and a message naming the fault;
 //!   6. **describe and history** — `--description` is written on the step, and
 //!      each recording is a version of the Protocol that names the way it was
-//!      reached;
+//!      reached, and its save's line in the folder's log names the step it
+//!      added;
 //!   7. **mcp** — `sql_record` writes the bytes the command writes, and is
 //!      listed, described and refused as the command is.
 //!
@@ -227,32 +228,34 @@ impl Protocol {
 /// The log a Protocol's folder holds, one line per version arc records.
 const LOG: &str = "arcform-log.txt";
 
-/// The folder's log with each line's time, way and version id left out, which
-/// differ between two Protocols that record the same versions at other times or
-/// through another way: what is left is each line's file, kind and steps.
+/// The folder's log with each line's time, interface and version id left out,
+/// which differ between two Protocols that record the same versions at other
+/// times or through another interface: what is left is each line's file, kind,
+/// step and change.
 fn log_without_times(bytes: &[u8]) -> Vec<u8> {
     String::from_utf8_lossy(bytes)
         .lines()
         .map(|line| {
-            let (_time, rest) = line.split_once(' ').unwrap();
-            let (head, tail) = rest.split_once(" by ").unwrap();
-            let (_way, tail) = tail.split_once(", version ").unwrap();
-            let (_id, steps) = tail.split_once(", ").unwrap();
-            format!("{head}, {steps}\n")
+            let mut object: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(line).unwrap();
+            for key in ["at", "interface", "version"] {
+                object.remove(key);
+            }
+            format!("{}\n", serde_json::Value::Object(object))
         })
         .collect::<String>()
         .into_bytes()
 }
 
-/// The way each line of the folder's log in `dir` names, in order.
+/// The interface each line of the folder's log in `dir` names, in order.
 #[cfg(feature = "mcp")]
 fn ways_in_log(dir: &Path) -> Vec<String> {
     std::fs::read_to_string(dir.join(LOG))
         .unwrap()
         .lines()
         .map(|line| {
-            let (_, tail) = line.split_once(" by ").unwrap();
-            tail.split_once(", ").unwrap().0.to_string()
+            let object: serde_json::Value = serde_json::from_str(line).unwrap();
+            object["interface"].as_str().unwrap().to_string()
         })
         .collect()
 }
@@ -812,6 +815,29 @@ fn each_recording_is_a_version_of_the_protocol() {
             protocol.arc(&["history", "show", &versions[0].0]).stdout,
             MANIFEST.as_bytes(),
             "{name}: the checkpoint is the Protocol as it was"
+        );
+        // The folder's log names the step the recording added, on the save's
+        // line, and no step on the checkpoint's.
+        let log = std::fs::read_to_string(protocol.dir.join(LOG)).unwrap();
+        let steps: Vec<(String, Option<String>, Option<String>)> = log
+            .lines()
+            .map(|line| {
+                let object: serde_json::Value = serde_json::from_str(line).unwrap();
+                let text = |key: &str| object.get(key).and_then(|v| v.as_str()).map(str::to_string);
+                (text("kind").unwrap(), text("step"), text("change"))
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                ("checkpoint".to_string(), None, None),
+                (
+                    "save".to_string(),
+                    Some(name.to_string()),
+                    Some("added".to_string())
+                ),
+            ],
+            "{name}: {log}"
         );
     }
 }

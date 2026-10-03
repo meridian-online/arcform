@@ -852,10 +852,11 @@ fn log_without_times(path: &Path) -> Vec<u8> {
         .unwrap()
         .lines()
         .map(|line| {
-            let (_time, rest) = line.split_once(' ').unwrap();
-            let (head, tail) = rest.split_once(", version ").unwrap();
-            let (_id, steps) = tail.split_once(", ").unwrap();
-            format!("{head}, {steps}\n")
+            let mut object: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(line).unwrap();
+            object.remove("at");
+            object.remove("version");
+            format!("{}\n", serde_json::Value::Object(object))
         })
         .collect::<String>()
         .into_bytes()
