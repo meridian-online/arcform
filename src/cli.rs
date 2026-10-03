@@ -1671,6 +1671,43 @@ mod tests {
     // The CLI surface end to end: create records the first save, an edit
     // checkpoints the state it replaces, list prints the policy beside the
     // entries, show hands back exact bytes, restore rolls back and reports.
+    /// A writer that refuses the line `arc history list` writes about the log,
+    /// and takes every other.
+    struct RefusesTheLogLine(Vec<u8>);
+
+    impl std::io::Write for RefusesTheLogLine {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if buf.starts_with(b"log: ") {
+                return Err(std::io::Error::other("the log line is refused"));
+            }
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // The line saying where the folder's log is fails the listing when it
+    // cannot be written, as every other line of the listing does.
+    #[test]
+    fn a_log_line_the_listing_cannot_write_fails_the_listing() {
+        let base = tempfile::tempdir().unwrap();
+        let history = LocalHistory::at_root(base.path().join("history"));
+        let dir = base.path().join("notes");
+        create_protocol(&dir, None, None, None, &history).unwrap();
+
+        let mut out = RefusesTheLogLine(Vec::new());
+        let refused = history_list(&dir, None, &history, &mut out);
+        let written = String::from_utf8(out.0).unwrap();
+        assert!(written.contains("policy: "), "{written}");
+        assert!(
+            refused.is_err(),
+            "the refused line went unreported:\n{written}"
+        );
+    }
+
     #[test]
     fn test_history_cli_round_trip() {
         let base = tempfile::tempdir().unwrap();
