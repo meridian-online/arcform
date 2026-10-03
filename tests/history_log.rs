@@ -27,8 +27,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use arc::spec::{
-    HistoryKind, HistoryWay, LOG_FILENAME, LocalHistory, MANIFEST_FILENAME, RecordedStep,
-    record_step_with_history,
+    HistoryKind, HistoryWay, LOG_FILENAME, LocalHistory, MANIFEST_FILENAME, RecordedStep, SpecEdit,
+    edit_spec_with_history, record_step_with_history,
 };
 
 const MANIFEST: &str = "\
@@ -330,6 +330,14 @@ fn a_chart_files_versions_go_to_the_spec_folders_one_log_and_a_plain_save_names_
         .record_save(&protocol.dir, MANIFEST)
         .unwrap()
         .expect("recorded");
+    let unsaved = app
+        .record_unsaved_for_file(&nested, "mark: area\n")
+        .unwrap()
+        .expect("recorded");
+    let checkpoint = app
+        .record_checkpoint_for_file(&beside, "mark: point\n")
+        .unwrap()
+        .expect("recorded");
 
     assert_eq!(protocol.logs(), [LOG_FILENAME], "one log for the folder");
     let lines = protocol.lines();
@@ -351,6 +359,20 @@ fn a_chart_files_versions_go_to_the_spec_folders_one_log_and_a_plain_save_names_
             ("panels/sales.yaml", "save", "app", chart.id.as_str(), None),
             ("trend.yaml", "save", "app", sibling.id.as_str(), None),
             (MANIFEST_FILENAME, "save", "app", spec.id.as_str(), None),
+            (
+                "panels/sales.yaml",
+                "unsaved",
+                "app",
+                unsaved.id.as_str(),
+                None
+            ),
+            (
+                "trend.yaml",
+                "checkpoint",
+                "app",
+                checkpoint.id.as_str(),
+                None
+            ),
         ]
     );
     let log = fs::read_to_string(protocol.dir.join(LOG_FILENAME)).unwrap();
@@ -401,6 +423,57 @@ fn no_line_holds_contents_and_a_line_is_as_long_for_a_large_file_as_a_small_one(
     assert_eq!(
         lengths[0], lengths[1],
         "the line grew with the file:\n{log}"
+    );
+}
+
+#[test]
+fn an_edit_writes_the_line_of_its_checkpoint_once_the_edit_lands_and_then_its_save() {
+    let protocol = Protocol::new();
+    let history = protocol.history(HistoryWay::new("app").unwrap());
+    let rename = SpecEdit::Replace {
+        path: vec!["name".into()],
+        value: "renamed".to_string(),
+    };
+    edit_spec_with_history(&protocol.dir, &[rename], &history).unwrap();
+
+    let ids: Vec<String> = history
+        .entries(&protocol.dir)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+    let lines = protocol.lines();
+    assert_eq!(
+        lines
+            .iter()
+            .map(|l| (l.kind.as_str(), l.id.as_str(), l.step.as_deref()))
+            .collect::<Vec<_>>(),
+        [
+            ("checkpoint", ids[0].as_str(), None),
+            ("save", ids[1].as_str(), None)
+        ]
+    );
+}
+
+#[test]
+fn a_restore_writes_the_line_of_the_checkpoint_it_takes() {
+    let protocol = Protocol::new();
+    let history = protocol.history(HistoryWay::new("app").unwrap());
+    let earlier = "name: shop\nengine: duckdb\nsteps: []\n";
+    let saved = history
+        .record_save(&protocol.dir, earlier)
+        .unwrap()
+        .expect("recorded");
+
+    history.restore(&protocol.dir, &saved.id).unwrap();
+
+    let entries = history.entries(&protocol.dir).unwrap();
+    let lines = protocol.lines();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(
+        (lines[1].kind.as_str(), lines[1].id.as_str()),
+        ("checkpoint", entries[1].id.as_str()),
+        "the restore's checkpoint of the text it replaced has its line"
     );
 }
 
