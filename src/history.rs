@@ -6,9 +6,10 @@
 //!
 //! A hand-authored document accumulates three kinds of history, and mature
 //! editors keep them strictly apart. **Undo** lives in memory, scoped to a
-//! session, gone when it ends. **Local history** — this module — lives on
-//! disk *outside* the project, written automatically at save boundaries,
-//! debounced and bounded. **Version control** is explicit, human-triggered,
+//! session, gone when it ends. **Local history** — this module — keeps its
+//! snapshots on disk *outside* the project, written automatically at save
+//! boundaries, debounced and bounded, and names each version in one line of a
+//! log inside the project's folder. **Version control** is explicit, human-triggered,
 //! in-project and shared. The only automatic promotion between tiers is the
 //! first: a state crosses from undo into local history when it is saved.
 //! **Nothing is ever promoted to version control automatically** — this
@@ -51,11 +52,13 @@
 //!
 //! # Where the store lives
 //!
-//! `$ARCFORM_HISTORY_DIR` when set, else `~/.arcform/history` — never inside
-//! the protocol directory. Both mature precedents for this tier put it in
-//! user data, and the reasons hold here: entries stay out of `git status`,
-//! out of diffs, out of archives, out of anything shared. Recording an entry
-//! changes nothing in the protocol directory.
+//! The snapshots live at `$ARCFORM_HISTORY_DIR` when set, else
+//! `~/.arcform/history` — never inside the protocol directory. Both mature
+//! precedents for this tier put them in user data, and the reasons hold here:
+//! the snapshots stay out of `git status`, out of diffs, out of archives, out
+//! of anything shared. Recording an entry writes nothing of a snapshot in the
+//! protocol directory; it appends one line to the folder's log, which
+//! [the next section](#the-log-in-the-protocols-folder) describes.
 //!
 //! Inside the root, each file gets a directory keyed by a hash of its
 //! canonical path, holding a `spec-path` file (the path in the clear, for a
@@ -75,6 +78,39 @@
 //! authored artifact — is what the net keeps. Versioning the whole working
 //! tree is the third tier's job, not this one's.
 //!
+//! # The log in the protocol's folder
+//!
+//! Every entry the store records — a save, a checkpoint or an unsaved text,
+//! of the spec or of a file beside it — appends one line to [`LOG_FILENAME`]
+//! in the protocol's folder: the directory that holds the spec, or for a file
+//! not named `arcform.yaml` the nearest directory at or above it that holds
+//! one. One folder has one log, and each line names the file it is about. The
+//! log is the provenance that travels with the folder, through git, a drive
+//! or an archive; the snapshots are the safety net that stays on the machine.
+//!
+//! A line reads as a sentence and parses by one rule:
+//!
+//! ```text
+//! 2026-10-03T07:15:02.123Z arcform.yaml save by terminal, version 1791011702123-0-save, step big_orders added
+//! ```
+//!
+//! — the time the version was recorded (RFC 3339, UTC, to the millisecond),
+//! the file's path inside the folder, the kind, `by` and the way (or `a way
+//! not recorded`), `version` and the id `arc history list` prints, and then
+//! what the version did to the steps: `step <name> added` when a verb that
+//! adds a step recorded it, else `no step named`. A path or step name holding
+//! anything but ASCII letters, digits, `.`, `_`, `-` and `/` is written as a
+//! JSON string. A line holds no contents of any file, so its length does not
+//! grow with the file's. The README states the same rule as a pattern.
+//!
+//! A line is appended in one write, so a reader never sees half of one, and
+//! a log whose last line lacks its newline gains one first. The line is a
+//! courtesy, as the save after a checkpointed write is: a folder arc cannot
+//! write to, or a file in no protocol's folder, gets no line, and the version
+//! is recorded all the same. A version the store does not record — a state
+//! identical to the newest entry — gets no line either. A line outlives its
+//! snapshot: pruning and the save debounce remove snapshots, never lines.
+//!
 //! # The way arc was reached
 //!
 //! Every entry records, beside its kind and its time, the way arc was reached
@@ -87,11 +123,12 @@
 //! of the call that wrote them. An entry written by a handle that names no
 //! way — and every entry an arc before ways wrote — has none, and says so.
 //!
-//! The way is kept in the store and nowhere else: the protocol directory
-//! holds the same bytes whichever way wrote them, because a way written into
-//! a step's file would be a changed step that runs again. It is kept in the
-//! entry's file name, so the snapshot and its way land in one atomic write
-//! and no reader sees one without the other.
+//! The way is kept in the store and in the folder's log, and never in the
+//! spec or a step's file: those hold the same bytes whichever way wrote them,
+//! because a way written into a step's file would be a changed step that runs
+//! again. In the store it is kept in the entry's file name, so the snapshot
+//! and its way land in one atomic write and no reader sees one without the
+//! other.
 //!
 //! # A file's own history
 //!
@@ -150,6 +187,12 @@ pub const HISTORY_MAX_ENTRIES: usize = 50;
 /// the debounce that keeps a burst of rapid saves from flooding the bound.
 pub const HISTORY_MERGE_WINDOW: Duration = Duration::from_secs(10);
 
+/// The log a protocol's folder holds beside `arcform.yaml`: one line per
+/// version the store records of a file in that folder, as the module docs
+/// describe. Its name does not end in `.log`, which the ignore lists of many
+/// projects name, so `git add` does not pass over it.
+pub const LOG_FILENAME: &str = "arcform-log.txt";
+
 /// Overrides the store root; without it the root is `~/.arcform/history`.
 const HISTORY_DIR_ENV: &str = "ARCFORM_HISTORY_DIR";
 
@@ -195,6 +238,18 @@ impl HistoryKind {
             _ => None,
         }
     }
+}
+
+/// What a version did to the protocol's steps, as its line in the folder's
+/// log names it.
+#[derive(Debug, Clone, Copy)]
+enum StepNote<'a> {
+    /// Nothing that recorded the version named a step: a plain save, a
+    /// checkpoint, an edit, a file that is not the spec.
+    Unnamed,
+    /// A verb that adds a step recorded the version, adding the step of this
+    /// name.
+    Added(&'a str),
 }
 
 /// The way arc was reached when an entry was written: [`TERMINAL`] for the
@@ -409,6 +464,7 @@ impl LocalHistory {
             HistoryKind::Save,
             SystemTime::now(),
             true,
+            StepNote::Unnamed,
         )
     }
 
@@ -426,6 +482,7 @@ impl LocalHistory {
             HistoryKind::Checkpoint,
             SystemTime::now(),
             false,
+            StepNote::Unnamed,
         )
     }
 
@@ -447,6 +504,7 @@ impl LocalHistory {
             HistoryKind::Unsaved,
             SystemTime::now(),
             false,
+            StepNote::Unnamed,
         )
     }
 
@@ -489,6 +547,7 @@ impl LocalHistory {
                 HistoryKind::Checkpoint,
                 SystemTime::now(),
                 false,
+                StepNote::Unnamed,
             )?;
         }
         write_atomic(target, text.as_bytes())?;
@@ -499,7 +558,7 @@ impl LocalHistory {
     /// debounce window and ordering rules are testable without a clock;
     /// `merge` engages the save debounce, and is true only for the
     /// save-boundary entry point — see the retention-policy discussion in the
-    /// module docs.
+    /// module docs. The folder's log names no step for the version.
     fn record(
         &self,
         dir: &Path,
@@ -508,7 +567,21 @@ impl LocalHistory {
         now: SystemTime,
         merge: bool,
     ) -> Result<Option<HistoryEntry>> {
-        self.record_keyed(self.key_dir(dir)?, text, kind, now, merge)
+        self.record_noted(dir, text, kind, now, merge, StepNote::Unnamed)
+    }
+
+    /// [`record`](Self::record), with `note` as what the folder's log says
+    /// the version did to the steps.
+    fn record_noted(
+        &self,
+        dir: &Path,
+        text: &str,
+        kind: HistoryKind,
+        now: SystemTime,
+        merge: bool,
+        note: StepNote,
+    ) -> Result<Option<HistoryEntry>> {
+        self.record_keyed(self.key_dir(dir)?, text, kind, now, merge, note)
     }
 
     /// Record one entry under `key`, the pair [`key_for`](Self::key_for)
@@ -520,6 +593,7 @@ impl LocalHistory {
         kind: HistoryKind,
         now: SystemTime,
         merge: bool,
+        note: StepNote,
     ) -> Result<Option<HistoryEntry>> {
         std::fs::create_dir_all(&key_dir)?;
 
@@ -576,6 +650,10 @@ impl LocalHistory {
             let _ = std::fs::remove_file(entry_path(&key_dir, &old));
         }
         prune(&key_dir)?;
+
+        // The folder's log names the version once it is recorded. A courtesy:
+        // a line arc cannot write refuses nothing the store has kept.
+        let _ = append_log_line(&spec_path, &entry, note);
 
         Ok(Some(entry))
     }
@@ -693,7 +771,9 @@ pub fn record_step_with_history(
     step: &RecordedStep,
     history: &LocalHistory,
 ) -> Result<(PathBuf, ValidatedSpec)> {
-    record_with_history(dir, history, || crate::record::record_step(dir, step))
+    record_with_history(dir, history, &step.name, || {
+        crate::record::record_step(dir, step)
+    })
 }
 
 /// [`record_step_with_history`] for [`record_sql_step`](crate::record::record_sql_step):
@@ -704,14 +784,18 @@ pub(crate) fn record_sql_step_with_history(
     step: &crate::record::SqlStep,
     history: &LocalHistory,
 ) -> Result<(PathBuf, ValidatedSpec)> {
-    record_with_history(dir, history, || crate::record::record_sql_step(dir, step))
+    record_with_history(dir, history, step.name, || {
+        crate::record::record_sql_step(dir, step)
+    })
 }
 
 /// The checkpoint, the promotion `record` makes and the save, in that order, as
-/// [`record_step_with_history`] describes them.
+/// [`record_step_with_history`] describes them. The save's line in the
+/// folder's log names `name` as the step added.
 fn record_with_history(
     dir: &Path,
     history: &LocalHistory,
+    name: &str,
     record: impl FnOnce() -> Result<(PathBuf, ValidatedSpec)>,
 ) -> Result<(PathBuf, ValidatedSpec)> {
     let path = dir.join(MANIFEST_FILENAME);
@@ -725,12 +809,13 @@ fn record_with_history(
     history.record_checkpoint(dir, &original)?;
     let (sql_rel, validated) = record()?;
     // Merge disabled for the same reason as in `edit_spec_with_history`.
-    let _ = history.record(
+    let _ = history.record_noted(
         dir,
         validated.text(),
         HistoryKind::Save,
         SystemTime::now(),
         false,
+        StepNote::Added(name),
     );
     Ok((sql_rel, validated))
 }
@@ -738,15 +823,134 @@ fn record_with_history(
 // ------------------------------------------------------------------ internals
 
 /// The retention policy in one line, for the surfaces that print it beside
-/// the entries it governs.
+/// the entries it governs. It is the snapshots' policy: the folder's log, which
+/// [`log_place_line`] places, is neither pruned nor kept outside the protocol.
 pub(crate) fn policy_line(root: &Path) -> String {
     format!(
-        "policy: keeps the last {HISTORY_MAX_ENTRIES} states per spec (oldest pruned first); \
-         saves within {}s of the newest save merge into it; stored outside the protocol \
-         at {}; never promoted to git",
+        "policy: keeps the last {HISTORY_MAX_ENTRIES} snapshots per file (oldest pruned first); \
+         saves within {}s of the newest save merge into it; the snapshots are stored outside \
+         the protocol at {} and never promoted to git",
         HISTORY_MERGE_WINDOW.as_secs(),
         root.display()
     )
+}
+
+/// Where the log naming the versions of `file` is, in one line, for the
+/// surfaces that print the policy: the log of `file`'s protocol folder, or the
+/// words that say `file` is in no protocol's folder and gets no line.
+pub(crate) fn log_place_line(file: &Path) -> String {
+    match log_path(file) {
+        Some(log) => format!(
+            "log: one line per version, naming its file and no contents, at {}{} — inside the \
+             protocol, so it goes with the folder and `git add` stages it",
+            log.display(),
+            if log.exists() {
+                ""
+            } else {
+                " (no line written yet)"
+            }
+        ),
+        None => format!(
+            "log: none — no folder at or above {} holds {MANIFEST_FILENAME}, so no line names \
+             its versions",
+            file.parent().unwrap_or(file).display()
+        ),
+    }
+}
+
+/// The log that names the versions of `file`, or `None` when `file` is in no
+/// protocol's folder or its directory cannot be resolved.
+fn log_path(file: &Path) -> Option<PathBuf> {
+    let parent = match file.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let file = parent.canonicalize().ok()?.join(file.file_name()?);
+    protocol_folder(&file).map(|folder| folder.join(LOG_FILENAME))
+}
+
+/// The folder whose log names the versions of `file`, a path under a canonical
+/// directory: the file's own directory when it is named `arcform.yaml`, else the
+/// nearest directory at or above it that holds an `arcform.yaml`. `None` for a
+/// file in no protocol's folder.
+fn protocol_folder(file: &Path) -> Option<&Path> {
+    let dir = file.parent()?;
+    if file.file_name() == Some(std::ffi::OsStr::new(MANIFEST_FILENAME)) {
+        return Some(dir);
+    }
+    dir.ancestors()
+        .find(|dir| dir.join(MANIFEST_FILENAME).is_file())
+}
+
+/// Append the line naming `entry`, a version of the file at `file`, to the log
+/// of `file`'s protocol folder, creating the log when there is none. The line
+/// lands in one write, so no reader sees half of it; a log whose last byte is
+/// not a newline gets one in the same write, ahead of the line. A file in no
+/// protocol's folder gets no line.
+fn append_log_line(file: &Path, entry: &HistoryEntry, note: StepNote) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let Some(folder) = protocol_folder(file) else {
+        return Ok(());
+    };
+    let inside = file.strip_prefix(folder).unwrap_or(file);
+    let name = inside
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+
+    let mut log = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(folder.join(LOG_FILENAME))?;
+    let mut bytes = Vec::new();
+    if log.metadata()?.len() > 0 {
+        let mut last = [0u8; 1];
+        log.seek(SeekFrom::End(-1))?;
+        log.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            bytes.push(b'\n');
+        }
+    }
+    bytes.extend_from_slice(log_line(&name, entry, note).as_bytes());
+    log.write_all(&bytes)
+}
+
+/// The log's line for `entry`, a version of the file named `name` inside its
+/// protocol folder, newline included, in the shape the module docs give.
+fn log_line(name: &str, entry: &HistoryEntry, note: StepNote) -> String {
+    let steps = match note {
+        StepNote::Unnamed => "no step named".to_string(),
+        StepNote::Added(step) => format!("step {} added", log_word(step)),
+    };
+    format!(
+        "{} {} {} by {}, version {}, {steps}\n",
+        humantime::format_rfc3339_millis(entry.at),
+        log_word(name),
+        entry.kind.tag(),
+        entry
+            .way
+            .as_ref()
+            .map_or("a way not recorded", HistoryWay::as_str),
+        entry.id,
+    )
+}
+
+/// `word`, a path or a step's name, as a line of the log writes it: bare when
+/// it is ASCII letters, digits, `.`, `_`, `-` and `/` alone, else as a JSON
+/// string, so a space, a comma or a newline in it cannot move the words after.
+fn log_word(word: &str) -> String {
+    let bare = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'));
+    if bare {
+        word.to_string()
+    } else {
+        serde_json::Value::String(word.to_string()).to_string()
+    }
 }
 
 /// `$ARCFORM_HISTORY_DIR` when set and non-empty, else `~/.arcform/history`.

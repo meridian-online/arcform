@@ -87,6 +87,9 @@ const EXPORTED: [(&str, &str); 34] = [
     ("HistoryWay", "history.rs"),
     ("HISTORY_MAX_ENTRIES", "history.rs"),
     ("HISTORY_MERGE_WINDOW", "history.rs"),
+    // The log a protocol's folder holds, one line per version: its name, so
+    // a caller that reads the log does not spell it a second time.
+    ("LOG_FILENAME", "history.rs"),
     ("edit_spec_with_history", "history.rs"),
     ("record_step_with_history", "history.rs"),
     ("Error", "error.rs"),
@@ -1025,6 +1028,7 @@ fn exported_modules_declare_only_contracted_items() {
             "HistoryWay",
             "HISTORY_MAX_ENTRIES",
             "HISTORY_MERGE_WINDOW",
+            "LOG_FILENAME",
             // The way: arc's two words, the one constructor a caller's own
             // word passes through — which refuses what cannot be stored, and
             // arc's own words spelt by a caller — and the word to print.

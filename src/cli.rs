@@ -92,14 +92,16 @@ pub enum Commands {
     ///
     /// The middle tier between editor undo and version control: saving
     /// records an entry and every machine edit checkpoints the state it is
-    /// about to replace, into `$ARCFORM_HISTORY_DIR` (default
-    /// `~/.arcform/history`) — outside the protocol directory, invisible to
-    /// `git status`. Each file keeps a history of its own: `--file
-    /// panels/a.yaml` lists, shows and restores that file's entries and no
-    /// other's, and a relative `--file` is read from `--dir`. At most 50
-    /// entries are kept per spec and per file, oldest pruned first, and
-    /// saves within 10 seconds of the newest save merge into it. Nothing is
-    /// ever promoted to git.
+    /// about to replace. The snapshots go into `$ARCFORM_HISTORY_DIR`
+    /// (default `~/.arcform/history`) — outside the protocol directory,
+    /// invisible to `git status` — and each version gets one line, with no
+    /// contents, in `arcform-log.txt` in the protocol's folder, which goes
+    /// with the folder and which `git add` stages. Each file keeps a history
+    /// of its own: `--file panels/a.yaml` lists, shows and restores that
+    /// file's entries and no other's, and a relative `--file` is read from
+    /// `--dir`. At most 50 snapshots are kept per spec and per file, oldest
+    /// pruned first, and saves within 10 seconds of the newest save merge
+    /// into it. No snapshot is ever promoted to git.
     History {
         #[command(subcommand)]
         cmd: HistoryCmd,
@@ -562,7 +564,8 @@ fn history_file(dir: &Path, file: &Path) -> PathBuf {
 /// a user should never have to hunt for the rules deciding what this command
 /// shows. Each state's line ends with the way arc was reached when it was
 /// written, or `not recorded` for a state written without one; last, so the
-/// columns before it stand where they always have.
+/// columns before it stand where they always have. The policy line says where
+/// the snapshots are, and the line after it where the folder's log is.
 pub fn history_list(
     dir: &Path,
     file: Option<&Path>,
@@ -611,6 +614,7 @@ pub fn history_list(
         )?;
     }
     writeln!(out, "{}", crate::history::policy_line(history.root()))?;
+    writeln!(out, "{}", crate::history::log_place_line(&subject))?;
     Ok(())
 }
 
