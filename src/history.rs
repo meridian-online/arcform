@@ -108,7 +108,10 @@
 //! courtesy, as the save after a checkpointed write is: a folder arc cannot
 //! write to, or a file in no protocol's folder, gets no line, and the version
 //! is recorded all the same. A version the store does not record — a state
-//! identical to the newest entry — gets no line either. A line outlives its
+//! identical to the newest entry — gets no line either. A checkpoint a write
+//! takes gets its line when that write lands, ahead of the save's: a write
+//! refused after its checkpoint leaves the folder as it was, and the
+//! checkpoint in the store alone. A line outlives its
 //! snapshot: pruning and the save debounce remove snapshots, never lines.
 //!
 //! # The way arc was reached
@@ -464,7 +467,7 @@ impl LocalHistory {
             HistoryKind::Save,
             SystemTime::now(),
             true,
-            StepNote::Unnamed,
+            Some(StepNote::Unnamed),
         )
     }
 
@@ -482,7 +485,7 @@ impl LocalHistory {
             HistoryKind::Checkpoint,
             SystemTime::now(),
             false,
-            StepNote::Unnamed,
+            Some(StepNote::Unnamed),
         )
     }
 
@@ -504,7 +507,7 @@ impl LocalHistory {
             HistoryKind::Unsaved,
             SystemTime::now(),
             false,
-            StepNote::Unnamed,
+            Some(StepNote::Unnamed),
         )
     }
 
@@ -536,21 +539,27 @@ impl LocalHistory {
     /// no write — and write the entry's bytes to `target`.
     fn restore_keyed(&self, key: (PathBuf, PathBuf), target: &Path, id: &str) -> Result<String> {
         let text = read_entry(&key.0, id)?;
+        let spec_path = key.1.clone();
+        let mut checkpoint = None;
         if target.exists() {
             let current = std::fs::read_to_string(target).map_err(|e| Error::FileRead {
                 path: target.to_path_buf(),
                 source: e,
             })?;
-            self.record_keyed(
+            checkpoint = self.record_keyed(
                 key,
                 &current,
                 HistoryKind::Checkpoint,
                 SystemTime::now(),
                 false,
-                StepNote::Unnamed,
+                None,
             )?;
         }
         write_atomic(target, text.as_bytes())?;
+        // The checkpoint's line lands with the write it was taken for.
+        if let Some(entry) = &checkpoint {
+            let _ = append_log_line(&spec_path, entry, StepNote::Unnamed);
+        }
         Ok(text)
     }
 
@@ -581,7 +590,32 @@ impl LocalHistory {
         merge: bool,
         note: StepNote,
     ) -> Result<Option<HistoryEntry>> {
-        self.record_keyed(self.key_dir(dir)?, text, kind, now, merge, note)
+        self.record_keyed(self.key_dir(dir)?, text, kind, now, merge, Some(note))
+    }
+
+    /// Record `text` as a checkpoint for the spec in `dir`, as
+    /// [`record_checkpoint`](Self::record_checkpoint) does, and hold its line
+    /// in the folder's log: the checkpoint is taken before a write, and its
+    /// line lands with the write, through [`log_held`](Self::log_held). A write
+    /// refused after the checkpoint leaves the folder as it was, and the
+    /// checkpoint in the store alone.
+    fn checkpoint_held(&self, dir: &Path, text: &str) -> Result<Option<HistoryEntry>> {
+        self.record_keyed(
+            self.key_dir(dir)?,
+            text,
+            HistoryKind::Checkpoint,
+            SystemTime::now(),
+            false,
+            None,
+        )
+    }
+
+    /// Append the held line of `checkpoint`, a checkpoint of the spec in `dir`,
+    /// once the write it was taken for has landed. Best-effort, as every line is.
+    fn log_held(&self, dir: &Path, checkpoint: Option<&HistoryEntry>) {
+        if let (Some(entry), Ok((_, spec_path))) = (checkpoint, self.key_dir(dir)) {
+            let _ = append_log_line(&spec_path, entry, StepNote::Unnamed);
+        }
     }
 
     /// Record one entry under `key`, the pair [`key_for`](Self::key_for)
@@ -593,7 +627,7 @@ impl LocalHistory {
         kind: HistoryKind,
         now: SystemTime,
         merge: bool,
-        note: StepNote,
+        line: Option<StepNote>,
     ) -> Result<Option<HistoryEntry>> {
         std::fs::create_dir_all(&key_dir)?;
 
@@ -651,9 +685,12 @@ impl LocalHistory {
         }
         prune(&key_dir)?;
 
-        // The folder's log names the version once it is recorded. A courtesy:
-        // a line arc cannot write refuses nothing the store has kept.
-        let _ = append_log_line(&spec_path, &entry, note);
+        // The folder's log names the version once it is recorded, unless the
+        // caller holds the line for a write still to land. A courtesy: a line
+        // arc cannot write refuses nothing the store has kept.
+        if let Some(note) = line {
+            let _ = append_log_line(&spec_path, &entry, note);
+        }
 
         Ok(Some(entry))
     }
@@ -741,8 +778,9 @@ pub fn edit_spec_with_history(
         source: e,
     })?;
     let validated = apply_edits(&original, edits)?;
-    history.record_checkpoint(dir, &original)?;
+    let checkpoint = history.checkpoint_held(dir, &original)?;
     validated.write_to(dir)?;
+    history.log_held(dir, checkpoint.as_ref());
     // Merge disabled: when the checkpoint deduplicated against a save entry
     // recorded moments ago, a merging save here would replace that entry —
     // folding away the state this write just promised was recoverable.
@@ -806,8 +844,9 @@ fn record_with_history(
         path: path.clone(),
         source: e,
     })?;
-    history.record_checkpoint(dir, &original)?;
+    let checkpoint = history.checkpoint_held(dir, &original)?;
     let (sql_rel, validated) = record()?;
+    history.log_held(dir, checkpoint.as_ref());
     // Merge disabled for the same reason as in `edit_spec_with_history`.
     let _ = history.record_noted(
         dir,

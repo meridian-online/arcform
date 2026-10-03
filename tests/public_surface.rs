@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 
 /// Every type, constant and function `arc::spec` re-exports, and the module that
 /// owns it. An `impl` on any of these names may only appear in its owning file.
-const EXPORTED: [(&str, &str); 34] = [
+const EXPORTED: [(&str, &str); 35] = [
     ("Manifest", "manifest.rs"),
     ("Step", "manifest.rs"),
     ("Param", "manifest.rs"),

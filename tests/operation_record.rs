@@ -10,8 +10,8 @@
 //!      condition keeps and no other;
 //!   3. **mcp** — the same request sent to `arc mcp` writes the same bytes,
 //!      and the two versions it records name `mcp` where the terminal's name
-//!      `terminal`; the way is in the history alone, and no file of the
-//!      Protocol names it;
+//!      `terminal`; the way is in the history and the folder's log, and the
+//!      spec and the model hold the same bytes either way;
 //!   4. **describe** — `--description`, and the tool's `description`, write
 //!      one line after `sql:` on the step, the same bytes both ways; the model
 //!      is as it is without one; a description that is empty or spans lines is
@@ -239,7 +239,7 @@ impl Protocol {
     }
 
     /// Every file under the Protocol's directory, by path relative to it, with
-    /// its bytes.
+    /// its bytes, the folder's log's with each line's time, way and id left out.
     fn files(&self) -> BTreeMap<PathBuf, Vec<u8>> {
         fn walk(root: &Path, dir: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
             for entry in std::fs::read_dir(dir).unwrap().flatten() {
@@ -247,7 +247,10 @@ impl Protocol {
                 if path.is_dir() {
                     walk(root, &path, files);
                 } else {
-                    let bytes = std::fs::read(&path).unwrap();
+                    let mut bytes = std::fs::read(&path).unwrap();
+                    if path.file_name().is_some_and(|name| name == LOG) {
+                        bytes = log_without_times(&bytes);
+                    }
                     files.insert(path.strip_prefix(root).unwrap().to_path_buf(), bytes);
                 }
             }
@@ -256,6 +259,38 @@ impl Protocol {
         walk(&self.dir, &self.dir, &mut files);
         files
     }
+}
+
+/// The log a Protocol's folder holds, one line per version arc records.
+const LOG: &str = "arcform-log.txt";
+
+/// The folder's log with each line's time, way and version id left out, which
+/// differ between two Protocols that record the same versions at other times or
+/// through another way: what is left is each line's file, kind and steps.
+fn log_without_times(bytes: &[u8]) -> Vec<u8> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(|line| {
+            let (_time, rest) = line.split_once(' ').unwrap();
+            let (head, tail) = rest.split_once(" by ").unwrap();
+            let (_way, tail) = tail.split_once(", version ").unwrap();
+            let (_id, steps) = tail.split_once(", ").unwrap();
+            format!("{head}, {steps}\n")
+        })
+        .collect::<String>()
+        .into_bytes()
+}
+
+/// The way each line of the folder's log in `dir` names, in order.
+fn ways_in_log(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join(LOG))
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let (_, tail) = line.split_once(" by ").unwrap();
+            tail.split_once(", ").unwrap().0.to_string()
+        })
+        .collect()
 }
 
 fn ok(out: &Output, what: &str) {
@@ -312,7 +347,8 @@ fn record_writes_one_generated_model_and_appends_one_step() {
         "the step is appended and every other byte of arcform.yaml is kept"
     );
 
-    // Recording runs nothing: the one file the directory gained is the model, and
+    // Recording runs nothing: the files the directory gained are the model and the
+    // folder's log, and
     // every file it held is as it was, arcform.yaml apart.
     let mut after = protocol.files();
     let model = after
@@ -320,6 +356,9 @@ fn record_writes_one_generated_model_and_appends_one_step() {
         .expect("the model was written");
     assert_eq!(model, BIG_ORDERS_MODEL.as_bytes());
     after.remove(Path::new("arcform.yaml"));
+    after
+        .remove(Path::new(LOG))
+        .expect("the log names the versions recorded");
     let mut untouched = before;
     untouched.remove(Path::new("arcform.yaml"));
     assert_eq!(
@@ -533,7 +572,8 @@ fn record_sort_writes_the_ordered_model_and_appends_one_step() {
         "the step is appended and every other byte of arcform.yaml is kept"
     );
 
-    // Recording runs nothing: the one file the directory gained is the model, and
+    // Recording runs nothing: the files the directory gained are the model and the
+    // folder's log, and
     // every file it held is as it was, arcform.yaml apart.
     let mut after = protocol.files();
     let model = after
@@ -541,6 +581,9 @@ fn record_sort_writes_the_ordered_model_and_appends_one_step() {
         .expect("the model was written");
     assert_eq!(model, BY_AMOUNT_MODEL.as_bytes());
     after.remove(Path::new("arcform.yaml"));
+    after
+        .remove(Path::new(LOG))
+        .expect("the log names the versions recorded");
     let mut untouched = before;
     untouched.remove(Path::new("arcform.yaml"));
     assert_eq!(
@@ -1203,10 +1246,18 @@ mod mcp {
         );
 
         // No file under either Protocol's directory names a way, in its name
-        // or in its bytes: the way is kept in the history alone.
-        for (protocol, name) in [(&terminal, "terminal"), (&agent, "agent")] {
-            for (path, bytes) in protocol.files() {
-                let text = String::from_utf8_lossy(&bytes);
+        // or in its bytes, but the folder's log: the way is kept in the history
+        // and the log, and never in the spec or the model.
+        let (mut by_agent, mut by_terminal) = (agent.files(), terminal.files());
+        let agent_log = by_agent.remove(Path::new(LOG)).expect("the agent's log");
+        let terminal_log = by_terminal
+            .remove(Path::new(LOG))
+            .expect("the terminal's log");
+        assert_eq!(ways_in_log(&agent.dir), ["mcp", "mcp"]);
+        assert_eq!(ways_in_log(&terminal.dir), ["terminal", "terminal"]);
+        for (files, name) in [(&by_terminal, "terminal"), (&by_agent, "agent")] {
+            for (path, bytes) in files {
+                let text = String::from_utf8_lossy(bytes);
                 for way in ["terminal", "mcp"] {
                     assert!(
                         !path.to_string_lossy().contains(way) && !text.contains(way),
@@ -1216,15 +1267,17 @@ mod mcp {
                 }
             }
         }
-
         assert_eq!(
-            agent.files(),
-            terminal.files(),
+            by_agent, by_terminal,
             "the Protocol the agent recorded into differs from the one the terminal did"
+        );
+        assert_eq!(
+            agent_log, terminal_log,
+            "the two logs differ in more than the way"
         );
         assert_eq!(agent.read("models/02_big_orders.sql"), BIG_ORDERS_MODEL);
 
-        // The way differs in the history alone: the same versions, the same
+        // The way differs in the history as in the log: the same versions, the same
         // bytes in each, and a different way beside them.
         let (by_terminal, by_agent) = (terminal.versions(), agent.versions());
         let kinds_and_ways = |versions: &[(String, String, String)]| -> Vec<(String, String)> {

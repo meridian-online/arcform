@@ -1,8 +1,9 @@
 //! The local-history contract, exercised through the published surface the
 //! way an editing tool would use it:
 //!
-//!   1. **outside the project** — recording touches nothing in the protocol
-//!      directory: no new files, no changed spec, nothing for `git status`;
+//!   1. **outside the project** — recording writes no snapshot in the
+//!      protocol directory: the spec is unchanged and the one file there that
+//!      recording adds is the folder's log;
 //!   2. **checkpoint before machine edit** — the checkpointed roads record
 //!      the state being replaced, distinct in kind from a save entry, before
 //!      the write lands — and a refusal touches neither file nor history;
@@ -23,8 +24,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use arc::spec::{
-    Error, HISTORY_MAX_ENTRIES, HistoryKind, HistoryWay, LocalHistory, MANIFEST_FILENAME,
-    RecordedStep, SpecEdit, edit_spec_with_history, record_step_with_history,
+    Error, HISTORY_MAX_ENTRIES, HistoryKind, HistoryWay, LOG_FILENAME, LocalHistory,
+    MANIFEST_FILENAME, RecordedStep, SpecEdit, edit_spec_with_history, record_step_with_history,
 };
 
 const SPEC: &str = "\
@@ -75,9 +76,18 @@ fn a_save_records_outside_the_protocol_and_the_protocol_is_untouched() {
     let entry = history.record_save(&dir, SPEC).unwrap().expect("recorded");
     assert_eq!(entry.kind, HistoryKind::Save);
 
-    // The protocol directory is exactly what it was: nothing new for a diff,
-    // nothing new for `git status`.
-    assert_eq!(files_under(&dir), before);
+    // The protocol directory is what it was and the log beside the spec: no
+    // snapshot for a diff or for `git status`, one line naming the version.
+    let mut after = before.clone();
+    after.push(LOG_FILENAME.to_string());
+    after.sort();
+    assert_eq!(files_under(&dir), after);
+    let log = fs::read_to_string(dir.join(LOG_FILENAME)).unwrap();
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(
+        !log.contains("command"),
+        "the line holds no contents: {log}"
+    );
     assert_eq!(
         fs::read_to_string(dir.join(MANIFEST_FILENAME)).unwrap(),
         SPEC
@@ -281,9 +291,10 @@ fn a_spec_rolls_back_with_no_git_and_the_rollback_is_itself_reversible() {
         "restoring the rollback's checkpoint goes forward again"
     );
 
-    // Still no repository anywhere: nothing was promoted to git.
+    // Still no repository anywhere: nothing was promoted to git, and the
+    // protocol holds its spec and the log naming its versions.
     assert!(!tmp.path().join(".git").exists());
-    assert!(files_under(&dir) == vec![MANIFEST_FILENAME.to_string()]);
+    assert_eq!(files_under(&dir), [LOG_FILENAME, MANIFEST_FILENAME]);
 }
 
 #[test]
@@ -627,6 +638,7 @@ fn a_way_that_cannot_be_stored_is_refused_before_anything_is_written() {
     history.record_save(&dir, SPEC).unwrap();
     let entries_before = history.entries(&dir).unwrap();
     let store_before = files_under(history.root());
+    let log_before = fs::read(dir.join(LOG_FILENAME)).unwrap();
     let too_long = "a".repeat(33);
 
     let refused: [(&str, &str); 11] = [
@@ -666,10 +678,15 @@ fn a_way_that_cannot_be_stored_is_refused_before_anything_is_written() {
         );
         assert_eq!(history.entries(&dir).unwrap(), entries_before, "{word:?}");
         assert_eq!(files_under(history.root()), store_before, "{word:?}");
+        assert_eq!(
+            fs::read(dir.join(LOG_FILENAME)).unwrap(),
+            log_before,
+            "{word:?} wrote a line to the log"
+        );
     }
     assert_eq!(
         files_under(&tmp.path().join("protocol")),
-        [MANIFEST_FILENAME]
+        [LOG_FILENAME, MANIFEST_FILENAME]
     );
 }
 

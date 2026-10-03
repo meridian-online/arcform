@@ -439,6 +439,9 @@ fn edit_protocol_leaves_a_db_line_as_it_was_and_the_protocol_runs_where_it_says(
 // property is what a person's `git add` does, and a test of the list's text alone
 // would pass over a list that git reads differently from the way it was written.
 
+/// The log a Protocol's folder holds, one line per version arc records.
+const LOG: &str = "arcform-log.txt";
+
 /// What `create-protocol` and `init` write when no `--db` puts a database inside the
 /// directory.
 const IGNORE_LIST: &str = "# Written by `arc`: what a run records belongs to the machine that ran it.\n/build/.arcform/\n";
@@ -489,9 +492,10 @@ fn staged_by_add_all(dir: &Path) -> Vec<String> {
     paths
 }
 
-/// `create-protocol` with no `--db`: `git add --all` stages the manifest and the list;
-/// after a first step is authored and a run completes, it stages the model the step
-/// generated and nothing arc recorded under `build/.arcform/`.
+/// `create-protocol` with no `--db`: `git add --all` stages the manifest, the list and
+/// the log naming the first version; after a first step is authored and a run
+/// completes, it stages the model the step generated and nothing arc recorded under
+/// `build/.arcform/`.
 #[test]
 fn a_fresh_protocol_stages_the_manifest_and_not_arcs_run_records() {
     let base = tempfile::tempdir().expect("tempdir");
@@ -509,8 +513,8 @@ fn a_fresh_protocol_stages_the_manifest_and_not_arcs_run_records() {
     );
     assert_eq!(
         staged_by_add_all(&proto),
-        [".gitignore", "arcform.yaml"],
-        "a fresh Protocol stages the manifest and the list"
+        [".gitignore", LOG, "arcform.yaml"],
+        "a fresh Protocol stages the manifest, the list and the log"
     );
 
     arc_ok(
@@ -535,7 +539,7 @@ fn a_fresh_protocol_stages_the_manifest_and_not_arcs_run_records() {
     let staged = staged_by_add_all(&proto);
     assert_eq!(
         staged,
-        [".gitignore", "arcform.yaml", "models/gen.sql"],
+        [".gitignore", LOG, "arcform.yaml", "models/gen.sql"],
         "the generated model is staged and no run record is"
     );
 }
@@ -653,7 +657,7 @@ fn the_spill_directory_beside_a_database_inside_the_directory_is_not_staged() {
 
         assert_eq!(
             staged_by_add_all(&proto),
-            [".gitignore", "arcform.yaml"],
+            [".gitignore", LOG, "arcform.yaml"],
             "{db}: staged something of the spill directory"
         );
     }
@@ -769,25 +773,35 @@ fn a_refused_create_writes_no_list() {
     );
 }
 
-/// `arc history list` prints the retention policy it printed before the list existed,
-/// word for word, and the word *git* in it is still the one claim arc makes about git.
+/// `arc history list` ends with the snapshots' retention policy, which says they are
+/// stored outside the Protocol and never promoted to git, and then the line saying the
+/// folder's log is inside it, where `git add` stages it.
 #[test]
-fn history_list_prints_the_policy_line_it_always_printed() {
+fn history_list_ends_saying_where_the_snapshots_are_and_where_the_log_is() {
     let base = tempfile::tempdir().expect("tempdir");
     arc_ok(base.path(), &["create-protocol", "notes"]);
     let out = arc_ok(base.path(), &["history", "list", "--dir", "notes"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
 
     let root = std::env::temp_dir().join("arc-cli-authoring-history");
-    let expected = format!(
-        "policy: keeps the last 50 states per spec (oldest pruned first); saves within 10s \
-         of the newest save merge into it; stored outside the protocol at {}; never promoted \
-         to git",
+    let policy = format!(
+        "policy: keeps the last 50 snapshots per file (oldest pruned first); saves within \
+         10s of the newest save merge into it; the snapshots are stored outside the protocol \
+         at {} and never promoted to git",
         root.display()
     );
-    assert!(
-        stdout.lines().any(|l| l == expected),
-        "the policy line, byte for byte:\n{expected}\nin:\n{stdout}"
+    let log = base.path().canonicalize().unwrap().join("notes").join(LOG);
+    let place = format!(
+        "log: one line per version, naming its file and no contents, at {} — inside the \
+         protocol, so it goes with the folder and `git add` stages it",
+        log.display()
+    );
+    assert!(log.is_file(), "the first save wrote {}", log.display());
+    assert_eq!(
+        lines[lines.len() - 2..],
+        [policy.as_str(), place.as_str()],
+        "the list ends with the snapshots' policy and the log's place:\n{stdout}"
     );
 }
 
@@ -819,7 +833,9 @@ fn tree(root: &Path, dir: &Path, into: &mut BTreeMap<String, Vec<u8>>, run_recor
             tree(root, &path, into, run_records);
         } else if !record {
             let keeps_bytes = !rel.ends_with(".duckdb") && !rel.ends_with(".wal");
-            let bytes = if keeps_bytes {
+            let bytes = if rel.ends_with(LOG) {
+                log_without_times(&path)
+            } else if keeps_bytes {
                 std::fs::read(&path).unwrap()
             } else {
                 Vec::new()
@@ -827,6 +843,22 @@ fn tree(root: &Path, dir: &Path, into: &mut BTreeMap<String, Vec<u8>>, run_recor
             into.insert(rel, bytes);
         }
     }
+}
+
+/// The folder's log at `path` with each line's time and version id left out, which
+/// differ between two runs that record the same versions.
+fn log_without_times(path: &Path) -> Vec<u8> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let (_time, rest) = line.split_once(' ').unwrap();
+            let (head, tail) = rest.split_once(", version ").unwrap();
+            let (_id, steps) = tail.split_once(", ").unwrap();
+            format!("{head}, {steps}\n")
+        })
+        .collect::<String>()
+        .into_bytes()
 }
 
 /// Create a Protocol with a database inside the directory, author a step, run it, and

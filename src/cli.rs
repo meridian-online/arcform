@@ -1654,7 +1654,7 @@ mod tests {
             .expect("history carries a long about")
             .to_string();
         assert!(
-            about.contains(&format!("{} entries", crate::spec::HISTORY_MAX_ENTRIES)),
+            about.contains(&format!("{} snapshots", crate::spec::HISTORY_MAX_ENTRIES)),
             "the stated bound drifted from HISTORY_MAX_ENTRIES:
 {about}"
         );
