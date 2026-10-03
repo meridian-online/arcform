@@ -45,8 +45,9 @@
 //! and that text has nowhere on disk to be recovered from. A
 //! [`HistoryKind::Unsaved`] entry records it, through
 //! [`LocalHistory::record_unsaved_for_file`], keyed to the file it was meant
-//! for. Recording it writes nothing to that file and creates no file that
-//! does not exist: the store keeps the text and the file stays as it was.
+//! for. Recording it writes nothing to that file and does not create it
+//! when it does not exist: the store keeps the text, the folder's log names
+//! the entry, and the file stays as it was.
 //! Restoring the entry writes the text to the file, with every restore's
 //! discipline. Why the caller holds such a text is the caller's affair.
 //!
@@ -493,8 +494,9 @@ impl LocalHistory {
     /// as an unsaved entry in that file's history, keyed as
     /// [`record_save_for_file`](Self::record_save_for_file) describes.
     ///
-    /// The store alone is written: the file keeps its bytes, and a file that
-    /// does not exist is not created. The entry is never merged — a save
+    /// The store is written, and the folder's log gains the entry's line: the
+    /// file keeps its bytes, and a file that does not exist is not created.
+    /// The entry is never merged — a save
     /// recorded moments later is an entry of its own, and so is this one
     /// after a save — and it counts toward the file's bound like any other.
     /// Only an exact duplicate of the newest entry is skipped (`Ok(None)`).
