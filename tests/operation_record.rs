@@ -4,8 +4,9 @@
 //!
 //!   1. **record** — `filter-rows` on `orders` writes one generated model whose
 //!      first line names the operation and the table and nothing else, and adds
-//!      one step to the end of `arcform.yaml`, every other byte kept; nothing else
-//!      in the Protocol's directory changes, so nothing ran;
+//!      one step to the end of `arcform.yaml`, every other byte kept; beside the
+//!      lines the folder's log gains, nothing else in the Protocol's directory
+//!      changes, so nothing ran;
 //!   2. **run** — `arc run` then runs the step, and its table holds the rows the
 //!      condition keeps and no other;
 //!   3. **mcp** — the same request sent to `arc mcp` writes the same bytes,
@@ -239,7 +240,8 @@ impl Protocol {
     }
 
     /// Every file under the Protocol's directory, by path relative to it, with
-    /// its bytes, the folder's log's with each line's time, way and id left out.
+    /// its bytes, the folder's log's with each line's time, interface and version
+    /// left out.
     fn files(&self) -> BTreeMap<PathBuf, Vec<u8>> {
         fn walk(root: &Path, dir: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
             for entry in std::fs::read_dir(dir).unwrap().flatten() {

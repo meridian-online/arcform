@@ -9,8 +9,9 @@
 //!      with no `-- generated:` line; for a `SELECT` the model's first line makes
 //!      the step's table and the statement as typed follows it, and a statement
 //!      the line cannot go in front of is written as typed;
-//!   3. **nothing runs** — recording changes `arcform.yaml` and adds the model,
-//!      and nothing else in the Protocol's directory;
+//!   3. **nothing runs** — recording changes `arcform.yaml`, adds the model and
+//!      appends to the folder's log, and changes nothing else in the Protocol's
+//!      directory;
 //!   4. **run** — `arc run` then makes the table each kind of step makes;
 //!   5. **refuse** — text DuckDB cannot parse, more than one statement, a filter of
 //!      a table no step makes, a name a step already has, a description that is
@@ -192,7 +193,8 @@ impl Protocol {
     }
 
     /// Every file under the Protocol's directory, by path relative to it, with
-    /// its bytes, the folder's log's with each line's time, way and id left out.
+    /// its bytes, the folder's log's with each line's time, interface and version
+    /// left out.
     fn files(&self) -> BTreeMap<PathBuf, Vec<u8>> {
         fn walk(root: &Path, dir: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
             for entry in std::fs::read_dir(dir).unwrap().flatten() {
