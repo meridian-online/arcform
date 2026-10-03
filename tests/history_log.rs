@@ -382,6 +382,28 @@ fn a_chart_files_versions_go_to_the_spec_folders_one_log_and_a_plain_save_names_
     );
 }
 
+// A spec not yet written in a folder inside another Protocol's is that
+// folder's spec: its line goes to that folder's log, not the outer one's.
+#[test]
+fn an_unwritten_spec_in_a_folder_inside_a_protocol_writes_to_its_own_folders_log() {
+    let protocol = Protocol::new();
+    let inner = protocol.dir.join("draft");
+    fs::create_dir_all(&inner).unwrap();
+    protocol
+        .history(HistoryWay::new("app").unwrap())
+        .record_unsaved_for_file(&inner.join(MANIFEST_FILENAME), "name: draft\n")
+        .unwrap()
+        .expect("recorded");
+
+    assert_eq!(protocol.logs(), [format!("draft/{LOG_FILENAME}")]);
+    let log = fs::read_to_string(inner.join(LOG_FILENAME)).unwrap();
+    let line = Line::read(log.trim_end());
+    assert_eq!(
+        (line.file.as_str(), line.kind.as_str()),
+        (MANIFEST_FILENAME, "unsaved")
+    );
+}
+
 #[test]
 fn a_file_in_no_protocols_folder_is_recorded_and_gets_no_line() {
     let root = tempfile::tempdir().unwrap();
