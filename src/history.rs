@@ -878,34 +878,34 @@ pub(crate) fn policy_line(root: &Path) -> String {
 /// surfaces that print the policy: the log of `file`'s protocol folder, or the
 /// words that say `file` is in no protocol's folder and gets no line.
 pub(crate) fn log_place_line(file: &Path) -> String {
-    match log_path(file) {
-        Some(log) => format!(
-            "log: one line per version, naming its file and no contents, at {}{} — inside the \
-             protocol, so it goes with the folder and `git add` stages it",
-            log.display(),
-            if log.exists() {
-                ""
-            } else {
-                " (no line written yet)"
-            }
-        ),
-        None => format!(
-            "log: none — no folder at or above {} holds {MANIFEST_FILENAME}, so no line names \
-             its versions",
-            file.parent().unwrap_or(file).display()
-        ),
-    }
-}
-
-/// The log that names the versions of `file`, or `None` when `file` is in no
-/// protocol's folder or its directory cannot be resolved.
-fn log_path(file: &Path) -> Option<PathBuf> {
-    let parent = match file.parent() {
+    let dir = match file.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
     };
-    let file = parent.canonicalize().ok()?.join(file.file_name()?);
-    protocol_folder(&file).map(|folder| folder.join(LOG_FILENAME))
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let folder = file
+        .file_name()
+        .and_then(|name| protocol_folder(&dir.join(name)).map(Path::to_path_buf));
+    match folder {
+        Some(folder) => {
+            let log = folder.join(LOG_FILENAME);
+            format!(
+                "log: one line per version, naming its file and no contents, at {}{} — inside \
+                 the protocol, so it goes with the folder and `git add` stages it",
+                log.display(),
+                if log.exists() {
+                    ""
+                } else {
+                    " (no line written yet)"
+                }
+            )
+        }
+        None => format!(
+            "log: none — no folder at or above {} holds {MANIFEST_FILENAME}, so no line names \
+             its versions",
+            dir.display()
+        ),
+    }
 }
 
 /// The folder whose log names the versions of `file`, a path under a canonical
@@ -1419,9 +1419,28 @@ mod tests {
     #[test]
     fn the_policy_line_states_the_bound_the_window_and_the_git_stance() {
         let line = policy_line(Path::new("/somewhere"));
-        assert!(line.contains(&HISTORY_MAX_ENTRIES.to_string()));
+        assert!(line.contains(&format!("{HISTORY_MAX_ENTRIES} snapshots per file")));
         assert!(line.contains(&format!("{}s", HISTORY_MERGE_WINDOW.as_secs())));
-        assert!(line.contains("never promoted to git"));
-        assert!(line.contains("/somewhere"));
+        assert!(line.ends_with(
+            "the snapshots are stored outside the protocol at /somewhere and never \
+             promoted to git"
+        ));
+    }
+
+    #[test]
+    fn a_word_in_the_log_is_bare_only_when_it_is_letters_digits_and_four_marks() {
+        for bare in ["arcform.yaml", "a.b", "a_b", "a-b", "a/b", "Step9"] {
+            assert_eq!(log_word(bare), bare);
+        }
+        for (word, written) in [
+            ("", r#""""#),
+            ("a b", r#""a b""#),
+            ("a,b", r#""a,b""#),
+            ("caf\u{e9}", "\"caf\u{e9}\""),
+            ("a\"b", r#""a\"b""#),
+            ("a\nb", r#""a\nb""#),
+        ] {
+            assert_eq!(log_word(word), written, "{word:?}");
+        }
     }
 }
