@@ -464,6 +464,33 @@ fn an_unknown_entry_is_refused_by_name() {
     }
 }
 
+// No checkpoint, no write, on the road a recorded step takes: a store whose
+// root is a file takes no entry, so the step is refused with the spec as it
+// was, no model written and no line in the folder's log.
+#[test]
+fn a_recorded_step_whose_checkpoint_cannot_land_is_refused() {
+    let (tmp, dir, _) = setup();
+    let root = tmp.path().join("store-is-a-file");
+    fs::write(&root, b"").unwrap();
+    let history = LocalHistory::at_root(&root);
+    let before = files_under(&dir);
+    let step = RecordedStep {
+        name: "derived".to_string(),
+        sql: "SELECT 1 AS x".to_string(),
+        provenance: "history contract test".to_string(),
+        description: None,
+    };
+
+    let result = record_step_with_history(&dir, &step, &history);
+
+    assert!(result.is_err(), "the step must be refused, got {result:?}");
+    assert_eq!(files_under(&dir), before, "the folder is as it was");
+    assert_eq!(
+        fs::read_to_string(dir.join(MANIFEST_FILENAME)).unwrap(),
+        SPEC
+    );
+}
+
 #[test]
 fn a_recorded_step_checkpoints_the_manifest_first() {
     let (_tmp, dir, history) = setup();
