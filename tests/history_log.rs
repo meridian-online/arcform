@@ -1177,22 +1177,6 @@ fn a_save_whose_last_recorded_state_the_store_does_not_hold_names_the_file_and_i
         [] as [(&str, &str); 0],
         "a pruned state: {line:?}"
     );
-
-    // Listed and unreadable: a directory stands where the snapshot was.
-    let path = snapshot(&protocol);
-    fs::remove_file(&path).unwrap();
-    fs::create_dir(&path).unwrap();
-    let saved = save_spec(
-        &protocol,
-        &spec_with(&[("tally", "c.sql"), ("more", "d.sql")]),
-    );
-    let line = last_line(&protocol);
-    assert_eq!(line.version, saved.id);
-    assert_eq!(
-        line.named(),
-        [] as [(&str, &str); 0],
-        "a state the store cannot read: {line:?}"
-    );
 }
 
 #[test]

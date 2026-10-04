@@ -117,8 +117,8 @@
 //! renamed step is one removed and one added; and the steps are named in the
 //! order they stand in the saved text, those removed after them. It is made
 //! for the spec alone. A line names the file and no step when the file is not
-//! `arcform.yaml`, when the store held no state, or none it could read, to
-//! compare with, when either text does not read as a sequence of steps with
+//! `arcform.yaml`, when the store held no state to compare with, when either
+//! text does not read as a sequence of steps with
 //! one name each, and when no step differs — a key at the manifest's top, a
 //! comment, the order of the steps. A checkpoint, an unsaved text and the save
 //! after an edit name no step this way, and the comparison names no more than
@@ -722,10 +722,12 @@ impl LocalHistory {
         let existing = entries_in(&key_dir)?;
         let newest = existing.last();
 
-        // The state the store held before this one. A snapshot the store lists
-        // and cannot read leaves nothing to compare with, and costs the line
-        // its step and the version nothing.
-        let before = newest.and_then(|newest| read_at(&key_dir, newest).ok());
+        // The state the store held before this one: the newest entry's bytes,
+        // which the line's comparison reads too.
+        let before = match newest {
+            Some(newest) => Some(read_at(&key_dir, newest)?),
+            None => None,
+        };
 
         // The newest entry already records exactly this state: nothing new
         // to keep, whatever the kind and whatever the way.
