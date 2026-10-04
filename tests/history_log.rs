@@ -243,11 +243,6 @@ fn readme_objects() -> Vec<String> {
     shown
 }
 
-/// The first line the README shows.
-fn readme_object() -> String {
-    readme_objects().remove(0)
-}
-
 /// The keys the README names: those of the lines its `json` blocks show, each
 /// of which its list of keys names in backticks.
 fn readme_keys() -> Vec<String> {
