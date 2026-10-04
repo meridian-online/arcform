@@ -100,10 +100,29 @@
 //! millisecond); `file`, the file's path inside the folder, with `/` between
 //! its parts; `kind`, `save`, `checkpoint` or `unsaved`; `interface`, the way
 //! arc was reached, left out for a handle that names none; `version`, the id
-//! `arc history list` prints; and `step` with `change`, the step's name and
-//! `added`, when a verb that adds a step recorded the version, both left out
-//! otherwise. A line holds no contents of any file, so its length does not
-//! grow with the file's. The README names the same keys.
+//! `arc history list` prints; and the steps the version touched, as `step`
+//! with `change` (`added`, `removed` or `changed`) when it touched one, or as
+//! `steps`, a list of objects each holding a `step` and its `change`, when it
+//! touched several. A line holds no contents of any file, so its length does
+//! not grow with the file's. The README names the same keys.
+//!
+//! The steps come from two places. A verb that adds a step names it: the line
+//! of [`record_step_with_history`]'s save says `added`. A plain save —
+//! [`LocalHistory::record_save`] and [`LocalHistory::record_save_for_file`],
+//! which take the whole text and are told nothing — is compared with the state
+//! the store held before it, the newest entry whatever its kind, and the line
+//! names each step the text added, removed or changed. The comparison reads
+//! both texts as YAML and matches steps by `name`: a step is changed when what
+//! it parses to differs, so a comment or the order of its keys is no change; a
+//! renamed step is one removed and one added; and the steps are named in the
+//! order they stand in the saved text, those removed after them. It is made
+//! for the spec alone. A line names the file and no step when the file is not
+//! `arcform.yaml`, when the store held no state, or none it could read, to
+//! compare with, when either text does not read as a sequence of steps with
+//! one name each, and when no step differs — a key at the manifest's top, a
+//! comment, the order of the steps. A checkpoint, an unsaved text and the save
+//! after an edit name no step this way, and the comparison names no more than
+//! the step: what changed inside it is in the snapshots.
 //!
 //! A line is appended in one write, so a reader never sees half of one, and
 //! a log whose last line lacks its newline gains one first. The line is a
@@ -457,6 +476,10 @@ impl LocalHistory {
     /// Debounced and deduplicated per the module policy: returns
     /// `Ok(Some(entry))` for a recorded (or merged) entry, `Ok(None)` when
     /// the state was already the newest entry and nothing needed recording.
+    ///
+    /// The folder's log names the version's steps: each one `text` added,
+    /// removed or changed since the newest entry before this call, as the
+    /// module docs describe.
     pub fn record_save(&self, dir: &Path, text: &str) -> Result<Option<HistoryEntry>> {
         self.record_noted(
             dir,
