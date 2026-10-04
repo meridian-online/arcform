@@ -7,7 +7,7 @@
 //!      holds; through `arc mcp` the lines name `mcp`;
 //!   2. **one log per folder** — a chart file's versions, under `panels/` or
 //!      beside the spec, land in the same log as the spec's, each line naming its
-//!      file, and a plain save names no step;
+//!      file, and a save with no earlier state names no step;
 //!   3. **no contents** — no line holds a byte of a file, and a line is as long
 //!      for a large file as for a small one;
 //!   4. **one JSON object** — every line reads back through a JSON reader with
@@ -18,7 +18,11 @@
 //!      `arcform.yaml` and nothing a run records, and a folder that is no
 //!      repository gets its log with no `git` to run;
 //!   6. **the list** — `arc history list` ends by saying where the log is, for
-//!      the spec and for a file under `panels/`.
+//!      the spec and for a file under `panels/`;
+//!   7. **a plain save's step** — a save of the spec names each step it added,
+//!      removed or changed, found by comparing the saved text with the state the
+//!      store held before it, and names the file alone when no step changed, when
+//!      the file has no steps or when the store holds no state to compare with.
 //!
 //! The README is read for the keys rather than the keys being copied here, so
 //! a README that drifts from what arc writes fails these tests.
@@ -132,6 +136,9 @@ struct Line {
     step: Option<String>,
     /// What was done to `step`, present exactly when `step` is.
     change: Option<String>,
+    /// The steps and what was done to each, when a save touched more than one;
+    /// present only when `step` is not.
+    steps: Option<Vec<(String, String)>>,
 }
 
 impl Line {
@@ -159,6 +166,26 @@ impl Line {
             })
         };
         let need = |key: &str| text(key).unwrap_or_else(|| panic!("{line:?} has no {key}"));
+        let steps = object.get("steps").map(|value| {
+            value
+                .as_array()
+                .unwrap_or_else(|| panic!("steps is not a list in {line:?}"))
+                .iter()
+                .map(|one| {
+                    let one = one
+                        .as_object()
+                        .unwrap_or_else(|| panic!("a step in {line:?} is not an object"));
+                    assert_eq!(one.len(), 2, "a step holds a name and a change: {line:?}");
+                    let word = |key: &str| {
+                        one.get(key)
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_else(|| panic!("a step has no text {key} in {line:?}"))
+                            .to_string()
+                    };
+                    (word("step"), word("change"))
+                })
+                .collect::<Vec<_>>()
+        });
         let read = Line {
             at: need("at"),
             file: need("file"),
@@ -167,35 +194,75 @@ impl Line {
             version: need("version"),
             step: text("step"),
             change: text("change"),
+            steps,
         };
         assert_eq!(
             read.step.is_some(),
             read.change.is_some(),
             "a step and its change come together: {line:?}"
         );
+        assert!(
+            read.step.is_none() || read.steps.is_none(),
+            "one step is `step` and `change`, several are `steps`: {line:?}"
+        );
+        if let Some(steps) = &read.steps {
+            assert!(steps.len() > 1, "`steps` is for several steps: {line:?}");
+        }
         read
+    }
+
+    /// Every step the line names with what was done to it, whichever way the
+    /// line holds them.
+    fn named(&self) -> Vec<(&str, &str)> {
+        match (&self.step, &self.change, &self.steps) {
+            (Some(step), Some(change), _) => vec![(step.as_str(), change.as_str())],
+            (_, _, Some(steps)) => steps
+                .iter()
+                .map(|(step, change)| (step.as_str(), change.as_str()))
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 }
 
-/// The object the README's `json` block shows, as written there.
-fn readme_object() -> String {
+/// Each line of the log the README's `json` blocks show, as written there.
+fn readme_objects() -> Vec<String> {
     let readme = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .expect("read the README");
-    let (_, after) = readme
-        .split_once("```json\n{\"at\"")
-        .expect("the README shows a line of the log in a json block");
-    let (rest, _) = after.split_once("\n```").expect("the block closes");
-    format!("{{\"at\"{rest}")
+    let mut shown = Vec::new();
+    let mut rest = readme.as_str();
+    while let Some((_, after)) = rest.split_once("```json\n{\"at\"") {
+        let (block, tail) = after.split_once("\n```").expect("the block closes");
+        shown.push(format!("{{\"at\"{block}"));
+        rest = tail;
+    }
+    assert!(
+        !shown.is_empty(),
+        "the README shows a line of the log in a json block"
+    );
+    shown
 }
 
-/// The keys the README names: those of the line its `json` block shows, each
+/// The first line the README shows.
+fn readme_object() -> String {
+    readme_objects().remove(0)
+}
+
+/// The keys the README names: those of the lines its `json` blocks show, each
 /// of which its list of keys names in backticks.
 fn readme_keys() -> Vec<String> {
     let readme = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .expect("read the README");
-    let object: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(&readme_object()).expect("the README's line is a JSON object");
-    let keys: Vec<String> = object.keys().cloned().collect();
+    let mut keys: Vec<String> = Vec::new();
+    for shown in readme_objects() {
+        let object: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&shown).expect("the README's line is a JSON object");
+        for key in object.keys() {
+            if !keys.contains(key) {
+                keys.push(key.clone());
+            }
+        }
+    }
     for key in &keys {
         assert!(
             readme.contains(&format!("- `{key}`")) || readme.contains(&format!(" and `{key}`:")),
@@ -275,6 +342,7 @@ fn an_operation_recorded_at_the_terminal_writes_its_checkpoint_and_its_save_nami
         version: id.clone(),
         step: step.map(str::to_string),
         change: step.map(|_| "added".to_string()),
+        steps: None,
     };
     assert_eq!(lines[0], expected(&versions[0], None), "the checkpoint");
     assert_eq!(
@@ -352,7 +420,8 @@ fn an_operation_recorded_through_arc_mcp_writes_lines_naming_mcp() {
 // ------------------------------------------------------- one log per folder
 
 #[test]
-fn a_chart_files_versions_go_to_the_spec_folders_one_log_and_a_plain_save_names_no_step() {
+fn a_chart_files_versions_go_to_the_spec_folders_one_log_and_a_save_with_no_earlier_state_names_no_step()
+ {
     let protocol = Protocol::new();
     let app = protocol.history(HistoryWay::new("app").unwrap());
     fs::create_dir_all(protocol.dir.join("panels")).unwrap();
@@ -432,7 +501,7 @@ fn a_chart_files_versions_go_to_the_spec_folders_one_log_and_a_plain_save_names_
     assert!(
         log.lines()
             .all(|line| !line.contains("\"step\"") && !line.contains("\"change\"")),
-        "a plain save names no step:\n{log}"
+        "a save with no earlier state names no step:\n{log}"
     );
 }
 
@@ -557,10 +626,8 @@ fn a_restore_writes_the_line_of_the_checkpoint_it_takes() {
 
 #[test]
 fn every_line_is_one_json_object_with_the_readme_keys_and_odd_names_read_back_as_written() {
-    // The README shows a line holding every key, and names each of them.
-    let shown: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(&readme_object()).unwrap();
-    let mut keys: Vec<&str> = shown.keys().map(String::as_str).collect();
+    // The README shows lines holding every key between them, and names each of them.
+    let mut keys = readme_keys();
     keys.sort_unstable();
     assert_eq!(
         keys,
@@ -571,10 +638,13 @@ fn every_line_is_one_json_object_with_the_readme_keys_and_odd_names_read_back_as
             "interface",
             "kind",
             "step",
+            "steps",
             "version"
         ]
     );
-    Line::read(&readme_object());
+    for shown in readme_objects() {
+        Line::read(&shown);
+    }
 
     let protocol = Protocol::new();
     let history = protocol.history(HistoryWay::new("app").unwrap());
@@ -863,4 +933,295 @@ fn history_list_says_a_file_in_no_protocols_folder_gets_no_line() {
             && last.ends_with(" holds arcform.yaml, so no line names its versions"),
         "{stdout}"
     );
+}
+
+// ------------------------------------------------------ a plain save's step
+
+/// A spec holding `steps`, each a name and the SQL file it names.
+fn spec_with(steps: &[(&str, &str)]) -> String {
+    let mut text = String::from("name: shop\nengine: duckdb\ndb: shop.duckdb\n\nsteps:\n");
+    for (name, sql) in steps {
+        text.push_str(&format!("  - name: {name}\n    sql: {sql}\n"));
+    }
+    text
+}
+
+/// A save of the spec in `protocol` through the app's handle, which names no
+/// step of its own: the entry recorded.
+fn save_spec(protocol: &Protocol, text: &str) -> arc::spec::HistoryEntry {
+    protocol
+        .history(HistoryWay::new("app").unwrap())
+        .record_save(&protocol.dir, text)
+        .unwrap()
+        .expect("a save of a new state is recorded")
+}
+
+/// The last line of the log, read back.
+fn last_line(protocol: &Protocol) -> Line {
+    protocol.lines().pop().expect("the log holds a line")
+}
+
+#[test]
+fn a_save_names_the_step_it_added_changed_or_removed() {
+    let protocol = Protocol::new();
+    let two = spec_with(&[("load_orders", "models/01_orders.sql"), ("tally", "a.sql")]);
+    save_spec(&protocol, &two);
+    assert_eq!(
+        last_line(&protocol).named(),
+        [] as [(&str, &str); 0],
+        "a first save has no earlier state to compare with"
+    );
+
+    // One step added to a Protocol holding two.
+    let three = spec_with(&[
+        ("load_orders", "models/01_orders.sql"),
+        ("tally", "a.sql"),
+        ("big_orders", "b.sql"),
+    ]);
+    let saved = save_spec(&protocol, &three);
+    let line = last_line(&protocol);
+    assert_eq!(line.version, saved.id);
+    assert_eq!(line.file, MANIFEST_FILENAME);
+    assert_eq!(line.interface.as_deref(), Some("app"));
+    assert_eq!(
+        (line.step.as_deref(), line.change.as_deref(), &line.steps),
+        (Some("big_orders"), Some("added"), &None),
+        "one step is `step` and `change`: {line:?}"
+    );
+
+    // One step's statement changed.
+    let changed = spec_with(&[
+        ("load_orders", "models/01_orders.sql"),
+        ("tally", "a.sql"),
+        ("big_orders", "c.sql"),
+    ]);
+    save_spec(&protocol, &changed);
+    let line = last_line(&protocol);
+    assert_eq!(line.named(), [("big_orders", "changed")], "{line:?}");
+
+    // That step removed.
+    let removed = spec_with(&[("load_orders", "models/01_orders.sql"), ("tally", "a.sql")]);
+    save_spec(&protocol, &removed);
+    let line = last_line(&protocol);
+    assert_eq!(line.named(), [("big_orders", "removed")], "{line:?}");
+    assert_eq!(protocol.lines().len(), 4, "one line for each save");
+}
+
+#[test]
+fn a_save_that_added_one_step_and_changed_another_names_both_on_one_line() {
+    let protocol = Protocol::new();
+    save_spec(
+        &protocol,
+        &spec_with(&[("load_orders", "models/01_orders.sql"), ("tally", "a.sql")]),
+    );
+
+    save_spec(
+        &protocol,
+        &spec_with(&[
+            ("load_orders", "models/01_orders.sql"),
+            ("tally", "changed.sql"),
+            ("big_orders", "b.sql"),
+        ]),
+    );
+
+    let lines = protocol.lines();
+    assert_eq!(lines.len(), 2, "one line for the one write: {lines:?}");
+    let line = &lines[1];
+    assert_eq!(
+        (&line.step, &line.change),
+        (&None, &None),
+        "several steps are `steps`, not `step` and `change`: {line:?}"
+    );
+    assert_eq!(
+        line.named(),
+        [("tally", "changed"), ("big_orders", "added")],
+        "{line:?}"
+    );
+    let raw = fs::read_to_string(protocol.dir.join(LOG_FILENAME)).unwrap();
+    assert!(
+        raw.lines().last().unwrap().contains(
+            "\"steps\":[{\"step\":\"tally\",\"change\":\"changed\"},\
+             {\"step\":\"big_orders\",\"change\":\"added\"}]"
+        ),
+        "{raw}"
+    );
+}
+
+#[test]
+fn a_renamed_step_reads_as_one_removed_and_one_added() {
+    let protocol = Protocol::new();
+    save_spec(&protocol, &spec_with(&[("tally", "a.sql")]));
+
+    save_spec(&protocol, &spec_with(&[("count", "a.sql")]));
+
+    assert_eq!(
+        last_line(&protocol).named(),
+        [("count", "added"), ("tally", "removed")]
+    );
+}
+
+#[test]
+fn a_save_that_changed_no_step_names_the_file_and_no_step() {
+    let protocol = Protocol::new();
+    let base = spec_with(&[("load_orders", "models/01_orders.sql"), ("tally", "a.sql")]);
+    save_spec(&protocol, &base);
+
+    // A key at the manifest's top.
+    let top = base.replace(
+        "engine: duckdb",
+        "engine: duckdb\nengine_version: \">=1.3\"",
+    );
+    assert_ne!(top, base);
+    let saved = save_spec(&protocol, &top);
+    let line = last_line(&protocol);
+    assert_eq!(
+        (line.file.as_str(), line.version.as_str()),
+        (MANIFEST_FILENAME, saved.id.as_str())
+    );
+    assert_eq!(line.named(), [] as [(&str, &str); 0], "a top key: {line:?}");
+
+    // A comment, above a step and inside one.
+    let comment = top.replace(
+        "  - name: tally\n    sql: a.sql",
+        "  # what the tally counts\n  - name: tally\n    # the file\n    sql: a.sql",
+    );
+    assert_ne!(comment, top);
+    save_spec(&protocol, &comment);
+    let line = last_line(&protocol);
+    assert_eq!(line.named(), [] as [(&str, &str); 0], "a comment: {line:?}");
+
+    // The order of a step's keys, and of the steps themselves.
+    let reordered = "name: shop\nengine: duckdb\nengine_version: \">=1.3\"\ndb: shop.duckdb\n\n\
+                     steps:\n  - sql: a.sql\n    name: tally\n  - name: load_orders\n    \
+                     sql: models/01_orders.sql\n";
+    save_spec(&protocol, reordered);
+    let line = last_line(&protocol);
+    assert_eq!(line.named(), [] as [(&str, &str); 0], "an order: {line:?}");
+
+    let lines = protocol.lines();
+    assert_eq!(lines.len(), 4, "each save has its line: {lines:?}");
+    assert!(
+        lines.iter().all(|line| line.file == MANIFEST_FILENAME),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn a_save_equal_to_the_last_recorded_state_records_no_version_and_writes_no_line() {
+    let protocol = Protocol::new();
+    let text = spec_with(&[("tally", "a.sql")]);
+    save_spec(&protocol, &text);
+    let history = protocol.history(HistoryWay::new("app").unwrap());
+    let lines_before = protocol.lines();
+
+    assert!(
+        history.record_save(&protocol.dir, &text).unwrap().is_none(),
+        "the store records nothing for a state it already holds"
+    );
+
+    assert_eq!(protocol.lines(), lines_before, "and the log gains no line");
+    assert_eq!(history.entries(&protocol.dir).unwrap().len(), 1);
+}
+
+#[test]
+fn a_save_of_a_file_that_is_not_the_spec_names_the_file_and_no_step() {
+    let protocol = Protocol::new();
+    let history = protocol.history(HistoryWay::new("app").unwrap());
+    fs::create_dir_all(protocol.dir.join("panels")).unwrap();
+    let chart = protocol.dir.join("panels/sales.yaml");
+    // The second text holds a `steps:` list that differs from the first's, so
+    // only the file's name says it is not a spec.
+    let texts = [
+        "mark: bar\n",
+        "mark: line\n",
+        "mark: line\nsteps:\n  - name: a\n",
+        "mark: line\nsteps:\n  - name: a\n  - name: b\n",
+    ];
+    for text in texts {
+        history.record_save_for_file(&chart, text).unwrap().unwrap();
+    }
+
+    let lines = protocol.lines();
+    assert_eq!(lines.len(), texts.len(), "{lines:?}");
+    for line in &lines {
+        assert_eq!(line.file, "panels/sales.yaml");
+        assert_eq!(line.named(), [] as [(&str, &str); 0], "{line:?}");
+    }
+}
+
+#[test]
+fn a_save_whose_last_recorded_state_the_store_does_not_hold_names_the_file_and_is_recorded() {
+    // Never on this machine: the Protocol came with its log and the store is empty.
+    let protocol = Protocol::new();
+    save_spec(&protocol, &spec_with(&[("tally", "a.sql")]));
+    assert_eq!(
+        last_line(&protocol).named(),
+        [] as [(&str, &str); 0],
+        "a spec the store has no state of"
+    );
+
+    // Pruned: the snapshot the store held is gone.
+    let snapshot = |protocol: &Protocol| -> PathBuf {
+        let mut found = Vec::new();
+        for dir in fs::read_dir(&protocol.store).unwrap().flatten() {
+            for file in fs::read_dir(dir.path()).unwrap().flatten() {
+                if file.path().extension().is_some_and(|ext| ext == "yaml") {
+                    found.push(file.path());
+                }
+            }
+        }
+        assert_eq!(found.len(), 1, "one snapshot: {found:?}");
+        found.remove(0)
+    };
+    fs::remove_file(snapshot(&protocol)).unwrap();
+    let saved = save_spec(&protocol, &spec_with(&[("tally", "b.sql")]));
+    let line = last_line(&protocol);
+    assert_eq!(line.version, saved.id);
+    assert_eq!(
+        line.named(),
+        [] as [(&str, &str); 0],
+        "a pruned state: {line:?}"
+    );
+
+    // Listed and unreadable: a directory stands where the snapshot was.
+    let path = snapshot(&protocol);
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    let saved = save_spec(
+        &protocol,
+        &spec_with(&[("tally", "c.sql"), ("more", "d.sql")]),
+    );
+    let line = last_line(&protocol);
+    assert_eq!(line.version, saved.id);
+    assert_eq!(
+        line.named(),
+        [] as [(&str, &str); 0],
+        "a state the store cannot read: {line:?}"
+    );
+}
+
+#[test]
+fn a_spec_that_does_not_read_as_steps_names_the_file_and_no_step() {
+    let protocol = Protocol::new();
+    save_spec(&protocol, &spec_with(&[("tally", "a.sql")]));
+
+    // Not YAML at all, then the same text read again, then two steps of one name.
+    save_spec(&protocol, "steps: [unclosed\n");
+    assert_eq!(last_line(&protocol).named(), [] as [(&str, &str); 0]);
+    save_spec(&protocol, &spec_with(&[("tally", "a.sql")]));
+    assert_eq!(
+        last_line(&protocol).named(),
+        [] as [(&str, &str); 0],
+        "after a text that did not read, there is nothing to compare with"
+    );
+    save_spec(
+        &protocol,
+        &spec_with(&[("tally", "a.sql"), ("tally", "b.sql")]),
+    );
+    assert_eq!(
+        last_line(&protocol).named(),
+        [] as [(&str, &str); 0],
+        "two steps of one name cannot be told apart"
+    );
+    assert_eq!(protocol.lines().len(), 4);
 }
