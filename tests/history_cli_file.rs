@@ -321,7 +321,7 @@ fn with_no_file_the_verbs_print_and_write_what_they_did() {
 
     let stdout = fx.arc_ok(&["history", "list"]);
     let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines.len(), 4, "{stdout}");
+    assert_eq!(lines.len(), 5, "{stdout}");
     assert_eq!(lines[0], entry_line(&fx.history, &fx.dir, &fx.spec_ids[0]));
     assert_eq!(lines[1], entry_line(&fx.history, &fx.dir, &fx.spec_ids[1]));
     assert_eq!(
@@ -329,6 +329,7 @@ fn with_no_file_the_verbs_print_and_write_what_they_did() {
         "(2 recorded state(s), newest last — `arc history restore <id>` rolls back)"
     );
     assert!(lines[3].starts_with("policy: "), "{stdout}");
+    assert!(lines[4].starts_with("log: "), "{stdout}");
 
     assert_eq!(fx.arc_ok(&["history", "show", &fx.spec_ids[0]]), SPEC_V1);
 
