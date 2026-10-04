@@ -247,14 +247,49 @@ impl HistoryKind {
 
 /// What a version did to the protocol's steps, as its line in the folder's
 /// log names it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum StepNote<'a> {
-    /// Nothing that recorded the version named a step: a plain save, a
-    /// checkpoint, an edit, a file that is not the spec.
+    /// Nothing that recorded the version named a step: a checkpoint, an edit,
+    /// an unsaved text, a file that is not the spec, or a save that changed
+    /// no step.
     Unnamed,
     /// A verb that adds a step recorded the version, adding the step of this
     /// name.
     Added(&'a str),
+    /// A plain save: [`LocalHistory::record_keyed`] names the steps by
+    /// comparing the saved text with the state the store held before it, and
+    /// turns this into [`StepNote::Steps`] or [`StepNote::Unnamed`].
+    Compare,
+    /// The steps a comparison found the save to have added, removed or
+    /// changed, never empty.
+    Steps(Vec<StepChange>),
+}
+
+/// What a save did to one step of the spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StepChange {
+    step: String,
+    change: Change,
+}
+
+/// What happened to a step between two states of the spec. A step that was
+/// renamed reads as one removed and one added, because nothing in the text
+/// says the two are the same step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Change {
+    Added,
+    Removed,
+    Changed,
+}
+
+impl Change {
+    fn word(self) -> &'static str {
+        match self {
+            Change::Added => "added",
+            Change::Removed => "removed",
+            Change::Changed => "changed",
+        }
+    }
 }
 
 /// A checkpoint's line in the folder's log, held until the write the
@@ -423,7 +458,14 @@ impl LocalHistory {
     /// `Ok(Some(entry))` for a recorded (or merged) entry, `Ok(None)` when
     /// the state was already the newest entry and nothing needed recording.
     pub fn record_save(&self, dir: &Path, text: &str) -> Result<Option<HistoryEntry>> {
-        self.record(dir, text, HistoryKind::Save, SystemTime::now(), true)
+        self.record_noted(
+            dir,
+            text,
+            HistoryKind::Save,
+            SystemTime::now(),
+            true,
+            Some(StepNote::Compare),
+        )
     }
 
     /// Record `text` — the bytes a machine edit is about to replace — as a
@@ -485,7 +527,7 @@ impl LocalHistory {
             HistoryKind::Save,
             SystemTime::now(),
             true,
-            Some(StepNote::Unnamed),
+            Some(StepNote::Compare),
         )
     }
 
@@ -657,11 +699,14 @@ impl LocalHistory {
         let existing = entries_in(&key_dir)?;
         let newest = existing.last();
 
+        // The state the store held before this one. A snapshot the store lists
+        // and cannot read leaves nothing to compare with, and costs the line
+        // its step and the version nothing.
+        let before = newest.and_then(|newest| read_at(&key_dir, newest).ok());
+
         // The newest entry already records exactly this state: nothing new
         // to keep, whatever the kind and whatever the way.
-        if let Some(newest) = newest
-            && read_at(&key_dir, newest)? == text
-        {
+        if before.as_deref() == Some(text) {
             return Ok(None);
         }
 
@@ -706,6 +751,10 @@ impl LocalHistory {
         // caller holds the line for a write still to land. A courtesy: a line
         // arc cannot write refuses nothing the store has kept.
         if let Some(note) = line {
+            let note = match note {
+                StepNote::Compare => name_steps(&spec_path, before.as_deref(), text),
+                other => other,
+            };
             let _ = append_log_line(&spec_path, &entry, note);
         }
 
@@ -942,6 +991,78 @@ fn protocol_folder(file: &Path) -> Option<&Path> {
         .find(|dir| dir.join(MANIFEST_FILENAME).is_file())
 }
 
+/// The steps a save of the file at `spec_path` added, removed or changed,
+/// found by comparing `after`, the text saved, with `before`, the state the
+/// store held before it, as the note the save's line carries.
+///
+/// Only the spec has steps, so a file with any other name is [`StepNote::Unnamed`],
+/// as is a save with no earlier state to compare with, a text on either side
+/// that does not read as a spec's steps, and a save that changed none: a key at
+/// the manifest's top, a comment, the order the steps stand in. The line then
+/// names the file, which every line does, and no step.
+fn name_steps(spec_path: &Path, before: Option<&str>, after: &str) -> StepNote<'static> {
+    let is_spec = spec_path.file_name() == Some(std::ffi::OsStr::new(MANIFEST_FILENAME));
+    let (true, Some(before)) = (is_spec, before) else {
+        return StepNote::Unnamed;
+    };
+    let (Some(before), Some(after)) = (steps_of(before), steps_of(after)) else {
+        return StepNote::Unnamed;
+    };
+    let mut found = Vec::new();
+    for (name, step) in &after {
+        let change = match before.iter().find(|(earlier, _)| earlier == name) {
+            None => Change::Added,
+            Some((_, earlier)) if earlier != step => Change::Changed,
+            Some(_) => continue,
+        };
+        found.push(StepChange {
+            step: name.clone(),
+            change,
+        });
+    }
+    for (name, _) in &before {
+        if !after.iter().any(|(kept, _)| kept == name) {
+            found.push(StepChange {
+                step: name.clone(),
+                change: Change::Removed,
+            });
+        }
+    }
+    if found.is_empty() {
+        StepNote::Unnamed
+    } else {
+        StepNote::Steps(found)
+    }
+}
+
+/// The steps of the spec in `text`, each with its name, in the order they stand
+/// there. The text is read as YAML and not through the loader, which refuses a
+/// spec for much besides its steps, and a state the store recorded may be one
+/// the loader refuses. `None` when `text` is not a mapping, when its `steps` is
+/// not a sequence of mappings each with a text `name`, or when two steps share
+/// a name, since a step cannot then be told from its namesake. A spec with no
+/// `steps` has none, and a step compares as the value it parses to, so a comment
+/// or the order of its keys is no change.
+fn steps_of(text: &str) -> Option<Vec<(String, serde_yaml::Value)>> {
+    let serde_yaml::Value::Mapping(spec) = serde_yaml::from_str(text).ok()? else {
+        return None;
+    };
+    let steps = match spec.get("steps") {
+        None | Some(serde_yaml::Value::Null) => return Some(Vec::new()),
+        Some(serde_yaml::Value::Sequence(steps)) => steps,
+        Some(_) => return None,
+    };
+    let mut named: Vec<(String, serde_yaml::Value)> = Vec::with_capacity(steps.len());
+    for step in steps {
+        let name = step.get("name")?.as_str()?.to_string();
+        if named.iter().any(|(earlier, _)| *earlier == name) {
+            return None;
+        }
+        named.push((name, step.clone()));
+    }
+    Some(named)
+}
+
 /// Append the line naming `entry`, a version of the file at `file`, to the log
 /// of `file`'s protocol folder, creating the log when there is none. The line
 /// lands in one write, so no reader sees half of it; a log whose last byte is
@@ -996,11 +1117,35 @@ fn log_line(name: &str, entry: &HistoryEntry, note: StepNote) -> String {
         step: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         change: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        steps: Option<Vec<Named<'a>>>,
     }
-    let (step, change) = match note {
-        StepNote::Unnamed => (None, None),
-        StepNote::Added(step) => (Some(step), Some("added")),
-    };
+    /// One of several steps a save touched.
+    #[derive(serde::Serialize)]
+    struct Named<'a> {
+        step: &'a str,
+        change: &'static str,
+    }
+    let (mut step, mut change, mut steps) = (None, None, None);
+    match &note {
+        StepNote::Unnamed | StepNote::Compare => {}
+        StepNote::Added(added) => (step, change) = (Some(*added), Some(Change::Added.word())),
+        StepNote::Steps(found) => match found.as_slice() {
+            [] => {}
+            [one] => (step, change) = (Some(one.step.as_str()), Some(one.change.word())),
+            several => {
+                steps = Some(
+                    several
+                        .iter()
+                        .map(|one| Named {
+                            step: &one.step,
+                            change: one.change.word(),
+                        })
+                        .collect(),
+                )
+            }
+        },
+    }
     let line = Line {
         at: humantime::format_rfc3339_millis(entry.at).to_string(),
         file: name,
@@ -1009,6 +1154,7 @@ fn log_line(name: &str, entry: &HistoryEntry, note: StepNote) -> String {
         version: &entry.id,
         step,
         change,
+        steps,
     };
     let mut text = serde_json::to_string(&line).expect("a line of strings serialises");
     text.push('\n');
