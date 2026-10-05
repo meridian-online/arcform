@@ -651,9 +651,11 @@ impl LocalHistory {
 
     /// Record one entry for the spec in `dir`. `now` is a parameter so the
     /// debounce window and ordering rules are testable without a clock;
-    /// `merge` engages the save debounce, and is true only for the
-    /// save-boundary entry point — see the retention-policy discussion in the
-    /// module docs. The folder's log names no step for the version.
+    /// `merge` engages the save debounce, which the save-boundary entry
+    /// points ask for through [`record_noted`](Self::record_noted) — see the
+    /// retention-policy discussion in the module docs. The folder's log names
+    /// no step for a version recorded here; the save-boundary entry points ask
+    /// `record_noted` for a comparison.
     fn record(
         &self,
         dir: &Path,
