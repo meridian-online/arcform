@@ -539,7 +539,13 @@ fn a_fresh_protocol_stages_the_manifest_and_not_arcs_run_records() {
     let staged = staged_by_add_all(&proto);
     assert_eq!(
         staged,
-        [".gitattributes", ".gitignore", LOG, "arcform.yaml", "models/gen.sql"],
+        [
+            ".gitattributes",
+            ".gitignore",
+            LOG,
+            "arcform.yaml",
+            "models/gen.sql"
+        ],
         "the generated model is staged and no run record is"
     );
 }
@@ -715,7 +721,10 @@ fn init_writes_the_same_list_and_says_so() {
         IGNORE_LIST
     );
     // `models/` and `sources/` are empty, which git does not stage.
-    assert_eq!(staged_by_add_all(&proto), [".gitattributes", ".gitignore", "arcform.yaml"]);
+    assert_eq!(
+        staged_by_add_all(&proto),
+        [".gitattributes", ".gitignore", "arcform.yaml"]
+    );
 }
 
 /// A `.gitignore` the author wrote before `create-protocol` ran is as they left it,

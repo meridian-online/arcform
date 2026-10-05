@@ -6,7 +6,8 @@ use clap::{Parser, Subcommand};
 use owo_colors::OwoColorize;
 
 use crate::edit::{
-    ATTRIBUTES_FILENAME, IGNORE_FILENAME, IgnoreList, MergeRule, write_ignore_list, write_merge_rule,
+    ATTRIBUTES_FILENAME, IGNORE_FILENAME, IgnoreList, MergeRule, write_ignore_list,
+    write_merge_rule,
 };
 use crate::engine::{ALLOW_UNTESTED_ENGINE_ENV, DuckDbEngine, Engine};
 use crate::error::{Error, Result};

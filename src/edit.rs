@@ -2188,7 +2188,10 @@ steps:
         let nowhere = dir.path().join("nowhere");
         std::os::unix::fs::symlink(&nowhere, dangling.join(ATTRIBUTES_FILENAME)).unwrap();
         assert_eq!(write_merge_rule(&dangling).unwrap(), MergeRule::Kept);
-        assert!(!nowhere.exists(), "the rule was not written through the link");
+        assert!(
+            !nowhere.exists(),
+            "the rule was not written through the link"
+        );
 
         let directory = dir.path().join("directory");
         std::fs::create_dir_all(directory.join(ATTRIBUTES_FILENAME)).unwrap();
