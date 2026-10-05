@@ -97,9 +97,11 @@ pub enum Commands {
     /// records an entry and every machine edit checkpoints the state it is
     /// about to replace. The snapshots go into `$ARCFORM_HISTORY_DIR`
     /// (default `~/.arcform/history`) — outside the protocol directory,
-    /// invisible to `git status` — and each version gets one line, with no
-    /// contents, in `arcform-log.txt` in the protocol's folder, which goes
-    /// with the folder and which `git add` stages. Each file keeps a history
+    /// invisible to `git status`, keyed to the protocol's path — and each
+    /// version gets one line, with no contents, in `arcform-log.txt` in the
+    /// protocol's folder, which goes with the folder and which `git add`
+    /// stages. A folder renamed, moved or copied on this machine finds its
+    /// snapshots again through that log. Each file keeps a history
     /// of its own: `--file panels/a.yaml` lists, shows and restores that
     /// file's entries and no other's, and a relative `--file` is read from
     /// `--dir`. At most 50 snapshots are kept per spec and per file, oldest

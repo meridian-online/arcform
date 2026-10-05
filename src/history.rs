@@ -63,7 +63,8 @@
 //!
 //! Inside the root, each file gets a directory keyed by a hash of its
 //! canonical path, holding a `spec-path` file (the path in the clear, for a
-//! human inspecting the store) and one snapshot file per entry, named
+//! human inspecting the store, and for a folder that moves to find its
+//! snapshots by) and one snapshot file per entry, named
 //! `<millis>-<seq>-<kind>.<way>.yaml` — or `<millis>-<seq>-<kind>.yaml` for an
 //! entry that names no way, which is every entry an arc before ways wrote.
 //! The entry's id is the name up to its first `.` either way. Entries are
@@ -87,7 +88,8 @@
 //! not named `arcform.yaml` the nearest directory at or above it that holds
 //! one. One folder has one log, and each line names the file it is about. The
 //! log is the provenance that travels with the folder, through git, a drive
-//! or an archive; the snapshots are the safety net that stays on the machine.
+//! or an archive; the snapshots are the safety net that stays on the machine,
+//! and a folder that moves finds them again through its log.
 //!
 //! A line is one JSON object, so a person reads it and any JSON reader parses
 //! it, the log as a whole being newline-delimited JSON:
@@ -134,6 +136,38 @@
 //! refused after its checkpoint leaves the folder as it was, and the
 //! checkpoint in the store alone. A line outlives its
 //! snapshot: pruning and the save debounce remove snapshots, never lines.
+//!
+//! # A folder renamed, moved or copied
+//!
+//! The snapshots are keyed to the file's path, so a folder renamed, moved or
+//! copied resolves to a key that holds nothing, while the log it carries names
+//! versions another key holds. Every call that reads or records a file's
+//! history finds them again through the log first. Each version the folder's
+//! log names for the file that is newer than the newest entry the file's own
+//! key holds is copied under that key from another key of the store that
+//! holds a version with that id for a file of the same name inside its folder:
+//! `arcform.yaml` for the spec, `panels/a.yaml` for a chart file there. Then
+//! the key is held to the bound. `arc history list` in a renamed folder prints
+//! what it printed before, and the first save there is compared with the state
+//! the folder had.
+//!
+//! A version is found by its id and never by its contents, so a Protocol
+//! whose log names no id this store holds takes nothing, however alike its
+//! files are: a fresh one, or a clone from another machine, whose snapshots
+//! stayed there. Where several keys hold an id, it is read from the one that
+//! holds the most of the versions the log names, which is the key the folder
+//! came from rather than another file recorded in the same millisecond.
+//!
+//! The copy leaves the old key as it was. A copied folder and its original
+//! list the same versions when the copy is made, and diverge from the first
+//! version either records after it, because the log of each names only its
+//! own. A folder moved back to a path it held before takes the versions it
+//! recorded while away, which are newer than any the old key holds. A version
+//! older than the newest its key holds is not taken again, so a snapshot the
+//! bound pruned or the save debounce folded away stays gone though the log
+//! still names it. The copy is a courtesy, as the log's line is: a snapshot
+//! that cannot be read stops it, the key keeps the older versions it copied,
+//! and the next call takes up from there.
 //!
 //! # The way arc was reached
 //!
