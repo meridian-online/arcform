@@ -446,6 +446,116 @@ fn escape_ignore_pattern(part: &str) -> Option<String> {
     Some(out)
 }
 
+// ------------------------------------------------------------- the merge rule
+
+/// The attributes file's name, written beside `arcform.yaml` and the ignore list.
+pub(crate) const ATTRIBUTES_FILENAME: &str = ".gitattributes";
+
+/// What [`write_merge_rule`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MergeRule {
+    /// The attributes file was written, holding the rule.
+    Written,
+    /// An attributes file was there, and the rule is now its last line.
+    Added,
+    /// An entry named `.gitattributes` was there already, and is as it was.
+    Kept,
+}
+
+/// The rule: git merges the Protocol's log by keeping both sides' lines. Anchored, so
+/// it names the log beside the file it sits in and no other log below it.
+fn merge_rule_line() -> String {
+    format!("/{} merge=union\n", crate::history::LOG_FILENAME)
+}
+
+/// A fresh attributes file: the rule, under a comment that names no file, so the rule
+/// is the one line that names the log.
+fn merge_rule_file_text() -> String {
+    format!(
+        "# Written by `arc`: when two clones of a Protocol are merged, git keeps both \
+         sides' lines of the log below.\n{}",
+        merge_rule_line()
+    )
+}
+
+/// Whether some line of `attributes` already sets the log's `merge` attribute, to
+/// `union` or to anything else: an author who named another driver for the log made
+/// that choice, and a later line of ours would override it.
+fn sets_the_logs_merge(attributes: &[u8]) -> bool {
+    let log = crate::history::LOG_FILENAME;
+    String::from_utf8_lossy(attributes).lines().any(|line| {
+        let mut words = line.split_ascii_whitespace();
+        let names_the_log = words.next().is_some_and(|pattern| {
+            pattern == log || pattern.strip_prefix('/').is_some_and(|p| p == log)
+        });
+        names_the_log
+            && words.any(|attribute| {
+                let name = attribute.strip_prefix(['-', '!']).unwrap_or(attribute);
+                name.split('=').next() == Some("merge")
+            })
+    })
+}
+
+/// Write the rule that makes git keep both sides' lines of the Protocol's log, beside
+/// `arcform.yaml` in `dir`, for the verbs that make a Protocol directory. Two clones
+/// that each record a version append to the same log, and without the rule their merge
+/// conflicts on it. The merged log holds each side's lines in the order git leaves
+/// them, not in time order: each line carries its own time.
+///
+/// An attributes file already in `dir` keeps its lines and gains the rule as its last
+/// line, unless a line of it already sets the log's `merge` attribute, in which case it
+/// is left as it is. A name that is a link or a directory is left as it is too: a link
+/// may lead to a file other folders share, and appending through it would edit theirs.
+/// Like the ignore list this looks for no repository and runs no `git`: the rule is
+/// written in a folder that is no repository, which may become one.
+pub(crate) fn write_merge_rule(dir: &Path) -> Result<MergeRule> {
+    use std::io::Write;
+
+    let path = dir.join(ATTRIBUTES_FILENAME);
+    let named = |e: std::io::Error| {
+        Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("{}: {e}", path.display()),
+        ))
+    };
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            if let Err(e) = file.write_all(merge_rule_file_text().as_bytes()) {
+                // A half-written file would be read as the author's on the next run.
+                let _ = std::fs::remove_file(&path);
+                return Err(named(e));
+            }
+            return Ok(MergeRule::Written);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(named(e)),
+    }
+
+    if !std::fs::symlink_metadata(&path).map_err(named)?.is_file() {
+        return Ok(MergeRule::Kept);
+    }
+    let existing = std::fs::read(&path).map_err(named)?;
+    if sets_the_logs_merge(&existing) {
+        return Ok(MergeRule::Kept);
+    }
+    // One append, so the rule lands whole; a file that ends mid-line is ended first.
+    let mut added = Vec::new();
+    if !existing.is_empty() && !existing.ends_with(b"\n") {
+        added.push(b'\n');
+    }
+    added.extend_from_slice(merge_rule_line().as_bytes());
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(&added))
+        .map_err(named)?;
+    Ok(MergeRule::Added)
+}
+
 // ------------------------------------------------------------------- splicing
 
 /// Apply every edit in order, each to the text the previous one left, then
@@ -1948,6 +2058,189 @@ steps:
             IgnoreList::Kept
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs");
+    }
+
+    #[test]
+    fn the_merge_rule_is_anchored_and_is_the_one_line_that_names_the_log() {
+        let log = crate::history::LOG_FILENAME;
+        assert_eq!(merge_rule_line(), format!("/{log} merge=union\n"));
+
+        let text = merge_rule_file_text();
+        let naming: Vec<&str> = text.lines().filter(|l| l.contains(log)).collect();
+        assert_eq!(
+            naming,
+            [format!("/{log} merge=union")],
+            "one line names the log, and it is the rule:\n{text}"
+        );
+        assert!(
+            text.lines().all(|l| l.starts_with('#') || l == naming[0]),
+            "everything else in the file is a comment:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_fresh_merge_rule_is_written_once_and_the_file_it_made_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(ATTRIBUTES_FILENAME);
+
+        assert_eq!(write_merge_rule(dir.path()).unwrap(), MergeRule::Written);
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(written, merge_rule_file_text().as_bytes());
+
+        assert_eq!(write_merge_rule(dir.path()).unwrap(), MergeRule::Kept);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            written,
+            "a folder that holds the rule is left byte-identical"
+        );
+    }
+
+    #[test]
+    fn an_attributes_file_already_there_keeps_its_lines_and_gains_the_rule() {
+        let rule = merge_rule_line();
+        // Two end mid-line, one of them after a CRLF line, and one is empty: the rule never
+        // joins the end of their last line, and their bytes are never rewritten.
+        for theirs in [
+            "*.csv -diff\n".to_string(),
+            "*.csv -diff".to_string(),
+            "*.csv -diff\r\n# notes".to_string(),
+            String::new(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(ATTRIBUTES_FILENAME);
+            std::fs::write(&path, &theirs).unwrap();
+
+            assert_eq!(write_merge_rule(dir.path()).unwrap(), MergeRule::Added);
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert!(after.starts_with(&theirs), "their bytes lead: {after:?}");
+            let tail = &after[theirs.len()..];
+            let expected_tail = if theirs.is_empty() || theirs.ends_with('\n') {
+                rule.clone()
+            } else {
+                format!("\n{rule}")
+            };
+            assert_eq!(tail, expected_tail, "after {theirs:?}");
+            assert_eq!(
+                after.lines().last(),
+                Some(rule.trim_end()),
+                "the rule is the last line"
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_that_already_sets_the_logs_merge_is_left_alone() {
+        let log = crate::history::LOG_FILENAME;
+        // Our own line, the same line unanchored, one with more attributes, one that
+        // names another driver, and one that turns merging off: each is the author's.
+        for theirs in [
+            format!("/{log} merge=union\n"),
+            format!("{log} merge=union\n"),
+            format!("*.csv -diff\n/{log}   text  merge=union\r\n"),
+            format!("{log} merge=ours\n"),
+            format!("/{log} -merge\n"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(ATTRIBUTES_FILENAME);
+            std::fs::write(&path, &theirs).unwrap();
+
+            assert_eq!(
+                write_merge_rule(dir.path()).unwrap(),
+                MergeRule::Kept,
+                "{theirs:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), theirs);
+        }
+    }
+
+    #[test]
+    fn a_line_that_does_not_set_the_logs_merge_is_not_taken_for_one() {
+        let log = crate::history::LOG_FILENAME;
+        for theirs in [
+            // A comment, a longer name, another file's merge, the log's other attributes,
+            // and a directory pattern that names more than the log.
+            format!("# {log} merge=union\n"),
+            format!("old-{log} merge=union\n"),
+            format!("{log}.bak merge=union\n"),
+            "notes.txt merge=union\n".to_string(),
+            format!("/{log} -diff\n"),
+            format!("/{log} nomerge=union\n"),
+            format!("/sub/{log} merge=union\n"),
+        ] {
+            assert!(!sets_the_logs_merge(theirs.as_bytes()), "{theirs:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_or_a_directory_named_as_the_attributes_file_is_not_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared-attributes");
+        std::fs::write(&shared, "*.csv -diff\n").unwrap();
+        let linked = dir.path().join("linked");
+        std::fs::create_dir(&linked).unwrap();
+        std::os::unix::fs::symlink(&shared, linked.join(ATTRIBUTES_FILENAME)).unwrap();
+        assert_eq!(write_merge_rule(&linked).unwrap(), MergeRule::Kept);
+        assert_eq!(std::fs::read_to_string(&shared).unwrap(), "*.csv -diff\n");
+
+        let dangling = dir.path().join("dangling");
+        std::fs::create_dir(&dangling).unwrap();
+        let nowhere = dir.path().join("nowhere");
+        std::os::unix::fs::symlink(&nowhere, dangling.join(ATTRIBUTES_FILENAME)).unwrap();
+        assert_eq!(write_merge_rule(&dangling).unwrap(), MergeRule::Kept);
+        assert!(
+            !nowhere.exists(),
+            "the rule was not written through the link"
+        );
+
+        let directory = dir.path().join("directory");
+        std::fs::create_dir_all(directory.join(ATTRIBUTES_FILENAME)).unwrap();
+        assert_eq!(write_merge_rule(&directory).unwrap(), MergeRule::Kept);
+    }
+
+    /// A file arc cannot read is one it cannot tell holds the rule, and one it cannot
+    /// append to cannot gain it: each is refused with the file named and left as it was,
+    /// not taken for an empty file or reported as added to.
+    #[cfg(unix)]
+    #[test]
+    fn an_attributes_file_arc_cannot_read_or_append_to_is_refused_and_left_as_it_was() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (case, mode) in [("unreadable", 0o200), ("read-only", 0o444)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(ATTRIBUTES_FILENAME);
+            let theirs = "*.csv -diff\n";
+            std::fs::write(&path, theirs).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let bound = if mode == 0o200 {
+                std::fs::read(&path).is_err()
+            } else {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .is_err()
+            };
+            if !bound {
+                // Running as a user the mode does not bind: there is no such file to test.
+                continue;
+            }
+
+            let refused = write_merge_rule(dir.path());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let message = refused
+                .err()
+                .unwrap_or_else(|| panic!("{case}: the file is refused"))
+                .to_string();
+            assert!(
+                message.contains(ATTRIBUTES_FILENAME),
+                "{case}: the refusal names the file: {message}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                theirs,
+                "{case}: the file is as it was"
+            );
+        }
     }
 
     #[test]
