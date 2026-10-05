@@ -347,6 +347,12 @@ fn a_path_naming_a_directory_or_no_file_is_refused_by_every_file_call() {
                 f.history.record_save_for_file(&path, SPEC).map(drop),
             ),
             (
+                "record_save_unmerged_for_file",
+                f.history
+                    .record_save_unmerged_for_file(&path, SPEC)
+                    .map(drop),
+            ),
+            (
                 "record_checkpoint_for_file",
                 f.history.record_checkpoint_for_file(&path, SPEC).map(drop),
             ),
@@ -478,6 +484,10 @@ fn the_directory_calls_still_refuse_a_missing_directory_by_name() {
             f.history.record_save(&missing, SPEC).map(drop),
         ),
         (
+            "record_save_unmerged",
+            f.history.record_save_unmerged(&missing, SPEC).map(drop),
+        ),
+        (
             "record_checkpoint",
             f.history.record_checkpoint(&missing, SPEC).map(drop),
         ),
@@ -597,6 +607,80 @@ fn recording_an_unsaved_text_leaves_its_file_as_it_was_and_creates_none() {
         "nothing else lands beside them"
     );
     assert_eq!(fs::read(&f.b).unwrap(), CHART_B.as_bytes());
+}
+
+#[test]
+fn two_unmerged_saves_of_a_file_inside_the_window_are_two_entries_of_kind_save_in_its_history() {
+    let f = setup();
+    f.history
+        .record_save_unmerged_for_file(&f.a, "mark: lineY\n")
+        .unwrap()
+        .expect("recorded");
+    f.history
+        .record_save_unmerged_for_file(&f.a, "mark: areaY\n")
+        .unwrap()
+        .expect("recorded");
+
+    let entries = f.history.entries_for_file(&f.a).unwrap();
+    let span = entries[entries.len() - 1]
+        .at
+        .duration_since(entries[0].at)
+        .unwrap();
+    assert!(
+        span <= HISTORY_MERGE_WINDOW,
+        "the two were recorded {span:?} apart, outside the window this test is about"
+    );
+    assert_eq!(
+        kinds_and_texts(&f.history, &f.a),
+        vec![
+            (HistoryKind::Save, "mark: lineY\n".to_string()),
+            (HistoryKind::Save, "mark: areaY\n".to_string()),
+        ],
+        "a save with the merge off is a save, and neither replaced the other"
+    );
+
+    assert!(
+        f.history.entries_for_file(&f.b).unwrap().is_empty(),
+        "another file's history shows neither"
+    );
+    assert!(
+        f.history.entries(&f.dir).unwrap().is_empty(),
+        "nor does the Protocol's"
+    );
+}
+
+#[test]
+fn a_file_save_after_an_unmerged_one_still_merges_into_it() {
+    let f = setup();
+    f.history
+        .record_save_unmerged_for_file(&f.a, "mark: lineY\n")
+        .unwrap();
+    f.history
+        .record_save_for_file(&f.a, "mark: areaY\n")
+        .unwrap();
+    assert_eq!(
+        kinds_and_texts(&f.history, &f.a),
+        vec![(HistoryKind::Save, "mark: areaY\n".to_string())],
+        "the merging call folds into the newest save inside the window"
+    );
+}
+
+#[test]
+fn an_unmerged_save_of_a_file_identical_to_its_newest_entry_is_not_recorded_again() {
+    let f = setup();
+    assert!(
+        f.history
+            .record_save_unmerged_for_file(&f.a, CHART_A)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        f.history
+            .record_save_unmerged_for_file(&f.a, CHART_A)
+            .unwrap(),
+        None
+    );
+    assert_eq!(f.history.entries_for_file(&f.a).unwrap().len(), 1);
 }
 
 #[test]

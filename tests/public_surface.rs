@@ -1056,6 +1056,9 @@ fn exported_modules_declare_only_contracted_items() {
             "reached_by",
             "root",
             "record_save",
+            // A save with the merge off: kind `Save`, an entry of its own
+            // inside the merge window.
+            "record_save_unmerged",
             "record_checkpoint",
             "entries",
             "read",
@@ -1063,6 +1066,7 @@ fn exported_modules_declare_only_contracted_items() {
             // The same five on one file rather than a protocol directory:
             // a file beside the spec keeps a history of its own.
             "record_save_for_file",
+            "record_save_unmerged_for_file",
             "record_checkpoint_for_file",
             // A text never written to its file, recorded in the store with a
             // line in the folder's log;
