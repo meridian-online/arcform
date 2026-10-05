@@ -1078,7 +1078,7 @@ fn steps_of(text: &str) -> Option<Vec<(String, serde_yaml::Value)>> {
         Some(serde_yaml::Value::Sequence(steps)) => steps,
         Some(_) => return None,
     };
-    let mut named: Vec<(String, serde_yaml::Value)> = Vec::with_capacity(steps.len());
+    let mut named: Vec<(String, serde_yaml::Value)> = Vec::new();
     for step in steps {
         let name = step.get("name")?.as_str()?.to_string();
         if named.iter().any(|(earlier, _)| *earlier == name) {
