@@ -2198,6 +2198,51 @@ steps:
         assert_eq!(write_merge_rule(&directory).unwrap(), MergeRule::Kept);
     }
 
+    /// A file arc cannot read is one it cannot tell holds the rule, and one it cannot
+    /// append to cannot gain it: each is refused with the file named and left as it was,
+    /// not taken for an empty file or reported as added to.
+    #[cfg(unix)]
+    #[test]
+    fn an_attributes_file_arc_cannot_read_or_append_to_is_refused_and_left_as_it_was() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (case, mode) in [("unreadable", 0o200), ("read-only", 0o444)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(ATTRIBUTES_FILENAME);
+            let theirs = "*.csv -diff\n";
+            std::fs::write(&path, theirs).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let bound = if mode == 0o200 {
+                std::fs::read(&path).is_err()
+            } else {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .is_err()
+            };
+            if !bound {
+                // Running as a user the mode does not bind: there is no such file to test.
+                continue;
+            }
+
+            let refused = write_merge_rule(dir.path());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let message = refused
+                .err()
+                .unwrap_or_else(|| panic!("{case}: the file is refused"))
+                .to_string();
+            assert!(
+                message.contains(ATTRIBUTES_FILENAME),
+                "{case}: the refusal names the file: {message}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                theirs,
+                "{case}: the file is as it was"
+            );
+        }
+    }
+
     #[test]
     fn create_spec_writes_the_spec_and_no_ignore_list() {
         let dir = tempfile::tempdir().unwrap();
