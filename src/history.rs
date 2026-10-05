@@ -789,16 +789,17 @@ impl LocalHistory {
     }
 
     /// The key of the spec in `dir`: its `arcform.yaml` under the canonical
-    /// directory.
+    /// directory, holding what [`adopted`](Self::adopted) finds for it.
     fn key_dir(&self, dir: &Path) -> Result<(PathBuf, PathBuf)> {
         let canonical = dir.canonicalize().map_err(|e| Error::FileRead {
             path: dir.to_path_buf(),
             source: e,
         })?;
-        Ok(self.key_for(canonical.join(MANIFEST_FILENAME)))
+        Ok(self.adopted(self.key_for(canonical.join(MANIFEST_FILENAME))))
     }
 
-    /// The key of the file at `file`: its name under its canonical directory.
+    /// The key of the file at `file`: its name under its canonical directory,
+    /// holding what [`adopted`](Self::adopted) finds for it.
     /// The directory is canonicalised and the name is not, so the key is the
     /// one [`key_dir`](Self::key_dir) gives the file's directory when the
     /// name is `arcform.yaml`, whether or not the file exists or is a link.
@@ -825,7 +826,104 @@ impl LocalHistory {
             path: parent.to_path_buf(),
             source: e,
         })?;
-        Ok(self.key_for(canonical.join(name)))
+        Ok(self.adopted(self.key_for(canonical.join(name))))
+    }
+
+    /// `key`, a pair [`key_for`](Self::key_for) returns, once it holds the
+    /// snapshots of the versions its folder's log names that another key of
+    /// this store holds: how a renamed, moved or copied folder finds its
+    /// history again, as the module docs describe. Every call that reads or
+    /// records a file's history resolves its key here first, so a folder's
+    /// first save after a move compares with the state it had before it.
+    fn adopted(&self, key: (PathBuf, PathBuf)) -> (PathBuf, PathBuf) {
+        // A courtesy, as the log's line is: a snapshot that cannot be read or
+        // copied leaves the file's history as it was, and refuses nothing.
+        let _ = self.adopt(&key.0, &key.1);
+        key
+    }
+
+    /// Copy under `key_dir`, the key of the file at `file`, each version the
+    /// folder's log names for that file that is newer than the newest entry
+    /// `key_dir` holds and that another key holds for a file of the same name
+    /// inside its folder, oldest first, then hold `key_dir` to the bound. A
+    /// version is found by its id alone, never by its contents. Where several
+    /// keys hold an id, the key holding the most of the versions the log names
+    /// is read, which is the key the folder came from rather than another
+    /// file recorded in the same millisecond.
+    ///
+    /// A version no key holds is passed over: one recorded on another machine,
+    /// or one every key has pruned. A snapshot that cannot be read or written
+    /// stops the copy, and `key_dir` keeps the versions copied before it, all
+    /// older than the rest, so the next call takes up from there.
+    fn adopt(&self, key_dir: &Path, file: &Path) -> Result<()> {
+        let Some((folder, name)) = log_place(file) else {
+            return Ok(());
+        };
+        let newest = entries_in(key_dir)?
+            .last()
+            .and_then(|entry| parse_id(&entry.id));
+        let wanted: Vec<String> = logged_versions(&folder.join(LOG_FILENAME), &name)
+            .into_iter()
+            .filter(|(stamp, _)| newest.is_none_or(|(millis, seq, _)| *stamp > (millis, seq)))
+            .map(|(_, id)| id)
+            .collect();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+
+        let holders = self.holders(&name, &wanted);
+        let found: Vec<(&PathBuf, &HistoryEntry)> = wanted
+            .iter()
+            .filter_map(|id| {
+                holders.iter().find_map(|(holder, entries)| {
+                    entries
+                        .iter()
+                        .find(|entry| entry.id == *id)
+                        .map(|entry| (holder, entry))
+                })
+            })
+            .collect();
+        if found.is_empty() {
+            return Ok(());
+        }
+
+        std::fs::create_dir_all(key_dir)?;
+        let marker = format!("{}\n", file.display());
+        write_atomic(&key_dir.join(SPEC_PATH_FILE), marker.as_bytes())?;
+        for (holder, entry) in found {
+            let text = read_at(holder, entry)?;
+            write_atomic(&entry_path(key_dir, entry), text.as_bytes())?;
+        }
+        prune(key_dir)
+    }
+
+    /// Every key of this store whose `spec-path` names a file called `name`
+    /// inside its folder, with the entries it holds: the key holding the most
+    /// of `wanted` first, and keys holding as many in the order of their
+    /// names. A key whose `spec-path` or entries cannot be read is not one.
+    fn holders(&self, name: &str, wanted: &[String]) -> Vec<(PathBuf, Vec<HistoryEntry>)> {
+        let Ok(listing) = std::fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        let mut keys: Vec<PathBuf> = listing.flatten().map(|entry| entry.path()).collect();
+        keys.sort();
+        let mut holders = Vec::new();
+        for key in keys {
+            let Ok(path) = std::fs::read_to_string(key.join(SPEC_PATH_FILE)) else {
+                continue;
+            };
+            let path = path.strip_suffix('\n').unwrap_or(&path);
+            if !Path::new(path).ends_with(name) {
+                continue;
+            }
+            if let Ok(entries) = entries_in(&key) {
+                holders.push((key, entries));
+            }
+        }
+        holders.sort_by_key(|(_, entries)| {
+            std::cmp::Reverse(entries.iter().filter(|e| wanted.contains(&e.id)).count())
+        });
+        holders
     }
 
     /// The per-file directory for `spec_path`, a canonical file path: the
@@ -1099,15 +1197,9 @@ fn steps_of(text: &str) -> Option<Vec<(String, serde_yaml::Value)>> {
 fn append_log_line(file: &Path, entry: &HistoryEntry, note: StepNote) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom, Write};
 
-    let Some(folder) = protocol_folder(file) else {
+    let Some((folder, name)) = log_place(file) else {
         return Ok(());
     };
-    let inside = file.strip_prefix(folder).unwrap_or(file);
-    let name = inside
-        .components()
-        .map(|part| part.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/");
 
     let mut log = std::fs::OpenOptions::new()
         .read(true)
@@ -1125,6 +1217,50 @@ fn append_log_line(file: &Path, entry: &HistoryEntry, note: StepNote) -> std::io
     }
     bytes.extend_from_slice(log_line(&name, entry, note).as_bytes());
     log.write_all(&bytes)
+}
+
+/// The protocol folder whose log names the versions of `file`, a path under a
+/// canonical directory, and the name a line gives `file`: its path inside that
+/// folder, with `/` between its parts. `None` for a file in no protocol's
+/// folder.
+fn log_place(file: &Path) -> Option<(&Path, String)> {
+    let folder = protocol_folder(file)?;
+    let inside = file.strip_prefix(folder).unwrap_or(file);
+    let name = inside
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    Some((folder, name))
+}
+
+/// The versions the log at `log` names for the file called `name` in its
+/// folder, each as its id's millis and sequence number and the id, oldest
+/// first and each once. A line that does not read as one of the log's, or
+/// whose version is not an id, names none; a log that cannot be read names
+/// none.
+fn logged_versions(log: &Path, name: &str) -> Vec<((u64, u32), String)> {
+    /// The keys of a line that say which version of which file it names.
+    #[derive(serde::Deserialize)]
+    struct Named {
+        file: String,
+        version: String,
+    }
+    let Ok(text) = std::fs::read_to_string(log) else {
+        return Vec::new();
+    };
+    let mut found: Vec<((u64, u32), String)> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Named>(line).ok())
+        .filter(|line| line.file == name)
+        .filter_map(|line| {
+            let (millis, seq, _) = parse_id(&line.version)?;
+            Some(((millis, seq), line.version))
+        })
+        .collect();
+    found.sort();
+    found.dedup();
+    found
 }
 
 /// The log's line for `entry`, a version of the file named `name` inside its
