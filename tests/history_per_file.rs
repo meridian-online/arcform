@@ -347,6 +347,12 @@ fn a_path_naming_a_directory_or_no_file_is_refused_by_every_file_call() {
                 f.history.record_save_for_file(&path, SPEC).map(drop),
             ),
             (
+                "record_save_unmerged_for_file",
+                f.history
+                    .record_save_unmerged_for_file(&path, SPEC)
+                    .map(drop),
+            ),
+            (
                 "record_checkpoint_for_file",
                 f.history.record_checkpoint_for_file(&path, SPEC).map(drop),
             ),
@@ -476,6 +482,10 @@ fn the_directory_calls_still_refuse_a_missing_directory_by_name() {
         (
             "record_save",
             f.history.record_save(&missing, SPEC).map(drop),
+        ),
+        (
+            "record_save_unmerged",
+            f.history.record_save_unmerged(&missing, SPEC).map(drop),
         ),
         (
             "record_checkpoint",
