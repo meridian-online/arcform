@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use owo_colors::OwoColorize;
 
-use crate::edit::{IGNORE_FILENAME, IgnoreList, write_ignore_list};
+use crate::edit::{
+    ATTRIBUTES_FILENAME, IGNORE_FILENAME, IgnoreList, MergeRule, write_ignore_list, write_merge_rule,
+};
 use crate::engine::{ALLOW_UNTESTED_ENGINE_ENV, DuckDbEngine, Engine};
 use crate::error::{Error, Result};
 use crate::manifest::Manifest;
@@ -445,8 +447,10 @@ pub fn create_protocol(
     let _ = history.record_save(dir, validated.text());
 
     // Written after the spec, so a refused or invalid manifest leaves nothing beside
-    // it, and an ignore list the author wrote first is kept.
+    // it, and an ignore list the author wrote first is kept. The merge rule joins the
+    // attributes file the author may have written first.
     let ignore = write_ignore_list(dir, manifest.db.as_deref(), &[])?;
+    let merge_rule = write_merge_rule(dir)?;
 
     println!(
         "created {} — author steps with `arc edit-protocol`",
@@ -454,6 +458,14 @@ pub fn create_protocol(
     );
     if ignore == IgnoreList::Written {
         println!("created {}", dir.join(IGNORE_FILENAME).display());
+    }
+    match merge_rule {
+        MergeRule::Written => println!("created {}", dir.join(ATTRIBUTES_FILENAME).display()),
+        MergeRule::Added => println!(
+            "added the log's merge rule to {}",
+            dir.join(ATTRIBUTES_FILENAME).display()
+        ),
+        MergeRule::Kept => {}
     }
     Ok(())
 }
@@ -708,12 +720,14 @@ pub fn init_at(name: &str, base: &std::path::Path) -> Result<()> {
     let yaml = serde_yaml::to_string(&manifest).expect("failed to serialize manifest");
     fs::write(project_dir.join("arcform.yaml"), yaml)?;
     write_ignore_list(&project_dir, manifest.db.as_deref(), &[])?;
+    write_merge_rule(&project_dir)?;
 
     println!("Initialized project '{}' with:", name);
     println!("  arcform.yaml");
     println!("  models/");
     println!("  sources/");
     println!("  {IGNORE_FILENAME}");
+    println!("  {ATTRIBUTES_FILENAME}");
     println!();
     println!("For a complete, runnable example — SQL + command steps, preconditions,");
     println!("retries, and parameters — see examples/brewtrend in the arcform repo.");
