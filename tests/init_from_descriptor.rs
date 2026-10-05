@@ -311,8 +311,9 @@ fn staged_by_add_all(dir: &Path) -> Vec<String> {
 }
 
 /// What the generated Protocol holds that git is meant to take: the manifest, the
-/// models, the companion descriptor and the list itself.
-const SHARED_FILES: [&str; 6] = [
+/// models, the companion descriptor, the list itself and the log's merge rule.
+const SHARED_FILES: [&str; 7] = [
+    ".gitattributes",
     ".gitignore",
     "arcform.yaml",
     "datapackage.json",

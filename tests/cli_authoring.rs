@@ -513,8 +513,8 @@ fn a_fresh_protocol_stages_the_manifest_and_not_arcs_run_records() {
     );
     assert_eq!(
         staged_by_add_all(&proto),
-        [".gitignore", LOG, "arcform.yaml"],
-        "a fresh Protocol stages the manifest, the list and the log"
+        [".gitattributes", ".gitignore", LOG, "arcform.yaml"],
+        "a fresh Protocol stages the manifest, the list, the merge rule and the log"
     );
 
     arc_ok(
@@ -539,7 +539,13 @@ fn a_fresh_protocol_stages_the_manifest_and_not_arcs_run_records() {
     let staged = staged_by_add_all(&proto);
     assert_eq!(
         staged,
-        [".gitignore", LOG, "arcform.yaml", "models/gen.sql"],
+        [
+            ".gitattributes",
+            ".gitignore",
+            LOG,
+            "arcform.yaml",
+            "models/gen.sql"
+        ],
         "the generated model is staged and no run record is"
     );
 }
@@ -657,7 +663,7 @@ fn the_spill_directory_beside_a_database_inside_the_directory_is_not_staged() {
 
         assert_eq!(
             staged_by_add_all(&proto),
-            [".gitignore", LOG, "arcform.yaml"],
+            [".gitattributes", ".gitignore", LOG, "arcform.yaml"],
             "{db}: staged something of the spill directory"
         );
     }
@@ -715,7 +721,10 @@ fn init_writes_the_same_list_and_says_so() {
         IGNORE_LIST
     );
     // `models/` and `sources/` are empty, which git does not stage.
-    assert_eq!(staged_by_add_all(&proto), [".gitignore", "arcform.yaml"]);
+    assert_eq!(
+        staged_by_add_all(&proto),
+        [".gitattributes", ".gitignore", "arcform.yaml"]
+    );
 }
 
 /// A `.gitignore` the author wrote before `create-protocol` ran is as they left it,
@@ -770,6 +779,126 @@ fn a_refused_create_writes_no_list() {
     assert!(
         !proto.join(".gitignore").exists(),
         "a refused create left a list beside a spec it did not write"
+    );
+    assert!(
+        !proto.join(".gitattributes").exists(),
+        "a refused create left a merge rule beside a spec it did not write"
+    );
+}
+
+// ------------------------------------------------------- the log's merge rule
+//
+// Beside the list, `create-protocol` and `init` write the attributes file that tells
+// git to merge the log by keeping both sides' lines. These tests ask real `git` what
+// it reads from the file, for the same reason the list's tests do, and the two clones
+// that merge with it are in `tests/history_merge.rs`.
+
+/// What git's `merge` attribute says of `path` in the repository at `dir`.
+fn merge_attribute_of(dir: &Path, path: &str) -> String {
+    git(dir, &["init", "-q"]);
+    let out = git(dir, &["check-attr", "merge", "--", path]);
+    out.trim_end().rsplit(": ").next().unwrap().to_string()
+}
+
+/// The lines of `.gitattributes` in `proto` that name the log.
+fn lines_naming_the_log(proto: &Path) -> Vec<String> {
+    std::fs::read_to_string(proto.join(".gitattributes"))
+        .unwrap()
+        .lines()
+        .filter(|l| l.contains(LOG))
+        .map(str::to_string)
+        .collect()
+}
+
+/// A fresh Protocol from either verb holds one line naming the log, git reads it as
+/// the union merge for the log beside the spec and for no log below it, and the lines
+/// each verb prints naming what it made name the file.
+#[test]
+fn a_fresh_protocol_holds_a_merge_rule_for_its_log_that_git_reads() {
+    let base = tempfile::tempdir().expect("tempdir");
+    let created = arc_ok(base.path(), &["create-protocol", "fieldbook"]);
+    let initialised = arc_ok(base.path(), &["init", "scaffold"]);
+
+    let stdout = String::from_utf8_lossy(&created.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l == "created fieldbook/.gitattributes"),
+        "create-protocol says it made the file:\n{stdout}"
+    );
+    let stdout = String::from_utf8_lossy(&initialised.stdout);
+    assert!(
+        stdout.lines().any(|l| l.trim() == ".gitattributes"),
+        "init names the file among what it made:\n{stdout}"
+    );
+
+    for name in ["fieldbook", "scaffold"] {
+        let proto = base.path().join(name);
+        assert_eq!(
+            lines_naming_the_log(&proto),
+            [format!("/{LOG} merge=union")],
+            "{name}: one line names the log"
+        );
+        assert_eq!(
+            merge_attribute_of(&proto, LOG),
+            "union",
+            "{name}: git merges the log by keeping both sides' lines"
+        );
+        assert_eq!(
+            merge_attribute_of(&proto, &format!("below/{LOG}")),
+            "unspecified",
+            "{name}: the rule is the log beside the spec, and no log below it"
+        );
+    }
+}
+
+/// An attributes file the author wrote first keeps its lines, to the byte, and gains
+/// the rule after them, even when it ends mid-line; one that already holds the rule is
+/// left byte-identical and is not said to have been made.
+#[test]
+fn an_attributes_file_already_there_keeps_its_lines_and_gains_the_rule_once() {
+    let base = tempfile::tempdir().expect("tempdir");
+
+    let proto = base.path().join("mine");
+    std::fs::create_dir(&proto).unwrap();
+    let theirs = "*.csv -diff\r\nscratch/** export-ignore";
+    std::fs::write(proto.join(".gitattributes"), theirs).unwrap();
+    let out = arc_ok(base.path(), &["create-protocol", "mine"]);
+    assert_eq!(
+        std::fs::read_to_string(proto.join(".gitattributes")).unwrap(),
+        format!("{theirs}\n/{LOG} merge=union\n"),
+        "their lines lead, to the byte, and the rule follows on a line of its own"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.starts_with("added") && l.ends_with("mine/.gitattributes")),
+        "create-protocol says it added to the file:\n{stdout}"
+    );
+    assert_eq!(merge_attribute_of(&proto, LOG), "union");
+    assert_eq!(
+        git(&proto, &["check-attr", "diff", "--", "data.csv"])
+            .trim_end()
+            .rsplit(": ")
+            .next(),
+        Some("unset"),
+        "their line still does what it did"
+    );
+
+    let holding = base.path().join("holding");
+    std::fs::create_dir(&holding).unwrap();
+    let rule = format!("# kept as written\n/{LOG} merge=union\n*.csv -diff\n");
+    std::fs::write(holding.join(".gitattributes"), &rule).unwrap();
+    let out = arc_ok(base.path(), &["create-protocol", "holding"]);
+    assert_eq!(
+        std::fs::read(holding.join(".gitattributes")).unwrap(),
+        rule.as_bytes(),
+        "a folder that holds the rule is left byte-identical"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains(".gitattributes"),
+        "it does not say it made or added to a file it left as it was"
     );
 }
 
@@ -946,8 +1075,10 @@ fn create_init_and_run_give_the_same_result_with_no_git_on_path() {
     assert_eq!(with_git, without_git);
     assert!(
         with_git.files.contains_key("fieldbook/.gitignore")
-            && with_git.files.contains_key("scaffold/.gitignore"),
-        "both lists were written: {:?}",
+            && with_git.files.contains_key("scaffold/.gitignore")
+            && with_git.files.contains_key("fieldbook/.gitattributes")
+            && with_git.files.contains_key("scaffold/.gitattributes"),
+        "both lists and both merge rules were written: {:?}",
         with_git.files.keys().collect::<Vec<_>>()
     );
 }

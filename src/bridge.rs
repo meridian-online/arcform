@@ -343,6 +343,8 @@ pub fn init_from_descriptor_at(name: &str, descriptor_path: &Path, base: &Path) 
         .map(|(_, dest)| dest.as_str())
         .collect();
     crate::edit::write_ignore_list(&project_dir, generated.manifest.db.as_deref(), &copied)?;
+    // And the rule that lets two clones of this Protocol merge their logs.
+    crate::edit::write_merge_rule(&project_dir)?;
 
     // Summary.
     let n_load = generated
@@ -368,6 +370,10 @@ pub fn init_from_descriptor_at(name: &str, descriptor_path: &Path, base: &Path) 
     println!(
         "  {}   (names arc's run records; each database copied in is kept out of git)",
         crate::edit::IGNORE_FILENAME
+    );
+    println!(
+        "  {}   (git keeps both sides' lines of the log when two clones are merged)",
+        crate::edit::ATTRIBUTES_FILENAME
     );
     if !generated.review_comments.is_empty() {
         println!(

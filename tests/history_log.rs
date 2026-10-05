@@ -763,6 +763,7 @@ fn git_add_all_stages_the_log_beside_the_spec_and_nothing_a_run_records() {
     assert_eq!(
         staged.lines().collect::<Vec<_>>(),
         [
+            ".gitattributes",
             ".gitignore",
             LOG_FILENAME,
             MANIFEST_FILENAME,
