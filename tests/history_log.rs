@@ -1043,6 +1043,30 @@ fn a_save_that_added_one_step_and_changed_another_names_both_on_one_line() {
 }
 
 #[test]
+fn a_save_of_the_spec_through_its_file_path_names_the_step_as_the_directory_call_does() {
+    let protocol = Protocol::new();
+    let history = protocol.history(HistoryWay::new("app").unwrap());
+    let spec = protocol.dir.join(MANIFEST_FILENAME);
+    history
+        .record_save_for_file(&spec, &spec_with(&[("tally", "a.sql")]))
+        .unwrap()
+        .expect("recorded");
+
+    let saved = history
+        .record_save_for_file(
+            &spec,
+            &spec_with(&[("tally", "a.sql"), ("big_orders", "b.sql")]),
+        )
+        .unwrap()
+        .expect("recorded");
+
+    let line = last_line(&protocol);
+    assert_eq!(line.version, saved.id);
+    assert_eq!(line.file, MANIFEST_FILENAME);
+    assert_eq!(line.named(), [("big_orders", "added")], "{line:?}");
+}
+
+#[test]
 fn a_renamed_step_reads_as_one_removed_and_one_added() {
     let protocol = Protocol::new();
     save_spec(&protocol, &spec_with(&[("tally", "a.sql")]));
