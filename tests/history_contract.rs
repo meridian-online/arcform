@@ -24,8 +24,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use arc::spec::{
-    Error, HISTORY_MAX_ENTRIES, HistoryKind, HistoryWay, LOG_FILENAME, LocalHistory,
-    MANIFEST_FILENAME, RecordedStep, SpecEdit, edit_spec_with_history, record_step_with_history,
+    Error, HISTORY_MAX_ENTRIES, HISTORY_MERGE_WINDOW, HistoryKind, HistoryWay, LOG_FILENAME,
+    LocalHistory, MANIFEST_FILENAME, RecordedStep, SpecEdit, edit_spec_with_history,
+    record_step_with_history,
 };
 
 const SPEC: &str = "\
@@ -123,6 +124,94 @@ fn rapid_saves_debounce_into_one_entry() {
         "name: b\nsteps: []\n",
         "the newer state wins the merge"
     );
+}
+
+#[test]
+fn two_unmerged_saves_inside_the_window_are_two_entries_of_kind_save_in_order() {
+    let (_tmp, dir, history) = setup();
+    let first = history
+        .record_save_unmerged(&dir, "name: a\nsteps: []\n")
+        .unwrap()
+        .expect("recorded");
+    let second = history
+        .record_save_unmerged(&dir, "name: b\nsteps: []\n")
+        .unwrap()
+        .expect("recorded");
+
+    let entries = history.entries(&dir).unwrap();
+    let span = second.at.duration_since(first.at).unwrap();
+    assert!(
+        span <= HISTORY_MERGE_WINDOW,
+        "the two were recorded {span:?} apart, outside the window this test is about"
+    );
+    assert_eq!(
+        entries.iter().map(|e| e.kind).collect::<Vec<_>>(),
+        [HistoryKind::Save, HistoryKind::Save],
+        "a save with the merge off is a save, not a checkpoint"
+    );
+    assert_eq!(
+        entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+        [first.id.as_str(), second.id.as_str()],
+        "both entries stand, oldest first"
+    );
+    assert_eq!(
+        history.read(&dir, &entries[0].id).unwrap(),
+        "name: a\nsteps: []\n"
+    );
+    assert_eq!(
+        history.read(&dir, &entries[1].id).unwrap(),
+        "name: b\nsteps: []\n"
+    );
+}
+
+#[test]
+fn a_save_after_an_unmerged_save_still_merges_and_a_checkpoint_still_records_a_checkpoint() {
+    let (_tmp, dir, history) = setup();
+    history
+        .record_save_unmerged(&dir, "name: a\nsteps: []\n")
+        .unwrap()
+        .expect("recorded");
+    history
+        .record_save(&dir, "name: b\nsteps: []\n")
+        .unwrap()
+        .expect("recorded");
+
+    let entries = history.entries(&dir).unwrap();
+    assert_eq!(
+        entries.len(),
+        1,
+        "the merging call still merges into the newest save inside the window"
+    );
+    assert_eq!(
+        history.read(&dir, &entries[0].id).unwrap(),
+        "name: b\nsteps: []\n"
+    );
+
+    let checkpoint = history
+        .record_checkpoint(&dir, "name: c\nsteps: []\n")
+        .unwrap()
+        .expect("recorded");
+    assert_eq!(checkpoint.kind, HistoryKind::Checkpoint);
+    assert_eq!(history.entries(&dir).unwrap().len(), 2);
+}
+
+#[test]
+fn an_unmerged_save_identical_to_the_newest_entry_is_not_recorded_again() {
+    let (_tmp, dir, history) = setup();
+    assert!(history.record_save_unmerged(&dir, SPEC).unwrap().is_some());
+    assert_eq!(
+        history.record_save_unmerged(&dir, SPEC).unwrap(),
+        None,
+        "an exact duplicate of the newest entry is skipped, as for the merging call"
+    );
+    assert_eq!(history.entries(&dir).unwrap().len(), 1);
+
+    // Whatever the newest entry's kind: a checkpoint of this text is the
+    // newest entry, and a save of the same text adds nothing to it.
+    let (_tmp, dir, history) = setup();
+    history.record_checkpoint(&dir, SPEC).unwrap().unwrap();
+    assert_eq!(history.record_save_unmerged(&dir, SPEC).unwrap(), None);
+    assert_eq!(history.entries(&dir).unwrap().len(), 1);
 }
 
 #[test]

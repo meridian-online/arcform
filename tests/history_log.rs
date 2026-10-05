@@ -1004,6 +1004,38 @@ fn a_save_names_the_step_it_added_changed_or_removed() {
 }
 
 #[test]
+fn an_unmerged_save_writes_a_line_of_its_own_and_names_the_step_it_added() {
+    let protocol = Protocol::new();
+    let history = protocol.history(HistoryWay::new("app").unwrap());
+    let one = spec_with(&[("load_orders", "models/01_orders.sql")]);
+    let two = spec_with(&[("load_orders", "models/01_orders.sql"), ("tally", "a.sql")]);
+    let first = history
+        .record_save_unmerged(&protocol.dir, &one)
+        .unwrap()
+        .expect("recorded");
+    let second = history
+        .record_save_unmerged(&protocol.dir, &two)
+        .unwrap()
+        .expect("recorded");
+
+    let lines = protocol.lines();
+    assert_eq!(
+        lines
+            .iter()
+            .map(|l| (l.kind.as_str(), l.version.as_str()))
+            .collect::<Vec<_>>(),
+        [("save", first.id.as_str()), ("save", second.id.as_str())],
+        "each unmerged save has its own line"
+    );
+    assert_eq!(
+        lines[1].named(),
+        [("tally", "added")],
+        "the line names the step by comparison, as a save's does: {:?}",
+        lines[1]
+    );
+}
+
+#[test]
 fn a_save_that_added_one_step_and_changed_another_names_both_on_one_line() {
     let protocol = Protocol::new();
     save_spec(

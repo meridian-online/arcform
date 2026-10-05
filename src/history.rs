@@ -110,8 +110,9 @@
 //!
 //! The steps come from two places. A verb that adds a step names it: the line
 //! of [`record_step_with_history`]'s save says `added`. A plain save —
-//! [`LocalHistory::record_save`] and [`LocalHistory::record_save_for_file`],
-//! which take the whole text and are told nothing — is compared with the state
+//! [`LocalHistory::record_save`], [`LocalHistory::record_save_unmerged`] and
+//! their `_for_file` twins, which take the whole text and are told nothing — is
+//! compared with the state
 //! the store held before it, the newest entry whatever its kind, and the line
 //! names each step the text added, removed or changed. The comparison reads
 //! both texts as YAML and matches steps by `name`: a step is changed when what
@@ -194,6 +195,7 @@
 //! `arcform.yaml` inside it. A file a tool writes beside the spec — a chart
 //! file under `panels/`, say — keeps a history of its own through the twin
 //! calls that take a file: [`LocalHistory::record_save_for_file`],
+//! [`LocalHistory::record_save_unmerged_for_file`],
 //! [`LocalHistory::record_checkpoint_for_file`],
 //! [`LocalHistory::entries_for_file`], [`LocalHistory::read_for_file`] and
 //! [`LocalHistory::restore_for_file`]. Each file is keyed by its own
@@ -218,7 +220,10 @@
 //!   the merge disabled — a machine edit must never fold away the state it
 //!   just promised was recoverable. An unsaved entry never merges either way:
 //!   it is not replaced by a save after it, and it does not replace a save
-//!   before it.
+//!   before it. [`LocalHistory::record_save_unmerged`] and
+//!   [`LocalHistory::record_save_unmerged_for_file`] record a save of kind
+//!   `Save` with the merge off, for a caller that wants each save kept as an
+//!   entry of its own inside the window.
 //! - A state identical to the newest entry is not recorded again, whatever
 //!   its kind.
 //!
@@ -525,6 +530,30 @@ impl LocalHistory {
         )
     }
 
+    /// Record `text` as a save entry for the spec in `dir` with the merge
+    /// off: [`record_save`](Self::record_save) in every respect but one, the
+    /// debounce. A second save recorded within [`HISTORY_MERGE_WINDOW`] of
+    /// the newest save is an entry of its own rather than the newer state
+    /// replacing the older entry, so two saves a person made seconds apart
+    /// list as two saves, in order.
+    ///
+    /// The kind is `Save`, not `Checkpoint`: a caller that wants every save
+    /// kept as an entry no longer has to record a checkpoint, which lists as
+    /// the state before a machine write. Only an exact duplicate of the
+    /// newest entry is skipped (`Ok(None)`), as for `record_save`, and the
+    /// entry counts toward the bound and gains its line in the folder's log,
+    /// naming the steps by comparison, as a save's does.
+    pub fn record_save_unmerged(&self, dir: &Path, text: &str) -> Result<Option<HistoryEntry>> {
+        self.record_noted(
+            dir,
+            text,
+            HistoryKind::Save,
+            SystemTime::now(),
+            false,
+            Some(StepNote::Compare),
+        )
+    }
+
     /// Record `text` — the bytes a machine edit is about to replace — as a
     /// checkpoint entry for the spec in `dir`. Distinct in kind from a save
     /// entry, never merged; only an exact duplicate of the newest entry is
@@ -584,6 +613,24 @@ impl LocalHistory {
             HistoryKind::Save,
             SystemTime::now(),
             true,
+            Some(StepNote::Compare),
+        )
+    }
+
+    /// [`record_save_unmerged`](Self::record_save_unmerged) for the file at
+    /// `file`, keyed as [`record_save_for_file`](Self::record_save_for_file)
+    /// describes: a save with the merge off, in that file's history alone.
+    pub fn record_save_unmerged_for_file(
+        &self,
+        file: &Path,
+        text: &str,
+    ) -> Result<Option<HistoryEntry>> {
+        self.record_keyed(
+            self.file_key(file)?,
+            text,
+            HistoryKind::Save,
+            SystemTime::now(),
+            false,
             Some(StepNote::Compare),
         )
     }
