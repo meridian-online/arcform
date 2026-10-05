@@ -1204,27 +1204,106 @@ fn a_save_whose_last_recorded_state_the_store_does_not_hold_names_the_file_and_i
 }
 
 #[test]
-fn a_spec_that_does_not_read_as_steps_names_the_file_and_no_step() {
+fn a_spec_that_does_not_read_as_steps_names_the_file_and_no_step_on_either_side() {
     let protocol = Protocol::new();
+    let valid = spec_with(&[("tally", "a.sql")]);
+    let unreadable = [
+        ("text that is not YAML", "steps: [unclosed\n".to_string()),
+        ("a document that is not a mapping", "- tally\n".to_string()),
+        (
+            "steps that are not a list",
+            "name: shop\nsteps: 3\n".to_string(),
+        ),
+        (
+            "a step with no name",
+            "name: shop\nsteps:\n  - sql: a.sql\n".to_string(),
+        ),
+        (
+            "a step whose name is not text",
+            "name: shop\nsteps:\n  - name: 5\n".to_string(),
+        ),
+        (
+            "a step that is not a mapping",
+            "name: shop\nsteps:\n  - tally\n".to_string(),
+        ),
+        (
+            "two steps of one name",
+            spec_with(&[("tally", "a.sql"), ("tally", "b.sql")]),
+        ),
+    ];
+    save_spec(&protocol, &valid);
+    for (why, text) in &unreadable {
+        // Out of a state that reads and into one that does not, and back.
+        save_spec(&protocol, text);
+        assert_eq!(
+            last_line(&protocol).named(),
+            [] as [(&str, &str); 0],
+            "a save of {why} after a spec that reads"
+        );
+        save_spec(&protocol, &valid);
+        assert_eq!(
+            last_line(&protocol).named(),
+            [] as [(&str, &str); 0],
+            "a save of a spec after {why}"
+        );
+    }
+    assert_eq!(protocol.lines().len(), 2 * unreadable.len() + 1);
+}
+
+#[test]
+fn a_spec_with_no_steps_key_or_an_empty_one_has_no_steps_to_compare() {
+    let protocol = Protocol::new();
+    let valid = spec_with(&[("tally", "a.sql")]);
+    save_spec(&protocol, &valid);
+
+    save_spec(&protocol, "name: shop\nengine: duckdb\n");
+    assert_eq!(
+        last_line(&protocol).named(),
+        [("tally", "removed")],
+        "a spec with no `steps` key has none"
+    );
+
+    save_spec(&protocol, &valid);
+    save_spec(&protocol, "name: shop\nengine: duckdb\nsteps:\n");
+    assert_eq!(
+        last_line(&protocol).named(),
+        [("tally", "removed")],
+        "an empty `steps` has none"
+    );
+
+    save_spec(&protocol, &valid);
+    assert_eq!(last_line(&protocol).named(), [("tally", "added")]);
+}
+
+#[test]
+fn a_checkpoint_and_an_unsaved_text_of_the_spec_name_no_step() {
+    let protocol = Protocol::new();
+    let history = protocol.history(HistoryWay::new("app").unwrap());
+    let spec = protocol.dir.join(MANIFEST_FILENAME);
     save_spec(&protocol, &spec_with(&[("tally", "a.sql")]));
 
-    // Not YAML at all, then the same text read again, then two steps of one name.
-    save_spec(&protocol, "steps: [unclosed\n");
-    assert_eq!(last_line(&protocol).named(), [] as [(&str, &str); 0]);
-    save_spec(&protocol, &spec_with(&[("tally", "a.sql")]));
+    // Each text differs from the newest state in a step, and neither is a save.
+    history
+        .record_checkpoint(
+            &protocol.dir,
+            &spec_with(&[("tally", "a.sql"), ("big_orders", "b.sql")]),
+        )
+        .unwrap()
+        .expect("recorded");
+    history
+        .record_unsaved_for_file(&spec, &spec_with(&[("tally", "changed.sql")]))
+        .unwrap()
+        .expect("recorded");
+
+    let lines = protocol.lines();
     assert_eq!(
-        last_line(&protocol).named(),
-        [] as [(&str, &str); 0],
-        "after a text that did not read, there is nothing to compare with"
+        lines
+            .iter()
+            .map(|line| line.kind.as_str())
+            .collect::<Vec<_>>(),
+        ["save", "checkpoint", "unsaved"]
     );
-    save_spec(
-        &protocol,
-        &spec_with(&[("tally", "a.sql"), ("tally", "b.sql")]),
-    );
-    assert_eq!(
-        last_line(&protocol).named(),
-        [] as [(&str, &str); 0],
-        "two steps of one name cannot be told apart"
-    );
-    assert_eq!(protocol.lines().len(), 4);
+    for line in &lines {
+        assert_eq!(line.named(), [] as [(&str, &str); 0], "{line:?}");
+    }
 }

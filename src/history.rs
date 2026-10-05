@@ -1069,8 +1069,9 @@ fn name_steps(spec_path: &Path, before: Option<&str>, after: &str) -> StepNote<'
 /// `steps` has none, and a step compares as the value it parses to, so a comment
 /// or the order of its keys is no change.
 fn steps_of(text: &str) -> Option<Vec<(String, serde_yaml::Value)>> {
-    let serde_yaml::Value::Mapping(spec) = serde_yaml::from_str(text).ok()? else {
-        return None;
+    let spec = match serde_yaml::from_str::<serde_yaml::Value>(text) {
+        Ok(serde_yaml::Value::Mapping(spec)) => spec,
+        _ => return None,
     };
     let steps = match spec.get("steps") {
         None | Some(serde_yaml::Value::Null) => return Some(Vec::new()),
@@ -1156,7 +1157,6 @@ fn log_line(name: &str, entry: &HistoryEntry, note: StepNote) -> String {
         StepNote::Unnamed | StepNote::Compare => {}
         StepNote::Added(added) => (step, change) = (Some(*added), Some(Change::Added.word())),
         StepNote::Steps(found) => match found.as_slice() {
-            [] => {}
             [one] => (step, change) = (Some(one.step.as_str()), Some(one.change.word())),
             several => {
                 steps = Some(
