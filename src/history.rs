@@ -63,7 +63,8 @@
 //!
 //! Inside the root, each file gets a directory keyed by a hash of its
 //! canonical path, holding a `spec-path` file (the path in the clear, for a
-//! human inspecting the store) and one snapshot file per entry, named
+//! human inspecting the store, and for a folder that moves to find its
+//! snapshots by) and one snapshot file per entry, named
 //! `<millis>-<seq>-<kind>.<way>.yaml` — or `<millis>-<seq>-<kind>.yaml` for an
 //! entry that names no way, which is every entry an arc before ways wrote.
 //! The entry's id is the name up to its first `.` either way. Entries are
@@ -87,7 +88,8 @@
 //! not named `arcform.yaml` the nearest directory at or above it that holds
 //! one. One folder has one log, and each line names the file it is about. The
 //! log is the provenance that travels with the folder, through git, a drive
-//! or an archive; the snapshots are the safety net that stays on the machine.
+//! or an archive; the snapshots are the safety net that stays on the machine,
+//! and a folder that moves finds them again through its log.
 //!
 //! A line is one JSON object, so a person reads it and any JSON reader parses
 //! it, the log as a whole being newline-delimited JSON:
@@ -134,6 +136,38 @@
 //! refused after its checkpoint leaves the folder as it was, and the
 //! checkpoint in the store alone. A line outlives its
 //! snapshot: pruning and the save debounce remove snapshots, never lines.
+//!
+//! # A folder renamed, moved or copied
+//!
+//! The snapshots are keyed to the file's path, so a folder renamed, moved or
+//! copied resolves to a key that holds nothing, while the log it carries names
+//! versions another key holds. Every call that reads or records a file's
+//! history finds them again through the log first. Each version the folder's
+//! log names for the file that is newer than the newest entry the file's own
+//! key holds is copied under that key from another key of the store that
+//! holds a version with that id for a file of the same name inside its folder:
+//! `arcform.yaml` for the spec, `panels/a.yaml` for a chart file there. Then
+//! the key is held to the bound. `arc history list` in a renamed folder prints
+//! what it printed before, and the first save there is compared with the state
+//! the folder had.
+//!
+//! A version is found by its id and never by its contents, so a Protocol
+//! whose log names no id this store holds takes nothing, however alike its
+//! files are: a fresh one, or a clone from another machine, whose snapshots
+//! stayed there. Where several keys hold an id, it is read from the one that
+//! holds the most of the versions the log names, which is the key the folder
+//! came from rather than another file recorded in the same millisecond.
+//!
+//! The copy leaves the old key as it was. A copied folder and its original
+//! list the same versions when the copy is made, and diverge from the first
+//! version either records after it, because the log of each names only its
+//! own. A folder moved back to a path it held before takes the versions it
+//! recorded while away, which are newer than any the old key holds. A version
+//! older than the newest its key holds is not taken again, so a snapshot the
+//! bound pruned or the save debounce folded away stays gone though the log
+//! still names it. The copy is a courtesy, as the log's line is: a snapshot
+//! that cannot be read stops it, the key keeps the older versions it copied,
+//! and the next call takes up from there.
 //!
 //! # The way arc was reached
 //!
@@ -789,16 +823,17 @@ impl LocalHistory {
     }
 
     /// The key of the spec in `dir`: its `arcform.yaml` under the canonical
-    /// directory.
+    /// directory, holding what [`adopted`](Self::adopted) finds for it.
     fn key_dir(&self, dir: &Path) -> Result<(PathBuf, PathBuf)> {
         let canonical = dir.canonicalize().map_err(|e| Error::FileRead {
             path: dir.to_path_buf(),
             source: e,
         })?;
-        Ok(self.key_for(canonical.join(MANIFEST_FILENAME)))
+        Ok(self.adopted(self.key_for(canonical.join(MANIFEST_FILENAME))))
     }
 
-    /// The key of the file at `file`: its name under its canonical directory.
+    /// The key of the file at `file`: its name under its canonical directory,
+    /// holding what [`adopted`](Self::adopted) finds for it.
     /// The directory is canonicalised and the name is not, so the key is the
     /// one [`key_dir`](Self::key_dir) gives the file's directory when the
     /// name is `arcform.yaml`, whether or not the file exists or is a link.
@@ -825,7 +860,104 @@ impl LocalHistory {
             path: parent.to_path_buf(),
             source: e,
         })?;
-        Ok(self.key_for(canonical.join(name)))
+        Ok(self.adopted(self.key_for(canonical.join(name))))
+    }
+
+    /// `key`, a pair [`key_for`](Self::key_for) returns, once it holds the
+    /// snapshots of the versions its folder's log names that another key of
+    /// this store holds: how a renamed, moved or copied folder finds its
+    /// history again, as the module docs describe. Every call that reads or
+    /// records a file's history resolves its key here first, so a folder's
+    /// first save after a move compares with the state it had before it.
+    fn adopted(&self, key: (PathBuf, PathBuf)) -> (PathBuf, PathBuf) {
+        // A courtesy, as the log's line is: a snapshot that cannot be read or
+        // copied leaves the file's history as it was, and refuses nothing.
+        let _ = self.adopt(&key.0, &key.1);
+        key
+    }
+
+    /// Copy under `key_dir`, the key of the file at `file`, each version the
+    /// folder's log names for that file that is newer than the newest entry
+    /// `key_dir` holds and that another key holds for a file of the same name
+    /// inside its folder, oldest first, then hold `key_dir` to the bound. A
+    /// version is found by its id alone, never by its contents. Where several
+    /// keys hold an id, the key holding the most of the versions the log names
+    /// is read, which is the key the folder came from rather than another
+    /// file recorded in the same millisecond.
+    ///
+    /// A version no key holds is passed over: one recorded on another machine,
+    /// or one every key has pruned. A snapshot that cannot be read or written
+    /// stops the copy, and `key_dir` keeps the versions copied before it, all
+    /// older than the rest, so the next call takes up from there.
+    fn adopt(&self, key_dir: &Path, file: &Path) -> Result<()> {
+        let Some((folder, name)) = log_place(file) else {
+            return Ok(());
+        };
+        let newest = entries_in(key_dir)?
+            .last()
+            .and_then(|entry| parse_id(&entry.id));
+        let wanted: Vec<String> = logged_versions(&folder.join(LOG_FILENAME), &name)
+            .into_iter()
+            .filter(|(stamp, _)| newest.is_none_or(|(millis, seq, _)| *stamp > (millis, seq)))
+            .map(|(_, id)| id)
+            .collect();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+
+        let holders = self.holders(&name, &wanted);
+        let found: Vec<(&PathBuf, &HistoryEntry)> = wanted
+            .iter()
+            .filter_map(|id| {
+                holders.iter().find_map(|(holder, entries)| {
+                    entries
+                        .iter()
+                        .find(|entry| entry.id == *id)
+                        .map(|entry| (holder, entry))
+                })
+            })
+            .collect();
+        if found.is_empty() {
+            return Ok(());
+        }
+
+        std::fs::create_dir_all(key_dir)?;
+        let marker = format!("{}\n", file.display());
+        write_atomic(&key_dir.join(SPEC_PATH_FILE), marker.as_bytes())?;
+        for (holder, entry) in found {
+            let text = read_at(holder, entry)?;
+            write_atomic(&entry_path(key_dir, entry), text.as_bytes())?;
+        }
+        prune(key_dir)
+    }
+
+    /// Every key of this store whose `spec-path` names a file called `name`
+    /// inside its folder, with the entries it holds: the key holding the most
+    /// of `wanted` first, and keys holding as many in the order of their
+    /// names. A key whose `spec-path` or entries cannot be read is not one.
+    fn holders(&self, name: &str, wanted: &[String]) -> Vec<(PathBuf, Vec<HistoryEntry>)> {
+        let Ok(listing) = std::fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        let mut keys: Vec<PathBuf> = listing.flatten().map(|entry| entry.path()).collect();
+        keys.sort();
+        let mut holders = Vec::new();
+        for key in keys {
+            let Ok(path) = std::fs::read_to_string(key.join(SPEC_PATH_FILE)) else {
+                continue;
+            };
+            let path = path.strip_suffix('\n').unwrap_or(&path);
+            if !Path::new(path).ends_with(name) {
+                continue;
+            }
+            if let Ok(entries) = entries_in(&key) {
+                holders.push((key, entries));
+            }
+        }
+        holders.sort_by_key(|(_, entries)| {
+            std::cmp::Reverse(entries.iter().filter(|e| wanted.contains(&e.id)).count())
+        });
+        holders
     }
 
     /// The per-file directory for `spec_path`, a canonical file path: the
@@ -961,11 +1093,14 @@ fn record_with_history(
 /// The retention policy in one line, for the surfaces that print it beside
 /// the entries it governs. It is the snapshots' policy: the folder's log, which
 /// [`log_place_line`] places, is neither pruned nor kept outside the protocol.
+/// It says where the snapshots are, what they are keyed to, and that a folder
+/// that moves finds them again through its log.
 pub(crate) fn policy_line(root: &Path) -> String {
     format!(
         "policy: keeps the last {HISTORY_MAX_ENTRIES} snapshots per file (oldest pruned first); \
          saves within {}s of the newest save merge into it; the snapshots are stored outside \
-         the protocol at {} and never promoted to git",
+         the protocol at {}, keyed to the protocol's path and found again through its log when \
+         the folder is renamed, moved or copied, and never promoted to git",
         HISTORY_MERGE_WINDOW.as_secs(),
         root.display()
     )
@@ -1099,15 +1234,9 @@ fn steps_of(text: &str) -> Option<Vec<(String, serde_yaml::Value)>> {
 fn append_log_line(file: &Path, entry: &HistoryEntry, note: StepNote) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom, Write};
 
-    let Some(folder) = protocol_folder(file) else {
+    let Some((folder, name)) = log_place(file) else {
         return Ok(());
     };
-    let inside = file.strip_prefix(folder).unwrap_or(file);
-    let name = inside
-        .components()
-        .map(|part| part.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/");
 
     let mut log = std::fs::OpenOptions::new()
         .read(true)
@@ -1125,6 +1254,50 @@ fn append_log_line(file: &Path, entry: &HistoryEntry, note: StepNote) -> std::io
     }
     bytes.extend_from_slice(log_line(&name, entry, note).as_bytes());
     log.write_all(&bytes)
+}
+
+/// The protocol folder whose log names the versions of `file`, a path under a
+/// canonical directory, and the name a line gives `file`: its path inside that
+/// folder, with `/` between its parts. `None` for a file in no protocol's
+/// folder.
+fn log_place(file: &Path) -> Option<(&Path, String)> {
+    let folder = protocol_folder(file)?;
+    let inside = file.strip_prefix(folder).unwrap_or(file);
+    let name = inside
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    Some((folder, name))
+}
+
+/// The versions the log at `log` names for the file called `name` in its
+/// folder, each as its id's millis and sequence number and the id, oldest
+/// first and each once. A line that does not read as one of the log's, or
+/// whose version is not an id, names none; a log that cannot be read names
+/// none.
+fn logged_versions(log: &Path, name: &str) -> Vec<((u64, u32), String)> {
+    /// The keys of a line that say which version of which file it names.
+    #[derive(serde::Deserialize)]
+    struct Named {
+        file: String,
+        version: String,
+    }
+    let Ok(text) = std::fs::read_to_string(log) else {
+        return Vec::new();
+    };
+    let mut found: Vec<((u64, u32), String)> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Named>(line).ok())
+        .filter(|line| line.file == name)
+        .filter_map(|line| {
+            let (millis, seq, _) = parse_id(&line.version)?;
+            Some(((millis, seq), line.version))
+        })
+        .collect();
+    found.sort();
+    found.dedup();
+    found
 }
 
 /// The log's line for `entry`, a version of the file named `name` inside its
@@ -1618,8 +1791,175 @@ mod tests {
         assert!(line.contains(&format!("{HISTORY_MAX_ENTRIES} snapshots per file")));
         assert!(line.contains(&format!("{}s", HISTORY_MERGE_WINDOW.as_secs())));
         assert!(line.ends_with(
-            "the snapshots are stored outside the protocol at /somewhere and never \
-             promoted to git"
+            "the snapshots are stored outside the protocol at /somewhere, keyed to the \
+             protocol's path and found again through its log when the folder is renamed, \
+             moved or copied, and never promoted to git"
         ));
+    }
+
+    // ------------------------------------------------- a folder that moves
+
+    /// The folder at `dir` renamed to `name` beside it.
+    fn renamed(dir: &Path, name: &str) -> PathBuf {
+        let to = dir.with_file_name(name);
+        std::fs::rename(dir, &to).unwrap();
+        to
+    }
+
+    /// A key of `history`'s store that no folder here resolves to, holding
+    /// `text` as entry `id` of a spec elsewhere. Its name sorts ahead of every
+    /// key a hash names, so it is read first among keys holding as many of a
+    /// log's versions.
+    fn stranger(history: &LocalHistory, id: &str, text: &str) {
+        let key = history.root().join("0000000000000000");
+        std::fs::create_dir_all(&key).unwrap();
+        std::fs::write(key.join(SPEC_PATH_FILE), "/elsewhere/arcform.yaml\n").unwrap();
+        std::fs::write(key.join(format!("{id}.yaml")), text).unwrap();
+    }
+
+    /// The texts of the spec in `dir`, oldest first.
+    fn texts(history: &LocalHistory, dir: &Path) -> Vec<String> {
+        let entries = history.entries(dir).unwrap();
+        entries
+            .iter()
+            .map(|entry| history.read(dir, &entry.id).unwrap())
+            .collect()
+    }
+
+    /// Record `texts` in `dir` as checkpoints a second apart from `T0`, which
+    /// never merge.
+    fn checkpoints(history: &LocalHistory, dir: &Path, texts: &[&str]) {
+        for (secs, text) in (0..).zip(texts) {
+            history
+                .record(dir, text, HistoryKind::Checkpoint, at(T0 + secs), false)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_version_is_read_from_the_key_holding_most_of_the_log_not_another_with_its_id() {
+        let (tmp, history) = store();
+        let dir = protocol(&tmp);
+        checkpoints(&history, &dir, &["a\n", "b\n", "c\n"]);
+        let newest = history.entries(&dir).unwrap().pop().unwrap();
+        stranger(&history, &newest.id, "stranger\n");
+        let dir = renamed(&dir, "renamed");
+        assert_eq!(texts(&history, &dir), ["a\n", "b\n", "c\n"]);
+    }
+
+    #[test]
+    fn the_newest_version_a_key_holds_is_not_taken_again() {
+        let (tmp, history) = store();
+        let dir = protocol(&tmp);
+        checkpoints(&history, &dir, &["a\n"]);
+        let dir = renamed(&dir, "renamed");
+        let held = history.entries(&dir).unwrap();
+        assert_eq!(held.len(), 1, "the rename keeps the one version");
+        stranger(&history, &held[0].id, "stranger\n");
+        assert_eq!(texts(&history, &dir), ["a\n"]);
+    }
+
+    #[test]
+    fn a_version_of_another_file_with_the_same_id_is_not_taken() {
+        let (tmp, history) = store();
+        let dir = protocol(&tmp);
+        std::fs::create_dir_all(dir.join("panels")).unwrap();
+        let chart = Path::new("panels").join("a.yaml");
+        // One millisecond, so the spec's version and the chart's share an id.
+        history
+            .record(&dir, "spec\n", HistoryKind::Save, at(T0), false)
+            .unwrap();
+        let key = history.file_key(&dir.join(&chart)).unwrap();
+        history
+            .record_keyed(
+                key,
+                "chart\n",
+                HistoryKind::Save,
+                at(T0),
+                false,
+                Some(StepNote::Unnamed),
+            )
+            .unwrap();
+        // The spec's own key is cleared by hand; the chart's still holds the id.
+        std::fs::remove_dir_all(history.key_dir(&dir).unwrap().0).unwrap();
+
+        let dir = renamed(&dir, "renamed");
+        assert_eq!(history.entries(&dir).unwrap(), []);
+        let chart = dir.join(&chart);
+        let entries = history.entries_for_file(&chart).unwrap();
+        assert_eq!(entries.len(), 1, "the chart's own version follows it");
+        assert_eq!(
+            history.read_for_file(&chart, &entries[0].id).unwrap(),
+            "chart\n"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_that_cannot_be_read_stops_the_copy_and_a_later_call_resumes_it() {
+        let (tmp, history) = store();
+        let dir = protocol(&tmp);
+        checkpoints(&history, &dir, &["a\n", "b\n", "c\n"]);
+        let (key, _) = history.key_dir(&dir).unwrap();
+        let second = entry_path(&key, &history.entries(&dir).unwrap()[1]);
+        // A directory where the second snapshot was: listed, and not read.
+        let bytes = std::fs::read(&second).unwrap();
+        std::fs::remove_file(&second).unwrap();
+        std::fs::create_dir(&second).unwrap();
+
+        let dir = renamed(&dir, "renamed");
+        assert_eq!(texts(&history, &dir), ["a\n"]);
+        std::fs::remove_dir(&second).unwrap();
+        std::fs::write(&second, bytes).unwrap();
+        assert_eq!(texts(&history, &dir), ["a\n", "b\n", "c\n"]);
+    }
+
+    #[test]
+    fn a_save_the_debounce_folded_away_is_not_taken_again_after_a_move() {
+        let (tmp, history) = store();
+        let dir = protocol(&tmp);
+        history
+            .record(&dir, "a\n", HistoryKind::Checkpoint, at(T0), false)
+            .unwrap();
+        history
+            .record(&dir, "b\n", HistoryKind::Save, at(T0 + 1), true)
+            .unwrap();
+        let dir = renamed(&dir, "renamed");
+        // Within the window of the save before the move, so it merges into it,
+        // as it would have in the folder's old place.
+        history
+            .record(&dir, "c\n", HistoryKind::Save, at(T0 + 3), true)
+            .unwrap();
+        assert_eq!(texts(&history, &dir), ["a\n", "c\n"]);
+    }
+
+    #[test]
+    fn versions_taken_from_two_keys_are_held_to_the_bound() {
+        let (tmp, history) = store();
+        let dir = protocol(&tmp);
+        let all: Vec<String> = (0..HISTORY_MAX_ENTRIES + 10)
+            .map(|n| format!("n: {n}\n"))
+            .collect();
+        let all: Vec<&str> = all.iter().map(String::as_str).collect();
+        let (first, rest) = all.split_at(HISTORY_MAX_ENTRIES);
+        checkpoints(&history, &dir, first);
+        // Ten more where the folder moved to: that key prunes the oldest ten,
+        // and the old key holds them still.
+        let dir = renamed(&dir, "moved");
+        for (secs, text) in (HISTORY_MAX_ENTRIES as u64..).zip(rest) {
+            history
+                .record(&dir, text, HistoryKind::Checkpoint, at(T0 + secs), false)
+                .unwrap();
+        }
+        let kept = texts(&history, &dir);
+        assert_eq!(kept, all[10..]);
+
+        // A copy takes the oldest ten from the old key and the rest from the
+        // new one, and keeps the newest the bound allows.
+        let copy = tmp.path().join("copy");
+        std::fs::create_dir_all(&copy).unwrap();
+        for name in [MANIFEST_FILENAME, LOG_FILENAME] {
+            std::fs::copy(dir.join(name), copy.join(name)).unwrap();
+        }
+        assert_eq!(texts(&history, &copy), kept);
     }
 }
