@@ -903,8 +903,9 @@ fn an_attributes_file_already_there_keeps_its_lines_and_gains_the_rule_once() {
 }
 
 /// `arc history list` ends with the snapshots' retention policy, which says they are
-/// stored outside the Protocol and never promoted to git, and then the line saying the
-/// folder's log is inside it, where `git add` stages it.
+/// stored outside the Protocol, keyed to its path and found again through its log when
+/// the folder moves, and never promoted to git, and then the line saying the folder's
+/// log is inside it, where `git add` stages it.
 #[test]
 fn history_list_ends_saying_where_the_snapshots_are_and_where_the_log_is() {
     let base = tempfile::tempdir().expect("tempdir");
@@ -917,7 +918,8 @@ fn history_list_ends_saying_where_the_snapshots_are_and_where_the_log_is() {
     let policy = format!(
         "policy: keeps the last 50 snapshots per file (oldest pruned first); saves within \
          10s of the newest save merge into it; the snapshots are stored outside the protocol \
-         at {} and never promoted to git",
+         at {}, keyed to the protocol's path and found again through its log when the folder \
+         is renamed, moved or copied, and never promoted to git",
         root.display()
     );
     let log = base.path().canonicalize().unwrap().join("notes").join(LOG);

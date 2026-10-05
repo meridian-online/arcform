@@ -1059,11 +1059,14 @@ fn record_with_history(
 /// The retention policy in one line, for the surfaces that print it beside
 /// the entries it governs. It is the snapshots' policy: the folder's log, which
 /// [`log_place_line`] places, is neither pruned nor kept outside the protocol.
+/// It says where the snapshots are, what they are keyed to, and that a folder
+/// that moves finds them again through its log.
 pub(crate) fn policy_line(root: &Path) -> String {
     format!(
         "policy: keeps the last {HISTORY_MAX_ENTRIES} snapshots per file (oldest pruned first); \
          saves within {}s of the newest save merge into it; the snapshots are stored outside \
-         the protocol at {} and never promoted to git",
+         the protocol at {}, keyed to the protocol's path and found again through its log when \
+         the folder is renamed, moved or copied, and never promoted to git",
         HISTORY_MERGE_WINDOW.as_secs(),
         root.display()
     )
@@ -1754,8 +1757,175 @@ mod tests {
         assert!(line.contains(&format!("{HISTORY_MAX_ENTRIES} snapshots per file")));
         assert!(line.contains(&format!("{}s", HISTORY_MERGE_WINDOW.as_secs())));
         assert!(line.ends_with(
-            "the snapshots are stored outside the protocol at /somewhere and never \
-             promoted to git"
+            "the snapshots are stored outside the protocol at /somewhere, keyed to the \
+             protocol's path and found again through its log when the folder is renamed, \
+             moved or copied, and never promoted to git"
         ));
+    }
+
+    // ------------------------------------------------- a folder that moves
+
+    /// The folder at `dir` renamed to `name` beside it.
+    fn renamed(dir: &Path, name: &str) -> PathBuf {
+        let to = dir.with_file_name(name);
+        std::fs::rename(dir, &to).unwrap();
+        to
+    }
+
+    /// A key of `history`'s store that no folder here resolves to, holding
+    /// `text` as entry `id` of a spec elsewhere. Its name sorts ahead of every
+    /// key a hash names, so it is read first among keys holding as many of a
+    /// log's versions.
+    fn stranger(history: &LocalHistory, id: &str, text: &str) {
+        let key = history.root().join("0000000000000000");
+        std::fs::create_dir_all(&key).unwrap();
+        std::fs::write(key.join(SPEC_PATH_FILE), "/elsewhere/arcform.yaml\n").unwrap();
+        std::fs::write(key.join(format!("{id}.yaml")), text).unwrap();
+    }
+
+    /// The texts of the spec in `dir`, oldest first.
+    fn texts(history: &LocalHistory, dir: &Path) -> Vec<String> {
+        let entries = history.entries(dir).unwrap();
+        entries
+            .iter()
+            .map(|entry| history.read(dir, &entry.id).unwrap())
+            .collect()
+    }
+
+    /// Record `texts` in `dir` as checkpoints a second apart from `T0`, which
+    /// never merge.
+    fn checkpoints(history: &LocalHistory, dir: &Path, texts: &[&str]) {
+        for (secs, text) in (0..).zip(texts) {
+            history
+                .record(dir, text, HistoryKind::Checkpoint, at(T0 + secs), false)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_version_is_read_from_the_key_holding_most_of_the_log_not_another_with_its_id() {
+        let (tmp, history) = store();
+        let dir = protocol(&tmp);
+        checkpoints(&history, &dir, &["a\n", "b\n", "c\n"]);
+        let newest = history.entries(&dir).unwrap().pop().unwrap();
+        stranger(&history, &newest.id, "stranger\n");
+        let dir = renamed(&dir, "renamed");
+        assert_eq!(texts(&history, &dir), ["a\n", "b\n", "c\n"]);
+    }
+
+    #[test]
+    fn the_newest_version_a_key_holds_is_not_taken_again() {
+        let (tmp, history) = store();
+        let dir = protocol(&tmp);
+        checkpoints(&history, &dir, &["a\n"]);
+        let dir = renamed(&dir, "renamed");
+        let held = history.entries(&dir).unwrap();
+        assert_eq!(held.len(), 1, "the rename keeps the one version");
+        stranger(&history, &held[0].id, "stranger\n");
+        assert_eq!(texts(&history, &dir), ["a\n"]);
+    }
+
+    #[test]
+    fn a_version_of_another_file_with_the_same_id_is_not_taken() {
+        let (tmp, history) = store();
+        let dir = protocol(&tmp);
+        std::fs::create_dir_all(dir.join("panels")).unwrap();
+        let chart = Path::new("panels").join("a.yaml");
+        // One millisecond, so the spec's version and the chart's share an id.
+        history
+            .record(&dir, "spec\n", HistoryKind::Save, at(T0), false)
+            .unwrap();
+        let key = history.file_key(&dir.join(&chart)).unwrap();
+        history
+            .record_keyed(
+                key,
+                "chart\n",
+                HistoryKind::Save,
+                at(T0),
+                false,
+                Some(StepNote::Unnamed),
+            )
+            .unwrap();
+        // The spec's own key is cleared by hand; the chart's still holds the id.
+        std::fs::remove_dir_all(history.key_dir(&dir).unwrap().0).unwrap();
+
+        let dir = renamed(&dir, "renamed");
+        assert_eq!(history.entries(&dir).unwrap(), []);
+        let chart = dir.join(&chart);
+        let entries = history.entries_for_file(&chart).unwrap();
+        assert_eq!(entries.len(), 1, "the chart's own version follows it");
+        assert_eq!(
+            history.read_for_file(&chart, &entries[0].id).unwrap(),
+            "chart\n"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_that_cannot_be_read_stops_the_copy_and_a_later_call_resumes_it() {
+        let (tmp, history) = store();
+        let dir = protocol(&tmp);
+        checkpoints(&history, &dir, &["a\n", "b\n", "c\n"]);
+        let (key, _) = history.key_dir(&dir).unwrap();
+        let second = entry_path(&key, &history.entries(&dir).unwrap()[1]);
+        // A directory where the second snapshot was: listed, and not read.
+        let bytes = std::fs::read(&second).unwrap();
+        std::fs::remove_file(&second).unwrap();
+        std::fs::create_dir(&second).unwrap();
+
+        let dir = renamed(&dir, "renamed");
+        assert_eq!(texts(&history, &dir), ["a\n"]);
+        std::fs::remove_dir(&second).unwrap();
+        std::fs::write(&second, bytes).unwrap();
+        assert_eq!(texts(&history, &dir), ["a\n", "b\n", "c\n"]);
+    }
+
+    #[test]
+    fn a_save_the_debounce_folded_away_is_not_taken_again_after_a_move() {
+        let (tmp, history) = store();
+        let dir = protocol(&tmp);
+        history
+            .record(&dir, "a\n", HistoryKind::Checkpoint, at(T0), false)
+            .unwrap();
+        history
+            .record(&dir, "b\n", HistoryKind::Save, at(T0 + 1), true)
+            .unwrap();
+        let dir = renamed(&dir, "renamed");
+        // Within the window of the save before the move, so it merges into it,
+        // as it would have in the folder's old place.
+        history
+            .record(&dir, "c\n", HistoryKind::Save, at(T0 + 3), true)
+            .unwrap();
+        assert_eq!(texts(&history, &dir), ["a\n", "c\n"]);
+    }
+
+    #[test]
+    fn versions_taken_from_two_keys_are_held_to_the_bound() {
+        let (tmp, history) = store();
+        let dir = protocol(&tmp);
+        let all: Vec<String> = (0..HISTORY_MAX_ENTRIES + 10)
+            .map(|n| format!("n: {n}\n"))
+            .collect();
+        let all: Vec<&str> = all.iter().map(String::as_str).collect();
+        let (first, rest) = all.split_at(HISTORY_MAX_ENTRIES);
+        checkpoints(&history, &dir, first);
+        // Ten more where the folder moved to: that key prunes the oldest ten,
+        // and the old key holds them still.
+        let dir = renamed(&dir, "moved");
+        for (secs, text) in (HISTORY_MAX_ENTRIES as u64..).zip(rest) {
+            history
+                .record(&dir, text, HistoryKind::Checkpoint, at(T0 + secs), false)
+                .unwrap();
+        }
+        let kept = texts(&history, &dir);
+        assert_eq!(kept, all[10..]);
+
+        // A copy takes the oldest ten from the old key and the rest from the
+        // new one, and keeps the newest the bound allows.
+        let copy = tmp.path().join("copy");
+        std::fs::create_dir_all(&copy).unwrap();
+        for name in [MANIFEST_FILENAME, LOG_FILENAME] {
+            std::fs::copy(dir.join(name), copy.join(name)).unwrap();
+        }
+        assert_eq!(texts(&history, &copy), kept);
     }
 }
