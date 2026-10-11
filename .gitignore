@@ -7,4 +7,5 @@ __pycache__/
 *.pyc
 # roborev snapshots
 /.roborev/
+# Kata per-machine overrides
 .kata.local.toml
