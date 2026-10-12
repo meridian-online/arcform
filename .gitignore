@@ -5,3 +5,7 @@ vendor/**/target/
 # Python bytecode from py_compile / uv-run script edits
 __pycache__/
 *.pyc
+# roborev snapshots
+/.roborev/
+# Kata per-machine overrides
+.kata.local.toml
