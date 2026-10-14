@@ -133,7 +133,9 @@ pub enum SpecEdit {
     /// between the colon and the old value, so `steps: []` replaced by a block
     /// sequence leaves `steps:` with no space at the end of its line, and a
     /// comment after the old value (`steps: []  # none yet`) stays on the
-    /// key's line (`steps:  # none yet`), ahead of the block.
+    /// key's line (`steps:  # none yet`), ahead of the block. The blank lines
+    /// and the comment lines indented less than an old block value, after its
+    /// last line, belong to what follows and are kept byte for byte.
     Replace { path: Vec<PathPart>, value: String },
 
     /// Replace one occurrence of `from` with `to` inside the value at `path` —
