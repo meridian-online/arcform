@@ -2,7 +2,7 @@
 
 Local-first data pipeline engine for analytical workflows. Part of the [Meridian](https://meridian.online) project.
 
-**Binary:** `arc` | **Version:** 0.1.0 | **Language:** Rust (edition 2024)
+**Binary:** `arc` | **Version:** 0.2.0 | **Language:** Rust (edition 2024)
 
 ## Sprint goal
 

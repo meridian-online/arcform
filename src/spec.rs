@@ -129,13 +129,13 @@
 //! The crate root carries one further item, `cli_main`, the `arc` binary's entry
 //! point. It is `#[doc(hidden)]` and gated behind the default `cli` feature, and it
 //! is not a library function: it parses the **calling process's** `argv` and can end
-//! the calling process. Depend on `arc` with `default-features = false` and it does
+//! the calling process. Depend on `arcform` with `default-features = false` and it does
 //! not exist at all — which also drops `clap` and the command dispatch from the
 //! build:
 //!
 //! ```toml
 //! [dependencies]
-//! arc = { version = "=0.1.0", default-features = false }
+//! arcform = { version = "=0.2.0", default-features = false }
 //! ```
 //!
 //! # Stability
