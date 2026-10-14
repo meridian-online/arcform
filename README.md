@@ -22,7 +22,7 @@ What arc needs beside it:
 - [`finetype`](https://github.com/meridian-online/finetype) 0.6.54 or later, for the five FineType tools `arc mcp` serves and the operators that use it;
 - [`uv`](https://docs.astral.sh/uv/), for the Python operators.
 
-Both builds carry DuckDB inside `arc` but leave out its ICU extension, so a time-zone function in `arc table describe` or `arc sql query` needs it installed once with `duckdb -c "INSTALL icu"`.
+Both builds carry DuckDB v1.5.6 inside `arc` but leave out its ICU extension, so a time-zone function in `arc table describe` or `arc sql query` needs it installed once. With the recommended v1.5.6 `duckdb`, run `duckdb -c "INSTALL icu"` once; a `duckdb` of another version installs it where arc does not look.
 
 ## What's in the box
 
@@ -31,7 +31,7 @@ Both builds carry DuckDB inside `arc` but leave out its ICU extension, so a time
 - **Advanced analytics:** operators for text embeddings, UMAP projection and entity resolution with Splink, and any Python script of your own, run through `uv`.
 - **Egress:** DuckDB's `COPY`, plus operators that export Parquet and publish to DuckLake.
 - **Data description:** semantic types and validation through FineType, and Frictionless Data Package descriptors.
-- **Local history:** every change to `arcform.yaml`, and to files beside it such as chart specs, is a version `arc history` can list and restore, with a log in the folder that travels with it through git.
+- **Local history:** every change arc makes to `arcform.yaml` is a version `arc history` can list and restore, with a log in the folder that travels with it through git, and a tool that writes files beside it, such as chart specs, can keep their history there too.
 - **Agents:** `arc mcp` serves all of this to an AI agent over the Model Context Protocol.
 
 ## First steps

@@ -20,7 +20,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use arcform::spec::{
-    Error, MANIFEST_FILENAME, Manifest, SpecEdit, Step, apply_edits, create_spec, edit_spec,
+    Error, MANIFEST_FILENAME, Manifest, SpecEdit, Step, apply_edits, apply_yaml_edits, create_spec,
+    edit_spec,
 };
 
 fn corpus_dir() -> PathBuf {
@@ -294,6 +295,54 @@ fn a_missing_target_is_refused_with_its_path() {
         Err(Error::EditTarget { path, .. }) => assert_eq!(path, "steps[9].command"),
         other => panic!("expected EditTarget, got {other:?}"),
     }
+}
+
+/// A block value replacing `[]` starts on the next line: the space after the
+/// colon goes with the old value, so the key's line does not end in a space.
+#[test]
+fn a_block_value_replacing_a_flow_value_leaves_no_space_after_the_colon() {
+    let edit = SpecEdit::Replace {
+        path: vec!["steps".into()],
+        value: "\n  - x".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("steps: []\n", &[edit]).unwrap(),
+        "steps:\n  - x\n"
+    );
+}
+
+/// A comment after the old value stays on the key's line, ahead of the block.
+#[test]
+fn a_block_value_keeps_the_comment_on_the_key_line() {
+    let edit = SpecEdit::Replace {
+        path: vec!["steps".into()],
+        value: "\n  - x".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("steps: []  # none yet\nnext: 1\n", &[edit]).unwrap(),
+        "steps:  # none yet\n  - x\nnext: 1\n"
+    );
+}
+
+/// The absent value of a bare `key:` is replaced just after the colon, as it was.
+#[test]
+fn a_bare_key_takes_its_value_just_after_the_colon() {
+    let block = SpecEdit::Replace {
+        path: vec!["steps".into()],
+        value: "\n  - x".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("steps:\nnext: 1\n", &[block]).unwrap(),
+        "steps:\n  - x\nnext: 1\n"
+    );
+    let scalar = SpecEdit::Replace {
+        path: vec!["name".into()],
+        value: " shop".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("name:\nnext: 1\n", &[scalar]).unwrap(),
+        "name: shop\nnext: 1\n"
+    );
 }
 
 // ------------------------------------------------------------- the whole path

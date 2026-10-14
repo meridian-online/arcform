@@ -233,6 +233,24 @@ fn recording_into_a_protocol_without_steps_gives_it_its_first_step() {
     );
 }
 
+/// A comment after `steps: []` stays on the `steps:` line when the first step
+/// is recorded.
+#[test]
+fn the_first_step_keeps_a_comment_on_the_steps_line() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(MANIFEST_FILENAME),
+        "name: bare\nsteps: []  # none yet\nassets: {}\n",
+    )
+    .unwrap();
+
+    record_step(dir.path(), &tide_capture()).expect("recorded");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap(),
+        "name: bare\nsteps:  # none yet\n  - name: dover_tides\n    sql: models/01_dover_tides.sql\nassets: {}\n"
+    );
+}
+
 /// A manifest with no `steps` key has no sequence to record into — refused
 /// before anything is written.
 #[test]
@@ -240,7 +258,10 @@ fn recording_into_a_manifest_without_a_steps_key_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join(MANIFEST_FILENAME), "name: bare\n").unwrap();
 
-    assert!(record_step(dir.path(), &tide_capture()).is_err());
+    match record_step(dir.path(), &tide_capture()) {
+        Err(Error::EditTarget { path, .. }) => assert_eq!(path, "steps"),
+        other => panic!("expected EditTarget on steps, got {other:?}"),
+    }
     assert!(!dir.path().join("models").exists());
     assert_eq!(
         std::fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap(),

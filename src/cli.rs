@@ -530,7 +530,7 @@ pub fn create_protocol(
 ) -> Result<()> {
     let created = create_protocol_files(dir, name, engine, db, history)?;
     println!(
-        "created {} — author steps with `arc edit-protocol`",
+        "created {} — record steps with `arc sql record`, or edit it with `arc edit-protocol`",
         created.manifest.display()
     );
     if created.ignore == IgnoreList::Written {

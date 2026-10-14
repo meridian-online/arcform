@@ -131,7 +131,9 @@ pub enum SpecEdit {
     /// (or a newline for a block value), since the splice lands right after
     /// the colon. A value that starts with a newline also takes the spaces
     /// between the colon and the old value, so `steps: []` replaced by a block
-    /// sequence leaves `steps:` with no space at the end of its line.
+    /// sequence leaves `steps:` with no space at the end of its line, and a
+    /// comment after the old value (`steps: []  # none yet`) stays on the
+    /// key's line (`steps:  # none yet`), ahead of the block.
     Replace { path: Vec<PathPart>, value: String },
 
     /// Replace one occurrence of `from` with `to` inside the value at `path` —
@@ -582,10 +584,18 @@ fn apply_one(text: &str, edit: &SpecEdit) -> Result<String> {
             let (mut start, end) = value_span(text, &doc, path)?;
             // A block value starts on the next line: the spaces between the
             // colon and the old value go with it, so no line ends in a space.
+            // A comment after the old value on its line stays on the key's line,
+            // ahead of the block, rather than ending up after its last line.
             if value.starts_with('\n') {
                 let spaces = text[..start].len() - text[..start].trim_end_matches(' ').len();
                 if text[..start - spaces].ends_with(':') {
                     start -= spaces;
+                }
+                let line_rest = &text[end..line_end(text, end)];
+                let comment = line_rest.trim_end_matches('\n');
+                if comment.trim_start().starts_with('#') {
+                    let replacement = format!("{comment}{value}");
+                    return Ok(splice(text, start, end + comment.len(), &replacement));
                 }
             }
             Ok(splice(text, start, end, value))
