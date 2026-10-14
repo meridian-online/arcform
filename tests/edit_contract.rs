@@ -324,6 +324,30 @@ fn a_block_value_keeps_the_comment_on_the_key_line() {
     );
 }
 
+/// An old value on one line is replaced exactly: only its own bytes change, and
+/// a trailing comment on its line and the comment line after it stay where they
+/// were, whether the new value is a scalar or a block.
+#[test]
+fn a_one_line_old_value_is_replaced_exactly() {
+    let text = "a: 1  # one\n# section\nb: 2\n";
+    let scalar = SpecEdit::Replace {
+        path: vec!["a".into()],
+        value: "3".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits(text, &[scalar]).unwrap(),
+        "a: 3  # one\n# section\nb: 2\n"
+    );
+    let block = SpecEdit::Replace {
+        path: vec!["a".into()],
+        value: "\n  x: 1\n".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits(text, &[block]).unwrap(),
+        "a:  # one\n  x: 1\n\n# section\nb: 2\n"
+    );
+}
+
 /// A full-line comment after a block mapping value is not the value's: a
 /// block value replacing the mapping leaves it where it was, byte for byte.
 #[test]
