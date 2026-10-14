@@ -124,6 +124,27 @@ fn describe_missing_table_is_refused() {
     assert!(err.contains("orders"), "{err}");
 }
 
+/// A view the columns and counts of which read cleanly but whose body fails once the
+/// sample query (the only one that says LIMIT) runs it: describe must refuse with that
+/// error, not report an empty sample as if the table held no rows.
+#[test]
+fn describe_refuses_when_the_sample_query_fails() {
+    let dir = protocol();
+    let conn = duckdb::Connection::open(dir.path().join("data.duckdb")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE src (a INTEGER);
+         INSERT INTO src VALUES (1), (2);
+         CREATE VIEW sample_fails AS
+           SELECT CASE WHEN current_query() ILIKE '%LIMIT%' THEN error('sample boom') ELSE a END AS a
+           FROM src;",
+    )
+    .unwrap();
+    drop(conn);
+    let out = describe(dir.path(), "sample_fails");
+    assert!(!out.status.success(), "describe succeeded: {out:?}");
+    assert!(stderr(&out).contains("sample boom"), "{}", stderr(&out));
+}
+
 #[test]
 fn describe_missing_database_is_refused() {
     let dir = protocol();
