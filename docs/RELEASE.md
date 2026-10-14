@@ -15,7 +15,7 @@ Hugh adds these under the arcform repository's Settings → Secrets and variable
 
 A pushed tag starts a release only when it is `v` followed by three dot-separated numbers, such as `v0.2.0`. `release.yml` filters its tag trigger on `v[0-9]+.[0-9]+.[0-9]+`, so a tag such as `v0.3.0-rc1` or `v19-train-state` starts nothing.
 
-A version tag then has to pass `release.yml`'s first job, `tag-guard`, before anything else runs. Every other job waits on it, directly or through another job, and none carries an `if:` that would run it after a failure, so a refusal stops the run before a binary is built, a release is created or a crate is published. `scripts/check_release_tag.py` refuses when:
+A version tag then has to pass `release.yml`'s first job, `tag-guard`, before anything else runs. Every other job waits on it, directly or through another job, none carries an `if:` that would run it after a failure, and `publish-crates` and `update-install-site` also wait on the `release` job, so a refusal stops the run before a binary is built, a release is created or a crate is published. `scripts/check_release_tag.py` refuses when:
 
 - the tag is not a version (exit 3), which is the second line of defence behind the trigger filter;
 - the tag's number differs from `version` under `[package]` in `Cargo.toml` (exit 4);
@@ -35,14 +35,14 @@ The script reads `release.yml` without a YAML library, so it understands only th
 | `tag-guard` | | Runs the check above and outputs `notes`. |
 | `build` | `tag-guard` | Builds `cargo build --release --locked --features mcp,bundled-duckdb` for `aarch64-apple-darwin` and `x86_64-apple-darwin` (on `macos-latest`), `x86_64-unknown-linux-gnu` (`ubuntu-22.04`) and `aarch64-unknown-linux-gnu` (`ubuntu-22.04-arm`), all native. Checks that `arc --version` prints `arc X.Y.Z` and that `arc mcp` answers an `initialize` with protocol version `2025-11-25`. Packages `arc-<tag>-<target>.tar.gz`, with `arc` at the archive's root, and `arc-<tag>-<target>.tar.gz.sha256` in `hash  filename` form. |
 | `release` | `tag-guard`, `build` | Requires all eight files and checks each checksum, then creates the GitHub release with `body: ${{ needs.tag-guard.outputs.notes }}` and `fail_on_unmatched_files: true`. |
-| `publish-crates` | `release` | Publishes `arcform-sqlparser` (from `vendor/sqlparser-0.55.0`) when `cargo search` does not show its version, then `arcform` when its version is not there either. |
+| `publish-crates` | `release` | Publishes `arcform-sqlparser` (from `vendor/sqlparser-0.55.0`) when crates.io's API answers 404 for its version, then `arcform` (`cargo publish --locked`) when its version is not there either. Any answer other than 200 or 404 stops the job. |
 | `update-install-site` | `release` | Sends `scripts/install.sh` to `meridian-online/install` as an `update-install-script` dispatch carrying the tag and repository. |
 
 The Linux binaries are built on Ubuntu 22.04, so they need glibc 2.35 or later. Older systems build from source with `cargo install arcform --locked --features mcp,bundled-duckdb`.
 
 ## The release, step by step
 
-1. **On a branch**, bump `version` in `Cargo.toml` (and the `**Version:**` line in `CLAUDE.md`), and move `CHANGELOG.md`'s `[Unreleased]` items under `## [X.Y.Z] - YYYY-MM-DD`, leaving an empty `[Unreleased]` above it. Run `python3 scripts/check_release_tag.py --tag vX.Y.Z` to see the guard accept it.
+1. **On a branch**, bump `version` in `Cargo.toml` (and the `**Version:**` line in `CLAUDE.md`), then refresh `Cargo.lock` with `cargo metadata --format-version 1 > /dev/null` and check it with `cargo metadata --locked --format-version 1 > /dev/null`: every build leg uses `--locked`, so a stale lock fails the tag. Move `CHANGELOG.md`'s `[Unreleased]` items under `## [X.Y.Z] - YYYY-MM-DD`, leaving an empty `[Unreleased]` above it, and update the link definitions at the foot of the file: `[Unreleased]: https://github.com/meridian-online/arcform/compare/vX.Y.Z...HEAD`, and a new `[X.Y.Z]: https://github.com/meridian-online/arcform/releases/tag/vX.Y.Z` above the previous version's. Run `python3 scripts/check_release_tag.py --tag vX.Y.Z` to see the guard accept it.
 2. **Open a pull request** and wait for CI. `release-guard` rehearses the tag against the bumped tree; the `bundled` and `package` jobs build the release binary and package both crates.
 3. **Hugh merges it and pushes the tag** from `main`: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 4. **Watch the release workflow** (`gh run watch`) until all five jobs are green, then check the release page lists eight assets.
@@ -50,6 +50,16 @@ The Linux binaries are built on Ubuntu 22.04, so they need glibc 2.35 or later. 
 
 ## When a release fails partway
 
-- **`tag-guard` refused:** nothing was published. Fix the tree on a branch, merge, delete the tag (`git push --delete origin vX.Y.Z`) and push it again on the fixed commit.
-- **A `build` leg failed:** nothing was published, because `release` needs every leg. Re-run the failed jobs if the failure was the runner's; otherwise fix, delete the tag and push it again.
+- **`tag-guard` refused:** nothing was published. Fix the tree on a branch and merge it, then Hugh moves the tag to the fixed `main` (below).
+- **A `build` leg failed:** nothing was published, because `release` needs every leg. Re-run the failed jobs if the failure was the runner's; otherwise fix and merge, then Hugh moves the tag.
+
+Moving the tag is Hugh's step, as pushing it was. Delete it on GitHub and locally, then tag the fixed `main` and push again:
+
+```bash
+git push --delete origin vX.Y.Z && git tag -d vX.Y.Z
+git switch main && git pull --ff-only
+git tag vX.Y.Z && git push origin vX.Y.Z
+```
+
+Move a tag only while nothing has been published from it. Once the GitHub release or a crate is out, fix forward with a new patch release.
 - **`publish-crates` or `update-install-site` failed:** the GitHub release is out. Fix the cause (usually a missing secret) and re-run the failed job. `publish-crates` skips a crate whose version is already on crates.io, so a re-run publishes only what is missing. A crate version, once published, cannot be replaced; a fix to it is a new patch release.

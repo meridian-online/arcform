@@ -46,7 +46,13 @@ git switch -c release-vX.Y.Z
 1. Merge any duplicate subsection headings under `[Unreleased]` (one `### Added`, one `### Changed`, one `### Fixed`, one `### Removed`, in that order).
 2. Add a short summary at the head of the section, about ten lines, written for someone who has never used arc: what this release lets them do. It sits above the first `###` heading.
 3. Rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` with today's date (`date +%F`), and put a fresh, empty `## [Unreleased]` above it.
-4. Strip anything that names private planning material: this repository is public. `./scripts/check-public-hygiene.sh` must be clean.
+4. Update the link definitions at the foot of the file. `[Unreleased]` now compares from the new tag, and the new version gets its own line above the previous one:
+
+   ```markdown
+   [Unreleased]: https://github.com/meridian-online/arcform/compare/vX.Y.Z...HEAD
+   [X.Y.Z]: https://github.com/meridian-online/arcform/releases/tag/vX.Y.Z
+   ```
+5. Strip anything that names private planning material: this repository is public. `./scripts/check-public-hygiene.sh` must be clean.
 
 Keep the section under 120,000 characters, or the tag guard refuses it (GitHub cuts a release body at 125,000).
 
@@ -108,7 +114,7 @@ cargo search arcform --limit 3                           # arcform = "X.Y.Z"
 curl -fsSL https://install.meridian.online/arc | head -n 5
 ```
 
-If a job fails, `docs/RELEASE.md` ("When a release fails partway") says what has and has not been published and how to recover. Report the failure to Hugh with the job's log; do not delete or move the tag yourself.
+If a job fails, `docs/RELEASE.md` ("When a release fails partway") says what has and has not been published and how to recover. Report the failure to Hugh with the job's log; do not delete or move the tag yourself. Moving it is Hugh's step, and `docs/RELEASE.md` gives the commands.
 
 ## 5. Open the web-repository pull request
 

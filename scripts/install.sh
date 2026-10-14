@@ -23,6 +23,9 @@ BINARY="arc"
 # the `duckdb` command for a protocol's SQL steps, so a user needs it on PATH.
 DUCKDB_RECOMMENDED="v1.5.6"
 SOURCE_INSTALL="cargo install arcform --locked --features mcp,bundled-duckdb"
+# FOR TESTS ONLY, not a user setting: --self-test points this at a file:// tree
+# laid out as a release is, so the install path runs without the network.
+ARC_INSTALL_BASE_URL="${ARC_INSTALL_BASE_URL:-}"
 
 info() { printf '  %s\n' "$*"; }
 warn() { printf '  warning: %s\n' "$*" >&2; }
@@ -83,7 +86,7 @@ normalise_version() {
 }
 
 latest_version() {
-  lv_tag="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+  lv_tag="$(curl -fsSL --proto '=https' --tlsv1.2 "https://api.github.com/repos/${REPO}/releases/latest" \
     | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)"
   [ -n "$lv_tag" ] || error "could not read the latest release of ${REPO} from GitHub; name a version instead, like: sh -s -- v0.2.0"
   normalise_version "$lv_tag"
@@ -146,6 +149,11 @@ main() {
   fi
   archive="$(archive_name "$version" "$target")"
   base_url="https://github.com/${REPO}/releases/download/${version}"
+  curl_proto="=https"
+  if [ -n "$ARC_INSTALL_BASE_URL" ]; then
+    base_url="${ARC_INSTALL_BASE_URL}/${version}"
+    curl_proto="=https,file"
+  fi
 
   echo ""
   echo "  arc installer (Meridian)"
@@ -154,11 +162,12 @@ main() {
 
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "$tmp_dir"' EXIT
+  trap 'rm -rf "$tmp_dir"; exit 130' INT TERM
 
   info "downloading ${archive}"
-  curl -fsSL -o "${tmp_dir}/${archive}" "${base_url}/${archive}" \
+  curl -fsSL --proto "$curl_proto" --tlsv1.2 -o "${tmp_dir}/${archive}" "${base_url}/${archive}" \
     || error "could not download ${base_url}/${archive}. Is ${version} released for ${target}?"
-  curl -fsSL -o "${tmp_dir}/${archive}.sha256" "${base_url}/${archive}.sha256" \
+  curl -fsSL --proto "$curl_proto" --tlsv1.2 -o "${tmp_dir}/${archive}.sha256" "${base_url}/${archive}.sha256" \
     || error "could not download the checksum for ${archive}"
   verify_checksum "${tmp_dir}/${archive}" "${tmp_dir}/${archive}.sha256"
   info "checksum verified"
@@ -185,8 +194,9 @@ main() {
 }
 
 # ---------------------------------------------------------------------------
-# --self-test: target resolution, version handling and the checksum refusal,
-# with no network and nothing written outside a temporary directory.
+# --self-test: target resolution, version handling, the checksum refusal, and
+# the whole install run against a local release tree with a temporary HOME.
+# No network, and nothing written outside a temporary directory.
 # ---------------------------------------------------------------------------
 
 st_passed=0
@@ -212,6 +222,66 @@ st_refuses() {
       *) st_fail "${st_label}: refused, but without '${st_needle}': ${st_out}" ;;
     esac
   fi
+}
+
+# The install itself: main() against a file:// release tree laid out as
+# release.yml publishes one (`arc` at the archive's root, a `hash  filename`
+# sidecar beside it), with HOME in a temporary directory.
+st_end_to_end() {
+  if ! st_target="$( (detect_target) 2> /dev/null)"; then
+    st_fail "end to end: this machine has no release target"
+    return 0
+  fi
+  st_e2e="$(mktemp -d)"
+  st_version="v0.0.1"
+  st_site="${st_e2e}/site"
+  st_archive="$(archive_name "$st_version" "$st_target")"
+  mkdir -p "${st_e2e}/pkg" "${st_site}/${st_version}"
+  printf '#!/bin/sh\necho "arc 0.0.1"\n' > "${st_e2e}/pkg/arc"
+  chmod +x "${st_e2e}/pkg/arc"
+  tar -C "${st_e2e}/pkg" -czf "${st_site}/${st_version}/${st_archive}" arc
+  printf '%s  %s\n' "$(sha256_of "${st_site}/${st_version}/${st_archive}")" "$st_archive" \
+    > "${st_site}/${st_version}/${st_archive}.sha256"
+
+  st_home="${st_e2e}/home"
+  mkdir -p "$st_home"
+  if (
+    HOME="$st_home"
+    ARC_INSTALL_BASE_URL="file://${st_site}"
+    main "$st_version"
+  ) > "${st_e2e}/install.log" 2>&1; then
+    st_pass
+  else
+    st_fail "end to end: the install failed: $(cat "${st_e2e}/install.log")"
+  fi
+  st_equal "end to end: latest is the installed version" \
+    "$(cd "${st_home}/.arcform/cli/${st_version}" 2> /dev/null && pwd -P)" \
+    "$(cd "${st_home}/.arcform/cli/latest" 2> /dev/null && pwd -P)"
+  st_equal "end to end: ~/.local/bin/arc runs" "arc 0.0.1" "$("${st_home}/.local/bin/arc" --version 2>&1)"
+
+  # The same release with its sidecar tampered with: refused, nothing installed.
+  printf '%s  %s\n' "0000000000000000000000000000000000000000000000000000000000000000" "$st_archive" \
+    > "${st_site}/${st_version}/${st_archive}.sha256"
+  st_home2="${st_e2e}/home2"
+  mkdir -p "$st_home2"
+  if (
+    HOME="$st_home2"
+    ARC_INSTALL_BASE_URL="file://${st_site}"
+    main "$st_version"
+  ) > "${st_e2e}/tampered.log" 2>&1; then
+    st_fail "end to end: a tampered checksum was installed"
+  else
+    case "$(cat "${st_e2e}/tampered.log")" in
+      *"checksum mismatch"*) st_pass ;;
+      *) st_fail "end to end: refused, but not for the checksum: $(cat "${st_e2e}/tampered.log")" ;;
+    esac
+  fi
+  if [ -e "${st_home2}/.arcform" ] || [ -e "${st_home2}/.local" ]; then
+    st_fail "end to end: a refused install left files in HOME"
+  else
+    st_pass
+  fi
+  rm -rf "$st_e2e"
 }
 
 self_test() {
@@ -262,6 +332,8 @@ v0.3.0"; do
   st_refuses "a mismatched checksum" "checksum mismatch" verify_checksum "$st_archive" "${st_dir}/bad.sha256"
   st_refuses "a missing checksum file" "no checksum file" verify_checksum "$st_archive" "${st_dir}/absent.sha256"
   rm -rf "$st_dir"
+
+  st_end_to_end
 
   printf 'install.sh self-test: %s passed, %s failed\n' "$st_passed" "$st_failed"
   [ "$st_failed" -eq 0 ]
