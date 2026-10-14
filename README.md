@@ -148,7 +148,7 @@ The folder of a file not named `arcform.yaml` is the nearest directory at or abo
 
 ```toml
 [dependencies]
-arc = { version = "=0.1.0", default-features = false }
+arcform = { version = "=0.1.0", default-features = false }
 ```
 
 `default-features = false` turns off the `cli` feature. That feature exists for the `arc`
@@ -157,7 +157,7 @@ the *calling* process's `argv` and can exit it. With the feature off the crate r
 `spec` and nothing else, and `clap` leaves the dependency graph.
 
 ```rust
-use arc::spec::{Manifest, Result, SpecEdit, edit_spec};
+use arcform::spec::{Manifest, Result, SpecEdit, edit_spec};
 
 fn example() -> Result<()> {
     // A spec on disk.
@@ -176,7 +176,7 @@ fn example() -> Result<()> {
 }
 ```
 
-`arc::spec` is the entire public surface: the spec schema types, the loading entry points,
+`arcform::spec` is the entire public surface: the spec schema types, the loading entry points,
 the write path, and the error type. Validation is a **gate, not a transform** — it parses
 raw YAML to reach a verdict and hands nothing back to write. The write path is built on
 that: a `SpecEdit` is a plain value, applied to the **original bytes** by splicing at
@@ -193,11 +193,9 @@ The surface is documented as a contract in `src/spec.rs` and enumerated by
 `tests/public_surface.rs`, which fails the build if it widens. Arcform is pre-1.0: **pin an
 exact version** (or, inside the same organisation, a git revision).
 
-Two build-time facts come with the dependency. Arcform parses SQL with its vendored
-`sqlparser` fork (`vendor/sqlparser-0.55.0`), wired in via `[patch.crates-io]` — and Cargo
-patch tables do not propagate through dependencies, so the consuming workspace must carry the
-same patch entry pointing at that vendored package in the same pinned Arcform source (without
-it, the build fails on missing `SetExpr::Pivot`/`Unpivot` variants). And the private engine
+Two build-time facts come with the dependency. Arcform parses SQL with its own `sqlparser`
+fork, published on crates.io as `arcform-sqlparser` and pinned to an exact version, so it
+resolves like any other dependency and the consuming workspace needs no patch entry. And the private engine
 still compiles into the library, so the DuckDB C library must be available to the build
 (`DUCKDB_LIB_DIR`/`DUCKDB_INCLUDE_DIR`) even for a consumer that only loads specs.
 

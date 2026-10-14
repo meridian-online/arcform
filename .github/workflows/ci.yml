@@ -307,6 +307,24 @@ jobs:
             echo "DUCKDB_INCLUDE_DIR=$HOME/duckdb"
           } >> "$GITHUB_ENV"
 
+      # arcform pins the fork with `=x.y.z`, and the path dependency builds this
+      # checkout whatever that says, so a fork bumped in one manifest and not the other
+      # would pass every other job and fail only at publish.
+      - name: The fork's version is the one arcform pins
+        run: |
+          python3 - <<'PY'
+          import sys, tomllib
+          with open("Cargo.toml", "rb") as f:
+              wanted = tomllib.load(f)["dependencies"]["sqlparser"]["version"].removeprefix("=")
+          with open("vendor/sqlparser-0.55.0/Cargo.toml", "rb") as f:
+              have = tomllib.load(f)["package"]["version"]
+          if have != wanted:
+              print(f"::error::arcform pins arcform-sqlparser ={wanted} but the fork is {have}; "
+                    "bump both together: the fork's [package] version and arcform's sqlparser dependency")
+              sys.exit(1)
+          print(f"arcform-sqlparser {have} matches arcform's pin")
+          PY
+
       - name: arcform-sqlparser publishes (dry run)
         run: cargo publish --dry-run --manifest-path vendor/sqlparser-0.55.0/Cargo.toml --features visitor
 

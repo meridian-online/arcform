@@ -8,8 +8,9 @@ which otherwise make `arc`'s SQL introspection degrade a whole SQL step to an *o
 node (undercutting the "0 opaque steps" legibility story).
 
 The fork started at upstream's version, `0.55.0`, and its dependency set is
-unchanged, so the resolved dep graph and licences are identical to upstream's. A later
-change to the fork bumps its patch number.
+unchanged, so the resolved dep graph and licences are identical to upstream's. Any
+change to the fork bumps its patch version in both manifests, its own `Cargo.toml` and the
+exact pin in arcform's; CI's `package` job fails when the two differ.
 
 ## What the fork adds
 
