@@ -201,7 +201,9 @@ jobs:
             release-assets/arc-*.tar.gz.sha256
 
   # The parser fork first, because arcform depends on it by exact version and
-  # crates.io must have it before arcform can be published. Each crate is skipped
+  # crates.io must have it before arcform can be published. A fork version that is
+  # already published must be this tree's source, file for file
+  # (scripts/check_fork_published.py), so an edit without a version bump stops here. Each crate is skipped
   # when crates.io's API already has its version, so re-running a release whose arcform
   # publish failed retries only what is missing. `cargo publish` waits until a
   # crate is in the index before it returns, so arcform resolves the fork.
@@ -249,7 +251,10 @@ jobs:
           }
 
           if published arcform-sqlparser "$fork_version"; then
-            echo "arcform-sqlparser $fork_version is already on crates.io; skipping it."
+            # Already published: it must be this tree's fork, or arcform would
+            # ship against stale parser source under the same version number.
+            echo "arcform-sqlparser $fork_version is already on crates.io; checking it is this source."
+            python3 scripts/check_fork_published.py --manifest-path "$fork_manifest"
           else
             cargo publish --locked --manifest-path "$fork_manifest" --features visitor
           fi

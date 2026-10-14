@@ -10,7 +10,11 @@ node (undercutting the "0 opaque steps" legibility story).
 The fork started at upstream's version, `0.55.0`, and its dependency set is
 unchanged, so the resolved dep graph and licences are identical to upstream's. Any
 change to the fork bumps its patch version in both manifests, its own `Cargo.toml` and the
-exact pin in arcform's; CI's `package` job fails when the two differ.
+exact pin in arcform's. CI's `package` job enforces both halves: it fails when the two
+versions differ, and, once a version is on crates.io, it fails when this source differs
+from the published crate file for file (`scripts/check_fork_published.py`), which is what
+a change without a bump looks like. The release's `publish-crates` job runs the same
+check before it skips publishing a fork version that is already there.
 
 ## What the fork adds
 

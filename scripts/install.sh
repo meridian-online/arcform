@@ -190,9 +190,33 @@ main() {
   info "installed ${version_dir}/${BINARY}"
   info "${install_root}/latest -> ${version_dir}"
 
+  # ~/.local/bin/arc is replaced only when it is this installer's own link. Any
+  # other file there, or a link to somewhere else, is someone else's `arc` and is
+  # left alone: the install has still succeeded, under ~/.arcform/cli/latest.
   mkdir -p "$local_bin"
-  ln -sf "${install_root}/latest/${BINARY}" "${local_bin}/${BINARY}"
-  info "linked ${local_bin}/${BINARY}"
+  link="${local_bin}/${BINARY}"
+  if [ -L "$link" ] || [ -e "$link" ]; then
+    existing=""
+    if [ -L "$link" ]; then
+      existing="$(readlink "$link")"
+    fi
+    case "$existing" in
+      "${install_root}"/*) ;;
+      *)
+        if [ -n "$existing" ]; then
+          warn "${link} already exists and links to ${existing}, not to this install, so it was left alone."
+        else
+          warn "${link} already exists and is not this installer's link, so it was left alone."
+        fi
+        warn "Run arc as ${install_root}/latest/${BINARY}, or remove ${link} and run this installer again."
+        link=""
+        ;;
+    esac
+  fi
+  if [ -n "$link" ]; then
+    ln -sf "${install_root}/latest/${BINARY}" "$link"
+    info "linked ${link}"
+  fi
 
   if "${version_dir}/${BINARY}" --version > /dev/null 2>&1; then
     info "$("${version_dir}/${BINARY}" --version) is ready"
@@ -234,6 +258,20 @@ st_refuses() {
   fi
 }
 
+# st_install HOME SITE LOG: main() for v0.0.1 with set -e in force, outside any
+# conditional (where the shell would ignore it); its exit status in st_rc.
+st_install() {
+  set +e
+  (
+    set -e
+    HOME="$1"
+    ARC_INSTALL_BASE_URL="file://$2"
+    main v0.0.1
+  ) > "$3" 2>&1
+  st_rc=$?
+  set -e
+}
+
 # The install itself: main() against a file:// release tree laid out as
 # release.yml publishes one (`arc` at the archive's root, a `hash  filename`
 # sidecar beside it), with HOME in a temporary directory.
@@ -271,6 +309,39 @@ st_end_to_end() {
     "$(cd "${st_home}/.arcform/cli/${st_version}" 2> /dev/null && pwd -P)" \
     "$(cd "${st_home}/.arcform/cli/latest" 2> /dev/null && pwd -P)"
   st_equal "end to end: ~/.local/bin/arc runs" "arc 0.0.1" "$("${st_home}/.local/bin/arc" --version 2>&1)"
+
+  # Someone else's `arc` in ~/.local/bin, a regular file: left byte for byte, with
+  # a warning, and the install still succeeds.
+  st_home3="${st_e2e}/home3"
+  mkdir -p "${st_home3}/.local/bin"
+  printf "someone else's arc\n" > "${st_home3}/.local/bin/arc"
+  cp "${st_home3}/.local/bin/arc" "${st_e2e}/other-arc"
+  st_install "$st_home3" "${st_site}" "${st_e2e}/other.log"
+  st_equal "end to end, another arc present: the install exits 0" "0" "$st_rc"
+  if cmp -s "${st_home3}/.local/bin/arc" "${st_e2e}/other-arc" && [ ! -L "${st_home3}/.local/bin/arc" ]; then
+    st_pass
+  else
+    st_fail "end to end: another arc in ~/.local/bin was replaced"
+  fi
+  case "$(cat "${st_e2e}/other.log")" in
+    *"so it was left alone"*) st_pass ;;
+    *) st_fail "end to end: no warning that another arc was left alone: $(cat "${st_e2e}/other.log")" ;;
+  esac
+
+  # A link to some other program: also left alone.
+  st_home5="${st_e2e}/home5"
+  mkdir -p "${st_home5}/.local/bin"
+  ln -s /bin/sh "${st_home5}/.local/bin/arc"
+  st_install "$st_home5" "${st_site}" "${st_e2e}/other-link.log"
+  st_equal "end to end, a link elsewhere: left alone" "/bin/sh" "$(readlink "${st_home5}/.local/bin/arc")"
+
+  # This installer's own link from an earlier install: replaced, as before.
+  st_home4="${st_e2e}/home4"
+  mkdir -p "${st_home4}/.local/bin"
+  ln -s "${st_home4}/.arcform/cli/v0.0.0/arc" "${st_home4}/.local/bin/arc"
+  st_install "$st_home4" "${st_site}" "${st_e2e}/own-link.log"
+  st_equal "end to end, its own earlier link: replaced" \
+    "${st_home4}/.arcform/cli/latest/arc" "$(readlink "${st_home4}/.local/bin/arc")"
 
   # The same release with its sidecar tampered with: refused, nothing installed.
   printf '%s  %s\n' "0000000000000000000000000000000000000000000000000000000000000000" "$st_archive" \
