@@ -251,6 +251,30 @@ fn a_failing_statement_keeps_the_others_results() {
     assert_eq!(got["keep"], KEEP);
 }
 
+/// A view that fails only under the query that counts the rows held back (the one
+/// reading `count(*) FROM (`): the statement reports that error, not a count of nothing.
+#[test]
+fn a_failing_count_of_the_rows_held_back_is_reported() {
+    let dir = protocol_with_data();
+    let conn = duckdb::Connection::open(dir.path().join("data.duckdb")).unwrap();
+    conn.execute_batch(
+        "CREATE VIEW count_fails AS
+           SELECT n FROM many
+           WHERE CASE WHEN current_query() ILIKE '%count(*) FROM (%' THEN error('count boom') ELSE true END;",
+    )
+    .unwrap();
+    drop(conn);
+    let out = query(dir.path(), &["--limit", "10", "SELECT n FROM count_fails"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let got: Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    let result = &got["results"][0];
+    assert!(
+        result["error"].as_str().unwrap().contains("count boom"),
+        "{result}"
+    );
+    assert!(result.get("rows_held_back").is_none(), "{result}");
+}
+
 #[test]
 fn a_statement_after_a_failed_one_still_runs() {
     let dir = protocol_with_data();

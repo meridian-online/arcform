@@ -145,6 +145,44 @@ fn describe_refuses_when_the_sample_query_fails() {
     assert!(stderr(&out).contains("sample boom"), "{}", stderr(&out));
 }
 
+/// A view whose columns read cleanly but whose body fails once the counting query (the
+/// only one that says `count(*) - count(`) runs it: describe must refuse with that
+/// error, not report counts it never got.
+#[test]
+fn describe_refuses_when_the_count_query_fails() {
+    let dir = protocol();
+    let conn = duckdb::Connection::open(dir.path().join("data.duckdb")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE src (a INTEGER);
+         INSERT INTO src VALUES (1), (2);
+         CREATE VIEW count_fails AS
+           SELECT CASE WHEN current_query() ILIKE '%count(*) - count(%' THEN error('count boom') ELSE a END AS a
+           FROM src;",
+    )
+    .unwrap();
+    drop(conn);
+    let out = describe(dir.path(), "count_fails");
+    assert!(!out.status.success(), "describe succeeded: {out:?}");
+    assert!(stderr(&out).contains("count boom"), "{}", stderr(&out));
+}
+
+/// With no `db:`, the database's place comes from the Protocol's name; a name that is
+/// not a plain file name is refused with that reason, not read as a missing database.
+#[test]
+fn describe_refuses_a_name_that_is_not_a_file_name() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("arcform.yaml"),
+        "name: a/b\nengine: duckdb\nsteps: []\nassets: {}\n",
+    )
+    .unwrap();
+    let out = describe(dir.path(), "orders");
+    assert!(!out.status.success(), "describe succeeded: {out:?}");
+    let err = stderr(&out);
+    assert!(!err.contains("no database for this Protocol"), "{err}");
+    assert!(err.contains("a/b"), "{err}");
+}
+
 #[test]
 fn describe_missing_database_is_refused() {
     let dir = protocol();
