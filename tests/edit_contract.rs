@@ -404,6 +404,72 @@ fn a_blank_line_before_the_comment_after_a_block_value_stays() {
     );
 }
 
+/// The key of a sequence item's first pair is measured from its own column,
+/// past the `- `, so a comment at that column after its block value stays.
+#[test]
+fn a_comment_at_a_sequence_items_key_column_stays_after_its_block_mapping() {
+    let edit = SpecEdit::Replace {
+        path: vec!["steps".into(), 0.into(), "params".into()],
+        value: "\n      b: 2".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits(
+            "steps:\n  - params:\n      a: 1\n    # c\n  - name: y\n",
+            &[edit]
+        )
+        .unwrap(),
+        "steps:\n  - params:\n      b: 2\n    # c\n  - name: y\n"
+    );
+}
+
+/// The same holds for a sequence item nested deeper.
+#[test]
+fn a_comment_at_a_nested_sequence_items_key_column_stays() {
+    let edit = SpecEdit::Replace {
+        path: vec!["outer".into(), "steps".into(), 0.into(), "a".into()],
+        value: "\n        y: 2".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits(
+            "outer:\n  steps:\n    - a:\n        x: 1\n      # c\n    - b: 2\n",
+            &[edit]
+        )
+        .unwrap(),
+        "outer:\n  steps:\n    - a:\n        y: 2\n      # c\n    - b: 2\n"
+    );
+}
+
+/// A block sequence under a sequence item's first key keeps the comment after it.
+#[test]
+fn a_comment_at_a_sequence_items_key_column_stays_after_its_block_sequence() {
+    let edit = SpecEdit::Replace {
+        path: vec!["steps".into(), 0.into(), "deps".into()],
+        value: "\n      - z".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits(
+            "steps:\n  - deps:\n      - x\n      - w\n    # c\n  - name: y\n",
+            &[edit]
+        )
+        .unwrap(),
+        "steps:\n  - deps:\n      - z\n    # c\n  - name: y\n"
+    );
+}
+
+/// A sequence item has no key: a comment indented less than the item's own
+/// column (here the dash's) is after it and stays.
+#[test]
+fn a_comment_after_a_replaced_sequence_item_stays() {
+    let edit = SpecEdit::Replace {
+        path: vec!["steps".into(), 0.into()],
+        value: "{a: 3}".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("steps:\n- a: 1\n  b: 2\n# c\n- name: y\n", &[edit]).unwrap(),
+        "steps:\n- {a: 3}\n# c\n- name: y\n"
+    );
+}
+
 /// The absent value of a bare `key:` is replaced just after the colon, as it was.
 #[test]
 fn a_bare_key_takes_its_value_just_after_the_colon() {

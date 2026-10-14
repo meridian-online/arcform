@@ -595,13 +595,23 @@ fn apply_one(text: &str, edit: &SpecEdit) -> Result<String> {
             // belong to what follows, so they stay byte for byte, whatever the
             // new value's form. A line is after the value when it is blank or a
             // comment indented no further than the key; a `#` line indented
-            // further is the value's own (text, in a block scalar). With no key
-            // to read, a comment indented less than the value is after it. An
-            // old value on one line is replaced exactly as before.
+            // further is the value's own (text, in a block scalar). The key is
+            // measured from its own column, so the first key of a sequence item
+            // (`  - params:`) counts from `params`, not from the dash. With no
+            // key (a sequence item), a comment indented less than the value's
+            // own column is after it. An old value on one line is replaced
+            // exactly as before.
             if text[start..end].contains('\n') {
-                let limit = match colon {
-                    Some(at) => indent_of(text, line_start(text, at - 1)) as isize,
-                    None => indent_of(text, line_start(text, value_start)) as isize - 1,
+                let key = match path.last() {
+                    Some(PathPart::Key(_)) => doc
+                        .query_key_only(&route_of(path))
+                        .ok()
+                        .map(|key| key.location.byte_span.0),
+                    _ => None,
+                };
+                let limit = match key {
+                    Some(at) => (at - line_start(text, at)) as isize,
+                    None => (value_start - line_start(text, value_start)) as isize - 1,
                 };
                 let mut content_end = if text.as_bytes()[end - 1] == b'\n' {
                     end - 1
