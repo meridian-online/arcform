@@ -618,7 +618,7 @@ fn table_describe_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "table": { "type": "string", "description": "The table or view to describe." },
+            "table": { "type": "string", "description": "The table or view to describe: a bare name, or schema.table." },
             "dir": { "type": "string", "description": "The Protocol's directory. Defaults to the server's working directory." }
         },
         "required": ["table"]
@@ -679,7 +679,7 @@ pub(super) fn tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "table_describe",
-            description: "Describe a table or view in a Protocol's database: its row count, each column's name, type and null count, and up to five rows as JSON. Opens the database read-only and changes nothing; a database the Protocol has not made yet is refused, and so is one another process holds.",
+            description: "Describe a table or view in a Protocol's database: its row count, each column's name, type and null count, and up to five rows as arrays of values in the order of the columns. A bare name is the table in main, or the one schema's that holds it; `schema.table` names another. Opens the database read-only and changes nothing; a database the Protocol has not made yet is refused, and so is one another process holds.",
             input_schema: table_describe_schema,
             handler: table_describe,
             annotations: Annotations::READ_ONLY,

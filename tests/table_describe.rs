@@ -103,10 +103,7 @@ fn describe_matches_duckdb() {
             .unwrap();
         assert_eq!(column["null_count"], nulls, "nulls in {name}");
     }
-    assert_eq!(
-        got["sample"][0],
-        json!({"id": 1, "label": "a", "price": 1.5})
-    );
+    assert_eq!(got["sample"][0], json!([1, "a", 1.5]));
 }
 
 #[test]
@@ -154,7 +151,7 @@ fn describe_quotes_identifiers() {
     assert_eq!(got["columns"][0]["name"], "order");
     assert_eq!(got["columns"][1]["name"], "a\"b");
     assert_eq!(got["columns"][1]["null_count"], 1);
-    assert_eq!(got["sample"][0], json!({"order": 1, "a\"b": "x"}));
+    assert_eq!(got["sample"][0], json!([1, "x"]));
 }
 
 #[test]
@@ -170,6 +167,117 @@ fn describe_while_locked_is_refused_with_message() {
         "{}",
         stderr(&out)
     );
+}
+
+#[test]
+fn describe_a_file_that_is_not_a_database_is_not_called_locked() {
+    let dir = protocol();
+    // The path holds "lock" and "block", which are not what DuckDB says of a lock.
+    let hidden = dir.path().join("blockchain-lock");
+    std::fs::create_dir(&hidden).unwrap();
+    std::fs::write(
+        dir.path().join("arcform.yaml"),
+        "name: p\nengine: duckdb\ndb: blockchain-lock/data.duckdb\nsteps: []\nassets: {}\n",
+    )
+    .unwrap();
+    let junk: Vec<u8> = (0..4096u32).map(|i| (i * 7 % 251) as u8).collect();
+    std::fs::write(hidden.join("data.duckdb"), junk).unwrap();
+    let out = describe(dir.path(), "orders");
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(!err.contains("in use by another process"), "{err}");
+    assert!(!err.contains("invalid manifest"), "{err}");
+}
+
+#[test]
+fn describe_names_a_table_in_another_schema() {
+    let dir = protocol();
+    let conn = duckdb::Connection::open(dir.path().join("data.duckdb")).unwrap();
+    conn.execute_batch(
+        "CREATE SCHEMA staging; CREATE SCHEMA other;
+         CREATE TABLE staging.orders (id INTEGER); INSERT INTO staging.orders VALUES (7);
+         CREATE TABLE staging.only_here (id INTEGER);
+         CREATE TABLE other.dup (id INTEGER); CREATE TABLE staging.dup (id INTEGER);
+         CREATE TABLE main.dup (id INTEGER, extra INTEGER);",
+    )
+    .unwrap();
+    drop(conn);
+    for name in ["staging.orders", "orders"] {
+        let got = describe_json(dir.path(), name);
+        assert_eq!(got["sample"], json!([[7]]), "{name}");
+    }
+    // A bare name in main wins over the same name elsewhere.
+    let dup = describe_json(dir.path(), "dup");
+    assert_eq!(dup["columns"].as_array().unwrap().len(), 2);
+    let err = stderr(&describe(dir.path(), "nope"));
+    assert!(err.contains("staging.orders"), "{err}");
+    assert!(err.contains("staging.only_here"), "{err}");
+}
+
+#[test]
+fn describe_a_bare_name_in_two_schemas_is_refused() {
+    let dir = protocol();
+    let conn = duckdb::Connection::open(dir.path().join("data.duckdb")).unwrap();
+    conn.execute_batch(
+        "CREATE SCHEMA a; CREATE SCHEMA b; CREATE TABLE a.t (x INT); CREATE TABLE b.t (x INT);",
+    )
+    .unwrap();
+    drop(conn);
+    let out = describe(dir.path(), "t");
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("a.t") && err.contains("b.t"), "{err}");
+}
+
+#[test]
+fn describe_a_column_named_like_the_row_alias_gives_real_rows() {
+    let dir = protocol();
+    let conn = duckdb::Connection::open(dir.path().join("data.duckdb")).unwrap();
+    conn.execute_batch("CREATE TABLE odd (t INTEGER, a VARCHAR); INSERT INTO odd VALUES (5, 'z');")
+        .unwrap();
+    drop(conn);
+    assert_eq!(
+        describe_json(dir.path(), "odd")["sample"],
+        json!([[5, "z"]])
+    );
+}
+
+#[test]
+fn describe_records_no_history() {
+    let dir = protocol_with_data();
+    describe_json(dir.path(), "orders");
+    let history = dir.path().join(".history");
+    let entries = std::fs::read_dir(&history).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(entries, 0, "describe wrote into the history folder");
+}
+
+#[test]
+fn describe_a_protocol_with_no_db_key_reads_the_default_location() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("arcform.yaml"),
+        "name: nodb\nengine: duckdb\nsteps:\n  - name: make\n    sql: make.sql\nassets: {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("make.sql"),
+        "CREATE TABLE t AS SELECT 1 AS n;\n",
+    )
+    .unwrap();
+    let data = dir.path().join(".db");
+    let run = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .current_dir(dir.path())
+        .env("ARCFORM_HISTORY_DIR", dir.path().join(".history"))
+        .env("ARCFORM_DB_DIR", &data)
+        .arg("run")
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "{run:?}");
+    let got = describe_json(dir.path(), "t");
+    assert_eq!(got["row_count"], 1);
+    let database = got["database"].as_str().unwrap();
+    assert!(database.contains(".db"), "{database}");
+    assert!(!database.starts_with(dir.path().join("nodb").to_str().unwrap()));
 }
 
 /// A child process that holds a read-write connection until it is dropped.

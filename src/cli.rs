@@ -182,9 +182,9 @@ pub enum Commands {
 
 /// The `arc table` verbs.
 #[derive(Subcommand)]
-pub(crate) enum TableCmd {
+pub enum TableCmd {
     /// Describe a table or view in the protocol's database: its row count, each
-    /// column's name, type and null count, and up to five rows, as JSON. Opens
+    /// column's name, type and null count, and up to five rows (each an array of values in column order), as JSON. Opens
     /// the database read-only; a database that does not exist yet is refused.
     Describe {
         /// The table or view to describe.
