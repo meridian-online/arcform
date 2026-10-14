@@ -252,6 +252,24 @@ fn a_failing_statement_keeps_the_others_results() {
 }
 
 #[test]
+fn a_statement_after_a_failed_one_still_runs() {
+    let dir = protocol_with_data();
+    let out = query(
+        dir.path(),
+        &["SELECT 1 AS a; SELECT nextval('seq'); SELECT 2 AS b"],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let got: Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    let results = got["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["rows"], json!([[1]]));
+    assert!(results[1]["error"].as_str().unwrap().contains("read-only"));
+    assert_eq!(results[2]["statement"], 3);
+    assert_eq!(results[2]["rows"], json!([[2]]));
+    assert!(results[2].get("error").is_none());
+}
+
+#[test]
 fn extensions_are_not_installed_by_a_query() {
     let dir = protocol_with_data();
     let got = query_json(

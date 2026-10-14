@@ -424,19 +424,13 @@ fn describe_writes_nested_values_as_duckdb_writes_them() {
 
 #[test]
 fn describe_opens_with_extension_install_off() {
-    // The answer of the same open, read through the query verb on this database.
-    let dir = protocol_with_data();
-    let out = Command::new(env!("CARGO_BIN_EXE_arc"))
-        .current_dir(dir.path())
-        .env("ARCFORM_HISTORY_DIR", dir.path().join(".history"))
-        .args([
-            "sql",
-            "query",
-            "SELECT current_setting('autoinstall_known_extensions')",
-        ])
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "{out:?}");
-    let got: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(got["results"][0]["rows"], json!([[false]]));
+    // A view reading the setting on the connection describe opens.
+    let dir = protocol();
+    let conn = duckdb::Connection::open(dir.path().join("data.duckdb")).unwrap();
+    conn.execute_batch(
+        "CREATE VIEW ext AS SELECT current_setting('autoinstall_known_extensions') AS v;",
+    )
+    .unwrap();
+    drop(conn);
+    assert_eq!(describe_json(dir.path(), "ext")["sample"], json!([[false]]));
 }

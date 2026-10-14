@@ -719,7 +719,7 @@ pub(super) fn tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "table_describe",
-            description: "Describe a table or view in a Protocol's database: its row count, each column's name, type and null count, and up to five rows as arrays of values in the order of the columns. A bare name is the table in main, or the one schema that holds it; `schema.table` names another. Opens the database read-only and never writes it; a view over a file reads that file. A database the Protocol has not made yet is refused, and so is one another process holds.",
+            description: "Describe a table or view in a Protocol's database: its row count, each column's name, type and null count, and up to five rows as arrays of values in the order of the columns. A bare name is the table in main, or the one schema that holds it; `schema.table` names another. Opens the database read-only and never writes it; a view may read the files and URLs it names, but no extension is installed for it. A database the Protocol has not made yet is refused, and so is one another process holds.",
             input_schema: table_describe_schema,
             handler: table_describe,
             annotations: Annotations::READS_OPEN,
