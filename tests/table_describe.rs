@@ -364,3 +364,42 @@ fn table_describe_tool_matches_verb_and_is_read_only() {
     assert_eq!(tool["annotations"]["readOnlyHint"], true);
     assert_eq!(by_id(3)["result"]["structuredContent"], verb);
 }
+
+/// A Protocol whose database holds `odd_numbers`: a DOUBLE column with NaN and the
+/// infinities, which DuckDB's `to_json` writes as bare words JSON has no place for,
+/// and a HUGEINT and a DECIMAL(20,2) wider than a double holds exactly.
+fn protocol_with_odd_numbers() -> tempfile::TempDir {
+    let dir = protocol();
+    let conn = duckdb::Connection::open(dir.path().join("data.duckdb")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE odd_numbers (d DOUBLE, h HUGEINT, m DECIMAL(20,2), s DECIMAL(9,2));
+         INSERT INTO odd_numbers VALUES
+           ('NaN', 170141183460469231731687303715884105727, 12345678901234567.89, 1.5),
+           ('Infinity', 1, 0.10, 2.25),
+           ('-Infinity', -2, -1.00, NULL);",
+    )
+    .unwrap();
+    drop(conn);
+    dir
+}
+
+#[test]
+fn describe_writes_non_finite_doubles_as_strings() {
+    let dir = protocol_with_odd_numbers();
+    let sample = &describe_json(dir.path(), "odd_numbers")["sample"];
+    assert_eq!(sample[0][0], "NaN");
+    assert_eq!(sample[1][0], "Infinity");
+    assert_eq!(sample[2][0], "-Infinity");
+}
+
+#[test]
+fn describe_keeps_wide_numbers_exact_as_strings() {
+    let dir = protocol_with_odd_numbers();
+    let sample = &describe_json(dir.path(), "odd_numbers")["sample"];
+    assert_eq!(sample[0][1], "170141183460469231731687303715884105727");
+    assert_eq!(sample[0][2], "12345678901234567.89");
+    assert_eq!(sample[1][2], "0.10");
+    // A decimal a double holds exactly stays a number.
+    assert_eq!(sample[0][3], json!(1.5));
+    assert_eq!(sample[2][3], Value::Null);
+}

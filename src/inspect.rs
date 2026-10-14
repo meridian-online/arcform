@@ -67,9 +67,65 @@ fn quote(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
+/// The select-list expression that gives the value of `expr`, a column of DuckDB
+/// type `ty`, as JSON text. A number a double cannot hold exactly (a HUGEINT, a
+/// UHUGEINT, or a DECIMAL of more than 15 digits) is cast to text first, so it comes
+/// back as a JSON string of its exact digits rather than a rounded number.
+fn json_value_sql(expr: &str, ty: &str) -> String {
+    if is_wide_number(ty) {
+        format!("to_json({expr}::VARCHAR)")
+    } else {
+        format!("to_json({expr})")
+    }
+}
+
+/// Whether a column of DuckDB type `ty` holds numbers a double cannot hold exactly.
+fn is_wide_number(ty: &str) -> bool {
+    let ty = ty.trim().to_ascii_uppercase();
+    if ty == "HUGEINT" || ty == "UHUGEINT" {
+        return true;
+    }
+    let precision = ty
+        .strip_prefix("DECIMAL(")
+        .or_else(|| ty.strip_prefix("NUMERIC("))
+        .and_then(|rest| rest.split([',', ')']).next())
+        .and_then(|p| p.trim().parse::<u32>().ok());
+    precision.is_some_and(|p| p > 15)
+}
+
+/// One cell of `to_json` text as a JSON value. DuckDB writes a non-finite double as
+/// a bare `NaN`, `Infinity` or `-Infinity`, which is not JSON; a cell that does not
+/// parse is kept as a JSON string of DuckDB's text, never an error.
+fn cell_value(text: Option<String>) -> Value {
+    match text {
+        None => Value::Null,
+        Some(text) => serde_json::from_str(&text).unwrap_or(Value::String(text)),
+    }
+}
+
+/// The rows `sql` returns, each an array of its `width` cells read by [`cell_value`].
+/// Each cell of `sql`'s select list is one `to_json` text, as [`json_value_sql`]
+/// writes it.
+fn json_rows(
+    conn: &Connection,
+    sql: &str,
+    width: usize,
+) -> std::result::Result<Vec<Value>, duckdb::Error> {
+    let mut stmt = conn.prepare(sql)?;
+    stmt.query_map([], |r| {
+        (0..width)
+            .map(|i| r.get::<_, Option<String>>(i).map(cell_value))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map(Value::Array)
+    })?
+    .collect()
+}
+
 /// What the table or view `table` holds: its row count, each column's name, type and
 /// null count, and up to five rows, each an array of the row's values as DuckDB's
-/// `to_json` writes them, in the order of `columns`.
+/// `to_json` writes them, in the order of `columns`. A value JSON cannot carry as
+/// DuckDB writes it (`NaN`, `Infinity`) and a number a double cannot hold exactly
+/// come back as strings: see [`json_value_sql`] and [`cell_value`].
 ///
 /// `table` is `schema.table` or a bare name. A bare name is the one in `main` if
 /// there is one, else the one schema that holds it.
@@ -189,32 +245,16 @@ fn describe_in(
     // named like the alias cannot shadow it, and the values keep the column order.
     let values: Vec<String> = described
         .iter()
-        .map(|(column, _)| format!("to_json({})", quote(column)))
+        .map(|(column, ty)| json_value_sql(&quote(column), ty))
         .collect();
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {} FROM {quoted} LIMIT {SAMPLE_ROWS}",
-        values.join(", ")
-    ))?;
-    let sample: Vec<Value> = stmt
-        .query_map([], |r| {
-            (0..described.len())
-                .map(|i| r.get::<_, Option<String>>(i))
-                .collect::<std::result::Result<Vec<_>, _>>()
-        })?
-        .map(|row| {
-            let cells = row?;
-            let parsed: std::result::Result<Vec<Value>, _> = cells
-                .iter()
-                .map(|c| match c {
-                    Some(text) => serde_json::from_str(text),
-                    None => Ok(Value::Null),
-                })
-                .collect();
-            parsed
-                .map(Value::Array)
-                .map_err(|e| ours(format!("database: a sample value was not JSON: {e}")))
-        })
-        .collect::<std::result::Result<_, DescribeError>>()?;
+    let sample = json_rows(
+        conn,
+        &format!(
+            "SELECT {} FROM {quoted} LIMIT {SAMPLE_ROWS}",
+            values.join(", ")
+        ),
+        described.len(),
+    )?;
 
     Ok(json!({
         "table": table,
