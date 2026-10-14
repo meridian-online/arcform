@@ -948,11 +948,17 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Commands::Sql { cmd } => dispatch_sql(cmd, &mut std::io::stdout()),
         #[cfg(feature = "mcp")]
         Commands::Mcp => crate::mcp::serve(),
-        Commands::Table {
-            cmd: TableCmd::Describe { table, dir },
-        } => {
+        Commands::Table { cmd } => dispatch_table(cmd, &mut std::io::stdout()),
+    }
+}
+
+/// Execute an `arc table` verb, writing its JSON to `out`. A write that fails is
+/// the error, not a silent success.
+fn dispatch_table(cmd: TableCmd, out: &mut impl Write) -> Result<()> {
+    match cmd {
+        TableCmd::Describe { table, dir } => {
             let described = crate::inspect::describe_table(&dir, &table)?;
-            println!("{}", serde_json::to_string_pretty(&described).unwrap());
+            writeln!(out, "{described:#}")?;
             Ok(())
         }
     }
@@ -1947,6 +1953,26 @@ mod tests {
             limit: 100,
         };
         let err = dispatch_sql(cmd, &mut FailingWriter).unwrap_err();
+        assert!(err.to_string().contains("stdout is closed"), "{err}");
+    }
+
+    #[test]
+    fn table_describe_reports_a_failed_write() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("arcform.yaml"),
+            "name: p\nengine: duckdb\ndb: data.duckdb\nsteps: []\nassets: {}\n",
+        )
+        .unwrap();
+        duckdb::Connection::open(dir.path().join("data.duckdb"))
+            .unwrap()
+            .execute_batch("CREATE TABLE t AS SELECT 1 AS i")
+            .unwrap();
+        let cmd = TableCmd::Describe {
+            table: "t".to_string(),
+            dir: dir.path().to_path_buf(),
+        };
+        let err = dispatch_table(cmd, &mut FailingWriter).unwrap_err();
         assert!(err.to_string().contains("stdout is closed"), "{err}");
     }
 
