@@ -552,10 +552,7 @@ pub(super) fn tools() -> Vec<ToolDef> {
             description: "Run an arc Protocol and return its live Protocol+Run contract (protocol, engine, params, assets, per-step outcome). A file beside arcform.yaml that may be a copy a synced drive set aside, which the run did not read, is named with its warning in run.protocol.possible_copies.",
             input_schema: protocol_run_schema,
             handler: protocol_run,
-            annotations: Annotations {
-                read_only: false,
-                open_world: true,
-            },
+            annotations: Annotations::RUNS,
         },
         ToolDef {
             name: "operator_describe",

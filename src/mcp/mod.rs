@@ -50,6 +50,7 @@ fn negotiate(requested: Option<&str>) -> &'static str {
         .copied()
         .expect("at least one supported protocol version")
 }
+
 /// Server identity reported in the `initialize` handshake.
 const SERVER_NAME: &str = "arc-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -122,8 +123,11 @@ pub(crate) type ToolResult = std::result::Result<ToolOutput, String>;
 pub(crate) struct Annotations {
     /// The tool changes nothing in its environment.
     pub read_only: bool,
-    /// The tool reaches entities outside arc's own files (the network, other programs).
+    /// The tool may interact with an open set of external entities: the network, or
+    /// whatever a Protocol's steps reach.
     pub open_world: bool,
+    /// The tool may replace or destroy existing state, not only add to it.
+    pub destructive: bool,
 }
 
 impl Annotations {
@@ -131,11 +135,21 @@ impl Annotations {
     pub(crate) const READ_ONLY: Annotations = Annotations {
         read_only: true,
         open_world: false,
+        destructive: false,
     };
-    /// A tool that writes files in the Protocol's folder and reaches nothing else.
+    /// A tool that adds to the Protocol's folder, never replaces what is there, and
+    /// reaches nothing else.
     pub(crate) const WRITES: Annotations = Annotations {
         read_only: false,
         open_world: false,
+        destructive: false,
+    };
+    /// A tool that runs a Protocol: it replaces tables, runs arbitrary steps and may
+    /// reach the network.
+    pub(crate) const RUNS: Annotations = Annotations {
+        read_only: false,
+        open_world: true,
+        destructive: true,
     };
 }
 
@@ -203,6 +217,7 @@ fn tools_list() -> Value {
                 "annotations": {
                     "readOnlyHint": t.annotations.read_only,
                     "openWorldHint": t.annotations.open_world,
+                    "destructiveHint": t.annotations.destructive,
                 },
             })
         })
@@ -402,6 +417,17 @@ mod tests {
             true
         );
         assert_eq!(tool(&list, "infer")["annotations"]["openWorldHint"], false);
+        for name in ["operation_record", "sql_record"] {
+            assert_eq!(
+                tool(&list, name)["annotations"]["destructiveHint"],
+                false,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            tool(&list, "protocol_run")["annotations"]["destructiveHint"],
+            true
+        );
     }
 
     #[test]
