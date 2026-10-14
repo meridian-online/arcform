@@ -101,7 +101,7 @@ jobs:
       - name: The published-fork check detects a changed source
         run: python3 scripts/check_fork_published.py --self-test
 
-  # scripts/install.sh is what `curl … | sh` runs on a stranger's machine, and
+  # scripts/install.sh is what `curl … | bash` runs on a stranger's machine, and
   # release.yml sends it to the install site on every tag, so it is checked here
   # first. The self-test needs no network: target resolution for each `uname` pair,
   # the version handling, and the checksum refusal against a local file. `sh` on
