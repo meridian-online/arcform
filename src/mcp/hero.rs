@@ -567,7 +567,7 @@ fn protocol_create(args: &Value) -> ToolResult {
     let (name, engine, db) = (optional("name")?, optional("engine")?, optional("db")?);
     let history = open_history()?;
     let created = crate::cli::create_protocol_files(&dir, name, engine, db, &history)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string().replace("pass --name", "pass `name`"))?;
     let mut files_written = vec![crate::spec::MANIFEST_FILENAME];
     if created.ignore == crate::edit::IgnoreList::Written {
         files_written.push(crate::edit::IGNORE_FILENAME);
