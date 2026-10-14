@@ -1933,6 +1933,24 @@ mod tests {
     }
 
     #[test]
+    fn sql_query_reports_a_failed_write() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("arcform.yaml"),
+            "name: p\nengine: duckdb\ndb: data.duckdb\nsteps: []\nassets: {}\n",
+        )
+        .unwrap();
+        duckdb::Connection::open(dir.path().join("data.duckdb")).unwrap();
+        let cmd = SqlCmd::Query {
+            sql: "SELECT 1".to_string(),
+            dir: dir.path().to_path_buf(),
+            limit: 100,
+        };
+        let err = dispatch_sql(cmd, &mut FailingWriter).unwrap_err();
+        assert!(err.to_string().contains("stdout is closed"), "{err}");
+    }
+
+    #[test]
     fn operation_record_reports_a_failed_write() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("shop");
