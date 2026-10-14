@@ -280,6 +280,30 @@ fn protocol_run_passes_force_only_when_asked() {
 }
 
 #[test]
+fn protocol_run_refuses_a_dir_or_force_of_the_wrong_type_and_runs_nothing() {
+    // A `dir` that is not a string must not fall back to the server's working
+    // directory (here the fixture), and a `force` that is not a boolean must not
+    // pass as false: each is refused by name, and no run starts.
+    let dir = copy_fixture("mcp_stdout");
+    for (extra, message) in [
+        (json!({ "dir": 7 }), "`dir` must be a string, not 7"),
+        (
+            json!({ "force": "yes" }),
+            "`force` must be a boolean, not \"yes\"",
+        ),
+    ] {
+        let result = protocol_run(dir.path(), extra.clone());
+        assert_eq!(result["isError"], true, "{extra} was not refused: {result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(message), "{extra}: {text}");
+        assert!(
+            !dir.path().join("build").exists(),
+            "{extra}: a refused call ran the Protocol"
+        );
+    }
+}
+
+#[test]
 fn protocol_run_passes_each_param_to_the_run() {
     let dir = copy_fixture("mcp_stdout");
     let manifest = dir.path().join("arcform.yaml");

@@ -2,11 +2,9 @@
 //!
 //! This is the entry point that subsumes the FineType MCP server's role: instead of a
 //! separate `finetype mcp` process, `arc mcp` federates the `finetype` CLI as a set of
-//! tools and adds ones of its own — one that runs a Protocol and returns the live
-//! Protocol+Run contract, one that emits an operator's `with:` JSON Schema, one
-//! that lists the SQL operations arc holds and describes what one takes, one that
-//! records an operation as a step, and one that answers what a SQL statement is
-//! read as.
+//! tools and adds tools of its own that run, inspect and record Protocols. The tool
+//! set is what [`tools_list`] registers, and [`INSTRUCTIONS`] tells a client when to
+//! reach for each; neither is repeated here, so this comment cannot fall behind.
 //!
 //! # Transport
 //!
