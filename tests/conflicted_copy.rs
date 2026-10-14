@@ -295,47 +295,35 @@ fn no_line_without_a_copy_nor_for_a_backup_or_a_name_that_does_not_start_with_ar
 
 #[cfg(feature = "mcp")]
 mod mcp {
-    use std::io::Write;
-    use std::process::Stdio;
-
     use serde_json::{Value, json};
 
     use super::*;
 
     /// Call `protocol_run` on `dir` through the real `arc mcp` server over stdio and
-    /// return the `result` it answers with.
-    ///
-    /// The run's own standard output reaches the server's standard output beside the
-    /// response, so the response is the one line that parses as a JSON-RPC message.
+    /// return the `result` it answers with, after checking that every line the server
+    /// wrote to standard output is a JSON-RPC message: the run's own output stays off it.
     fn protocol_run(dir: &Path) -> Value {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_arc"))
-            .current_dir(dir)
-            .arg("mcp")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn arc mcp");
-        {
-            let mut stdin = child.stdin.take().expect("stdin is piped");
-            let request = json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {
-                    "name": "protocol_run",
-                    "arguments": { "dir": dir.to_str().expect("a UTF-8 path") },
-                },
-            });
-            writeln!(stdin, "{request}").expect("write the request");
-        }
-        let out = child.wait_with_output().expect("wait for arc mcp");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let response: Value = stdout
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "protocol_run",
+                "arguments": { "dir": dir.to_str().expect("a UTF-8 path") },
+            },
+        });
+        let lines = common::mcp_session(dir, &[request]);
+        let messages: Vec<Value> = lines
+            .iter()
+            .map(|line| {
+                serde_json::from_str(line)
+                    .unwrap_or_else(|_| panic!("arc mcp wrote a line that is not JSON-RPC: {line}"))
+            })
+            .collect();
+        let response = messages
+            .iter()
             .find(|v| v["id"] == 1)
-            .unwrap_or_else(|| panic!("no response to the call in:\n{stdout}"));
+            .unwrap_or_else(|| panic!("no response to the call in:\n{}", lines.join("\n")));
         response["result"].clone()
     }
 

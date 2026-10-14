@@ -6,6 +6,8 @@
 //!   per-step outcome, the same JSON `arc run` writes under `build/.arcform/runs/`.
 //!   A file beside `arcform.yaml` that may be a copy a synced drive set aside is named
 //!   in its `run.protocol.possible_copies`, with the warning `arc run` prints for it.
+//!   The run is a child `arc run` whose output this process reads, so the server's
+//!   standard output carries JSON-RPC alone.
 //! - `operator_describe` emits an operator's `with:` JSON Schema (or lists the
 //!   catalog) so an agent or authoring UI can build and check a `with:` block.
 //! - `operation_describe` lists the SQL operations arc holds, or describes an
@@ -41,17 +43,17 @@ fn protocol_run(args: &Value) -> ToolResult {
     let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
     let cli_params = parse_params(args.get("params"))?;
 
-    let manifest = crate::manifest::Manifest::load(&dir).map_err(|e| e.to_string())?;
-    let engine = crate::engine::DuckDbEngine;
-    let state = crate::state::DuckDbStateBackend::for_protocol(&manifest, &dir)
-        .map_err(|e| e.to_string())?;
-
+    // The run happens in a child `arc run`, so what the runner, the DuckDB command line,
+    // a command step or an operator prints lands in a pipe this process drains, and the
+    // server's own standard output carries JSON-RPC alone.
+    //
     // The contract is written to `<dir>/build/.arcform/runs/<run_id>.json` at run end
     // (on success and failure alike). Snapshot the directory, run, then read the file
     // the run just added.
     let runs = crate::contract::runs_dir(&dir);
     let before = list_contracts(&runs);
-    let run_result = crate::runner::run_with_params(&dir, &engine, &state, force, &cli_params);
+    let child = run_child(&dir, force, &cli_params)
+        .map_err(|e| format!("could not start `arc run`: {e}"))?;
 
     match newest_new_contract(&runs, &before) {
         Some(path) => {
@@ -62,10 +64,13 @@ fn protocol_run(args: &Value) -> ToolResult {
             Ok(ToolOutput::json(contract))
         }
         None => {
-            let mut message = match run_result {
-                Err(e) => format!("run failed before a contract was written: {e}"),
-                Ok(()) => "the run produced no contract (a protocol with no steps writes none)"
-                    .to_string(),
+            let mut message = if child.status.success() {
+                "the run produced no contract (a protocol with no steps writes none)".to_string()
+            } else {
+                format!(
+                    "run failed before a contract was written: `arc run` exited with {}",
+                    child.status
+                )
             };
             // The contract carries these in `run.protocol.possible_copies`; with none written,
             // the result an agent receives is the one place left to name them.
@@ -73,9 +78,91 @@ fn protocol_run(args: &Value) -> ToolResult {
                 message.push_str("\nwarning: ");
                 message.push_str(&copy.warning);
             }
+            message.push_str("\n--- last output ---\n");
+            message.push_str(&child.tail);
             Err(message)
         }
     }
+}
+
+/// The most of a child run's output [`run_child`] keeps: its last 4,000 bytes.
+const TAIL_BYTES: usize = 4_000;
+
+/// What a child `arc run` left: how it exited and the end of what it printed.
+struct ChildRun {
+    status: std::process::ExitStatus,
+    /// The last [`TAIL_BYTES`] of standard output and standard error, interleaved in
+    /// the order they arrived, read as UTF-8 with anything invalid replaced.
+    tail: String,
+}
+
+/// Run `arc run` on the Protocol in `dir` as a child of this process, with `--force`
+/// when `force` is set and one `--param K=V` for each of `params`.
+///
+/// Its standard input is closed, and its standard output and standard error are piped
+/// and drained on two threads into one buffer that keeps the last [`TAIL_BYTES`], so a
+/// child that prints megabytes never blocks on a full pipe and never reaches this
+/// process's standard output.
+fn run_child(dir: &Path, force: bool, params: &[(String, String)]) -> std::io::Result<ChildRun> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
+
+    let mut command = Command::new(std::env::current_exe()?);
+    command.arg("run");
+    if force {
+        command.arg("--force");
+    }
+    for (key, value) in params {
+        command.arg("--param").arg(format!("{key}={value}"));
+    }
+    let mut child = command
+        .current_dir(dir)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let tail = Arc::new(Mutex::new(std::collections::VecDeque::<u8>::with_capacity(
+        TAIL_BYTES,
+    )));
+    let drain = |mut pipe: Box<dyn Read + Send>| {
+        let tail = Arc::clone(&tail);
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let mut tail = tail.lock().unwrap_or_else(|e| e.into_inner());
+                        tail.extend(&chunk[..n]);
+                        let excess = tail.len().saturating_sub(TAIL_BYTES);
+                        tail.drain(..excess);
+                    }
+                }
+            }
+        })
+    };
+    let readers = [
+        child.stdout.take().map(|p| drain(Box::new(p))),
+        child.stderr.take().map(|p| drain(Box::new(p))),
+    ];
+    let status = child.wait()?;
+    for reader in readers.into_iter().flatten() {
+        let _ = reader.join();
+    }
+
+    let bytes: Vec<u8> = tail
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .collect();
+    Ok(ChildRun {
+        status,
+        tail: String::from_utf8_lossy(&bytes).into_owned(),
+    })
 }
 
 /// Runtime parameter overrides, accepted as an object `{key: value}` or an array of
@@ -613,34 +700,5 @@ mod tests {
 
         assert_eq!(parse_params(None).unwrap(), Vec::new());
         assert!(parse_params(Some(&json!("nope"))).is_err());
-    }
-
-    #[test]
-    fn protocol_run_returns_the_b4_protocol_and_run_contract() {
-        let dir = tempfile::tempdir().unwrap();
-        // A minimal Protocol: one no-op command step (executes via `sh -c`), which is
-        // enough for the runner to build and write a contract. It names its `db:` so
-        // the run's database stays in the test's directory: in-process, a test cannot
-        // point `ARCFORM_DB_DIR` at a directory of its own.
-        std::fs::write(
-            dir.path().join("arcform.yaml"),
-            "name: mcp_smoke\ndb: mcp_smoke.duckdb\nsteps:\n  - name: noop\n    command: \"true\"\n",
-        )
-        .unwrap();
-
-        let result = protocol_run(&json!({ "dir": dir.path().to_str().unwrap() }))
-            .expect("protocol_run succeeds");
-        let contract = result.structured.expect("a structured contract");
-
-        assert_eq!(
-            contract["contract_version"], "b4/1",
-            "protocol_run must return the live Protocol+Run contract"
-        );
-        assert_eq!(contract["run"]["protocol"]["name"], "mcp_smoke");
-        assert_eq!(contract["run"]["outcome"], "success");
-        assert!(contract["steps"].is_array());
-        assert!(contract["assets"].is_array());
-        let steps = contract["steps"].as_array().unwrap();
-        assert!(steps.iter().any(|s| s["name"] == "noop"));
     }
 }

@@ -1,0 +1,7 @@
+name: mcp_stdout
+db: mcp_stdout.duckdb
+steps:
+  - name: t
+    sql: models/01_t.sql
+  - name: echo_step
+    command: echo hello-from-command
