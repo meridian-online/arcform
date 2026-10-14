@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use super::{ToolDef, ToolOutput, ToolResult};
+use super::{Annotations, ToolDef, ToolOutput, ToolResult};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // protocol_run
@@ -552,36 +552,45 @@ pub(super) fn tools() -> Vec<ToolDef> {
             description: "Run an arc Protocol and return its live Protocol+Run contract (protocol, engine, params, assets, per-step outcome). A file beside arcform.yaml that may be a copy a synced drive set aside, which the run did not read, is named with its warning in run.protocol.possible_copies.",
             input_schema: protocol_run_schema,
             handler: protocol_run,
+            annotations: Annotations {
+                read_only: false,
+                open_world: true,
+            },
         },
         ToolDef {
             name: "operator_describe",
             description: "Emit an operator's `with:` JSON Schema for authoring — or list the operator catalog when called with no operator.",
             input_schema: operator_describe_schema,
             handler: operator_describe,
+            annotations: Annotations::READ_ONLY,
         },
         ToolDef {
             name: "operation_describe",
             description: "List the SQL operations arc holds when called with no operation — or describe one operation or operator (what it does, what its step reads and writes by role, and the JSON Schema of what it takes) by its name.",
             input_schema: operation_describe_schema,
             handler: operation_describe,
+            annotations: Annotations::READ_ONLY,
         },
         ToolDef {
             name: "operation_record",
             description: "Record an SQL operation as a new step at the end of a Protocol, from its long name, the table it is applied to, the step's name and its arguments. Writes a generated model and the step naming it; runs nothing.",
             input_schema: operation_record_schema,
             handler: operation_record,
+            annotations: Annotations::WRITES,
         },
         ToolDef {
             name: "sql_recognise",
             description: "Answer what arc reads one SQL statement as: the operation arc holds that it is, with `operation`, `on` and `arguments` as operation_record takes them, or `operation` null when it is none. Read from DuckDB's own parse; writes no file and runs nothing.",
             input_schema: sql_recognise_schema,
             handler: sql_recognise,
+            annotations: Annotations::READ_ONLY,
         },
         ToolDef {
             name: "sql_record",
             description: "Record one SQL statement as a new step at the end of a Protocol. A statement sql_recognise reads as an operation is recorded as the step operation_record writes for it; any other statement DuckDB parses is recorded as a SQL step, whose model has no `-- generated:` line, so arc does not rewrite it: for a SELECT the model's first line is `CREATE OR REPLACE TABLE \"<name>\" AS` and the statement as typed follows it, so the step makes a table of its name when it runs. Writes the step; runs nothing.",
             input_schema: sql_record_schema,
             handler: sql_record,
+            annotations: Annotations::WRITES,
         },
     ]
 }

@@ -38,23 +38,36 @@ use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
 
-/// The MCP protocol revision this server implements.
-const PROTOCOL_VERSION: &str = "2025-06-18";
+/// The MCP protocol revisions this server implements, newest last.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-11-25"];
+
+/// Negotiate the protocol version: the client's request when this server supports it,
+/// else the newest version it does (the client then decides whether to proceed).
+fn negotiate(requested: Option<&str>) -> &'static str {
+    requested
+        .and_then(|r| SUPPORTED_PROTOCOL_VERSIONS.iter().find(|v| **v == r))
+        .or_else(|| SUPPORTED_PROTOCOL_VERSIONS.last())
+        .copied()
+        .expect("at least one supported protocol version")
+}
 /// Server identity reported in the `initialize` handshake.
 const SERVER_NAME: &str = "arc-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const INSTRUCTIONS: &str = "arc — a local-first data-pipeline engine, exposed over MCP.\n\n\
+const INSTRUCTIONS: &str = "Use arc when you analyse data over DuckDB and the work should be kept as a \
+    versioned, re-runnable Protocol rather than a one-off query. arc is a local-first \
+    data-pipeline engine, exposed over MCP.\n\n\
     Tools: infer / profile / taxonomy / validate / generate federate the FineType CLI \
-    (semantic type inference over tabular data); protocol_run runs an arc Protocol and \
-    returns its live Protocol+Run contract; operator_describe emits an operator's `with:` \
-    JSON Schema for authoring; operation_describe lists the SQL operations arc holds and, \
-    given an operation's long name or an operator's name, describes what its step reads, \
-    writes and takes; operation_record records an operation as a new step of a Protocol; \
-    sql_recognise answers what arc reads a SQL statement as: an operation it holds, with \
-    the table and the arguments operation_record takes, or none; sql_record records a \
-    SQL statement as a new step of a Protocol, as the operation it is read as or else as a \
-    SQL step, and runs nothing.";
+    (semantic type inference over tabular data) and change nothing; protocol_run runs an arc \
+    Protocol, which can write tables and files and reach the network, and returns its live \
+    Protocol+Run contract; operator_describe emits an operator's `with:` JSON Schema for \
+    authoring; operation_describe lists the SQL operations arc holds and, given an \
+    operation's long name or an operator's name, describes what its step reads, writes and \
+    takes; operation_record records an operation as a new step of a Protocol; sql_recognise \
+    answers what arc reads a SQL statement as: an operation it holds, with the table and the \
+    arguments operation_record takes, or none; sql_record records a SQL statement as a new \
+    step of a Protocol, as the operation it is read as or else as a SQL step, and runs \
+    nothing.";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool result shapes
@@ -104,6 +117,28 @@ impl ToolOutput {
 /// as an `isError: true` result.
 pub(crate) type ToolResult = std::result::Result<ToolOutput, String>;
 
+/// What a tool tells the client about its effects, emitted as MCP tool annotations.
+#[derive(Clone, Copy)]
+pub(crate) struct Annotations {
+    /// The tool changes nothing in its environment.
+    pub read_only: bool,
+    /// The tool reaches entities outside arc's own files (the network, other programs).
+    pub open_world: bool,
+}
+
+impl Annotations {
+    /// A tool that changes nothing and reaches nothing outside the files it is given.
+    pub(crate) const READ_ONLY: Annotations = Annotations {
+        read_only: true,
+        open_world: false,
+    };
+    /// A tool that writes files in the Protocol's folder and reaches nothing else.
+    pub(crate) const WRITES: Annotations = Annotations {
+        read_only: false,
+        open_world: false,
+    };
+}
+
 /// A registered tool: its MCP name, one-line description, input-schema builder, and
 /// handler.
 pub(crate) struct ToolDef {
@@ -111,6 +146,7 @@ pub(crate) struct ToolDef {
     pub description: &'static str,
     pub input_schema: fn() -> Value,
     pub handler: fn(&Value) -> ToolResult,
+    pub annotations: Annotations,
 }
 
 /// Every tool this server registers: the five FineType-federating proxies followed by
@@ -143,13 +179,10 @@ fn dispatch(method: &str, params: &Value) -> std::result::Result<Value, (i64, St
     }
 }
 
-/// The `initialize` handshake result. Echoes the client's requested `protocolVersion`
-/// when present (maximising compatibility), else offers ours.
+/// The `initialize` handshake result. Negotiates the client's requested `protocolVersion`:
+/// when this server supports it, else offers the newest it does.
 fn initialize_result(params: &Value) -> Value {
-    let protocol_version = params
-        .get("protocolVersion")
-        .and_then(Value::as_str)
-        .unwrap_or(PROTOCOL_VERSION);
+    let protocol_version = negotiate(params.get("protocolVersion").and_then(Value::as_str));
     json!({
         "protocolVersion": protocol_version,
         "capabilities": { "tools": {} },
@@ -167,6 +200,10 @@ fn tools_list() -> Value {
                 "name": t.name,
                 "description": t.description,
                 "inputSchema": (t.input_schema)(),
+                "annotations": {
+                    "readOnlyHint": t.annotations.read_only,
+                    "openWorldHint": t.annotations.open_world,
+                },
             })
         })
         .collect();
@@ -305,9 +342,78 @@ mod tests {
     }
 
     #[test]
-    fn initialize_echoes_client_protocol_version() {
+    fn initialize_offers_newest_version_for_an_unsupported_request() {
         let result = initialize_result(&json!({ "protocolVersion": "2024-11-05" }));
-        assert_eq!(result["protocolVersion"], "2024-11-05");
+        assert_eq!(result["protocolVersion"], "2025-11-25");
+    }
+
+    fn tool<'a>(list: &'a Value, name: &str) -> &'a Value {
+        list["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("no tool {name}"))
+    }
+
+    #[test]
+    fn negotiate_returns_supported_request() {
+        assert_eq!(negotiate(Some("2025-06-18")), "2025-06-18");
+    }
+
+    #[test]
+    fn negotiate_unknown_returns_newest() {
+        assert_eq!(negotiate(Some("2099-01-01")), "2025-11-25");
+    }
+
+    #[test]
+    fn negotiate_absent_returns_newest() {
+        assert_eq!(negotiate(None), "2025-11-25");
+    }
+
+    #[test]
+    fn read_only_tools_say_so() {
+        let list = tools_list();
+        for name in [
+            "infer",
+            "profile",
+            "taxonomy",
+            "validate",
+            "generate",
+            "operator_describe",
+            "operation_describe",
+            "sql_recognise",
+        ] {
+            assert_eq!(
+                tool(&list, name)["annotations"]["readOnlyHint"],
+                true,
+                "{name}"
+            );
+        }
+        for name in ["operation_record", "sql_record", "protocol_run"] {
+            assert_eq!(
+                tool(&list, name)["annotations"]["readOnlyHint"],
+                false,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            tool(&list, "protocol_run")["annotations"]["openWorldHint"],
+            true
+        );
+        assert_eq!(tool(&list, "infer")["annotations"]["openWorldHint"], false);
+    }
+
+    #[test]
+    fn instructions_open_with_when_to_use_arc_and_name_every_tool() {
+        assert!(INSTRUCTIONS.starts_with("Use arc when"));
+        for t in tools() {
+            assert!(
+                INSTRUCTIONS.contains(t.name),
+                "INSTRUCTIONS omits {}",
+                t.name
+            );
+        }
     }
 
     #[test]
