@@ -72,7 +72,8 @@ const INSTRUCTIONS: &str = "Use arc when you analyse data over DuckDB and the wo
     and refuses one that already has a spec; table_describe reads what a table in a \
     Protocol's database holds (row count, columns, null counts, sample rows) and changes nothing; \
     sql_query runs SELECT statements against a Protocol's database, read-only, refuses any \
-    other statement before anything runs, and changes nothing.";
+    other statement before anything runs, and changes nothing. The SQL table_describe and \
+    sql_query run may read files and URLs it names; the database itself is never written.";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool result shapes
@@ -139,6 +140,13 @@ impl Annotations {
     pub(crate) const READ_ONLY: Annotations = Annotations {
         read_only: true,
         open_world: false,
+        destructive: false,
+    };
+    /// A tool that changes nothing, but runs SQL that may read files and URLs it names:
+    /// it reads a Protocol's database without writing it.
+    pub(crate) const READS_OPEN: Annotations = Annotations {
+        read_only: true,
+        open_world: true,
         destructive: false,
     };
     /// A tool that adds to the Protocol's folder, never replaces what is there, and
@@ -402,12 +410,20 @@ mod tests {
             "operator_describe",
             "operation_describe",
             "sql_recognise",
+            "table_describe",
+            "sql_query",
         ] {
             assert_eq!(
                 tool(&list, name)["annotations"]["readOnlyHint"],
                 true,
                 "{name}"
             );
+        }
+        // The SQL these run may read the files and URLs it names.
+        for name in ["table_describe", "sql_query"] {
+            let annotations = &tool(&list, name)["annotations"];
+            assert_eq!(annotations["openWorldHint"], true, "{name}");
+            assert_eq!(annotations["destructiveHint"], false, "{name}");
         }
         for name in ["operation_record", "sql_record", "protocol_run"] {
             assert_eq!(

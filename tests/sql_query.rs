@@ -40,7 +40,9 @@ fn protocol_with_data() -> tempfile::TempDir {
          CREATE TABLE odd_numbers (d DOUBLE, h HUGEINT, m DECIMAL(20,2));
          INSERT INTO odd_numbers VALUES
            ('NaN', 170141183460469231731687303715884105727, 12345678901234567.89),
-           ('Infinity', 1, 0.10);",
+           ('Infinity', 1, 0.10);
+         CREATE TABLE nested (ds DOUBLE[], ms DECIMAL(38,2)[]);
+         INSERT INTO nested VALUES ([1.5::DOUBLE, 'NaN'::DOUBLE], [1.50, 2.25]);",
     )
     .unwrap();
     drop(conn);
@@ -134,7 +136,8 @@ fn writes_are_refused_and_bytes_unchanged() {
         let err = stderr(&out);
         assert!(
             err.contains(
-                "only read-only SELECT statements can be queried; refused before anything ran: "
+                "only read-only SELECT statements can be queried; refused before anything ran: \
+                 a statement is not a SELECT"
             ),
             "{sql}: {err}"
         );
@@ -191,7 +194,8 @@ fn query_side_effect_inside_select_is_stopped() {
     let before = sha(&db);
     // Each of these is a SELECT, so the gate lets it through; what stops it is
     // DuckDB: `query()` takes a SELECT alone, and `nextval` would advance a
-    // sequence, a write the read-only connection refuses.
+    // sequence, a write the read-only connection refuses. The failure is the
+    // statement's own result, and the command exits 1.
     for (sql, why) in [
         (
             "SELECT * FROM query('CREATE TABLE x(i INT)')",
@@ -200,11 +204,16 @@ fn query_side_effect_inside_select_is_stopped() {
         ("SELECT nextval('seq')", "read-only"),
     ] {
         let out = query(dir.path(), &[sql]);
-        assert!(!out.status.success(), "{sql}: {out:?}");
-        assert!(out.stdout.is_empty(), "{sql}: {out:?}");
-        let err = stderr(&out);
-        assert!(err.contains(why), "{sql}: {err}");
-        assert!(!err.contains("refused before anything ran"), "{sql}: {err}");
+        assert_eq!(out.status.code(), Some(1), "{sql}: {out:?}");
+        let got: Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+        let result = &got["results"][0];
+        assert_eq!(result["statement"], 1);
+        let error = result["error"].as_str().expect("an error result");
+        assert!(error.contains(why), "{sql}: {error}");
+        assert!(
+            !stderr(&out).contains("refused before anything ran"),
+            "{sql}"
+        );
         assert_eq!(before, sha(&db), "{sql} changed the database");
     }
     let conn = duckdb::Connection::open(&db).unwrap();
@@ -220,6 +229,62 @@ fn query_side_effect_inside_select_is_stopped() {
         .query_row("SELECT nextval('seq')", [], |r| r.get(0))
         .unwrap();
     assert_eq!(next, 1, "the sequence had advanced");
+}
+
+#[test]
+fn a_failing_statement_keeps_the_others_results() {
+    let dir = protocol_with_data();
+    let out = query(dir.path(), &["SELECT 1 AS a; SELECT nextval('seq')"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let got: Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    let results = got["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["rows"], json!([[1]]));
+    assert!(results[0].get("error").is_none());
+    assert_eq!(results[1]["statement"], 2);
+    assert!(
+        results[1]["error"].as_str().unwrap().contains("read-only"),
+        "{}",
+        results[1]
+    );
+    assert!(results[1].get("rows").is_none());
+    assert_eq!(got["keep"], KEEP);
+}
+
+#[test]
+fn extensions_are_not_installed_by_a_query() {
+    let dir = protocol_with_data();
+    let got = query_json(
+        dir.path(),
+        &["SELECT current_setting('autoinstall_known_extensions') AS v"],
+    );
+    assert_eq!(got["results"][0]["rows"], json!([[false]]));
+}
+
+#[test]
+fn a_limit_over_the_bound_is_refused() {
+    let dir = protocol_with_data();
+    let out = query(dir.path(), &["SELECT 1", "--limit", "100001"]);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(
+        stderr(&out).contains("the limit is at most 100000 rows"),
+        "{}",
+        stderr(&out)
+    );
+    query_json(dir.path(), &["SELECT 1", "--limit", "100000"]);
+}
+
+#[test]
+fn nested_values_are_written_as_duckdb_writes_them() {
+    let dir = protocol_with_data();
+    let got = query_json(dir.path(), &["SELECT ds, ms FROM nested"]);
+    // A list holding NaN is not JSON, so the whole cell is DuckDB's text; a list of
+    // wide decimals is not cast, so its values are JSON numbers.
+    assert_eq!(
+        got["results"][0]["rows"],
+        json!([["[1.5,NaN]", [1.5, 2.25]]])
+    );
 }
 
 #[test]
@@ -260,7 +325,7 @@ fn a_text_that_does_not_parse_is_refused() {
     let out = query(dir.path(), &["selec 1"]);
     assert!(!out.status.success());
     assert!(
-        stderr(&out).contains("refused before anything ran"),
+        stderr(&out).contains("refused before anything ran: syntax error at or near"),
         "{}",
         stderr(&out)
     );
@@ -291,6 +356,10 @@ fn sql_query_tool_matches_verb_and_is_read_only() {
             "name": "sql_query", "arguments": {"sql": sql, "limit": 5}}}),
         json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
             "name": "sql_query", "arguments": {"sql": "DROP TABLE t"}}}),
+        json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {
+            "name": "sql_query", "arguments": {"sql": "SELECT 1 AS a; SELECT nextval('seq')"}}}),
+        json!({"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {
+            "name": "sql_query", "arguments": {"sql": "SELECT 1", "limit": 100001}}}),
     ];
     let lines = common::mcp_session_env(
         dir.path(),
@@ -310,7 +379,27 @@ fn sql_query_tool_matches_verb_and_is_read_only() {
         .expect("sql_query is listed")
         .clone();
     assert_eq!(tool["annotations"]["readOnlyHint"], true);
+    assert_eq!(tool["annotations"]["openWorldHint"], true);
+    assert_eq!(
+        tool["inputSchema"]["properties"]["limit"]["maximum"],
+        100000
+    );
     assert_eq!(by_id(3)["result"]["structuredContent"], verb);
+    // A statement that fails while running is in the result, not a tool error.
+    let partial = &by_id(5)["result"];
+    assert_eq!(partial["isError"], false, "{partial}");
+    let results = &partial["structuredContent"]["results"];
+    assert_eq!(results[0]["rows"], json!([[1]]));
+    assert!(results[1]["error"].as_str().unwrap().contains("read-only"));
+    let over = &by_id(6)["result"];
+    assert_eq!(over["isError"], true);
+    assert!(
+        over["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("the limit is at most 100000 rows"),
+        "{over}"
+    );
     let refused = &by_id(4)["result"];
     assert_eq!(refused["isError"], true);
     assert!(

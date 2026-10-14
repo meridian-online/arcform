@@ -403,3 +403,40 @@ fn describe_keeps_wide_numbers_exact_as_strings() {
     assert_eq!(sample[0][3], json!(1.5));
     assert_eq!(sample[2][3], Value::Null);
 }
+
+#[test]
+fn describe_writes_nested_values_as_duckdb_writes_them() {
+    let dir = protocol();
+    let conn = duckdb::Connection::open(dir.path().join("data.duckdb")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE nested (ds DOUBLE[], ms DECIMAL(38,2)[]);
+         INSERT INTO nested VALUES ([1.5::DOUBLE, 'NaN'::DOUBLE], [1.50, 2.25]);",
+    )
+    .unwrap();
+    drop(conn);
+    // A list holding NaN is not JSON, so the whole cell is DuckDB's text; a list of
+    // wide decimals is not cast, so its values are JSON numbers.
+    assert_eq!(
+        describe_json(dir.path(), "nested")["sample"],
+        json!([["[1.5,NaN]", [1.5, 2.25]]])
+    );
+}
+
+#[test]
+fn describe_opens_with_extension_install_off() {
+    // The answer of the same open, read through the query verb on this database.
+    let dir = protocol_with_data();
+    let out = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .current_dir(dir.path())
+        .env("ARCFORM_HISTORY_DIR", dir.path().join(".history"))
+        .args([
+            "sql",
+            "query",
+            "SELECT current_setting('autoinstall_known_extensions')",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let got: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(got["results"][0]["rows"], json!([[false]]));
+}

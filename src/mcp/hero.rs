@@ -659,7 +659,7 @@ fn sql_query_schema() -> Value {
         "properties": {
             "sql": { "type": "string", "description": "One or more SELECT statements, separated by `;`." },
             "dir": { "type": "string", "description": "The Protocol's directory. Defaults to the server's working directory." },
-            "limit": { "type": "integer", "minimum": 0, "description": "The most rows returned for each statement. Defaults to 100." }
+            "limit": { "type": "integer", "minimum": 0, "maximum": 100000, "description": "The most rows returned for each statement. Defaults to 100; at most 100000." }
         },
         "required": ["sql"]
     })
@@ -719,17 +719,17 @@ pub(super) fn tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "table_describe",
-            description: "Describe a table or view in a Protocol's database: its row count, each column's name, type and null count, and up to five rows as arrays of values in the order of the columns. A bare name is the table in main, or the one schema that holds it; `schema.table` names another. Opens the database read-only and changes nothing; a database the Protocol has not made yet is refused, and so is one another process holds.",
+            description: "Describe a table or view in a Protocol's database: its row count, each column's name, type and null count, and up to five rows as arrays of values in the order of the columns. A bare name is the table in main, or the one schema that holds it; `schema.table` names another. Opens the database read-only and never writes it; a view over a file reads that file. A database the Protocol has not made yet is refused, and so is one another process holds.",
             input_schema: table_describe_schema,
             handler: table_describe,
-            annotations: Annotations::READ_ONLY,
+            annotations: Annotations::READS_OPEN,
         },
         ToolDef {
             name: "sql_query",
-            description: "Run SELECT statements against a Protocol's database and return, for each, its columns and types and up to `limit` rows (100 by default) as arrays of values in the order of the columns, with `capped` and `rows_held_back` saying when more rows were there. Before anything runs, DuckDB reads the whole text, and a text holding anything but SELECTs is refused whole. Opens the database read-only and changes nothing; `keep` says how to record a query as a step with sql_record.",
+            description: "Run SELECT statements against a Protocol's database and return, for each, its columns and types and up to `limit` rows (100 by default, at most 100000) as arrays of values in the order of the columns, with `capped` and `rows_held_back` saying when more rows were there; `rows_held_back` is a recount, running the statement a second time. Before anything runs, DuckDB reads the whole text, and a text holding anything but SELECTs is refused whole. A statement that fails while running gives `{statement, error}` in its place and the others are kept. The SQL may read files and URLs it names; the database is opened read-only and never written. `keep` says how to record a query as a step with sql_record.",
             input_schema: sql_query_schema,
             handler: sql_query,
-            annotations: Annotations::READ_ONLY,
+            annotations: Annotations::READS_OPEN,
         },
     ]
 }

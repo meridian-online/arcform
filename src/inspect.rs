@@ -21,6 +21,10 @@ const SAMPLE_ROWS: usize = 5;
 /// does not exist yet is refused, since a read-only open would not make it and the
 /// reader should be told to run the Protocol. A file another process holds for
 /// writing is refused with a message that says to try again.
+///
+/// DuckDB's external access stays on, so a view over a Parquet or CSV file, and a
+/// query naming a file or a URL, can be read. Installing an extension DuckDB knows
+/// is off: an extension already installed may still load, but none is fetched.
 pub(crate) fn open_read_only(dir: &Path) -> Result<(Connection, PathBuf)> {
     let manifest = crate::manifest::Manifest::load(dir)?;
     let path = manifest.db_path(dir)?;
@@ -32,6 +36,7 @@ pub(crate) fn open_read_only(dir: &Path) -> Result<(Connection, PathBuf)> {
     }
     let config = Config::default()
         .access_mode(AccessMode::ReadOnly)
+        .and_then(|c| c.with("autoinstall_known_extensions", "false"))
         .map_err(db_error)?;
     let conn = Connection::open_with_flags(&path, config).map_err(|e| {
         if is_lock_error(&e.to_string()) {
@@ -70,8 +75,10 @@ fn quote(identifier: &str) -> String {
 
 /// The select-list expression that gives the value of `expr`, a column of DuckDB
 /// type `ty`, as JSON text. A number a double cannot hold exactly (a HUGEINT, a
-/// UHUGEINT, or a DECIMAL of more than 15 digits) is cast to text first, so it comes
-/// back as a JSON string of its exact digits rather than a rounded number.
+/// UHUGEINT, or a DECIMAL of more than 15 digits) at the top level of a row is cast
+/// to text first, so it comes back as a JSON string of its exact digits rather than
+/// a rounded number. A value nested in a LIST, STRUCT or MAP is written as DuckDB's
+/// `to_json` writes it.
 fn json_value_sql(expr: &str, ty: &str) -> String {
     if is_wide_number(ty) {
         format!("to_json({expr}::VARCHAR)")
@@ -85,6 +92,12 @@ fn is_wide_number(ty: &str) -> bool {
     let ty = ty.trim().to_ascii_uppercase();
     if ty == "HUGEINT" || ty == "UHUGEINT" {
         return true;
+    }
+    // A DECIMAL at the top level of a row: its type ends at the `)` of its
+    // precision and scale. `DECIMAL(38,2)[]` or a STRUCT holding one is a nested
+    // value, written as DuckDB's `to_json` writes it.
+    if !ty.ends_with(')') {
+        return false;
     }
     let precision = ty
         .strip_prefix("DECIMAL(")
@@ -273,6 +286,9 @@ const KEEP: &str = "to keep a query as a step: arc sql record '<statement>' --na
 const GATE_REFUSAL: &str =
     "only read-only SELECT statements can be queried; refused before anything ran";
 
+/// The most rows `query` returns for each statement.
+pub(crate) const MAX_LIMIT: usize = 100_000;
+
 /// The query nodes a SELECT statement is made of, as `json_serialize_sql` names them:
 /// a plain SELECT, a UNION and its kin, and a WITH.
 const SELECT_NODES: [&str; 4] = [
@@ -290,7 +306,8 @@ const SELECT_NODES: [&str; 4] = [
 /// alone, so if it reports an error (a statement of another kind, or text it cannot
 /// parse), or a statement in it is not a SELECT, the whole text is refused and none
 /// of it runs. The read-only connection is the backstop for a SELECT that would
-/// still write, such as one calling `nextval`.
+/// still write, such as one calling `nextval`. A SELECT may still read the files
+/// and URLs it names (see [`open_read_only`]); the database is never written.
 ///
 /// **Each statement.** The statements are the ones DuckDB's parse split the text
 /// into for the gate, each turned back into SQL by `json_deserialize_sql`: DuckDB
@@ -299,15 +316,42 @@ const SELECT_NODES: [&str; 4] = [
 /// as a subquery whose columns are renamed by position, so a column name cannot
 /// shadow another, each value read as [`describe_table`]'s sample is. When more
 /// than `limit` rows come back, `capped` is true and `rows_held_back` says how many
-/// rows past `limit` the statement returns.
+/// rows past `limit` the statement returns. That is a recount: the statement runs a
+/// second time under `count(*)`, so over data that changed in between it is the
+/// second run's count, never below 0.
+///
+/// **Errors.** A statement that fails while running gives `{"statement": n,
+/// "error": <DuckDB's message>}` in its place, and the others' results are kept.
+/// The `Err` this returns is a refusal before anything ran: the gate, a `limit`
+/// above [`MAX_LIMIT`], a database that is missing or held by another process.
 pub(crate) fn query(dir: &Path, sql: &str, limit: usize) -> Result<Value> {
+    if limit > MAX_LIMIT {
+        return Err(refusal(format!(
+            "the limit is at most {MAX_LIMIT} rows for each statement; {limit} was asked for"
+        )));
+    }
     let (conn, _path) = open_read_only(dir)?;
     let statements = gate(&conn, sql)?;
-    let mut results = Vec::with_capacity(statements.len());
-    for (index, statement) in statements.iter().enumerate() {
-        results.push(run_statement(&conn, index + 1, statement, limit).map_err(db_error)?);
-    }
+    let results: Vec<Value> = statements
+        .iter()
+        .enumerate()
+        .map(|(index, statement)| {
+            run_statement(&conn, index + 1, statement, limit)
+                .unwrap_or_else(|e| json!({ "statement": index + 1, "error": e.to_string() }))
+        })
+        .collect();
     Ok(json!({ "results": results, "keep": KEEP }))
+}
+
+/// The numbers of the statements in a [`query`] answer that failed while running.
+pub(crate) fn failed_statements(answer: &Value) -> Vec<u64> {
+    answer["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r.get("error").is_some())
+        .filter_map(|r| r["statement"].as_u64())
+        .collect()
 }
 
 /// The SQL of each statement in `sql`, or the gate's refusal: see [`query`].
@@ -322,6 +366,11 @@ fn gate(conn: &Connection, sql: &str) -> Result<Vec<String>> {
         let message = parsed["error_message"]
             .as_str()
             .unwrap_or("DuckDB could not read the text");
+        // DuckDB's own wording here names its serialiser, not the query; a parser
+        // error is passed through as DuckDB gives it.
+        if message.contains("Only SELECT statements can be serialized") {
+            return Err(refuse("a statement is not a SELECT".to_string()));
+        }
         return Err(refuse(message.to_string()));
     }
     let statements = parsed["statements"].as_array().cloned().unwrap_or_default();
@@ -385,7 +434,7 @@ fn run_statement(
         rows.truncate(limit);
         let total: i64 =
             conn.query_row(&format!("SELECT count(*) FROM {wrapped}"), [], |r| r.get(0))?;
-        json!(total - limit as i64)
+        json!((total - limit as i64).max(0))
     } else {
         Value::Null
     };

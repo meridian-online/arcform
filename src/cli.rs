@@ -246,9 +246,12 @@ pub enum SqlCmd {
     /// Run read-only SELECT statements against the protocol's database and print
     /// what they return, as JSON: for each statement its columns and types, and up
     /// to `--limit` rows, each an array of values in column order, with `capped`
-    /// and `rows_held_back` saying when more rows were there. Before anything runs,
-    /// DuckDB reads the whole text, and a text holding anything but SELECTs is
-    /// refused whole. The database is opened read-only, so nothing here changes it.
+    /// and `rows_held_back` saying when more rows were there (a recount: the
+    /// statement runs a second time). Before anything runs, DuckDB reads the whole
+    /// text, and a text holding anything but SELECTs is refused whole. A statement
+    /// that fails while running gives its error in its place and the others are
+    /// kept; the command then exits 1. A SELECT may read the files and URLs it
+    /// names; the database is opened read-only, so nothing here changes it.
     Query {
         /// One or more SELECT statements, as typed.
         #[arg(allow_hyphen_values = true)]
@@ -258,7 +261,7 @@ pub enum SqlCmd {
         #[arg(long, default_value = ".")]
         dir: PathBuf,
 
-        /// The most rows printed for each statement.
+        /// The most rows printed for each statement, at most 100000.
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
@@ -1014,7 +1017,15 @@ fn dispatch_sql(cmd: SqlCmd, out: &mut impl Write) -> Result<()> {
         SqlCmd::Query { sql, dir, limit } => {
             let answer = crate::inspect::query(&dir, &sql, limit)?;
             writeln!(out, "{answer:#}")?;
-            Ok(())
+            let failed = crate::inspect::failed_statements(&answer);
+            if failed.is_empty() {
+                return Ok(());
+            }
+            let numbers: Vec<String> = failed.iter().map(u64::to_string).collect();
+            Err(Error::Io(std::io::Error::other(format!(
+                "statement {} failed while running; its error is in the results",
+                numbers.join(", ")
+            ))))
         }
     }
 }
