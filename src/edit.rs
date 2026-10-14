@@ -133,9 +133,10 @@ pub enum SpecEdit {
     /// between the colon and the old value, so `steps: []` replaced by a block
     /// sequence leaves `steps:` with no space at the end of its line, and a
     /// comment after the old value (`steps: []  # none yet`) stays on the
-    /// key's line (`steps:  # none yet`), ahead of the block. The blank lines
-    /// and the comment lines indented less than an old block value, after its
-    /// last line, belong to what follows and are kept byte for byte.
+    /// key's line (`steps:  # none yet`), ahead of the block. Whatever the new
+    /// value's form, the blank lines and the comment lines indented no further
+    /// than the key, after an old value's last line, belong to what follows and
+    /// are kept byte for byte.
     Replace { path: Vec<PathPart>, value: String },
 
     /// Replace one occurrence of `from` with `to` inside the value at `path` —
@@ -584,38 +585,55 @@ fn apply_one(text: &str, edit: &SpecEdit) -> Result<String> {
         SpecEdit::Replace { path, value } => {
             let doc = parse(text)?;
             let (mut start, mut end) = value_span(text, &doc, path)?;
+            let value_start = start;
+            // The colon before the value, when only spaces and line breaks
+            // separate them: the key's line is the line it is on.
+            let before = text[..start].trim_end_matches([' ', '\n']);
+            let colon = before.ends_with(':').then_some(before.len());
+            // An old value over several lines may have a span that runs past its
+            // last line, over blank lines and comment lines after it. Those
+            // belong to what follows, so they stay byte for byte, whatever the
+            // new value's form. A line is after the value when it is blank or a
+            // comment indented no further than the key; a `#` line indented
+            // further is the value's own (text, in a block scalar). With no key
+            // to read, a comment indented less than the value is after it. An
+            // old value on one line is replaced exactly as before.
+            if text[start..end].contains('\n') {
+                let limit = match colon {
+                    Some(at) => indent_of(text, line_start(text, at - 1)) as isize,
+                    None => indent_of(text, line_start(text, value_start)) as isize - 1,
+                };
+                let mut content_end = if text.as_bytes()[end - 1] == b'\n' {
+                    end - 1
+                } else {
+                    end
+                };
+                loop {
+                    let last = line_start(text, content_end);
+                    let indent = indent_of(text, last);
+                    let line = &text[last + indent..content_end];
+                    let blank = line.trim_end_matches('\r').is_empty();
+                    let comment = line.starts_with('#') && indent as isize <= limit;
+                    if last > start && (blank || comment) {
+                        content_end = last - 1;
+                    } else {
+                        break;
+                    }
+                }
+                // The line break ending the old value's last line stays, unless
+                // the new value brings its own.
+                end = if value.ends_with('\n') && content_end < end {
+                    content_end + 1
+                } else {
+                    content_end
+                };
+            }
             if value.starts_with('\n') {
-                let value_start = start;
                 // A block value starts on the next line: the spaces (and, for an
                 // old block value, the line break) between the colon and the old
                 // value go with it, so no line ends in a space.
-                let before = text[..start].trim_end_matches([' ', '\n']);
-                if before.ends_with(':') {
-                    start = before.len();
-                }
-                // An old block value's span may run past its last line, over
-                // the blank lines and the comment lines indented less than the
-                // value after it. Those belong to what follows, so they stay,
-                // byte for byte, and so does the line break that ends the old
-                // value's last line. A line indented as far as the value is the
-                // value's own: in a block scalar, `# x` there is text.
-                if text[start..end].contains('\n') {
-                    let value_indent = indent_of(text, line_start(text, value_start));
-                    if text.as_bytes()[end - 1] == b'\n' {
-                        end -= 1;
-                    }
-                    loop {
-                        let last = line_start(text, end);
-                        let indent = indent_of(text, last);
-                        let line = &text[last + indent..end];
-                        let after =
-                            line.is_empty() || (line.starts_with('#') && indent < value_indent);
-                        if last > start && after {
-                            end = last - 1;
-                        } else {
-                            break;
-                        }
-                    }
+                if let Some(at) = colon {
+                    start = at;
                 }
                 // A comment after an old value on the key's own line
                 // (`steps: []  # none yet`) stays on that line, ahead of the

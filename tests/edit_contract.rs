@@ -365,6 +365,45 @@ fn a_hash_line_inside_a_block_scalar_is_replaced_with_it() {
     );
 }
 
+/// A block sequence written at its key's own indent keeps the comment after it.
+#[test]
+fn a_comment_line_after_a_sequence_at_the_key_indent_stays_where_it_was() {
+    let edit = SpecEdit::Replace {
+        path: vec!["steps".into()],
+        value: "\n  - x".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("steps:\n- a\n- b\n# section\nnext: 1\n", &[edit]).unwrap(),
+        "steps:\n  - x\n# section\nnext: 1\n"
+    );
+}
+
+/// A value that is not a block keeps the comment after an old block value too.
+#[test]
+fn a_flow_value_replacing_a_block_mapping_keeps_the_comment_after_it() {
+    let edit = SpecEdit::Replace {
+        path: vec!["params".into()],
+        value: "{b: 2}".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("params:\n  a: 1\n# section\nnext: 1\n", &[edit]).unwrap(),
+        "params:\n  {b: 2}\n# section\nnext: 1\n"
+    );
+}
+
+/// A blank line between an old block value and the comment after it stays.
+#[test]
+fn a_blank_line_before_the_comment_after_a_block_value_stays() {
+    let edit = SpecEdit::Replace {
+        path: vec!["params".into()],
+        value: "\n  b: 2".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("params:\n  a: 1\n\n# section\nnext: 1\n", &[edit]).unwrap(),
+        "params:\n  b: 2\n\n# section\nnext: 1\n"
+    );
+}
+
 /// The absent value of a bare `key:` is replaced just after the colon, as it was.
 #[test]
 fn a_bare_key_takes_its_value_just_after_the_colon() {
