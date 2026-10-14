@@ -23,9 +23,12 @@ BINARY="arc"
 # the `duckdb` command for a protocol's SQL steps, so a user needs it on PATH.
 DUCKDB_RECOMMENDED="v1.5.6"
 SOURCE_INSTALL="cargo install arcform --locked --features mcp,bundled-duckdb"
-# FOR TESTS ONLY, not a user setting: --self-test points this at a file:// tree
-# laid out as a release is, so the install path runs without the network.
-ARC_INSTALL_BASE_URL="${ARC_INSTALL_BASE_URL:-}"
+# FOR TESTS ONLY, not a user setting: --self-test sets this, inside a subshell,
+# to a file:// tree laid out as a release is, so the install path runs without
+# the network. It is cleared here rather than read from the environment, so a
+# variable in the caller's environment cannot point a real install at another
+# host, whose own sidecar would make the checksum meaningless.
+ARC_INSTALL_BASE_URL=""
 
 info() { printf '  %s\n' "$*"; }
 warn() { printf '  warning: %s\n' "$*" >&2; }
@@ -92,6 +95,17 @@ latest_version() {
   normalise_version "$lv_tag"
 }
 
+# Sets base_url and curl_proto for VERSION: the GitHub release over HTTPS, or the
+# self-test's local tree.
+release_source() {
+  base_url="https://github.com/${REPO}/releases/download/$1"
+  curl_proto="=https"
+  if [ -n "$ARC_INSTALL_BASE_URL" ]; then
+    base_url="${ARC_INSTALL_BASE_URL}/$1"
+    curl_proto="=https,file"
+  fi
+}
+
 archive_name() {
   printf '%s-%s-%s.tar.gz\n' "$BINARY" "$1" "$2"
 }
@@ -148,12 +162,7 @@ main() {
     version="$(latest_version)"
   fi
   archive="$(archive_name "$version" "$target")"
-  base_url="https://github.com/${REPO}/releases/download/${version}"
-  curl_proto="=https"
-  if [ -n "$ARC_INSTALL_BASE_URL" ]; then
-    base_url="${ARC_INSTALL_BASE_URL}/${version}"
-    curl_proto="=https,file"
-  fi
+  release_source "$version"
 
   echo ""
   echo "  arc installer (Meridian)"
@@ -162,7 +171,8 @@ main() {
 
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "$tmp_dir"' EXIT
-  trap 'rm -rf "$tmp_dir"; exit 130' INT TERM
+  trap 'rm -rf "$tmp_dir"; exit 130' INT
+  trap 'rm -rf "$tmp_dir"; exit 143' TERM
 
   info "downloading ${archive}"
   curl -fsSL --proto "$curl_proto" --tlsv1.2 -o "${tmp_dir}/${archive}" "${base_url}/${archive}" \
@@ -245,15 +255,18 @@ st_end_to_end() {
 
   st_home="${st_e2e}/home"
   mkdir -p "$st_home"
-  if (
+  # Not inside `if`, `&&` or `||`: there the shell ignores `set -e`, even one
+  # set inside the subshell, and a failing step in main would go unnoticed.
+  set +e
+  (
+    set -e
     HOME="$st_home"
     ARC_INSTALL_BASE_URL="file://${st_site}"
     main "$st_version"
-  ) > "${st_e2e}/install.log" 2>&1; then
-    st_pass
-  else
-    st_fail "end to end: the install failed: $(cat "${st_e2e}/install.log")"
-  fi
+  ) > "${st_e2e}/install.log" 2>&1
+  st_rc=$?
+  set -e
+  st_equal "end to end: the install exits 0 under set -e ($(cat "${st_e2e}/install.log"))" "0" "$st_rc"
   st_equal "end to end: latest is the installed version" \
     "$(cd "${st_home}/.arcform/cli/${st_version}" 2> /dev/null && pwd -P)" \
     "$(cd "${st_home}/.arcform/cli/latest" 2> /dev/null && pwd -P)"
@@ -264,11 +277,16 @@ st_end_to_end() {
     > "${st_site}/${st_version}/${st_archive}.sha256"
   st_home2="${st_e2e}/home2"
   mkdir -p "$st_home2"
-  if (
+  set +e
+  (
+    set -e
     HOME="$st_home2"
     ARC_INSTALL_BASE_URL="file://${st_site}"
     main "$st_version"
-  ) > "${st_e2e}/tampered.log" 2>&1; then
+  ) > "${st_e2e}/tampered.log" 2>&1
+  st_rc=$?
+  set -e
+  if [ "$st_rc" -eq 0 ]; then
     st_fail "end to end: a tampered checksum was installed"
   else
     case "$(cat "${st_e2e}/tampered.log")" in
@@ -335,6 +353,12 @@ v0.3.0"; do
 
   st_end_to_end
 
+  # A real install ignores ARC_INSTALL_BASE_URL from the environment: a fresh
+  # run of this script, with it exported, still downloads from GitHub over HTTPS.
+  st_equal "an exported ARC_INSTALL_BASE_URL is ignored" \
+    "https://github.com/${REPO}/releases/download/v0.0.1 =https" \
+    "$(ARC_INSTALL_BASE_URL="file:///tmp/elsewhere" sh "$0" --release-source v0.0.1 2>&1)"
+
   printf 'install.sh self-test: %s passed, %s failed\n' "$st_passed" "$st_failed"
   [ "$st_failed" -eq 0 ]
 }
@@ -342,5 +366,11 @@ v0.3.0"; do
 if [ "${1:-}" = "--self-test" ]; then
   self_test
   exit $?
+fi
+# For the self-test only: print where VERSION would be downloaded from.
+if [ "${1:-}" = "--release-source" ]; then
+  release_source "$2"
+  printf '%s %s\n' "$base_url" "$curl_proto"
+  exit 0
 fi
 main "$@"

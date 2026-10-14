@@ -52,6 +52,7 @@ The Linux binaries are built on Ubuntu 22.04, so they need glibc 2.35 or later. 
 
 - **`tag-guard` refused:** nothing was published. Fix the tree on a branch and merge it, then Hugh moves the tag to the fixed `main` (below).
 - **A `build` leg failed:** nothing was published, because `release` needs every leg. Re-run the failed jobs if the failure was the runner's; otherwise fix and merge, then Hugh moves the tag.
+- **`publish-crates` or `update-install-site` failed:** the GitHub release is out. Fix the cause (usually a missing secret) and re-run the failed job. `publish-crates` skips a crate whose version is already on crates.io, so a re-run publishes only what is missing. A crate version, once published, cannot be replaced; a fix to it is a new patch release.
 
 Moving the tag is Hugh's step, as pushing it was. Delete it on GitHub and locally, then tag the fixed `main` and push again:
 
@@ -62,4 +63,3 @@ git tag vX.Y.Z && git push origin vX.Y.Z
 ```
 
 Move a tag only while nothing has been published from it. Once the GitHub release or a crate is out, fix forward with a new patch release.
-- **`publish-crates` or `update-install-site` failed:** the GitHub release is out. Fix the cause (usually a missing secret) and re-run the failed job. `publish-crates` skips a crate whose version is already on crates.io, so a re-run publishes only what is missing. A crate version, once published, cannot be replaced; a fix to it is a new patch release.
