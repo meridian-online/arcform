@@ -581,19 +581,47 @@ fn apply_one(text: &str, edit: &SpecEdit) -> Result<String> {
     match edit {
         SpecEdit::Replace { path, value } => {
             let doc = parse(text)?;
-            let (mut start, end) = value_span(text, &doc, path)?;
-            // A block value starts on the next line: the spaces between the
-            // colon and the old value go with it, so no line ends in a space.
-            // A comment after the old value on its line stays on the key's line,
-            // ahead of the block, rather than ending up after its last line.
+            let (mut start, mut end) = value_span(text, &doc, path)?;
             if value.starts_with('\n') {
-                let spaces = text[..start].len() - text[..start].trim_end_matches(' ').len();
-                if text[..start - spaces].ends_with(':') {
-                    start -= spaces;
+                let value_start = start;
+                // A block value starts on the next line: the spaces (and, for an
+                // old block value, the line break) between the colon and the old
+                // value go with it, so no line ends in a space.
+                let before = text[..start].trim_end_matches([' ', '\n']);
+                if before.ends_with(':') {
+                    start = before.len();
                 }
-                let line_rest = &text[end..line_end(text, end)];
-                let comment = line_rest.trim_end_matches('\n');
-                if comment.trim_start().starts_with('#') {
+                // An old block value's span may run past its last line, over
+                // the blank lines and the comment lines indented less than the
+                // value after it. Those belong to what follows, so they stay,
+                // byte for byte, and so does the line break that ends the old
+                // value's last line. A line indented as far as the value is the
+                // value's own: in a block scalar, `# x` there is text.
+                if text[start..end].contains('\n') {
+                    let value_indent = indent_of(text, line_start(text, value_start));
+                    if text.as_bytes()[end - 1] == b'\n' {
+                        end -= 1;
+                    }
+                    loop {
+                        let last = line_start(text, end);
+                        let indent = indent_of(text, last);
+                        let line = &text[last + indent..end];
+                        let after =
+                            line.is_empty() || (line.starts_with('#') && indent < value_indent);
+                        if last > start && after {
+                            end = last - 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                // A comment after an old value on the key's own line
+                // (`steps: []  # none yet`) stays on that line, ahead of the
+                // block, rather than ending up after the block's last line. Only
+                // text on the old value's own line counts.
+                let same_line = end > 0 && text.as_bytes()[end - 1] != b'\n';
+                let comment = text[end..line_end(text, end)].trim_end_matches('\n');
+                if same_line && comment.trim_start_matches(' ').starts_with('#') {
                     let replacement = format!("{comment}{value}");
                     return Ok(splice(text, start, end + comment.len(), &replacement));
                 }

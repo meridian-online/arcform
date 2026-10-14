@@ -324,6 +324,47 @@ fn a_block_value_keeps_the_comment_on_the_key_line() {
     );
 }
 
+/// A full-line comment after a block mapping value is not the value's: a
+/// block value replacing the mapping leaves it where it was, byte for byte.
+#[test]
+fn a_comment_line_after_a_block_mapping_value_stays_where_it_was() {
+    let edit = SpecEdit::Replace {
+        path: vec!["params".into()],
+        value: "\n  b: 2".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("params:\n  a: 1\n# section\nnext: 1\n", &[edit]).unwrap(),
+        "params:\n  b: 2\n# section\nnext: 1\n"
+    );
+}
+
+/// The same for a block scalar value: the comment line after it stays put.
+#[test]
+fn a_comment_line_after_a_block_scalar_value_stays_where_it_was() {
+    let edit = SpecEdit::Replace {
+        path: vec!["note".into()],
+        value: "\n  - x".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("note: |\n  first\n  second\n# section\nnext: 1\n", &[edit]).unwrap(),
+        "note:\n  - x\n# section\nnext: 1\n"
+    );
+}
+
+/// A `# …` line indented as far as a block scalar's text is the scalar's own
+/// text, and is replaced with it.
+#[test]
+fn a_hash_line_inside_a_block_scalar_is_replaced_with_it() {
+    let edit = SpecEdit::Replace {
+        path: vec!["note".into()],
+        value: "\n  - x".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("note: |\n  first\n  # not a comment\nnext: 1\n", &[edit]).unwrap(),
+        "note:\n  - x\nnext: 1\n"
+    );
+}
+
 /// The absent value of a bare `key:` is replaced just after the colon, as it was.
 #[test]
 fn a_bare_key_takes_its_value_just_after_the_colon() {
