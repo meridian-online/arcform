@@ -741,7 +741,7 @@ pub(super) fn tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "sql_query",
-            description: "Run SELECT statements against a Protocol's database and return, for each, its columns and types and up to `limit` rows (100 by default, at most 100000) as arrays of values in the order of the columns, with `capped` and `rows_held_back` saying when more rows were there; `rows_held_back` is a recount, running the statement a second time. Before anything runs, DuckDB reads the whole text, and a text holding anything but SELECTs is refused whole. A statement that fails while running gives `{statement, error}` in its place and the others are kept. The SQL may read files and URLs it names; the database is opened read-only and never written. `keep` says how to record a query as a step with sql_record.",
+            description: "Run SELECT statements against a Protocol's database and return, for each, its columns and types and up to `limit` rows (100 by default, at most 100000) as arrays of values in the order of the columns, with `capped` and `rows_held_back` saying when more rows were there; `rows_held_back` is a recount, running the statement a second time. Before anything runs, DuckDB reads the whole text, and a text holding anything but SELECTs is refused whole. A statement that fails while running gives `{statement, error}` in its place and the others are kept. The SQL may read files and URLs it names; the database is opened read-only and never written. `keep` says how to record a query as a step: the `arc sql record` command, or the sql_record tool.",
             input_schema: sql_query_schema,
             handler: sql_query,
             annotations: Annotations::READS_OPEN,

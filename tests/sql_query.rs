@@ -20,7 +20,8 @@ use std::process::{Command, Output};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-const KEEP: &str = "to keep a query as a step: arc sql record '<statement>' --name <name>";
+const KEEP: &str =
+    "to keep a query as a step: `arc sql record '<statement>' --name <name>` (MCP: sql_record)";
 
 /// A Protocol whose database `data.duckdb` holds `t` (one INTEGER column `i`, 1..=3)
 /// and `many` (150 rows).
@@ -356,8 +357,41 @@ fn query_writes_non_finite_and_wide_numbers_as_strings() {
                 "170141183460469231731687303715884105727",
                 "12345678901234567.89"
             ],
-            ["Infinity", "1", "0.10"],
+            ["Infinity", 1, "0.10"],
         ])
+    );
+}
+
+#[test]
+fn query_gives_a_huge_integer_within_two_to_the_53_as_a_number() {
+    // sum() of an INTEGER column is a HUGEINT: a small total is a number, not "6".
+    let dir = protocol_with_data();
+    let got = query_json(dir.path(), &["SELECT sum(i) FROM t"]);
+    assert_eq!(got["results"][0]["rows"], json!([[6]]));
+
+    // ±2^53 is the edge: inside it a double holds every integer, so a number; one
+    // past it, or the widest values, keep their exact digits as a string.
+    let got = query_json(
+        dir.path(),
+        &[
+            "SELECT 9007199254740992::HUGEINT, 9007199254740993::HUGEINT, \
+           -9007199254740992::HUGEINT, -9007199254740993::HUGEINT, \
+           '-170141183460469231731687303715884105728'::HUGEINT, \
+           5::UHUGEINT, 340282366920938463463374607431768211455::UHUGEINT, NULL::HUGEINT",
+        ],
+    );
+    assert_eq!(
+        got["results"][0]["rows"],
+        json!([[
+            9007199254740992_i64,
+            "9007199254740993",
+            -9007199254740992_i64,
+            "-9007199254740993",
+            "-170141183460469231731687303715884105728",
+            5,
+            "340282366920938463463374607431768211455",
+            null
+        ]])
     );
 }
 
