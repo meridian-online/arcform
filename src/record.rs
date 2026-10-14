@@ -140,9 +140,8 @@ pub struct RecordedStep {
 /// [`Error::EditTarget`] when the step name would not splice faithfully
 /// (empty, control characters, `#`, `:`, surrounding whitespace, a leading
 /// YAML indicator — or, as the structural backstop, any name the reloaded
-/// document does not read back verbatim), when `steps` is missing or empty
-/// (an empty protocol has nothing to explore, so it has nothing to record
-/// against), when the provenance note spans lines, or when the description
+/// document does not read back verbatim), when `steps` is missing, when the
+/// provenance note spans lines, or when the description
 /// is empty, spans lines, holds another control character or does not read
 /// back verbatim;
 /// [`Error::GeneratedSqlExists`] when the model path is already occupied; the
@@ -206,24 +205,35 @@ fn write_recorded(
     // of the last existing step, so the appended lines match the document's
     // own convention.
     let steps_path = vec![PathPart::Key("steps".to_string())];
-    let indent = sequence_item_indent(&original, &steps_path)?;
-    let mut item = format!(
-        "{indent}- name: {}\n{indent}  sql: {sql_cited}\n",
-        step.name
-    );
-    if let Some(description) = &step.description {
-        item.push_str(&format!(
-            "{indent}  description: {}\n",
-            description_scalar(description)
-        ));
-    }
-    let validated = apply_edits(
-        &original,
-        &[SpecEdit::Append {
+    let item = |indent: &str| {
+        let mut item = format!(
+            "{indent}- name: {}\n{indent}  sql: {sql_cited}\n",
+            step.name
+        );
+        if let Some(description) = &step.description {
+            item.push_str(&format!(
+                "{indent}  description: {}\n",
+                description_scalar(description)
+            ));
+        }
+        item
+    };
+    // A Protocol with no steps yet, as `arc create-protocol` writes it
+    // (`steps: []`), has no step to copy the indentation of: its empty value is
+    // replaced by a block sequence holding the new step, indented two spaces.
+    // A manifest with no `steps` key at all is refused by the splice.
+    let edit = if steps_before == 0 {
+        SpecEdit::Replace {
             path: steps_path,
-            item,
-        }],
-    )?;
+            value: format!("\n{}", item("  ").trim_end_matches('\n')),
+        }
+    } else {
+        SpecEdit::Append {
+            item: item(&sequence_item_indent(&original, &steps_path)?),
+            path: steps_path,
+        }
+    };
+    let validated = apply_edits(&original, &[edit])?;
 
     // The reloaded document is the arbiter: see [`reads_back`].
     reads_back(validated.manifest(), steps_before, step, &sql_cited)?;

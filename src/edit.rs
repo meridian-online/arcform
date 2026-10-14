@@ -129,7 +129,9 @@ pub enum SpecEdit {
     /// value's own bytes are replaced. Replacing the absent value of a bare
     /// `key:` is supported — start the replacement with the separating space
     /// (or a newline for a block value), since the splice lands right after
-    /// the colon.
+    /// the colon. A value that starts with a newline also takes the spaces
+    /// between the colon and the old value, so `steps: []` replaced by a block
+    /// sequence leaves `steps:` with no space at the end of its line.
     Replace { path: Vec<PathPart>, value: String },
 
     /// Replace one occurrence of `from` with `to` inside the value at `path` —
@@ -577,7 +579,15 @@ fn apply_one(text: &str, edit: &SpecEdit) -> Result<String> {
     match edit {
         SpecEdit::Replace { path, value } => {
             let doc = parse(text)?;
-            let (start, end) = value_span(text, &doc, path)?;
+            let (mut start, end) = value_span(text, &doc, path)?;
+            // A block value starts on the next line: the spaces between the
+            // colon and the old value go with it, so no line ends in a space.
+            if value.starts_with('\n') {
+                let spaces = text[..start].len() - text[..start].trim_end_matches(' ').len();
+                if text[..start - spaces].ends_with(':') {
+                    start -= spaces;
+                }
+            }
             Ok(splice(text, start, end, value))
         }
         SpecEdit::RewriteFragment { path, from, to } => {

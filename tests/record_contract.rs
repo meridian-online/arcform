@@ -214,22 +214,38 @@ fn an_occupied_model_number_is_sidestepped_never_overwritten() {
     );
 }
 
-/// An empty protocol has nothing to explore, so it has nothing to record
-/// against — refused with the sequence named, before anything is written.
+/// A protocol with no steps yet, as `arc create-protocol` writes it, takes its
+/// first recorded step: the empty sequence becomes a block sequence holding it.
 #[test]
-fn recording_into_a_protocol_without_steps_is_refused() {
+fn recording_into_a_protocol_without_steps_gives_it_its_first_step() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join(MANIFEST_FILENAME),
-        "name: bare\nsteps: []\n",
+        "name: bare\nsteps: []\nassets: {}\n",
     )
     .unwrap();
 
-    match record_step(dir.path(), &tide_capture()) {
-        Err(Error::EditTarget { path, .. }) => assert_eq!(path, "steps"),
-        other => panic!("expected EditTarget, got {other:?}"),
-    }
+    let (sql_rel, _) = record_step(dir.path(), &tide_capture()).expect("recorded");
+    assert_eq!(sql_rel, Path::new("models").join("01_dover_tides.sql"));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap(),
+        "name: bare\nsteps:\n  - name: dover_tides\n    sql: models/01_dover_tides.sql\nassets: {}\n"
+    );
+}
+
+/// A manifest with no `steps` key has no sequence to record into — refused
+/// before anything is written.
+#[test]
+fn recording_into_a_manifest_without_a_steps_key_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(MANIFEST_FILENAME), "name: bare\n").unwrap();
+
+    assert!(record_step(dir.path(), &tide_capture()).is_err());
     assert!(!dir.path().join("models").exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap(),
+        "name: bare\n"
+    );
 }
 
 /// The provenance note is the one-line marker header; a note that spans lines
