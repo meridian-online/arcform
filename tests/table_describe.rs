@@ -456,6 +456,9 @@ fn describe_keeps_wide_numbers_exact_as_strings() {
     let dir = protocol_with_odd_numbers();
     let sample = &describe_json(dir.path(), "odd_numbers")["sample"];
     assert_eq!(sample[0][1], "170141183460469231731687303715884105727");
+    // A HUGEINT within ±2^53 is a number: a double holds it exactly.
+    assert_eq!(sample[1][1], json!(1));
+    assert_eq!(sample[2][1], json!(-2));
     assert_eq!(sample[0][2], "12345678901234567.89");
     assert_eq!(sample[1][2], "0.10");
     // A decimal a double holds exactly stays a number.
