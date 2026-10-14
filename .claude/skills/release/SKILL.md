@@ -122,7 +122,7 @@ In `meridian-online/web`, on a new branch:
 
 1. **`src/data/releases.json`**: add `{ "package": "arcform", "version": "X.Y.Z", "date": "YYYY-MM-DD" }`, dated to the release's publish date (`publishedAt` above, not the changelog heading's date), keeping the rows grouped by package and in version order.
 2. **`content/changelog/arcform-vX-Y-Z.mdx`**: a short entry in the form of the existing ones (frontmatter `title`, `date`, `package: arcform`, `version`; a bold lead sentence on what shipped; a link to the arcform docs and to the GitHub release).
-3. **The arcform docs page's install section** (`content/docs/projects/arcform/`): the install line `curl -fsSL https://install.meridian.online/arc | sh`, the `cargo install arcform --locked --features mcp,bundled-duckdb` alternative, and the `duckdb` prerequisite. Change only what this release makes untrue.
+3. **The arcform docs page's install section** (`content/docs/projects/arcform/`): the install line `curl -fsSL https://install.meridian.online/arc | bash`, the `cargo install arcform --locked --features mcp,bundled-duckdb` alternative, and the `duckdb` prerequisite. Change only what this release makes untrue.
 
 Open the pull request with `gh pr create`, wait for its checks, and tell Hugh it is ready with its link. Do not merge it.
 
