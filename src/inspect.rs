@@ -1,5 +1,6 @@
 //! Look inside a Protocol's database without changing it: the one place a read-only
-//! connection is opened, and the verbs built on it (`arc table describe` first).
+//! connection is opened, and the verbs built on it: `arc table describe` and
+//! `arc sql query`.
 //!
 //! The database is opened with DuckDB's read-only access mode, so nothing here can
 //! write to it, and a file that is not there is refused rather than created.
@@ -262,5 +263,142 @@ fn describe_in(
         "row_count": counts[0],
         "columns": columns,
         "sample": sample,
+    }))
+}
+
+/// What `arc sql query` prints after the results: how to keep a query as a step.
+const KEEP: &str = "to keep a query as a step: arc sql record '<statement>' --name <name>";
+
+/// The start of every refusal the gate makes.
+const GATE_REFUSAL: &str =
+    "only read-only SELECT statements can be queried; refused before anything ran";
+
+/// The query nodes a SELECT statement is made of, as `json_serialize_sql` names them:
+/// a plain SELECT, a UNION and its kin, and a WITH.
+const SELECT_NODES: [&str; 4] = [
+    "SELECT_NODE",
+    "SET_OPERATION_NODE",
+    "CTE_NODE",
+    "RECURSIVE_CTE_NODE",
+];
+
+/// Run the SELECT statements in `sql` against the Protocol's database in `dir`,
+/// read-only, and return each one's columns and up to `limit` rows.
+///
+/// **The gate.** Before anything runs, the whole text is handed to DuckDB's
+/// `json_serialize_sql` on the read-only connection. It serialises SELECT statements
+/// alone, so if it reports an error (a statement of another kind, or text it cannot
+/// parse), or a statement in it is not a SELECT, the whole text is refused and none
+/// of it runs. The read-only connection is the backstop for a SELECT that would
+/// still write, such as one calling `nextval`.
+///
+/// **Each statement.** The statements are the ones DuckDB's parse split the text
+/// into for the gate, each turned back into SQL by `json_deserialize_sql`: DuckDB
+/// gives no other way to have a statement's text from its split. Each statement's
+/// columns and types come from `DESCRIBE`, and its rows from the statement wrapped
+/// as a subquery whose columns are renamed by position, so a column name cannot
+/// shadow another, each value read as [`describe_table`]'s sample is. When more
+/// than `limit` rows come back, `capped` is true and `rows_held_back` says how many
+/// rows past `limit` the statement returns.
+pub(crate) fn query(dir: &Path, sql: &str, limit: usize) -> Result<Value> {
+    let (conn, _path) = open_read_only(dir)?;
+    let statements = gate(&conn, sql)?;
+    let mut results = Vec::with_capacity(statements.len());
+    for (index, statement) in statements.iter().enumerate() {
+        results.push(run_statement(&conn, index + 1, statement, limit).map_err(db_error)?);
+    }
+    Ok(json!({ "results": results, "keep": KEEP }))
+}
+
+/// The SQL of each statement in `sql`, or the gate's refusal: see [`query`].
+fn gate(conn: &Connection, sql: &str) -> Result<Vec<String>> {
+    let serialised: String = conn
+        .query_row("SELECT json_serialize_sql(?::VARCHAR)", [sql], |r| r.get(0))
+        .map_err(db_error)?;
+    let parsed: Value = serde_json::from_str(&serialised)
+        .map_err(|e| refusal(format!("database: json_serialize_sql gave no JSON: {e}")))?;
+    let refuse = |why: String| refusal(format!("{GATE_REFUSAL}: {why}"));
+    if parsed["error"] != Value::Bool(false) {
+        let message = parsed["error_message"]
+            .as_str()
+            .unwrap_or("DuckDB could not read the text");
+        return Err(refuse(message.to_string()));
+    }
+    let statements = parsed["statements"].as_array().cloned().unwrap_or_default();
+    if statements.is_empty() {
+        return Err(refuse("the text holds no SQL statement".to_string()));
+    }
+    for (index, statement) in statements.iter().enumerate() {
+        let node = statement["node"]["type"].as_str().unwrap_or("");
+        if !SELECT_NODES.contains(&node) {
+            return Err(refuse(format!(
+                "statement {} is not a SELECT (DuckDB reads it as {node})",
+                index + 1
+            )));
+        }
+    }
+    statements
+        .into_iter()
+        .map(|statement| {
+            let one = json!({ "error": false, "statements": [statement] }).to_string();
+            conn.query_row("SELECT json_deserialize_sql(?::JSON)", [one], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(db_error)
+        })
+        .collect()
+}
+
+/// One statement's result: see [`query`].
+fn run_statement(
+    conn: &Connection,
+    number: usize,
+    statement: &str,
+    limit: usize,
+) -> std::result::Result<Value, duckdb::Error> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT column_name, column_type FROM (DESCRIBE ({statement}))"
+    ))?;
+    let described: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+
+    // The statement's columns are renamed `c0`, `c1`, ... by position, and read
+    // qualified by the subquery's alias, so no name the statement chose (two
+    // columns called `a`, a column called like the alias) can shadow another.
+    let renamed: Vec<String> = (0..described.len()).map(|i| format!("c{i}")).collect();
+    let values: Vec<String> = described
+        .iter()
+        .zip(&renamed)
+        .map(|((_, ty), column)| json_value_sql(&format!("q.{column}"), ty))
+        .collect();
+    let wrapped = format!("({statement}) AS q({})", renamed.join(", "));
+    let fetch = limit.saturating_add(1);
+    let mut rows = json_rows(
+        conn,
+        &format!("SELECT {} FROM {wrapped} LIMIT {fetch}", values.join(", ")),
+        described.len(),
+    )?;
+
+    let capped = rows.len() > limit;
+    let held_back = if capped {
+        rows.truncate(limit);
+        let total: i64 =
+            conn.query_row(&format!("SELECT count(*) FROM {wrapped}"), [], |r| r.get(0))?;
+        json!(total - limit as i64)
+    } else {
+        Value::Null
+    };
+    let columns: Vec<Value> = described
+        .iter()
+        .map(|(name, ty)| json!({ "name": name, "type": ty }))
+        .collect();
+    Ok(json!({
+        "statement": number,
+        "columns": columns,
+        "row_count": rows.len(),
+        "rows": rows,
+        "capped": capped,
+        "rows_held_back": held_back,
     }))
 }

@@ -153,8 +153,9 @@ pub enum Commands {
         cmd: OperationCmd,
     },
 
-    /// Read SQL as arc reads it, and record a statement as a step: whether a
-    /// statement is an operation arc holds, and the step that records it.
+    /// Read SQL as arc reads it, record a statement as a step, and query a
+    /// protocol's database read-only: whether a statement is an operation arc
+    /// holds, the step that records it, and what a SELECT returns.
     Sql {
         #[command(subcommand)]
         cmd: SqlCmd,
@@ -167,9 +168,10 @@ pub enum Commands {
     /// `operation_describe` (the SQL operations arc holds, and what one takes),
     /// `operation_record` (record an operation as a step of a Protocol),
     /// `sql_recognise` (what arc reads a SQL statement as), `sql_record` (record
-    /// a SQL statement as a step of a Protocol) and `protocol_create` (make a new
-    /// Protocol, as `arc create-protocol` does) and `table_describe` (what a table in
-    /// a Protocol's database holds, read-only).
+    /// a SQL statement as a step of a Protocol), `protocol_create` (make a new
+    /// Protocol, as `arc create-protocol` does), `table_describe` (what a table in
+    /// a Protocol's database holds, read-only) and `sql_query` (run read-only
+    /// SELECTs against a Protocol's database).
     #[cfg(feature = "mcp")]
     Mcp,
 
@@ -240,6 +242,25 @@ pub enum SqlCmd {
         /// Protocol directory (where arcform.yaml lives).
         #[arg(long, default_value = ".")]
         dir: PathBuf,
+    },
+    /// Run read-only SELECT statements against the protocol's database and print
+    /// what they return, as JSON: for each statement its columns and types, and up
+    /// to `--limit` rows, each an array of values in column order, with `capped`
+    /// and `rows_held_back` saying when more rows were there. Before anything runs,
+    /// DuckDB reads the whole text, and a text holding anything but SELECTs is
+    /// refused whole. The database is opened read-only, so nothing here changes it.
+    Query {
+        /// One or more SELECT statements, as typed.
+        #[arg(allow_hyphen_values = true)]
+        sql: String,
+
+        /// Protocol directory (where arcform.yaml lives).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+
+        /// The most rows printed for each statement.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
     },
 }
 
@@ -966,8 +987,9 @@ fn dispatch_operation(cmd: OperationCmd, out: &mut impl Write) -> Result<()> {
 
 /// Execute an `arc sql` verb. `recognise` prints what arc reads a statement as,
 /// read by DuckDB's parse alone: it reads no protocol and writes no file.
-/// `record` writes a step into a protocol, and runs nothing. A refusal is the
-/// error, with nothing written to `out`.
+/// `record` writes a step into a protocol, and runs nothing. `query` runs SELECTs
+/// on the protocol's database, opened read-only. A refusal is the error, with
+/// nothing written to `out`.
 fn dispatch_sql(cmd: SqlCmd, out: &mut impl Write) -> Result<()> {
     match cmd {
         SqlCmd::Recognise { sql } => {
@@ -988,6 +1010,11 @@ fn dispatch_sql(cmd: SqlCmd, out: &mut impl Write) -> Result<()> {
                 description: description.as_deref(),
             };
             sql_record(&dir, &request, &history, out)
+        }
+        SqlCmd::Query { sql, dir, limit } => {
+            let answer = crate::inspect::query(&dir, &sql, limit)?;
+            writeln!(out, "{answer:#}")?;
+            Ok(())
         }
     }
 }

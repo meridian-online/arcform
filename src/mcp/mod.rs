@@ -70,7 +70,9 @@ const INSTRUCTIONS: &str = "Use arc when you analyse data over DuckDB and the wo
     step of a Protocol, as the operation it is read as or else as a SQL step, and runs \
     nothing; protocol_create makes a new Protocol in a directory, as arc create-protocol does, \
     and refuses one that already has a spec; table_describe reads what a table in a \
-    Protocol's database holds (row count, columns, null counts, sample rows) and changes nothing.";
+    Protocol's database holds (row count, columns, null counts, sample rows) and changes nothing; \
+    sql_query runs SELECT statements against a Protocol's database, read-only, refuses any \
+    other statement before anything runs, and changes nothing.";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool result shapes
@@ -445,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_registers_all_twelve_tools() {
+    fn tools_list_registers_every_tool() {
         let listed = tools_list();
         let names: Vec<&str> = listed["tools"]
             .as_array()
@@ -467,13 +469,14 @@ mod tests {
             "sql_record",
             "protocol_create",
             "table_describe",
+            "sql_query",
         ] {
             assert!(
                 names.contains(&expected),
                 "missing tool `{expected}` in {names:?}"
             );
         }
-        assert_eq!(names.len(), 13, "unexpected tool set: {names:?}");
+        assert_eq!(names.len(), 14, "unexpected tool set: {names:?}");
         // Every tool advertises an object input schema.
         for tool in listed["tools"].as_array().unwrap() {
             assert!(tool["description"].is_string());

@@ -24,6 +24,8 @@
 //!   bytes from either.
 //! - `table_describe` reads a table in the Protocol's database, read-only, as
 //!   `arc table describe` does.
+//! - `sql_query` runs SELECT statements against the Protocol's database,
+//!   read-only, as `arc sql query` does.
 //! - `protocol_create` makes a new Protocol in a directory, through the same
 //!   creation `arc create-protocol` takes, so the same request writes the same files
 //!   from either.
@@ -625,6 +627,44 @@ fn table_describe_schema() -> Value {
     })
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// sql_query
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The rows SELECT statements return from the Protocol's database, as `arc sql
+/// query` prints them. The database is opened read-only, and a text holding
+/// anything but SELECTs is refused before any of it runs.
+fn sql_query(args: &Value) -> ToolResult {
+    let sql = required_string(args, "sql")?;
+    let dir = match args.get("dir") {
+        None | Some(Value::Null) => PathBuf::from("."),
+        Some(Value::String(dir)) => PathBuf::from(dir),
+        Some(other) => return Err(format!("`dir` must be a string, not {other}")),
+    };
+    let limit = match args.get("limit") {
+        None | Some(Value::Null) => 100,
+        Some(value) => value
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| format!("`limit` must be a whole number, not {value}"))?,
+    };
+    crate::inspect::query(&dir, sql, limit)
+        .map(ToolOutput::json)
+        .map_err(|e| e.to_string())
+}
+
+fn sql_query_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "sql": { "type": "string", "description": "One or more SELECT statements, separated by `;`." },
+            "dir": { "type": "string", "description": "The Protocol's directory. Defaults to the server's working directory." },
+            "limit": { "type": "integer", "minimum": 0, "description": "The most rows returned for each statement. Defaults to 100." }
+        },
+        "required": ["sql"]
+    })
+}
+
 /// The tools native to `arc`.
 pub(super) fn tools() -> Vec<ToolDef> {
     vec![
@@ -682,6 +722,13 @@ pub(super) fn tools() -> Vec<ToolDef> {
             description: "Describe a table or view in a Protocol's database: its row count, each column's name, type and null count, and up to five rows as arrays of values in the order of the columns. A bare name is the table in main, or the one schema that holds it; `schema.table` names another. Opens the database read-only and changes nothing; a database the Protocol has not made yet is refused, and so is one another process holds.",
             input_schema: table_describe_schema,
             handler: table_describe,
+            annotations: Annotations::READ_ONLY,
+        },
+        ToolDef {
+            name: "sql_query",
+            description: "Run SELECT statements against a Protocol's database and return, for each, its columns and types and up to `limit` rows (100 by default) as arrays of values in the order of the columns, with `capped` and `rows_held_back` saying when more rows were there. Before anything runs, DuckDB reads the whole text, and a text holding anything but SELECTs is refused whole. Opens the database read-only and changes nothing; `keep` says how to record a query as a step with sql_record.",
+            input_schema: sql_query_schema,
+            handler: sql_query,
             annotations: Annotations::READ_ONLY,
         },
     ]
