@@ -269,6 +269,30 @@ fn recording_into_a_manifest_without_a_steps_key_is_refused() {
     );
 }
 
+/// A `steps` sequence the manifest reads but the splice cannot see items in (here
+/// one under an explicit `!!seq` tag) is refused by name, with nothing written.
+/// The new step's indentation comes from the last item; when that cannot be read
+/// the recording stops there rather than appending at a guessed indentation.
+#[test]
+fn recording_into_a_steps_sequence_whose_items_cannot_be_read_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = "name: tagged\nsteps: !!seq\n  - name: a\n    sql: models/a.sql\n";
+    std::fs::write(dir.path().join(MANIFEST_FILENAME), manifest).unwrap();
+
+    match record_step(dir.path(), &tide_capture()) {
+        Err(Error::EditTarget { path, detail }) => {
+            assert_eq!(path, "steps");
+            assert!(detail.contains("the sequence has no items"), "{detail}");
+        }
+        other => panic!("expected EditTarget on steps, got {other:?}"),
+    }
+    assert!(!dir.path().join("models").exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap(),
+        manifest
+    );
+}
+
 /// The provenance note is the one-line marker header; a note that spans lines
 /// would smuggle its tail into the SQL body, so it is refused up front.
 #[test]

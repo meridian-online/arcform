@@ -74,25 +74,29 @@ fn quote(identifier: &str) -> String {
 }
 
 /// The select-list expression that gives the value of `expr`, a column of DuckDB
-/// type `ty`, as JSON text. A number a double cannot hold exactly (a HUGEINT, a
-/// UHUGEINT, or a DECIMAL of more than 15 digits) at the top level of a row is cast
-/// to text first, so it comes back as a JSON string of its exact digits rather than
-/// a rounded number. A value nested in a LIST, STRUCT or MAP is written as DuckDB's
-/// `to_json` writes it.
+/// type `ty`, as JSON text. A HUGEINT or UHUGEINT at the top level of a row comes
+/// back as a JSON number while it lies within ±2^53, where a double holds every
+/// integer exactly, and as a JSON string of its exact digits outside that range. A
+/// DECIMAL of more than 15 digits at the top level of a row is always cast to text,
+/// so it comes back as a string of its exact digits rather than a rounded number. A
+/// value nested in a LIST, STRUCT or MAP is written as DuckDB's `to_json` writes it.
 fn json_value_sql(expr: &str, ty: &str) -> String {
-    if is_wide_number(ty) {
-        format!("to_json({expr}::VARCHAR)")
-    } else {
-        format!("to_json({expr})")
-    }
+    const EXACT: u64 = 1 << 53;
+    // A UHUGEINT is compared with no negative bound: DuckDB reads a negative literal
+    // beside one as a HUGEINT, which the widest UHUGEINTs overflow.
+    let exact = match ty.trim().to_ascii_uppercase().as_str() {
+        "HUGEINT" => format!("{expr} BETWEEN -{EXACT} AND {EXACT}"),
+        "UHUGEINT" => format!("{expr} <= {EXACT}"),
+        _ if is_wide_decimal(ty) => return format!("to_json({expr}::VARCHAR)"),
+        _ => return format!("to_json({expr})"),
+    };
+    format!("CASE WHEN {exact} THEN to_json({expr}::BIGINT) ELSE to_json({expr}::VARCHAR) END")
 }
 
-/// Whether a column of DuckDB type `ty` holds numbers a double cannot hold exactly.
-fn is_wide_number(ty: &str) -> bool {
+/// Whether a column of DuckDB type `ty` is a DECIMAL whose numbers a double cannot
+/// hold exactly.
+fn is_wide_decimal(ty: &str) -> bool {
     let ty = ty.trim().to_ascii_uppercase();
-    if ty == "HUGEINT" || ty == "UHUGEINT" {
-        return true;
-    }
     // A DECIMAL at the top level of a row: its type ends at the `)` of its
     // precision and scale. `DECIMAL(38,2)[]` or a STRUCT holding one is a nested
     // value, written as DuckDB's `to_json` writes it.
@@ -279,8 +283,10 @@ fn describe_in(
     }))
 }
 
-/// What `arc sql query` prints after the results: how to keep a query as a step.
-const KEEP: &str = "to keep a query as a step: arc sql record '<statement>' --name <name>";
+/// What `arc sql query` and the `sql_query` tool give after the results: how to
+/// keep a query as a step, from the command line and from `arc mcp`.
+const KEEP: &str =
+    "to keep a query as a step: `arc sql record '<statement>' --name <name>` (MCP: sql_record)";
 
 /// The start of every refusal the gate makes.
 const GATE_REFUSAL: &str =
