@@ -11,12 +11,16 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # arcform links a SYSTEM DuckDB — `libduckdb-sys` ships no `bundled` feature, so
-  # every job that compiles the crate must provide the C library and its headers.
-  # Pinned to the version the crate is developed against; bump in lockstep with the
-  # `duckdb` dependency. The install step below writes the *_DIR / LD_LIBRARY_PATH
-  # env vars that libduckdb-sys and the test runtime read.
-  DUCKDB_VERSION: v1.5.4
+  # Development builds link a SYSTEM DuckDB, so every job here that compiles the
+  # crate without the `bundled-duckdb` feature provides the C library and its headers.
+  # The `bundled` job below builds DuckDB into the binary instead, as release binaries
+  # are built. One version throughout: this pin, the exact `duckdb` crate version in
+  # Cargo.toml (1.10506.0 is v1.5.6) and the versions in src/vetted_extensions.json
+  # move together, because arc loads extensions into the linked library in-process and
+  # an extension loads only into the version it was built for. The install step below
+  # writes the *_DIR / LD_LIBRARY_PATH env vars that libduckdb-sys and the test
+  # runtime read.
+  DUCKDB_VERSION: v1.5.6
 
 jobs:
   # Formatting is build-free, so it reports in seconds and never waits on the
@@ -264,6 +268,74 @@ jobs:
       # recompiles one module rather than resolving a second dependency graph.
       - name: test (mcp feature)
         run: cargo test --workspace --features mcp
+
+  # The binary a release ships: DuckDB compiled in (`bundled-duckdb`, with the
+  # parquet and json extensions), no system libduckdb, built --release on the
+  # Ubuntu 22.04 the Linux release legs use, so glibc 2.35 is what it is tested on.
+  # It runs the suite against that binary on every pull request, so a tag never ships
+  # a build no test has run. DUCKDB_LIB_DIR is deliberately absent: were it set, the
+  # tests could pass against the system library and say nothing about the bundled one.
+  bundled:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+      # Keyed on the feature set, so this job's compiled DuckDB never shares a cache
+      # entry with the dynamic build's target directory.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mcp-bundled-duckdb
+
+      # The `duckdb` command line only, no C library: arc's engine shells out to it to
+      # run a protocol's SQL steps, which the bundled build does not change.
+      - name: Install the DuckDB CLI
+        run: |
+          set -euo pipefail
+          base="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}"
+          mkdir -p "$HOME/duckdb"
+          curl -fsSL -o /tmp/duckdb-cli.zip "$base/duckdb_cli-linux-amd64.zip"
+          unzip -o /tmp/duckdb-cli.zip -d "$HOME/duckdb"
+          chmod +x "$HOME/duckdb/duckdb"
+          "$HOME/duckdb/duckdb" --version
+          echo "$HOME/duckdb" >> "$GITHUB_PATH"
+
+      # As in the build job: the finetype tests load this extension into the linked
+      # library in-process, which here is the bundled one, so they prove the bundled
+      # DuckDB is the version the extension was built for. ARCFORM_REQUIRE_FINETYPE_EXT
+      # makes them panic rather than skip if the staging goes missing.
+      - name: Stage the finetype, ducklake and httpfs DuckDB extensions
+        run: |
+          set -euo pipefail
+          "$HOME/duckdb/duckdb" -c "INSTALL finetype FROM community; INSTALL ducklake; INSTALL httpfs;"
+          dir="$HOME/.duckdb/extensions/${DUCKDB_VERSION}/linux_amd64"
+          test -f "$dir/finetype.duckdb_extension"
+          test -f "$dir/ducklake.duckdb_extension"
+          test -f "$dir/httpfs.duckdb_extension"
+          {
+            echo "FINETYPE_DUCKDB_EXT=$dir/finetype.duckdb_extension"
+            echo "ARCFORM_REQUIRE_FINETYPE_EXT=1"
+          } >> "$GITHUB_ENV"
+
+      - name: test (release, mcp + bundled-duckdb)
+        run: |
+          set -euo pipefail
+          test -z "${DUCKDB_LIB_DIR:-}"
+          cargo test --release --features mcp,bundled-duckdb
+
+      # The binary itself, not just the test harness: it starts, and it names no
+      # libduckdb among the shared libraries it needs.
+      - name: the release binary carries DuckDB
+        run: |
+          set -euo pipefail
+          cargo build --release --features mcp,bundled-duckdb
+          ./target/release/arc --version
+          if ldd target/release/arc | grep -i duckdb; then
+            echo "target/release/arc links a shared libduckdb" >&2
+            exit 1
+          fi
 
   # A mechanism can be added, wired in and shipped, and deleting its body leaves
   # `cargo test` green — which is how a change that does nothing reaches a merge

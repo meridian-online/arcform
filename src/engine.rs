@@ -1079,8 +1079,8 @@ enum ExtensionSql {
 // the file: the CLI reads it a line at a time, skips some lines, and hands the parser one
 // batch of lines at a time; the parser then replaces some unicode spaces before its scanner
 // runs. Each function below copies one of those steps from DuckDB v1.5.5's source, and
-// v1.5.4's is the same: `tools/shell/shell.cpp` for the CLI, `src/parser/parser.cpp` for the
-// pre-pass. A step is copied as far as it changes which text DuckDB reads as SQL, and no
+// v1.5.4's and v1.5.6's are the same: `tools/shell/shell.cpp` for the CLI,
+// `src/parser/parser.cpp` for the pre-pass. A step is copied as far as it changes which text DuckDB reads as SQL, and no
 // further.
 
 /// The lines DuckDB's CLI reads from a file, each with the file line it starts on, as
@@ -2712,7 +2712,7 @@ mod extension_tests {
             &[("step 'a'", "SELECT 1;\nSET extension_directory = 'ext';")],
         );
         assert_eq!(
-            refusals(check_extension_installs(&sql, Some(&v("1.5.5")))),
+            refusals(check_extension_installs(&sql, Some(&v("1.5.6")))),
             vec![
                 "step 'a' (s0.sql, line 2) names the setting extension_directory, which moves where DuckDB keeps the extensions it installs"
             ]
@@ -2737,7 +2737,7 @@ mod extension_tests {
             ],
         );
         assert_eq!(
-            check_extension_installs(&sql, Some(&v("1.5.5")))
+            check_extension_installs(&sql, Some(&v("1.5.6")))
                 .unwrap()
                 .installed,
             vec!["onager".to_string(), "mlpack".to_string()]
@@ -2798,8 +2798,8 @@ mod extension_tests {
         let (pinned, warnings) = check_extension_pins(
             &engine,
             &["mlpack".into()],
-            &pins(&[("mlpack", "v1.5.5", "linux_amd64", &hash)]),
-            Some(&v("1.5.5")),
+            &pins(&[("mlpack", "v1.5.6", "linux_amd64", &hash)]),
+            Some(&v("1.5.6")),
         )
         .unwrap();
         assert_eq!(warnings, Vec::<String>::new());
@@ -2807,7 +2807,7 @@ mod extension_tests {
             pinned,
             vec![PinnedExtension {
                 name: "mlpack".into(),
-                version: "v1.5.5".into(),
+                version: "v1.5.6".into(),
                 platform: "linux_amd64".into(),
                 pin: hash,
                 path,
@@ -2825,13 +2825,13 @@ mod extension_tests {
         let refused = pin_refusals(check_extension_pins(
             &engine,
             &["mlpack".into()],
-            &pins(&[("mlpack", "v1.5.5", "linux_amd64", PIN_A)]),
-            Some(&v("1.5.5")),
+            &pins(&[("mlpack", "v1.5.6", "linux_amd64", PIN_A)]),
+            Some(&v("1.5.6")),
         ));
         assert_eq!(
             refused,
             vec![format!(
-                "mlpack on DuckDB v1.5.5, linux_amd64: pinned {PIN_A}, and the installed file {} hashes to {hash}; `arc upgrade mlpack` installs the build the community registry serves and pins it",
+                "mlpack on DuckDB v1.5.6, linux_amd64: pinned {PIN_A}, and the installed file {} hashes to {hash}; `arc upgrade mlpack` installs the build the community registry serves and pins it",
                 path.display()
             )]
         );
@@ -2839,19 +2839,19 @@ mod extension_tests {
 
     #[test]
     fn an_install_that_fails_or_names_no_file_is_refused_and_not_warned() {
-        let pinned = pins(&[("mlpack", "v1.5.5", "linux_amd64", PIN_A)]);
+        let pinned = pins(&[("mlpack", "v1.5.6", "linux_amd64", PIN_A)]);
         let engine = mock::MockEngine::new();
         engine.set_install("mlpack", Err("HTTP 404".into()));
         let failed = pin_refusals(check_extension_pins(
             &engine,
             &["mlpack".into()],
             &pinned,
-            Some(&v("1.5.5")),
+            Some(&v("1.5.6")),
         ));
         assert_eq!(failed.len(), 1, "{failed:?}");
         assert!(
             failed[0]
-                .starts_with("mlpack on DuckDB v1.5.5, linux_amd64: arc could not install mlpack")
+                .starts_with("mlpack on DuckDB v1.5.6, linux_amd64: arc could not install mlpack")
                 && failed[0].contains("HTTP 404"),
             "{failed:?}"
         );
@@ -2862,12 +2862,12 @@ mod extension_tests {
             &engine,
             &["mlpack".into()],
             &pinned,
-            Some(&v("1.5.5")),
+            Some(&v("1.5.6")),
         ));
         assert_eq!(
             no_file,
             vec![
-                "mlpack on DuckDB v1.5.5, linux_amd64: DuckDB named no installed file for mlpack after installing it"
+                "mlpack on DuckDB v1.5.6, linux_amd64: DuckDB named no installed file for mlpack after installing it"
             ]
         );
 
@@ -2880,7 +2880,7 @@ mod extension_tests {
             &engine,
             &["mlpack".into()],
             &pinned,
-            Some(&v("1.5.5")),
+            Some(&v("1.5.6")),
         ));
         assert!(
             unreadable[0]
@@ -2896,13 +2896,13 @@ mod extension_tests {
         let refused = pin_refusals(check_extension_pins(
             &engine,
             &["mlpack".into(), "onager".into()],
-            &pins(&[("mlpack", "v1.5.5", "linux_amd64", PIN_A)]),
-            Some(&v("1.5.5")),
+            &pins(&[("mlpack", "v1.5.6", "linux_amd64", PIN_A)]),
+            Some(&v("1.5.6")),
         ));
         assert_eq!(refused.len(), 1, "{refused:?}");
         assert!(
             refused[0]
-                .starts_with("mlpack has a pin for DuckDB v1.5.5, and arc could not choose it"),
+                .starts_with("mlpack has a pin for DuckDB v1.5.6, and arc could not choose it"),
             "{refused:?}"
         );
         assert_eq!(calls(&engine), vec!["platform"]);
@@ -2926,27 +2926,27 @@ mod extension_tests {
             (
                 "no key",
                 pins(&[]),
-                Some(v("1.5.5")),
-                "for DuckDB v1.5.5",
+                Some(v("1.5.6")),
+                "for DuckDB v1.5.6",
                 vec![],
             ),
             (
                 "another version",
                 pins(&[("mlpack", "v1.5.4", "linux_amd64", PIN_A)]),
-                Some(v("1.5.5")),
-                "for DuckDB v1.5.5",
+                Some(v("1.5.6")),
+                "for DuckDB v1.5.6",
                 vec![],
             ),
             (
                 "another platform",
-                pins(&[("mlpack", "v1.5.5", "osx_arm64", PIN_A)]),
-                Some(v("1.5.5")),
-                "for DuckDB v1.5.5 on linux_amd64",
+                pins(&[("mlpack", "v1.5.6", "osx_arm64", PIN_A)]),
+                Some(v("1.5.6")),
+                "for DuckDB v1.5.6 on linux_amd64",
                 vec!["platform"],
             ),
             (
                 "no version",
-                pins(&[("mlpack", "v1.5.5", "linux_amd64", PIN_A)]),
+                pins(&[("mlpack", "v1.5.6", "linux_amd64", PIN_A)]),
                 None,
                 "arc could not read this engine's DuckDB version to choose one",
                 vec![],
@@ -2974,8 +2974,8 @@ mod extension_tests {
         let (pinned, warnings) = check_extension_pins(
             &engine,
             &[],
-            &pins(&[("mlpack", "v1.5.5", "linux_amd64", PIN_A)]),
-            Some(&v("1.5.5")),
+            &pins(&[("mlpack", "v1.5.6", "linux_amd64", PIN_A)]),
+            Some(&v("1.5.6")),
         )
         .unwrap();
         assert!(pinned.is_empty() && warnings.is_empty());
@@ -2990,14 +2990,14 @@ mod extension_tests {
         let pinned = vec![
             PinnedExtension {
                 name: "mlpack".into(),
-                version: "v1.5.5".into(),
+                version: "v1.5.6".into(),
                 platform: "linux_amd64".into(),
                 pin: hash.clone(),
                 path: path.clone(),
             },
             PinnedExtension {
                 name: "onager".into(),
-                version: "v1.5.5".into(),
+                version: "v1.5.6".into(),
                 platform: "linux_amd64".into(),
                 pin: other_hash,
                 path: other,
@@ -3010,7 +3010,7 @@ mod extension_tests {
             Err(Error::ExtensionChanged { changes }) => assert_eq!(
                 changes,
                 vec![format!(
-                    "mlpack on DuckDB v1.5.5, linux_amd64: pinned {hash}, and when the run ended {} hashed to {found}",
+                    "mlpack on DuckDB v1.5.6, linux_amd64: pinned {hash}, and when the run ended {} hashed to {found}",
                     path.display()
                 )]
             ),
@@ -3273,7 +3273,7 @@ mod extension_tests {
                 .warnings,
             vec![
                 format!(
-                    "mlpack is vetted on DuckDB v1.5.5, and this engine is DuckDB v1.5.4; running it anyway ({VETTED_EXTENSIONS_DOC})"
+                    "mlpack is vetted on DuckDB v1.5.6, and this engine is DuckDB v1.5.4; running it anyway ({VETTED_EXTENSIONS_DOC})"
                 ),
                 format!(
                     "step 'a' (s0.sql) can run or write SQL that is not in its file: IMPORT DATABASE on line 1, query() on line 2, .duckdbrc on line 3{tail}"
@@ -3302,7 +3302,7 @@ mod extension_tests {
             ],
         );
         assert_eq!(
-            refusals(check_extension_installs(&sql, Some(&v("1.5.5")))),
+            refusals(check_extension_installs(&sql, Some(&v("1.5.6")))),
             vec![
                 "step 'b' (s1.sql, line 1) installs anofox_forecast from the community registry, and anofox_forecast is not on the vetted list"
             ]
@@ -3404,7 +3404,7 @@ mod extension_tests {
             ],
         );
         assert_eq!(
-            refusals(check_extension_installs(&sql, Some(&v("1.5.5")))),
+            refusals(check_extension_installs(&sql, Some(&v("1.5.6")))),
             vec![
                 "step 'a' (s0.sql, line 1) installs anofox_forecast from the community registry, and anofox_forecast is not on the vetted list",
                 "hook on_init 'h' (s1.sql, line 2) installs mlpack from the repository core_nightly; a community extension is installed FROM community",
@@ -3473,15 +3473,15 @@ mod extension_tests {
                 .warnings,
             vec![
                 format!(
-                    "mlpack is vetted on DuckDB v1.5.5, and this engine is DuckDB v1.5.4; running it anyway ({VETTED_EXTENSIONS_DOC})"
+                    "mlpack is vetted on DuckDB v1.5.6, and this engine is DuckDB v1.5.4; running it anyway ({VETTED_EXTENSIONS_DOC})"
                 ),
                 format!(
-                    "h3 is vetted on DuckDB v1.5.5, and this engine is DuckDB v1.5.4; running it anyway ({VETTED_EXTENSIONS_DOC})"
+                    "h3 is vetted on DuckDB v1.5.6, and this engine is DuckDB v1.5.4; running it anyway ({VETTED_EXTENSIONS_DOC})"
                 ),
             ]
         );
         assert_eq!(
-            check_extension_installs(&sql, Some(&v("1.5.5")))
+            check_extension_installs(&sql, Some(&v("1.5.6")))
                 .unwrap()
                 .warnings,
             Vec::<String>::new(),
@@ -3490,7 +3490,7 @@ mod extension_tests {
         assert_eq!(
             check_extension_installs(&sql[..1], None).unwrap().warnings,
             vec![format!(
-                "mlpack is vetted on DuckDB v1.5.5, and arc could not read this engine's version; running it anyway ({VETTED_EXTENSIONS_DOC})"
+                "mlpack is vetted on DuckDB v1.5.6, and arc could not read this engine's version; running it anyway ({VETTED_EXTENSIONS_DOC})"
             )]
         );
     }
@@ -3542,7 +3542,7 @@ mod extension_tests {
         let answers: Vec<String> = [
             "version\tv1.5.4",
             "platform\tlinux_amd64",
-            "extension\tmlpack\tcommunity\tv1.5.5\t/x/mlpack.duckdb_extension",
+            "extension\tmlpack\tcommunity\tv1.5.6\t/x/mlpack.duckdb_extension",
             // DuckDB gives no repository and no version for a file with no `.info` beside it,
             // and a tab in the path stays in it.
             "extension\thttpfs\t\t\t/x/a\tb/httpfs.duckdb_extension",
@@ -3563,7 +3563,7 @@ mod extension_tests {
                 ReportedExtension {
                     path: Some("/x/mlpack.duckdb_extension".into()),
                     repository: Some("community".into()),
-                    version: Some("v1.5.5".into()),
+                    version: Some("v1.5.6".into()),
                 },
             ),
             (
@@ -3608,7 +3608,7 @@ mod extension_tests {
                 ),
             ],
         );
-        let installs = check_extension_installs(&sql, Some(&v("1.5.5"))).unwrap();
+        let installs = check_extension_installs(&sql, Some(&v("1.5.6"))).unwrap();
         assert_eq!(installs.recorded, vec!["httpfs", "mlpack", "spatial"]);
         assert_eq!(installs.installed, vec!["mlpack"]);
     }
@@ -3617,13 +3617,13 @@ mod extension_tests {
     fn the_check_before_a_file_runs_records_what_it_installs_that_no_check_found() {
         let dir = tempfile::tempdir().unwrap();
         let before = sources(dir.path(), &[("step 'a'", "INSTALL httpfs;")]);
-        let installs = check_extension_installs(&before, Some(&v("1.5.5"))).unwrap();
+        let installs = check_extension_installs(&before, Some(&v("1.5.6"))).unwrap();
         let mut recheck = ExtensionRecheck::new(
             installs,
             Vec::new(),
             Vec::new(),
             &ExtensionPins::new(),
-            Some(&v("1.5.5")),
+            Some(&v("1.5.6")),
         );
         assert_eq!(recheck.recorded(), ["httpfs"]);
         let engine = mock::MockEngine::new();
@@ -3661,21 +3661,21 @@ mod extension_tests {
     fn the_extensions_a_run_loaded_are_each_named_once_with_what_the_first_report_gave() {
         let mut loaded = LoadedExtensions::default();
         loaded.add(vec![
-            ("fts".into(), reported("core", "v1.5.5", "/a/fts")),
+            ("fts".into(), reported("core", "v1.5.6", "/a/fts")),
             ("json".into(), reported("", "", BUILT_IN)),
         ]);
         loaded.add(vec![
-            ("httpfs".into(), reported("core", "v1.5.5", "/a/httpfs")),
+            ("httpfs".into(), reported("core", "v1.5.6", "/a/httpfs")),
             ("fts".into(), reported("community", "0000000", "/b/fts")),
         ]);
         assert_eq!(
             loaded.iter().cloned().collect::<Vec<_>>(),
             vec![
-                ("fts".to_string(), reported("core", "v1.5.5", "/a/fts")),
+                ("fts".to_string(), reported("core", "v1.5.6", "/a/fts")),
                 ("json".to_string(), reported("", "", BUILT_IN)),
                 (
                     "httpfs".to_string(),
-                    reported("core", "v1.5.5", "/a/httpfs")
+                    reported("core", "v1.5.6", "/a/httpfs")
                 ),
             ]
         );
@@ -3683,10 +3683,10 @@ mod extension_tests {
 
     #[test]
     fn the_answer_a_steps_process_writes_is_read_in_order_and_nothing_else_is() {
-        let answer = "arc-answer:extension\tfts\tcore\tv1.5.5\t/x/fts.duckdb_extension\n\
+        let answer = "arc-answer:extension\tfts\tcore\tv1.5.6\t/x/fts.duckdb_extension\n\
                       arc-answer:extension\tparquet\t\t\t(BUILT-IN)\n\
                       extension\tunmarked\tcore\tv1\t/x/unmarked\n\
-                      arc-answer:version\tv1.5.5\n\
+                      arc-answer:version\tv1.5.6\n\
                       arc-answer:extension\tshort\tcore\n\
                       arc-answer:extension\thttpfs\t\t\t/x/a\tb\n";
         assert_eq!(
@@ -3694,7 +3694,7 @@ mod extension_tests {
             vec![
                 (
                     "fts".to_string(),
-                    reported("core", "v1.5.5", "/x/fts.duckdb_extension")
+                    reported("core", "v1.5.6", "/x/fts.duckdb_extension")
                 ),
                 ("parquet".to_string(), reported("", "", BUILT_IN)),
                 ("httpfs".to_string(), reported("", "", "/x/a\tb")),

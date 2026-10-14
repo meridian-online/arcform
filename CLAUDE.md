@@ -35,7 +35,7 @@ The build track is maintained in the project's private planning repo. In plain t
 
 ## Known issues
 
-- **Tests need libduckdb to link** — where the DuckDB shared library is not on the linker search path, `cargo test` fails with `cannot find -lduckdb`. Point the linker at it (for example `DUCKDB_LIB_DIR`) and the suite compiles and runs.
+- **Development builds need libduckdb to link** — where the DuckDB shared library is not on the linker search path, `cargo build` and `cargo test` fail with `cannot find -lduckdb`. Point the linker at a DuckDB v1.5.6 library (for example `DUCKDB_LIB_DIR=/opt/homebrew/lib`) and the suite compiles and runs. Release builds use `--features mcp,bundled-duckdb`, which compiles DuckDB into the binary and needs no library, but takes tens of minutes from cold; keep it off for everyday work, and run one such build at a time.
 
 ## Tier-2 references — load on demand
 

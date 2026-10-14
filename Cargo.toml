@@ -31,7 +31,11 @@ serde_json = "1"
 thiserror = "2"
 owo-colors = "4"
 sqlparser = { version = "0.55", features = ["visitor"] }
-duckdb = "1.2"
+# Pinned exact: arc loads DuckDB extensions (finetype among them) into this library
+# in-process, and an extension loads only into the DuckDB version it was built for.
+# 1.10506.0 is DuckDB v1.5.6. Bump in lockstep with `DUCKDB_VERSION` in
+# .github/workflows/ci.yml and the versions in src/vetted_extensions.json.
+duckdb = "=1.10506.0"
 semver = "1"
 sha2 = "0.10"
 humantime = "2"
@@ -107,6 +111,19 @@ opendal = ["dep:opendal", "dep:opendal-http-transport-reqwest", "dep:reqwest", "
 # because the entry point is an `arc mcp` subcommand. Deliberately dependency-free —
 # it speaks JSON-RPC 2.0 over stdio with the `serde_json` already in the graph.
 mcp = ["cli"]
+# Compile DuckDB into the binary instead of linking the system libduckdb, with the
+# parquet and json extensions: arc reads parquet in-process, and the plain `bundled`
+# build leaves both out. ICU, the third extension the official library carries, is
+# not compiled in: the crate builds it only through its CMake backend
+# (`bundled-cmake`), which works from a duckdb-rs git checkout and not from the
+# crates.io package (whose sources carry core_functions, json and parquet alone), so
+# `cargo install` could not build it. A query that needs ICU, such as `AT TIME ZONE`,
+# loads `icu` from DuckDB's extension directory when `INSTALL icu` has put it there;
+# where it has not, DuckDB's error names `INSTALL icu`.
+# Release binaries are built with `--features mcp,bundled-duckdb`. Off by default: a
+# cold build compiles DuckDB's C++ and takes tens of minutes, so everyday development
+# links the system library through `DUCKDB_LIB_DIR`.
+bundled-duckdb = ["duckdb/bundled", "duckdb/parquet", "duckdb/json"]
 
 [dev-dependencies]
 tempfile = "3"

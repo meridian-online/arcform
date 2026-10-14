@@ -6,26 +6,26 @@ The list arc enforces is `src/vetted_extensions.json`, compiled into the `arc` b
 
 ## The list
 
-Each extension below has a permissive licence, a build the community registry serves for `linux_amd64` and `osx_arm64`, and a statement that ran it on data and checked the result. The entries were taken from the community registry's descriptors at commit `80bed7b173cd`, and their builds were probed on 2026-09-27.
+Each extension below has a permissive licence, a build the community registry serves for `linux_amd64` and `osx_arm64`, and a statement that ran it on data and checked the result. The entries were taken from the community registry's descriptors at commit `80bed7b173cd`. Their builds for DuckDB v1.5.6, the version arc is built against, were probed on both platforms on 2026-10-14, and each statement was run again on v1.5.6 on `osx_arm64`.
 
 | extension | licence | repository | DuckDB version | what was run |
 |---|---|---|---|---|
-| `dta` | MIT | `codedthinking/duckdb-dta` | v1.5.5 | read a Stata file; write one and read it back |
-| `finetype` | MIT | `meridian-online/finetype` | v1.5.5 | the semantic type of a column and of a value is inferred from what it holds |
-| `h3` | Apache-2.0 | `isaacbrodsky/h3-duckdb` | v1.5.5 | the hexagonal cell for a point |
-| `http_client` | MIT | `query-farm/httpclient` | v1.5.5 | an HTTP GET returning status and body |
-| `minijinja` | Apache-2.0 | `query-farm/minijinja` | v1.5.5 | a template is rendered once for each row and once over all of them |
-| `mlpack` | MIT | `eddelbuettel/duckdb-mlpack` | v1.5.5 | train a random forest, store it and score new rows; a logistic regression; k-means |
-| `onager` | MIT OR Apache-2.0 | `CogitatorTech/onager` | v1.5.5 | shortest paths and components from an edge table |
-| `rapidfuzz` | MIT | `query-farm/rapidfuzz` | v1.5.5 | a token-sort ratio between two strings |
-| `splink_udfs` | MIT | `moj-analytical-services/splink_udfs` | v1.5.5 | names are blocked by the soundex of the surname and compared without diacritics |
-| `stats_duck` | Apache-2.0 | `KoliStat/the-stats-duck` | v1.5.5 | a two-sample t-test |
-| `stochastic` | Apache-2.0 | `query-farm/stochastic` | v1.5.5 | the normal distribution at its known points |
-| `subtoken` | MIT | `meridian-online/subtoken` | v1.5.5 | embed text and rank by cosine similarity |
-| `textplot` | Apache-2.0 | `query-farm/textplot` | v1.5.5 | a text plot from SQL |
-| `us_address_standardizer` | MIT | `ericmanning/duckdb-address-standardizer` | v1.5.5 | a US address parsed into its parts |
-| `webbed` | MIT | `teaguesterling/duckdb_webbed` | v1.5.5 | parse XML into rows; write rows as XML |
-| `zipfs` | MIT | `isaacbrodsky/duckdb-zipfs` | v1.5.5 | read a file inside a zip archive |
+| `dta` | MIT | `codedthinking/duckdb-dta` | v1.5.6 | read a Stata file; write one and read it back |
+| `finetype` | MIT | `meridian-online/finetype` | v1.5.6 | the semantic type of a column and of a value is inferred from what it holds |
+| `h3` | Apache-2.0 | `isaacbrodsky/h3-duckdb` | v1.5.6 | the hexagonal cell for a point |
+| `http_client` | MIT | `query-farm/httpclient` | v1.5.6 | an HTTP GET returning status and body |
+| `minijinja` | Apache-2.0 | `query-farm/minijinja` | v1.5.6 | a template is rendered once for each row and once over all of them |
+| `mlpack` | MIT | `eddelbuettel/duckdb-mlpack` | v1.5.6 | train a random forest, store it and score new rows; a logistic regression; k-means |
+| `onager` | MIT OR Apache-2.0 | `CogitatorTech/onager` | v1.5.6 | shortest paths and components from an edge table |
+| `rapidfuzz` | MIT | `query-farm/rapidfuzz` | v1.5.6 | a token-sort ratio between two strings |
+| `splink_udfs` | MIT | `moj-analytical-services/splink_udfs` | v1.5.6 | names are blocked by the soundex of the surname and compared without diacritics |
+| `stats_duck` | Apache-2.0 | `KoliStat/the-stats-duck` | v1.5.6 | a two-sample t-test |
+| `stochastic` | Apache-2.0 | `query-farm/stochastic` | v1.5.6 | the normal distribution at its known points |
+| `subtoken` | MIT | `meridian-online/subtoken` | v1.5.6 | embed text and rank by cosine similarity |
+| `textplot` | Apache-2.0 | `query-farm/textplot` | v1.5.6 | a text plot from SQL |
+| `us_address_standardizer` | MIT | `ericmanning/duckdb-address-standardizer` | v1.5.6 | a US address parsed into its parts |
+| `webbed` | MIT | `teaguesterling/duckdb_webbed` | v1.5.6 | parse XML into rows; write rows as XML |
+| `zipfs` | MIT | `isaacbrodsky/duckdb-zipfs` | v1.5.6 | read a file inside a zip archive |
 
 ## What `arc run` refuses
 
@@ -39,7 +39,7 @@ Each extension below has a permissive licence, a build the community registry se
 
 `FORCE INSTALL` is checked as `INSTALL` is, in any letter case, and so is an `INSTALL` that follows `EXPLAIN ANALYZE`, which DuckDB runs. A step whose SQL arc cannot otherwise parse is checked too.
 
-arc reads a SQL file as the DuckDB CLI reads a file given with `-f` with its default parser, which is how `arc run` runs a step. A statement that names the switch to the second parser is refused (above). The rules are copied from DuckDB v1.5.5's source, which is the same as v1.5.4's:
+arc reads a SQL file as the DuckDB CLI reads a file given with `-f` with its default parser, which is how `arc run` runs a step. A statement that names the switch to the second parser is refused (above). The rules are copied from DuckDB v1.5.5's source, which is the same as v1.5.4's and v1.5.6's:
 
 - The CLI's lines and the batches it hands the parser. A line starting with `.` or `#` while no statement is open is a dot command or a comment, and is not SQL, whatever quote or comment it holds. A line starting with the byte `0x03` drops the lines held before it. A NUL byte drops the rest of the chunk the CLI read it in.
 - The parser's pre-pass, which reads a byte-order mark, a zero-width space (U+200B) and the other unicode spaces it knows as a space, except inside what it reads as a string or a comment.
@@ -70,7 +70,7 @@ This is not a boundary. A `command:` step can start a DuckDB of its own and inst
 
   The warning says arc does not read the SQL the step builds or writes, and not that the step installs anything. It reads shapes and is not a boundary: a path to `.duckdbrc` assembled from pieces, such as `'~/.duck' || 'dbrc'`, draws no warning. Neither does SQL held in a database. A view or a table macro holds SQL in a database, and a step that reads from it runs that SQL, in the database arc runs the step on or in one the step attaches: after `ATTACH 'lib.duckdb' AS lib;`, `FROM lib.v;` runs what the view `v` holds, and a view holding `FROM enable_peg_parser()` switches the parser for the statements after it, though the step's file does not name the switch.
 - What a DuckDB CLI dot command in a SQL file runs, such as the file `.read` names or the program `.shell` starts. arc skips the dot command's line, as DuckDB does.
-- A DuckDB version other than v1.5.4 and v1.5.5. The CLI's rules above were read from those two, and another version's were not compared.
+- A DuckDB version other than v1.5.4, v1.5.5 and v1.5.6. The CLI's rules above were read from those three, and another version's were not compared.
 
 ## The DuckDB version
 
@@ -84,12 +84,12 @@ A Protocol pins the build of each community extension it installs under the `ext
 engine_version: ">=1.5"
 extensions:
   mlpack:
-    v1.5.5:
-      linux_amd64: <the SHA-256 of the file DuckDB v1.5.5 installs on linux_amd64>
-      osx_arm64: <the SHA-256 of the file DuckDB v1.5.5 installs on osx_arm64>
+    v1.5.6:
+      linux_amd64: <the SHA-256 of the file DuckDB v1.5.6 installs on linux_amd64>
+      osx_arm64: <the SHA-256 of the file DuckDB v1.5.6 installs on osx_arm64>
 ```
 
-A manifest whose pin is not 64 lower-case hex digits is refused when it loads, and the message names the pin's place, such as `extensions.mlpack.v1.5.5.linux_amd64`.
+A manifest whose pin is not 64 lower-case hex digits is refused when it loads, and the message names the pin's place, such as `extensions.mlpack.v1.5.6.linux_amd64`.
 
 - **Before any step or hook runs**, `arc run` installs each extension that a step's or hook's SQL installs `FROM community` and that has a pin for the engine's DuckDB version and platform. It runs `INSTALL <name> FROM community` on the DuckDB the steps run on, with no Protocol database and no `LOAD`, so the extension's code does not run in the check; on a machine that does not hold the extension yet, the install fetches it. arc then hashes the file DuckDB names as the extension's `install_path` in `duckdb_extensions()`, and refuses the run with exit 1 when that hash differs from the pin, when the install fails, or when DuckDB names no installed file. The refusal names the extension, the DuckDB version, the platform, the pin, the hash found and the file, and for a hash that differs names `arc upgrade <name>`; a refusal because the install failed or named no file says so and does not say the file differs. The check runs whether or not the steps are fresh, and under `--force`.
 - **Just before a step or hook runs**, an extension on the list that its file, read again, installs `FROM community`, and that no check in the run has found, is checked as above: installed and compared when it has a pin, with the step or hook refused with exit 2 when the hash differs, as [Each file, read again](#each-file-read-again) says.
@@ -114,7 +114,7 @@ The record's `run.engine` gives:
 ```json
 "engine": {
   "arc": "0.1.0",
-  "duckdb": "v1.5.5",
+  "duckdb": "v1.5.6",
   "duckdb_cli": "v1.5.4",
   "platform": "linux_amd64",
   "extensions": [
