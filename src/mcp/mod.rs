@@ -68,7 +68,8 @@ const INSTRUCTIONS: &str = "Use arc when you analyse data over DuckDB and the wo
     answers what arc reads a SQL statement as: an operation it holds, with the table and the \
     arguments operation_record takes, or none; sql_record records a SQL statement as a new \
     step of a Protocol, as the operation it is read as or else as a SQL step, and runs \
-    nothing.";
+    nothing; protocol_create makes a new Protocol in a directory, as arc create-protocol does, \
+    and refuses one that already has a spec.";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool result shapes
@@ -463,6 +464,7 @@ mod tests {
             "operation_record",
             "sql_recognise",
             "sql_record",
+            "protocol_create",
         ] {
             assert!(
                 names.contains(&expected),

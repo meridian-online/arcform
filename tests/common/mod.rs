@@ -73,11 +73,22 @@ pub fn arc_run(project: &Path) -> String {
 /// module too.
 #[allow(dead_code)]
 pub fn mcp_session(dir: &Path, requests: &[serde_json::Value]) -> Vec<String> {
+    mcp_session_env(dir, requests, &[])
+}
+
+/// [`mcp_session`], with `env` set on the spawned server.
+#[allow(dead_code)]
+pub fn mcp_session_env(
+    dir: &Path,
+    requests: &[serde_json::Value],
+    env: &[(&str, &Path)],
+) -> Vec<String> {
     use std::io::Write;
     use std::process::Stdio;
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_arc"))
         .current_dir(dir)
+        .envs(env.iter().copied())
         .arg("mcp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

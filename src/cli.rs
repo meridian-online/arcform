@@ -166,8 +166,9 @@ pub enum Commands {
     /// Protocol+Run contract), `operator_describe` (an operator's `with:` schema),
     /// `operation_describe` (the SQL operations arc holds, and what one takes),
     /// `operation_record` (record an operation as a step of a Protocol),
-    /// `sql_recognise` (what arc reads a SQL statement as) and `sql_record` (record
-    /// a SQL statement as a step of a Protocol).
+    /// `sql_recognise` (what arc reads a SQL statement as), `sql_record` (record
+    /// a SQL statement as a step of a Protocol) and `protocol_create` (make a new
+    /// Protocol, as `arc create-protocol` does).
     #[cfg(feature = "mcp")]
     Mcp,
 }
@@ -410,17 +411,27 @@ pub enum HistoryCmd {
     },
 }
 
-/// Execute the `arc create-protocol` command: assemble the manifest value the
-/// arguments describe and hand it to the library's creation path — the same
-/// gate and the same atomic write every other caller gets. Nothing is written
-/// unless the result loads; an existing spec is refused, never overwritten.
-pub fn create_protocol(
+/// What [`create_protocol_files`] wrote: the manifest's path, and what became of the
+/// ignore list and the attributes file beside it.
+#[derive(Debug)]
+pub(crate) struct CreatedProtocol {
+    pub manifest: PathBuf,
+    pub ignore: IgnoreList,
+    pub merge_rule: MergeRule,
+}
+
+/// Write a new Protocol into `dir`: assemble the manifest value the arguments
+/// describe and hand it to the library's creation path — the same gate and the
+/// same atomic write every other caller gets. Nothing is written unless the
+/// result loads; an existing spec is refused, never overwritten. Prints nothing,
+/// so a caller whose standard output is a protocol channel (`arc mcp`) can use it.
+pub(crate) fn create_protocol_files(
     dir: &Path,
     name: Option<String>,
     engine: Option<String>,
     db: Option<String>,
     history: &LocalHistory,
-) -> Result<()> {
+) -> Result<CreatedProtocol> {
     let name = match name {
         Some(name) => name,
         None => dir
@@ -454,15 +465,31 @@ pub fn create_protocol(
     // attributes file the author may have written first.
     let ignore = write_ignore_list(dir, manifest.db.as_deref(), &[])?;
     let merge_rule = write_merge_rule(dir)?;
+    Ok(CreatedProtocol {
+        manifest: dir.join(crate::spec::MANIFEST_FILENAME),
+        ignore,
+        merge_rule,
+    })
+}
 
+/// Execute the `arc create-protocol` command: [`create_protocol_files`], then say
+/// what it wrote.
+pub fn create_protocol(
+    dir: &Path,
+    name: Option<String>,
+    engine: Option<String>,
+    db: Option<String>,
+    history: &LocalHistory,
+) -> Result<()> {
+    let created = create_protocol_files(dir, name, engine, db, history)?;
     println!(
         "created {} — author steps with `arc edit-protocol`",
-        dir.join(crate::spec::MANIFEST_FILENAME).display()
+        created.manifest.display()
     );
-    if ignore == IgnoreList::Written {
+    if created.ignore == IgnoreList::Written {
         println!("created {}", dir.join(IGNORE_FILENAME).display());
     }
-    match merge_rule {
+    match created.merge_rule {
         MergeRule::Written => println!("created {}", dir.join(ATTRIBUTES_FILENAME).display()),
         MergeRule::Added => println!(
             "added the log's merge rule to {}",

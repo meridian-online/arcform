@@ -22,6 +22,9 @@
 //! - `sql_record` records a SQL statement as a new step of a Protocol, through the
 //!   same record path `arc sql record` takes, so the same statement writes the same
 //!   bytes from either.
+//! - `protocol_create` makes a new Protocol in a directory, through the same
+//!   creation `arc create-protocol` takes, so the same request writes the same files
+//!   from either.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -544,6 +547,53 @@ fn sql_record_schema() -> Value {
     })
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// protocol_create
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Make a new Protocol in `dir` as `arc create-protocol` does: `arcform.yaml`, the
+/// ignore list and the log's merge rule, through the one creation both share. An
+/// existing spec is refused and left as it was. `files_written` lists only the files
+/// written or added to; the tool prints nothing, since standard output is JSON-RPC.
+fn protocol_create(args: &Value) -> ToolResult {
+    let dir = PathBuf::from(required_string(args, "dir")?);
+    let optional = |key: &str| -> std::result::Result<Option<String>, String> {
+        match args.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) => Ok(Some(value.clone())),
+            Some(other) => Err(format!("`{key}` must be a string, not {other}")),
+        }
+    };
+    let (name, engine, db) = (optional("name")?, optional("engine")?, optional("db")?);
+    let history = open_history()?;
+    let created = crate::cli::create_protocol_files(&dir, name, engine, db, &history)
+        .map_err(|e| e.to_string())?;
+    let mut files_written = vec![crate::spec::MANIFEST_FILENAME];
+    if created.ignore == crate::edit::IgnoreList::Written {
+        files_written.push(crate::edit::IGNORE_FILENAME);
+    }
+    if created.merge_rule != crate::edit::MergeRule::Kept {
+        files_written.push(crate::edit::ATTRIBUTES_FILENAME);
+    }
+    Ok(ToolOutput::json(json!({
+        "manifest": created.manifest.display().to_string(),
+        "files_written": files_written,
+    })))
+}
+
+fn protocol_create_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "dir": { "type": "string", "description": "The directory to make the Protocol in; arcform.yaml is written there. Made if absent." },
+            "name": { "type": "string", "description": "The Protocol's name. Defaults to the directory's name." },
+            "engine": { "type": "string", "description": "The SQL engine the Protocol targets. Defaults to duckdb." },
+            "db": { "type": "string", "description": "The Protocol's working database file, relative to the directory. Defaults to none." }
+        },
+        "required": ["dir"]
+    })
+}
+
 /// The tools native to `arc`.
 pub(super) fn tools() -> Vec<ToolDef> {
     vec![
@@ -587,6 +637,13 @@ pub(super) fn tools() -> Vec<ToolDef> {
             description: "Record one SQL statement as a new step at the end of a Protocol. A statement sql_recognise reads as an operation is recorded as the step operation_record writes for it; any other statement DuckDB parses is recorded as a SQL step, whose model has no `-- generated:` line, so arc does not rewrite it: for a SELECT the model's first line is `CREATE OR REPLACE TABLE \"<name>\" AS` and the statement as typed follows it, so the step makes a table of its name when it runs. Writes the step; runs nothing.",
             input_schema: sql_record_schema,
             handler: sql_record,
+            annotations: Annotations::WRITES,
+        },
+        ToolDef {
+            name: "protocol_create",
+            description: "Make a new Protocol in a directory, as `arc create-protocol` does: writes arcform.yaml with no steps, and the .gitignore and .gitattributes beside it. Refuses a directory that already holds an arcform.yaml and leaves it as it was. Runs nothing.",
+            input_schema: protocol_create_schema,
+            handler: protocol_create,
             annotations: Annotations::WRITES,
         },
     ]
