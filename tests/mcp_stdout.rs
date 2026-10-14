@@ -205,6 +205,10 @@ fn protocol_run_failure_carries_bounded_tail() {
         "the error does not carry the run's last output: {text}"
     );
     assert!(
+        !text.contains('\u{1b}'),
+        "the error carries terminal escape sequences: {text:?}"
+    );
+    assert!(
         text.len() < 6_000,
         "the error is not bounded: {} bytes",
         text.len()
@@ -295,5 +299,43 @@ fn protocol_run_passes_each_param_to_the_run() {
     assert_eq!(
         who["value"], "somebody",
         "the run did not take the param: {who}"
+    );
+}
+
+#[test]
+fn protocol_run_answers_when_a_step_leaves_a_process_holding_its_output() {
+    let dir = copy_fixture("mcp_stdout");
+    // The background `sleep` inherits the run's standard output and standard error and
+    // keeps both open for 30 seconds after `arc run` has exited.
+    with_command(dir.path(), "sleep 30 &");
+    let started = std::time::Instant::now();
+    let result = protocol_run(dir.path(), json!({}));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "protocol_run waited {elapsed:?} on a process the run left behind"
+    );
+    assert_eq!(result["isError"], false, "protocol_run failed: {result}");
+    assert_eq!(result["structuredContent"]["run"]["outcome"], "success");
+}
+
+#[test]
+fn protocol_run_refuses_a_param_key_the_command_line_cannot_carry() {
+    let dir = copy_fixture("mcp_stdout");
+    for (key, why) in [("a=b", "`=`"), ("", "empty")] {
+        let result = protocol_run(dir.path(), json!({ "params": { key: "c" } }));
+        assert_eq!(
+            result["isError"], true,
+            "a key {why} was accepted: {result}"
+        );
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains(&format!("`{key}`")),
+            "the error does not name the key {key:?}: {text}"
+        );
+    }
+    assert!(
+        !dir.path().join("build/.arcform/runs").exists(),
+        "a refused call ran the Protocol"
     );
 }

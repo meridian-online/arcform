@@ -88,6 +88,10 @@ fn protocol_run(args: &Value) -> ToolResult {
 /// The most of a child run's output [`run_child`] keeps: its last 4,000 bytes.
 const TAIL_BYTES: usize = 4_000;
 
+/// How long [`run_child`] waits, once `arc run` has exited, for the rest of what it
+/// printed.
+const READER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// What a child `arc run` left: how it exited and the end of what it printed.
 struct ChildRun {
     status: std::process::ExitStatus,
@@ -102,7 +106,7 @@ struct ChildRun {
 /// Its standard input is closed, and its standard output and standard error are piped
 /// and drained on two threads into one buffer that keeps the last [`TAIL_BYTES`], so a
 /// child that prints megabytes never blocks on a full pipe and never reaches this
-/// process's standard output.
+/// process's standard output. Escape sequences are dropped from the tail.
 fn run_child(dir: &Path, force: bool, params: &[(String, String)]) -> std::io::Result<ChildRun> {
     use std::io::Read;
     use std::process::{Command, Stdio};
@@ -127,8 +131,10 @@ fn run_child(dir: &Path, force: bool, params: &[(String, String)]) -> std::io::R
     let tail = Arc::new(Mutex::new(std::collections::VecDeque::<u8>::with_capacity(
         TAIL_BYTES,
     )));
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     let drain = |mut pipe: Box<dyn Read + Send>| {
         let tail = Arc::clone(&tail);
+        let done = done_tx.clone();
         std::thread::spawn(move || {
             let mut chunk = [0u8; 8192];
             loop {
@@ -142,6 +148,7 @@ fn run_child(dir: &Path, force: bool, params: &[(String, String)]) -> std::io::R
                     }
                 }
             }
+            let _ = done.send(());
         })
     };
     let readers = [
@@ -149,8 +156,16 @@ fn run_child(dir: &Path, force: bool, params: &[(String, String)]) -> std::io::R
         child.stderr.take().map(|p| drain(Box::new(p))),
     ];
     let status = child.wait()?;
-    for reader in readers.into_iter().flatten() {
-        let _ = reader.join();
+    // A process the run left behind, such as a step's `sleep 30 &`, inherits the pipes
+    // and holds them open after `arc run` exits. Wait a short while for the readers to
+    // reach the end of what the run printed, then answer with what has arrived and
+    // leave a reader still waiting on such a process to finish on its own.
+    let deadline = std::time::Instant::now() + READER_GRACE;
+    for _ in readers.iter().flatten() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if done_rx.recv_timeout(left).is_err() {
+            break;
+        }
     }
 
     let bytes: Vec<u8> = tail
@@ -161,8 +176,30 @@ fn run_child(dir: &Path, force: bool, params: &[(String, String)]) -> std::io::R
         .collect();
     Ok(ChildRun {
         status,
-        tail: String::from_utf8_lossy(&bytes).into_owned(),
+        tail: strip_ansi(&String::from_utf8_lossy(&bytes)),
     })
+}
+
+/// Drop terminal escape sequences, which arc writes whatever `NO_COLOR` says, so the
+/// tail an agent reads is plain text. A control sequence (`ESC [` up to its final
+/// byte) is dropped whole, and any other escape with the one character after it.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        if chars.next() == Some('[') {
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Runtime parameter overrides, accepted as an object `{key: value}` or an array of
@@ -175,16 +212,23 @@ fn parse_params(value: Option<&Value>) -> std::result::Result<Vec<(String, Strin
         return Ok(Vec::new());
     }
     if let Some(map) = value.as_object() {
-        return Ok(map
+        return map
             .iter()
             .map(|(key, value)| {
+                // Each param reaches the run as `--param KEY=VALUE`, which splits at the
+                // first `=`, so a key holding one, or none at all, cannot get there whole.
+                if key.is_empty() || key.contains('=') {
+                    return Err(format!(
+                        "param key `{key}` must be non-empty and hold no `=`"
+                    ));
+                }
                 let value = match value {
                     Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                (key.clone(), value)
+                Ok((key.clone(), value))
             })
-            .collect());
+            .collect();
     }
     if let Some(array) = value.as_array() {
         let mut out = Vec::new();
@@ -195,7 +239,11 @@ fn parse_params(value: Option<&Value>) -> std::result::Result<Vec<(String, Strin
             let (key, value) = entry
                 .split_once('=')
                 .ok_or_else(|| format!("param `{entry}` must be KEY=VALUE"))?;
-            out.push((key.trim().to_string(), value.to_string()));
+            let key = key.trim();
+            if key.is_empty() {
+                return Err(format!("param `{entry}` has an empty key"));
+            }
+            out.push((key.to_string(), value.to_string()));
         }
         return Ok(out);
     }
@@ -700,5 +748,23 @@ mod tests {
 
         assert_eq!(parse_params(None).unwrap(), Vec::new());
         assert!(parse_params(Some(&json!("nope"))).is_err());
+    }
+
+    #[test]
+    fn parse_params_refuses_a_key_the_command_line_cannot_carry() {
+        let err = parse_params(Some(&json!({ "a=b": "c" }))).unwrap_err();
+        assert!(err.contains("`a=b`"), "{err}");
+        let err = parse_params(Some(&json!({ "": "c" }))).unwrap_err();
+        assert!(err.contains("``"), "{err}");
+        let err = parse_params(Some(&json!(["=c"]))).unwrap_err();
+        assert!(err.contains("`=c`"), "{err}");
+    }
+
+    #[test]
+    fn strip_ansi_drops_escape_sequences_and_keeps_the_text() {
+        assert_eq!(
+            strip_ansi("\u{1b}[2m[hook]\u{1b}[0m \u{1b}[1;31msetup\u{1b}[0m ...\nplain"),
+            "[hook] setup ...\nplain"
+        );
     }
 }
