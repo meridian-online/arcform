@@ -15,8 +15,17 @@ src/
   introspect.rs   # SQL introspection via sqlparser-rs
   precondition.rs # Typed step preconditions (modified_after, fresh, command, tool)
   state.rs        # Run state tracking (step config hash, artifact hash, staleness)
+  inspect.rs      # Read-only look inside a Protocol's database: `arc table describe`, `arc sql query`
   error.rs        # Error types
+  mcp/            # `arc mcp`: a Model Context Protocol server over stdio (feature `mcp`)
+    mod.rs        #   JSON-RPC transport, protocol-version negotiation, the tool registry
+    finetype.rs   #   The five FineType tools, each running the `finetype` command
+    hero.rs       #   arc's own tools: protocol_run, protocol_create, the record, describe and query tools
 ```
+
+### `arc mcp` and `protocol_run`
+
+The MCP stdio transport gives standard output to JSON-RPC alone: one message per line, and any other byte there breaks the client's reading of the stream. A run prints a great deal (step progress, the asset graph, the rows a SQL step's `SELECT` prints on the DuckDB command line, whatever a `command:` step writes), so `protocol_run` does not run the Protocol inside the server. It starts `arc run` as a child process from the server's own executable, in the Protocol's directory, with standard input closed and standard output and standard error piped into a buffer that keeps the last 4,000 bytes. When the child exits, the tool returns the run record it wrote under the Protocol's runs directory; when it wrote none, the tool's error carries the exit status and that tail of output.
 
 ## Key types
 

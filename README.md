@@ -1,8 +1,113 @@
 # Arcform
 
-> Local-first data pipeline engine for analytical workflows.
+> Local-first data analysis in one binary, for people and their agents.
 
-Arcform is a Rust-based workflow engine built for data analysts who want the power of a structured pipeline without the overhead of cloud infrastructure. It runs as a single binary, orchestrates multi-stage dataflows, and understands the internal structure of its steps — not just whether they succeeded.
+Arcform's command, `arc`, is for anyone working with data, whether it is new or already in place, and whether the job is a quick look or the upkeep of a larger data asset. Batteries are included: one binary fetches data, models it in SQL on DuckDB, runs advanced analytics through its operators, exports the results, and keeps a local history of every change. The work is kept as a Protocol, a folder holding `arcform.yaml` and its SQL, which `arc run` runs again from the top. That makes arc a good framework for agentic data analysis: an agent that explores data through arc leaves behind a versioned Protocol anyone can re-run, not a scratchpad.
+
+## Install
+
+```sh
+curl -fsSL https://install.meridian.online/arc | bash
+```
+
+This installs a release build for macOS (Apple silicon and Intel) or Linux (x86_64 and aarch64, glibc 2.35 or later) and links `arc` into `~/.local/bin`. To build from source instead:
+
+```sh
+cargo install arcform --locked --features mcp,bundled-duckdb
+```
+
+What arc needs beside it:
+
+- the `duckdb` command on `PATH`, which runs a Protocol's SQL steps (v1.5.6 recommended; arc accepts `>=1.3, <2`);
+- [`finetype`](https://github.com/meridian-online/finetype) 0.6.54 or later, for the five FineType tools `arc mcp` serves and the operators that use it;
+- [`uv`](https://docs.astral.sh/uv/), for the Python operators.
+
+Both builds carry DuckDB inside `arc` but leave out its ICU extension, so a time-zone function in `arc table describe` or `arc sql query` needs it installed once with `duckdb -c "INSTALL icu"`.
+
+## What's in the box
+
+- **Ingress:** DuckDB's `read_*` functions, plus operators that fetch over HTTP, discover links on a page and unpack archives.
+- **Modelling:** SQL steps run on DuckDB, and arc reads each query for the tables it loads and makes, so it knows how the steps connect and which ones a change makes stale.
+- **Advanced analytics:** operators for text embeddings, UMAP projection and entity resolution with Splink, and any Python script of your own, run through `uv`.
+- **Egress:** DuckDB's `COPY`, plus operators that export Parquet and publish to DuckLake.
+- **Data description:** semantic types and validation through FineType, and Frictionless Data Package descriptors.
+- **Local history:** every change to `arcform.yaml`, and to files beside it such as chart specs, is a version `arc history` can list and restore, with a log in the folder that travels with it through git.
+- **Agents:** `arc mcp` serves all of this to an AI agent over the Model Context Protocol.
+
+## First steps
+
+With a CSV of your own (here `orders.csv`, with `region` and `amount` columns):
+
+```sh
+arc create-protocol shop
+cd shop
+cp ~/Downloads/orders.csv .
+
+# Record two steps. Recording writes SQL files and arcform.yaml; nothing runs yet.
+arc sql record "SELECT * FROM read_csv('orders.csv')" --name orders
+arc sql record "SELECT region, count(*) AS orders, sum(amount) AS revenue FROM orders GROUP BY region" --name revenue
+
+# Run the Protocol: each step makes the table it is named after.
+arc run
+
+# Look at what the run made, read-only. Both print JSON.
+arc table describe revenue
+arc sql query "SELECT * FROM revenue ORDER BY revenue DESC"
+```
+
+`arc history list` shows each recording as a version, and `arcform-log.txt` in the folder lists them, so the record goes with the Protocol through git. The database lives outside the folder, in `~/.arcform/db`, unless `arc create-protocol --db <file>` names one.
+
+## Using arc from an agent
+
+Install arc as above, with `duckdb` (and `finetype` and `uv`, if you use them) on `PATH`. Then add it to Claude Code:
+
+```sh
+claude mcp add arc -- arc mcp
+```
+
+An agent started from a desktop app may not see your shell's `PATH`. In that case, give the absolute path of `arc` (`which arc` prints it) and a `PATH` that holds `duckdb`, `finetype` and `uv`, as in this `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "arc": {
+      "command": "/Users/you/.local/bin/arc",
+      "args": ["mcp"],
+      "env": {
+        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+      }
+    }
+  }
+}
+```
+
+For Codex, add this to `~/.codex/config.toml`. A run can take longer than Codex's default 60-second tool timeout, so raise it:
+
+```toml
+[mcp_servers.arc]
+command = "/Users/you/.local/bin/arc"
+args = ["mcp"]
+tool_timeout_sec = 600
+```
+
+Through these tools an agent can start a Protocol, look at its tables, query them read-only, record steps and run them, and every change it makes to a Protocol is a version in arc's local history.
+
+| Tool | What it does |
+| --- | --- |
+| `protocol_create` | Make a new Protocol, as `arc create-protocol` does. |
+| `protocol_run` | Run a Protocol and return its run record: each step's outcome, the assets and the engine. |
+| `table_describe` | A table's row count, columns, types, null counts and five sample rows, read-only. |
+| `sql_query` | Run SELECT statements against a Protocol's database, read-only, and return the rows. |
+| `sql_recognise` | Say what arc reads a SQL statement as: an operation it holds, or none. |
+| `sql_record` | Record a SQL statement as a new step. Runs nothing. |
+| `operation_describe` | List the SQL operations arc holds, or describe what one takes. |
+| `operation_record` | Record an operation, such as `filter-rows`, as a new step. Runs nothing. |
+| `operator_describe` | List the operator catalogue, or give an operator's `with:` JSON Schema. |
+| `infer` | Infer the semantic type of string values, through `finetype infer`. |
+| `profile` | Profile each column of a CSV or JSON file, through `finetype profile`. |
+| `taxonomy` | Browse FineType's type taxonomy, or export a type's JSON Schema. |
+| `validate` | Validate CSV or Parquet data against a JSON Schema and report its quality. |
+| `generate` | Generate synthetic sample data from FineType's taxonomy. |
 
 ---
 
@@ -96,7 +201,7 @@ For SQL steps, the DataFusion SQL parser provides structural introspection — a
 
 ## Relationship to the Meridian Ecosystem
 
-Arcform is part of the [Meridian](https://github.com/meridian) project family, alongside [FineType](https://github.com/meridian/finetype).
+Arcform is part of the [Meridian](https://github.com/meridian-online) project family, alongside [FineType](https://github.com/meridian-online/finetype).
 
 - **FineType** classifies and validates text data types, providing a transformation contract from raw text to typed DuckDB expressions.
 - **Arcform** orchestrates the pipelines in which that data flows — from ingestion through modelling to output.
@@ -143,18 +248,14 @@ The folder of a file not named `arcform.yaml` is the nearest directory at or abo
 
 ## Using Arcform as a library
 
-`arc` ships a library target alongside the binary, for one purpose: a tool that edits an
-`arcform.yaml` should not carry its own copy of the schema. Two schemas drift; one cannot.
+The `arcform` crate ships a library target alongside the `arc` binary, for one purpose: a tool that edits an `arcform.yaml` should not carry its own copy of the schema. Two schemas drift; one cannot.
 
 ```toml
 [dependencies]
-arcform = { version = "=0.1.0", default-features = false }
+arcform = { version = "=0.2.0", default-features = false }
 ```
 
-`default-features = false` turns off the `cli` feature. That feature exists for the `arc`
-binary; it also compiles a doc-hidden `cli_main` into the crate root, and `cli_main` parses
-the *calling* process's `argv` and can exit it. With the feature off the crate root is
-`spec` and nothing else, and `clap` leaves the dependency graph.
+`default-features = false` turns off the `cli` feature. That feature exists for the `arc` binary; it also compiles a doc-hidden `cli_main` into the crate root, and `cli_main` parses the *calling* process's `argv` and can exit it. With the feature off the crate root is `spec` and nothing else, and `clap` leaves the dependency graph.
 
 ```rust
 use arcform::spec::{Manifest, Result, SpecEdit, edit_spec};
@@ -176,34 +277,17 @@ fn example() -> Result<()> {
 }
 ```
 
-`arcform::spec` is the entire public surface: the spec schema types, the loading entry points,
-the write path, and the error type. Validation is a **gate, not a transform** — it parses
-raw YAML to reach a verdict and hands nothing back to write. The write path is built on
-that: a `SpecEdit` is a plain value, applied to the **original bytes** by splicing at
-tree-sitter node spans, so every byte an edit does not target — comments, blank lines, key
-order, quote style — survives verbatim, and a result that will not load is refused with the
-loader's reason, leaving the file untouched. Writes are atomic (temp file + rename).
-`create_spec` serialises a brand-new manifest directly — a spec with no prior authorship
-has nothing to preserve — through the same gate. Serialising an *existing* spec yourself
-remains out of contract: load-serialise-write-back destroys the author's bytes, which is
-the whole reason the write path exists. Everything else — the runner, the engine, SQL
-introspection, the operator catalog, the registry — is private and moves without notice.
+`arcform::spec` is the entire public surface: the spec schema types, the loading entry points, the write path, and the error type. Validation is a **gate, not a transform** — it parses raw YAML to reach a verdict and hands nothing back to write. The write path is built on that: a `SpecEdit` is a plain value, applied to the **original bytes** by splicing at tree-sitter node spans, so every byte an edit does not target — comments, blank lines, key order, quote style — survives verbatim, and a result that will not load is refused with the loader's reason, leaving the file untouched. Writes are atomic (temp file + rename). `create_spec` serialises a brand-new manifest directly — a spec with no prior authorship has nothing to preserve — through the same gate. Serialising an *existing* spec yourself remains out of contract: load-serialise-write-back destroys the author's bytes, which is the whole reason the write path exists. Everything else — the runner, the engine, SQL introspection, the operator catalogue, the registry — is private and moves without notice.
 
-The surface is documented as a contract in `src/spec.rs` and enumerated by
-`tests/public_surface.rs`, which fails the build if it widens. Arcform is pre-1.0: **pin an
-exact version** (or, inside the same organisation, a git revision).
+The surface is documented as a contract in `src/spec.rs` and enumerated by `tests/public_surface.rs`, which fails the build if it widens. Arcform is pre-1.0: **pin an exact version** (or, inside the same organisation, a git revision).
 
-Two build-time facts come with the dependency. Arcform parses SQL with its own `sqlparser`
-fork, published on crates.io as `arcform-sqlparser` and pinned to an exact version, so it
-resolves like any other dependency and the consuming workspace needs no patch entry. And the private engine
-still compiles into the library, so the DuckDB C library must be available to the build
-(`DUCKDB_LIB_DIR`/`DUCKDB_INCLUDE_DIR`) even for a consumer that only loads specs.
+Two build-time facts come with the dependency. Arcform parses SQL with its own `sqlparser` fork, published on crates.io as `arcform-sqlparser` and pinned to an exact version, so it resolves like any other dependency and the consuming workspace needs no patch entry. And the private engine still compiles into the library, so the build needs the DuckDB C library (`DUCKDB_LIB_DIR`/`DUCKDB_INCLUDE_DIR`) even for a consumer that only loads specs, or the `bundled-duckdb` feature, which compiles DuckDB in and takes tens of minutes from cold.
 
 ---
 
 ## Status
 
-Early development. The project is in the discovery and design phase.
+Pre-1.0. v0.2.0 is the first published release, and the command line, the `arc mcp` tools and the library's `spec` surface may still change between minor versions. [CHANGELOG.md](CHANGELOG.md) records each change.
 
 ---
 
