@@ -42,12 +42,16 @@ use super::{Annotations, ToolDef, ToolOutput, ToolResult};
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn protocol_run(args: &Value) -> ToolResult {
-    let dir = match args.get("dir").and_then(Value::as_str) {
+    let dir = match optional_string(args, "dir")? {
         Some(dir) => PathBuf::from(dir),
         None => std::env::current_dir()
             .map_err(|e| format!("no `dir` given and the current directory is unavailable: {e}"))?,
     };
-    let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+    let force = match args.get("force") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(force)) => *force,
+        Some(other) => return Err(format!("`force` must be a boolean, not {other}")),
+    };
     let cli_params = parse_params(args.get("params"))?;
 
     // The run happens in a child `arc run`, so what the runner, the DuckDB command line,
@@ -403,7 +407,7 @@ fn operation_describe_schema() -> Value {
 /// as `--description` is. A refusal is an error result naming what was wrong, with
 /// the Protocol's directory untouched.
 fn operation_record(args: &Value) -> ToolResult {
-    let dir = PathBuf::from(args.get("dir").and_then(Value::as_str).unwrap_or("."));
+    let dir = PathBuf::from(optional_string(args, "dir")?.unwrap_or("."));
     let operation = required_string(args, "operation")?;
     let on = required_string(args, "on")?;
     let name = required_string(args, "name")?;
@@ -452,6 +456,17 @@ fn required_string<'a>(args: &'a Value, key: &str) -> std::result::Result<&'a st
     match args.get(key) {
         Some(Value::String(value)) => Ok(value),
         None | Some(Value::Null) => Err(format!("`{key}` is required")),
+        Some(other) => Err(format!("`{key}` must be a string, not {other}")),
+    }
+}
+
+/// The string `key` of a tool's arguments, `None` when absent or null, refused by
+/// name when it is anything other than a string — so a mistyped `dir` is an error,
+/// never the server's working directory.
+fn optional_string<'a>(args: &'a Value, key: &str) -> std::result::Result<Option<&'a str>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
         Some(other) => Err(format!("`{key}` must be a string, not {other}")),
     }
 }
@@ -510,7 +525,7 @@ fn sql_recognise_schema() -> Value {
 /// table it was applied to under `on`. A refusal is an error result naming what
 /// was wrong, with the Protocol's directory untouched.
 fn sql_record(args: &Value) -> ToolResult {
-    let dir = PathBuf::from(args.get("dir").and_then(Value::as_str).unwrap_or("."));
+    let dir = PathBuf::from(optional_string(args, "dir")?.unwrap_or("."));
     let sql = required_string(args, "sql")?;
     let name = required_string(args, "name")?;
     let description = match args.get("description") {
@@ -726,7 +741,7 @@ pub(super) fn tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "sql_query",
-            description: "Run SELECT statements against a Protocol's database and return, for each, its columns and types and up to `limit` rows (100 by default, at most 100000) as arrays of values in the order of the columns, with `capped` and `rows_held_back` saying when more rows were there; `rows_held_back` is a recount, running the statement a second time. Before anything runs, DuckDB reads the whole text, and a text holding anything but SELECTs is refused whole. A statement that fails while running gives `{statement, error}` in its place and the others are kept. The SQL may read files and URLs it names; the database is opened read-only and never written. `keep` says how to record a query as a step with sql_record.",
+            description: "Run SELECT statements against a Protocol's database and return, for each, its columns and types and up to `limit` rows (100 by default, at most 100000) as arrays of values in the order of the columns, with `capped` and `rows_held_back` saying when more rows were there; `rows_held_back` is a recount, running the statement a second time. Before anything runs, DuckDB reads the whole text, and a text holding anything but SELECTs is refused whole. A statement that fails while running gives `{statement, error}` in its place and the others are kept. The SQL may read files and URLs it names; the database is opened read-only and never written. `keep` says how to record a query as a step: the `arc sql record` command, or the sql_record tool.",
             input_schema: sql_query_schema,
             handler: sql_query,
             annotations: Annotations::READS_OPEN,
@@ -864,6 +879,7 @@ mod tests {
                 json!("where=amount > 100"),
                 "`arguments` must be an object",
             ),
+            ("dir", json!(7), "`dir` must be a string, not 7"),
         ];
         for (key, value, message) in refusals {
             let mut args = request.clone();
@@ -879,6 +895,22 @@ mod tests {
             std::fs::read_dir(dir.path()).unwrap().count(),
             0,
             "a refused request wrote into the directory"
+        );
+    }
+
+    #[test]
+    fn sql_record_refuses_a_dir_that_is_not_a_string() {
+        // Not the server's working directory: a mistyped `dir` is refused by name
+        // before anything is read or written.
+        let err = sql_record(&json!({
+            "dir": 7,
+            "sql": "SELECT 1 AS one",
+            "name": "one",
+        }))
+        .unwrap_err();
+        assert!(
+            err.contains("`dir` must be a string, not 7"),
+            "message: {err}"
         );
     }
 
