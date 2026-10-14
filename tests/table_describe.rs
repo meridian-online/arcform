@@ -434,3 +434,30 @@ fn describe_opens_with_extension_install_off() {
     drop(conn);
     assert_eq!(describe_json(dir.path(), "ext")["sample"], json!([[false]]));
 }
+
+#[cfg(feature = "mcp")]
+#[test]
+fn table_describe_tool_without_table_names_the_missing_argument() {
+    let dir = protocol_with_data();
+    let history = dir.path().join(".history");
+    let requests = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {},
+            "clientInfo": {"name": "table_describe", "version": "0"}}}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "table_describe", "arguments": {}}}),
+    ];
+    let lines = common::mcp_session_env(
+        dir.path(),
+        &requests,
+        &[("ARCFORM_HISTORY_DIR", history.as_path())],
+    );
+    let responses: Vec<Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let result = &responses.iter().find(|v| v["id"] == 2).unwrap()["result"];
+    assert_eq!(result["isError"], true, "{result}");
+    let text = result["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("`table` is required"), "{result}");
+}
