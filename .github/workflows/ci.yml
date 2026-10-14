@@ -77,6 +77,28 @@ jobs:
       - name: map-refit-stability findings match results.json
         run: python3 eval/map-refit-stability/check_findings.py
 
+  # The release tag guard: release.yml's first job, which every other release job
+  # waits on. release.yml runs only on a pushed tag, so this is where its guard is
+  # exercised before one is pushed. --wiring reads the tag filter and the guard's
+  # place in the release job graph; --release-rehearsal executes the `tag-guard`
+  # job's own `run:` line against a copy of this tree, once with this tree's version
+  # and once for each refusal, so a version bump without its CHANGELOG.md heading
+  # fails here rather than on the tag; --self-test mutates each of those and requires
+  # the check to refuse. No path filter: the diffs likeliest to break the guard are a
+  # version bump or an edit to release.yml, neither of which touches the script, and
+  # a skipped required check passes. Stdlib-only and build-free, seconds to report.
+  release-guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Only a version tag starts a release, and the guard runs first
+        run: python3 scripts/check_release_tag.py --wiring
+      - name: The tag guard passes this tree's version and refuses the bad tags
+        run: python3 scripts/check_release_tag.py --release-rehearsal
+      - name: The tag guard detects each defect it exists for
+        run: python3 scripts/check_release_tag.py --self-test
+
   # Clippy and the test suite both compile the crate against system DuckDB, so
   # they share a job that provisions the library once.
   build:

@@ -1,0 +1,248 @@
+name: Release
+
+on:
+  push:
+    # `v` and three dot-separated numbers, and nothing else: GitHub's filter
+    # reads `+` as one or more of the character before it, so `v0.3.0-rc1` or
+    # `v19-train-state` starts no run. The `tag-guard` job below refuses the
+    # same shapes again, for the day this filter is loosened.
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+# This file is read by scripts/check_release_tag.py (`--wiring` and
+# `--release-rehearsal`, run by ci.yml on every pull request) without a YAML
+# library. Keep its block style: jobs at two spaces, job keys at four, `needs:`
+# written inline, steps as `- ` items with keys at eight. A shape the reader does
+# not recognise fails CI with exit 2 rather than being guessed at.
+jobs:
+  # Every other job waits on this one, so a tag that does not name this tree's
+  # release fails here, in about a minute, before anything is built or
+  # published. scripts/check_release_tag.py refuses a tag whose number differs
+  # from Cargo.toml's `[package] version` (exit 4), or that has no heading in
+  # CHANGELOG.md (exit 5), or whose section is empty or over 120,000 characters
+  # (exit 6). It sets that section as the `notes` output, which the `release`
+  # job publishes as the release body.
+  #
+  # Keep the call on one line: --wiring requires it, and --release-rehearsal
+  # executes exactly this `run:` line against a copy of the tree.
+  tag-guard:
+    name: The tag names this tree's version and its changelog entry
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      notes: ${{ steps.guard.outputs.notes }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag, Cargo.toml and CHANGELOG.md agree
+        id: guard
+        run: python3 scripts/check_release_tag.py --tag "${GITHUB_REF_NAME}" --github-output "${GITHUB_OUTPUT}"
+
+  # Native runners throughout, no `cross`: `bundled-duckdb` compiles DuckDB's C++
+  # on each leg, which is slow enough natively and far slower under emulation.
+  # The Linux legs build on Ubuntu 22.04, so the binaries need glibc 2.35 or
+  # later. Both macOS legs run on the Apple-silicon runner; the x86_64 one
+  # cross-compiles with Apple's toolchain and is smoke-tested under Rosetta.
+  build:
+    name: Build ${{ matrix.target }}
+    needs: tag-guard
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      # The toolchain ci.yml pins, so the binary is built by the compiler the
+      # pull request's checks ran.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --features mcp,bundled-duckdb --target "${{ matrix.target }}"
+
+      # The binary starts, reports the tagged version, and answers an MCP
+      # `initialize` with the newest protocol version it supports. tag-guard has
+      # already proved the tag equals Cargo.toml's version, so the tag is the
+      # version `arc --version` must print.
+      - name: Smoke-test the binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/arc"
+          want="arc ${GITHUB_REF_NAME#v}"
+          got="$("$bin" --version)"
+          if [ "$got" != "$want" ]; then
+            echo "::error::arc --version printed '$got', not '$want'"
+            exit 1
+          fi
+          request='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"release-smoke","version":"0"}}}'
+          printf '%s\n' "$request" | "$bin" mcp > initialize.json
+          python3 - initialize.json <<'PY'
+          import json, sys
+          with open(sys.argv[1], encoding="utf-8") as fh:
+              response = json.loads(fh.readline())
+          version = response["result"]["protocolVersion"]
+          if version != "2025-11-25":
+              sys.exit(f"arc mcp answered initialize with protocolVersion {version!r}, not '2025-11-25'")
+          print(f"arc mcp: initialize answered, protocolVersion {version}")
+          PY
+
+      # `arc` at the archive's root, and a `hash  filename` sidecar beside it,
+      # which `shasum -a 256 -c` and scripts/install.sh both read.
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="arc-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "$archive" arc
+          if command -v shasum > /dev/null; then
+            shasum -a 256 "$archive" > "$archive.sha256"
+          else
+            sha256sum "$archive" > "$archive.sha256"
+          fi
+          cat "$archive.sha256"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: arc-${{ matrix.target }}
+          # `error` fails the leg when neither glob matches. A partial upload
+          # (an archive without its sidecar) is caught by the `release` job,
+          # which requires all eight files before it publishes anything.
+          if-no-files-found: error
+          path: |
+            arc-*.tar.gz
+            arc-*.tar.gz.sha256
+
+  release:
+    name: Create the GitHub release
+    needs: [tag-guard, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Each leg's files have distinct names, so merging the four artifacts into
+      # one directory cannot collide.
+      - name: Download the build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: arc-*
+          merge-multiple: true
+
+      - name: Every target has its archive and a checksum that matches it
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            archive="arc-${GITHUB_REF_NAME}-${target}.tar.gz"
+            test -f "$archive" || { echo "::error::missing $archive"; exit 1; }
+            test -f "$archive.sha256" || { echo "::error::missing $archive.sha256"; exit 1; }
+            sha256sum -c "$archive.sha256"
+          done
+          ls -la
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          # The tag's section of CHANGELOG.md, read by `tag-guard`. Not GitHub's
+          # generated notes, which list pull-request titles rather than what
+          # changed.
+          body: ${{ needs.tag-guard.outputs.notes }}
+          # An entry that matches nothing fails the job rather than publishing a
+          # release without it.
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/arc-*.tar.gz
+            release-assets/arc-*.tar.gz.sha256
+
+  # The parser fork first, because arcform depends on it by exact version and
+  # crates.io must have it before arcform can be published. Each crate is skipped
+  # when its version is already there, so re-running a release whose arcform
+  # publish failed retries only what is missing. `cargo publish` waits until a
+  # crate is in the index before it returns, so arcform resolves the fork.
+  #
+  # arcform is published with --no-verify: verifying would compile it against a
+  # system libduckdb this runner does not have, and the `build` job has already
+  # built and smoke-tested this source on four targets. CI's `package` job checks
+  # on every pull request that the packaged source builds.
+  publish-crates:
+    name: Publish to crates.io
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+
+      - name: Publish arcform-sqlparser if its version is new, then arcform
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set on this repository, so nothing was published to crates.io. Add the secret and re-run this job."
+            exit 1
+          fi
+          fork_manifest=vendor/sqlparser-0.55.0/Cargo.toml
+          fork_version="$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["package"]["version"])' "$fork_manifest")"
+          arcform_version="${GITHUB_REF_NAME#v}"
+
+          # `cargo search` prints `name = "latest-version"    # description`.
+          published() {
+            cargo search "$1" --limit 5 | grep -q "^$1 = \"$2\""
+          }
+
+          if published arcform-sqlparser "$fork_version"; then
+            echo "arcform-sqlparser $fork_version is already on crates.io; skipping it."
+          else
+            cargo publish --locked --manifest-path "$fork_manifest" --features visitor
+          fi
+
+          if published arcform "$arcform_version"; then
+            echo "arcform $arcform_version is already on crates.io; skipping it."
+          else
+            cargo publish --no-verify -p arcform
+          fi
+
+  update-install-site:
+    name: Update the install site
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # install.meridian.online's update.yml writes the script it is sent to
+      # `arc.sh`, choosing the file by the `repo` in the payload.
+      - name: Dispatch to install.meridian.online
+        run: |
+          SCRIPT_CONTENT=$(base64 -w 0 scripts/install.sh)
+          curl -fsSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.INSTALL_SITE_TOKEN }}" \
+            "https://api.github.com/repos/meridian-online/install/dispatches" \
+            -d "{\"event_type\":\"update-install-script\",\"client_payload\":{\"tag\":\"${GITHUB_REF_NAME}\",\"repo\":\"${GITHUB_REPOSITORY}\",\"script_base64\":\"${SCRIPT_CONTENT}\"}}"
