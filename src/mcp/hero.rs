@@ -104,7 +104,7 @@ struct ChildRun {
 }
 
 /// Run `arc run` on the Protocol in `dir` as a child of this process, with `--force`
-/// when `force` is set and one `--param K=V` for each of `params`.
+/// when `force` is set and one `--param=K=V` for each of `params`.
 ///
 /// Its standard input is closed, and its standard output and standard error are piped
 /// and drained on two threads into one buffer that keeps the last [`TAIL_BYTES`], so a
@@ -121,7 +121,7 @@ fn run_child(dir: &Path, force: bool, params: &[(String, String)]) -> std::io::R
         command.arg("--force");
     }
     for (key, value) in params {
-        command.arg("--param").arg(format!("{key}={value}"));
+        command.arg(format!("--param={key}={value}"));
     }
     let mut child = command
         .current_dir(dir)

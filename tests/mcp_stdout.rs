@@ -303,6 +303,29 @@ fn protocol_run_passes_each_param_to_the_run() {
 }
 
 #[test]
+fn protocol_run_carries_a_param_key_that_starts_with_a_dash() {
+    let dir = copy_fixture("mcp_stdout");
+    let manifest = dir.path().join("arcform.yaml");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        &manifest,
+        text.replace(
+            "steps:\n",
+            "params:\n  \"-x\":\n    default: nobody\nsteps:\n",
+        ),
+    )
+    .unwrap();
+    let result = protocol_run(dir.path(), json!({ "params": { "-x": "1" } }));
+    assert_eq!(result["isError"], false, "protocol_run failed: {result}");
+    let params = &result["structuredContent"]["run"]["params"];
+    let x = params
+        .as_array()
+        .and_then(|ps| ps.iter().find(|p| p["key"] == "-x"))
+        .unwrap_or_else(|| panic!("no param `-x` in {params}"));
+    assert_eq!(x["value"], "1", "the run did not take the param: {x}");
+}
+
+#[test]
 fn protocol_run_answers_when_a_step_leaves_a_process_holding_its_output() {
     let dir = copy_fixture("mcp_stdout");
     // The background `sleep` inherits the run's standard output and standard error and
