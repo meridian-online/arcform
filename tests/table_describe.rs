@@ -276,8 +276,20 @@ fn describe_a_protocol_with_no_db_key_reads_the_default_location() {
     let got = describe_json(dir.path(), "t");
     assert_eq!(got["row_count"], 1);
     let database = got["database"].as_str().unwrap();
-    assert!(database.contains(".db"), "{database}");
-    assert!(!database.starts_with(dir.path().join("nodb").to_str().unwrap()));
+    let mut made = Vec::new();
+    let mut pending = vec![data.clone()];
+    while let Some(folder) = pending.pop() {
+        for entry in std::fs::read_dir(&folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|e| e == "duckdb") {
+                made.push(path.canonicalize().unwrap());
+            }
+        }
+    }
+    assert_eq!(made.len(), 1, "arc run made one database: {made:?}");
+    assert_eq!(Path::new(database).canonicalize().unwrap(), made[0]);
 }
 
 /// A child process that holds a read-write connection until it is dropped.

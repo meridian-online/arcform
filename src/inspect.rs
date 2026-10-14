@@ -72,7 +72,7 @@ fn quote(identifier: &str) -> String {
 /// `to_json` writes them, in the order of `columns`.
 ///
 /// `table` is `schema.table` or a bare name. A bare name is the one in `main` if
-/// there is one, else the one schema's that holds it.
+/// there is one, else the one schema that holds it.
 pub(crate) fn describe_table(dir: &Path, table: &str) -> Result<Value> {
     let (conn, path) = open_read_only(dir)?;
     describe_in(&conn, &path, table).map_err(|e| match e {
