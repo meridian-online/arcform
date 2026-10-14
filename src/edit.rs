@@ -598,8 +598,8 @@ fn apply_one(text: &str, edit: &SpecEdit) -> Result<String> {
             // further is the value's own (text, in a block scalar). The key is
             // measured from its own column, so the first key of a sequence item
             // (`  - params:`) counts from `params`, not from the dash. With no
-            // key (a sequence item), a comment indented less than the value's
-            // own column is after it. An old value on one line is replaced
+            // key (a sequence item), a comment indented no further than the
+            // item's dash is after it. An old value on one line is replaced
             // exactly as before.
             if text[start..end].contains('\n') {
                 let key = match path.last() {
@@ -611,7 +611,16 @@ fn apply_one(text: &str, edit: &SpecEdit) -> Result<String> {
                 };
                 let limit = match key {
                     Some(at) => (at - line_start(text, at)) as isize,
-                    None => (value_start - line_start(text, value_start)) as isize - 1,
+                    // A sequence item: measured from the dash that introduces
+                    // it, since a block scalar item may indent its text less
+                    // than its `|`. Its text is always deeper than the dash.
+                    None => {
+                        let item = text[..value_start].trim_end_matches([' ', '\n']);
+                        match item.strip_suffix('-') {
+                            Some(dash) => (dash.len() - line_start(text, dash.len())) as isize,
+                            None => (value_start - line_start(text, value_start)) as isize - 1,
+                        }
+                    }
                 };
                 let mut content_end = if text.as_bytes()[end - 1] == b'\n' {
                     end - 1

@@ -470,6 +470,20 @@ fn a_comment_after_a_replaced_sequence_item_stays() {
     );
 }
 
+/// A block scalar item may indent its text less than its `|`: a `#` line
+/// deeper than the item's dash is still its text and is replaced with it.
+#[test]
+fn a_hash_line_inside_a_shallow_block_scalar_item_is_replaced_with_it() {
+    let edit = SpecEdit::Replace {
+        path: vec!["steps".into(), 0.into()],
+        value: "x2".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("steps:\n- |\n a\n # b\n- x\n", &[edit]).unwrap(),
+        "steps:\n- x2\n- x\n"
+    );
+}
+
 /// The absent value of a bare `key:` is replaced just after the colon, as it was.
 #[test]
 fn a_bare_key_takes_its_value_just_after_the_colon() {
