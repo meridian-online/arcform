@@ -449,18 +449,20 @@ jobs:
             echo "ARCFORM_REQUIRE_FINETYPE_EXT=1"
           } >> "$GITHUB_ENV"
 
+      # --locked, as release.yml builds: a version bump whose Cargo.lock was not
+      # updated fails here, on the pull request, rather than on every leg of the tag.
       - name: test (release, mcp + bundled-duckdb)
         run: |
           set -euo pipefail
           test -z "${DUCKDB_LIB_DIR:-}"
-          cargo test --release --features mcp,bundled-duckdb
+          cargo test --release --locked --features mcp,bundled-duckdb
 
       # The binary itself, not just the test harness: it starts, and it names no
       # libduckdb among the shared libraries it needs.
       - name: the release binary carries DuckDB
         run: |
           set -euo pipefail
-          cargo build --release --features mcp,bundled-duckdb
+          cargo build --release --locked --features mcp,bundled-duckdb
           ./target/release/arc --version
           if ldd target/release/arc | grep -i duckdb; then
             echo "target/release/arc links a shared libduckdb" >&2
