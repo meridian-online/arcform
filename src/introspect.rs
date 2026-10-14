@@ -102,9 +102,11 @@ fn read_path_kind(path: &str) -> AssetKind {
 /// (`src/function/table/copy_csv.cpp`) and `ParquetWriteRotateFiles`
 /// (`extension/parquet/parquet_extension.cpp`) — return true for `FILE_SIZE_BYTES`,
 /// and the parquet one additionally for `ROW_GROUPS_PER_FILE`. That branch and its
-/// three inputs are byte-identical in v1.5.2 (the `libduckdb-sys` this crate's
-/// lockfile pins) and v1.5.5 (the newest published at the time of writing); CI links
-/// v1.5.4, between them.
+/// three inputs read the same in v1.5.2 and v1.5.6, the version this crate pins and CI
+/// links, compared in the DuckDB sources `libduckdb-sys` 1.10502.0 and 1.10506.0 carry:
+/// `physical_copy_to_file.cpp` and `copy_csv.cpp` are byte-identical, `bind_copy.cpp`
+/// differs only in how three error-message arguments are built, and
+/// `parquet_extension.cpp` only in registering the variant functions.
 const DIRECTORY_WRITING_COPY_OPTIONS: [&str; 4] = [
     "PARTITION_BY",
     "PER_THREAD_OUTPUT",

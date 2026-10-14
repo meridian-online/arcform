@@ -115,10 +115,10 @@ The record's `run.engine` gives:
 "engine": {
   "arc": "0.1.0",
   "duckdb": "v1.5.6",
-  "duckdb_cli": "v1.5.4",
+  "duckdb_cli": "v1.5.6",
   "platform": "linux_amd64",
   "extensions": [
-    { "name": "mlpack", "repository": "community", "version": "v1.5.4", "sha256": "<64 hex digits>" },
+    { "name": "mlpack", "repository": "community", "version": "v1.5.6", "sha256": "<64 hex digits>" },
     { "name": "httpfs", "repository": "core", "version": "827222f", "sha256": "<64 hex digits>" }
   ]
 }
