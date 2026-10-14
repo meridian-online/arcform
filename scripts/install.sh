@@ -1,0 +1,274 @@
+#!/bin/sh
+#
+# arc installer
+# https://meridian.online
+#
+# Resolves this machine's release target from `uname`, downloads that target's
+# arc archive from the GitHub release, checks it against the release's .sha256
+# sidecar, unpacks it into ~/.arcform/cli/<version>, points
+# ~/.arcform/cli/latest at that directory, and links `arc` into ~/.local/bin.
+#
+# Usage:
+#   curl -fsSL https://install.meridian.online/arc | sh
+#   curl -fsSL https://install.meridian.online/arc | sh -s -- v0.2.0
+#   sh scripts/install.sh --self-test    # no network, nothing installed
+#
+# POSIX sh rather than bash, so it runs the same under dash, bash and zsh's sh.
+# release.yml sends this file to the install site on every release.
+set -eu
+
+REPO="meridian-online/arcform"
+BINARY="arc"
+# The DuckDB release arc is built and tested against. arc's engine shells out to
+# the `duckdb` command for a protocol's SQL steps, so a user needs it on PATH.
+DUCKDB_RECOMMENDED="v1.5.6"
+SOURCE_INSTALL="cargo install arcform --locked --features mcp,bundled-duckdb"
+
+info() { printf '  %s\n' "$*"; }
+warn() { printf '  warning: %s\n' "$*" >&2; }
+error() {
+  printf '  error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" > /dev/null 2>&1 || error "need '$1' (command not found)"
+}
+
+# The release target for a `uname -s` / `uname -m` pair. Releases are built for
+# macOS and Linux (glibc), x86_64 and aarch64; anything else builds from source.
+target_for() {
+  case "$1" in
+    Darwin) tf_os="apple-darwin" ;;
+    Linux) tf_os="unknown-linux-gnu" ;;
+    *) error "arc's release binaries are for macOS and Linux, not $1. Build it from source instead: ${SOURCE_INSTALL}" ;;
+  esac
+  case "$2" in
+    x86_64 | amd64) tf_arch="x86_64" ;;
+    aarch64 | arm64) tf_arch="aarch64" ;;
+    *) error "arc's release binaries are for x86_64 and aarch64, not $2. Build it from source instead: ${SOURCE_INSTALL}" ;;
+  esac
+  printf '%s-%s\n' "$tf_arch" "$tf_os"
+}
+
+detect_target() {
+  dt_os="$(uname -s)"
+  dt_arch="$(uname -m)"
+  # A shell running under Rosetta on Apple silicon reports x86_64; the native
+  # binary is the one to install there.
+  if [ "$dt_os" = "Darwin" ] && [ "$dt_arch" = "x86_64" ] \
+    && [ "$(sysctl -n sysctl.proc_translated 2> /dev/null || echo 0)" = "1" ]; then
+    dt_arch="arm64"
+  fi
+  target_for "$dt_os" "$dt_arch"
+}
+
+# `v0.2.0` or `0.2.0` becomes `v0.2.0`; anything that is not three
+# dot-separated numbers is refused before a request is made.
+normalise_version() {
+  case "$1" in
+    v*) nv="$1" ;;
+    *) nv="v$1" ;;
+  esac
+  nv_rest="${nv#v}"
+  case "$nv_rest" in
+    '' | *[!0-9.]* | .* | *. | *..*)
+      error "'$1' is not a release version; give one like v0.2.0, or none for the latest"
+      ;;
+  esac
+  if [ "$(printf '%s' "$nv_rest" | tr -cd . | wc -c | tr -d ' ')" != "2" ]; then
+    error "'$1' is not a release version; give one like v0.2.0, or none for the latest"
+  fi
+  printf '%s\n' "$nv"
+}
+
+latest_version() {
+  lv_tag="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+    | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)"
+  [ -n "$lv_tag" ] || error "could not read the latest release of ${REPO} from GitHub; name a version instead, like: sh -s -- v0.2.0"
+  normalise_version "$lv_tag"
+}
+
+archive_name() {
+  printf '%s-%s-%s.tar.gz\n' "$BINARY" "$1" "$2"
+}
+
+sha256_of() {
+  if command -v shasum > /dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum > /dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    error "need shasum or sha256sum to check the download"
+  fi
+}
+
+# Refuses unless ARCHIVE hashes to the first field of SIDECAR, which the
+# release writes in `hash  filename` form.
+verify_checksum() {
+  [ -f "$2" ] || error "no checksum file for $(basename "$1")"
+  vc_expected="$(awk 'NR == 1 {print $1}' "$2")"
+  [ -n "$vc_expected" ] || error "the checksum file for $(basename "$1") is empty"
+  vc_actual="$(sha256_of "$1")"
+  if [ "$vc_expected" != "$vc_actual" ]; then
+    error "checksum mismatch for $(basename "$1"): the release says ${vc_expected}, the download is ${vc_actual}. Nothing was installed."
+  fi
+}
+
+post_install_warnings() {
+  case ":${PATH}:" in
+    *":$1:"*) ;;
+    *)
+      warn "$1 is not on your PATH, so your shell will not find arc yet. Add this line to your shell's startup file (~/.zshrc, ~/.bashrc):"
+      warn "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+      ;;
+  esac
+  if ! command -v duckdb > /dev/null 2>&1; then
+    warn "the duckdb command is not on your PATH. arc runs a protocol's SQL steps with it, so install DuckDB ${DUCKDB_RECOMMENDED}: https://duckdb.org/docs/installation/"
+  fi
+}
+
+main() {
+  need_cmd uname
+  need_cmd curl
+  need_cmd tar
+  need_cmd mktemp
+  [ -n "${HOME:-}" ] || error "HOME is not set, so there is nowhere to install to"
+
+  install_root="${HOME}/.arcform/cli"
+  local_bin="${HOME}/.local/bin"
+
+  target="$(detect_target)"
+  if [ -n "${1:-}" ]; then
+    version="$(normalise_version "$1")"
+  else
+    version="$(latest_version)"
+  fi
+  archive="$(archive_name "$version" "$target")"
+  base_url="https://github.com/${REPO}/releases/download/${version}"
+
+  echo ""
+  echo "  arc installer (Meridian)"
+  echo ""
+  info "installing arc ${version} for ${target}"
+
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+
+  info "downloading ${archive}"
+  curl -fsSL -o "${tmp_dir}/${archive}" "${base_url}/${archive}" \
+    || error "could not download ${base_url}/${archive}. Is ${version} released for ${target}?"
+  curl -fsSL -o "${tmp_dir}/${archive}.sha256" "${base_url}/${archive}.sha256" \
+    || error "could not download the checksum for ${archive}"
+  verify_checksum "${tmp_dir}/${archive}" "${tmp_dir}/${archive}.sha256"
+  info "checksum verified"
+
+  version_dir="${install_root}/${version}"
+  mkdir -p "$version_dir"
+  tar -xzf "${tmp_dir}/${archive}" -C "$version_dir" "$BINARY"
+  chmod +x "${version_dir}/${BINARY}"
+  ln -sfn "$version_dir" "${install_root}/latest"
+  info "installed ${version_dir}/${BINARY}"
+  info "${install_root}/latest -> ${version_dir}"
+
+  mkdir -p "$local_bin"
+  ln -sf "${install_root}/latest/${BINARY}" "${local_bin}/${BINARY}"
+  info "linked ${local_bin}/${BINARY}"
+
+  if "${version_dir}/${BINARY}" --version > /dev/null 2>&1; then
+    info "$("${version_dir}/${BINARY}" --version) is ready"
+  else
+    warn "the installed arc did not start. On Linux the release binaries need glibc 2.35 or later (Ubuntu 22.04, Debian 12 or newer); on an older system, build from source: ${SOURCE_INSTALL}"
+  fi
+  echo ""
+  post_install_warnings "$local_bin"
+}
+
+# ---------------------------------------------------------------------------
+# --self-test: target resolution, version handling and the checksum refusal,
+# with no network and nothing written outside a temporary directory.
+# ---------------------------------------------------------------------------
+
+st_passed=0
+st_failed=0
+st_pass() { st_passed=$((st_passed + 1)); }
+st_fail() {
+  st_failed=$((st_failed + 1))
+  printf '  FAILED %s\n' "$*" >&2
+}
+st_equal() {
+  if [ "$2" = "$3" ]; then st_pass; else st_fail "$1: wanted '$2', got '$3'"; fi
+}
+# st_refuses LABEL NEEDLE COMMAND...: the command fails, and says NEEDLE.
+st_refuses() {
+  st_label="$1"
+  st_needle="$2"
+  shift 2
+  if st_out="$( ("$@") 2>&1)"; then
+    st_fail "${st_label}: accepted (printed '${st_out}')"
+  else
+    case "$st_out" in
+      *"$st_needle"*) st_pass ;;
+      *) st_fail "${st_label}: refused, but without '${st_needle}': ${st_out}" ;;
+    esac
+  fi
+}
+
+self_test() {
+  # Each supported `uname -s` / `uname -m` pair, and the target it names.
+  for st_case in \
+    "Darwin arm64 aarch64-apple-darwin" \
+    "Darwin aarch64 aarch64-apple-darwin" \
+    "Darwin x86_64 x86_64-apple-darwin" \
+    "Linux x86_64 x86_64-unknown-linux-gnu" \
+    "Linux amd64 x86_64-unknown-linux-gnu" \
+    "Linux aarch64 aarch64-unknown-linux-gnu" \
+    "Linux arm64 aarch64-unknown-linux-gnu"; do
+    # shellcheck disable=SC2086 # split the case into its three words
+    set -- $st_case
+    st_equal "target for $1 $2" "$3" "$( (target_for "$1" "$2") 2>&1)"
+  done
+
+  # Every other system is refused, and pointed at a source build.
+  for st_case in "FreeBSD amd64" "MINGW64_NT-10.0 x86_64" "SunOS i86pc" "Linux armv7l" "Darwin i386" "Linux riscv64"; do
+    # shellcheck disable=SC2086
+    set -- $st_case
+    st_refuses "refuse $1 $2" "cargo install arcform" target_for "$1" "$2"
+  done
+
+  st_equal "the archive name" "arc-v0.2.0-aarch64-apple-darwin.tar.gz" "$(archive_name v0.2.0 aarch64-apple-darwin)"
+  st_equal "a version without its v" "v0.2.0" "$( (normalise_version 0.2.0) 2>&1)"
+  st_equal "a version with its v" "v0.2.0" "$( (normalise_version v0.2.0) 2>&1)"
+  for st_bad in "latest" "v0.2" "v0.2.0-rc1" "v0.2.0.1" "v0..2" "v.2.0" "vX.Y.Z" "v0.2.0
+v0.3.0"; do
+    st_refuses "refuse version '${st_bad}'" "is not a release version" normalise_version "$st_bad"
+  done
+
+  # The hash is SHA-256, read off a known value.
+  st_dir="$(mktemp -d)"
+  printf 'abc' > "${st_dir}/abc"
+  st_equal "sha256 of 'abc'" "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" "$(sha256_of "${st_dir}/abc")"
+
+  # A local archive against a matching sidecar, a mismatched one and none.
+  st_archive="${st_dir}/arc-v0.2.0-x86_64-unknown-linux-gnu.tar.gz"
+  printf 'not really an archive\n' > "$st_archive"
+  printf '%s  %s\n' "$(sha256_of "$st_archive")" "$(basename "$st_archive")" > "${st_dir}/good.sha256"
+  printf '%s  %s\n' "0000000000000000000000000000000000000000000000000000000000000000" "$(basename "$st_archive")" > "${st_dir}/bad.sha256"
+  if (verify_checksum "$st_archive" "${st_dir}/good.sha256") > /dev/null 2>&1; then
+    st_pass
+  else
+    st_fail "a matching checksum was refused"
+  fi
+  st_refuses "a mismatched checksum" "checksum mismatch" verify_checksum "$st_archive" "${st_dir}/bad.sha256"
+  st_refuses "a missing checksum file" "no checksum file" verify_checksum "$st_archive" "${st_dir}/absent.sha256"
+  rm -rf "$st_dir"
+
+  printf 'install.sh self-test: %s passed, %s failed\n' "$st_passed" "$st_failed"
+  [ "$st_failed" -eq 0 ]
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+  self_test
+  exit $?
+fi
+main "$@"

@@ -99,6 +99,24 @@ jobs:
       - name: The tag guard detects each defect it exists for
         run: python3 scripts/check_release_tag.py --self-test
 
+  # scripts/install.sh is what `curl … | sh` runs on a stranger's machine, and
+  # release.yml sends it to the install site on every tag, so it is checked here
+  # first. The self-test needs no network: target resolution for each `uname` pair,
+  # the version handling, and the checksum refusal against a local file. `sh` on
+  # Ubuntu is dash, the strictest POSIX shell a user is likely to have; shellcheck
+  # comes with the runner image.
+  install-script:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.sh is POSIX sh
+        run: shellcheck --shell=sh scripts/install.sh
+      - name: install.sh self-test
+        run: sh scripts/install.sh --self-test
+      - name: install.sh self-test, with an empty environment
+        run: env -i PATH=/usr/bin:/bin sh scripts/install.sh --self-test
+
   # Clippy and the test suite both compile the crate against system DuckDB, so
   # they share a job that provisions the library once.
   build:
