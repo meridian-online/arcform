@@ -19,7 +19,7 @@ cargo install arcform --locked --features mcp,bundled-duckdb
 What arc needs beside it:
 
 - the `duckdb` command on `PATH`, which runs a Protocol's SQL steps (v1.5.6 recommended; arc accepts `>=1.3, <2`);
-- [`finetype`](https://github.com/meridian-online/finetype) 0.6.54 or later, for the five FineType tools `arc mcp` serves and the operators that use it;
+- [`finetype`](https://github.com/meridian-online/finetype) 0.6.54 or later, for the five FineType tools `arc mcp` serves and the operators that use it (a `datapackage_describe` step with `nominations:` needs 0.6.60 or later);
 - [`uv`](https://docs.astral.sh/uv/), for the Python operators.
 
 Both builds carry DuckDB v1.5.6 inside `arc` but leave out its ICU extension, so a time-zone function in `arc table describe` or `arc sql query` needs it installed once. With the recommended v1.5.6 `duckdb`, run `duckdb -c "INSTALL icu"` once; a `duckdb` of another version installs it where arc does not look.
