@@ -1,14 +1,15 @@
 # Meridian fork of sqlparser 0.55.0
 
 This is a **vendored, minimal fork** of [`sqlparser`](https://crates.io/crates/sqlparser)
-`0.55.0`, wired into `arc` via `[patch.crates-io]` in the top-level `Cargo.toml`.
+`0.55.0`, published as `arcform-sqlparser` (library name still `sqlparser`) and pinned
+exactly by arcform's top-level `Cargo.toml`.
 It teaches the **DuckDB dialect** three grammars the published crate rejects, all of
 which otherwise make `arc`'s SQL introspection degrade a whole SQL step to an *opaque*
 node (undercutting the "0 opaque steps" legibility story).
 
-The version stays `0.55.0` and the dependency set is unchanged, so the patch applies
-cleanly and the resolved dep graph / licenses are identical to upstream (`Cargo.lock`
-only drops the registry `source`/`checksum` lines for `sqlparser`).
+The fork started at upstream's version, `0.55.0`, and its dependency set is
+unchanged, so the resolved dep graph and licences are identical to upstream's. A later
+change to the fork bumps its patch number.
 
 ## What the fork adds
 

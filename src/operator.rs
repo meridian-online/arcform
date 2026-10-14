@@ -2860,7 +2860,7 @@ impl Operator for ParquetExport {
 // REACHABILITY (2026-07-24). This operator, `html_link_discover`, and the `fresh`
 // precondition are the crate's only ureq users, and ureq is the only runtime-linked
 // consumer of the rustls/ring TLS stack. None of them is reachable through the
-// published library surface — `arc::spec` exports the spec loader alone (src/lib.rs);
+// published library surface — `arcform::spec` exports the spec loader alone (src/lib.rs);
 // the engine, the operator catalog, and this operator are all private. A pipeline is
 // only ever run through the `arc` CLI. So a crate linking arc with
 // `default-features = false` — brightfield's desktop shell, which wants only the spec

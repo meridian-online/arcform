@@ -1,6 +1,6 @@
 //! The published surface, enumerated.
 //!
-//! `arc` exports a spec loader and nothing else. That is a promise, and promises made
+//! `arcform` exports a spec loader and nothing else. That is a promise, and promises made
 //! only in prose get broken by a stray `pub` in an unrelated commit. This test reads
 //! the source and fails when the surface changes — widening it is then a deliberate
 //! act with a diff to argue about, not a side effect.
@@ -26,7 +26,7 @@
 //! 2. The crate root exports `spec`, plus the doc-hidden `cli_main` under the `cli`
 //!    feature; `Cargo.toml` gates the feature so `default-features = false` leaves
 //!    `spec` alone at the root.
-//! 3. `arc::spec` re-exports exactly the documented contract.
+//! 3. `arcform::spec` re-exports exactly the documented contract.
 //! 4. Every `impl` block on an exported type lives in that type's own module — so
 //!    inherent methods (and trait impls) cannot be bolted on from somewhere this
 //!    file does not freeze.
@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------- the contract
 
-/// Every type, constant and function `arc::spec` re-exports, and the module that
+/// Every type, constant and function `arcform::spec` re-exports, and the module that
 /// owns it. An `impl` on any of these names may only appear in its owning file.
 const EXPORTED: [(&str, &str); 35] = [
     ("Manifest", "manifest.rs"),
@@ -872,6 +872,15 @@ fn cargo_toml_gates_the_binary_entry_point() {
         manifest.contains("url = { version = \"2\", optional = true }"),
         "`url` must be optional, or turning `http-fetch` off still builds it"
     );
+    // The names a consumer types: the crate is published, and imported, as
+    // `arcform`; the command it installs stays `arc`.
+    assert!(
+        manifest.contains("[package]\nname = \"arcform\"\n")
+            && manifest.contains("[lib]\nname = \"arcform\"\n")
+            && manifest.contains("[[bin]]\nname = \"arc\"\n"),
+        "the package and library are `arcform` (`use arcform::spec`) and the binary is \
+         `arc`; renaming either breaks every consumer's import or every user's command"
+    );
     assert!(
         manifest.contains("required-features = [\"cli\"]"),
         "the `arc` binary must require `cli`, so `--no-default-features` builds the \
@@ -879,7 +888,7 @@ fn cargo_toml_gates_the_binary_entry_point() {
     );
 }
 
-/// The contract itself: what `arc::spec` re-exports.
+/// The contract itself: what `arcform::spec` re-exports.
 #[test]
 fn the_spec_module_exports_exactly_the_documented_contract() {
     let spec = src("spec.rs");
@@ -887,7 +896,7 @@ fn the_spec_module_exports_exactly_the_documented_contract() {
     assert_eq!(
         pub_use_names(&spec),
         exported_names(),
-        "`arc::spec` is the published contract. If this assertion fails, either the \
+        "`arcform::spec` is the published contract. If this assertion fails, either the \
          export was unintended — revert it — or it is intended, in which case update \
          `EXPORTED` here and the contract doc at the top of `src/spec.rs` together."
     );

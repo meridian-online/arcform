@@ -3,6 +3,21 @@
 version = 4
 
 [[package]]
+name = "arcform-sqlparser"
+version = "0.55.0"
+dependencies = [
+ "bigdecimal",
+ "log",
+ "matches",
+ "pretty_assertions",
+ "recursive",
+ "serde",
+ "serde_json",
+ "simple_logger",
+ "sqlparser_derive",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -264,21 +279,6 @@ dependencies = [
  "log",
  "time",
  "windows-sys 0.48.0",
-]
-
-[[package]]
-name = "sqlparser"
-version = "0.55.0"
-dependencies = [
- "bigdecimal",
- "log",
- "matches",
- "pretty_assertions",
- "recursive",
- "serde",
- "serde_json",
- "simple_logger",
- "sqlparser_derive",
 ]
 
 [[package]]

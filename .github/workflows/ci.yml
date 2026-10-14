@@ -269,6 +269,78 @@ jobs:
       - name: test (mcp feature)
         run: cargo test --workspace --features mcp
 
+  # What crates.io would receive, checked on every pull request so a packaging fault
+  # shows before a tag. arcform is published as `arcform`, and depends on its sqlparser
+  # fork published as `arcform-sqlparser`. The fork is not a workspace member (that
+  # would put upstream's code under this repo's `--workspace` clippy and test gates),
+  # so it is addressed by its manifest path rather than `-p`.
+  #
+  # Until `arcform-sqlparser` is on crates.io, `cargo publish --dry-run -p arcform`
+  # cannot resolve it, so the last step builds what `cargo package` produces for
+  # arcform against what it produces for the fork: both .crate files unpacked, the
+  # fork patched in for the crates.io dependency, and `cargo check` run on the
+  # unpacked arcform. That catches an `include` list that leaves out a file the
+  # source embeds with `include_str!`, which the `--list` step alone would not.
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: package
+
+      # `cargo check` links nothing, but libduckdb-sys's build script still looks for
+      # the library, so it gets the same one the `build` job uses.
+      - name: Install the DuckDB C library
+        run: |
+          set -euo pipefail
+          base="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}"
+          mkdir -p "$HOME/duckdb"
+          curl -fsSL -o /tmp/libduckdb.zip "$base/libduckdb-linux-amd64.zip"
+          unzip -o /tmp/libduckdb.zip -d "$HOME/duckdb"
+          {
+            echo "DUCKDB_LIB_DIR=$HOME/duckdb"
+            echo "DUCKDB_INCLUDE_DIR=$HOME/duckdb"
+          } >> "$GITHUB_ENV"
+
+      - name: arcform-sqlparser publishes (dry run)
+        run: cargo publish --dry-run --manifest-path vendor/sqlparser-0.55.0/Cargo.toml --features visitor
+
+      # The list is printed for the log, then held to the `include` rule: the source,
+      # the embedded operator scripts and the top-level documents, and nothing else —
+      # no fixture, no example database, no vendored fork.
+      - name: arcform's package contents
+        run: |
+          set -euo pipefail
+          cargo package -p arcform --list | tee /tmp/arcform-files
+          if grep -Ev '^(src/|operators/[a-z_]+/[a-z_]+\.py$|Cargo\.toml$|Cargo\.toml\.orig$|Cargo\.lock$|README\.md$|CHANGELOG\.md$|LICENSE$|\.cargo_vcs_info\.json$)' /tmp/arcform-files; then
+            echo "::error::files above are outside arcform's include rule"
+            exit 1
+          fi
+
+      - name: Packaged arcform builds against the packaged fork
+        run: |
+          set -euo pipefail
+          cargo package --manifest-path vendor/sqlparser-0.55.0/Cargo.toml --no-verify
+          cargo package -p arcform --no-verify --exclude-lockfile
+          size=$(wc -c < target/package/arcform-*.crate)
+          echo "arcform .crate: $size bytes"
+          test "$size" -lt 10000000
+          work="$RUNNER_TEMP/packaged"
+          mkdir -p "$work"
+          tar -xzf vendor/sqlparser-0.55.0/target/package/arcform-sqlparser-*.crate -C "$work"
+          tar -xzf target/package/arcform-*.crate -C "$work"
+          fork=$(ls -d "$work"/arcform-sqlparser-*)
+          crate=$(ls -d "$work"/arcform-[0-9]*)
+          printf '\n[patch.crates-io]\narcform-sqlparser = { path = "%s" }\n' "$fork" >> "$crate/Cargo.toml"
+          cp Cargo.lock "$crate/"
+          cargo check --manifest-path "$crate/Cargo.toml" --features mcp --target-dir target/packaged
+          cargo check --manifest-path "$crate/Cargo.toml" --no-default-features --target-dir target/packaged
+
   # The binary a release ships: DuckDB compiled in (`bundled-duckdb`, with the
   # parquet and json extensions), no system libduckdb, built --release on the
   # Ubuntu 22.04 the Linux release legs use, so glibc 2.35 is what it is tested on.

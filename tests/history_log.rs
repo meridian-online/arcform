@@ -31,7 +31,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use arc::spec::{
+use arcform::spec::{
     HistoryKind, HistoryWay, LOG_FILENAME, LocalHistory, MANIFEST_FILENAME, RecordedStep, SpecEdit,
     edit_spec_with_history, record_step_with_history,
 };
@@ -944,7 +944,7 @@ fn spec_with(steps: &[(&str, &str)]) -> String {
 
 /// A save of the spec in `protocol` through the app's handle, which names no
 /// step of its own: the entry recorded.
-fn save_spec(protocol: &Protocol, text: &str) -> arc::spec::HistoryEntry {
+fn save_spec(protocol: &Protocol, text: &str) -> arcform::spec::HistoryEntry {
     protocol
         .history(HistoryWay::new("app").unwrap())
         .record_save(&protocol.dir, text)

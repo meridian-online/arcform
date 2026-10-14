@@ -1,5 +1,5 @@
 //! The write path, exercised the way a sibling editor would use it: link the
-//! crate, build [`SpecEdit`] values, apply them through `arc::spec`, and hold
+//! crate, build [`SpecEdit`] values, apply them through `arcform::spec`, and hold
 //! the result to the two promises that matter —
 //!
 //!   1. **byte preservation** — every byte an edit did not target is identical
@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use arc::spec::{
+use arcform::spec::{
     Error, MANIFEST_FILENAME, Manifest, SpecEdit, Step, apply_edits, create_spec, edit_spec,
 };
 

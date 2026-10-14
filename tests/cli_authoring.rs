@@ -20,7 +20,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use arc::spec::{MANIFEST_FILENAME, Manifest, SpecEdit, apply_edits};
+use arcform::spec::{MANIFEST_FILENAME, Manifest, SpecEdit, apply_edits};
 
 /// Run the real `arc` binary with `args` in `dir`. The spawned binary gets a
 /// test-scoped local-history root and data folder: authoring commands record

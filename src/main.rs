@@ -3,5 +3,5 @@
 //! built from different code.
 
 fn main() {
-    arc::cli_main();
+    arcform::cli_main();
 }

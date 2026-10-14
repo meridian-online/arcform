@@ -535,8 +535,7 @@ impl<'a> Parser<'a> {
                 // DuckDB statement-form PIVOT/UNPIVOT (`PIVOT t ON … USING …`) are
                 // queries in their own right — route them through `parse_query`,
                 // which handles the body via `parse_query_body`.
-                Keyword::PIVOT | Keyword::UNPIVOT
-                    if dialect_of!(self is DuckDbDialect | GenericDialect) =>
+                Keyword::PIVOT | Keyword::UNPIVOT if dialect_of!(self is DuckDbDialect | GenericDialect) =>
                 {
                     self.prev_token();
                     self.parse_query().map(Statement::Query)
@@ -8540,10 +8539,7 @@ impl<'a> Parser<'a> {
                 // so multi-option COPY parses instead of degrading to an opaque step.
                 if dialect_of!(self is DuckDbDialect | GenericDialect) {
                     let name = self.parse_identifier()?;
-                    let value = if matches!(
-                        self.peek_token().token,
-                        Token::Comma | Token::RParen
-                    ) {
+                    let value = if matches!(self.peek_token().token, Token::Comma | Token::RParen) {
                         None
                     } else {
                         Some(self.parse_expr()?)

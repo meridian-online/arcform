@@ -25,7 +25,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use arc::spec::{
+use arcform::spec::{
     Error, HISTORY_MAX_ENTRIES, HISTORY_MERGE_WINDOW, HistoryEntry, HistoryKind, HistoryWay,
     LocalHistory, MANIFEST_FILENAME, Result,
 };
@@ -505,7 +505,7 @@ fn the_directory_calls_still_refuse_a_missing_directory_by_name() {
 
 #[test]
 fn the_file_calls_are_on_arc_spec_and_the_directory_calls_keep_their_signatures() {
-    // Each coercion fails to compile if its call is missing from `arc::spec`
+    // Each coercion fails to compile if its call is missing from `arcform::spec`
     // or its signature changes.
     type Record = fn(&LocalHistory, &Path, &str) -> Result<Option<HistoryEntry>>;
     type Entries = fn(&LocalHistory, &Path) -> Result<Vec<HistoryEntry>>;

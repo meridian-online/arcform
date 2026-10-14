@@ -24,7 +24,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use arc::spec::{
+use arcform::spec::{
     Error, GENERATED_MARKER, MANIFEST_FILENAME, Manifest, RecordedStep, Step, amend_step_sql,
     create_spec, record_step, sql_is_generated,
 };
@@ -495,11 +495,11 @@ fn amend_refuses_a_hand_authored_model_and_leaves_it_untouched() {
     std::fs::write(models.join("curated.sql"), hand).unwrap();
 
     // Cite the hand-authored model from a step, through the write path.
-    let edit = arc::spec::SpecEdit::Append {
+    let edit = arcform::spec::SpecEdit::Append {
         path: vec!["steps".into()],
         item: "  - name: curated\n    sql: models/curated.sql\n".to_string(),
     };
-    arc::spec::edit_spec(dir.path(), &[edit]).expect("the citation splices");
+    arcform::spec::edit_spec(dir.path(), &[edit]).expect("the citation splices");
 
     match amend_step_sql(dir.path(), "curated", "SELECT 2;", "retune") {
         Err(Error::HandAuthoredSql { step, path }) => {

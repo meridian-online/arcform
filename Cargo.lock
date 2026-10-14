@@ -115,9 +115,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "arc"
+name = "arcform"
 version = "0.1.0"
 dependencies = [
+ "arcform-sqlparser",
  "clap",
  "dirs",
  "dotenvy",
@@ -136,7 +137,6 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
- "sqlparser",
  "tar",
  "tempfile",
  "thiserror 2.0.18",
@@ -145,6 +145,15 @@ dependencies = [
  "url",
  "yamlpath",
  "zip",
+]
+
+[[package]]
+name = "arcform-sqlparser"
+version = "0.55.0"
+dependencies = [
+ "log",
+ "recursive",
+ "sqlparser_derive",
 ]
 
 [[package]]
@@ -2720,15 +2729,6 @@ name = "spin"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
-
-[[package]]
-name = "sqlparser"
-version = "0.55.0"
-dependencies = [
- "log",
- "recursive",
- "sqlparser_derive",
-]
 
 [[package]]
 name = "sqlparser_derive"

@@ -1,5 +1,5 @@
 //! An external consumer of the `arc` library, exercised the way a sibling tool would
-//! use it: link the crate, call `arc::spec`, never shell out to the binary.
+//! use it: link the crate, call `arcform::spec`, never shell out to the binary.
 //!
 //! Everything here goes through the published surface only. If a future refactor
 //! moves the loader behind a private door, this file stops compiling — which is the
@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use arc::spec::{Error, MANIFEST_FILENAME, Manifest, Precondition};
+use arcform::spec::{Error, MANIFEST_FILENAME, Manifest, Precondition};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
