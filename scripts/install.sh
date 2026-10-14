@@ -9,8 +9,8 @@
 # ~/.arcform/cli/latest at that directory, and links `arc` into ~/.local/bin.
 #
 # Usage:
-#   curl -fsSL https://install.meridian.online/arc | sh
-#   curl -fsSL https://install.meridian.online/arc | sh -s -- v0.2.0
+#   curl -fsSL https://install.meridian.online/arc | bash
+#   curl -fsSL https://install.meridian.online/arc | bash -s -- v0.2.0
 #   sh scripts/install.sh --self-test    # no network, nothing installed
 #
 # POSIX sh rather than bash, so it runs the same under dash, bash and zsh's sh.
