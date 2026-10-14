@@ -22,6 +22,8 @@
 //! - `sql_record` records a SQL statement as a new step of a Protocol, through the
 //!   same record path `arc sql record` takes, so the same statement writes the same
 //!   bytes from either.
+//! - `table_describe` reads a table in the Protocol's database, read-only, as
+//!   `arc table describe` does.
 //! - `protocol_create` makes a new Protocol in a directory, through the same
 //!   creation `arc create-protocol` takes, so the same request writes the same files
 //!   from either.
@@ -594,6 +596,35 @@ fn protocol_create_schema() -> Value {
     })
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// table_describe
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What a table in the Protocol's database holds, as `arc table describe` prints it.
+/// The database is opened read-only; the answer is the verb's JSON.
+fn table_describe(args: &Value) -> ToolResult {
+    let table = required_string(args, "table")?;
+    let dir = match args.get("dir") {
+        None | Some(Value::Null) => PathBuf::from("."),
+        Some(Value::String(dir)) => PathBuf::from(dir),
+        Some(other) => return Err(format!("`dir` must be a string, not {other}")),
+    };
+    crate::inspect::describe_table(&dir, table)
+        .map(ToolOutput::json)
+        .map_err(|e| e.to_string())
+}
+
+fn table_describe_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "table": { "type": "string", "description": "The table or view to describe." },
+            "dir": { "type": "string", "description": "The Protocol's directory. Defaults to the server's working directory." }
+        },
+        "required": ["table"]
+    })
+}
+
 /// The tools native to `arc`.
 pub(super) fn tools() -> Vec<ToolDef> {
     vec![
@@ -645,6 +676,13 @@ pub(super) fn tools() -> Vec<ToolDef> {
             input_schema: protocol_create_schema,
             handler: protocol_create,
             annotations: Annotations::WRITES,
+        },
+        ToolDef {
+            name: "table_describe",
+            description: "Describe a table or view in a Protocol's database: its row count, each column's name, type and null count, and up to five rows as JSON. Opens the database read-only and changes nothing; a database the Protocol has not made yet is refused, and so is one another process holds.",
+            input_schema: table_describe_schema,
+            handler: table_describe,
+            annotations: Annotations::READ_ONLY,
         },
     ]
 }

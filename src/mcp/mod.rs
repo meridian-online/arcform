@@ -69,7 +69,8 @@ const INSTRUCTIONS: &str = "Use arc when you analyse data over DuckDB and the wo
     arguments operation_record takes, or none; sql_record records a SQL statement as a new \
     step of a Protocol, as the operation it is read as or else as a SQL step, and runs \
     nothing; protocol_create makes a new Protocol in a directory, as arc create-protocol does, \
-    and refuses one that already has a spec.";
+    and refuses one that already has a spec; table_describe reads what a table in a \
+    Protocol's database holds (row count, columns, null counts, sample rows) and changes nothing.";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool result shapes
@@ -465,13 +466,14 @@ mod tests {
             "sql_recognise",
             "sql_record",
             "protocol_create",
+            "table_describe",
         ] {
             assert!(
                 names.contains(&expected),
                 "missing tool `{expected}` in {names:?}"
             );
         }
-        assert_eq!(names.len(), 12, "unexpected tool set: {names:?}");
+        assert_eq!(names.len(), 13, "unexpected tool set: {names:?}");
         // Every tool advertises an object input schema.
         for tool in listed["tools"].as_array().unwrap() {
             assert!(tool["description"].is_string());

@@ -46,6 +46,7 @@ mod error;
 mod fetch_cache;
 mod history;
 mod ingress_meta;
+mod inspect;
 mod introspect;
 mod manifest;
 #[cfg(feature = "mcp")]

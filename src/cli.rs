@@ -168,9 +168,32 @@ pub enum Commands {
     /// `operation_record` (record an operation as a step of a Protocol),
     /// `sql_recognise` (what arc reads a SQL statement as), `sql_record` (record
     /// a SQL statement as a step of a Protocol) and `protocol_create` (make a new
-    /// Protocol, as `arc create-protocol` does).
+    /// Protocol, as `arc create-protocol` does) and `table_describe` (what a table in
+    /// a Protocol's database holds, read-only).
     #[cfg(feature = "mcp")]
     Mcp,
+
+    /// Look at a table in a protocol's database, read-only.
+    Table {
+        #[command(subcommand)]
+        cmd: TableCmd,
+    },
+}
+
+/// The `arc table` verbs.
+#[derive(Subcommand)]
+pub(crate) enum TableCmd {
+    /// Describe a table or view in the protocol's database: its row count, each
+    /// column's name, type and null count, and up to five rows, as JSON. Opens
+    /// the database read-only; a database that does not exist yet is refused.
+    Describe {
+        /// The table or view to describe.
+        table: String,
+
+        /// Directory the protocol lives in.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
 }
 
 /// The verbs that take SQL as it is typed.
@@ -901,6 +924,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Commands::Sql { cmd } => dispatch_sql(cmd, &mut std::io::stdout()),
         #[cfg(feature = "mcp")]
         Commands::Mcp => crate::mcp::serve(),
+        Commands::Table {
+            cmd: TableCmd::Describe { table, dir },
+        } => {
+            let described = crate::inspect::describe_table(&dir, &table)?;
+            println!("{}", serde_json::to_string_pretty(&described).unwrap());
+            Ok(())
+        }
     }
 }
 
