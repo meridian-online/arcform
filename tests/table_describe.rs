@@ -274,6 +274,24 @@ fn describe_names_a_table_in_another_schema() {
 }
 
 #[test]
+fn describe_lists_main_tables_by_bare_name() {
+    let dir = protocol();
+    let conn = duckdb::Connection::open(dir.path().join("data.duckdb")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE main.orders (id INTEGER);
+         CREATE SCHEMA staging; CREATE TABLE staging.only_here (id INTEGER);",
+    )
+    .unwrap();
+    drop(conn);
+    let err = stderr(&describe(dir.path(), "nope"));
+    assert!(
+        err.contains("the tables are: orders, staging.only_here"),
+        "{err}"
+    );
+    assert!(!err.contains("main."), "{err}");
+}
+
+#[test]
 fn describe_a_bare_name_in_two_schemas_is_refused() {
     let dir = protocol();
     let conn = duckdb::Connection::open(dir.path().join("data.duckdb")).unwrap();
