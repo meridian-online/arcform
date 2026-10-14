@@ -444,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_registers_all_eleven_tools() {
+    fn tools_list_registers_all_twelve_tools() {
         let listed = tools_list();
         let names: Vec<&str> = listed["tools"]
             .as_array()
@@ -471,7 +471,7 @@ mod tests {
                 "missing tool `{expected}` in {names:?}"
             );
         }
-        assert_eq!(names.len(), 11, "unexpected tool set: {names:?}");
+        assert_eq!(names.len(), 12, "unexpected tool set: {names:?}");
         // Every tool advertises an object input schema.
         for tool in listed["tools"].as_array().unwrap() {
             assert!(tool["description"].is_string());
