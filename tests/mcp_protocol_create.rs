@@ -171,5 +171,8 @@ fn protocol_create_names_the_name_argument_when_the_dir_gives_none() {
     let result = &out[0]["result"];
     assert_eq!(result["isError"], json!(true), "{result}");
     let text = result["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("`name`") && !text.contains("--name"), "{text}");
+    assert!(
+        text.contains("`name`") && !text.contains("--name"),
+        "{text}"
+    );
 }
