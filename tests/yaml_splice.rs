@@ -1,6 +1,6 @@
 //! The splice over YAML that is not a spec, exercised the way a sibling tool
 //! editing a chart file would use it: link the crate, build [`SpecEdit`]
-//! values, and hand them to `arc::spec::apply_yaml_edits` with the chart's text.
+//! values, and hand them to `arcform::spec::apply_yaml_edits` with the chart's text.
 //!
 //! The promise held here is the one `tests/edit_contract.rs` holds for a spec:
 //! every byte an edit did not target is identical afterwards, asserted by
@@ -16,7 +16,7 @@
 //! Nothing here needs the `arc` binary, so the file runs with the `cli` feature
 //! off: `cargo test --no-default-features --test yaml_splice`.
 
-use arc::spec::{Error, MANIFEST_FILENAME, SpecEdit, apply_edits, apply_yaml_edits, edit_spec};
+use arcform::spec::{Error, MANIFEST_FILENAME, SpecEdit, apply_edits, apply_yaml_edits, edit_spec};
 
 const CHART: &str = include_str!("fixtures/mosaic_chart.yaml");
 
@@ -224,7 +224,7 @@ const FLAT_COMMENTS: [&str; 3] = [
     "# summed per week upstream",
 ];
 
-fn nest_plot(path: Vec<arc::spec::PathPart>) -> SpecEdit {
+fn nest_plot(path: Vec<arcform::spec::PathPart>) -> SpecEdit {
     SpecEdit::Nest {
         path,
         keys: vec!["plot".into(), "yScale".into(), "height".into()],
@@ -232,7 +232,7 @@ fn nest_plot(path: Vec<arc::spec::PathPart>) -> SpecEdit {
     }
 }
 
-fn lift_vconcat(path: Vec<arc::spec::PathPart>) -> SpecEdit {
+fn lift_vconcat(path: Vec<arcform::spec::PathPart>) -> SpecEdit {
     SpecEdit::Lift {
         path,
         key: "vconcat".into(),

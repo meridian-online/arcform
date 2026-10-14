@@ -153,8 +153,9 @@ pub enum Commands {
         cmd: OperationCmd,
     },
 
-    /// Read SQL as arc reads it, and record a statement as a step: whether a
-    /// statement is an operation arc holds, and the step that records it.
+    /// Read SQL as arc reads it, record a statement as a step, and query a
+    /// protocol's database read-only: whether a statement is an operation arc
+    /// holds, the step that records it, and what a SELECT returns.
     Sql {
         #[command(subcommand)]
         cmd: SqlCmd,
@@ -166,10 +167,35 @@ pub enum Commands {
     /// Protocol+Run contract), `operator_describe` (an operator's `with:` schema),
     /// `operation_describe` (the SQL operations arc holds, and what one takes),
     /// `operation_record` (record an operation as a step of a Protocol),
-    /// `sql_recognise` (what arc reads a SQL statement as) and `sql_record` (record
-    /// a SQL statement as a step of a Protocol).
+    /// `sql_recognise` (what arc reads a SQL statement as), `sql_record` (record
+    /// a SQL statement as a step of a Protocol), `protocol_create` (make a new
+    /// Protocol, as `arc create-protocol` does), `table_describe` (what a table in
+    /// a Protocol's database holds, read-only) and `sql_query` (run read-only
+    /// SELECTs against a Protocol's database).
     #[cfg(feature = "mcp")]
     Mcp,
+
+    /// Look at a table in a protocol's database, read-only.
+    Table {
+        #[command(subcommand)]
+        cmd: TableCmd,
+    },
+}
+
+/// The `arc table` verbs.
+#[derive(Subcommand)]
+pub enum TableCmd {
+    /// Describe a table or view in the protocol's database: its row count, each
+    /// column's name, type and null count, and up to five rows (each an array of values in column order), as JSON. Opens
+    /// the database read-only; a database that does not exist yet is refused.
+    Describe {
+        /// The table or view to describe.
+        table: String,
+
+        /// Directory the protocol lives in.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
 }
 
 /// The verbs that take SQL as it is typed.
@@ -216,6 +242,28 @@ pub enum SqlCmd {
         /// Protocol directory (where arcform.yaml lives).
         #[arg(long, default_value = ".")]
         dir: PathBuf,
+    },
+    /// Run read-only SELECT statements against the protocol's database and print
+    /// what they return, as JSON: for each statement its columns and types, and up
+    /// to `--limit` rows, each an array of values in column order, with `capped`
+    /// and `rows_held_back` saying when more rows were there (a recount: the
+    /// statement runs a second time). Before anything runs, DuckDB reads the whole
+    /// text, and a text holding anything but SELECTs is refused whole. A statement
+    /// that fails while running gives its error in its place and the others are
+    /// kept; the command then exits 1. A SELECT may read the files and URLs it
+    /// names; the database is opened read-only, so nothing here changes it.
+    Query {
+        /// One or more SELECT statements, as typed.
+        #[arg(allow_hyphen_values = true)]
+        sql: String,
+
+        /// Protocol directory (where arcform.yaml lives).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+
+        /// The most rows printed for each statement, at most 100000.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
     },
 }
 
@@ -410,17 +458,27 @@ pub enum HistoryCmd {
     },
 }
 
-/// Execute the `arc create-protocol` command: assemble the manifest value the
-/// arguments describe and hand it to the library's creation path — the same
-/// gate and the same atomic write every other caller gets. Nothing is written
-/// unless the result loads; an existing spec is refused, never overwritten.
-pub fn create_protocol(
+/// What [`create_protocol_files`] wrote: the manifest's path, and what became of the
+/// ignore list and the attributes file beside it.
+#[derive(Debug)]
+pub(crate) struct CreatedProtocol {
+    pub manifest: PathBuf,
+    pub ignore: IgnoreList,
+    pub merge_rule: MergeRule,
+}
+
+/// Write a new Protocol into `dir`: assemble the manifest value the arguments
+/// describe and hand it to the library's creation path — the same gate and the
+/// same atomic write every other caller gets. Nothing is written unless the
+/// result loads; an existing spec is refused, never overwritten. Prints nothing,
+/// so a caller whose standard output is a protocol channel (`arc mcp`) can use it.
+pub(crate) fn create_protocol_files(
     dir: &Path,
     name: Option<String>,
     engine: Option<String>,
     db: Option<String>,
     history: &LocalHistory,
-) -> Result<()> {
+) -> Result<CreatedProtocol> {
     let name = match name {
         Some(name) => name,
         None => dir
@@ -454,15 +512,31 @@ pub fn create_protocol(
     // attributes file the author may have written first.
     let ignore = write_ignore_list(dir, manifest.db.as_deref(), &[])?;
     let merge_rule = write_merge_rule(dir)?;
+    Ok(CreatedProtocol {
+        manifest: dir.join(crate::spec::MANIFEST_FILENAME),
+        ignore,
+        merge_rule,
+    })
+}
 
+/// Execute the `arc create-protocol` command: [`create_protocol_files`], then say
+/// what it wrote.
+pub fn create_protocol(
+    dir: &Path,
+    name: Option<String>,
+    engine: Option<String>,
+    db: Option<String>,
+    history: &LocalHistory,
+) -> Result<()> {
+    let created = create_protocol_files(dir, name, engine, db, history)?;
     println!(
-        "created {} — author steps with `arc edit-protocol`",
-        dir.join(crate::spec::MANIFEST_FILENAME).display()
+        "created {} — record steps with `arc sql record`, or edit it with `arc edit-protocol`",
+        created.manifest.display()
     );
-    if ignore == IgnoreList::Written {
+    if created.ignore == IgnoreList::Written {
         println!("created {}", dir.join(IGNORE_FILENAME).display());
     }
-    match merge_rule {
+    match created.merge_rule {
         MergeRule::Written => println!("created {}", dir.join(ATTRIBUTES_FILENAME).display()),
         MergeRule::Added => println!(
             "added the log's merge rule to {}",
@@ -874,6 +948,19 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Commands::Sql { cmd } => dispatch_sql(cmd, &mut std::io::stdout()),
         #[cfg(feature = "mcp")]
         Commands::Mcp => crate::mcp::serve(),
+        Commands::Table { cmd } => dispatch_table(cmd, &mut std::io::stdout()),
+    }
+}
+
+/// Execute an `arc table` verb, writing its JSON to `out`. A write that fails is
+/// the error, not a silent success.
+fn dispatch_table(cmd: TableCmd, out: &mut impl Write) -> Result<()> {
+    match cmd {
+        TableCmd::Describe { table, dir } => {
+            let described = crate::inspect::describe_table(&dir, &table)?;
+            writeln!(out, "{described:#}")?;
+            Ok(())
+        }
     }
 }
 
@@ -909,8 +996,9 @@ fn dispatch_operation(cmd: OperationCmd, out: &mut impl Write) -> Result<()> {
 
 /// Execute an `arc sql` verb. `recognise` prints what arc reads a statement as,
 /// read by DuckDB's parse alone: it reads no protocol and writes no file.
-/// `record` writes a step into a protocol, and runs nothing. A refusal is the
-/// error, with nothing written to `out`.
+/// `record` writes a step into a protocol, and runs nothing. `query` runs SELECTs
+/// on the protocol's database, opened read-only. A refusal is the error, with
+/// nothing written to `out`.
 fn dispatch_sql(cmd: SqlCmd, out: &mut impl Write) -> Result<()> {
     match cmd {
         SqlCmd::Recognise { sql } => {
@@ -931,6 +1019,19 @@ fn dispatch_sql(cmd: SqlCmd, out: &mut impl Write) -> Result<()> {
                 description: description.as_deref(),
             };
             sql_record(&dir, &request, &history, out)
+        }
+        SqlCmd::Query { sql, dir, limit } => {
+            let answer = crate::inspect::query(&dir, &sql, limit)?;
+            writeln!(out, "{answer:#}")?;
+            let failed = crate::inspect::failed_statements(&answer);
+            if failed.is_empty() {
+                return Ok(());
+            }
+            let numbers: Vec<String> = failed.iter().map(u64::to_string).collect();
+            Err(Error::Io(std::io::Error::other(format!(
+                "statement {} failed while running; its error is in the results",
+                numbers.join(", ")
+            ))))
         }
     }
 }
@@ -1834,6 +1935,44 @@ mod tests {
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
         };
         let err = dispatch_sql(cmd, &mut FailingWriter).unwrap_err();
+        assert!(err.to_string().contains("stdout is closed"), "{err}");
+    }
+
+    #[test]
+    fn sql_query_reports_a_failed_write() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("arcform.yaml"),
+            "name: p\nengine: duckdb\ndb: data.duckdb\nsteps: []\nassets: {}\n",
+        )
+        .unwrap();
+        duckdb::Connection::open(dir.path().join("data.duckdb")).unwrap();
+        let cmd = SqlCmd::Query {
+            sql: "SELECT 1".to_string(),
+            dir: dir.path().to_path_buf(),
+            limit: 100,
+        };
+        let err = dispatch_sql(cmd, &mut FailingWriter).unwrap_err();
+        assert!(err.to_string().contains("stdout is closed"), "{err}");
+    }
+
+    #[test]
+    fn table_describe_reports_a_failed_write() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("arcform.yaml"),
+            "name: p\nengine: duckdb\ndb: data.duckdb\nsteps: []\nassets: {}\n",
+        )
+        .unwrap();
+        duckdb::Connection::open(dir.path().join("data.duckdb"))
+            .unwrap()
+            .execute_batch("CREATE TABLE t AS SELECT 1 AS i")
+            .unwrap();
+        let cmd = TableCmd::Describe {
+            table: "t".to_string(),
+            dir: dir.path().to_path_buf(),
+        };
+        let err = dispatch_table(cmd, &mut FailingWriter).unwrap_err();
         assert!(err.to_string().contains("stdout is closed"), "{err}");
     }
 

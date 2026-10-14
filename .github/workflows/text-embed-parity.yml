@@ -43,7 +43,7 @@ env:
   SUBTOKEN_REF: 27e6aaa6442ca7bdf5b91fe701ba258399959f37
   # Matches ci.yml's build job — arcform's own crate still links a system DuckDB to
   # compile and run its tests, independent of the extension under test.
-  DUCKDB_VERSION: v1.5.4
+  DUCKDB_VERSION: v1.5.6
 
 jobs:
   # Unconditional: this job always builds its own artifact and always runs every test

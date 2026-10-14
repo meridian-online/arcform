@@ -2,11 +2,9 @@
 //!
 //! This is the entry point that subsumes the FineType MCP server's role: instead of a
 //! separate `finetype mcp` process, `arc mcp` federates the `finetype` CLI as a set of
-//! tools and adds ones of its own — one that runs a Protocol and returns the live
-//! Protocol+Run contract, one that emits an operator's `with:` JSON Schema, one
-//! that lists the SQL operations arc holds and describes what one takes, one that
-//! records an operation as a step, and one that answers what a SQL statement is
-//! read as.
+//! tools and adds tools of its own that run, inspect and record Protocols. The tool
+//! set is what [`tools_list`] registers, and [`INSTRUCTIONS`] tells a client when to
+//! reach for each; neither is repeated here, so this comment cannot fall behind.
 //!
 //! # Transport
 //!
@@ -38,23 +36,42 @@ use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
 
-/// The MCP protocol revision this server implements.
-const PROTOCOL_VERSION: &str = "2025-06-18";
+/// The MCP protocol revisions this server implements, newest last.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-11-25"];
+
+/// Negotiate the protocol version: the client's request when this server supports it,
+/// else the newest version it does (the client then decides whether to proceed).
+fn negotiate(requested: Option<&str>) -> &'static str {
+    requested
+        .and_then(|r| SUPPORTED_PROTOCOL_VERSIONS.iter().find(|v| **v == r))
+        .or_else(|| SUPPORTED_PROTOCOL_VERSIONS.last())
+        .copied()
+        .expect("at least one supported protocol version")
+}
+
 /// Server identity reported in the `initialize` handshake.
 const SERVER_NAME: &str = "arc-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const INSTRUCTIONS: &str = "arc — a local-first data-pipeline engine, exposed over MCP.\n\n\
+const INSTRUCTIONS: &str = "Use arc when you analyse data over DuckDB and the work should be kept as a \
+    versioned, re-runnable Protocol rather than a one-off query. arc is a local-first \
+    data-pipeline engine, exposed over MCP.\n\n\
     Tools: infer / profile / taxonomy / validate / generate federate the FineType CLI \
-    (semantic type inference over tabular data); protocol_run runs an arc Protocol and \
-    returns its live Protocol+Run contract; operator_describe emits an operator's `with:` \
-    JSON Schema for authoring; operation_describe lists the SQL operations arc holds and, \
-    given an operation's long name or an operator's name, describes what its step reads, \
-    writes and takes; operation_record records an operation as a new step of a Protocol; \
-    sql_recognise answers what arc reads a SQL statement as: an operation it holds, with \
-    the table and the arguments operation_record takes, or none; sql_record records a \
-    SQL statement as a new step of a Protocol, as the operation it is read as or else as a \
-    SQL step, and runs nothing.";
+    (semantic type inference over tabular data) and change nothing; protocol_run runs an arc \
+    Protocol, which can write tables and files and reach the network, and returns its live \
+    Protocol+Run contract; operator_describe emits an operator's `with:` JSON Schema for \
+    authoring; operation_describe lists the SQL operations arc holds and, given an \
+    operation's long name or an operator's name, describes what its step reads, writes and \
+    takes; operation_record records an operation as a new step of a Protocol; sql_recognise \
+    answers what arc reads a SQL statement as: an operation it holds, with the table and the \
+    arguments operation_record takes, or none; sql_record records a SQL statement as a new \
+    step of a Protocol, as the operation it is read as or else as a SQL step, and runs \
+    nothing; protocol_create makes a new Protocol in a directory, as arc create-protocol does, \
+    and refuses one that already has a spec; table_describe reads what a table in a \
+    Protocol's database holds (row count, columns, null counts, sample rows) and changes nothing; \
+    sql_query runs SELECT statements against a Protocol's database, read-only, refuses any \
+    other statement before anything runs, and changes nothing. The SQL table_describe and \
+    sql_query run may read files and URLs it names; the database itself is never written.";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool result shapes
@@ -104,6 +121,48 @@ impl ToolOutput {
 /// as an `isError: true` result.
 pub(crate) type ToolResult = std::result::Result<ToolOutput, String>;
 
+/// What a tool tells the client about its effects, emitted as MCP tool annotations.
+#[derive(Clone, Copy)]
+pub(crate) struct Annotations {
+    /// The tool changes nothing in its environment.
+    pub read_only: bool,
+    /// The tool may interact with an open set of external entities: the network, or
+    /// whatever a Protocol's steps reach.
+    pub open_world: bool,
+    /// The tool may replace or destroy existing state, not only add to it.
+    pub destructive: bool,
+}
+
+impl Annotations {
+    /// A tool that changes nothing and reaches nothing outside the files it is given.
+    pub(crate) const READ_ONLY: Annotations = Annotations {
+        read_only: true,
+        open_world: false,
+        destructive: false,
+    };
+    /// A tool that changes nothing, but runs SQL that may read files and URLs it names:
+    /// it reads a Protocol's database without writing it.
+    pub(crate) const READS_OPEN: Annotations = Annotations {
+        read_only: true,
+        open_world: true,
+        destructive: false,
+    };
+    /// A tool that adds to the Protocol's folder, never replaces what is there, and
+    /// reaches nothing else.
+    pub(crate) const WRITES: Annotations = Annotations {
+        read_only: false,
+        open_world: false,
+        destructive: false,
+    };
+    /// A tool that runs a Protocol: it replaces tables, runs arbitrary steps and may
+    /// reach the network.
+    pub(crate) const RUNS: Annotations = Annotations {
+        read_only: false,
+        open_world: true,
+        destructive: true,
+    };
+}
+
 /// A registered tool: its MCP name, one-line description, input-schema builder, and
 /// handler.
 pub(crate) struct ToolDef {
@@ -111,6 +170,7 @@ pub(crate) struct ToolDef {
     pub description: &'static str,
     pub input_schema: fn() -> Value,
     pub handler: fn(&Value) -> ToolResult,
+    pub annotations: Annotations,
 }
 
 /// Every tool this server registers: the five FineType-federating proxies followed by
@@ -143,13 +203,10 @@ fn dispatch(method: &str, params: &Value) -> std::result::Result<Value, (i64, St
     }
 }
 
-/// The `initialize` handshake result. Echoes the client's requested `protocolVersion`
-/// when present (maximising compatibility), else offers ours.
+/// The `initialize` handshake result. Negotiates the client's requested `protocolVersion`:
+/// when this server supports it, else offers the newest it does.
 fn initialize_result(params: &Value) -> Value {
-    let protocol_version = params
-        .get("protocolVersion")
-        .and_then(Value::as_str)
-        .unwrap_or(PROTOCOL_VERSION);
+    let protocol_version = negotiate(params.get("protocolVersion").and_then(Value::as_str));
     json!({
         "protocolVersion": protocol_version,
         "capabilities": { "tools": {} },
@@ -167,6 +224,11 @@ fn tools_list() -> Value {
                 "name": t.name,
                 "description": t.description,
                 "inputSchema": (t.input_schema)(),
+                "annotations": {
+                    "readOnlyHint": t.annotations.read_only,
+                    "openWorldHint": t.annotations.open_world,
+                    "destructiveHint": t.annotations.destructive,
+                },
             })
         })
         .collect();
@@ -305,13 +367,101 @@ mod tests {
     }
 
     #[test]
-    fn initialize_echoes_client_protocol_version() {
+    fn initialize_offers_newest_version_for_an_unsupported_request() {
         let result = initialize_result(&json!({ "protocolVersion": "2024-11-05" }));
-        assert_eq!(result["protocolVersion"], "2024-11-05");
+        assert_eq!(result["protocolVersion"], "2025-11-25");
+    }
+
+    fn tool<'a>(list: &'a Value, name: &str) -> &'a Value {
+        list["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("no tool {name}"))
     }
 
     #[test]
-    fn tools_list_registers_all_eleven_tools() {
+    fn negotiate_returns_supported_request() {
+        assert_eq!(negotiate(Some("2025-06-18")), "2025-06-18");
+    }
+
+    #[test]
+    fn negotiate_unknown_returns_newest() {
+        assert_eq!(negotiate(Some("2099-01-01")), "2025-11-25");
+    }
+
+    #[test]
+    fn negotiate_absent_returns_newest() {
+        assert_eq!(negotiate(None), "2025-11-25");
+    }
+
+    #[test]
+    fn read_only_tools_say_so() {
+        let list = tools_list();
+        for name in [
+            "infer",
+            "profile",
+            "taxonomy",
+            "validate",
+            "generate",
+            "operator_describe",
+            "operation_describe",
+            "sql_recognise",
+            "table_describe",
+            "sql_query",
+        ] {
+            assert_eq!(
+                tool(&list, name)["annotations"]["readOnlyHint"],
+                true,
+                "{name}"
+            );
+        }
+        // The SQL these run may read the files and URLs it names.
+        for name in ["table_describe", "sql_query"] {
+            let annotations = &tool(&list, name)["annotations"];
+            assert_eq!(annotations["openWorldHint"], true, "{name}");
+            assert_eq!(annotations["destructiveHint"], false, "{name}");
+        }
+        for name in ["operation_record", "sql_record", "protocol_run"] {
+            assert_eq!(
+                tool(&list, name)["annotations"]["readOnlyHint"],
+                false,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            tool(&list, "protocol_run")["annotations"]["openWorldHint"],
+            true
+        );
+        assert_eq!(tool(&list, "infer")["annotations"]["openWorldHint"], false);
+        for name in ["operation_record", "sql_record"] {
+            assert_eq!(
+                tool(&list, name)["annotations"]["destructiveHint"],
+                false,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            tool(&list, "protocol_run")["annotations"]["destructiveHint"],
+            true
+        );
+    }
+
+    #[test]
+    fn instructions_open_with_when_to_use_arc_and_name_every_tool() {
+        assert!(INSTRUCTIONS.starts_with("Use arc when"));
+        for t in tools() {
+            assert!(
+                INSTRUCTIONS.contains(t.name),
+                "INSTRUCTIONS omits {}",
+                t.name
+            );
+        }
+    }
+
+    #[test]
+    fn tools_list_registers_every_tool() {
         let listed = tools_list();
         let names: Vec<&str> = listed["tools"]
             .as_array()
@@ -331,13 +481,16 @@ mod tests {
             "operation_record",
             "sql_recognise",
             "sql_record",
+            "protocol_create",
+            "table_describe",
+            "sql_query",
         ] {
             assert!(
                 names.contains(&expected),
                 "missing tool `{expected}` in {names:?}"
             );
         }
-        assert_eq!(names.len(), 11, "unexpected tool set: {names:?}");
+        assert_eq!(names.len(), 14, "unexpected tool set: {names:?}");
         // Every tool advertises an object input schema.
         for tool in listed["tools"].as_array().unwrap() {
             assert!(tool["description"].is_string());

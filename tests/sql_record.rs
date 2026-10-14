@@ -637,6 +637,49 @@ fn arc_run_makes_a_table_of_each_form_of_select() {
     }
 }
 
+#[test]
+fn a_protocol_arc_create_protocol_just_made_takes_its_first_step_and_runs() {
+    // `arc create-protocol` writes `steps: []`: there is no step before the
+    // first to copy the indentation of, and the recording still lands.
+    let root = tempfile::tempdir().expect("tempdir");
+    let protocol = Protocol {
+        dir: root.path().join("shop"),
+        history: root.path().join("history"),
+        _root: root,
+    };
+    ok(
+        &protocol.arc_from(
+            protocol._root.path(),
+            &["create-protocol", "shop", "--db", "shop.duckdb"],
+        ),
+        "arc create-protocol",
+    );
+    ok(
+        &protocol.record(
+            "SELECT * FROM (VALUES (1, 50), (2, 150), (3, 300)) AS t(id, amount)",
+            "orders",
+        ),
+        "the first arc sql record",
+    );
+    ok(
+        &protocol.record(FILTER, "big_orders"),
+        "the second arc sql record",
+    );
+    assert!(
+        protocol.read("arcform.yaml").contains(
+            "steps:\n  - name: orders\n    sql: models/01_orders.sql\n  - name: big_orders\n    sql: models/02_big_orders.sql\n"
+        ),
+        "the empty steps become a block sequence of the two steps:\n{}",
+        protocol.read("arcform.yaml")
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    assert_eq!(
+        protocol.rows("SELECT id, amount FROM big_orders ORDER BY id"),
+        [(2, 150), (3, 300)],
+        "big_orders holds the rows of the first step's table over 100"
+    );
+}
+
 // ------------------------------------------------------------------ refuse
 
 #[test]

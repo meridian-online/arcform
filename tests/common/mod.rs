@@ -64,3 +64,53 @@ pub fn arc_run(project: &Path) -> String {
     );
     stdout
 }
+
+/// Start `arc mcp` in `dir`, write each request on its own line, close stdin, and
+/// return every line the server wrote to standard output, unfiltered, so a caller can
+/// check that each one is a JSON-RPC message.
+///
+/// Only the tests built with the `mcp` feature call it, and the others include this
+/// module too.
+#[allow(dead_code)]
+pub fn mcp_session(dir: &Path, requests: &[serde_json::Value]) -> Vec<String> {
+    mcp_session_env(dir, requests, &[])
+}
+
+/// [`mcp_session`], with `env` set on the spawned server.
+#[allow(dead_code)]
+pub fn mcp_session_env(
+    dir: &Path,
+    requests: &[serde_json::Value],
+    env: &[(&str, &Path)],
+) -> Vec<String> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .current_dir(dir)
+        .envs(env.iter().copied())
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn arc mcp");
+    {
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        for request in requests {
+            writeln!(stdin, "{request}").expect("write a request");
+        }
+        // Dropping stdin closes it, which ends the server's read loop.
+    }
+    let out = child.wait_with_output().expect("wait for arc mcp");
+    assert!(
+        out.status.success(),
+        "arc mcp failed (code {:?}):\nstderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}

@@ -70,14 +70,14 @@ pub use self::query::{
     NamedWindowDefinition, NamedWindowExpr, NonBlock, Offset, OffsetRows, OpenJsonTableColumn,
     OrderBy, OrderByExpr, OrderByKind, OrderByOptions, PivotStatement, PivotValueSource,
     ProjectionSelect, Query, RenameSelectItem, RepetitionQuantifier, ReplaceSelectElement,
-    ReplaceSelectItem, RowsPerMatch,
-    Select, SelectFlavor, SelectInto, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
-    SetOperator, SetQuantifier, Setting, SymbolDefinition, Table, TableAlias, TableAliasColumnDef,
-    TableFactor, TableFunctionArgs, TableIndexHintForClause, TableIndexHintType, TableIndexHints,
-    TableIndexType, TableSample, TableSampleBucket, TableSampleKind, TableSampleMethod,
-    TableSampleModifier, TableSampleQuantity, TableSampleSeed, TableSampleSeedModifier,
-    TableSampleUnit, TableVersion, TableWithJoins, Top, TopQuantity, UnpivotInto, UnpivotStatement,
-    UpdateTableFromKind, ValueTableMode, Values, WildcardAdditionalOptions, With, WithFill,
+    ReplaceSelectItem, RowsPerMatch, Select, SelectFlavor, SelectInto, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier, Setting,
+    SymbolDefinition, Table, TableAlias, TableAliasColumnDef, TableFactor, TableFunctionArgs,
+    TableIndexHintForClause, TableIndexHintType, TableIndexHints, TableIndexType, TableSample,
+    TableSampleBucket, TableSampleKind, TableSampleMethod, TableSampleModifier,
+    TableSampleQuantity, TableSampleSeed, TableSampleSeedModifier, TableSampleUnit, TableVersion,
+    TableWithJoins, Top, TopQuantity, UnpivotInto, UnpivotStatement, UpdateTableFromKind,
+    ValueTableMode, Values, WildcardAdditionalOptions, With, WithFill,
 };
 
 pub use self::trigger::{
@@ -7328,10 +7328,7 @@ pub enum CopyOption {
     /// DuckDB's COPY option set is open-ended, so these are captured generically
     /// as a name and an optional value expression (`None` = a bare flag).
     /// See <https://duckdb.org/docs/stable/sql/statements/copy>.
-    DuckDbOption {
-        name: Ident,
-        value: Option<Expr>,
-    },
+    DuckDbOption { name: Ident, value: Option<Expr> },
 }
 
 impl fmt::Display for CopyOption {
@@ -7356,7 +7353,10 @@ impl fmt::Display for CopyOption {
             }
             ForceNull(columns) => write!(f, "FORCE_NULL ({})", display_comma_separated(columns)),
             Encoding(name) => write!(f, "ENCODING '{}'", value::escape_single_quote_string(name)),
-            DuckDbOption { name, value: Some(value) } => write!(f, "{name} {value}"),
+            DuckDbOption {
+                name,
+                value: Some(value),
+            } => write!(f, "{name} {value}"),
             DuckDbOption { name, value: None } => write!(f, "{name}"),
         }
     }

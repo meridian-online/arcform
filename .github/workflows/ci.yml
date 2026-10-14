@@ -11,12 +11,16 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # arcform links a SYSTEM DuckDB — `libduckdb-sys` ships no `bundled` feature, so
-  # every job that compiles the crate must provide the C library and its headers.
-  # Pinned to the version the crate is developed against; bump in lockstep with the
-  # `duckdb` dependency. The install step below writes the *_DIR / LD_LIBRARY_PATH
-  # env vars that libduckdb-sys and the test runtime read.
-  DUCKDB_VERSION: v1.5.4
+  # Development builds link a SYSTEM DuckDB, so every job here that compiles the
+  # crate without the `bundled-duckdb` feature provides the C library and its headers.
+  # The `bundled` job below builds DuckDB into the binary instead, as release binaries
+  # are built. One version throughout: this pin, the exact `duckdb` crate version in
+  # Cargo.toml (1.10506.0 is v1.5.6) and the versions in src/vetted_extensions.json
+  # move together, because arc loads extensions into the linked library in-process and
+  # an extension loads only into the version it was built for. The install step below
+  # writes the *_DIR / LD_LIBRARY_PATH env vars that libduckdb-sys and the test
+  # runtime read.
+  DUCKDB_VERSION: v1.5.6
 
 jobs:
   # Formatting is build-free, so it reports in seconds and never waits on the
@@ -72,6 +76,48 @@ jobs:
       # else, so no gate ever observed whether they were clearing.
       - name: map-refit-stability findings match results.json
         run: python3 eval/map-refit-stability/check_findings.py
+
+  # The release tag guard: release.yml's first job, which every other release job
+  # waits on. release.yml runs only on a pushed tag, so this is where its guard is
+  # exercised before one is pushed. --wiring reads the tag filter and the guard's
+  # place in the release job graph; --release-rehearsal executes the `tag-guard`
+  # job's own `run:` line against a copy of this tree, once with this tree's version
+  # and once for each refusal, so a version bump without its CHANGELOG.md heading
+  # fails here rather than on the tag; --self-test mutates each of those and requires
+  # the check to refuse. No path filter: the diffs likeliest to break the guard are a
+  # version bump or an edit to release.yml, neither of which touches the script, and
+  # a skipped required check passes. Stdlib-only and build-free, seconds to report.
+  release-guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Only a version tag starts a release, and the guard runs first
+        run: python3 scripts/check_release_tag.py --wiring
+      - name: The tag guard passes this tree's version and refuses the bad tags
+        run: python3 scripts/check_release_tag.py --release-rehearsal
+      - name: The tag guard detects each defect it exists for
+        run: python3 scripts/check_release_tag.py --self-test
+      - name: The published-fork check detects a changed source
+        run: python3 scripts/check_fork_published.py --self-test
+
+  # scripts/install.sh is what `curl … | bash` runs on a stranger's machine, and
+  # release.yml sends it to the install site on every tag, so it is checked here
+  # first. The self-test needs no network: target resolution for each `uname` pair,
+  # the version handling, and the checksum refusal against a local file. `sh` on
+  # Ubuntu is dash, the strictest POSIX shell a user is likely to have; shellcheck
+  # comes with the runner image.
+  install-script:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.sh is POSIX sh
+        run: shellcheck --shell=sh scripts/install.sh
+      - name: install.sh self-test
+        run: sh scripts/install.sh --self-test
+      - name: install.sh self-test, with an empty environment
+        run: env -i PATH=/usr/bin:/bin sh scripts/install.sh --self-test
 
   # Clippy and the test suite both compile the crate against system DuckDB, so
   # they share a job that provisions the library once.
@@ -264,6 +310,175 @@ jobs:
       # recompiles one module rather than resolving a second dependency graph.
       - name: test (mcp feature)
         run: cargo test --workspace --features mcp
+
+  # What crates.io would receive, checked on every pull request so a packaging fault
+  # shows before a tag. arcform is published as `arcform`, and depends on its sqlparser
+  # fork published as `arcform-sqlparser`. The fork is not a workspace member (that
+  # would put upstream's code under this repo's `--workspace` clippy and test gates),
+  # so it is addressed by its manifest path rather than `-p`.
+  #
+  # Until `arcform-sqlparser` is on crates.io, `cargo publish --dry-run -p arcform`
+  # cannot resolve it, so the last step builds what `cargo package` produces for
+  # arcform against what it produces for the fork: both .crate files unpacked, the
+  # fork patched in for the crates.io dependency, and `cargo check` run on the
+  # unpacked arcform. That catches an `include` list that leaves out a file the
+  # source embeds with `include_str!`, which the `--list` step alone would not.
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: package
+
+      # `cargo check` links nothing, but libduckdb-sys's build script still looks for
+      # the library, so it gets the same one the `build` job uses.
+      - name: Install the DuckDB C library
+        run: |
+          set -euo pipefail
+          base="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}"
+          mkdir -p "$HOME/duckdb"
+          curl -fsSL -o /tmp/libduckdb.zip "$base/libduckdb-linux-amd64.zip"
+          unzip -o /tmp/libduckdb.zip -d "$HOME/duckdb"
+          {
+            echo "DUCKDB_LIB_DIR=$HOME/duckdb"
+            echo "DUCKDB_INCLUDE_DIR=$HOME/duckdb"
+          } >> "$GITHUB_ENV"
+
+      # arcform pins the fork with `=x.y.z`, and the path dependency builds this
+      # checkout whatever that says, so a fork bumped in one manifest and not the other
+      # would pass every other job and fail only at publish. This step enforces that
+      # the two manifests agree; it does not notice a source edit without a bump. The
+      # next step does.
+      - name: The fork's version is the one arcform pins
+        run: |
+          python3 - <<'PY'
+          import sys, tomllib
+          with open("Cargo.toml", "rb") as f:
+              wanted = tomllib.load(f)["dependencies"]["sqlparser"]["version"].removeprefix("=")
+          with open("vendor/sqlparser-0.55.0/Cargo.toml", "rb") as f:
+              have = tomllib.load(f)["package"]["version"]
+          if have != wanted:
+              print(f"::error::arcform pins arcform-sqlparser ={wanted} but the fork is {have}; "
+                    "bump both together: the fork's [package] version and arcform's sqlparser dependency")
+              sys.exit(1)
+          print(f"arcform-sqlparser {have} matches arcform's pin")
+          PY
+
+      # When the fork's version is already on crates.io, the published crate must be
+      # this tree's fork, file for file (the files cargo writes itself aside), or the
+      # release would skip publishing it and ship arcform against the old source.
+      # Before the version is published there is nothing to compare, and it passes.
+      - name: A published fork version is this tree's fork source
+        run: python3 scripts/check_fork_published.py --manifest-path vendor/sqlparser-0.55.0/Cargo.toml
+
+      - name: arcform-sqlparser publishes (dry run)
+        run: cargo publish --dry-run --manifest-path vendor/sqlparser-0.55.0/Cargo.toml --features visitor
+
+      # The list is printed for the log, then held to the `include` rule: the source,
+      # the embedded operator scripts and the top-level documents, and nothing else —
+      # no fixture, no example database, no vendored fork.
+      - name: arcform's package contents
+        run: |
+          set -euo pipefail
+          cargo package -p arcform --list | tee /tmp/arcform-files
+          if grep -Ev '^(src/|operators/[a-z_]+/[a-z_]+\.py$|Cargo\.toml$|Cargo\.toml\.orig$|Cargo\.lock$|README\.md$|CHANGELOG\.md$|LICENSE$|\.cargo_vcs_info\.json$)' /tmp/arcform-files; then
+            echo "::error::files above are outside arcform's include rule"
+            exit 1
+          fi
+
+      - name: Packaged arcform builds against the packaged fork
+        run: |
+          set -euo pipefail
+          cargo package --manifest-path vendor/sqlparser-0.55.0/Cargo.toml --no-verify
+          cargo package -p arcform --no-verify --exclude-lockfile
+          size=$(wc -c < target/package/arcform-*.crate)
+          echo "arcform .crate: $size bytes"
+          test "$size" -lt 10000000
+          work="$RUNNER_TEMP/packaged"
+          mkdir -p "$work"
+          tar -xzf vendor/sqlparser-0.55.0/target/package/arcform-sqlparser-*.crate -C "$work"
+          tar -xzf target/package/arcform-*.crate -C "$work"
+          fork=$(ls -d "$work"/arcform-sqlparser-*)
+          crate=$(ls -d "$work"/arcform-[0-9]*)
+          printf '\n[patch.crates-io]\narcform-sqlparser = { path = "%s" }\n' "$fork" >> "$crate/Cargo.toml"
+          cp Cargo.lock "$crate/"
+          cargo check --manifest-path "$crate/Cargo.toml" --features mcp --target-dir target/packaged
+          cargo check --manifest-path "$crate/Cargo.toml" --no-default-features --target-dir target/packaged
+
+  # The binary a release ships: DuckDB compiled in (`bundled-duckdb`, with the
+  # parquet and json extensions), no system libduckdb, built --release on the
+  # Ubuntu 22.04 the Linux release legs use, so glibc 2.35 is what it is tested on.
+  # It runs the suite against that binary on every pull request, so a tag never ships
+  # a build no test has run. DUCKDB_LIB_DIR is deliberately absent: were it set, the
+  # tests could pass against the system library and say nothing about the bundled one.
+  bundled:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+      # Keyed on the feature set, so this job's compiled DuckDB never shares a cache
+      # entry with the dynamic build's target directory.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mcp-bundled-duckdb
+
+      # The `duckdb` command line only, no C library: arc's engine shells out to it to
+      # run a protocol's SQL steps, which the bundled build does not change.
+      - name: Install the DuckDB CLI
+        run: |
+          set -euo pipefail
+          base="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}"
+          mkdir -p "$HOME/duckdb"
+          curl -fsSL -o /tmp/duckdb-cli.zip "$base/duckdb_cli-linux-amd64.zip"
+          unzip -o /tmp/duckdb-cli.zip -d "$HOME/duckdb"
+          chmod +x "$HOME/duckdb/duckdb"
+          "$HOME/duckdb/duckdb" --version
+          echo "$HOME/duckdb" >> "$GITHUB_PATH"
+
+      # As in the build job: the finetype tests load this extension into the linked
+      # library in-process, which here is the bundled one, so they prove the bundled
+      # DuckDB is the version the extension was built for. ARCFORM_REQUIRE_FINETYPE_EXT
+      # makes them panic rather than skip if the staging goes missing.
+      - name: Stage the finetype, ducklake and httpfs DuckDB extensions
+        run: |
+          set -euo pipefail
+          "$HOME/duckdb/duckdb" -c "INSTALL finetype FROM community; INSTALL ducklake; INSTALL httpfs;"
+          dir="$HOME/.duckdb/extensions/${DUCKDB_VERSION}/linux_amd64"
+          test -f "$dir/finetype.duckdb_extension"
+          test -f "$dir/ducklake.duckdb_extension"
+          test -f "$dir/httpfs.duckdb_extension"
+          {
+            echo "FINETYPE_DUCKDB_EXT=$dir/finetype.duckdb_extension"
+            echo "ARCFORM_REQUIRE_FINETYPE_EXT=1"
+          } >> "$GITHUB_ENV"
+
+      # --locked, as release.yml builds: a version bump whose Cargo.lock was not
+      # updated fails here, on the pull request, rather than on every leg of the tag.
+      - name: test (release, mcp + bundled-duckdb)
+        run: |
+          set -euo pipefail
+          test -z "${DUCKDB_LIB_DIR:-}"
+          cargo test --release --locked --features mcp,bundled-duckdb
+
+      # The binary itself, not just the test harness: it starts, and it names no
+      # libduckdb among the shared libraries it needs.
+      - name: the release binary carries DuckDB
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --features mcp,bundled-duckdb
+          ./target/release/arc --version
+          if ldd target/release/arc | grep -i duckdb; then
+            echo "target/release/arc links a shared libduckdb" >&2
+            exit 1
+          fi
 
   # A mechanism can be added, wired in and shipped, and deleting its body leaves
   # `cargo test` green — which is how a change that does nothing reaches a merge

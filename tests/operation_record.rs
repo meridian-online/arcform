@@ -395,7 +395,7 @@ fn record_with_a_description_writes_it_after_sql_and_the_model_as_without_one() 
         BIG_ORDERS_MODEL,
         "a description is on the step and not in the model"
     );
-    let manifest = arc::spec::Manifest::load(&protocol.dir).expect("the Protocol loads");
+    let manifest = arcform::spec::Manifest::load(&protocol.dir).expect("the Protocol loads");
     let step = manifest.steps.last().unwrap();
     assert_eq!(step.name, "big_orders");
     assert_eq!(step.description.as_deref(), Some(WORTH_CHASING));

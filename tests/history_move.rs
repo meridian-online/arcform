@@ -18,7 +18,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use arc::spec::{HistoryWay, LocalHistory, MANIFEST_FILENAME};
+use arcform::spec::{HistoryWay, LocalHistory, MANIFEST_FILENAME};
 
 const MANIFEST: &str = "\
 name: shop
@@ -363,7 +363,7 @@ fn a_log_naming_no_version_this_store_holds_takes_nothing() {
     // A fresh Protocol whose files are byte for byte the first's, and no log.
     let fresh = machine.at("fresh");
     copy_folder(&first, &fresh);
-    fs::remove_file(fresh.join(arc::spec::LOG_FILENAME)).unwrap();
+    fs::remove_file(fresh.join(arcform::spec::LOG_FILENAME)).unwrap();
 
     // A clone from another machine: the same files, and a log naming versions
     // a store this machine never saw recorded.

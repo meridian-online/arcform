@@ -1,14 +1,20 @@
 # Meridian fork of sqlparser 0.55.0
 
 This is a **vendored, minimal fork** of [`sqlparser`](https://crates.io/crates/sqlparser)
-`0.55.0`, wired into `arc` via `[patch.crates-io]` in the top-level `Cargo.toml`.
+`0.55.0`, published as `arcform-sqlparser` (library name still `sqlparser`) and pinned
+exactly by arcform's top-level `Cargo.toml`.
 It teaches the **DuckDB dialect** three grammars the published crate rejects, all of
 which otherwise make `arc`'s SQL introspection degrade a whole SQL step to an *opaque*
 node (undercutting the "0 opaque steps" legibility story).
 
-The version stays `0.55.0` and the dependency set is unchanged, so the patch applies
-cleanly and the resolved dep graph / licenses are identical to upstream (`Cargo.lock`
-only drops the registry `source`/`checksum` lines for `sqlparser`).
+The fork started at upstream's version, `0.55.0`, and its dependency set is
+unchanged, so the resolved dep graph and licences are identical to upstream's. Any
+change to the fork bumps its patch version in both manifests, its own `Cargo.toml` and the
+exact pin in arcform's. CI's `package` job enforces both halves: it fails when the two
+versions differ, and, once a version is on crates.io, it fails when this source differs
+from the published crate file for file (`scripts/check_fork_published.py`), which is what
+a change without a bump looks like. The release's `publish-crates` job runs the same
+check before it skips publishing a fork version that is already there.
 
 ## What the fork adds
 

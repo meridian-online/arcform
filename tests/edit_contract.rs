@@ -1,5 +1,5 @@
 //! The write path, exercised the way a sibling editor would use it: link the
-//! crate, build [`SpecEdit`] values, apply them through `arc::spec`, and hold
+//! crate, build [`SpecEdit`] values, apply them through `arcform::spec`, and hold
 //! the result to the two promises that matter —
 //!
 //!   1. **byte preservation** — every byte an edit did not target is identical
@@ -19,8 +19,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use arc::spec::{
-    Error, MANIFEST_FILENAME, Manifest, SpecEdit, Step, apply_edits, create_spec, edit_spec,
+use arcform::spec::{
+    Error, MANIFEST_FILENAME, Manifest, SpecEdit, Step, apply_edits, apply_yaml_edits, create_spec,
+    edit_spec,
 };
 
 fn corpus_dir() -> PathBuf {
@@ -294,6 +295,252 @@ fn a_missing_target_is_refused_with_its_path() {
         Err(Error::EditTarget { path, .. }) => assert_eq!(path, "steps[9].command"),
         other => panic!("expected EditTarget, got {other:?}"),
     }
+}
+
+/// A block value replacing `[]` starts on the next line: the space after the
+/// colon goes with the old value, so the key's line does not end in a space.
+#[test]
+fn a_block_value_replacing_a_flow_value_leaves_no_space_after_the_colon() {
+    let edit = SpecEdit::Replace {
+        path: vec!["steps".into()],
+        value: "\n  - x".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("steps: []\n", &[edit]).unwrap(),
+        "steps:\n  - x\n"
+    );
+}
+
+/// A comment after the old value stays on the key's line, ahead of the block.
+#[test]
+fn a_block_value_keeps_the_comment_on_the_key_line() {
+    let edit = SpecEdit::Replace {
+        path: vec!["steps".into()],
+        value: "\n  - x".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("steps: []  # none yet\nnext: 1\n", &[edit]).unwrap(),
+        "steps:  # none yet\n  - x\nnext: 1\n"
+    );
+}
+
+/// An old value on one line is replaced exactly: only its own bytes change, and
+/// a trailing comment on its line and the comment line after it stay where they
+/// were, whether the new value is a scalar or a block.
+#[test]
+fn a_one_line_old_value_is_replaced_exactly() {
+    let text = "a: 1  # one\n# section\nb: 2\n";
+    let scalar = SpecEdit::Replace {
+        path: vec!["a".into()],
+        value: "3".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits(text, &[scalar]).unwrap(),
+        "a: 3  # one\n# section\nb: 2\n"
+    );
+    let block = SpecEdit::Replace {
+        path: vec!["a".into()],
+        value: "\n  x: 1\n".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits(text, &[block]).unwrap(),
+        "a:  # one\n  x: 1\n\n# section\nb: 2\n"
+    );
+}
+
+/// A full-line comment after a block mapping value is not the value's: a
+/// block value replacing the mapping leaves it where it was, byte for byte.
+#[test]
+fn a_comment_line_after_a_block_mapping_value_stays_where_it_was() {
+    let edit = SpecEdit::Replace {
+        path: vec!["params".into()],
+        value: "\n  b: 2".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("params:\n  a: 1\n# section\nnext: 1\n", &[edit]).unwrap(),
+        "params:\n  b: 2\n# section\nnext: 1\n"
+    );
+}
+
+/// The same for a block scalar value: the comment line after it stays put.
+#[test]
+fn a_comment_line_after_a_block_scalar_value_stays_where_it_was() {
+    let edit = SpecEdit::Replace {
+        path: vec!["note".into()],
+        value: "\n  - x".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("note: |\n  first\n  second\n# section\nnext: 1\n", &[edit]).unwrap(),
+        "note:\n  - x\n# section\nnext: 1\n"
+    );
+}
+
+/// A `# …` line indented as far as a block scalar's text is the scalar's own
+/// text, and is replaced with it.
+#[test]
+fn a_hash_line_inside_a_block_scalar_is_replaced_with_it() {
+    let edit = SpecEdit::Replace {
+        path: vec!["note".into()],
+        value: "\n  - x".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("note: |\n  first\n  # not a comment\nnext: 1\n", &[edit]).unwrap(),
+        "note:\n  - x\nnext: 1\n"
+    );
+}
+
+/// A block sequence written at its key's own indent keeps the comment after it.
+#[test]
+fn a_comment_line_after_a_sequence_at_the_key_indent_stays_where_it_was() {
+    let edit = SpecEdit::Replace {
+        path: vec!["steps".into()],
+        value: "\n  - x".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("steps:\n- a\n- b\n# section\nnext: 1\n", &[edit]).unwrap(),
+        "steps:\n  - x\n# section\nnext: 1\n"
+    );
+}
+
+/// A value that is not a block keeps the comment after an old block value too.
+#[test]
+fn a_flow_value_replacing_a_block_mapping_keeps_the_comment_after_it() {
+    let edit = SpecEdit::Replace {
+        path: vec!["params".into()],
+        value: "{b: 2}".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("params:\n  a: 1\n# section\nnext: 1\n", &[edit]).unwrap(),
+        "params:\n  {b: 2}\n# section\nnext: 1\n"
+    );
+}
+
+/// A blank line between an old block value and the comment after it stays.
+#[test]
+fn a_blank_line_before_the_comment_after_a_block_value_stays() {
+    let edit = SpecEdit::Replace {
+        path: vec!["params".into()],
+        value: "\n  b: 2".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("params:\n  a: 1\n\n# section\nnext: 1\n", &[edit]).unwrap(),
+        "params:\n  b: 2\n\n# section\nnext: 1\n"
+    );
+}
+
+/// The key of a sequence item's first pair is measured from its own column,
+/// past the `- `, so a comment at that column after its block value stays.
+#[test]
+fn a_comment_at_a_sequence_items_key_column_stays_after_its_block_mapping() {
+    let edit = SpecEdit::Replace {
+        path: vec!["steps".into(), 0.into(), "params".into()],
+        value: "\n      b: 2".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits(
+            "steps:\n  - params:\n      a: 1\n    # c\n  - name: y\n",
+            &[edit]
+        )
+        .unwrap(),
+        "steps:\n  - params:\n      b: 2\n    # c\n  - name: y\n"
+    );
+}
+
+/// The same holds for a sequence item nested deeper.
+#[test]
+fn a_comment_at_a_nested_sequence_items_key_column_stays() {
+    let edit = SpecEdit::Replace {
+        path: vec!["outer".into(), "steps".into(), 0.into(), "a".into()],
+        value: "\n        y: 2".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits(
+            "outer:\n  steps:\n    - a:\n        x: 1\n      # c\n    - b: 2\n",
+            &[edit]
+        )
+        .unwrap(),
+        "outer:\n  steps:\n    - a:\n        y: 2\n      # c\n    - b: 2\n"
+    );
+}
+
+/// A block sequence under a sequence item's first key keeps the comment after it.
+#[test]
+fn a_comment_at_a_sequence_items_key_column_stays_after_its_block_sequence() {
+    let edit = SpecEdit::Replace {
+        path: vec!["steps".into(), 0.into(), "deps".into()],
+        value: "\n      - z".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits(
+            "steps:\n  - deps:\n      - x\n      - w\n    # c\n  - name: y\n",
+            &[edit]
+        )
+        .unwrap(),
+        "steps:\n  - deps:\n      - z\n    # c\n  - name: y\n"
+    );
+}
+
+/// A sequence item has no key: a comment indented no further than the item's
+/// dash is after it and stays.
+#[test]
+fn a_comment_after_a_replaced_sequence_item_stays() {
+    let edit = SpecEdit::Replace {
+        path: vec!["steps".into(), 0.into()],
+        value: "{a: 3}".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("steps:\n- a: 1\n  b: 2\n# c\n- name: y\n", &[edit]).unwrap(),
+        "steps:\n- {a: 3}\n# c\n- name: y\n"
+    );
+}
+
+/// A block value replacing an old one on a later line leaves no spaces-only
+/// line, even when the key's line carries a comment.
+#[test]
+fn a_block_value_under_a_commented_key_leaves_no_spaces_only_line() {
+    let edit = SpecEdit::Replace {
+        path: vec!["steps".into()],
+        value: "\n  - name: b".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("steps:  # pipeline\n  - name: a\nnext: 1\n", &[edit]).unwrap(),
+        "steps:  # pipeline\n  - name: b\nnext: 1\n"
+    );
+}
+
+/// A block scalar item may indent its text less than its `|`: a `#` line
+/// deeper than the item's dash is still its text and is replaced with it.
+#[test]
+fn a_hash_line_inside_a_shallow_block_scalar_item_is_replaced_with_it() {
+    let edit = SpecEdit::Replace {
+        path: vec!["steps".into(), 0.into()],
+        value: "x2".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("steps:\n- |\n a\n # b\n- x\n", &[edit]).unwrap(),
+        "steps:\n- x2\n- x\n"
+    );
+}
+
+/// The absent value of a bare `key:` is replaced just after the colon, as it was.
+#[test]
+fn a_bare_key_takes_its_value_just_after_the_colon() {
+    let block = SpecEdit::Replace {
+        path: vec!["steps".into()],
+        value: "\n  - x".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("steps:\nnext: 1\n", &[block]).unwrap(),
+        "steps:\n  - x\nnext: 1\n"
+    );
+    let scalar = SpecEdit::Replace {
+        path: vec!["name".into()],
+        value: " shop".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("name:\nnext: 1\n", &[scalar]).unwrap(),
+        "name: shop\nnext: 1\n"
+    );
 }
 
 // ------------------------------------------------------------- the whole path

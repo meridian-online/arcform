@@ -16,7 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use arc::spec::{LOG_FILENAME, MANIFEST_FILENAME};
+use arcform::spec::{LOG_FILENAME, MANIFEST_FILENAME};
 
 /// `git` in `dir` with the developer's own configuration out of reach, so a global
 /// attributes file cannot make a merge succeed for a reason that is not arc's.

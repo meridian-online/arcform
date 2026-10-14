@@ -28,7 +28,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use arc::spec::{HISTORY_MAX_ENTRIES, HistoryKind, HistoryWay, LocalHistory, MANIFEST_FILENAME};
+use arcform::spec::{
+    HISTORY_MAX_ENTRIES, HistoryKind, HistoryWay, LocalHistory, MANIFEST_FILENAME,
+};
 
 const SPEC_V1: &str = "name: fixture\nsteps: []\n";
 const SPEC_V2: &str = "name: fixture-renamed\nsteps: []\n";
@@ -67,7 +69,7 @@ fn setup() -> Fixture {
 
     // A save then a checkpoint: a checkpoint is never merged into the save
     // before it, so each file keeps both entries however fast this runs.
-    let id = |e: Option<arc::spec::HistoryEntry>| e.expect("recorded").id;
+    let id = |e: Option<arcform::spec::HistoryEntry>| e.expect("recorded").id;
     let spec_ids = [
         id(history.record_save(&dir, SPEC_V1).unwrap()),
         id(history.record_checkpoint(&dir, SPEC_V2).unwrap()),

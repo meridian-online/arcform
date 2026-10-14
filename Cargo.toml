@@ -1,18 +1,43 @@
 [package]
-name = "arc"
-version = "0.1.0"
+name = "arcform"
+version = "0.2.0"
 edition = "2024"
 description = "Local-first data pipeline engine for analytical workflows"
 license = "MIT"
+repository = "https://github.com/meridian-online/arcform"
+homepage = "https://meridian.online"
+readme = "README.md"
+keywords = ["pipeline", "duckdb", "sql", "data", "etl"]
+categories = ["command-line-utilities", "database"]
+# What crates.io receives: the source, the operator scripts `src/operator.rs` embeds
+# with `include_str!`, and the top-level documents. Everything else stays out — the
+# 40 MB examples/brewtrend/trends.db, the test fixtures (only `#[cfg(test)]` code
+# embeds them, and the packaged crate is never tested), the vendored sqlparser fork
+# (published as its own crate, `arcform-sqlparser`), and the docs and evals. An
+# `include_str!` added outside src/ must be added here too, or the published crate
+# stops compiling; CI's `package` job catches that before a tag. The leading `/`
+# anchors a name to the crate root: without it `README.md` would match every README
+# in the tree.
+include = [
+    "/src/**",
+    "/operators/gleif_ra_fetch/fetch_gleif_ra.py",
+    "/operators/splink_resolve/resolve.py",
+    "/operators/text_embed/text_embed.py",
+    "/operators/umap_project/umap_project.py",
+    "/Cargo.toml",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+]
 
-# The library target. `arc` is a binary first, but the spec it runs is now also
+# The library target. arcform is a binary first, but the spec it runs is now also
 # consumed by sibling Rust tools that must not reimplement the schema — they link
 # this crate and call the real loader. With `default-features = false` the crate
 # root exports `spec` and nothing else; the default `cli` feature adds one further
 # root item, the doc-hidden `cli_main` the binary shim calls. Both shapes are
 # enumerated by `tests/public_surface.rs`, which fails the build if either widens.
 [lib]
-name = "arc"
+name = "arcform"
 path = "src/lib.rs"
 
 # Needs `cli`, so `--no-default-features` builds the library alone.
@@ -30,8 +55,25 @@ serde_yaml = "0.9"
 serde_json = "1"
 thiserror = "2"
 owo-colors = "4"
-sqlparser = { version = "0.55", features = ["visitor"] }
-duckdb = "1.2"
+# arcform's sqlparser fork: sqlparser 0.55.0, taught the DuckDB grammars the published
+# crate rejects — statement-form PIVOT/UNPIVOT (`PIVOT t ON … USING …`), multi-option
+# COPY (`COPY … TO 'f' (FORMAT parquet, COMPRESSION zstd)`), the `lambda x: expr`
+# colon-form lambda, `INSTALL … FROM <repository>` / `FORCE INSTALL`, an empty-string
+# COPY option (`QUOTE ''`), a `PRAGMA` call with several arguments, and
+# `SET VARIABLE <name> = <expr>`. Without them SQL introspection degrades those steps
+# to opaque nodes. Published as `arcform-sqlparser` so the arcform crate resolves from
+# crates.io alone; its library keeps the name `sqlparser`, so the source says
+# `use sqlparser::…` as before. The path builds this checkout against the fork as it
+# stands; the exact version is what the published arcform asks crates.io for, and a
+# change to the fork bumps its patch number here and in its own Cargo.toml together.
+# Upstreaming is the maintenance path — vendor/sqlparser-0.55.0/MERIDIAN_PATCH.md
+# holds the diff summary and draft PR text.
+sqlparser = { package = "arcform-sqlparser", version = "=0.55.0", path = "vendor/sqlparser-0.55.0", features = ["visitor"] }
+# Pinned exact: arc loads DuckDB extensions (finetype among them) into this library
+# in-process, and an extension loads only into the DuckDB version it was built for.
+# 1.10506.0 is DuckDB v1.5.6. Bump in lockstep with `DUCKDB_VERSION` in
+# .github/workflows/ci.yml and the versions in src/vetted_extensions.json.
+duckdb = "=1.10506.0"
 semver = "1"
 sha2 = "0.10"
 humantime = "2"
@@ -101,12 +143,25 @@ http-fetch = ["dep:ureq", "dep:url"]
 # The OpenDAL-backed opendal_fetch operator (multi-backend ingress; securelake s3://).
 opendal = ["dep:opendal", "dep:opendal-http-transport-reqwest", "dep:reqwest", "dep:tokio"]
 # The `arc mcp` entry point: a Model Context Protocol server over stdio that
-# federates the `finetype` CLI as tools and exposes protocol-run + operator-describe.
+# federates the `finetype` CLI as tools and adds arc's own (the set is in src/mcp).
 # Gated OFF by default (like `opendal`) so the flagship binary stays lean and pulls
 # no MCP/agent machinery unless asked; enable with `--features mcp`. Pulls in `cli`
 # because the entry point is an `arc mcp` subcommand. Deliberately dependency-free —
 # it speaks JSON-RPC 2.0 over stdio with the `serde_json` already in the graph.
 mcp = ["cli"]
+# Compile DuckDB into the binary instead of linking the system libduckdb, with the
+# parquet and json extensions: arc reads parquet in-process, and the plain `bundled`
+# build leaves both out. ICU, the third extension the official library carries, is
+# not compiled in: the crate builds it only through its CMake backend
+# (`bundled-cmake`), which works from a duckdb-rs git checkout and not from the
+# crates.io package (whose sources carry core_functions, json and parquet alone), so
+# `cargo install` could not build it. A query that needs ICU, such as `AT TIME ZONE`,
+# loads `icu` from DuckDB's extension directory when `INSTALL icu` has put it there;
+# where it has not, DuckDB's error names `INSTALL icu`.
+# Release binaries are built with `--features mcp,bundled-duckdb`. Off by default: a
+# cold build compiles DuckDB's C++ and takes tens of minutes, so everyday development
+# links the system library through `DUCKDB_LIB_DIR`.
+bundled-duckdb = ["duckdb/bundled", "duckdb/parquet", "duckdb/json"]
 
 [dev-dependencies]
 tempfile = "3"
@@ -114,19 +169,3 @@ filetime = "0.2"
 # Already a dependency; named here so `tests/uv_operator.rs` can compute the digest a
 # `uv@1` step pins rather than hard-coding one into a fixture that would then rot.
 sha2 = "0.10"
-
-# Vendored sqlparser: a local fork of sqlparser 0.55.0 that teaches the DuckDB
-# dialect several grammars the published crate rejects — statement-form PIVOT/UNPIVOT
-# (`PIVOT t ON … USING …`), multi-option COPY (`COPY … TO 'f' (FORMAT parquet,
-# COMPRESSION zstd)`), the `lambda x: expr` colon-form lambda DuckDB is replacing its
-# single-arrow lambda with, `INSTALL … FROM <repository>` / `FORCE INSTALL`, an
-# empty-string COPY option (`QUOTE ''`, `ESCAPE ''`, `DELIMITER ''`), a `PRAGMA` call
-# with several positional and/or named arguments, and `SET VARIABLE <name> = <expr>`.
-# Without these, SQL introspection degrades those steps to opaque nodes (the opposite
-# of structural transparency). The fork is minimal and version-pinned to 0.55.0 so the
-# patch applies cleanly and the dep graph is unchanged. Upstreaming is the maintenance
-# path — see vendor/sqlparser-0.55.0/MERIDIAN_PATCH.md for the diff summary + draft PR
-# text (the additions past PIVOT/UNPIVOT and COPY are recorded there but not yet
-# drafted as upstream PRs).
-[patch.crates-io]
-sqlparser = { path = "vendor/sqlparser-0.55.0" }

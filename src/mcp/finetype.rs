@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 
-use super::{ToolDef, ToolOutput, ToolResult};
+use super::{Annotations, ToolDef, ToolOutput, ToolResult};
 
 /// The minimum `finetype` version these proxies target. The CLI surface they rely on
 /// (JSON-Schema `profile`/`taxonomy` output, Parquet `validate`, batch `infer`) landed
@@ -396,30 +396,35 @@ pub(super) fn tools() -> Vec<ToolDef> {
             description: "Infer the semantic type of string values (federates `finetype infer`). Pass `values` (a column's sample) with an optional `header`.",
             input_schema: infer_schema,
             handler: infer,
+            annotations: Annotations::READ_ONLY,
         },
         ToolDef {
             name: "profile",
             description: "Profile every column of a CSV/JSON file — semantic types, or a table-level JSON Schema (federates `finetype profile`).",
             input_schema: profile_schema,
             handler: profile,
+            annotations: Annotations::READ_ONLY,
         },
         ToolDef {
             name: "taxonomy",
             description: "Browse the FineType type taxonomy, or export per-type JSON Schema (federates `finetype taxonomy`).",
             input_schema: taxonomy_schema,
             handler: taxonomy,
+            annotations: Annotations::READ_ONLY,
         },
         ToolDef {
             name: "validate",
             description: "Validate CSV/Parquet data against a JSON Schema and return a quality report (federates `finetype validate`).",
             input_schema: validate_schema,
             handler: validate,
+            annotations: Annotations::READ_ONLY,
         },
         ToolDef {
             name: "generate",
             description: "Generate synthetic sample data from the taxonomy (federates `finetype generate`).",
             input_schema: generate_schema,
             handler: generate,
+            annotations: Annotations::READ_ONLY,
         },
     ]
 }

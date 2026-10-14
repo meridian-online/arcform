@@ -24,7 +24,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use arc::spec::{
+use arcform::spec::{
     Error, GENERATED_MARKER, MANIFEST_FILENAME, Manifest, RecordedStep, Step, amend_step_sql,
     create_spec, record_step, sql_is_generated,
 };
@@ -214,22 +214,83 @@ fn an_occupied_model_number_is_sidestepped_never_overwritten() {
     );
 }
 
-/// An empty protocol has nothing to explore, so it has nothing to record
-/// against — refused with the sequence named, before anything is written.
+/// A protocol with no steps yet, as `arc create-protocol` writes it, takes its
+/// first recorded step: the empty sequence becomes a block sequence holding it.
 #[test]
-fn recording_into_a_protocol_without_steps_is_refused() {
+fn recording_into_a_protocol_without_steps_gives_it_its_first_step() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join(MANIFEST_FILENAME),
-        "name: bare\nsteps: []\n",
+        "name: bare\nsteps: []\nassets: {}\n",
     )
     .unwrap();
 
+    let (sql_rel, _) = record_step(dir.path(), &tide_capture()).expect("recorded");
+    assert_eq!(sql_rel, Path::new("models").join("01_dover_tides.sql"));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap(),
+        "name: bare\nsteps:\n  - name: dover_tides\n    sql: models/01_dover_tides.sql\nassets: {}\n"
+    );
+}
+
+/// A comment after `steps: []` stays on the `steps:` line when the first step
+/// is recorded.
+#[test]
+fn the_first_step_keeps_a_comment_on_the_steps_line() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(MANIFEST_FILENAME),
+        "name: bare\nsteps: []  # none yet\nassets: {}\n",
+    )
+    .unwrap();
+
+    record_step(dir.path(), &tide_capture()).expect("recorded");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap(),
+        "name: bare\nsteps:  # none yet\n  - name: dover_tides\n    sql: models/01_dover_tides.sql\nassets: {}\n"
+    );
+}
+
+/// A manifest with no `steps` key has no sequence to record into — refused
+/// before anything is written.
+#[test]
+fn recording_into_a_manifest_without_a_steps_key_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(MANIFEST_FILENAME), "name: bare\n").unwrap();
+
     match record_step(dir.path(), &tide_capture()) {
         Err(Error::EditTarget { path, .. }) => assert_eq!(path, "steps"),
-        other => panic!("expected EditTarget, got {other:?}"),
+        other => panic!("expected EditTarget on steps, got {other:?}"),
     }
     assert!(!dir.path().join("models").exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap(),
+        "name: bare\n"
+    );
+}
+
+/// A `steps` sequence the manifest reads but the splice cannot see items in (here
+/// one under an explicit `!!seq` tag) is refused by name, with nothing written.
+/// The new step's indentation comes from the last item; when that cannot be read
+/// the recording stops there rather than appending at a guessed indentation.
+#[test]
+fn recording_into_a_steps_sequence_whose_items_cannot_be_read_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = "name: tagged\nsteps: !!seq\n  - name: a\n    sql: models/a.sql\n";
+    std::fs::write(dir.path().join(MANIFEST_FILENAME), manifest).unwrap();
+
+    match record_step(dir.path(), &tide_capture()) {
+        Err(Error::EditTarget { path, detail }) => {
+            assert_eq!(path, "steps");
+            assert!(detail.contains("the sequence has no items"), "{detail}");
+        }
+        other => panic!("expected EditTarget on steps, got {other:?}"),
+    }
+    assert!(!dir.path().join("models").exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap(),
+        manifest
+    );
 }
 
 /// The provenance note is the one-line marker header; a note that spans lines
@@ -495,11 +556,11 @@ fn amend_refuses_a_hand_authored_model_and_leaves_it_untouched() {
     std::fs::write(models.join("curated.sql"), hand).unwrap();
 
     // Cite the hand-authored model from a step, through the write path.
-    let edit = arc::spec::SpecEdit::Append {
+    let edit = arcform::spec::SpecEdit::Append {
         path: vec!["steps".into()],
         item: "  - name: curated\n    sql: models/curated.sql\n".to_string(),
     };
-    arc::spec::edit_spec(dir.path(), &[edit]).expect("the citation splices");
+    arcform::spec::edit_spec(dir.path(), &[edit]).expect("the citation splices");
 
     match amend_step_sql(dir.path(), "curated", "SELECT 2;", "retune") {
         Err(Error::HandAuthoredSql { step, path }) => {

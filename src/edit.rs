@@ -129,7 +129,14 @@ pub enum SpecEdit {
     /// value's own bytes are replaced. Replacing the absent value of a bare
     /// `key:` is supported — start the replacement with the separating space
     /// (or a newline for a block value), since the splice lands right after
-    /// the colon.
+    /// the colon. A value that starts with a newline also takes the spaces
+    /// between the colon and the old value, so `steps: []` replaced by a block
+    /// sequence leaves `steps:` with no space at the end of its line, and a
+    /// comment after the old value (`steps: []  # none yet`) stays on the
+    /// key's line (`steps:  # none yet`), ahead of the block. Whatever the new
+    /// value's form, the blank lines and the comment lines indented no further
+    /// than the key, after an old value's last line, belong to what follows and
+    /// are kept byte for byte.
     Replace { path: Vec<PathPart>, value: String },
 
     /// Replace one occurrence of `from` with `to` inside the value at `path` —
@@ -577,7 +584,96 @@ fn apply_one(text: &str, edit: &SpecEdit) -> Result<String> {
     match edit {
         SpecEdit::Replace { path, value } => {
             let doc = parse(text)?;
-            let (start, end) = value_span(text, &doc, path)?;
+            let (mut start, mut end) = value_span(text, &doc, path)?;
+            let value_start = start;
+            // The colon before the value, when only spaces and line breaks
+            // separate them: the key's line is the line it is on.
+            let before = text[..start].trim_end_matches([' ', '\n']);
+            let colon = before.ends_with(':').then_some(before.len());
+            // An old value over several lines may have a span that runs past its
+            // last line, over blank lines and comment lines after it. Those
+            // belong to what follows, so they stay byte for byte, whatever the
+            // new value's form. A line is after the value when it is blank or a
+            // comment indented no further than the key; a `#` line indented
+            // further is the value's own (text, in a block scalar). The key is
+            // measured from its own column, so the first key of a sequence item
+            // (`  - params:`) counts from `params`, not from the dash. With no
+            // key (a sequence item), a comment indented no further than the
+            // item's dash is after it. An old value on one line is replaced
+            // exactly as before.
+            if text[start..end].contains('\n') {
+                let key = match path.last() {
+                    Some(PathPart::Key(_)) => doc
+                        .query_key_only(&route_of(path))
+                        .ok()
+                        .map(|key| key.location.byte_span.0),
+                    _ => None,
+                };
+                let limit = match key {
+                    Some(at) => (at - line_start(text, at)) as isize,
+                    // A sequence item: measured from the dash that introduces
+                    // it, since a block scalar item may indent its text less
+                    // than its `|`. Its text is always deeper than the dash.
+                    None => {
+                        let item = text[..value_start].trim_end_matches([' ', '\n']);
+                        match item.strip_suffix('-') {
+                            Some(dash) => (dash.len() - line_start(text, dash.len())) as isize,
+                            None => (value_start - line_start(text, value_start)) as isize - 1,
+                        }
+                    }
+                };
+                let mut content_end = if text.as_bytes()[end - 1] == b'\n' {
+                    end - 1
+                } else {
+                    end
+                };
+                loop {
+                    let last = line_start(text, content_end);
+                    let indent = indent_of(text, last);
+                    let line = &text[last + indent..content_end];
+                    let blank = line.trim_end_matches('\r').is_empty();
+                    let comment = line.starts_with('#') && indent as isize <= limit;
+                    if last > start && (blank || comment) {
+                        content_end = last - 1;
+                    } else {
+                        break;
+                    }
+                }
+                // The line break ending the old value's last line stays, unless
+                // the new value brings its own.
+                end = if value.ends_with('\n') && content_end < end {
+                    content_end + 1
+                } else {
+                    content_end
+                };
+            }
+            if value.starts_with('\n') {
+                // A block value starts on the next line: the spaces (and, for an
+                // old block value, the line break) between the colon and the old
+                // value go with it, so no line ends in a space.
+                if let Some(at) = colon {
+                    start = at;
+                } else {
+                    // The key's line carries a comment, so the old value starts
+                    // on a later line: when only spaces precede it there, the
+                    // line break before that line goes too, or a line of
+                    // spaces is left under the key.
+                    let line = line_start(text, start);
+                    if line > 0 && text[line..start].bytes().all(|b| b == b' ') {
+                        start = line - 1;
+                    }
+                }
+                // A comment after an old value on the key's own line
+                // (`steps: []  # none yet`) stays on that line, ahead of the
+                // block, rather than ending up after the block's last line. Only
+                // text on the old value's own line counts.
+                let same_line = end > 0 && text.as_bytes()[end - 1] != b'\n';
+                let comment = text[end..line_end(text, end)].trim_end_matches('\n');
+                if same_line && comment.trim_start_matches(' ').starts_with('#') {
+                    let replacement = format!("{comment}{value}");
+                    return Ok(splice(text, start, end + comment.len(), &replacement));
+                }
+            }
             Ok(splice(text, start, end, value))
         }
         SpecEdit::RewriteFragment { path, from, to } => {

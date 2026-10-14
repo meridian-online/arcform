@@ -129,18 +129,18 @@
 //! The crate root carries one further item, `cli_main`, the `arc` binary's entry
 //! point. It is `#[doc(hidden)]` and gated behind the default `cli` feature, and it
 //! is not a library function: it parses the **calling process's** `argv` and can end
-//! the calling process. Depend on `arc` with `default-features = false` and it does
+//! the calling process. Depend on `arcform` with `default-features = false` and it does
 //! not exist at all — which also drops `clap` and the command dispatch from the
 //! build:
 //!
 //! ```toml
 //! [dependencies]
-//! arc = { version = "=0.1.0", default-features = false }
+//! arcform = { version = "=0.2.0", default-features = false }
 //! ```
 //!
 //! # Stability
 //!
-//! **Pin an exact version.** `arc` is pre-1.0 and the spec schema is still growing;
+//! **Pin an exact version.** `arcform` is pre-1.0 and the spec schema is still growing;
 //! treat every version bump as potentially breaking and move deliberately. A
 //! consumer inside the same organisation should pin a git revision; one outside
 //! should pin `version = "=x.y.z"`. The guarantee offered is narrow and real:
@@ -156,12 +156,11 @@
 //! Two build-time facts a consumer inherits, recorded here because they bite at
 //! resolve or link time rather than in this API:
 //!
-//! - `arc` parses SQL with its **vendored `sqlparser` fork** (see `vendor/`), wired
-//!   in with a `[patch.crates-io]` entry — and Cargo patch tables do not propagate
-//!   through dependencies. The workspace that links this crate must carry the same
-//!   patch entry, pointing at the `vendor/sqlparser-0.55.0` package inside the same
-//!   pinned `arc` source; without it the build fails on missing
-//!   `SetExpr::Pivot`/`SetExpr::Unpivot` variants.
+//! - `arcform` parses SQL with its **`sqlparser` fork**, published as
+//!   `arcform-sqlparser` and pinned to an exact version, so a consumer resolves it like
+//!   any other dependency and carries no patch entry. Its library is still named
+//!   `sqlparser`; a workspace that also depends on upstream `sqlparser` gets two
+//!   distinct crates, and their AST types do not mix.
 //! - The private engine still compiles into the library, so the **DuckDB C library**
 //!   must be present to build (`DUCKDB_LIB_DIR`/`DUCKDB_INCLUDE_DIR`, or a system
 //!   install the linker finds), even for a consumer that only loads specs.
@@ -170,7 +169,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use arc::spec::{Manifest, Result, SpecEdit, edit_spec};
+//! use arcform::spec::{Manifest, Result, SpecEdit, edit_spec};
 //!
 //! # fn main() -> Result<()> {
 //! // Load and validate a spec that is on disk.

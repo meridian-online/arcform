@@ -6,6 +6,8 @@
 //!   per-step outcome, the same JSON `arc run` writes under `build/.arcform/runs/`.
 //!   A file beside `arcform.yaml` that may be a copy a synced drive set aside is named
 //!   in its `run.protocol.possible_copies`, with the warning `arc run` prints for it.
+//!   The run is a child `arc run` whose output this process reads, so the server's
+//!   standard output carries JSON-RPC alone.
 //! - `operator_describe` emits an operator's `with:` JSON Schema (or lists the
 //!   catalog) so an agent or authoring UI can build and check a `with:` block.
 //! - `operation_describe` lists the SQL operations arc holds, or describes an
@@ -20,38 +22,49 @@
 //! - `sql_record` records a SQL statement as a new step of a Protocol, through the
 //!   same record path `arc sql record` takes, so the same statement writes the same
 //!   bytes from either.
+//! - `table_describe` reads a table in the Protocol's database, read-only, as
+//!   `arc table describe` does.
+//! - `sql_query` runs SELECT statements against the Protocol's database,
+//!   read-only, as `arc sql query` does.
+//! - `protocol_create` makes a new Protocol in a directory, through the same
+//!   creation `arc create-protocol` takes, so the same request writes the same files
+//!   from either.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use super::{ToolDef, ToolOutput, ToolResult};
+use super::{Annotations, ToolDef, ToolOutput, ToolResult};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // protocol_run
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn protocol_run(args: &Value) -> ToolResult {
-    let dir = match args.get("dir").and_then(Value::as_str) {
+    let dir = match optional_string(args, "dir")? {
         Some(dir) => PathBuf::from(dir),
         None => std::env::current_dir()
             .map_err(|e| format!("no `dir` given and the current directory is unavailable: {e}"))?,
     };
-    let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+    let force = match args.get("force") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(force)) => *force,
+        Some(other) => return Err(format!("`force` must be a boolean, not {other}")),
+    };
     let cli_params = parse_params(args.get("params"))?;
 
-    let manifest = crate::manifest::Manifest::load(&dir).map_err(|e| e.to_string())?;
-    let engine = crate::engine::DuckDbEngine;
-    let state = crate::state::DuckDbStateBackend::for_protocol(&manifest, &dir)
-        .map_err(|e| e.to_string())?;
-
+    // The run happens in a child `arc run`, so what the runner, the DuckDB command line,
+    // a command step or an operator prints lands in a pipe this process drains, and the
+    // server's own standard output carries JSON-RPC alone.
+    //
     // The contract is written to `<dir>/build/.arcform/runs/<run_id>.json` at run end
     // (on success and failure alike). Snapshot the directory, run, then read the file
     // the run just added.
     let runs = crate::contract::runs_dir(&dir);
     let before = list_contracts(&runs);
-    let run_result = crate::runner::run_with_params(&dir, &engine, &state, force, &cli_params);
+    let child = run_child(&dir, force, &cli_params)
+        .map_err(|e| format!("could not start `arc run`: {e}"))?;
 
     match newest_new_contract(&runs, &before) {
         Some(path) => {
@@ -62,10 +75,13 @@ fn protocol_run(args: &Value) -> ToolResult {
             Ok(ToolOutput::json(contract))
         }
         None => {
-            let mut message = match run_result {
-                Err(e) => format!("run failed before a contract was written: {e}"),
-                Ok(()) => "the run produced no contract (a protocol with no steps writes none)"
-                    .to_string(),
+            let mut message = if child.status.success() {
+                "the run produced no contract (a protocol with no steps writes none)".to_string()
+            } else {
+                format!(
+                    "run failed before a contract was written: `arc run` exited with {}",
+                    child.status
+                )
             };
             // The contract carries these in `run.protocol.possible_copies`; with none written,
             // the result an agent receives is the one place left to name them.
@@ -73,9 +89,128 @@ fn protocol_run(args: &Value) -> ToolResult {
                 message.push_str("\nwarning: ");
                 message.push_str(&copy.warning);
             }
+            message.push_str("\n--- last output ---\n");
+            message.push_str(&child.tail);
             Err(message)
         }
     }
+}
+
+/// The most of a child run's output [`run_child`] keeps: its last 4,000 bytes.
+const TAIL_BYTES: usize = 4_000;
+
+/// How long [`run_child`] waits, once `arc run` has exited, for the rest of what it
+/// printed.
+const READER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What a child `arc run` left: how it exited and the end of what it printed.
+struct ChildRun {
+    status: std::process::ExitStatus,
+    /// The last [`TAIL_BYTES`] of standard output and standard error, interleaved in
+    /// the order they arrived, read as UTF-8 with anything invalid replaced.
+    tail: String,
+}
+
+/// Run `arc run` on the Protocol in `dir` as a child of this process, with `--force`
+/// when `force` is set and one `--param=K=V` for each of `params`.
+///
+/// Its standard input is closed, and its standard output and standard error are piped
+/// and drained on two threads into one buffer that keeps the last [`TAIL_BYTES`], so a
+/// child that prints megabytes never blocks on a full pipe and never reaches this
+/// process's standard output. Escape sequences are dropped from the tail.
+fn run_child(dir: &Path, force: bool, params: &[(String, String)]) -> std::io::Result<ChildRun> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
+
+    let mut command = Command::new(std::env::current_exe()?);
+    command.arg("run");
+    if force {
+        command.arg("--force");
+    }
+    for (key, value) in params {
+        command.arg(format!("--param={key}={value}"));
+    }
+    let mut child = command
+        .current_dir(dir)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let tail = Arc::new(Mutex::new(std::collections::VecDeque::<u8>::with_capacity(
+        TAIL_BYTES,
+    )));
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let drain = |mut pipe: Box<dyn Read + Send>| {
+        let tail = Arc::clone(&tail);
+        let done = done_tx.clone();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let mut tail = tail.lock().unwrap_or_else(|e| e.into_inner());
+                        tail.extend(&chunk[..n]);
+                        let excess = tail.len().saturating_sub(TAIL_BYTES);
+                        tail.drain(..excess);
+                    }
+                }
+            }
+            let _ = done.send(());
+        })
+    };
+    let readers = [
+        child.stdout.take().map(|p| drain(Box::new(p))),
+        child.stderr.take().map(|p| drain(Box::new(p))),
+    ];
+    let status = child.wait()?;
+    // A process the run left behind, such as a step's `sleep 30 &`, inherits the pipes
+    // and holds them open after `arc run` exits. Wait a short while for the readers to
+    // reach the end of what the run printed, then answer with what has arrived and
+    // leave a reader still waiting on such a process to finish on its own.
+    let deadline = std::time::Instant::now() + READER_GRACE;
+    for _ in readers.iter().flatten() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if done_rx.recv_timeout(left).is_err() {
+            break;
+        }
+    }
+
+    let bytes: Vec<u8> = tail
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .collect();
+    Ok(ChildRun {
+        status,
+        tail: strip_ansi(&String::from_utf8_lossy(&bytes)),
+    })
+}
+
+/// Drop terminal escape sequences, which arc writes whatever `NO_COLOR` says, so the
+/// tail an agent reads is plain text. A control sequence (`ESC [` up to its final
+/// byte) is dropped whole, and any other escape with the one character after it.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        if chars.next() == Some('[') {
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Runtime parameter overrides, accepted as an object `{key: value}` or an array of
@@ -88,16 +223,23 @@ fn parse_params(value: Option<&Value>) -> std::result::Result<Vec<(String, Strin
         return Ok(Vec::new());
     }
     if let Some(map) = value.as_object() {
-        return Ok(map
+        return map
             .iter()
             .map(|(key, value)| {
+                // Each param reaches the run as `--param KEY=VALUE`, which splits at the
+                // first `=`, so a key holding one, or none at all, cannot get there whole.
+                if key.is_empty() || key.contains('=') {
+                    return Err(format!(
+                        "param key `{key}` must be non-empty and hold no `=`"
+                    ));
+                }
                 let value = match value {
                     Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                (key.clone(), value)
+                Ok((key.clone(), value))
             })
-            .collect());
+            .collect();
     }
     if let Some(array) = value.as_array() {
         let mut out = Vec::new();
@@ -108,7 +250,11 @@ fn parse_params(value: Option<&Value>) -> std::result::Result<Vec<(String, Strin
             let (key, value) = entry
                 .split_once('=')
                 .ok_or_else(|| format!("param `{entry}` must be KEY=VALUE"))?;
-            out.push((key.trim().to_string(), value.to_string()));
+            let key = key.trim();
+            if key.is_empty() {
+                return Err(format!("param `{entry}` has an empty key"));
+            }
+            out.push((key.to_string(), value.to_string()));
         }
         return Ok(out);
     }
@@ -261,7 +407,7 @@ fn operation_describe_schema() -> Value {
 /// as `--description` is. A refusal is an error result naming what was wrong, with
 /// the Protocol's directory untouched.
 fn operation_record(args: &Value) -> ToolResult {
-    let dir = PathBuf::from(args.get("dir").and_then(Value::as_str).unwrap_or("."));
+    let dir = PathBuf::from(optional_string(args, "dir")?.unwrap_or("."));
     let operation = required_string(args, "operation")?;
     let on = required_string(args, "on")?;
     let name = required_string(args, "name")?;
@@ -310,6 +456,17 @@ fn required_string<'a>(args: &'a Value, key: &str) -> std::result::Result<&'a st
     match args.get(key) {
         Some(Value::String(value)) => Ok(value),
         None | Some(Value::Null) => Err(format!("`{key}` is required")),
+        Some(other) => Err(format!("`{key}` must be a string, not {other}")),
+    }
+}
+
+/// The string `key` of a tool's arguments, `None` when absent or null, refused by
+/// name when it is anything other than a string — so a mistyped `dir` is an error,
+/// never the server's working directory.
+fn optional_string<'a>(args: &'a Value, key: &str) -> std::result::Result<Option<&'a str>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
         Some(other) => Err(format!("`{key}` must be a string, not {other}")),
     }
 }
@@ -368,7 +525,7 @@ fn sql_recognise_schema() -> Value {
 /// table it was applied to under `on`. A refusal is an error result naming what
 /// was wrong, with the Protocol's directory untouched.
 fn sql_record(args: &Value) -> ToolResult {
-    let dir = PathBuf::from(args.get("dir").and_then(Value::as_str).unwrap_or("."));
+    let dir = PathBuf::from(optional_string(args, "dir")?.unwrap_or("."));
     let sql = required_string(args, "sql")?;
     let name = required_string(args, "name")?;
     let description = match args.get("description") {
@@ -409,6 +566,120 @@ fn sql_record_schema() -> Value {
     })
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// protocol_create
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Make a new Protocol in `dir` as `arc create-protocol` does: `arcform.yaml`, the
+/// ignore list and the log's merge rule, through the one creation both share. An
+/// existing spec is refused and left as it was. `files_written` lists only the files
+/// written or added to; the tool prints nothing, since standard output is JSON-RPC.
+fn protocol_create(args: &Value) -> ToolResult {
+    let dir = PathBuf::from(required_string(args, "dir")?);
+    let optional = |key: &str| -> std::result::Result<Option<String>, String> {
+        match args.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) => Ok(Some(value.clone())),
+            Some(other) => Err(format!("`{key}` must be a string, not {other}")),
+        }
+    };
+    let (name, engine, db) = (optional("name")?, optional("engine")?, optional("db")?);
+    let history = open_history()?;
+    let created = crate::cli::create_protocol_files(&dir, name, engine, db, &history)
+        .map_err(|e| e.to_string().replace("pass --name", "pass `name`"))?;
+    let mut files_written = vec![crate::spec::MANIFEST_FILENAME];
+    if created.ignore == crate::edit::IgnoreList::Written {
+        files_written.push(crate::edit::IGNORE_FILENAME);
+    }
+    if created.merge_rule != crate::edit::MergeRule::Kept {
+        files_written.push(crate::edit::ATTRIBUTES_FILENAME);
+    }
+    Ok(ToolOutput::json(json!({
+        "manifest": created.manifest.display().to_string(),
+        "files_written": files_written,
+    })))
+}
+
+fn protocol_create_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "dir": { "type": "string", "description": "The directory to make the Protocol in; arcform.yaml is written there. Made if absent." },
+            "name": { "type": "string", "description": "The Protocol's name. Defaults to the directory's name." },
+            "engine": { "type": "string", "description": "The SQL engine the Protocol targets. Defaults to duckdb." },
+            "db": { "type": "string", "description": "The Protocol's working database file, relative to the directory. Defaults to none." }
+        },
+        "required": ["dir"]
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// table_describe
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What a table in the Protocol's database holds, as `arc table describe` prints it.
+/// The database is opened read-only; the answer is the verb's JSON.
+fn table_describe(args: &Value) -> ToolResult {
+    let table = required_string(args, "table")?;
+    let dir = match args.get("dir") {
+        None | Some(Value::Null) => PathBuf::from("."),
+        Some(Value::String(dir)) => PathBuf::from(dir),
+        Some(other) => return Err(format!("`dir` must be a string, not {other}")),
+    };
+    crate::inspect::describe_table(&dir, table)
+        .map(ToolOutput::json)
+        .map_err(|e| e.to_string())
+}
+
+fn table_describe_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "table": { "type": "string", "description": "The table or view to describe: a bare name, or schema.table." },
+            "dir": { "type": "string", "description": "The Protocol's directory. Defaults to the server's working directory." }
+        },
+        "required": ["table"]
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// sql_query
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The rows SELECT statements return from the Protocol's database, as `arc sql
+/// query` prints them. The database is opened read-only, and a text holding
+/// anything but SELECTs is refused before any of it runs.
+fn sql_query(args: &Value) -> ToolResult {
+    let sql = required_string(args, "sql")?;
+    let dir = match args.get("dir") {
+        None | Some(Value::Null) => PathBuf::from("."),
+        Some(Value::String(dir)) => PathBuf::from(dir),
+        Some(other) => return Err(format!("`dir` must be a string, not {other}")),
+    };
+    let limit = match args.get("limit") {
+        None | Some(Value::Null) => 100,
+        Some(value) => value
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| format!("`limit` must be a whole number, not {value}"))?,
+    };
+    crate::inspect::query(&dir, sql, limit)
+        .map(ToolOutput::json)
+        .map_err(|e| e.to_string())
+}
+
+fn sql_query_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "sql": { "type": "string", "description": "One or more SELECT statements, separated by `;`." },
+            "dir": { "type": "string", "description": "The Protocol's directory. Defaults to the server's working directory." },
+            "limit": { "type": "integer", "minimum": 0, "maximum": 100000, "description": "The most rows returned for each statement. Defaults to 100; at most 100000." }
+        },
+        "required": ["sql"]
+    })
+}
+
 /// The tools native to `arc`.
 pub(super) fn tools() -> Vec<ToolDef> {
     vec![
@@ -417,36 +688,63 @@ pub(super) fn tools() -> Vec<ToolDef> {
             description: "Run an arc Protocol and return its live Protocol+Run contract (protocol, engine, params, assets, per-step outcome). A file beside arcform.yaml that may be a copy a synced drive set aside, which the run did not read, is named with its warning in run.protocol.possible_copies.",
             input_schema: protocol_run_schema,
             handler: protocol_run,
+            annotations: Annotations::RUNS,
         },
         ToolDef {
             name: "operator_describe",
             description: "Emit an operator's `with:` JSON Schema for authoring — or list the operator catalog when called with no operator.",
             input_schema: operator_describe_schema,
             handler: operator_describe,
+            annotations: Annotations::READ_ONLY,
         },
         ToolDef {
             name: "operation_describe",
             description: "List the SQL operations arc holds when called with no operation — or describe one operation or operator (what it does, what its step reads and writes by role, and the JSON Schema of what it takes) by its name.",
             input_schema: operation_describe_schema,
             handler: operation_describe,
+            annotations: Annotations::READ_ONLY,
         },
         ToolDef {
             name: "operation_record",
             description: "Record an SQL operation as a new step at the end of a Protocol, from its long name, the table it is applied to, the step's name and its arguments. Writes a generated model and the step naming it; runs nothing.",
             input_schema: operation_record_schema,
             handler: operation_record,
+            annotations: Annotations::WRITES,
         },
         ToolDef {
             name: "sql_recognise",
             description: "Answer what arc reads one SQL statement as: the operation arc holds that it is, with `operation`, `on` and `arguments` as operation_record takes them, or `operation` null when it is none. Read from DuckDB's own parse; writes no file and runs nothing.",
             input_schema: sql_recognise_schema,
             handler: sql_recognise,
+            annotations: Annotations::READ_ONLY,
         },
         ToolDef {
             name: "sql_record",
             description: "Record one SQL statement as a new step at the end of a Protocol. A statement sql_recognise reads as an operation is recorded as the step operation_record writes for it; any other statement DuckDB parses is recorded as a SQL step, whose model has no `-- generated:` line, so arc does not rewrite it: for a SELECT the model's first line is `CREATE OR REPLACE TABLE \"<name>\" AS` and the statement as typed follows it, so the step makes a table of its name when it runs. Writes the step; runs nothing.",
             input_schema: sql_record_schema,
             handler: sql_record,
+            annotations: Annotations::WRITES,
+        },
+        ToolDef {
+            name: "protocol_create",
+            description: "Make a new Protocol in a directory, as `arc create-protocol` does: writes arcform.yaml with no steps, and the .gitignore and .gitattributes beside it. Refuses a directory that already holds an arcform.yaml and leaves it as it was. Runs nothing.",
+            input_schema: protocol_create_schema,
+            handler: protocol_create,
+            annotations: Annotations::WRITES,
+        },
+        ToolDef {
+            name: "table_describe",
+            description: "Describe a table or view in a Protocol's database: its row count, each column's name, type and null count, and up to five rows as arrays of values in the order of the columns. A bare name is the table in main, or the one schema that holds it; `schema.table` names another. Opens the database read-only and never writes it; a view may read the files and URLs it names, but no extension is installed for it. A database the Protocol has not made yet is refused, and so is one another process holds.",
+            input_schema: table_describe_schema,
+            handler: table_describe,
+            annotations: Annotations::READS_OPEN,
+        },
+        ToolDef {
+            name: "sql_query",
+            description: "Run SELECT statements against a Protocol's database and return, for each, its columns and types and up to `limit` rows (100 by default, at most 100000) as arrays of values in the order of the columns, with `capped` and `rows_held_back` saying when more rows were there; `rows_held_back` is a recount, running the statement a second time. Before anything runs, DuckDB reads the whole text, and a text holding anything but SELECTs is refused whole. A statement that fails while running gives `{statement, error}` in its place and the others are kept. The SQL may read files and URLs it names; the database is opened read-only and never written. `keep` says how to record a query as a step: the `arc sql record` command, or the sql_record tool.",
+            input_schema: sql_query_schema,
+            handler: sql_query,
+            annotations: Annotations::READS_OPEN,
         },
     ]
 }
@@ -581,6 +879,7 @@ mod tests {
                 json!("where=amount > 100"),
                 "`arguments` must be an object",
             ),
+            ("dir", json!(7), "`dir` must be a string, not 7"),
         ];
         for (key, value, message) in refusals {
             let mut args = request.clone();
@@ -596,6 +895,22 @@ mod tests {
             std::fs::read_dir(dir.path()).unwrap().count(),
             0,
             "a refused request wrote into the directory"
+        );
+    }
+
+    #[test]
+    fn sql_record_refuses_a_dir_that_is_not_a_string() {
+        // Not the server's working directory: a mistyped `dir` is refused by name
+        // before anything is read or written.
+        let err = sql_record(&json!({
+            "dir": 7,
+            "sql": "SELECT 1 AS one",
+            "name": "one",
+        }))
+        .unwrap_err();
+        assert!(
+            err.contains("`dir` must be a string, not 7"),
+            "message: {err}"
         );
     }
 
@@ -616,31 +931,20 @@ mod tests {
     }
 
     #[test]
-    fn protocol_run_returns_the_b4_protocol_and_run_contract() {
-        let dir = tempfile::tempdir().unwrap();
-        // A minimal Protocol: one no-op command step (executes via `sh -c`), which is
-        // enough for the runner to build and write a contract. It names its `db:` so
-        // the run's database stays in the test's directory: in-process, a test cannot
-        // point `ARCFORM_DB_DIR` at a directory of its own.
-        std::fs::write(
-            dir.path().join("arcform.yaml"),
-            "name: mcp_smoke\ndb: mcp_smoke.duckdb\nsteps:\n  - name: noop\n    command: \"true\"\n",
-        )
-        .unwrap();
+    fn parse_params_refuses_a_key_the_command_line_cannot_carry() {
+        let err = parse_params(Some(&json!({ "a=b": "c" }))).unwrap_err();
+        assert!(err.contains("`a=b`"), "{err}");
+        let err = parse_params(Some(&json!({ "": "c" }))).unwrap_err();
+        assert!(err.contains("``"), "{err}");
+        let err = parse_params(Some(&json!(["=c"]))).unwrap_err();
+        assert!(err.contains("`=c`"), "{err}");
+    }
 
-        let result = protocol_run(&json!({ "dir": dir.path().to_str().unwrap() }))
-            .expect("protocol_run succeeds");
-        let contract = result.structured.expect("a structured contract");
-
+    #[test]
+    fn strip_ansi_drops_escape_sequences_and_keeps_the_text() {
         assert_eq!(
-            contract["contract_version"], "b4/1",
-            "protocol_run must return the live Protocol+Run contract"
+            strip_ansi("\u{1b}[2m[hook]\u{1b}[0m \u{1b}[1;31msetup\u{1b}[0m ...\nplain"),
+            "[hook] setup ...\nplain"
         );
-        assert_eq!(contract["run"]["protocol"]["name"], "mcp_smoke");
-        assert_eq!(contract["run"]["outcome"], "success");
-        assert!(contract["steps"].is_array());
-        assert!(contract["assets"].is_array());
-        let steps = contract["steps"].as_array().unwrap();
-        assert!(steps.iter().any(|s| s["name"] == "noop"));
     }
 }

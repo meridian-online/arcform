@@ -236,7 +236,12 @@ pub struct PivotStatement {
 
 impl fmt::Display for PivotStatement {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "PIVOT {} ON {}", self.source, display_comma_separated(&self.on))?;
+        write!(
+            f,
+            "PIVOT {} ON {}",
+            self.source,
+            display_comma_separated(&self.on)
+        )?;
         if !self.using.is_empty() {
             write!(f, " USING {}", display_comma_separated(&self.using))?;
         }
@@ -278,7 +283,12 @@ pub struct UnpivotInto {
 
 impl fmt::Display for UnpivotStatement {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "UNPIVOT {} ON {}", self.source, display_comma_separated(&self.on))?;
+        write!(
+            f,
+            "UNPIVOT {} ON {}",
+            self.source,
+            display_comma_separated(&self.on)
+        )?;
         if let Some(into) = &self.into {
             write!(
                 f,

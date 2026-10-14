@@ -17,6 +17,8 @@
   under the License.
 -->
 
+> **This is `arcform-sqlparser`, arcform's fork of [`sqlparser`](https://crates.io/crates/sqlparser) 0.55.0.** It teaches the DuckDB dialect grammars the published crate rejects (statement-form `PIVOT`/`UNPIVOT`, multi-option `COPY`, the `lambda x: expr` form, `INSTALL … FROM`, empty-string `COPY` options, multi-argument `PRAGMA` calls and `SET VARIABLE`), so that [arcform](https://github.com/meridian-online/arcform) can introspect DuckDB SQL. `MERIDIAN_PATCH.md`, beside this file, lists every change. The library is still named `sqlparser`, the licence is upstream's Apache-2.0, and the work is upstream's apart from those changes. Use upstream `sqlparser` unless you need these grammars.
+
 # Extensible SQL Lexer and Parser for Rust
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)

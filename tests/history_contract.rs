@@ -23,7 +23,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use arc::spec::{
+use arcform::spec::{
     Error, HISTORY_MAX_ENTRIES, HISTORY_MERGE_WINDOW, HistoryKind, HistoryWay, LOG_FILENAME,
     LocalHistory, MANIFEST_FILENAME, RecordedStep, SpecEdit, edit_spec_with_history,
     record_step_with_history,
@@ -771,7 +771,7 @@ fn a_way_that_cannot_be_stored_is_refused_before_anything_is_written() {
         (too_long.as_str(), "at most 32 characters"),
     ];
     for (word, why) in refused {
-        let attempt = || -> arc::spec::Result<()> {
+        let attempt = || -> arcform::spec::Result<()> {
             let way = HistoryWay::new(word)?;
             edit_spec_with_history(
                 &dir,
