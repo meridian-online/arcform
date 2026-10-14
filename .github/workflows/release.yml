@@ -8,8 +8,10 @@ on:
     # same shapes again, for the day this filter is loosened.
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
 
+# Read-only by default; only the `release` job, which creates the GitHub release,
+# can write to the repository.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -80,6 +82,26 @@ jobs:
         shell: bash
         run: cargo build --release --locked --features mcp,bundled-duckdb --target "${{ matrix.target }}"
 
+      # Both macOS legs run on one Apple-silicon runner, so a leg that quietly built
+      # for the host would still pass the smoke test (Rosetta runs either). The
+      # binary's own architecture is what proves the x86_64 leg built for x86_64.
+      - name: The macOS binary is built for its target's architecture
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin) want=arm64 ;;
+            x86_64-apple-darwin) want=x86_64 ;;
+            *) echo "::error::no expected architecture for ${{ matrix.target }}"; exit 1 ;;
+          esac
+          got="$(lipo -archs "target/${{ matrix.target }}/release/arc")"
+          if [ "$got" != "$want" ]; then
+            echo "::error::target/${{ matrix.target }}/release/arc is built for '$got', not '$want'"
+            exit 1
+          fi
+          echo "arc is built for $got"
+
       # The binary starts, reports the tagged version, and answers an MCP
       # `initialize` with the newest protocol version it supports. tag-guard has
       # already proved the tag equals Cargo.toml's version, so the tag is the
@@ -139,6 +161,8 @@ jobs:
     needs: [tag-guard, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       # Each leg's files have distinct names, so merging the four artifacts into
       # one directory cannot collide.
@@ -178,7 +202,7 @@ jobs:
 
   # The parser fork first, because arcform depends on it by exact version and
   # crates.io must have it before arcform can be published. Each crate is skipped
-  # when its version is already there, so re-running a release whose arcform
+  # when crates.io's API already has its version, so re-running a release whose arcform
   # publish failed retries only what is missing. `cargo publish` waits until a
   # crate is in the index before it returns, so arcform resolves the fork.
   #
@@ -211,9 +235,17 @@ jobs:
           fork_version="$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["package"]["version"])' "$fork_manifest")"
           arcform_version="${GITHUB_REF_NAME#v}"
 
-          # `cargo search` prints `name = "latest-version"    # description`.
+          # crates.io's API answers 200 for a published version and 404 for one that
+          # is not; anything else stops the job rather than guessing.
           published() {
-            cargo search "$1" --limit 5 | grep -q "^$1 = \"$2\""
+            status="$(curl -sS -o /dev/null -w '%{http_code}' \
+              -A "arcform-release (+https://github.com/${GITHUB_REPOSITORY})" \
+              "https://crates.io/api/v1/crates/$1/$2")"
+            case "$status" in
+              200) return 0 ;;
+              404) return 1 ;;
+              *) echo "::error::crates.io answered $status for $1 $2"; exit 1 ;;
+            esac
           }
 
           if published arcform-sqlparser "$fork_version"; then
@@ -225,7 +257,7 @@ jobs:
           if published arcform "$arcform_version"; then
             echo "arcform $arcform_version is already on crates.io; skipping it."
           else
-            cargo publish --no-verify -p arcform
+            cargo publish --locked --no-verify -p arcform
           fi
 
   update-install-site:
@@ -239,10 +271,12 @@ jobs:
       # install.meridian.online's update.yml writes the script it is sent to
       # `arc.sh`, choosing the file by the `repo` in the payload.
       - name: Dispatch to install.meridian.online
+        env:
+          INSTALL_SITE_TOKEN: ${{ secrets.INSTALL_SITE_TOKEN }}
         run: |
           SCRIPT_CONTENT=$(base64 -w 0 scripts/install.sh)
           curl -fsSL -X POST \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.INSTALL_SITE_TOKEN }}" \
+            -H "Authorization: Bearer ${INSTALL_SITE_TOKEN}" \
             "https://api.github.com/repos/meridian-online/install/dispatches" \
             -d "{\"event_type\":\"update-install-script\",\"client_payload\":{\"tag\":\"${GITHUB_REF_NAME}\",\"repo\":\"${GITHUB_REPOSITORY}\",\"script_base64\":\"${SCRIPT_CONTENT}\"}}"

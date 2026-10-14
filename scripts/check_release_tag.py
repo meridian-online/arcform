@@ -23,7 +23,8 @@ WHAT ONLY A PUSHED TAG RUNS, AND WHAT STANDS IN FOR IT
     GitHub's tag matching cannot be run anywhere but GitHub. `--wiring` reads
     release.yml instead: the tag filter is exactly `v[0-9]+.[0-9]+.[0-9]+`,
     the guard step is unconditional and refuses rather than warns, every other
-    job needs it, none runs after a failure, and the release body is the
+    job needs it, none runs after a failure, publish-crates and
+    update-install-site wait on the release, and the release body is the
     guard's notes. That is a reading of the workflow text, and it is the
     honest limit of what a pull request can check about a trigger.
 
@@ -75,6 +76,9 @@ CHANGELOG_REL = "CHANGELOG.md"
 GUARD_JOB = "tag-guard"
 GUARD_STEP_ID = "guard"
 PUBLISH_ACTION = "softprops/action-gh-release"
+# Jobs that publish beyond GitHub. They wait for the GitHub release, so a tag
+# whose build failed never reaches crates.io or the install site.
+AFTER_RELEASE_JOBS = ("publish-crates", "update-install-site")
 TAG_FILTER = "v[0-9]+.[0-9]+.[0-9]+"
 # The notes travel as step output -> job output -> the publish step's `body:`.
 GUARD_ARGS = '--tag "${GITHUB_REF_NAME}" --github-output "${GITHUB_OUTPUT}"'
@@ -531,13 +535,17 @@ def check_wiring(root: Path) -> None:
         if guard.outputs.get(NOTES_OUTPUT) != NOTES_JOB_OUTPUT:
             findings.append(f"{rel}: job `{GUARD_JOB}` does not output `{NOTES_OUTPUT}: {NOTES_JOB_OUTPUT}`")
 
-    def needs_guard(job_id: str, seen: frozenset = frozenset()) -> bool:
+    def reaches(job_id: str, target: str, seen: frozenset = frozenset()) -> bool:
+        """Whether `job_id` waits on `target`, directly or through other jobs."""
         job = jobs.get(job_id)
         if job is None or job_id in seen:
             return False
-        if GUARD_JOB in job.needs:
+        if target in job.needs:
             return True
-        return any(needs_guard(n, seen | {job_id}) for n in job.needs)
+        return any(reaches(n, target, seen | {job_id}) for n in job.needs)
+
+    def needs_guard(job_id: str) -> bool:
+        return reaches(job_id, GUARD_JOB)
 
     for job_id, job in jobs.items():
         if job_id == GUARD_JOB:
@@ -567,6 +575,14 @@ def check_wiring(root: Path) -> None:
             findings.append(f"{rel}:{publish.lineno}: `body_path:` overrides `body:`")
         if publish.with_.get("fail_on_unmatched_files") != "true":
             findings.append(f"{rel}:{publish.lineno}: fail_on_unmatched_files is not true, so a missing asset is skipped with a warning")
+        for job_id in AFTER_RELEASE_JOBS:
+            if job_id not in jobs:
+                findings.append(f"{rel}: no `{job_id}` job")
+            elif not reaches(job_id, publish.job):
+                findings.append(
+                    f"{rel}: job `{job_id}` does not wait on `{publish.job}`, so it can publish "
+                    "for a tag whose build or GitHub release failed"
+                )
 
     if findings:
         raise Refused(EXIT_WIRING, "\n".join(findings))
@@ -814,6 +830,8 @@ def self_test() -> int:
             ("the guard job made conditional", (RELEASE_WORKFLOW, "    timeout-minutes: 5\n    outputs:", "    timeout-minutes: 5\n    if: github.ref_type == 'tag'\n    outputs:")),
             ("the guard call commented out", (RELEASE_WORKFLOW, f"        run: {guard_call}", f"        run: echo skipped # {guard_call}")),
             ("the guard step's id changed", (RELEASE_WORKFLOW, f"        id: {GUARD_STEP_ID}\n", "        id: check\n")),
+            ("update-install-site stops waiting on the release", (RELEASE_WORKFLOW, "    name: Update the install site\n    needs: release\n", f"    name: Update the install site\n    needs: {GUARD_JOB}\n")),
+            ("publish-crates stops waiting on the release", (RELEASE_WORKFLOW, "    needs: release\n", f"    needs: [{GUARD_JOB}, build]\n")),
             ("the guard's job output renamed", (RELEASE_WORKFLOW, f"      {NOTES_OUTPUT}: {NOTES_JOB_OUTPUT}", f"      body: {NOTES_JOB_OUTPUT}")),
         )
         for label, edit in wiring_cases:
