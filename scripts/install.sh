@@ -132,12 +132,17 @@ verify_checksum() {
   fi
 }
 
+# post_install_warnings LOCAL_BIN LINKED: LINKED is "no" when another arc in
+# LOCAL_BIN was left alone, and then adding LOCAL_BIN to PATH would find that
+# one, so the hint is not given.
 post_install_warnings() {
   case ":${PATH}:" in
     *":$1:"*) ;;
     *)
-      warn "$1 is not on your PATH, so your shell will not find arc yet. Add this line to your shell's startup file (~/.zshrc, ~/.bashrc):"
-      warn "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+      if [ "${2:-yes}" != "no" ]; then
+        warn "$1 is not on your PATH, so your shell will not find arc yet. Add this line to your shell's startup file (~/.zshrc, ~/.bashrc):"
+        warn "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+      fi
       ;;
   esac
   if ! command -v duckdb > /dev/null 2>&1; then
@@ -195,6 +200,7 @@ main() {
   # left alone: the install has still succeeded, under ~/.arcform/cli/latest.
   mkdir -p "$local_bin"
   link="${local_bin}/${BINARY}"
+  linked=yes
   if [ -L "$link" ] || [ -e "$link" ]; then
     existing=""
     if [ -L "$link" ]; then
@@ -210,6 +216,7 @@ main() {
         fi
         warn "Run arc as ${install_root}/latest/${BINARY}, or remove ${link} and run this installer again."
         link=""
+        linked=no
         ;;
     esac
   fi
@@ -224,7 +231,7 @@ main() {
     warn "the installed arc did not start. On Linux the release binaries need glibc 2.35 or later (Ubuntu 22.04, Debian 12 or newer); on an older system, build from source: ${SOURCE_INSTALL}"
   fi
   echo ""
-  post_install_warnings "$local_bin"
+  post_install_warnings "$local_bin" "$linked"
 }
 
 # ---------------------------------------------------------------------------
@@ -326,6 +333,11 @@ st_end_to_end() {
   case "$(cat "${st_e2e}/other.log")" in
     *"so it was left alone"*) st_pass ;;
     *) st_fail "end to end: no warning that another arc was left alone: $(cat "${st_e2e}/other.log")" ;;
+  esac
+  # ...and no hint to put ~/.local/bin on PATH, which would find the other arc.
+  case "$(cat "${st_e2e}/other.log")" in
+    *"is not on your PATH, so your shell will not find arc"*) st_fail "end to end: told to put ~/.local/bin on PATH with another arc there" ;;
+    *) st_pass ;;
   esac
 
   # A link to some other program: also left alone.
