@@ -653,6 +653,15 @@ fn apply_one(text: &str, edit: &SpecEdit) -> Result<String> {
                 // value go with it, so no line ends in a space.
                 if let Some(at) = colon {
                     start = at;
+                } else {
+                    // The key's line carries a comment, so the old value starts
+                    // on a later line: when only spaces precede it there, the
+                    // line break before that line goes too, or a line of
+                    // spaces is left under the key.
+                    let line = line_start(text, start);
+                    if line > 0 && text[line..start].bytes().all(|b| b == b' ') {
+                        start = line - 1;
+                    }
                 }
                 // A comment after an old value on the key's own line
                 // (`steps: []  # none yet`) stays on that line, ahead of the

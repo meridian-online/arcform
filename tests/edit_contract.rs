@@ -456,8 +456,8 @@ fn a_comment_at_a_sequence_items_key_column_stays_after_its_block_sequence() {
     );
 }
 
-/// A sequence item has no key: a comment indented less than the item's own
-/// column (here the dash's) is after it and stays.
+/// A sequence item has no key: a comment indented no further than the item's
+/// dash is after it and stays.
 #[test]
 fn a_comment_after_a_replaced_sequence_item_stays() {
     let edit = SpecEdit::Replace {
@@ -467,6 +467,20 @@ fn a_comment_after_a_replaced_sequence_item_stays() {
     assert_eq!(
         apply_yaml_edits("steps:\n- a: 1\n  b: 2\n# c\n- name: y\n", &[edit]).unwrap(),
         "steps:\n- {a: 3}\n# c\n- name: y\n"
+    );
+}
+
+/// A block value replacing an old one on a later line leaves no spaces-only
+/// line, even when the key's line carries a comment.
+#[test]
+fn a_block_value_under_a_commented_key_leaves_no_spaces_only_line() {
+    let edit = SpecEdit::Replace {
+        path: vec!["steps".into()],
+        value: "\n  - name: b".into(),
+    };
+    assert_eq!(
+        apply_yaml_edits("steps:  # pipeline\n  - name: a\nnext: 1\n", &[edit]).unwrap(),
+        "steps:  # pipeline\n  - name: b\nnext: 1\n"
     );
 }
 
