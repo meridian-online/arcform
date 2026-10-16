@@ -110,6 +110,27 @@ arc table describe sales
 "rows_profiled": 200
 ```
 
+With `FINETYPE_DUCKDB_EXT` set, validate the table in the database. The schema here is a small one written by hand, as you would write one to correct a type FineType chose wrongly; this needs only the extension, not the finetype binary:
+
+```sh arc-example needs=finetype-ext
+arc run
+arc protocol write-file schemas/sales.json <<'EOF'
+{
+  "type": "object",
+  "properties": {
+    "category": {"type": "string", "enum": ["books", "dining", "groceries", "software", "travel"]},
+    "email": {"type": "string", "pattern": "^[^@ ]+@[^@ ]+$"}
+  },
+  "required": ["category", "email"]
+}
+EOF
+arc table validate sales --schema schemas/sales.json
+```
+
+```text expect
+"valid": true
+```
+
 Without `FINETYPE_DUCKDB_EXT`, validate the table through a Parquet export of it:
 
 ```sh arc-example needs=finetype
@@ -123,13 +144,21 @@ finetype validate build/sales.parquet schemas/sales.json -o json
 "valid_rows": 200
 ```
 
-Data that is not a CSV goes in through a raw step first. Here a JSON file is loaded and profiled as a table:
+Data that is not a CSV goes in through a raw step first. Here `orders.json`, a JSON array of orders, is loaded as it arrives and described; none of this needs finetype:
+
+```sh arc-example
+arc sql record "SELECT * FROM read_json('orders.json')" --name raw_orders --description "Load the orders as they arrive"
+arc run
+arc table describe raw_orders
+```
+
+```text expect
+"row_count": 2
+```
+
+Then profile the table it makes:
 
 ```sh arc-example needs=finetype
-cat > orders.json <<'EOF'
-[{"order_id": 1, "placed": "2026-02-01", "email": "a@example.com"},
- {"order_id": 2, "placed": "2026-02-02", "email": "b@example.com"}]
-EOF
 arc sql record "SELECT * FROM read_json('orders.json')" --name raw_orders --description "Load the orders as they arrive"
 arc run
 arc table profile raw_orders

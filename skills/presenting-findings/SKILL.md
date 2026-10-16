@@ -1,6 +1,6 @@
 ---
 name: presenting-findings
-description: "Use once a run is clean and every table holds the rows you expect, to hand the user the answer: whenever they want a chart, a summary, a write-up or a report of an analysis done in a Protocol. Writes each chart as a Mosaic spec at panels/<name>.yaml in the Protocol folder, reading a table the Protocol makes, in a chart kind Brightfield draws, and acts on any warning the panel check returns. States the answer, the quality caveats from profiling and the next steps; guides the user to open the Protocol folder in Brightfield to see the charts and how the answer was derived; writes report.md when they want a document. Do not use it to draw a chart with another tool, or to present a number no table in the Protocol holds."
+description: "Use once a run is clean and every table holds the rows you expect, to hand the user the answer: whenever they want a chart, a summary, a write-up or a report of an analysis done in a Protocol. Writes each chart as a Mosaic spec in a YAML file under panels/ in the Protocol folder, reading a table the Protocol makes, in a chart kind Brightfield draws, and acts on any warning the panel check returns. States the answer, the quality caveats from profiling and the next steps; guides the user to open the Protocol folder in Brightfield to see the charts and how the answer was derived; writes report.md when they want a document. Do not use it to draw a chart with another tool, or to present a number no table in the Protocol holds."
 metadata:
   arc_version: "0.2.0"
 ---
@@ -109,7 +109,7 @@ The PDF, with the charts drawn in it, comes from Brightfield's export. That rele
 
 ## 6. Hand over the folder
 
-End by telling the user the Protocol folder can be committed to git or shared as it is: the spec, its models, the schemas, the panels and the report are all in it, and anyone with arc can run it again to rebuild the tables. The tables themselves live in the Protocol's database, outside the folder unless the spec names a `db:` inside it, and are not part of what they share.
+End by telling the user the Protocol folder can be committed to git or shared as it is: the spec, its models, the schemas, the panels and the report are all in it, and anyone with arc can run it again to rebuild the tables. If a step reads a file by an absolute path (a source outside the folder that could not be moved into it), say so: the Protocol is then tied to this machine, and runs elsewhere only once that file is copied into the folder and the step reads it by a relative path. The tables themselves live in the Protocol's database, outside the folder unless the spec names a `db:` inside it, and are not part of what they share.
 
 ## When to switch
 

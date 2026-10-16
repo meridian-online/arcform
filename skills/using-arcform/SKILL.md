@@ -28,7 +28,7 @@ A folder holding `arcform.yaml`, which lists the steps in order, and `models/`, 
 | Step | CLI | MCP |
 | --- | --- | --- |
 | Make a Protocol | `arc create-protocol <dir> --name <name>` | `protocol_create` with `dir`, `name` |
-| Record a step | `arc sql record "<select>" --name <step> --description "<why>"` | `sql_record` with `sql`, `name`, `description` |
+| Record a step | `arc sql record "<select>" --name <step> --description "<why>" --dir <dir>` | `sql_record` with `sql`, `name`, `description`, `dir` |
 | Run it | `arc run` | `protocol_run` with `dir` |
 | Undo a change | `arc history restore <id> --file <file> --dir <dir>` | `history_restore` with `id`, `file`, `dir` |
 
@@ -66,7 +66,7 @@ arc --version
 ```
 
 ```text expect
-arc 
+arc 0.
 ```
 
 ## When to switch
@@ -88,6 +88,6 @@ arc
 | A run says `1 skipped (fresh)` after you changed an input | Steps whose inputs arc saw unchanged are skipped. Offer `arc run --force` (`force` on `protocol_run`); do not default to it |
 | A run exits 0 but a table is empty | Read the run record: `run.outcome`, each step's `status.state`, each asset's `row_count`. Trace the empty table upstream |
 | `finetype <version> is older than the minimum 0.6.54` | Tell the user to upgrade finetype to 0.6.54 or later; an older one mistypes columns |
-| `finetype DuckDB extension not configured` | Set `FINETYPE_DUCKDB_EXT`, or validate an exported CSV with `validate` |
+| `finetype DuckDB extension not configured` | Set `FINETYPE_DUCKDB_EXT`, or validate the source CSV, or a `parquet_export`, with `validate` |
 | A tool reports that `duckdb` or `finetype` cannot be found from a desktop app | The app lacks the shell's `PATH`; give the MCP server one in its configuration |
 | `protocol_run` times out in Codex | Raise `tool_timeout_sec` for the `arc` server (600 seconds is enough for most runs) |

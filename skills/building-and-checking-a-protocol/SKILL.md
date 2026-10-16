@@ -1,6 +1,6 @@
 ---
 name: building-and-checking-a-protocol
-description: "Use once the data is profiled and its quality findings are agreed, to turn it into the tables that answer the question, and again whenever a run looks wrong. Records each step into the Protocol (raw, then cleaned and conformed, then aggregated, one purpose and one description per step), choosing the step kind in order: an operation arc holds, then SQL, then an operator for fetching, matching, embedding or export, and a shell command last. Runs the Protocol, reads the run record rather than the exit status (the run's outcome, each step's status, each table's row count), traces an empty or wrong table upstream to the step that caused it, and undoes edits through history. Do not use it to compute an answer outside the Protocol, or to fix a table by hand."
+description: "Use once the data is profiled and its quality findings are reported (and, past a quick look, agreed), to turn it into the tables that answer the question, and again whenever a run looks wrong. Records each step into the Protocol (raw, then cleaned and conformed, then aggregated, one purpose and one description per step), choosing the step kind in order: an operation arc holds, then SQL, then an operator for fetching, matching, embedding or export, and a shell command last. Runs the Protocol, reads the run record rather than the exit status (the run's outcome, each step's status, each table's row count), traces an empty or wrong table upstream to the step that caused it, and undoes edits through history. Do not use it to compute an answer outside the Protocol, or to fix a table by hand."
 metadata:
   arc_version: "0.2.0"
 ---
@@ -95,7 +95,7 @@ The Check stage's checkpoint is anything that changes the meaning of the answer:
 | Step | CLI | MCP |
 | --- | --- | --- |
 | List the recorded versions of the spec | `arc history list --json --dir <dir>` | `history_list` with `dir` |
-| Print one version | `arc history show <id> --dir <dir>` | None: no tool prints a version. Choose the id by each entry's at and way fields |
+| Print one version | `arc history show <id> --dir <dir>` | None: no tool prints a version. Entries come oldest first, so choose the id by position, `at` and `bytes`; the newest is last |
 | Roll the spec back to a version | `arc history restore <id> --dir <dir>` | `history_restore` with `id`, `dir` |
 
 A restore keeps the state it replaces, so a wrong restore is undone by restoring the entry it made. Restoring the spec removes the steps recorded after that version; a model file a removed step wrote stays in `models/`, unused. History does not bring back a table: after a restore, run again so the tables match the spec.
@@ -113,14 +113,14 @@ A restore keeps the state it replaces, so a wrong restore is undone by restoring
 | --- | --- |
 | The run exits 0 and you are about to present | Read `run.outcome`, each step's `status.state` and each asset's `row_count` first |
 | A table has 0 rows | Trace it upstream with `references/tracing-a-wrong-table.md`; do not present from it |
-| `invalid manifest: duplicate step name` | A step of that name exists. To change it, delete it (`protocol_edit` with `edit` `delete`, or `arc edit-protocol --dir <dir> delete 'steps[<i>]'`) and record it again |
-| `dependency order violation: step '<a>' reads asset '<b>' but ... runs after it` | Steps are recorded at the end. Move the reader after the step that makes its table: `arc edit-protocol --dir <dir> reorder steps <from> <to>` (`protocol_edit` with `edit` `reorder`) |
+| `invalid manifest: duplicate step name` | A step of that name exists. To change it, delete it (`protocol_edit` with `edit` set to "delete", or `arc edit-protocol --dir <dir> delete 'steps[<i>]'`) and record it again |
+| `dependency order violation: step '<a>' reads asset '<b>' but ... runs after it` | Steps are recorded at the end. Move the reader after the step that makes its table: `arc edit-protocol --dir <dir> reorder steps <from> <to>` (`protocol_edit` with `edit` set to "reorder") |
 | `sql_query` over `read_text` returns no rows | The path was relative, read from the server's working directory. Give the absolute path to the Protocol folder |
 | A replayed step's SELECT fails over MCP with `No files found that match the pattern` | `sql_query` reads relative paths from the server's working directory. Rewrite them as absolute paths under the Protocol folder |
 | `failed to parse arcform.yaml: mapping values are not allowed` after `protocol_edit` | The value has a colon and was written unquoted. Wrap it in double quotes inside the string, escaping `"` as `\"` and `\` as `\\`, or in single quotes with any `'` doubled |
 | `no database for this Protocol yet` | The Protocol has not run. Run it, then look |
 | A run says `skipped (fresh)` after you changed a source | The step's inputs looked unchanged, or a fetch is inside its period. Offer `force`, saying what it re-fetches |
-| A step is `skipped` with a null `skip_reason` | It never ran: an earlier step failed. Fix that one |
+| A step is `skipped`, its `skip_reason` null | It never ran: an earlier step failed. Fix that one |
 | `succeeded but does not appear to have produced: <name>` | A `produces:` names something the step does not write. Name the file or table it really writes, or drop the `produces:` (an operator's output file is already known) |
 | You are about to compute the answer with `sql_query` | `sql_query` is for looking. Record the step and run it, so the Protocol reproduces the answer |
 | You are about to add a shell command step | Check `operator_describe` first; a command is the last resort, and arc cannot see what it reads or writes |

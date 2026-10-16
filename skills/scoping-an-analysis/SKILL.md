@@ -28,7 +28,7 @@ Say the size in one line with its reason, and let the user override it: "This is
 | Size | Checkpoints | Requirements | Ends with |
 | --- | --- | --- | --- |
 | A quick look | One, at the end | The restated question is enough | The answer and the Protocol that reached it |
-| An analysis | After scope (the plan) and after profile (the quality findings) | Played back, not written | The answer, its caveats and next steps |
+| An analysis | After scope (the plan), after profile (the quality findings), at a change of grain while building, and at present | Played back, not written | The answer, its caveats and next steps |
 | A project | At every stage | Written into `README.md` and agreed | A report, as well as the answer |
 
 ## 3. Play the plan back
@@ -41,7 +41,7 @@ Before anything is built, tell the user three things: the data source (the file,
 
 ## 4. Create the Protocol, and for a project write the requirements
 
-Create the Protocol in its own folder, named for the question. If you have no file access of your own (an agent reaching arc only through `arc mcp`), ask the user for an absolute working folder before creating the Protocol. Then, for a project only, write the requirements into its `README.md`: the question, the end state, the data sources, what is in and out of scope, the checks the answer must pass, and who will read it. Show the user the README and have it agreed before profiling. If they change it, write it again: each write is kept in history.
+Create the Protocol in its own folder, named for the question, with the data inside it, so that it runs on any machine. If you have no file access of your own (an agent reaching arc only through `arc mcp`), you cannot copy the data in: ask the user for the folder that holds the data, or to move the file into the working folder, then create the Protocol in that folder and load the file by a path relative to it (`sales.csv`, not its absolute path). A step that reads a file by its absolute path ties the Protocol to this machine. Then, for a project only, write the requirements into its `README.md`: the question, the end state, the data sources, what is in and out of scope, the checks the answer must pass, and who will read it. Show the user the README and have it agreed before profiling. If they change it, write it again: each write is kept in history.
 
 | Step | CLI | MCP |
 | --- | --- | --- |

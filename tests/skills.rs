@@ -8,14 +8,20 @@
 //!
 //! # What a skill author writes, and what is checked
 //!
-//! **An MCP tool** is recognised in exactly two places, so that prose such as `arcform.yaml` or
+//! **An MCP tool** is recognised in exactly three places, so that prose such as `arcform.yaml` or
 //! `row_count` is never mistaken for one:
 //!
 //!   1. *A verb table.* A table whose header row has a cell containing `MCP` (and one containing
 //!      `CLI`). In each row's MCP cell the first backticked name is the tool; every further
 //!      backticked name in that same cell that is a plain identifier (`[a-z][a-z0-9_]*`) is an
-//!      argument of it. Other cells (the CLI cell, prose cells) are never read for arguments.
-//!   2. *A JSON tool-call block.* A fenced `json` block that parses to
+//!      argument of it. A cell that begins `None:` names no tool and is not read.
+//!   2. *A tool named in prose.* Anywhere else outside a fence (a sentence, a trap table, a verb
+//!      table's other cells), a backticked identifier followed by ` with ` is a tool, and the
+//!      backticked identifiers after it, up to the end of the clause (the next `.`, `;`, `:`, `|`,
+//!      `(` or `)`), are its arguments: "`sql_query` with `sql`, `dir`". So write a value as
+//!      `` `edit` set to "delete" ``, not `` `edit` `delete` ``, and do not follow a backticked word
+//!      that is not a tool with " with ".
+//!   3. *A JSON tool-call block.* A fenced `json` block that parses to
 //!      `{"name": "<tool>", "arguments": {...}}` (or the same under a `"params"` key), where the
 //!      top-level keys of `arguments` are the arguments; or a fenced block whose info string is
 //!      `json tool=<tool>`, whose body is the arguments object itself. Any `json` block with a
@@ -31,26 +37,36 @@
 //! or in a backticked span that begins `arc `. `arc <verb> [<sub>] --help` must exit 0 (the sub
 //! is the token straight after the verb, when the verb has subcommands), and every `--flag` in the
 //! form must appear in that help (or in `arc --help`, for global flags). A form whose verb is a
-//! placeholder (`arc <verb>`, `arc ...`) is skipped. Leading `NAME=value` assignments are skipped.
+//! placeholder (a token beginning `<`, or `...` or `…`) is skipped, as is a placeholder
+//! subcommand; any other verb or subcommand arc lacks is an error, so `arc table_describe` fails.
+//! Leading `NAME=value` assignments are skipped.
 //! Not checked: `finetype ...` (a separate binary), forms wrapped in `time`, `$(...)` and the
 //! like, and forms in fences other than `sh`.
 //!
 //! **A verb table** (a table with both `CLI` and `MCP` header cells) must have something in both
-//! cells of every row.
+//! cells of every row, and each MCP cell must begin with a backticked tool or with `None:` and why
+//! no tool does that work. `every_verb_table_row_has_both_columns` prints the `None:` cells, so the
+//! known gaps in the MCP tools stay in view.
 //!
 //! **An example** is a fenced block with the info string `sh arc-example`. It runs under `sh -c`,
 //! with `set -e` and `arc` on `PATH`, in a fresh copy of `tests/fixtures/skills/` (or of
 //! `tests/fixtures/<name>/` for `sh arc-example fixture=<name>`), and must exit 0. If the next
-//! block is `text expect`, its trimmed text must appear in the example's stdout or stderr. An
-//! example is skipped, with a printed reason, when it needs `finetype` and the binary is absent
-//! or older than the floor in `src/finetype_cli.rs`, or needs `FINETYPE_DUCKDB_EXT` and that is
-//! unset. A pipeline's exit status is its last command's, so an example should not pipe `arc`'s
-//! output. It needs them when it says so (`needs=finetype`, `needs=finetype-ext`) or when its text
-//! mentions `finetype`, `table profile`, `datapackage_describe` (finetype) or `table validate`
-//! (finetype and the extension).
+//! block is `text expect`, its trimmed text must appear in the example's stdout or stderr. A
+//! pipeline's exit status is its last command's, so an example should not pipe `arc`'s output.
+//!
+//! An example says what it needs in its info string, and nothing else decides it: `needs=finetype`
+//! when it runs the `finetype` binary, directly or through `arc table profile` (which runs it);
+//! `needs=finetype-ext` when it needs FineType's DuckDB extension, as `arc table validate` does;
+//! `needs=finetype,finetype-ext` for both. Any other need is an error. An example that needs
+//! `finetype` is skipped, with a printed reason, when the binary (`FINETYPE_BIN`, or `finetype` on
+//! `PATH`) is absent or older than the floor in `src/finetype_cli.rs`. One that needs the extension
+//! is skipped when `FINETYPE_DUCKDB_EXT` is unset, unless `ARCFORM_REQUIRE_FINETYPE_EXT` is set: then
+//! the test panics instead. CI stages the extension and sets both, so the extension's examples run
+//! there; it has no `finetype` binary, so the `needs=finetype` examples are skipped there.
 //!
 //! **Frontmatter** (`SKILL.md`): valid YAML (so an unquoted description containing `:` is
-//! refused), `name` equal to the folder, `description` present and at most 1,024 characters,
+//! refused), `name` equal to the folder, hyphen-case and at most 64 characters, `description`
+//! present, at most 1,024 characters and free of `<` and `>` (which skill loaders refuse), and
 //! `metadata.arc_version` equal to this crate's version.
 
 #![cfg(feature = "mcp")]
@@ -308,14 +324,60 @@ struct ToolRef {
     args: Vec<String>,
 }
 
-fn tool_refs(doc: &Doc, errors: &mut Vec<String>) -> Vec<ToolRef> {
+/// An MCP cell that says no tool does this row's work: `None: <why>`.
+fn is_none_cell(cell: &str) -> bool {
+    cell.trim_start().starts_with("None:")
+}
+
+/// `` `tool` with `arg`, `arg` `` in prose (outside verb tables' MCP cells), up to the end of the
+/// clause: the next `.`, `;`, `:`, `|`, `(` or `)`.
+fn prose_tool_refs(doc: &Doc) -> Vec<ToolRef> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"`([a-z][a-z0-9_]*)` with ([^.;:|()]*)").unwrap());
+    let mut mcp_cells: BTreeMap<usize, usize> = BTreeMap::new();
+    for table in tables(doc) {
+        if let Some(mcp) = table.column("mcp") {
+            for (n, _) in &table.rows {
+                mcp_cells.insert(*n, mcp);
+            }
+        }
+    }
     let mut refs = Vec::new();
+    for (n, line) in &doc.prose {
+        let text = match mcp_cells.get(n) {
+            Some(&mcp) => {
+                let mut cells = split_row(line);
+                if mcp < cells.len() {
+                    cells.remove(mcp);
+                }
+                cells.join(" | ")
+            }
+            None => line.clone(),
+        };
+        for c in re.captures_iter(&text) {
+            refs.push(ToolRef {
+                at: doc.at(*n),
+                tool: c[1].to_string(),
+                args: backticked(&c[2])
+                    .into_iter()
+                    .filter(|a| is_identifier(a))
+                    .collect(),
+            });
+        }
+    }
+    refs
+}
+
+fn tool_refs(doc: &Doc, errors: &mut Vec<String>) -> Vec<ToolRef> {
+    let mut refs = prose_tool_refs(doc);
     for table in tables(doc) {
         let Some(mcp) = table.column("mcp") else {
             continue;
         };
         for (n, cells) in &table.rows {
-            let Some(cell) = cells.get(mcp) else { continue };
+            let Some(cell) = cells.get(mcp).filter(|c| !is_none_cell(c)) else {
+                continue;
+            };
             let names = backticked(cell);
             let Some((tool, rest)) = names.split_first() else {
                 continue;
@@ -654,6 +716,11 @@ fn help_has_flag(help: &str, flag: &str) -> bool {
     false
 }
 
+/// A token standing for a verb or subcommand rather than naming one: `<verb>`, `...`, `…`.
+fn is_placeholder(token: &str) -> bool {
+    token.starts_with('<') || token == "..." || token == "\u{2026}"
+}
+
 fn check_cli_form(form: &CliForm, helps: &mut Helps, errors: &mut Vec<String>) {
     let mut i = 0;
     while form.tokens.get(i).is_some_and(|t| t.starts_with('-')) {
@@ -661,8 +728,8 @@ fn check_cli_form(form: &CliForm, helps: &mut Helps, errors: &mut Vec<String>) {
     }
     let mut scope: Vec<String> = Vec::new();
     if let Some(verb) = form.tokens.get(i) {
-        if !Regex::new(r"^[a-z][a-z0-9-]*$").unwrap().is_match(verb) {
-            return; // a placeholder such as `<verb>` or `...`
+        if is_placeholder(verb) {
+            return;
         }
         let (ok, help) = helps.get(&[verb]).clone();
         if !ok {
@@ -676,7 +743,7 @@ fn check_cli_form(form: &CliForm, helps: &mut Helps, errors: &mut Vec<String>) {
         {
             if subs.contains(next) {
                 scope.push(next.clone());
-            } else if Regex::new(r"^[a-z][a-z0-9-]*$").unwrap().is_match(next) {
+            } else if !is_placeholder(next) {
                 errors.push(format!(
                     "{}: `arc {verb} {next}` is not a subcommand of `arc {verb}` (it has: {})",
                     form.at,
@@ -764,15 +831,54 @@ fn check_tables(docs: &[Doc]) -> Vec<String> {
                         ));
                     }
                 }
+                if let Some(cell) = cells.get(mcp).map(|c| c.trim())
+                    && !cell.is_empty()
+                    && !cell.starts_with('`')
+                    && !is_none_cell(cell)
+                    && !cell.eq_ignore_ascii_case("n/a")
+                    && !cell
+                        .chars()
+                        .all(|ch| matches!(ch, '-' | '\u{2013}' | '\u{2014}'))
+                {
+                    errors.push(format!(
+                        "{}: the MCP cell of this row must begin with a backticked tool, or with `None:` and why no tool does it",
+                        doc.at(*n)
+                    ));
+                }
             }
         }
     }
     errors
 }
 
+/// Every `None:` MCP cell, as `file:line: text`: the work the MCP tools cannot yet do.
+fn none_cells(docs: &[Doc]) -> Vec<String> {
+    let mut out = Vec::new();
+    for doc in docs {
+        for table in tables(doc) {
+            let Some(mcp) = table.column("mcp") else {
+                continue;
+            };
+            for (n, cells) in &table.rows {
+                if let Some(cell) = cells.get(mcp).filter(|c| is_none_cell(c)) {
+                    out.push(format!("{}: {cell}", doc.at(*n)));
+                }
+            }
+        }
+    }
+    out
+}
+
 #[test]
 fn every_verb_table_row_has_both_columns() {
-    let errors = check_tables(&skill_docs(&real_skills()));
+    let docs = skill_docs(&real_skills());
+    let gaps = none_cells(&docs);
+    println!(
+        "{} MCP cells say no tool does the work:\n{}",
+        gaps.len(),
+        gaps.join("\n")
+    );
+    let errors = check_tables(&docs);
     assert!(errors.is_empty(), "\n{}", errors.join("\n"));
 }
 
@@ -809,12 +915,28 @@ fn frontmatter_problems(text: &str, folder: &str, version: &str) -> Vec<(usize, 
         }
     };
     let mut problems = Vec::new();
+    let hyphen_case = Regex::new(r"^[a-z0-9]+(-[a-z0-9]+)*$").unwrap();
     match value["name"].as_str() {
-        Some(n) if n == folder => {}
-        Some(n) => problems.push((
-            1,
-            format!("name `{n}` must equal the folder name `{folder}`"),
-        )),
+        Some(n) => {
+            if n != folder {
+                problems.push((
+                    1,
+                    format!("name `{n}` must equal the folder name `{folder}`"),
+                ));
+            }
+            if !hyphen_case.is_match(n) {
+                problems.push((
+                    1,
+                    format!("name `{n}` must be hyphen-case (lowercase letters, digits and `-`)"),
+                ));
+            }
+            if n.chars().count() > 64 {
+                problems.push((
+                    1,
+                    format!("name is {} characters; the limit is 64", n.chars().count()),
+                ));
+            }
+        }
         None => problems.push((1, "frontmatter has no string `name`".into())),
     }
     match value["description"].as_str() {
@@ -825,6 +947,10 @@ fn frontmatter_problems(text: &str, folder: &str, version: &str) -> Vec<(usize, 
                 "description is {} characters; the limit is 1,024",
                 d.chars().count()
             ),
+        )),
+        Some(d) if d.contains(['<', '>']) => problems.push((
+            desc_line,
+            "description contains `<` or `>`, which skill loaders refuse".into(),
         )),
         Some(_) => {}
         None => problems.push((1, "frontmatter has no string `description`".into())),
@@ -840,9 +966,9 @@ fn frontmatter_problems(text: &str, folder: &str, version: &str) -> Vec<(usize, 
     problems
 }
 
-fn check_frontmatter(skills: &Path, version: &str) -> Vec<String> {
+fn check_frontmatter(dirs: &[PathBuf], version: &str) -> Vec<String> {
     let mut errors = Vec::new();
-    for dir in skill_dirs(skills) {
+    for dir in dirs {
         let folder = dir.file_name().unwrap().to_string_lossy().into_owned();
         let file = dir.join("SKILL.md");
         let shown = file
@@ -863,7 +989,7 @@ fn check_frontmatter(skills: &Path, version: &str) -> Vec<String> {
 
 #[test]
 fn frontmatter_is_loadable() {
-    let errors = check_frontmatter(&real_skills(), env!("CARGO_PKG_VERSION"));
+    let errors = check_frontmatter(&skill_dirs(&real_skills()), env!("CARGO_PKG_VERSION"));
     assert!(errors.is_empty(), "\n{}", errors.join("\n"));
 }
 
@@ -875,6 +1001,32 @@ fn frontmatter_refuses_an_unquoted_colon() {
     let good = "---\nname: x\ndescription: \"Use when: asked\"\nmetadata:\n  arc_version: \"1.0.0\"\n---\n";
     assert!(!frontmatter_problems(bad, "x", "1.0.0").is_empty());
     assert!(frontmatter_problems(good, "x", "1.0.0").is_empty());
+}
+
+/// The checker's own rules for names and angle brackets, tried on text.
+#[test]
+fn frontmatter_refuses_bad_names_and_angle_brackets() {
+    let doc = |name: &str, description: &str| {
+        format!(
+            "---\nname: {name}\ndescription: \"{description}\"\nmetadata:\n  arc_version: \"1.0.0\"\n---\n"
+        )
+    };
+    let problems = |name: &str, description: &str| {
+        frontmatter_problems(&doc(name, description), name, "1.0.0")
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert!(problems("a-skill-2", "Use it.").is_empty());
+    assert!(problems("a_skill", "Use it.").contains("hyphen-case"));
+    assert!(problems("A-Skill", "Use it.").contains("hyphen-case"));
+    assert!(problems("-a", "Use it.").contains("hyphen-case"));
+    let long = "a".repeat(65);
+    assert!(problems(&long, "Use it.").contains("the limit is 64"));
+    assert!(problems(&"a".repeat(64), "Use it.").is_empty());
+    assert!(problems("x", "Writes panels/<name>.yaml").contains("`<` or `>`"));
+    assert!(problems("x", "Goes a -> b").contains("`<` or `>`"));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -987,22 +1139,37 @@ fn check_examples(docs: &[Doc]) -> Vec<String> {
                     .find_map(|w| w.strip_prefix(key).map(str::to_string))
             };
             let fixture = attr("fixture=").unwrap_or_else(|| "skills".into());
-            let needs = attr("needs=").unwrap_or_default();
-            let mentions = |s: &[&str]| s.iter().any(|m| b.body.contains(m));
-            let needs_ext =
-                needs == "finetype-ext" || mentions(&["FINETYPE_DUCKDB_EXT", "table validate"]);
-            let needs_finetype = needs_ext
-                || needs == "finetype"
-                || mentions(&["finetype", "table profile", "datapackage_describe"]);
-            if needs_finetype && let Some(why) = finetype.get_or_init(finetype_unavailable) {
-                println!("skipping example at {}: {why}", doc.at(b.line));
+            let needs: Vec<String> = attr("needs=")
+                .map(|v| v.split(',').map(str::to_string).collect())
+                .unwrap_or_default();
+            if let Some(odd) = needs
+                .iter()
+                .find(|n| !matches!(n.as_str(), "finetype" | "finetype-ext"))
+            {
+                errors.push(format!(
+                    "{}: `needs={odd}` is not a need the checker knows (`finetype`, `finetype-ext`)",
+                    doc.at(b.line)
+                ));
                 continue;
             }
+            let needs_finetype = needs.iter().any(|n| n == "finetype");
+            let needs_ext = needs.iter().any(|n| n == "finetype-ext");
             if needs_ext && std::env::var_os("FINETYPE_DUCKDB_EXT").is_none() {
+                assert!(
+                    std::env::var_os("ARCFORM_REQUIRE_FINETYPE_EXT").is_none(),
+                    "ARCFORM_REQUIRE_FINETYPE_EXT is set, so this run promised the finetype \
+                     DuckDB extension, but FINETYPE_DUCKDB_EXT is unset: the example at {} \
+                     would be skipped",
+                    doc.at(b.line)
+                );
                 println!(
                     "skipping example at {}: FINETYPE_DUCKDB_EXT is not set",
                     doc.at(b.line)
                 );
+                continue;
+            }
+            if needs_finetype && let Some(why) = finetype.get_or_init(finetype_unavailable) {
+                println!("skipping example at {}: {why}", doc.at(b.line));
                 continue;
             }
             let source = root().join("tests/fixtures").join(&fixture);
@@ -1110,7 +1277,10 @@ fn the_good_fixture_skill_passes_every_check() {
         ("cli", check_cli(&docs)),
         ("tables", check_tables(&docs)),
         ("examples", check_examples(&docs)),
-        ("frontmatter", check_frontmatter(&fixture_skills(), "0.0.0")),
+        (
+            "frontmatter",
+            check_frontmatter(&[fixture_skills().join("good")], "0.0.0"),
+        ),
     ] {
         assert!(errors.is_empty(), "{name}:\n{}", errors.join("\n"));
     }
@@ -1173,12 +1343,55 @@ fn the_bad_fixture_skill_fails_each_check_at_its_line() {
     assert_error_at(&cli, doc, "arc nosuchverb", "not a verb arc has");
     assert_error_at(&cli, doc, "arc table nosuchsub", "not a subcommand");
     assert_error_at(&cli, doc, "--bogus-flag", "`--bogus-flag` is not a flag");
+    // An underscore is not a placeholder: a misspelt verb or subcommand is still refused.
+    assert_error_at(
+        &cli,
+        doc,
+        "arc table_describe",
+        "`arc table_describe` is not a verb",
+    );
+    assert_error_at(
+        &cli,
+        doc,
+        "arc sql record_step",
+        "`arc sql record_step` is not a subcommand",
+    );
 
     assert_error_at(
-        &check_tables(&docs),
+        &tools,
         doc,
-        "EMPTY-CELL",
-        "MCP cell of this row is empty",
+        "`no_prose_tool` with",
+        "`no_prose_tool` is not a tool",
+    );
+    assert_error_at(
+        &tools,
+        doc,
+        "`prose_bogus_arg`",
+        "`prose_bogus_arg` is not an argument of `sql_query`",
+    );
+
+    let tables = check_tables(&docs);
+    assert_error_at(&tables, doc, "EMPTY-CELL", "MCP cell of this row is empty");
+    assert_error_at(
+        &tables,
+        doc,
+        "FREE-TEXT-CELL",
+        "must begin with a backticked tool, or with `None:`",
+    );
+
+    let frontmatter = check_frontmatter(
+        &[
+            fixture_skills().join("bad"),
+            fixture_skills().join("bad_name"),
+        ],
+        "0.0.0",
+    );
+    assert_error_at(&frontmatter, doc, "description:", "`<` or `>`");
+    assert!(
+        frontmatter.iter().any(|e| e
+            .starts_with("tests/fixtures/skills-docs/bad_name/SKILL.md:1:")
+            && e.contains("hyphen-case")),
+        "{frontmatter:?}"
     );
 
     // The first command fails and the last succeeds: `set -e` must still fail the example.
@@ -1189,5 +1402,11 @@ fn the_bad_fixture_skill_fails_each_check_at_its_line() {
             .iter()
             .any(|e| e.starts_with(&at) && e.contains("example exited")),
         "{examples:?}"
+    );
+    assert_error_at(
+        &examples,
+        doc,
+        "needs=nonsense",
+        "`needs=nonsense` is not a need",
     );
 }

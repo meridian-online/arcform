@@ -36,11 +36,11 @@ When an agent started from a desktop app reports that `duckdb`, `finetype` or `u
 finetype --version
 ```
 
-finetype types columns for the profile stage. arc refuses any finetype older than **0.6.54**. The floor tracks label correctness, not just which commands exist: up to and including 0.6.53, any eight-digit number (a financial figure, a surrogate key) typed as a confident date with a date-parsing transform attached, so a step that followed the transform corrupted the column. arc reads `finetype` from `PATH`, or from `FINETYPE_BIN` when that is set.
+finetype types columns for the profile stage. arc refuses any finetype older than **0.6.54**. The floor tracks label correctness, not just which commands exist: up to and including 0.6.53, any eight-digit number (a financial figure, a surrogate key) was typed as a confident date with a date-parsing transform attached, so a step that followed the transform corrupted the column. arc reads `finetype` from `PATH`, or from `FINETYPE_BIN` when that is set.
 
 - **Not installed.** Tell the user: "Profiling needs finetype 0.6.54 or later; install it and I'll type the columns." Until then, describe tables with `table_describe` and say plainly that the columns are untyped.
 - **Below the floor.** arc refuses with `finetype <found> is older than the minimum 0.6.54`. Tell the user to upgrade finetype, and why: an older one can silently mistype columns.
-- **Validation in the database.** Validating a table in a Protocol (`arc table validate`, `table_validate`) also needs FineType's DuckDB extension, found through the `FINETYPE_DUCKDB_EXT` environment variable. When it is unset, say so and validate an exported CSV with finetype's own `validate` instead.
+- **Validation in the database.** Validating a table in a Protocol (`arc table validate`, `table_validate`) also needs FineType's DuckDB extension, found through the `FINETYPE_DUCKDB_EXT` environment variable. When it is unset, say so and validate the source CSV, or a `parquet_export`, with finetype's own `validate` instead.
 
 ## What to say when all is well
 
