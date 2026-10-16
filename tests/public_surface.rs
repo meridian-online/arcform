@@ -1163,3 +1163,31 @@ fn the_error_type_stays_non_exhaustive() {
          breaking change for consumers"
     );
 }
+
+/// The library snippet in the README and the crate docs pins this crate's version
+/// exactly, so one a release forgets to bump tells every reader of the published docs
+/// to stay on the previous release.
+#[test]
+fn the_library_snippets_pin_this_version() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let pin = format!(
+        "arcform = {{ version = \"={}\", default-features = false }}",
+        env!("CARGO_PKG_VERSION")
+    );
+    for file in ["README.md", "src/lib.rs", "src/spec.rs"] {
+        let text =
+            std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| panic!("read {file}: {e}"));
+        let snippets: Vec<&str> = text.lines().filter(|l| l.contains("arcform = {")).collect();
+        assert!(
+            !snippets.is_empty(),
+            "{file} has no `arcform = {{ … }}` snippet"
+        );
+        for line in snippets {
+            assert!(
+                line.contains(&pin),
+                "{file}: `{}` should pin the crate's version, as `{pin}`",
+                line.trim()
+            );
+        }
+    }
+}

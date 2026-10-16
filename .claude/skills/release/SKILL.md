@@ -61,7 +61,7 @@ Keep the section under 120,000 characters, or the tag guard refuses it (GitHub c
 1. `version` under `[package]` in `Cargo.toml`.
 2. The `**Version:**` line in `CLAUDE.md`.
 3. `Cargo.lock`'s `arcform` entry. Run `cargo metadata --format-version 1 > /dev/null` to rewrite it, then check with `cargo metadata --locked --format-version 1 > /dev/null`. The release builds with `--locked`, so a stale lock fails every build leg of the tag.
-4. The library snippet `arcform = { version = "=X.Y.Z", default-features = false }` in `README.md`, `src/lib.rs` and `src/spec.rs`. It pins exactly, so a stale one keeps a reader of the published docs on the previous release.
+4. The library snippet `arcform = { version = "=X.Y.Z", default-features = false }` in `README.md`, `src/lib.rs` and `src/spec.rs`. It pins exactly, so a stale one keeps a reader of the published docs on the previous release; `tests/public_surface.rs` fails CI until all three match `Cargo.toml`.
 
 **Set the skills' version.** In every `skills/*/SKILL.md`, set `metadata.arc_version` to the new version. `tests/skills.rs` (`frontmatter_is_loadable`) requires it to equal the crate version, so a stale one fails CI. Add the `skills/` folders to the `git add` in step 2.
 
