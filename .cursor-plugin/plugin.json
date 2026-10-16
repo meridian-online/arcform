@@ -1,0 +1,30 @@
+{
+  "name": "arcform",
+  "displayName": "Arcform",
+  "description": "Agent skills for analysing tabular data with arc: every step is recorded in a Protocol the user can re-run, inspect and share, and the arc MCP server is connected for you.",
+  "version": "0.2.0",
+  "author": {
+    "name": "Meridian"
+  },
+  "homepage": "https://meridian.online",
+  "repository": "https://github.com/meridian-online/arcform",
+  "license": "MIT",
+  "keywords": [
+    "data",
+    "analysis",
+    "duckdb",
+    "sql",
+    "csv",
+    "skills",
+    "mcp"
+  ],
+  "skills": "./skills/",
+  "mcpServers": {
+    "arc": {
+      "command": "arc",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
+}

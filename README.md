@@ -61,7 +61,28 @@ Beyond recording and running, the rest of the analyst's loop has a verb each, an
 
 ## Using arc from an agent
 
-Install arc as above, with `duckdb` (and `finetype` and `uv`, if you use them) on `PATH`. Then add it to Claude Code:
+An analyst working through an agent needs three things: arc with its MCP server, arc's agent skills, and the agent connected to `arc mcp`.
+
+1. **Install arc with its MCP server.** The install script above gives you a release build, which includes it; from source, build with `--features mcp`. `arc mcp --help` exits 0 when the server is in your build. Put `duckdb` (and `finetype` and `uv`, if you use them) on `PATH`.
+2. **Give your agent the skills and the server.** Install arc's plugin, which brings both (the next section), or run `arc skills install` and connect `arc mcp` yourself (the two sections after it). Choose one: with both, the agent holds two copies of every skill.
+3. **Ask a question about your data.** The `using-arcform` skill picks it up and works through a Protocol.
+
+### Plugins
+
+This repository is a plugin for each of these agents. Each one installs the five [agent skills](#agent-skills) and starts `arc mcp` from `PATH`; arc itself is not part of the plugin, so install it first.
+
+| Agent | Install |
+| --- | --- |
+| Claude Code | `claude plugin marketplace add meridian-online/arcform`, then `claude plugin install arcform@arcform` |
+| Codex | `codex plugin marketplace add meridian-online/arcform`, then `codex plugin add arcform@arcform` |
+| Gemini CLI | `gemini extensions install https://github.com/meridian-online/arcform` |
+| Cursor | Install from this repository through Cursor's plugin settings |
+
+Each manifest (`.claude-plugin/`, `.codex-plugin/`, `.cursor-plugin/`, `gemini-extension.json`) is generated from [`plugin/plugin.meta.json`](plugin/plugin.meta.json) by `python3 scripts/generate-plugins.py`, and CI fails when a committed manifest differs from what it generates. Per-agent notes, such as what each agent calls the arc tools, are in [`skills/using-arcform/references/agents/`](skills/using-arcform/references/agents/), with one for a desktop chat app, which has no plugin route.
+
+### Connecting `arc mcp` yourself
+
+Add it to Claude Code:
 
 ```sh
 claude mcp add arc -- arc mcp
@@ -124,7 +145,7 @@ Through these tools an agent can start a Protocol, look at its tables, query the
 
 [`skills/`](skills/) holds five agent skills that teach an agent the analyst workflow through these tools: `using-arcform`, the entry point, then `scoping-an-analysis`, `profiling-and-typing-data`, `building-and-checking-a-protocol` and `presenting-findings`, one for each stage from agreeing the question to handing over the answer. Each shows every step both as an `arc` command and as the matching tool, and `cargo test --features mcp --test skills` checks what they name and runs their examples against this binary.
 
-The skills ship inside `arc`, at its version. Install them into each agent found on this machine:
+The skills ship inside `arc`, at its version. Without a [plugin](#plugins), install them into each agent found on this machine:
 
 ```sh
 arc skills install

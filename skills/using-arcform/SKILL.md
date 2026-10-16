@@ -11,7 +11,7 @@ arc is a local-first engine that records an analysis as a **Protocol** and runs 
 
 Every analysis step goes into the Protocol. Never compute an answer outside it: an answer the committed Protocol cannot reproduce is not one the user can check.
 
-Load `references/environment-check.md` at the start of a session, before the first Protocol. Load `references/verb-map.md` whenever you need the exact CLI or MCP form of a verb.
+Load `references/environment-check.md` at the start of a session, before the first Protocol. Load `references/verb-map.md` whenever you need the exact CLI or MCP form of a verb. When your agent names the arc tools differently, or you are setting arc up in it, load its notes from `references/agents/` (Claude Code, Codex, Cursor, Gemini CLI or a desktop chat app).
 
 ## What a Protocol is
 

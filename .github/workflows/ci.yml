@@ -214,6 +214,9 @@ jobs:
       - name: clippy (mcp, opendal features)
         run: cargo clippy --workspace --all-targets --features mcp,opendal -- -D warnings
 
+      # This includes tests/plugin_manifests.rs, which runs scripts/generate-plugins.py
+      # with the runner's python3 and fails when a committed agent plugin manifest is not
+      # what plugin/plugin.meta.json generates, naming that file and the command to run.
       - name: test
         run: cargo test --workspace
 
