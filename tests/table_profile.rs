@@ -276,6 +276,18 @@ fn empty_table_says_so() {
         got["message"].as_str().unwrap().contains("no rows"),
         "{got}"
     );
+
+    // No schema can come from no rows, and nothing is written.
+    let before = protocol.tree();
+    let out = protocol.arc(&["table", "profile", "nothing", "--format", "json-schema"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("no rows to infer a schema from"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(out.stdout.is_empty());
+    assert_eq!(protocol.tree(), before);
 }
 
 #[test]
