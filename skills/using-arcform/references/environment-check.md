@@ -1,6 +1,6 @@
 # Environment check
 
-Run this once at the start of a session, before the first Protocol. It takes three commands, and each failure has one thing to tell the user. Do not work around a failure by computing the answer in a script instead: the user then gets an answer with no Protocol behind it.
+Run this once at the start of a session, before the first Protocol. With only the server's tools, the arc version check is the exception: it can usually be made only after a first run (section 1). It takes three commands, and each failure has one thing to tell the user. Do not work around a failure by computing the answer in a script instead: the user then gets an answer with no Protocol behind it.
 
 | Check | With a shell | With only the server's tools |
 | --- | --- | --- |
@@ -14,7 +14,7 @@ Run this once at the start of a session, before the first Protocol. It takes thr
 arc --version
 ```
 
-It prints `arc <version>`. Compare that with `metadata.arc_version` in the frontmatter of the skill you loaded. With only the server's tools, the version usually cannot be seen before a run: when the client does not show the server version, compare `run.engine.arc` from the first `protocol_run` with `metadata.arc_version`. Skills are written against one arc version: an older arc may lack a verb a skill names, and a newer one may have changed what a verb prints.
+It prints `arc <version>`. Compare that with `metadata.arc_version` in the frontmatter of the skill you loaded. With only the server's tools, the version usually cannot be seen before a run: when the client does not show the server version, compare `run.engine.arc` from the first `protocol_run` with `metadata.arc_version`. Make that first run one whose steps neither fetch nor overwrite anything the user cares about, such as a Protocol whose only step loads the user's file. If no run record comes back, tell the user "arc version unknown" rather than passing the check silently. Skills are written against one arc version: an older arc may lack a verb a skill names, and a newer one may have changed what a verb prints.
 
 When they differ, tell the user: "Your arc is <version> and these skills were written for <arc_version>. Upgrade arc, or reinstall the skills from where you got them, so the two match." Then carry on carefully: if a verb a skill names is refused as unknown, stop and say so rather than guessing at another.
 

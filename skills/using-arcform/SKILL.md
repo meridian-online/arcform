@@ -30,7 +30,7 @@ A folder holding `arcform.yaml`, which lists the steps in order, and `models/`, 
 | Make a Protocol | `arc create-protocol <dir> --name <name>` | `protocol_create` with `dir`, `name` |
 | Record a step | `arc sql record "<select>" --name <step> --description "<why>"` | `sql_record` with `sql`, `name`, `description` |
 | Run it | `arc run` | `protocol_run` with `dir` |
-| Undo a change | `arc history restore <id>` | `history_restore` with `id` |
+| Undo a change | `arc history restore <id> --file <file> --dir <dir>` | `history_restore` with `id`, `file`, `dir` |
 
 ## Where results land
 
