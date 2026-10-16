@@ -30,6 +30,7 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 - **The `brewtrend` example fetches its six files with the `http_fetch` operator instead of `curl` command steps, and every step carries a description.** The fetches keep their URLs, output paths and 24-hour preconditions, and the example no longer needs `curl`.
 - **The library example in the README loads `examples/almanac` instead of `examples/brewtrend`.** brewtrend's `http_fetch` steps need the `http-fetch` feature, which `default-features = false` turns off, so the example could no longer load it.
+- **The `using-arcform` skill says a quick look still starts with `scoping-an-analysis` and ends with `presenting-findings`.** An agent given a quick look loaded only `using-arcform` and skipped the plan playback, the offer to override the size, the next steps and the findings panel; only profiling and building are cut short.
 
 ### Fixed
 
