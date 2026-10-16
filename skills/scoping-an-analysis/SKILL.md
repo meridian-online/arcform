@@ -20,7 +20,7 @@ In one or two sentences, in the user's words, say what they asked and what they 
 Apply these in order and stop at the first that fits:
 
 1. **A quick look** when one or two aggregates answer it ("total sales last month", "how many rows have no email") and the user has not asked for a report. A large, messy or unfamiliar file does not change this: profiling will find the mess, and that is not a reason to add ceremony.
-2. **A project** when the user wants a report, the work spans several datasets, or the answer will be shared beyond the conversation (a board pack, a team, a client).
+2. **A project** when the user wants a report, the work spans several datasets, or the answer will be shared beyond the conversation (a board pack, a team, a client). Sharing alone does not lift a question that one or two numbers answer: that stays a quick look by rule 1. When the user says such a number is for a deck or a client, offer the larger size and let them choose.
 3. **An analysis** otherwise. It is the default: a question that needs a comparison, a trend, a breakdown or a judgement about the data.
 
 Say the size in one line with its reason, and let the user override it: "This is a quick look: one total answers it. Say if you want more than that." Take an override without argument.
@@ -41,7 +41,7 @@ Before anything is built, tell the user three things: the data source (the file,
 
 ## 4. Create the Protocol, and for a project write the requirements
 
-Create the Protocol in its own folder, named for the question. Then, for a project only, write the requirements into its `README.md`: the question, the end state, the data sources, what is in and out of scope, the checks the answer must pass, and who will read it. Show the user the README and have it agreed before profiling. If they change it, write it again: each write is kept in history.
+Create the Protocol in its own folder, named for the question. If you have no file access of your own (an agent reaching arc only through `arc mcp`) and the environment check did not settle a working folder, ask the user for one before creating the Protocol. Then, for a project only, write the requirements into its `README.md`: the question, the end state, the data sources, what is in and out of scope, the checks the answer must pass, and who will read it. Show the user the README and have it agreed before profiling. If they change it, write it again: each write is kept in history.
 
 | Step | CLI | MCP |
 | --- | --- | --- |
@@ -86,7 +86,7 @@ wrote README.md as a readme in monthly-sales
 
 - The size is said, the plan is agreed (or, for a quick look, stated) and the Protocol exists: load `profiling-and-typing-data`.
 - The user changes the question part-way through any stage: come back here, restate it, check the size still fits, and keep the Protocol you have.
-- You need the exact form of another verb: `using-arcform`'s `references/verb-map.md`.
+- You need the exact form of another verb: the verb map in `using-arcform`, at `../using-arcform/references/verb-map.md`.
 
 ## Traps
 
@@ -96,6 +96,7 @@ wrote README.md as a readme in monthly-sales
 | You sized the work up because the data looked messy | Size by the question, not the data. Profiling deals with the mess |
 | `a spec already exists at <dir>/arcform.yaml` | A Protocol is already there. Use it, or create the new one in its own folder |
 | `<dir> holds no arcform.yaml; make the Protocol first` | Create the Protocol before writing its README |
-| `<path> is not a file arc writes` | arc writes only `README.md`, `report.md`, `schemas/` and `panels/`. The requirements go in `README.md` at the Protocol's top level |
+| `<path> is not a file arc writes` | `protocol_write_file` (`arc protocol write-file`) accepts only `README.md`, `schemas/<name>.json` and `panels/<name>.yaml`. The requirements go in `README.md` at the Protocol's top level |
+| `report.md is written by the report_write tool, not this one` | The report goes through `report_write` (`arc report write`), at the present stage, not through `protocol_write_file` |
 | The README landed in the wrong Protocol | `--dir` defaults to the current folder; pass the new Protocol's folder. Over MCP, `dir` must be absolute |
 | The user rewrote the requirements and wants the old ones back | `history_restore` with `id`, `file` set to `README.md`, and `dir` (`arc history restore <id> --file README.md --dir <dir>`) |
