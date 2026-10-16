@@ -18,7 +18,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(feature = "mcp")]
+use serde_json::json;
 
 /// Whether `finetype` at arc's floor is on PATH; prints why when it is not.
 fn finetype_present() -> bool {
@@ -47,7 +49,12 @@ fn finetype_present() -> bool {
 fn extension_present() -> bool {
     match std::env::var("FINETYPE_DUCKDB_EXT") {
         Ok(path) if Path::new(&path).exists() => true,
-        _ => {
+        found => {
+            assert!(
+                std::env::var_os("ARCFORM_REQUIRE_FINETYPE_EXT").is_none(),
+                "ARCFORM_REQUIRE_FINETYPE_EXT is set, so this run promised a finetype \
+                 extension, but FINETYPE_DUCKDB_EXT is {found:?}"
+            );
             eprintln!("skipping: FINETYPE_DUCKDB_EXT does not name a built extension");
             false
         }
@@ -135,6 +142,7 @@ impl Protocol {
     }
 
     /// One `tools/call` to a fresh `arc mcp` started in the Protocol's directory.
+    #[cfg(feature = "mcp")]
     fn call(&self, tool: &str, arguments: Value) -> Value {
         let mut child = Command::new(env!("CARGO_BIN_EXE_arc"))
             .current_dir(&self.dir)
@@ -229,6 +237,11 @@ fn json_schema_format_saves_through_write_file() {
     let out = protocol.arc(&["table", "profile", "contacts", "--format", "json-schema"]);
     assert!(out.status.success(), "{}", stderr(&out));
     let schema = String::from_utf8(out.stdout).unwrap();
+    // A clean JSON Schema: FineType's own, with an `$id` naming the table.
+    let parsed: Value = serde_json::from_str(&schema).unwrap();
+    assert_eq!(parsed["$id"], "finetype://contacts", "{schema}");
+    assert!(parsed.get("rows_profiled").is_none(), "{schema}");
+    assert!(parsed.get("table").is_none(), "{schema}");
     protocol.write_schema("schemas/contacts.json", &schema);
 
     let csv = protocol._root.path().join("contacts.csv");
@@ -255,9 +268,6 @@ fn json_schema_format_saves_through_write_file() {
 
 #[test]
 fn empty_table_says_so() {
-    if !finetype_present() {
-        return;
-    }
     let protocol = Protocol::new("CREATE TABLE nothing (a VARCHAR, b INTEGER);");
     let got = stdout_json(&protocol.arc(&["table", "profile", "nothing"]));
     assert_eq!(got["rows_profiled"], 0);
@@ -281,6 +291,7 @@ fn refuses_missing_table() {
 }
 
 #[test]
+#[cfg(feature = "mcp")]
 fn mcp_table_profile_matches_the_command() {
     if !finetype_present() {
         return;
@@ -323,12 +334,15 @@ fn validate_table_passes_its_own_schema() {
     assert_eq!(got["schema"], "schemas/contacts.json");
     assert!(got["columns"].as_array().unwrap().len() >= 3, "{got}");
 
-    let result = protocol.call(
-        "table_validate",
-        json!({ "table": "contacts", "schema": "schemas/contacts.json" }),
-    );
-    assert_ne!(result["isError"], true, "{result}");
-    assert_eq!(result["structuredContent"]["valid"], true, "{result}");
+    #[cfg(feature = "mcp")]
+    {
+        let result = protocol.call(
+            "table_validate",
+            json!({ "table": "contacts", "schema": "schemas/contacts.json" }),
+        );
+        assert_ne!(result["isError"], true, "{result}");
+        assert_eq!(result["structuredContent"]["valid"], true, "{result}");
+    }
 }
 
 #[test]
@@ -374,11 +388,14 @@ fn validate_refuses_schema_outside_protocol() {
         let err = stderr(&out);
         assert!(err.contains("outside the Protocol folder"), "{err}");
     }
-    let result = protocol.call(
-        "table_validate",
-        json!({ "table": "contacts", "schema": "../outside.json" }),
-    );
-    assert_eq!(result["isError"], true, "{result}");
+    #[cfg(feature = "mcp")]
+    {
+        let result = protocol.call(
+            "table_validate",
+            json!({ "table": "contacts", "schema": "../outside.json" }),
+        );
+        assert_eq!(result["isError"], true, "{result}");
+    }
     assert_eq!(protocol.tree(), before);
 }
 
@@ -405,4 +422,28 @@ fn validate_without_extension_names_the_variable() {
         "{}",
         stderr(&out)
     );
+}
+
+#[test]
+fn refuses_a_sample_size_of_nothing() {
+    let protocol = Protocol::new(CONTACTS);
+    let before = protocol.tree();
+    let out = protocol.arc(&["table", "profile", "contacts", "--sample-size", "0"]);
+    assert!(!out.status.success());
+    #[cfg(feature = "mcp")]
+    {
+        let result = protocol.call(
+            "table_profile",
+            json!({ "table": "contacts", "sample_size": 0 }),
+        );
+        assert_eq!(result["isError"], true, "{result}");
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("at least 1"),
+            "{result}"
+        );
+    }
+    assert_eq!(protocol.tree(), before);
 }

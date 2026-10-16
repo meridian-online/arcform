@@ -12,6 +12,8 @@
 //! Every write is a version of the Protocol, so each run points
 //! `ARCFORM_HISTORY_DIR` at a directory of its own, outside the Protocol.
 
+#![cfg(feature = "mcp")]
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};

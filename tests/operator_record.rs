@@ -12,9 +12,12 @@
 //! Every recording is a version of the Protocol, so each run points
 //! `ARCFORM_HISTORY_DIR` at a directory of its own, outside the Protocol.
 
+#[cfg(feature = "mcp")]
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+#[cfg(feature = "mcp")]
+use std::process::Stdio;
+use std::process::{Command, Output};
 
 use serde_json::{Value, json};
 
@@ -79,6 +82,7 @@ impl Protocol {
 
     /// One `tools/call` of `operator_record` to a fresh `arc mcp` started in the
     /// Protocol's directory.
+    #[cfg(feature = "mcp")]
     fn call(&self, arguments: Value) -> Value {
         let mut child = Command::new(env!("CARGO_BIN_EXE_arc"))
             .current_dir(&self.dir)
@@ -241,6 +245,7 @@ fn refuses_a_with_that_is_not_json_or_not_an_object() {
 }
 
 #[test]
+#[cfg(feature = "mcp")]
 fn the_tool_writes_the_bytes_the_command_writes() {
     let by_command = Protocol::new();
     let by_tool = Protocol::new();
@@ -276,6 +281,7 @@ fn the_tool_writes_the_bytes_the_command_writes() {
 }
 
 #[test]
+#[cfg(feature = "mcp")]
 fn the_tool_refuses_as_the_command_does() {
     let protocol = Protocol::new();
     let before = protocol.manifest();

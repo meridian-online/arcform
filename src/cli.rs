@@ -245,7 +245,7 @@ pub enum TableCmd {
         format: ProfileFormatArg,
 
         /// The most rows to copy and profile.
-        #[arg(long)]
+        #[arg(long, value_parser = parse_sample_size)]
         sample_size: Option<usize>,
 
         /// Directory the protocol lives in.
@@ -269,6 +269,15 @@ pub enum TableCmd {
         #[arg(long, default_value = ".")]
         dir: PathBuf,
     },
+}
+
+/// A sample size of at least one row.
+fn parse_sample_size(text: &str) -> std::result::Result<usize, String> {
+    match text.parse::<usize>() {
+        Ok(0) => Err("a sample of no rows profiles nothing; give at least 1".to_string()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// The formats `arc table profile` prints.

@@ -15,7 +15,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(feature = "mcp")]
+use serde_json::json;
 
 struct Protocol {
     _root: tempfile::TempDir,
@@ -87,6 +89,7 @@ impl Protocol {
         paths
     }
 
+    #[cfg(feature = "mcp")]
     fn call(&self, arguments: Value) -> Value {
         let mut child = Command::new(env!("CARGO_BIN_EXE_arc"))
             .current_dir(&self.dir)
@@ -296,6 +299,7 @@ fn refuses_without_arcform_yaml() {
 }
 
 #[test]
+#[cfg(feature = "mcp")]
 fn mcp_writes_the_bytes_the_command_writes() {
     let protocol = Protocol::new();
     let result = protocol.call(json!({ "path": "schemas/rates.json", "content": SCHEMA }));
