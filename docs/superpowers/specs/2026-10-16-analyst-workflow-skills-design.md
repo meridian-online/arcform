@@ -51,7 +51,7 @@ The work has failed, even if it technically runs, if:
 - Public repository: no private planning identifiers in committed files.
 - arc stays local-first: no cloud service in the path, including for PDF output.
 - The CLI is the canonical surface. Every MCP tool maps to a CLI capability; a new MCP tool needs its CLI verb.
-- The finetype federation keeps its version floor (`src/mcp/finetype.rs`), and the skills state it.
+- The finetype federation keeps its version floor (`src/finetype_cli.rs`), and the skills state it.
 - Skills install at the binary's version, so a skill never describes a newer or older arc than the one running. Channels that serve the repository rather than the binary (skills.sh, GitHub, plugin directories) can drift from the user's arc, so each skill states the arc version it was written for, and the entry skill's environment check compares it with `arc --version` and tells the agent to run the install command when they differ. *My call.*
 
 ## The workflow
