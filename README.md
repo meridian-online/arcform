@@ -252,7 +252,7 @@ The `arcform` crate ships a library target alongside the `arc` binary, for one p
 
 ```toml
 [dependencies]
-arcform = { version = "=0.2.0", default-features = false }
+arcform = { version = "=0.2.1", default-features = false }
 ```
 
 `default-features = false` turns off the `cli` feature. That feature exists for the `arc` binary; it also compiles a doc-hidden `cli_main` into the crate root, and `cli_main` parses the *calling* process's `argv` and can exit it. With the feature off the crate root is `spec` and nothing else, and `clap` leaves the dependency graph.
