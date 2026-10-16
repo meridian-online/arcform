@@ -297,6 +297,10 @@ impl Ask for Process<'_> {
 
 impl Process<'_> {
     /// Runs `script` and returns each result DuckDB printed, as JSON, with its stderr.
+    ///
+    /// Logging is turned off first. The 2.0 shell prints a warning DuckDB logs, such as
+    /// the one for parsing the deprecated `PRAGMA threads = 4`, to stdout in the middle
+    /// of the JSON it is printing, and the answer can no longer be read.
     fn run(&self, script: &str) -> Result<(Vec<Value>, String), Refusal> {
         let not_run = |e: std::io::Error| Refusal::NotRun {
             program: self.program(),
@@ -312,7 +316,7 @@ impl Process<'_> {
         // Written from a thread: DuckDB answers each statement as it reads it, and an
         // answer larger than the pipe would stall a write made from this thread.
         let mut stdin = child.stdin.take().expect("stdin is piped");
-        let script = script.to_owned();
+        let script = format!("SET enable_logging = false;\n{script}");
         let writer = std::thread::spawn(move || stdin.write_all(script.as_bytes()));
         let output = child.wait_with_output().map_err(not_run)?;
         // A write cut short by DuckDB exiting shows in its stderr, which the caller reads.
@@ -2094,6 +2098,24 @@ mod tests {
             answers.first().map(|rows| &rows[0]["s"]),
             Some(&Value::from(text)),
             "DuckDB reads the literal back as the text sent; stderr: {stderr}"
+        );
+    }
+
+    /// The 2.0 preview prints a warning it logs into the JSON on stdout, which then
+    /// cannot be read; the 1.x `duckdb` on `PATH` prints none, so this checks the reader
+    /// asks with logging off, and the preview checks show what that buys.
+    #[test]
+    fn duckdb_is_asked_with_logging_off() {
+        let duckdb = Process {
+            program: OsStr::new("duckdb"),
+        };
+        let (answers, stderr) = duckdb
+            .run("SELECT current_setting('enable_logging')::BOOLEAN AS logging;\n")
+            .expect("the duckdb on PATH runs");
+        assert_eq!(
+            answers.first().map(|rows| &rows[0]["logging"]),
+            Some(&Value::from(false)),
+            "the reader's script runs with logging off; stderr: {stderr}"
         );
     }
 

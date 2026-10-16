@@ -31,6 +31,10 @@ Rationale for each change is recorded in the project's design notes and commit h
 - **The `brewtrend` example fetches its six files with the `http_fetch` operator instead of `curl` command steps, and every step carries a description.** The fetches keep their URLs, output paths and 24-hour preconditions, and the example no longer needs `curl`.
 - **The library example in the README loads `examples/almanac` instead of `examples/brewtrend`.** brewtrend's `http_fetch` steps need the `http-fetch` feature, which `default-features = false` turns off, so the example could no longer load it.
 
+### Fixed
+
+- **With `ARC_SQL_READER=duckdb`, a step holding a statement DuckDB warns about when parsing it, such as `PRAGMA threads = 4`, is read again.** Recent DuckDB 2.0 previews print the warning into the parse arc asks for, and the step was refused as unreadable; arc now asks with DuckDB's logging off.
+
 ## [0.2.0] - 2026-10-15
 
 arc is local-first data analysis in one binary, for people and their agents. The work is kept as a Protocol, a folder holding `arcform.yaml` and its SQL, which `arc run` runs again from the top; arc reads each SQL step for the tables it reads and makes, so it knows how the steps connect and which ones a change makes stale. This is the first published release.
