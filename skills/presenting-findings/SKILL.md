@@ -22,6 +22,7 @@ arc draws no chart. You write each one as a Mosaic spec, and arc saves it to `pa
 | See a table's columns and types before charting it | `arc table describe <table> --dir <dir>` | `table_describe` with `table`, `dir` |
 | Write a chart as a panel | `arc protocol write-file panels/<name>.yaml --dir <dir> < panel.yaml` | `protocol_write_file` with `path`, `content`, `dir` |
 | Check every panel against what the Protocol makes | `arc panel check --dir <dir>` | `panel_check` with `dir` |
+| List a panel's recorded versions, to find the id to restore | `arc history list --json --file panels/<name>.yaml --dir <dir>` | `history_list` with `file`, `dir` |
 | Roll a panel back | `arc history restore <id> --file panels/<name>.yaml --dir <dir>` | `history_restore` with `id`, `file`, `dir` |
 
 - **One question per chart.** Chart the aggregated table the answer reads, not the raw one: then the number on the chart is the number in the table, and the report can show where it came from.
@@ -40,18 +41,19 @@ Fix it in one of two ways, then write the panel again:
 
 Before presenting, run `panel_check` (`arc panel check`) over every panel. From a shell it prints one line per finding and exits 1 when there is any; over MCP it returns `clean` and each panel's `findings`. Present only when it is clean.
 
-Write the panel after the Protocol has run. Before the first run there is no database, so the check knows only the tables the steps will make and cannot check a single column. It does not look inside an object channel either (`{ sum: amount }`, `{ bin: amount }`): check those column names against `table_describe` yourself.
+Write the panel after the Protocol has run. Before the first run there is no database, so the check knows only the tables the steps will make and cannot check a single column. Three things it does not check at all: an object channel (`{ sum: amount }`, `{ bin: amount }`), a `data:` written as a bare string, and a three-part `catalog.schema.table` name. Check those against `table_describe` yourself.
 
-Here a bar chart of spend by category is written for the fixture, and the check finds nothing:
+Here the fixture gains an aggregate step, runs, and a bar chart of its two columns is written as bare strings, so the check really reads them; it finds nothing:
 
 ```sh arc-example
+arc sql record "SELECT category, sum(amount) AS total FROM sales GROUP BY category" --name spend_by_category --description "Total spend in each category"
 arc run
 arc protocol write-file panels/spend_by_category.yaml <<'YAML'
 title: Spend by category
 plot:
   - mark: barX
-    data: { from: sales }
-    x: { sum: amount }
+    data: { from: spend_by_category }
+    x: total
     y: category
     sort: { y: -x }
 yLabel: category
@@ -73,7 +75,7 @@ Say it in the chat, in this order, before anything else:
 3. **The caveats from profiling** that bear on it: rows dropped and how many, columns that failed validation, a source that covers only part of the period. Say what each does to the answer.
 4. **What else was found**, and **the next steps**: the question the answer raises, the data that would settle a caveat.
 
-At the analysis and project sizes this is the stage's checkpoint: stop for the user here. For a quick look, the answer and its caveats are the whole presentation.
+Every size stops for the user here; for a quick look it is the only checkpoint. A quick look skips the report, but still gets a panel when a chart helps, the pointer to Brightfield and the handover of the folder.
 
 ## 4. Guide them to Brightfield
 
@@ -90,11 +92,12 @@ For someone who will not open Brightfield, offer the report.
 
 The prose is the answer, its caveats and the next steps, with no `##` headings of your own. arc adds three sections after it: how the answer was derived (each step, its description, status and row counts), the charts (each panel's title and anything `panel_check` finds), and the run. `references/report.md` says what to put in the prose. A project ends with a report whether or not the user asks.
 
-Here the fixture runs, and the report is written from its run:
+Here the fixture gains the same aggregate step and runs, and the report is written from that run:
 
 ```sh arc-example
+arc sql record "SELECT category, sum(amount) AS total FROM sales GROUP BY category" --name spend_by_category --description "Total spend in each category"
 arc run
-printf 'Travel is the largest category by spend.\n\nThe amounts were not validated, so treat them as provisional.\n' | arc report write
+printf 'Dining had the highest total spend (spend_by_category), but all five categories are within 5%% of each other.\n\nThe amounts were not validated, so treat them as provisional.\n' | arc report write
 cat report.md
 ```
 
@@ -122,8 +125,8 @@ End by telling the user the Protocol folder can be committed to git or shared as
 | `warning: a mark reads the column <c> of <t>, which <t> does not have` | The panel names a column the table lacks. Correct it from `table_describe` and write the panel again |
 | `warning: a mark reads <t>, which is neither in the panel's data nor a table the Protocol makes` | Use the name of a table a step makes, or record the step that makes it and run |
 | ``the panel has no `plot` key`` | A panel is a plot: put the marks in a list under `plot` (or in a `hconcat`/`vconcat` list of plots) |
-| `arc panel check` exits 1 with `thing in the panels the protocol does not make` | Fix each panel it names, then check again; present only when it prints nothing |
-| `panel_check` is clean but a chart is blank in Brightfield | The check does not look inside `{ sum: … }` or `{ bin: … }`, and checks no column before the first run. Check those names with `table_describe` |
+| `arc panel check` exits 1 with `in the panels the protocol does not make` | Fix each panel it names, then check again; present only when it prints nothing |
+| `panel_check` is clean but a chart is blank in Brightfield | The check does not look inside `{ sum: … }` or `{ bin: … }`, a bare-string `data:` or a `catalog.schema.table` name, and checks no column before the first run. Check those names with `table_describe` |
 | A `title`, `xLabel` or `width` has no effect | It is indented under the last mark. Plot attributes are siblings of `plot`, at its indent |
 | Brightfield shows a banner saying an instruction had no effect | An interactor binds `as: $<name>` that `params` does not declare. Declare it, or drop the interactor |
 | A bar chart of dates comes out as the ten busiest days | It is ranked bars. Use `counts-over-time` from `references/panels.md`: no `sort`, no `limit` |

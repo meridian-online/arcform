@@ -24,7 +24,12 @@ yLabel: category
 
 ## The six chart kinds
 
-Brightfield's registry declares six kinds, in the order it prefers them when it chooses a first chart for a table. The examples below are the smallest form of each. Brightfield's own versions add a ghost layer (the whole table in grey behind a filtered layer) and a crossfilter selection, so brushing one chart filters the others; add those only when the user will explore in Brightfield.
+Brightfield's registry declares six kinds, in the order it prefers them when it chooses a first chart for a table. The examples below are the smallest form of each. Brightfield's own versions add interaction, declared as a crossfilter selection under `params`, and they do it two ways; add it only when the user will explore in Brightfield, and copy the way the kind uses:
+
+- **`binned-histogram`, `scatter` and `point-map`** draw a ghost layer (the whole table in grey) under a second layer that reads `data: { from: <table>, filterBy: $sel }`, and brush with `intervalX` or `intervalXY`.
+- **`ranked-category-bars` and `counts-over-time`** have one layer with no `filterBy`, and use `select: toggleY` (or `toggleX`) to publish a click and `select: highlight` to show the selection inside each bar. Brightfield's `ranked_bars.rs` warns that `filterBy` on these marks takes the total off the page and reorders the axis under the pointer.
+
+`count-grid` adds no interaction.
 
 | Kind | What it shows | Takes |
 | --- | --- | --- |
@@ -155,10 +160,10 @@ Brightfield aims to draw any Mosaic spec, and records each place it does not in 
 | `colorDomain` of two numbers on a diverging scale | Draws the ends as written, even when they are uneven about the pivot |
 | `colorScale: quantize` with `colorN` | Draws exactly that many equal steps (1 to 256), where Mosaic rounds to tidy edges |
 | `xScale: log` on a binned column | Bins in base 10, so the edges fall on 1, 10, 100 where the axis labels are; rows at or below zero are dropped |
-| `xDomain` or `yDomain` as two numbers, low first | Fixes that axis's ends. High first (`[100, 0]`) is not read as a reversal: the key is ignored and a banner names it. Use `xReverse` to turn an axis |
+| `xDomain` or `yDomain` as two numbers, low first | Fixes that axis's ends. High first (`[100, 0]`) is not read as a reversal: the key is ignored and a banner names it. Use `xReverse` to turn an axis. On an axis of dates or of names two numbers change nothing, and a banner says so |
 | `xDomain: Fixed`, `yDomain: Fixed` | Read, as in Mosaic. `xyDomain: Fixed`, `fxDomain` and `fyDomain` are not: facets are not drawn |
 | `axis`, `facetGrid`, `facetLabel`, `padding`, `align` | Not read; the chart draws as if they were absent, and a banner names them |
-| `xTicks`, `xTickFormat`, `xGrid`, `xZero`, `xNice`, `xReverse` (or the `y` ones) on a plot with `projectionType` | Not used: a projected plot has no axes. A banner names them |
+| `xTicks`, `xTickFormat`, `xGrid`, `grid`, `xZero`, `xNice`, `xReverse` (or the `y` ones) on a plot with `projectionType` | Not used: a projected plot has no axes. A banner names them |
 | `xTickFormat` or `yTickFormat` on an axis of category names | Not used; the names print as they are |
 | `stackOffset: normalize` on the plot, over a binned `rectY` with a column on `fill` | Brightfield's own key: each bin's stack is drawn as shares of that bin. Mosaic has no such option, so the panel draws differently there |
 | `colorDomain: Fixed` | Pins a numeric colour scale's ends from the first render; not a colour of category names |

@@ -6,6 +6,7 @@
 | --- | --- | --- |
 | Write the report from the newest run | `arc report write --dir <dir> < prose.md` | `report_write` with `prose`, `dir` |
 | Write it from an earlier run | `arc report write --run <run-id> --dir <dir> < prose.md` | `report_write` with `prose`, `run`, `dir` |
+| List the report's recorded versions, to find the id to restore | `arc history list --json --file report.md --dir <dir>` | `history_list` with `file`, `dir` |
 | Roll the report back | `arc history restore <id> --file report.md --dir <dir>` | `history_restore` with `id`, `file`, `dir` |
 
 Write the report after the run you are presenting: arc reads that run's record, so a report written before a re-run describes the old one. A Protocol that has not run is refused, and so is empty prose, with nothing written.
