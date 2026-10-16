@@ -56,11 +56,12 @@ git switch -c release-vX.Y.Z
 
 Keep the section under 120,000 characters, or the tag guard refuses it (GitHub cuts a release body at 125,000).
 
-**Bump the version** in three places:
+**Bump the version** in four places:
 
 1. `version` under `[package]` in `Cargo.toml`.
 2. The `**Version:**` line in `CLAUDE.md`.
 3. `Cargo.lock`'s `arcform` entry. Run `cargo metadata --format-version 1 > /dev/null` to rewrite it, then check with `cargo metadata --locked --format-version 1 > /dev/null`. The release builds with `--locked`, so a stale lock fails every build leg of the tag.
+4. The library snippet `arcform = { version = "=X.Y.Z", default-features = false }` in `README.md`, `src/lib.rs` and `src/spec.rs`. It pins exactly, so a stale one keeps a reader of the published docs on the previous release.
 
 **Set the skills' version.** In every `skills/*/SKILL.md`, set `metadata.arc_version` to the new version. `tests/skills.rs` (`frontmatter_is_loadable`) requires it to equal the crate version, so a stale one fails CI. Add the `skills/` folders to the `git add` in step 2.
 
@@ -90,7 +91,7 @@ Once it passes, run the tasks by `eval/analyst-workflow/README.md` and fill a co
 Then commit these files by name and open the pull request:
 
 ```bash
-git add CHANGELOG.md Cargo.toml Cargo.lock CLAUDE.md skills .claude-plugin .codex-plugin .cursor-plugin gemini-extension.json plugin
+git add CHANGELOG.md Cargo.toml Cargo.lock CLAUDE.md README.md src/lib.rs src/spec.rs skills .claude-plugin .codex-plugin .cursor-plugin gemini-extension.json plugin
 git commit -m "Release X.Y.Z: <one line on what it brings>"
 git push -u origin release-vX.Y.Z
 gh pr create --title "Release X.Y.Z" --body "<the summary from the changelog section, then the eval's scored results, then: merging this and pushing vX.Y.Z publishes the release>"
