@@ -9,6 +9,17 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ## [Unreleased]
 
+### Added
+
+- **`arc operator record` and the `arc mcp` tool `operator_record` record an operator as a new step of a Protocol, and do not run it.** An operator step used to be written by hand into `arcform.yaml`. The step's `with:` is checked against the operator's schema first, and a block that does not fit is refused naming the field, with the Protocol untouched.
+- **`arc mcp` gains `protocol_edit`, `history_list` and `history_restore`, matching `arc edit-protocol`, `arc history list` and `arc history restore`; `arc history list --json` prints the versions as JSON.** An agent could record steps but not change or undo one. `protocol_edit` and `history_restore` replace content, as do `protocol_write_file` and `report_write`, so all four are marked destructive, and what they replace stays in history. A `--file` path for history must stay inside the Protocol.
+- **`arc protocol write-file` and the `arc mcp` tool `protocol_write_file` write `schemas/<name>.json`, `panels/<name>.yaml` or `README.md` in a Protocol.** These files used to be written outside arc and so left no history. The content is checked to read as its kind, a path outside the Protocol or any other file is refused with nothing written, `report.md` is left to `report_write`, and what the write replaces is kept in history.
+- **`arc table profile` and the `arc mcp` tool `table_profile` profile a table in a Protocol's database with FineType.** The table's rows are copied, up to `--sample-size`, to a temporary CSV outside the Protocol, and `--format json` gives each column's type while `--format json-schema` gives a JSON Schema its rows pass. The profile of a table with no rows is said so, and a schema of one is refused.
+- **`arc table validate` and the `arc mcp` tool `table_validate` check a table against a JSON Schema file in the Protocol, in DuckDB with FineType's extension.** The answer is `valid` and each column's rejects as JSON, and the command exits 1 when a row is rejected. It needs `FINETYPE_DUCKDB_EXT` to name the extension.
+- **`arc panel check` and the `arc mcp` tool `panel_check` report each panel whose marks read a table or a column the Protocol does not make.** A misspelt column used to show only as an empty chart. One line per finding, and the command exits 1 when there is any.
+- **`arc report write` and the `arc mcp` tool `report_write` write `report.md` beside a Protocol.** The prose is the author's, on standard input or in the tool's arguments; arc adds how the answer was derived, the charts and the run, from the newest run's record or the one `--run` names. A Protocol that has not run is refused, and a report already there is replaced, both versions kept in history.
+- **The `arc mcp` instructions are rewritten as one guide: discover, record, run, check, present, and what each step may change.** They named each tool in a clause of its own; they now give the order of work and say that recording runs nothing, a run runs, and history undoes.
+
 ## [0.2.0] - 2026-10-15
 
 arc is local-first data analysis in one binary, for people and their agents. The work is kept as a Protocol, a folder holding `arcform.yaml` and its SQL, which `arc run` runs again from the top; arc reads each SQL step for the tables it reads and makes, so it knows how the steps connect and which ones a change makes stale. This is the first published release.

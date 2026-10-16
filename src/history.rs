@@ -352,7 +352,7 @@ impl Change {
 
 /// A checkpoint's line in the folder's log, held until the write the
 /// checkpoint was taken for has landed.
-struct HeldLine {
+pub(crate) struct HeldLine {
     /// The spec the checkpoint is of, whose folder's log takes the line.
     spec_path: PathBuf,
     entry: HistoryEntry,
@@ -361,7 +361,7 @@ struct HeldLine {
 impl HeldLine {
     /// Append the line, now that the write has landed. Best-effort, as every
     /// line is.
-    fn land(self) {
+    pub(crate) fn land(self) {
         let _ = append_log_line(&self.spec_path, &self.entry, StepNote::Unnamed);
     }
 }
@@ -704,23 +704,13 @@ impl LocalHistory {
     /// no write — and write the entry's bytes to `target`.
     fn restore_keyed(&self, key: (PathBuf, PathBuf), target: &Path, id: &str) -> Result<String> {
         let text = read_entry(&key.0, id)?;
-        let spec_path = key.1.clone();
         let mut held = None;
         if target.exists() {
             let current = std::fs::read_to_string(target).map_err(|e| Error::FileRead {
                 path: target.to_path_buf(),
                 source: e,
             })?;
-            held = self
-                .record_keyed(
-                    key,
-                    &current,
-                    HistoryKind::Checkpoint,
-                    SystemTime::now(),
-                    false,
-                    None,
-                )?
-                .map(|entry| HeldLine { spec_path, entry });
+            held = self.checkpoint_held_keyed(key, &current)?;
         }
         write_atomic(target, text.as_bytes())?;
         // The checkpoint's line lands with the write it was taken for.
@@ -760,6 +750,34 @@ impl LocalHistory {
         line: Option<StepNote>,
     ) -> Result<Option<HistoryEntry>> {
         self.record_keyed(self.key_dir(dir)?, text, kind, now, merge, line)
+    }
+
+    /// [`checkpoint_held`](Self::checkpoint_held) for the file at `file`, keyed
+    /// as [`record_save_for_file`](Self::record_save_for_file) describes.
+    pub(crate) fn checkpoint_held_for_file(
+        &self,
+        file: &Path,
+        text: &str,
+    ) -> Result<Option<HeldLine>> {
+        self.checkpoint_held_keyed(self.file_key(file)?, text)
+    }
+
+    /// A checkpoint of `text` under `key`, its line held for the caller.
+    fn checkpoint_held_keyed(
+        &self,
+        key: (PathBuf, PathBuf),
+        text: &str,
+    ) -> Result<Option<HeldLine>> {
+        let spec_path = key.1.clone();
+        let entry = self.record_keyed(
+            key,
+            text,
+            HistoryKind::Checkpoint,
+            SystemTime::now(),
+            false,
+            None,
+        )?;
+        Ok(entry.map(|entry| HeldLine { spec_path, entry }))
     }
 
     /// Record `text` as a checkpoint for the spec in `dir`, as
@@ -1099,6 +1117,22 @@ pub(crate) fn record_sql_step_with_history(
     record_with_history(dir, history, step.name, || {
         crate::record::record_sql_step(dir, step)
     })
+}
+
+/// [`record_step_with_history`] for a step already spliced and gated in memory
+/// (see [`record_operator`](crate::record::record_operator)): the same checkpoint
+/// before the write and the same save after it, around writing `validated`.
+pub(crate) fn record_validated_step_with_history(
+    dir: &Path,
+    name: &str,
+    validated: ValidatedSpec,
+    history: &LocalHistory,
+) -> Result<ValidatedSpec> {
+    let (_, validated) = record_with_history(dir, history, name, || {
+        validated.write_to(dir)?;
+        Ok((PathBuf::new(), validated))
+    })?;
+    Ok(validated)
 }
 
 /// The checkpoint, the promotion `record` makes and the save, in that order, as

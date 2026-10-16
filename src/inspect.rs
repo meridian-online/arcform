@@ -40,15 +40,20 @@ pub(crate) fn open_read_only(dir: &Path) -> Result<(Connection, PathBuf)> {
         .map_err(db_error)?;
     let conn = Connection::open_with_flags(&path, config).map_err(|e| {
         if is_lock_error(&e.to_string()) {
-            refusal(format!(
-                "the Protocol's database at {} is in use by another process; try again when the run or app holding it has finished",
-                path.display()
-            ))
+            lock_refusal(&path)
         } else {
             db_error(e)
         }
     })?;
     Ok((conn, path))
+}
+
+/// The refusal for a database file another process holds.
+fn lock_refusal(path: &Path) -> Error {
+    refusal(format!(
+        "the Protocol's database at {} is in use by another process; try again when the run or app holding it has finished",
+        path.display()
+    ))
 }
 
 /// DuckDB's own wording when another process holds the file.
@@ -222,11 +227,12 @@ fn resolve(
     }
 }
 
-fn describe_in(
+/// Which `(schema, table)` of the database `table` names, or why none does.
+fn find_table(
     conn: &Connection,
-    path: &Path,
     table: &str,
-) -> std::result::Result<Value, DescribeError> {
+    path: &Path,
+) -> std::result::Result<(String, String), DescribeError> {
     let mut stmt = conn.prepare(
         "SELECT table_schema, table_name FROM information_schema.tables \
          WHERE table_schema NOT IN ('information_schema', 'pg_catalog')",
@@ -234,7 +240,24 @@ fn describe_in(
     let entries: Vec<(String, String)> = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<std::result::Result<_, _>>()?;
-    let (schema, name) = resolve(&entries, table, path)?;
+    resolve(&entries, table, path)
+}
+
+/// The table `table` names in the Protocol's database `conn` is open on, as its
+/// quoted `schema.table`, or the refusal.
+fn locate_table(conn: &Connection, table: &str, path: &Path) -> Result<(String, String)> {
+    find_table(conn, table, path).map_err(|e| match e {
+        DescribeError::Ours(e) => e,
+        DescribeError::Duck(e) => db_error(e),
+    })
+}
+
+fn describe_in(
+    conn: &Connection,
+    path: &Path,
+    table: &str,
+) -> std::result::Result<Value, DescribeError> {
+    let (schema, name) = find_table(conn, table, path)?;
     let quoted = format!("{}.{}", quote(&schema), quote(&name));
 
     let mut stmt = conn.prepare(&format!(
@@ -455,5 +478,239 @@ fn run_statement(
         "rows": rows,
         "capped": capped,
         "rows_held_back": held_back,
+    }))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// profile and validate
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The rows `profile_table` copies when it is not told how many: FineType's own
+/// default sample.
+const DEFAULT_SAMPLE_SIZE: usize = 100;
+
+/// What `finetype profile` writes for a table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProfileFormat {
+    /// Each column's type, confidence and transform.
+    Json,
+    /// A table-level JSON Schema that the table's rows pass.
+    JsonSchema,
+}
+
+impl ProfileFormat {
+    fn finetype_word(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::JsonSchema => "json-schema",
+        }
+    }
+}
+
+/// A folder made for one profile, outside the Protocol, that is removed when it
+/// goes out of scope.
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    /// A new, empty folder in the temporary directory: one that already exists is
+    /// never reused.
+    fn new() -> Result<Self> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        for attempt in 0..100u32 {
+            let path = std::env::temp_dir().join(format!(
+                "arc-profile-{}-{stamp}-{attempt}",
+                std::process::id()
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                // Owner only: the folder holds copied rows.
+                builder.mode(0o700);
+            }
+            match builder.create(&path) {
+                Ok(()) => return Ok(ScratchDir(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(refusal(
+            "could not make a temporary folder for the profile".to_string(),
+        ))
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Profile the table or view `table` of the Protocol's database with FineType.
+///
+/// Up to `sample_size` rows (FineType's default of 100 when none is given) are
+/// copied to a temporary CSV outside the Protocol, through a read-only
+/// connection, and `finetype profile` is run over it. The answer is FineType's
+/// JSON with `table` and `rows_profiled` added; for `JsonSchema` it is the schema
+/// alone, its `$id` naming the table. A table with no rows is not an error
+/// for `Json`: the answer says so, and FineType is not run; for `JsonSchema`
+/// there is nothing to infer a schema from, and it is refused.
+pub(crate) fn profile_table(
+    dir: &Path,
+    table: &str,
+    format: ProfileFormat,
+    sample_size: Option<usize>,
+) -> Result<Value> {
+    if sample_size == Some(0) {
+        return Err(refusal(
+            "sample_size must be at least 1: a sample of no rows profiles nothing".to_string(),
+        ));
+    }
+    let limit = sample_size.unwrap_or(DEFAULT_SAMPLE_SIZE);
+    let (conn, path) = open_read_only(dir)?;
+    let (schema, name) = locate_table(&conn, table, &path)?;
+    let quoted = format!("{}.{}", quote(&schema), quote(&name));
+    let rows = format!("SELECT * FROM {quoted} LIMIT {limit}");
+    let copied: i64 = conn
+        .query_row(&format!("SELECT count(*) FROM ({rows})"), [], |r| r.get(0))
+        .map_err(db_error)?;
+    if copied == 0 {
+        if format == ProfileFormat::JsonSchema {
+            return Err(refusal(format!(
+                "{table} has no rows to infer a schema from; load some, or profile it with format json"
+            )));
+        }
+        return Ok(json!({
+            "table": table,
+            "rows_profiled": 0,
+            "message": format!("{table} has no rows to profile"),
+        }));
+    }
+
+    let bin = crate::finetype_cli::finetype_bin();
+    crate::finetype_cli::ensure_min_version(&bin).map_err(refusal)?;
+    let scratch = ScratchDir::new()?;
+    let csv = scratch.0.join("table.csv");
+    conn.execute_batch(&format!(
+        "COPY ({rows}) TO '{}' (HEADER)",
+        csv.display().to_string().replace('\'', "''")
+    ))
+    .map_err(db_error)?;
+
+    let mut args = vec![
+        "profile".to_string(),
+        "--file".to_string(),
+        csv.display().to_string(),
+        "--output".to_string(),
+        format.finetype_word().to_string(),
+    ];
+    if let Some(n) = sample_size {
+        args.push("--sample-size".to_string());
+        args.push(n.to_string());
+    }
+    let stdout = crate::finetype_cli::run_cli(&bin, &args, None).map_err(refusal)?;
+    let mut profile: Value = serde_json::from_str(&stdout)
+        .map_err(|e| refusal(format!("finetype profile did not give JSON: {e}")))?;
+    let Some(object) = profile.as_object_mut() else {
+        return Err(refusal(
+            "finetype profile did not give a JSON object".to_string(),
+        ));
+    };
+    match format {
+        ProfileFormat::Json => {
+            object.insert("table".to_string(), json!(table));
+            object.insert("rows_profiled".to_string(), json!(copied));
+        }
+        // A schema is kept as FineType wrote it, so what is saved is a clean JSON
+        // Schema; only the `$id`, which names the scratch file, is made to name the table.
+        ProfileFormat::JsonSchema => {
+            if object.contains_key("$id") {
+                object.insert("$id".to_string(), json!(format!("finetype://{table}")));
+            }
+        }
+    }
+    Ok(profile)
+}
+
+/// Validate the table or view `table` of the Protocol's database against the
+/// JSON Schema file `schema` (relative to `dir`, and inside it) with FineType's
+/// DuckDB extension: the database is attached read-only to an in-memory
+/// connection that has the extension loaded, and `ft_validate` is run over the
+/// table. The answer is `{table, schema, valid, columns}`, each column with
+/// `column_name`, `total`, `rejects` and `sample_message`; `valid` is true when
+/// no row of any column is rejected.
+pub(crate) fn validate_table(dir: &Path, table: &str, schema: &Path) -> Result<Value> {
+    let outside = || {
+        refusal(format!(
+            "{} is outside the Protocol folder {}; name a file inside it",
+            schema.display(),
+            dir.display()
+        ))
+    };
+    if !crate::protocol_files::stays_inside_by_name(schema) {
+        return Err(outside());
+    }
+    let schema_path = dir.join(schema);
+    if !crate::protocol_files::resolves_inside(dir, &schema_path)? {
+        return Err(outside());
+    }
+    if !schema_path.is_file() {
+        return Err(refusal(format!(
+            "no schema file at {}; write one with `arc protocol write-file` or `arc table profile --format json-schema`",
+            schema_path.display()
+        )));
+    }
+    // Absolute, so `ft_validate` never reads the name as inline JSON (it does for a
+    // value that starts with `{`).
+    let schema_path = schema_path.canonicalize()?;
+    let ext = crate::operator::resolve_finetype_ext(None).map_err(|(_, m)| refusal(m))?;
+
+    // The read-only open finds the table and refuses a database that is missing or
+    // held by another process; it is closed before the database is attached again.
+    let (conn, path) = open_read_only(dir)?;
+    let (found_schema, found_name) = locate_table(&conn, table, &path)?;
+    drop(conn);
+
+    let conn = crate::operator::open_finetype_connection(&ext).map_err(refusal)?;
+    // As `open_read_only` does: a view over a remote file must not fetch an extension.
+    conn.execute_batch("SET autoinstall_known_extensions = false")
+        .map_err(db_error)?;
+    conn.execute_batch(&format!(
+        "ATTACH '{}' AS arc_protocol (READ_ONLY); \
+         CREATE TEMP VIEW _arc_table AS SELECT * FROM arc_protocol.{}.{};",
+        path.display().to_string().replace('\'', "''"),
+        quote(&found_schema),
+        quote(&found_name)
+    ))
+    .map_err(|e| {
+        if is_lock_error(&e.to_string()) {
+            lock_refusal(&path)
+        } else {
+            db_error(e)
+        }
+    })?;
+    let report =
+        crate::operator::ft_validate_report(&conn, "_arc_table", &schema_path).map_err(refusal)?;
+
+    let valid = report.iter().all(|c| c.rejects == 0);
+    let columns: Vec<Value> = report
+        .into_iter()
+        .map(|c| {
+            json!({
+                "column_name": c.column,
+                "total": c.total,
+                "rejects": c.rejects,
+                "sample_message": c.message,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "table": table,
+        "schema": schema.display().to_string(),
+        "valid": valid,
+        "columns": columns,
     }))
 }

@@ -98,7 +98,7 @@ const EXPORTED: [(&str, &str); 35] = [
 
 /// Every module file in the crate. Frozen so a new one cannot be added without
 /// passing under the checks below.
-const MODULE_FILES: [&str; 34] = [
+const MODULE_FILES: [&str; 38] = [
     "asset.rs",
     "asset_kind.rs",
     "bridge.rs",
@@ -112,6 +112,9 @@ const MODULE_FILES: [&str; 34] = [
     // The shared fetch cache: one transfer per URL however many Protocols want it.
     // Private to the crate — a store is a run-time facility, not a schema.
     "fetch_cache.rs",
+    // The `finetype` command line run behind its version floor, for the MCP tools
+    // and `arc table profile`. Private to the crate.
+    "finetype_cli.rs",
     "history.rs",
     "ingress_meta.rs",
     "inspect.rs",
@@ -129,7 +132,9 @@ const MODULE_FILES: [&str; 34] = [
     // `ducklake_publish`, split out of `operator.rs` because it is a module's worth of
     // code on its own. Private to the crate like every operator: it exports nothing.
     "operator/ducklake_publish.rs",
+    "panel_check.rs",
     "precondition.rs",
+    "protocol_files.rs",
     "record.rs",
     "registry/cache.rs",
     "registry/index.rs",
@@ -137,6 +142,8 @@ const MODULE_FILES: [&str; 34] = [
     "registry/resolve.rs",
     "registry/run.rs",
     "registry/transport.rs",
+    // The report `arc report write` writes beside a Protocol. Private to the crate.
+    "report.rs",
     "runner.rs",
     "spec.rs",
     "state.rs",

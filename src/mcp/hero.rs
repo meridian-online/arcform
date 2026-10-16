@@ -17,6 +17,14 @@
 //! - `operation_record` records an operation as a new step of a Protocol, through
 //!   the same record path `arc operation record` takes, so the same request writes
 //!   the same bytes from either.
+//! - `operator_record` records an operator step of a Protocol, its `with:` checked
+//!   against the operator's schema, through the same record path `arc operator
+//!   record` takes, so the same request writes the same bytes from either.
+//! - `protocol_edit` makes one edit to a Protocol's spec, through the same write
+//!   path `arc edit-protocol` takes, and returns the edited step list.
+//! - `history_list` and `history_restore` list the recorded states of a Protocol's
+//!   spec, or of one file beside it, and roll it back to one, as `arc history list
+//!   --json` and `arc history restore` do.
 //! - `sql_recognise` answers what arc reads a SQL statement as: the object `arc sql
 //!   recognise` prints, both read through the one reader in `record`.
 //! - `sql_record` records a SQL statement as a new step of a Protocol, through the
@@ -24,6 +32,9 @@
 //!   bytes from either.
 //! - `table_describe` reads a table in the Protocol's database, read-only, as
 //!   `arc table describe` does.
+//! - `table_profile` and `table_validate` profile a table with FineType and check
+//!   it against a schema file of the Protocol, as `arc table profile` and
+//!   `arc table validate` do.
 //! - `sql_query` runs SELECT statements against the Protocol's database,
 //!   read-only, as `arc sql query` does.
 //! - `protocol_create` makes a new Protocol in a directory, through the same
@@ -487,6 +498,224 @@ fn operation_record_schema() -> Value {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// operator_record
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Record an operator step at the end of a Protocol.
+///
+/// The request is handed to the record path `arc operator record` takes, which
+/// checks `with` against the operator's schema before it writes the step. `dir`
+/// defaults to `.`, the server's working directory, as `--dir` does, and
+/// `description` is absent for a step with none. A refusal is an error result
+/// naming what was wrong, with the Protocol's directory untouched.
+fn operator_record(args: &Value) -> ToolResult {
+    let dir = dir_arg(args)?;
+    let operator = required_string(args, "operator")?;
+    let name = required_string(args, "name")?;
+    let with = match args.get("with") {
+        Some(with @ Value::Object(_)) => with,
+        None | Some(Value::Null) => return Err("`with` is required".to_string()),
+        Some(other) => {
+            return Err(format!(
+                "`with` must be an object of the operator's `with:` block, not {other}"
+            ));
+        }
+    };
+    let description = match args.get("description") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(description)) => Some(description.as_str()),
+        Some(other) => return Err(format!("`description` must be a string, not {other}")),
+    };
+    let history = open_history()?;
+    let request = crate::record::OperatorRequest {
+        operator,
+        name,
+        with,
+        description,
+    };
+    crate::record::record_operator(&dir, &request, &history).map_err(|e| e.to_string())?;
+    Ok(ToolOutput::json(json!({
+        "step": name,
+        "operator": operator,
+    })))
+}
+
+fn operator_record_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "operator": { "type": "string", "description": "The operator's name (e.g. http_fetch), as operator_describe lists them." },
+            "name": { "type": "string", "description": "The new step's name." },
+            "with": { "type": "object", "description": "The step's `with:` block, as the JSON Schema operator_describe returns for the operator describes it." },
+            "description": { "type": "string", "description": "One line saying what the step does and why, written on the step for the person who reads the Protocol next." },
+            "dir": { "type": "string", "description": "Protocol directory (where arcform.yaml lives). Defaults to the current directory." }
+        },
+        "required": ["operator", "name", "with"]
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// protocol_edit
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The string `key` of an edit's arguments, refused by name when absent.
+fn edit_string(args: &Value, key: &str) -> std::result::Result<String, String> {
+    required_string(args, key).map(str::to_string)
+}
+
+/// The index `key` of an edit's arguments, refused by name when absent or not a
+/// non-negative whole number.
+fn edit_index(args: &Value, key: &str) -> std::result::Result<usize, String> {
+    match args.get(key) {
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| format!("`{key}` must be a non-negative whole number, not {n}")),
+        None | Some(Value::Null) => Err(format!("`{key}` is required")),
+        Some(other) => Err(format!(
+            "`{key}` must be a non-negative whole number, not {other}"
+        )),
+    }
+}
+
+/// Make one edit to a Protocol's spec as `arc edit-protocol` does: the arguments
+/// name the same edit and carry the same fields as the command's, and are handed
+/// to the one write path, which applies the edit to the file's bytes, validates
+/// the result and writes it atomically, checkpointing the state it replaces. The
+/// result is the edited Protocol's step list. A refusal is an error result naming
+/// what was wrong, with the Protocol's directory untouched.
+fn protocol_edit(args: &Value) -> ToolResult {
+    use crate::cli::EditOp;
+    let dir = dir_arg(args)?;
+    let path = edit_string(args, "path")?;
+    let op = match required_string(args, "edit")? {
+        "replace" => EditOp::Replace {
+            path,
+            value: edit_string(args, "value")?,
+        },
+        "rewrite" => EditOp::Rewrite {
+            path,
+            from: edit_string(args, "from")?,
+            to: edit_string(args, "to")?,
+        },
+        "add" => EditOp::Add {
+            path,
+            key: edit_string(args, "key")?,
+            value: edit_string(args, "value")?,
+        },
+        "append" => EditOp::Append {
+            path,
+            item: edit_string(args, "item")?,
+        },
+        "delete" => EditOp::Delete { path },
+        "reorder" => EditOp::Reorder {
+            path,
+            from: edit_index(args, "from")?,
+            to: edit_index(args, "to")?,
+        },
+        other => {
+            return Err(format!(
+                "`edit` must be one of replace, rewrite, add, append, delete, reorder, not `{other}`"
+            ));
+        }
+    };
+    let history = open_history()?;
+    crate::cli::edit_protocol_files(&dir, op, &history).map_err(|e| e.to_string())?;
+    let manifest = crate::manifest::Manifest::load(&dir).map_err(|e| e.to_string())?;
+    let steps = serde_json::to_value(&manifest.steps).map_err(|e| e.to_string())?;
+    Ok(ToolOutput::json(steps))
+}
+
+fn protocol_edit_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "edit": { "type": "string", "enum": ["replace", "rewrite", "add", "append", "delete", "reorder"], "description": "Which edit to make." },
+            "path": { "type": "string", "description": "Where in arcform.yaml: dot-separated mapping keys with zero-based [N] sequence indices, such as `steps[2].command` or `params.port.default`; `.` alone is the manifest root (only `add` takes it)." },
+            "value": { "type": "string", "description": "replace and add: the new value, spliced verbatim; a multi-line value arrives already indented for where it lands." },
+            "from": { "description": "rewrite: the text to change, which must occur exactly once in the value at `path`. reorder: the index the item is at (a whole number)." },
+            "to": { "description": "rewrite: the text that replaces it. reorder: the index the item should end up at (a whole number)." },
+            "key": { "type": "string", "description": "add: the key to add to the mapping at `path`." },
+            "item": { "type": "string", "description": "append: the item to append to the sequence at `path`; for a block sequence it carries its own pre-indented `- ` line(s)." },
+            "dir": { "type": "string", "description": "Protocol directory (where arcform.yaml lives). Defaults to the current directory." }
+        },
+        "required": ["edit", "path"]
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// history_list, history_restore
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The file an optional `file` argument names, read from `dir` when relative, as
+/// `--file` is.
+fn optional_file(args: &Value) -> std::result::Result<Option<PathBuf>, String> {
+    Ok(optional_string(args, "file")?.map(PathBuf::from))
+}
+
+/// The recorded states of a Protocol's spec, or given `file` of that one file,
+/// oldest first: the array `arc history list --json` prints. Reads only.
+fn history_list(args: &Value) -> ToolResult {
+    let dir = dir_arg(args)?;
+    let file = optional_file(args)?;
+    let history = open_history()?;
+    crate::cli::history_entries_json(&dir, file.as_deref(), &history)
+        .map(ToolOutput::json)
+        .map_err(|e| e.to_string())
+}
+
+fn history_list_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "file": { "type": "string", "description": "List this file's own history instead of the spec's, such as a chart file beside the spec. The path is relative to the Protocol folder (`dir`) and must stay inside it; absolute paths and `..` are refused." },
+            "dir": { "type": "string", "description": "Protocol directory (where arcform.yaml lives). Defaults to the current directory." }
+        }
+    })
+}
+
+/// Roll a Protocol's spec, or given `file` that one file, back to the state an
+/// entry recorded, as `arc history restore` does: the state being replaced is
+/// checkpointed first, so a restore can itself be undone. When the restored spec
+/// does not load, `note` says why. An unknown entry is an error result, with
+/// nothing written.
+fn history_restore(args: &Value) -> ToolResult {
+    let dir = dir_arg(args)?;
+    let id = required_string(args, "id")?;
+    let file = optional_file(args)?;
+    let history = open_history()?;
+    let restored = crate::cli::history_restore_files(&dir, file.as_deref(), id, &history)
+        .map_err(|e| e.to_string())?;
+    let mut result = json!({
+        "restored": id,
+        // Relative to the Protocol, as protocol_write_file and report_write give theirs.
+        "file": file
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(crate::spec::MANIFEST_FILENAME))
+            .display()
+            .to_string(),
+    });
+    if let Some(fault) = restored.load_fault {
+        result["note"] = json!(format!(
+            "the restored state does not load as a spec: {fault}"
+        ));
+    }
+    Ok(ToolOutput::json(result))
+}
+
+fn history_restore_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string", "description": "The entry's id, as history_list returns it for the same file." },
+            "file": { "type": "string", "description": "Restore this file from its own history instead of the spec; no other file is written. The path is relative to the Protocol folder (`dir`) and must stay inside it; absolute paths and `..` are refused." },
+            "dir": { "type": "string", "description": "Protocol directory (where arcform.yaml lives). Defaults to the current directory." }
+        },
+        "required": ["id"]
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // sql_recognise
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -614,6 +843,71 @@ fn protocol_create_schema() -> Value {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// protocol_write_file
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Write a schema, panel or README file of a Protocol, as `arc protocol
+/// write-file` does: both call `write_protocol_file`. `dir` defaults to `.`.
+/// The result names the file's `path`, its `kind` and any `warnings`; a refusal
+/// is an error result with the folder untouched.
+fn protocol_write_file(args: &Value) -> ToolResult {
+    let dir = dir_arg(args)?;
+    let path = required_string(args, "path")?;
+    let content = required_string(args, "content")?;
+    let history = open_history()?;
+    let written =
+        crate::protocol_files::write_protocol_file(&dir, Path::new(path), content, &history)
+            .map_err(|e| e.to_string())?;
+    Ok(ToolOutput::json(json!({
+        "path": written.path.display().to_string(),
+        "kind": written.kind.word(),
+        "warnings": written.warnings,
+    })))
+}
+
+fn protocol_write_file_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": { "type": "string", "description": "The file's path relative to the Protocol directory: schemas/<name>.json, panels/<name>.yaml or README.md." },
+            "content": { "type": "string", "description": "The whole file. A schema must be JSON and a panel YAML with a `plot` key." },
+            "dir": { "type": "string", "description": "Protocol directory (where arcform.yaml lives). Defaults to the current directory." }
+        },
+        "required": ["path", "content"]
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// report_write
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Write the report of a Protocol's run, as `arc report write` does: both call
+/// `write_report`. `dir` defaults to `.`. The result names the report's `path`.
+fn report_write(args: &Value) -> ToolResult {
+    let dir = dir_arg(args)?;
+    let prose = required_string(args, "prose")?;
+    let run = optional_string(args, "run")?;
+    let history = open_history()?;
+    let path =
+        crate::report::write_report(&dir, prose, run, &history).map_err(|e| e.to_string())?;
+    Ok(ToolOutput::json(
+        json!({ "path": path.display().to_string() }),
+    ))
+}
+
+fn report_write_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "prose": { "type": "string", "description": "Your part of the report: the answer, its caveats and the next steps. arc adds the sections it knows from the run." },
+            "run": { "type": "string", "description": "The run whose contract to use. Defaults to the newest run." },
+            "dir": { "type": "string", "description": "Protocol directory (where arcform.yaml lives). Defaults to the current directory." }
+        },
+        "required": ["prose"]
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // table_describe
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -639,6 +933,117 @@ fn table_describe_schema() -> Value {
             "dir": { "type": "string", "description": "The Protocol's directory. Defaults to the server's working directory." }
         },
         "required": ["table"]
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// panel_check
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What each panel of a Protocol names that the Protocol does not make, as `arc
+/// panel check` prints it. A panel with findings is a result, not an error.
+fn panel_check(args: &Value) -> ToolResult {
+    let dir = dir_arg(args)?;
+    let checked = crate::panel_check::check_panels(&dir).map_err(|e| e.to_string())?;
+    let panels: Vec<Value> = checked
+        .iter()
+        .map(|(panel, findings)| {
+            json!({
+                "panel": panel.display().to_string(),
+                "findings": findings.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let clean = checked.iter().all(|(_, findings)| findings.is_empty());
+    Ok(ToolOutput::json(
+        json!({ "clean": clean, "panels": panels }),
+    ))
+}
+
+fn panel_check_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "dir": { "type": "string", "description": "The Protocol's directory. Defaults to the server's working directory." }
+        }
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// table_profile and table_validate
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn dir_arg(args: &Value) -> std::result::Result<PathBuf, String> {
+    match args.get("dir") {
+        None | Some(Value::Null) => Ok(PathBuf::from(".")),
+        Some(Value::String(dir)) => Ok(PathBuf::from(dir)),
+        Some(other) => Err(format!("`dir` must be a string, not {other}")),
+    }
+}
+
+/// FineType's profile of a table in the Protocol's database, as `arc table profile`
+/// prints it.
+fn table_profile(args: &Value) -> ToolResult {
+    let table = required_string(args, "table")?;
+    let dir = dir_arg(args)?;
+    let format = match args.get("format") {
+        None | Some(Value::Null) => crate::inspect::ProfileFormat::Json,
+        Some(Value::String(f)) if f == "json" => crate::inspect::ProfileFormat::Json,
+        Some(Value::String(f)) if f == "json-schema" => crate::inspect::ProfileFormat::JsonSchema,
+        Some(other) => {
+            return Err(format!(
+                "`format` must be \"json\" or \"json-schema\", not {other}"
+            ));
+        }
+    };
+    let sample_size = match args.get("sample_size") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| format!("`sample_size` must be a whole number, not {value}"))?,
+        ),
+    };
+    crate::inspect::profile_table(&dir, table, format, sample_size)
+        .map(ToolOutput::json)
+        .map_err(|e| e.to_string())
+}
+
+fn table_profile_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "table": { "type": "string", "description": "The table or view to profile: a bare name, or schema.table." },
+            "format": { "type": "string", "enum": ["json", "json-schema"], "default": "json", "description": "json gives each column's type; json-schema gives a JSON Schema the rows pass, which protocol_write_file can save as schemas/<name>.json." },
+            "sample_size": { "type": "integer", "minimum": 1, "description": "The most rows to copy and profile. Defaults to FineType's 100." },
+            "dir": { "type": "string", "description": "The Protocol's directory. Defaults to the server's working directory." }
+        },
+        "required": ["table"]
+    })
+}
+
+/// A table in the Protocol's database checked against a schema file of the
+/// Protocol, as `arc table validate` prints it. Rejected rows are an answer
+/// (`valid: false`), not an error.
+fn table_validate(args: &Value) -> ToolResult {
+    let table = required_string(args, "table")?;
+    let schema = required_string(args, "schema")?;
+    let dir = dir_arg(args)?;
+    crate::inspect::validate_table(&dir, table, std::path::Path::new(schema))
+        .map(ToolOutput::json)
+        .map_err(|e| e.to_string())
+}
+
+fn table_validate_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "table": { "type": "string", "description": "The table or view to validate: a bare name, or schema.table." },
+            "schema": { "type": "string", "description": "The JSON Schema file, relative to the Protocol's directory and inside it (e.g. schemas/orders.json)." },
+            "dir": { "type": "string", "description": "The Protocol's directory. Defaults to the server's working directory." }
+        },
+        "required": ["table", "schema"]
     })
 }
 
@@ -712,6 +1117,34 @@ pub(super) fn tools() -> Vec<ToolDef> {
             annotations: Annotations::WRITES,
         },
         ToolDef {
+            name: "operator_record",
+            description: "Record an operator step (a fetch, an entity resolution, an embedding, an export) as a new step at the end of a Protocol, from the operator's name, the step's name and its `with:` block. The `with:` is checked against the operator's schema, the one operator_describe returns, and a block that does not fit is refused naming the field, with the Protocol untouched. Writes the step; runs nothing.",
+            input_schema: operator_record_schema,
+            handler: operator_record,
+            annotations: Annotations::WRITES,
+        },
+        ToolDef {
+            name: "protocol_edit",
+            description: "Make one edit to a Protocol's arcform.yaml, as `arc edit-protocol` does: replace a value, rewrite one fragment of it, add a key, append a sequence item, delete an element or reorder a sequence, addressed by a path such as `steps[2].command`. The edit is applied to the file's bytes, so every byte it does not target survives (comments, key order, quoting), and is checked by the loader before anything is written; one that does not apply or does not load is refused with the file untouched. The state replaced is kept in history. Returns the edited Protocol's steps. Runs nothing.",
+            input_schema: protocol_edit_schema,
+            handler: protocol_edit,
+            annotations: Annotations::EDITS,
+        },
+        ToolDef {
+            name: "history_list",
+            description: "List the recorded states of a Protocol's arcform.yaml, or with `file` of one file beside it, oldest first: each entry's `id`, `kind` (save, checkpoint or unsaved), `at`, `bytes` and `way` arc was reached by. The ids are what history_restore takes. Changes nothing.",
+            input_schema: history_list_schema,
+            handler: history_list,
+            annotations: Annotations::READ_ONLY,
+        },
+        ToolDef {
+            name: "history_restore",
+            description: "Roll a Protocol's arcform.yaml, or with `file` that one file alone, back to the state a history_list entry recorded. The state being replaced is kept in history first, so a restore can itself be undone. A restored spec that no longer loads is restored all the same and says so in `note`.",
+            input_schema: history_restore_schema,
+            handler: history_restore,
+            annotations: Annotations::EDITS,
+        },
+        ToolDef {
             name: "sql_recognise",
             description: "Answer what arc reads one SQL statement as: the operation arc holds that it is, with `operation`, `on` and `arguments` as operation_record takes them, or `operation` null when it is none. Read from DuckDB's own parse; writes no file and runs nothing.",
             input_schema: sql_recognise_schema,
@@ -733,10 +1166,45 @@ pub(super) fn tools() -> Vec<ToolDef> {
             annotations: Annotations::WRITES,
         },
         ToolDef {
+            name: "protocol_write_file",
+            description: "Write one file of a Protocol, as `arc protocol write-file` does: a table's schema (schemas/<name>.json, JSON), a panel (panels/<name>.yaml, YAML with a `plot` key) or README.md. The file is written whole, replacing one already there, and the state it replaces is kept in its history. A path outside the Protocol's folder, any other place and content that does not read as its kind are refused with nothing written; report.md has a tool of its own, report_write. Runs nothing.",
+            input_schema: protocol_write_file_schema,
+            handler: protocol_write_file,
+            annotations: Annotations::EDITS,
+        },
+        ToolDef {
+            name: "report_write",
+            description: "Write report.md beside a Protocol, as `arc report write` does: your `prose` (the answer, its caveats and the next steps) first, then three sections arc writes from the run's contract. \"How this was derived\" lists each step in order with its description, status and the tables it made with their row counts; \"Charts\" lists each panel with its title and anything panel_check would say of it; \"Run\" gives the run id, when it finished, its outcome and each asset's content hash. Uses the newest run unless `run` names one; arc's sections follow your prose, so leave your own headings out of it. The panel findings are checked against the Protocol's current database, not the run's (or, before it has one, against the tables its steps make), and a database that cannot be opened is noted in the section instead of stopping the report. Replaces a report already there, and the state it replaces is kept in its history. A Protocol that has not run, or a `run` with no contract, is refused with nothing written: run the Protocol first with protocol_run. Runs nothing.",
+            input_schema: report_write_schema,
+            handler: report_write,
+            annotations: Annotations::EDITS,
+        },
+        ToolDef {
+            name: "panel_check",
+            description: "Check each panel (panels/<name>.yaml) of a Protocol against what the Protocol makes, as `arc panel check` does. A mark's `data.from` must be a key of the panel's own `data:` or a table in the Protocol's database, and a channel written as a bare string (`x: name`) must be a column of that table; marks nested under `hconcat`/`vconcat` are checked too. Not checked: object-valued channels (expressions and aggregates), a `data:` that is a bare string, and three-part `catalog.schema.table` names. A file that is not YAML or holds no `plot` is reported as a finding. Returns `clean` and, for each panel, its `findings` as plain sentences. Before the Protocol has run there is no database, so a table is checked against the relations its steps produce and columns are not checked. Opens the database read-only. protocol_write_file reports the same findings as `warnings` when it writes a panel.",
+            input_schema: panel_check_schema,
+            handler: panel_check,
+            annotations: Annotations::READS_OPEN,
+        },
+        ToolDef {
             name: "table_describe",
             description: "Describe a table or view in a Protocol's database: its row count, each column's name, type and null count, and up to five rows as arrays of values in the order of the columns. A bare name is the table in main, or the one schema that holds it; `schema.table` names another. Opens the database read-only and never writes it; a view may read the files and URLs it names, but no extension is installed for it. A database the Protocol has not made yet is refused, and so is one another process holds.",
             input_schema: table_describe_schema,
             handler: table_describe,
+            annotations: Annotations::READS_OPEN,
+        },
+        ToolDef {
+            name: "table_profile",
+            description: "Profile a table or view in a Protocol's database with FineType: the type of each column (`format` json), or a JSON Schema its rows pass (`format` json-schema, which protocol_write_file can save as schemas/<name>.json). Up to `sample_size` rows (100 by default) are copied to a temporary CSV outside the Protocol and `finetype profile` is run over it; for `json`, `table` and `rows_profiled` are added to what FineType gives, and `json-schema` returns FineType's schema with an `$id` naming the table. A table with no rows says so for `json` and is refused for `json-schema`, which has nothing to infer a schema from. Opens the database read-only; needs finetype on PATH at the version arc requires.",
+            input_schema: table_profile_schema,
+            handler: table_profile,
+            annotations: Annotations::READS_OPEN,
+        },
+        ToolDef {
+            name: "table_validate",
+            description: "Validate a table or view in a Protocol's database against a JSON Schema file of the Protocol, in DuckDB with FineType's extension (the FINETYPE_DUCKDB_EXT environment variable names it; without it the call is refused). Returns `valid` and, for each column, `total`, `rejects` and a `sample_message`; rejected rows give `valid` false, not an error. A schema outside the Protocol's folder is refused. Opens the database read-only.",
+            input_schema: table_validate_schema,
+            handler: table_validate,
             annotations: Annotations::READS_OPEN,
         },
         ToolDef {
@@ -896,6 +1364,27 @@ mod tests {
             0,
             "a refused request wrote into the directory"
         );
+    }
+
+    #[test]
+    fn operator_record_refuses_arguments_of_the_wrong_shape_before_anything_is_read() {
+        let base = json!({ "operator": "http_fetch", "name": "x", "with": {} });
+        for (key, value, message) in [
+            ("dir", json!(7), "`dir` must be a string, not 7"),
+            ("with", json!("text"), "`with` must be an object"),
+            ("with", Value::Null, "`with` is required"),
+            (
+                "description",
+                json!(3),
+                "`description` must be a string, not 3",
+            ),
+            ("operator", json!(null), "`operator` is required"),
+        ] {
+            let mut args = base.clone();
+            args[key] = value;
+            let err = operator_record(&args).unwrap_err();
+            assert!(err.contains(message), "{key}: {err}");
+        }
     }
 
     #[test]

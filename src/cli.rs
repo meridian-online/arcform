@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use owo_colors::OwoColorize;
 
 use crate::edit::{
@@ -153,6 +153,13 @@ pub enum Commands {
         cmd: OperationCmd,
     },
 
+    /// Record an operator step (a fetch, an entity resolution, an embedding, an
+    /// export) with its `with:` checked against the operator's schema.
+    Operator {
+        #[command(subcommand)]
+        cmd: OperatorCmd,
+    },
+
     /// Read SQL as arc reads it, record a statement as a step, and query a
     /// protocol's database read-only: whether a statement is an operation arc
     /// holds, the step that records it, and what a SELECT returns.
@@ -167,18 +174,99 @@ pub enum Commands {
     /// Protocol+Run contract), `operator_describe` (an operator's `with:` schema),
     /// `operation_describe` (the SQL operations arc holds, and what one takes),
     /// `operation_record` (record an operation as a step of a Protocol),
-    /// `sql_recognise` (what arc reads a SQL statement as), `sql_record` (record
-    /// a SQL statement as a step of a Protocol), `protocol_create` (make a new
-    /// Protocol, as `arc create-protocol` does), `table_describe` (what a table in
-    /// a Protocol's database holds, read-only) and `sql_query` (run read-only
-    /// SELECTs against a Protocol's database).
+    /// `operator_record` (record an operator step, its `with:` checked against the
+    /// operator's schema), `sql_recognise` (what arc reads a SQL statement as),
+    /// `sql_record` (record a SQL statement as a step of a Protocol),
+    /// `protocol_create` (make a new Protocol, as `arc create-protocol` does),
+    /// `protocol_edit` (one edit to a Protocol's spec, as `arc edit-protocol` does),
+    /// `history_list` and `history_restore` (list and roll back the recorded states
+    /// of a spec or of a file beside it), `protocol_write_file` (write a Protocol's
+    /// schema, panel or README file), `panel_check` (find panels that name a table or
+    /// column the Protocol does not make), `report_write` (write the report of a
+    /// run), `table_describe` (what a table in a Protocol's database holds,
+    /// read-only), `table_profile` (a table's column types, or a JSON Schema, from
+    /// FineType), `table_validate` (check a table against a schema file with
+    /// FineType's DuckDB extension) and `sql_query` (run read-only SELECTs against a
+    /// Protocol's database).
     #[cfg(feature = "mcp")]
     Mcp,
+
+    /// Write a file of a protocol: its table schemas, panels and README.
+    Protocol {
+        #[command(subcommand)]
+        cmd: ProtocolCmd,
+    },
+
+    /// Check the protocol's panels against what the protocol makes.
+    Panel {
+        #[command(subcommand)]
+        cmd: PanelCmd,
+    },
+
+    /// Write the report of the protocol's newest run.
+    Report {
+        #[command(subcommand)]
+        cmd: ReportCmd,
+    },
 
     /// Look at a table in a protocol's database, read-only.
     Table {
         #[command(subcommand)]
         cmd: TableCmd,
+    },
+}
+
+/// The `arc protocol` verbs.
+#[derive(Subcommand)]
+pub enum ProtocolCmd {
+    /// Write a file of the protocol from standard input: `schemas/<name>.json`
+    /// (JSON), `panels/<name>.yaml` (YAML with a `plot` key) or `README.md`.
+    /// The file is written whole, replacing one already there, and recorded in
+    /// its own history. A path outside the protocol's folder, any other place,
+    /// and content that does not read as its kind are refused with nothing
+    /// written.
+    WriteFile {
+        /// The file's path, relative to the protocol directory.
+        path: PathBuf,
+
+        /// Protocol directory (where arcform.yaml lives).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+}
+
+/// The `arc report` verbs.
+#[derive(Subcommand)]
+pub enum ReportCmd {
+    /// Write report.md beside the protocol: the prose on standard input (the
+    /// answer, its caveats and the next steps), then what arc knows from the run
+    /// contract: how the answer was derived, the charts, and the run. Replaces a
+    /// report already there, keeping both in its history. A protocol that has not
+    /// run is refused, with nothing written.
+    Write {
+        /// The run whose contract to use; the newest run when left out.
+        #[arg(long)]
+        run: Option<String>,
+
+        /// Protocol directory (where arcform.yaml lives).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+}
+
+/// The `arc panel` verbs.
+#[derive(Subcommand)]
+pub enum PanelCmd {
+    /// Report each panel under panels/ whose marks read a table or a column the
+    /// protocol does not make, one line per finding, and exit 1 when there is any.
+    /// A table is one in the protocol's database, or the panel's own `data:`; before
+    /// the first run it is one a step produces, and columns are not checked. Not
+    /// checked: object-valued channels, a bare-string `data:`, and three-part
+    /// `catalog.schema.table` names.
+    Check {
+        /// Directory the protocol lives in.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
     },
 }
 
@@ -196,6 +284,74 @@ pub enum TableCmd {
         #[arg(long, default_value = ".")]
         dir: PathBuf,
     },
+
+    /// Profile a table or view in the protocol's database with FineType: the type of
+    /// each column, as JSON, or a JSON Schema its rows pass. Copies up to
+    /// --sample-size rows (100 by default) to a temporary CSV outside the protocol and
+    /// runs `finetype profile` over it. For json, `table` and `rows_profiled` are added to
+    /// what FineType gives; json-schema prints FineType's schema with an `$id` naming
+    /// the table. A table with no rows is said so for json, and refused for json-schema.
+    Profile {
+        /// The table or view to profile.
+        table: String,
+
+        /// What to print: each column's type, or a JSON Schema.
+        #[arg(long, value_enum, default_value = "json")]
+        format: ProfileFormatArg,
+
+        /// The most rows to copy and profile.
+        #[arg(long, value_parser = parse_sample_size)]
+        sample_size: Option<usize>,
+
+        /// Directory the protocol lives in.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+
+    /// Validate a table or view in the protocol's database against a JSON Schema
+    /// file inside the protocol, in DuckDB with FineType's extension (set
+    /// FINETYPE_DUCKDB_EXT to it). Prints `valid` and each column's rejects as JSON,
+    /// and exits 1 when any row is rejected.
+    Validate {
+        /// The table or view to validate.
+        table: String,
+
+        /// The JSON Schema file, relative to the protocol directory.
+        #[arg(long)]
+        schema: PathBuf,
+
+        /// Directory the protocol lives in.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+}
+
+/// A sample size of at least one row.
+fn parse_sample_size(text: &str) -> std::result::Result<usize, String> {
+    match text.parse::<usize>() {
+        Ok(0) => Err("a sample of no rows profiles nothing; give at least 1".to_string()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The formats `arc table profile` prints.
+#[derive(Clone, Copy, ValueEnum)]
+pub enum ProfileFormatArg {
+    /// Each column's type, confidence and transform.
+    Json,
+    /// A table-level JSON Schema.
+    #[value(name = "json-schema")]
+    JsonSchema,
+}
+
+impl From<ProfileFormatArg> for crate::inspect::ProfileFormat {
+    fn from(format: ProfileFormatArg) -> Self {
+        match format {
+            ProfileFormatArg::Json => Self::Json,
+            ProfileFormatArg::JsonSchema => Self::JsonSchema,
+        }
+    }
 }
 
 /// The verbs that take SQL as it is typed.
@@ -316,6 +472,39 @@ pub enum OperationCmd {
     },
 }
 
+/// The operator verbs. Operator names come from `arc operation describe` with an
+/// operator's name, or the `operator_describe` tool with no arguments.
+#[derive(Subcommand)]
+pub enum OperatorCmd {
+    /// Record an operator as a new step at the end of a protocol: a step in
+    /// arcform.yaml with the operator's name as `op:` and `--with` as its `with:`.
+    /// The `with:` is checked against the operator's schema first, and a block
+    /// that does not fit is refused naming the field. Runs nothing; `arc run`
+    /// runs the step.
+    Record {
+        /// The operator's name, as a step's `op:` names it (for example `http_fetch`).
+        operator: String,
+
+        /// The new step's name.
+        #[arg(long)]
+        name: String,
+
+        /// The step's `with:` block, as a JSON object.
+        #[arg(long = "with", value_name = "JSON", allow_hyphen_values = true)]
+        with: String,
+
+        /// One line saying what the step does and why, for whoever reads the
+        /// protocol next. Written on the step as `description:`; without it the
+        /// step carries none.
+        #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
+        description: Option<String>,
+
+        /// Protocol directory (where arcform.yaml lives).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+}
+
 #[derive(Subcommand)]
 pub enum RegistryCmd {
     /// List the entries available in the registry, grouped by pillar.
@@ -422,9 +611,14 @@ pub enum HistoryCmd {
         dir: PathBuf,
 
         /// List this file's own history instead of the spec's — a chart file
-        /// beside the spec, say. A relative path is read from `--dir`.
+        /// beside the spec, say. The path is relative to the Protocol folder (`--dir`) and must stay inside it; absolute paths and `..` are refused.
         #[arg(long)]
         file: Option<PathBuf>,
+
+        /// Print the entries as a JSON array — `id`, `kind`, `at`, `bytes` and
+        /// `way` for each, oldest first — and nothing else.
+        #[arg(long)]
+        json: bool,
     },
     /// Print the exact bytes an entry recorded, to stdout.
     Show {
@@ -436,7 +630,7 @@ pub enum HistoryCmd {
         dir: PathBuf,
 
         /// Read the entry from this file's own history instead of the
-        /// spec's. A relative path is read from `--dir`.
+        /// spec's. The path is relative to the Protocol folder (`--dir`) and must stay inside it; absolute paths and `..` are refused.
         #[arg(long)]
         file: Option<PathBuf>,
     },
@@ -452,7 +646,7 @@ pub enum HistoryCmd {
         dir: PathBuf,
 
         /// Restore this file from its own history instead of the spec; no
-        /// other file is written. A relative path is read from `--dir`.
+        /// other file is written. The path is relative to the Protocol folder (`--dir`) and must stay inside it; absolute paths and `..` are refused.
         #[arg(long)]
         file: Option<PathBuf>,
     },
@@ -554,12 +748,19 @@ pub fn create_protocol(
 /// apply, a result the loader rejects, or a checkpoint that cannot land)
 /// surfaces here as the error, before the file is touched.
 pub fn edit_protocol(dir: &Path, op: EditOp, history: &LocalHistory) -> Result<()> {
-    let edit = spec_edit_of(op)?;
-    crate::spec::edit_spec_with_history(dir, &[edit], history)?;
+    edit_protocol_files(dir, op, history)?;
     println!(
         "edited {}",
         dir.join(crate::spec::MANIFEST_FILENAME).display()
     );
+    Ok(())
+}
+
+/// The write [`edit_protocol`] makes, without saying anything: a caller whose
+/// standard output is a protocol channel (`arc mcp`) uses this one.
+pub(crate) fn edit_protocol_files(dir: &Path, op: EditOp, history: &LocalHistory) -> Result<()> {
+    let edit = spec_edit_of(op)?;
+    crate::spec::edit_spec_with_history(dir, &[edit], history)?;
     Ok(())
 }
 
@@ -640,11 +841,26 @@ fn parse_path(raw: &str) -> Result<Vec<PathPart>> {
     Ok(parts)
 }
 
-/// The path `--file` names: a relative path is read from the protocol
-/// directory, the way `--dir` scopes everything else a history verb touches,
-/// and an absolute one is taken as it stands.
-fn history_file(dir: &Path, file: &Path) -> PathBuf {
-    dir.join(file)
+/// The path `--file` names: a relative path read from the protocol directory,
+/// the way `--dir` scopes everything else a history verb touches. A file outside
+/// the Protocol's folder is refused: an absolute path, one with a `..`
+/// component, and one that reaches out through a symbolic link.
+fn history_file(dir: &Path, file: &Path) -> Result<PathBuf> {
+    let outside = || {
+        crate::record::refused(format!(
+            "--file {} is outside the Protocol folder {}; name a file inside it",
+            file.display(),
+            dir.display()
+        ))
+    };
+    if !crate::protocol_files::stays_inside_by_name(file) {
+        return Err(outside());
+    }
+    let path = dir.join(file);
+    if !crate::protocol_files::resolves_inside(dir, &path)? {
+        return Err(outside());
+    }
+    Ok(path)
 }
 
 /// Execute `arc history list`: the recorded states of the spec in `dir`, or
@@ -669,7 +885,7 @@ pub fn history_list(
             "`arc history restore <id>`".to_string(),
         ),
         Some(file) => {
-            let path = history_file(dir, file);
+            let path = history_file(dir, file)?;
             let entries = history.entries_for_file(&path)?;
             let restore = format!("`arc history restore <id> --file {}`", file.display());
             (path, "file", entries, restore)
@@ -707,6 +923,35 @@ pub fn history_list(
     Ok(())
 }
 
+/// The entries `arc history list --json` prints, and `arc mcp`'s `history_list`
+/// returns: a JSON array, oldest first, of `id`, `kind`, `at` (RFC 3339),
+/// `bytes` and `way` (`null` for a state written without one) — the spec's, or
+/// given `file` that one file's.
+pub(crate) fn history_entries_json(
+    dir: &Path,
+    file: Option<&Path>,
+    history: &LocalHistory,
+) -> Result<serde_json::Value> {
+    let entries = match file {
+        None => history.entries(dir)?,
+        Some(file) => history.entries_for_file(&history_file(dir, file)?)?,
+    };
+    Ok(serde_json::Value::Array(
+        entries
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "id": entry.id,
+                    "kind": kind_word(entry.kind),
+                    "at": humantime::format_rfc3339_seconds(entry.at).to_string(),
+                    "bytes": entry.bytes,
+                    "way": entry.way.as_ref().map(HistoryWay::as_str),
+                })
+            })
+            .collect(),
+    ))
+}
+
 /// Execute `arc history show`: the exact recorded bytes and nothing else —
 /// the output is the historical spec, or given `file` that file's historical
 /// text, fit for a diff or a redirect.
@@ -719,7 +964,7 @@ pub fn history_show(
 ) -> Result<()> {
     let text = match file {
         None => history.read(dir, id)?,
-        Some(file) => history.read_for_file(&history_file(dir, file), id)?,
+        Some(file) => history.read_for_file(&history_file(dir, file)?, id)?,
     };
     write!(out, "{text}")?;
     Ok(())
@@ -740,27 +985,51 @@ pub fn history_restore(
     history: &LocalHistory,
     out: &mut impl Write,
 ) -> Result<()> {
+    let restored = history_restore_files(dir, file, id, history)?;
+    writeln!(
+        out,
+        "restored {} to {id} — the replaced state was checkpointed first",
+        restored.target.display()
+    )?;
+    if let Some(e) = restored.load_fault {
+        writeln!(out, "note: the restored state does not load as a spec: {e}")?;
+    }
+    Ok(())
+}
+
+/// What [`history_restore_files`] wrote: the file, and for a spec that no
+/// longer loads, why.
+pub(crate) struct Restored {
+    pub target: PathBuf,
+    pub load_fault: Option<Error>,
+}
+
+/// The write [`history_restore`] makes, without saying anything: a caller whose
+/// standard output is a protocol channel (`arc mcp`) uses this one.
+pub(crate) fn history_restore_files(
+    dir: &Path,
+    file: Option<&Path>,
+    id: &str,
+    history: &LocalHistory,
+) -> Result<Restored> {
     let (target, text) = match file {
         None => (
             dir.join(crate::spec::MANIFEST_FILENAME),
             history.restore(dir, id)?,
         ),
         Some(file) => {
-            let path = history_file(dir, file);
+            let path = history_file(dir, file)?;
             let text = history.restore_for_file(&path, id)?;
             (path, text)
         }
     };
-    writeln!(
-        out,
-        "restored {} to {id} — the replaced state was checkpointed first",
-        target.display()
-    )?;
     let is_spec = target.file_name() == Some(crate::spec::MANIFEST_FILENAME.as_ref());
-    if is_spec && let Err(e) = Manifest::from_yaml_str(&text) {
-        writeln!(out, "note: the restored state does not load as a spec: {e}")?;
-    }
-    Ok(())
+    let load_fault = if is_spec {
+        Manifest::from_yaml_str(&text).err()
+    } else {
+        None
+    };
+    Ok(Restored { target, load_fault })
 }
 
 fn kind_word(kind: HistoryKind) -> &'static str {
@@ -945,10 +1214,92 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Commands::Registry { cmd } => dispatch_registry(cmd, verbose),
         Commands::Operation { cmd } => dispatch_operation(cmd, &mut std::io::stdout()),
+        Commands::Operator { cmd } => dispatch_operator(cmd, &mut std::io::stdout()),
         Commands::Sql { cmd } => dispatch_sql(cmd, &mut std::io::stdout()),
         #[cfg(feature = "mcp")]
         Commands::Mcp => crate::mcp::serve(),
+        Commands::Protocol { cmd } => {
+            dispatch_protocol(cmd, &mut std::io::stdin(), &mut std::io::stdout())
+        }
+        Commands::Panel { cmd } => dispatch_panel(cmd, &mut std::io::stdout()),
+        Commands::Report { cmd } => {
+            dispatch_report(cmd, &mut std::io::stdin(), &mut std::io::stdout())
+        }
         Commands::Table { cmd } => dispatch_table(cmd, &mut std::io::stdout()),
+    }
+}
+
+/// Execute an `arc panel` verb: each finding on its own line, and an error when
+/// there is any.
+fn dispatch_panel(cmd: PanelCmd, out: &mut impl Write) -> Result<()> {
+    match cmd {
+        PanelCmd::Check { dir } => {
+            let mut found = 0;
+            for (panel, findings) in crate::panel_check::check_panels(&dir)? {
+                for finding in &findings {
+                    writeln!(out, "{}: {finding}", panel.display())?;
+                }
+                found += findings.len();
+            }
+            if found == 0 {
+                Ok(())
+            } else {
+                Err(Error::Io(std::io::Error::other(format!(
+                    "{found} thing{} in the panels the protocol does not make",
+                    if found == 1 { "" } else { "s" }
+                ))))
+            }
+        }
+    }
+}
+
+/// Execute an `arc protocol` verb: the file's content is read from `input`
+/// whole, and a refusal is the error with nothing written.
+fn dispatch_protocol(
+    cmd: ProtocolCmd,
+    input: &mut impl std::io::Read,
+    out: &mut impl Write,
+) -> Result<()> {
+    match cmd {
+        ProtocolCmd::WriteFile { path, dir } => {
+            let mut content = String::new();
+            input.read_to_string(&mut content)?;
+            let written = crate::protocol_files::write_protocol_file(
+                &dir,
+                &path,
+                &content,
+                &open_history()?,
+            )?;
+            writeln!(
+                out,
+                "wrote {} as a {} in {}",
+                written.path.display(),
+                written.kind.word(),
+                dir.display()
+            )?;
+            for warning in &written.warnings {
+                writeln!(out, "warning: {warning}")?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Execute an `arc report` verb: the prose is read from `input` whole, and a
+/// refusal is the error with nothing written.
+fn dispatch_report(
+    cmd: ReportCmd,
+    input: &mut impl std::io::Read,
+    out: &mut impl Write,
+) -> Result<()> {
+    match cmd {
+        ReportCmd::Write { run, dir } => {
+            let mut prose = String::new();
+            input.read_to_string(&mut prose)?;
+            let path = crate::report::write_report(&dir, &prose, run.as_deref(), &open_history()?)?;
+            writeln!(out, "wrote {} in {}", path.display(), dir.display())?;
+            Ok(())
+        }
     }
 }
 
@@ -960,6 +1311,28 @@ fn dispatch_table(cmd: TableCmd, out: &mut impl Write) -> Result<()> {
             let described = crate::inspect::describe_table(&dir, &table)?;
             writeln!(out, "{described:#}")?;
             Ok(())
+        }
+        TableCmd::Profile {
+            table,
+            format,
+            sample_size,
+            dir,
+        } => {
+            let profile = crate::inspect::profile_table(&dir, &table, format.into(), sample_size)?;
+            writeln!(out, "{profile:#}")?;
+            Ok(())
+        }
+        TableCmd::Validate { table, schema, dir } => {
+            let report = crate::inspect::validate_table(&dir, &table, &schema)?;
+            writeln!(out, "{report:#}")?;
+            if report["valid"] == true {
+                Ok(())
+            } else {
+                Err(Error::Io(std::io::Error::other(format!(
+                    "{table} has rows that {} rejects",
+                    schema.display()
+                ))))
+            }
         }
     }
 }
@@ -992,6 +1365,53 @@ fn dispatch_operation(cmd: OperationCmd, out: &mut impl Write) -> Result<()> {
             operation_record(&dir, &request, &history, out)
         }
     }
+}
+
+/// Execute an `arc operator` verb. `record` writes a step into a protocol and
+/// runs nothing. A refusal is the error, with nothing written to the protocol or
+/// to `out`.
+fn dispatch_operator(cmd: OperatorCmd, out: &mut impl Write) -> Result<()> {
+    match cmd {
+        OperatorCmd::Record {
+            operator,
+            name,
+            with,
+            description,
+            dir,
+        } => {
+            let with: serde_json::Value = serde_json::from_str(&with).map_err(|e| {
+                Error::Io(std::io::Error::other(format!("`--with` is not JSON: {e}")))
+            })?;
+            let history = open_history()?;
+            let request = crate::record::OperatorRequest {
+                operator: &operator,
+                name: &name,
+                with: &with,
+                description: description.as_deref(),
+            };
+            operator_record(&dir, &request, &history, out)
+        }
+    }
+}
+
+/// Execute `arc operator record`: hand the request to the record path, which
+/// checks `with` against the operator's schema and writes the step. A refusal is
+/// the error, with nothing written to the protocol or to `out`.
+fn operator_record(
+    dir: &Path,
+    request: &crate::record::OperatorRequest,
+    history: &LocalHistory,
+    out: &mut impl Write,
+) -> Result<()> {
+    crate::record::record_operator(dir, request, history)?;
+    writeln!(
+        out,
+        "recorded step {} as {} in {} — `arc run` runs it",
+        request.name,
+        request.operator,
+        dir.join(crate::spec::MANIFEST_FILENAME).display()
+    )?;
+    Ok(())
 }
 
 /// Execute an `arc sql` verb. `recognise` prints what arc reads a statement as,
@@ -1146,7 +1566,16 @@ fn dispatch_history(cmd: HistoryCmd) -> Result<()> {
     let history = open_history()?;
     let mut stdout = std::io::stdout();
     match cmd {
-        HistoryCmd::List { dir, file } => {
+        HistoryCmd::List {
+            dir,
+            file,
+            json: true,
+        } => {
+            let entries = history_entries_json(&dir, file.as_deref(), &history)?;
+            writeln!(stdout, "{entries}")?;
+            Ok(())
+        }
+        HistoryCmd::List { dir, file, .. } => {
             history_list(&dir, file.as_deref(), &history, &mut stdout)
         }
         HistoryCmd::Show { id, dir, file } => {
@@ -1685,7 +2114,7 @@ mod tests {
         let cli = Cli::try_parse_from(["arc", "history", "list"]).unwrap();
         match cli.command {
             Commands::History {
-                cmd: HistoryCmd::List { dir, file },
+                cmd: HistoryCmd::List { dir, file, .. },
             } => {
                 assert_eq!(dir, PathBuf::from("."));
                 assert_eq!(file, None);
@@ -1823,6 +2252,42 @@ mod tests {
         assert!(
             refused.is_err(),
             "the refused line went unreported:\n{written}"
+        );
+    }
+
+    // The human listing without `--file` carries each recorded entry, so a
+    // listing that read no entries would fail here.
+    #[test]
+    fn the_human_listing_without_a_file_names_every_recorded_entry() {
+        let base = tempfile::tempdir().unwrap();
+        let history = LocalHistory::at_root(base.path().join("history"));
+        let dir = base.path().join("notes");
+        create_protocol(&dir, None, None, None, &history).unwrap();
+        edit_protocol(
+            &dir,
+            EditOp::Replace {
+                path: "name".into(),
+                value: "renamed".into(),
+            },
+            &history,
+        )
+        .unwrap();
+        let entries = history.entries(&dir).unwrap();
+        assert!(!entries.is_empty());
+
+        let mut listed = Vec::new();
+        history_list(&dir, None, &history, &mut listed).unwrap();
+        let listed = String::from_utf8(listed).unwrap();
+        for entry in &entries {
+            assert!(
+                listed.contains(&entry.id),
+                "{} missing:\n{listed}",
+                entry.id
+            );
+        }
+        assert!(
+            listed.contains(&format!("({} recorded state(s)", entries.len())),
+            "{listed}"
         );
     }
 

@@ -56,22 +56,24 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const INSTRUCTIONS: &str = "Use arc when you analyse data over DuckDB and the work should be kept as a \
     versioned, re-runnable Protocol rather than a one-off query. arc is a local-first \
     data-pipeline engine, exposed over MCP.\n\n\
-    Tools: infer / profile / taxonomy / validate / generate federate the FineType CLI \
-    (semantic type inference over tabular data) and change nothing; protocol_run runs an arc \
-    Protocol, which can write tables and files and reach the network, and returns its live \
-    Protocol+Run contract; operator_describe emits an operator's `with:` JSON Schema for \
-    authoring; operation_describe lists the SQL operations arc holds and, given an \
-    operation's long name or an operator's name, describes what its step reads, writes and \
-    takes; operation_record records an operation as a new step of a Protocol; sql_recognise \
-    answers what arc reads a SQL statement as: an operation it holds, with the table and the \
-    arguments operation_record takes, or none; sql_record records a SQL statement as a new \
-    step of a Protocol, as the operation it is read as or else as a SQL step, and runs \
-    nothing; protocol_create makes a new Protocol in a directory, as arc create-protocol does, \
-    and refuses one that already has a spec; table_describe reads what a table in a \
-    Protocol's database holds (row count, columns, null counts, sample rows) and changes nothing; \
-    sql_query runs SELECT statements against a Protocol's database, read-only, refuses any \
-    other statement before anything runs, and changes nothing. The SQL table_describe and \
-    sql_query run may read files and URLs it names; the database itself is never written.";
+    Work in this order. Discover: table_describe shows what a table in a Protocol's database \
+    holds, sql_query runs SELECTs against it, table_profile types its columns with FineType, \
+    operation_describe and operator_describe say what arc's operations and operators take, and \
+    sql_recognise says what arc reads a SQL statement as. Record: protocol_create makes a \
+    Protocol, then sql_record, operation_record and operator_record add a step each, an \
+    operator's `with:` checked against its schema; protocol_edit changes one thing in the spec, \
+    and protocol_write_file writes a table schema, a panel or the README. Run: protocol_run \
+    runs the Protocol and returns its Protocol+Run contract. Check: table_validate tests a \
+    table against a schema file with FineType's DuckDB extension, and panel_check reports a \
+    panel that names a table or column the Protocol does not make. Present: report_write writes \
+    report.md from your prose and the newest run's contract.\n\n\
+    Recording runs nothing and a run runs: it can write tables and files and reach the \
+    network. history_list shows the recorded states of the spec, or of one file beside it, and \
+    history_restore rolls it back to one, so a change can be undone. protocol_edit, \
+    protocol_write_file and report_write replace content, but what they replace stays in \
+    history. table_describe, sql_query, table_profile and table_validate never write the \
+    database, though the SQL they run may read files and URLs it names. The FineType tools \
+    (infer, profile, taxonomy, validate, generate) work on files and change nothing.";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool result shapes
@@ -153,6 +155,13 @@ impl Annotations {
         read_only: false,
         open_world: false,
         destructive: false,
+    };
+    /// A tool that changes a file of the Protocol's folder in place, keeping the state
+    /// it replaces in history, and reaches nothing else.
+    pub(crate) const EDITS: Annotations = Annotations {
+        read_only: false,
+        open_world: false,
+        destructive: true,
     };
     /// A tool that runs a Protocol: it replaces tables, runs arbitrary steps and may
     /// reach the network.
@@ -408,7 +417,10 @@ mod tests {
             "operator_describe",
             "operation_describe",
             "sql_recognise",
+            "panel_check",
             "table_describe",
+            "table_profile",
+            "table_validate",
             "sql_query",
         ] {
             assert_eq!(
@@ -435,15 +447,28 @@ mod tests {
             true
         );
         assert_eq!(tool(&list, "infer")["annotations"]["openWorldHint"], false);
-        for name in ["operation_record", "sql_record"] {
+        for name in ["operation_record", "sql_record", "operator_record"] {
             assert_eq!(
                 tool(&list, name)["annotations"]["destructiveHint"],
                 false,
                 "{name}"
             );
         }
+        for name in [
+            "protocol_run",
+            "protocol_edit",
+            "history_restore",
+            "protocol_write_file",
+            "report_write",
+        ] {
+            assert_eq!(
+                tool(&list, name)["annotations"]["destructiveHint"],
+                true,
+                "{name}"
+            );
+        }
         assert_eq!(
-            tool(&list, "protocol_run")["annotations"]["destructiveHint"],
+            tool(&list, "history_list")["annotations"]["readOnlyHint"],
             true
         );
     }
@@ -479,18 +504,27 @@ mod tests {
             "operator_describe",
             "operation_describe",
             "operation_record",
+            "operator_record",
             "sql_recognise",
+            "protocol_edit",
+            "history_list",
+            "history_restore",
             "sql_record",
             "protocol_create",
+            "protocol_write_file",
+            "report_write",
             "table_describe",
+            "table_profile",
+            "table_validate",
             "sql_query",
+            "panel_check",
         ] {
             assert!(
                 names.contains(&expected),
                 "missing tool `{expected}` in {names:?}"
             );
         }
-        assert_eq!(names.len(), 14, "unexpected tool set: {names:?}");
+        assert_eq!(names.len(), 23, "unexpected tool set: {names:?}");
         // Every tool advertises an object input schema.
         for tool in listed["tools"].as_array().unwrap() {
             assert!(tool["description"].is_string());
@@ -566,6 +600,10 @@ mod tests {
             "operator_describe",
             "operation_describe",
             "operation_record",
+            "operator_record",
+            "protocol_edit",
+            "history_list",
+            "history_restore",
             "sql_recognise",
             "sql_record",
         ] {
