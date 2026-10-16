@@ -56,6 +56,13 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const INSTRUCTIONS: &str = "Use arc when you analyse data over DuckDB and the work should be kept as a \
     versioned, re-runnable Protocol rather than a one-off query. arc is a local-first \
     data-pipeline engine, exposed over MCP.\n\n\
+    The analyst workflow has five stages. Scope: agree the question, the data and the size of \
+    the work (scoping-an-analysis). Profile: type the columns and report data-quality findings \
+    (profiling-and-typing-data). Build: record each step into the Protocol \
+    (building-and-checking-a-protocol). Check: run it and test the tables it makes \
+    (building-and-checking-a-protocol). Present: give the answer, how it was derived and what \
+    else turned up (presenting-findings). Start with the using-arcform skill where skills are \
+    available; the rest of this text lists the tools.\n\n\
     Work in this order. Discover: table_describe shows what a table in a Protocol's database \
     holds, sql_query runs SELECTs against it, table_profile types its columns with FineType, \
     operation_describe and operator_describe say what arc's operations and operators take, and \
@@ -482,6 +489,20 @@ mod tests {
                 "INSTRUCTIONS omits {}",
                 t.name
             );
+        }
+    }
+
+    #[test]
+    fn instructions_outline_the_workflow() {
+        for word in [
+            "Scope",
+            "Profile",
+            "Build",
+            "Check",
+            "Present",
+            "using-arcform",
+        ] {
+            assert!(INSTRUCTIONS.contains(word), "INSTRUCTIONS omits {word}");
         }
     }
 
