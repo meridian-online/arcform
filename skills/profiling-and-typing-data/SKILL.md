@@ -41,13 +41,13 @@ Say before the first run that a fetch step reaches the network. Read the run rec
 | Step | CLI | MCP |
 | --- | --- | --- |
 | Type each column of a table in the Protocol | `arc table profile <table> --sample-size 500 --dir <dir>` | `table_profile` with `table`, `sample_size`, `dir` |
-| Type each column of a local CSV (`file` absolute over MCP) | `finetype profile -f <file.csv> -o json` | `profile` with `file`, `format` |
+| Type each column of a local CSV (`file` absolute over MCP) | `finetype profile -f <file.csv> --sample-size <n> -o json` | `profile` with `file`, `sample_size`, `format` |
 
 `table_profile` copies the table's first rows (100 unless you give `sample_size`) and types those. On a large or sorted table, raise the sample size; validation (step 4) is what reads every row. Prefer the table verbs once the data is in the Protocol: they read any table, not only a CSV, and they see the data as the Protocol loaded it.
 
 ## 3. Save the schema
 
-A table-level JSON Schema is the data's contract: what each column must look like for the analysis to be sound. Make it with the `json-schema` format, from the same sample size the profile used, and write it into the Protocol at `schemas/<table>.json`, where history versions it. A schema inferred from fewer rows than you profiled makes validation report its own gaps as problems in the data.
+A table-level JSON Schema is the data's contract: what each column must look like for the analysis to be sound. Make it with the `json-schema` format, from the same sample size the profile used (when the profile used the default, leave the sample size out here too), and write it into the Protocol at `schemas/<table>.json`, where history versions it. A schema inferred from fewer rows than you profiled makes validation report its own gaps as problems in the data.
 
 | Step | CLI | MCP |
 | --- | --- | --- |
