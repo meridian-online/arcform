@@ -8,13 +8,15 @@ It exercises most of ArcForm in one realistic workflow:
 
 | Capability | Where |
 |---|---|
-| Command steps | the six `fetch_*` steps (`curl`) |
+| Operator steps | the six `fetch_*` steps (`http_fetch`) |
 | Preconditions (`modified_after`) | each fetch is cached 24h |
+| Step descriptions | every step says what it does and why |
 | Execution resilience (retry + backoff) | `defaults.retry` |
 | Runtime parameters | `trend_threshold`, read in `trending.sql` via `getenv()` |
 | SQL steps + dependencies | `load` → `trending` → `rank` |
-| Asset lineage | `produces` / `depends_on` wiring |
+| Asset lineage | each fetch writes its file; `load` declares `depends_on` on all six |
 | Export | `rank` writes `data/ranking.parquet` |
+| Command step | `show_top20` prints the top 20 with the `duckdb` CLI |
 
 ## Run it
 
@@ -66,7 +68,7 @@ their real `produces`/`depends_on` wiring — not as one opaque step.
 ## Requirements
 
 - The `duckdb` CLI on your `PATH` (the SQL engine; ArcForm delegates to it).
-- `curl` for the fetch steps.
+- Network access for the fetch steps, which download with arc's own `http_fetch` operator (no `curl` needed).
 
 > **Building `arc` on macOS:** if the build fails with `ld: library 'duckdb' not
 > found`, point the linker at Homebrew's copy:

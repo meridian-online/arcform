@@ -89,8 +89,13 @@ fn the_exported_schema_describes_the_spec_it_loaded() {
     assert!(trending.command.is_none());
 
     let fetch = &manifest.steps[0];
-    assert!(fetch.command.is_some());
-    assert_eq!(fetch.produces, ["cask_json"]);
+    assert!(fetch.command.is_none());
+    assert_eq!(fetch.op.as_deref(), Some("http_fetch@1"));
+    let with = fetch.with.as_ref().expect("an op step carries with:");
+    assert_eq!(
+        with.get("out").and_then(|v| v.as_str()),
+        Some("data/cask/cask.json")
+    );
 
     // Preconditions come back as the typed enum, not an opaque blob.
     match fetch
