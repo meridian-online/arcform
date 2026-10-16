@@ -448,6 +448,27 @@ fn what_a_history_does_not_hold_is_refused() {
     assert_eq!(fs::read(&fx.a).unwrap(), a_before);
 }
 
+// The human listing refuses a file outside the Protocol, by relative and by
+// absolute path, naming the Protocol folder rather than failing some other way.
+#[test]
+fn the_human_listing_refuses_a_file_outside_the_protocol() {
+    let fx = setup();
+    let outside = fx.root.join("x.yaml");
+    fs::write(&outside, "kept\n").unwrap();
+    let absolute = outside.display().to_string();
+    for file in ["../x.yaml", absolute.as_str()] {
+        let out = fx.arc_in(&fx.dir, &["history", "list", "--file", file]);
+        assert_ne!(out.status.code(), Some(0), "{file} was not refused");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("outside the Protocol folder"),
+            "{file}: {stderr}"
+        );
+        assert!(!stderr.contains("invalid manifest"), "{file}: {stderr}");
+        assert!(out.stdout.is_empty(), "{file} printed a listing");
+    }
+}
+
 // A show whose text cannot be written fails rather than exiting as though it
 // printed: the pipe's reader is closed before arc writes a byte.
 #[test]
