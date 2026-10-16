@@ -35,3 +35,25 @@ arc run --bogus-flag
 arc table describe nosuchtable
 arc run
 ```
+
+```sh
+FOO=bar arc nosuchverb
+```
+
+Inline: `arc nosuchverb2`.
+
+```json tool=sql_query
+{"bogus_key": 1}
+```
+
+```json
+{"params": {"name": "params_wrapped_tool", "arguments": {}}, "note": "PARAMS-WRAPPED"}
+```
+
+```json
+{"name": "table_describe", "arguments": ["ARRAY-ARGS"]}
+```
+
+```json tool=sql_query
+[1, 2]
+```

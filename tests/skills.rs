@@ -351,6 +351,13 @@ fn tool_refs(doc: &Doc, errors: &mut Vec<String>) -> Vec<ToolRef> {
             }
         };
         let (tool, args) = if let Some(tool) = tagged {
+            if !value.is_object() {
+                errors.push(format!(
+                    "{}: the body of a `json tool={tool}` block is not a JSON object",
+                    doc.at(b.line)
+                ));
+                continue;
+            }
             (tool, value.as_object().cloned())
         } else {
             let envelope = value
@@ -654,7 +661,7 @@ fn check_cli_form(form: &CliForm, helps: &mut Helps, errors: &mut Vec<String>) {
     }
     let mut scope: Vec<String> = Vec::new();
     if let Some(verb) = form.tokens.get(i) {
-        if !Regex::new(r"^[a-z][a-z-]*$").unwrap().is_match(verb) {
+        if !Regex::new(r"^[a-z][a-z0-9-]*$").unwrap().is_match(verb) {
             return; // a placeholder such as `<verb>` or `...`
         }
         let (ok, help) = helps.get(&[verb]).clone();
@@ -669,7 +676,7 @@ fn check_cli_form(form: &CliForm, helps: &mut Helps, errors: &mut Vec<String>) {
         {
             if subs.contains(next) {
                 scope.push(next.clone());
-            } else if Regex::new(r"^[a-z][a-z-]*$").unwrap().is_match(next) {
+            } else if Regex::new(r"^[a-z][a-z0-9-]*$").unwrap().is_match(next) {
                 errors.push(format!(
                     "{}: `arc {verb} {next}` is not a subcommand of `arc {verb}` (it has: {})",
                     form.at,
@@ -833,17 +840,21 @@ fn frontmatter_problems(text: &str, folder: &str, version: &str) -> Vec<(usize, 
     problems
 }
 
-fn check_frontmatter(skills: &Path) -> Vec<String> {
+fn check_frontmatter(skills: &Path, version: &str) -> Vec<String> {
     let mut errors = Vec::new();
     for dir in skill_dirs(skills) {
         let folder = dir.file_name().unwrap().to_string_lossy().into_owned();
         let file = dir.join("SKILL.md");
-        let shown = format!("skills/{folder}/SKILL.md");
+        let shown = file
+            .strip_prefix(root())
+            .unwrap_or(&file)
+            .display()
+            .to_string();
         let Ok(text) = std::fs::read_to_string(&file) else {
             errors.push(format!("{shown}:1: the skill has no SKILL.md"));
             continue;
         };
-        for (n, msg) in frontmatter_problems(&text, &folder, env!("CARGO_PKG_VERSION")) {
+        for (n, msg) in frontmatter_problems(&text, &folder, version) {
             errors.push(format!("{shown}:{n}: {msg}"));
         }
     }
@@ -852,7 +863,7 @@ fn check_frontmatter(skills: &Path) -> Vec<String> {
 
 #[test]
 fn frontmatter_is_loadable() {
-    let errors = check_frontmatter(&real_skills());
+    let errors = check_frontmatter(&real_skills(), env!("CARGO_PKG_VERSION"));
     assert!(errors.is_empty(), "\n{}", errors.join("\n"));
 }
 
@@ -1099,6 +1110,7 @@ fn the_good_fixture_skill_passes_every_check() {
         ("cli", check_cli(&docs)),
         ("tables", check_tables(&docs)),
         ("examples", check_examples(&docs)),
+        ("frontmatter", check_frontmatter(&fixture_skills(), "0.0.0")),
     ] {
         assert!(errors.is_empty(), "{name}:\n{}", errors.join("\n"));
     }
@@ -1125,7 +1137,39 @@ fn the_bad_fixture_skill_fails_each_check_at_its_line() {
         "json block does not parse",
     );
 
+    assert_error_on(
+        &tools,
+        doc,
+        fence("PARAMS-WRAPPED"),
+        "`params_wrapped_tool` is not a tool",
+    );
+    assert_error_on(
+        &tools,
+        doc,
+        fence("\"bogus_key\""),
+        "`bogus_key` is not an argument of `sql_query`",
+    );
+    assert_error_on(
+        &tools,
+        doc,
+        fence("ARRAY-ARGS"),
+        "`arguments` of the `table_describe` call is not a JSON object",
+    );
+    assert_error_on(&tools, doc, fence("[1, 2]"), "is not a JSON object");
+
     let cli = check_cli(&docs);
+    assert_error_at(
+        &cli,
+        doc,
+        "FOO=bar arc nosuchverb",
+        "`arc nosuchverb` is not a verb",
+    );
+    assert_error_at(
+        &cli,
+        doc,
+        "`arc nosuchverb2`",
+        "`arc nosuchverb2` is not a verb",
+    );
     assert_error_at(&cli, doc, "arc nosuchverb", "not a verb arc has");
     assert_error_at(&cli, doc, "arc table nosuchsub", "not a subcommand");
     assert_error_at(&cli, doc, "--bogus-flag", "`--bogus-flag` is not a flag");
