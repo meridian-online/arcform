@@ -1337,8 +1337,8 @@ fn dispatch_skills(cmd: SkillsCmd, out: &mut impl Write) -> Result<()> {
             }
             if !outcome.failed.is_empty() {
                 problems.push(
-                    "these skills folders could not be written; each skill folder in them is \
-                     still the old one or the new one, whole:"
+                    "these skills folders could not be written (each line says what went wrong, \
+                     and where an earlier install was left when it could not be put back):"
                         .to_string(),
                 );
             }
