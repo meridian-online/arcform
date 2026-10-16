@@ -114,3 +114,80 @@ pub fn mcp_session_env(
         .map(str::to_string)
         .collect()
 }
+
+/// The `finetype` binary arc runs: `$FINETYPE_BIN` if set, else `finetype` on PATH.
+#[allow(dead_code)]
+pub fn finetype_bin() -> String {
+    std::env::var("FINETYPE_BIN").unwrap_or_else(|_| "finetype".into())
+}
+
+/// arc's minimum finetype version, read from `MIN_VERSION` in `src/finetype_cli.rs`.
+#[allow(dead_code)]
+pub fn finetype_floor() -> semver::Version {
+    let src =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/finetype_cli.rs"))
+            .unwrap();
+    let c = regex::Regex::new(r"MIN_VERSION: \(u64, u64, u64\) = \((\d+), (\d+), (\d+)\)")
+        .unwrap()
+        .captures(&src)
+        .expect("MIN_VERSION in src/finetype_cli.rs");
+    semver::Version::new(
+        c[1].parse().unwrap(),
+        c[2].parse().unwrap(),
+        c[3].parse().unwrap(),
+    )
+}
+
+/// Why the finetype arc would run cannot be used, or None if it is at the floor.
+#[allow(dead_code)]
+pub fn finetype_unavailable() -> Option<String> {
+    let bin = finetype_bin();
+    let out = match Command::new(&bin).arg("--version").output() {
+        Ok(o) => o,
+        Err(_) => return Some(format!("`{bin}` is not installed")),
+    };
+    // clap prints the version to stdout; fall back to stderr as `detect_version` does.
+    let text = if out.stdout.is_empty() {
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    } else {
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let token = text
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().next_back());
+    let Some(found) = token.and_then(|t| semver::Version::parse(t.trim_start_matches('v')).ok())
+    else {
+        return Some(format!(
+            "could not parse a finetype version from `{}`",
+            text.trim()
+        ));
+    };
+    let floor = finetype_floor();
+    if found >= floor {
+        None
+    } else {
+        Some(format!(
+            "`{bin}` is {found}, older than arc's floor {floor}"
+        ))
+    }
+}
+
+/// Whether the finetype arc would run is at its floor, printing why when it is not.
+///
+/// A test that needs the real CLI returns early when this is false. With
+/// `ARCFORM_REQUIRE_FINETYPE_CLI` set, as CI sets it after installing a pinned
+/// release, a missing or too-old binary panics instead, so those tests cannot pass
+/// by skipping.
+#[allow(dead_code)]
+pub fn finetype_cli_present() -> bool {
+    let Some(why) = finetype_unavailable() else {
+        return true;
+    };
+    assert!(
+        std::env::var_os("ARCFORM_REQUIRE_FINETYPE_CLI").is_none(),
+        "ARCFORM_REQUIRE_FINETYPE_CLI is set, so this run promised the finetype CLI, but {why}"
+    );
+    eprintln!("skipping: {why}");
+    false
+}

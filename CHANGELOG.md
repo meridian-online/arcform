@@ -35,6 +35,7 @@ Rationale for each change is recorded in the project's design notes and commit h
 ### Fixed
 
 - **With `ARC_SQL_READER=duckdb`, a step holding a statement DuckDB warns about when parsing it, such as `PRAGMA threads = 4`, is read again.** Recent DuckDB 2.0 previews print the warning into the parse arc asks for, and the step was refused as unreadable; arc now asks with DuckDB's logging off.
+- **The `arc mcp` tools `taxonomy` and `generate` no longer offer a `priority` argument.** finetype 0.6.62 removed the `--priority` flag both passed it to, so a call that set it failed; finetype has no replacement for it. CI now installs finetype 0.6.62 and calls the five finetype tools through `arc mcp` with every argument their schemas advertise, so an argument finetype stops accepting fails arc's CI. The tests that need the finetype CLI, which CI used to skip, now run there, and fail when it is missing.
 
 ## [0.2.0] - 2026-10-15
 

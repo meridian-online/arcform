@@ -12,7 +12,8 @@
 //!
 //! The profile tests need `finetype` at its version floor on PATH, and the
 //! validate tests need `FINETYPE_DUCKDB_EXT`; each skips with a printed reason
-//! when its tool is not there.
+//! when its tool is not there, unless `ARCFORM_REQUIRE_FINETYPE_CLI` or
+//! `ARCFORM_REQUIRE_FINETYPE_EXT` promised it, when it fails instead.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -22,28 +23,8 @@ use serde_json::Value;
 #[cfg(feature = "mcp")]
 use serde_json::json;
 
-/// Whether `finetype` at arc's floor is on PATH; prints why when it is not.
-fn finetype_present() -> bool {
-    let out = match Command::new("finetype").arg("--version").output() {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("skipping: finetype is not on PATH ({e})");
-            return false;
-        }
-    };
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    let version = text
-        .split_whitespace()
-        .next_back()
-        .and_then(|v| semver::Version::parse(v).ok());
-    match version {
-        Some(v) if v >= semver::Version::new(0, 6, 54) => true,
-        _ => {
-            eprintln!("skipping: finetype is older than 0.6.54 ({})", text.trim());
-            false
-        }
-    }
-}
+#[allow(dead_code)]
+mod common;
 
 /// Whether the DuckDB extension is configured; prints why when it is not.
 fn extension_present() -> bool {
@@ -195,7 +176,7 @@ fn types(profile: &Value) -> Vec<(String, String)> {
 
 #[test]
 fn profiles_table_columns() {
-    if !finetype_present() {
+    if !common::finetype_cli_present() {
         return;
     }
     let protocol = Protocol::new(CONTACTS);
@@ -212,7 +193,7 @@ fn profiles_table_columns() {
     ))
     .unwrap();
     drop(conn);
-    let direct = Command::new("finetype")
+    let direct = Command::new(common::finetype_bin())
         .args(["profile", "-o", "json", "-f"])
         .arg(&csv)
         .output()
@@ -230,7 +211,7 @@ fn profiles_table_columns() {
 
 #[test]
 fn json_schema_format_saves_through_write_file() {
-    if !finetype_present() {
+    if !common::finetype_cli_present() {
         return;
     }
     let protocol = Protocol::new(CONTACTS);
@@ -252,7 +233,7 @@ fn json_schema_format_saves_through_write_file() {
     ))
     .unwrap();
     drop(conn);
-    let checked = Command::new("finetype")
+    let checked = Command::new(common::finetype_bin())
         .arg("validate")
         .arg(&csv)
         .arg(protocol.dir.join("schemas/contacts.json"))
@@ -305,7 +286,7 @@ fn refuses_missing_table() {
 #[test]
 #[cfg(feature = "mcp")]
 fn mcp_table_profile_matches_the_command() {
-    if !finetype_present() {
+    if !common::finetype_cli_present() {
         return;
     }
     let protocol = Protocol::new(CONTACTS);
@@ -322,7 +303,7 @@ fn mcp_table_profile_matches_the_command() {
 
 #[test]
 fn validate_table_passes_its_own_schema() {
-    if !finetype_present() || !extension_present() {
+    if !common::finetype_cli_present() || !extension_present() {
         return;
     }
     let protocol = Protocol::new(CONTACTS);
