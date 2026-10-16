@@ -81,6 +81,9 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde_json::{Value, json};
 
+#[allow(dead_code)]
+mod common;
+
 const ARC: &str = env!("CARGO_BIN_EXE_arc");
 
 fn root() -> PathBuf {
@@ -1034,55 +1037,6 @@ fn frontmatter_refuses_bad_names_and_angle_brackets() {
 // Examples
 // ---------------------------------------------------------------------------------------------
 
-/// The finetype floor, read from `src/finetype_cli.rs` so the two cannot drift.
-fn finetype_floor() -> (u64, u64, u64) {
-    let src = std::fs::read_to_string(root().join("src/finetype_cli.rs")).unwrap();
-    let c = Regex::new(r"MIN_VERSION: \(u64, u64, u64\) = \((\d+), (\d+), (\d+)\)")
-        .unwrap()
-        .captures(&src)
-        .expect("MIN_VERSION in src/finetype_cli.rs");
-    (
-        c[1].parse().unwrap(),
-        c[2].parse().unwrap(),
-        c[3].parse().unwrap(),
-    )
-}
-
-/// Why finetype cannot be used, or None if a recent enough one is on hand.
-fn finetype_unavailable() -> Option<String> {
-    let bin = std::env::var("FINETYPE_BIN").unwrap_or_else(|_| "finetype".into());
-    let out = match Command::new(&bin).arg("--version").output() {
-        Ok(o) => o,
-        Err(_) => return Some(format!("`{bin}` is not installed")),
-    };
-    // clap prints the version to stdout; fall back to stderr as `detect_version` does.
-    let text = if out.stdout.is_empty() {
-        String::from_utf8_lossy(&out.stderr).into_owned()
-    } else {
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    };
-    let token = text
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().next_back());
-    let Some(found) = token.and_then(|t| semver::Version::parse(t.trim_start_matches('v')).ok())
-    else {
-        return Some(format!(
-            "could not parse a finetype version from `{}`",
-            text.trim()
-        ));
-    };
-    let floor = finetype_floor();
-    if found >= semver::Version::new(floor.0, floor.1, floor.2) {
-        None
-    } else {
-        Some(format!(
-            "finetype {found} is older than the floor {}.{}.{}",
-            floor.0, floor.1, floor.2
-        ))
-    }
-}
-
 fn copy_dir(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for e in std::fs::read_dir(from).unwrap() {
@@ -1169,7 +1123,8 @@ fn check_examples(docs: &[Doc]) -> Vec<String> {
                 );
                 continue;
             }
-            if needs_finetype && let Some(why) = finetype.get_or_init(finetype_unavailable) {
+            if needs_finetype && let Some(why) = finetype.get_or_init(common::finetype_unavailable)
+            {
                 assert!(
                     std::env::var_os("ARCFORM_REQUIRE_FINETYPE_CLI").is_none(),
                     "ARCFORM_REQUIRE_FINETYPE_CLI is set, so this run promised the finetype \

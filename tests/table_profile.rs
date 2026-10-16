@@ -193,7 +193,7 @@ fn profiles_table_columns() {
     ))
     .unwrap();
     drop(conn);
-    let direct = Command::new("finetype")
+    let direct = Command::new(common::finetype_bin())
         .args(["profile", "-o", "json", "-f"])
         .arg(&csv)
         .output()
@@ -233,7 +233,7 @@ fn json_schema_format_saves_through_write_file() {
     ))
     .unwrap();
     drop(conn);
-    let checked = Command::new("finetype")
+    let checked = Command::new(common::finetype_bin())
         .arg("validate")
         .arg(&csv)
         .arg(protocol.dir.join("schemas/contacts.json"))

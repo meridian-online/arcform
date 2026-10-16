@@ -111,7 +111,7 @@ fn every_advertised_argument_reaches_the_real_finetype() {
     let csv = dir.path().join("contacts.csv");
     std::fs::write(&csv, CONTACTS).unwrap();
     let schema = dir.path().join("contacts.schema.json");
-    let profiled = Command::new("finetype")
+    let profiled = Command::new(common::finetype_bin())
         .args(["profile", "--output", "json-schema", "--file"])
         .arg(&csv)
         .output()
