@@ -85,7 +85,7 @@ DUCKDB_LIB_DIR=/opt/homebrew/lib cargo build --features mcp
 ARC=target/debug/arc eval/analyst-workflow/preflight.sh
 ```
 
-Once it passes, run the tasks by `eval/analyst-workflow/README.md` and fill a copy of `eval/analyst-workflow/score.md` outside the repository: one row per task and agent, the failure clusters and the pass bar's verdict. Its results go in the pull request's description (below), not in a commit. When a cluster needs a skill edit, make it on this branch and add it to `CHANGELOG.md`; then rebuild arc with the MCP feature (`skills/` is embedded in the binary, so the old binary would reinstall the old skills), run the preflight again, reinstall the skills in each agent (`arc skills install`; for the desktop client, zip and upload each skill folder again), and only then rerun the failing tasks.
+Once it passes, run the tasks by `eval/analyst-workflow/README.md` and fill a copy of `eval/analyst-workflow/score.md` outside the repository: one row per task and agent, the failure clusters and the pass bar's verdict. Its results go in the pull request's description (below), not in a commit. When a cluster needs a skill edit, make it on this branch and add it to `CHANGELOG.md`; then rebuild arc with the MCP feature (`skills/` is embedded in the binary, so the old binary would reinstall the old skills), run the preflight again, reinstall the skills in each agent with the rebuilt binary the second preflight passed (`target/debug/arc skills install ...`, not an `arc` found on `PATH`, which may be older; copy it over `run/bin/arc` again for a headless rerun; for the desktop client, zip and upload each skill folder again), and only then rerun the failing tasks.
 
 Then commit these files by name and open the pull request:
 
