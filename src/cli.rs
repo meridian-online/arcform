@@ -230,7 +230,8 @@ pub enum SkillsCmd {
     /// Code, Codex, Cursor, Gemini CLI, and the shared `~/.agents/skills`), or into
     /// the agents and folders named. Prints each folder written. A folder of the
     /// same name that arc did not write (it has no `.arc-skill` marker) is refused,
-    /// and nothing is written; one arc wrote is replaced whole.
+    /// and nothing is written into that agent's skills folder (other agents still
+    /// install, and the command exits 1); one arc wrote is replaced whole.
     Install {
         /// Install for this agent, whether or not it is found (repeatable).
         #[arg(long = "agent", value_name = "NAME",
@@ -1294,8 +1295,8 @@ fn dispatch_skills(cmd: SkillsCmd, out: &mut impl Write) -> Result<()> {
                     skills_dir: dir,
                 });
             }
-            let installed = crate::skills::install(&targets)?;
-            for i in &installed {
+            let outcome = crate::skills::install(&targets);
+            for i in &outcome.installed {
                 match &i.replaced {
                     Some(v) => writeln!(
                         out,
@@ -1306,14 +1307,43 @@ fn dispatch_skills(cmd: SkillsCmd, out: &mut impl Write) -> Result<()> {
                     None => writeln!(out, "{:<12} {}", i.agent, i.path.display())?,
                 }
             }
+            let n = outcome.installed.len();
             writeln!(
                 out,
-                "Installed {} skill folder{} at arc {}.",
-                installed.len(),
-                if installed.len() == 1 { "" } else { "s" },
+                "Installed {n} skill folder{} at arc {}.",
+                if n == 1 { "" } else { "s" },
                 env!("CARGO_PKG_VERSION")
             )?;
-            Ok(())
+            if outcome.refused.is_empty() && outcome.failed.is_empty() {
+                return Ok(());
+            }
+            let mut problems = Vec::new();
+            if !outcome.refused.is_empty() {
+                problems.push(
+                    "arc does not overwrite a folder it did not write, so nothing was installed \
+                     into the skills folder of each of these:"
+                        .to_string(),
+                );
+                for r in &outcome.refused {
+                    problems.push(format!(
+                        "  {:<12} {}: {}",
+                        r.agent,
+                        r.path.display(),
+                        r.reason
+                    ));
+                }
+            }
+            for (target, e) in &outcome.failed {
+                problems.push(format!(
+                    "  {:<12} {}: failed: {e}",
+                    target.agent,
+                    target.skills_dir.display()
+                ));
+            }
+            Err(Error::Io(std::io::Error::other(format!(
+                "skills: {}",
+                problems.join("\n")
+            ))))
         }
     }
 }

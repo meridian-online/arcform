@@ -381,8 +381,8 @@ jobs:
 
       # The list is printed for the log, then held to the `include` rule: the source,
       # the embedded operator scripts, build.rs and the skills it embeds, and the
-      # top-level documents, and nothing else —
-      # no fixture, no example database, no vendored fork.
+      # top-level documents, and nothing else — no fixture, no example database, no
+      # vendored fork.
       - name: arcform's package contents
         run: |
           set -euo pipefail

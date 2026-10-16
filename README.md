@@ -130,7 +130,7 @@ The skills ship inside `arc`, at its version. Install them into each agent found
 arc skills install
 ```
 
-It finds Claude Code (`~/.claude/skills`), Codex (`~/.agents/skills`), Cursor (`~/.cursor/skills`), Gemini CLI (`~/.gemini/skills`) and the shared `~/.agents/skills` by their folders under your home directory, and prints each skill folder it writes. When it finds none it says where it would install and exits 1: name an agent with `--agent claude-code` (repeatable), or a folder with `--target <dir>`. Each folder it writes holds a `.arc-skill` file recording the arc version, and only such a folder is replaced, whole, when you upgrade arc and run the command again; a skill of the same name you wrote yourself is refused and nothing is written. `arc skills list` prints the skills this arc carries and the version each was written for.
+It finds Claude Code (`~/.claude/skills`), Codex (`~/.agents/skills`), Cursor (`~/.cursor/skills`), Gemini CLI (`~/.gemini/skills`) and the shared `~/.agents/skills` by their folders under your home directory, and prints each skill folder it writes. When it finds none it says where it would install and exits 1: name an agent with `--agent claude-code` (repeatable), or a folder with `--target <dir>`. Each folder it writes holds a `.arc-skill` file recording the arc version, and only such a folder is replaced, whole, when you upgrade arc and run the command again; a skill of the same name you wrote yourself is refused, nothing is written into that agent's skills folder, and the command exits 1 after installing for the other agents. `arc skills list` prints the skills this arc carries and the version each was written for.
 
 ---
 

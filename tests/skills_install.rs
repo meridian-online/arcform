@@ -137,11 +137,83 @@ fn refuses_user_folder_of_same_name() {
         "my own skill\n",
         "the user's skill is untouched"
     );
-    // Nothing is written when any folder is refused: a partial set of skills that name
-    // each other is worse than none.
+    // Nothing is written into a skills folder when any folder in it is refused: a partial
+    // set of skills that name each other is worse than none.
     for name in skill_names().iter().filter(|n| *n != "using-arcform") {
         assert!(!home.path().join(".claude/skills").join(name).exists());
     }
+}
+
+#[test]
+fn a_refused_folder_blocks_only_its_own_agent() {
+    let home = tempfile::tempdir().unwrap();
+    let mine = home.path().join(".claude/skills/using-arcform");
+    fs::create_dir_all(&mine).unwrap();
+    fs::write(mine.join("SKILL.md"), "my own skill\n").unwrap();
+    fs::create_dir(home.path().join(".gemini")).unwrap();
+
+    let out = arc(home.path(), &["skills", "install"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a refusal is reported as a failure"
+    );
+    let stdout = text(&out.stdout);
+    let stderr = text(&out.stderr);
+    assert!(stderr.contains(&mine.display().to_string()), "{stderr}");
+    for name in skill_names() {
+        let gemini = home.path().join(".gemini/skills").join(&name);
+        assert!(
+            gemini.join("SKILL.md").is_file(),
+            "another agent still installs"
+        );
+        assert!(stdout.contains(&gemini.display().to_string()), "{stdout}");
+        if name != "using-arcform" {
+            assert!(!home.path().join(".claude/skills").join(&name).exists());
+        }
+    }
+}
+
+#[test]
+fn a_marker_that_is_not_a_file_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+    let folder = home.path().join(".claude/skills/using-arcform");
+    fs::create_dir_all(folder.join(".arc-skill")).unwrap();
+
+    let out = arc(home.path(), &["skills", "install"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains(&folder.display().to_string()) && stderr.contains("not a file"),
+        "{stderr}"
+    );
+    assert!(
+        folder.join(".arc-skill").is_dir(),
+        "the folder is untouched"
+    );
+}
+
+#[test]
+fn a_target_that_is_an_agent_folder_installs_once() {
+    let home = tempfile::tempdir().unwrap();
+    let skills = home.path().join(".claude/skills");
+
+    let out = arc(
+        home.path(),
+        &[
+            "skills",
+            "install",
+            "--agent",
+            "claude-code",
+            "--target",
+            skills.to_str().unwrap(),
+        ],
+    );
+    assert_ok(&out);
+    let stdout = text(&out.stdout);
+    let folder = skills.join("using-arcform").display().to_string();
+    assert_eq!(stdout.matches(&folder).count(), 1, "{stdout}");
+    assert!(!stdout.contains("replaced"), "{stdout}");
 }
 
 #[test]

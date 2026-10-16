@@ -84,10 +84,26 @@ pub struct AgentTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installed {
     pub agent: &'static str,
-    pub skill: String,
     pub path: PathBuf,
     /// The arc version of the install this one replaced, when it replaced one.
     pub replaced: Option<String>,
+}
+
+/// A skill folder [`install`] would not overwrite, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    pub agent: &'static str,
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+/// What [`install`] did: the folders written, the folders refused (each of which kept its
+/// whole target from being written), and the targets that failed part way, with the error.
+#[derive(Debug, Default)]
+pub struct Outcome {
+    pub installed: Vec<Installed>,
+    pub refused: Vec<Refused>,
+    pub failed: Vec<(AgentTarget, Error)>,
 }
 
 /// The agents installed under `home`: each whose config folder exists. Two agents that read
@@ -197,46 +213,94 @@ enum Plan {
     Replace(String),
 }
 
-/// Install every embedded skill into each target's skills folder.
+/// `err`, with the path it happened at.
+fn at(path: &Path, err: io::Error) -> Error {
+    Error::Io(io::Error::new(
+        err.kind(),
+        format!("{}: {err}", path.display()),
+    ))
+}
+
+/// Install every embedded skill into each target's skills folder. Targets naming the same
+/// folder are installed once, under the first one's agent.
 ///
-/// A folder holding [`MARKER`] is replaced wholesale, so a file a newer version dropped is
-/// gone; an absent folder is written; any other folder of the same name is refused. Every
-/// folder is checked before any is written, and one refusal writes nothing, since a partial
-/// set of skills that name each other is worse than none.
-pub fn install(targets: &[AgentTarget]) -> Result<Vec<Installed>> {
+/// A folder holding [`MARKER`] is replaced whole, so a file a newer version dropped is gone;
+/// an absent folder is written; any other folder of the same name is refused. Each target is
+/// all or nothing as far as refusal goes: every folder is checked before any is written, and
+/// one refusal writes nothing into that target, since a partial set of skills that name each
+/// other is worse than none. Other targets still install.
+///
+/// For a target that passes, every skill is first written to a staging folder beside its
+/// destination, so an error while staging leaves the target as it was. Then each is swapped
+/// in: the old folder is renamed aside, the new one renamed into place, and the old one
+/// deleted; if the second rename fails the old folder is put back. An error while swapping
+/// therefore leaves each skill folder either the old one or the new one, whole, with the
+/// skills before it new and those after it old; the ones already new are in
+/// [`Outcome::installed`].
+pub fn install(targets: &[AgentTarget]) -> Outcome {
     let skills = skills();
+    let mut outcome = Outcome::default();
+    for target in dedupe(targets.iter().cloned()) {
+        if let Err(e) = install_target(&target, &skills, &mut outcome) {
+            outcome.failed.push((target, e));
+        }
+    }
+    outcome
+}
+
+type Skills = BTreeMap<&'static str, Vec<(&'static str, &'static [u8])>>;
+
+fn install_target(target: &AgentTarget, skills: &Skills, outcome: &mut Outcome) -> Result<()> {
     let mut plans = Vec::new();
     let mut refused = Vec::new();
-    for target in targets {
-        for name in skills.keys() {
-            let dest = target.skills_dir.join(name);
-            match plan(&dest)? {
-                Ok(p) => plans.push((target, *name, dest, p)),
-                Err(reason) => refused.push(format!("  {}: {reason}", dest.display())),
-            }
+    for name in skills.keys() {
+        let dest = target.skills_dir.join(name);
+        match plan(&dest)? {
+            Ok(p) => plans.push((*name, dest, p)),
+            Err(reason) => refused.push(Refused {
+                agent: target.agent,
+                path: dest,
+                reason,
+            }),
         }
     }
     if !refused.is_empty() {
-        return Err(refusal(format!(
-            "skills: nothing installed; arc does not overwrite a folder it did not write:\n{}",
-            refused.join("\n")
-        )));
+        outcome.refused.extend(refused);
+        return Ok(());
     }
 
-    let mut installed = Vec::new();
-    for (target, name, dest, plan) in plans {
-        write_skill(&target.skills_dir, name, &skills[name], &dest)?;
-        installed.push(Installed {
+    fs::create_dir_all(&target.skills_dir).map_err(|e| at(&target.skills_dir, e))?;
+    let mut staged = Vec::new();
+    for (name, _, _) in &plans {
+        let stage = target.skills_dir.join(format!(".{name}.arc-new"));
+        staged.push(stage.clone());
+        if let Err(e) = stage_skill(&stage, &skills[name]) {
+            for stage in &staged {
+                let _ = remove_any(stage);
+            }
+            return Err(e);
+        }
+    }
+
+    for (i, ((name, dest, plan), stage)) in plans.into_iter().zip(&staged).enumerate() {
+        let replaced = match plan {
+            Plan::Write => None,
+            Plan::Replace(v) => Some(v),
+        };
+        if let Err(e) = swap_in(&target.skills_dir, name, stage, &dest, replaced.is_some()) {
+            // This skill's staging folder and every later one are still there.
+            for stage in &staged[i..] {
+                let _ = remove_any(stage);
+            }
+            return Err(e);
+        }
+        outcome.installed.push(Installed {
             agent: target.agent,
-            skill: name.to_string(),
             path: dest,
-            replaced: match plan {
-                Plan::Write => None,
-                Plan::Replace(v) => Some(v),
-            },
+            replaced,
         });
     }
-    Ok(installed)
+    Ok(())
 }
 
 /// Whether `dest` can be written: `Ok(Err(reason))` when it must be refused.
@@ -244,51 +308,81 @@ fn plan(dest: &Path) -> Result<std::result::Result<Plan, String>> {
     let meta = match fs::symlink_metadata(dest) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Ok(Plan::Write)),
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(at(dest, e)),
     };
     if !meta.is_dir() {
         return Ok(Err(
             "it exists and is not a folder arc wrote (no .arc-skill marker)".to_string(),
         ));
     }
-    match fs::read_to_string(dest.join(MARKER)) {
-        Ok(marker) => {
-            let first = marker.lines().next().unwrap_or("").trim();
-            let version = first.strip_prefix("arc ").unwrap_or(first).trim();
-            Ok(Ok(Plan::Replace(version.to_string())))
+    let marker = dest.join(MARKER);
+    match fs::symlink_metadata(&marker) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => {
+            return Ok(Err(
+                "its .arc-skill is not a file, so it is not arc's to replace".to_string(),
+            ));
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Err(
-            "a skill of this name is already there and has no .arc-skill marker, so it is not arc's to replace; rename or remove it, or install with --target elsewhere".to_string(),
-        )),
-        Err(e) => Err(e.into()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(Err(
+                "a skill of this name is already there and has no .arc-skill marker, so it is not arc's to replace; rename or remove it, or install with --target elsewhere".to_string(),
+            ));
+        }
+        Err(e) => return Err(at(&marker, e)),
     }
+    let text = fs::read_to_string(&marker).map_err(|e| at(&marker, e))?;
+    let first = text.lines().next().unwrap_or("").trim();
+    let version = first.strip_prefix("arc ").unwrap_or(first).trim();
+    Ok(Ok(Plan::Replace(version.to_string())))
 }
 
-/// Write one skill into a staging folder beside `dest`, then swap it in, so a failure part
-/// way leaves the old folder whole.
-fn write_skill(skills_dir: &Path, name: &str, files: &[(&str, &[u8])], dest: &Path) -> Result<()> {
-    fs::create_dir_all(skills_dir)?;
-    let stage = skills_dir.join(format!(".{name}.arc-new"));
-    if fs::symlink_metadata(&stage).is_ok() {
-        fs::remove_dir_all(&stage)?;
-    }
+/// Remove whatever is at `path`, a folder or a file; nothing there is not an error.
+fn remove_any(path: &Path) -> Result<()> {
+    let result = match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => Err(e),
+        Ok(m) if m.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+    };
+    result.map_err(|e| at(path, e))
+}
+
+/// Write one skill's files and its marker into `stage`, clearing anything left there by an
+/// earlier run that stopped part way.
+fn stage_skill(stage: &Path, files: &[(&str, &[u8])]) -> Result<()> {
+    remove_any(stage)?;
     for (rel, bytes) in files {
         let path = stage.join(rel);
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).map_err(|e| at(parent, e))?;
         }
-        fs::write(path, bytes)?;
+        fs::write(&path, bytes).map_err(|e| at(&path, e))?;
     }
+    let marker = stage.join(MARKER);
     fs::write(
-        stage.join(MARKER),
+        &marker,
         format!(
             "arc {VERSION}\nWritten by `arc skills install`, which replaces this folder when it is run again. Delete this file to keep the folder as your own.\n"
         ),
-    )?;
-    if dest.exists() {
-        fs::remove_dir_all(dest)?;
+    )
+    .map_err(|e| at(&marker, e))
+}
+
+/// Move `stage` to `dest`. When `dest` holds an earlier install, it is renamed aside first,
+/// put back if the move fails, and deleted once the new folder is in place.
+fn swap_in(skills_dir: &Path, name: &str, stage: &Path, dest: &Path, replace: bool) -> Result<()> {
+    if !replace {
+        return fs::rename(stage, dest).map_err(|e| at(dest, e));
     }
-    fs::rename(&stage, dest)?;
+    let old = skills_dir.join(format!(".{name}.arc-old"));
+    remove_any(&old)?;
+    fs::rename(dest, &old).map_err(|e| at(dest, e))?;
+    if let Err(e) = fs::rename(stage, dest) {
+        let _ = fs::rename(&old, dest);
+        return Err(at(dest, e));
+    }
+    // The new folder is in place; an old one that cannot be deleted is cleared by the next run.
+    let _ = remove_any(&old);
     Ok(())
 }
 
@@ -316,6 +410,33 @@ mod tests {
                 skills_dir: home.path().join(".agents/skills"),
             }]
         );
+    }
+
+    #[test]
+    fn a_failed_swap_puts_the_old_folder_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("s");
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("SKILL.md"), "old").unwrap();
+        // No staging folder, so moving it into place fails.
+        let err =
+            swap_in(dir.path(), "s", &dir.path().join(".s.arc-new"), &dest, true).unwrap_err();
+        assert!(
+            err.to_string().contains(&dest.display().to_string()),
+            "{err}"
+        );
+        assert_eq!(fs::read_to_string(dest.join("SKILL.md")).unwrap(), "old");
+        assert!(!dir.path().join(".s.arc-old").exists());
+    }
+
+    #[test]
+    fn a_stale_staging_file_is_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join(".s.arc-new");
+        fs::write(&stage, "left by a run that stopped").unwrap();
+        stage_skill(&stage, &[("SKILL.md", b"new")]).unwrap();
+        assert_eq!(fs::read_to_string(stage.join("SKILL.md")).unwrap(), "new");
+        assert!(stage.join(MARKER).is_file());
     }
 
     #[test]

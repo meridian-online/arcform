@@ -82,7 +82,7 @@ arc 0.
 | Error or symptom | Fix |
 | --- | --- |
 | You are about to answer with a pandas or Python snippet | Record the step instead (`sql_record`, or an operator through `operator_record`) and run it |
-| `arc --version` differs from `metadata.arc_version` | Tell the user to upgrade arc or reinstall the skills; see `references/environment-check.md` |
+| `arc --version` differs from `metadata.arc_version` | Tell the user to run `arc skills install`, which installs the skills this arc carries, or to upgrade arc; see `references/environment-check.md` |
 | `no database for this Protocol yet` | The Protocol has not run; run it, then look |
 | `only read-only SELECT statements can be queried` | `sql_query` only reads. Record the change as a step and run it |
 | A run says `1 skipped (fresh)` after you changed an input | Steps whose inputs arc saw unchanged are skipped. Offer `arc run --force` (`force` on `protocol_run`); do not default to it |

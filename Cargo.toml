@@ -12,14 +12,13 @@ categories = ["command-line-utilities", "database"]
 # What crates.io receives: the source, the operator scripts `src/operator.rs` embeds
 # with `include_str!`, `build.rs` and the agent skills under `skills/` it embeds (so
 # `arc skills install` works from the published crate), and the top-level documents.
-# Everything else stays out — the
-# 40 MB examples/brewtrend/trends.db, the test fixtures (only `#[cfg(test)]` code
-# embeds them, and the packaged crate is never tested), the vendored sqlparser fork
-# (published as its own crate, `arcform-sqlparser`), and the docs and evals. An
-# `include_str!` added outside src/ must be added here too, or the published crate
-# stops compiling; CI's `package` job catches that before a tag. The leading `/`
-# anchors a name to the crate root: without it `README.md` would match every README
-# in the tree.
+# Everything else stays out — the 40 MB examples/brewtrend/trends.db, the test
+# fixtures (only `#[cfg(test)]` code embeds them, and the packaged crate is never
+# tested), the vendored sqlparser fork (published as its own crate,
+# `arcform-sqlparser`), and the docs and evals. An `include_str!` added outside src/
+# must be added here too, or the published crate stops compiling; CI's `package` job
+# catches that before a tag. The leading `/` anchors a name to the crate root:
+# without it `README.md` would match every README in the tree.
 include = [
     "/src/**",
     "/build.rs",
