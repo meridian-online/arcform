@@ -2255,6 +2255,42 @@ mod tests {
         );
     }
 
+    // The human listing without `--file` carries each recorded entry, so a
+    // listing that read no entries would fail here.
+    #[test]
+    fn the_human_listing_without_a_file_names_every_recorded_entry() {
+        let base = tempfile::tempdir().unwrap();
+        let history = LocalHistory::at_root(base.path().join("history"));
+        let dir = base.path().join("notes");
+        create_protocol(&dir, None, None, None, &history).unwrap();
+        edit_protocol(
+            &dir,
+            EditOp::Replace {
+                path: "name".into(),
+                value: "renamed".into(),
+            },
+            &history,
+        )
+        .unwrap();
+        let entries = history.entries(&dir).unwrap();
+        assert!(!entries.is_empty());
+
+        let mut listed = Vec::new();
+        history_list(&dir, None, &history, &mut listed).unwrap();
+        let listed = String::from_utf8(listed).unwrap();
+        for entry in &entries {
+            assert!(
+                listed.contains(&entry.id),
+                "{} missing:\n{listed}",
+                entry.id
+            );
+        }
+        assert!(
+            listed.contains(&format!("({} recorded state(s)", entries.len())),
+            "{listed}"
+        );
+    }
+
     #[test]
     fn test_history_cli_round_trip() {
         let base = tempfile::tempdir().unwrap();
