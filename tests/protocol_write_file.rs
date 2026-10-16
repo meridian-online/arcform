@@ -151,20 +151,89 @@ fn writes_panel_under_panels() {
 #[test]
 fn refuses_path_outside_protocol() {
     let protocol = Protocol::new();
-    let elsewhere = protocol._root.path().join("elsewhere");
-    std::fs::create_dir(&elsewhere).unwrap();
-    std::os::unix::fs::symlink(&elsewhere, protocol.dir.join("panels")).unwrap();
     let before = protocol.tree();
-
     let outside = protocol._root.path().join("x.json");
     let absolute = outside.display().to_string();
-    for path in ["../x.json", absolute.as_str(), "panels/trend.yaml"] {
-        let out = protocol.write(path, PANEL);
+    for path in ["../x.json", absolute.as_str()] {
+        let out = protocol.write(path, SCHEMA);
         assert!(!out.status.success(), "{path} was written");
         assert_eq!(protocol.tree(), before, "{path} changed the folder");
     }
     assert!(!outside.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn refuses_a_link_that_leaves_the_protocol() {
+    let protocol = Protocol::new();
+    let elsewhere = protocol._root.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, protocol.dir.join("panels")).unwrap();
+    let before = protocol.tree();
+    let out = protocol.write("panels/trend.yaml", PANEL);
+    assert!(!out.status.success());
+    assert_eq!(protocol.tree(), before);
     assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn refuses_a_file_that_is_a_link_to_outside_and_replaces_a_dangling_one() {
+    let protocol = Protocol::new();
+    let panels = protocol.dir.join("panels");
+    std::fs::create_dir(&panels).unwrap();
+    let target = protocol._root.path().join("outside.yaml");
+    std::fs::write(&target, "plot: {}\n").unwrap();
+    std::os::unix::fs::symlink(&target, panels.join("trend.yaml")).unwrap();
+    let before = protocol.tree();
+    let out = protocol.write("panels/trend.yaml", PANEL);
+    assert!(!out.status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "plot: {}\n");
+    assert_eq!(protocol.tree(), before);
+
+    // A dangling link inside the folder is replaced, and nothing lands outside.
+    std::fs::remove_file(panels.join("trend.yaml")).unwrap();
+    let gone = protocol._root.path().join("gone.yaml");
+    std::os::unix::fs::symlink(&gone, panels.join("old.yaml")).unwrap();
+    let out = protocol.write("panels/old.yaml", PANEL);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        std::fs::read_to_string(panels.join("old.yaml")).unwrap(),
+        PANEL
+    );
+    assert!(!gone.exists());
+}
+
+#[test]
+fn keeps_what_it_replaces_and_both_quick_writes() {
+    let protocol = Protocol::new();
+    std::fs::write(protocol.dir.join("README.md"), "by hand\n").unwrap();
+    assert!(protocol.write("README.md", "first\n").status.success());
+    assert!(protocol.write("README.md", "second\n").status.success());
+    assert_eq!(protocol.history_lines("README.md"), 3);
+
+    let list = protocol.run(
+        &protocol.dir,
+        &["history", "list", "--file", "README.md", "--json"],
+        None,
+    );
+    let entries: Value = serde_json::from_slice(&list.stdout).unwrap();
+    let mut texts = Vec::new();
+    for entry in entries.as_array().unwrap() {
+        let id = entry["id"].as_str().unwrap();
+        let shown = protocol.run(
+            &protocol.dir,
+            &["history", "show", id, "--file", "README.md"],
+            None,
+        );
+        texts.push(String::from_utf8(shown.stdout).unwrap());
+    }
+    for kept in ["by hand\n", "first\n", "second\n"] {
+        assert!(
+            texts.iter().any(|t| t == kept),
+            "{kept:?} missing: {texts:?}"
+        );
+    }
 }
 
 #[test]

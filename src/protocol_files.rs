@@ -161,8 +161,18 @@ pub(crate) fn write_protocol_file(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    // A file already there may never have been written through arc: keep what
+    // it holds before it is replaced, and write only once that is kept.
+    if path.exists() {
+        let current = fs::read_to_string(&path).map_err(|e| Error::FileRead {
+            path: path.clone(),
+            source: e,
+        })?;
+        history.record_checkpoint_for_file(&path, &current)?;
+    }
     write_atomic(&path, content.as_bytes())?;
-    history.record_save_for_file(&path, content)?;
+    // Never merged, so two quick writes keep both versions.
+    history.record_save_unmerged_for_file(&path, content)?;
     Ok(WrittenFile {
         path: rel
             .components()

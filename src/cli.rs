@@ -177,7 +177,8 @@ pub enum Commands {
     /// `operator_record` (record an operator step, its `with:` checked against the
     /// operator's schema), `sql_recognise` (what arc reads a SQL statement as), `sql_record` (record
     /// a SQL statement as a step of a Protocol), `protocol_create` (make a new
-    /// Protocol, as `arc create-protocol` does), `table_describe` (what a table in
+    /// Protocol, as `arc create-protocol` does), `protocol_write_file` (write a
+    /// Protocol's schema, panel or README file), `table_describe` (what a table in
     /// a Protocol's database holds, read-only) and `sql_query` (run read-only
     /// SELECTs against a Protocol's database).
     #[cfg(feature = "mcp")]
