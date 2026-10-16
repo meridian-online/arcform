@@ -243,11 +243,19 @@ fn history_files_stay_inside_the_protocol() {
         assert_eq!(listed["isError"], true, "{file}: {listed}");
         let restored = protocol.call("history_restore", json!({ "id": id, "file": file }));
         assert_eq!(restored["isError"], true, "{file}: {restored}");
+        assert!(
+            !restored.to_string().contains("invalid manifest"),
+            "{file}: {restored}"
+        );
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "kept\n");
         assert_eq!(protocol.manifest(), before);
 
         let out = protocol.arc(&["history", "restore", &id, "--file", file]);
         assert!(!out.status.success(), "{file}");
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("invalid manifest"),
+            "{file}"
+        );
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "kept\n");
     }
 }

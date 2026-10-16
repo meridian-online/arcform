@@ -847,7 +847,7 @@ fn parse_path(raw: &str) -> Result<Vec<PathPart>> {
 /// component, and one that reaches out through a symbolic link.
 fn history_file(dir: &Path, file: &Path) -> Result<PathBuf> {
     let outside = || {
-        Error::ManifestValidation(format!(
+        crate::record::refused(format!(
             "--file {} is outside the Protocol folder {}; name a file inside it",
             file.display(),
             dir.display()

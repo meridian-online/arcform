@@ -34,7 +34,7 @@ pub(crate) fn write_report(
     run_id: Option<&str>,
     history: &LocalHistory,
 ) -> Result<PathBuf> {
-    let refuse = |message: String| Error::ManifestValidation(message);
+    let refuse = crate::record::refused;
     if !dir.join(MANIFEST_FILENAME).is_file() {
         return Err(refuse(format!(
             "{} holds no {MANIFEST_FILENAME}; make the Protocol first",
@@ -83,7 +83,7 @@ pub(crate) fn write_report(
 
 /// The contract of the run `run_id` names, or of the newest run.
 fn load_contract(dir: &Path, run_id: Option<&str>) -> Result<Contract> {
-    let refuse = |message: String| Error::ManifestValidation(message);
+    let refuse = crate::record::refused;
     let runs = runs_dir(dir);
     let path = match run_id {
         Some(id) => {

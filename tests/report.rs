@@ -235,6 +235,7 @@ fn refuses_before_any_run() {
         message.contains("arc run") && message.contains("protocol_run"),
         "{message}"
     );
+    assert!(!message.contains("invalid manifest"), "{message}");
     assert_eq!(protocol.tree(), before);
 }
 

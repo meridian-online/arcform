@@ -1805,7 +1805,7 @@ fn made_by_a_step(dir: &Path, on: &str) -> Result<()> {
 }
 
 /// A request to record an operation that is refused before anything is written.
-fn refused(message: String) -> Error {
+pub(crate) fn refused(message: String) -> Error {
     Error::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         message,
