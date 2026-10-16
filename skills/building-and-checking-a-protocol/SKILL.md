@@ -50,13 +50,13 @@ Take the first that fits; `references/step-kinds.md` has the forms and the reaso
 
 ## 4. Describe every step
 
-Every record verb takes a description: `--description "<why>"` from a shell, `description` over MCP. Write one line saying what the step does and why, in the user's words ("Keep only paid orders: refunds are counted separately"). It is what the user, Brightfield and the next agent read; a step without one is a step nobody can check.
+Every record verb takes a description: `--description "<why>"` from a shell, `description` over MCP. Write one line saying what the step does and why, in the user's words ("Keep only paid orders, since refunds are counted separately"). The record verbs quote it for you. It is what the user, Brightfield and the next agent read; a step without one is a step nobody can check.
 
 | Step | CLI | MCP |
 | --- | --- | --- |
-| Add a description to a step recorded without one | `arc edit-protocol --dir <dir> add steps[<i>] description "<why>"` | `protocol_edit` with `edit`, `path`, `key`, `value`, `dir` |
+| Add a description to a step recorded without one | `arc edit-protocol --dir <dir> add 'steps[<i>]' description '"<why>"'` | `protocol_edit` with `edit`, `path`, `key`, `value`, `dir` |
 
-Over MCP, `edit` is "add", `path` is "steps[<i>]" (the step's place in the list, from 0) and `key` is "description".
+Over MCP, `edit` is "add", `path` is "steps[<i>]" (the step's place in the list, from 0) and `key` is "description". `value` is written into the YAML as it stands, so wrap it in double quotes inside the string; a description with a colon in it is otherwise refused as a YAML error.
 
 ## 5. Run
 
@@ -71,7 +71,7 @@ Before the first run of a fetch step, say that it reaches the network. A run ski
 
 A run that exits 0 can still have made an empty table: a filter no row meets is a successful step. Read the run record in this order, every time.
 
-1. **`run.outcome`**: `success`, `partial` (some steps ran, then one failed) or `error`. Anything but `success` means a step failed; fix it first. From a shell, `arc run` prints the failing step's error and exits non-zero. Over MCP the run record carries no error text: take the failing step's model text from its `sql` entry in the record and run the SELECT after its `CREATE OR REPLACE TABLE` line with `sql_query`, which returns DuckDB's error in its place. For a failing operator or command step there is no MCP route to its error; ask the user to run `arc run` in the Protocol folder and paste what it prints.
+1. **`run.outcome`**: `success`, `partial` (some steps ran, then one failed) or `error`. Anything but `success` means a step failed; fix it first. From a shell, `arc run` prints the failing step's error and exits non-zero. Over MCP the run record carries no error text: take the failing step's model text from its `sql` entry in the record and run the SELECT after its `CREATE OR REPLACE TABLE` line with `sql_query`, which returns DuckDB's error in its place. Rewrite every relative file path in that SELECT (`read_csv('sales.csv')`) as an absolute path under the Protocol folder first: `sql_query` reads files from the server's working directory, not the Protocol's. For a failing operator or command step there is no MCP route to its error; ask the user to run `arc run` in the Protocol folder and paste what it prints.
 2. **Each step's `status.state`**: `success`, `failed` or `skipped`. A skip with a `skip_reason` (`hash_clean`, `precondition_modified_after`) was fresh. A skip with a null `skip_reason` never ran, because an earlier step failed.
 3. **Each asset's `row_count`**: every table should hold about the rows you expect. Zero, or far fewer than its input, is a finding: trace it with `references/tracing-a-wrong-table.md` before you go on.
 
@@ -113,9 +113,11 @@ A restore keeps the state it replaces, so a wrong restore is undone by restoring
 | --- | --- |
 | The run exits 0 and you are about to present | Read `run.outcome`, each step's `status.state` and each asset's `row_count` first |
 | A table has 0 rows | Trace it upstream with `references/tracing-a-wrong-table.md`; do not present from it |
-| `invalid manifest: duplicate step name` | A step of that name exists. To change it, delete it (`protocol_edit` with `edit` `delete`, or `arc edit-protocol --dir <dir> delete steps[<i>]`) and record it again |
+| `invalid manifest: duplicate step name` | A step of that name exists. To change it, delete it (`protocol_edit` with `edit` `delete`, or `arc edit-protocol --dir <dir> delete 'steps[<i>]'`) and record it again |
 | `dependency order violation: step '<a>' reads asset '<b>' but ... runs after it` | Steps are recorded at the end. Move the reader after the step that makes its table: `arc edit-protocol --dir <dir> reorder steps <from> <to>` (`protocol_edit` with `edit` `reorder`) |
 | `sql_query` over `read_text` returns no rows | The path was relative, read from the server's working directory. Give the absolute path to the Protocol folder |
+| A replayed step's SELECT fails over MCP with `No files found that match the pattern` | `sql_query` reads relative paths from the server's working directory. Rewrite them as absolute paths under the Protocol folder |
+| `failed to parse arcform.yaml: mapping values are not allowed` after `protocol_edit` | The value has a colon and was written unquoted. Wrap it in double quotes inside the string |
 | `no database for this Protocol yet` | The Protocol has not run. Run it, then look |
 | A run says `skipped (fresh)` after you changed a source | The step's inputs looked unchanged, or a fetch is inside its period. Offer `force`, saying what it re-fetches |
 | A step is `skipped` with a null `skip_reason` | It never ran: an earlier step failed. Fix that one |

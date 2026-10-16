@@ -34,7 +34,7 @@ From a shell, `arc run` prints the same graph: each asset with its row count, th
 | Fault in | How to change it |
 | --- | --- |
 | An operation or SQL step | Delete it and record it again under the same name, then move it back above the steps that read its table (see `step-kinds.md`) |
-| An operator's `with:` | `protocol_edit` with `edit` "replace" and `path` "steps[<i>].with.<key>" (`arc edit-protocol --dir <dir> replace steps[<i>].with.<key> <value>`) |
+| An operator's `with:` | `protocol_edit` with `edit` "replace" and `path` "steps[<i>].with.<key>" (`arc edit-protocol --dir <dir> replace 'steps[<i>].with.<key>' <value>`) |
 | The source itself | Tell the user what the source holds; the fix may be a different source, or a different question |
 
 Then run, and read the result again in order: `run.outcome`, each step's `status.state`, each asset's `row_count`.

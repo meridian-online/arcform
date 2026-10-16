@@ -273,15 +273,15 @@ use arcform::spec::{Manifest, Result, SpecEdit, edit_spec};
 
 fn example() -> Result<()> {
     // A spec on disk.
-    let dir = std::path::Path::new("examples/brewtrend");
+    let dir = std::path::Path::new("examples/almanac");
     let manifest = Manifest::load(dir)?;
     println!("{} — {} steps", manifest.name, manifest.steps.len());
 
     // Edit it through the write path: applied to the original bytes, validated
     // by the same loader, written atomically — or refused with a reason.
     let edit = SpecEdit::Replace {
-        path: vec!["params".into(), "trend_threshold".into(), "default".into()],
-        value: "\"25\"".into(),
+        path: vec!["params".into(), "port".into(), "default".into()],
+        value: "\"hobart\"".into(),
     };
     edit_spec(dir, &[edit])?;
     Ok(())
