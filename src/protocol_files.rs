@@ -163,14 +163,19 @@ pub(crate) fn write_protocol_file(
     }
     // A file already there may never have been written through arc: keep what
     // it holds before it is replaced, and write only once that is kept.
+    let mut held = None;
     if path.exists() {
         let current = fs::read_to_string(&path).map_err(|e| Error::FileRead {
             path: path.clone(),
             source: e,
         })?;
-        history.record_checkpoint_for_file(&path, &current)?;
+        held = history.checkpoint_held_for_file(&path, &current)?;
     }
     write_atomic(&path, content.as_bytes())?;
+    // The checkpoint's line in the folder's log lands with the write it was for.
+    if let Some(held) = held {
+        held.land();
+    }
     // Never merged, so two quick writes keep both versions.
     history.record_save_unmerged_for_file(&path, content)?;
     Ok(WrittenFile {

@@ -352,7 +352,7 @@ impl Change {
 
 /// A checkpoint's line in the folder's log, held until the write the
 /// checkpoint was taken for has landed.
-struct HeldLine {
+pub(crate) struct HeldLine {
     /// The spec the checkpoint is of, whose folder's log takes the line.
     spec_path: PathBuf,
     entry: HistoryEntry,
@@ -361,7 +361,7 @@ struct HeldLine {
 impl HeldLine {
     /// Append the line, now that the write has landed. Best-effort, as every
     /// line is.
-    fn land(self) {
+    pub(crate) fn land(self) {
         let _ = append_log_line(&self.spec_path, &self.entry, StepNote::Unnamed);
     }
 }
@@ -760,6 +760,26 @@ impl LocalHistory {
         line: Option<StepNote>,
     ) -> Result<Option<HistoryEntry>> {
         self.record_keyed(self.key_dir(dir)?, text, kind, now, merge, line)
+    }
+
+    /// [`checkpoint_held`](Self::checkpoint_held) for the file at `file`, keyed
+    /// as [`record_save_for_file`](Self::record_save_for_file) describes.
+    pub(crate) fn checkpoint_held_for_file(
+        &self,
+        file: &Path,
+        text: &str,
+    ) -> Result<Option<HeldLine>> {
+        let key = self.file_key(file)?;
+        let spec_path = key.1.clone();
+        let entry = self.record_keyed(
+            key,
+            text,
+            HistoryKind::Checkpoint,
+            SystemTime::now(),
+            false,
+            None,
+        )?;
+        Ok(entry.map(|entry| HeldLine { spec_path, entry }))
     }
 
     /// Record `text` as a checkpoint for the spec in `dir`, as

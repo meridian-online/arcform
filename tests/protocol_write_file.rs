@@ -321,3 +321,26 @@ fn mcp_writes_the_bytes_the_command_writes() {
     );
     assert_eq!(protocol.tree(), before);
 }
+
+#[cfg(unix)]
+#[test]
+fn a_failed_write_leaves_no_checkpoint_line_in_the_log() {
+    use std::os::unix::fs::PermissionsExt;
+    let protocol = Protocol::new();
+    std::fs::write(protocol.dir.join("README.md"), "by hand\n").unwrap();
+    let log = || std::fs::read(protocol.dir.join("arcform-log.txt")).unwrap_or_default();
+    let before = log();
+    // A folder that cannot take a new file makes the atomic write fail.
+    let locked = std::fs::Permissions::from_mode(0o555);
+    std::fs::set_permissions(&protocol.dir, locked).unwrap();
+    let out = protocol.write("README.md", "new\n");
+    std::fs::set_permissions(&protocol.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if out.status.success() {
+        return; // running with rights that ignore the mode: nothing to show
+    }
+    assert_eq!(log(), before);
+    assert_eq!(
+        std::fs::read_to_string(protocol.dir.join("README.md")).unwrap(),
+        "by hand\n"
+    );
+}
