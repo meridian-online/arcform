@@ -704,23 +704,13 @@ impl LocalHistory {
     /// no write — and write the entry's bytes to `target`.
     fn restore_keyed(&self, key: (PathBuf, PathBuf), target: &Path, id: &str) -> Result<String> {
         let text = read_entry(&key.0, id)?;
-        let spec_path = key.1.clone();
         let mut held = None;
         if target.exists() {
             let current = std::fs::read_to_string(target).map_err(|e| Error::FileRead {
                 path: target.to_path_buf(),
                 source: e,
             })?;
-            held = self
-                .record_keyed(
-                    key,
-                    &current,
-                    HistoryKind::Checkpoint,
-                    SystemTime::now(),
-                    false,
-                    None,
-                )?
-                .map(|entry| HeldLine { spec_path, entry });
+            held = self.checkpoint_held_keyed(key, &current)?;
         }
         write_atomic(target, text.as_bytes())?;
         // The checkpoint's line lands with the write it was taken for.
@@ -769,7 +759,15 @@ impl LocalHistory {
         file: &Path,
         text: &str,
     ) -> Result<Option<HeldLine>> {
-        let key = self.file_key(file)?;
+        self.checkpoint_held_keyed(self.file_key(file)?, text)
+    }
+
+    /// A checkpoint of `text` under `key`, its line held for the caller.
+    fn checkpoint_held_keyed(
+        &self,
+        key: (PathBuf, PathBuf),
+        text: &str,
+    ) -> Result<Option<HeldLine>> {
         let spec_path = key.1.clone();
         let entry = self.record_keyed(
             key,
