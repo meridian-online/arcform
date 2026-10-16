@@ -214,6 +214,35 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: TableCmd,
     },
+
+    /// The analyst skills this arc carries: list them, or install them into an
+    /// agent's skills folder at this arc's version.
+    Skills {
+        #[command(subcommand)]
+        cmd: SkillsCmd,
+    },
+}
+
+/// The `arc skills` verbs.
+#[derive(Subcommand)]
+pub enum SkillsCmd {
+    /// Install the skills into each agent found under the home directory (Claude
+    /// Code, Codex, Cursor, Gemini CLI, and the shared `~/.agents/skills`), or into
+    /// the agents and folders named. Prints each folder written. A folder of the
+    /// same name that arc did not write (it has no `.arc-skill` marker) is refused,
+    /// and nothing is written; one arc wrote is replaced whole.
+    Install {
+        /// Install for this agent, whether or not it is found (repeatable).
+        #[arg(long = "agent", value_name = "NAME",
+              value_parser = clap::builder::PossibleValuesParser::new(crate::skills::AGENT_NAMES))]
+        agents: Vec<String>,
+
+        /// Install into this skills folder instead.
+        #[arg(long, value_name = "DIR")]
+        target: Option<PathBuf>,
+    },
+    /// List the skills this arc carries and the arc version each was written for.
+    List,
 }
 
 /// The `arc protocol` verbs.
@@ -1226,6 +1255,66 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             dispatch_report(cmd, &mut std::io::stdin(), &mut std::io::stdout())
         }
         Commands::Table { cmd } => dispatch_table(cmd, &mut std::io::stdout()),
+        Commands::Skills { cmd } => dispatch_skills(cmd, &mut std::io::stdout()),
+    }
+}
+
+/// Execute an `arc skills` verb.
+fn dispatch_skills(cmd: SkillsCmd, out: &mut impl Write) -> Result<()> {
+    match cmd {
+        SkillsCmd::List => {
+            for (name, version) in crate::skills::list() {
+                writeln!(out, "{name:<34} arc {version}")?;
+            }
+            Ok(())
+        }
+        SkillsCmd::Install { agents, target } => {
+            let home = dirs::home_dir();
+            let mut targets = Vec::new();
+            if !agents.is_empty() || target.is_none() {
+                let home = home.as_deref().ok_or_else(|| {
+                    Error::Io(std::io::Error::other(
+                        "skills: no home directory to find agents in; name a folder with --target",
+                    ))
+                })?;
+                if agents.is_empty() {
+                    targets = crate::skills::agent_targets(home);
+                    if targets.is_empty() {
+                        return Err(Error::Io(std::io::Error::other(
+                            crate::skills::no_agent_message(home),
+                        )));
+                    }
+                } else {
+                    targets = crate::skills::named_targets(home, &agents)?;
+                }
+            }
+            if let Some(dir) = target {
+                targets.push(crate::skills::AgentTarget {
+                    agent: "target",
+                    skills_dir: dir,
+                });
+            }
+            let installed = crate::skills::install(&targets)?;
+            for i in &installed {
+                match &i.replaced {
+                    Some(v) => writeln!(
+                        out,
+                        "{:<12} {}  (replaced arc {v})",
+                        i.agent,
+                        i.path.display()
+                    )?,
+                    None => writeln!(out, "{:<12} {}", i.agent, i.path.display())?,
+                }
+            }
+            writeln!(
+                out,
+                "Installed {} skill folder{} at arc {}.",
+                installed.len(),
+                if installed.len() == 1 { "" } else { "s" },
+                env!("CARGO_PKG_VERSION")
+            )?;
+            Ok(())
+        }
     }
 }
 

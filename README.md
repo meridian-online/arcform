@@ -124,6 +124,14 @@ Through these tools an agent can start a Protocol, look at its tables, query the
 
 [`skills/`](skills/) holds five agent skills that teach an agent the analyst workflow through these tools: `using-arcform`, the entry point, then `scoping-an-analysis`, `profiling-and-typing-data`, `building-and-checking-a-protocol` and `presenting-findings`, one for each stage from agreeing the question to handing over the answer. Each shows every step both as an `arc` command and as the matching tool, and `cargo test --features mcp --test skills` checks what they name and runs their examples against this binary.
 
+The skills ship inside `arc`, at its version. Install them into each agent found on this machine:
+
+```sh
+arc skills install
+```
+
+It finds Claude Code (`~/.claude/skills`), Codex (`~/.agents/skills`), Cursor (`~/.cursor/skills`), Gemini CLI (`~/.gemini/skills`) and the shared `~/.agents/skills` by their folders under your home directory, and prints each skill folder it writes. When it finds none it says where it would install and exits 1: name an agent with `--agent claude-code` (repeatable), or a folder with `--target <dir>`. Each folder it writes holds a `.arc-skill` file recording the arc version, and only such a folder is replaced, whole, when you upgrade arc and run the command again; a skill of the same name you wrote yourself is refused and nothing is written. `arc skills list` prints the skills this arc carries and the version each was written for.
+
 ---
 
 ## Design Principles

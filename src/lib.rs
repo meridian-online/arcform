@@ -60,6 +60,7 @@ mod record;
 mod registry;
 mod report;
 mod runner;
+mod skills;
 mod state;
 mod working_db;
 
