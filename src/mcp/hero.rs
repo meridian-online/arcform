@@ -17,6 +17,9 @@
 //! - `operation_record` records an operation as a new step of a Protocol, through
 //!   the same record path `arc operation record` takes, so the same request writes
 //!   the same bytes from either.
+//! - `operator_record` records an operator step of a Protocol, its `with:` checked
+//!   against the operator's schema, through the same record path `arc operator
+//!   record` takes, so the same request writes the same bytes from either.
 //! - `sql_recognise` answers what arc reads a SQL statement as: the object `arc sql
 //!   recognise` prints, both read through the one reader in `record`.
 //! - `sql_record` records a SQL statement as a new step of a Protocol, through the
@@ -487,6 +490,63 @@ fn operation_record_schema() -> Value {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// operator_record
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Record an operator step at the end of a Protocol.
+///
+/// The request is handed to the record path `arc operator record` takes, which
+/// checks `with` against the operator's schema before it writes the step. `dir`
+/// defaults to `.`, the server's working directory, as `--dir` does, and
+/// `description` is absent for a step with none. A refusal is an error result
+/// naming what was wrong, with the Protocol's directory untouched.
+fn operator_record(args: &Value) -> ToolResult {
+    let dir = PathBuf::from(optional_string(args, "dir")?.unwrap_or("."));
+    let operator = required_string(args, "operator")?;
+    let name = required_string(args, "name")?;
+    let with = match args.get("with") {
+        Some(with @ Value::Object(_)) => with,
+        None | Some(Value::Null) => return Err("`with` is required".to_string()),
+        Some(other) => {
+            return Err(format!(
+                "`with` must be an object of the operator's `with:` block, not {other}"
+            ));
+        }
+    };
+    let description = match args.get("description") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(description)) => Some(description.as_str()),
+        Some(other) => return Err(format!("`description` must be a string, not {other}")),
+    };
+    let history = open_history()?;
+    let request = crate::record::OperatorRequest {
+        operator,
+        name,
+        with,
+        description,
+    };
+    crate::record::record_operator(&dir, &request, &history).map_err(|e| e.to_string())?;
+    Ok(ToolOutput::json(json!({
+        "step": name,
+        "operator": operator,
+    })))
+}
+
+fn operator_record_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "operator": { "type": "string", "description": "The operator's name (e.g. http_fetch), as operator_describe lists them." },
+            "name": { "type": "string", "description": "The new step's name." },
+            "with": { "type": "object", "description": "The step's `with:` block, as the JSON Schema operator_describe returns for the operator describes it." },
+            "description": { "type": "string", "description": "One line saying what the step does and why, written on the step for the person who reads the Protocol next." },
+            "dir": { "type": "string", "description": "Protocol directory (where arcform.yaml lives). Defaults to the current directory." }
+        },
+        "required": ["operator", "name", "with"]
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // sql_recognise
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -712,6 +772,13 @@ pub(super) fn tools() -> Vec<ToolDef> {
             annotations: Annotations::WRITES,
         },
         ToolDef {
+            name: "operator_record",
+            description: "Record an operator step (a fetch, an entity resolution, an embedding, an export) as a new step at the end of a Protocol, from the operator's name, the step's name and its `with:` block. The `with:` is checked against the operator's schema, the one operator_describe returns, and a block that does not fit is refused naming the field, with the Protocol untouched. Writes the step; runs nothing.",
+            input_schema: operator_record_schema,
+            handler: operator_record,
+            annotations: Annotations::WRITES,
+        },
+        ToolDef {
             name: "sql_recognise",
             description: "Answer what arc reads one SQL statement as: the operation arc holds that it is, with `operation`, `on` and `arguments` as operation_record takes them, or `operation` null when it is none. Read from DuckDB's own parse; writes no file and runs nothing.",
             input_schema: sql_recognise_schema,
@@ -896,6 +963,27 @@ mod tests {
             0,
             "a refused request wrote into the directory"
         );
+    }
+
+    #[test]
+    fn operator_record_refuses_arguments_of_the_wrong_shape_before_anything_is_read() {
+        let base = json!({ "operator": "http_fetch", "name": "x", "with": {} });
+        for (key, value, message) in [
+            ("dir", json!(7), "`dir` must be a string, not 7"),
+            ("with", json!("text"), "`with` must be an object"),
+            ("with", Value::Null, "`with` is required"),
+            (
+                "description",
+                json!(3),
+                "`description` must be a string, not 3",
+            ),
+            ("operator", json!(null), "`operator` is required"),
+        ] {
+            let mut args = base.clone();
+            args[key] = value;
+            let err = operator_record(&args).unwrap_err();
+            assert!(err.contains(message), "{key}: {err}");
+        }
     }
 
     #[test]

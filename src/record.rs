@@ -1311,6 +1311,136 @@ pub(crate) fn record_operation(
     Ok(sql_rel)
 }
 
+// ----------------------------------------------- recording an operator step
+
+/// What a caller asks [`record_operator`] to record. The command line and `arc
+/// mcp` each build one from what they were given and hand it over unchanged.
+#[derive(Clone, Copy)]
+pub(crate) struct OperatorRequest<'a> {
+    /// The operator's name, as a step's `op:` names it.
+    pub(crate) operator: &'a str,
+    /// The new step's name.
+    pub(crate) name: &'a str,
+    /// The step's `with:` block, an object.
+    pub(crate) with: &'a serde_json::Value,
+    /// The step's `description:`, or `None` for a step with none.
+    pub(crate) description: Option<&'a str>,
+}
+
+/// Record an `op:` step of the operator `request.operator`, named `request.name`
+/// and configured by `request.with`, at the end of `steps` of the protocol at
+/// `dir`, and return the validated spec now on disk.
+///
+/// The step is `name:`, `op:`, `with:` as a block mapping, then `description:`
+/// when one is given, and nothing else. `with` is checked against the
+/// operator's `with:` schema (see [`check_with`](crate::operator::check_with))
+/// before anything is written, so a block that misses a required field or
+/// carries a value of the wrong type is refused here, with the field named,
+/// rather than at the next load. The splice is applied and gated in memory
+/// first, then written through
+/// [`record_validated_step_with_history`](crate::history::record_validated_step_with_history),
+/// so the recording is a version of the protocol. Nothing runs.
+///
+/// Refused, with the protocol's directory untouched: an operator arc does not
+/// hold; a `with` that is not an object or that the schema does not admit; a
+/// step name or a description the record path refuses (see [`record_step`]);
+/// and a result the loader refuses, a name a step already has among them. Each
+/// refusal's message names what was wrong.
+pub(crate) fn record_operator(
+    dir: &Path,
+    request: &OperatorRequest,
+    history: &crate::history::LocalHistory,
+) -> Result<ValidatedSpec> {
+    let OperatorRequest {
+        operator,
+        name,
+        with,
+        description,
+    } = *request;
+    let Some(faults) = crate::operator::check_with(operator, with) else {
+        return Err(refused(format!(
+            "unknown operator `{operator}` — call operator_describe with no arguments to list the catalog"
+        )));
+    };
+    if !faults.is_empty() {
+        return Err(refused(format!(
+            "`with` does not fit the schema of `{operator}`: {}",
+            faults.join("; ")
+        )));
+    }
+    valid_step_name(name)?;
+    if let Some(description) = description {
+        valid_description(description)?;
+    }
+
+    let manifest_path = dir.join(MANIFEST_FILENAME);
+    if !manifest_path.exists() {
+        return Err(Error::ManifestNotFound);
+    }
+    let original = std::fs::read_to_string(&manifest_path).map_err(|e| Error::FileRead {
+        path: manifest_path.clone(),
+        source: e,
+    })?;
+    let steps_before = Manifest::from_yaml_str(&original)?.steps.len();
+
+    // `with` as a block mapping, every line pushed in under the step's keys. An
+    // empty object has no block form and is written inline.
+    let with_yaml = serde_yaml::to_string(with)
+        .map_err(|e| refused(format!("`with` cannot be written as YAML: {e}")))?;
+    let item = |indent: &str| {
+        let mut item = format!("{indent}- name: {name}\n{indent}  op: {operator}\n");
+        if with.as_object().is_some_and(|map| map.is_empty()) {
+            item.push_str(&format!("{indent}  with: {{}}\n"));
+        } else {
+            item.push_str(&format!("{indent}  with:\n"));
+            for line in with_yaml.lines() {
+                item.push_str(&format!("{indent}    {line}\n"));
+            }
+        }
+        if let Some(description) = description {
+            item.push_str(&format!(
+                "{indent}  description: {}\n",
+                description_scalar(description)
+            ));
+        }
+        item
+    };
+    let steps_path = vec![PathPart::Key("steps".to_string())];
+    let edit = if steps_before == 0 {
+        SpecEdit::Replace {
+            path: steps_path,
+            value: format!("\n{}", item("  ").trim_end_matches('\n')),
+        }
+    } else {
+        SpecEdit::Append {
+            item: item(&sequence_item_indent(&original, &steps_path)?),
+            path: steps_path,
+        }
+    };
+    let validated = apply_edits(&original, &[edit])?;
+
+    // The reloaded document is the arbiter, as it is for [`record_step`].
+    let manifest = validated.manifest();
+    let wanted = serde_yaml::to_value(with).ok();
+    let faithful = manifest.steps.len() == steps_before + 1
+        && manifest.steps.last().is_some_and(|last| {
+            last.name == name
+                && last.op.as_deref() == Some(operator)
+                && last.with == wanted
+                && last.description.as_deref() == description
+        });
+    if !faithful {
+        return Err(Error::EditTarget {
+            path: "(step)".to_string(),
+            detail: format!(
+                "the step {name:?} does not record faithfully — spliced into the manifest it \
+                 reads back as something other than itself; use a plain single-line name"
+            ),
+        });
+    }
+    crate::history::record_validated_step_with_history(dir, name, validated, history)
+}
+
 // ------------------------------------------------- recording a SQL statement
 
 /// What a caller asks [`record_sql`] to record. The command line and `arc mcp`

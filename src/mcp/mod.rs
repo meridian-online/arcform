@@ -62,7 +62,8 @@ const INSTRUCTIONS: &str = "Use arc when you analyse data over DuckDB and the wo
     Protocol+Run contract; operator_describe emits an operator's `with:` JSON Schema for \
     authoring; operation_describe lists the SQL operations arc holds and, given an \
     operation's long name or an operator's name, describes what its step reads, writes and \
-    takes; operation_record records an operation as a new step of a Protocol; sql_recognise \
+    takes; operation_record records an operation as a new step of a Protocol; operator_record records an \
+    operator step, its `with:` checked against the operator's schema; sql_recognise \
     answers what arc reads a SQL statement as: an operation it holds, with the table and the \
     arguments operation_record takes, or none; sql_record records a SQL statement as a new \
     step of a Protocol, as the operation it is read as or else as a SQL step, and runs \
@@ -479,6 +480,7 @@ mod tests {
             "operator_describe",
             "operation_describe",
             "operation_record",
+            "operator_record",
             "sql_recognise",
             "sql_record",
             "protocol_create",
@@ -490,7 +492,7 @@ mod tests {
                 "missing tool `{expected}` in {names:?}"
             );
         }
-        assert_eq!(names.len(), 14, "unexpected tool set: {names:?}");
+        assert_eq!(names.len(), 15, "unexpected tool set: {names:?}");
         // Every tool advertises an object input schema.
         for tool in listed["tools"].as_array().unwrap() {
             assert!(tool["description"].is_string());
@@ -566,6 +568,7 @@ mod tests {
             "operator_describe",
             "operation_describe",
             "operation_record",
+            "operator_record",
             "sql_recognise",
             "sql_record",
         ] {

@@ -1101,6 +1101,22 @@ pub(crate) fn record_sql_step_with_history(
     })
 }
 
+/// [`record_step_with_history`] for a step already spliced and gated in memory
+/// (see [`record_operator`](crate::record::record_operator)): the same checkpoint
+/// before the write and the same save after it, around writing `validated`.
+pub(crate) fn record_validated_step_with_history(
+    dir: &Path,
+    name: &str,
+    validated: ValidatedSpec,
+    history: &LocalHistory,
+) -> Result<ValidatedSpec> {
+    let (_, validated) = record_with_history(dir, history, name, || {
+        validated.write_to(dir)?;
+        Ok((PathBuf::new(), validated))
+    })?;
+    Ok(validated)
+}
+
 /// The checkpoint, the promotion `record` makes and the save, in that order, as
 /// [`record_step_with_history`] describes them. The save's line in the
 /// folder's log names `name` as the step added.

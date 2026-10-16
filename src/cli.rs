@@ -153,6 +153,13 @@ pub enum Commands {
         cmd: OperationCmd,
     },
 
+    /// Record an operator step (a fetch, an entity resolution, an embedding, an
+    /// export) with its `with:` checked against the operator's schema.
+    Operator {
+        #[command(subcommand)]
+        cmd: OperatorCmd,
+    },
+
     /// Read SQL as arc reads it, record a statement as a step, and query a
     /// protocol's database read-only: whether a statement is an operation arc
     /// holds, the step that records it, and what a SELECT returns.
@@ -167,7 +174,8 @@ pub enum Commands {
     /// Protocol+Run contract), `operator_describe` (an operator's `with:` schema),
     /// `operation_describe` (the SQL operations arc holds, and what one takes),
     /// `operation_record` (record an operation as a step of a Protocol),
-    /// `sql_recognise` (what arc reads a SQL statement as), `sql_record` (record
+    /// `operator_record` (record an operator step, its `with:` checked against the
+    /// operator's schema), `sql_recognise` (what arc reads a SQL statement as), `sql_record` (record
     /// a SQL statement as a step of a Protocol), `protocol_create` (make a new
     /// Protocol, as `arc create-protocol` does), `table_describe` (what a table in
     /// a Protocol's database holds, read-only) and `sql_query` (run read-only
@@ -303,6 +311,39 @@ pub enum OperationCmd {
         /// lists them. Format: KEY=VALUE.
         #[arg(long = "arg", value_name = "KEY=VALUE")]
         args: Vec<String>,
+
+        /// One line saying what the step does and why, for whoever reads the
+        /// protocol next. Written on the step as `description:`; without it the
+        /// step carries none.
+        #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
+        description: Option<String>,
+
+        /// Protocol directory (where arcform.yaml lives).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+}
+
+/// The operator verbs. Operator names come from `arc operation describe` with an
+/// operator's name, or the `operator_describe` tool with no arguments.
+#[derive(Subcommand)]
+pub enum OperatorCmd {
+    /// Record an operator as a new step at the end of a protocol: a step in
+    /// arcform.yaml with the operator's name as `op:` and `--with` as its `with:`.
+    /// The `with:` is checked against the operator's schema first, and a block
+    /// that does not fit is refused naming the field. Runs nothing; `arc run`
+    /// runs the step.
+    Record {
+        /// The operator's name, as a step's `op:` names it (for example `http_fetch`).
+        operator: String,
+
+        /// The new step's name.
+        #[arg(long)]
+        name: String,
+
+        /// The step's `with:` block, as a JSON object.
+        #[arg(long = "with", value_name = "JSON", allow_hyphen_values = true)]
+        with: String,
 
         /// One line saying what the step does and why, for whoever reads the
         /// protocol next. Written on the step as `description:`; without it the
@@ -945,6 +986,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Commands::Registry { cmd } => dispatch_registry(cmd, verbose),
         Commands::Operation { cmd } => dispatch_operation(cmd, &mut std::io::stdout()),
+        Commands::Operator { cmd } => dispatch_operator(cmd, &mut std::io::stdout()),
         Commands::Sql { cmd } => dispatch_sql(cmd, &mut std::io::stdout()),
         #[cfg(feature = "mcp")]
         Commands::Mcp => crate::mcp::serve(),
@@ -992,6 +1034,53 @@ fn dispatch_operation(cmd: OperationCmd, out: &mut impl Write) -> Result<()> {
             operation_record(&dir, &request, &history, out)
         }
     }
+}
+
+/// Execute an `arc operator` verb. `record` writes a step into a protocol and
+/// runs nothing. A refusal is the error, with nothing written to the protocol or
+/// to `out`.
+fn dispatch_operator(cmd: OperatorCmd, out: &mut impl Write) -> Result<()> {
+    match cmd {
+        OperatorCmd::Record {
+            operator,
+            name,
+            with,
+            description,
+            dir,
+        } => {
+            let with: serde_json::Value = serde_json::from_str(&with).map_err(|e| {
+                Error::Io(std::io::Error::other(format!("`--with` is not JSON: {e}")))
+            })?;
+            let history = open_history()?;
+            let request = crate::record::OperatorRequest {
+                operator: &operator,
+                name: &name,
+                with: &with,
+                description: description.as_deref(),
+            };
+            operator_record(&dir, &request, &history, out)
+        }
+    }
+}
+
+/// Execute `arc operator record`: hand the request to the record path, which
+/// checks `with` against the operator's schema and writes the step. A refusal is
+/// the error, with nothing written to the protocol or to `out`.
+fn operator_record(
+    dir: &Path,
+    request: &crate::record::OperatorRequest,
+    history: &LocalHistory,
+    out: &mut impl Write,
+) -> Result<()> {
+    crate::record::record_operator(dir, request, history)?;
+    writeln!(
+        out,
+        "recorded step {} as {} in {} — `arc run` runs it",
+        request.name,
+        request.operator,
+        dir.join(crate::spec::MANIFEST_FILENAME).display()
+    )?;
+    Ok(())
 }
 
 /// Execute an `arc sql` verb. `recognise` prints what arc reads a statement as,
