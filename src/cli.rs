@@ -228,7 +228,9 @@ pub enum PanelCmd {
     /// Report each panel under panels/ whose marks read a table or a column the
     /// protocol does not make, one line per finding, and exit 1 when there is any.
     /// A table is one in the protocol's database, or the panel's own `data:`; before
-    /// the first run it is one a step produces, and columns are not checked.
+    /// the first run it is one a step produces, and columns are not checked. Not
+    /// checked: object-valued channels, a bare-string `data:`, and three-part
+    /// `catalog.schema.table` names.
     Check {
         /// Directory the protocol lives in.
         #[arg(long, default_value = ".")]

@@ -60,43 +60,175 @@ const CHANNELS: [&str; 28] = [
 /// The channels where a bare string may be a CSS colour rather than a column.
 const COLOUR_CHANNELS: [&str; 2] = ["fill", "stroke"];
 
-/// Colour names common enough that a panel writes them as `fill: steelblue`.
-const COLOUR_NAMES: [&str; 28] = [
-    "none",
-    "currentcolor",
-    "transparent",
+/// The CSS named colours (CSS Color Level 4, section 6.1), plus `transparent` and
+/// `currentcolor`, lowercased. A fixed standard, so it does not go stale.
+const COLOUR_NAMES: [&str; 150] = [
+    "aliceblue",
+    "antiquewhite",
+    "aqua",
+    "aquamarine",
+    "azure",
+    "beige",
+    "bisque",
     "black",
-    "white",
-    "gray",
-    "grey",
-    "red",
-    "green",
+    "blanchedalmond",
     "blue",
-    "orange",
-    "yellow",
-    "purple",
-    "pink",
+    "blueviolet",
     "brown",
-    "teal",
-    "navy",
-    "crimson",
-    "tomato",
-    "gold",
+    "burlywood",
+    "cadetblue",
+    "chartreuse",
+    "chocolate",
     "coral",
-    "salmon",
-    "steelblue",
-    "skyblue",
-    "slategray",
+    "cornflowerblue",
+    "cornsilk",
+    "crimson",
+    "cyan",
     "darkblue",
+    "darkcyan",
+    "darkgoldenrod",
+    "darkgray",
+    "darkgreen",
+    "darkgrey",
+    "darkkhaki",
+    "darkmagenta",
+    "darkolivegreen",
+    "darkorange",
+    "darkorchid",
+    "darkred",
+    "darksalmon",
+    "darkseagreen",
+    "darkslateblue",
+    "darkslategray",
+    "darkslategrey",
+    "darkturquoise",
+    "darkviolet",
+    "deeppink",
+    "deepskyblue",
+    "dimgray",
+    "dimgrey",
+    "dodgerblue",
+    "firebrick",
+    "floralwhite",
+    "forestgreen",
+    "fuchsia",
+    "gainsboro",
+    "ghostwhite",
+    "gold",
+    "goldenrod",
+    "gray",
+    "green",
+    "greenyellow",
+    "grey",
+    "honeydew",
+    "hotpink",
+    "indianred",
+    "indigo",
+    "ivory",
+    "khaki",
+    "lavender",
+    "lavenderblush",
+    "lawngreen",
+    "lemonchiffon",
+    "lightblue",
+    "lightcoral",
+    "lightcyan",
+    "lightgoldenrodyellow",
     "lightgray",
+    "lightgreen",
     "lightgrey",
+    "lightpink",
+    "lightsalmon",
+    "lightseagreen",
+    "lightskyblue",
+    "lightslategray",
+    "lightslategrey",
+    "lightsteelblue",
+    "lightyellow",
+    "lime",
+    "limegreen",
+    "linen",
+    "magenta",
+    "maroon",
+    "mediumaquamarine",
+    "mediumblue",
+    "mediumorchid",
+    "mediumpurple",
+    "mediumseagreen",
+    "mediumslateblue",
+    "mediumspringgreen",
+    "mediumturquoise",
+    "mediumvioletred",
+    "midnightblue",
+    "mintcream",
+    "mistyrose",
+    "moccasin",
+    "navajowhite",
+    "navy",
+    "oldlace",
+    "olive",
+    "olivedrab",
+    "orange",
+    "orangered",
+    "orchid",
+    "palegoldenrod",
+    "palegreen",
+    "paleturquoise",
+    "palevioletred",
+    "papayawhip",
+    "peachpuff",
+    "peru",
+    "pink",
+    "plum",
+    "powderblue",
+    "purple",
+    "rebeccapurple",
+    "red",
+    "rosybrown",
+    "royalblue",
+    "saddlebrown",
+    "salmon",
+    "sandybrown",
+    "seagreen",
+    "seashell",
+    "sienna",
+    "silver",
+    "skyblue",
+    "slateblue",
+    "slategray",
+    "slategrey",
+    "snow",
+    "springgreen",
+    "steelblue",
+    "tan",
+    "teal",
+    "thistle",
+    "tomato",
+    "turquoise",
+    "violet",
+    "wheat",
+    "white",
+    "whitesmoke",
+    "yellow",
+    "yellowgreen",
+    "transparent",
+    "currentcolor",
 ];
 
 /// What a panel names that the Protocol does not make.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PanelFinding {
-    MissingTable { from: String },
-    MissingColumn { from: String, column: String },
+    MissingTable {
+        from: String,
+    },
+    MissingColumn {
+        from: String,
+        column: String,
+    },
+    /// The file is not YAML, or holds no `plot`: nothing in it could be checked.
+    Unreadable {
+        reason: String,
+    },
 }
 
 impl fmt::Display for PanelFinding {
@@ -106,6 +238,7 @@ impl fmt::Display for PanelFinding {
                 f,
                 "a mark reads {from}, which is neither in the panel's data nor a table the Protocol makes"
             ),
+            Self::Unreadable { reason } => write!(f, "the panel could not be checked: {reason}"),
             Self::MissingColumn { from, column } => {
                 write!(
                     f,
@@ -220,9 +353,32 @@ fn push_once(into: &mut Vec<PanelFinding>, finding: PanelFinding) {
 fn is_colour(value: &str) -> bool {
     let lowered = value.to_lowercase();
     lowered.starts_with('#')
-        || lowered.starts_with("rgb")
-        || lowered.starts_with("hsl")
+        || [
+            "rgb(", "rgba(", "hsl(", "hsla(", "hwb(", "lab(", "lch(", "oklab(", "oklch(", "color(",
+        ]
+        .iter()
+        .any(|prefix| lowered.starts_with(prefix))
         || COLOUR_NAMES.contains(&lowered.as_str())
+}
+
+/// Every mark of the panel: those under `plot`, and those of a plot nested in
+/// `hconcat`/`vconcat` lists (or any mapping holding a `plot`), as Brightfield's
+/// examples lay out linked views. Counts the `plot` keys met.
+fn marks<'a>(node: &'a Value, into: &mut Vec<&'a Value>, plots: &mut usize) {
+    if let Some(list) = node.get("plot").and_then(Value::as_sequence) {
+        *plots += 1;
+        into.extend(list);
+    }
+    for key in ["hconcat", "vconcat"] {
+        for child in node
+            .get(key)
+            .and_then(Value::as_sequence)
+            .into_iter()
+            .flatten()
+        {
+            marks(child, into, plots);
+        }
+    }
 }
 
 /// The panel's findings against `catalogue`.
@@ -233,8 +389,14 @@ fn findings_in(panel: &Value, catalogue: &Catalogue) -> Vec<PanelFinding> {
         .map(|m| m.keys().filter_map(Value::as_str).collect())
         .unwrap_or_default();
     let mut findings = Vec::new();
-    let marks = panel.get("plot").and_then(Value::as_sequence);
-    for mark in marks.into_iter().flatten() {
+    let (mut all, mut plots) = (Vec::new(), 0);
+    marks(panel, &mut all, &mut plots);
+    if plots == 0 {
+        findings.push(PanelFinding::Unreadable {
+            reason: "it has no `plot`".to_string(),
+        });
+    }
+    for mark in all {
         let Some(from) = mark
             .get("data")
             .and_then(|d| d.get("from"))
@@ -259,13 +421,17 @@ fn findings_in(panel: &Value, catalogue: &Catalogue) -> Vec<PanelFinding> {
     findings
 }
 
-fn read_panel(panel: &Path) -> Result<Value> {
-    let text = fs::read_to_string(panel).map_err(|e| Error::FileRead {
-        path: panel.to_path_buf(),
+/// The panel at `path` read and checked; a file that is not YAML is a finding.
+fn check_file(path: &Path, catalogue: &Catalogue) -> Result<Vec<PanelFinding>> {
+    let text = fs::read_to_string(path).map_err(|e| Error::FileRead {
+        path: path.to_path_buf(),
         source: e,
     })?;
-    serde_yaml::from_str(&text).map_err(|e| {
-        Error::ManifestValidation(format!("{} is not valid YAML: {e}", panel.display()))
+    Ok(match serde_yaml::from_str::<Value>(&text) {
+        Ok(panel) => findings_in(&panel, catalogue),
+        Err(e) => vec![PanelFinding::Unreadable {
+            reason: format!("it is not valid YAML: {e}"),
+        }],
     })
 }
 
@@ -273,7 +439,7 @@ fn read_panel(panel: &Path) -> Result<Value> {
 /// Protocol in `dir` does not make.
 pub(crate) fn check_panel(dir: &Path, panel: &Path) -> Result<Vec<PanelFinding>> {
     let catalogue = Catalogue::load(dir)?;
-    Ok(findings_in(&read_panel(&dir.join(panel))?, &catalogue))
+    check_file(&dir.join(panel), &catalogue)
 }
 
 /// Every `panels/*.yaml` of the Protocol in `dir` with its findings, in name order.
@@ -292,7 +458,7 @@ pub(crate) fn check_panels(dir: &Path) -> Result<Vec<(PathBuf, Vec<PanelFinding>
     paths
         .into_iter()
         .map(|path| {
-            let findings = findings_in(&read_panel(&path)?, &catalogue);
+            let findings = check_file(&path, &catalogue)?;
             let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
             Ok((rel, findings))
         })

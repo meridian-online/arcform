@@ -134,6 +134,60 @@ fn missing_column_reported() {
 }
 
 #[test]
+fn colours_are_not_columns_but_typos_are() {
+    let dir = protocol_with_database();
+    put_panel(
+        dir.path(),
+        "colours.yaml",
+        &panel(
+            "trips",
+            "    x: name\n    fill: darkorange\n    stroke: oklch(0.7 0.1 200)\n",
+        ),
+    );
+    let out = arc(dir.path(), &["panel", "check"], None);
+    assert!(out.status.success(), "{out:?}");
+    put_panel(
+        dir.path(),
+        "typo.yaml",
+        &panel("trips", "    x: name\n    fill: cuont\n"),
+    );
+    let out = arc(dir.path(), &["panel", "check"], None);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(stdout(&out).contains("cuont"), "{}", stdout(&out));
+}
+
+#[test]
+fn nested_concat_marks_are_checked() {
+    let dir = protocol_with_database();
+    put_panel(
+        dir.path(),
+        "concat.yaml",
+        "hconcat:\n  - plot:\n      - mark: dot\n        data: { from: rides }\n        x: name\n",
+    );
+    let out = arc(dir.path(), &["panel", "check"], None);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(stdout(&out).contains("rides"), "{}", stdout(&out));
+}
+
+#[test]
+fn an_unreadable_panel_is_a_finding_and_the_rest_are_checked() {
+    let dir = protocol_with_database();
+    put_panel(dir.path(), "a_broken.yaml", "plot: [unclosed\n");
+    put_panel(dir.path(), "b_bad.yaml", &panel("rides", "    x: name\n"));
+    let out = arc(dir.path(), &["panel", "check"], None);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let text = stdout(&out);
+    assert!(
+        text.contains("a_broken.yaml") && text.contains("not valid YAML"),
+        "{text}"
+    );
+    assert!(
+        text.contains("b_bad.yaml") && text.contains("rides"),
+        "{text}"
+    );
+}
+
+#[test]
 fn expression_channel_not_checked() {
     let dir = protocol_with_database();
     put_panel(
