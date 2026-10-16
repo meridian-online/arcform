@@ -140,7 +140,7 @@ pub(crate) fn write_protocol_file(
     content: &str,
     history: &LocalHistory,
 ) -> Result<WrittenFile> {
-    let refuse = |message: String| Error::ManifestValidation(message);
+    let refuse = crate::record::refused;
     if !stays_inside_by_name(rel) {
         return Err(refuse(format!(
             "{} is outside the Protocol folder {}; name a file inside it",
@@ -174,7 +174,7 @@ pub(crate) fn write_protocol_file(
         ProtocolFileKind::Panel => {
             let panel: serde_yaml::Value = serde_yaml::from_str(content)
                 .map_err(|e| refuse(format!("the panel is not valid YAML: {e}")))?;
-            if panel.get("plot").is_none() {
+            if !crate::panel_check::has_plot(&panel) {
                 return Err(refuse("the panel has no `plot` key".to_string()));
             }
         }

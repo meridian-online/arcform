@@ -152,6 +152,18 @@ fn writes_panel_under_panels() {
 }
 
 #[test]
+fn writes_a_linked_view_panel_with_a_top_level_vconcat() {
+    let protocol = Protocol::new();
+    let panel = "vconcat:\n  - plot:\n      - mark: line\n  - plot:\n      - mark: dot\n";
+    let out = protocol.write("panels/linked.yaml", panel);
+    assert!(out.status.success(), "write failed: {}", stderr(&out));
+    assert_eq!(
+        std::fs::read_to_string(protocol.dir.join("panels/linked.yaml")).unwrap(),
+        panel
+    );
+}
+
+#[test]
 fn refuses_path_outside_protocol() {
     let protocol = Protocol::new();
     let before = protocol.tree();
@@ -279,6 +291,11 @@ fn refuses_report_and_names_report_write() {
     let out = protocol.write("report.md", "# Findings\n");
     assert!(!out.status.success());
     assert!(stderr(&out).contains("report_write"), "{}", stderr(&out));
+    assert!(
+        !stderr(&out).contains("invalid manifest"),
+        "{}",
+        stderr(&out)
+    );
     assert_eq!(protocol.tree(), before);
 }
 

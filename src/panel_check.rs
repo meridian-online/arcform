@@ -382,6 +382,18 @@ fn marks<'a>(node: &'a Value, into: &mut Vec<&'a Value>, plots: &mut usize) {
     }
 }
 
+/// Whether the panel holds a plot anywhere `marks` looks: under `plot`, or in
+/// a `hconcat`/`vconcat` child.
+pub(crate) fn has_plot(panel: &Value) -> bool {
+    panel.get("plot").is_some()
+        || ["hconcat", "vconcat"].iter().any(|key| {
+            panel
+                .get(key)
+                .and_then(Value::as_sequence)
+                .is_some_and(|list| list.iter().any(has_plot))
+        })
+}
+
 /// The panel's findings against `catalogue`.
 fn findings_in(panel: &Value, catalogue: &Catalogue) -> Vec<PanelFinding> {
     let inline: BTreeSet<&str> = panel
