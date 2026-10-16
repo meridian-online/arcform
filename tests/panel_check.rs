@@ -214,6 +214,27 @@ fn expression_channel_not_checked() {
 }
 
 #[test]
+fn a_three_part_name_is_not_checked_before_or_after_a_run() {
+    let before = protocol_before_first_run();
+    put_panel(
+        before.path(),
+        "p.yaml",
+        &panel("arc.main.ranking", "    x: whatever\n"),
+    );
+    let out = arc(before.path(), &["panel", "check"], None);
+    assert!(out.status.success(), "{out:?}");
+
+    let after = protocol_with_database();
+    put_panel(
+        after.path(),
+        "p.yaml",
+        &panel("arc.main.trips", "    x: whatever\n"),
+    );
+    let out = arc(after.path(), &["panel", "check"], None);
+    assert!(out.status.success(), "{out:?}");
+}
+
+#[test]
 fn before_first_run_checks_produced_tables() {
     let dir = protocol_before_first_run();
     put_panel(

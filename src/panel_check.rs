@@ -309,6 +309,10 @@ impl Catalogue {
                 }
             }
             Self::Database(tables) => {
+                // `catalog.schema.table` is not looked into, as before the first run.
+                if wanted.matches('.').count() >= 2 {
+                    return;
+                }
                 let found = if wanted.contains('.') {
                     tables.get(&wanted)
                 } else {
