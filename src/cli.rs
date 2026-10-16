@@ -178,7 +178,8 @@ pub enum Commands {
     /// operator's schema), `sql_recognise` (what arc reads a SQL statement as), `sql_record` (record
     /// a SQL statement as a step of a Protocol), `protocol_create` (make a new
     /// Protocol, as `arc create-protocol` does), `protocol_write_file` (write a
-    /// Protocol's schema, panel or README file), `table_describe` (what a table in
+    /// Protocol's schema, panel or README file), `report_write` (write the report of a
+    /// run), `table_describe` (what a table in
     /// a Protocol's database holds, read-only) and `sql_query` (run read-only
     /// SELECTs against a Protocol's database).
     #[cfg(feature = "mcp")]
@@ -194,6 +195,12 @@ pub enum Commands {
     Panel {
         #[command(subcommand)]
         cmd: PanelCmd,
+    },
+
+    /// Write the report of the protocol's newest run.
+    Report {
+        #[command(subcommand)]
+        cmd: ReportCmd,
     },
 
     /// Look at a table in a protocol's database, read-only.
@@ -215,6 +222,25 @@ pub enum ProtocolCmd {
     WriteFile {
         /// The file's path, relative to the protocol directory.
         path: PathBuf,
+
+        /// Protocol directory (where arcform.yaml lives).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+}
+
+/// The `arc report` verbs.
+#[derive(Subcommand)]
+pub enum ReportCmd {
+    /// Write report.md beside the protocol: the prose on standard input (the
+    /// answer, its caveats and the next steps), then what arc knows from the run
+    /// contract: how the answer was derived, the charts, and the run. Replaces a
+    /// report already there, keeping both in its history. A protocol that has not
+    /// run is refused, with nothing written.
+    Write {
+        /// The run whose contract to use; the newest run when left out.
+        #[arg(long)]
+        run: Option<String>,
 
         /// Protocol directory (where arcform.yaml lives).
         #[arg(long, default_value = ".")]
@@ -1190,6 +1216,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             dispatch_protocol(cmd, &mut std::io::stdin(), &mut std::io::stdout())
         }
         Commands::Panel { cmd } => dispatch_panel(cmd, &mut std::io::stdout()),
+        Commands::Report { cmd } => {
+            dispatch_report(cmd, &mut std::io::stdin(), &mut std::io::stdout())
+        }
         Commands::Table { cmd } => dispatch_table(cmd, &mut std::io::stdout()),
     }
 }
@@ -1245,6 +1274,24 @@ fn dispatch_protocol(
             for warning in &written.warnings {
                 writeln!(out, "warning: {warning}")?;
             }
+            Ok(())
+        }
+    }
+}
+
+/// Execute an `arc report` verb: the prose is read from `input` whole, and a
+/// refusal is the error with nothing written.
+fn dispatch_report(
+    cmd: ReportCmd,
+    input: &mut impl std::io::Read,
+    out: &mut impl Write,
+) -> Result<()> {
+    match cmd {
+        ReportCmd::Write { run, dir } => {
+            let mut prose = String::new();
+            input.read_to_string(&mut prose)?;
+            let path = crate::report::write_report(&dir, &prose, run.as_deref(), &open_history()?)?;
+            writeln!(out, "wrote {} in {}", path.display(), dir.display())?;
             Ok(())
         }
     }

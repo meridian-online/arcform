@@ -873,6 +873,36 @@ fn protocol_write_file_schema() -> Value {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// report_write
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Write the report of a Protocol's run, as `arc report write` does: both call
+/// `write_report`. `dir` defaults to `.`. The result names the report's `path`.
+fn report_write(args: &Value) -> ToolResult {
+    let dir = dir_arg(args)?;
+    let prose = required_string(args, "prose")?;
+    let run = optional_string(args, "run")?;
+    let history = open_history()?;
+    let path =
+        crate::report::write_report(&dir, prose, run, &history).map_err(|e| e.to_string())?;
+    Ok(ToolOutput::json(
+        json!({ "path": path.display().to_string() }),
+    ))
+}
+
+fn report_write_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "prose": { "type": "string", "description": "Your part of the report: the answer, its caveats and the next steps. arc adds the sections it knows from the run." },
+            "run": { "type": "string", "description": "The run whose contract to use. Defaults to the newest run." },
+            "dir": { "type": "string", "description": "Protocol directory (where arcform.yaml lives). Defaults to the current directory." }
+        },
+        "required": ["prose"]
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // table_describe
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1135,6 +1165,13 @@ pub(super) fn tools() -> Vec<ToolDef> {
             description: "Write one file of a Protocol, as `arc protocol write-file` does: a table's schema (schemas/<name>.json, JSON), a panel (panels/<name>.yaml, YAML with a `plot` key) or README.md. The file is written whole, replacing one already there, and the state it replaces is kept in its history. A path outside the Protocol's folder, any other place and content that does not read as its kind are refused with nothing written; report.md has a tool of its own, report_write. Runs nothing.",
             input_schema: protocol_write_file_schema,
             handler: protocol_write_file,
+            annotations: Annotations::EDITS,
+        },
+        ToolDef {
+            name: "report_write",
+            description: "Write report.md beside a Protocol, as `arc report write` does: your `prose` (the answer, its caveats and the next steps) first, then three sections arc writes from the run's contract. \"How this was derived\" lists each step in order with its description, status and the tables it made with their row counts; \"Charts\" lists each panel with its title and anything panel_check would say of it; \"Run\" gives the run id, when it finished, its outcome and each asset's content hash. Uses the newest run unless `run` names one. Replaces a report already there, and the state it replaces is kept in its history. A Protocol that has not run, or a `run` with no contract, is refused with nothing written: run the Protocol first with protocol_run. Runs nothing.",
+            input_schema: report_write_schema,
+            handler: report_write,
             annotations: Annotations::EDITS,
         },
         ToolDef {

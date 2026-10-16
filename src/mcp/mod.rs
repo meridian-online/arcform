@@ -72,7 +72,7 @@ const INSTRUCTIONS: &str = "Use arc when you analyse data over DuckDB and the wo
     nothing; protocol_create makes a new Protocol in a directory, as arc create-protocol does, \
     and refuses one that already has a spec; protocol_write_file writes a Protocol's schema, panel or \
     README file, as arc protocol write-file does, and warns of a table or column a panel names that the \
-    Protocol does not make; panel_check reports the same for every panel and changes nothing; table_describe reads what a table in a \
+    Protocol does not make; panel_check reports the same for every panel and changes nothing; report_write writes report.md beside a Protocol, as arc report write does, from your prose and the newest run's contract, once the Protocol has run; table_describe reads what a table in a \
     Protocol's database holds (row count, columns, null counts, sample rows) and changes nothing; \
     table_profile profiles a table's columns with FineType, or gives a JSON Schema its rows pass, and \
     table_validate checks a table against such a schema file with FineType's DuckDB extension; both \
@@ -460,7 +460,12 @@ mod tests {
                 "{name}"
             );
         }
-        for name in ["protocol_run", "protocol_edit", "history_restore"] {
+        for name in [
+            "protocol_run",
+            "protocol_edit",
+            "history_restore",
+            "report_write",
+        ] {
             assert_eq!(
                 tool(&list, name)["annotations"]["destructiveHint"],
                 true,
@@ -512,6 +517,7 @@ mod tests {
             "sql_record",
             "protocol_create",
             "protocol_write_file",
+            "report_write",
             "table_describe",
             "table_profile",
             "table_validate",
@@ -522,7 +528,7 @@ mod tests {
                 "missing tool `{expected}` in {names:?}"
             );
         }
-        assert_eq!(names.len(), 22, "unexpected tool set: {names:?}");
+        assert_eq!(names.len(), 23, "unexpected tool set: {names:?}");
         // Every tool advertises an object input schema.
         for tool in listed["tools"].as_array().unwrap() {
             assert!(tool["description"].is_string());

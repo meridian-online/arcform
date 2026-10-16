@@ -98,7 +98,7 @@ const EXPORTED: [(&str, &str); 35] = [
 
 /// Every module file in the crate. Frozen so a new one cannot be added without
 /// passing under the checks below.
-const MODULE_FILES: [&str; 37] = [
+const MODULE_FILES: [&str; 38] = [
     "asset.rs",
     "asset_kind.rs",
     "bridge.rs",
@@ -142,6 +142,8 @@ const MODULE_FILES: [&str; 37] = [
     "registry/resolve.rs",
     "registry/run.rs",
     "registry/transport.rs",
+    // The report `arc report write` writes beside a Protocol. Private to the crate.
+    "report.rs",
     "runner.rs",
     "spec.rs",
     "state.rs",

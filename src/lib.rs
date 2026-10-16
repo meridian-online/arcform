@@ -58,6 +58,7 @@ mod precondition;
 mod protocol_files;
 mod record;
 mod registry;
+mod report;
 mod runner;
 mod state;
 mod working_db;

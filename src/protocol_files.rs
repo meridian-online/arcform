@@ -96,6 +96,36 @@ pub(crate) fn resolves_inside(dir: &Path, path: &Path) -> Result<bool> {
     Ok(held.starts_with(&root))
 }
 
+/// Replace the file at `path` with `content`, keeping both the old and the new
+/// state in the file's history.
+///
+/// A file already there may never have been written through arc: its text is
+/// kept before it is replaced, and the write waits until that is kept. The new
+/// text is never merged into the last entry, so two quick writes keep both
+/// versions. The caller has made the parent folder and decided the path is
+/// inside the Protocol.
+pub(crate) fn replace_file_with_history(
+    path: &Path,
+    content: &str,
+    history: &LocalHistory,
+) -> Result<()> {
+    let mut held = None;
+    if path.exists() {
+        let current = fs::read_to_string(path).map_err(|e| Error::FileRead {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        held = history.checkpoint_held_for_file(path, &current)?;
+    }
+    write_atomic(path, content.as_bytes())?;
+    // The checkpoint's line in the folder's log lands with the write it was for.
+    if let Some(held) = held {
+        held.land();
+    }
+    history.record_save_unmerged_for_file(path, content)?;
+    Ok(())
+}
+
 /// Write `content` to the file at `rel` in the Protocol folder `dir`, and
 /// record it in that file's history.
 ///
@@ -161,23 +191,7 @@ pub(crate) fn write_protocol_file(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    // A file already there may never have been written through arc: keep what
-    // it holds before it is replaced, and write only once that is kept.
-    let mut held = None;
-    if path.exists() {
-        let current = fs::read_to_string(&path).map_err(|e| Error::FileRead {
-            path: path.clone(),
-            source: e,
-        })?;
-        held = history.checkpoint_held_for_file(&path, &current)?;
-    }
-    write_atomic(&path, content.as_bytes())?;
-    // The checkpoint's line in the folder's log lands with the write it was for.
-    if let Some(held) = held {
-        held.land();
-    }
-    // Never merged, so two quick writes keep both versions.
-    history.record_save_unmerged_for_file(&path, content)?;
+    replace_file_with_history(&path, content, history)?;
     // The panel is kept whatever it names; what the Protocol does not make is said.
     let warnings = if kind == ProtocolFileKind::Panel {
         match crate::panel_check::check_panel(dir, rel) {
