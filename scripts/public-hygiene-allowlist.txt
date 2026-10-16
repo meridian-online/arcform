@@ -1,7 +1,9 @@
 # Allowlist for scripts/check-public-hygiene.sh.
 #
-# Empty on purpose, and it should stay that way. If the gate fires, the fix is
-# to delete the private planning identifier — not to record it here.
+# It holds only genuine content that must stay, such as a path relative to a
+# folder chosen at run time, which the path rule cannot tell from a path into
+# another checkout. A private planning identifier is fixed by deleting it,
+# never by listing it here.
 #
 # Format, one entry per line, THREE pipe-separated fields:
 #
