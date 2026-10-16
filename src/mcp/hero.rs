@@ -902,6 +902,39 @@ fn table_describe_schema() -> Value {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// panel_check
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What each panel of a Protocol names that the Protocol does not make, as `arc
+/// panel check` prints it. A panel with findings is a result, not an error.
+fn panel_check(args: &Value) -> ToolResult {
+    let dir = dir_arg(args)?;
+    let checked = crate::panel_check::check_panels(&dir).map_err(|e| e.to_string())?;
+    let panels: Vec<Value> = checked
+        .iter()
+        .map(|(panel, findings)| {
+            json!({
+                "panel": panel.display().to_string(),
+                "findings": findings.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let clean = checked.iter().all(|(_, findings)| findings.is_empty());
+    Ok(ToolOutput::json(
+        json!({ "clean": clean, "panels": panels }),
+    ))
+}
+
+fn panel_check_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "dir": { "type": "string", "description": "The Protocol's directory. Defaults to the server's working directory." }
+        }
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // table_profile and table_validate
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1103,6 +1136,13 @@ pub(super) fn tools() -> Vec<ToolDef> {
             input_schema: protocol_write_file_schema,
             handler: protocol_write_file,
             annotations: Annotations::EDITS,
+        },
+        ToolDef {
+            name: "panel_check",
+            description: "Check each panel (panels/<name>.yaml) of a Protocol against what the Protocol makes, as `arc panel check` does. A mark's `data.from` must be a key of the panel's own `data:` or a table in the Protocol's database, and a channel written as a bare string (`x: name`) must be a column of that table; an object channel (an expression or an aggregate) is not looked into. Returns `clean` and, for each panel, its `findings` as plain sentences. Before the Protocol has run there is no database, so a table is checked against the relations its steps produce and columns are not checked. Opens the database read-only. protocol_write_file reports the same findings as `warnings` when it writes a panel.",
+            input_schema: panel_check_schema,
+            handler: panel_check,
+            annotations: Annotations::READS_OPEN,
         },
         ToolDef {
             name: "table_describe",

@@ -190,6 +190,12 @@ pub enum Commands {
         cmd: ProtocolCmd,
     },
 
+    /// Check the protocol's panels against what the protocol makes.
+    Panel {
+        #[command(subcommand)]
+        cmd: PanelCmd,
+    },
+
     /// Look at a table in a protocol's database, read-only.
     Table {
         #[command(subcommand)]
@@ -211,6 +217,20 @@ pub enum ProtocolCmd {
         path: PathBuf,
 
         /// Protocol directory (where arcform.yaml lives).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+}
+
+/// The `arc panel` verbs.
+#[derive(Subcommand)]
+pub enum PanelCmd {
+    /// Report each panel under panels/ whose marks read a table or a column the
+    /// protocol does not make, one line per finding, and exit 1 when there is any.
+    /// A table is one in the protocol's database, or the panel's own `data:`; before
+    /// the first run it is one a step produces, and columns are not checked.
+    Check {
+        /// Directory the protocol lives in.
         #[arg(long, default_value = ".")]
         dir: PathBuf,
     },
@@ -1167,7 +1187,32 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Commands::Protocol { cmd } => {
             dispatch_protocol(cmd, &mut std::io::stdin(), &mut std::io::stdout())
         }
+        Commands::Panel { cmd } => dispatch_panel(cmd, &mut std::io::stdout()),
         Commands::Table { cmd } => dispatch_table(cmd, &mut std::io::stdout()),
+    }
+}
+
+/// Execute an `arc panel` verb: each finding on its own line, and an error when
+/// there is any.
+fn dispatch_panel(cmd: PanelCmd, out: &mut impl Write) -> Result<()> {
+    match cmd {
+        PanelCmd::Check { dir } => {
+            let mut found = 0;
+            for (panel, findings) in crate::panel_check::check_panels(&dir)? {
+                for finding in &findings {
+                    writeln!(out, "{}: {finding}", panel.display())?;
+                }
+                found += findings.len();
+            }
+            if found == 0 {
+                Ok(())
+            } else {
+                Err(Error::Io(std::io::Error::other(format!(
+                    "{found} thing{} in the panels the protocol does not make",
+                    if found == 1 { "" } else { "s" }
+                ))))
+            }
+        }
     }
 }
 

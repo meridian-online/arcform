@@ -53,6 +53,7 @@ mod manifest;
 #[cfg(feature = "mcp")]
 mod mcp;
 mod operator;
+mod panel_check;
 mod precondition;
 mod protocol_files;
 mod record;

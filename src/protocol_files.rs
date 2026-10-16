@@ -178,12 +178,23 @@ pub(crate) fn write_protocol_file(
     }
     // Never merged, so two quick writes keep both versions.
     history.record_save_unmerged_for_file(&path, content)?;
+    // The panel is kept whatever it names; what the Protocol does not make is said.
+    let warnings = if kind == ProtocolFileKind::Panel {
+        match crate::panel_check::check_panel(dir, rel) {
+            Ok(findings) => findings.iter().map(ToString::to_string).collect(),
+            Err(e) => vec![format!(
+                "the panel was not checked against the Protocol: {e}"
+            )],
+        }
+    } else {
+        Vec::new()
+    };
     Ok(WrittenFile {
         path: rel
             .components()
             .filter(|c| !matches!(c, Component::CurDir))
             .collect(),
         kind,
-        warnings: Vec::new(),
+        warnings,
     })
 }
