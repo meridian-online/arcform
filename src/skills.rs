@@ -47,18 +47,21 @@ const AGENTS: &[Agent] = &[
         config_dir: ".codex",
         skills_dir: ".agents/skills",
     },
-    // https://cursor.com/docs/skills (global skills: `~/.cursor/skills/` and `~/.agents/skills/`)
+    // https://cursor.com/docs/skills (global skills: `~/.cursor/skills/` and `~/.agents/skills/`).
+    // Cursor and Gemini CLI get the shared folder, not their own: each reads both, so a machine
+    // with Codex beside them would otherwise hold two copies of every skill, and refreshing one
+    // agent's own folder would leave a stale copy in the shared one.
     Agent {
         name: "cursor",
         config_dir: ".cursor",
-        skills_dir: ".cursor/skills",
+        skills_dir: ".agents/skills",
     },
     // https://geminicli.com/docs/cli/skills/ (user skills: `~/.gemini/skills/`, alias
-    // `~/.agents/skills/`)
+    // `~/.agents/skills/`, which takes precedence)
     Agent {
         name: "gemini",
         config_dir: ".gemini",
-        skills_dir: ".gemini/skills",
+        skills_dir: ".agents/skills",
     },
     // The shared folder of the Agent Skills standard, read by Codex, Cursor and Gemini CLI
     // (sources above).

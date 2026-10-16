@@ -92,8 +92,9 @@ fn installs_into_each_detected_agent() {
     assert_ok(&out);
     let stdout = text(&out.stdout);
 
-    for agent_dir in [".claude", ".gemini"] {
-        let skills = home.path().join(agent_dir).join("skills");
+    // Gemini CLI's skills go into the shared folder, which it reads.
+    for dir in [".claude/skills", ".agents/skills"] {
+        let skills = home.path().join(dir);
         for name in skill_names() {
             let folder = skills.join(&name);
             assert!(
@@ -113,9 +114,62 @@ fn installs_into_each_detected_agent() {
             );
         }
     }
-    // An agent whose config folder is absent is left alone.
+    // An agent whose config folder is absent is left alone, and Gemini CLI's own folder is
+    // not written.
     assert!(!home.path().join(".cursor").exists());
-    assert!(!home.path().join(".agents").exists());
+    assert!(!home.path().join(".gemini/skills").exists());
+}
+
+/// Codex, Cursor and Gemini CLI all read `~/.agents/skills`, so with all three present each
+/// skill is written there once, and neither agent's own folder gets a second copy.
+#[test]
+fn agents_that_share_a_folder_get_one_copy() {
+    let home = tempfile::tempdir().unwrap();
+    for dir in [".codex", ".cursor", ".gemini"] {
+        fs::create_dir(home.path().join(dir)).unwrap();
+    }
+
+    let out = arc(home.path(), &["skills", "install"]);
+    assert_ok(&out);
+    let stdout = text(&out.stdout);
+
+    for name in skill_names() {
+        let folder = home.path().join(".agents/skills").join(&name);
+        assert!(
+            folder.join("SKILL.md").is_file(),
+            "{} missing",
+            folder.display()
+        );
+        assert_eq!(
+            stdout.matches(&folder.display().to_string()).count(),
+            1,
+            "each folder is written and printed once:\n{stdout}"
+        );
+    }
+    assert!(!home.path().join(".cursor/skills").exists());
+    assert!(!home.path().join(".gemini/skills").exists());
+}
+
+/// `--agent cursor` and `--agent gemini` refresh the shared folder those agents read, so an
+/// upgrade leaves no older copy there.
+#[test]
+fn agent_flag_refreshes_the_shared_folder() {
+    for agent in ["cursor", "gemini"] {
+        let home = tempfile::tempdir().unwrap();
+        let shared = home.path().join(".agents/skills/using-arcform");
+        fs::create_dir_all(&shared).unwrap();
+        fs::write(shared.join("SKILL.md"), "old\n").unwrap();
+        fs::write(shared.join(".arc-skill"), "arc 0.0.1\n").unwrap();
+
+        let out = arc(home.path(), &["skills", "install", "--agent", agent]);
+        assert_ok(&out);
+        let marker = fs::read_to_string(shared.join(".arc-skill")).unwrap();
+        assert!(
+            marker.contains(env!("CARGO_PKG_VERSION")),
+            "--agent {agent} replaces the shared copy: {marker}"
+        );
+        assert!(!home.path().join(format!(".{agent}/skills")).exists());
+    }
 }
 
 #[test]
@@ -162,7 +216,7 @@ fn a_refused_folder_blocks_only_its_own_agent() {
     let stderr = text(&out.stderr);
     assert!(stderr.contains(&mine.display().to_string()), "{stderr}");
     for name in skill_names() {
-        let gemini = home.path().join(".gemini/skills").join(&name);
+        let gemini = home.path().join(".agents/skills").join(&name);
         assert!(
             gemini.join("SKILL.md").is_file(),
             "another agent still installs"
@@ -256,12 +310,7 @@ fn no_agent_detected_prints_targets_and_exits_1() {
     let out = arc(home.path(), &["skills", "install"]);
     assert_eq!(out.status.code(), Some(1));
     let stderr = text(&out.stderr);
-    for dir in [
-        ".claude/skills",
-        ".cursor/skills",
-        ".gemini/skills",
-        ".agents/skills",
-    ] {
+    for dir in [".claude/skills", ".agents/skills", ".cursor", ".gemini"] {
         assert!(stderr.contains(dir), "{dir} is not named in:\n{stderr}");
     }
     assert!(
@@ -283,7 +332,8 @@ fn agent_flag_installs_for_an_undetected_agent() {
     assert_ok(&out);
     assert!(
         home.path()
-            .join(".cursor/skills/using-arcform/SKILL.md")
+            .join(".agents/skills/using-arcform")
+            .join("SKILL.md")
             .is_file()
     );
 }
@@ -381,7 +431,7 @@ fn an_unwritable_skills_folder_fails_only_its_own_agent() {
         "nothing is left behind: {leftovers:?}"
     );
     for name in skill_names() {
-        let gemini = home.path().join(".gemini/skills").join(&name);
+        let gemini = home.path().join(".agents/skills").join(&name);
         assert!(
             gemini.join("SKILL.md").is_file(),
             "another agent still installs"

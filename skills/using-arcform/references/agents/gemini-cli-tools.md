@@ -14,7 +14,7 @@ Use one of two routes, not both: with both, Gemini CLI holds two copies of every
 
   Put the version `arc --version` prints in place of `X.Y.Z`, so the skills match your arc; it works from the first release that carries the extension manifest. After upgrading arc, uninstall the extension and install it again at the new tag.
 
-- **The skills folder.** `arc skills install --agent gemini` writes the skills into `~/.gemini/skills/`. Connect the server yourself (below).
+- **The skills folder.** `arc skills install --agent gemini` writes the skills into `~/.agents/skills/`, the shared folder Gemini CLI reads ahead of `~/.gemini/skills/`, so Codex and Cursor on the same machine share the one copy. Connect the server yourself (below).
 
 ## Connecting `arc mcp`
 
