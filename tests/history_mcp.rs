@@ -217,6 +217,37 @@ fn history_list_given_a_dir_that_is_not_the_working_directory() {
     let response: Value =
         serde_json::from_slice(out.stdout.split(|b| *b == b'\n').next().unwrap()).unwrap();
     assert_ne!(response["result"]["isError"], true, "{response}");
+    let from_elsewhere: Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(!from_elsewhere.as_array().unwrap().is_empty());
+    assert_eq!(from_elsewhere, protocol.call_ok("history_list", json!({})));
+}
+
+#[test]
+fn history_files_stay_inside_the_protocol() {
+    let protocol = Protocol::new();
+    let outside = protocol.dir.parent().unwrap().join("x.yaml");
+    std::fs::write(&outside, "kept\n").unwrap();
+    let store = LocalHistory::at_root(&protocol.history);
+    let id = store
+        .record_save_for_file(&outside, "old\n")
+        .unwrap()
+        .expect("recorded")
+        .id;
+    let before = protocol.manifest();
+    let absolute = outside.display().to_string();
+    for file in ["../x.yaml", absolute.as_str()] {
+        let listed = protocol.call("history_list", json!({ "file": file }));
+        assert_eq!(listed["isError"], true, "{file}: {listed}");
+        let restored = protocol.call("history_restore", json!({ "id": id, "file": file }));
+        assert_eq!(restored["isError"], true, "{file}: {restored}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "kept\n");
+        assert_eq!(protocol.manifest(), before);
+
+        let out = protocol.arc(&["history", "restore", &id, "--file", file]);
+        assert!(!out.status.success(), "{file}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "kept\n");
+    }
 }
 
 #[test]

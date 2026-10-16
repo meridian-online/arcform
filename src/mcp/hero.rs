@@ -944,7 +944,7 @@ pub(super) fn tools() -> Vec<ToolDef> {
             description: "Make one edit to a Protocol's arcform.yaml, as `arc edit-protocol` does: replace a value, rewrite one fragment of it, add a key, append a sequence item, delete an element or reorder a sequence, addressed by a path such as `steps[2].command`. The edit is applied to the file's bytes, so every byte it does not target survives (comments, key order, quoting), and is checked by the loader before anything is written; one that does not apply or does not load is refused with the file untouched. The state replaced is kept in history. Returns the edited Protocol's steps. Runs nothing.",
             input_schema: protocol_edit_schema,
             handler: protocol_edit,
-            annotations: Annotations::WRITES,
+            annotations: Annotations::EDITS,
         },
         ToolDef {
             name: "history_list",
@@ -958,7 +958,7 @@ pub(super) fn tools() -> Vec<ToolDef> {
             description: "Roll a Protocol's arcform.yaml, or with `file` that one file alone, back to the state a history_list entry recorded. The state being replaced is kept in history first, so a restore can itself be undone. A restored spec that no longer loads is restored all the same and says so in `note`.",
             input_schema: history_restore_schema,
             handler: history_restore,
-            annotations: Annotations::WRITES,
+            annotations: Annotations::EDITS,
         },
         ToolDef {
             name: "sql_recognise",

@@ -693,11 +693,41 @@ fn parse_path(raw: &str) -> Result<Vec<PathPart>> {
     Ok(parts)
 }
 
-/// The path `--file` names: a relative path is read from the protocol
-/// directory, the way `--dir` scopes everything else a history verb touches,
-/// and an absolute one is taken as it stands.
-fn history_file(dir: &Path, file: &Path) -> PathBuf {
-    dir.join(file)
+/// The path `--file` names: a relative path read from the protocol directory,
+/// the way `--dir` scopes everything else a history verb touches. A file outside
+/// the Protocol's folder is refused: an absolute path, one with a `..`
+/// component, and one that reaches out through a symbolic link.
+fn history_file(dir: &Path, file: &Path) -> Result<PathBuf> {
+    let outside = || {
+        Error::ManifestValidation(format!(
+            "--file {} is outside the Protocol folder {}; name a file inside it",
+            file.display(),
+            dir.display()
+        ))
+    };
+    if file.components().any(|c| {
+        !matches!(
+            c,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
+        return Err(outside());
+    }
+    let path = dir.join(file);
+    // The nearest ancestor that exists, canonicalised, must sit under the
+    // canonical folder: that catches a link that points out.
+    let root = fs::canonicalize(dir)?;
+    let mut probe = path.as_path();
+    let held = loop {
+        match fs::canonicalize(probe) {
+            Ok(held) => break held,
+            Err(_) => probe = probe.parent().ok_or_else(outside)?,
+        }
+    };
+    if !held.starts_with(&root) {
+        return Err(outside());
+    }
+    Ok(path)
 }
 
 /// Execute `arc history list`: the recorded states of the spec in `dir`, or
@@ -722,7 +752,7 @@ pub fn history_list(
             "`arc history restore <id>`".to_string(),
         ),
         Some(file) => {
-            let path = history_file(dir, file);
+            let path = history_file(dir, file)?;
             let entries = history.entries_for_file(&path)?;
             let restore = format!("`arc history restore <id> --file {}`", file.display());
             (path, "file", entries, restore)
@@ -771,7 +801,7 @@ pub(crate) fn history_entries_json(
 ) -> Result<serde_json::Value> {
     let entries = match file {
         None => history.entries(dir)?,
-        Some(file) => history.entries_for_file(&history_file(dir, file))?,
+        Some(file) => history.entries_for_file(&history_file(dir, file)?)?,
     };
     Ok(serde_json::Value::Array(
         entries
@@ -801,7 +831,7 @@ pub fn history_show(
 ) -> Result<()> {
     let text = match file {
         None => history.read(dir, id)?,
-        Some(file) => history.read_for_file(&history_file(dir, file), id)?,
+        Some(file) => history.read_for_file(&history_file(dir, file)?, id)?,
     };
     write!(out, "{text}")?;
     Ok(())
@@ -855,7 +885,7 @@ pub(crate) fn history_restore_files(
             history.restore(dir, id)?,
         ),
         Some(file) => {
-            let path = history_file(dir, file);
+            let path = history_file(dir, file)?;
             let text = history.restore_for_file(&path, id)?;
             (path, text)
         }

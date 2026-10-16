@@ -157,6 +157,13 @@ impl Annotations {
         open_world: false,
         destructive: false,
     };
+    /// A tool that changes a file of the Protocol's folder in place, keeping the state
+    /// it replaces in history, and reaches nothing else.
+    pub(crate) const EDITS: Annotations = Annotations {
+        read_only: false,
+        open_world: false,
+        destructive: true,
+    };
     /// A tool that runs a Protocol: it replaces tables, runs arbitrary steps and may
     /// reach the network.
     pub(crate) const RUNS: Annotations = Annotations {
@@ -445,8 +452,15 @@ mod tests {
                 "{name}"
             );
         }
+        for name in ["protocol_run", "protocol_edit", "history_restore"] {
+            assert_eq!(
+                tool(&list, name)["annotations"]["destructiveHint"],
+                true,
+                "{name}"
+            );
+        }
         assert_eq!(
-            tool(&list, "protocol_run")["annotations"]["destructiveHint"],
+            tool(&list, "history_list")["annotations"]["readOnlyHint"],
             true
         );
     }
