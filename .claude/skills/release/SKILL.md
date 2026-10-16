@@ -64,6 +64,8 @@ Keep the section under 120,000 characters, or the tag guard refuses it (GitHub c
 
 **Set the skills' version.** In every `skills/*/SKILL.md`, set `metadata.arc_version` to the new version. `tests/skills.rs` (`frontmatter_is_loadable`) requires it to equal the crate version, so a stale one fails CI. Add the `skills/` folders to the `git add` in step 2.
 
+**Regenerate the plugin manifests.** Run `python3 scripts/generate-plugins.py`: each agent's manifest carries the crate version, and `tests/plugin_manifests.rs` fails CI until they match `Cargo.toml`. Add what it writes to the `git add` in step 2.
+
 Leave `vendor/sqlparser-0.55.0` alone unless the fork itself changed. If it did, its patch version moves in both its own `Cargo.toml` and arcform's `=` pin, and CI's `package` job fails if they differ.
 
 ## 2. Check locally, then open the pull request and wait for CI
@@ -76,15 +78,26 @@ cargo fmt --all --check
 ./scripts/check-public-hygiene.sh
 ```
 
+**Run the analyst workflow's release eval.** It tests the skills in real agents and needs paid sessions, so it is not in CI. Build arc with the MCP feature and run its preflight against that binary; every dataset must answer and every skill's `arc_version` must equal the new version:
+
+```bash
+DUCKDB_LIB_DIR=/opt/homebrew/lib cargo build --features mcp
+ARC=target/debug/arc eval/analyst-workflow/preflight.sh
+```
+
+Once it passes, run the tasks by `eval/analyst-workflow/README.md` and fill a copy of `eval/analyst-workflow/score.md` outside the repository: one row per task and agent, the failure clusters and the pass bar's verdict. Its results go in the pull request's description (below), not in a commit. When a cluster needs a skill edit, make it on this branch and add it to `CHANGELOG.md`; then rebuild arc with the MCP feature (`skills/` is embedded in the binary, so the old binary would reinstall the old skills), run the preflight again, reinstall the skills in each agent with the rebuilt binary the second preflight passed (`target/debug/arc skills install ...`, not an `arc` found on `PATH`, which may be older; copy it over `run/bin/arc` again for a headless rerun; for the desktop client, zip and upload each skill folder again), and only then rerun the failing tasks.
+
 Then commit these files by name and open the pull request:
 
 ```bash
-git add CHANGELOG.md Cargo.toml Cargo.lock CLAUDE.md skills
+git add CHANGELOG.md Cargo.toml Cargo.lock CLAUDE.md skills .claude-plugin .codex-plugin .cursor-plugin gemini-extension.json plugin
 git commit -m "Release X.Y.Z: <one line on what it brings>"
 git push -u origin release-vX.Y.Z
-gh pr create --title "Release X.Y.Z" --body "<the summary from the changelog section, then: merging this and pushing vX.Y.Z publishes the release>"
+gh pr create --title "Release X.Y.Z" --body "<the summary from the changelog section, then the eval's scored results, then: merging this and pushing vX.Y.Z publishes the release>"
 gh pr checks --watch
 ```
+
+The eval's scored results in the body are the filled `score.md`: its results table, the pass bar's verdict, each failure cluster with the edit made, and the reruns. If the pass bar is not met, say so at the top of the body; the release waits for Hugh's decision on it.
 
 A check still pending is pending, not green. If CI fails, fix it on the branch and wait again.
 

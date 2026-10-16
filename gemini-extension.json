@@ -1,0 +1,13 @@
+{
+  "name": "arcform",
+  "version": "0.2.0",
+  "description": "Agent skills for analysing tabular data with arc: every step is recorded in a Protocol the user can re-run, inspect and share, and the arc MCP server is connected for you.",
+  "mcpServers": {
+    "arc": {
+      "command": "arc",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
+}

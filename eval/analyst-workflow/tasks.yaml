@@ -1,0 +1,161 @@
+# The analyst workflow's release eval: ten analyst tasks on public datasets.
+#
+# Each prompt is what an analyst would type, pasted into the agent verbatim. It never names
+# arc or arcform: the eval measures whether the agent reaches for arc on its own. Every URL a
+# prompt carries, and every dataset_url, is checked by preflight.sh before a run.
+#
+# Fields: id, size (quick | analysis | project), dataset_url, licence, prompt, notes.
+# `notes` is for the evaluator, not the agent: what the data holds, the quality issue a good
+# session should surface, and, for an analysis or a project, the refinement to give when the
+# agent plays its plan back (it tests outcome 4, the analyst's say in the process).
+
+tasks:
+  # --- A quick look: one or two aggregates answer it -------------------------------------
+
+  - id: quick-penguins
+    size: quick
+    dataset_url: https://raw.githubusercontent.com/allisonhorst/palmerpenguins/main/inst/extdata/penguins.csv
+    licence: CC0 1.0 (palmerpenguins, Horst, Hill and Gorman)
+    prompt: >-
+      Here's the Palmer penguins data:
+      https://raw.githubusercontent.com/allisonhorst/palmerpenguins/main/inst/extdata/penguins.csv
+      Which species is heaviest on average, and by how much?
+    notes: >-
+      CSV, 344 rows, three species. Two rows have no body mass, written as the string "NA",
+      so a column read as text or an average that counts them is the trap. Expected answer:
+      Gentoo, about 1.3–1.4 kg heavier than either other species.
+
+  - id: quick-bad-drivers
+    size: quick
+    dataset_url: https://raw.githubusercontent.com/fivethirtyeight/data/master/bad-drivers/bad-drivers.csv
+    licence: CC BY 4.0 (FiveThirtyEight)
+    prompt: >-
+      Which US state pays the most for car insurance, and is it also one of the worst for fatal
+      collisions? Data: https://raw.githubusercontent.com/fivethirtyeight/data/master/bad-drivers/bad-drivers.csv
+    notes: >-
+      CSV, 51 rows (the states plus the District of Columbia, which is not a state). Long
+      column names with spaces and punctuation. Collisions are per billion miles travelled,
+      so "worst" needs saying in those terms. Expected answer: New Jersey pays the most and
+      has one of the lowest fatal-collision rates (45th of 51).
+
+  - id: quick-earthquakes-month
+    size: quick
+    dataset_url: https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_month.geojson
+    licence: Public domain (US Geological Survey, a US Government work)
+    prompt: >-
+      How many magnitude 4.5+ earthquakes were there in the last 30 days, and where was the
+      biggest one? USGS feed: https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_month.geojson
+    notes: >-
+      GeoJSON from a live feed: one object whose `features` array holds the events, each with
+      nested `properties` and a time in epoch milliseconds. The answer changes daily, so score
+      the method and that the session states the moment the feed was read, not the number.
+
+  - id: quick-global-temperature
+    size: quick
+    dataset_url: https://raw.githubusercontent.com/datasets/global-temp/main/data/annual.csv
+    licence: CC BY 4.0 (as stated in the dataset's datapackage.json)
+    prompt: >-
+      From this file of global temperature anomalies, which year was the warmest on record and
+      by how much did it beat the previous record?
+      https://raw.githubusercontent.com/datasets/global-temp/main/data/annual.csv
+    notes: >-
+      CSV of three columns (Source, Year, Mean) holding two series stacked in one table, one
+      row per source per year. A session that takes the maximum over both series mixes them;
+      a good one notices the Source column and answers per series, or says which it used.
+
+  # --- An analysis: a comparison, a trend or a breakdown ----------------------------------
+
+  - id: analysis-co2-per-capita
+    size: analysis
+    dataset_url: https://raw.githubusercontent.com/owid/co2-data/master/owid-co2-data.csv
+    licence: CC BY 4.0 (Our World in Data)
+    prompt: >-
+      How have per-capita CO2 emissions changed since 1990 in the G7 compared with China and
+      India? I'd like a chart. Our World in Data's CO2 file is here:
+      https://raw.githubusercontent.com/owid/co2-data/master/owid-co2-data.csv
+    notes: >-
+      CSV, about 14 MB and 80 columns, one row per country or region per year. Aggregate rows
+      (World, continents, income groups) sit beside countries and have no iso_code; early
+      years are sparse. At the playback, ask for the G7 shown as its own countries rather than
+      one average.
+
+  - id: analysis-brisbane-weather
+    size: analysis
+    dataset_url: https://archive-api.open-meteo.com/v1/archive?latitude=-27.47&longitude=153.03&start_date=2004-01-01&end_date=2024-12-31&daily=temperature_2m_max,precipitation_sum&timezone=Australia%2FBrisbane
+    licence: CC BY 4.0 (Open-Meteo data; the free API is for non-commercial use)
+    prompt: >-
+      Pull daily weather for Brisbane from Open-Meteo:
+      https://archive-api.open-meteo.com/v1/archive?latitude=-27.47&longitude=153.03&start_date=2004-01-01&end_date=2024-12-31&daily=temperature_2m_max,precipitation_sum&timezone=Australia%2FBrisbane
+      Was 2024 unusually hot or wet compared with the previous twenty years? Break it down by
+      month.
+    notes: >-
+      A JSON API response, not a table: the `daily` object holds parallel arrays (time,
+      temperature_2m_max, precipitation_sum) that need unnesting into rows. The values are
+      reanalysis, not station observations, which the caveats should say. At the playback,
+      ask for rainfall to be compared as monthly totals, not daily averages.
+
+  - id: analysis-green-taxi-tips
+    size: analysis
+    dataset_url: https://d37ci6vzurychx.cloudfront.net/trip-data/green_tripdata_2024-01.parquet
+    licence: NYC Open Data terms of use (NYC Taxi and Limousine Commission; free to use)
+    prompt: >-
+      Here's a month of NYC green taxi trips:
+      https://d37ci6vzurychx.cloudfront.net/trip-data/green_tripdata_2024-01.parquet
+      and the zone names: https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv
+      How does tipping vary by hour of day and by pickup borough?
+    notes: >-
+      Parquet, about 56,000 trips, joined to a CSV lookup. Tips are recorded only for card
+      payments, so a tip rate over all trips understates tipping: the session should find
+      that and restrict or say so. Some trips fall outside January 2024 and some amounts are
+      negative. At the playback, ask for tips as a percentage of the fare.
+
+  - id: analysis-us-unemployment
+    size: analysis
+    dataset_url: https://fred.stlouisfed.org/graph/fredgraph.xlsx?id=UNRATE
+    licence: Public domain (US Bureau of Labor Statistics series, distributed by FRED; cite FRED)
+    prompt: >-
+      This spreadsheet from FRED has the US unemployment rate:
+      https://fred.stlouisfed.org/graph/fredgraph.xlsx?id=UNRATE
+      How long did unemployment take to get back to its pre-recession low after 2008, compared
+      with after 2020?
+    notes: >-
+      An Excel workbook, not CSV: rows of notes sit above the data, and the dates are Excel
+      dates. Monthly, seasonally adjusted. Check the series for gaps before measuring a
+      recovery. At the playback, ask for the pre-recession low to be taken over the twelve
+      months before each recession began.
+
+  # --- A project: shared beyond the conversation, with requirements and a report ----------
+
+  - id: project-airport-trips
+    size: project
+    dataset_url: https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet
+    licence: NYC Open Data terms of use (NYC Taxi and Limousine Commission; free to use)
+    prompt: >-
+      I need a repeatable analysis for my team of taxi trips to and from JFK and LaGuardia in
+      January 2024. Use the TLC yellow-taxi file
+      https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet and the
+      zone lookup https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv - we want to
+      know how fares, trip times and tips compare between the two airports and by hour of day,
+      and I'd like a short report we can rerun next month.
+    notes: >-
+      Parquet, about 3 million trips (50 MB). JFK trips from Manhattan carry a flat fare (rate
+      code 2), the airport fee applies only to pickups, zones 264 and 265 are unknown, some
+      amounts are negative and some trips are dated outside the month. "Rerun next month"
+      should shape the Protocol: the month a parameter, not a literal. When the requirements
+      are played back, add one: drop trips under one minute or over three hours.
+
+  - id: project-seismic-2023
+    size: project
+    dataset_url: https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&starttime=2023-01-01&endtime=2024-01-01&minmagnitude=4.5
+    licence: Public domain (US Geological Survey, a US Government work)
+    prompt: >-
+      Put together a report on the world's magnitude 4.5+ earthquakes in 2023 from USGS:
+      https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&starttime=2023-01-01&endtime=2024-01-01&minmagnitude=4.5
+      Where were they concentrated, how did the months compare, and what stood out? It's for
+      a non-specialist audience.
+    notes: >-
+      GeoJSON from the USGS query API, several thousand events with nested properties and
+      epoch-millisecond times. Magnitude types are mixed (mb, mww and others), so comparing
+      magnitudes across types needs a caveat; February holds the Turkey-Syria sequence and its
+      aftershocks, which distort a monthly count. When the requirements are played back, ask
+      for aftershocks of the February sequence to be shown separately.

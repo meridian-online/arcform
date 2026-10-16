@@ -1,0 +1,31 @@
+{
+  "name": "arcform",
+  "displayName": "Arcform",
+  "description": "Agent skills for analysing tabular data with arc: every step is recorded in a Protocol the user can re-run, inspect and share, and the arc MCP server is connected for you.",
+  "longDescription": "Five skills take an agent from agreeing the question to handing over the answer: scoping, profiling and typing the data, building and checking a Protocol, and presenting the findings. Each step is recorded through arc, so the analysis is a folder anyone can run again rather than a throwaway script. Needs the arc binary, with its MCP server, on PATH.",
+  "shortDescription": "Analyse tabular data in Protocols you can re-run",
+  "author": {
+    "name": "Meridian",
+    "url": "https://meridian.online"
+  },
+  "homepage": "https://meridian.online",
+  "repository": "https://github.com/meridian-online/arcform",
+  "license": "MIT",
+  "keywords": ["data", "analysis", "duckdb", "sql", "csv", "skills", "mcp"],
+  "category": "Developer Tools",
+  "defaultPrompt": [
+    "Here is a CSV. What does it tell us?",
+    "Profile this table and tell me what needs cleaning."
+  ],
+  "skills": "./skills/",
+  "mcpServer": {
+    "name": "arc",
+    "command": "arc",
+    "args": ["mcp"],
+    "toolTimeoutSec": 600
+  },
+  "marketplace": {
+    "name": "arcform",
+    "description": "Meridian's arcform plugin: analyst skills and the arc MCP server"
+  }
+}

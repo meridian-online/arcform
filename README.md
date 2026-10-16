@@ -61,7 +61,30 @@ Beyond recording and running, the rest of the analyst's loop has a verb each, an
 
 ## Using arc from an agent
 
-Install arc as above, with `duckdb` (and `finetype` and `uv`, if you use them) on `PATH`. Then add it to Claude Code:
+An analyst working through an agent needs three things: arc with its MCP server, arc's agent skills, and the agent connected to `arc mcp`.
+
+1. **Install arc with its MCP server.** The install script above gives you a release build, which includes it; from source, build with `--features mcp`. `arc mcp --help` exits 0 when the server is in your build. Put `duckdb` (and `finetype` and `uv`, if you use them) on `PATH`.
+2. **Give your agent the skills and the server.** Install arc's plugin, which brings both (the next section), or run `arc skills install` and connect `arc mcp` yourself (the two sections after it). Choose one: with both, the agent holds two copies of every skill.
+3. **Ask a question about your data.** The `using-arcform` skill picks it up and works through a Protocol.
+
+### Plugins
+
+This repository is a plugin for each of these agents. Each one installs the five [agent skills](#agent-skills) and starts `arc mcp` from `PATH`; arc itself is not part of the plugin, so install it first. A plugin route installs the skills of a released arc from a release tag: the one you name for Gemini CLI and Cursor (`v` and the version `arc --version` prints), and the newest release's for Claude Code and Codex. These routes work from the first release that carries the plugin manifests; until then, use `arc skills install`.
+
+| Agent | Install |
+| --- | --- |
+| Claude Code | `claude plugin marketplace add meridian-online/arcform`, then `claude plugin install arcform@arcform` |
+| Codex | `codex plugin marketplace add meridian-online/arcform`, then `codex plugin add arcform@arcform` |
+| Gemini CLI | `gemini extensions install https://github.com/meridian-online/arcform --ref vX.Y.Z`, with the version `arc --version` prints |
+| Cursor | Untested. Install from this repository at the tag `vX.Y.Z` matching `arc --version`, as [Cursor's plugin docs](https://cursor.com/docs/reference/plugins) describe |
+
+The Claude Code and Codex marketplace names the plugin at the tag of the newest release, so those two install that release's skills. When your arc is older, upgrade arc, or remove the plugin and then run `arc skills install`; with both, the agent holds two copies of every skill. Gemini CLI and Cursor install at the tag you name, so when arc and the skills differ, reinstall at the tag matching `arc --version`.
+
+Each manifest (`.claude-plugin/`, `.codex-plugin/`, `.cursor-plugin/`, `gemini-extension.json` and `plugin/codex-mcp.json`) is generated from [`plugin/plugin.meta.json`](plugin/plugin.meta.json) by `python3 scripts/generate-plugins.py`, and CI fails when a committed manifest differs from what it generates. Per-agent notes, such as what each agent calls the arc tools, are in [`skills/using-arcform/references/agents/`](skills/using-arcform/references/agents/), with one for a desktop chat app, which has no plugin route.
+
+### Connecting `arc mcp` yourself
+
+Add it to Claude Code:
 
 ```sh
 claude mcp add arc -- arc mcp
@@ -123,6 +146,14 @@ Through these tools an agent can start a Protocol, look at its tables, query the
 ### Agent skills
 
 [`skills/`](skills/) holds five agent skills that teach an agent the analyst workflow through these tools: `using-arcform`, the entry point, then `scoping-an-analysis`, `profiling-and-typing-data`, `building-and-checking-a-protocol` and `presenting-findings`, one for each stage from agreeing the question to handing over the answer. Each shows every step both as an `arc` command and as the matching tool, and `cargo test --features mcp --test skills` checks what they name and runs their examples against this binary.
+
+The skills ship inside `arc`, at its version. Without a [plugin](#plugins), install them into each agent found on this machine:
+
+```sh
+arc skills install
+```
+
+It finds Claude Code (`~/.claude/skills`), Codex (`~/.agents/skills`), Cursor (`~/.cursor/skills`), Gemini CLI (`~/.gemini/skills`) and the shared `~/.agents/skills` by their folders under your home directory, and prints each skill folder it writes. When it finds none it says where it would install and exits 1: name an agent with `--agent claude-code` (repeatable), or a folder with `--target <dir>`. Each folder it writes holds a `.arc-skill` file recording the arc version, and only such a folder is replaced, whole, when you upgrade arc and run the command again; a skill of the same name you wrote yourself is refused, nothing is written into that agent's skills folder, and the command exits 1 after installing for the other agents. `arc skills list` prints the skills this arc carries and the version each was written for.
 
 ---
 

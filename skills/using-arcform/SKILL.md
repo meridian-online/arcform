@@ -11,7 +11,7 @@ arc is a local-first engine that records an analysis as a **Protocol** and runs 
 
 Every analysis step goes into the Protocol. Never compute an answer outside it: an answer the committed Protocol cannot reproduce is not one the user can check.
 
-Load `references/environment-check.md` at the start of a session, before the first Protocol. Load `references/verb-map.md` whenever you need the exact CLI or MCP form of a verb.
+Load `references/environment-check.md` at the start of a session, before the first Protocol. Load `references/verb-map.md` whenever you need the exact CLI or MCP form of a verb. When your agent names the arc tools differently, or you are setting arc up in it, load its notes from `references/agents/` (Claude Code, Codex, Cursor, Gemini CLI or a desktop chat app).
 
 ## What a Protocol is
 
@@ -82,7 +82,7 @@ arc 0.
 | Error or symptom | Fix |
 | --- | --- |
 | You are about to answer with a pandas or Python snippet | Record the step instead (`sql_record`, or an operator through `operator_record`) and run it |
-| `arc --version` differs from `metadata.arc_version` | Tell the user to upgrade arc or reinstall the skills; see `references/environment-check.md` |
+| `arc --version` differs from `metadata.arc_version` | Skills from `arc skills install`: run it again. Claude Code or Codex plugin: update it when arc is newer; when arc is older, upgrade arc, or remove the plugin before `arc skills install`. Gemini CLI or Cursor: reinstall at the tag matching `arc --version`. See `references/environment-check.md` |
 | `no database for this Protocol yet` | The Protocol has not run; run it, then look |
 | `only read-only SELECT statements can be queried` | `sql_query` only reads. Record the change as a step and run it |
 | A run says `1 skipped (fresh)` after you changed an input | Steps whose inputs arc saw unchanged are skipped. Offer `arc run --force` (`force` on `protocol_run`); do not default to it |

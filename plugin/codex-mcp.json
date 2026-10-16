@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "arc": {
+      "command": "arc",
+      "args": [
+        "mcp"
+      ],
+      "tool_timeout_sec": 600
+    }
+  }
+}

@@ -16,7 +16,14 @@ arc --version
 
 It prints `arc <version>`. Compare that with `metadata.arc_version` in the frontmatter of the skill you loaded. With only the server's tools, the version usually cannot be seen before a run: when the client does not show the server version, compare `run.engine.arc` from the first `protocol_run` with `metadata.arc_version`. Make that first run one whose steps neither fetch nor overwrite anything the user cares about, such as a Protocol whose only step loads the user's file. If no run record comes back, tell the user "arc version unknown" rather than passing the check silently. Skills are written against one arc version: an older arc may lack a verb a skill names, and a newer one may have changed what a verb prints.
 
-When they differ, tell the user: "Your arc is <version> and these skills were written for <arc_version>. Upgrade arc, or reinstall the skills from where you got them, so the two match." Then carry on carefully: if a verb a skill names is refused as unknown, stop and say so rather than guessing at another.
+When they differ, the remedy depends on how the skills were installed. A skill folder holding a `.arc-skill` file was written by `arc skills install`; skills listed under a plugin's name (such as `arcform:using-arcform`) came with a plugin or extension.
+
+- **Installed by `arc skills install`.** Tell the user: "Your arc is <version> and these skills were written for <arc_version>. Run `arc skills install` to install the skills this arc carries, so the two match."
+- **A Claude Code or Codex plugin, and arc is newer than the skills.** Tell the user to update the plugin, as their agent's notes in `references/agents/` show: it brings the skills of the newest release.
+- **A Claude Code or Codex plugin, and arc is older than the skills.** Their marketplace offers only the newest release's skills, so tell the user to upgrade arc, or to remove the plugin and then run `arc skills install`, which installs the skills their arc carries. Never suggest `arc skills install` while the plugin is still installed: it would add a second copy of every skill beside the plugin's.
+- **A Gemini CLI extension or a Cursor plugin.** Tell the user to reinstall it at the tag `v<version>` matching what `arc --version` prints, as their agent's notes in `references/agents/` show; that works whichever side is newer.
+
+`arc skills install` writes into each agent's skills folder it finds and prints each folder it writes; a skill folder the user wrote under the same name is refused, so pass on its reason rather than deleting anything. When it finds no agent, it names where it would install: `arc skills install --target <dir>` installs into a folder the user names. Then carry on carefully: if a verb a skill names is refused as unknown, stop and say so rather than guessing at another.
 
 When `arc` is not found at all, tell the user to install it, on macOS or Linux with `curl -fsSL https://install.meridian.online/arc | bash`, and stop: nothing in these skills works without it.
 

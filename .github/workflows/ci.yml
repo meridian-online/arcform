@@ -214,6 +214,9 @@ jobs:
       - name: clippy (mcp, opendal features)
         run: cargo clippy --workspace --all-targets --features mcp,opendal -- -D warnings
 
+      # This includes tests/plugin_manifests.rs, which runs scripts/generate-plugins.py
+      # with the runner's python3 and fails when a committed agent plugin manifest is not
+      # what plugin/plugin.meta.json generates, naming that file and the command to run.
       - name: test
         run: cargo test --workspace
 
@@ -380,13 +383,14 @@ jobs:
         run: cargo publish --dry-run --manifest-path vendor/sqlparser-0.55.0/Cargo.toml --features visitor
 
       # The list is printed for the log, then held to the `include` rule: the source,
-      # the embedded operator scripts and the top-level documents, and nothing else —
-      # no fixture, no example database, no vendored fork.
+      # the embedded operator scripts, build.rs and the skills it embeds, and the
+      # top-level documents, and nothing else — no fixture, no example database, no
+      # vendored fork.
       - name: arcform's package contents
         run: |
           set -euo pipefail
           cargo package -p arcform --list | tee /tmp/arcform-files
-          if grep -Ev '^(src/|operators/[a-z_]+/[a-z_]+\.py$|Cargo\.toml$|Cargo\.toml\.orig$|Cargo\.lock$|README\.md$|CHANGELOG\.md$|LICENSE$|\.cargo_vcs_info\.json$)' /tmp/arcform-files; then
+          if grep -Ev '^(src/|build\.rs$|skills/|operators/[a-z_]+/[a-z_]+\.py$|Cargo\.toml$|Cargo\.toml\.orig$|Cargo\.lock$|README\.md$|CHANGELOG\.md$|LICENSE$|\.cargo_vcs_info\.json$)' /tmp/arcform-files; then
             echo "::error::files above are outside arcform's include rule"
             exit 1
           fi
