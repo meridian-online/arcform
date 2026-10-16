@@ -234,8 +234,9 @@ pub enum TableCmd {
     /// Profile a table or view in the protocol's database with FineType: the type of
     /// each column, as JSON, or a JSON Schema its rows pass. Copies up to
     /// --sample-size rows (100 by default) to a temporary CSV outside the protocol and
-    /// runs `finetype profile` over it; `table` and `rows_profiled` are added to what
-    /// FineType gives. A table with no rows is said so, not refused.
+    /// runs `finetype profile` over it. For json, `table` and `rows_profiled` are added to
+    /// what FineType gives; json-schema prints FineType's schema with an `$id` naming
+    /// the table. A table with no rows is said so for json, and refused for json-schema.
     Profile {
         /// The table or view to profile.
         table: String,

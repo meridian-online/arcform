@@ -1113,7 +1113,7 @@ pub(super) fn tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "table_profile",
-            description: "Profile a table or view in a Protocol's database with FineType: the type of each column (`format` json), or a JSON Schema its rows pass (`format` json-schema, which protocol_write_file can save as schemas/<name>.json). Up to `sample_size` rows (100 by default) are copied to a temporary CSV outside the Protocol and `finetype profile` is run over it; `table` and `rows_profiled` are added to what FineType gives. A table with no rows says so and is not an error. Opens the database read-only; needs finetype on PATH at the version arc requires.",
+            description: "Profile a table or view in a Protocol's database with FineType: the type of each column (`format` json), or a JSON Schema its rows pass (`format` json-schema, which protocol_write_file can save as schemas/<name>.json). Up to `sample_size` rows (100 by default) are copied to a temporary CSV outside the Protocol and `finetype profile` is run over it; for `json`, `table` and `rows_profiled` are added to what FineType gives, and `json-schema` returns FineType's schema with an `$id` naming the table. A table with no rows says so for `json` and is refused for `json-schema`, which has nothing to infer a schema from. Opens the database read-only; needs finetype on PATH at the version arc requires.",
             input_schema: table_profile_schema,
             handler: table_profile,
             annotations: Annotations::READS_OPEN,

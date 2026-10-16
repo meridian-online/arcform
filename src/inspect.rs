@@ -548,8 +548,9 @@ impl Drop for ScratchDir {
 /// copied to a temporary CSV outside the Protocol, through a read-only
 /// connection, and `finetype profile` is run over it. The answer is FineType's
 /// JSON with `table` and `rows_profiled` added; for `JsonSchema` it is the schema
-/// alone, its `$id` naming the table. A table with no rows is not an
-/// error: the answer says so, and FineType is not run.
+/// alone, its `$id` naming the table. A table with no rows is not an error
+/// for `Json`: the answer says so, and FineType is not run; for `JsonSchema`
+/// there is nothing to infer a schema from, and it is refused.
 pub(crate) fn profile_table(
     dir: &Path,
     table: &str,
@@ -570,6 +571,11 @@ pub(crate) fn profile_table(
         .query_row(&format!("SELECT count(*) FROM ({rows})"), [], |r| r.get(0))
         .map_err(db_error)?;
     if copied == 0 {
+        if format == ProfileFormat::JsonSchema {
+            return Err(refusal(format!(
+                "{table} has no rows to infer a schema from; load some, or profile it with format json"
+            )));
+        }
         return Ok(json!({
             "table": table,
             "rows_profiled": 0,
