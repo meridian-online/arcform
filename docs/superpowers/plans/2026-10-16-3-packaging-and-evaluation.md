@@ -38,7 +38,7 @@
 
 **Files:**
 - Create: `build.rs` addition (or a new `build.rs` if none) embedding `skills/**` as `static SKILLS: &[(&str, &[u8])]`; `src/skills.rs`
-- Modify: `src/cli.rs` (`arc skills install`, `arc skills list`), `src/lib.rs`
+- Modify: `src/cli.rs` (`arc skills install`, `arc skills list`), `src/lib.rs`, `tests/public_surface.rs` (`MODULE_FILES`), `Cargo.toml` (`"/build.rs"` and `"/skills/**"` in `include`), `.github/workflows/ci.yml` (allow `build.rs` and `skills/` in the package-contents check, so the "Packaged arcform builds" step passes)
 - Test: `tests/skills_install.rs`
 
 **Interfaces:**

@@ -21,6 +21,8 @@
 - Public repository: no private planning identifiers in code, comments, tests or commit messages.
 - British English in user-facing text, matching the existing tool descriptions.
 - A refusal leaves the Protocol folder untouched, and a test pins that, as the existing record tests do.
+- `tests/public_surface.rs` freezes the crate's module list (`MODULE_FILES`) and public surface. A task that creates a module adds it to `MODULE_FILES`; new functions stay `pub(crate)`, and integration tests in `tests/` drive the `arc` binary (`env!("CARGO_BIN_EXE_arc")`) rather than calling library functions.
+- A task that registers an MCP tool adds it to `tools_list_registers_every_tool` (names and count) and names it in `INSTRUCTIONS` in the same commit, so every commit's tests pass.
 - Builds need `DUCKDB_LIB_DIR=/opt/homebrew/lib` (or wherever DuckDB 1.5.6 is) on this machine. Run one cargo build at a time.
 
 ## Review Focus
@@ -102,7 +104,7 @@
 
 - [ ] **Step 1: Write failing tests:** `writes_schema_and_records_history`; `writes_panel_under_panels`; `refuses_path_outside_protocol` (`../x.json`, `/tmp/x.json`, and a `panels` symlink to a directory outside, each refused, nothing written); `refuses_unlisted_path` (`models/x.sql`, with a message naming the four allowed places); `refuses_invalid_schema_json`; `refuses_report_and_names_report_write`; `refuses_without_arcform_yaml`.
 - [ ] **Step 2: Run** `cargo test --features mcp --test protocol_write_file`. Expected: fail to compile.
-- [ ] **Step 3: Implement** `write_protocol_file`, canonicalising the parent directory after creating it and refusing when it is not under the canonical `dir`.
+- [ ] **Step 3: Implement** `write_protocol_file`. Check the path kind, the `arcform.yaml` and the content first; then canonicalise the nearest existing ancestor of the target and refuse when it is not under the canonical `dir`, before creating any directory, so a refusal leaves no new empty `schemas/` or `panels/` behind.
 - [ ] **Step 4: Add the CLI verb and MCP tool;** run the tests. Expected: pass.
 - [ ] **Step 5: Commit** "Write a Protocol's schema, panel and README files from the CLI or MCP".
 
@@ -137,10 +139,10 @@
   - `pub fn check_panel(dir: &Path, panel: &Path) -> Result<Vec<PanelFinding>>`; `pub fn check_panels(dir: &Path) -> Result<Vec<(PathBuf, Vec<PanelFinding>)>>` over `panels/*.yaml`.
   - `pub enum PanelFinding { MissingTable { from: String }, MissingColumn { from: String, column: String } }`, each displayed as one plain sentence.
   - Rule: for each mark under `plot`, `data.from` must be a key of the panel's top-level `data:` or a table in the Protocol's database; when it is a database table, each channel whose value is a bare string (`x`, `y`, `fill`, `stroke`, `text`, `z`, and the rest of the channel names Mosaic uses) must be a column of it. Channel values that are objects (expressions, aggregates) are not checked.
-  - With no database yet, `MissingTable` is checked against the step names in `arcform.yaml` instead, and columns are not checked.
+  - With no database yet, `MissingTable` is checked against the relations the asset graph says the steps produce (SQL introspection in `crate::asset`), not the step names, since one step can make several tables (brewtrend's `rank` makes `details` and `ranking`); columns are not checked.
   - CLI: `arc panel check [--dir DIR]`, exit 1 when any finding. MCP tool `panel_check`, `dir`; annotation `READS_OPEN`.
 
-- [ ] **Step 1: Write failing tests** using Brightfield's own example shape (`plot: [{mark: barY, data: {from: T}, x: name, y: count}]`): `inline_data_is_not_missing`; `missing_table_reported`; `missing_column_reported`; `expression_channel_not_checked`; `before_first_run_checks_step_names`; `write_file_returns_findings_as_warnings` (writing a panel with a missing column succeeds and returns the warning).
+- [ ] **Step 1: Write failing tests** using Brightfield's own example shape (`plot: [{mark: barY, data: {from: T}, x: name, y: count}]`): `inline_data_is_not_missing`; `missing_table_reported`; `missing_column_reported`; `expression_channel_not_checked`; `before_first_run_checks_produced_tables` (a step that makes two tables; a panel reading the second is not reported); `write_file_returns_findings_as_warnings` (writing a panel with a missing column succeeds and returns the warning).
 - [ ] **Step 2: Run** `cargo test --features mcp --test panel_check`. Expected: fail.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** the tests. Expected: pass.

@@ -86,7 +86,7 @@ Five skills ship at the line. Names are the builder's call within one rule: each
 4. **Build and check a Protocol.** Discover first; a decision table for the step kind (a catalogue operation when `sql_recognise` names one, else a SQL step, an operator for fetch, resolution, embedding or export, a shell command last); a description on every step; run; read the run result rather than the exit status (`run.outcome`, then each step's status, then each asset's row count); trace an empty or wrong table upstream; offer `--force` rather than default to it; undo through history. `examples/brewtrend` is the worked Protocol.
 5. **Present the findings.** Write each chart as a Mosaic spec at `panels/<name>.yaml` in the Protocol folder, which Brightfield opens and `arc history` versions; state the answer, the quality caveats from profile, and next steps; produce a report on request, as Markdown or PDF. Guide toward opening the Protocol in Brightfield; offer the PDF to someone who will not.
 
-Each skill states the arc version floor it was written against, ends with when to switch to another skill, and puts its known traps in an error-to-fix table.
+Each skill states the arc version it was written for (the constraint above), ends with when to switch to another skill, and puts its known traps in an error-to-fix table.
 
 ## Capability work arc needs before the line
 
