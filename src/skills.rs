@@ -294,6 +294,11 @@ fn install_target(target: &AgentTarget, skills: &Skills, outcome: &mut Outcome) 
             }
             return Err(e);
         }
+        // The new folder is in place, so an earlier install set aside is no longer needed:
+        // this one's, or one left by a run killed between swap_in's two renames (which then
+        // left no folder at `dest`, so this run planned a plain write). One that cannot be
+        // deleted is tried again by the next run.
+        let _ = remove_any(&old_path(&target.skills_dir, name));
         outcome.installed.push(Installed {
             agent: target.agent,
             path: dest,
@@ -368,21 +373,34 @@ fn stage_skill(stage: &Path, files: &[(&str, &[u8])]) -> Result<()> {
     .map_err(|e| at(&marker, e))
 }
 
-/// Move `stage` to `dest`. When `dest` holds an earlier install, it is renamed aside first,
-/// put back if the move fails, and deleted once the new folder is in place.
+/// Where an earlier install of skill `name` is set aside while the new one moves in.
+fn old_path(skills_dir: &Path, name: &str) -> PathBuf {
+    skills_dir.join(format!(".{name}.arc-old"))
+}
+
+/// Move `stage` to `dest`. When `dest` holds an earlier install, it is renamed aside first
+/// and put back if the move fails; the caller deletes it once the new folder is in place.
+/// Should putting it back fail too, the error names where the earlier install now is.
 fn swap_in(skills_dir: &Path, name: &str, stage: &Path, dest: &Path, replace: bool) -> Result<()> {
     if !replace {
         return fs::rename(stage, dest).map_err(|e| at(dest, e));
     }
-    let old = skills_dir.join(format!(".{name}.arc-old"));
+    let old = old_path(skills_dir, name);
     remove_any(&old)?;
     fs::rename(dest, &old).map_err(|e| at(dest, e))?;
     if let Err(e) = fs::rename(stage, dest) {
-        let _ = fs::rename(&old, dest);
+        if let Err(back) = fs::rename(&old, dest) {
+            return Err(Error::Io(io::Error::new(
+                e.kind(),
+                format!(
+                    "{}: {e}; the earlier install could not be put back ({back}) and is at {}",
+                    dest.display(),
+                    old.display()
+                ),
+            )));
+        }
         return Err(at(dest, e));
     }
-    // The new folder is in place; an old one that cannot be deleted is cleared by the next run.
-    let _ = remove_any(&old);
     Ok(())
 }
 
@@ -427,6 +445,24 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(dest.join("SKILL.md")).unwrap(), "old");
         assert!(!dir.path().join(".s.arc-old").exists());
+    }
+
+    #[test]
+    fn an_install_set_aside_by_an_interrupted_run_is_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        // A run killed between the two renames: no folder at the destination, the earlier
+        // install set aside.
+        let old = old_path(dir.path(), "using-arcform");
+        fs::create_dir(&old).unwrap();
+        fs::write(old.join(MARKER), "arc 0.0.1\n").unwrap();
+        let target = AgentTarget {
+            agent: "target",
+            skills_dir: dir.path().to_path_buf(),
+        };
+        let outcome = install(&[target]);
+        assert!(outcome.failed.is_empty() && outcome.refused.is_empty());
+        assert!(dir.path().join("using-arcform/SKILL.md").is_file());
+        assert!(!old.exists(), "the set-aside folder is cleared");
     }
 
     #[test]

@@ -1308,12 +1308,14 @@ fn dispatch_skills(cmd: SkillsCmd, out: &mut impl Write) -> Result<()> {
                 }
             }
             let n = outcome.installed.len();
-            writeln!(
-                out,
-                "Installed {n} skill folder{} at arc {}.",
-                if n == 1 { "" } else { "s" },
-                env!("CARGO_PKG_VERSION")
-            )?;
+            if n > 0 {
+                writeln!(
+                    out,
+                    "Installed {n} skill folder{} at arc {}.",
+                    if n == 1 { "" } else { "s" },
+                    env!("CARGO_PKG_VERSION")
+                )?;
+            }
             if outcome.refused.is_empty() && outcome.failed.is_empty() {
                 return Ok(());
             }
@@ -1333,9 +1335,16 @@ fn dispatch_skills(cmd: SkillsCmd, out: &mut impl Write) -> Result<()> {
                     ));
                 }
             }
+            if !outcome.failed.is_empty() {
+                problems.push(
+                    "these skills folders could not be written; each skill folder in them is \
+                     still the old one or the new one, whole:"
+                        .to_string(),
+                );
+            }
             for (target, e) in &outcome.failed {
                 problems.push(format!(
-                    "  {:<12} {}: failed: {e}",
+                    "  {:<12} {}: {e}",
                     target.agent,
                     target.skills_dir.display()
                 ));

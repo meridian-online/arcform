@@ -348,3 +348,43 @@ fn list_prints_each_skill_and_its_arc_version() {
         assert!(line.contains(env!("CARGO_PKG_VERSION")), "{line}");
     }
 }
+
+/// A skills folder arc cannot write into fails that agent alone, and leaves no staging
+/// folder behind.
+#[cfg(unix)]
+#[test]
+fn an_unwritable_skills_folder_fails_only_its_own_agent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().unwrap();
+    let locked = home.path().join(".claude/skills");
+    fs::create_dir_all(&locked).unwrap();
+    fs::create_dir(home.path().join(".gemini")).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let out = arc(home.path(), &["skills", "install"]);
+    let leftovers: Vec<_> = fs::read_dir(&locked)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    // Restore permissions before anything can panic, so the temporary folder can be removed.
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("could not be written") && stderr.contains(&locked.display().to_string()),
+        "the failed folder is named:\n{stderr}"
+    );
+    assert!(
+        leftovers.is_empty(),
+        "nothing is left behind: {leftovers:?}"
+    );
+    for name in skill_names() {
+        let gemini = home.path().join(".gemini/skills").join(&name);
+        assert!(
+            gemini.join("SKILL.md").is_file(),
+            "another agent still installs"
+        );
+    }
+}
