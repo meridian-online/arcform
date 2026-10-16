@@ -73,7 +73,7 @@ Follow superpowers' layout for each agent's manifest, reading its current files 
 
 **Files:**
 - Create: `eval/analyst-workflow/README.md` (the runbook), `eval/analyst-workflow/tasks.yaml`, `eval/analyst-workflow/score.md` (the scoring sheet), `eval/analyst-workflow/preflight.sh`
-- Modify: `.claude/skills/release/SKILL.md` (two steps: set every skill's `metadata.arc_version` to the new version when bumping it, since the skills test requires them equal; and attach the eval's scored results to the release pull request)
+- Modify: `.claude/skills/release/SKILL.md` (attach the eval's scored results to the release pull request; plan 2 already taught it to set each skill's `metadata.arc_version`)
 
 **Interfaces:**
 - `tasks.yaml`: ten tasks, each `{ id, size: quick|analysis|project, dataset_url, licence, prompt, notes }`. The prompt is what an analyst would type and never names arc. Four quick, four analysis, two project; at least three datasets that are not CSV (JSON API, spreadsheet, Parquet). Public datasets whose licences allow use.

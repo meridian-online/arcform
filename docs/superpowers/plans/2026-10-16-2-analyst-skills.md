@@ -50,13 +50,14 @@
 
 - [ ] **Step 1: Write the tests** (they pass vacuously until a skill exists, so also add `skills/_probe/SKILL.md` naming one real tool, one fake tool and one fake flag, to see them fail):
   - `every_named_tool_is_advertised`: start `arc mcp`, call `tools/list`, and assert every `` `name` `` in a skill that looks like a tool (snake_case, in an MCP column or JSON block) is advertised, and each argument named with it is in that tool's `inputSchema.properties`.
-  - `every_cli_form_exists`: for each `arc <verb> [<sub>]` in a skill, `arc <verb> [<sub>] --help` exits 0, and each `--flag` named with it appears in that help.
+  - `every_cli_form_exists`: for each `arc <verb> [<sub>]` in a skill (its SKILL.md and every file under `references/`), `arc <verb> [<sub>] --help` exits 0, and each `--flag` named with it appears in that help.
   - `every_verb_table_row_has_both_columns`.
   - `frontmatter_is_loadable`: `name` matches the folder, `description` at most 1,024 characters, a `:` in an unquoted description is refused, `metadata.arc_version` equals `CARGO_PKG_VERSION`.
   - `examples_run`: each `sh arc-example` block exits 0 against a fresh copy of the fixture and its output contains the `text expect` substring.
 - [ ] **Step 2: Run** `cargo test --features mcp --test skills`. Expected: the probe's fake tool and fake flag fail with messages naming the skill file and line.
 - [ ] **Step 3: Delete the probe skill; run again.** Expected: pass.
-- [ ] **Step 4: Commit** "Check agent skills against the tools and verbs arc has".
+- [ ] **Step 4: Teach the release skill the version rule.** In `.claude/skills/release/SKILL.md`, add a step: when bumping the crate version, set every skill's `metadata.arc_version` to it, since `frontmatter_is_loadable` requires them equal.
+- [ ] **Step 5: Commit** "Check agent skills against the tools and verbs arc has".
 
 ### Task 2: The entry skill, `using-arcform`
 
@@ -67,7 +68,7 @@ Its description is the most important text in the set. It must make an agent use
 
 SKILL.md covers, briefly: what a Protocol is (a folder with `arcform.yaml` and `models/`); why arc over a script, in the words the agent can say to the user; the safety model (recording runs nothing, a run runs, history undoes, and every write is a version); where run results land; the three sizes, each in one line; the five stages and which skill carries each; "Load when" pointers to the two references.
 
-- [ ] **Step 1: Write the skill and references.** `verb-map.md` is the full CLI | MCP table for every verb the five skills use, including plan 1's. `environment-check.md`: `arc --version` against `metadata.arc_version` (when they differ, run `arc skills install`, from plan 3, or upgrade arc); whether `arc mcp` is available; `finetype --version` at or above the floor; what to tell the user for each failure.
+- [ ] **Step 1: Write the skill and references.** `verb-map.md` is the full CLI | MCP table for every verb the five skills use, including plan 1's. `environment-check.md`: `arc --version` against `metadata.arc_version` (when they differ, upgrade arc or reinstall the skills from where they came; plan 3 adds `arc skills install` here); whether `arc mcp` is available; `finetype --version` at or above the floor; what to tell the user for each failure.
 - [ ] **Step 2: Add one `sh arc-example`**: `arc --version`, expecting `arc `.
 - [ ] **Step 3: Run** `cargo test --features mcp --test skills`. Expected: pass.
 - [ ] **Step 4: Commit** "Add the entry skill for the analyst workflow".
