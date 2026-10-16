@@ -20,6 +20,11 @@
 //! - `operator_record` records an operator step of a Protocol, its `with:` checked
 //!   against the operator's schema, through the same record path `arc operator
 //!   record` takes, so the same request writes the same bytes from either.
+//! - `protocol_edit` makes one edit to a Protocol's spec, through the same write
+//!   path `arc edit-protocol` takes, and returns the edited step list.
+//! - `history_list` and `history_restore` list the recorded states of a Protocol's
+//!   spec, or of one file beside it, and roll it back to one, as `arc history list
+//!   --json` and `arc history restore` do.
 //! - `sql_recognise` answers what arc reads a SQL statement as: the object `arc sql
 //!   recognise` prints, both read through the one reader in `record`.
 //! - `sql_record` records a SQL statement as a new step of a Protocol, through the
@@ -547,6 +552,162 @@ fn operator_record_schema() -> Value {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// protocol_edit
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The string `key` of an edit's arguments, refused by name when absent.
+fn edit_string(args: &Value, key: &str) -> std::result::Result<String, String> {
+    required_string(args, key).map(str::to_string)
+}
+
+/// The index `key` of an edit's arguments, refused by name when absent or not a
+/// non-negative whole number.
+fn edit_index(args: &Value, key: &str) -> std::result::Result<usize, String> {
+    match args.get(key) {
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| format!("`{key}` must be a non-negative whole number, not {n}")),
+        None | Some(Value::Null) => Err(format!("`{key}` is required")),
+        Some(other) => Err(format!(
+            "`{key}` must be a non-negative whole number, not {other}"
+        )),
+    }
+}
+
+/// Make one edit to a Protocol's spec as `arc edit-protocol` does: the arguments
+/// name the same edit and carry the same fields as the command's, and are handed
+/// to the one write path, which applies the edit to the file's bytes, validates
+/// the result and writes it atomically, checkpointing the state it replaces. The
+/// result is the edited Protocol's step list. A refusal is an error result naming
+/// what was wrong, with the Protocol's directory untouched.
+fn protocol_edit(args: &Value) -> ToolResult {
+    use crate::cli::EditOp;
+    let dir = PathBuf::from(optional_string(args, "dir")?.unwrap_or("."));
+    let path = edit_string(args, "path")?;
+    let op = match required_string(args, "edit")? {
+        "replace" => EditOp::Replace {
+            path,
+            value: edit_string(args, "value")?,
+        },
+        "rewrite" => EditOp::Rewrite {
+            path,
+            from: edit_string(args, "from")?,
+            to: edit_string(args, "to")?,
+        },
+        "add" => EditOp::Add {
+            path,
+            key: edit_string(args, "key")?,
+            value: edit_string(args, "value")?,
+        },
+        "append" => EditOp::Append {
+            path,
+            item: edit_string(args, "item")?,
+        },
+        "delete" => EditOp::Delete { path },
+        "reorder" => EditOp::Reorder {
+            path,
+            from: edit_index(args, "from")?,
+            to: edit_index(args, "to")?,
+        },
+        other => {
+            return Err(format!(
+                "`edit` must be one of replace, rewrite, add, append, delete, reorder, not `{other}`"
+            ));
+        }
+    };
+    let history = open_history()?;
+    crate::cli::edit_protocol_files(&dir, op, &history).map_err(|e| e.to_string())?;
+    let manifest = crate::manifest::Manifest::load(&dir).map_err(|e| e.to_string())?;
+    let steps = serde_json::to_value(&manifest.steps).map_err(|e| e.to_string())?;
+    Ok(ToolOutput::json(steps))
+}
+
+fn protocol_edit_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "edit": { "type": "string", "enum": ["replace", "rewrite", "add", "append", "delete", "reorder"], "description": "Which edit to make." },
+            "path": { "type": "string", "description": "Where in arcform.yaml: dot-separated mapping keys with zero-based [N] sequence indices, such as `steps[2].command` or `params.port.default`; `.` alone is the manifest root (only `add` takes it)." },
+            "value": { "type": "string", "description": "replace and add: the new value, spliced verbatim; a multi-line value arrives already indented for where it lands." },
+            "from": { "description": "rewrite: the text to change, which must occur exactly once in the value at `path`. reorder: the index the item is at (a whole number)." },
+            "to": { "description": "rewrite: the text that replaces it. reorder: the index the item should end up at (a whole number)." },
+            "key": { "type": "string", "description": "add: the key to add to the mapping at `path`." },
+            "item": { "type": "string", "description": "append: the item to append to the sequence at `path`; for a block sequence it carries its own pre-indented `- ` line(s)." },
+            "dir": { "type": "string", "description": "Protocol directory (where arcform.yaml lives). Defaults to the current directory." }
+        },
+        "required": ["edit", "path"]
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// history_list, history_restore
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The file an optional `file` argument names, read from `dir` when relative, as
+/// `--file` is.
+fn optional_file(args: &Value) -> std::result::Result<Option<PathBuf>, String> {
+    Ok(optional_string(args, "file")?.map(PathBuf::from))
+}
+
+/// The recorded states of a Protocol's spec, or given `file` of that one file,
+/// oldest first: the array `arc history list --json` prints. Reads only.
+fn history_list(args: &Value) -> ToolResult {
+    let dir = PathBuf::from(optional_string(args, "dir")?.unwrap_or("."));
+    let file = optional_file(args)?;
+    let history = open_history()?;
+    crate::cli::history_entries_json(&dir, file.as_deref(), &history)
+        .map(ToolOutput::json)
+        .map_err(|e| e.to_string())
+}
+
+fn history_list_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "file": { "type": "string", "description": "List this file's own history instead of the spec's, such as a chart file beside the spec. A relative path is read from `dir`." },
+            "dir": { "type": "string", "description": "Protocol directory (where arcform.yaml lives). Defaults to the current directory." }
+        }
+    })
+}
+
+/// Roll a Protocol's spec, or given `file` that one file, back to the state an
+/// entry recorded, as `arc history restore` does: the state being replaced is
+/// checkpointed first, so a restore can itself be undone. When the restored spec
+/// does not load, `note` says why. An unknown entry is an error result, with
+/// nothing written.
+fn history_restore(args: &Value) -> ToolResult {
+    let dir = PathBuf::from(optional_string(args, "dir")?.unwrap_or("."));
+    let id = required_string(args, "id")?;
+    let file = optional_file(args)?;
+    let history = open_history()?;
+    let restored = crate::cli::history_restore_files(&dir, file.as_deref(), id, &history)
+        .map_err(|e| e.to_string())?;
+    let mut result = json!({
+        "restored": id,
+        "file": restored.target.display().to_string(),
+    });
+    if let Some(fault) = restored.load_fault {
+        result["note"] = json!(format!(
+            "the restored state does not load as a spec: {fault}"
+        ));
+    }
+    Ok(ToolOutput::json(result))
+}
+
+fn history_restore_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string", "description": "The entry's id, as history_list returns it for the same file." },
+            "file": { "type": "string", "description": "Restore this file from its own history instead of the spec; no other file is written. A relative path is read from `dir`." },
+            "dir": { "type": "string", "description": "Protocol directory (where arcform.yaml lives). Defaults to the current directory." }
+        },
+        "required": ["id"]
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // sql_recognise
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -776,6 +937,27 @@ pub(super) fn tools() -> Vec<ToolDef> {
             description: "Record an operator step (a fetch, an entity resolution, an embedding, an export) as a new step at the end of a Protocol, from the operator's name, the step's name and its `with:` block. The `with:` is checked against the operator's schema, the one operator_describe returns, and a block that does not fit is refused naming the field, with the Protocol untouched. Writes the step; runs nothing.",
             input_schema: operator_record_schema,
             handler: operator_record,
+            annotations: Annotations::WRITES,
+        },
+        ToolDef {
+            name: "protocol_edit",
+            description: "Make one edit to a Protocol's arcform.yaml, as `arc edit-protocol` does: replace a value, rewrite one fragment of it, add a key, append a sequence item, delete an element or reorder a sequence, addressed by a path such as `steps[2].command`. The edit is applied to the file's bytes, so every byte it does not target survives (comments, key order, quoting), and is checked by the loader before anything is written; one that does not apply or does not load is refused with the file untouched. The state replaced is kept in history. Returns the edited Protocol's steps. Runs nothing.",
+            input_schema: protocol_edit_schema,
+            handler: protocol_edit,
+            annotations: Annotations::WRITES,
+        },
+        ToolDef {
+            name: "history_list",
+            description: "List the recorded states of a Protocol's arcform.yaml, or with `file` of one file beside it, oldest first: each entry's `id`, `kind` (save, checkpoint or unsaved), `at`, `bytes` and `way` arc was reached by. The ids are what history_restore takes. Changes nothing.",
+            input_schema: history_list_schema,
+            handler: history_list,
+            annotations: Annotations::READ_ONLY,
+        },
+        ToolDef {
+            name: "history_restore",
+            description: "Roll a Protocol's arcform.yaml, or with `file` that one file alone, back to the state a history_list entry recorded. The state being replaced is kept in history first, so a restore can itself be undone. A restored spec that no longer loads is restored all the same and says so in `note`.",
+            input_schema: history_restore_schema,
+            handler: history_restore,
             annotations: Annotations::WRITES,
         },
         ToolDef {

@@ -466,6 +466,11 @@ pub enum HistoryCmd {
         /// beside the spec, say. A relative path is read from `--dir`.
         #[arg(long)]
         file: Option<PathBuf>,
+
+        /// Print the entries as a JSON array — `id`, `kind`, `at`, `bytes` and
+        /// `way` for each, oldest first — and nothing else.
+        #[arg(long)]
+        json: bool,
     },
     /// Print the exact bytes an entry recorded, to stdout.
     Show {
@@ -595,12 +600,19 @@ pub fn create_protocol(
 /// apply, a result the loader rejects, or a checkpoint that cannot land)
 /// surfaces here as the error, before the file is touched.
 pub fn edit_protocol(dir: &Path, op: EditOp, history: &LocalHistory) -> Result<()> {
-    let edit = spec_edit_of(op)?;
-    crate::spec::edit_spec_with_history(dir, &[edit], history)?;
+    edit_protocol_files(dir, op, history)?;
     println!(
         "edited {}",
         dir.join(crate::spec::MANIFEST_FILENAME).display()
     );
+    Ok(())
+}
+
+/// The write [`edit_protocol`] makes, without saying anything: a caller whose
+/// standard output is a protocol channel (`arc mcp`) uses this one.
+pub(crate) fn edit_protocol_files(dir: &Path, op: EditOp, history: &LocalHistory) -> Result<()> {
+    let edit = spec_edit_of(op)?;
+    crate::spec::edit_spec_with_history(dir, &[edit], history)?;
     Ok(())
 }
 
@@ -748,6 +760,35 @@ pub fn history_list(
     Ok(())
 }
 
+/// The entries `arc history list --json` prints, and `arc mcp`'s `history_list`
+/// returns: a JSON array, oldest first, of `id`, `kind`, `at` (RFC 3339),
+/// `bytes` and `way` (`null` for a state written without one) — the spec's, or
+/// given `file` that one file's.
+pub(crate) fn history_entries_json(
+    dir: &Path,
+    file: Option<&Path>,
+    history: &LocalHistory,
+) -> Result<serde_json::Value> {
+    let entries = match file {
+        None => history.entries(dir)?,
+        Some(file) => history.entries_for_file(&history_file(dir, file))?,
+    };
+    Ok(serde_json::Value::Array(
+        entries
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "id": entry.id,
+                    "kind": kind_word(entry.kind),
+                    "at": humantime::format_rfc3339_seconds(entry.at).to_string(),
+                    "bytes": entry.bytes,
+                    "way": entry.way.as_ref().map(HistoryWay::as_str),
+                })
+            })
+            .collect(),
+    ))
+}
+
 /// Execute `arc history show`: the exact recorded bytes and nothing else —
 /// the output is the historical spec, or given `file` that file's historical
 /// text, fit for a diff or a redirect.
@@ -781,6 +822,33 @@ pub fn history_restore(
     history: &LocalHistory,
     out: &mut impl Write,
 ) -> Result<()> {
+    let restored = history_restore_files(dir, file, id, history)?;
+    writeln!(
+        out,
+        "restored {} to {id} — the replaced state was checkpointed first",
+        restored.target.display()
+    )?;
+    if let Some(e) = restored.load_fault {
+        writeln!(out, "note: the restored state does not load as a spec: {e}")?;
+    }
+    Ok(())
+}
+
+/// What [`history_restore_files`] wrote: the file, and for a spec that no
+/// longer loads, why.
+pub(crate) struct Restored {
+    pub target: PathBuf,
+    pub load_fault: Option<Error>,
+}
+
+/// The write [`history_restore`] makes, without saying anything: a caller whose
+/// standard output is a protocol channel (`arc mcp`) uses this one.
+pub(crate) fn history_restore_files(
+    dir: &Path,
+    file: Option<&Path>,
+    id: &str,
+    history: &LocalHistory,
+) -> Result<Restored> {
     let (target, text) = match file {
         None => (
             dir.join(crate::spec::MANIFEST_FILENAME),
@@ -792,16 +860,13 @@ pub fn history_restore(
             (path, text)
         }
     };
-    writeln!(
-        out,
-        "restored {} to {id} — the replaced state was checkpointed first",
-        target.display()
-    )?;
     let is_spec = target.file_name() == Some(crate::spec::MANIFEST_FILENAME.as_ref());
-    if is_spec && let Err(e) = Manifest::from_yaml_str(&text) {
-        writeln!(out, "note: the restored state does not load as a spec: {e}")?;
-    }
-    Ok(())
+    let load_fault = if is_spec {
+        Manifest::from_yaml_str(&text).err()
+    } else {
+        None
+    };
+    Ok(Restored { target, load_fault })
 }
 
 fn kind_word(kind: HistoryKind) -> &'static str {
@@ -1235,7 +1300,16 @@ fn dispatch_history(cmd: HistoryCmd) -> Result<()> {
     let history = open_history()?;
     let mut stdout = std::io::stdout();
     match cmd {
-        HistoryCmd::List { dir, file } => {
+        HistoryCmd::List {
+            dir,
+            file,
+            json: true,
+        } => {
+            let entries = history_entries_json(&dir, file.as_deref(), &history)?;
+            writeln!(stdout, "{entries}")?;
+            Ok(())
+        }
+        HistoryCmd::List { dir, file, .. } => {
             history_list(&dir, file.as_deref(), &history, &mut stdout)
         }
         HistoryCmd::Show { id, dir, file } => {
@@ -1774,7 +1848,7 @@ mod tests {
         let cli = Cli::try_parse_from(["arc", "history", "list"]).unwrap();
         match cli.command {
             Commands::History {
-                cmd: HistoryCmd::List { dir, file },
+                cmd: HistoryCmd::List { dir, file, .. },
             } => {
                 assert_eq!(dir, PathBuf::from("."));
                 assert_eq!(file, None);

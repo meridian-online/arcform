@@ -65,8 +65,10 @@ const INSTRUCTIONS: &str = "Use arc when you analyse data over DuckDB and the wo
     takes; operation_record records an operation as a new step of a Protocol; operator_record records an \
     operator step, its `with:` checked against the operator's schema; sql_recognise \
     answers what arc reads a SQL statement as: an operation it holds, with the table and the \
-    arguments operation_record takes, or none; sql_record records a SQL statement as a new \
-    step of a Protocol, as the operation it is read as or else as a SQL step, and runs \
+    arguments operation_record takes, or none; protocol_edit makes one edit to a Protocol's \
+    spec, as arc edit-protocol does, and returns its steps; history_list lists the recorded \
+    states of a spec, or of one file beside it, and history_restore rolls it back to one; sql_record records a SQL \
+    statement as a new step of a Protocol, as the operation it is read as or else as a SQL step, and runs \
     nothing; protocol_create makes a new Protocol in a directory, as arc create-protocol does, \
     and refuses one that already has a spec; table_describe reads what a table in a \
     Protocol's database holds (row count, columns, null counts, sample rows) and changes nothing; \
@@ -482,6 +484,9 @@ mod tests {
             "operation_record",
             "operator_record",
             "sql_recognise",
+            "protocol_edit",
+            "history_list",
+            "history_restore",
             "sql_record",
             "protocol_create",
             "table_describe",
@@ -492,7 +497,7 @@ mod tests {
                 "missing tool `{expected}` in {names:?}"
             );
         }
-        assert_eq!(names.len(), 15, "unexpected tool set: {names:?}");
+        assert_eq!(names.len(), 18, "unexpected tool set: {names:?}");
         // Every tool advertises an object input schema.
         for tool in listed["tools"].as_array().unwrap() {
             assert!(tool["description"].is_string());
@@ -569,6 +574,9 @@ mod tests {
             "operation_describe",
             "operation_record",
             "operator_record",
+            "protocol_edit",
+            "history_list",
+            "history_restore",
             "sql_recognise",
             "sql_record",
         ] {
