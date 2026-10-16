@@ -234,9 +234,10 @@ fn at(path: &Path, err: io::Error) -> Error {
 /// destination, so an error while staging leaves the target as it was. Then each is swapped
 /// in: the old folder is renamed aside, the new one renamed into place, and the old one
 /// deleted; if the second rename fails the old folder is put back. An error while swapping
-/// therefore leaves each skill folder either the old one or the new one, whole, with the
-/// skills before it new and those after it old; the ones already new are in
-/// [`Outcome::installed`].
+/// therefore leaves the skills before it new and those after it old, the ones already new in
+/// [`Outcome::installed`], and the failing skill's folder the old one, whole, unless putting
+/// it back failed too: then that folder is missing, the old one is set aside as
+/// `.<skill>.arc-old`, and the error names where; the next run writes the skill afresh.
 pub fn install(targets: &[AgentTarget]) -> Outcome {
     let skills = skills();
     let mut outcome = Outcome::default();

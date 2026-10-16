@@ -69,7 +69,7 @@ An analyst working through an agent needs three things: arc with its MCP server,
 
 ### Plugins
 
-This repository is a plugin for each of these agents. Each one installs the five [agent skills](#agent-skills) and starts `arc mcp` from `PATH`; arc itself is not part of the plugin, so install it first. A plugin route installs the skills of a released arc, from the release's tag (`v` and the version `arc --version` prints), so that they match the arc you installed. These routes work from the first release that carries the plugin manifests; until then, use `arc skills install`.
+This repository is a plugin for each of these agents. Each one installs the five [agent skills](#agent-skills) and starts `arc mcp` from `PATH`; arc itself is not part of the plugin, so install it first. A plugin route installs the skills of a released arc from a release tag: the one you name for Gemini CLI and Cursor (`v` and the version `arc --version` prints), and the newest release's for Claude Code and Codex. These routes work from the first release that carries the plugin manifests; until then, use `arc skills install`.
 
 | Agent | Install |
 | --- | --- |

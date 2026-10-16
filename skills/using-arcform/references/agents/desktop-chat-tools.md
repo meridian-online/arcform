@@ -4,7 +4,7 @@ A desktop chat app, such as Claude Desktop, usually has no shell. It reaches arc
 
 ## Loading the skills
 
-There is no plugin to install. Claude Desktop takes each skill as a ZIP of its folder, uploaded through its skills settings: zip each folder under `skills/` (start with `using-arcform`) and upload it. `arc skills list` prints the skills this arc carries and the version each was written for. Upload the skills again after upgrading arc.
+There is no plugin to install. Claude Desktop takes each skill as a ZIP of its folder, uploaded through its skills settings. Run `arc skills install --target <folder>` to write this arc's skills into a folder of your choosing, then zip each skill folder there (start with `using-arcform`) and upload it: from that folder, `zip -r using-arcform.zip using-arcform -x '*/.arc-skill'`. Leave out the `.arc-skill` marker, as that command does: it tells `arc skills install` the folder is its own to replace, which means nothing to an uploaded copy. `arc skills list` prints the skills this arc carries and the version each was written for. Upload the skills again after upgrading arc.
 
 ## Connecting `arc mcp`
 
