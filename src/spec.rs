@@ -135,7 +135,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! arcform = { version = "=0.2.0", default-features = false }
+//! arcform = { version = "=0.2.1", default-features = false }
 //! ```
 //!
 //! # Stability
