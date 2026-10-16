@@ -55,6 +55,8 @@ arc table describe revenue
 arc sql query "SELECT * FROM revenue ORDER BY revenue DESC"
 ```
 
+Beyond recording and running, the rest of the analyst's loop has a verb each, and each has an `arc mcp` tool of the same name. `arc operator record <operator> --name <step> --with '<json>'` records an operator step, its `with:` checked against the operator's schema. `arc edit-protocol` makes one edit to `arcform.yaml`, and `arc history list --json` and `arc history restore` list and roll back its versions. `arc protocol write-file <path>` writes `schemas/<name>.json`, `panels/<name>.yaml` or `README.md` from standard input, and keeps what it replaces in history. `arc table profile <table>` types a table's columns with FineType (`--format json-schema` gives a schema its rows pass), and `arc table validate <table> --schema <file>` checks a table against such a schema in DuckDB with FineType's extension, which `FINETYPE_DUCKDB_EXT` names. `arc panel check` reports a panel that names a table or column the Protocol does not make. `arc report write` takes your prose on standard input and writes `report.md` with how the answer was derived, the charts and the run; it refuses a Protocol that has not run.
+
 `arc history list` shows each recording as a version, and `arcform-log.txt` in the folder lists them, so the record goes with the Protocol through git. The database lives outside the folder, in `~/.arcform/db`, unless `arc create-protocol --db <file>` names one.
 
 ## Using arc from an agent
@@ -103,6 +105,15 @@ Through these tools an agent can start a Protocol, look at its tables, query the
 | `operation_describe` | List the SQL operations arc holds, or describe what one takes. |
 | `operation_record` | Record an operation, such as `filter-rows`, as a new step. Runs nothing. |
 | `operator_describe` | List the operator catalogue, or give an operator's `with:` JSON Schema. |
+| `operator_record` | Record an operator as a new step, its `with:` checked against the operator's schema. Runs nothing. |
+| `protocol_edit` | Make one edit to a Protocol's `arcform.yaml`, as `arc edit-protocol` does. The previous text stays in history. |
+| `history_list` | List the recorded versions of `arcform.yaml`, or of one file beside it. |
+| `history_restore` | Roll `arcform.yaml`, or one file beside it, back to a recorded version. |
+| `protocol_write_file` | Write a table schema (`schemas/<name>.json`), a panel (`panels/<name>.yaml`) or `README.md`, keeping what it replaces in history. |
+| `table_profile` | Profile a table's columns with FineType, or give a JSON Schema its rows pass, read-only. |
+| `table_validate` | Check a table against a schema file with FineType's DuckDB extension (needs `FINETYPE_DUCKDB_EXT`), read-only. |
+| `panel_check` | Report each panel that names a table or column the Protocol does not make. |
+| `report_write` | Write `report.md` from your prose and the newest run's record. Replaces one already there, keeping it in history. |
 | `infer` | Infer the semantic type of string values, through `finetype infer`. |
 | `profile` | Profile each column of a CSV or JSON file, through `finetype profile`. |
 | `taxonomy` | Browse FineType's type taxonomy, or export a type's JSON Schema. |

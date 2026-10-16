@@ -16,11 +16,15 @@ src/
   precondition.rs # Typed step preconditions (modified_after, fresh, command, tool)
   state.rs        # Run state tracking (step config hash, artifact hash, staleness)
   inspect.rs      # Read-only look inside a Protocol's database: `arc table describe`, `arc sql query`
+  protocol_files.rs # Writes a Protocol's schemas/, panels/ and README.md, each recorded in its own history: `arc protocol write-file`
+  panel_check.rs  # Finds panels that name a table or column the Protocol does not make: `arc panel check`
+  report.rs       # Writes report.md from an agent's prose and a run's contract: `arc report write`
+  finetype_cli.rs # Runs the `finetype` command and holds its version floor, `MIN_VERSION`; shared by the CLI verbs and the MCP tools
   error.rs        # Error types
   mcp/            # `arc mcp`: a Model Context Protocol server over stdio (feature `mcp`)
-    mod.rs        #   JSON-RPC transport, protocol-version negotiation, the tool registry
+    mod.rs        #   JSON-RPC transport, protocol-version negotiation, the tool registry, each tool's read-only, open-world and destructive annotations
     finetype.rs   #   The five FineType tools, each running the `finetype` command
-    hero.rs       #   arc's own tools: protocol_run, protocol_create, the record, describe and query tools
+    hero.rs       #   arc's own tools: protocol_run, protocol_create, the record, edit, history, describe, query, check and report tools
 ```
 
 ### `arc mcp` and `protocol_run`

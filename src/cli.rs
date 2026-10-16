@@ -175,13 +175,19 @@ pub enum Commands {
     /// `operation_describe` (the SQL operations arc holds, and what one takes),
     /// `operation_record` (record an operation as a step of a Protocol),
     /// `operator_record` (record an operator step, its `with:` checked against the
-    /// operator's schema), `sql_recognise` (what arc reads a SQL statement as), `sql_record` (record
-    /// a SQL statement as a step of a Protocol), `protocol_create` (make a new
-    /// Protocol, as `arc create-protocol` does), `protocol_write_file` (write a
-    /// Protocol's schema, panel or README file), `report_write` (write the report of a
-    /// run), `table_describe` (what a table in
-    /// a Protocol's database holds, read-only) and `sql_query` (run read-only
-    /// SELECTs against a Protocol's database).
+    /// operator's schema), `sql_recognise` (what arc reads a SQL statement as),
+    /// `sql_record` (record a SQL statement as a step of a Protocol),
+    /// `protocol_create` (make a new Protocol, as `arc create-protocol` does),
+    /// `protocol_edit` (one edit to a Protocol's spec, as `arc edit-protocol` does),
+    /// `history_list` and `history_restore` (list and roll back the recorded states
+    /// of a spec or of a file beside it), `protocol_write_file` (write a Protocol's
+    /// schema, panel or README file), `panel_check` (find panels that name a table or
+    /// column the Protocol does not make), `report_write` (write the report of a
+    /// run), `table_describe` (what a table in a Protocol's database holds,
+    /// read-only), `table_profile` (a table's column types, or a JSON Schema, from
+    /// FineType), `table_validate` (check a table against a schema file with
+    /// FineType's DuckDB extension) and `sql_query` (run read-only SELECTs against a
+    /// Protocol's database).
     #[cfg(feature = "mcp")]
     Mcp,
 
