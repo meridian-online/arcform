@@ -78,7 +78,7 @@ This repository is a plugin for each of these agents. Each one installs the five
 | Gemini CLI | `gemini extensions install https://github.com/meridian-online/arcform --ref vX.Y.Z`, with the version `arc --version` prints |
 | Cursor | Untested. Install from this repository at the tag `vX.Y.Z` matching `arc --version`, as [Cursor's plugin docs](https://cursor.com/docs/reference/plugins) describe |
 
-The Claude Code and Codex marketplace names the plugin at the tag of the newest release, so those two install that release's skills; when your arc is older, use `arc skills install` instead, or upgrade arc.
+The Claude Code and Codex marketplace names the plugin at the tag of the newest release, so those two install that release's skills. When your arc is older, upgrade arc, or remove the plugin and then run `arc skills install`; with both, the agent holds two copies of every skill.
 
 Each manifest (`.claude-plugin/`, `.codex-plugin/`, `.cursor-plugin/`, `gemini-extension.json` and `plugin/codex-mcp.json`) is generated from [`plugin/plugin.meta.json`](plugin/plugin.meta.json) by `python3 scripts/generate-plugins.py`, and CI fails when a committed manifest differs from what it generates. Per-agent notes, such as what each agent calls the arc tools, are in [`skills/using-arcform/references/agents/`](skills/using-arcform/references/agents/), with one for a desktop chat app, which has no plugin route.
 

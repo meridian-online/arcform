@@ -64,27 +64,52 @@ const OUTPUT_DIRS: &[&str] = &[
 ];
 const OUTPUT_FILES: &[&str] = &["gemini-extension.json"];
 
-/// The generated files present in the repository, by path relative to `root`: everything in
-/// `OUTPUT_DIRS` except the source itself, and each of `OUTPUT_FILES` that exists.
+/// The generated files committed to the repository, by path relative to `root`: every tracked
+/// file in `OUTPUT_DIRS` except the source itself, and each of `OUTPUT_FILES` that is tracked.
+/// Tracked files come from `git ls-files`, so a stray `.DS_Store` or editor swap file is not
+/// mistaken for a manifest. Without git, the folders are walked and dotfiles are skipped, since
+/// the generator writes none inside them.
 fn committed_outputs(root: &Path) -> Vec<String> {
-    let mut found = Vec::new();
-    for dir in OUTPUT_DIRS {
-        let dir = root.join(dir);
-        if dir.is_dir() {
+    let listed = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z", "--"])
+        .args(OUTPUT_DIRS)
+        .args(OUTPUT_FILES)
+        .output()
+        .ok()
+        .filter(|out| out.status.success());
+    let mut found: Vec<String> = match listed {
+        Some(out) => String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_string)
+            .collect(),
+        None => {
+            let mut found = Vec::new();
+            for dir in OUTPUT_DIRS {
+                let dir = root.join(dir);
+                if dir.is_dir() {
+                    found.extend(
+                        tree(&dir)
+                            .into_keys()
+                            .filter(|rel| !rel.split('/').any(|part| part.starts_with('.')))
+                            .map(|rel| {
+                                format!("{}/{rel}", dir.file_name().unwrap().to_string_lossy())
+                            }),
+                    );
+                }
+            }
             found.extend(
-                tree(&dir)
-                    .into_keys()
-                    .map(|rel| format!("{}/{rel}", dir.file_name().unwrap().to_string_lossy())),
+                OUTPUT_FILES
+                    .iter()
+                    .filter(|f| root.join(f).is_file())
+                    .map(|f| f.to_string()),
             );
+            found
         }
-    }
+    };
     found.retain(|path| path != SOURCE);
-    found.extend(
-        OUTPUT_FILES
-            .iter()
-            .filter(|f| root.join(f).is_file())
-            .map(|f| f.to_string()),
-    );
     found
 }
 
