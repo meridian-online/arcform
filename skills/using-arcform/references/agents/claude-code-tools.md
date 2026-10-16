@@ -6,12 +6,14 @@ The skills name each tool by its bare name, such as `sql_query`, and each comman
 
 Use one of two routes, not both: with both, Claude Code holds two copies of every skill.
 
-- **The plugin.** Add this repository as a marketplace and install the `arcform` plugin from it. The plugin brings the five skills and starts the arc MCP server for you; its skills are listed as `arcform:using-arcform` and so on.
+- **The plugin.** Add this repository as a marketplace and install the `arcform` plugin from it. The plugin brings the five skills and starts the arc MCP server for you; its skills are listed as `arcform:using-arcform` and so on. The marketplace names the plugin at the tag of the newest arc release, so it brings the skills of a released arc; it works from the first release that carries the plugin manifests.
 
   ```sh
   claude plugin marketplace add meridian-online/arcform
   claude plugin install arcform@arcform
   ```
+
+  After upgrading arc, refresh both: `claude plugin marketplace update arcform`, then `claude plugin update arcform@arcform`.
 
 - **The skills folder.** `arc skills install --agent claude-code` writes the skills into `~/.claude/skills/`, at the version of the arc that wrote them. Connect the server yourself (below).
 

@@ -69,16 +69,18 @@ An analyst working through an agent needs three things: arc with its MCP server,
 
 ### Plugins
 
-This repository is a plugin for each of these agents. Each one installs the five [agent skills](#agent-skills) and starts `arc mcp` from `PATH`; arc itself is not part of the plugin, so install it first.
+This repository is a plugin for each of these agents. Each one installs the five [agent skills](#agent-skills) and starts `arc mcp` from `PATH`; arc itself is not part of the plugin, so install it first. A plugin route installs the skills of a released arc, from the release's tag (`v` and the version `arc --version` prints), so that they match the arc you installed. These routes work from the first release that carries the plugin manifests; until then, use `arc skills install`.
 
 | Agent | Install |
 | --- | --- |
 | Claude Code | `claude plugin marketplace add meridian-online/arcform`, then `claude plugin install arcform@arcform` |
 | Codex | `codex plugin marketplace add meridian-online/arcform`, then `codex plugin add arcform@arcform` |
-| Gemini CLI | `gemini extensions install https://github.com/meridian-online/arcform` |
-| Cursor | Install from this repository through Cursor's plugin settings |
+| Gemini CLI | `gemini extensions install https://github.com/meridian-online/arcform --ref vX.Y.Z`, with the version `arc --version` prints |
+| Cursor | Untested. Install from this repository at the tag `vX.Y.Z` matching `arc --version`, as [Cursor's plugin docs](https://cursor.com/docs/reference/plugins) describe |
 
-Each manifest (`.claude-plugin/`, `.codex-plugin/`, `.cursor-plugin/`, `gemini-extension.json`) is generated from [`plugin/plugin.meta.json`](plugin/plugin.meta.json) by `python3 scripts/generate-plugins.py`, and CI fails when a committed manifest differs from what it generates. Per-agent notes, such as what each agent calls the arc tools, are in [`skills/using-arcform/references/agents/`](skills/using-arcform/references/agents/), with one for a desktop chat app, which has no plugin route.
+The Claude Code and Codex marketplace names the plugin at the tag of the newest release, so those two install that release's skills; when your arc is older, use `arc skills install` instead, or upgrade arc.
+
+Each manifest (`.claude-plugin/`, `.codex-plugin/`, `.cursor-plugin/`, `gemini-extension.json` and `plugin/codex-mcp.json`) is generated from [`plugin/plugin.meta.json`](plugin/plugin.meta.json) by `python3 scripts/generate-plugins.py`, and CI fails when a committed manifest differs from what it generates. Per-agent notes, such as what each agent calls the arc tools, are in [`skills/using-arcform/references/agents/`](skills/using-arcform/references/agents/), with one for a desktop chat app, which has no plugin route.
 
 ### Connecting `arc mcp` yourself
 

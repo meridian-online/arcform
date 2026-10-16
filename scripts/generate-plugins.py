@@ -6,8 +6,8 @@ descriptions, homepage, licence, where its skills are and the MCP server it conn
 version comes from Cargo.toml's [package] version, and this script writes:
 
   .claude-plugin/plugin.json       Claude Code plugin (skills/ and the arc MCP server)
-  .claude-plugin/marketplace.json  Claude Code marketplace listing this repository's plugin;
-                                   Codex also reads this file as a marketplace
+  .claude-plugin/marketplace.json  marketplace listing the plugin at the release tag v<version>;
+                                   Claude Code and Codex both read it
   .codex-plugin/plugin.json        Codex plugin
   plugin/codex-mcp.json            the MCP server file the Codex plugin names
   .cursor-plugin/plugin.json       Cursor plugin
@@ -25,11 +25,16 @@ Standard library only (Python 3.11 or later, for tomllib).
 
 from __future__ import annotations
 
+import sys
+
+if sys.version_info < (3, 11):
+    sys.exit("generate-plugins: needs Python 3.11 or later (for tomllib)")
+
 import argparse
 import json
-import sys
 import tomllib
 from pathlib import Path
+from typing import NoReturn
 
 ROOT = Path(__file__).resolve().parent.parent
 META = ROOT / "plugin" / "plugin.meta.json"
@@ -60,7 +65,7 @@ KEYS = {
 MCP_KEYS = {"name", "command", "args", "toolTimeoutSec"}
 
 
-def fail(message: str) -> None:
+def fail(message: str) -> NoReturn:
     print(f"generate-plugins: {message}", file=sys.stderr)
     sys.exit(1)
 
@@ -107,6 +112,13 @@ def claude_plugin(meta: dict, version: str) -> dict:
     }
 
 
+def release_source(meta: dict, version: str) -> dict:
+    # The plugin is fetched from the release tag of this version, not the default branch,
+    # so a plugin install carries the skills of a released arc. Both Claude Code and
+    # Codex read a `url` source with a `ref` (Codex has no `github` source type).
+    return {"source": "url", "url": f"{meta['repository']}.git", "ref": f"v{version}"}
+
+
 def claude_marketplace(meta: dict, version: str) -> dict:
     return {
         "name": meta["marketplace"]["name"],
@@ -117,7 +129,7 @@ def claude_marketplace(meta: dict, version: str) -> dict:
                 "name": meta["name"],
                 "description": meta["description"],
                 "version": version,
-                "source": "./",
+                "source": release_source(meta, version),
                 "author": meta["author"],
             }
         ],
@@ -187,7 +199,7 @@ def render(doc: dict) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").strip().partition("\n")[0])
     parser.add_argument("--out", type=Path, default=ROOT, help="folder to write into (default: the repository root)")
     out = parser.parse_args().out
 

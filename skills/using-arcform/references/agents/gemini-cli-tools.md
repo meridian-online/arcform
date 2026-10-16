@@ -9,8 +9,10 @@ Use one of two routes, not both: with both, Gemini CLI holds two copies of every
 - **The extension.** This repository is a Gemini CLI extension (`gemini-extension.json`): it brings the five skills, which Gemini CLI finds in the extension's `skills/` folder, and the arc MCP server.
 
   ```sh
-  gemini extensions install https://github.com/meridian-online/arcform
+  gemini extensions install https://github.com/meridian-online/arcform --ref vX.Y.Z
   ```
+
+  Put the version `arc --version` prints in place of `X.Y.Z`, so the skills match your arc; it works from the first release that carries the extension manifest. After upgrading arc, uninstall the extension and install it again at the new tag.
 
 - **The skills folder.** `arc skills install --agent gemini` writes the skills into `~/.gemini/skills/`. Connect the server yourself (below).
 

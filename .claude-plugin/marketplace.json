@@ -10,7 +10,11 @@
       "name": "arcform",
       "description": "Agent skills for analysing tabular data with arc: every step is recorded in a Protocol the user can re-run, inspect and share, and the arc MCP server is connected for you.",
       "version": "0.2.0",
-      "source": "./",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/meridian-online/arcform.git",
+        "ref": "v0.2.0"
+      },
       "author": {
         "name": "Meridian",
         "url": "https://meridian.online"

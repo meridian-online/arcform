@@ -6,12 +6,14 @@ The skills name each tool by its bare name, such as `sql_query`, and each comman
 
 Use one of two routes, not both: with both, Codex holds two copies of every skill.
 
-- **The plugin.** Add this repository as a marketplace and install the `arcform` plugin from it. The plugin brings the five skills and the arc MCP server, with its tool timeout already raised.
+- **The plugin.** Add this repository as a marketplace and install the `arcform` plugin from it. The plugin brings the five skills and the arc MCP server, with its tool timeout already raised. The marketplace names the plugin at the tag of the newest arc release, so it brings the skills of a released arc; it works from the first release that carries the plugin manifests.
 
   ```sh
   codex plugin marketplace add meridian-online/arcform
   codex plugin add arcform@arcform
   ```
+
+  After upgrading arc, refresh the marketplace with `codex plugin marketplace upgrade`, then `codex plugin remove arcform` and `codex plugin add arcform@arcform`.
 
 - **The skills folder.** `arc skills install --agent codex` writes the skills into `~/.agents/skills/`, the folder Codex reads. Connect the server yourself (below).
 

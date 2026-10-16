@@ -5,8 +5,8 @@
 //! written by `scripts/generate-plugins.py` from `plugin/plugin.meta.json`, with the version
 //! taken from `Cargo.toml`. This test runs the generator into a temporary folder and compares
 //! what it writes, byte for byte, with the files committed at the repository root, so a
-//! manifest edited by hand, or a version bump without a regenerate, fails here with the file
-//! to edit and the command to run.
+//! manifest edited by hand, a version bump without a regenerate, or a manifest the generator no
+//! longer writes, fails here with the file to edit and the command to run.
 //!
 //! It needs `python3` (3.11 or later, for `tomllib`) on `PATH`, as CI's runners have.
 
@@ -54,6 +54,40 @@ fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
     out
 }
 
+/// The places only the generator writes: every file in these folders, and these root files.
+/// A file found here that the generator did not write is a manifest left behind.
+const OUTPUT_DIRS: &[&str] = &[
+    ".claude-plugin",
+    ".codex-plugin",
+    ".cursor-plugin",
+    "plugin",
+];
+const OUTPUT_FILES: &[&str] = &["gemini-extension.json"];
+
+/// The generated files present in the repository, by path relative to `root`: everything in
+/// `OUTPUT_DIRS` except the source itself, and each of `OUTPUT_FILES` that exists.
+fn committed_outputs(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    for dir in OUTPUT_DIRS {
+        let dir = root.join(dir);
+        if dir.is_dir() {
+            found.extend(
+                tree(&dir)
+                    .into_keys()
+                    .map(|rel| format!("{}/{rel}", dir.file_name().unwrap().to_string_lossy())),
+            );
+        }
+    }
+    found.retain(|path| path != SOURCE);
+    found.extend(
+        OUTPUT_FILES
+            .iter()
+            .filter(|f| root.join(f).is_file())
+            .map(|f| f.to_string()),
+    );
+    found
+}
+
 #[test]
 fn manifests_match_source() {
     let root = repo_root();
@@ -88,6 +122,13 @@ fn manifests_match_source() {
             Ok(have) if &have == want => {}
             Ok(_) => drift.push(format!("  {path} differs from what {SOURCE} generates")),
             Err(_) => drift.push(format!("  {path} is missing")),
+        }
+    }
+    for path in committed_outputs(&root) {
+        if !generated.contains_key(&path) {
+            drift.push(format!(
+                "  {path} is no longer generated from {SOURCE}; delete it"
+            ));
         }
     }
     assert!(
