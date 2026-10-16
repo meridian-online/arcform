@@ -56,7 +56,7 @@ Every record verb takes a description: `--description "<why>"` from a shell, `de
 | --- | --- | --- |
 | Add a description to a step recorded without one | `arc edit-protocol --dir <dir> add 'steps[<i>]' description '"<why>"'` | `protocol_edit` with `edit`, `path`, `key`, `value`, `dir` |
 
-Over MCP, `edit` is "add", `path` is "steps[<i>]" (the step's place in the list, from 0) and `key` is "description". `value` is written into the YAML as it stands, so wrap it in double quotes inside the string; a description with a colon in it is otherwise refused as a YAML error.
+Over MCP, `edit` is "add", `path` is "steps[<i>]" (the step's place in the list, from 0) and `key` is "description". `value` is written into the YAML as it stands, so wrap it in double quotes inside the string, and inside them escape any `"` as `\"` and any `\` as `\\`; or wrap it in single quotes and double any `'` inside. A description with a colon in it is otherwise refused as a YAML error.
 
 ## 5. Run
 
@@ -117,7 +117,7 @@ A restore keeps the state it replaces, so a wrong restore is undone by restoring
 | `dependency order violation: step '<a>' reads asset '<b>' but ... runs after it` | Steps are recorded at the end. Move the reader after the step that makes its table: `arc edit-protocol --dir <dir> reorder steps <from> <to>` (`protocol_edit` with `edit` `reorder`) |
 | `sql_query` over `read_text` returns no rows | The path was relative, read from the server's working directory. Give the absolute path to the Protocol folder |
 | A replayed step's SELECT fails over MCP with `No files found that match the pattern` | `sql_query` reads relative paths from the server's working directory. Rewrite them as absolute paths under the Protocol folder |
-| `failed to parse arcform.yaml: mapping values are not allowed` after `protocol_edit` | The value has a colon and was written unquoted. Wrap it in double quotes inside the string |
+| `failed to parse arcform.yaml: mapping values are not allowed` after `protocol_edit` | The value has a colon and was written unquoted. Wrap it in double quotes inside the string, escaping `"` as `\"` and `\` as `\\`, or in single quotes with any `'` doubled |
 | `no database for this Protocol yet` | The Protocol has not run. Run it, then look |
 | A run says `skipped (fresh)` after you changed a source | The step's inputs looked unchanged, or a fetch is inside its period. Offer `force`, saying what it re-fetches |
 | A step is `skipped` with a null `skip_reason` | It never ran: an earlier step failed. Fix that one |
