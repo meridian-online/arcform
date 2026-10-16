@@ -4,6 +4,22 @@ This eval checks that the analyst skills under `skills/` do their job in real ag
 
 It runs by hand before each release, because it needs paid agent sessions. It is not a CI job. Its scored results go in the release pull request.
 
+## What it checks
+
+`cargo test --features mcp --test skills` already proves that every tool, verb and flag a skill names exists and that its examples run. It cannot show whether an agent, given a data question and a choice of tools, picks arc up and follows the method to the end. Only real sessions show that, so the eval scores them against what the analyst should end a session with:
+
+1. Confidence that the analysis is sound: every step is recorded, ran, and was checked.
+2. Work sized to the question: a quick look gets a short Protocol and few checkpoints, a larger piece of work gets agreed requirements and more of them.
+3. Awareness of the data's quality issues and what they mean for the answer.
+4. A say in the process: the agent plays the plan back and the analyst can refine the requirements before it builds.
+5. An arc Protocol that can be stored, committed to git or shared.
+6. The answer, and next steps.
+7. A visual account of how the answer was derived, and of anything else found along the way.
+
+A task passes in an agent when the agent chose arc without being told to and the session ended with all seven. `score.md` says what counts as a yes for each at each size.
+
+The eval runs in at least two agents with a shell, so that a result is not one agent's quirk, and in a desktop chat client with only `arc mcp`, because that client has no file access of its own and so proves every file the workflow needs can be written through arc. Failures are clustered by cause and each cluster is fixed with the smallest skill edit, the way a skill's description or error table is tuned, rather than by rewriting a skill to pass one task.
+
 | File | What it holds |
 | --- | --- |
 | `tasks.yaml` | Ten analyst tasks on public datasets: four quick looks, four analyses and two projects, each with the prompt to paste, the dataset's licence and notes for the evaluator |
