@@ -114,3 +114,34 @@ pub fn mcp_session_env(
         .map(str::to_string)
         .collect()
 }
+
+/// Whether `finetype` at arc's version floor is on PATH, printing why when it is not.
+///
+/// A test that needs the real CLI returns early when this is false. With
+/// `ARCFORM_REQUIRE_FINETYPE_CLI` set, as CI sets it after installing a pinned
+/// release, a missing or too-old binary panics instead, so those tests cannot pass
+/// by skipping.
+#[allow(dead_code)]
+pub fn finetype_cli_present() -> bool {
+    let floor = semver::Version::new(0, 6, 54);
+    let found = match Command::new("finetype").arg("--version").output() {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            let version = text
+                .split_whitespace()
+                .next_back()
+                .and_then(|v| semver::Version::parse(v.trim_start_matches('v')).ok());
+            match version {
+                Some(v) if v >= floor => return true,
+                _ => format!("finetype is older than {floor} ({})", text.trim()),
+            }
+        }
+        Err(e) => format!("finetype is not on PATH ({e})"),
+    };
+    assert!(
+        std::env::var_os("ARCFORM_REQUIRE_FINETYPE_CLI").is_none(),
+        "ARCFORM_REQUIRE_FINETYPE_CLI is set, so this run promised the finetype CLI, but {found}"
+    );
+    eprintln!("skipping: {found}");
+    false
+}

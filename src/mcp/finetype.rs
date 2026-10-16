@@ -125,10 +125,6 @@ fn taxonomy_with(bin: &str, args: &Value) -> ToolResult {
         cli.push("--category".to_string());
         cli.push(category.to_string());
     }
-    if let Some(priority) = opt_u64(args, "priority") {
-        cli.push("--priority".to_string());
-        cli.push(priority.to_string());
-    }
     if opt_bool(args, "full").unwrap_or(false) {
         cli.push("--full".to_string());
     }
@@ -185,10 +181,6 @@ fn generate_with(bin: &str, args: &Value) -> ToolResult {
         "--output".to_string(),
         out_path.display().to_string(),
     ];
-    if let Some(priority) = opt_u64(args, "priority") {
-        cli.push("--priority".to_string());
-        cli.push(priority.to_string());
-    }
     if let Some(seed) = opt_u64(args, "seed") {
         cli.push("--seed".to_string());
         cli.push(seed.to_string());
@@ -243,7 +235,6 @@ fn taxonomy_schema() -> Value {
             "type_key": { "type": "string", "description": "Type key (identity.person.email) or glob (identity.person.*)." },
             "domain": { "type": "string", "description": "Filter by domain." },
             "category": { "type": "string", "description": "Filter by category." },
-            "priority": { "type": "integer", "description": "Minimum release priority." },
             "format": { "type": "string", "enum": ["json", "json-schema", "plain", "csv"], "default": "json", "description": "Output shape." },
             "full": { "type": "boolean", "description": "Export all fields (description, validation, samples)." },
             "taxonomy_file": { "type": "string", "description": "Taxonomy file/dir (defaults to finetype's bundled labels)." }
@@ -269,7 +260,6 @@ fn generate_schema() -> Value {
         "type": "object",
         "properties": {
             "samples": { "type": "integer", "minimum": 1, "default": 10, "description": "Samples generated per label." },
-            "priority": { "type": "integer", "description": "Minimum release priority." },
             "seed": { "type": "integer", "description": "Random seed for reproducibility." },
             "localized": { "type": "boolean", "description": "Emit 4-level labels with locale suffixes." },
             "taxonomy_file": { "type": "string", "description": "Taxonomy file/dir (defaults to finetype's bundled labels)." }

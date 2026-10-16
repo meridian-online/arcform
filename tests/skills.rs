@@ -59,10 +59,11 @@
 //! `needs=finetype-ext` when it needs FineType's DuckDB extension, as `arc table validate` does;
 //! `needs=finetype,finetype-ext` for both. Any other need is an error. An example that needs
 //! `finetype` is skipped, with a printed reason, when the binary (`FINETYPE_BIN`, or `finetype` on
-//! `PATH`) is absent or older than the floor in `src/finetype_cli.rs`. One that needs the extension
+//! `PATH`) is absent or older than the floor in `src/finetype_cli.rs`, unless
+//! `ARCFORM_REQUIRE_FINETYPE_CLI` is set: then the test panics instead. One that needs the extension
 //! is skipped when `FINETYPE_DUCKDB_EXT` is unset, unless `ARCFORM_REQUIRE_FINETYPE_EXT` is set: then
-//! the test panics instead. CI stages the extension and sets both, so the extension's examples run
-//! there; it has no `finetype` binary, so the `needs=finetype` examples are skipped there.
+//! the test panics instead. CI installs a pinned finetype release, stages the extension and sets all
+//! three, so every example runs there.
 //!
 //! **Frontmatter** (`SKILL.md`): valid YAML (so an unquoted description containing `:` is
 //! refused), `name` equal to the folder, hyphen-case and at most 64 characters, `description`
@@ -1169,6 +1170,12 @@ fn check_examples(docs: &[Doc]) -> Vec<String> {
                 continue;
             }
             if needs_finetype && let Some(why) = finetype.get_or_init(finetype_unavailable) {
+                assert!(
+                    std::env::var_os("ARCFORM_REQUIRE_FINETYPE_CLI").is_none(),
+                    "ARCFORM_REQUIRE_FINETYPE_CLI is set, so this run promised the finetype \
+                     CLI, but {why}: the example at {} would be skipped",
+                    doc.at(b.line)
+                );
                 println!("skipping example at {}: {why}", doc.at(b.line));
                 continue;
             }
