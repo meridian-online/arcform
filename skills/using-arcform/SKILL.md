@@ -47,6 +47,8 @@ Choose one with `scoping-an-analysis`, say which, and let the user override.
 - **An analysis.** The default: all five stages, the plan played back after scoping and the quality findings shown after profiling.
 - **A project.** Requirements agreed and written into the Protocol's `README.md` before building, a checkpoint at each stage and a report at the end.
 
+A quick look still starts with `scoping-an-analysis` and ends with `presenting-findings`, loaded before you give the answer; only profiling and building are cut short.
+
 ## The stages and their skills
 
 | Stage | Skill to load | Checkpoint with the user |

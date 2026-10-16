@@ -76,7 +76,7 @@ wrote README.md as a readme in monthly-sales
 
 ## Worked examples
 
-**A quick look.** "What did we sell in total in January?" One sum over `sales.csv` answers it. Say: "This is a quick look: one total answers it. I'll load `sales.csv` into a new Protocol, sum `amount` for January and give you the figure with the Protocol behind it." Create the Protocol and go straight on; no README, no waiting.
+**A quick look.** "What did we sell in total in January?" One sum over `sales.csv` answers it. Say: "This is a quick look: one total answers it. I'll load `sales.csv` into a new Protocol, sum `amount` for January and give you the figure with the Protocol behind it. Say if you want more than that." Create the Protocol and go straight on; no README, no waiting.
 
 **An analysis.** "Which categories are growing?" That needs monthly totals per category and a judgement about trend, so it is an analysis. Play back: the source (`sales.csv`), the stages (profile the columns, build monthly totals per category, check them, present a chart), and the end state (the growing categories, with the caveats profiling finds). Wait for agreement, then create the Protocol.
 
