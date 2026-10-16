@@ -139,14 +139,9 @@ RULE_EXTRA_EXCLUDES=(
 # Only `.md`: without the extension the pattern collides with MIME types and
 # with module paths in prose. `$`, `{` and `}` are in the lookbehind because an
 # interpolated path has a variable where its root segment should be.
-#
-# A literal passed straight to `join("`, as Rust's `path.join("a/b.md")` takes
-# it, is relative to a folder chosen at run time, such as a test's
-# temporary home or an agent's skills folder, not to this checkout, so it is
-# skipped unless it climbs out with `../`, which still names a sibling checkout.
 # ---------------------------------------------------------------------------
 PATH_LABEL='cross-repo-doc-path'
-PATH_PATTERN='(?i)(?<![-_A-Za-z0-9/.:${}])(?:(?<!join\(")|(?=\.\./))(?:\.{1,2}/)*[A-Za-z0-9_.][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_.-]+)+\.md(?![A-Za-z0-9])'
+PATH_PATTERN='(?i)(?<![-_A-Za-z0-9/.:${}])(?:\.{1,2}/)*[A-Za-z0-9_.][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_.-]+)+\.md(?![A-Za-z0-9])'
 
 # ---------------------------------------------------------------------------
 # Allowlist.

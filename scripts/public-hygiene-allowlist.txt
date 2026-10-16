@@ -22,3 +22,8 @@
 # string to scripts/public-hygiene-innocent-strings.txt so the tightening stays
 # fixed. The allowlist is for genuine content that must stay, never for papering
 # over a bad regex.
+
+src/skills.rs | using-arcform/SKILL.md | a skill folder inside a test's temporary install target, not a path into another checkout
+tests/skills_install.rs | references/dropped.md | a file written inside a test's temporary agent skills folder, not a path into another checkout
+tests/skills_install.rs | using-arcform/SKILL.md | this repository's own skills/ folder, joined at run time, not a path into another checkout
+tests/skills_install.rs | .cursor/skills/using-arcform/SKILL.md | Cursor's skills folder under a test's temporary home, not a path into another checkout
