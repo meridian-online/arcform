@@ -42,6 +42,7 @@
 **Files:**
 - Create: `tests/skills.rs`, `tests/fixtures/skills/` (a small Protocol: one CSV of 200 rows with a date, a category, an amount and an email column, and an `arcform.yaml` that loads it)
 - Create: a `README.md` in the new `skills/` folder (what the directory is, for a person browsing GitHub)
+- Modify: `.claude/skills/release/SKILL.md` (set each skill's `metadata.arc_version` when bumping the version)
 
 **Interfaces:**
 - Produces, for later tasks:
