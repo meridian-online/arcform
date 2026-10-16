@@ -449,10 +449,13 @@ pub(crate) fn check_panels(dir: &Path) -> Result<Vec<(PathBuf, Vec<PanelFinding>
     check_panels_from(dir).map(|(_, panels)| panels)
 }
 
+/// Whether the tables came from the database, and each panel with its findings.
+pub(crate) type CheckedPanels = (bool, Vec<(PathBuf, Vec<PanelFinding>)>);
+
 /// [`check_panels`], and whether the tables were read from the Protocol's database
 /// (true) or taken from what its steps produce because it has none yet (false). With
 /// no `panels/` folder nothing is loaded and the answer is false.
-pub(crate) fn check_panels_from(dir: &Path) -> Result<(bool, Vec<(PathBuf, Vec<PanelFinding>)>)> {
+pub(crate) fn check_panels_from(dir: &Path) -> Result<CheckedPanels> {
     let folder = dir.join("panels");
     if !folder.is_dir() {
         return Ok((false, Vec::new()));

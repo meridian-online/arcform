@@ -15,7 +15,7 @@ use crate::contract::{Contract, runs_dir};
 use crate::error::{Error, Result};
 use crate::history::LocalHistory;
 use crate::manifest::{MANIFEST_FILENAME, Manifest};
-use crate::panel_check::check_panels_from;
+use crate::panel_check::{CheckedPanels, check_panels_from};
 use crate::protocol_files::replace_file_with_history;
 
 /// The report's place in the Protocol's folder.
@@ -187,14 +187,7 @@ fn derivation(
     text.push('\n');
 }
 
-fn charts(
-    text: &mut String,
-    dir: &Path,
-    panels: &std::result::Result<
-        (bool, Vec<(PathBuf, Vec<crate::panel_check::PanelFinding>)>),
-        String,
-    >,
-) {
+fn charts(text: &mut String, dir: &Path, panels: &std::result::Result<CheckedPanels, String>) {
     text.push_str("## Charts\n\n");
     let (from_database, panels) = match panels {
         Ok((from_database, panels)) => (*from_database, panels),
@@ -207,9 +200,11 @@ fn charts(
         text.push_str("The Protocol has no panels.\n\n");
         return;
     }
-    text.push_str(
-        "Findings are checked against the Protocol's current database, not the run's.\n\n",
-    );
+    text.push_str(if from_database {
+        "Findings are checked against the Protocol's current database, not the run's.\n\n"
+    } else {
+        "Findings are checked against the tables the Protocol's steps make; it has no database yet.\n\n"
+    });
     for (path, findings) in panels {
         let title = fs::read_to_string(dir.join(path))
             .ok()
