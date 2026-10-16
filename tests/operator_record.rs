@@ -178,7 +178,7 @@ fn refuses_with_that_fails_schema() {
     );
     assert!(!out.status.success());
     assert!(
-        stderr(&out).contains("out"),
+        stderr(&out).contains("`out`"),
         "names the field: {}",
         stderr(&out)
     );
