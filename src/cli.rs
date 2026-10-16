@@ -227,7 +227,7 @@ pub enum Commands {
 #[derive(Subcommand)]
 pub enum SkillsCmd {
     /// Install the skills into each agent found under the home directory (Claude
-    /// Code, Codex, Cursor, Gemini CLI, and the shared `~/.agents/skills`), or into
+    /// Code, and the shared `~/.agents/skills` for Codex, Cursor and Gemini CLI), or into
     /// the agents and folders named. Prints each folder written. A folder of the
     /// same name that arc did not write (it has no `.arc-skill` marker) is refused,
     /// and nothing is written into that agent's skills folder (other agents still
