@@ -108,7 +108,7 @@
 - [ ] **Step 4: Add the CLI verb and MCP tool;** run the tests. Expected: pass.
 - [ ] **Step 5: Commit** "Write a Protocol's schema, panel and README files from the CLI or MCP".
 
-### Task 4: Profile a table
+### Task 4: Profile and validate a table
 
 **Files:**
 - Modify: `src/inspect.rs` (add `profile_table`), `src/cli.rs` (`arc table profile`), `src/mcp/hero.rs` (`table_profile`), `src/mcp/finetype.rs` (expose the version-checked runner to `inspect`)
@@ -120,12 +120,15 @@
   - `pub(crate) fn profile_table(dir: &Path, table: &str, format: ProfileFormat, sample_size: Option<usize>) -> Result<Value>` with `pub enum ProfileFormat { Json, JsonSchema }`. Copies up to `sample_size` rows (default the finetype default) of the table to a temporary CSV outside the Protocol, runs `finetype profile` on it, and returns finetype's JSON with `"table"` and `"rows_profiled"` added.
   - CLI: `arc table profile <TABLE> [--format json|json-schema] [--sample-size N] [--dir DIR]`.
   - MCP tool `table_profile`: `table` (required), `format`, `sample_size`, `dir`. Annotation `READS_OPEN`.
+  - `pub(crate) fn validate_table(dir: &Path, table: &str, schema: &Path) -> Result<Value>`: validates a table in the Protocol's database against a JSON Schema in DuckDB, with finetype's extension and its `ft_validate(table, schema)` macro, as the `finetype_validate` operator does (src/operator.rs): open an in-memory DuckDB with unsigned extensions allowed, `LOAD` the extension found by the operator's `finetype_ext_path` (the `FINETYPE_DUCKDB_EXT` variable), attach the Protocol's database read-only, and run `ft_validate` over the table. `schema` is relative to `dir` and must stay inside it (the containment check `protocol_files` already has). Returns `{ "table", "schema", "valid": bool, "columns": [{ column_name, total, rejects, sample_message }] }`. Share the extension loading and report reading with the operator rather than copying them.
+  - CLI: `arc table validate <TABLE> --schema <PATH> [--dir DIR]`, exit 1 when any row is rejected.
+  - MCP tool `table_validate`: `table`, `schema` (both required), `dir`. Annotation `READS_OPEN`. A missing extension is refused with a message naming `FINETYPE_DUCKDB_EXT`.
 
-- [ ] **Step 1: Write failing tests:** `profiles_table_columns` (a Protocol whose one SQL step makes a table of dates and emails; the result names both columns with the types finetype gives the same CSV directly); `json_schema_format_saves_through_write_file` (the `json-schema` output written with Task 3's verb then passes `finetype validate`); `empty_table_says_so` (zero rows gives `{"rows_profiled": 0}` and a message, not an error); `refuses_missing_table` (lists the tables there are, as `describe_table` does).
+- [ ] **Step 1: Write failing tests:** `profiles_table_columns` (a Protocol whose one SQL step makes a table of dates and emails; the result names both columns with the types finetype gives the same CSV directly); `json_schema_format_saves_through_write_file` (the `json-schema` output written with Task 3's verb then passes `finetype validate`); `empty_table_says_so` (zero rows gives `{"rows_profiled": 0}` and a message, not an error); `refuses_missing_table` (lists the tables there are, as `describe_table` does); `validate_table_passes_its_own_schema` (profile a table to `json-schema`, write it with Task 3's verb, validate the same table: valid); `validate_table_reports_rejects` (a schema whose `enum` excludes a value in the table: invalid, the column named with its reject count); `validate_refuses_schema_outside_protocol`; `validate_without_extension_names_the_variable`. The extension tests skip with a printed reason when `FINETYPE_DUCKDB_EXT` is unset, as the operator's tests do.
 - [ ] **Step 2: Run** `cargo test --features mcp --test table_profile`. Expected: fail.
-- [ ] **Step 3: Implement** `profile_table` with DuckDB's `COPY (SELECT * FROM <quoted table> LIMIT n) TO '<tmp>' (HEADER)`, through the read-only connection.
+- [ ] **Step 3: Implement** `profile_table` with DuckDB's `COPY (SELECT * FROM <quoted table> LIMIT n) TO '<tmp>' (HEADER)`, through the read-only connection. Implement `validate_table` as above.
 - [ ] **Step 4: Run** the tests. Expected: pass.
-- [ ] **Step 5: Commit** "Profile a table in a Protocol's database with finetype".
+- [ ] **Step 5: Commit** "Profile and validate a table in a Protocol's database with finetype".
 
 ### Task 5: Check panels against the Protocol
 
