@@ -4,7 +4,7 @@ Run this once at the start of a session, before the first Protocol. It takes thr
 
 | Check | With a shell | With only the server's tools |
 | --- | --- | --- |
-| arc's version matches the skills | `arc --version` | The server version your client shows, or `run.engine.arc` in any run record |
+| arc's version matches the skills | `arc --version` | The server version, if your client shows it; otherwise `run.engine.arc` from the first `protocol_run` |
 | The MCP server is in this build | `arc mcp --help` exits 0 | You are talking to it, so it is |
 | finetype is at or above its floor | `finetype --version` | The first `table_profile` or `profile` call refuses, naming the floor, when it is not |
 
@@ -14,7 +14,7 @@ Run this once at the start of a session, before the first Protocol. It takes thr
 arc --version
 ```
 
-It prints `arc <version>`. Compare that with `metadata.arc_version` in the frontmatter of the skill you loaded. Skills are written against one arc version: an older arc may lack a verb a skill names, and a newer one may have changed what a verb prints.
+It prints `arc <version>`. Compare that with `metadata.arc_version` in the frontmatter of the skill you loaded. With only the server's tools, the version usually cannot be seen before a run: when the client does not show the server version, compare `run.engine.arc` from the first `protocol_run` with `metadata.arc_version`. Skills are written against one arc version: an older arc may lack a verb a skill names, and a newer one may have changed what a verb prints.
 
 When they differ, tell the user: "Your arc is <version> and these skills were written for <arc_version>. Upgrade arc, or reinstall the skills from where you got them, so the two match." Then carry on carefully: if a verb a skill names is refused as unknown, stop and say so rather than guessing at another.
 

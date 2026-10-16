@@ -13,7 +13,8 @@ In the CLI column, `--dir` defaults to the current directory; for `arc edit-prot
 | Say what arc reads a SQL statement as: an operation it holds, or none | `arc sql recognise "<statement>"` | `sql_recognise` with `sql` |
 | List the SQL operations arc holds | `arc operation list --json` | `operation_describe` (no arguments) |
 | Say what one operation takes | `arc operation describe <long-name>` | `operation_describe` with `operation` |
-| Give an operator's `with:` JSON Schema (or list the operators) | `arc operation describe <operator>` | `operator_describe` with `operator` |
+| List the operators | None: the CLI has no operator listing | `operator_describe` with no arguments |
+| Give one operator's `with:` JSON Schema | `arc operation describe <operator>` | `operator_describe` with `operator` |
 
 ## Profile and type
 
@@ -56,7 +57,7 @@ Recording writes the step into `arcform.yaml` (and a model under `models/`) and 
 | Run the Protocol and get its run record | `arc run --param <key>=<value>` (in the Protocol folder) | `protocol_run` with `dir`, `params` |
 | Re-run every step, fresh or not (offer it; do not default to it) | `arc run --force` | `protocol_run` with `dir`, `force` |
 | List the recorded versions of the spec, or of one file | `arc history list --json --file <file> --dir <dir>` | `history_list` with `file`, `dir` |
-| Print the bytes one version recorded | `arc history show <id> --file <file> --dir <dir>` | None: restore it, or read the file |
+| Print the bytes one version recorded | `arc history show <id> --file <file> --dir <dir>` | `history_restore` with `id`, `file`, `dir`. No tool prints a version, so choose the id by its at and way fields in the history list, then restore; a wrong choice is undone by restoring the checkpoint the restore itself made |
 | Roll the spec, or one file, back to a version | `arc history restore <id> --file <file> --dir <dir>` | `history_restore` with `id`, `file`, `dir` |
 
 ## Present

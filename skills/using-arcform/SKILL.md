@@ -21,8 +21,8 @@ A folder holding `arcform.yaml`, which lists the steps in order, and `models/`, 
 
 - **Recording runs nothing.** `sql_record`, `operation_record` and `operator_record` write a step into the spec. Nothing touches the data.
 - **A run runs.** `protocol_run` executes the steps: it writes tables and files and may reach the network. Say so before the first run of a step that fetches.
-- **History undoes.** Every machine edit, and every file arc writes, keeps what it replaced. `history_list` and `history_restore` roll the spec, or one file, back.
-- **Every write is a version.** Nothing arc writes is lost to an overwrite, so try things; but say what you are replacing.
+- **History undoes edits.** Recording a step, editing the spec, and writing a schema, panel, README or report through `protocol_write_file` or `report_write` each keep what they replaced. `history_list` and `history_restore` roll the spec, or one of those files, back.
+- **A run keeps no versions.** History does not cover what a run writes: a run replaces its tables, and the files an export step writes, with no earlier version kept. Before re-running, say which tables and files it will overwrite.
 - **Looking is read-only.** `table_describe`, `sql_query`, `table_profile` and `table_validate` never write the database.
 
 | Step | CLI | MCP |
@@ -53,7 +53,8 @@ Choose one with `scoping-an-analysis`, say which, and let the user override.
 | --- | --- | --- |
 | Scope | `scoping-an-analysis` | The plan, played back before anything is built |
 | Profile | `profiling-and-typing-data` | The data-quality findings and what they mean for the question |
-| Build and check | `building-and-checking-a-protocol` | Anything that changes the answer's meaning |
+| Build | `building-and-checking-a-protocol` | None by default for a quick look; at larger sizes, when the model changes grain or drops rows |
+| Check | `building-and-checking-a-protocol` | Anything that changes the answer's meaning |
 | Present | `presenting-findings` | The answer, how it was derived, and what else was found |
 
 Start every task at Scope, even a quick look: choosing the size is what keeps a quick look quick.
