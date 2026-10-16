@@ -19,6 +19,14 @@ Rationale for each change is recorded in the project's design notes and commit h
 - **`arc panel check` and the `arc mcp` tool `panel_check` report each panel whose marks read a table or a column the Protocol does not make.** A misspelt column used to show only as an empty chart. One line per finding, and the command exits 1 when there is any.
 - **`arc report write` and the `arc mcp` tool `report_write` write `report.md` beside a Protocol.** The prose is the author's, on standard input or in the tool's arguments; arc adds how the answer was derived, the charts and the run, from the newest run's record or the one `--run` names. A Protocol that has not run is refused, and a report already there is replaced, both versions kept in history.
 - **The `arc mcp` instructions are rewritten as one guide: discover, record, run, check, present, and what each step may change.** They named each tool in a clause of its own; they now give the order of work and say that recording runs nothing, a run runs, and history undoes.
+- **Five agent skills under `skills/` teach an agent the analyst workflow through arc: `using-arcform`, `scoping-an-analysis`, `profiling-and-typing-data`, `building-and-checking-a-protocol` and `presenting-findings`.** An agent had the tools but no method: when to stop and ask, how to type data before trusting it, how to read a run record rather than its exit status. Each skill scales its stage to the size of the task, shows every step as an `arc` command beside the matching `arc mcp` tool, records each analysis step into the Protocol, and ends with when to switch and a table of known traps.
+- **`cargo test --features mcp --test skills` holds the skills to the binary.** Prose drifts from the tools arc has. The test checks every tool, argument, verb and flag a skill names against `arc mcp` and `arc --help`, checks each skill's frontmatter, and runs each skill's examples against small fixture Protocols; the notation is in the module doc of `tests/skills.rs`.
+- **The `arc mcp` instructions outline the five stages of the analyst workflow, Scope, Profile, Build, Check and Present, each with the skill that covers it.** An agent connected without the skills now still learns the order of the work, and one that has them learns which to load.
+
+### Changed
+
+- **The `brewtrend` example fetches its six files with the `http_fetch` operator instead of `curl` command steps, and every step carries a description.** The fetches keep their URLs, output paths and 24-hour preconditions, and the example no longer needs `curl`.
+- **The library example in the README loads `examples/almanac` instead of `examples/brewtrend`.** brewtrend's `http_fetch` steps need the `http-fetch` feature, which `default-features = false` turns off, so the example could no longer load it.
 
 ## [0.2.0] - 2026-10-15
 
