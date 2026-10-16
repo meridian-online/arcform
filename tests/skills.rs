@@ -18,7 +18,10 @@
 //!   2. *A JSON tool-call block.* A fenced `json` block that parses to
 //!      `{"name": "<tool>", "arguments": {...}}` (or the same under a `"params"` key), where the
 //!      top-level keys of `arguments` are the arguments; or a fenced block whose info string is
-//!      `json tool=<tool>`, whose body is the arguments object itself.
+//!      `json tool=<tool>`, whose body is the arguments object itself. Any `json` block with a
+//!      `name` key is a tool call, with or without `arguments`, and a `json` block that does not
+//!      parse is an error: show sample output, or anything else with a `name` key, under another
+//!      info string such as `text`.
 //!
 //! Each tool must be advertised by `tools/list`, and each argument must be a key of that tool's
 //! `inputSchema.properties`.
@@ -28,19 +31,21 @@
 //! or in a backticked span that begins `arc `. `arc <verb> [<sub>] --help` must exit 0 (the sub
 //! is the token straight after the verb, when the verb has subcommands), and every `--flag` in the
 //! form must appear in that help (or in `arc --help`, for global flags). A form whose verb is a
-//! placeholder (`arc <verb>`, `arc ...`) is skipped. `finetype ...` forms are not checked: it is
-//! a separate binary.
+//! placeholder (`arc <verb>`, `arc ...`) is skipped. Leading `NAME=value` assignments are skipped.
+//! Not checked: `finetype ...` (a separate binary), forms wrapped in `time`, `$(...)` and the
+//! like, and forms in fences other than `sh`.
 //!
 //! **A verb table** (a table with both `CLI` and `MCP` header cells) must have something in both
 //! cells of every row.
 //!
 //! **An example** is a fenced block with the info string `sh arc-example`. It runs under `sh -c`,
-//! with `arc` on `PATH`, in a fresh copy of `tests/fixtures/skills/` (or of
+//! with `set -e` and `arc` on `PATH`, in a fresh copy of `tests/fixtures/skills/` (or of
 //! `tests/fixtures/<name>/` for `sh arc-example fixture=<name>`), and must exit 0. If the next
 //! block is `text expect`, its trimmed text must appear in the example's stdout or stderr. An
 //! example is skipped, with a printed reason, when it needs `finetype` and the binary is absent
 //! or older than the floor in `src/finetype_cli.rs`, or needs `FINETYPE_DUCKDB_EXT` and that is
-//! unset. It needs them when it says so (`needs=finetype`, `needs=finetype-ext`) or when its text
+//! unset. A pipeline's exit status is its last command's, so an example should not pipe `arc`'s
+//! output. It needs them when it says so (`needs=finetype`, `needs=finetype-ext`) or when its text
 //! mentions `finetype`, `table profile`, `datapackage_describe` (finetype) or `table validate`
 //! (finetype and the extension).
 //!
@@ -154,9 +159,8 @@ impl Doc {
 }
 
 /// Every skill folder under `skills/`, by folder name. Plain files (the README) are not skills.
-fn skill_dirs() -> Vec<PathBuf> {
-    let dir = root().join("skills");
-    let Ok(read) = std::fs::read_dir(&dir) else {
+fn skill_dirs(skills: &Path) -> Vec<PathBuf> {
+    let Ok(read) = std::fs::read_dir(skills) else {
         return Vec::new();
     };
     let mut dirs: Vec<PathBuf> = read
@@ -184,9 +188,9 @@ fn markdown_under(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// `SKILL.md` and every Markdown file under `references/`, for every skill.
-fn skill_docs() -> Vec<Doc> {
+fn skill_docs(skills: &Path) -> Vec<Doc> {
     let mut docs = Vec::new();
-    for dir in skill_dirs() {
+    for dir in skill_dirs(skills) {
         let mut files = Vec::new();
         if dir.join("SKILL.md").is_file() {
             files.push(dir.join("SKILL.md"));
@@ -195,6 +199,16 @@ fn skill_docs() -> Vec<Doc> {
         docs.extend(files.iter().map(|f| Doc::parse(f)));
     }
     docs
+}
+
+/// The skills the repository ships.
+fn real_skills() -> PathBuf {
+    root().join("skills")
+}
+
+/// Test-only skills that exercise the checker: `good/` must pass, `bad/` must fail as asserted.
+fn fixture_skills() -> PathBuf {
+    root().join("tests/fixtures/skills-docs")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -326,40 +340,45 @@ fn tool_refs(doc: &Doc, errors: &mut Vec<String>) -> Vec<ToolRef> {
             continue;
         }
         let tagged = words.find_map(|w| w.strip_prefix("tool=").map(str::to_string));
-        let parsed: Result<Value, _> = serde_json::from_str(&b.body);
-        let value = match parsed {
+        let value: Value = match serde_json::from_str(&b.body) {
             Ok(v) => v,
             Err(e) => {
-                if tagged.is_some() || b.body.contains("\"arguments\"") {
-                    errors.push(format!(
-                        "{}: tool-call JSON does not parse: {e}",
-                        doc.at(b.line)
-                    ));
-                }
+                errors.push(format!(
+                    "{}: json block does not parse ({e}); give a block that is not JSON another info string",
+                    doc.at(b.line)
+                ));
                 continue;
             }
         };
-        let call = if let Some(tool) = tagged {
-            Some((tool, value.as_object().cloned()))
+        let (tool, args) = if let Some(tool) = tagged {
+            (tool, value.as_object().cloned())
         } else {
             let envelope = value
                 .get("params")
                 .filter(|p| p.is_object())
                 .unwrap_or(&value);
-            match (envelope["name"].as_str(), envelope["arguments"].as_object()) {
-                (Some(name), Some(args)) => Some((name.to_string(), Some(args.clone()))),
-                _ => None,
+            let Some(name) = envelope.get("name").and_then(Value::as_str) else {
+                continue; // no `name` key: not a tool call
+            };
+            match envelope.get("arguments") {
+                None => (name.to_string(), None),
+                Some(a) if a.is_object() => (name.to_string(), a.as_object().cloned()),
+                Some(_) => {
+                    errors.push(format!(
+                        "{}: `arguments` of the `{name}` call is not a JSON object",
+                        doc.at(b.line)
+                    ));
+                    continue;
+                }
             }
         };
-        if let Some((tool, args)) = call {
-            refs.push(ToolRef {
-                at: doc.at(b.line),
-                tool,
-                args: args
-                    .map(|a| a.keys().cloned().collect())
-                    .unwrap_or_default(),
-            });
-        }
+        refs.push(ToolRef {
+            at: doc.at(b.line),
+            tool,
+            args: args
+                .map(|a| a.keys().cloned().collect())
+                .unwrap_or_default(),
+        });
     }
     refs
 }
@@ -400,9 +419,7 @@ fn advertised() -> BTreeMap<String, BTreeSet<String>> {
         .collect()
 }
 
-#[test]
-fn every_named_tool_is_advertised() {
-    let docs = skill_docs();
+fn check_tools(docs: &[Doc]) -> Vec<String> {
     let mut errors = Vec::new();
     let refs: Vec<ToolRef> = docs
         .iter()
@@ -430,6 +447,12 @@ fn every_named_tool_is_advertised() {
             }
         }
     }
+    errors
+}
+
+#[test]
+fn every_named_tool_is_advertised() {
+    let errors = check_tools(&skill_docs(&real_skills()));
     assert!(errors.is_empty(), "\n{}", errors.join("\n"));
 }
 
@@ -537,7 +560,15 @@ fn cli_forms(doc: &Doc) -> Vec<CliForm> {
         if text.starts_with('#') {
             return;
         }
-        for cmd in commands(text) {
+        for mut cmd in commands(text) {
+            // Leading `NAME=value` assignments belong to the command, not the form.
+            while cmd.first().is_some_and(|t| {
+                t.split_once('=').is_some_and(|(k, _)| {
+                    !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                })
+            }) {
+                cmd.remove(0);
+            }
             if cmd.first().map(String::as_str) == Some("arc") {
                 forms.push(CliForm {
                     at: doc.at(n),
@@ -680,23 +711,27 @@ fn check_cli_form(form: &CliForm, helps: &mut Helps, errors: &mut Vec<String>) {
     }
 }
 
-#[test]
-fn every_cli_form_exists() {
+fn check_cli(docs: &[Doc]) -> Vec<String> {
     let mut helps = Helps(HashMap::new());
     let mut errors = Vec::new();
-    for doc in skill_docs() {
-        for form in cli_forms(&doc) {
+    for doc in docs {
+        for form in cli_forms(doc) {
             check_cli_form(&form, &mut helps, &mut errors);
         }
     }
-    assert!(errors.is_empty(), "\n{}", errors.join("\n"));
+    errors
 }
 
 #[test]
-fn every_verb_table_row_has_both_columns() {
+fn every_cli_form_exists() {
+    let errors = check_cli(&skill_docs(&real_skills()));
+    assert!(errors.is_empty(), "\n{}", errors.join("\n"));
+}
+
+fn check_tables(docs: &[Doc]) -> Vec<String> {
     let mut errors = Vec::new();
-    for doc in skill_docs() {
-        for table in tables(&doc) {
+    for doc in docs {
+        for table in tables(doc) {
             let Some(mcp) = table.column("mcp") else {
                 continue;
             };
@@ -710,8 +745,10 @@ fn every_verb_table_row_has_both_columns() {
             for (n, cells) in &table.rows {
                 for (col, name) in [(cli, "CLI"), (mcp, "MCP")] {
                     let empty = cells.get(col).is_none_or(|c| {
-                        c.trim_matches(|ch: char| ch == '-' || ch.is_whitespace())
-                            .is_empty()
+                        let c = c.trim_matches(|ch: char| {
+                            matches!(ch, '-' | '\u{2013}' | '\u{2014}') || ch.is_whitespace()
+                        });
+                        c.is_empty() || c.eq_ignore_ascii_case("n/a")
                     });
                     if empty {
                         errors.push(format!(
@@ -723,6 +760,12 @@ fn every_verb_table_row_has_both_columns() {
             }
         }
     }
+    errors
+}
+
+#[test]
+fn every_verb_table_row_has_both_columns() {
+    let errors = check_tables(&skill_docs(&real_skills()));
     assert!(errors.is_empty(), "\n{}", errors.join("\n"));
 }
 
@@ -790,10 +833,9 @@ fn frontmatter_problems(text: &str, folder: &str, version: &str) -> Vec<(usize, 
     problems
 }
 
-#[test]
-fn frontmatter_is_loadable() {
+fn check_frontmatter(skills: &Path) -> Vec<String> {
     let mut errors = Vec::new();
-    for dir in skill_dirs() {
+    for dir in skill_dirs(skills) {
         let folder = dir.file_name().unwrap().to_string_lossy().into_owned();
         let file = dir.join("SKILL.md");
         let shown = format!("skills/{folder}/SKILL.md");
@@ -805,6 +847,12 @@ fn frontmatter_is_loadable() {
             errors.push(format!("{shown}:{n}: {msg}"));
         }
     }
+    errors
+}
+
+#[test]
+fn frontmatter_is_loadable() {
+    let errors = check_frontmatter(&real_skills());
     assert!(errors.is_empty(), "\n{}", errors.join("\n"));
 }
 
@@ -843,29 +891,31 @@ fn finetype_unavailable() -> Option<String> {
         Ok(o) => o,
         Err(_) => return Some(format!("`{bin}` is not installed")),
     };
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    // clap prints the version to stdout; fall back to stderr as `detect_version` does.
+    let text = if out.stdout.is_empty() {
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    } else {
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
     let token = text
         .lines()
         .next()
         .and_then(|l| l.split_whitespace().next_back());
-    let parsed: Option<Vec<u64>> = token
-        .map(|t| {
-            t.trim_start_matches('v')
-                .split('.')
-                .map(|p| p.parse().ok())
-                .collect()
-        })
-        .unwrap_or(None);
+    let Some(found) = token.and_then(|t| semver::Version::parse(t.trim_start_matches('v')).ok())
+    else {
+        return Some(format!(
+            "could not parse a finetype version from `{}`",
+            text.trim()
+        ));
+    };
     let floor = finetype_floor();
-    match parsed.as_deref() {
-        Some(&[a, b, c]) if (a, b, c) >= floor => None,
-        Some(_) | None => Some(format!(
-            "finetype `{}` is older than the floor {}.{}.{}",
-            text.trim(),
-            floor.0,
-            floor.1,
-            floor.2
-        )),
+    if found >= semver::Version::new(floor.0, floor.1, floor.2) {
+        None
+    } else {
+        Some(format!(
+            "finetype {found} is older than the floor {}.{}.{}",
+            floor.0, floor.1, floor.2
+        ))
     }
 }
 
@@ -889,8 +939,7 @@ fn strip_ansi(s: &str) -> String {
         .into_owned()
 }
 
-#[test]
-fn examples_run() {
+fn check_examples(docs: &[Doc]) -> Vec<String> {
     let mut errors = Vec::new();
     let bin = tempfile::tempdir().unwrap();
     #[cfg(unix)]
@@ -901,7 +950,7 @@ fn examples_run() {
         std::env::var("PATH").unwrap_or_default()
     );
     let finetype = std::cell::OnceCell::new();
-    for doc in skill_docs() {
+    for doc in docs {
         for (i, b) in doc.blocks.iter().enumerate() {
             let words: Vec<&str> = b.info.split_whitespace().collect();
             if b.info == "text expect" {
@@ -958,11 +1007,13 @@ fn examples_run() {
             copy_dir(&source, &cwd);
             let out = Command::new("sh")
                 .arg("-c")
-                .arg(&b.body)
+                .arg(format!("set -e\n{}", b.body))
                 .current_dir(&cwd)
                 .env("PATH", &path)
                 .env("ARCFORM_HISTORY_DIR", work.path().join("history"))
                 .env("ARCFORM_DB_DIR", work.path().join("db"))
+                .env("ARCFORM_FETCH_CACHE", work.path().join("fetch-cache"))
+                .env_remove("ARCFORM_VERBOSE")
                 .output()
                 .expect("spawn sh");
             let combined = strip_ansi(&format!(
@@ -994,5 +1045,105 @@ fn examples_run() {
             }
         }
     }
+    errors
+}
+
+#[test]
+fn examples_run() {
+    let errors = check_examples(&skill_docs(&real_skills()));
     assert!(errors.is_empty(), "\n{}", errors.join("\n"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The checker, tried on test-only skills (tests/fixtures/skills-docs/)
+// ---------------------------------------------------------------------------------------------
+
+fn fixture_docs(name: &str) -> Vec<Doc> {
+    let docs: Vec<Doc> = skill_docs(&fixture_skills())
+        .into_iter()
+        .filter(|d| d.shown.contains(&format!("/{name}/")))
+        .collect();
+    assert!(!docs.is_empty(), "no fixture skill `{name}`");
+    docs
+}
+
+/// 1-based line of the first line of `docs[0]` containing `marker`.
+fn line_of(doc: &Doc, marker: &str) -> usize {
+    doc.lines
+        .iter()
+        .position(|l| l.contains(marker))
+        .unwrap_or_else(|| panic!("no line with {marker}"))
+        + 1
+}
+
+fn assert_error_at(errors: &[String], doc: &Doc, marker: &str, fragment: &str) {
+    assert_error_on(errors, doc, line_of(doc, marker), fragment);
+}
+
+fn assert_error_on(errors: &[String], doc: &Doc, line: usize, fragment: &str) {
+    let at = doc.at(line);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.starts_with(&at) && e.contains(fragment)),
+        "expected an error at {at} containing {fragment:?}; got:\n{}",
+        errors.join("\n")
+    );
+}
+
+#[test]
+fn the_good_fixture_skill_passes_every_check() {
+    let docs = fixture_docs("good");
+    for (name, errors) in [
+        ("tools", check_tools(&docs)),
+        ("cli", check_cli(&docs)),
+        ("tables", check_tables(&docs)),
+        ("examples", check_examples(&docs)),
+    ] {
+        assert!(errors.is_empty(), "{name}:\n{}", errors.join("\n"));
+    }
+}
+
+#[test]
+fn the_bad_fixture_skill_fails_each_check_at_its_line() {
+    let docs = fixture_docs("bad");
+    let doc = &docs[0];
+    let tools = check_tools(&docs);
+    assert_error_at(&tools, doc, "UNKNOWN-TOOL", "`no_such_tool` is not a tool");
+    assert_error_at(&tools, doc, "UNKNOWN-ARG", "`bogus_arg` is not an argument");
+    let fence = |marker: &str| line_of(doc, marker) - 1;
+    assert_error_on(
+        &tools,
+        doc,
+        fence("fake_json_tool"),
+        "`fake_json_tool` is not a tool",
+    );
+    assert_error_on(
+        &tools,
+        doc,
+        fence("\"arguments\":"),
+        "json block does not parse",
+    );
+
+    let cli = check_cli(&docs);
+    assert_error_at(&cli, doc, "arc nosuchverb", "not a verb arc has");
+    assert_error_at(&cli, doc, "arc table nosuchsub", "not a subcommand");
+    assert_error_at(&cli, doc, "--bogus-flag", "`--bogus-flag` is not a flag");
+
+    assert_error_at(
+        &check_tables(&docs),
+        doc,
+        "EMPTY-CELL",
+        "MCP cell of this row is empty",
+    );
+
+    // The first command fails and the last succeeds: `set -e` must still fail the example.
+    let examples = check_examples(&docs);
+    let at = doc.at(line_of(doc, "```sh arc-example"));
+    assert!(
+        examples
+            .iter()
+            .any(|e| e.starts_with(&at) && e.contains("example exited")),
+        "{examples:?}"
+    );
 }
