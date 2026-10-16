@@ -9,12 +9,11 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-17
+
 ### Fixed
 
 - **The `arc mcp` tools `taxonomy` and `generate` no longer offer a `priority` argument.** finetype 0.6.62 removed the `--priority` flag both passed it to, so a call that set it failed; finetype has no replacement for it. CI now installs finetype 0.6.62 and calls the five finetype tools through `arc mcp` with every argument their schemas advertise, so an argument finetype stops accepting fails arc's CI.
-
-### Fixed
-
 - **With `ARC_SQL_READER=duckdb`, a step holding a statement DuckDB warns about when parsing it, such as `PRAGMA threads = 4`, is read again.** Recent DuckDB 2.0 previews print the warning into the parse arc asks for, and the step was refused as unreadable; arc now asks with DuckDB's logging off.
 
 ## [0.2.0] - 2026-10-15
@@ -130,6 +129,7 @@ Then `arc mcp` serves arc to an AI agent over the Model Context Protocol. An age
 - Shell command steps with real-time stdout streaming.
 - Sequential step execution with per-step progress feedback.
 
-[Unreleased]: https://github.com/meridian-online/arcform/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/meridian-online/arcform/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/meridian-online/arcform/releases/tag/v0.2.1
 [0.2.0]: https://github.com/meridian-online/arcform/releases/tag/v0.2.0
 [0.1.0]: https://github.com/meridian-online/arcform/tree/a7a852a4b72b0a55f148a8452197772104ff884c
