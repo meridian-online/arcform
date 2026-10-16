@@ -20,7 +20,7 @@ Usage, from anywhere:
 
 tests/plugin_manifests.rs runs it with --out and compares the result with the committed files,
 so edit plugin/plugin.meta.json and re-run this; never edit the generated files by hand.
-Standard library only (Python 3.8 or later).
+Standard library only (Python 3.9 or later).
 """
 
 from __future__ import annotations
