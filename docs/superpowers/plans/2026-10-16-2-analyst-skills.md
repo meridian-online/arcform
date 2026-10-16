@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-16-analyst-workflow-skills-design.md`, sections "The workflow", "The skills", and "Verification" (structural and examples).
 
-**Order:** Runs after plan 1, whose verbs the skills name. Plan 3 packages these skills.
+**Order:** Runs after plan 1 (arc capabilities), which has landed: its verbs and tools are listed in README.md's CLI and MCP sections and `arc mcp`'s instructions, and its modules in docs/ARCHITECTURE.md. Plan 3 packages these skills.
 
 ## Global Constraints
 
