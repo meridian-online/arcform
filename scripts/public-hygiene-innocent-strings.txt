@@ -108,6 +108,11 @@ first draft of the rule turned red on this repository's own self-test.
     let p = format!("{dir}/notes.md");
     let q = format!("{}/notes.md", dir);
     path = os.path.join(base, "notes.md")
+A literal passed straight to `join("` is relative to a folder chosen at run time
+(a test's temporary home, an agent's skills folder), not to any checkout.
+    assert!(dir.path().join("using-arcform/SKILL.md").is_file());
+    folder.join("references/dropped.md"),
+    home.path().join(".cursor/skills/using-arcform/SKILL.md")
 
 TOML array-of-table headers, not vault wikilinks
 -------------------------------------------------

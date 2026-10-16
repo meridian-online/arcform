@@ -96,6 +96,7 @@ CASES=(
 	'review-finding-ref|review-spec find^ing 3 covers it'
 	'review-finding-ref|as agreed (find^ing 7).'
 	'cross-repo-doc-path|see ../other/notes.m^d'
+	'cross-repo-doc-path|let p = dir.join("../other/notes.m^d");'
 	'planning-choice-id|consumes it as a library (choi^ce\n0012): the rest'
 	'planning-choice-id|/// which rung was chosen (choi^ce\n/// 0004); the rest'
 	'milestone-id|# the work slipped past mile^stone\n# 12 and on'
