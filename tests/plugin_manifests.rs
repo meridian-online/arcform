@@ -8,7 +8,7 @@
 //! manifest edited by hand, a version bump without a regenerate, or a manifest the generator no
 //! longer writes, fails here with the file to edit and the command to run.
 //!
-//! It needs `python3` (3.11 or later, for `tomllib`) on `PATH`, as CI's runners have.
+//! It needs `python3` (3.8 or later) on `PATH`, as CI's runners have.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -123,7 +123,7 @@ fn manifests_match_source() {
         .arg(out.path())
         .current_dir(&root)
         .output()
-        .expect("run python3: the plugin manifest test needs python3 (3.11 or later) on PATH");
+        .expect("run python3: the plugin manifest test needs python3 (3.8 or later) on PATH");
     assert!(
         run.status.success(),
         "scripts/generate-plugins.py failed (code {:?}):\nstdout:\n{}\nstderr:\n{}",

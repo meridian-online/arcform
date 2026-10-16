@@ -20,19 +20,15 @@ Usage, from anywhere:
 
 tests/plugin_manifests.rs runs it with --out and compares the result with the committed files,
 so edit plugin/plugin.meta.json and re-run this; never edit the generated files by hand.
-Standard library only (Python 3.11 or later, for tomllib).
+Standard library only (Python 3.8 or later).
 """
 
 from __future__ import annotations
 
-import sys
-
-if sys.version_info < (3, 11):
-    sys.exit("generate-plugins: needs Python 3.11 or later (for tomllib)")
-
 import argparse
 import json
-import tomllib
+import re
+import sys
 from pathlib import Path
 from typing import NoReturn
 
@@ -70,6 +66,28 @@ def fail(message: str) -> NoReturn:
     sys.exit(1)
 
 
+def cargo_package(keys: tuple[str, ...]) -> dict:
+    """The given `key = "value"` lines of Cargo.toml's [package] table.
+
+    Not a TOML parser (tomllib needs Python 3.11): it reads only plain double-quoted strings
+    on one line, which is how these keys are written here.
+    """
+    found: dict = {}
+    in_package = False
+    for line in CARGO.read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if text.startswith("["):
+            in_package = text == "[package]"
+            continue
+        match = re.fullmatch(r'([A-Za-z0-9_-]+)\s*=\s*"([^"\\]*)"\s*(#.*)?', text)
+        if in_package and match and match.group(1) in keys:
+            found[match.group(1)] = match.group(2)
+    absent = [key for key in keys if key not in found]
+    if absent:
+        fail(f'Cargo.toml: [package] has no plain `key = "value"` line for {absent}')
+    return found
+
+
 def load() -> tuple[dict, str]:
     meta = json.loads(META.read_text(encoding="utf-8"))
     unknown = set(meta) - KEYS
@@ -79,8 +97,7 @@ def load() -> tuple[dict, str]:
     if set(meta["mcpServer"]) != MCP_KEYS:
         fail(f"{META.relative_to(ROOT)}: mcpServer must have exactly {sorted(MCP_KEYS)}")
 
-    with CARGO.open("rb") as f:
-        package = tomllib.load(f)["package"]
+    package = cargo_package(("version", "license", "homepage", "repository"))
     # The crate and the plugin are one project: where both say it, they must say the same.
     for key in ("license", "homepage", "repository"):
         if meta[key] != package[key]:
@@ -215,7 +232,9 @@ def main() -> None:
     for rel, doc in files.items():
         path = out / rel
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(render(doc), encoding="utf-8", newline="\n")
+        # Path.write_text has no `newline` argument before Python 3.10.
+        with path.open("w", encoding="utf-8", newline="\n") as f:
+            f.write(render(doc))
         print(rel)
 
 
