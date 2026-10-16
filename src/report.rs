@@ -15,7 +15,7 @@ use crate::contract::{Contract, runs_dir};
 use crate::error::{Error, Result};
 use crate::history::LocalHistory;
 use crate::manifest::{MANIFEST_FILENAME, Manifest};
-use crate::panel_check::check_panels;
+use crate::panel_check::check_panels_from;
 use crate::protocol_files::replace_file_with_history;
 
 /// The report's place in the Protocol's folder.
@@ -57,7 +57,7 @@ pub(crate) fn write_report(
         ),
         Err(e) => (Default::default(), Some(e.to_string())),
     };
-    let panels = check_panels(dir).map_err(|e| e.to_string());
+    let panels = check_panels_from(dir).map_err(|e| e.to_string());
 
     let mut text = String::from(prose.trim_end());
     text.push_str("\n\n");
@@ -190,11 +190,14 @@ fn derivation(
 fn charts(
     text: &mut String,
     dir: &Path,
-    panels: &std::result::Result<Vec<(PathBuf, Vec<crate::panel_check::PanelFinding>)>, String>,
+    panels: &std::result::Result<
+        (bool, Vec<(PathBuf, Vec<crate::panel_check::PanelFinding>)>),
+        String,
+    >,
 ) {
     text.push_str("## Charts\n\n");
-    let panels = match panels {
-        Ok(panels) => panels,
+    let (from_database, panels) = match panels {
+        Ok((from_database, panels)) => (*from_database, panels),
         Err(reason) => {
             let _ = writeln!(text, "Panels not checked: {}\n", one_line(reason));
             return;

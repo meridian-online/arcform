@@ -188,6 +188,10 @@ fn report_has_prose_then_generated_sections() {
         "{report}"
     );
     assert!(report.contains("panels/top.yaml"), "{report}");
+    assert!(
+        report.contains("current database, not the run's"),
+        "{report}"
+    );
     assert!(report.contains("nothing"), "the finding is named: {report}");
     assert!(report.contains("Seven ids to start from"), "{report}");
     assert!(report.contains("success"), "{report}");
@@ -371,6 +375,7 @@ fn a_locked_database_does_not_stop_the_report() {
     assert!(out.status.success(), "{}", stderr(&out));
     let report = protocol.report();
     assert!(report.contains("Panels not checked"), "{report}");
+    assert!(!report.contains("no database yet"), "{report}");
     assert!(report.contains("## Run"), "{report}");
 }
 

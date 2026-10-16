@@ -446,9 +446,16 @@ pub(crate) fn check_panel(dir: &Path, panel: &Path) -> Result<Vec<PanelFinding>>
 /// Every `panels/*.yaml` of the Protocol in `dir` with its findings, in name order.
 /// A Protocol with no `panels/` folder has none.
 pub(crate) fn check_panels(dir: &Path) -> Result<Vec<(PathBuf, Vec<PanelFinding>)>> {
+    check_panels_from(dir).map(|(_, panels)| panels)
+}
+
+/// [`check_panels`], and whether the tables were read from the Protocol's database
+/// (true) or taken from what its steps produce because it has none yet (false). With
+/// no `panels/` folder nothing is loaded and the answer is false.
+pub(crate) fn check_panels_from(dir: &Path) -> Result<(bool, Vec<(PathBuf, Vec<PanelFinding>)>)> {
     let folder = dir.join("panels");
     if !folder.is_dir() {
-        return Ok(Vec::new());
+        return Ok((false, Vec::new()));
     }
     let mut paths: Vec<PathBuf> = fs::read_dir(&folder)?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
@@ -456,12 +463,14 @@ pub(crate) fn check_panels(dir: &Path) -> Result<Vec<(PathBuf, Vec<PanelFinding>
         .collect();
     paths.sort();
     let catalogue = Catalogue::load(dir)?;
-    paths
+    let from_database = matches!(catalogue, Catalogue::Database(_));
+    let panels = paths
         .into_iter()
         .map(|path| {
             let findings = check_file(&path, &catalogue)?;
             let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
             Ok((rel, findings))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok((from_database, panels))
 }
