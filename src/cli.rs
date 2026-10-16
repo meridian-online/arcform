@@ -463,7 +463,7 @@ pub enum HistoryCmd {
         dir: PathBuf,
 
         /// List this file's own history instead of the spec's — a chart file
-        /// beside the spec, say. A relative path is read from `--dir`.
+        /// beside the spec, say. The path is relative to the Protocol folder (`--dir`) and must stay inside it; absolute paths and `..` are refused.
         #[arg(long)]
         file: Option<PathBuf>,
 
@@ -482,7 +482,7 @@ pub enum HistoryCmd {
         dir: PathBuf,
 
         /// Read the entry from this file's own history instead of the
-        /// spec's. A relative path is read from `--dir`.
+        /// spec's. The path is relative to the Protocol folder (`--dir`) and must stay inside it; absolute paths and `..` are refused.
         #[arg(long)]
         file: Option<PathBuf>,
     },
@@ -498,7 +498,7 @@ pub enum HistoryCmd {
         dir: PathBuf,
 
         /// Restore this file from its own history instead of the spec; no
-        /// other file is written. A relative path is read from `--dir`.
+        /// other file is written. The path is relative to the Protocol folder (`--dir`) and must stay inside it; absolute paths and `..` are refused.
         #[arg(long)]
         file: Option<PathBuf>,
     },

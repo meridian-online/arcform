@@ -315,3 +315,27 @@ fn history_restore_refuses_an_unknown_entry() {
         assert_eq!(protocol.manifest(), before);
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn history_files_do_not_follow_a_link_out_of_the_protocol() {
+    let protocol = Protocol::new();
+    let elsewhere = protocol.dir.parent().unwrap().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let outside = elsewhere.join("x.yaml");
+    std::fs::write(&outside, "kept\n").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, protocol.dir.join("out")).unwrap();
+    let id = LocalHistory::at_root(&protocol.history)
+        .record_save_for_file(&outside, "old\n")
+        .unwrap()
+        .expect("recorded")
+        .id;
+    let before = protocol.manifest();
+
+    let listed = protocol.call("history_list", json!({ "file": "out/x.yaml" }));
+    assert_eq!(listed["isError"], true, "{listed}");
+    let restored = protocol.call("history_restore", json!({ "id": id, "file": "out/x.yaml" }));
+    assert_eq!(restored["isError"], true, "{restored}");
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "kept\n");
+    assert_eq!(protocol.manifest(), before);
+}

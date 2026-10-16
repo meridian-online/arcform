@@ -665,7 +665,7 @@ fn history_list_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "file": { "type": "string", "description": "List this file's own history instead of the spec's, such as a chart file beside the spec. A relative path is read from `dir`." },
+            "file": { "type": "string", "description": "List this file's own history instead of the spec's, such as a chart file beside the spec. The path is relative to the Protocol folder (`dir`) and must stay inside it; absolute paths and `..` are refused." },
             "dir": { "type": "string", "description": "Protocol directory (where arcform.yaml lives). Defaults to the current directory." }
         }
     })
@@ -700,7 +700,7 @@ fn history_restore_schema() -> Value {
         "type": "object",
         "properties": {
             "id": { "type": "string", "description": "The entry's id, as history_list returns it for the same file." },
-            "file": { "type": "string", "description": "Restore this file from its own history instead of the spec; no other file is written. A relative path is read from `dir`." },
+            "file": { "type": "string", "description": "Restore this file from its own history instead of the spec; no other file is written. The path is relative to the Protocol folder (`dir`) and must stay inside it; absolute paths and `..` are refused." },
             "dir": { "type": "string", "description": "Protocol directory (where arcform.yaml lives). Defaults to the current directory." }
         },
         "required": ["id"]
