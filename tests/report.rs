@@ -248,7 +248,6 @@ fn named_run_used() {
     newer["run"]["outcome"] = "failed".into();
     older["run"]["outcome"] = "success".into();
     std::fs::write(&path, serde_json::to_string_pretty(&older).unwrap()).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(50));
     std::fs::write(
         path.with_file_name("20990101-000000-later.json"),
         serde_json::to_string_pretty(&newer).unwrap(),
@@ -313,5 +312,85 @@ fn mcp_writes_the_same_bytes_as_the_command() {
             .as_str()
             .unwrap()
             .contains("protocol_run")
+    );
+}
+
+#[test]
+fn a_run_id_that_leaves_the_runs_folder_is_refused() {
+    let protocol = Protocol::new();
+    protocol.arc_run();
+    let before = protocol.tree();
+    for id in ["../x", "a/b", ".."] {
+        let out = protocol.run(&["report", "write", "--run", id], Some("x\n"));
+        assert!(!out.status.success(), "{id}");
+        assert_eq!(protocol.tree(), before, "{id}");
+    }
+}
+
+#[test]
+fn newest_run_is_the_greatest_id_not_the_latest_file() {
+    let protocol = Protocol::new();
+    protocol.arc_run();
+    let path = protocol.contract_path();
+    let mut older: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    older["run"]["run_id"] = "19990101-000000-old".into();
+    // Written last, so the latest file, but the smaller id.
+    std::fs::write(
+        path.with_file_name("19990101-000000-old.json"),
+        serde_json::to_string(&older).unwrap(),
+    )
+    .unwrap();
+    assert!(protocol.write("x\n").status.success());
+    assert!(!protocol.report().contains("19990101-000000-old"));
+}
+
+#[test]
+fn a_locked_database_does_not_stop_the_report() {
+    let protocol = Protocol::new();
+    protocol.arc_run();
+    std::fs::create_dir(protocol.dir.join("panels")).unwrap();
+    std::fs::write(
+        protocol.dir.join("panels/top.yaml"),
+        "title: Top\nplot:\n  - mark: barY\n    data: { from: top }\n    x: id\n",
+    )
+    .unwrap();
+    let db = std::fs::read_dir(&protocol.dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .chain(
+            std::fs::read_dir(protocol._root.path().join("db"))
+                .into_iter()
+                .flatten()
+                .map(|e| e.unwrap().path()),
+        )
+        .find(|p| p.extension().is_some_and(|e| e == "duckdb"));
+    let db = db.expect("the run left a database");
+    let _held = duckdb::Connection::open(db).unwrap();
+    let out = protocol.write("Prose.\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let report = protocol.report();
+    assert!(report.contains("Panels not checked"), "{report}");
+    assert!(report.contains("## Run"), "{report}");
+}
+
+#[test]
+fn panels_without_a_database_still_write() {
+    let protocol = Protocol::new();
+    protocol.arc_run();
+    std::fs::create_dir(protocol.dir.join("panels")).unwrap();
+    std::fs::write(
+        protocol.dir.join("panels/top.yaml"),
+        "title: >\n  A long\n  title\nplot:\n  - mark: barY\n    data: { from: top }\n",
+    )
+    .unwrap();
+    let _ = std::fs::remove_file(protocol.dir.join("data.duckdb"));
+    let _ = std::fs::remove_dir_all(protocol._root.path().join("db"));
+    let out = protocol.write("Prose.\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        protocol
+            .report()
+            .contains("`panels/top.yaml`: A long title")
     );
 }

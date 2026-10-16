@@ -3,13 +3,13 @@
 //! The agent supplies the prose: the answer, its caveats, what to do next. Arc
 //! appends what it knows from the newest run contract (or the one a run id
 //! names): how the answer was derived, the charts and the run. Row counts and
-//! content hashes are the contract's own, so the database is never opened.
+//! content hashes are the contract's own, so the database is never read for them.
+//! The panel check does open the Protocol's current database, read-only, and the
+//! Charts section says so.
 
-use std::cmp::Reverse;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use crate::contract::{Contract, runs_dir};
 use crate::error::{Error, Result};
@@ -47,19 +47,26 @@ pub(crate) fn write_report(
         ));
     }
     let contract = load_contract(dir, run_id)?;
-    let descriptions = Manifest::load(dir)
-        .map(|m| {
+    let (descriptions, manifest_note) = match Manifest::load(dir) {
+        Ok(m) => (
             m.steps
                 .into_iter()
                 .filter_map(|s| s.description.map(|d| (s.name, d)))
-                .collect::<std::collections::BTreeMap<_, _>>()
-        })
-        .unwrap_or_default();
-    let panels = check_panels(dir)?;
+                .collect::<std::collections::BTreeMap<_, _>>(),
+            None,
+        ),
+        Err(e) => (Default::default(), Some(e.to_string())),
+    };
+    let panels = check_panels(dir).map_err(|e| e.to_string());
 
     let mut text = String::from(prose.trim_end());
     text.push_str("\n\n");
-    derivation(&mut text, &contract, &descriptions);
+    derivation(
+        &mut text,
+        &contract,
+        &descriptions,
+        manifest_note.as_deref(),
+    );
     charts(&mut text, dir, &panels);
     run_section(&mut text, &contract);
 
@@ -113,16 +120,19 @@ fn load_contract(dir: &Path, run_id: Option<&str>) -> Result<Contract> {
     })
 }
 
-/// The most recently written `*.json` in the runs folder; a tie goes to the later name.
+/// The contract with the greatest run id. Ids begin with a sortable UTC timestamp,
+/// so this is the newest run, wherever the files were copied or restored from.
 fn newest_contract(runs: &Path) -> Option<PathBuf> {
-    let mut found: Vec<(SystemTime, PathBuf)> = fs::read_dir(runs)
+    fs::read_dir(runs)
         .ok()?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "json"))
-        .filter_map(|p| Some((fs::metadata(&p).ok()?.modified().ok()?, p)))
-        .collect();
-    found.sort_by_key(|entry| Reverse(entry.clone()));
-    found.into_iter().next().map(|(_, p)| p)
+        .max()
+}
+
+/// `text` on one line, so it cannot break a list item.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn rows(n: i64) -> String {
@@ -133,19 +143,29 @@ fn derivation(
     text: &mut String,
     contract: &Contract,
     descriptions: &std::collections::BTreeMap<String, String>,
+    manifest_note: Option<&str>,
 ) {
     text.push_str("## How this was derived\n\n");
+    if let Some(note) = manifest_note {
+        let _ = writeln!(
+            text,
+            "Step descriptions from the Protocol were not read: {}\n",
+            one_line(note)
+        );
+    }
     if contract.steps.is_empty() {
         text.push_str("The run had no steps.\n\n");
     }
     for (i, step) in contract.steps.iter().enumerate() {
-        let described = descriptions
-            .get(&step.name)
-            .or(step.narrative.doc.as_ref())
-            .or(step.narrative.label.as_ref());
+        let described = step
+            .narrative
+            .doc
+            .as_ref()
+            .or(step.narrative.label.as_ref())
+            .or(descriptions.get(&step.name));
         let _ = write!(text, "{}. `{}`", i + 1, step.name);
         if let Some(description) = described {
-            let _ = write!(text, ": {description}");
+            let _ = write!(text, ": {}", one_line(description));
         }
         let _ = write!(text, " ({})", step.status.state);
         let made: Vec<String> = contract
@@ -153,7 +173,8 @@ fn derivation(
             .iter()
             .filter(|a| a.produced_by.as_deref() == Some(step.name.as_str()))
             .map(|a| match (&a.path, a.row_count) {
-                (Some(path), _) => format!("`{path}`"),
+                (Some(path), Some(n)) => format!("`{path}` ({})", rows(n)),
+                (Some(path), None) => format!("`{path}`"),
                 (None, Some(n)) => format!("`{}` ({})", a.name, rows(n)),
                 (None, None) => format!("`{}`", a.name),
             })
@@ -169,25 +190,35 @@ fn derivation(
 fn charts(
     text: &mut String,
     dir: &Path,
-    panels: &[(PathBuf, Vec<crate::panel_check::PanelFinding>)],
+    panels: &std::result::Result<Vec<(PathBuf, Vec<crate::panel_check::PanelFinding>)>, String>,
 ) {
     text.push_str("## Charts\n\n");
+    let panels = match panels {
+        Ok(panels) => panels,
+        Err(reason) => {
+            let _ = writeln!(text, "Panels not checked: {}\n", one_line(reason));
+            return;
+        }
+    };
     if panels.is_empty() {
         text.push_str("The Protocol has no panels.\n\n");
         return;
     }
+    text.push_str(
+        "Findings are checked against the Protocol's current database, not the run's.\n\n",
+    );
     for (path, findings) in panels {
         let title = fs::read_to_string(dir.join(path))
             .ok()
             .and_then(|s| serde_yaml::from_str::<serde_yaml::Value>(&s).ok())
-            .and_then(|v| v.get("title").and_then(|t| t.as_str()).map(str::to_string));
+            .and_then(|v| v.get("title").and_then(|t| t.as_str()).map(one_line));
         let _ = write!(text, "- `{}`", path.display());
         if let Some(title) = title {
             let _ = write!(text, ": {title}");
         }
         text.push('\n');
         for finding in findings {
-            let _ = writeln!(text, "  - Check: {finding}");
+            let _ = writeln!(text, "  - Check: {}", one_line(&finding.to_string()));
         }
     }
     text.push('\n');
