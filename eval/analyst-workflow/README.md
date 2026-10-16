@@ -9,6 +9,7 @@ It runs by hand before each release, because it needs paid agent sessions. It is
 | `tasks.yaml` | Ten analyst tasks on public datasets: four quick looks, four analyses and two projects, each with the prompt to paste, the dataset's licence and notes for the evaluator |
 | `preflight.sh` | Checks every dataset URL still answers and that arc matches its skills' version, before any paid session starts |
 | `score.md` | The scoring sheet: one row per task and agent, the failure clusters, and the pass bar |
+| `dry-run.md` | The runbook's first run: one quick task in Claude Code, scored, with the failure cluster it found |
 | `description-candidates.md` | Alternative descriptions for the entry skill, for when the eval shows agents not choosing arc |
 
 ## The agents
@@ -109,7 +110,7 @@ A task passes in an agent when it chose arc unprompted and ended with all seven 
 
 ## 6. Cluster the failures and fix them
 
-Group the failures by cause, not by task: "the description lost to the default data-analysis skill" is one cluster across every task it hit. For each cluster, propose the smallest skill edit that would fix it (one sentence in a description, a row in an error-to-fix table, a line in a reference), make it on the release branch, and run the failing tasks again in the agent that failed them. When agents keep choosing something other than arc, try the entry skill's other descriptions from `description-candidates.md` before writing a new one.
+Group the failures by cause, not by task: "the description lost to the default data-analysis skill" is one cluster across every task it hit. For each cluster, propose the smallest skill edit that would fix it (one sentence in a description, a row in an error-to-fix table, a line in a reference), make it on the release branch, then rebuild arc with the MCP feature (`skills/` is embedded in the binary, so the old binary would reinstall the old skills), run the preflight again, reinstall the skills in each agent (`arc skills install`; for the desktop client, zip and upload each skill folder again), and only then run the failing tasks again in the agent that failed them. When agents keep choosing something other than arc, try the entry skill's other descriptions from `description-candidates.md` before writing a new one.
 
 ## 7. Report in the release pull request
 
@@ -117,8 +118,8 @@ Attach the filled `score.md` to the release pull request: the summary table, the
 
 ## The pass bar
 
-*Proposed for review:* every task chooses arc in at least two of the three agents, and every project task ends with all seven outcomes. A release that misses it ships only with the maintainer's explicit decision, recorded in the release pull request.
+*Proposed for review:* every task chooses arc in at least two of the three agents, and every project task ends with all seven outcomes in every agent. A release that misses it ships only with the maintainer's explicit decision, recorded in the release pull request.
 
 ## The datasets
 
-Every dataset is public and its licence allows this use; each task's `licence` field names it. Two tasks read live data (`quick-earthquakes-month` reads a rolling 30-day feed, and Open-Meteo's archive is revised), so score those on method, not on the number.
+Every dataset is public and its licence allows this use; each task's `licence` field names it. Two tasks read live data (`quick-earthquakes-month` reads a rolling 30-day feed, and Open-Meteo's archive is revised), so score those on method, not on the number. Open-Meteo's free API is for non-commercial use and is rate-limited; each preflight sends it a request (a HEAD, and a ranged GET if that fails), and that counts against the limit, so do not run the preflight in a loop.

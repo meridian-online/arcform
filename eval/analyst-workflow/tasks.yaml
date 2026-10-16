@@ -23,7 +23,7 @@ tasks:
     notes: >-
       CSV, 344 rows, three species. Two rows have no body mass, written as the string "NA",
       so a column read as text or an average that counts them is the trap. Expected answer:
-      Gentoo, about 1.35 kg heavier than either other species.
+      Gentoo, about 1.3–1.4 kg heavier than either other species.
 
   - id: quick-bad-drivers
     size: quick

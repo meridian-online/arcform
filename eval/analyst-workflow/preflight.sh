@@ -104,7 +104,8 @@ EOF
 if ! version_line="$("$arc" --version 2>/dev/null)"; then
   fail "cannot run '$arc --version': put arc on PATH or set ARC"
 else
-  version="${version_line##* }"
+  version="$(printf '%s\n' "$version_line" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)"
+  [ -n "$version" ] || fail "no version in '$arc --version' output: $version_line"
   if ! skills="$("$arc" skills list 2>/dev/null)" || [ -z "$skills" ]; then
     fail "'$arc skills list' printed nothing: this arc predates the skills, or failed"
   else
