@@ -13,6 +13,10 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 - **The `arc mcp` tools `taxonomy` and `generate` no longer offer a `priority` argument.** finetype 0.6.62 removed the `--priority` flag both passed it to, so a call that set it failed; finetype has no replacement for it. CI now installs finetype 0.6.62 and calls the five finetype tools through `arc mcp` with every argument their schemas advertise, so an argument finetype stops accepting fails arc's CI.
 
+### Fixed
+
+- **With `ARC_SQL_READER=duckdb`, a step holding a statement DuckDB warns about when parsing it, such as `PRAGMA threads = 4`, is read again.** Recent DuckDB 2.0 previews print the warning into the parse arc asks for, and the step was refused as unreadable; arc now asks with DuckDB's logging off.
+
 ## [0.2.0] - 2026-10-15
 
 arc is local-first data analysis in one binary, for people and their agents. The work is kept as a Protocol, a folder holding `arcform.yaml` and its SQL, which `arc run` runs again from the top; arc reads each SQL step for the tables it reads and makes, so it knows how the steps connect and which ones a change makes stale. This is the first published release.
