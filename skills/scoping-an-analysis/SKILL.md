@@ -41,7 +41,7 @@ Before anything is built, tell the user three things: the data source (the file,
 
 ## 4. Create the Protocol, and for a project write the requirements
 
-Create the Protocol in its own folder, named for the question. If you have no file access of your own (an agent reaching arc only through `arc mcp`) and the environment check did not settle a working folder, ask the user for one before creating the Protocol. Then, for a project only, write the requirements into its `README.md`: the question, the end state, the data sources, what is in and out of scope, the checks the answer must pass, and who will read it. Show the user the README and have it agreed before profiling. If they change it, write it again: each write is kept in history.
+Create the Protocol in its own folder, named for the question. If you have no file access of your own (an agent reaching arc only through `arc mcp`), ask the user for an absolute working folder before creating the Protocol. Then, for a project only, write the requirements into its `README.md`: the question, the end state, the data sources, what is in and out of scope, the checks the answer must pass, and who will read it. Show the user the README and have it agreed before profiling. If they change it, write it again: each write is kept in history.
 
 | Step | CLI | MCP |
 | --- | --- | --- |
