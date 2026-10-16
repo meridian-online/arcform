@@ -417,6 +417,13 @@ mod tests {
     }
 
     #[test]
+    fn a_skill_without_frontmatter_has_no_arc_version() {
+        // An `arc_version:` line and a later `---` line, but no opening `---`: not frontmatter.
+        let md = "# X\n\n  arc_version: \"1.2.3\"\n---\n\nbody\n";
+        assert_eq!(arc_version(md), None);
+    }
+
+    #[test]
     fn agents_sharing_a_folder_give_one_target() {
         let home = tempfile::tempdir().unwrap();
         fs::create_dir(home.path().join(".codex")).unwrap();
