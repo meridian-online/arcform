@@ -11,6 +11,10 @@ Profile tells you what the data is before you build on it: each column's type an
 
 The stage has five steps, and profiling is only the second. **Do not stop after profiling.** A profile reads a sample and catches no bad rows; validation reads every row.
 
+**Scale it to the size.** A quick look keeps all five steps but only for the tables and columns the answer rests on: the default sample, one schema, one validation, one description, and the findings folded into the answer with no separate wait. An analysis or a project profiles every table the build will read and stops for the user at step 5.
+
+**Paths over MCP.** The `profile` and `validate` tools take no `dir`: they run FineType from the server's working directory, which is not the Protocol's. Pass `file` and `schema` as absolute paths: the user's CSV by its absolute path, `<dir>/schemas/<table>.json`, `<dir>/build/<table>.parquet`. Only `table_validate` reads `schema` relative to the Protocol folder.
+
 Load `references/reading-the-results.md` when you read a profile or a validation report. Load `references/what-finetype-teaches.md` when the user asks for something FineType's own tools do (a Data Package, a typed table with a reject sidecar, one type's schema).
 
 **FineType's floor.** arc refuses any finetype older than **0.6.54**. Up to and including 0.6.53, any eight-digit number (a financial figure, a surrogate key) was typed as a confident date with a date-parsing transform attached, so a step that followed the transform corrupted the column. If arc refuses with the floor, tell the user to upgrade finetype; do not profile with an older one by hand.
@@ -37,18 +41,18 @@ Say before the first run that a fetch step reaches the network. Read the run rec
 | Step | CLI | MCP |
 | --- | --- | --- |
 | Type each column of a table in the Protocol | `arc table profile <table> --sample-size 500 --dir <dir>` | `table_profile` with `table`, `sample_size`, `dir` |
-| Type each column of a local CSV | `finetype profile -f <file.csv> -o json` | `profile` with `file`, `format` |
+| Type each column of a local CSV (`file` absolute over MCP) | `finetype profile -f <file.csv> -o json` | `profile` with `file`, `format` |
 
 `table_profile` copies the table's first rows (100 unless you give `sample_size`) and types those. On a large or sorted table, raise the sample size; validation (step 4) is what reads every row. Prefer the table verbs once the data is in the Protocol: they read any table, not only a CSV, and they see the data as the Protocol loaded it.
 
 ## 3. Save the schema
 
-A table-level JSON Schema is the data's contract: what each column must look like for the analysis to be sound. Make it with the `json-schema` format and write it into the Protocol at `schemas/<table>.json`, where history versions it.
+A table-level JSON Schema is the data's contract: what each column must look like for the analysis to be sound. Make it with the `json-schema` format, from the same sample size the profile used, and write it into the Protocol at `schemas/<table>.json`, where history versions it. A schema inferred from fewer rows than you profiled makes validation report its own gaps as problems in the data.
 
 | Step | CLI | MCP |
 | --- | --- | --- |
-| A JSON Schema for a table | `arc table profile <table> --format json-schema --dir <dir>` | `table_profile` with `table`, `format`, `dir` |
-| A JSON Schema for a local CSV | `finetype profile -f <file.csv> -o json-schema` | `profile` with `file`, `format` |
+| A JSON Schema for a table | `arc table profile <table> --format json-schema --sample-size <n> --dir <dir>` | `table_profile` with `table`, `format`, `sample_size`, `dir` |
+| A JSON Schema for a local CSV (`file` absolute over MCP) | `finetype profile -f <file.csv> -o json-schema --sample-size <n>` | `profile` with `file`, `format`, `sample_size` |
 | Save it in the Protocol | `arc protocol write-file schemas/<table>.json --dir <dir> < schema.json` | `protocol_write_file` with `path`, `content`, `dir` |
 
 Over MCP, pass the schema the profile returned, unchanged, as `content`. From a shell, pipe it: `arc protocol write-file` refuses empty or non-JSON input, so a failed profile cannot save a blank schema.
@@ -58,9 +62,9 @@ Over MCP, pass the schema the profile returned, unchanged, as `content`. From a 
 | Step | CLI | MCP |
 | --- | --- | --- |
 | Validate a table in the Protocol (needs `FINETYPE_DUCKDB_EXT`) | `arc table validate <table> --schema schemas/<table>.json --dir <dir>` | `table_validate` with `table`, `schema`, `dir` |
-| Validate a local CSV or Parquet file | `finetype validate <file> schemas/<table>.json -o json` | `validate` with `file`, `schema`, `format` |
+| Validate a local CSV or Parquet file (`file` and `schema` absolute over MCP) | `finetype validate <file> schemas/<table>.json -o json` | `validate` with `file`, `schema`, `format` |
 
-`table_validate` runs in DuckDB with FineType's extension, found through `FINETYPE_DUCKDB_EXT`. When that is unset, validate a file instead: the source CSV itself, or a Parquet export of the table (record a `parquet_export` operator step, run it, and validate the file it writes). Both validators report rejected rows; `finetype validate` also exits 1 when there are any. That is a finding to read, not a failure to retry.
+`table_validate` runs in DuckDB with FineType's extension, found through `FINETYPE_DUCKDB_EXT`. When that is unset, validate a file instead: the source CSV itself, or a Parquet export of the table (record a `parquet_export` operator step, run it, and validate the file it writes). Both validators report rejected rows, and from a shell both `arc table validate` and `finetype validate` exit 1 when there are any. That is a finding to read, not a failure to retry.
 
 ## 5. Describe, then report
 
@@ -98,7 +102,7 @@ Load the CSV into the Protocol, then profile the table it makes and save that ta
 ```sh arc-example needs=finetype
 arc run
 arc table profile sales --sample-size 200
-arc table profile sales --format json-schema | arc protocol write-file schemas/sales.json
+arc table profile sales --format json-schema --sample-size 200 | arc protocol write-file schemas/sales.json
 arc table describe sales
 ```
 
@@ -151,9 +155,10 @@ arc table profile raw_orders
 | `no database for this Protocol yet` | Run the load step, then profile |
 | `<table> has no rows to infer a schema from` | The load made an empty table. Read the run record and trace it upstream before profiling again |
 | `finetype DuckDB extension not configured` | Set `FINETYPE_DUCKDB_EXT`, or validate a file: the source CSV, or a `parquet_export` of the table, with `validate` |
-| `no schema file at <path>` or `<path> is outside the Protocol folder` | Save the schema first, at `schemas/<table>.json`, and pass that path relative to the Protocol folder |
+| `no schema file at <path>` or `<path> is outside the Protocol folder` from `table_validate` | Save the schema first, at `schemas/<table>.json`, and pass that path relative to the Protocol folder |
+| `profile` or `validate` over MCP cannot find a file that is in the Protocol | Those tools run from the server's working directory and take no `dir`. Pass `file` and `schema` as absolute paths (`<dir>/schemas/<table>.json`) |
 | `the schema is not valid JSON` when saving | The profile before it failed; read its error, not this one |
-| `finetype validate` exits 1 | Rows were rejected. Read the report and say what the rejects mean; pass `--lenient` only to get the report without the exit code |
+| `finetype validate` or `arc table validate` exits 1 | Rows were rejected. Read the report and say what the rejects mean; `finetype validate --lenient` gives the report without the exit code (the MCP `validate` tool is lenient unless `strict` is set) |
 | A column's type changes when you profile again | The first sample missed part of the data. Raise `sample_size`, and trust validation over either profile |
 | The output starts with `Loading model from ...` | FineType's progress on standard error. The JSON follows it on standard output |
 | The user wants a typed DuckDB table with a reject sidecar, or a Data Package | See `references/what-finetype-teaches.md` for the route through arc |

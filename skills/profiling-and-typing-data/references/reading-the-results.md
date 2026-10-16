@@ -13,7 +13,7 @@ What a profile, a validation report and a description tell you, and what each fi
 | `transform` | The DuckDB expression that casts a value to that type, with `{col}` for the column | Use it in the build's cleaning step rather than writing your own cast |
 | `confidence` and `quality_band` | How sure FineType is (0 to 1), and the band it falls in (`high`, `medium`, `low`) | A quality signal about the data, not an error in FineType. See below |
 | `validation_pass_rate` | The share of sampled values that pass the label's own validation | Below 1.0 means some values do not look like the rest |
-| `null`, `non_null` | Empty values in the sample | Rows the question may silently lose |
+| `null`, `non_null` | Empty and filled values: over the whole file for `profile` on a CSV, over the copied rows for `table_profile` | Rows the question may silently lose. For a table, `table_describe` gives the whole table's null counts |
 | `disambiguation_rule`, `runner_up`, `vetoed_type` | Why FineType chose this label over another, and the next best | Read these when the label surprises you |
 | `is_generic` | The label is a generic one (a plain number or word) rather than a specific format | Fine for a measure; worth saying when the question needs a specific meaning (a currency, a code) |
 | `x-finetype-enum` | A column with few distinct values, and the values | A closed set: check it holds the categories the question expects, and no stray spellings |

@@ -24,13 +24,13 @@ In the CLI column, `--dir` defaults to the current directory; for `arc edit-prot
 | A JSON Schema the table's rows pass | `arc table profile <table> --format json-schema --dir <dir>` | `table_profile` with `table`, `format`, `dir` |
 | Save that schema in the Protocol | `arc protocol write-file schemas/<table>.json --dir <dir> < schema.json` | `protocol_write_file` with `path`, `content`, `dir` |
 | Validate a table against the saved schema (needs `FINETYPE_DUCKDB_EXT`) | `arc table validate <table> --schema schemas/<table>.json --dir <dir>` | `table_validate` with `table`, `schema`, `dir` |
-| Profile a CSV file before it is loaded | `finetype profile -f <file.csv> -o json` | `profile` with `file`, `format` |
-| A JSON Schema for a CSV file | `finetype profile -f <file.csv> -o json-schema` | `profile` with `file`, `format` |
-| Validate a CSV or Parquet file against a schema | `finetype validate <file> <schema.json> -o json` | `validate` with `file`, `schema`, `format` |
+| Profile a CSV file before it is loaded | `finetype profile -f <file.csv> -o json` | `profile` with `file`, `format`; `file` absolute |
+| A JSON Schema for a CSV file | `finetype profile -f <file.csv> -o json-schema` | `profile` with `file`, `format`; `file` absolute |
+| Validate a CSV or Parquet file against a schema | `finetype validate <file> <schema.json> -o json` | `validate` with `file`, `schema`, `format`; `file` and `schema` absolute (`<dir>/schemas/<table>.json`) |
 | Type a handful of loose values | `finetype infer -f <values.txt> -o json` | `infer` with `values` |
 | Browse FineType's types, or export one type's schema | `finetype taxonomy <type-key> -o json` | `taxonomy` with `type_key`, `format` |
 
-The `finetype` rows run a separate binary; arc's MCP server federates them as tools. Prefer the `arc table` verbs once the data is in a Protocol: they read any table, not only a CSV file.
+The `finetype` rows run a separate binary; arc's MCP server federates them as tools. Those tools take no `dir` and run from the server's working directory, so give them absolute paths. Prefer the `arc table` verbs once the data is in a Protocol: they read any table, not only a CSV file.
 
 ## Record
 
