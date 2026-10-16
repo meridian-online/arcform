@@ -524,7 +524,14 @@ impl ScratchDir {
                 "arc-profile-{}-{stamp}-{attempt}",
                 std::process::id()
             ));
-            match std::fs::create_dir(&path) {
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                // Owner only: the folder holds copied rows.
+                builder.mode(0o700);
+            }
+            match builder.create(&path) {
                 Ok(()) => return Ok(ScratchDir(path)),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e.into()),
@@ -656,6 +663,9 @@ pub(crate) fn validate_table(dir: &Path, table: &str, schema: &Path) -> Result<V
             schema_path.display()
         )));
     }
+    // Absolute, so `ft_validate` never reads the name as inline JSON (it does for a
+    // value that starts with `{`).
+    let schema_path = schema_path.canonicalize()?;
     let ext = crate::operator::resolve_finetype_ext(None).map_err(|(_, m)| refusal(m))?;
 
     // The read-only open finds the table and refuses a database that is missing or
