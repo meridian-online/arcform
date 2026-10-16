@@ -302,6 +302,10 @@ impl Catalogue {
     /// Findings for one mark's `from` and bare-string channels.
     fn check(&self, from: &str, channels: &[String], into: &mut Vec<PanelFinding>) {
         let wanted = from.to_lowercase();
+        // `catalog.schema.table` is not looked into, whether or not the Protocol has run.
+        if wanted.matches('.').count() >= 2 {
+            return;
+        }
         match self {
             Self::Produced(names) => {
                 if !names.contains(&bare(&wanted)) {
@@ -309,10 +313,6 @@ impl Catalogue {
                 }
             }
             Self::Database(tables) => {
-                // `catalog.schema.table` is not looked into, as before the first run.
-                if wanted.matches('.').count() >= 2 {
-                    return;
-                }
                 let found = if wanted.contains('.') {
                     tables.get(&wanted)
                 } else {

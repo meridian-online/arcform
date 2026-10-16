@@ -219,7 +219,7 @@ fn a_three_part_name_is_not_checked_before_or_after_a_run() {
     put_panel(
         before.path(),
         "p.yaml",
-        &panel("arc.main.ranking", "    x: whatever\n"),
+        &panel("arc.main.nope", "    x: whatever\n"),
     );
     let out = arc(before.path(), &["panel", "check"], None);
     assert!(out.status.success(), "{out:?}");
