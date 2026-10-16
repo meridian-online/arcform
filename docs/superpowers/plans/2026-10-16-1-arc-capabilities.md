@@ -21,7 +21,7 @@
 - Public repository: no private planning identifiers in code, comments, tests or commit messages.
 - British English in user-facing text, matching the existing tool descriptions.
 - A refusal leaves the Protocol folder untouched, and a test pins that, as the existing record tests do.
-- `tests/public_surface.rs` freezes the crate's module list (`MODULE_FILES`) and public surface. A task that creates a module adds it to `MODULE_FILES`; new functions stay `pub(crate)`, and integration tests in `tests/` drive the `arc` binary (`env!("CARGO_BIN_EXE_arc")`) rather than calling library functions.
+- `tests/public_surface.rs` freezes the crate's module list (`MODULE_FILES`) and public surface. A task that creates a module adds it to `MODULE_FILES`; new items stay `pub(crate)` (where an Interfaces block below writes `pub`, read `pub(crate)`), and integration tests in `tests/` drive the `arc` binary (`env!("CARGO_BIN_EXE_arc")`) rather than calling library functions.
 - A task that registers an MCP tool adds it to `tools_list_registers_every_tool` (names and count) and names it in `INSTRUCTIONS` in the same commit, so every commit's tests pass.
 - Builds need `DUCKDB_LIB_DIR=/opt/homebrew/lib` (or wherever DuckDB 1.5.6 is) on this machine. Run one cargo build at a time.
 
