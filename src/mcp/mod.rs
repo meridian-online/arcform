@@ -447,7 +447,7 @@ mod tests {
             true
         );
         assert_eq!(tool(&list, "infer")["annotations"]["openWorldHint"], false);
-        for name in ["operation_record", "sql_record"] {
+        for name in ["operation_record", "sql_record", "operator_record"] {
             assert_eq!(
                 tool(&list, name)["annotations"]["destructiveHint"],
                 false,
@@ -458,6 +458,7 @@ mod tests {
             "protocol_run",
             "protocol_edit",
             "history_restore",
+            "protocol_write_file",
             "report_write",
         ] {
             assert_eq!(
@@ -475,19 +476,6 @@ mod tests {
     #[test]
     fn instructions_open_with_when_to_use_arc_and_name_every_tool() {
         assert!(INSTRUCTIONS.starts_with("Use arc when"));
-        for name in [
-            "operator_record",
-            "protocol_edit",
-            "history_list",
-            "history_restore",
-            "protocol_write_file",
-            "table_profile",
-            "table_validate",
-            "panel_check",
-            "report_write",
-        ] {
-            assert!(INSTRUCTIONS.contains(name), "INSTRUCTIONS omits {name}");
-        }
         for t in tools() {
             assert!(
                 INSTRUCTIONS.contains(t.name),
@@ -529,6 +517,7 @@ mod tests {
             "table_profile",
             "table_validate",
             "sql_query",
+            "panel_check",
         ] {
             assert!(
                 names.contains(&expected),

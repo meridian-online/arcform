@@ -509,7 +509,7 @@ fn operation_record_schema() -> Value {
 /// `description` is absent for a step with none. A refusal is an error result
 /// naming what was wrong, with the Protocol's directory untouched.
 fn operator_record(args: &Value) -> ToolResult {
-    let dir = PathBuf::from(optional_string(args, "dir")?.unwrap_or("."));
+    let dir = dir_arg(args)?;
     let operator = required_string(args, "operator")?;
     let name = required_string(args, "name")?;
     let with = match args.get("with") {
@@ -586,7 +586,7 @@ fn edit_index(args: &Value, key: &str) -> std::result::Result<usize, String> {
 /// what was wrong, with the Protocol's directory untouched.
 fn protocol_edit(args: &Value) -> ToolResult {
     use crate::cli::EditOp;
-    let dir = PathBuf::from(optional_string(args, "dir")?.unwrap_or("."));
+    let dir = dir_arg(args)?;
     let path = edit_string(args, "path")?;
     let op = match required_string(args, "edit")? {
         "replace" => EditOp::Replace {
@@ -656,7 +656,7 @@ fn optional_file(args: &Value) -> std::result::Result<Option<PathBuf>, String> {
 /// The recorded states of a Protocol's spec, or given `file` of that one file,
 /// oldest first: the array `arc history list --json` prints. Reads only.
 fn history_list(args: &Value) -> ToolResult {
-    let dir = PathBuf::from(optional_string(args, "dir")?.unwrap_or("."));
+    let dir = dir_arg(args)?;
     let file = optional_file(args)?;
     let history = open_history()?;
     crate::cli::history_entries_json(&dir, file.as_deref(), &history)
@@ -680,7 +680,7 @@ fn history_list_schema() -> Value {
 /// does not load, `note` says why. An unknown entry is an error result, with
 /// nothing written.
 fn history_restore(args: &Value) -> ToolResult {
-    let dir = PathBuf::from(optional_string(args, "dir")?.unwrap_or("."));
+    let dir = dir_arg(args)?;
     let id = required_string(args, "id")?;
     let file = optional_file(args)?;
     let history = open_history()?;
@@ -688,7 +688,12 @@ fn history_restore(args: &Value) -> ToolResult {
         .map_err(|e| e.to_string())?;
     let mut result = json!({
         "restored": id,
-        "file": restored.target.display().to_string(),
+        // Relative to the Protocol, as protocol_write_file and report_write give theirs.
+        "file": file
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(crate::spec::MANIFEST_FILENAME))
+            .display()
+            .to_string(),
     });
     if let Some(fault) = restored.load_fault {
         result["note"] = json!(format!(
@@ -846,7 +851,7 @@ fn protocol_create_schema() -> Value {
 /// The result names the file's `path`, its `kind` and any `warnings`; a refusal
 /// is an error result with the folder untouched.
 fn protocol_write_file(args: &Value) -> ToolResult {
-    let dir = PathBuf::from(optional_string(args, "dir")?.unwrap_or("."));
+    let dir = dir_arg(args)?;
     let path = required_string(args, "path")?;
     let content = required_string(args, "content")?;
     let history = open_history()?;

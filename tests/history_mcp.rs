@@ -282,7 +282,7 @@ fn history_restore_undoes_record() {
     let restored = protocol.call_ok("history_restore", json!({ "id": id }));
     assert_eq!(restored["restored"], id);
     // `dir` defaults to the working directory, so the path reads from there.
-    assert_eq!(restored["file"], "./arcform.yaml");
+    assert_eq!(restored["file"], "arcform.yaml");
     assert_eq!(protocol.manifest(), earlier);
 }
 
@@ -309,7 +309,7 @@ fn history_restore_for_panel_file() {
         json!({ "id": id, "file": "panels/x.yaml" }),
     );
     assert_eq!(restored["restored"], id.as_str());
-    assert_eq!(restored["file"], "./panels/x.yaml");
+    assert_eq!(restored["file"], "panels/x.yaml");
     assert_eq!(std::fs::read_to_string(&panel).unwrap(), "mark: lineY\n");
     assert_eq!(protocol.manifest(), spec, "no other file is written");
 }
