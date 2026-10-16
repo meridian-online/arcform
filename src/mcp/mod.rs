@@ -63,7 +63,8 @@ const INSTRUCTIONS: &str = "Use arc when you analyse data over DuckDB and the wo
     (building-and-checking-a-protocol). Present: give the answer, how it was derived and what \
     else turned up (presenting-findings). Start with the using-arcform skill where skills are \
     available.\n\n\
-    The tools below are grouped by what you do at each stage of that outline.\n\n\
+    The tools below are listed in the order you use them: Discover serves Scope and Profile, \
+    Record and Run serve Build, Check serves Check, and Present serves Present.\n\n\
     Work in this order. Discover: table_describe shows what a table in a Protocol's database \
     holds, sql_query runs SELECTs against it, table_profile types its columns with FineType, \
     operation_describe and operator_describe say what arc's operations and operators take, and \
@@ -506,6 +507,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("outline omits {label} in order"));
             at += found + label.len();
         }
+        assert!(
+            outline.contains("using-arcform"),
+            "outline names using-arcform"
+        );
         let mut skills = vec!["using-arcform"];
         let mut rest = outline;
         while let Some(open) = rest.find('(') {
