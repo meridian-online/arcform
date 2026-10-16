@@ -60,9 +60,9 @@ const CHANNELS: [&str; 28] = [
 /// The channels where a bare string may be a CSS colour rather than a column.
 const COLOUR_CHANNELS: [&str; 2] = ["fill", "stroke"];
 
-/// The CSS named colours (CSS Color Level 4, section 6.1), plus `transparent` and
-/// `currentcolor`, lowercased. A fixed standard, so it does not go stale.
-const COLOUR_NAMES: [&str; 150] = [
+/// The CSS named colours (CSS Color Level 4, section 6.1), plus `none`, `transparent` and
+/// `currentcolor` (valid paint values, not colours), lowercased. A fixed standard, so it does not go stale.
+const COLOUR_NAMES: [&str; 151] = [
     "aliceblue",
     "antiquewhite",
     "aqua",
@@ -211,6 +211,7 @@ const COLOUR_NAMES: [&str; 150] = [
     "whitesmoke",
     "yellow",
     "yellowgreen",
+    "none",
     "transparent",
     "currentcolor",
 ];

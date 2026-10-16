@@ -144,6 +144,11 @@ fn colours_are_not_columns_but_typos_are() {
             "    x: name\n    fill: darkorange\n    stroke: oklch(0.7 0.1 200)\n",
         ),
     );
+    put_panel(
+        dir.path(),
+        "none.yaml",
+        &panel("trips", "    x: name\n    fill: none\n    stroke: none\n"),
+    );
     let out = arc(dir.path(), &["panel", "check"], None);
     assert!(out.status.success(), "{out:?}");
     put_panel(
@@ -154,6 +159,15 @@ fn colours_are_not_columns_but_typos_are() {
     let out = arc(dir.path(), &["panel", "check"], None);
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     assert!(stdout(&out).contains("cuont"), "{}", stdout(&out));
+}
+
+#[test]
+fn a_panel_with_no_plot_is_a_finding() {
+    let dir = protocol_with_database();
+    put_panel(dir.path(), "empty.yaml", "data:\n  t: []\n");
+    let out = arc(dir.path(), &["panel", "check"], None);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(stdout(&out).contains("has no `plot`"), "{}", stdout(&out));
 }
 
 #[test]
