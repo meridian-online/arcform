@@ -62,7 +62,8 @@ const INSTRUCTIONS: &str = "Use arc when you analyse data over DuckDB and the wo
     (building-and-checking-a-protocol). Check: run it and test the tables it makes \
     (building-and-checking-a-protocol). Present: give the answer, how it was derived and what \
     else turned up (presenting-findings). Start with the using-arcform skill where skills are \
-    available; the rest of this text lists the tools.\n\n\
+    available.\n\n\
+    The tools below are grouped by what you do at each stage of that outline.\n\n\
     Work in this order. Discover: table_describe shows what a table in a Protocol's database \
     holds, sql_query runs SELECTs against it, table_profile types its columns with FineType, \
     operation_describe and operator_describe say what arc's operations and operators take, and \
@@ -494,15 +495,31 @@ mod tests {
 
     #[test]
     fn instructions_outline_the_workflow() {
-        for word in [
-            "Scope",
-            "Profile",
-            "Build",
-            "Check",
-            "Present",
-            "using-arcform",
-        ] {
-            assert!(INSTRUCTIONS.contains(word), "INSTRUCTIONS omits {word}");
+        let outline = INSTRUCTIONS
+            .split("\n\n")
+            .find(|p| p.starts_with("The analyst workflow"))
+            .expect("INSTRUCTIONS has an outline paragraph");
+        let mut at = 0;
+        for label in ["Scope:", "Profile:", "Build:", "Check:", "Present:"] {
+            let found = outline[at..]
+                .find(label)
+                .unwrap_or_else(|| panic!("outline omits {label} in order"));
+            at += found + label.len();
+        }
+        let mut skills = vec!["using-arcform"];
+        let mut rest = outline;
+        while let Some(open) = rest.find('(') {
+            let close = rest[open..].find(')').expect("closing parenthesis") + open;
+            skills.push(&rest[open + 1..close]);
+            rest = &rest[close + 1..];
+        }
+        assert!(skills.len() >= 5, "outline names its skills: {skills:?}");
+        for name in skills {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("skills")
+                .join(name)
+                .join("SKILL.md");
+            assert!(path.is_file(), "no skill file for {name}");
         }
     }
 
