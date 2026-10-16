@@ -41,14 +41,14 @@
 
 **Files:**
 - Create: `tests/skills.rs`, `tests/fixtures/skills/` (a small Protocol: one CSV of 200 rows with a date, a category, an amount and an email column, and an `arcform.yaml` that loads it)
-- Create: `skills/README.md` (what the directory is, for a person browsing GitHub)
+- Create: a `README.md` in the new `skills/` folder (what the directory is, for a person browsing GitHub)
 
 **Interfaces:**
 - Produces, for later tasks:
   - In a skill, an MCP tool is written as `` `tool_name` `` followed by its arguments in a JSON block or as `` `argument` `` names in the same table row; a CLI form is a fenced `sh` block or `` `arc …` `` inline. The checker reads both.
   - An example the checker runs is a fenced block with the info string `sh arc-example`; it runs with the fixture Protocol as its working directory, and an optional following block with info string `text expect` holds a substring its output must contain.
 
-- [ ] **Step 1: Write the tests** (they pass vacuously until a skill exists, so also add `skills/_probe/SKILL.md` naming one real tool, one fake tool and one fake flag, to see them fail):
+- [ ] **Step 1: Write the tests** (they pass vacuously until a skill exists, so also add a probe skill, a `SKILL.md` in a `skills/_probe/` folder, naming one real tool, one fake tool and one fake flag, to see them fail):
   - `every_named_tool_is_advertised`: start `arc mcp`, call `tools/list`, and assert every `` `name` `` in a skill that looks like a tool (snake_case, in an MCP column or JSON block) is advertised, and each argument named with it is in that tool's `inputSchema.properties`.
   - `every_cli_form_exists`: for each `arc <verb> [<sub>]` in a skill (its SKILL.md and every file under `references/`), `arc <verb> [<sub>] --help` exits 0, and each `--flag` named with it appears in that help.
   - `every_verb_table_row_has_both_columns`.
@@ -62,7 +62,7 @@
 ### Task 2: The entry skill, `using-arcform`
 
 **Files:**
-- Create: `skills/using-arcform/SKILL.md`, `skills/using-arcform/references/verb-map.md`, `skills/using-arcform/references/environment-check.md`
+- Create: the folder `skills/using-arcform/` with its `SKILL.md`, and in its `references/` folder `verb-map.md` and `environment-check.md`
 
 Its description is the most important text in the set. It must make an agent use arc for any question about tabular data (CSV, spreadsheet, JSON records, a table on the web), a chart from data, or a data report, without arc being named; and it must say when not to use arc (a single value read off a small file the user pasted; non-tabular data). Write three candidate descriptions and keep the one the plan 3 eval does best with; until then, keep the first.
 
@@ -76,7 +76,7 @@ SKILL.md covers, briefly: what a Protocol is (a folder with `arcform.yaml` and `
 ### Task 3: `scoping-an-analysis`
 
 **Files:**
-- Create: `skills/scoping-an-analysis/SKILL.md`
+- Create: the folder `skills/scoping-an-analysis/` with its `SKILL.md`
 
 Covers: restate the question and the end state in the user's words; choose the size by the rules (a quick look when one or two aggregates answer it; an analysis by default; a project when the user wants a report, the work spans several datasets, or the answer will be shared); say the size and let the user override; play the plan back (data source, stages, what they will get) before building; for a project, write the requirements into the Protocol's `README.md` through `protocol_write_file` / `arc protocol write-file` and have them agreed; create the Protocol (`protocol_create` / `arc create-protocol`). Three short worked examples, one per size.
 
@@ -87,7 +87,7 @@ Covers: restate the question and the end state in the user's words; choose the s
 ### Task 4: `profiling-and-typing-data`
 
 **Files:**
-- Create: `skills/profiling-and-typing-data/SKILL.md`, `skills/profiling-and-typing-data/references/reading-the-results.md`, `skills/profiling-and-typing-data/references/what-finetype-teaches.md`
+- Create: the folder `skills/profiling-and-typing-data/` with its `SKILL.md`, and in its `references/` folder `reading-the-results.md` and `what-finetype-teaches.md`
 
 Covers: get the data in first (a local CSV can be profiled directly; anything else is loaded by a raw step, an `http_fetch` operator or a SQL step, then profiled as a table with `table_profile` / `arc table profile`); `profile` or `table_profile`; save a table-level JSON Schema with `format: json-schema` written by `protocol_write_file` to `schemas/<table>.json`; `validate` against it (`table_validate` / `arc table validate` for a table, run in DuckDB by finetype's extension; `validate` for a local CSV or Parquet file); do not stop after profiling; `table_describe` for row and null counts; what each result means for the user's question (`reading-the-results.md`: confidence as a quality signal, the reject report, nulls, mixed types); the finetype version floor and the reason for it (finetype 0.6.53 and earlier read any eight-digit number as a confident date). `what-finetype-teaches.md` takes everything finetype's own two agent skills teach and, for each, gives the route through arc (the `finetype_validate` operator as a check that fails a step when a built Parquet breaks its JSON Schema contract; typed materialisation into a DuckDB table with a reject sidecar is not reachable through arc, so say what to run instead; a Data Package through `datapackage_describe`; one type's schema through `taxonomy`) or says it is not reachable and what to run instead.
 
@@ -99,7 +99,7 @@ Covers: get the data in first (a local CSV can be profiled directly; anything el
 ### Task 5: `building-and-checking-a-protocol`, and brewtrend as its worked example
 
 **Files:**
-- Create: `skills/building-and-checking-a-protocol/SKILL.md`, `.../references/step-kinds.md`, `.../references/tracing-a-wrong-table.md`
+- Create: the folder `skills/building-and-checking-a-protocol/` with its `SKILL.md`, and in its `references/` folder `step-kinds.md` and `tracing-a-wrong-table.md`
 - Modify: `examples/brewtrend/arcform.yaml` (fetch steps use `http_fetch` instead of `curl` commands) and `examples/brewtrend/README.md`
 - Create: `tests/fixtures/skills-empty-filter/` (the fixture Protocol plus a filter step whose condition no row meets)
 
@@ -115,7 +115,7 @@ Covers: discover first (read `arcform.yaml`, `operation_describe` with no argume
 ### Task 6: `presenting-findings`
 
 **Files:**
-- Create: `skills/presenting-findings/SKILL.md`, `.../references/panels.md`, `.../references/report.md`
+- Create: the folder `skills/presenting-findings/` with its `SKILL.md`, and in its `references/` folder `panels.md` and `report.md`
 
 Covers: write each chart as a Mosaic spec to `panels/<name>.yaml` through `protocol_write_file`, reading from a table the Protocol makes, and act on any warning the write returns (`panel_check`); the chart kinds Brightfield draws (`panels.md`, taken from Brightfield's chart-kind registry and its documented departures from Mosaic, with one example per kind); state the answer, the quality caveats from profiling, and next steps; guide the user to open the Protocol folder in Brightfield to see the charts and how the answer was derived; when they want a document, write the report with `report_write` / `arc report write` and offer the PDF through Brightfield's export (`report.md`: what to put in the prose, which sections arc adds). Ends by telling the user the Protocol folder can be committed or shared as it is.
 
