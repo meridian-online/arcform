@@ -389,13 +389,29 @@ fn panels_without_a_database_still_write() {
         "title: >\n  A long\n  title\nplot:\n  - mark: barY\n    data: { from: top }\n",
     )
     .unwrap();
-    let _ = std::fs::remove_file(protocol.dir.join("data.duckdb"));
-    let _ = std::fs::remove_dir_all(protocol._root.path().join("db"));
+    let databases = |protocol: &Protocol| -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for root in [protocol.dir.clone(), protocol._root.path().join("db")] {
+            for entry in std::fs::read_dir(root).into_iter().flatten() {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|e| e == "duckdb") {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    };
+    for path in databases(&protocol) {
+        std::fs::remove_file(path).unwrap();
+    }
+    assert!(databases(&protocol).is_empty(), "the database is gone");
     let out = protocol.write("Prose.\n");
     assert!(out.status.success(), "{}", stderr(&out));
+    let report = protocol.report();
     assert!(
-        protocol
-            .report()
-            .contains("`panels/top.yaml`: A long title")
+        report.contains("`panels/top.yaml`: A long title"),
+        "{report}"
     );
+    assert!(report.contains("it has no database yet"), "{report}");
+    assert!(!report.contains("current database"), "{report}");
 }

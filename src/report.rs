@@ -4,8 +4,8 @@
 //! appends what it knows from the newest run contract (or the one a run id
 //! names): how the answer was derived, the charts and the run. Row counts and
 //! content hashes are the contract's own, so the database is never read for them.
-//! The panel check does open the Protocol's current database, read-only, and the
-//! Charts section says so.
+//! The panel check reads the Protocol's current database, read-only, when one
+//! exists, and otherwise the tables its steps make; the Charts section says which.
 
 use std::fmt::Write as _;
 use std::fs;
