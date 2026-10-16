@@ -53,6 +53,7 @@ mod manifest;
 mod mcp;
 mod operator;
 mod precondition;
+mod protocol_files;
 mod record;
 mod registry;
 mod runner;

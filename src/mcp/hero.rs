@@ -835,6 +835,41 @@ fn protocol_create_schema() -> Value {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// protocol_write_file
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Write a schema, panel or README file of a Protocol, as `arc protocol
+/// write-file` does: both call `write_protocol_file`. `dir` defaults to `.`.
+/// The result names the file's `path`, its `kind` and any `warnings`; a refusal
+/// is an error result with the folder untouched.
+fn protocol_write_file(args: &Value) -> ToolResult {
+    let dir = PathBuf::from(optional_string(args, "dir")?.unwrap_or("."));
+    let path = required_string(args, "path")?;
+    let content = required_string(args, "content")?;
+    let history = open_history()?;
+    let written =
+        crate::protocol_files::write_protocol_file(&dir, Path::new(path), content, &history)
+            .map_err(|e| e.to_string())?;
+    Ok(ToolOutput::json(json!({
+        "path": written.path.display().to_string(),
+        "kind": written.kind.word(),
+        "warnings": written.warnings,
+    })))
+}
+
+fn protocol_write_file_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": { "type": "string", "description": "The file's path relative to the Protocol directory: schemas/<name>.json, panels/<name>.yaml or README.md." },
+            "content": { "type": "string", "description": "The whole file. A schema must be JSON and a panel YAML with a `plot` key." },
+            "dir": { "type": "string", "description": "Protocol directory (where arcform.yaml lives). Defaults to the current directory." }
+        },
+        "required": ["path", "content"]
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // table_describe
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -980,6 +1015,13 @@ pub(super) fn tools() -> Vec<ToolDef> {
             input_schema: protocol_create_schema,
             handler: protocol_create,
             annotations: Annotations::WRITES,
+        },
+        ToolDef {
+            name: "protocol_write_file",
+            description: "Write one file of a Protocol, as `arc protocol write-file` does: a table's schema (schemas/<name>.json, JSON), a panel (panels/<name>.yaml, YAML with a `plot` key) or README.md. The file is written whole, replacing one already there, and the state it replaces is kept in its history. A path outside the Protocol's folder, any other place and content that does not read as its kind are refused with nothing written; report.md has a tool of its own, report_write. Runs nothing.",
+            input_schema: protocol_write_file_schema,
+            handler: protocol_write_file,
+            annotations: Annotations::EDITS,
         },
         ToolDef {
             name: "table_describe",

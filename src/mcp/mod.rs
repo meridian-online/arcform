@@ -70,7 +70,8 @@ const INSTRUCTIONS: &str = "Use arc when you analyse data over DuckDB and the wo
     states of a spec, or of one file beside it, and history_restore rolls it back to one; sql_record records a SQL \
     statement as a new step of a Protocol, as the operation it is read as or else as a SQL step, and runs \
     nothing; protocol_create makes a new Protocol in a directory, as arc create-protocol does, \
-    and refuses one that already has a spec; table_describe reads what a table in a \
+    and refuses one that already has a spec; protocol_write_file writes a Protocol's schema, panel or \
+    README file, as arc protocol write-file does; table_describe reads what a table in a \
     Protocol's database holds (row count, columns, null counts, sample rows) and changes nothing; \
     sql_query runs SELECT statements against a Protocol's database, read-only, refuses any \
     other statement before anything runs, and changes nothing. The SQL table_describe and \
@@ -503,6 +504,7 @@ mod tests {
             "history_restore",
             "sql_record",
             "protocol_create",
+            "protocol_write_file",
             "table_describe",
             "sql_query",
         ] {
@@ -511,7 +513,7 @@ mod tests {
                 "missing tool `{expected}` in {names:?}"
             );
         }
-        assert_eq!(names.len(), 18, "unexpected tool set: {names:?}");
+        assert_eq!(names.len(), 19, "unexpected tool set: {names:?}");
         // Every tool advertises an object input schema.
         for tool in listed["tools"].as_array().unwrap() {
             assert!(tool["description"].is_string());

@@ -183,10 +183,35 @@ pub enum Commands {
     #[cfg(feature = "mcp")]
     Mcp,
 
+    /// Write a file of a protocol: its table schemas, panels and README.
+    Protocol {
+        #[command(subcommand)]
+        cmd: ProtocolCmd,
+    },
+
     /// Look at a table in a protocol's database, read-only.
     Table {
         #[command(subcommand)]
         cmd: TableCmd,
+    },
+}
+
+/// The `arc protocol` verbs.
+#[derive(Subcommand)]
+pub enum ProtocolCmd {
+    /// Write a file of the protocol from standard input: `schemas/<name>.json`
+    /// (JSON), `panels/<name>.yaml` (YAML with a `plot` key) or `README.md`.
+    /// The file is written whole, replacing one already there, and recorded in
+    /// its own history. A path outside the protocol's folder, any other place,
+    /// and content that does not read as its kind are refused with nothing
+    /// written.
+    WriteFile {
+        /// The file's path, relative to the protocol directory.
+        path: PathBuf,
+
+        /// Protocol directory (where arcform.yaml lives).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
     },
 }
 
@@ -705,26 +730,11 @@ fn history_file(dir: &Path, file: &Path) -> Result<PathBuf> {
             dir.display()
         ))
     };
-    if file.components().any(|c| {
-        !matches!(
-            c,
-            std::path::Component::Normal(_) | std::path::Component::CurDir
-        )
-    }) {
+    if !crate::protocol_files::stays_inside_by_name(file) {
         return Err(outside());
     }
     let path = dir.join(file);
-    // The nearest ancestor that exists, canonicalised, must sit under the
-    // canonical folder: that catches a link that points out.
-    let root = fs::canonicalize(dir)?;
-    let mut probe = path.as_path();
-    let held = loop {
-        match fs::canonicalize(probe) {
-            Ok(held) => break held,
-            Err(_) => probe = probe.parent().ok_or_else(outside)?,
-        }
-    };
-    if !held.starts_with(&root) {
+    if !crate::protocol_files::resolves_inside(dir, &path)? {
         return Err(outside());
     }
     Ok(path)
@@ -1085,7 +1095,42 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Commands::Sql { cmd } => dispatch_sql(cmd, &mut std::io::stdout()),
         #[cfg(feature = "mcp")]
         Commands::Mcp => crate::mcp::serve(),
+        Commands::Protocol { cmd } => {
+            dispatch_protocol(cmd, &mut std::io::stdin(), &mut std::io::stdout())
+        }
         Commands::Table { cmd } => dispatch_table(cmd, &mut std::io::stdout()),
+    }
+}
+
+/// Execute an `arc protocol` verb: the file's content is read from `input`
+/// whole, and a refusal is the error with nothing written.
+fn dispatch_protocol(
+    cmd: ProtocolCmd,
+    input: &mut impl std::io::Read,
+    out: &mut impl Write,
+) -> Result<()> {
+    match cmd {
+        ProtocolCmd::WriteFile { path, dir } => {
+            let mut content = String::new();
+            input.read_to_string(&mut content)?;
+            let written = crate::protocol_files::write_protocol_file(
+                &dir,
+                &path,
+                &content,
+                &open_history()?,
+            )?;
+            writeln!(
+                out,
+                "wrote {} as a {} in {}",
+                written.path.display(),
+                written.kind.word(),
+                dir.display()
+            )?;
+            for warning in &written.warnings {
+                writeln!(out, "warning: {warning}")?;
+            }
+            Ok(())
+        }
     }
 }
 
