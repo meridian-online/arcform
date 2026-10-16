@@ -1,0 +1,10 @@
+name: skills-empty-filter
+engine: duckdb
+engine_version: '>=1.0'
+steps:
+  - name: load_sales
+    sql: models/01_load_sales.sql
+    description: Load the sales as they arrive
+  - name: large_sales
+    sql: models/02_large_sales.sql
+    description: Keep the sales over 1,000, a condition no row meets

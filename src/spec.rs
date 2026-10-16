@@ -173,7 +173,7 @@
 //!
 //! # fn main() -> Result<()> {
 //! // Load and validate a spec that is on disk.
-//! let dir = std::path::Path::new("examples/brewtrend");
+//! let dir = std::path::Path::new("examples/almanac");
 //! let manifest = Manifest::load(dir)?;
 //! println!("{} — {} steps", manifest.name, manifest.steps.len());
 //!
@@ -181,8 +181,8 @@
 //! // bytes, validated by the same loader, and written atomically — or refused
 //! // with a reason, leaving the file untouched.
 //! let edit = SpecEdit::Replace {
-//!     path: vec!["params".into(), "trend_threshold".into(), "default".into()],
-//!     value: "\"25\"".into(),
+//!     path: vec!["params".into(), "port".into(), "default".into()],
+//!     value: "\"hobart\"".into(),
 //! };
 //! edit_spec(dir, &[edit])?;
 //! # Ok(())

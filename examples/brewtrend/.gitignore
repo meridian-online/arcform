@@ -2,3 +2,5 @@
 data/
 trends.db
 trends.db.wal
+# Run records arc writes on each run.
+build/

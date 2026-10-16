@@ -96,7 +96,8 @@ mod tests {
 
     // The ordering-token shape this repo's own examples ship, and the file-shaped
     // spellings an extension allowlist walked into from the other side (`tides_csv`
-    // and `report_csv` in `examples/almanac`, `cask_json` in `examples/brewtrend`).
+    // and `report_csv` in `examples/almanac`, and `cask_json`, which brewtrend's fetch
+    // steps declared before they became `http_fetch` operators).
     // Each is a path here; beyond a glob metacharacter the spelling is not read.
     #[test]
     fn every_non_glob_name_is_a_path_on_both_sides() {

@@ -7552,7 +7552,7 @@ steps:
             }
         }
         assert_eq!(
-            gated, 9,
+            gated, 3,
             "precondition-gated command steps across examples/"
         );
         assert_eq!(

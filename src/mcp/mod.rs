@@ -56,6 +56,15 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const INSTRUCTIONS: &str = "Use arc when you analyse data over DuckDB and the work should be kept as a \
     versioned, re-runnable Protocol rather than a one-off query. arc is a local-first \
     data-pipeline engine, exposed over MCP.\n\n\
+    The analyst workflow has five stages. Scope: agree the question, the data and the size of \
+    the work (scoping-an-analysis). Profile: type the columns and report data-quality findings \
+    (profiling-and-typing-data). Build: record each step into the Protocol \
+    (building-and-checking-a-protocol). Check: run it and test the tables it makes \
+    (building-and-checking-a-protocol). Present: give the answer, how it was derived and what \
+    else turned up (presenting-findings). Start with the using-arcform skill where skills are \
+    available.\n\n\
+    The tools below are listed in the order you use them: Discover serves Scope and Profile, \
+    Record serves Build, Run and Check serve Check, and Present serves Present.\n\n\
     Work in this order. Discover: table_describe shows what a table in a Protocol's database \
     holds, sql_query runs SELECTs against it, table_profile types its columns with FineType, \
     operation_describe and operator_describe say what arc's operations and operators take, and \
@@ -482,6 +491,40 @@ mod tests {
                 "INSTRUCTIONS omits {}",
                 t.name
             );
+        }
+    }
+
+    #[test]
+    fn instructions_outline_the_workflow() {
+        let outline = INSTRUCTIONS
+            .split("\n\n")
+            .find(|p| p.starts_with("The analyst workflow"))
+            .expect("INSTRUCTIONS has an outline paragraph");
+        let mut at = 0;
+        for label in ["Scope:", "Profile:", "Build:", "Check:", "Present:"] {
+            let found = outline[at..]
+                .find(label)
+                .unwrap_or_else(|| panic!("outline omits {label} in order"));
+            at += found + label.len();
+        }
+        assert!(
+            outline.contains("using-arcform"),
+            "outline omits using-arcform"
+        );
+        let mut skills = vec!["using-arcform"];
+        let mut rest = outline;
+        while let Some(open) = rest.find('(') {
+            let close = rest[open..].find(')').expect("closing parenthesis") + open;
+            skills.push(&rest[open + 1..close]);
+            rest = &rest[close + 1..];
+        }
+        assert!(skills.len() >= 5, "outline names its skills: {skills:?}");
+        for name in skills {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("skills")
+                .join(name)
+                .join("SKILL.md");
+            assert!(path.is_file(), "no skill file for {name}");
         }
     }
 

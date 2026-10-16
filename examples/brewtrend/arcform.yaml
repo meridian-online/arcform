@@ -19,57 +19,86 @@ defaults:
     backoff_sec: 2.0
 
 steps:
-  # --- Fetch: Homebrew analytics + catalogue (cached 24h via preconditions) ---
+  # --- Fetch: Homebrew analytics + catalogue with the http_fetch operator
+  #     (cached 24h via preconditions) ---
   - name: fetch_cask_catalogue
-    command: "mkdir -p data/cask && curl -fsSL https://formulae.brew.sh/api/cask.json -o data/cask/cask.json"
-    produces: [cask_json]
+    description: Download the Homebrew cask catalogue (names, descriptions, homepages)
+    op: http_fetch@1
+    with:
+      url: https://formulae.brew.sh/api/cask.json
+      out: data/cask/cask.json
     preconditions:
       - modified_after: { path: data/cask/cask.json, period: 24h }
 
   - name: fetch_formula_catalogue
-    command: "mkdir -p data/formula && curl -fsSL https://formulae.brew.sh/api/formula.json -o data/formula/formula.json"
-    produces: [formula_json]
+    description: Download the Homebrew formula catalogue (names, descriptions, homepages)
+    op: http_fetch@1
+    with:
+      url: https://formulae.brew.sh/api/formula.json
+      out: data/formula/formula.json
     preconditions:
       - modified_after: { path: data/formula/formula.json, period: 24h }
 
   - name: fetch_cask_30d
-    command: "mkdir -p data/cask && curl -fsSL https://formulae.brew.sh/api/analytics/cask-install/homebrew-cask/30d.json -o data/cask/30d.json"
-    produces: [cask_30d]
+    description: Download cask install counts for the last 30 days
+    op: http_fetch@1
+    with:
+      url: https://formulae.brew.sh/api/analytics/cask-install/homebrew-cask/30d.json
+      out: data/cask/30d.json
     preconditions:
       - modified_after: { path: data/cask/30d.json, period: 24h }
 
   - name: fetch_cask_90d
-    command: "mkdir -p data/cask && curl -fsSL https://formulae.brew.sh/api/analytics/cask-install/homebrew-cask/90d.json -o data/cask/90d.json"
-    produces: [cask_90d]
+    description: Download cask install counts for the last 90 days
+    op: http_fetch@1
+    with:
+      url: https://formulae.brew.sh/api/analytics/cask-install/homebrew-cask/90d.json
+      out: data/cask/90d.json
     preconditions:
       - modified_after: { path: data/cask/90d.json, period: 24h }
 
   - name: fetch_formula_30d
-    command: "mkdir -p data/formula && curl -fsSL https://formulae.brew.sh/api/analytics/install-on-request/homebrew-core/30d.json -o data/formula/30d.json"
-    produces: [formula_30d]
+    description: Download formula install-on-request counts for the last 30 days
+    op: http_fetch@1
+    with:
+      url: https://formulae.brew.sh/api/analytics/install-on-request/homebrew-core/30d.json
+      out: data/formula/30d.json
     preconditions:
       - modified_after: { path: data/formula/30d.json, period: 24h }
 
   - name: fetch_formula_90d
-    command: "mkdir -p data/formula && curl -fsSL https://formulae.brew.sh/api/analytics/install-on-request/homebrew-core/90d.json -o data/formula/90d.json"
-    produces: [formula_90d]
+    description: Download formula install-on-request counts for the last 90 days
+    op: http_fetch@1
+    with:
+      url: https://formulae.brew.sh/api/analytics/install-on-request/homebrew-core/90d.json
+      out: data/formula/90d.json
     preconditions:
       - modified_after: { path: data/formula/90d.json, period: 24h }
 
   # --- Load: raw JSON → DuckDB tables (depends on all six fetches) ---
   - name: load
+    description: Load the six downloads as they arrived into the casks, core and brew_analytics tables
     sql: models/load_data.sql
-    depends_on: [cask_json, formula_json, cask_30d, cask_90d, formula_30d, formula_90d]
+    depends_on:
+      - data/cask/cask.json
+      - data/formula/formula.json
+      - data/cask/30d.json
+      - data/cask/90d.json
+      - data/formula/30d.json
+      - data/formula/90d.json
 
   # --- Transform: compute trend metrics (reads trend_threshold param) ---
   - name: trending
+    description: Compute 30- and 90-day install measures and each package's trend index
     sql: models/trending.sql
 
   # --- Analyse + export: final ranking → data/ranking.parquet ---
   - name: rank
+    description: Rank packages by trend and volume, join their descriptions, and export data/ranking.parquet
     sql: models/full_ranking.sql
 
   # --- Report: print the top 20 to the terminal (depends on the ranking table) ---
   - name: show_top20
+    description: Print the top 20 of the ranking to the terminal
     command: 'duckdb trends.db -markdown -c "SELECT rank, category, name, installs_30d, ROUND(trend_index, 3) AS trend FROM ranking ORDER BY rank LIMIT 20"'
     depends_on: [ranking]

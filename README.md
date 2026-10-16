@@ -120,6 +120,10 @@ Through these tools an agent can start a Protocol, look at its tables, query the
 | `validate` | Validate CSV or Parquet data against a JSON Schema and report its quality. |
 | `generate` | Generate synthetic sample data from FineType's taxonomy. |
 
+### Agent skills
+
+[`skills/`](skills/) holds five agent skills that teach an agent the analyst workflow through these tools: `using-arcform`, the entry point, then `scoping-an-analysis`, `profiling-and-typing-data`, `building-and-checking-a-protocol` and `presenting-findings`, one for each stage from agreeing the question to handing over the answer. Each shows every step both as an `arc` command and as the matching tool, and `cargo test --features mcp --test skills` checks what they name and runs their examples against this binary.
+
 ---
 
 ## Design Principles
@@ -273,15 +277,15 @@ use arcform::spec::{Manifest, Result, SpecEdit, edit_spec};
 
 fn example() -> Result<()> {
     // A spec on disk.
-    let dir = std::path::Path::new("examples/brewtrend");
+    let dir = std::path::Path::new("examples/almanac");
     let manifest = Manifest::load(dir)?;
     println!("{} — {} steps", manifest.name, manifest.steps.len());
 
     // Edit it through the write path: applied to the original bytes, validated
     // by the same loader, written atomically — or refused with a reason.
     let edit = SpecEdit::Replace {
-        path: vec!["params".into(), "trend_threshold".into(), "default".into()],
-        value: "\"25\"".into(),
+        path: vec!["params".into(), "port".into(), "default".into()],
+        value: "\"hobart\"".into(),
     };
     edit_spec(dir, &[edit])?;
     Ok(())
