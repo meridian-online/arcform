@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use owo_colors::OwoColorize;
 
 use crate::edit::{
@@ -230,6 +230,64 @@ pub enum TableCmd {
         #[arg(long, default_value = ".")]
         dir: PathBuf,
     },
+
+    /// Profile a table or view in the protocol's database with FineType: the type of
+    /// each column, as JSON, or a JSON Schema its rows pass. Copies up to
+    /// --sample-size rows (100 by default) to a temporary CSV outside the protocol and
+    /// runs `finetype profile` over it; `table` and `rows_profiled` are added to what
+    /// FineType gives. A table with no rows is said so, not refused.
+    Profile {
+        /// The table or view to profile.
+        table: String,
+
+        /// What to print: each column's type, or a JSON Schema.
+        #[arg(long, value_enum, default_value = "json")]
+        format: ProfileFormatArg,
+
+        /// The most rows to copy and profile.
+        #[arg(long)]
+        sample_size: Option<usize>,
+
+        /// Directory the protocol lives in.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+
+    /// Validate a table or view in the protocol's database against a JSON Schema
+    /// file inside the protocol, in DuckDB with FineType's extension (set
+    /// FINETYPE_DUCKDB_EXT to it). Prints `valid` and each column's rejects as JSON,
+    /// and exits 1 when any row is rejected.
+    Validate {
+        /// The table or view to validate.
+        table: String,
+
+        /// The JSON Schema file, relative to the protocol directory.
+        #[arg(long)]
+        schema: PathBuf,
+
+        /// Directory the protocol lives in.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+}
+
+/// The formats `arc table profile` prints.
+#[derive(Clone, Copy, ValueEnum)]
+pub enum ProfileFormatArg {
+    /// Each column's type, confidence and transform.
+    Json,
+    /// A table-level JSON Schema.
+    #[value(name = "json-schema")]
+    JsonSchema,
+}
+
+impl From<ProfileFormatArg> for crate::inspect::ProfileFormat {
+    fn from(format: ProfileFormatArg) -> Self {
+        match format {
+            ProfileFormatArg::Json => Self::Json,
+            ProfileFormatArg::JsonSchema => Self::JsonSchema,
+        }
+    }
 }
 
 /// The verbs that take SQL as it is typed.
@@ -1143,6 +1201,28 @@ fn dispatch_table(cmd: TableCmd, out: &mut impl Write) -> Result<()> {
             let described = crate::inspect::describe_table(&dir, &table)?;
             writeln!(out, "{described:#}")?;
             Ok(())
+        }
+        TableCmd::Profile {
+            table,
+            format,
+            sample_size,
+            dir,
+        } => {
+            let profile = crate::inspect::profile_table(&dir, &table, format.into(), sample_size)?;
+            writeln!(out, "{profile:#}")?;
+            Ok(())
+        }
+        TableCmd::Validate { table, schema, dir } => {
+            let report = crate::inspect::validate_table(&dir, &table, &schema)?;
+            writeln!(out, "{report:#}")?;
+            if report["valid"] == true {
+                Ok(())
+            } else {
+                Err(Error::Io(std::io::Error::other(format!(
+                    "{table} has rows that {} rejects",
+                    schema.display()
+                ))))
+            }
         }
     }
 }

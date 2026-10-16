@@ -44,6 +44,7 @@ mod edit;
 mod engine;
 mod error;
 mod fetch_cache;
+mod finetype_cli;
 mod history;
 mod ingress_meta;
 mod inspect;

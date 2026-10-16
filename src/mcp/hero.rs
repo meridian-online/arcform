@@ -32,6 +32,9 @@
 //!   bytes from either.
 //! - `table_describe` reads a table in the Protocol's database, read-only, as
 //!   `arc table describe` does.
+//! - `table_profile` and `table_validate` profile a table with FineType and check
+//!   it against a schema file of the Protocol, as `arc table profile` and
+//!   `arc table validate` do.
 //! - `sql_query` runs SELECT statements against the Protocol's database,
 //!   read-only, as `arc sql query` does.
 //! - `protocol_create` makes a new Protocol in a directory, through the same
@@ -899,6 +902,84 @@ fn table_describe_schema() -> Value {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// table_profile and table_validate
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn dir_arg(args: &Value) -> std::result::Result<PathBuf, String> {
+    match args.get("dir") {
+        None | Some(Value::Null) => Ok(PathBuf::from(".")),
+        Some(Value::String(dir)) => Ok(PathBuf::from(dir)),
+        Some(other) => Err(format!("`dir` must be a string, not {other}")),
+    }
+}
+
+/// FineType's profile of a table in the Protocol's database, as `arc table profile`
+/// prints it.
+fn table_profile(args: &Value) -> ToolResult {
+    let table = required_string(args, "table")?;
+    let dir = dir_arg(args)?;
+    let format = match args.get("format") {
+        None | Some(Value::Null) => crate::inspect::ProfileFormat::Json,
+        Some(Value::String(f)) if f == "json" => crate::inspect::ProfileFormat::Json,
+        Some(Value::String(f)) if f == "json-schema" => crate::inspect::ProfileFormat::JsonSchema,
+        Some(other) => {
+            return Err(format!(
+                "`format` must be \"json\" or \"json-schema\", not {other}"
+            ));
+        }
+    };
+    let sample_size = match args.get("sample_size") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| format!("`sample_size` must be a whole number, not {value}"))?,
+        ),
+    };
+    crate::inspect::profile_table(&dir, table, format, sample_size)
+        .map(ToolOutput::json)
+        .map_err(|e| e.to_string())
+}
+
+fn table_profile_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "table": { "type": "string", "description": "The table or view to profile: a bare name, or schema.table." },
+            "format": { "type": "string", "enum": ["json", "json-schema"], "default": "json", "description": "json gives each column's type; json-schema gives a JSON Schema the rows pass, which protocol_write_file can save as schemas/<name>.json." },
+            "sample_size": { "type": "integer", "minimum": 1, "description": "The most rows to copy and profile. Defaults to FineType's 100." },
+            "dir": { "type": "string", "description": "The Protocol's directory. Defaults to the server's working directory." }
+        },
+        "required": ["table"]
+    })
+}
+
+/// A table in the Protocol's database checked against a schema file of the
+/// Protocol, as `arc table validate` prints it. Rejected rows are an answer
+/// (`valid: false`), not an error.
+fn table_validate(args: &Value) -> ToolResult {
+    let table = required_string(args, "table")?;
+    let schema = required_string(args, "schema")?;
+    let dir = dir_arg(args)?;
+    crate::inspect::validate_table(&dir, table, std::path::Path::new(schema))
+        .map(ToolOutput::json)
+        .map_err(|e| e.to_string())
+}
+
+fn table_validate_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "table": { "type": "string", "description": "The table or view to validate: a bare name, or schema.table." },
+            "schema": { "type": "string", "description": "The JSON Schema file, relative to the Protocol's directory and inside it (e.g. schemas/orders.json)." },
+            "dir": { "type": "string", "description": "The Protocol's directory. Defaults to the server's working directory." }
+        },
+        "required": ["table", "schema"]
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // sql_query
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1028,6 +1109,20 @@ pub(super) fn tools() -> Vec<ToolDef> {
             description: "Describe a table or view in a Protocol's database: its row count, each column's name, type and null count, and up to five rows as arrays of values in the order of the columns. A bare name is the table in main, or the one schema that holds it; `schema.table` names another. Opens the database read-only and never writes it; a view may read the files and URLs it names, but no extension is installed for it. A database the Protocol has not made yet is refused, and so is one another process holds.",
             input_schema: table_describe_schema,
             handler: table_describe,
+            annotations: Annotations::READS_OPEN,
+        },
+        ToolDef {
+            name: "table_profile",
+            description: "Profile a table or view in a Protocol's database with FineType: the type of each column (`format` json), or a JSON Schema its rows pass (`format` json-schema, which protocol_write_file can save as schemas/<name>.json). Up to `sample_size` rows (100 by default) are copied to a temporary CSV outside the Protocol and `finetype profile` is run over it; `table` and `rows_profiled` are added to what FineType gives. A table with no rows says so and is not an error. Opens the database read-only; needs finetype on PATH at the version arc requires.",
+            input_schema: table_profile_schema,
+            handler: table_profile,
+            annotations: Annotations::READS_OPEN,
+        },
+        ToolDef {
+            name: "table_validate",
+            description: "Validate a table or view in a Protocol's database against a JSON Schema file of the Protocol, in DuckDB with FineType's extension (the FINETYPE_DUCKDB_EXT environment variable names it; without it the call is refused). Returns `valid` and, for each column, `total`, `rejects` and a `sample_message`; rejected rows give `valid` false, not an error. A schema outside the Protocol's folder is refused. Opens the database read-only.",
+            input_schema: table_validate_schema,
+            handler: table_validate,
             annotations: Annotations::READS_OPEN,
         },
         ToolDef {

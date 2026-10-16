@@ -73,6 +73,9 @@ const INSTRUCTIONS: &str = "Use arc when you analyse data over DuckDB and the wo
     and refuses one that already has a spec; protocol_write_file writes a Protocol's schema, panel or \
     README file, as arc protocol write-file does; table_describe reads what a table in a \
     Protocol's database holds (row count, columns, null counts, sample rows) and changes nothing; \
+    table_profile profiles a table's columns with FineType, or gives a JSON Schema its rows pass, and \
+    table_validate checks a table against such a schema file with FineType's DuckDB extension; both \
+    change nothing; \
     sql_query runs SELECT statements against a Protocol's database, read-only, refuses any \
     other statement before anything runs, and changes nothing. The SQL table_describe and \
     sql_query run may read files and URLs it names; the database itself is never written.";
@@ -420,6 +423,8 @@ mod tests {
             "operation_describe",
             "sql_recognise",
             "table_describe",
+            "table_profile",
+            "table_validate",
             "sql_query",
         ] {
             assert_eq!(
@@ -506,6 +511,8 @@ mod tests {
             "protocol_create",
             "protocol_write_file",
             "table_describe",
+            "table_profile",
+            "table_validate",
             "sql_query",
         ] {
             assert!(
@@ -513,7 +520,7 @@ mod tests {
                 "missing tool `{expected}` in {names:?}"
             );
         }
-        assert_eq!(names.len(), 19, "unexpected tool set: {names:?}");
+        assert_eq!(names.len(), 21, "unexpected tool set: {names:?}");
         // Every tool advertises an object input schema.
         for tool in listed["tools"].as_array().unwrap() {
             assert!(tool["description"].is_string());

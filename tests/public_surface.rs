@@ -98,7 +98,7 @@ const EXPORTED: [(&str, &str); 35] = [
 
 /// Every module file in the crate. Frozen so a new one cannot be added without
 /// passing under the checks below.
-const MODULE_FILES: [&str; 35] = [
+const MODULE_FILES: [&str; 36] = [
     "asset.rs",
     "asset_kind.rs",
     "bridge.rs",
@@ -112,6 +112,9 @@ const MODULE_FILES: [&str; 35] = [
     // The shared fetch cache: one transfer per URL however many Protocols want it.
     // Private to the crate — a store is a run-time facility, not a schema.
     "fetch_cache.rs",
+    // The `finetype` command line run behind its version floor, for the MCP tools
+    // and `arc table profile`. Private to the crate.
+    "finetype_cli.rs",
     "history.rs",
     "ingress_meta.rs",
     "inspect.rs",
