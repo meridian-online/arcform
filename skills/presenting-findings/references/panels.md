@@ -181,7 +181,7 @@ YAML
 arc panel check
 ```
 
-- **List every series in `colorDomain`.** One left out is not drawn grey: it takes a colour from `colorRange` in turn, and looks like a focus series. Read the series from the table (`SELECT DISTINCT store FROM store_sales`) rather than from memory.
+- **List every series in `colorDomain`.** One left out is not drawn grey: it takes the palette's first colour, the same blue as the first focus series, and looks like one. Read the series from the table (`SELECT DISTINCT store FROM store_sales`) rather than from memory.
 - **`colorDomain` and `colorRange` are plot attributes**, siblings of `plot`, like `title`.
 - **Do not build the grey from two layers** (a grey line of every series with `z:` under a coloured line). Brightfield does not read `z`, so the grey layer draws as one line zigzagging through every series, and the coloured layer still colours every series.
 
