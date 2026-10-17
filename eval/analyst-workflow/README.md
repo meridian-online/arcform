@@ -61,7 +61,7 @@ Nothing else may tell the agent about arc. Each task runs in a new, empty folder
 
 ## 3. Run a task
 
-Start a fresh session per task, in the task's empty folder, and paste the task's `prompt` verbatim. Then play the analyst, the same way in every agent:
+Start a fresh session per task, in the task's empty folder, and paste the task's `prompt` verbatim, adding nothing to it: a note that you will be away, or a request for a report, changes the size the agent picks and the checkpoints it keeps, which are what the eval scores. Then play the analyst, the same way in every agent:
 
 - **At the plan playback** (an analysis or a project), give the refinement in the task's `notes`, in your own words. Agree to everything else as it stands.
 - **At any other checkpoint**, agree and let it go on, unless the agent is about to answer a different question from the one asked; then restate the question once.
