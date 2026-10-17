@@ -27,7 +27,7 @@ Say the size in one line with its reason, and let the user override it: "This is
 
 | Size | Checkpoints | Requirements | Ends with |
 | --- | --- | --- | --- |
-| A quick look | One, at the end | The restated question is enough | The answer and the Protocol that reached it |
+| A quick look | One, at the end | The restated question is enough | The answer, a next step and the Protocol that reached it |
 | An analysis | After scope (the plan), after profile (the quality findings), at a change of grain while building, and at present | Played back, not written | The answer, its caveats and next steps |
 | A project | At every stage | Written into `README.md` and agreed | A report, as well as the answer |
 
