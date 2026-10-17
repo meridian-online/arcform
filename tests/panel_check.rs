@@ -320,3 +320,28 @@ fn the_tool_reports_what_the_verb_does() {
             .contains("total")
     );
 }
+
+/// A Protocol whose spec does not load, with a panel beside it: the check cannot say
+/// what the Protocol makes.
+fn protocol_with_broken_spec() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("arcform.yaml"), "name: [unclosed\n").unwrap();
+    put_panel(dir.path(), "a.yaml", &panel("trips", "    x: name\n"));
+    dir
+}
+
+#[test]
+fn a_check_that_cannot_run_is_an_error_not_a_clean_pass() {
+    let dir = protocol_with_broken_spec();
+    let out = arc(dir.path(), &["panel", "check"], None);
+    assert!(!out.status.success(), "{out:?}");
+    assert!(!out.stderr.is_empty(), "{out:?}");
+}
+
+#[cfg(feature = "mcp")]
+#[test]
+fn the_tool_reports_a_check_that_cannot_run_as_an_error() {
+    let dir = protocol_with_broken_spec();
+    let result = call(dir.path(), "panel_check", json!({ "dir": dir.path() }));
+    assert_eq!(result["isError"], true, "{result}");
+}
