@@ -185,7 +185,7 @@ const MODULE_FILES: [&str; 40] = [
 /// `src/spec.rs`: editing an existing spec goes through the write path, which splices
 /// original bytes and never re-serialises. This freeze keeps any change to that
 /// arrangement a deliberate, version-visible act instead of a silent drift.
-const FROZEN_DERIVES: [(&str, &str, &[&str]); 21] = [
+const FROZEN_DERIVES: [(&str, &str, &[&str]); 23] = [
     (
         "manifest.rs",
         "Param",
@@ -290,6 +290,16 @@ const FROZEN_DERIVES: [(&str, &str, &[&str]); 21] = [
     (
         "history.rs",
         "LogLine",
+        &["Debug", "Clone", "PartialEq", "Eq"],
+    ),
+    (
+        "panel_check.rs",
+        "PanelFinding",
+        &["Debug", "Clone", "PartialEq", "Eq"],
+    ),
+    (
+        "protocol_read.rs",
+        "RunTables",
         &["Debug", "Clone", "PartialEq", "Eq"],
     ),
     ("error.rs", "Error", &["Debug", "thiserror::Error"]),
@@ -1130,6 +1140,33 @@ fn exported_modules_declare_only_contracted_items() {
     );
 
     assert_eq!(
+        pub_items(&src("panel_check.rs")),
+        frozen(&[
+            // Re-exported types and entry points.
+            "PanelFinding",
+            "CheckedPanels",
+            "check_panel",
+            "check_panels",
+        ]),
+        "a `pub` item in `panel_check.rs` is public API once its types are re-exported; \
+         use `pub(crate)` unless you mean to promise it"
+    );
+
+    assert_eq!(
+        pub_items(&src("protocol_read.rs")),
+        frozen(&[
+            // Re-exported type and entry points.
+            "RunTables",
+            "protocol_db_path",
+            "run_tables",
+            "report_run",
+            "read_log",
+        ]),
+        "a `pub` item in `protocol_read.rs` is public API once its types are re-exported; \
+         use `pub(crate)` unless you mean to promise it"
+    );
+
+    assert_eq!(
         pub_items(&src("record.rs")),
         frozen(&[
             // Re-exported types and the ownership marker.
@@ -1159,6 +1196,8 @@ fn the_schema_types_derive_exactly_what_is_recorded() {
         "edit.rs",
         "record.rs",
         "history.rs",
+        "panel_check.rs",
+        "protocol_read.rs",
         "error.rs",
     ] {
         let found = pub_type_derives(&src(owner));
