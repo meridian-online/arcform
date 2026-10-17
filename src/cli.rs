@@ -1211,12 +1211,23 @@ pub fn upgrade_extension(
 }
 
 /// The local-history store as every verb of the command line opens it: the
-/// conventional root, reached by [`HistoryWay::TERMINAL`]. Every version a
+/// conventional root, reached by [`HistoryWay::TERMINAL`], or by the word in
+/// `$ARCFORM_HISTORY_WAY` when a caller that runs `arc` sets one. Every version a
 /// verb writes — `create-protocol`'s first save, `edit-protocol`'s and
 /// `upgrade`'s checkpoint and save, a recording's two, and the checkpoint a
 /// restore takes — carries the way from here, so none can name another.
 fn open_history() -> Result<LocalHistory> {
-    Ok(LocalHistory::open_default()?.reached_by(HistoryWay::TERMINAL))
+    let way = match std::env::var(crate::history::HISTORY_WAY_ENV) {
+        Ok(word) if !word.is_empty() => HistoryWay::new(&word).map_err(|e| match e {
+            Error::HistoryWay { way, detail } => Error::HistoryWay {
+                way,
+                detail: format!("{} is set to it; {detail}", crate::history::HISTORY_WAY_ENV),
+            },
+            other => other,
+        })?,
+        _ => HistoryWay::TERMINAL,
+    };
+    Ok(LocalHistory::open_default()?.reached_by(way))
 }
 
 /// Dispatch CLI commands.
@@ -1363,7 +1374,7 @@ fn dispatch_panel(cmd: PanelCmd, out: &mut impl Write) -> Result<()> {
     match cmd {
         PanelCmd::Check { dir } => {
             let mut found = 0;
-            for (panel, findings) in crate::panel_check::check_panels(&dir)? {
+            for (panel, findings) in crate::panel_check::check_panels(&dir)?.1 {
                 for finding in &findings {
                     writeln!(out, "{}: {finding}", panel.display())?;
                 }

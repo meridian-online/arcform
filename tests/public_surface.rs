@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 
 /// Every type, constant and function `arcform::spec` re-exports, and the module that
 /// owns it. An `impl` on any of these names may only appear in its owning file.
-const EXPORTED: [(&str, &str); 35] = [
+const EXPORTED: [(&str, &str); 46] = [
     ("Manifest", "manifest.rs"),
     ("Step", "manifest.rs"),
     ("Param", "manifest.rs"),
@@ -90,15 +90,30 @@ const EXPORTED: [(&str, &str); 35] = [
     // The log a protocol's folder holds, one line per version: its name, so
     // a caller that reads the log does not spell it a second time.
     ("LOG_FILENAME", "history.rs"),
+    ("LogLine", "history.rs"),
+    // The variable that names the way the command line records under.
+    ("HISTORY_WAY_ENV", "history.rs"),
     ("edit_spec_with_history", "history.rs"),
     ("record_step_with_history", "history.rs"),
+    // Reading a Protocol an agent wrote, with arc's own rules: the panel check,
+    // where its database is, what its newest run made, the run its report
+    // names, and its version log.
+    ("PanelFinding", "panel_check.rs"),
+    ("CheckedPanels", "panel_check.rs"),
+    ("check_panel", "panel_check.rs"),
+    ("check_panels", "panel_check.rs"),
+    ("RunTables", "protocol_read.rs"),
+    ("protocol_db_path", "protocol_read.rs"),
+    ("run_tables", "protocol_read.rs"),
+    ("report_run", "protocol_read.rs"),
+    ("read_log", "protocol_read.rs"),
     ("Error", "error.rs"),
     ("Result", "error.rs"),
 ];
 
 /// Every module file in the crate. Frozen so a new one cannot be added without
 /// passing under the checks below.
-const MODULE_FILES: [&str; 39] = [
+const MODULE_FILES: [&str; 40] = [
     "asset.rs",
     "asset_kind.rs",
     "bridge.rs",
@@ -135,6 +150,8 @@ const MODULE_FILES: [&str; 39] = [
     "panel_check.rs",
     "precondition.rs",
     "protocol_files.rs",
+    // What an application reads from a Protocol it did not write.
+    "protocol_read.rs",
     "record.rs",
     "registry/cache.rs",
     "registry/index.rs",
@@ -168,7 +185,7 @@ const MODULE_FILES: [&str; 39] = [
 /// `src/spec.rs`: editing an existing spec goes through the write path, which splices
 /// original bytes and never re-serialises. This freeze keeps any change to that
 /// arrangement a deliberate, version-visible act instead of a silent drift.
-const FROZEN_DERIVES: [(&str, &str, &[&str]); 20] = [
+const FROZEN_DERIVES: [(&str, &str, &[&str]); 23] = [
     (
         "manifest.rs",
         "Param",
@@ -270,6 +287,21 @@ const FROZEN_DERIVES: [(&str, &str, &[&str]); 20] = [
         &["Debug", "Clone", "PartialEq", "Eq"],
     ),
     ("history.rs", "LocalHistory", &["Debug", "Clone"]),
+    (
+        "history.rs",
+        "LogLine",
+        &["Debug", "Clone", "PartialEq", "Eq"],
+    ),
+    (
+        "panel_check.rs",
+        "PanelFinding",
+        &["Debug", "Clone", "PartialEq", "Eq"],
+    ),
+    (
+        "protocol_read.rs",
+        "RunTables",
+        &["Debug", "Clone", "PartialEq", "Eq"],
+    ),
     ("error.rs", "Error", &["Debug", "thiserror::Error"]),
 ];
 
@@ -986,10 +1018,13 @@ fn exported_modules_declare_only_contracted_items() {
             "AssetOverride",
             "MANIFEST_FILENAME",
             // Re-exported entry points. Everything else on these types —
-            // `new_project`, `db_path`, `has_sql_steps`, `Step::new`, `Step::is_sql` —
+            // `new_project`, `has_sql_steps`, `Step::new`, `Step::is_sql` —
             // is `pub(crate)` on purpose: authoring and execution are not the contract.
             "load",
             "from_yaml_str",
+            // Where the Protocol's database is, so an application that opens one
+            // asks arc rather than spelling the rule a second time.
+            "db_path",
         ]),
         "a `pub` item in `manifest.rs` is public API once its type is re-exported; \
          use `pub(crate)` unless you mean to promise it"
@@ -1049,6 +1084,8 @@ fn exported_modules_declare_only_contracted_items() {
             "HISTORY_MAX_ENTRIES",
             "HISTORY_MERGE_WINDOW",
             "LOG_FILENAME",
+            "LogLine",
+            "HISTORY_WAY_ENV",
             // The way: arc's two words, the one constructor a caller's own
             // word passes through — which refuses what cannot be stored, and
             // arc's own words spelt by a caller — and the word to print.
@@ -1103,6 +1140,33 @@ fn exported_modules_declare_only_contracted_items() {
     );
 
     assert_eq!(
+        pub_items(&src("panel_check.rs")),
+        frozen(&[
+            // Re-exported types and entry points.
+            "PanelFinding",
+            "CheckedPanels",
+            "check_panel",
+            "check_panels",
+        ]),
+        "a `pub` item in `panel_check.rs` is public API once its types are re-exported; \
+         use `pub(crate)` unless you mean to promise it"
+    );
+
+    assert_eq!(
+        pub_items(&src("protocol_read.rs")),
+        frozen(&[
+            // Re-exported type and entry points.
+            "RunTables",
+            "protocol_db_path",
+            "run_tables",
+            "report_run",
+            "read_log",
+        ]),
+        "a `pub` item in `protocol_read.rs` is public API once its types are re-exported; \
+         use `pub(crate)` unless you mean to promise it"
+    );
+
+    assert_eq!(
         pub_items(&src("record.rs")),
         frozen(&[
             // Re-exported types and the ownership marker.
@@ -1132,6 +1196,8 @@ fn the_schema_types_derive_exactly_what_is_recorded() {
         "edit.rs",
         "record.rs",
         "history.rs",
+        "panel_check.rs",
+        "protocol_read.rs",
         "error.rs",
     ] {
         let found = pub_type_derives(&src(owner));

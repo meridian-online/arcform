@@ -11,15 +11,19 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::contract::{Contract, runs_dir};
-use crate::error::{Error, Result};
+use crate::contract::{Contract, load_contract};
+use crate::error::Result;
 use crate::history::LocalHistory;
 use crate::manifest::{MANIFEST_FILENAME, Manifest};
-use crate::panel_check::{CheckedPanels, check_panels_from};
+use crate::panel_check::{CheckedPanels, check_panels};
 use crate::protocol_files::replace_file_with_history;
 
 /// The report's place in the Protocol's folder.
 pub(crate) const REPORT_FILENAME: &str = "report.md";
+
+/// What the report's Run section's first line starts with, before the run id in
+/// backticks.
+pub(crate) const RUN_LINE_PREFIX: &str = "- Run: ";
 
 /// Write `report.md` in the Protocol folder `dir`: `prose`, then the three
 /// sections arc generates from the run contract, and record the file in its
@@ -57,7 +61,7 @@ pub(crate) fn write_report(
         ),
         Err(e) => (Default::default(), Some(e.to_string())),
     };
-    let panels = check_panels_from(dir).map_err(|e| e.to_string());
+    let panels = check_panels(dir).map_err(|e| e.to_string());
 
     let mut text = String::from(prose.trim_end());
     text.push_str("\n\n");
@@ -79,55 +83,6 @@ pub(crate) fn write_report(
     }
     replace_file_with_history(&path, &text, history)?;
     Ok(PathBuf::from(REPORT_FILENAME))
-}
-
-/// The contract of the run `run_id` names, or of the newest run.
-fn load_contract(dir: &Path, run_id: Option<&str>) -> Result<Contract> {
-    let refuse = crate::record::refused;
-    let runs = runs_dir(dir);
-    let path = match run_id {
-        Some(id) => {
-            let named = Path::new(id).components().count() == 1
-                && !id.contains(['/', '\\'])
-                && id != "."
-                && id != "..";
-            let path = runs.join(format!("{id}.json"));
-            if !named || !path.is_file() {
-                return Err(refuse(format!(
-                    "there is no run {id} in {}; leave the run out for the newest",
-                    runs.display()
-                )));
-            }
-            path
-        }
-        None => newest_contract(&runs).ok_or_else(|| {
-            refuse(format!(
-                "{} has not run yet: run the Protocol first (arc run, or protocol_run) \
-                 so the report can say how the answer was derived",
-                dir.display()
-            ))
-        })?,
-    };
-    let json = fs::read_to_string(&path).map_err(|e| Error::FileRead {
-        path: path.clone(),
-        source: e,
-    })?;
-    serde_json::from_str(&json).map_err(|e| {
-        refuse(format!(
-            "the run contract {} is unreadable: {e}",
-            path.display()
-        ))
-    })
-}
-
-/// The contract with the greatest run id. Ids begin with a sortable UTC timestamp,
-/// so this is the newest run, wherever the files were copied or restored from.
-fn newest_contract(runs: &Path) -> Option<PathBuf> {
-    fs::read_dir(runs)
-        .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "json"))
-        .max()
 }
 
 /// `text` on one line, so it cannot break a list item.
@@ -225,7 +180,7 @@ fn charts(text: &mut String, dir: &Path, panels: &std::result::Result<CheckedPan
 fn run_section(text: &mut String, contract: &Contract) {
     let run = &contract.run;
     text.push_str("## Run\n\n");
-    let _ = writeln!(text, "- Run: `{}`", run.run_id);
+    let _ = writeln!(text, "{RUN_LINE_PREFIX}`{}`", run.run_id);
     let _ = writeln!(
         text,
         "- Finished: {}",
