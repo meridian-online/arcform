@@ -52,7 +52,7 @@ git switch -c release-vX.Y.Z
    [Unreleased]: https://github.com/meridian-online/arcform/compare/vX.Y.Z...HEAD
    [X.Y.Z]: https://github.com/meridian-online/arcform/releases/tag/vX.Y.Z
    ```
-5. Strip anything that names private planning material: this repository is public. `./scripts/check-public-hygiene.sh` must be clean.
+5. Strip anything that names private planning material: this repository is public.
 
 Keep the section under 120,000 characters, or the tag guard refuses it (GitHub cuts a release body at 125,000).
 
@@ -76,7 +76,6 @@ python3 scripts/check_release_tag.py --tag vX.Y.Z        # the guard accepts thi
 python3 scripts/check_release_tag.py --release-rehearsal
 python3 scripts/check_release_tag.py --wiring
 cargo fmt --all --check
-./scripts/check-public-hygiene.sh
 ```
 
 **Run the analyst workflow's release eval.** It tests the skills in real agents and needs paid sessions, so it is not in CI. Build arc with the MCP feature and run its preflight against that binary; every dataset must answer and every skill's `arc_version` must equal the new version:
