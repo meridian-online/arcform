@@ -25,7 +25,7 @@ The eval runs in at least two agents with a shell, so that a result is not one a
 | `tasks.yaml` | Ten analyst tasks on public datasets: four quick looks, four analyses and two projects, each with the prompt to paste, the dataset's licence and notes for the evaluator |
 | `preflight.sh` | Checks every dataset URL still answers and that arc matches its skills' version, before any paid session starts |
 | `score.md` | The scoring sheet: one row per task and agent, the failure clusters, and the pass bar |
-| `dry-run.md` | The runbook's first run: one quick task in Claude Code, scored, with the failure cluster it found |
+| `dry-run.md` | Runs made before any release, in the order they ran: the runbook's first run of one quick task in Claude Code and two reruns of it after skill edits, then an unattended run of all ten tasks and two reruns of the four quick looks, scored, with the failure clusters they found |
 | `description-candidates.md` | Alternative descriptions for the entry skill, for when the eval shows agents not choosing arc |
 
 ## The agents
@@ -61,7 +61,7 @@ Nothing else may tell the agent about arc. Each task runs in a new, empty folder
 
 ## 3. Run a task
 
-Start a fresh session per task, in the task's empty folder, and paste the task's `prompt` verbatim. Then play the analyst, the same way in every agent:
+Start a fresh session per task, in the task's empty folder, and paste the task's `prompt` verbatim, adding nothing to it: a note that you will be away, or a request for a report, changes the size the agent picks and the checkpoints it keeps, which are what the eval scores. Then play the analyst, the same way in every agent:
 
 - **At the plan playback** (an analysis or a project), give the refinement in the task's `notes`, in your own words. Agree to everything else as it stands.
 - **At any other checkpoint**, agree and let it go on, unless the agent is about to answer a different question from the one asked; then restate the question once.

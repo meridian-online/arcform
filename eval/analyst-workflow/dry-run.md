@@ -1,6 +1,6 @@
-# Dry run of the runbook (arc 0.2.0, 2026-10-16)
+# Dry runs of the runbook (arc 0.2.0)
 
-The runbook's first run, before any release: one quick task in one agent, to test the instructions rather than the skills. It is not a release result, and it is kept apart from `score.md` so that copies of the sheet start empty.
+Runs made before any release. The first, below (2026-10-16), is one quick task in one agent, to test the instructions rather than the skills; the later sections, each dated, rerun tasks in Claude Code to test skill edits. It is not a release result, and it is kept apart from `score.md` so that copies of the sheet start empty.
 
 `quick-penguins` in Claude Code (headless, `claude -p` with the prompt verbatim; the skills installed in the task folder's `.claude/skills` beside the user's own skills; only `arc mcp` connected). Ten turns, 26 seconds. Result: **fail** (outcomes 4, 6 and 7).
 
@@ -48,3 +48,55 @@ Same setup as above, arc rebuilt with the MCP feature, preflight passed and the 
 - 7. Visual: not confirmed until the panel is opened in Brightfield. `panels/mass_by_species.yaml` is a bar chart of the averages, `arc panel check` came back clean, and it said "open `penguin-mass/` in Brightfield".
 
 The release run should open the panel in Brightfield to settle outcome 7, and check whether outcomes 4 and 6 still fail. If outcome 6 still fails, `presenting-findings` should ask for the next step to be offered outright. If outcome 4 still fails, the next edit goes in `scoping-an-analysis`'s rule rather than its example: on a quick look the override offer is part of the sentence that gives the size, and leaving it out is the trap.
+
+## The ten tasks, unattended, and the quick looks rerun (arc 0.2.0, 2026-10-17)
+
+All ten tasks ran headless in Claude Code, scored for outcomes 4 and 6 only. Each prompt carried a line the runbook does not allow: "I won't be around to answer questions, so go ahead without checking back, make your own sensible calls, chart what helps, and write me a report at the end." That line made every quick look a project, because a report was asked for, and told every agent not to wait, so outcome 4 could not be judged fairly. The runbook now says to add nothing to a prompt.
+
+| Task | 4. Say | 6. Answer |
+| --- | --- | --- |
+| quick-penguins | n | n |
+| quick-bad-drivers | n | y |
+| quick-earthquakes-month | n | n |
+| quick-global-temperature | n | y |
+| analysis-co2-per-capita | n | n |
+| analysis-brisbane-weather | n | n |
+| analysis-green-taxi-tips | n | y |
+| analysis-us-unemployment | n | y |
+| project-airport-trips | n | y |
+| project-seismic-2023 | n | n |
+
+- 4. Say: no run offered the size for override. Seven said the size and that they would not wait ("I treated this as a project with a written report, because you asked for one. I didn't wait for you to approve the plan.", quick-bad-drivers); three played nothing back.
+- 6. Answer: half offered a next step outright ("Worth doing next: Add more months to see whether the evening peak and the Bronx gap hold across the year", analysis-green-taxi-tips). The other half ended at opening, re-running or sharing the Protocol ("you can open it in Brightfield to see the charts and each step, re-run it, or share it", analysis-co2-per-capita).
+
+**Rerun 1**, the four quick looks with the prompts verbatim, after `presenting-findings` was edited to ask for at least one next step offered outright. All four were sized as quick looks.
+
+| Task | Skills loaded | 4. Say | 6. Answer |
+| --- | --- | --- | --- |
+| quick-penguins | `using-arcform`, `scoping-an-analysis` | n | n |
+| quick-bad-drivers | all but `building-and-checking-a-protocol` | n | y |
+| quick-earthquakes-month | `using-arcform`, `scoping-an-analysis`, `presenting-findings` | n | y |
+| quick-global-temperature | all but `building-and-checking-a-protocol` | n | y |
+
+- 4. Say: three gave the size and the plan without the offer ("Quick look: one mean per species answers this. I'll download the CSV into a new Protocol, average `body_mass_g` by species, and give you the gap.", quick-penguins); quick-global-temperature played nothing back.
+- 6. Answer: every run that loaded `presenting-findings` offered a next step ("A possible next step is to compare each record against the trend line", quick-global-temperature). quick-penguins never loaded it and offered none.
+
+**Rerun 2**, after `scoping-an-analysis`'s rule for a quick look was edited to end the size's message with the offer to override it.
+
+| Task | Skills loaded | 4. Say | 6. Answer |
+| --- | --- | --- | --- |
+| quick-penguins | `using-arcform` only | n | n |
+| quick-bad-drivers | all five | n | y |
+| quick-earthquakes-month | all but `building-and-checking-a-protocol` | n | y |
+| quick-global-temperature | `using-arcform`, `presenting-findings` | n | y |
+
+- 4. Say: still no offer. quick-penguins and quick-global-temperature never loaded `scoping-an-analysis` ("This is a quick look: one aggregate answers it. The run will fetch the CSV from GitHub."); quick-bad-drivers and quick-earthquakes-month loaded it and played nothing back before building.
+- 6. Answer: again every run that loaded `presenting-findings` offered a next step ("Next step. Panama has few M7+ events, so an M7.7 there probably set off aftershocks. Counting the feed's events within about 200 km of the main shock would show whether they account for much of the 620.", quick-earthquakes-month), and quick-penguins, which did not, offered none.
+
+| Cluster | Runs | Smallest skill edit | Rerun |
+| --- | --- | --- | --- |
+| The answer ends without a next step beyond opening, re-running or sharing the Protocol | Five of the ten unattended runs | In `presenting-findings`, ask for at least one next step offered outright, and say opening, re-running or sharing the Protocol is not one | Made; in both reruns every run that loaded the skill offered one (six of six) |
+| A quick look skips `scoping-an-analysis` or `presenting-findings`, despite `using-arcform` saying both are loaded | quick-penguins in both reruns, quick-global-temperature in rerun 2 | Not yet found: the sentence in `using-arcform` is already there, and quick-penguins skipped more skills in rerun 2 than rerun 1 | — |
+| The quick look's size is never offered for override, and often no plan is played back at all | All four quick looks in both reruns | Made: the offer moved from `scoping-an-analysis`'s example into its rule and its trap row | No change; none of the eight runs offered it, including the two that loaded the skill after the edit |
+
+Outcome 4 for a quick look is not fixed by wording in `scoping-an-analysis`. In rerun 1 all four loaded it and three played back the size and plan, but without the offer; in rerun 2 two never loaded it, and the two that did played nothing back. The next thing to try is in `using-arcform`, which every run loads: put the playback sentence, with its override offer, in that skill's own steps for a quick look, so it does not depend on a second skill being loaded. The analyses and projects still need the interactive runs the runbook prescribes before their outcome 4 can be scored.

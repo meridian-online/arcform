@@ -73,7 +73,7 @@ Say it in the chat, in this order, before anything else:
 1. **The answer**, in one sentence, with its number and its unit, in the user's words.
 2. **How it was derived**, in a line or two: the tables it reads and the steps that matter (a filter that dropped rows, a join). The detail is in the Protocol.
 3. **The caveats from profiling** that bear on it: rows dropped and how many, columns that failed validation, a source that covers only part of the period. Say what each does to the answer.
-4. **What else was found**, and **the next steps**: the question the answer raises, the data that would settle a caveat.
+4. **What else was found**, and **the next steps**: the question the answer raises, the data that would settle a caveat. Offer at least one outright, as something the user could do next and what it would tell them; opening, re-running or sharing the Protocol is not a next step.
 
 Every size stops for the user here; for a quick look it is the only checkpoint. A quick look skips the report, but still gets a panel when a chart helps, the pointer to Brightfield and the handover of the folder.
 

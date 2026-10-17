@@ -27,7 +27,7 @@ Say the size in one line with its reason, and let the user override it: "This is
 
 | Size | Checkpoints | Requirements | Ends with |
 | --- | --- | --- | --- |
-| A quick look | One, at the end | The restated question is enough | The answer and the Protocol that reached it |
+| A quick look | One, at the end | The restated question is enough | The answer, a next step and the Protocol that reached it |
 | An analysis | After scope (the plan), after profile (the quality findings), at a change of grain while building, and at present | Played back, not written | The answer, its caveats and next steps |
 | A project | At every stage | Written into `README.md` and agreed | A report, as well as the answer |
 
@@ -35,7 +35,7 @@ Say the size in one line with its reason, and let the user override it: "This is
 
 Before anything is built, tell the user three things: the data source (the file, URL or table, and how it gets in), the stages you will run, and what they will get. Keep it to a few lines.
 
-- **A quick look:** state the plan in the same message as the size and carry on; the checkpoint is at the end.
+- **A quick look:** state the plan in the same message as the size, end that message with the offer to override it ("Say if you want more than that."), and carry on; the checkpoint is at the end. The offer is what gives the user a say in a quick look, so leaving it out is the trap.
 - **An analysis:** wait for the user to agree or redirect.
 - **A project:** the plan becomes the requirements (step 4); wait for agreement on those.
 
@@ -92,7 +92,7 @@ wrote README.md as a readme in monthly-sales
 
 | Error or symptom | Fix |
 | --- | --- |
-| You are about to write a README, or wait for agreement, on a one-number question | It is a quick look. Say the size and the plan in one message and carry on |
+| You are about to write a README, or wait for agreement, on a one-number question | It is a quick look. Say the size, the plan and the offer to override the size in one message and carry on |
 | You sized the work up because the data looked messy | Size by the question, not the data. Profiling deals with the mess |
 | `a spec already exists at <dir>/arcform.yaml` | A Protocol is already there. Use it, or create the new one in its own folder |
 | `<dir> holds no arcform.yaml; make the Protocol first` | Create the Protocol before writing its README |
