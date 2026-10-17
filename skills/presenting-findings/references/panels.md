@@ -158,7 +158,7 @@ Brightfield colours categories from an eight-colour palette, ordered so that nei
 
 ### Highlight one to three series and grey the rest
 
-Colour the series by its column as usual, then write the colours yourself: `colorDomain` lists every series, the ones the answer is about first, and `colorRange` gives each a colour, in the same order. The focus series take the palette's first colours (`#0083c4` blue, then `#d4572a` orange) and every other series takes the same grey (`#c8c8c8`). Keep the legend: it lists the focus series first, in colour, and the greys after them. Put the finding in the `title`, so the reader knows why those lines are coloured.
+Colour the series by its column as usual, then write the colours yourself: `colorDomain` lists every series, the ones the answer is about first, and `colorRange` gives each a colour, in the same order. The focus series take the palette's first colours, in its order (`#0083c4` blue, `#cca124` gold, `#31aa8c` teal), and every other series takes the same grey (`#c8c8c8`). Keep the legend: it lists the focus series first, in colour, and the greys after them. Put the finding in the `title`, so the reader knows why those lines are coloured.
 
 Here a step has loaded a year of monthly revenue for twelve stores, and the answer is that Leeds grew fastest and Hull shrank:
 
@@ -174,7 +174,7 @@ plot:
     stroke: store
   - legend: color
 colorDomain: [Leeds, Hull, Aberdeen, Bristol, Cardiff, Derby, Exeter, Glasgow, Norwich, Oxford, Swansea, York]
-colorRange: ["#0083c4", "#d4572a", "#c8c8c8", "#c8c8c8", "#c8c8c8", "#c8c8c8", "#c8c8c8", "#c8c8c8", "#c8c8c8", "#c8c8c8", "#c8c8c8", "#c8c8c8"]
+colorRange: ["#0083c4", "#cca124", "#c8c8c8", "#c8c8c8", "#c8c8c8", "#c8c8c8", "#c8c8c8", "#c8c8c8", "#c8c8c8", "#c8c8c8", "#c8c8c8", "#c8c8c8"]
 xLabel: month
 yLabel: revenue
 YAML
