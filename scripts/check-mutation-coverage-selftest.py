@@ -4,9 +4,8 @@
 A gate that cannot fail is green against working code and green against broken
 code, and the two runs are indistinguishable — so the only evidence that a gate
 works is watching it go red on purpose.  This is that evidence, checked in and run
-by CI BEFORE the gate itself, for the same reason the public-hygiene workflow
-runs its self-test first: a checker fails silently in both directions, and "the
-tree is clean" means nothing until "the checker still bites" is established.
+by CI BEFORE the gate itself: a checker fails silently in both directions, and
+"the tree is clean" means nothing until "the checker still bites" is established.
 
 Two layers, because the failure modes are different.
 
