@@ -334,6 +334,16 @@ pub fn runs_dir(dir: &Path) -> PathBuf {
     dir.join("build").join(".arcform").join("runs")
 }
 
+/// The contract with the greatest run id. Ids begin with a sortable UTC timestamp,
+/// so this is the newest run, wherever the files were copied or restored from.
+pub(crate) fn newest_contract(runs: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(runs)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "json"))
+        .max()
+}
+
 /// How a single step fared, captured by the run loop for the contract.
 #[derive(Debug, Clone)]
 pub struct StepOutcome {

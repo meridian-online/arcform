@@ -256,6 +256,12 @@ pub const HISTORY_MERGE_WINDOW: Duration = Duration::from_secs(10);
 /// projects name, so `git add` does not pass over it.
 pub const LOG_FILENAME: &str = "arcform-log.txt";
 
+/// Names the way a caller that runs `arc` as a child process reached it, so the
+/// versions the command line writes carry that word instead of `terminal`. Unset
+/// or empty, the command line names itself; set to one of arc's own words, or to a
+/// word [`HistoryWay::new`] refuses, the command is refused.
+pub const HISTORY_WAY_ENV: &str = "ARCFORM_HISTORY_WAY";
+
 /// Overrides the store root; without it the root is `~/.arcform/history`.
 const HISTORY_DIR_ENV: &str = "ARCFORM_HISTORY_DIR";
 
@@ -1379,6 +1385,65 @@ fn logged_versions(log: &Path, name: &str) -> Vec<((u64, u32), String)> {
     found.sort();
     found.dedup();
     found
+}
+
+/// One line of a protocol's [`LOG_FILENAME`], as [`parse_log_line`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogLine {
+    /// When the version was recorded, as the line writes it (RFC 3339).
+    pub at: String,
+    /// The file the version is of, as a path inside the protocol's folder.
+    pub file: String,
+    /// The kind word of the entry, for example `save` or `checkpoint`.
+    pub kind: String,
+    /// The way arc was reached when the line was written; `None` for a line that
+    /// names none.
+    pub interface: Option<String>,
+    /// Who wrote the version, for a line that says; `None` otherwise.
+    pub author: Option<String>,
+    /// The version's id.
+    pub version: String,
+    /// Each step the version touched with how it changed, in the line's order.
+    pub steps: Vec<(String, String)>,
+}
+
+/// The line `text` as a [`LogLine`], or `None` when it is not one of the log's.
+/// A line's `step` and `change` pair and its `steps` list both come back as `steps`.
+pub(crate) fn parse_log_line(text: &str) -> Option<LogLine> {
+    /// A step and how it changed.
+    #[derive(serde::Deserialize)]
+    struct Pair {
+        step: String,
+        change: String,
+    }
+    /// The keys a line may hold.
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        at: String,
+        file: String,
+        kind: String,
+        interface: Option<String>,
+        author: Option<String>,
+        version: String,
+        step: Option<String>,
+        change: Option<String>,
+        steps: Option<Vec<Pair>>,
+    }
+    let raw: Raw = serde_json::from_str(text).ok()?;
+    let mut steps = Vec::new();
+    if let (Some(step), Some(change)) = (raw.step, raw.change) {
+        steps.push((step, change));
+    }
+    steps.extend(raw.steps.into_iter().flatten().map(|p| (p.step, p.change)));
+    Some(LogLine {
+        at: raw.at,
+        file: raw.file,
+        kind: raw.kind,
+        interface: raw.interface,
+        author: raw.author,
+        version: raw.version,
+        steps,
+    })
 }
 
 /// The log's line for `entry`, a version of the file named `name` inside its

@@ -56,6 +56,7 @@ mod operator;
 mod panel_check;
 mod precondition;
 mod protocol_files;
+mod protocol_read;
 mod record;
 mod registry;
 mod report;

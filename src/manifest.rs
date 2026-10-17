@@ -303,7 +303,7 @@ impl Manifest {
     /// under a key made from the directory's canonical path (see [`crate::working_db`]).
     /// Refused when the directory cannot be canonicalised or the data folder cannot be
     /// resolved. It reads the filesystem and writes nothing.
-    pub(crate) fn db_path(&self, manifest_dir: &Path) -> Result<PathBuf> {
+    pub fn db_path(&self, manifest_dir: &Path) -> Result<PathBuf> {
         match &self.db {
             Some(db) => Ok(manifest_dir.join(db)),
             None => crate::working_db::locate(&self.name, manifest_dir).map(|db| db.path),

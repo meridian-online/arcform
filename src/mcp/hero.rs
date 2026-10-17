@@ -944,7 +944,9 @@ fn table_describe_schema() -> Value {
 /// panel check` prints it. A panel with findings is a result, not an error.
 fn panel_check(args: &Value) -> ToolResult {
     let dir = dir_arg(args)?;
-    let checked = crate::panel_check::check_panels(&dir).map_err(|e| e.to_string())?;
+    let checked = crate::panel_check::check_panels(&dir)
+        .map_err(|e| e.to_string())?
+        .1;
     let panels: Vec<Value> = checked
         .iter()
         .map(|(panel, findings)| {

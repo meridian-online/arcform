@@ -111,6 +111,19 @@
 //!   as constants a surface can print beside the entries it governs
 //! - [`LOG_FILENAME`] — the log in a protocol's folder that names each version
 //!   the store records of a file there, one line each, with no contents
+//! - [`LogLine`] — one such line as a value, and [`HISTORY_WAY_ENV`], the variable
+//!   that names the way the `arc` command line records under when a caller runs it
+//!
+//! Reading a Protocol written by someone else (the `protocol_read` module's docs
+//! carry the detail; each call reads the filesystem and writes nothing):
+//!
+//! - [`protocol_db_path`] — where the Protocol's database is, by arc's own rule
+//! - [`check_panels`], [`check_panel`], [`PanelFinding`], [`CheckedPanels`] — what a
+//!   panel names that the Protocol does not make
+//! - [`run_tables`], [`RunTables`] — the tables of a run, with their content hashes,
+//!   from the run's contract
+//! - [`report_run`] — the run `report.md` names
+//! - [`read_log`] — the lines of the log, in file order
 //!
 //! Exported error types:
 //!
@@ -122,9 +135,11 @@
 //! # What is deliberately not here
 //!
 //! Execution. There is no way through this surface to run a pipeline, open a DuckDB
-//! connection, resolve a database path, introspect SQL, evaluate a precondition,
-//! build an asset graph, reach the operator catalog, read the run contract, or touch
-//! the registry. Those are the engine's business and they move; the spec does not.
+//! connection, introspect SQL, evaluate a precondition, build an asset graph, reach
+//! the operator catalog, or touch the registry. Of the database and the run contract
+//! it gives the database's path and the tables a run made with their hashes, and
+//! reads neither further. Those are the engine's business and they move; the spec
+//! does not.
 //!
 //! The crate root carries one further item, `cli_main`, the `arc` binary's entry
 //! point. It is `#[doc(hidden)]` and gated behind the default `cli` feature, and it
@@ -188,19 +203,42 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! Reading a Protocol an agent wrote, with arc's own rules:
+//!
+//! ```no_run
+//! use arcform::spec::{Result, check_panels, protocol_db_path, report_run, run_tables};
+//!
+//! # fn main() -> Result<()> {
+//! let dir = std::path::Path::new("examples/almanac");
+//! println!("database: {}", protocol_db_path(dir)?.display());
+//! let (_from_database, panels) = check_panels(dir)?;
+//! for (panel, findings) in panels {
+//!     println!("{}: {} findings", panel.display(), findings.len());
+//! }
+//! let newest = run_tables(dir, None)?;
+//! println!("{} made {} tables", newest.run_id, newest.tables.len());
+//! // The report is current when it names the newest run.
+//! println!("{}", report_run(dir)?.as_deref() == Some(newest.run_id.as_str()));
+//! # Ok(())
+//! # }
+//! ```
 
 pub use crate::edit::{
     PathPart, SpecEdit, ValidatedSpec, apply_edits, apply_yaml_edits, create_spec, edit_spec,
 };
 pub use crate::error::{Error, Result};
 pub use crate::history::{
-    HISTORY_MAX_ENTRIES, HISTORY_MERGE_WINDOW, HistoryEntry, HistoryKind, HistoryWay, LOG_FILENAME,
-    LocalHistory, edit_spec_with_history, record_step_with_history,
+    HISTORY_MAX_ENTRIES, HISTORY_MERGE_WINDOW, HISTORY_WAY_ENV, HistoryEntry, HistoryKind,
+    HistoryWay, LOG_FILENAME, LocalHistory, LogLine, edit_spec_with_history,
+    record_step_with_history,
 };
 pub use crate::manifest::{
     AssetOverride, Defaults, Hooks, MANIFEST_FILENAME, Manifest, Param, RetryPolicy, Step,
 };
+pub use crate::panel_check::{CheckedPanels, PanelFinding, check_panel, check_panels};
 pub use crate::precondition::{FreshConfig, ModifiedAfterConfig, Precondition, ToolConfig};
+pub use crate::protocol_read::{RunTables, protocol_db_path, read_log, report_run, run_tables};
 pub use crate::record::{
     GENERATED_MARKER, RecordedStep, amend_step_sql, record_step, sql_is_generated,
 };

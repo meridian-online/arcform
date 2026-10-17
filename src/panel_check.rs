@@ -218,16 +218,22 @@ const COLOUR_NAMES: [&str; 151] = [
 
 /// What a panel names that the Protocol does not make.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PanelFinding {
+pub enum PanelFinding {
+    /// A mark reads a table that is neither in the panel's own data nor made by the Protocol.
     MissingTable {
+        /// The table the mark names.
         from: String,
     },
+    /// A mark reads a column its table does not have.
     MissingColumn {
+        /// The table the mark reads.
         from: String,
+        /// The column it names.
         column: String,
     },
     /// The file is not YAML, or holds no `plot`: nothing in it could be checked.
     Unreadable {
+        /// Why nothing could be checked.
         reason: String,
     },
 }
@@ -454,24 +460,19 @@ fn check_file(path: &Path, catalogue: &Catalogue) -> Result<Vec<PanelFinding>> {
 
 /// What the panel at `panel` (a path under `dir`, or relative to it) names that the
 /// Protocol in `dir` does not make.
-pub(crate) fn check_panel(dir: &Path, panel: &Path) -> Result<Vec<PanelFinding>> {
+pub fn check_panel(dir: &Path, panel: &Path) -> Result<Vec<PanelFinding>> {
     let catalogue = Catalogue::load(dir)?;
     check_file(&dir.join(panel), &catalogue)
 }
 
-/// Every `panels/*.yaml` of the Protocol in `dir` with its findings, in name order.
-/// A Protocol with no `panels/` folder has none.
-pub(crate) fn check_panels(dir: &Path) -> Result<Vec<(PathBuf, Vec<PanelFinding>)>> {
-    check_panels_from(dir).map(|(_, panels)| panels)
-}
-
 /// Whether the tables came from the database, and each panel with its findings.
-pub(crate) type CheckedPanels = (bool, Vec<(PathBuf, Vec<PanelFinding>)>);
+pub type CheckedPanels = (bool, Vec<(PathBuf, Vec<PanelFinding>)>);
 
-/// [`check_panels`], and whether the tables were read from the Protocol's database
+/// Every `panels/*.yaml` of the Protocol in `dir` with its findings, in name order, and
+/// whether the tables were read from the Protocol's database
 /// (true) or taken from what its steps produce because it has none yet (false). With
 /// no `panels/` folder nothing is loaded and the answer is false.
-pub(crate) fn check_panels_from(dir: &Path) -> Result<CheckedPanels> {
+pub fn check_panels(dir: &Path) -> Result<CheckedPanels> {
     let folder = dir.join("panels");
     if !folder.is_dir() {
         return Ok((false, Vec::new()));
