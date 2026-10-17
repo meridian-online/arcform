@@ -1,6 +1,6 @@
-# Dry run of the runbook (arc 0.2.0, 2026-10-16)
+# Dry runs of the runbook (arc 0.2.0)
 
-Runs made before any release. The first, below, is one quick task in one agent, to test the instructions rather than the skills; the later sections run more tasks, in Claude Code only, to test skill edits. It is not a release result, and it is kept apart from `score.md` so that copies of the sheet start empty.
+Runs made before any release. The first, below, is one quick task in one agent, to test the instructions rather than the skills; the later sections, each dated, rerun tasks in Claude Code to test skill edits. It is not a release result, and it is kept apart from `score.md` so that copies of the sheet start empty.
 
 `quick-penguins` in Claude Code (headless, `claude -p` with the prompt verbatim; the skills installed in the task folder's `.claude/skills` beside the user's own skills; only `arc mcp` connected). Ten turns, 26 seconds. Result: **fail** (outcomes 4, 6 and 7).
 
