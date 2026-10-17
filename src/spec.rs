@@ -120,8 +120,8 @@
 //! - [`protocol_db_path`] — where the Protocol's database is, by arc's own rule
 //! - [`check_panels`], [`check_panel`], [`PanelFinding`], [`CheckedPanels`] — what a
 //!   panel names that the Protocol does not make
-//! - [`run_tables`], [`RunTables`] — the tables of a run, with their content hashes,
-//!   from the run's contract
+//! - [`run_tables`], [`RunTables`] — the tables a run made, with their content hashes,
+//!   from the run's contract (sources it only read are not included)
 //! - [`report_run`] — the run `report.md` names
 //! - [`read_log`] — the lines of the log, in file order
 //!

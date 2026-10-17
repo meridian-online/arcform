@@ -1399,8 +1399,6 @@ pub struct LogLine {
     /// The way arc was reached when the line was written; `None` for a line that
     /// names none.
     pub interface: Option<String>,
-    /// Who wrote the version, for a line that says; `None` otherwise.
-    pub author: Option<String>,
     /// The version's id.
     pub version: String,
     /// Each step the version touched with how it changed, in the line's order.
@@ -1423,7 +1421,6 @@ pub(crate) fn parse_log_line(text: &str) -> Option<LogLine> {
         file: String,
         kind: String,
         interface: Option<String>,
-        author: Option<String>,
         version: String,
         step: Option<String>,
         change: Option<String>,
@@ -1440,7 +1437,6 @@ pub(crate) fn parse_log_line(text: &str) -> Option<LogLine> {
         file: raw.file,
         kind: raw.kind,
         interface: raw.interface,
-        author: raw.author,
         version: raw.version,
         steps,
     })

@@ -11,8 +11,8 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::contract::{Contract, newest_contract, runs_dir};
-use crate::error::{Error, Result};
+use crate::contract::{Contract, load_contract};
+use crate::error::Result;
 use crate::history::LocalHistory;
 use crate::manifest::{MANIFEST_FILENAME, Manifest};
 use crate::panel_check::{CheckedPanels, check_panels};
@@ -83,45 +83,6 @@ pub(crate) fn write_report(
     }
     replace_file_with_history(&path, &text, history)?;
     Ok(PathBuf::from(REPORT_FILENAME))
-}
-
-/// The contract of the run `run_id` names, or of the newest run.
-fn load_contract(dir: &Path, run_id: Option<&str>) -> Result<Contract> {
-    let refuse = crate::record::refused;
-    let runs = runs_dir(dir);
-    let path = match run_id {
-        Some(id) => {
-            let named = Path::new(id).components().count() == 1
-                && !id.contains(['/', '\\'])
-                && id != "."
-                && id != "..";
-            let path = runs.join(format!("{id}.json"));
-            if !named || !path.is_file() {
-                return Err(refuse(format!(
-                    "there is no run {id} in {}; leave the run out for the newest",
-                    runs.display()
-                )));
-            }
-            path
-        }
-        None => newest_contract(&runs).ok_or_else(|| {
-            refuse(format!(
-                "{} has not run yet: run the Protocol first (arc run, or protocol_run) \
-                 so the report can say how the answer was derived",
-                dir.display()
-            ))
-        })?,
-    };
-    let json = fs::read_to_string(&path).map_err(|e| Error::FileRead {
-        path: path.clone(),
-        source: e,
-    })?;
-    serde_json::from_str(&json).map_err(|e| {
-        refuse(format!(
-            "the run contract {} is unreadable: {e}",
-            path.display()
-        ))
-    })
 }
 
 /// `text` on one line, so it cannot break a list item.

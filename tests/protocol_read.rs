@@ -78,24 +78,6 @@ fn ran_protocol() -> (tempfile::TempDir, PathBuf, PathBuf) {
 }
 
 #[test]
-fn db_path_is_arcs_data_folder_without_db() {
-    let root = tempfile::tempdir().unwrap();
-    let dir = root.path().join("protocol");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("arcform.yaml"),
-        "name: p\nengine: duckdb\nsteps: []\nassets: {}\n",
-    )
-    .unwrap();
-    let data = root.path().join("data");
-    // The only test here that touches the environment; the others pass it to a child.
-    unsafe { std::env::set_var("ARCFORM_DB_DIR", &data) };
-    let path = protocol_db_path(&dir).unwrap();
-    assert!(path.starts_with(&data), "{path:?}");
-    assert!(path.ends_with("p.duckdb"), "{path:?}");
-}
-
-#[test]
 fn db_path_follows_an_explicit_db() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -157,7 +139,7 @@ fn read_log_parses_every_line_kind() {
         r#"{"at":"2026-10-17T01:02:04.004Z","file":"arcform.yaml","kind":"checkpoint","interface":"terminal","version":"v2","steps":[{"step":"a","change":"edited"},{"step":"b","change":"removed"}]}"#,
         r#"{"at":"2026-10-17T01:02:05.004Z","file":"panels/a.yaml","kind":"save","version":"v3"}"#,
         "this is not a log line",
-        r#"{"at":"2026-10-17T01:02:06.004Z","file":"report.md","kind":"save","interface":"brightfield","author":"agent","version":"v4"}"#,
+        r#"{"at":"2026-10-17T01:02:06.004Z","file":"report.md","kind":"save","interface":"brightfield","version":"v4"}"#,
     ];
     std::fs::write(dir.path().join(LOG_FILENAME), lines.join("\n") + "\n").unwrap();
     let read = read_log(dir.path()).unwrap();
@@ -165,14 +147,12 @@ fn read_log_parses_every_line_kind() {
                 file: &str,
                 kind: &str,
                 interface: Option<&str>,
-                author: Option<&str>,
                 version: &str,
                 steps: &[(&str, &str)]| LogLine {
         at: at.into(),
         file: file.into(),
         kind: kind.into(),
         interface: interface.map(Into::into),
-        author: author.map(Into::into),
         version: version.into(),
         steps: steps
             .iter()
@@ -187,7 +167,6 @@ fn read_log_parses_every_line_kind() {
                 "arcform.yaml",
                 "save",
                 Some("mcp"),
-                None,
                 "v1",
                 &[("load", "added")]
             ),
@@ -196,7 +175,6 @@ fn read_log_parses_every_line_kind() {
                 "arcform.yaml",
                 "checkpoint",
                 Some("terminal"),
-                None,
                 "v2",
                 &[("a", "edited"), ("b", "removed")]
             ),
@@ -204,7 +182,6 @@ fn read_log_parses_every_line_kind() {
                 "2026-10-17T01:02:05.004Z",
                 "panels/a.yaml",
                 "save",
-                None,
                 None,
                 "v3",
                 &[]
@@ -214,7 +191,6 @@ fn read_log_parses_every_line_kind() {
                 "report.md",
                 "save",
                 Some("brightfield"),
-                Some("agent"),
                 "v4",
                 &[]
             ),

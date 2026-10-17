@@ -344,6 +344,46 @@ pub(crate) fn newest_contract(runs: &Path) -> Option<PathBuf> {
         .max()
 }
 
+/// The contract of the run `run_id` names, or of the newest run, in the Protocol
+/// folder `dir`. Refused when the run has no contract, when the Protocol has not run,
+/// or when the contract cannot be read.
+pub(crate) fn load_contract(dir: &Path, run_id: Option<&str>) -> crate::error::Result<Contract> {
+    let refuse = crate::record::refused;
+    let runs = runs_dir(dir);
+    let path = match run_id {
+        Some(id) => {
+            let named = Path::new(id).components().count() == 1
+                && !id.contains(['/', '\\'])
+                && id != "."
+                && id != "..";
+            let path = runs.join(format!("{id}.json"));
+            if !named || !path.is_file() {
+                return Err(refuse(format!(
+                    "there is no run {id} in {}; leave the run out for the newest",
+                    runs.display()
+                )));
+            }
+            path
+        }
+        None => newest_contract(&runs).ok_or_else(|| {
+            refuse(format!(
+                "{} has not run yet: run the Protocol first (arc run, or protocol_run)",
+                dir.display()
+            ))
+        })?,
+    };
+    let json = std::fs::read_to_string(&path).map_err(|e| crate::error::Error::FileRead {
+        path: path.clone(),
+        source: e,
+    })?;
+    serde_json::from_str(&json).map_err(|e| {
+        refuse(format!(
+            "the run contract {} is unreadable: {e}",
+            path.display()
+        ))
+    })
+}
+
 /// How a single step fared, captured by the run loop for the contract.
 #[derive(Debug, Clone)]
 pub struct StepOutcome {

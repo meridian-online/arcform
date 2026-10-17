@@ -32,6 +32,19 @@ fn the_env_names_the_cli_interface() {
     );
     let log = std::fs::read_to_string(root.path().join("protocol/arcform-log.txt")).unwrap();
     assert!(log.contains(r#""interface":"brightfield""#), "{log}");
+    // What arc's writer wrote reads back through the exported reader.
+    let read = arcform::spec::read_log(&root.path().join("protocol")).unwrap();
+    assert!(!read.is_empty(), "{log}");
+    assert!(
+        read.iter()
+            .all(|l| l.interface.as_deref() == Some("brightfield")),
+        "{read:?}"
+    );
+    assert!(
+        read.iter()
+            .any(|l| l.steps == [("t".to_string(), "added".to_string())]),
+        "{read:?}"
+    );
 
     let (root, out) = record("");
     assert!(out.status.success());

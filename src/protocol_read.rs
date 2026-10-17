@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::contract::{Contract, newest_contract, runs_dir};
+use crate::contract::load_contract;
 use crate::error::{Error, Result};
 use crate::history::{LOG_FILENAME, LogLine, parse_log_line};
 use crate::manifest::Manifest;
@@ -20,48 +20,20 @@ pub fn protocol_db_path(dir: &Path) -> Result<PathBuf> {
     Manifest::load(dir)?.db_path(dir)
 }
 
-/// The tables a run made or read, each with the content hash its contract records.
+/// The tables a run made, each with the content hash its contract records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunTables {
     /// The run the tables are of.
     pub run_id: String,
-    /// Each table's name and its content hash, `None` when the run could not measure it.
+    /// Each table the run made, with its content hash, `None` when the run could not measure it.
     pub tables: BTreeMap<String, Option<String>>,
 }
 
 /// The tables of the run `run_id` names, or of the newest run when it is `None`, from
-/// the run's contract. A run with no contract, and a Protocol that has not run, are
+/// the run's contract. Sources the run only read are not included. A run with no contract, and a Protocol that has not run, are
 /// refused.
 pub fn run_tables(dir: &Path, run_id: Option<&str>) -> Result<RunTables> {
-    let runs = runs_dir(dir);
-    let path = match run_id {
-        Some(id) => {
-            let named = Path::new(id).components().count() == 1
-                && !id.contains(['/', '\\'])
-                && id != "."
-                && id != "..";
-            let path = runs.join(format!("{id}.json"));
-            if !named || !path.is_file() {
-                return Err(crate::record::refused(format!(
-                    "there is no run {id} in {}",
-                    runs.display()
-                )));
-            }
-            path
-        }
-        None => newest_contract(&runs)
-            .ok_or_else(|| crate::record::refused(format!("{} has not run yet", dir.display())))?,
-    };
-    let json = fs::read_to_string(&path).map_err(|e| Error::FileRead {
-        path: path.clone(),
-        source: e,
-    })?;
-    let contract: Contract = serde_json::from_str(&json).map_err(|e| {
-        crate::record::refused(format!(
-            "the run contract {} is unreadable: {e}",
-            path.display()
-        ))
-    })?;
+    let contract = load_contract(dir, run_id)?;
     let tables = contract
         .assets
         .into_iter()
