@@ -25,7 +25,7 @@ The eval runs in at least two agents with a shell, so that a result is not one a
 | `tasks.yaml` | Ten analyst tasks on public datasets: four quick looks, four analyses and two projects, each with the prompt to paste, the dataset's licence and notes for the evaluator |
 | `preflight.sh` | Checks every dataset URL still answers and that arc matches its skills' version, before any paid session starts |
 | `score.md` | The scoring sheet: one row per task and agent, the failure clusters, and the pass bar |
-| `dry-run.md` | Runs made before any release: the runbook's first run, one quick task in Claude Code, then an unattended run of all ten tasks and the reruns after each skill edit it led to, scored, with the failure clusters they found |
+| `dry-run.md` | Runs made before any release, in the order they ran: the runbook's first run of one quick task in Claude Code and two reruns of it after skill edits, then an unattended run of all ten tasks and two reruns of the four quick looks, scored, with the failure clusters they found |
 | `description-candidates.md` | Alternative descriptions for the entry skill, for when the eval shows agents not choosing arc |
 
 ## The agents
