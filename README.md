@@ -16,6 +16,14 @@ This installs a release build for macOS (Apple silicon and Intel) or Linux (x86_
 cargo install arcform --locked --features mcp,bundled-duckdb
 ```
 
+From a checkout of this repository, build the same binary into `target/release/arc`:
+
+```sh
+cargo build --release --locked --features mcp,bundled-duckdb
+```
+
+The `mcp` feature, which adds `arc mcp`, is off by default, and `bundled-duckdb` compiles DuckDB into `arc` so the build needs no DuckDB library; it takes tens of minutes from cold.
+
 What arc needs beside it:
 
 - the `duckdb` command on `PATH`, which runs a Protocol's SQL steps (v1.5.6 recommended; arc accepts `>=1.3, <2`);
@@ -145,7 +153,7 @@ Through these tools an agent can start a Protocol, look at its tables, query the
 
 ### Agent skills
 
-[`skills/`](skills/) holds five agent skills that teach an agent the analyst workflow through these tools: `using-arcform`, the entry point, then `scoping-an-analysis`, `profiling-and-typing-data`, `building-and-checking-a-protocol` and `presenting-findings`, one for each stage from agreeing the question to handing over the answer. Each shows every step both as an `arc` command and as the matching tool, and `cargo test --features mcp --test skills` checks what they name and runs their examples against this binary.
+[`skills/`](skills/) holds five agent skills that teach an agent the analyst workflow through these tools: `using-arcform`, the entry point, then `scoping-an-analysis`, `profiling-and-typing-data`, `building-and-checking-a-protocol` and `presenting-findings`, one for each stage from agreeing the question to handing over the answer. Each shows every step both as an `arc` command and as the matching tool, and `cargo test --features mcp --test skills` checks what they name and runs their examples against this binary. FineType's five tools (`infer`, `profile`, `taxonomy`, `validate`, `generate`) are taught in [`skills/profiling-and-typing-data/`](skills/profiling-and-typing-data/), whose [`references/what-finetype-teaches.md`](skills/profiling-and-typing-data/references/what-finetype-teaches.md) routes everything FineType's own agent skills teach through arc, so an agent working through arc does not need FineType's skills.
 
 The skills ship inside `arc`, at its version. Without a [plugin](#plugins), install them into each agent found on this machine:
 

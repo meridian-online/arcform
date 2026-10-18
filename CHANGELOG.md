@@ -28,6 +28,7 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Changed
 
+- **The `profiling-and-typing-data` skill now names all five FineType tools `arc mcp` serves, `generate` among them, and the README gives the command that builds `arc` with `arc mcp` from a checkout and says where FineType's tools are taught.** The skill's FineType reference listed `finetype generate` as a maintainer's command although `arc mcp` serves it as a tool, and did not say that the `profile` tool cannot give a Data Package. The README built `arc` only from crates.io.
 - **The `brewtrend` example fetches its six files with the `http_fetch` operator instead of `curl` command steps, and every step carries a description.** The fetches keep their URLs, output paths and 24-hour preconditions, and the example no longer needs `curl`.
 - **The library example in the README loads `examples/almanac` instead of `examples/brewtrend`.** brewtrend's `http_fetch` steps need the `http-fetch` feature, which `default-features = false` turns off, so the example could no longer load it.
 - **The `using-arcform` skill says a quick look still starts with `scoping-an-analysis` and ends with `presenting-findings`, loaded before the answer, and `scoping-an-analysis`'s quick-look example now offers the size for override.** An agent given a quick look loaded only `using-arcform` and skipped the plan playback, the offer to override the size, the next steps and the findings panel. Only profiling and building are cut short.
