@@ -27,6 +27,7 @@ arc draws no chart. You write each one as a Mosaic spec, and arc saves it to `pa
 
 - **One question per chart.** Chart the aggregated table the answer reads, not the raw one: then the number on the chart is the number in the table, and the report can show where it came from.
 - **Choose the kind from `references/panels.md`**: a distribution, two measures, a map, counts over time, a grid of two categories, or ranked bars. Brightfield builds and tests those six.
+- **Eight series at most in colour.** Brightfield's palette has eight colours and repeats them past eight. When a chart would have more, highlight the one to three series the answer is about and draw the rest in grey, fold the tail into `Other` in a step, or split the series across panels: `references/panels.md`, "Past eight series", says which and how.
 - **Give every panel a `title`** saying what it shows. The report lists each panel under it.
 - **Name the file for what it shows** (`panels/spend_by_category.yaml`), in lowercase with underscores.
 
@@ -130,6 +131,7 @@ End by telling the user the Protocol folder can be committed to git or shared as
 | A `title`, `xLabel` or `width` has no effect | It is indented under the last mark. Plot attributes are siblings of `plot`, at its indent |
 | Brightfield shows a banner saying an instruction had no effect | An interactor binds `as: $<name>` that `params` does not declare. Declare it, or drop the interactor |
 | A bar chart of dates comes out as the ten busiest days | It is ranked bars. Use `counts-over-time` from `references/panels.md`: no `sort`, no `limit` |
+| Brightfield notes on a panel that its colours repeat | The chart colours more than eight series. Highlight the ones the answer is about and grey the rest, fold the tail into `Other`, or split it: "Past eight series" in `references/panels.md` |
 | `has not run yet: run the Protocol first` from `report_write` | Run the Protocol, then write the report |
 | `the report has no prose` | Write the answer, its caveats and the next steps, and pass them as the prose |
 | The report's Charts section shows a `Check:` line | A panel names something the Protocol does not make. Fix it and write the report again |
