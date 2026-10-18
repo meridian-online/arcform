@@ -22,7 +22,7 @@ From a checkout of this repository, build the same binary into `target/release/a
 cargo build --release --locked --features mcp,bundled-duckdb
 ```
 
-The `mcp` feature, which adds `arc mcp`, is off by default, and `bundled-duckdb` compiles DuckDB into `arc` so the build needs no DuckDB library; it takes tens of minutes from cold.
+The `mcp` feature, which adds `arc mcp`, is off by default, and `bundled-duckdb` compiles DuckDB into `arc` so the build needs no DuckDB library.
 
 What arc needs beside it:
 
