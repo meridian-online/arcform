@@ -116,7 +116,7 @@ jq -r 'select(.type == "assistant") | .message.content[]
 
 ## 4. Open the panels in Brightfield
 
-For every session that wrote panels, open its Protocol folder in Brightfield and check each panel draws. arc checks a panel's table and column names; only Brightfield shows whether it can draw the chart. A panel that does not draw fails outcome 7.
+Use Brightfield v0.1.7 or later, the first release that opens an agent-written Protocol with its panels: install it with `brew install meridian-online/tap/brightfield` (or `brew upgrade brightfield`) and check `brightfield --version`. For every session that wrote panels, open its Protocol folder in Brightfield and check each panel draws. arc checks a panel's table and column names; only Brightfield shows whether it can draw the chart. A panel that does not draw fails outcome 7.
 
 ## 5. Score
 
