@@ -3,8 +3,9 @@
 
 arc loads extensions into the linked libduckdb in-process, and an extension
 loads only into the version it was built for. So CI's DuckDB, the version
-install.sh recommends and the versions vetted_extensions.json lists must all
-be the DuckDB that `libduckdb-sys` in Cargo.lock links.
+install.sh recommends must be the DuckDB that `libduckdb-sys` in Cargo.lock
+links, and each entry in vetted_extensions.json must list that version (it may
+list others too, as an extension can be vetted on two patches at once).
 
 libduckdb-sys encodes DuckDB's version in its own: 1.20000.0 is v2.0.0. The
 decoding follows duckdb-rs build_linked.rs, major = n / 10000,

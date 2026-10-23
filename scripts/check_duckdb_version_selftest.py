@@ -70,6 +70,8 @@ def main():
 
     code, out = run()
     check("agreeing files exit 0", code == 0, out)
+    code, out = run(vetted='v2.0.0", "v2.0.1')
+    check("a vetted entry listing v2.0.0 and v2.0.1 passes", code == 0, out)
     expect_fail("a workflow on v2.0.1 fails, naming ci.yml", "ci.yml", "v2.0.1", ci="v2.0.1")
     expect_fail("the parity workflow disagreeing fails", "parity.yml", "v1.5.6", parity="v1.5.6")
     expect_fail("install.sh disagreeing fails", "install.sh", "v1.5.6", install="v1.5.6")
