@@ -506,7 +506,7 @@ fn a_dev_build_of_another_commit_is_still_untested() {
 /// A project whose one step installs a vetted community extension, run on a fake engine
 /// printing `line`; returns stderr.
 fn community_install_stderr(line: &str) -> String {
-    let fx = Fixture::new(None, "INSTALL mlpack FROM community;\nSELECT 42;");
+    let fx = Fixture::new(None, "INSTALL zipfs FROM community;\nSELECT 42;");
     let empty = fx.dir("empty-path");
     let told = fx.fake_printing(&fx.dir("engine"), "told-duckdb", line);
     let (code, stderr) = arc_run(
