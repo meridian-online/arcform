@@ -19,9 +19,17 @@ use std::process::Command;
 
 const BIN_ENV: &str = "ARC_DUCKDB_BIN";
 const ALLOW_ENV: &str = "ARC_ALLOW_UNTESTED_ENGINE";
-const RANGE: &str = ">=1.3, <2";
-const OLDEST: &str = "1.3.0";
+const RANGE: &str = ">=2.0, <3";
+const OLDEST: &str = "2.0.0";
 const NAME: &str = "engine_contract";
+/// The command arc names for installing DuckDB's release build.
+const INSTALLER: &str = "curl https://install.duckdb.org | DUCKDB_VERSION=2.0.0 sh";
+/// What Homebrew's DuckDB 2.0.0, built without the autocomplete extension, says when it is
+/// asked for `sql_tokenize`.
+const NO_AUTOCOMPLETE: &str = "Extension Autoloading Error: An error occurred while trying to \
+    automatically install the required extension 'autocomplete': Failed to install local \
+    extension \"autocomplete\", no access to the file at PATH \
+    \"/tmp/build/repository/d54cbbe3df/osx_arm64/autocomplete.duckdb_extension\"";
 
 /// A project directory plus somewhere to put engines and PATH directories.
 struct Fixture {
@@ -80,19 +88,124 @@ impl Fixture {
 
     /// A fake engine at `<dir>/<name>` reporting `version`, logging to `<dir>/<name>.log`.
     fn fake(&self, dir: &Path, name: &str, version: &str) -> FakeEngine {
+        self.fake_printing(dir, name, &format!("v{version} (fake) 0000000000"))
+    }
+
+    /// A fake engine whose `--version` prints `line` exactly.
+    fn fake_printing(&self, dir: &Path, name: &str, line: &str) -> FakeEngine {
         let bin = dir.join(name);
         let log = dir.join(format!("{name}.log"));
         // Builtins only: several tests run arc with a PATH that holds nothing else.
         fs::write(
             &bin,
             format!(
-                "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$1\" = \"--version\" ]; then echo 'v{version} (fake) 0000000000'; fi\nexit 0\n",
+                "#!/bin/sh\n{}echo \"$*\" >> '{}'\nif [ \"$1\" = \"--version\" ]; then echo '{line}'; fi\nexit 0\n",
+                tokens_from_real_duckdb(),
                 log.display()
             ),
         )
         .unwrap();
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
         FakeEngine { bin, log }
+    }
+
+    /// A fake engine whose `--version` prints `line` and which, like a DuckDB built without
+    /// its autocomplete extension, fails every question arc asks it on standard input
+    /// (`-no-init`, as the token questions and the tokenizer probe are asked) with the error
+    /// such a build gives for `sql_tokenize`.
+    fn fake_without_tokenizer(&self, dir: &Path, name: &str, line: &str) -> FakeEngine {
+        let bin = dir.join(name);
+        let log = dir.join(format!("{name}.log"));
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$1\" = \"--version\" ]; then echo '{line}'; exit 0; fi\n\
+                 if [ \"$1\" = \"-no-init\" ]; then echo 'Error: {}' >&2; exit 1; fi\nexit 0\n",
+                log.display(),
+                NO_AUTOCOMPLETE.replace('\'', ""),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        FakeEngine { bin, log }
+    }
+
+    /// A fake engine whose `--version` prints `v<version> (fake) 0000000000` and whose
+    /// token answers, from [`real_duckdb`], name `v<version>` as the version that answered:
+    /// a DuckDB of that version, as far as arc's questions can tell.
+    fn fake_answering_as(&self, dir: &Path, name: &str, version: &str) -> FakeEngine {
+        let bin = dir.join(name);
+        let log = dir.join(format!("{name}.log"));
+        // Builtins only: several tests run arc with a PATH that holds nothing else.
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh
+if [ \"$1\" = \"-no-init\" ]; then
+  '{}' \"$@\" | while IFS= read -r line; do
+    \
+                 case \"$line\" in
+      arc-tokens:version:*) echo 'arc-tokens:version:v{version}' ;;
+      \
+                 *) printf '%s\\n' \"$line\" ;;
+    esac
+  done
+  exit 0
+fi
+\
+                 echo \"$*\" >> '{}'
+if [ \"$1\" = \"--version\" ]; then echo 'v{version} (fake) 0000000000'; fi
+exit 0
+",
+                real_duckdb().display(),
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        FakeEngine { bin, log }
+    }
+
+    /// A fake engine whose `--version` prints `line`, whose token answers come from
+    /// [`real_duckdb`], and which prints nothing for a question for trees (`-no-init -json`):
+    /// a DuckDB 2 that gives tokens and no trees.
+    fn fake_without_trees(&self, dir: &Path, name: &str, line: &str) -> FakeEngine {
+        let bin = dir.join(name);
+        let log = dir.join(format!("{name}.log"));
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh
+if [ \"$1\" = \"-no-init\" ] && [ \"$2\" = \"-json\" ]; then exit 0; fi
+{}\
+                 echo \"$*\" >> '{}'
+if [ \"$1\" = \"--version\" ]; then echo '{line}'; fi
+exit 0
+",
+                tokens_from_real_duckdb(),
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        FakeEngine { bin, log }
+    }
+
+    /// Every DuckDB database file under the data folder `arc_run` points the project at.
+    fn databases(&self) -> Vec<PathBuf> {
+        fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, found);
+                } else if path.extension().is_some_and(|e| e == "duckdb") {
+                    found.push(path);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(&self.root.path().join("db"), &mut found);
+        found
     }
 
     /// `(steps_executed, outcome)` of every row in the run record.
@@ -106,6 +219,16 @@ impl Fixture {
             .map(|r| r.unwrap())
             .collect()
     }
+}
+
+/// The line a fake engine opens with: it hands a question for a SQL file's tokens, which
+/// arc asks with `-no-init` first, to [`real_duckdb`] by its path, unlogged, so what the fake logs is
+/// still the calls a run makes of its own engine.
+fn tokens_from_real_duckdb() -> String {
+    format!(
+        "if [ \"$1\" = \"-no-init\" ]; then exec '{}' \"$@\"; fi\n",
+        real_duckdb().display()
+    )
 }
 
 struct FakeEngine {
@@ -191,7 +314,7 @@ fn real_duckdb() -> PathBuf {
 fn a_told_engine_runs_with_no_duckdb_on_the_search_path() {
     let fx = Fixture::new(None, "SELECT 42;");
     let empty = fx.dir("empty-path");
-    let told = fx.fake(&fx.dir("engine"), "told-duckdb", "1.5.4");
+    let told = fx.fake(&fx.dir("engine"), "told-duckdb", "2.0.0");
 
     let (code, stderr) = arc_run(
         &fx.project(),
@@ -251,7 +374,7 @@ fn a_told_real_duckdb_writes_the_table_with_no_duckdb_on_the_search_path() {
 fn unset_arc_runs_the_duckdb_on_the_search_path() {
     let fx = Fixture::new(None, "SELECT 42;");
     let on_path = fx.dir("path");
-    let duckdb = fx.fake(&on_path, "duckdb", "1.5.4");
+    let duckdb = fx.fake(&on_path, "duckdb", "2.0.0");
 
     let (code, stderr) = arc_run(
         &fx.project(),
@@ -266,13 +389,52 @@ fn unset_arc_runs_the_duckdb_on_the_search_path() {
     assert_eq!(duckdb.sql_calls(), 1, "calls: {:?}", duckdb.calls());
 }
 
+// A Protocol cannot change which DuckDB runs its SQL step: what arc adds to a step's
+// environment is named `ARC_…`, so a parameter called `PATH` reaches the step as
+// `ARC_PARAM_PATH`. The step runs the `duckdb` arc's own search path finds, the one arc asked
+// for the version and the file's tokens, so the refusals read the file as the DuckDB that
+// runs it reads it.
+#[test]
+fn a_parameter_called_path_does_not_change_which_duckdb_runs_the_step() {
+    let fx = Fixture::new(None, "SELECT 42;");
+    let on_path = fx.dir("path");
+    let duckdb = fx.fake(&on_path, "duckdb", "2.0.0");
+    let elsewhere = fx.dir("elsewhere");
+    let other = fx.fake(&elsewhere, "duckdb", "2.0.0");
+    let manifest = fx.project().join("arcform.yaml");
+    let text = fs::read_to_string(&manifest).unwrap();
+    fs::write(
+        &manifest,
+        text.replace(
+            "steps:\n",
+            &format!(
+                "params:\n  PATH:\n    default: \"{}\"\nsteps:\n",
+                elsewhere.display()
+            ),
+        ),
+    )
+    .unwrap();
+
+    let (code, stderr) = arc_run(
+        &fx.project(),
+        Run {
+            path: &on_path,
+            told: None,
+            allow_untested: false,
+        },
+    );
+    assert_eq!(code, Some(0), "the step must run:\n{stderr}");
+    assert_eq!(duckdb.sql_calls(), 1, "calls: {:?}", duckdb.calls());
+    assert_eq!(other.calls(), Vec::<String>::new());
+}
+
 // A told path that is not an executable file refuses the run, naming the variable
 // and the path, and the working `duckdb` on the search path is never started.
 #[test]
 fn a_told_path_that_is_not_an_executable_file_is_refused_and_path_is_not_tried() {
     let fx = Fixture::new(None, "SELECT 42;");
     let on_path = fx.dir("path");
-    let decoy = fx.fake(&on_path, "duckdb", "1.5.4");
+    let decoy = fx.fake(&on_path, "duckdb", "2.0.0");
 
     let not_executable = fx.dir("engine").join("duckdb-no-x");
     fs::write(&not_executable, "#!/bin/sh\nexit 0\n").unwrap();
@@ -317,8 +479,8 @@ fn a_told_path_that_is_not_an_executable_file_is_refused_and_path_is_not_tried()
 fn preflight_and_sql_both_reach_the_told_engine() {
     let fx = Fixture::new(None, "SELECT 42;");
     let on_path = fx.dir("path");
-    let decoy = fx.fake(&on_path, "duckdb", "1.5.4");
-    let told = fx.fake(&fx.dir("engine"), "told-duckdb", "1.5.4");
+    let decoy = fx.fake(&on_path, "duckdb", "2.0.0");
+    let told = fx.fake(&fx.dir("engine"), "told-duckdb", "2.0.0");
 
     let (code, stderr) = arc_run(
         &fx.project(),
@@ -340,8 +502,8 @@ fn preflight_and_sql_both_reach_the_told_engine() {
 fn a_relative_told_path_resolves_against_the_working_directory_not_path() {
     let fx = Fixture::new(None, "SELECT 42;");
     let on_path = fx.dir("path");
-    let decoy = fx.fake(&on_path, "told-duckdb", "1.5.4");
-    let told = fx.fake(&fx.project(), "told-duckdb", "1.5.4");
+    let decoy = fx.fake(&on_path, "told-duckdb", "2.0.0");
+    let told = fx.fake(&fx.project(), "told-duckdb", "2.0.0");
 
     let (code, stderr) = arc_run(
         &fx.project(),
@@ -382,63 +544,259 @@ fn run_on_version(
 // step runs, and the message names the version, the range and the override.
 #[test]
 fn an_engine_outside_the_range_is_refused_before_a_step_runs() {
-    let (code, stderr, sql) = run_on_version(None, "2.0.0", false);
-    assert_eq!(code, Some(1), "2.0.0 must be refused:\n{stderr}");
-    assert_eq!(sql, 0, "a step ran on 2.0.0");
-    for needle in ["2.0.0", RANGE, ALLOW_ENV] {
+    let (code, stderr, sql) = run_on_version(None, "3.0.0", false);
+    assert_eq!(code, Some(1), "3.0.0 must be refused:\n{stderr}");
+    assert_eq!(sql, 0, "a step ran on 3.0.0");
+    for needle in ["3.0.0", RANGE, ALLOW_ENV] {
         assert!(stderr.contains(needle), "expected '{needle}':\n{stderr}");
     }
-
-    let (code, stderr, sql) = run_on_version(None, "1.5.4", false);
-    assert_eq!(code, Some(0), "1.5.4 must run:\n{stderr}");
-    assert_eq!(sql, 1);
 }
 
-// An engine older than the oldest release arc accepts is refused before a step runs, and
-// the message names the version found and the oldest release. With the override it runs,
-// and the warning says what that costs on the version found: a failed SQL step is reported
-// as passed.
 #[test]
-fn an_engine_older_than_the_oldest_release_is_refused_and_the_override_names_the_risk() {
-    let (code, stderr, sql) = run_on_version(None, "1.2.0", false);
-    assert_eq!(code, Some(1), "1.2.0 must be refused:\n{stderr}");
-    assert_eq!(sql, 0, "a step ran on 1.2.0");
-    for needle in ["DuckDB 1.2.0 is older than", OLDEST, ALLOW_ENV] {
-        assert!(stderr.contains(needle), "expected '{needle}':\n{stderr}");
-    }
-
-    let (code, stderr, sql) = run_on_version(None, "1.2.0", true);
-    assert_eq!(code, Some(0), "override must run 1.2.0:\n{stderr}");
-    assert_eq!(sql, 1);
-    let warning = stderr
-        .lines()
-        .find(|l| l.contains("warning:"))
-        .unwrap_or_else(|| panic!("no warning printed:\n{stderr}"));
-    assert!(
-        warning.contains("1.2.0") && warning.contains("reports the failed step as passed"),
-        "the warning must say a failed step is reported as passed on 1.2.0: {warning}"
-    );
-
+fn a_2_0_0_engine_runs() {
     let (code, stderr, sql) = run_on_version(None, OLDEST, false);
     assert_eq!(code, Some(0), "{OLDEST} must run:\n{stderr}");
     assert_eq!(sql, 1);
     assert!(!stderr.contains("warning:"), "stderr: {stderr}");
+    assert!(!stderr.contains(RANGE), "stderr: {stderr}");
+}
+
+#[test]
+fn a_2_7_3_engine_runs() {
+    let (code, stderr, sql) = run_on_version(None, "2.7.3", false);
+    assert_eq!(code, Some(0), "2.7.3 must run:\n{stderr}");
+    assert_eq!(sql, 1);
+    assert!(!stderr.contains("warning:"), "stderr: {stderr}");
+}
+
+// A 1.x engine cannot open a database the linked 2.0 library shares with it, so it is
+// refused, and the message names the release of arc that is for DuckDB 1.5.
+#[test]
+fn a_1_5_6_engine_is_refused_as_too_old_naming_0_2_1() {
+    let (code, stderr, sql) = run_on_version(None, "1.5.6", false);
+    assert_eq!(code, Some(1), "1.5.6 must be refused:\n{stderr}");
+    assert_eq!(sql, 0, "a step ran on 1.5.6");
+    for needle in ["1.5.6", RANGE, "0.2.1"] {
+        assert!(stderr.contains(needle), "expected '{needle}':\n{stderr}");
+    }
+}
+
+#[test]
+fn a_1_5_6_engine_is_refused_even_with_the_override_set() {
+    let (code, stderr, sql) = run_on_version(None, "1.5.6", true);
+    assert_eq!(code, Some(1), "1.5.6 must be refused:\n{stderr}");
+    assert_eq!(sql, 0, "a step ran on 1.5.6");
+    for needle in ["1.5.6", RANGE, "0.2.1"] {
+        assert!(stderr.contains(needle), "expected '{needle}':\n{stderr}");
+    }
+}
+
+#[test]
+fn a_3_0_0_engine_is_untested_and_the_override_lifts_it() {
+    let (code, stderr, sql) = run_on_version(None, "3.0.0", false);
+    assert_eq!(code, Some(1), "3.0.0 must be refused:\n{stderr}");
+    assert_eq!(sql, 0);
+    assert!(stderr.contains("outside the versions"), "stderr: {stderr}");
+
+    let (code, stderr, sql) = run_on_version(None, "3.0.0", true);
+    assert_eq!(code, Some(0), "override must run 3.0.0:\n{stderr}");
+    assert_eq!(sql, 1);
+}
+
+// The override lifts the range for a 3.x, and arc reads the tokens a 3.x gives under it;
+// without the override the same engine is refused as untested, and a 1.x is refused either
+// way.
+#[test]
+fn the_override_runs_a_3_x_whose_tokens_name_3_x_and_never_a_1_x() {
+    let run = |version: &str, allow: bool| {
+        let fx = Fixture::new(None, "CREATE TABLE t AS SELECT 42 AS x;");
+        let empty = fx.dir("empty-path");
+        let told = fx.fake_answering_as(&fx.dir("engine"), "told-duckdb", version);
+        let (code, stderr) = arc_run(
+            &fx.project(),
+            Run {
+                path: &empty,
+                told: Some(told.bin.as_os_str()),
+                allow_untested: allow,
+            },
+        );
+        (code, stderr, told.sql_calls())
+    };
+
+    let (code, stderr, sql) = run("3.0.0", true);
+    assert_eq!(code, Some(0), "the override runs 3.0.0:\n{stderr}");
+    assert_eq!(sql, 1, "the step ran");
+    assert!(!stderr.contains("the tokens came from"), "{stderr}");
+
+    let (code, stderr, sql) = run("3.0.0", false);
+    assert_eq!(
+        code,
+        Some(1),
+        "3.0.0 is refused without the override:\n{stderr}"
+    );
+    assert_eq!(sql, 0);
+    assert!(stderr.contains("outside the versions"), "{stderr}");
+
+    for allow in [false, true] {
+        let (code, stderr, sql) = run("1.5.6", allow);
+        assert_eq!(
+            code,
+            Some(1),
+            "1.5.6 is refused (override {allow}):\n{stderr}"
+        );
+        assert_eq!(sql, 0);
+        assert!(stderr.contains("0.2.1"), "{stderr}");
+    }
+}
+
+// A DuckDB 2 that gives tokens and no trees is refused before any step runs, naming the
+// step, from the asset graph's own question, and before the run's state is set up: the
+// refused run leaves no database behind.
+#[test]
+fn a_duckdb_that_gives_no_trees_is_refused_before_a_step_and_leaves_no_run() {
+    let fx = Fixture::new(None, "CREATE TABLE t AS SELECT 42 AS x;");
+    let empty = fx.dir("empty-path");
+    let told = fx.fake_without_trees(&fx.dir("engine"), "told-duckdb", "v2.0.0 (fake) 0000000000");
+    let (code, stderr) = arc_run(
+        &fx.project(),
+        Run {
+            path: &empty,
+            told: Some(told.bin.as_os_str()),
+            allow_untested: false,
+        },
+    );
+    assert_eq!(code, Some(1), "refused:\n{stderr}");
+    assert_eq!(told.sql_calls(), 0, "calls: {:?}", told.calls());
+    for needle in [
+        "step 's1'",
+        "could not be read",
+        "no trees",
+        "ARC_SQL_READER=sqlparser",
+    ] {
+        assert!(stderr.contains(needle), "expected {needle:?}:\n{stderr}");
+    }
+    assert_eq!(
+        fx.databases(),
+        Vec::<PathBuf>::new(),
+        "a refused run leaves no database"
+    );
+}
+
+#[test]
+fn a_2_0_0_pre_release_is_untested() {
+    let (code, stderr, sql) = run_on_version(None, "2.0.0-alpha48730", false);
+    assert_eq!(code, Some(1), "a pre-release must be refused:\n{stderr}");
+    assert_eq!(sql, 0);
+    assert!(stderr.contains("2.0.0-alpha48730"), "stderr: {stderr}");
+}
+
+/// What Homebrew's DuckDB 2.0.0, built from the v2.0.0 commit, prints for `--version`.
+const HOMEBREW_2_0_0: &str = "v2.0.0-dev88614 (Development Version) d54cbbe3df";
+
+// Homebrew's build of the v2.0.0 commit calls itself a dev build, and is v2.0.0: arc's range
+// and a Protocol's `engine_version: ">=1.0"` both take it as that release.
+#[test]
+fn homebrews_dev_build_of_the_2_0_0_commit_runs_as_2_0_0() {
+    let fx = Fixture::new(Some(">=1.0"), "SELECT 42;");
+    let empty = fx.dir("empty-path");
+    let told = fx.fake_printing(&fx.dir("engine"), "told-duckdb", HOMEBREW_2_0_0);
+    let (code, stderr) = arc_run(
+        &fx.project(),
+        Run {
+            path: &empty,
+            told: Some(told.bin.as_os_str()),
+            allow_untested: false,
+        },
+    );
+    assert_eq!(code, Some(0), "the dev build must run:\n{stderr}");
+    assert_eq!(told.sql_calls(), 1);
+    assert!(!stderr.contains("warning:"), "stderr: {stderr}");
+}
+
+#[test]
+fn a_dev_build_of_another_commit_is_still_untested() {
+    let fx = Fixture::new(None, "SELECT 42;");
+    let empty = fx.dir("empty-path");
+    let told = fx.fake_printing(
+        &fx.dir("engine"),
+        "told-duckdb",
+        "v2.0.0-dev88614 (Development Version) 0123456789",
+    );
+    let (code, stderr) = arc_run(
+        &fx.project(),
+        Run {
+            path: &empty,
+            told: Some(told.bin.as_os_str()),
+            allow_untested: false,
+        },
+    );
+    assert_eq!(
+        code,
+        Some(1),
+        "an unknown dev build must be refused:\n{stderr}"
+    );
+    assert_eq!(told.sql_calls(), 0);
+    assert!(stderr.contains("2.0.0-dev88614"), "stderr: {stderr}");
+}
+
+/// A project whose one step installs a vetted community extension, run on a fake engine
+/// printing `line`; returns stderr.
+fn community_install_stderr(line: &str) -> String {
+    let fx = Fixture::new(None, "INSTALL zipfs FROM community;\nSELECT 42;");
+    let empty = fx.dir("empty-path");
+    let told = fx.fake_printing(&fx.dir("engine"), "told-duckdb", line);
+    let (code, stderr) = arc_run(
+        &fx.project(),
+        Run {
+            path: &empty,
+            told: Some(told.bin.as_os_str()),
+            allow_untested: false,
+        },
+    );
+    assert_eq!(code, Some(0), "the run must proceed:\n{stderr}");
+    assert_eq!(told.sql_calls(), 1);
+    stderr
+}
+
+#[test]
+fn a_release_build_of_a_protocol_installing_an_extension_draws_no_dev_build_warning() {
+    let stderr = community_install_stderr("v2.0.0 (Cyanoptera) d54cbbe3df");
+    assert!(!stderr.contains("community extensions"), "stderr: {stderr}");
+}
+
+#[test]
+fn a_dev_build_running_a_protocol_that_installs_a_community_extension_warns_before_the_first_step()
+{
+    let stderr = community_install_stderr(HOMEBREW_2_0_0);
+    let warning = stderr
+        .lines()
+        .find(|l| l.contains("cannot download community extensions"))
+        .unwrap_or_else(|| panic!("no dev-build warning:\n{stderr}"));
+    for needle in ["v2.0.0-dev88614", INSTALLER] {
+        assert!(warning.contains(needle), "expected '{needle}': {warning}");
+    }
+    assert_eq!(
+        stderr
+            .matches("cannot download community extensions")
+            .count(),
+        1,
+        "stderr: {stderr}"
+    );
 }
 
 // A manifest asking for a range that starts below the oldest release still loads, and runs
-// on an engine arc accepts; on an engine older than the oldest release, arc's own range
-// refuses it, not the manifest's.
+// on an engine arc accepts; on a 1.x engine, arc's own range refuses it, not the manifest's.
 #[test]
 fn a_manifest_that_starts_below_the_oldest_release_loads_and_does_not_widen_the_range() {
-    let (code, stderr, sql) = run_on_version(Some(">=1.2"), "1.5.4", false);
-    assert_eq!(code, Some(0), ">=1.2 on 1.5.4 must run:\n{stderr}");
+    let (code, stderr, sql) = run_on_version(Some(">=1.2"), "2.0.0", false);
+    assert_eq!(code, Some(0), ">=1.2 on 2.0.0 must run:\n{stderr}");
     assert_eq!(sql, 1);
 
-    let (code, stderr, sql) = run_on_version(Some(">=1.2"), "1.2.0", false);
-    assert_eq!(code, Some(1), ">=1.2 on 1.2.0 must be refused:\n{stderr}");
-    assert_eq!(sql, 0, "a step ran on 1.2.0");
+    let (code, stderr, sql) = run_on_version(Some(">=1.2"), "1.5.6", false);
+    assert_eq!(code, Some(1), ">=1.2 on 1.5.6 must be refused:\n{stderr}");
+    assert_eq!(sql, 0, "a step ran on 1.5.6");
     assert!(
-        stderr.contains("DuckDB 1.2.0 is older than") && stderr.contains(OLDEST),
+        stderr.contains("DuckDB 1.5.6 is older than") && stderr.contains(OLDEST),
         "arc's range must be the refusal: {stderr}"
     );
 }
@@ -486,20 +844,20 @@ fn a_failed_statement_on_a_real_duckdb_fails_the_run_and_stops_it() {
     assert_eq!(second, 0, "the second step ran after the first failed");
 }
 
-// A manifest's constraint narrows the range and does not replace it. `>=1.2`, the
-// constraint the Protocols in this repository state, does not switch the ceiling off.
+// A manifest's constraint narrows the range and does not replace it. `>=1.2` does not
+// switch the ceiling off.
 #[test]
 fn a_manifest_constraint_narrows_the_range_and_does_not_replace_it() {
-    let (code, stderr, sql) = run_on_version(Some(">=1.2"), "2.0.0", false);
-    assert_eq!(code, Some(1), ">=1.2 on 2.0.0 must be refused:\n{stderr}");
-    assert_eq!(sql, 0, "a step ran on 2.0.0");
+    let (code, stderr, sql) = run_on_version(Some(">=1.2"), "3.0.0", false);
+    assert_eq!(code, Some(1), ">=1.2 on 3.0.0 must be refused:\n{stderr}");
+    assert_eq!(sql, 0, "a step ran on 3.0.0");
     assert!(stderr.contains(RANGE), "stderr: {stderr}");
 
-    let (code, stderr, sql) = run_on_version(Some(">=1.6"), "1.5.4", false);
-    assert_eq!(code, Some(1), ">=1.6 on 1.5.4 must be refused:\n{stderr}");
-    assert_eq!(sql, 0, "a step ran on 1.5.4");
+    let (code, stderr, sql) = run_on_version(Some(">=2.1"), "2.0.0", false);
+    assert_eq!(code, Some(1), ">=2.1 on 2.0.0 must be refused:\n{stderr}");
+    assert_eq!(sql, 0, "a step ran on 2.0.0");
     assert!(
-        stderr.contains("requires >=1.6, found 1.5.4"),
+        stderr.contains("requires >=2.1, found 2.0.0"),
         "stderr: {stderr}"
     );
 }
@@ -508,31 +866,195 @@ fn a_manifest_constraint_narrows_the_range_and_does_not_replace_it() {
 // range, and lifts only arc's range: a manifest's own constraint still refuses.
 #[test]
 fn the_override_runs_an_untested_engine_with_a_warning_and_keeps_the_manifest_constraint() {
-    let (code, stderr, sql) = run_on_version(None, "2.0.0", true);
-    assert_eq!(code, Some(0), "override must run 2.0.0:\n{stderr}");
+    let (code, stderr, sql) = run_on_version(None, "3.0.0", true);
+    assert_eq!(code, Some(0), "override must run 3.0.0:\n{stderr}");
     assert_eq!(sql, 1);
     let warning = stderr
         .lines()
         .find(|l| l.contains("warning:"))
         .unwrap_or_else(|| panic!("no warning printed:\n{stderr}"));
     assert!(
-        warning.contains("2.0.0") && warning.contains(RANGE),
+        warning.contains("3.0.0") && warning.contains(RANGE),
         "the warning must name the version and the range: {warning}"
     );
 
-    let (code, stderr, sql) = run_on_version(Some(">=1.6"), "1.5.4", true);
-    assert_eq!(code, Some(1), "override must not lift >=1.6:\n{stderr}");
+    let (code, stderr, sql) = run_on_version(Some(">=2.1"), "2.0.0", true);
+    assert_eq!(code, Some(1), "override must not lift >=2.1:\n{stderr}");
     assert_eq!(sql, 0);
     assert!(
-        stderr.contains("requires >=1.6, found 1.5.4"),
+        stderr.contains("requires >=2.1, found 2.0.0"),
         "stderr: {stderr}"
     );
 
-    let (code, stderr, sql) = run_on_version(Some("<2"), "2.0.0", true);
-    assert_eq!(code, Some(1), "override must not lift <2:\n{stderr}");
+    let (code, stderr, sql) = run_on_version(Some("<3"), "3.0.0", true);
+    assert_eq!(code, Some(1), "override must not lift <3:\n{stderr}");
     assert_eq!(sql, 0);
     assert!(
-        stderr.contains("requires <2, found 2.0.0"),
+        stderr.contains("requires <3, found 3.0.0"),
         "stderr: {stderr}"
     );
+}
+
+/// The refusal of a run on a DuckDB that cannot read SQL into tokens, checked for what it
+/// must say and must not.
+fn assert_no_tokenizer_refusal(stderr: &str, names: &str) {
+    for needle in [
+        names,
+        "which prints `v2.0.0-dev88614 (Development Version) d54cbbe3df`, cannot read",
+        "cannot read SQL into tokens",
+        "autocomplete extension",
+        "check what each SQL step installs",
+        INSTALLER,
+        "~/.duckdb/cli/2.0.0",
+        "ARC_DUCKDB_BIN=~/.duckdb/cli/2.0.0/duckdb",
+        "No step was run.",
+    ] {
+        assert!(stderr.contains(needle), "expected {needle:?}:\n{stderr}");
+    }
+    assert!(
+        !stderr.contains("could not read the tokens"),
+        "the old wording: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("cannot read SQL into tokens").count(),
+        1,
+        "one message: {stderr}"
+    );
+}
+
+// A DuckDB built without its autocomplete extension, as Homebrew's 2.0.0 is, has no
+// `sql_tokenize`, and arc reads every SQL step's tokens from it. The run is refused before a
+// step runs, naming the DuckDB, why, and DuckDB's own installer as the way out.
+#[test]
+fn a_duckdb_without_the_tokenizer_is_refused_naming_the_installer() {
+    let fx = Fixture::with_steps(None, &["SELECT 42;", "SELECT 43;"]);
+    let empty = fx.dir("empty-path");
+    let told = fx.fake_without_tokenizer(&fx.dir("engine"), "told-duckdb", HOMEBREW_2_0_0);
+    let (code, stderr) = arc_run(
+        &fx.project(),
+        Run {
+            path: &empty,
+            told: Some(told.bin.as_os_str()),
+            allow_untested: false,
+        },
+    );
+    assert_eq!(code, Some(2), "refused:\n{stderr}");
+    assert_eq!(told.sql_calls(), 0, "calls: {:?}", told.calls());
+    assert!(
+        !told.calls().iter().any(|c| c.contains(" -f ")),
+        "a step ran: {:?}",
+        told.calls()
+    );
+    assert_no_tokenizer_refusal(&stderr, &told.bin.display().to_string());
+}
+
+// The `duckdb` on PATH is named by the file the search path finds.
+#[test]
+fn a_duckdb_on_path_without_the_tokenizer_is_refused_naming_where_it_is() {
+    let fx = Fixture::new(None, "SELECT 42;");
+    let on_path = fx.dir("path");
+    let engine = fx.fake_without_tokenizer(&on_path, "duckdb", HOMEBREW_2_0_0);
+    let (code, stderr) = arc_run(
+        &fx.project(),
+        Run {
+            path: &on_path,
+            told: None,
+            allow_untested: false,
+        },
+    );
+    assert_eq!(code, Some(2), "refused:\n{stderr}");
+    assert_eq!(engine.sql_calls(), 0, "calls: {:?}", engine.calls());
+    assert_no_tokenizer_refusal(&stderr, &engine.bin.display().to_string());
+}
+
+// A Protocol whose SQL holds nothing to tokenise before the run, such as a step whose file
+// an earlier step writes, is still checked before its first step: the probe asks DuckDB for
+// the tokens of `SELECT 1`.
+#[test]
+fn a_protocol_with_no_sql_to_read_yet_is_still_refused_before_a_step_runs() {
+    let fx = Fixture::new(None, "");
+    let empty = fx.dir("empty-path");
+    let told = fx.fake_without_tokenizer(&fx.dir("engine"), "told-duckdb", HOMEBREW_2_0_0);
+    let (code, stderr) = arc_run(
+        &fx.project(),
+        Run {
+            path: &empty,
+            told: Some(told.bin.as_os_str()),
+            allow_untested: false,
+        },
+    );
+    assert_eq!(code, Some(2), "refused:\n{stderr}");
+    assert_eq!(told.sql_calls(), 0, "calls: {:?}", told.calls());
+    assert_no_tokenizer_refusal(&stderr, &told.bin.display().to_string());
+}
+
+// On a DuckDB whose tokenizer answers, the same empty file runs: the probe passes.
+#[test]
+fn a_protocol_with_no_sql_to_read_yet_runs_on_a_duckdb_that_tokenises() {
+    let fx = Fixture::new(None, "");
+    let empty = fx.dir("empty-path");
+    let told = fx.fake(&fx.dir("engine"), "told-duckdb", "2.0.0");
+    let (code, stderr) = arc_run(
+        &fx.project(),
+        Run {
+            path: &empty,
+            told: Some(told.bin.as_os_str()),
+            allow_untested: false,
+        },
+    );
+    assert_eq!(code, Some(0), "runs:\n{stderr}");
+    assert_eq!(told.sql_calls(), 1, "calls: {:?}", told.calls());
+    assert!(!stderr.contains("cannot read SQL into tokens"), "{stderr}");
+}
+
+// Outside a run, a command that reads the asset graph reads it with arc's own parser when
+// DuckDB gives no tokens, and its one warning names the missing tokenizer and the fix.
+#[test]
+fn a_graph_only_command_on_a_duckdb_without_the_tokenizer_warns_naming_the_fix() {
+    let fx = Fixture::new(
+        None,
+        "CREATE TABLE orders AS SELECT * FROM (VALUES (1, 50)) AS t(id, amount);\n",
+    );
+    let empty = fx.dir("empty-path");
+    let told = fx.fake_without_tokenizer(&fx.dir("engine"), "told-duckdb", HOMEBREW_2_0_0);
+    let out = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .current_dir(fx.project())
+        .env("PATH", &empty)
+        .env("ARCFORM_DB_DIR", fx.project().with_file_name("db"))
+        .env("ARCFORM_HISTORY_DIR", fx.dir("history"))
+        .env(BIN_ENV, &told.bin)
+        .env_remove("ARC_SQL_READER")
+        .env("NO_COLOR", "1")
+        .args([
+            "sql",
+            "record",
+            "SELECT * FROM orders WHERE amount > 10",
+            "--name",
+            "big_orders",
+        ])
+        .output()
+        .expect("spawn arc");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "arc sql record succeeds: {stderr}");
+    let warnings: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("cannot read SQL into tokens"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "one warning: {stderr}");
+    for needle in [
+        "warning:",
+        told.bin.display().to_string().as_str(),
+        "v2.0.0-dev88614",
+        "autocomplete extension",
+        "arc's own reading",
+        INSTALLER,
+        "ARC_DUCKDB_BIN=~/.duckdb/cli/2.0.0/duckdb",
+    ] {
+        assert!(
+            warnings[0].contains(needle),
+            "expected {needle:?}: {}",
+            warnings[0]
+        );
+    }
+    assert!(!stderr.contains("no DuckDB 2 answered"), "{stderr}");
 }

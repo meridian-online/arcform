@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.12,<3.13"
 # dependencies = [
-#   "duckdb>=1,<2",
+#   "duckdb>=2,<3",
 # ]
 # ///
 """text_embed — arcform typed Python operator (uv-run).
@@ -308,7 +308,7 @@ def main() -> int:
     )
     empty = con.execute(
         "SELECT count(*) FROM arc_vec "
-        "WHERE list_sum(list_transform(vec, x -> abs(x))) = 0"
+        "WHERE list_sum(list_transform(vec, lambda x: abs(x))) = 0"
     ).fetchone()[0]
     if empty:
         print(

@@ -5,8 +5,13 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use crate::duckdb_lineage::Refusal;
+use crate::duckdb_tokens::{FileTokens, Token, TokenCache, to_tok};
 use crate::error::{Error, Result};
 use crate::manifest::{Manifest, Step};
+
+/// The tokens of each string a `query(…)` call is given, by its text: [`FileTokens::literals`].
+type Literals = BTreeMap<String, Vec<Token>>;
 
 /// Information about the detected engine, returned by preflight.
 #[derive(Debug, Clone)]
@@ -14,6 +19,11 @@ pub struct EngineInfo {
     /// Parsed semantic version of the installed engine CLI,
     /// or None if version output was unparseable.
     pub version: Option<semver::Version>,
+    /// The version as the engine printed it (`v2.0.0-dev88614`) when it is a development
+    /// build of a release's commit, which `version` then names as that release.
+    pub dev_build: Option<String>,
+    /// What the engine's `--version` printed, trimmed, for a message naming it.
+    pub printed: String,
 }
 
 /// Output captured from a step execution.
@@ -112,6 +122,20 @@ pub trait Engine {
     /// loads nothing. A question DuckDB does not answer gives a report with each value absent,
     /// since recording refuses no run.
     fn report(&self, extensions: &[String]) -> EngineReport;
+
+    /// The tokens the DuckDB the steps run on reads in the SQL file holding `file`, as
+    /// [`crate::duckdb_tokens::tokenize_file`] asks for them. The refusals read a SQL file
+    /// from these alone, so a failure here refuses the file.
+    fn tokenize(&self, file: &[u8]) -> std::result::Result<FileTokens, Refusal>;
+
+    /// What the DuckDB the steps run on said when it could not answer `sql_tokenize` on
+    /// `SELECT 1` at all, as a build without DuckDB's autocomplete extension cannot; `None`
+    /// when it answered. A DuckDB that cannot be started, or answers in a way arc cannot
+    /// read, is `None`, left to the check that asked it first.
+    fn tokenizer_failure(&self) -> Option<String>;
+
+    /// The DuckDB the steps run on, as a person can find it, with the version `printed`.
+    fn which(&self, printed: &str) -> String;
 }
 
 /// What the DuckDB the steps run on reports, as [`Engine::report`] asks it. Each value is
@@ -333,19 +357,142 @@ pub const DUCKDB_BIN_ENV: &str = "ARC_DUCKDB_BIN";
 /// The DuckDB versions arc is tested on. Enforced on every run with a SQL step, whether or
 /// not the manifest states an `engine_version:`; a manifest's constraint narrows this and
 /// never widens it. It starts at [`OLDEST_ENGINE`].
-pub const SUPPORTED_ENGINE_RANGE: &str = ">=1.3, <2";
+pub const SUPPORTED_ENGINE_RANGE: &str = ">=2.0, <3";
 
-/// The oldest DuckDB arc accepts, where [`SUPPORTED_ENGINE_RANGE`] starts: the first release
-/// whose command line, run as arc runs a SQL step, exits non-zero when a statement in the
-/// step's file fails. arc learns that a step failed from that exit status and nothing else,
-/// and on 1.2.x it is 0, so a failed step would be recorded as passed and the steps after it
-/// would run.
-pub const OLDEST_ENGINE: &str = "1.3.0";
+/// The oldest DuckDB arc accepts, where [`SUPPORTED_ENGINE_RANGE`] starts: the major release
+/// of the DuckDB library arc links. arc links DuckDB 2.0, and a database file it creates
+/// carries a storage version a 1.x DuckDB refuses to open, so no override reaches below
+/// this. arc 0.2.1 is the release for DuckDB 1.5.
+pub const OLDEST_ENGINE: &str = "2.0.0";
+
+/// The DuckDB release arc is tested on, which a message naming DuckDB's installer pins.
+/// `scripts/check_duckdb_version.py` fails when it differs from the version Cargo.lock links,
+/// as it does for `DUCKDB_RECOMMENDED` in `scripts/install.sh` and CI's `DUCKDB_VERSION`.
+pub const DUCKDB_RECOMMENDED: &str = "v2.0.0";
+
+/// How to install DuckDB's release build, which has the autocomplete extension arc reads
+/// tokens from and downloads community extensions, pinned to [`DUCKDB_RECOMMENDED`]: DuckDB's
+/// own installer, then the `PATH` entry or [`DUCKDB_BIN_ENV`] that has arc run it.
+///
+/// The installer always puts a pinned version in `~/.duckdb/cli/<version>`; it moves
+/// `~/.duckdb/cli/latest` there only while that version is DuckDB's newest release, so the
+/// directory named is the version's own.
+pub(crate) fn release_install_fix() -> String {
+    let version = DUCKDB_RECOMMENDED.trim_start_matches('v');
+    let dir = format!("~/.duckdb/cli/{version}");
+    format!(
+        "Install DuckDB's release build with DuckDB's own installer, pinned to the version arc \
+         is tested on: `curl https://install.duckdb.org | DUCKDB_VERSION={version} sh`, which \
+         installs it to {dir}. Then put {dir} first on PATH, or set {DUCKDB_BIN_ENV}={dir}/duckdb."
+    )
+}
+
+/// Why a DuckDB whose tokenizer does not answer cannot be read, naming it as `which` does,
+/// from `error`, what it said. Built without DuckDB's autocomplete extension is said as fact
+/// only when DuckDB's error names that extension or `sql_tokenize`; any other error is
+/// quoted, on one line: DuckDB's error can run to several (its message, a blank line, then
+/// `LINE 1:` and a caret), and the refusal and the warning that quote it are one line each.
+pub(crate) fn no_tokenizer_cause(which: &str, error: &str) -> String {
+    let lower = error.to_lowercase();
+    let why = if lower.contains("autocomplete") || lower.contains("sql_tokenize") {
+        "cannot read SQL into tokens, because it was built without DuckDB's autocomplete \
+         extension"
+            .to_string()
+    } else {
+        format!(
+            "could not answer DuckDB's tokenizer, `sql_tokenize`, and said \"{}\"",
+            one_line(error)
+        )
+    };
+    format!("{which} {why}. arc needs those tokens to check what each SQL step installs.")
+}
+
+/// `text` on one line: each line trimmed, blank lines dropped, and the rest joined by a space.
+fn one_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The DuckDB `program` names, as a person can find it, with the version it printed, as
+/// the subject of a sentence: the path `ARC_DUCKDB_BIN` gives, or the file the search path
+/// finds for `duckdb`. A printed version holds brackets of its own, so it is quoted:
+/// "the duckdb on PATH, `/usr/bin/duckdb`, which prints `v2.0.0 (Cyanoptera) d54cbbe3df`,".
+pub(crate) fn which_duckdb(program: &DuckDbProgram, printed: &str) -> String {
+    let path = match program {
+        DuckDbProgram::Told(path) => Some(path.clone()),
+        DuckDbProgram::SearchPath => on_search_path("duckdb"),
+    };
+    let mut which = match program {
+        DuckDbProgram::Told(_) => format!("the DuckDB {DUCKDB_BIN_ENV} names"),
+        DuckDbProgram::SearchPath => "the duckdb on PATH".to_string(),
+    };
+    if let Some(path) = &path {
+        which.push_str(&format!(", `{}`", path.display()));
+    }
+    let printed = printed.trim();
+    if !printed.is_empty() {
+        which.push_str(&format!(", which prints `{printed}`,"));
+    } else if path.is_some() {
+        which.push(',');
+    }
+    which
+}
+
+/// The first file called `name` on `PATH` that the user may run, as the operating system
+/// would find it.
+fn on_search_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| {
+            std::fs::metadata(candidate).is_ok_and(|meta| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    meta.is_file() && meta.permissions().mode() & 0o111 != 0
+                }
+                #[cfg(not(unix))]
+                {
+                    meta.is_file()
+                }
+            })
+        })
+}
+
+/// What `program --version` printed, trimmed, or nothing when it printed nothing or failed.
+// Read by the graph-only warning, which the lib's tests do not start a DuckDB for.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn printed_version(program: &DuckDbProgram) -> String {
+    program
+        .command()
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// The commit of each DuckDB release arc knows, by release tag. A development build, such as
+/// Homebrew's, is built from a release's commit and prints a pre-release version with that
+/// commit after it; [`parse_engine_version`] takes it for the release when the two match.
+const RELEASE_COMMITS: [(&str, &str); 1] = [("2.0.0", "d54cbbe3df17e8e5ce68312f483b4155836112aa")];
 
 /// Set to any non-empty value, lifts [`SUPPORTED_ENGINE_RANGE`] for a person who accepts
 /// an engine arc was not tested on. The run warns, and a manifest's own `engine_version:`
 /// still refuses what it refused before.
 pub const ALLOW_UNTESTED_ENGINE_ENV: &str = "ARC_ALLOW_UNTESTED_ENGINE";
+
+/// Whether [`ALLOW_UNTESTED_ENGINE_ENV`] is set to a non-empty value. The engine check and the
+/// check on the version a token answer came from both read it here, so the one variable lifts
+/// both: a DuckDB 3.x the override runs is also one whose tokens arc reads.
+pub(crate) fn untested_engine_allowed() -> bool {
+    std::env::var_os(ALLOW_UNTESTED_ENGINE_ENV).is_some_and(|v| !v.is_empty())
+}
 
 /// The DuckDB executable arc runs: the one `ARC_DUCKDB_BIN` names when it is set, else
 /// `duckdb` found on the search path.
@@ -393,11 +540,29 @@ pub(crate) enum DuckDbProgram {
     SearchPath,
 }
 
+/// The variable the DuckDB 2.0 shell reads to decide it is being run by an agent. Set by
+/// the harness an agent works in (`AI_AGENT`, `CLAUDECODE` and the like), it turns the shell's
+/// output into markdown and adds a banner on stderr, which arc cannot read as DuckDB's
+/// answer. `0` turns it off.
+pub(crate) const AGENT_MODE_ENV: &str = "DUCKDB_AGENT_MODE";
+
 impl DuckDbProgram {
-    fn command(&self) -> Command {
-        match self {
+    /// A command for this DuckDB, run out of agent mode ([`AGENT_MODE_ENV`]). Every DuckDB
+    /// process arc starts itself is built here.
+    pub(crate) fn command(&self) -> Command {
+        let mut command = match self {
             DuckDbProgram::Told(path) => Command::new(path),
             DuckDbProgram::SearchPath => Command::new("duckdb"),
+        };
+        command.env(AGENT_MODE_ENV, "0");
+        command
+    }
+
+    /// The program as a person reads it: the path told, else `duckdb`.
+    pub(crate) fn display_name(&self) -> String {
+        match self {
+            DuckDbProgram::Told(path) => path.to_string_lossy().into_owned(),
+            DuckDbProgram::SearchPath => "duckdb".to_string(),
         }
     }
 }
@@ -465,6 +630,9 @@ impl Engine for DuckDbEngine {
             .arg("-f")
             .arg(sql_path)
             .args(question)
+            // Every name arc adds here starts `ARC_` (a parameter is `ARC_PARAM_<NAME>`), so
+            // nothing a Protocol declares sets `PATH` or `DUCKDB_AGENT_MODE` for the step: it
+            // runs the DuckDB arc asked for the version and the file's tokens.
             .envs(env)
             .stdout(Stdio::inherit())
             .stderr(Stdio::piped())
@@ -565,8 +733,12 @@ impl Engine for DuckDbEngine {
         match (output, program) {
             (Ok(o), _) if o.status.success() => {
                 let stdout = String::from_utf8_lossy(&o.stdout);
-                let version = parse_version_output(&stdout);
-                Ok(EngineInfo { version })
+                let parsed = parse_engine_version(&stdout);
+                Ok(EngineInfo {
+                    version: parsed.as_ref().map(|p| p.version.clone()),
+                    dev_build: parsed.and_then(|p| p.dev_build),
+                    printed: stdout.trim().to_string(),
+                })
             }
             (output, DuckDbProgram::Told(path)) => Err(Error::EngineBinInvalid {
                 var: DUCKDB_BIN_ENV,
@@ -633,6 +805,35 @@ impl Engine for DuckDbEngine {
         .map(|answers| read_report(&answers))
         .unwrap_or_default()
     }
+
+    fn tokenize(&self, file: &[u8]) -> std::result::Result<FileTokens, Refusal> {
+        match duckdb_program() {
+            // The asset graph reads the same answer for the same bytes.
+            Ok(program) => crate::duckdb_tokens::shared_tokens(&program, file),
+            // A file with no SQL asks nothing, so it has nothing to refuse even then. The
+            // program named is the one `ARC_DUCKDB_BIN` gives, which is what failed.
+            Err(e) => crate::duckdb_tokens::tokenize_with(file, &mut |_| {
+                Err(Refusal::NotRun {
+                    program: std::env::var_os(DUCKDB_BIN_ENV).map_or_else(
+                        || DuckDbProgram::SearchPath.display_name(),
+                        |bin| bin.to_string_lossy().into_owned(),
+                    ),
+                    reason: e.to_string(),
+                })
+            }),
+        }
+    }
+
+    fn tokenizer_failure(&self) -> Option<String> {
+        crate::duckdb_tokens::tokenizer_failure(&duckdb_program().ok()?)
+    }
+
+    fn which(&self, printed: &str) -> String {
+        duckdb_program().map_or_else(
+            |_| "the DuckDB arc runs".to_string(),
+            |program| which_duckdb(&program, printed),
+        )
+    }
 }
 
 /// Run `install`, SQL that installs the extension `name`, and return the file DuckDB then
@@ -656,23 +857,60 @@ fn install_and_name(name: &str, install: &str, what: &str) -> Result<Option<Path
         .map(PathBuf::from))
 }
 
+/// What [`parse_engine_version`] found, and the development build it took for a release.
+pub(crate) struct ParsedEngineVersion {
+    pub(crate) version: semver::Version,
+    /// The version as the engine printed it, `v2.0.0-dev88614`, when it is a development
+    /// build taken for the release in `version`.
+    pub(crate) dev_build: Option<String>,
+}
+
 /// Parse a version string from engine CLI output.
 ///
 /// Handles formats like:
-/// - "v1.5.2 (Variegata) 8a5851971f"
+/// - "v2.0.0 (Cyanoptera) d54cbbe3df"
 /// - "v0.10.0 1234abc"
 /// - "1.5.2"
 ///
+/// A development build of a release's own commit is that release: Homebrew's DuckDB 2.0.0
+/// prints `v2.0.0-dev88614 (Development Version) d54cbbe3df`, the commit of the v2.0.0 tag,
+/// and parses as 2.0.0, so arc's range and a Protocol's `engine_version:` see the release.
+/// A development build of any other commit keeps its pre-release.
+///
 /// Returns None if the version cannot be parsed.
-pub fn parse_version_output(output: &str) -> Option<semver::Version> {
+pub(crate) fn parse_engine_version(output: &str) -> Option<ParsedEngineVersion> {
     // Find the first token that looks like a version (with or without leading 'v').
     for token in output.split_whitespace() {
         let stripped = token.strip_prefix('v').unwrap_or(token);
         if let Ok(ver) = semver::Version::parse(stripped) {
-            return Some(ver);
+            if !ver.pre.is_empty() && printed_commit_is_release(output, &ver) {
+                let release = semver::Version::new(ver.major, ver.minor, ver.patch);
+                return Some(ParsedEngineVersion {
+                    version: release,
+                    dev_build: Some(token.to_string()),
+                });
+            }
+            return Some(ParsedEngineVersion {
+                version: ver,
+                dev_build: None,
+            });
         }
     }
     None
+}
+
+/// Whether the source id the engine prints after its version, the last word of `output`, is
+/// a prefix of the commit of the release tag for `ver`'s major, minor and patch. A prefix
+/// shorter than seven characters proves nothing and is not taken.
+fn printed_commit_is_release(output: &str, ver: &semver::Version) -> bool {
+    let Some(id) = output.split_whitespace().last() else {
+        return false;
+    };
+    let release = format!("{}.{}.{}", ver.major, ver.minor, ver.patch);
+    id.len() >= 7
+        && RELEASE_COMMITS
+            .iter()
+            .any(|(tag, commit)| *tag == release && commit.starts_with(id))
 }
 
 // ---- The community extensions a Protocol's SQL installs ----
@@ -699,29 +937,42 @@ const EXTENSION_REPOSITORY_SETTINGS: [&str; 2] = [
 /// `extension_directory`, the list `extension_directories`, and `home_directory`, under which
 /// DuckDB keeps them when neither of the others is set. A step that sets one installs to a
 /// directory the check of each pinned extension does not read, and a second DuckDB does not
-/// find the file there. DuckDB v1.5.5's `duckdb_settings()` lists these three and no other
-/// that moves it, and a test holds the list to what the DuckDB CLI it runs lists.
+/// find the file there. DuckDB v2.0.0's `duckdb_settings()` lists `extension_directories` and
+/// `home_directory` and no other that moves it; it no longer lists the deprecated
+/// `extension_directory`, which it still sets. A test holds the list to what the DuckDB CLI it
+/// runs lists.
 const EXTENSION_DIRECTORY_SETTINGS: [&str; 3] = [
     "extension_directory",
     "extension_directories",
     "home_directory",
 ];
 
-/// What switches DuckDB to its second parser. The DuckDB CLI loads the `autocomplete`
-/// extension, whose parser replaces the default one once `allow_parser_override_extension` is
-/// `'fallback'` or `'strict'`, and `enable_peg_parser()` sets it to `'strict'`. That parser
-/// reads comments and strings by rules of its own: a block comment does not nest, and a
-/// backslash escapes nothing inside `E'…'`. arc reads SQL by the default parser's rules, so a
-/// statement naming either is refused, whatever value it sets. Everything before the switch
-/// is read by the default rules, the only ones in force until it runs.
+/// The settings that hand a step's SQL to a parser other than DuckDB's own, whose comments and
+/// strings arc does not read. In DuckDB v2.0.0, `allow_parser_override_extension` set to
+/// `'fallback'` or `'strict'` lets an extension that registers a `parser_override` claim each
+/// batch the CLI hands over (`src/main/parse_iterator.cpp:39-74`), and `current_dialect` hands
+/// the batches after it to a dialect an extension registers, with a tokenizer of the dialect's
+/// own (`src/main/parser_context.cpp:27-34`,
+/// `src/include/duckdb/parser/peg/dialect_extension.hpp:73`), which can escape with a
+/// backslash or quote with another character
+/// (`src/include/duckdb/parser/peg/tokenizer/tokenizer.hpp:62-66`). No extension in v2.0.0's
+/// tree registers either. A statement naming one is refused, whatever value it sets.
+/// Everything before the switch is read by DuckDB's own rules, the only ones in force until
+/// it runs: v2.0.0 resolves the override once per batch, before its first statement, and
+/// tokenises each batch once, before any of it runs (`src/main/parse_iterator.cpp:42-43`,
+/// `137-147`).
 ///
-/// A string naming either is refused too: `query('FROM enable_peg_parser()')` runs the SQL a
-/// string holds.
-const PARSER_SWITCHES: [&str; 2] = ["enable_peg_parser", "allow_parser_override_extension"];
+/// A string naming one is refused too, as SQL a step can write to a file DuckDB runs later,
+/// such as `~/.duckdbrc`. DuckDB 2.0 removed `enable_peg_parser()`, which switched 1.5 to its
+/// second parser: its PEG parser is the only one, and the name is a catalog error.
+const PARSER_SWITCHES: [&str; 2] = ["allow_parser_override_extension", "current_dialect"];
 
 /// The functions that run SQL held in their argument: `query()` a `SELECT` in a string, and
 /// `json_execute_serialized_sql()` one serialized as JSON. A step can assemble that argument
-/// while it runs, as `'FROM enable_' || 'peg_parser()'`, and arc reads only its text.
+/// while it runs, as `'FROM ' || 'secret_table'`, and arc reads only its text. In v2.0.0 each
+/// takes a single `SELECT` alone (`src/function/table/query_function.cpp:90-93`,
+/// `extension/json/json_functions/json_serialize_sql.cpp:170-203`), and no function a
+/// `SELECT` calls sets a setting, so what they run cannot be an `INSTALL` or a parser switch.
 const RUNS_SQL: [&str; 2] = ["query", "json_execute_serialized_sql"];
 
 /// The words after which a name is one a statement declares or writes to, and a column list
@@ -756,265 +1007,20 @@ pub(crate) fn vetted_extensions() -> &'static [VettedExtension] {
     })
 }
 
-/// A token of DuckDB SQL, as much of one as the extension check reads.
+/// A token of DuckDB SQL, as much of one as the extension check reads:
+/// [`crate::duckdb_tokens::to_tok`] makes them from DuckDB's own tokens.
 #[derive(Debug, Clone, PartialEq)]
-enum Tok {
-    /// A keyword or an identifier; `quoted` for a `"double-quoted"` one, kept as written.
+pub(crate) enum Tok {
+    /// A keyword or an identifier; `quoted` for a `"double-quoted"` or `` `backticked` ``
+    /// one, kept as written.
     Word { text: String, quoted: bool },
-    /// A string constant: `'…'`, `E'…'`, `X'…'`, `$$…$$` or `$tag$…$tag$`.
-    Str(String),
+    /// A string constant: `'…'`, `E'…'`, `X'…'`, `$$…$$` or `$tag$…$tag$`. `raw` is the text
+    /// between the quotes as DuckDB's parser strips it, which is what an `INSTALL` takes as
+    /// its name; `text` is what the string evaluates to, which differs from `raw` only for
+    /// an `E'…'` string holding a backslash.
+    Str { text: String, raw: String },
     /// Any other character outside a comment: `;`, an operator, a digit, a parenthesis.
     Other(char),
-}
-
-/// How a quoted run treats a quote or a backslash inside it.
-#[derive(Clone, Copy, PartialEq)]
-enum Escapes {
-    /// `''` is one quote: `'…'` and `"…"`.
-    Doubled,
-    /// `''` and a backslash both escape: `E'…'`.
-    Backslash,
-    /// The first quote ends it: `X'…'` and `B'…'`.
-    None,
-}
-
-fn is_ident_start(ch: char) -> bool {
-    ch.is_alphabetic() || ch == '_' || !ch.is_ascii()
-}
-
-fn is_ident_char(ch: char) -> bool {
-    ch.is_alphanumeric() || ch == '_' || ch == '$' || !ch.is_ascii()
-}
-
-/// The characters DuckDB's scanner skips between tokens: space, tab, `\n`, `\r` and form
-/// feed. A vertical tab is not one of them, and neither is any character above ASCII: DuckDB
-/// reads those as part of a word, after its parser has replaced the few in
-/// [`unicode_space_len`] with a space.
-fn is_scanner_space(ch: char) -> bool {
-    matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{c}')
-}
-
-/// Count the `\n` in `c[from..to]`, the one line end every reader here counts.
-fn newlines(c: &[char], from: usize, to: usize) -> usize {
-    c[from..to].iter().filter(|&&ch| ch == '\n').count()
-}
-
-/// Where a `'…'` string goes on after its closing quote at `j - 1`, if it does: DuckDB
-/// reads `'anofox_'` and `'forecast'` as one string when all that separates them is
-/// whitespace holding a `\n` or a `\r`, and `--` comments. The spaces and comments before
-/// that line end are its own line's; after it, each comment has to end at a line end.
-fn quote_continues(c: &[char], mut j: usize) -> Option<usize> {
-    let comment_end = |j: usize| {
-        (j + 2..c.len())
-            .find(|&k| matches!(c[k], '\n' | '\r'))
-            .unwrap_or(c.len())
-    };
-    loop {
-        match c.get(j) {
-            Some(' ' | '\t' | '\u{c}') => j += 1,
-            Some('-') if c.get(j + 1) == Some(&'-') => j = comment_end(j),
-            Some('\n' | '\r') => break,
-            _ => return None,
-        }
-    }
-    loop {
-        match c.get(j) {
-            Some(&ch) if is_scanner_space(ch) => j += 1,
-            Some('-') if c.get(j + 1) == Some(&'-') => j = comment_end(j) + 1,
-            Some('\'') => return Some(j + 1),
-            _ => return None,
-        }
-    }
-}
-
-/// The character a backslash escape in an `E'…'` string stands for, as DuckDB's scanner
-/// decodes it, and how many characters after the backslash the escape spans: `\b`, `\f`,
-/// `\n`, `\r` and `\t`; one to three octal digits; `\x` and one or two hex digits. Any other
-/// character stands for itself, and a backslash at the end of the input for a backslash.
-/// DuckDB's CLI refuses a file whose SQL holds a `\u` or `\U` escape, so arc reads those as
-/// the letter, which can only turn a name the list holds into one it does not.
-fn e_escape(c: &[char], at: usize) -> (char, usize) {
-    let digits = |from: usize, radix: u32, most: usize| {
-        c.get(from..)
-            .unwrap_or_default()
-            .iter()
-            .take(most)
-            .take_while(|ch| ch.is_digit(radix))
-            .count()
-    };
-    let value = |from: usize, len: usize, radix: u32| {
-        c[from..from + len]
-            .iter()
-            .fold(0u32, |v, ch| v * radix + ch.to_digit(radix).unwrap_or(0))
-    };
-    let byte = |v: u32| char::from((v & 0xff) as u8);
-    let Some(&ch) = c.get(at) else {
-        return ('\\', 0);
-    };
-    match (ch, digits(at + 1, 16, 2)) {
-        ('0'..='7', _) => {
-            let len = digits(at, 8, 3);
-            (byte(value(at, len, 8)), len)
-        }
-        ('x', len @ 1..) => (byte(value(at + 1, len, 16)), len + 1),
-        ('b', _) => ('\u{8}', 1),
-        ('f', _) => ('\u{c}', 1),
-        ('n', _) => ('\n', 1),
-        ('r', _) => ('\r', 1),
-        ('t', _) => ('\t', 1),
-        (other, _) => (other, 1),
-    }
-}
-
-/// Read a quoted run from `*i`, just after its opening `quote`, to its closing quote or the
-/// end of the input, and leave `*i` after it. A `'…'` run goes on where
-/// [`quote_continues`] finds the next.
-fn read_quoted(
-    c: &[char],
-    i: &mut usize,
-    quote: char,
-    escapes: Escapes,
-    line: &mut usize,
-) -> String {
-    let mut text = String::new();
-    while *i < c.len() {
-        let ch = c[*i];
-        if escapes == Escapes::Backslash && ch == '\\' {
-            let (decoded, len) = e_escape(c, *i + 1);
-            *line += newlines(c, *i + 1, *i + 1 + len);
-            text.push(decoded);
-            *i += 1 + len;
-            continue;
-        }
-        if ch == quote {
-            if escapes != Escapes::None && c.get(*i + 1) == Some(&quote) {
-                text.push(quote);
-                *i += 2;
-                continue;
-            }
-            *i += 1;
-            let Some(next) = (quote == '\'').then(|| quote_continues(c, *i)).flatten() else {
-                return text;
-            };
-            *line += newlines(c, *i, next);
-            *i = next;
-            continue;
-        }
-        *line += usize::from(ch == '\n');
-        text.push(ch);
-        *i += 1;
-    }
-    text
-}
-
-/// The length of the `$tag$` or `$$` that opens a dollar-quoted string at `i`, if one does.
-/// A `$` followed by a digit is a parameter, and a `$` inside an identifier is part of it.
-fn dollar_tag_len(c: &[char], i: usize) -> Option<usize> {
-    let mut j = i + 1;
-    if c.get(j).is_some_and(|&ch| is_ident_start(ch)) {
-        while c.get(j).is_some_and(|&ch| is_ident_char(ch) && ch != '$') {
-            j += 1;
-        }
-    }
-    (c.get(j) == Some(&'$')).then_some(j + 1 - i)
-}
-
-/// Split DuckDB SQL into tokens, each with the line it starts on, and drop the comments.
-///
-/// `sql` is one batch, as [`cli_batches`] cuts it and [`strip_unicode_spaces`] leaves it.
-/// Each rule is DuckDB's own scanner's, `third_party/libpg_query/scan.l` in DuckDB v1.5.5:
-/// the characters in [`is_scanner_space`] are skipped; a `--` comment ends at `\n` or `\r`;
-/// a `/* */` comment nests; `''` is a quote inside `'…'`; a backslash escapes only inside
-/// `E'…'`; `$$…$$` and `$tag$…$tag$` are string constants; two `'…'` strings with a line
-/// end between them are one. Text left open at the end of the input runs to the end, where
-/// DuckDB refuses the statement rather than running it.
-///
-/// Every branch consumes the characters it matched before it calls a helper or loops, so the
-/// scan advances on each pass whatever a helper returns: a lexer that can stall would hang
-/// `arc run` on one bad edit and fill memory with tokens.
-fn lex_sql(sql: &str) -> Vec<(Tok, usize)> {
-    let c: Vec<char> = sql.chars().collect();
-    let n = c.len();
-    let mut out = Vec::new();
-    let mut i = 0;
-    let mut line = 1;
-    while i < n {
-        let ch = c[i];
-        let at = line;
-        if is_scanner_space(ch) {
-            line += usize::from(ch == '\n');
-            i += 1;
-        } else if ch == '-' && c.get(i + 1) == Some(&'-') {
-            i += 2;
-            while i < n && !matches!(c[i], '\n' | '\r') {
-                i += 1;
-            }
-        } else if ch == '/' && c.get(i + 1) == Some(&'*') {
-            let mut depth = 1usize;
-            i += 2;
-            while i < n && depth > 0 {
-                if c[i] == '/' && c.get(i + 1) == Some(&'*') {
-                    depth += 1;
-                    i += 2;
-                } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    line += usize::from(c[i] == '\n');
-                    i += 1;
-                }
-            }
-        } else if ch == '\'' || ch == '"' {
-            i += 1;
-            let text = read_quoted(&c, &mut i, ch, Escapes::Doubled, &mut line);
-            out.push((
-                if ch == '"' {
-                    Tok::Word { text, quoted: true }
-                } else {
-                    Tok::Str(text)
-                },
-                at,
-            ));
-        } else if let Some(tag_len) = (ch == '$').then(|| dollar_tag_len(&c, i)).flatten() {
-            let tag = &c[i..i + tag_len];
-            let body = i + tag_len;
-            let close = (body..n).find(|&k| c[k..].starts_with(tag));
-            let end = close.unwrap_or(n);
-            line += c[body..end].iter().filter(|&&ch| ch == '\n').count();
-            out.push((Tok::Str(c[body..end].iter().collect()), at));
-            i = close.map_or(n, |k| k + tag_len);
-        } else if is_ident_start(ch) {
-            let start = i;
-            i += 1;
-            while i < n && is_ident_char(c[i]) {
-                i += 1;
-            }
-            let text: String = c[start..i].iter().collect();
-            let prefixed = match text.as_str() {
-                "e" | "E" => Some(Escapes::Backslash),
-                "x" | "X" | "b" | "B" => Some(Escapes::None),
-                _ => None,
-            };
-            match prefixed {
-                Some(escapes) if c.get(i) == Some(&'\'') => {
-                    i += 1;
-                    let text = read_quoted(&c, &mut i, '\'', escapes, &mut line);
-                    out.push((Tok::Str(text), at));
-                }
-                _ => out.push((
-                    Tok::Word {
-                        text,
-                        quoted: false,
-                    },
-                    at,
-                )),
-            }
-        } else {
-            out.push((Tok::Other(ch), at));
-            i += 1;
-        }
-    }
-    out
 }
 
 /// Where one `INSTALL` asks DuckDB to fetch an extension from.
@@ -1075,17 +1081,25 @@ enum ExtensionSql {
 
 // ---- A SQL file as DuckDB's CLI reads it ----
 //
-// `arc run` hands a SQL step to `duckdb <db> -f <file>`. What reaches DuckDB's scanner is not
+// `arc run` hands a SQL step to `duckdb <db> -f <file>`. What reaches DuckDB's tokenizer is not
 // the file: the CLI reads it a line at a time, skips some lines, and hands the parser one
-// batch of lines at a time; the parser then replaces some unicode spaces before its scanner
-// runs. Each function below copies one of those steps from DuckDB v1.5.5's source, and
-// v1.5.4's and v1.5.6's are the same: `tools/shell/shell.cpp` for the CLI,
-// `src/parser/parser.cpp` for the pre-pass. A step is copied as far as it changes which text DuckDB reads as SQL, and no
-// further.
+// batch of lines at a time (`ShellState::ProcessInput`, `tools/shell/shell.cpp:3135-3266`);
+// the parser then replaces some unicode spaces before its tokenizer runs over the whole batch
+// (`ShellState::ExecuteSQL`, `shell.cpp:1082-1132`, and `src/main/parse_iterator.cpp:18-20`,
+// `137-147`). Each function below copies one of those steps from DuckDB v2.0.0's source, cited
+// by file and line, and says where it differs from v1.5.5's. A step is copied as far as it
+// changes which text DuckDB reads as SQL, and no further. What DuckDB's tokenizer reads in
+// each batch is asked of DuckDB itself, in `crate::duckdb_tokens`.
+//
+// Two things v2.0.0 adds change no rule here. A batch that is not valid UTF-8 is refused
+// before any of it runs (`src/parser/parser.cpp:78-89`, `240-247`), and the CLI stops at it;
+// arc reads the batch and those after it all the same, which refuses more and never less.
+// And the CLI runs a bare name as `SELECT * FROM name` (`SET active_grammar_extensions`,
+// `shell.cpp:1313`), which changes what a batch's statements are and not its tokens.
 
 /// The lines DuckDB's CLI reads from a file, each with the file line it starts on, as
-/// `local_getline` reads them with `fgets`: a line ends at `\n`, and a NUL byte ends what the
-/// line keeps of the `fgets` chunk it is in. The rest of that chunk is dropped, and the next
+/// `local_getline` reads them with `fgets` (`tools/shell/shell.cpp:531-562`, as in v1.5.5): a
+/// line ends at `\n`, and a NUL byte ends what the line keeps of the `fgets` chunk it is in. The rest of that chunk is dropped, and the next
 /// chunk joins the line, which for a short line is the next line of the file. A chunk holds
 /// the room left in a buffer that starts at 100 bytes and grows to twice its size and 100
 /// more whenever 100 bytes are not left, less one byte for the NUL `fgets` writes.
@@ -1093,11 +1107,13 @@ enum ExtensionSql {
 /// The `\r` DuckDB drops before each `\n` is kept: every rule after this one reads a `\r` as
 /// it reads a space. So is a last line the CLI would not return because a NUL left it empty:
 /// an empty line is no SQL.
-fn cli_lines(bytes: &[u8]) -> Vec<(Vec<u8>, usize)> {
+fn cli_lines(bytes: &[u8]) -> Vec<CliLine> {
     let mut lines = Vec::new();
     let mut line = Vec::new();
+    let mut origin = Origin::default();
     let mut size = 100;
     let mut starts_on = 1;
+    let mut base = 0;
     for (index, physical) in bytes.split_inclusive(|&b| b == b'\n').enumerate() {
         let mut at = 0;
         // Each pass reads one chunk of at least one byte, so a pass per byte is enough.
@@ -1106,29 +1122,143 @@ fn cli_lines(bytes: &[u8]) -> Vec<(Vec<u8>, usize)> {
                 size = size * 2 + 100;
             }
             let take = (size - line.len() - 1).min(physical.len() - at);
-            line.extend(physical[at..at + take].iter().take_while(|&&b| b != 0));
+            let kept = physical[at..at + take]
+                .iter()
+                .take_while(|&&b| b != 0)
+                .count();
+            line.extend_from_slice(&physical[at..at + kept]);
+            origin.push_bytes(base + at, kept);
             at += take;
             if line.last() == Some(&b'\n') {
                 line.pop();
-                lines.push((std::mem::take(&mut line), starts_on));
+                origin.pop();
+                lines.push(CliLine {
+                    bytes: std::mem::take(&mut line),
+                    starts_on,
+                    origin: std::mem::take(&mut origin),
+                });
                 size = 100;
                 starts_on = index + 2;
             }
         }
+        base += physical.len();
     }
-    lines.push((line, starts_on));
+    lines.push(CliLine {
+        bytes: line,
+        starts_on,
+        origin,
+    });
     lines
 }
 
-/// A space to the CLI's own tests of a line: DuckDB's `CharacterIsSpace`, which unlike its
-/// scanner counts a vertical tab.
+/// One line the CLI reads: its bytes, the file line it starts on, and where each byte came
+/// from in the file.
+struct CliLine {
+    bytes: Vec<u8>,
+    starts_on: usize,
+    origin: Origin,
+}
+
+/// Where each byte of a text came from in the file it was made from, as runs of bytes that
+/// are consecutive in both. The text is a file's lines after the CLI's cuts and the parser's
+/// unicode-space pass, so most of it is a few long runs: a dropped line, a NUL, or a unicode
+/// space replaced by a space each start a new one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Origin {
+    /// Each run's first byte in the text and in the file, in text order.
+    runs: Vec<(usize, usize)>,
+    /// The text's length.
+    len: usize,
+}
+
+impl Origin {
+    /// Adds `count` bytes that start at `file` in the file.
+    fn push_bytes(&mut self, file: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let continues = self
+            .runs
+            .last()
+            .is_some_and(|&(text, at)| at + (self.len - text) == file);
+        if !continues {
+            self.runs.push((self.len, file));
+        }
+        self.len += count;
+    }
+
+    /// Drops the last byte.
+    fn pop(&mut self) {
+        self.len = self.len.saturating_sub(1);
+        if self.runs.last().is_some_and(|&(text, _)| text >= self.len) {
+            self.runs.pop();
+        }
+    }
+
+    /// Adds `other` after this text.
+    fn append(&mut self, other: &Origin) {
+        for &(text, file) in &other.runs {
+            let start = self.len + text;
+            // A run that continues this text's last is not added again.
+            let continues = self
+                .runs
+                .last()
+                .is_some_and(|&(t, at)| at + (start - t) == file);
+            if !continues {
+                self.runs.push((start, file));
+            }
+        }
+        self.len += other.len;
+    }
+
+    /// The file byte the text's byte `pos` came from, if it came from one.
+    pub(crate) fn at(&self, pos: usize) -> Option<usize> {
+        if pos >= self.len {
+            return None;
+        }
+        let run = self.runs.partition_point(|&(text, _)| text <= pos);
+        let &(text, file) = self.runs.get(run.checked_sub(1)?)?;
+        Some(file + (pos - text))
+    }
+
+    /// This text after a pass that copied bytes of it into a new text: `copies` gives each
+    /// run of the new text as its first byte there and in this text, and `len` is the new
+    /// text's length.
+    pub(crate) fn through(&self, copies: &[(usize, usize)], len: usize) -> Origin {
+        let mut out = Origin::default();
+        for (n, &(to, from)) in copies.iter().enumerate() {
+            let end = copies.get(n + 1).map_or(len, |next| next.0);
+            let mut at = from;
+            let mut left = end - to;
+            while left > 0 {
+                let run = self.runs.partition_point(|&(text, _)| text <= at);
+                let Some(&(text, file)) = run.checked_sub(1).and_then(|r| self.runs.get(r)) else {
+                    return Origin::default();
+                };
+                let run_end = self.runs.get(run).map_or(self.len, |next| next.0);
+                let take = left.min(run_end.saturating_sub(at));
+                if take == 0 {
+                    return Origin::default();
+                }
+                out.push_bytes(file + (at - text), take);
+                at += take;
+                left -= take;
+            }
+        }
+        out
+    }
+}
+
+/// A space to the CLI's own tests of a line: DuckDB's `CharacterIsSpace`
+/// (`tools/shell/shell.cpp:430-432`, `src/include/duckdb/common/string_util.hpp:55-57`), which
+/// counts a vertical tab where `SQLIsComplete` does not.
 fn is_cli_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
 }
 
-/// Whether `z` holds only spaces and comments, as the CLI's `_all_whitespace` reads it: a
-/// `/* */` comment does not nest, and one left open is not whitespace; a `--` comment runs
-/// to `\n`.
+/// Whether `z` holds only spaces and comments, as the CLI's `_all_whitespace` reads it
+/// (`tools/shell/shell.cpp:2879-2907`, as in v1.5.5): a `/* */` comment does not nest, and one
+/// left open is not whitespace; a `--` comment runs to `\n`.
 fn all_whitespace(z: &[u8]) -> bool {
     let mut i = 0;
     while let Some(&b) = z.get(i) {
@@ -1155,10 +1285,15 @@ fn is_tag_byte(b: u8, first: bool) -> bool {
 }
 
 /// Whether the CLI hands the lines it holds to the parser now, as its `SQLIsComplete` reads
-/// them: when they end in a `;` outside a string or comment. This is not the scanner's
-/// reading: a `/* */` comment does not nest, a backslash escapes nothing, a `--` comment runs
-/// to `\n` alone, and a `$tag$` opens anywhere, inside a word too. Each difference moves
-/// where a batch ends, and so which lines after it are read as SQL.
+/// them (`tools/shell/shell.cpp:2939-3061`): when they end in a `;` outside a string, a quoted
+/// name or a comment. This is not the tokenizer's reading: a `/* */` comment does not nest, a
+/// backslash escapes nothing, a `--` comment runs to `\n` alone, and a `$tag$` opens
+/// anywhere, inside a word too. Each difference moves where a batch ends, and so which lines
+/// after it are read as SQL.
+///
+/// v2.0.0 reads a backtick as it reads a `'` or a `"`, running to the next backtick
+/// (`shell.cpp:3036-3050`), where v1.5.5 left the case commented out: on 2.0,
+/// ``SELECT 1 AS `x;`` holds the batch open, and a `.` or `#` line after it is SQL.
 fn sql_is_complete(z: &[u8]) -> bool {
     let mut semicolon = false;
     let mut i = 0;
@@ -1196,7 +1331,7 @@ fn sql_is_complete(z: &[u8]) -> bool {
                     (i + 1, Some(false))
                 }
             }
-            b'\'' | b'"' => match rest.iter().position(|&q| q == b) {
+            b'\'' | b'"' | b'`' => match rest.iter().position(|&q| q == b) {
                 Some(k) => (i + 1 + k + 1, None),
                 None => return false,
             },
@@ -1210,24 +1345,45 @@ fn sql_is_complete(z: &[u8]) -> bool {
     semicolon
 }
 
+/// One batch [`cli_batches_mapped`] cuts.
+pub(crate) struct CliBatch {
+    pub(crate) text: Vec<u8>,
+    /// The file line each of its lines starts on.
+    pub(crate) lines: Vec<usize>,
+    /// Where each byte of `text` came from in the file.
+    pub(crate) origin: Origin,
+}
+
 /// The batches of SQL DuckDB's CLI hands its parser from a file, each with the file line
-/// each of its lines starts on, as the CLI's `ProcessInput` cuts them. A line whose first
-/// byte is `\x03` drops the lines held so far. A line starting with `.` or `#` while no line
-/// is held is a dot command or a comment, and is not SQL, whatever quote or comment it opens.
-/// Any other line is held, and the lines held go to the parser together once a line holding
-/// a `;` completes them by [`sql_is_complete`], or at the end of the file. Lines that hold
-/// only spaces and comments are dropped.
+/// each of its lines starts on, as the CLI's `ProcessInput` cuts them
+/// (`tools/shell/shell.cpp:3135-3266`; for a file, as in v1.5.5). A line whose first byte is
+/// `\x03` drops the lines held so far (`shell.cpp:3174-3187`). A line starting with `.` or
+/// `#` while no line is held is a dot command or a comment, and is not SQL, whatever quote or
+/// comment it opens (`shell.cpp:3206-3221`). Any other line is held, and the lines held go to
+/// the parser together once a line holding a `;` completes them by [`sql_is_complete`]
+/// (`shell.cpp:3244`), or at the end of the file (`shell.cpp:3260-3262`). Lines that hold only
+/// spaces and comments are dropped (`shell.cpp:3200-3205`, `3253-3258`).
 ///
 /// A dot command can itself run SQL or a program, such as `.read` and `.shell`; what it runs
 /// is not read here.
-fn cli_batches(bytes: &[u8]) -> Vec<(Vec<u8>, Vec<usize>)> {
+///
+/// Each batch also says where each of its bytes came from in the file. The `\n` the CLI puts
+/// between two lines of a batch is given the byte after the line before it.
+pub(crate) fn cli_batches_mapped(bytes: &[u8]) -> Vec<CliBatch> {
     let mut batches = Vec::new();
     let mut sql = Vec::new();
     let mut lines = Vec::new();
-    for (line, starts_on) in cli_lines(bytes) {
+    let mut origin = Origin::default();
+    for CliLine {
+        bytes: line,
+        starts_on,
+        origin: line_origin,
+    } in cli_lines(bytes)
+    {
         if line.first() == Some(&0x03) {
             sql.clear();
             lines.clear();
+            origin = Origin::default();
             continue;
         }
         if sql.is_empty() && matches!(line.first(), Some(b'.' | b'#')) {
@@ -1236,19 +1392,31 @@ fn cli_batches(bytes: &[u8]) -> Vec<(Vec<u8>, Vec<usize>)> {
         let prior = sql.len();
         if !sql.is_empty() {
             sql.push(b'\n');
+            let after = origin.len.checked_sub(1).and_then(|last| origin.at(last));
+            origin.push_bytes(after.map_or(0, |at| at + 1), 1);
         }
         sql.extend_from_slice(&line);
+        origin.append(&line_origin);
         lines.push(starts_on);
         if sql[prior..].contains(&b';') && sql_is_complete(&sql) {
-            batches.push((std::mem::take(&mut sql), std::mem::take(&mut lines)));
+            batches.push(CliBatch {
+                text: std::mem::take(&mut sql),
+                lines: std::mem::take(&mut lines),
+                origin: std::mem::take(&mut origin),
+            });
         } else if all_whitespace(&sql) {
             sql.clear();
             lines.clear();
+            origin = Origin::default();
         }
     }
     // The CLI hands over what is left unless it is only spaces and comments, which hold no
     // statement to find.
-    batches.push((sql, lines));
+    batches.push(CliBatch {
+        text: sql,
+        lines,
+        origin,
+    });
     batches
 }
 
@@ -1266,22 +1434,42 @@ fn unicode_space_len(q: &[u8]) -> Option<usize> {
     }
 }
 
-/// A batch as DuckDB's scanner receives it: each unicode space in [`unicode_space_len`]
-/// replaced with a space, as the parser's `StripUnicodeSpaces` pre-pass does, except inside
-/// what the pre-pass reads as a string or a comment. That is not the scanner's reading: a
+/// A batch as DuckDB's tokenizer receives it: each unicode space in [`unicode_space_len`]
+/// replaced with a space, as the parser's `StripUnicodeSpaces` pre-pass does
+/// (`src/parser/parser.cpp:94-200`, with `ReplaceUnicodeSpaces` at `51-64`; both bodies are
+/// unchanged from v1.5.5), except inside what the pre-pass
+/// reads as a string or a comment. That is not the tokenizer's reading: a
 /// `'` or `"` opens a string until the next of the same quote, a `$` and a tag open a
 /// dollar-quoted string, a `--` comment ends at `\n` or `\r`, and `/* */` is not a comment.
 /// So a `'` inside a block comment opens a string for the pre-pass, and a U+200B after it
-/// stays, to be read by the scanner as part of a word.
+/// stays, to be read by the tokenizer as part of a word.
 ///
-/// DuckDB repeats the pass until it replaces nothing; one pass leaves nothing for a second,
+/// v2.0.0 makes the pass once (`Parser::NormalizeSQLString`, `src/parser/parser.cpp:240-247`),
+/// where v1.5.5 repeated it until it replaced nothing; a second pass would replace nothing,
 /// because a space opens nothing and a unicode space after a `$` is read as part of a tag.
-fn strip_unicode_spaces(q: &[u8]) -> Vec<u8> {
+pub(crate) fn strip_unicode_spaces(q: &[u8]) -> Vec<u8> {
+    strip_unicode_spaces_copies(q).0
+}
+
+/// [`strip_unicode_spaces`], with the runs of `q` it copied: each as its first byte in the
+/// result and in `q`. A replaced unicode space is a run of its own, from the space's first
+/// byte.
+pub(crate) fn strip_unicode_spaces_copies(q: &[u8]) -> (Vec<u8>, Vec<(usize, usize)>) {
     let mut out = Vec::new();
+    let mut copies: Vec<(usize, usize)> = Vec::new();
+    let mut copy = |out: &Vec<u8>, from: usize| {
+        if copies
+            .last()
+            .is_none_or(|&(to, at)| at + (out.len() - to) != from)
+        {
+            copies.push((out.len(), from));
+        }
+    };
     let mut pos = 0;
     while pos < q.len() {
         let rest = &q[pos..];
         if let Some(len) = unicode_space_len(rest) {
+            copy(&out, pos);
             out.push(b' ');
             pos += len;
             continue;
@@ -1317,27 +1505,28 @@ fn strip_unicode_spaces(q: &[u8]) -> Vec<u8> {
             }
             _ => pos + 1,
         };
+        copy(&out, pos);
         out.extend_from_slice(&q[pos..end]);
         pos = end;
     }
-    out
+    (out, copies)
 }
 
 /// Every place in a SQL file that says where DuckDB installs an extension from, and every
-/// place where it runs SQL that is not in the file, each with the file line it is on. The
-/// file is read as DuckDB's CLI reads it: [`cli_batches`], then [`strip_unicode_spaces`],
-/// then [`lex_sql`], each batch alone.
-fn scan_extension_sql(file: &[u8]) -> Vec<(ExtensionSql, usize)> {
+/// place where it runs SQL that is not in the file, each with the file line it is on, read
+/// from the file's tokens as the DuckDB that runs it gave them: each batch
+/// [`cli_batches_mapped`] cuts, after [`strip_unicode_spaces`], read alone.
+fn scan_extension_sql(tokens: &FileTokens) -> Vec<(ExtensionSql, usize)> {
     let mut found = Vec::new();
-    for (batch, lines) in cli_batches(file) {
-        let batch = strip_unicode_spaces(&batch);
-        let toks = lex_sql(&String::from_utf8_lossy(&batch));
-        let run_time = scan_run_time_sql(&toks)
+    for batch in &tokens.batches {
+        let toks = to_tok(batch.text.as_bytes(), &batch.tokens);
+        let run_time = scan_run_time_sql(&toks, &tokens.literals)
             .into_iter()
             .map(|(shape, line)| (ExtensionSql::RunTime(shape), line));
         // A batch holds one `\n` between each two of its lines, and nothing else adds one.
+        let last = batch.lines.last().copied().unwrap_or(1);
         for (finding, line) in scan_tokens(&toks).into_iter().chain(run_time) {
-            found.push((finding, lines[line - 1]));
+            found.push((finding, batch.lines.get(line - 1).copied().unwrap_or(last)));
         }
     }
     found
@@ -1347,14 +1536,15 @@ fn scan_extension_sql(file: &[u8]) -> Vec<(ExtensionSql, usize)> {
 /// its line in the batch: a call in [`unread_calls`]; `IMPORT DATABASE` or `import_database`,
 /// in any letter case and whatever follows; and a string or a quoted name whose text holds
 /// `.duckdbrc` in any letter case, since macOS's default file system does not tell
-/// `.DuckDBrc` from `.duckdbrc`. `import_database` is one word to [`lex_sql`], as `_` is a
-/// word character, so `PRAGMA import_database('imp')` is looked for by its own name.
+/// `.DuckDBrc` from `.duckdbrc`. `import_database` is one word to DuckDB's tokenizer, as `_`
+/// is a word character, so `PRAGMA import_database('imp')` is looked for by its own name.
+/// A string is read both as it evaluates and as it is written.
 ///
 /// These are shapes, not a boundary: a path to `.duckdbrc` assembled from pieces is not among
 /// them. A step that writes over a later step's or hook's SQL file is not a shape either: that
 /// file is read again just before it runs, by [`ExtensionRecheck::check`].
-fn scan_run_time_sql(toks: &[(Tok, usize)]) -> Vec<(RunTimeSql, usize)> {
-    let mut found: Vec<(RunTimeSql, usize)> = unread_calls(toks)
+fn scan_run_time_sql(toks: &[(Tok, usize)], literals: &Literals) -> Vec<(RunTimeSql, usize)> {
+    let mut found: Vec<(RunTimeSql, usize)> = unread_calls(toks, literals)
         .into_iter()
         .map(|(name, line)| (RunTimeSql::Call(name), line))
         .collect();
@@ -1368,8 +1558,13 @@ fn scan_run_time_sql(toks: &[(Tok, usize)]) -> Vec<(RunTimeSql, usize)> {
             (Tok::Word { text, .. }, _) if text.eq_ignore_ascii_case("import_database") => {
                 RunTimeSql::ImportDatabase
             }
-            (Tok::Word { text, quoted: true } | Tok::Str(text), _)
-                if text.to_lowercase().contains(".duckdbrc") =>
+            (Tok::Word { text, quoted: true }, _) if text.to_lowercase().contains(".duckdbrc") => {
+                RunTimeSql::Duckdbrc
+            }
+            (Tok::Str { text, raw }, _)
+                if [text, raw]
+                    .iter()
+                    .any(|t| t.to_lowercase().contains(".duckdbrc")) =>
             {
                 RunTimeSql::Duckdbrc
             }
@@ -1384,7 +1579,8 @@ fn scan_run_time_sql(toks: &[(Tok, usize)]) -> Vec<(RunTimeSql, usize)> {
 /// function's name, with the line of the call. The name is read in any letter case, quoted or
 /// not and after a schema, as DuckDB runs `FROM "query"('SELECT 1')` and
 /// `FROM system.main.query('SELECT 1')`; a name a column list follows is not a call.
-fn unread_calls(toks: &[(Tok, usize)]) -> Vec<(&'static str, usize)> {
+/// `literals` holds the tokens of each string a `query(…)` call is given.
+fn unread_calls(toks: &[(Tok, usize)], literals: &Literals) -> Vec<(&'static str, usize)> {
     let mut found = Vec::new();
     for (k, (tok, line)) in toks.iter().enumerate() {
         let Tok::Word { text, .. } = tok else {
@@ -1399,7 +1595,7 @@ fn unread_calls(toks: &[(Tok, usize)]) -> Vec<(&'static str, usize)> {
         let [(Tok::Other('('), _), argument @ ..] = &toks[k + 1..] else {
             continue;
         };
-        if names_a_table(&toks[..k]) || reads_argument(name, argument) {
+        if names_a_table(&toks[..k]) || reads_argument(name, argument, literals) {
             continue;
         }
         found.push((name, *line));
@@ -1423,15 +1619,24 @@ fn names_a_table(before: &[(Tok, usize)]) -> bool {
 
 /// Whether arc reads the SQL a call to `name` runs, from the tokens after its `(`: one string
 /// literal and the `)`, whose text makes no call arc does not read. `query()` runs the literal
-/// as SQL, which DuckDB's parser reads after its unicode-space pass; the serialized SQL
-/// `json_execute_serialized_sql()` runs is read by [`serialized_calls`].
-fn reads_argument(name: &str, argument: &[(Tok, usize)]) -> bool {
-    let [(Tok::Str(literal), _), (Tok::Other(')'), _), ..] = argument else {
+/// as SQL, which DuckDB's parser reads after its unicode-space pass, and whose tokens
+/// `literals` holds; a literal it does not hold is read as making such a call. The
+/// serialized SQL `json_execute_serialized_sql()` runs is read by [`serialized_calls`].
+fn reads_argument(name: &str, argument: &[(Tok, usize)], literals: &Literals) -> bool {
+    let [
+        (Tok::Str { text: literal, .. }, _),
+        (Tok::Other(')'), _),
+        ..,
+    ] = argument
+    else {
         return false;
     };
     if name == "query" {
-        let literal = strip_unicode_spaces(literal.as_bytes());
-        unread_calls(&lex_sql(&String::from_utf8_lossy(&literal))).is_empty()
+        let literal =
+            String::from_utf8_lossy(&strip_unicode_spaces(literal.as_bytes())).into_owned();
+        literals.get(&literal).is_some_and(|tokens| {
+            unread_calls(&to_tok(literal.as_bytes(), tokens), literals).is_empty()
+        })
     } else {
         !serialized_calls(literal)
     }
@@ -1489,9 +1694,11 @@ fn scan_tokens(toks: &[(Tok, usize)]) -> Vec<(ExtensionSql, usize)> {
             Tok::Word { text, .. } => PARSER_SWITCHES
                 .iter()
                 .find(|name| text.eq_ignore_ascii_case(name)),
-            Tok::Str(text) => {
-                let text = text.to_ascii_lowercase();
-                PARSER_SWITCHES.iter().find(|name| text.contains(*name))
+            Tok::Str { text, raw } => {
+                let (text, raw) = (text.to_ascii_lowercase(), raw.to_ascii_lowercase());
+                PARSER_SWITCHES
+                    .iter()
+                    .find(|name| text.contains(*name) || raw.contains(*name))
             }
             Tok::Other(_) => None,
         };
@@ -1522,7 +1729,9 @@ fn scan_tokens(toks: &[(Tok, usize)]) -> Vec<(ExtensionSql, usize)> {
             {
                 text
             }
-            Some((Tok::Str(text), _)) => text,
+            // DuckDB installs the string as it is written: `INSTALL E'a\x5fb'` installs a
+            // file `a\x5fb`, so a backslash in it makes it a path.
+            Some((Tok::Str { raw, .. }, _)) => raw,
             _ => continue,
         };
         if name.contains(['.', '/', '\\']) {
@@ -1544,7 +1753,7 @@ fn scan_tokens(toks: &[(Tok, usize)]) -> Vec<(ExtensionSql, usize)> {
                     Tok::Word { text, .. } if text == "core" => InstallFrom::Core,
                     Tok::Word { text, .. } if text == "community" => InstallFrom::Community,
                     Tok::Word { text, .. } => InstallFrom::Alias(text.clone()),
-                    Tok::Str(address) => InstallFrom::Address(address.clone()),
+                    Tok::Str { text: address, .. } => InstallFrom::Address(address.clone()),
                     // `INSTALL x FROM;` does not parse, and DuckDB runs nothing of it.
                     Tok::Other(_) => continue,
                 }
@@ -1627,6 +1836,9 @@ pub(crate) struct ExtensionInstalls {
     /// community`, once, in the order the Protocol first installs it: what the run record
     /// names first, before each other extension a step's process reports it loaded.
     pub(crate) recorded: Vec<String>,
+    /// The tokens of each file the check read, which the check of each file just before it
+    /// runs reads again when the file has not changed.
+    pub(crate) tokens: TokenCache,
 }
 
 /// What the check reads in one SQL file: a line for each statement it refuses, each vetted
@@ -1649,9 +1861,9 @@ fn add_new(list: &mut Vec<String>, names: impl IntoIterator<Item = String>) {
     }
 }
 
-/// Check the SQL file `source` runs, holding `bytes`, as [`check_extension_installs`] checks
-/// each file.
-fn check_file(source: &ProtocolSql, bytes: &[u8]) -> FileCheck {
+/// Check the SQL file `source` runs, whose tokens are `tokens`, as
+/// [`check_extension_installs`] checks each file.
+fn check_file(source: &ProtocolSql, tokens: &FileTokens) -> FileCheck {
     let vetted = vetted_extensions();
     let mut found = FileCheck {
         refusals: Vec::new(),
@@ -1659,7 +1871,7 @@ fn check_file(source: &ProtocolSql, bytes: &[u8]) -> FileCheck {
         recorded: Vec::new(),
         shapes: Vec::new(),
     };
-    for (finding, line) in scan_extension_sql(bytes) {
+    for (finding, line) in scan_extension_sql(tokens) {
         let why = match finding {
             ExtensionSql::RunTime(shape) => {
                 found.shapes.push((shape, line));
@@ -1710,6 +1922,9 @@ fn check_file(source: &ProtocolSql, bytes: &[u8]) -> FileCheck {
             ExtensionSql::Setting(setting) => format!(
                 "names the setting {setting}, which moves where DuckDB installs an extension from"
             ),
+            ExtensionSql::ParserSwitch(name) if name == "current_dialect" => format!(
+                "names {name}, which hands the SQL after it to a dialect an extension registers, whose tokenizer and grammar arc does not read"
+            ),
             ExtensionSql::ParserSwitch(name) => format!(
                 "names {name}, which switches DuckDB to a second parser whose comments and strings arc does not read"
             ),
@@ -1740,10 +1955,16 @@ fn check_file(source: &ProtocolSql, bytes: &[u8]) -> FileCheck {
 /// boundary: a `command:` step can start a DuckDB
 /// of its own and install what it likes, and a process an earlier step leaves running can
 /// write a file after the check just before it runs has read it.
+///
+/// Each file is read from the tokens `engine`'s DuckDB gives for it. A file it gives no
+/// tokens for, or tokens arc cannot read, is refused: arc does not fall back to a reading of
+/// its own.
 pub(crate) fn check_extension_installs(
     sql: &[ProtocolSql],
     engine_version: Option<&semver::Version>,
+    engine: &dyn Engine,
 ) -> Result<ExtensionInstalls> {
+    let mut tokens = TokenCache::default();
     let mut refusals = Vec::new();
     let mut installed: Vec<&VettedExtension> = Vec::new();
     let mut recorded = Vec::new();
@@ -1754,7 +1975,10 @@ pub(crate) fn check_extension_installs(
         let Ok(bytes) = std::fs::read(&source.path) else {
             continue;
         };
-        let found = check_file(source, &bytes);
+        let found = match tokens.get(&bytes, |file| engine.tokenize(file)) {
+            Ok(file_tokens) => check_file(source, file_tokens),
+            Err(refusal) => return Err(not_read(source, refusal)),
+        };
         refusals.extend(found.refusals);
         for entry in found.installed {
             if !installed.iter().any(|seen| seen.name == entry.name) {
@@ -1783,7 +2007,26 @@ pub(crate) fn check_extension_installs(
         warnings,
         installed: names,
         recorded,
+        tokens,
     })
+}
+
+/// The refusal of the SQL file `source` runs when DuckDB gave no tokens for it, or tokens arc
+/// cannot read.
+fn not_read(source: &ProtocolSql, refusal: Refusal) -> Error {
+    let reason = match refusal {
+        Refusal::NotStarted { program, reason } | Refusal::NotRun { program, reason } => {
+            format!("DuckDB `{program}` did not answer: {reason}")
+        }
+        Refusal::Unreadable(reason) => reason,
+        not_2 @ Refusal::NotDuckDb2 { .. } => not_2.to_string(),
+    };
+    Error::SqlNotRead {
+        place: source.place.clone(),
+        step: source.step.clone(),
+        file: source.file.clone(),
+        reason,
+    }
 }
 
 /// The check of each SQL step's and hook's file just before it runs, for a file a step
@@ -1806,6 +2049,8 @@ pub(crate) struct ExtensionRecheck {
     loaded: LoadedExtensions,
     /// Each warning printed so far.
     warned: HashSet<String>,
+    /// The tokens of each file a check has read, shared with the check before the run.
+    tokens: TokenCache,
     pins: ExtensionPins,
     engine_version: Option<semver::Version>,
 }
@@ -1827,6 +2072,7 @@ impl ExtensionRecheck {
             pinned,
             loaded: LoadedExtensions::default(),
             warned: installs.warnings.into_iter().chain(pin_warnings).collect(),
+            tokens: installs.tokens,
             pins: pins.clone(),
             engine_version: engine_version.cloned(),
         }
@@ -1860,7 +2106,9 @@ impl ExtensionRecheck {
     /// what [`check_extension_installs`] refuses in a file, and check each vetted community
     /// extension it installs that no check has found against its pin, as
     /// [`check_extension_pins`] does. Returns each warning those two give that the run has not
-    /// printed. A file arc cannot read is left to the engine, which reads it next.
+    /// printed. A file arc cannot open is left to the engine, which reports it when it runs
+    /// the file next; a file whose tokens DuckDB does not give, or gives in a form arc cannot
+    /// read, is refused with [`Error::SqlNotRead`].
     pub(crate) fn check(
         &mut self,
         engine: &dyn Engine,
@@ -1869,7 +2117,10 @@ impl ExtensionRecheck {
         let Ok(bytes) = std::fs::read(&source.path) else {
             return Ok(Vec::new());
         };
-        let found = check_file(source, &bytes);
+        let found = match self.tokens.get(&bytes, |file| engine.tokenize(file)) {
+            Ok(file_tokens) => check_file(source, file_tokens),
+            Err(refusal) => return Err(not_read(source, refusal)),
+        };
         if !found.refusals.is_empty() {
             return Err(Error::ExtensionRefusedBeforeItRan {
                 place: source.place.clone(),
@@ -2096,7 +2347,7 @@ pub mod mock {
         exec_count: RefCell<usize>,
         /// If true, preflight returns EngineNotFound.
         pub preflight_should_fail: RefCell<bool>,
-        /// Version to report from preflight. Defaults to 1.5.4, inside the range arc is
+        /// Version to report from preflight. Defaults to 2.0.0, inside the range arc is
         /// tested on, so a test that does not care about the version is not refused by it.
         pub version: RefCell<Option<semver::Version>>,
         /// Simulated stdout for command steps with capture_stdout=true.
@@ -2116,6 +2367,15 @@ pub mod mock {
         /// What a SQL step's or hook's process reports it loaded when the step passes, by the
         /// file name of its SQL. A file not here reports nothing.
         pub loads: RefCell<HashMap<String, Vec<(String, ReportedExtension)>>>,
+        /// How many times `tokenize` was asked.
+        pub tokenized: RefCell<usize>,
+        /// If set, `tokenize` fails with this reason.
+        pub tokens_failure: RefCell<Option<String>>,
+        /// What `tokenizer_failure` says the DuckDB said; `None`, a tokenizer that answers,
+        /// unless set.
+        pub tokenizer_failure: RefCell<Option<String>>,
+        /// How many times `tokenizer_failure` was asked.
+        pub probed: RefCell<usize>,
     }
 
     #[derive(Debug, Clone)]
@@ -2145,7 +2405,7 @@ pub mod mock {
                 fail_on_call: RefCell::new(None),
                 exec_count: RefCell::new(0),
                 preflight_should_fail: RefCell::new(false),
-                version: RefCell::new(Some(semver::Version::new(1, 5, 4))),
+                version: RefCell::new(Some(semver::Version::new(2, 0, 0))),
                 simulated_stdout: RefCell::new(None),
                 timeout_should_fire: RefCell::new(false),
                 platform: RefCell::new(Some("linux_amd64".to_string())),
@@ -2153,6 +2413,10 @@ pub mod mock {
                 report: RefCell::new(EngineReport::default()),
                 reported: RefCell::new(Vec::new()),
                 loads: RefCell::new(HashMap::new()),
+                tokenized: RefCell::new(0),
+                tokens_failure: RefCell::new(None),
+                tokenizer_failure: RefCell::new(None),
+                probed: RefCell::new(0),
             }
         }
 
@@ -2309,6 +2573,8 @@ pub mod mock {
             }
             Ok(EngineInfo {
                 version: self.version.borrow().clone(),
+                dev_build: None,
+                printed: String::new(),
             })
         }
 
@@ -2344,6 +2610,26 @@ pub mod mock {
             panic!("the mock engine was asked to force-install {name}, which arc run never does")
         }
 
+        /// The tokens DuckDB v2.0.0 gave for the file, as `crate::duckdb_tokens::recorded`
+        /// holds them.
+        fn tokenize(&self, file: &[u8]) -> std::result::Result<FileTokens, Refusal> {
+            *self.tokenized.borrow_mut() += 1;
+            let failure = self.tokens_failure.borrow().clone();
+            crate::duckdb_tokens::tokenize_with(file, &mut |texts| match &failure {
+                Some(reason) => Err(Refusal::Unreadable(reason.clone())),
+                None => crate::duckdb_tokens::recorded::ask(texts),
+            })
+        }
+
+        fn tokenizer_failure(&self) -> Option<String> {
+            *self.probed.borrow_mut() += 1;
+            self.tokenizer_failure.borrow().clone()
+        }
+
+        fn which(&self, _printed: &str) -> String {
+            "the mock DuckDB".to_string()
+        }
+
         fn report(&self, extensions: &[String]) -> EngineReport {
             self.reported.borrow_mut().push(extensions.to_vec());
             self.report.borrow().clone()
@@ -2355,33 +2641,149 @@ pub mod mock {
 mod tests {
     use super::*;
 
+    // Every arc build must link a DuckDB that reports the release, not a development
+    // version. libduckdb-sys vendors a development DuckDB for the bundled build
+    // (duckdb/duckdb-rs#917); CI's `bundled` job and the release workflow define
+    // DUCKDB_VERSION at build. Remove this note with the workaround.
+    #[test]
+    fn the_linked_duckdb_reports_the_release_version() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let version: String = conn
+            .query_row("SELECT version()", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            version, DUCKDB_RECOMMENDED,
+            "link DuckDB's release library (DUCKDB_LIB_DIR); a development build such as \
+             Homebrew's 2.0.0 library reports a development version. For a bundled build, \
+             set CXXFLAGS='-DDUCKDB_VERSION=\"{DUCKDB_RECOMMENDED}\"'"
+        );
+    }
+
+    fn parse_version(output: &str) -> Option<semver::Version> {
+        parse_engine_version(output).map(|parsed| parsed.version)
+    }
+
     // Parse version with codename (standard DuckDB format).
     #[test]
     fn test_lrp_parse_version_with_codename() {
-        let version = parse_version_output("v1.5.2 (Variegata) 8a5851971f");
+        let version = parse_version("v1.5.2 (Variegata) 8a5851971f");
         assert_eq!(version.unwrap(), semver::Version::new(1, 5, 2));
+    }
+
+    // A development build of a release's own commit is that release.
+    #[test]
+    fn a_tokenizer_error_naming_autocomplete_or_sql_tokenize_is_said_as_a_missing_extension() {
+        for error in [
+            "Extension Autoloading Error: the required extension 'autocomplete'",
+            "Catalog Error: Table Function with name sql_tokenize does not exist!",
+        ] {
+            assert_eq!(
+                no_tokenizer_cause("the duckdb on PATH", error),
+                "the duckdb on PATH cannot read SQL into tokens, because it was built without \
+                 DuckDB's autocomplete extension. arc needs those tokens to check what each SQL \
+                 step installs.",
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn any_other_tokenizer_error_is_quoted_rather_than_named() {
+        assert_eq!(
+            no_tokenizer_cause(
+                "the duckdb on PATH",
+                "Out of Memory Error: could not allocate"
+            ),
+            "the duckdb on PATH could not answer DuckDB's tokenizer, `sql_tokenize`, and said \
+             \"Out of Memory Error: could not allocate\". arc needs those tokens to check what \
+             each SQL step installs."
+        );
+    }
+
+    // DuckDB's error can run to several lines; the one-line refusal and warning quote it on
+    // one, and the sentence goes on after it.
+    #[test]
+    fn a_multi_line_tokenizer_error_is_quoted_on_one_line() {
+        let error =
+            "Parser Error: syntax error at or near \"x\"\n\nLINE 1: SELECT x\n               ^\n";
+        let cause = no_tokenizer_cause("the duckdb on PATH", error);
+        assert_eq!(
+            cause,
+            "the duckdb on PATH could not answer DuckDB's tokenizer, `sql_tokenize`, and said \
+             \"Parser Error: syntax error at or near \"x\" LINE 1: SELECT x ^\". arc needs those \
+             tokens to check what each SQL step installs."
+        );
+        assert!(!cause.contains('\n'), "{cause}");
+        let warning = crate::introspect::no_tokenizer_warning("the duckdb on PATH", error);
+        assert!(!warning.contains('\n'), "{warning}");
+        let refusal = crate::error::Error::NoTokenizer {
+            which: "the duckdb on PATH".to_string(),
+            error: error.to_string(),
+        }
+        .to_string();
+        assert!(!refusal.contains('\n'), "{refusal}");
+    }
+
+    #[test]
+    fn a_told_duckdb_is_named_by_its_path_with_its_printed_version_quoted() {
+        let told = DuckDbProgram::Told(PathBuf::from("/opt/duckdb"));
+        assert_eq!(
+            which_duckdb(&told, "v2.0.0-dev88614 (Development Version) d54cbbe3df\n"),
+            "the DuckDB ARC_DUCKDB_BIN names, `/opt/duckdb`, which prints \
+             `v2.0.0-dev88614 (Development Version) d54cbbe3df`,"
+        );
+        assert_eq!(
+            which_duckdb(&told, ""),
+            "the DuckDB ARC_DUCKDB_BIN names, `/opt/duckdb`,"
+        );
+    }
+
+    #[test]
+    fn a_dev_build_of_a_release_commit_parses_as_the_release() {
+        let parsed =
+            parse_engine_version("v2.0.0-dev88614 (Development Version) d54cbbe3df").unwrap();
+        assert_eq!(parsed.version, semver::Version::new(2, 0, 0));
+        assert_eq!(parsed.dev_build.as_deref(), Some("v2.0.0-dev88614"));
+        let release = parse_engine_version("v2.0.0 (Cyanoptera) d54cbbe3df").unwrap();
+        assert_eq!(release.version, semver::Version::new(2, 0, 0));
+        assert!(release.dev_build.is_none());
+    }
+
+    // Another commit, a commit too short to tell, or another version keeps the pre-release.
+    #[test]
+    fn a_dev_build_of_any_other_commit_keeps_its_pre_release() {
+        for output in [
+            "v2.0.0-dev88614 (Development Version) 0123456789",
+            "v2.0.0-dev88614 (Development Version) d54cb",
+            "v2.0.1-dev88614 (Development Version) d54cbbe3df",
+            "v2.0.0-dev88614",
+        ] {
+            let parsed = parse_engine_version(output).unwrap();
+            assert!(!parsed.version.pre.is_empty(), "{output}");
+            assert!(parsed.dev_build.is_none(), "{output}");
+        }
     }
 
     // Parse version without codename.
     #[test]
     fn test_lrp_parse_version_without_codename() {
-        let version = parse_version_output("v0.10.0 1234abc");
+        let version = parse_version("v0.10.0 1234abc");
         assert_eq!(version.unwrap(), semver::Version::new(0, 10, 0));
     }
 
     // Parse bare version (no leading 'v').
     #[test]
     fn test_lrp_parse_bare_version() {
-        let version = parse_version_output("1.5.2");
+        let version = parse_version("1.5.2");
         assert_eq!(version.unwrap(), semver::Version::new(1, 5, 2));
     }
 
     // Unparseable output returns None.
     #[test]
     fn test_lrp_unparseable_version_returns_none() {
-        assert!(parse_version_output("not a version").is_none());
-        assert!(parse_version_output("").is_none());
-        assert!(parse_version_output("duckdb").is_none());
+        assert!(parse_version("not a version").is_none());
+        assert!(parse_version("").is_none());
+        assert!(parse_version("duckdb").is_none());
     }
 
     // MockEngine returns configurable version.
@@ -2389,14 +2791,14 @@ mod tests {
     fn test_lrp_mock_engine_configurable_version() {
         let engine = mock::MockEngine::new();
 
-        // Default is 1.5.4, inside the supported range.
+        // Default is 2.0.0, inside the supported range.
         let info = engine.preflight().unwrap();
-        assert_eq!(info.version.unwrap(), semver::Version::new(1, 5, 4));
+        assert_eq!(info.version.unwrap(), semver::Version::new(2, 0, 0));
 
         // Set custom version.
-        engine.set_version(Some(semver::Version::new(1, 3, 0)));
+        engine.set_version(Some(semver::Version::new(2, 1, 0)));
         let info = engine.preflight().unwrap();
-        assert_eq!(info.version.unwrap(), semver::Version::new(1, 3, 0));
+        assert_eq!(info.version.unwrap(), semver::Version::new(2, 1, 0));
 
         // Set None (unparseable).
         engine.set_version(None);
@@ -2408,28 +2810,22 @@ mod tests {
 #[cfg(test)]
 mod extension_tests {
     use super::*;
+    use crate::duckdb_tokens::recorded::{self, record_program};
+    use crate::duckdb_tokens::tokenize_file;
 
-    fn word(text: &str) -> Tok {
-        Tok::Word {
-            text: text.to_string(),
-            quoted: false,
-        }
+    /// [`super::scan_extension_sql`] on the tokens DuckDB v2.0.0 gives for `file`, as
+    /// [`recorded`] holds them.
+    fn scan_extension_sql(file: &[u8]) -> Vec<(ExtensionSql, usize)> {
+        super::scan_extension_sql(&recorded::tokenize(file).expect("tokens"))
     }
 
-    fn quoted(text: &str) -> Tok {
-        Tok::Word {
-            text: text.to_string(),
-            quoted: true,
-        }
-    }
-
-    fn string(text: &str) -> Tok {
-        Tok::Str(text.to_string())
-    }
-
-    /// The tokens of `sql`, without their lines.
-    fn toks(sql: &str) -> Vec<Tok> {
-        lex_sql(sql).into_iter().map(|(tok, _)| tok).collect()
+    /// [`super::check_extension_installs`], with the tokens DuckDB v2.0.0 gives for each
+    /// file, as [`recorded`] holds them.
+    fn check_extension_installs(
+        sql: &[ProtocolSql],
+        engine_version: Option<&semver::Version>,
+    ) -> Result<ExtensionInstalls> {
+        super::check_extension_installs(sql, engine_version, &mock::MockEngine::new())
     }
 
     /// The findings of `sql`, without their lines.
@@ -2447,126 +2843,13 @@ mod extension_tests {
         }
     }
 
-    // ---- the lexer, rule by rule ----
-
-    #[test]
-    fn lex_splits_words_strings_and_punctuation() {
-        assert_eq!(
-            toks("INSTALL x FROM 'a';"),
-            vec![
-                word("INSTALL"),
-                word("x"),
-                word("FROM"),
-                string("a"),
-                Tok::Other(';')
-            ]
-        );
-        assert_eq!(
-            toks("1 - 2 / _a é"),
-            vec![
-                Tok::Other('1'),
-                Tok::Other('-'),
-                Tok::Other('2'),
-                Tok::Other('/'),
-                word("_a"),
-                word("é")
-            ]
-        );
-        assert_eq!(toks("a$$b c1"), vec![word("a$$b"), word("c1")]);
-    }
-
-    #[test]
-    fn lex_drops_a_line_comment_to_the_end_of_its_line() {
-        assert_eq!(
-            lex_sql("-- INSTALL a\nINSTALL b"),
-            vec![(word("INSTALL"), 2), (word("b"), 2)]
-        );
-    }
-
-    #[test]
-    fn lex_nests_block_comments_as_duckdb_does() {
-        assert_eq!(
-            toks("/* /* */ INSTALL a; */ INSTALL b"),
-            vec![word("INSTALL"), word("b")]
-        );
-        assert_eq!(toks("/* a */ x /* b */"), vec![word("x")]);
-        assert_eq!(lex_sql("/*\n\n*/ x"), vec![(word("x"), 3)]);
-        assert_eq!(toks("/* open /* INSTALL a */ INSTALL b"), Vec::<Tok>::new());
-    }
-
-    #[test]
-    fn lex_reads_a_doubled_quote_as_one_and_a_backslash_as_itself() {
-        assert_eq!(toks("'it''s' x"), vec![string("it's"), word("x")]);
-        assert_eq!(toks(r"'a\' x"), vec![string(r"a\"), word("x")]);
-        assert_eq!(toks("'open"), vec![string("open")]);
-        assert_eq!(toks(r#""a""b" c"#), vec![quoted(r#"a"b"#), word("c")]);
-    }
-
-    #[test]
-    fn lex_honours_a_backslash_only_inside_an_e_string() {
-        assert_eq!(toks(r"E'a\'b' x"), vec![string("a'b"), word("x")]);
-        assert_eq!(toks(r"e'a\'b' x"), vec![string("a'b"), word("x")]);
-        assert_eq!(toks("E'a''b'"), vec![string("a'b")]);
-        assert_eq!(toks("e x"), vec![word("e"), word("x")]);
-        assert_eq!(
-            toks(r"ex'a\' x"),
-            vec![word("ex"), string(r"a\"), word("x")]
-        );
-        assert_eq!(
-            lex_sql("E'\\\n' x"),
-            vec![(string("\n"), 1), (word("x"), 2)]
-        );
-    }
-
-    #[test]
-    fn lex_ends_a_bit_or_hex_string_at_its_first_quote() {
-        assert_eq!(toks("X'ab''cd'"), vec![string("ab"), string("cd")]);
-        assert_eq!(toks("x'ab''cd'"), vec![string("ab"), string("cd")]);
-        assert_eq!(toks("B'01''10'"), vec![string("01"), string("10")]);
-        assert_eq!(toks("b'01''10'"), vec![string("01"), string("10")]);
-    }
-
-    #[test]
-    fn lex_reads_dollar_quoted_strings() {
-        assert_eq!(toks("$$ a ' b $$ x"), vec![string(" a ' b "), word("x")]);
-        assert_eq!(toks("$t$ $$ $t$ x"), vec![string(" $$ "), word("x")]);
-        assert_eq!(toks("$$ open"), vec![string(" open")]);
-        // `$1` is a parameter, so `$1a$` opens no string: a tag cannot start with a digit.
-        assert_eq!(
-            toks("$1a$ x"),
-            vec![Tok::Other('$'), Tok::Other('1'), word("a$"), word("x")]
-        );
-        assert_eq!(
-            toks("$1 $name x"),
-            vec![
-                Tok::Other('$'),
-                Tok::Other('1'),
-                Tok::Other('$'),
-                word("name"),
-                word("x")
-            ]
-        );
-        assert_eq!(
-            lex_sql("$$\n\n$$ x"),
-            vec![(string("\n\n"), 1), (word("x"), 3)]
-        );
-    }
-
-    #[test]
-    fn lex_counts_lines_inside_a_string() {
-        assert_eq!(
-            lex_sql("'a\nb' x\ny"),
-            vec![(string("a\nb"), 1), (word("x"), 2), (word("y"), 3)]
-        );
-    }
-
     // ---- what the scan finds ----
 
     #[test]
     fn scan_reads_where_each_install_fetches_from() {
         assert_eq!(
-            scan("INSTALL mlpack FROM community;"),
-            vec![install("mlpack", InstallFrom::Community)]
+            scan("INSTALL zipfs FROM community;"),
+            vec![install("zipfs", InstallFrom::Community)]
         );
         assert_eq!(
             scan("INSTALL spatial FROM core; INSTALL excel; INSTALL x VERSION 'v1';"),
@@ -2577,13 +2860,13 @@ mod extension_tests {
             ]
         );
         assert_eq!(
-            scan("INSTALL mlpack FROM core_nightly;"),
-            vec![install("mlpack", InstallFrom::Alias("core_nightly".into()))]
+            scan("INSTALL zipfs FROM core_nightly;"),
+            vec![install("zipfs", InstallFrom::Alias("core_nightly".into()))]
         );
         assert_eq!(
-            scan("INSTALL mlpack FROM 'https://example.org/ext';"),
+            scan("INSTALL zipfs FROM 'https://example.org/ext';"),
             vec![install(
-                "mlpack",
+                "zipfs",
                 InstallFrom::Address("https://example.org/ext".into())
             )]
         );
@@ -2592,16 +2875,16 @@ mod extension_tests {
     #[test]
     fn scan_compares_a_repository_as_written() {
         assert_eq!(
-            scan("INSTALL mlpack FROM Community;"),
-            vec![install("mlpack", InstallFrom::Alias("Community".into()))]
+            scan("INSTALL zipfs FROM Community;"),
+            vec![install("zipfs", InstallFrom::Alias("Community".into()))]
         );
         assert_eq!(
-            scan(r#"INSTALL mlpack FROM "community";"#),
-            vec![install("mlpack", InstallFrom::Community)]
+            scan(r#"INSTALL zipfs FROM "community";"#),
+            vec![install("zipfs", InstallFrom::Community)]
         );
         assert_eq!(
-            scan("INSTALL mlpack FROM 'community';"),
-            vec![install("mlpack", InstallFrom::Address("community".into()))]
+            scan("INSTALL zipfs FROM 'community';"),
+            vec![install("zipfs", InstallFrom::Address("community".into()))]
         );
     }
 
@@ -2612,9 +2895,9 @@ mod extension_tests {
             vec![install("anofox_forecast", InstallFrom::Community)]
         );
         assert_eq!(
-            scan(r#"INSTALL "MLPACK" FROM community; INSTALL 'Rapidfuzz' FROM community;"#),
+            scan(r#"INSTALL "ZIPFS" FROM community; INSTALL 'Rapidfuzz' FROM community;"#),
             vec![
-                install("mlpack", InstallFrom::Community),
+                install("zipfs", InstallFrom::Community),
                 install("rapidfuzz", InstallFrom::Community)
             ]
         );
@@ -2635,9 +2918,9 @@ mod extension_tests {
     #[test]
     fn scan_reads_a_name_holding_a_path_character_as_a_path() {
         assert_eq!(
-            scan("INSTALL '/tmp/ext/mlpack.duckdb_extension';"),
+            scan("INSTALL '/tmp/ext/zipfs.duckdb_extension';"),
             vec![ExtensionSql::InstallPath(
-                "/tmp/ext/mlpack.duckdb_extension".into()
+                "/tmp/ext/zipfs.duckdb_extension".into()
             )]
         );
         assert_eq!(
@@ -2657,7 +2940,7 @@ mod extension_tests {
         assert_eq!(scan("SELECT install FROM community;"), vec![]);
         assert_eq!(scan(r#"SELECT "install" x FROM community;"#), vec![]);
         assert_eq!(scan("INSTALL x FROM; INSTALL; INSTALL"), vec![]);
-        assert_eq!(scan("LOAD mlpack; LOAD '/tmp/x.duckdb_extension';"), vec![]);
+        assert_eq!(scan("LOAD zipfs; LOAD '/tmp/x.duckdb_extension';"), vec![]);
         assert_eq!(
             scan(
                 "-- INSTALL a FROM community;\n/* INSTALL b FROM community; */ SELECT 'INSTALL c FROM community';"
@@ -2669,10 +2952,10 @@ mod extension_tests {
     #[test]
     fn scan_finds_a_repository_setting_in_any_form() {
         assert_eq!(
-            scan("SET custom_extension_repository = '/tmp/ext'; INSTALL mlpack;"),
+            scan("SET custom_extension_repository = '/tmp/ext'; INSTALL zipfs;"),
             vec![
                 ExtensionSql::Setting("custom_extension_repository".into()),
-                install("mlpack", InstallFrom::Core)
+                install("zipfs", InstallFrom::Core)
             ]
         );
         assert_eq!(
@@ -2712,7 +2995,7 @@ mod extension_tests {
             &[("step 'a'", "SELECT 1;\nSET extension_directory = 'ext';")],
         );
         assert_eq!(
-            refusals(check_extension_installs(&sql, Some(&v("1.5.6")))),
+            refusals(check_extension_installs(&sql, Some(&v("2.0.0")))),
             vec![
                 "step 'a' (s0.sql, line 2) names the setting extension_directory, which moves where DuckDB keeps the extensions it installs"
             ]
@@ -2725,10 +3008,10 @@ mod extension_tests {
         let sql = sources(
             dir.path(),
             &[
-                ("step 'a'", "INSTALL onager FROM community; INSTALL excel;"),
+                ("step 'a'", "INSTALL webbed FROM community; INSTALL excel;"),
                 (
                     "step 'b'",
-                    "FORCE INSTALL mlpack FROM community; INSTALL onager FROM community;",
+                    "FORCE INSTALL zipfs FROM community; INSTALL webbed FROM community;",
                 ),
                 (
                     "hook on_exit 'h'",
@@ -2737,10 +3020,10 @@ mod extension_tests {
             ],
         );
         assert_eq!(
-            check_extension_installs(&sql, Some(&v("1.5.6")))
+            check_extension_installs(&sql, Some(&v("2.0.0")))
                 .unwrap()
                 .installed,
-            vec!["onager".to_string(), "mlpack".to_string()]
+            vec!["webbed".to_string(), "zipfs".to_string()]
         );
     }
 
@@ -2792,46 +3075,46 @@ mod extension_tests {
     #[test]
     fn a_pin_equal_to_the_installed_file_passes_and_is_kept_for_the_end() {
         let dir = tempfile::tempdir().unwrap();
-        let (path, hash) = installed_file(dir.path(), "mlpack", b"build one");
+        let (path, hash) = installed_file(dir.path(), "zipfs", b"build one");
         let engine = mock::MockEngine::new();
-        engine.set_install("mlpack", Ok(Some(path.clone())));
+        engine.set_install("zipfs", Ok(Some(path.clone())));
         let (pinned, warnings) = check_extension_pins(
             &engine,
-            &["mlpack".into()],
-            &pins(&[("mlpack", "v1.5.6", "linux_amd64", &hash)]),
-            Some(&v("1.5.6")),
+            &["zipfs".into()],
+            &pins(&[("zipfs", "v2.0.0", "linux_amd64", &hash)]),
+            Some(&v("2.0.0")),
         )
         .unwrap();
         assert_eq!(warnings, Vec::<String>::new());
         assert_eq!(
             pinned,
             vec![PinnedExtension {
-                name: "mlpack".into(),
-                version: "v1.5.6".into(),
+                name: "zipfs".into(),
+                version: "v2.0.0".into(),
                 platform: "linux_amd64".into(),
                 pin: hash,
                 path,
             }]
         );
-        assert_eq!(calls(&engine), vec!["platform", "install mlpack"]);
+        assert_eq!(calls(&engine), vec!["platform", "install zipfs"]);
     }
 
     #[test]
     fn a_pin_that_differs_is_refused_naming_each_part() {
         let dir = tempfile::tempdir().unwrap();
-        let (path, hash) = installed_file(dir.path(), "mlpack", b"build two");
+        let (path, hash) = installed_file(dir.path(), "zipfs", b"build two");
         let engine = mock::MockEngine::new();
-        engine.set_install("mlpack", Ok(Some(path.clone())));
+        engine.set_install("zipfs", Ok(Some(path.clone())));
         let refused = pin_refusals(check_extension_pins(
             &engine,
-            &["mlpack".into()],
-            &pins(&[("mlpack", "v1.5.6", "linux_amd64", PIN_A)]),
-            Some(&v("1.5.6")),
+            &["zipfs".into()],
+            &pins(&[("zipfs", "v2.0.0", "linux_amd64", PIN_A)]),
+            Some(&v("2.0.0")),
         ));
         assert_eq!(
             refused,
             vec![format!(
-                "mlpack on DuckDB v1.5.6, linux_amd64: pinned {PIN_A}, and the installed file {} hashes to {hash}; `arc upgrade mlpack` installs the build the community registry serves and pins it",
+                "zipfs on DuckDB v2.0.0, linux_amd64: pinned {PIN_A}, and the installed file {} hashes to {hash}; `arc upgrade zipfs` installs the build the community registry serves and pins it",
                 path.display()
             )]
         );
@@ -2839,52 +3122,52 @@ mod extension_tests {
 
     #[test]
     fn an_install_that_fails_or_names_no_file_is_refused_and_not_warned() {
-        let pinned = pins(&[("mlpack", "v1.5.6", "linux_amd64", PIN_A)]);
+        let pinned = pins(&[("zipfs", "v2.0.0", "linux_amd64", PIN_A)]);
         let engine = mock::MockEngine::new();
-        engine.set_install("mlpack", Err("HTTP 404".into()));
+        engine.set_install("zipfs", Err("HTTP 404".into()));
         let failed = pin_refusals(check_extension_pins(
             &engine,
-            &["mlpack".into()],
+            &["zipfs".into()],
             &pinned,
-            Some(&v("1.5.6")),
+            Some(&v("2.0.0")),
         ));
         assert_eq!(failed.len(), 1, "{failed:?}");
         assert!(
             failed[0]
-                .starts_with("mlpack on DuckDB v1.5.6, linux_amd64: arc could not install mlpack")
+                .starts_with("zipfs on DuckDB v2.0.0, linux_amd64: arc could not install zipfs")
                 && failed[0].contains("HTTP 404"),
             "{failed:?}"
         );
 
         let engine = mock::MockEngine::new();
-        engine.set_install("mlpack", Ok(None));
+        engine.set_install("zipfs", Ok(None));
         let no_file = pin_refusals(check_extension_pins(
             &engine,
-            &["mlpack".into()],
+            &["zipfs".into()],
             &pinned,
-            Some(&v("1.5.6")),
+            Some(&v("2.0.0")),
         ));
         assert_eq!(
             no_file,
             vec![
-                "mlpack on DuckDB v1.5.6, linux_amd64: DuckDB named no installed file for mlpack after installing it"
+                "zipfs on DuckDB v2.0.0, linux_amd64: DuckDB named no installed file for zipfs after installing it"
             ]
         );
 
         let engine = mock::MockEngine::new();
         engine.set_install(
-            "mlpack",
-            Ok(Some(PathBuf::from("/nonexistent/mlpack.duckdb_extension"))),
+            "zipfs",
+            Ok(Some(PathBuf::from("/nonexistent/zipfs.duckdb_extension"))),
         );
         let unreadable = pin_refusals(check_extension_pins(
             &engine,
-            &["mlpack".into()],
+            &["zipfs".into()],
             &pinned,
-            Some(&v("1.5.6")),
+            Some(&v("2.0.0")),
         ));
         assert!(
             unreadable[0]
-                .contains("could not read the installed file /nonexistent/mlpack.duckdb_extension"),
+                .contains("could not read the installed file /nonexistent/zipfs.duckdb_extension"),
             "{unreadable:?}"
         );
     }
@@ -2895,14 +3178,14 @@ mod extension_tests {
         *engine.platform.borrow_mut() = None;
         let refused = pin_refusals(check_extension_pins(
             &engine,
-            &["mlpack".into(), "onager".into()],
-            &pins(&[("mlpack", "v1.5.6", "linux_amd64", PIN_A)]),
-            Some(&v("1.5.6")),
+            &["zipfs".into(), "webbed".into()],
+            &pins(&[("zipfs", "v2.0.0", "linux_amd64", PIN_A)]),
+            Some(&v("2.0.0")),
         ));
         assert_eq!(refused.len(), 1, "{refused:?}");
         assert!(
             refused[0]
-                .starts_with("mlpack has a pin for DuckDB v1.5.6, and arc could not choose it"),
+                .starts_with("zipfs has a pin for DuckDB v2.0.0, and arc could not choose it"),
             "{refused:?}"
         );
         assert_eq!(calls(&engine), vec!["platform"]);
@@ -2912,7 +3195,7 @@ mod extension_tests {
     fn an_extension_with_no_pin_for_this_version_and_platform_warns_once_and_asks_only_what_it_needs()
      {
         let tail = format!(
-            ", so arc runs whichever build DuckDB installs; `arc upgrade mlpack` pins the build the community registry serves ({VETTED_EXTENSIONS_DOC})"
+            ", so arc runs whichever build DuckDB installs; `arc upgrade zipfs` pins the build the community registry serves ({VETTED_EXTENSIONS_DOC})"
         );
         // (label, pins, version, the warning's place, the calls DuckDB receives)
         type Case = (
@@ -2926,27 +3209,27 @@ mod extension_tests {
             (
                 "no key",
                 pins(&[]),
-                Some(v("1.5.6")),
-                "for DuckDB v1.5.6",
+                Some(v("2.0.0")),
+                "for DuckDB v2.0.0",
                 vec![],
             ),
             (
                 "another version",
-                pins(&[("mlpack", "v1.5.4", "linux_amd64", PIN_A)]),
-                Some(v("1.5.6")),
-                "for DuckDB v1.5.6",
+                pins(&[("zipfs", "v2.0.1", "linux_amd64", PIN_A)]),
+                Some(v("2.0.0")),
+                "for DuckDB v2.0.0",
                 vec![],
             ),
             (
                 "another platform",
-                pins(&[("mlpack", "v1.5.6", "osx_arm64", PIN_A)]),
-                Some(v("1.5.6")),
-                "for DuckDB v1.5.6 on linux_amd64",
+                pins(&[("zipfs", "v2.0.0", "osx_arm64", PIN_A)]),
+                Some(v("2.0.0")),
+                "for DuckDB v2.0.0 on linux_amd64",
                 vec!["platform"],
             ),
             (
                 "no version",
-                pins(&[("mlpack", "v1.5.6", "linux_amd64", PIN_A)]),
+                pins(&[("zipfs", "v2.0.0", "linux_amd64", PIN_A)]),
                 None,
                 "arc could not read this engine's DuckDB version to choose one",
                 vec![],
@@ -2955,12 +3238,12 @@ mod extension_tests {
         for (label, pins, version, place, asked) in cases {
             let engine = mock::MockEngine::new();
             let (pinned, warnings) =
-                check_extension_pins(&engine, &["mlpack".into()], &pins, version.as_ref()).unwrap();
+                check_extension_pins(&engine, &["zipfs".into()], &pins, version.as_ref()).unwrap();
             assert!(pinned.is_empty(), "[{label}]");
             assert_eq!(
                 warnings,
                 vec![format!(
-                    "mlpack has no pin under the extensions: key of arcform.yaml ({place}){tail}"
+                    "zipfs has no pin under the extensions: key of arcform.yaml ({place}){tail}"
                 )],
                 "[{label}]"
             );
@@ -2974,8 +3257,8 @@ mod extension_tests {
         let (pinned, warnings) = check_extension_pins(
             &engine,
             &[],
-            &pins(&[("mlpack", "v1.5.6", "linux_amd64", PIN_A)]),
-            Some(&v("1.5.6")),
+            &pins(&[("zipfs", "v2.0.0", "linux_amd64", PIN_A)]),
+            Some(&v("2.0.0")),
         )
         .unwrap();
         assert!(pinned.is_empty() && warnings.is_empty());
@@ -2985,19 +3268,19 @@ mod extension_tests {
     #[test]
     fn the_end_of_the_run_fails_on_a_file_that_changed_and_passes_one_that_did_not() {
         let dir = tempfile::tempdir().unwrap();
-        let (path, hash) = installed_file(dir.path(), "mlpack", b"build one");
-        let (other, other_hash) = installed_file(dir.path(), "onager", b"build one");
+        let (path, hash) = installed_file(dir.path(), "zipfs", b"build one");
+        let (other, other_hash) = installed_file(dir.path(), "webbed", b"build one");
         let pinned = vec![
             PinnedExtension {
-                name: "mlpack".into(),
-                version: "v1.5.6".into(),
+                name: "zipfs".into(),
+                version: "v2.0.0".into(),
                 platform: "linux_amd64".into(),
                 pin: hash.clone(),
                 path: path.clone(),
             },
             PinnedExtension {
-                name: "onager".into(),
-                version: "v1.5.6".into(),
+                name: "webbed".into(),
+                version: "v2.0.0".into(),
                 platform: "linux_amd64".into(),
                 pin: other_hash,
                 path: other,
@@ -3010,7 +3293,7 @@ mod extension_tests {
             Err(Error::ExtensionChanged { changes }) => assert_eq!(
                 changes,
                 vec![format!(
-                    "mlpack on DuckDB v1.5.6, linux_amd64: pinned {hash}, and when the run ended {} hashed to {found}",
+                    "zipfs on DuckDB v2.0.0, linux_amd64: pinned {hash}, and when the run ended {} hashed to {found}",
                     path.display()
                 )]
             ),
@@ -3018,31 +3301,127 @@ mod extension_tests {
         }
     }
 
+    /// DuckDB 2.0 has no `enable_peg_parser()`: its PEG parser is the only one, and
+    /// `CALL enable_peg_parser();` is a catalog error. Naming it switches nothing.
     #[test]
-    fn scan_finds_a_parser_switch_in_any_form() {
+    fn naming_enable_peg_parser_is_no_longer_refused() {
+        for sql in [
+            "SELECT 'enable_peg_parser';",
+            "CALL enable_peg_parser();",
+            "FROM query('FROM ENABLE_PEG_PARSER()');",
+        ] {
+            assert_eq!(scan(sql), vec![], "{sql}");
+        }
+    }
+
+    #[test]
+    fn setting_allow_parser_override_extension_is_still_refused() {
         let switch = |name: &str| ExtensionSql::ParserSwitch(name.into());
-        assert_eq!(
-            scan("CALL enable_peg_parser();\nFROM Enable_Peg_Parser();"),
-            vec![switch("enable_peg_parser"), switch("enable_peg_parser")]
-        );
         assert_eq!(
             scan(
                 r#"SET allow_parser_override_extension = 'fallback'; PRAGMA ALLOW_PARSER_OVERRIDE_EXTENSION='strict'; SET GLOBAL "allow_parser_override_extension" TO 'default';"#
             ),
             vec![switch("allow_parser_override_extension"); 3]
         );
-        // A string DuckDB runs as SQL, with its escapes read.
+        // A string, with its escapes read.
         assert_eq!(
             scan(
-                r"FROM query('FROM ENABLE_PEG_PARSER()'); FROM query(E'FROM enable\x5fpeg_parser()');"
+                r"SELECT 'ALLOW_PARSER_OVERRIDE_EXTENSION', E'allow\x5fparser_override_extension';"
             ),
-            vec![switch("enable_peg_parser"); 2]
+            vec![switch("allow_parser_override_extension"); 2]
         );
-        // In a comment, inside a longer name, and the function that switches back.
+        // In a comment, and inside a longer name.
         assert_eq!(
             scan(
-                "-- CALL enable_peg_parser();\n/* SET allow_parser_override_extension = 'strict'; */ CALL disable_peg_parser(); SELECT my_enable_peg_parser;"
+                "-- SET allow_parser_override_extension = 'strict';\n/* SET current_dialect = 'x'; */ SELECT my_allow_parser_override_extension;"
             ),
+            vec![]
+        );
+    }
+
+    /// DuckDB 2.0's `current_dialect` hands the parser to a dialect an extension registers,
+    /// with a tokenizer of the dialect's own, so it is refused as the parser override is.
+    #[test]
+    fn setting_current_dialect_is_refused() {
+        let switch = |name: &str| ExtensionSql::ParserSwitch(name.into());
+        assert_eq!(
+            scan(
+                "SET current_dialect = 'x'; RESET Current_Dialect; SET LOCAL \"current_dialect\" TO 'y';"
+            ),
+            vec![switch("current_dialect"); 3]
+        );
+    }
+
+    /// Every byte of a batch the CLI holds, after the parser's unicode-space pass, is found
+    /// in the file where the batch's origin says, except the `\n` between lines and a unicode
+    /// space the pass replaced (which comes from the space's first byte).
+    #[test]
+    fn a_batch_byte_is_found_in_the_file_where_its_origin_says() {
+        let files: [&[u8]; 6] = [
+            b"SELECT 1;\nSELECT 2;\n",
+            b".mode list\n# note\nSELECT 1;\n\x03junk\nSELECT 2;\n",
+            b"SELECT 1;\r\nSELECT\r\n 2;\r\n",
+            "\u{feff}SELECT 1;\nSELECT\u{a0}2;\n".as_bytes(),
+            // A NUL ends what the line keeps of its chunk, and the next line joins it.
+            b"SELECT 1;\0 dropped\nSELECT 2;\n",
+            b"-- a comment only\n\nSELECT 1\n;\n.print x\nSELECT 2",
+        ];
+        for file in files {
+            for batch in cli_batches_mapped(file) {
+                let (stripped, copies) = strip_unicode_spaces_copies(&batch.text);
+                let origin = batch.origin.through(&copies, stripped.len());
+                for (i, byte) in stripped.iter().enumerate() {
+                    if *byte == b'\n' || *byte == b' ' {
+                        continue;
+                    }
+                    let found = origin.at(i).map(|f| file[f]);
+                    assert_eq!(
+                        found,
+                        Some(*byte),
+                        "byte {i} of {:?} in {:?}",
+                        String::from_utf8_lossy(&stripped),
+                        String::from_utf8_lossy(file)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_nul_joins_the_next_line_and_the_origin_skips_what_it_dropped() {
+        let file = b"SELECT 1;\0 dropped\nSELECT 2;\n";
+        let batches = cli_batches_mapped(file);
+        let first = &batches[0];
+        assert_eq!(first.text, b"SELECT 1;SELECT 2;");
+        // The second `SELECT` starts at text byte 9, after the NUL and what it dropped.
+        assert_eq!(first.origin.at(9), Some(19));
+        assert_eq!(file[19], b'S');
+    }
+
+    /// DuckDB 2.0's CLI reads a backtick as it reads a `"` when it decides whether the lines it
+    /// holds end in a `;`, so a `.` or `#` line after an open backtick is SQL.
+    #[test]
+    fn a_backtick_holds_a_batch_open_across_lines_on_2_0() {
+        let file = b"SELECT 1 AS `x;\n# `; INSTALL h3x FROM community;\n";
+        let first = &cli_batches_mapped(file)[0];
+        assert_eq!(
+            (first.text.clone(), first.lines.clone()),
+            (
+                b"SELECT 1 AS `x;\n# `; INSTALL h3x FROM community;".to_vec(),
+                vec![1, 2]
+            )
+        );
+        assert_eq!(
+            scan_extension_sql(file),
+            vec![(install("h3x", InstallFrom::Community), 2)]
+        );
+        assert_eq!(
+            scan_extension_sql(b"SELECT 1 AS `;\n.print`; INSTALL h3x FROM community;"),
+            vec![(install("h3x", InstallFrom::Community), 2)]
+        );
+        // Inside a string a backtick opens nothing, and the `#` line after is not SQL.
+        assert_eq!(
+            scan_extension_sql(b"SELECT '`';\n# INSTALL h3x FROM community;"),
             vec![]
         );
     }
@@ -3260,7 +3639,7 @@ mod extension_tests {
                 ),
                 (
                     "hook on_exit 'h'",
-                    "INSTALL mlpack FROM community;\nPRAGMA import_database('imp');",
+                    "INSTALL zipfs FROM community;\nPRAGMA import_database('imp');",
                 ),
             ],
         );
@@ -3268,12 +3647,12 @@ mod extension_tests {
             ". arc does not read the SQL a step builds or writes while it runs, for an extension that SQL installs; running it anyway ({VETTED_EXTENSIONS_DOC})"
         );
         assert_eq!(
-            check_extension_installs(&sql, Some(&v("1.5.4")))
+            check_extension_installs(&sql, Some(&v("2.0.1")))
                 .unwrap()
                 .warnings,
             vec![
                 format!(
-                    "mlpack is vetted on DuckDB v1.5.6, and this engine is DuckDB v1.5.4; running it anyway ({VETTED_EXTENSIONS_DOC})"
+                    "zipfs is vetted on DuckDB v2.0.0, and this engine is DuckDB v2.0.1; running it anyway ({VETTED_EXTENSIONS_DOC})"
                 ),
                 format!(
                     "step 'a' (s0.sql) can run or write SQL that is not in its file: IMPORT DATABASE on line 1, query() on line 2, .duckdbrc on line 3{tail}"
@@ -3302,7 +3681,7 @@ mod extension_tests {
             ],
         );
         assert_eq!(
-            refusals(check_extension_installs(&sql, Some(&v("1.5.6")))),
+            refusals(check_extension_installs(&sql, Some(&v("2.0.0")))),
             vec![
                 "step 'b' (s1.sql, line 1) installs anofox_forecast from the community registry, and anofox_forecast is not on the vetted list"
             ]
@@ -3340,7 +3719,7 @@ mod extension_tests {
 
     #[test]
     fn a_plain_extension_name_is_letters_digits_and_underscores() {
-        for name in ["mlpack", "splink_udfs", "h3", "us_address_standardizer"] {
+        for name in ["zipfs", "splink_udfs", "h3", "us_address_standardizer"] {
             assert!(is_plain_extension_name(name), "{name}");
         }
         for name in ["", "x'y", "a.b", "a b", "a;b", "a-b", "ä"] {
@@ -3376,7 +3755,7 @@ mod extension_tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), names.len(), "a name appears twice: {names:?}");
-        assert!(names.contains(&"mlpack"), "{names:?}");
+        assert!(names.contains(&"zipfs"), "{names:?}");
         assert!(!names.contains(&"anofox_forecast"), "{names:?}");
         assert!(
             vetted_extensions()
@@ -3395,23 +3774,23 @@ mod extension_tests {
                 ("step 'a'", "INSTALL anofox_forecast FROM community;"),
                 (
                     "hook on_init 'h'",
-                    "SELECT 1;\nINSTALL mlpack FROM core_nightly;\nINSTALL mlpack FROM 'https://x.org/e';",
+                    "SELECT 1;\nINSTALL zipfs FROM core_nightly;\nINSTALL zipfs FROM 'https://x.org/e';",
                 ),
                 (
                     "step 'b'",
-                    "INSTALL '/tmp/m.duckdb_extension';\nSET custom_extension_repository = '/tmp';\nCALL enable_peg_parser();",
+                    "INSTALL '/tmp/m.duckdb_extension';\nSET custom_extension_repository = '/tmp';\nSET allow_parser_override_extension = 'strict';",
                 ),
             ],
         );
         assert_eq!(
-            refusals(check_extension_installs(&sql, Some(&v("1.5.6")))),
+            refusals(check_extension_installs(&sql, Some(&v("2.0.0")))),
             vec![
                 "step 'a' (s0.sql, line 1) installs anofox_forecast from the community registry, and anofox_forecast is not on the vetted list",
-                "hook on_init 'h' (s1.sql, line 2) installs mlpack from the repository core_nightly; a community extension is installed FROM community",
-                "hook on_init 'h' (s1.sql, line 3) installs mlpack from the address 'https://x.org/e'",
+                "hook on_init 'h' (s1.sql, line 2) installs zipfs from the repository core_nightly; a community extension is installed FROM community",
+                "hook on_init 'h' (s1.sql, line 3) installs zipfs from the address 'https://x.org/e'",
                 "step 'b' (s2.sql, line 1) installs the extension at '/tmp/m.duckdb_extension'",
                 "step 'b' (s2.sql, line 2) names the setting custom_extension_repository, which moves where DuckDB installs an extension from",
-                "step 'b' (s2.sql, line 3) names enable_peg_parser, which switches DuckDB to a second parser whose comments and strings arc does not read",
+                "step 'b' (s2.sql, line 3) names allow_parser_override_extension, which switches DuckDB to a second parser whose comments and strings arc does not read",
             ]
         );
     }
@@ -3422,12 +3801,12 @@ mod extension_tests {
         let sql = sources(
             dir.path(),
             &[
-                ("step 'a'", "INSTALL mlpack FROM community;"),
+                ("step 'a'", "INSTALL zipfs FROM community;"),
                 ("step 'b'", "INSTALL anofox_forecast FROM community;"),
             ],
         );
         assert_eq!(
-            refusals(check_extension_installs(&sql, Some(&v("1.5.4")))).len(),
+            refusals(check_extension_installs(&sql, Some(&v("2.0.1")))).len(),
             1
         );
     }
@@ -3439,7 +3818,7 @@ mod extension_tests {
             dir.path(),
             &[(
                 "step 'a'",
-                "INSTALL spatial FROM core; INSTALL excel; LOAD mlpack;",
+                "INSTALL spatial FROM core; INSTALL excel; LOAD zipfs;",
             )],
         );
         sql.push(ProtocolSql {
@@ -3449,7 +3828,7 @@ mod extension_tests {
             path: dir.path().join("later.sql"),
         });
         assert_eq!(
-            check_extension_installs(&sql, Some(&v("1.5.4")))
+            check_extension_installs(&sql, Some(&v("2.0.1")))
                 .unwrap()
                 .warnings,
             Vec::<String>::new()
@@ -3462,26 +3841,26 @@ mod extension_tests {
         let sql = sources(
             dir.path(),
             &[
-                ("step 'a'", "INSTALL mlpack FROM community; LOAD mlpack;"),
-                ("step 'b'", "FORCE INSTALL mlpack FROM community;"),
+                ("step 'a'", "INSTALL zipfs FROM community; LOAD zipfs;"),
+                ("step 'b'", "FORCE INSTALL zipfs FROM community;"),
                 ("step 'c'", "INSTALL h3 FROM community;"),
             ],
         );
         assert_eq!(
-            check_extension_installs(&sql, Some(&v("1.5.4")))
+            check_extension_installs(&sql, Some(&v("2.0.1")))
                 .unwrap()
                 .warnings,
             vec![
                 format!(
-                    "mlpack is vetted on DuckDB v1.5.6, and this engine is DuckDB v1.5.4; running it anyway ({VETTED_EXTENSIONS_DOC})"
+                    "zipfs is vetted on DuckDB v2.0.0, and this engine is DuckDB v2.0.1; running it anyway ({VETTED_EXTENSIONS_DOC})"
                 ),
                 format!(
-                    "h3 is vetted on DuckDB v1.5.6, and this engine is DuckDB v1.5.4; running it anyway ({VETTED_EXTENSIONS_DOC})"
+                    "h3 is vetted on DuckDB v2.0.0, and this engine is DuckDB v2.0.1; running it anyway ({VETTED_EXTENSIONS_DOC})"
                 ),
             ]
         );
         assert_eq!(
-            check_extension_installs(&sql, Some(&v("1.5.6")))
+            check_extension_installs(&sql, Some(&v("2.0.0")))
                 .unwrap()
                 .warnings,
             Vec::<String>::new(),
@@ -3490,7 +3869,7 @@ mod extension_tests {
         assert_eq!(
             check_extension_installs(&sql[..1], None).unwrap().warnings,
             vec![format!(
-                "mlpack is vetted on DuckDB v1.5.6, and arc could not read this engine's version; running it anyway ({VETTED_EXTENSIONS_DOC})"
+                "zipfs is vetted on DuckDB v2.0.0, and arc could not read this engine's version; running it anyway ({VETTED_EXTENSIONS_DOC})"
             )]
         );
     }
@@ -3540,13 +3919,13 @@ mod extension_tests {
     #[test]
     fn the_report_reads_each_tagged_answer_and_skips_the_rest() {
         let answers: Vec<String> = [
-            "version\tv1.5.4",
+            "version\tv2.0.1",
             "platform\tlinux_amd64",
-            "extension\tmlpack\tcommunity\tv1.5.6\t/x/mlpack.duckdb_extension",
+            "extension\tzipfs\tcommunity\tv2.0.0\t/x/zipfs.duckdb_extension",
             // DuckDB gives no repository and no version for a file with no `.info` beside it,
             // and a tab in the path stays in it.
             "extension\thttpfs\t\t\t/x/a\tb/httpfs.duckdb_extension",
-            "extension\tjson\tcore\tv1.5.4\t",
+            "extension\tjson\tcore\tv2.0.1\t",
             // Too few fields, an answer to another question, and a tag arc does not ask for.
             "extension\tshort\tcore",
             "linux_amd64",
@@ -3555,15 +3934,15 @@ mod extension_tests {
         .map(String::from)
         .to_vec();
         let report = read_report(&answers);
-        assert_eq!(report.version.as_deref(), Some("v1.5.4"));
+        assert_eq!(report.version.as_deref(), Some("v2.0.1"));
         assert_eq!(report.platform.as_deref(), Some("linux_amd64"));
         let expected: HashMap<String, ReportedExtension> = [
             (
-                "mlpack",
+                "zipfs",
                 ReportedExtension {
-                    path: Some("/x/mlpack.duckdb_extension".into()),
+                    path: Some("/x/zipfs.duckdb_extension".into()),
                     repository: Some("community".into()),
-                    version: Some("v1.5.6".into()),
+                    version: Some("v2.0.0".into()),
                 },
             ),
             (
@@ -3579,7 +3958,7 @@ mod extension_tests {
                 ReportedExtension {
                     path: None,
                     repository: Some("core".into()),
-                    version: Some("v1.5.4".into()),
+                    version: Some("v2.0.1".into()),
                 },
             ),
         ]
@@ -3600,30 +3979,30 @@ mod extension_tests {
             &[
                 (
                     "step 'a'",
-                    "INSTALL httpfs; INSTALL mlpack FROM community; INSTALL httpfs FROM core;",
+                    "INSTALL httpfs; INSTALL zipfs FROM community; INSTALL httpfs FROM core;",
                 ),
                 (
                     "step 'b'",
-                    "FORCE INSTALL mlpack FROM community; INSTALL spatial; LOAD json;",
+                    "FORCE INSTALL zipfs FROM community; INSTALL spatial; LOAD json;",
                 ),
             ],
         );
-        let installs = check_extension_installs(&sql, Some(&v("1.5.6"))).unwrap();
-        assert_eq!(installs.recorded, vec!["httpfs", "mlpack", "spatial"]);
-        assert_eq!(installs.installed, vec!["mlpack"]);
+        let installs = check_extension_installs(&sql, Some(&v("2.0.0"))).unwrap();
+        assert_eq!(installs.recorded, vec!["httpfs", "zipfs", "spatial"]);
+        assert_eq!(installs.installed, vec!["zipfs"]);
     }
 
     #[test]
     fn the_check_before_a_file_runs_records_what_it_installs_that_no_check_found() {
         let dir = tempfile::tempdir().unwrap();
         let before = sources(dir.path(), &[("step 'a'", "INSTALL httpfs;")]);
-        let installs = check_extension_installs(&before, Some(&v("1.5.6"))).unwrap();
+        let installs = check_extension_installs(&before, Some(&v("2.0.0"))).unwrap();
         let mut recheck = ExtensionRecheck::new(
             installs,
             Vec::new(),
             Vec::new(),
             &ExtensionPins::new(),
-            Some(&v("1.5.6")),
+            Some(&v("2.0.0")),
         );
         assert_eq!(recheck.recorded(), ["httpfs"]);
         let engine = mock::MockEngine::new();
@@ -3640,11 +4019,11 @@ mod extension_tests {
             dir.path(),
             &[(
                 "step 'c'",
-                "INSTALL httpfs; INSTALL excel; INSTALL mlpack FROM community;",
+                "INSTALL httpfs; INSTALL excel; INSTALL zipfs FROM community;",
             )],
         );
         recheck.check(&engine, &passed[0]).unwrap();
-        assert_eq!(recheck.recorded(), ["httpfs", "excel", "mlpack"]);
+        assert_eq!(recheck.recorded(), ["httpfs", "excel", "zipfs"]);
     }
 
     // ---- Which extensions a SQL step's own process loaded ----
@@ -3661,21 +4040,21 @@ mod extension_tests {
     fn the_extensions_a_run_loaded_are_each_named_once_with_what_the_first_report_gave() {
         let mut loaded = LoadedExtensions::default();
         loaded.add(vec![
-            ("fts".into(), reported("core", "v1.5.6", "/a/fts")),
+            ("fts".into(), reported("core", "v2.0.0", "/a/fts")),
             ("json".into(), reported("", "", BUILT_IN)),
         ]);
         loaded.add(vec![
-            ("httpfs".into(), reported("core", "v1.5.6", "/a/httpfs")),
+            ("httpfs".into(), reported("core", "v2.0.0", "/a/httpfs")),
             ("fts".into(), reported("community", "0000000", "/b/fts")),
         ]);
         assert_eq!(
             loaded.iter().cloned().collect::<Vec<_>>(),
             vec![
-                ("fts".to_string(), reported("core", "v1.5.6", "/a/fts")),
+                ("fts".to_string(), reported("core", "v2.0.0", "/a/fts")),
                 ("json".to_string(), reported("", "", BUILT_IN)),
                 (
                     "httpfs".to_string(),
-                    reported("core", "v1.5.6", "/a/httpfs")
+                    reported("core", "v2.0.0", "/a/httpfs")
                 ),
             ]
         );
@@ -3683,10 +4062,10 @@ mod extension_tests {
 
     #[test]
     fn the_answer_a_steps_process_writes_is_read_in_order_and_nothing_else_is() {
-        let answer = "arc-answer:extension\tfts\tcore\tv1.5.6\t/x/fts.duckdb_extension\n\
+        let answer = "arc-answer:extension\tfts\tcore\tv2.0.0\t/x/fts.duckdb_extension\n\
                       arc-answer:extension\tparquet\t\t\t(BUILT-IN)\n\
                       extension\tunmarked\tcore\tv1\t/x/unmarked\n\
-                      arc-answer:version\tv1.5.6\n\
+                      arc-answer:version\tv2.0.0\n\
                       arc-answer:extension\tshort\tcore\n\
                       arc-answer:extension\thttpfs\t\t\t/x/a\tb\n";
         assert_eq!(
@@ -3694,7 +4073,7 @@ mod extension_tests {
             vec![
                 (
                     "fts".to_string(),
-                    reported("core", "v1.5.6", "/x/fts.duckdb_extension")
+                    reported("core", "v2.0.0", "/x/fts.duckdb_extension")
                 ),
                 ("parquet".to_string(), reported("", "", BUILT_IN)),
                 ("httpfs".to_string(), reported("", "", "/x/a\tb")),
@@ -3723,6 +4102,191 @@ mod extension_tests {
         assert_eq!(commands.len(), 6, "{commands:?}");
         // A path a dot command cannot be given in quotes is not asked about.
         assert_eq!(loaded_question(Path::new("/tmp/it's/loaded")), None);
+    }
+
+    // ---- read from DuckDB 2.0's own tokens ----
+
+    /// The findings in `file`, with their lines, read from the tokens the DuckDB
+    /// `ARC_DUCKDB_RECORD_BIN` names gives for it.
+    fn live(file: &[u8]) -> Vec<(ExtensionSql, usize)> {
+        super::scan_extension_sql(
+            &tokenize_file(&record_program(), file).expect("DuckDB gives the file's tokens"),
+        )
+    }
+
+    #[test]
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build \
+                job runs it"]
+    fn an_install_in_sql_duckdb_cannot_parse_is_still_refused() {
+        assert_eq!(
+            live(b"selec 1 frm ;; INSTALL h3x FROM community;"),
+            vec![(install("h3x", InstallFrom::Community), 1)]
+        );
+    }
+
+    #[test]
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build \
+                job runs it"]
+    fn an_install_inside_a_nested_comment_is_not_refused() {
+        assert_eq!(
+            live(b"/* a /* INSTALL h3x FROM community; */ still */ SELECT 1;"),
+            vec![]
+        );
+    }
+
+    #[test]
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build \
+                job runs it"]
+    fn a_switch_name_in_an_e_string_with_an_escaped_quote_is_refused() {
+        assert_eq!(
+            live(br"SELECT E'it\'s allow_parser_override_extension';"),
+            vec![(
+                ExtensionSql::ParserSwitch("allow_parser_override_extension".into()),
+                1
+            )]
+        );
+    }
+
+    #[test]
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build \
+                job runs it"]
+    fn crlf_bom_and_zero_width_space_files_are_read_as_lf() {
+        let lf = "SELECT 1;\n\nINSTALL h3x FROM community;\n";
+        let refused = vec![(install("h3x", InstallFrom::Community), 3)];
+        assert_eq!(live(lf.as_bytes()), refused);
+        let zero_width = lf.replace("INSTALL", "\u{200b}INSTALL");
+        for file in [
+            lf.replace('\n', "\r\n"),
+            format!("\u{feff}{lf}"),
+            zero_width.clone(),
+            format!("\u{feff}{}", zero_width.replace('\n', "\r\n")),
+        ] {
+            assert_eq!(live(file.as_bytes()), refused, "{file:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build \
+                job runs it"]
+    fn a_five_megabyte_values_list_is_tokenised_within_thirty_seconds() {
+        let mut sql = String::from("INSERT INTO t VALUES ");
+        let mut i = 0;
+        while sql.len() < 5_000_000 {
+            sql.push_str(&format!("({i}, 'name {i}', 'it''s'),"));
+            i += 1;
+        }
+        sql.push_str("(0, 'last', '');\nINSTALL h3x FROM community;\n");
+        let started = Instant::now();
+        let found = live(sql.as_bytes());
+        let took = started.elapsed();
+        assert_eq!(found, vec![(install("h3x", InstallFrom::Community), 2)]);
+        assert!(took < Duration::from_secs(30), "tokenising took {took:?}");
+    }
+
+    /// DuckDB 2.0 reads a backticked name as it reads a double-quoted one, and runs
+    /// `` INSTALL `h3x` FROM community ``.
+    #[test]
+    fn a_backticked_name_is_read_as_a_quoted_one() {
+        assert_eq!(
+            scan("INSTALL `h3x` FROM community;"),
+            vec![install("h3x", InstallFrom::Community)]
+        );
+        assert_eq!(
+            scan("SET `custom_extension_repository` = '/tmp/ext';"),
+            vec![ExtensionSql::Setting("custom_extension_repository".into())]
+        );
+    }
+
+    /// DuckDB 2.0 installs an `E'…'` name as it is written, escapes and all, so one holding
+    /// a backslash is a path: `INSTALL E'h3\x78'` installs a file called `h3\x78`.
+    #[test]
+    fn an_install_of_an_e_string_holding_a_backslash_is_a_path() {
+        assert_eq!(
+            scan(r"INSTALL E'h3\x78' FROM community;"),
+            vec![ExtensionSql::InstallPath(r"h3\x78".into())]
+        );
+        assert_eq!(
+            scan(r"INSTALL E'h3\x78';"),
+            vec![ExtensionSql::InstallPath(r"h3\x78".into())]
+        );
+        assert_eq!(
+            scan("INSTALL E'h3x' FROM community;"),
+            vec![install("h3x", InstallFrom::Community)]
+        );
+    }
+
+    /// A name split over two lines is one to DuckDB, so a vetted prefix does not pass it.
+    #[test]
+    fn a_name_continued_on_the_next_line_is_read_whole() {
+        assert_eq!(
+            scan("INSTALL 'h3'\n'x' FROM community;"),
+            vec![install("h3x", InstallFrom::Community)]
+        );
+        assert_eq!(
+            scan("INSTALL 'h3' -- note\r'x' FROM community;"),
+            vec![install("h3x", InstallFrom::Community)]
+        );
+    }
+
+    #[test]
+    fn a_file_duckdb_gives_no_tokens_for_is_refused_naming_its_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql = sources(dir.path(), &[("step 'load'", "SELECT 1;")]);
+        let engine = mock::MockEngine::new();
+        *engine.tokens_failure.borrow_mut() = Some("it printed nothing".into());
+        let refused =
+            super::check_extension_installs(&sql, Some(&v("2.0.0")), &engine).unwrap_err();
+        assert!(matches!(refused, Error::SqlNotRead { .. }), "{refused:?}");
+        assert_eq!(refused.exit_code(), 2);
+        let message = refused.to_string();
+        for needle in ["step 'load' (s0.sql)", "tokens", "it printed nothing"] {
+            assert!(message.contains(needle), "{needle:?} in {message}");
+        }
+        // The check just before the file runs refuses it too, as a step refused before it ran.
+        let mut recheck = ExtensionRecheck::default();
+        let refused = recheck.check(&engine, &sql[0]).unwrap_err();
+        assert!(refused.refused_before_it_ran(), "{refused:?}");
+    }
+
+    #[test]
+    fn a_file_with_no_sql_is_not_refused_when_duckdb_gives_no_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql = sources(
+            dir.path(),
+            &[("step 'a'", ""), ("step 'b'", ".mode list\n# x\n")],
+        );
+        let engine = mock::MockEngine::new();
+        *engine.tokens_failure.borrow_mut() = Some("it would not start".into());
+        assert!(super::check_extension_installs(&sql, Some(&v("2.0.0")), &engine).is_ok());
+    }
+
+    #[test]
+    fn the_check_before_each_file_runs_asks_again_only_for_a_file_that_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql = sources(
+            dir.path(),
+            &[("step 'a'", "SELECT 1;"), ("step 'b'", "SELECT 2;")],
+        );
+        let engine = mock::MockEngine::new();
+        let installs = super::check_extension_installs(&sql, Some(&v("2.0.0")), &engine).unwrap();
+        assert_eq!(*engine.tokenized.borrow(), 2);
+        let mut recheck = ExtensionRecheck::new(
+            installs,
+            Vec::new(),
+            Vec::new(),
+            &ExtensionPins::new(),
+            Some(&v("2.0.0")),
+        );
+        recheck.check(&engine, &sql[0]).unwrap();
+        recheck.check(&engine, &sql[1]).unwrap();
+        assert_eq!(*engine.tokenized.borrow(), 2, "neither file changed");
+        std::fs::write(&sql[1].path, "SELECT 3;").unwrap();
+        recheck.check(&engine, &sql[1]).unwrap();
+        assert_eq!(
+            *engine.tokenized.borrow(),
+            3,
+            "the file that changed is asked again"
+        );
     }
 
     #[test]

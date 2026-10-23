@@ -128,18 +128,18 @@ pub enum Error {
     },
 
     // Older than the oldest DuckDB arc accepts. Said apart from `UntestedEngine`, because
-    // what is wrong with an older engine is known rather than untested.
+    // what is wrong with an older engine is known rather than untested, and no override
+    // lifts it.
     #[error(
         "engine DuckDB {found} is older than {oldest}, the oldest DuckDB arc accepts ({range}): \
-         {oldest} is the first release whose command line exits non-zero when a statement in a \
-         SQL step fails, which is how arc learns that a step failed; upgrade DuckDB, or set \
-         {override_var}=1 to run on {found} at your own risk"
+         arc links DuckDB 2.0, and a database it creates cannot be opened by DuckDB 1.x; \
+         use DuckDB {oldest} or later, or install arc 0.2.1, the release for DuckDB 1.5 (`cargo install arcform \
+         --version 0.2.1`)"
     )]
     EngineTooOld {
         found: String,
         oldest: &'static str,
         range: &'static str,
-        override_var: &'static str,
     },
 
     // A Protocol's SQL installs a DuckDB extension from somewhere arc has not vetted. One
@@ -183,6 +183,34 @@ pub enum Error {
         step: Option<String>,
         refusals: Vec<String>,
     },
+
+    // The DuckDB the steps run on gave no tokens for a step's or hook's SQL file, or tokens
+    // arc cannot read, before the run or just before the step or hook ran. The refusals read
+    // a file from those tokens alone, so the file is refused rather than read some other
+    // way; nothing in it ran. `step` is `None` for a hook.
+    #[error(
+        "{place} ({file}) was refused and did not run: arc could not read the tokens of its SQL from DuckDB: {reason}\n\
+         arc reads each SQL file's tokens from the DuckDB that runs it, to check what the file installs, and runs no file it could not read. See {}",
+        crate::engine::VETTED_EXTENSIONS_DOC
+    )]
+    SqlNotRead {
+        place: String,
+        step: Option<String>,
+        file: String,
+        reason: String,
+    },
+
+    // The DuckDB the steps run on gives no tokens at all, not even for `SELECT 1`: it was
+    // built without DuckDB's autocomplete extension, where `sql_tokenize` lives. Refused
+    // before any step runs, in place of the refusal of the first file it gave none for, so
+    // the message names the cause and the fix. `which` names the DuckDB and its version, and
+    // `error` is what it said.
+    #[error(
+        "{} No step was run. {}",
+        crate::engine::no_tokenizer_cause(which, error),
+        crate::engine::release_install_fix()
+    )]
+    NoTokenizer { which: String, error: String },
 
     // A community extension that a step's or hook's SQL file installs, first found when the
     // file was read again just before it ran, is not the build `arcform.yaml` pins for this
@@ -228,8 +256,9 @@ pub enum Error {
     #[error("DuckDB could not {what}: {reason}")]
     EngineQuery { what: String, reason: String },
 
-    // `ARC_SQL_READER` names no reader, or names DuckDB's parse and the DuckDB arc runs
-    // cannot give it. The message names the variable and what it takes.
+    // `ARC_SQL_READER` names no reader, or chooses DuckDB's parse, as it does unset, and the
+    // DuckDB arc runs is not a 2.x build that gives it. The message names the variable and
+    // what it takes.
     #[error("{0}")]
     SqlReader(String),
 
@@ -338,6 +367,13 @@ impl Error {
     ///   is the bucket a step forced to re-run by a corrected staleness decision lands
     ///   in if that re-run then fails for a real reason.
     ///
+    /// Two refusals made before any step runs are 2 all the same, by design. `SqlNotRead` is
+    /// shared by the check before the run and the check just before a step or hook (where 2
+    /// is plain), so a file DuckDB gives no readable tokens for exits 2 whichever check found
+    /// it. `NoTokenizer`, a DuckDB that gives no tokens for any file, is said in place of the
+    /// first `SqlNotRead` it would otherwise be, and keeps that code. Other refusals before
+    /// the run, such as `ExtensionRefused`, are 1. `docs/ARCHITECTURE.md` states both.
+    ///
     /// Kept distinguishable on purpose: a mutation test on the staleness gate that
     /// reverts the fix and finds the run still exits 1 either way would prove nothing —
     /// see [`crate::runner`]'s `is_hash_stale`, the gate this distinction exists for.
@@ -351,7 +387,9 @@ impl Error {
             | Error::PipelineTimeout { .. }
             | Error::ExtensionChanged { .. }
             | Error::ExtensionRefusedBeforeItRan { .. }
-            | Error::ExtensionPinRefusedBeforeItRan { .. } => 2,
+            | Error::ExtensionPinRefusedBeforeItRan { .. }
+            | Error::SqlNotRead { .. }
+            | Error::NoTokenizer { .. } => 2,
             _ => 1,
         }
     }
@@ -362,6 +400,7 @@ impl Error {
             self,
             Error::ExtensionRefusedBeforeItRan { .. }
                 | Error::ExtensionPinRefusedBeforeItRan { .. }
+                | Error::SqlNotRead { .. }
         )
     }
 }
@@ -573,15 +612,14 @@ mod exit_code_tests {
                 reason: "no such file".into(),
             },
             Error::UntestedEngine {
-                found: "2.0.0".into(),
+                found: "3.0.0".into(),
                 range: crate::engine::SUPPORTED_ENGINE_RANGE,
                 override_var: "ARC_ALLOW_UNTESTED_ENGINE",
             },
             Error::EngineTooOld {
-                found: "1.2.0".into(),
+                found: "1.5.6".into(),
                 oldest: crate::engine::OLDEST_ENGINE,
                 range: crate::engine::SUPPORTED_ENGINE_RANGE,
-                override_var: "ARC_ALLOW_UNTESTED_ENGINE",
             },
             Error::StateBackend("locked".into()),
             Error::ExtensionPinRefused {
@@ -622,6 +660,12 @@ mod exit_code_tests {
                 place: "step 's'".into(),
                 step: Some("s".into()),
                 refusals: vec!["anofox_forecast".into()],
+            },
+            Error::SqlNotRead {
+                place: "step 's'".into(),
+                step: Some("s".into()),
+                file: "models/s.sql".into(),
+                reason: "it printed nothing".into(),
             },
             Error::ExtensionPinRefusedBeforeItRan {
                 place: "hook on_success 'h'".into(),

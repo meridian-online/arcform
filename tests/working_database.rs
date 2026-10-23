@@ -134,6 +134,7 @@ fn copy_dir(from: &Path, to: &Path) {
 /// One value from the database at `db`, read through the DuckDB CLI.
 fn query(db: &Path, sql: &str) -> String {
     let out = Command::new("duckdb")
+        .env("DUCKDB_AGENT_MODE", "0")
         .arg(db)
         .args(["-noheader", "-list", "-readonly", "-c", sql])
         .output()

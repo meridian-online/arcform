@@ -224,7 +224,7 @@ by reading the input with insertion order preserved, carrying an explicit ordina
 through the join and ordering the output by it. Parquet bytes follow row order.
 
 What is **not** pinned is the dependency set. The PEP-723 header bounds the one direct
-dependency at both ends — `duckdb>=1,<2` — but a resolve inside those bounds can still
+dependency at both ends — `duckdb>=2,<3` — but a resolve inside those bounds can still
 pick a newer DuckDB, which writes its own version into the Parquet footer. The same
 environment reproduces the same bytes; two machines are not thereby made to agree. The
 vectors themselves are the extension's and do not move with the resolve.

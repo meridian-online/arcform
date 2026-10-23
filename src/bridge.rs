@@ -463,7 +463,9 @@ mod tests {
     #[test]
     fn load_sql_registers_the_table_as_a_produced_asset() {
         let sql = load_sql("accounts", "signups.duckdb", "accounts");
-        let assets = crate::introspect::extract_assets(&sql).expect("load SQL parses");
+        let assets = crate::introspect::read_sql(&sql)
+            .expect("the default reader")
+            .merged();
         assert!(
             assets.outputs.contains("accounts"),
             "produces accounts: {assets:?}"

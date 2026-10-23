@@ -268,7 +268,7 @@ fn an_embedding_is_a_finished_artifact_with_no_map_attached() {
     let mut stmt = conn
         .prepare(&format!(
             "SELECT len(embedding), \
-             sqrt(list_sum(list_transform(embedding, x -> CAST(x AS DOUBLE) * \
+             sqrt(list_sum(list_transform(embedding, lambda x: CAST(x AS DOUBLE) * \
              CAST(x AS DOUBLE)))) \
              FROM read_parquet('{}') ORDER BY id",
             out.display()
