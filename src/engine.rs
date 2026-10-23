@@ -339,9 +339,9 @@ pub const DUCKDB_BIN_ENV: &str = "ARC_DUCKDB_BIN";
 pub const SUPPORTED_ENGINE_RANGE: &str = ">=2.0, <3";
 
 /// The oldest DuckDB arc accepts, where [`SUPPORTED_ENGINE_RANGE`] starts: the major release
-/// of the DuckDB library arc links. arc and its DuckDB command line open the same database
-/// file, and the 2.0 library cannot open a file a 1.x command line shares with it, so no
-/// override reaches below this. arc 0.2.1 is the release for DuckDB 1.5.
+/// of the DuckDB library arc links. arc links DuckDB 2.0, and a database file it creates
+/// carries storage version 2.0, which a 1.x DuckDB refuses to open, so no override reaches
+/// below this. arc 0.2.1 is the release for DuckDB 1.5.
 pub const OLDEST_ENGINE: &str = "2.0.0";
 
 /// The commit of each DuckDB release arc knows, by release tag. A development build, such as

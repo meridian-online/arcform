@@ -1206,7 +1206,7 @@ mod tests {
 
     use super::*;
 
-    /// Names the DuckDB 2.0 build the ignored tests ask. `ci.yml` downloads the preview
+    /// Names the DuckDB 2.0 build the ignored tests ask. `ci.yml` points it at the v2.0.0 release CLI
     /// and sets it.
     const PREVIEW_ENV: &str = "ARC_DUCKDB_PREVIEW_BIN";
 
@@ -1983,7 +1983,7 @@ mod tests {
                 $(
                     #[test]
                     #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; \
-                                ci.yml's build job downloads the preview and passes \
+                                ci.yml's build job runs it on the v2.0.0 release CLI and passes \
                                 --include-ignored"]
                     fn $check() {
                         super::$check(&mut super::preview());
@@ -2019,7 +2019,7 @@ mod tests {
 
     #[test]
     #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build \
-                job downloads the preview and passes --include-ignored"]
+                job runs it on the v2.0.0 release CLI with --include-ignored"]
     fn the_recorded_answers_are_what_the_preview_answers() {
         let mut recording = Recording {
             inner: preview(),

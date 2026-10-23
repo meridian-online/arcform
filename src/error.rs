@@ -132,9 +132,8 @@ pub enum Error {
     // lifts it.
     #[error(
         "engine DuckDB {found} is older than {oldest}, the oldest DuckDB arc accepts ({range}): \
-         the database file is shared with the DuckDB 2.0 library arc links, and that library \
-         cannot open a file a DuckDB 1.x command line shares with it; use DuckDB {oldest} or \
-         later, or install arc 0.2.1, the release for DuckDB 1.5 (`cargo install arcform \
+         arc links DuckDB 2.0, and a database it creates cannot be opened by DuckDB 1.x; \
+         use DuckDB {oldest} or later, or install arc 0.2.1, the release for DuckDB 1.5 (`cargo install arcform \
          --version 0.2.1`)"
     )]
     EngineTooOld {

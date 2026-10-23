@@ -237,6 +237,20 @@ jobs:
       - name: test
         run: cargo test --workspace
 
+      # The reader in src/duckdb_lineage.rs asks a DuckDB 2.0 command line for its parse of
+      # a step. Its tests that start DuckDB, and the `arc run` tests with
+      # ARC_SQL_READER=duckdb in tests/duckdb_reader_switch.rs, are #[ignore]d so the step
+      # above reports them as ignored; run them here on the v2.0.0 release command line
+      # the install step put in $HOME/duckdb. Every job runs 2.0.0, so this is
+      # unconditional. The tests that read from captured answers ran above.
+      - name: test (DuckDB lineage reader, on the DuckDB 2.0 command line)
+        run: |
+          set -euo pipefail
+          "$HOME/duckdb/duckdb" --version
+          export ARC_DUCKDB_PREVIEW_BIN="$HOME/duckdb/duckdb"
+          cargo test --workspace --lib duckdb_lineage -- --include-ignored --nocapture
+          cargo test --workspace --test duckdb_reader_switch -- --include-ignored
+
       # `uv` — and unlike the subtoken extension, it is cheap enough to belong on
       # the routine gate. `tests/uv_operator.rs` proves three of its four properties
       # with no `uv` at all (the two load-time refusals and the digest pin refuse

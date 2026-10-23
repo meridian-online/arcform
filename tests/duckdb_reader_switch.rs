@@ -4,7 +4,7 @@
 //!
 //! The tests that read a step with DuckDB's parse need a DuckDB 2.0 build, named by
 //! `ARC_DUCKDB_PREVIEW_BIN`, and are `#[ignore]`d so an ordinary run skips them; `ci.yml`
-//! downloads the 2.0 preview and runs them with `--include-ignored`. A 2.0 build is outside
+//! runs them on the v2.0.0 release command line with `--include-ignored`. A 2.0 build is outside
 //! the versions arc is tested on, so those runs set `ARC_ALLOW_UNTESTED_ENGINE` as well.
 //! The rest need the `duckdb` on PATH, a 1.x release, as any `arc run` does.
 
@@ -26,6 +26,8 @@ enum Reader {
     DuckDbPreview,
     /// `ARC_SQL_READER` set to `value`, on the `duckdb` found on PATH.
     Told(&'static str),
+    /// `ARC_SQL_READER=duckdb`, on the executable at this path.
+    Program(PathBuf),
 }
 
 fn preview() -> OsString {
@@ -89,6 +91,11 @@ fn arc_run(project: &Path, reader: Reader) -> Run {
         }
         Reader::Told(value) => {
             command.env("ARC_SQL_READER", value);
+        }
+        Reader::Program(path) => {
+            command
+                .env("ARC_SQL_READER", "duckdb")
+                .env("ARC_DUCKDB_BIN", path);
         }
     }
     let out = command.output().expect("spawn arc run");
@@ -180,7 +187,7 @@ const ASOF: &str = "CREATE TABLE r AS SELECT * EXCLUDE (a) FROM t ASOF LEFT JOIN
 
 #[test]
 #[ignore = "needs the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build job \
-            downloads the preview and passes --include-ignored"]
+            runs it on the v2.0.0 release CLI with --include-ignored"]
 fn with_the_reader_set_a_step_is_read_from_duckdbs_parse() {
     let dir = project(&[("load", LOAD), ("asof", ASOF)]);
     let run = arc_run(dir.path(), Reader::DuckDbPreview);
@@ -262,7 +269,7 @@ fn without_the_reader_set_a_step_is_read_as_before() {
 
 #[test]
 #[ignore = "needs the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build job \
-            downloads the preview and passes --include-ignored"]
+            runs it on the v2.0.0 release CLI with --include-ignored"]
 fn table_functions_are_read_as_with_the_reader_unset() {
     let steps = [
         (
@@ -310,7 +317,7 @@ fn table_functions_are_read_as_with_the_reader_unset() {
 
 #[test]
 #[ignore = "needs the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build job \
-            downloads the preview and passes --include-ignored"]
+            runs it on the v2.0.0 release CLI with --include-ignored"]
 fn a_copy_from_a_query_records_its_file_and_the_querys_table() {
     let dir = project(&[
         (
@@ -341,29 +348,31 @@ fn a_copy_from_a_query_records_its_file_and_the_querys_table() {
     );
 }
 
-/// What `duckdb` on PATH reports as its version: `v1.5.5`.
-fn version_on_path() -> String {
-    let out = Command::new("duckdb")
-        .args(["-no-init", "-csv", "-noheader", "-c", "SELECT version()"])
-        .output()
-        .expect("a duckdb on PATH");
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+/// A stand-in `duckdb` that reports `version` and answers nothing else, so the test needs
+/// no particular DuckDB on PATH.
+fn fake_duckdb(dir: &Path, version: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("fake-duckdb");
+    std::fs::write(
+        &bin,
+        format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '{version} (fake) 0000000000'; fi\nexit 0\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
 }
 
 #[test]
 fn with_the_reader_set_a_duckdb_before_2_is_refused_before_a_step_runs() {
-    let version = version_on_path();
-    assert!(
-        version.starts_with("v1."),
-        "the duckdb on PATH is {version}, and this test needs a 1.x"
-    );
+    let engines = tempfile::tempdir().unwrap();
+    let version = "v1.5.6";
+    let bin = fake_duckdb(engines.path(), version);
     let dir = project(&[("load", LOAD)]);
-    let run = arc_run(dir.path(), Reader::Told("duckdb"));
+    let run = arc_run(dir.path(), Reader::Program(bin));
     assert_eq!(run.code, Some(1), "arc run must refuse:\n{}", run.printed());
     assert!(
-        run.stderr.contains(&format!("is DuckDB {version}"))
-            && run.stderr.contains("needs a DuckDB 2.0 build"),
-        "the refusal must name {version} and ask for a 2.0 build:\n{}",
+        run.stderr.contains("DuckDB 1.5.6") && run.stderr.contains(">=2.0, <3"),
+        "the refusal must name {version} and the supported range:\n{}",
         run.stderr
     );
     assert!(
@@ -399,7 +408,7 @@ fn a_reader_arc_does_not_have_is_refused_naming_the_one_it_has() {
 
 #[test]
 #[ignore = "needs the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build job \
-            downloads the preview and passes --include-ignored"]
+            runs it on the v2.0.0 release CLI with --include-ignored"]
 fn a_pivot_joined_to_another_table_is_not_read_as_reading_its_first() {
     let dir = project(&[
         ("load", LOAD),
