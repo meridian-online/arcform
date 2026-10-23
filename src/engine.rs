@@ -1143,7 +1143,8 @@ fn unicode_space_len(q: &[u8]) -> Option<usize> {
 
 /// A batch as DuckDB's tokenizer receives it: each unicode space in [`unicode_space_len`]
 /// replaced with a space, as the parser's `StripUnicodeSpaces` pre-pass does
-/// (`src/parser/parser.cpp:51-200`, unchanged from v1.5.5), except inside what the pre-pass
+/// (`src/parser/parser.cpp:94-200`, with `ReplaceUnicodeSpaces` at `51-64`; both bodies are
+/// unchanged from v1.5.5), except inside what the pre-pass
 /// reads as a string or a comment. That is not the tokenizer's reading: a
 /// `'` or `"` opens a string until the next of the same quote, a `$` and a tag open a
 /// dollar-quoted string, a `--` comment ends at `\n` or `\r`, and `/* */` is not a comment.
@@ -1609,6 +1610,9 @@ fn check_file(source: &ProtocolSql, tokens: &FileTokens) -> FileCheck {
             }
             ExtensionSql::Setting(setting) => format!(
                 "names the setting {setting}, which moves where DuckDB installs an extension from"
+            ),
+            ExtensionSql::ParserSwitch(name) if name == "current_dialect" => format!(
+                "names {name}, which hands the SQL after it to a dialect an extension registers, whose tokenizer and grammar arc does not read"
             ),
             ExtensionSql::ParserSwitch(name) => format!(
                 "names {name}, which switches DuckDB to a second parser whose comments and strings arc does not read"

@@ -370,26 +370,39 @@ fn the_extension_directory_setting_is_refused_as_a_repository_setting_is() {
 
 #[test]
 fn a_parser_switch_is_refused_by_name() {
-    for (sql, named) in [
+    const OVERRIDE: &str =
+        "names allow_parser_override_extension, which switches DuckDB to a second parser";
+    const DIALECT: &str = "names current_dialect, which hands the SQL after it to a dialect";
+    for (sql, why) in [
         (
             "SET allow_parser_override_extension = 'fallback';",
-            "names allow_parser_override_extension",
+            OVERRIDE,
         ),
+        ("SET allow_parser_override_extension = 'strict';", OVERRIDE),
         (
-            "SET allow_parser_override_extension = 'strict';",
-            "names allow_parser_override_extension",
+            "PRAGMA allow_parser_override_extension = 'strict';",
+            OVERRIDE,
         ),
-        ("SET current_dialect = 'x';", "names current_dialect"),
+        ("SELECT 'allow_parser_override_extension';", OVERRIDE),
+        ("SET current_dialect = 'x';", DIALECT),
+        ("SELECT 'current_dialect';", DIALECT),
     ] {
         let run = Protocol::steps(&[("s", sql)]).run(VETTED_ON);
         run.assert_refused(sql);
         assert!(
-            run.stderr.contains(&format!(
-                "models/s.sql, line 1) {named}, which switches DuckDB to a second parser"
-            )),
-            "[{sql}] should name {named:?}:\n{}",
+            run.stderr.contains(&format!("models/s.sql, line 1) {why}")),
+            "[{sql}] should say {why:?}:\n{}",
             run.stderr
         );
+    }
+    // A longer name holding a switch's name is another name, and its step runs.
+    for sql in [
+        "SELECT 1 AS my_allow_parser_override_extension;",
+        "SELECT 1 AS my_current_dialect;",
+    ] {
+        let run = Protocol::steps(&[("s", sql)]).run(VETTED_ON);
+        run.assert_not_refused(sql, &["s.sql"]);
+        assert!(!run.stderr.contains(") names "), "[{sql}]\n{}", run.stderr);
     }
 }
 
@@ -596,7 +609,7 @@ fn a_protocol_with_no_install_prints_what_it_printed_before() {
 fn a_call_that_runs_sql_arc_does_not_read_warns_and_runs_the_step() {
     let run = Protocol::steps(&[(
         "s",
-        "SELECT 1;\nFROM query('FROM enable_' || 'peg_parser()');\n",
+        "SELECT 1;\nFROM query('SET allow_parser_' || 'override_extension = ''strict''');\n",
     )])
     .run(VETTED_ON);
     let warning = run.assert_warned_once("assembled", &["s.sql"]);
@@ -609,17 +622,17 @@ fn a_call_that_runs_sql_arc_does_not_read_warns_and_runs_the_step() {
     for (sql, named) in [
         ("FROM query(getvariable('q'));", "query() on line 1"),
         (
-            "FROM json_execute_serialized_sql(json_serialize_sql('FROM enable_' || 'peg_parser()'));",
+            "FROM json_execute_serialized_sql(json_serialize_sql('INSTALL anofox_' || 'forecast FROM community'));",
             "json_execute_serialized_sql() on line 1",
         ),
         // A call held in the literal another call runs is read as one in the file, and the
         // warning names the line of the call in the file.
         (
-            "SET VARIABLE q = 'FROM enable_' || 'peg_parser()'; FROM query('FROM query(getvariable(''q''))');",
+            "SET VARIABLE q = 'INSTALL anofox_' || 'forecast FROM community'; FROM query('FROM query(getvariable(''q''))');",
             "query() on line 1",
         ),
         (
-            "SET VARIABLE q = 'FROM enable_' || 'peg_parser()'; FROM query($$FROM query(getvariable('q'))$$);",
+            "SET VARIABLE q = 'INSTALL anofox_' || 'forecast FROM community'; FROM query($$FROM query(getvariable('q'))$$);",
             "query() on line 1",
         ),
         (
