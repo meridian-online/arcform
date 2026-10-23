@@ -43,6 +43,8 @@ Every DuckDB process arc starts goes through `DuckDbProgram::command()`, which s
 
 `arc run` prints one notice on stderr before the first step when the newest readable run record that names `duckdb_cli` names a different major.minor from the engine about to run; for 1.x to 2.x it also names the four results DuckDB 2.0 changes without an error. It changes no setting.
 
+The bundled build (`bundled-duckdb`) compiles in the DuckDB source `libduckdb-sys` vendors, which names itself a development version; until duckdb-rs fixes that (duckdb/duckdb-rs#917), CI's `bundled` job and the release workflow define `DUCKDB_VERSION` for the C++ compile through `CXXFLAGS`, and `bundled_duckdb_reports_the_release_version` in `src/engine.rs` asserts the result. `cargo install --features bundled-duckdb` from crates.io does not get the override and reports the development version until then.
+
 One DuckDB version runs throughout: the crate pin in `Cargo.toml`, `DUCKDB_VERSION` in the CI workflows, `DUCKDB_RECOMMENDED` in `scripts/install.sh` and in `src/engine.rs` (the version arc's messages pin DuckDB's installer to) and each entry's `duckdb_versions` in `src/vetted_extensions.json`. `scripts/check_duckdb_version.py`, run in CI's `release-guard` job with its self-test, fails when a pin disagrees with the version Cargo.lock's `libduckdb-sys` decodes to; a vetted entry must include the linked version and may list others. CI's build job also runs the tests that need a real DuckDB, with `--include-ignored`, against the v2.0.0 command line it installs, named by `ARC_DUCKDB_RECORD_BIN`.
 
 ### Reading a step's SQL

@@ -2641,6 +2641,22 @@ pub mod mock {
 mod tests {
     use super::*;
 
+    // The DuckDB compiled into a bundled build reports the release, not the development
+    // version libduckdb-sys vendors (duckdb/duckdb-rs#917); CI's `bundled` job and the
+    // release workflow define DUCKDB_VERSION at build. Remove with the workaround.
+    #[cfg(feature = "bundled-duckdb")]
+    #[test]
+    fn bundled_duckdb_reports_the_release_version() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let version: String = conn
+            .query_row("SELECT version()", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            version, DUCKDB_RECOMMENDED,
+            "build the bundled DuckDB with CXXFLAGS=-DDUCKDB_VERSION=\"<release>\""
+        );
+    }
+
     fn parse_version(output: &str) -> Option<semver::Version> {
         parse_engine_version(output).map(|parsed| parsed.version)
     }

@@ -480,6 +480,15 @@ jobs:
             echo "ARCFORM_REQUIRE_FINETYPE_EXT=1"
           } >> "$GITHUB_ENV"
 
+      # Stopgap for duckdb/duckdb-rs#917: libduckdb-sys vendors DuckDB with a development
+      # version ("v2.0.0-dev..."), so the bundled DuckDB would look its extensions up under
+      # a commit hash and refuse the release ones. `cc` reads CXXFLAGS, splits it on
+      # whitespace and passes each piece to the compiler without a shell, so the quotes
+      # stay and the macro is a C string. Remove this step when duckdb-rs ships the fix.
+      - name: Define DuckDB's version for the bundled build
+        shell: bash
+        run: echo "CXXFLAGS=${CXXFLAGS:-} -DDUCKDB_VERSION=\"${DUCKDB_VERSION}\"" >> "$GITHUB_ENV"
+
       # --locked, as release.yml builds: a version bump whose Cargo.lock was not
       # updated fails here, on the pull request, rather than on every leg of the tag.
       - name: test (release, mcp + bundled-duckdb)

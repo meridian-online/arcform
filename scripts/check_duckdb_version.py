@@ -30,7 +30,11 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-WORKFLOWS = [".github/workflows/ci.yml", ".github/workflows/text-embed-parity.yml"]
+WORKFLOWS = [
+    ".github/workflows/ci.yml",
+    ".github/workflows/release.yml",
+    ".github/workflows/text-embed-parity.yml",
+]
 
 
 class Unreadable(Exception):
