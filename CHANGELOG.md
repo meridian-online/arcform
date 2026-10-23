@@ -9,7 +9,18 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-24
+
+arc 0.2.2 moves arc onto DuckDB 2.0. arc is a single binary that runs a data pipeline, a Protocol, from a YAML manifest of SQL and shell steps, and reads each SQL step to work out which tables it reads and makes. From this release it links DuckDB 2.0, runs SQL steps on DuckDB 2.0's own `duckdb` command line, and works out each step's inputs and outputs from DuckDB's own parse of the SQL rather than a copy of DuckDB's grammar. The install script now installs DuckDB 2.0.0's release build for you when no suitable `duckdb` is found, and `arc run` warns when a Protocol last ran on a different DuckDB, since DuckDB 2.0 changes some results without an error.
+
 **arc now needs DuckDB 2.0.** It links DuckDB 2.0 and runs SQL steps only on a 2.x `duckdb` command, and a 1.x one is refused. If you use DuckDB 1.5, stay on arc 0.2.1: `cargo install arcform --version 0.2.1`. `cargo install` and the install script treat this release as a compatible upgrade of 0.2.1, so they will move a DuckDB 1.5 user onto it unless the version is pinned.
+
+### Added
+
+- **`arc run` says when a Protocol runs on a different DuckDB from its last run.** When the newest readable run record names a DuckDB whose major or minor version differs from the one about to run, one notice on standard error before the first step says `this Protocol last ran on DuckDB <previous>, and this run uses DuckDB <current>; results can differ between them`, and for a move from 1.x to 2.x it names the four result changes listed under Changed. The run goes on. A Protocol with no run record draws no notice.
+- **Homebrew's DuckDB 2.0.0 passes arc's version check as 2.0.0.** It prints `v2.0.0-dev88614 (Development Version) d54cbbe3df`, a development version built from the commit of the v2.0.0 release, which arc's range would otherwise refuse. arc treats a development build of a release's commit as that release everywhere it compares versions: its own range, a Protocol's `engine_version:` and the extension pins. Such a build cannot download community extensions, so a run of a Protocol that installs one warns before the first step, naming DuckDB's installer for the release build, which can. A run with a SQL step on it is still refused, because that build lacks DuckDB's autocomplete extension: see the next entry.
+- **`arc run` names a DuckDB built without its autocomplete extension, and the install script installs DuckDB's release build.** arc reads each SQL step's tokens from DuckDB's `sql_tokenize`, which lives in that extension, and a `duckdb` built without it, such as Homebrew's 2.0.0 at the time of writing, gave no tokens for any file, so every SQL step was refused as one whose tokens arc could not read. A run on such a DuckDB is now refused before any step with exit 2 and one message: which DuckDB, with its path and printed version, cannot read SQL into tokens and why, and the fix, `curl https://install.duckdb.org | DUCKDB_VERSION=2.0.0 sh`, then `~/.duckdb/cli/2.0.0` first on `PATH` or `ARC_DUCKDB_BIN=~/.duckdb/cli/2.0.0/duckdb`. arc probes for the tokenizer, so a build that gains the extension runs. A command that reads the graph without running it, such as `arc sql record`, still reads it with arc's own parser, and its warning names the same cause and fix. After installing arc, the install script installs DuckDB's v2.0.0 release build with DuckDB's own installer when no `duckdb` is on `PATH` or the one there cannot read SQL into tokens, and says what to put on `PATH` when another `duckdb` comes first; `ARC_SKIP_DUCKDB=1` leaves DuckDB alone.
+- **Each statement in the run record says which reader read it,** in `read_by`: `duckdb`, `sqlparser` or `nothing`. A record written before this change has no `read_by`.
 
 ### Changed
 
@@ -21,20 +32,13 @@ Rationale for each change is recorded in the project's design notes and commit h
 - **`arc sql record` makes a table of a `DESCRIBE`, a `SHOW` or a `SUMMARIZE`, as it does of a `SELECT`.** DuckDB 2.0 parses and runs `CREATE TABLE … AS DESCRIBE …`, so the recorded step opens with the `CREATE OR REPLACE TABLE` line and makes a table of the step's name; on DuckDB 1.5 the statement was written as typed.
 - **The run record's statement byte ranges split where DuckDB splits the step.** They used to be dropped when arc's own split and its parser counted the statements differently, such as for a `;` inside a `$$…$$` string.
 
-### Added
+### Fixed
 
-- **`arc run` says when a Protocol runs on a different DuckDB from its last run.** When the newest readable run record names a DuckDB whose major or minor version differs from the one about to run, one notice on standard error before the first step says `this Protocol last ran on DuckDB <previous>, and this run uses DuckDB <current>; results can differ between them`, and for a move from 1.x to 2.x it names the four changes above. The run goes on. A Protocol with no run record draws no notice.
-- **Homebrew's DuckDB 2.0.0 passes arc's version check as 2.0.0.** It prints `v2.0.0-dev88614 (Development Version) d54cbbe3df`, a development version built from the commit of the v2.0.0 release, which arc's range would otherwise refuse. arc treats a development build of a release's commit as that release everywhere it compares versions: its own range, a Protocol's `engine_version:` and the extension pins. Such a build cannot download community extensions, so a run of a Protocol that installs one warns before the first step, naming DuckDB's installer for the release build, which can. A run with a SQL step on it is still refused, because that build lacks DuckDB's autocomplete extension: see the next entry.
-- **`arc run` names a DuckDB built without its autocomplete extension, and the install script installs DuckDB's release build.** arc reads each SQL step's tokens from DuckDB's `sql_tokenize`, which lives in that extension, and a `duckdb` built without it, such as Homebrew's 2.0.0 at the time of writing, gave no tokens for any file, so every SQL step was refused as one whose tokens arc could not read. A run on such a DuckDB is now refused before any step with exit 2 and one message: which DuckDB, with its path and printed version, cannot read SQL into tokens and why, and the fix, `curl https://install.duckdb.org | DUCKDB_VERSION=2.0.0 sh`, then `~/.duckdb/cli/2.0.0` first on `PATH` or `ARC_DUCKDB_BIN=~/.duckdb/cli/2.0.0/duckdb`. arc probes for the tokenizer, so a build that gains the extension runs. A command that reads the graph without running it, such as `arc sql record`, still reads it with arc's own parser, and its warning names the same cause and fix. After installing arc, the install script installs DuckDB's v2.0.0 release build with DuckDB's own installer when no `duckdb` is on `PATH` or the one there cannot read SQL into tokens, and says what to put on `PATH` when another `duckdb` comes first; `ARC_SKIP_DUCKDB=1` leaves DuckDB alone.
-- **Each statement in the run record says which reader read it,** in `read_by`: `duckdb`, `sqlparser` or `nothing`. A record written before this change has no `read_by`.
+- **arc depends on opendal 0.58.2, in place of 0.58.0, which was yanked from crates.io.** A build with the `opendal` feature no longer warns about a yanked dependency.
 
 ### Removed
 
 - **Nine extensions leave the vetted list, which is re-vetted on DuckDB v2.0.0.** `dta`, `mlpack`, `onager` and `stats_duck` have no v2.0.0 build in the community registry. `http_client`, `minijinja`, `rapidfuzz`, `stochastic` and `textplot` have one, but it refuses to load: from DuckDB 2.0 those five are distributed from the Query.Farm repository, which arc does not allow a Protocol to install from. A Protocol that installs any of the nine `FROM community` is refused. The seven that stay are `finetype`, `h3`, `splink_udfs`, `subtoken`, `us_address_standardizer`, `webbed` and `zipfs`, each re-run on v2.0.0, and their entries now name v2.0.0.
-
-### Fixed
-
-- **arc depends on opendal 0.58.2, in place of 0.58.0, which was yanked from crates.io.** A build with the `opendal` feature no longer warns about a yanked dependency.
 
 ## [0.2.1] - 2026-10-17
 
@@ -156,7 +160,8 @@ Then `arc mcp` serves arc to an AI agent over the Model Context Protocol. An age
 - Shell command steps with real-time stdout streaming.
 - Sequential step execution with per-step progress feedback.
 
-[Unreleased]: https://github.com/meridian-online/arcform/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/meridian-online/arcform/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/meridian-online/arcform/releases/tag/v0.2.2
 [0.2.1]: https://github.com/meridian-online/arcform/releases/tag/v0.2.1
 [0.2.0]: https://github.com/meridian-online/arcform/releases/tag/v0.2.0
 [0.1.0]: https://github.com/meridian-online/arcform/tree/a7a852a4b72b0a55f148a8452197772104ff884c
