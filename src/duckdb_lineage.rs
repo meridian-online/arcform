@@ -36,7 +36,7 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::ops::Range;
 
-use crate::duckdb_tokens::{FileTokens, Process, Token, hex_text, shared_tokens};
+use crate::duckdb_tokens::{BatchTokens, FileTokens, Process, Token, hex_text, shared_tokens};
 use crate::engine::DuckDbProgram;
 
 use serde_json::Value;
@@ -150,6 +150,10 @@ pub(crate) struct Statement {
     pub(crate) text: String,
     /// The line of the file it starts on, counting from 1.
     pub(crate) line: usize,
+    /// The statement's `[start, end)` bytes in the file, `;` included when it has one, as
+    /// the command line's batches and DuckDB's tokens place them. `None` when they cannot be
+    /// placed in the file.
+    pub(crate) byte_range: Option<(usize, usize)>,
     pub(crate) form: Form,
     pub(crate) reads: Vec<Relation>,
     pub(crate) produces: Vec<Relation>,
@@ -275,7 +279,7 @@ fn read_step_with(ask: &mut dyn Ask, sql: &str) -> Result<StepReading, Refusal> 
     let file = ask.tokens(sql.as_bytes())?;
     let mut pieces = Vec::new();
     for batch in &file.batches {
-        pieces.extend(split(&batch.text, &batch.tokens, &batch.lines)?);
+        pieces.extend(split(batch)?);
     }
     let frames: Vec<Frame> = pieces.iter().map(frame).collect();
 
@@ -297,6 +301,16 @@ fn read_step_with(ask: &mut dyn Ask, sql: &str) -> Result<StepReading, Refusal> 
         let query = frame.query.clone().map(|text| (text, held.next()));
         statements.push(read_statement(piece, frame, tree, query)?);
     }
+    // A unicode space the parser replaced with a space ends a range inside its character,
+    // which the range keeps whole.
+    for statement in &mut statements {
+        statement.byte_range = statement.byte_range.and_then(|(start, mut end)| {
+            while end <= sql.len() && !sql.is_char_boundary(end) {
+                end += 1;
+            }
+            (sql.is_char_boundary(start) && end <= sql.len()).then_some((start, end))
+        });
+    }
     Ok(StepReading {
         duckdb_version: file.version,
         statements,
@@ -317,32 +331,37 @@ pub(crate) fn major(version: &str) -> Option<u64> {
 struct Piece {
     text: String,
     line: usize,
+    /// Its `[start, end)` bytes in the file; see [`Statement::byte_range`].
+    byte_range: Option<(usize, usize)>,
     tokens: Vec<Token>,
 }
 
-/// The statements of a batch, `sql`, whose tokens are `tokens` and whose lines start on the
-/// file lines `lines`.
-fn split(sql: &str, tokens: &[Token], lines: &[usize]) -> Result<Vec<Piece>, Refusal> {
+/// The statements of a batch, whose text is `sql`, whose tokens are `tokens` and whose lines
+/// start on the file lines `lines`.
+fn split(batch: &BatchTokens) -> Result<Vec<Piece>, Refusal> {
     let mut pieces = Vec::new();
     let mut words: Vec<&Token> = Vec::new();
-    for token in tokens {
+    for token in &batch.tokens {
         if token.word == ";" {
-            pieces.extend(piece(sql, lines, &words, token.start)?);
+            pieces.extend(piece(batch, &words, token.start, true)?);
             words.clear();
         } else if !token.is_comment() {
             words.push(token);
         }
     }
-    pieces.extend(piece(sql, lines, &words, sql.len())?);
+    pieces.extend(piece(batch, &words, batch.text.len(), false)?);
     Ok(pieces)
 }
 
+/// The statement of `words`, which ends where `end` says in the batch: at its `;` when
+/// `terminated`, else at the batch's end.
 fn piece(
-    sql: &str,
-    lines: &[usize],
+    batch: &BatchTokens,
     words: &[&Token],
     end: usize,
+    terminated: bool,
 ) -> Result<Option<Piece>, Refusal> {
+    let (sql, lines) = (batch.text.as_str(), &batch.lines);
     let Some(first) = words.first() else {
         return Ok(None);
     };
@@ -361,6 +380,18 @@ fn piece(
             lines.len()
         ))
     })?;
+    // The range in the file: from the first word to the `;` that ends the statement, which
+    // the range includes, or to the end of what the statement holds.
+    let batch_end = if terminated {
+        end + 1
+    } else {
+        first.start + text.trim_end().len()
+    };
+    let byte_range = batch
+        .origin
+        .at(first.start)
+        .zip(batch.origin.at(batch_end - 1).map(|last| last + 1))
+        .filter(|(start, end)| start < end);
     let tokens = words
         .iter()
         .map(|t| Token {
@@ -371,6 +402,7 @@ fn piece(
     Ok(Some(Piece {
         text: text.trim_end().to_string(),
         line,
+        byte_range,
         tokens,
     }))
 }
@@ -851,6 +883,7 @@ fn read_statement(
     let mut statement = Statement {
         text: piece.text.clone(),
         line: piece.line,
+        byte_range: piece.byte_range,
         form: frame.form,
         reads: frame.reads,
         produces: frame.produces,
@@ -1232,6 +1265,9 @@ mod tests {
 "CREATE TABLE r AS SELECT * FROM a":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
 "CREATE TABLE r AS SELECT * FROM a JOIN b USING (k) WHERE x IN (SELECT x FROM c)":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
 "CREATE TABLE r AS SELECT * FROM summary((SELECT src, dst FROM edges WHERE kind = 'road'))":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
+"CREATE TABLE t AS\n  SELECT 2":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
+"CREATE TABLE t AS\r\nSELECT 2":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
+"CREATE TABLE t AS SELECT 1":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
 "CREATE TABLE w AS SELECT * FROM recent(7 * 2)":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
 "CREATE TEMPORARY VIEW w AS FROM c":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
 "CREATE VIEW v (x) AS SELECT * FROM b":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
@@ -1258,6 +1294,7 @@ mod tests {
 "PIVOT t ON c USING sum(v)":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
 "PIVOT_WIDER s.t ON c USING sum(v)":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
 "PRAGMA threads = 4":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
+"SELECT $$a;b$$":{"error":false,"statements":[{"named_param_map":[],"node":{"aggregate_handling":"STANDARD_HANDLING","cte_map":{"map":[]},"from_table":{"alias":"","query_location":18446744073709551615,"query_location_length":0,"sample":null,"type":"EMPTY"},"group_expressions":[],"group_sets":[],"having":null,"modifiers":[],"qualify":null,"sample":null,"select_list":[{"alias":"","class":"CONSTANT","literal":{"kind":"STRING","text":"a;b"},"query_location":7,"query_location_length":7,"type":"VALUE_CONSTANT"}],"type":"SELECT_NODE","where_clause":null}}]},
 "SELECT 'a;b' AS s":{"error":false,"statements":[{"named_param_map":[],"node":{"aggregate_handling":"STANDARD_HANDLING","cte_map":{"map":[]},"from_table":{"alias":"","query_location":18446744073709551615,"query_location_length":0,"sample":null,"type":"EMPTY"},"group_expressions":[],"group_sets":[],"having":null,"modifiers":[],"qualify":null,"sample":null,"select_list":[{"alias":"s","class":"CONSTANT","literal":{"kind":"STRING","text":"a;b"},"query_location":7,"query_location_length":5,"type":"VALUE_CONSTANT"}],"type":"SELECT_NODE","where_clause":null}}]},
 "SELECT (SELECT max(d) FROM events)":{"error":false,"statements":[{"named_param_map":[],"node":{"aggregate_handling":"STANDARD_HANDLING","cte_map":{"map":[]},"from_table":{"alias":"","query_location":18446744073709551615,"query_location_length":0,"sample":null,"type":"EMPTY"},"group_expressions":[],"group_sets":[],"having":null,"modifiers":[],"qualify":null,"sample":null,"select_list":[{"alias":"","child":null,"class":"SUBQUERY","comparison_type":"INVALID","query_location":7,"query_location_length":27,"subquery":{"named_param_map":[],"node":{"aggregate_handling":"STANDARD_HANDLING","cte_map":{"map":[]},"from_table":{"alias":"","at_clause":null,"catalog_name":"","column_name_alias":[],"qualified_name":{"path":["events"]},"query_location":27,"query_location_length":6,"sample":null,"schema_name":"","table_name":"events","type":"BASE_TABLE"},"group_expressions":[],"group_sets":[],"having":null,"modifiers":[],"qualify":null,"sample":null,"select_list":[{"alias":"","arguments":[{"expression":{"alias":"","class":"COLUMN_REF","column_names":["d"],"query_location":19,"query_location_length":1,"type":"COLUMN_REF"},"name":""}],"catalog":"","class":"FUNCTION","distinct":false,"export_state":false,"filter":null,"function_name":"max","is_operator":false,"order_bys":{"orders":[],"type":"ORDER_MODIFIER"},"qualified_name":{"path":["max"]},"query_location":15,"query_location_length":6,"schema":"","type":"FUNCTION"}],"type":"SELECT_NODE","where_clause":null}},"subquery_type":"SCALAR","type":"SUBQUERY"}],"type":"SELECT_NODE","where_clause":null}}]},
 "SELECT * EXCLUDE (a) FROM t ASOF LEFT JOIN u USING (k)":{"error":false,"statements":[{"named_param_map":[],"node":{"aggregate_handling":"STANDARD_HANDLING","cte_map":{"map":[]},"from_table":{"alias":"","condition":null,"delim_flipped":false,"duplicate_eliminated_columns":[],"is_implicit":false,"join_type":"LEFT","left":{"alias":"","at_clause":null,"catalog_name":"","column_name_alias":[],"qualified_name":{"path":["t"]},"query_location":26,"query_location_length":1,"sample":null,"schema_name":"","table_name":"t","type":"BASE_TABLE"},"nearest_approx":false,"nearest_count":1,"nearest_order_type":"ASCENDING","query_location":28,"query_location_length":26,"ranking_expression":null,"ref_type":"ASOF","right":{"alias":"","at_clause":null,"catalog_name":"","column_name_alias":[],"qualified_name":{"path":["u"]},"query_location":43,"query_location_length":1,"sample":null,"schema_name":"","table_name":"u","type":"BASE_TABLE"},"sample":null,"type":"JOIN","using_columns":["k"]},"group_expressions":[],"group_sets":[],"having":null,"modifiers":[],"qualify":null,"sample":null,"select_list":[{"alias":"","class":"STAR","columns":false,"exclude_list":["a"],"expr":null,"qualified_exclude_list":[],"query_location":7,"query_location_length":13,"relation_name":"","rename_list":[],"replace_list":[],"type":"STAR"}],"type":"SELECT_NODE","where_clause":null}}]},
@@ -1282,6 +1319,7 @@ mod tests {
 "SELECT * FROM recent(7 * 2)":{"error":false,"statements":[{"named_param_map":[],"node":{"aggregate_handling":"STANDARD_HANDLING","cte_map":{"map":[]},"from_table":{"alias":"","column_name_alias":[],"function":{"alias":"","arguments":[{"expression":{"alias":"","arguments":[{"expression":{"alias":"","class":"CONSTANT","literal":{"kind":"INTEGER","text":"7"},"query_location":21,"query_location_length":1,"type":"VALUE_CONSTANT"},"name":""},{"expression":{"alias":"","class":"CONSTANT","literal":{"kind":"INTEGER","text":"2"},"query_location":25,"query_location_length":1,"type":"VALUE_CONSTANT"},"name":""}],"catalog":"","class":"FUNCTION","distinct":false,"export_state":false,"filter":null,"function_name":"*","is_operator":true,"order_bys":{"orders":[],"type":"ORDER_MODIFIER"},"qualified_name":{"path":["*"]},"query_location":21,"query_location_length":5,"schema":"","type":"FUNCTION"},"name":""}],"catalog":"","class":"FUNCTION","distinct":false,"export_state":false,"filter":null,"function_name":"recent","is_operator":false,"order_bys":{"orders":[],"type":"ORDER_MODIFIER"},"qualified_name":{"path":["recent"]},"query_location":18446744073709551615,"query_location_length":0,"schema":"","type":"FUNCTION"},"query_location":14,"query_location_length":13,"sample":null,"type":"TABLE_FUNCTION","with_ordinality":"WITHOUT_ORDINALITY"},"group_expressions":[],"group_sets":[],"having":null,"modifiers":[],"qualify":null,"sample":null,"select_list":[{"alias":"","class":"STAR","columns":false,"exclude_list":[],"expr":null,"qualified_exclude_list":[],"query_location":7,"query_location_length":1,"relation_name":"","rename_list":[],"replace_list":[],"type":"STAR"}],"type":"SELECT_NODE","where_clause":null}}]},
 "SELECT * FROM summary((SELECT src, dst FROM edges WHERE kind = 'road'))":{"error":false,"statements":[{"named_param_map":[],"node":{"aggregate_handling":"STANDARD_HANDLING","cte_map":{"map":[]},"from_table":{"alias":"","column_name_alias":[],"function":{"alias":"","arguments":[{"expression":{"alias":"","child":null,"class":"SUBQUERY","comparison_type":"INVALID","query_location":22,"query_location_length":48,"subquery":{"named_param_map":[],"node":{"aggregate_handling":"STANDARD_HANDLING","cte_map":{"map":[]},"from_table":{"alias":"","at_clause":null,"catalog_name":"","column_name_alias":[],"qualified_name":{"path":["edges"]},"query_location":44,"query_location_length":5,"sample":null,"schema_name":"","table_name":"edges","type":"BASE_TABLE"},"group_expressions":[],"group_sets":[],"having":null,"modifiers":[],"qualify":null,"sample":null,"select_list":[{"alias":"","class":"COLUMN_REF","column_names":["src"],"query_location":30,"query_location_length":3,"type":"COLUMN_REF"},{"alias":"","class":"COLUMN_REF","column_names":["dst"],"query_location":35,"query_location_length":3,"type":"COLUMN_REF"}],"type":"SELECT_NODE","where_clause":{"alias":"","class":"COMPARISON","left":{"alias":"","class":"COLUMN_REF","column_names":["kind"],"query_location":56,"query_location_length":4,"type":"COLUMN_REF"},"query_location":56,"query_location_length":13,"right":{"alias":"","class":"CONSTANT","literal":{"kind":"STRING","text":"road"},"query_location":63,"query_location_length":6,"type":"VALUE_CONSTANT"},"type":"COMPARE_EQUAL"}}},"subquery_type":"SCALAR","type":"SUBQUERY"},"name":""}],"catalog":"","class":"FUNCTION","distinct":false,"export_state":false,"filter":null,"function_name":"summary","is_operator":false,"order_bys":{"orders":[],"type":"ORDER_MODIFIER"},"qualified_name":{"path":["summary"]},"query_location":18446744073709551615,"query_location_length":0,"schema":"","type":"FUNCTION"},"query_location":14,"query_location_length":57,"sample":null,"type":"TABLE_FUNCTION","with_ordinality":"WITHOUT_ORDINALITY"},"group_expressions":[],"group_sets":[],"having":null,"modifiers":[],"qualify":null,"sample":null,"select_list":[{"alias":"","class":"STAR","columns":false,"exclude_list":[],"expr":null,"qualified_exclude_list":[],"query_location":7,"query_location_length":1,"relation_name":"","rename_list":[],"replace_list":[],"type":"STAR"}],"type":"SELECT_NODE","where_clause":null}}]},
 "SELECT 1":{"error":false,"statements":[{"named_param_map":[],"node":{"aggregate_handling":"STANDARD_HANDLING","cte_map":{"map":[]},"from_table":{"alias":"","query_location":18446744073709551615,"query_location_length":0,"sample":null,"type":"EMPTY"},"group_expressions":[],"group_sets":[],"having":null,"modifiers":[],"qualify":null,"sample":null,"select_list":[{"alias":"","class":"CONSTANT","literal":{"kind":"INTEGER","text":"1"},"query_location":7,"query_location_length":1,"type":"VALUE_CONSTANT"}],"type":"SELECT_NODE","where_clause":null}}]},
+"SELECT 2":{"error":false,"statements":[{"named_param_map":[],"node":{"aggregate_handling":"STANDARD_HANDLING","cte_map":{"map":[]},"from_table":{"alias":"","query_location":18446744073709551615,"query_location_length":0,"sample":null,"type":"EMPTY"},"group_expressions":[],"group_sets":[],"having":null,"modifiers":[],"qualify":null,"sample":null,"select_list":[{"alias":"","class":"CONSTANT","literal":{"kind":"INTEGER","text":"2"},"query_location":7,"query_location_length":1,"type":"VALUE_CONSTANT"}],"type":"SELECT_NODE","where_clause":null}}]},
 "SELECT 2 /* ; */":{"error":false,"statements":[{"named_param_map":[],"node":{"aggregate_handling":"STANDARD_HANDLING","cte_map":{"map":[]},"from_table":{"alias":"","query_location":18446744073709551615,"query_location_length":0,"sample":null,"type":"EMPTY"},"group_expressions":[],"group_sets":[],"having":null,"modifiers":[],"qualify":null,"sample":null,"select_list":[{"alias":"","class":"CONSTANT","literal":{"kind":"INTEGER","text":"2"},"query_location":7,"query_location_length":1,"type":"VALUE_CONSTANT"}],"type":"SELECT_NODE","where_clause":null}}]},
 "SELECT DATE '2026-01-01'":{"error":false,"statements":[{"named_param_map":[],"node":{"aggregate_handling":"STANDARD_HANDLING","cte_map":{"map":[]},"from_table":{"alias":"","query_location":18446744073709551615,"query_location_length":0,"sample":null,"type":"EMPTY"},"group_expressions":[],"group_sets":[],"having":null,"modifiers":[],"qualify":null,"sample":null,"select_list":[{"alias":"","child":{"alias":"","class":"CONSTANT","literal":{"kind":"STRING","text":"2026-01-01"},"query_location":18446744073709551615,"query_location_length":0,"type":"VALUE_CONSTANT"},"class":"CAST","query_location":7,"query_location_length":17,"try_cast":false,"type":"OPERATOR_CAST","type_expr":{"alias":"","catalog":"","children":[],"class":"TYPE","qualified_name":{"path":["DATE"]},"query_location":7,"query_location_length":4,"schema":"","type":"TYPE","type_name":"DATE"}}],"type":"SELECT_NODE","where_clause":null}}]},
 "SET VARIABLE cutoff = DATE '2026-01-01'":{"error":true,"error_message":"Only SELECT statements can be serialized to json!","error_type":"not implemented"},
@@ -1690,6 +1728,56 @@ mod tests {
         );
     }
 
+    /// The file's text at each statement's byte range.
+    fn slices<'a>(ask: &mut dyn Ask, file: &'a str) -> Vec<&'a str> {
+        read(ask, file)
+            .iter()
+            .map(|s| {
+                let (start, end) = s
+                    .byte_range
+                    .unwrap_or_else(|| panic!("no byte range for {s:?} in {file:?}"));
+                &file[start..end]
+            })
+            .collect()
+    }
+
+    fn a_dollar_quoted_semicolon_does_not_split_the_ranges(ask: &mut dyn Ask) {
+        assert_eq!(
+            slices(ask, "SELECT $$a;b$$; CREATE TABLE t AS SELECT 1;"),
+            ["SELECT $$a;b$$;", "CREATE TABLE t AS SELECT 1;"],
+            "a range is the statement's text from its first word to its `;`, whole"
+        );
+    }
+
+    fn ranges_skip_the_lines_the_command_line_drops(ask: &mut dyn Ask) {
+        assert_eq!(
+            slices(
+                ask,
+                ".mode list\n# a note\nSELECT 1;\n-- c\nCREATE TABLE t AS\n  SELECT 2\n"
+            ),
+            ["SELECT 1;", "CREATE TABLE t AS\n  SELECT 2"],
+            "a dot command and a `#` line are no SQL, so no range starts in them; a comment \
+             before a statement is not in its range; the last statement needs no `;`"
+        );
+    }
+
+    fn ranges_in_a_crlf_file_keep_their_carriage_returns(ask: &mut dyn Ask) {
+        assert_eq!(
+            slices(ask, "SELECT 1;\r\nCREATE TABLE t AS\r\nSELECT 2;\r\n"),
+            ["SELECT 1;", "CREATE TABLE t AS\r\nSELECT 2;"],
+            "the ranges are bytes of the file, and a `\\r` inside a statement is in it"
+        );
+    }
+
+    fn ranges_follow_a_byte_order_mark_and_unicode_spaces(ask: &mut dyn Ask) {
+        assert_eq!(
+            slices(ask, "\u{feff}SELECT 1;\nSELECT\u{a0}2\u{a0};\n"),
+            ["SELECT 1;", "SELECT\u{a0}2\u{a0};"],
+            "the parser reads a byte-order mark and a no-break space as one space each, and \
+             the ranges are still the file's bytes, which are longer"
+        );
+    }
+
     fn inserts_are_framed_around_their_query(ask: &mut dyn Ask) {
         let s = read(
             ask,
@@ -1962,6 +2050,10 @@ mod tests {
         comments_alone_are_no_statement_and_a_last_semicolon_is_optional,
         a_statement_duckdb_cannot_parse_keeps_duckdbs_message,
         a_dot_command_is_no_statement_and_each_statement_knows_its_line,
+        a_dollar_quoted_semicolon_does_not_split_the_ranges,
+        ranges_skip_the_lines_the_command_line_drops,
+        ranges_in_a_crlf_file_keep_their_carriage_returns,
+        ranges_follow_a_byte_order_mark_and_unicode_spaces,
         inserts_are_framed_around_their_query,
         creates_are_framed_around_their_query,
         copies_are_framed_from_their_words,

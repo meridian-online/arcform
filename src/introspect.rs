@@ -302,6 +302,10 @@ pub struct StepSql {
     pub statements: Vec<SqlAssets>,
     /// Which reader read each statement, in the order of `statements`.
     pub read_by: Vec<ReadBy>,
+    /// Each statement's `[start, end)` bytes in the step's SQL, in the order of
+    /// `statements`: where DuckDB's tokens place it when DuckDB read the step, else where
+    /// [`statement_byte_ranges`] cuts it. `None` for a statement that cannot be placed.
+    pub byte_ranges: Vec<Option<(usize, usize)>>,
     /// Each statement neither reader could read, as it reads nothing; see [`unread_warning`].
     pub unread: Vec<UnreadStatement>,
     /// Why DuckDB's answer for the step could not be read, when a DuckDB 2 answered and
@@ -543,8 +547,21 @@ fn duckdb_step(reading: &duckdb_lineage::StepReading) -> StepSql {
         }
         step.statements.push(assets);
         step.read_by.push(read_by);
+        step.byte_ranges.push(statement.byte_range);
     }
     step
+}
+
+/// The ranges [`statement_byte_ranges`] cuts in `sql`, one per statement of a step that has
+/// `count`. A cut that counts statements differently from the reader gives none, rather than
+/// ranges misaligned with the statements.
+fn lexical_ranges(sql: &str, count: usize) -> Vec<Option<(usize, usize)>> {
+    let ranges = statement_byte_ranges(sql);
+    if ranges.len() == count {
+        ranges.into_iter().map(Some).collect()
+    } else {
+        vec![None; count]
+    }
 }
 
 /// sqlparser-rs's reading of a step. A step it cannot parse whole is cut where
@@ -554,12 +571,14 @@ fn sqlparser_step(sql: &str) -> StepSql {
     if let Ok(statements) = sqlparser_per_statement(sql) {
         return StepSql {
             read_by: vec![ReadBy::Sqlparser; statements.len()],
+            byte_ranges: lexical_ranges(sql, statements.len()),
             statements,
             ..StepSql::default()
         };
     }
     let mut step = StepSql::default();
     for (n, (start, end)) in statement_byte_ranges(sql).into_iter().enumerate() {
+        step.byte_ranges.push(Some((start, end)));
         match sql
             .get(start..end)
             .ok_or_else(Vec::new)
@@ -752,6 +771,9 @@ fn record_table_call(call: &FunctionCall, assets: &mut SqlAssets) {
 /// on well-formed SQL the count matches [`read_sql`]'s; the caller zips the
 /// two and falls back to no ranges if they ever disagree. Ranges are trimmed of leading
 /// whitespace/comments and trailing whitespace.
+///
+/// This is the fallback cut: [`read_sql`] places a statement by DuckDB's own tokens when
+/// DuckDB answers, and gives these ranges only when it does not.
 pub fn statement_byte_ranges(sql: &str) -> Vec<(usize, usize)> {
     let bytes = sql.as_bytes();
     let n = bytes.len();
@@ -1453,6 +1475,46 @@ mod tests {
     /// DuckDB's reading, with sqlparser-rs reading each statement it cannot.
     fn read_by_default(sql: &str) -> StepSql {
         duckdb_step(&recorded_steps::reading(sql))
+    }
+
+    #[test]
+    fn a_step_duckdb_did_not_answer_keeps_the_lexical_ranges() {
+        let sql = "SELECT 1;\nCREATE TABLE t AS SELECT 2;\n";
+        let step = test_reading::with(
+            |_| Err(duckdb_lineage::Refusal::Unreadable("no answer".to_string())),
+            || read_sql(sql).unwrap(),
+        );
+        assert_eq!(step.unreadable.as_deref(), Some("no answer"));
+        assert_eq!(
+            step.byte_ranges,
+            [Some((0, 9)), Some((10, 37))],
+            "sqlparser-rs read the step, and the ranges are the lexical cut's"
+        );
+    }
+
+    #[test]
+    fn lexical_ranges_are_dropped_when_the_cut_counts_statements_differently() {
+        assert_eq!(lexical_ranges("SELECT 1; SELECT 2;", 3), [None; 3]);
+        assert_eq!(
+            lexical_ranges("SELECT 1; SELECT 2;", 2),
+            [Some((0, 9)), Some((10, 19))]
+        );
+    }
+
+    #[test]
+    fn duckdbs_range_for_a_statement_follows_its_tokens() {
+        let sql = ".mode list\nSELECT * FROM a;\n";
+        let step = read_by_default(sql);
+        assert_eq!(
+            step.byte_ranges,
+            [Some((11, 27))],
+            "DuckDB's tokens start the range at SELECT"
+        );
+        assert_eq!(
+            statement_byte_ranges(sql),
+            [(0, 27)],
+            "the lexical cut starts at the dot command"
+        );
     }
 
     #[test]

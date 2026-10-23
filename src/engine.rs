@@ -965,11 +965,13 @@ enum ExtensionSql {
 /// The `\r` DuckDB drops before each `\n` is kept: every rule after this one reads a `\r` as
 /// it reads a space. So is a last line the CLI would not return because a NUL left it empty:
 /// an empty line is no SQL.
-fn cli_lines(bytes: &[u8]) -> Vec<(Vec<u8>, usize)> {
+fn cli_lines(bytes: &[u8]) -> Vec<CliLine> {
     let mut lines = Vec::new();
     let mut line = Vec::new();
+    let mut origin = Origin::default();
     let mut size = 100;
     let mut starts_on = 1;
+    let mut base = 0;
     for (index, physical) in bytes.split_inclusive(|&b| b == b'\n').enumerate() {
         let mut at = 0;
         // Each pass reads one chunk of at least one byte, so a pass per byte is enough.
@@ -978,18 +980,131 @@ fn cli_lines(bytes: &[u8]) -> Vec<(Vec<u8>, usize)> {
                 size = size * 2 + 100;
             }
             let take = (size - line.len() - 1).min(physical.len() - at);
-            line.extend(physical[at..at + take].iter().take_while(|&&b| b != 0));
+            let kept = physical[at..at + take]
+                .iter()
+                .take_while(|&&b| b != 0)
+                .count();
+            line.extend_from_slice(&physical[at..at + kept]);
+            origin.push_bytes(base + at, kept);
             at += take;
             if line.last() == Some(&b'\n') {
                 line.pop();
-                lines.push((std::mem::take(&mut line), starts_on));
+                origin.pop();
+                lines.push(CliLine {
+                    bytes: std::mem::take(&mut line),
+                    starts_on,
+                    origin: std::mem::take(&mut origin),
+                });
                 size = 100;
                 starts_on = index + 2;
             }
         }
+        base += physical.len();
     }
-    lines.push((line, starts_on));
+    lines.push(CliLine {
+        bytes: line,
+        starts_on,
+        origin,
+    });
     lines
+}
+
+/// One line the CLI reads: its bytes, the file line it starts on, and where each byte came
+/// from in the file.
+struct CliLine {
+    bytes: Vec<u8>,
+    starts_on: usize,
+    origin: Origin,
+}
+
+/// Where each byte of a text came from in the file it was made from, as runs of bytes that
+/// are consecutive in both. The text is a file's lines after the CLI's cuts and the parser's
+/// unicode-space pass, so most of it is a few long runs: a dropped line, a NUL, or a unicode
+/// space replaced by a space each start a new one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Origin {
+    /// Each run's first byte in the text and in the file, in text order.
+    runs: Vec<(usize, usize)>,
+    /// The text's length.
+    len: usize,
+}
+
+impl Origin {
+    /// Adds `count` bytes that start at `file` in the file.
+    fn push_bytes(&mut self, file: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let continues = self
+            .runs
+            .last()
+            .is_some_and(|&(text, at)| at + (self.len - text) == file);
+        if !continues {
+            self.runs.push((self.len, file));
+        }
+        self.len += count;
+    }
+
+    /// Drops the last byte.
+    fn pop(&mut self) {
+        self.len = self.len.saturating_sub(1);
+        if self.runs.last().is_some_and(|&(text, _)| text >= self.len) {
+            self.runs.pop();
+        }
+    }
+
+    /// Adds `other` after this text.
+    fn append(&mut self, other: &Origin) {
+        for &(text, file) in &other.runs {
+            let start = self.len + text;
+            // A run that continues this text's last is not added again.
+            let continues = self
+                .runs
+                .last()
+                .is_some_and(|&(t, at)| at + (start - t) == file);
+            if !continues {
+                self.runs.push((start, file));
+            }
+        }
+        self.len += other.len;
+    }
+
+    /// The file byte the text's byte `pos` came from, if it came from one.
+    pub(crate) fn at(&self, pos: usize) -> Option<usize> {
+        if pos >= self.len {
+            return None;
+        }
+        let run = self.runs.partition_point(|&(text, _)| text <= pos);
+        let &(text, file) = self.runs.get(run.checked_sub(1)?)?;
+        Some(file + (pos - text))
+    }
+
+    /// This text after a pass that copied bytes of it into a new text: `copies` gives each
+    /// run of the new text as its first byte there and in this text, and `len` is the new
+    /// text's length.
+    pub(crate) fn through(&self, copies: &[(usize, usize)], len: usize) -> Origin {
+        let mut out = Origin::default();
+        for (n, &(to, from)) in copies.iter().enumerate() {
+            let end = copies.get(n + 1).map_or(len, |next| next.0);
+            let mut at = from;
+            let mut left = end - to;
+            while left > 0 {
+                let run = self.runs.partition_point(|&(text, _)| text <= at);
+                let Some(&(text, file)) = run.checked_sub(1).and_then(|r| self.runs.get(r)) else {
+                    return Origin::default();
+                };
+                let run_end = self.runs.get(run).map_or(self.len, |next| next.0);
+                let take = left.min(run_end.saturating_sub(at));
+                if take == 0 {
+                    return Origin::default();
+                }
+                out.push_bytes(file + (at - text), take);
+                at += take;
+                left -= take;
+            }
+        }
+        out
+    }
 }
 
 /// A space to the CLI's own tests of a line: DuckDB's `CharacterIsSpace`
@@ -1088,6 +1203,15 @@ fn sql_is_complete(z: &[u8]) -> bool {
     semicolon
 }
 
+/// One batch [`cli_batches_mapped`] cuts.
+pub(crate) struct CliBatch {
+    pub(crate) text: Vec<u8>,
+    /// The file line each of its lines starts on.
+    pub(crate) lines: Vec<usize>,
+    /// Where each byte of `text` came from in the file.
+    pub(crate) origin: Origin,
+}
+
 /// The batches of SQL DuckDB's CLI hands its parser from a file, each with the file line
 /// each of its lines starts on, as the CLI's `ProcessInput` cuts them
 /// (`tools/shell/shell.cpp:3135-3266`; for a file, as in v1.5.5). A line whose first byte is
@@ -1100,14 +1224,24 @@ fn sql_is_complete(z: &[u8]) -> bool {
 ///
 /// A dot command can itself run SQL or a program, such as `.read` and `.shell`; what it runs
 /// is not read here.
-pub(crate) fn cli_batches(bytes: &[u8]) -> Vec<(Vec<u8>, Vec<usize>)> {
+///
+/// Each batch also says where each of its bytes came from in the file. The `\n` the CLI puts
+/// between two lines of a batch is given the byte after the line before it.
+pub(crate) fn cli_batches_mapped(bytes: &[u8]) -> Vec<CliBatch> {
     let mut batches = Vec::new();
     let mut sql = Vec::new();
     let mut lines = Vec::new();
-    for (line, starts_on) in cli_lines(bytes) {
+    let mut origin = Origin::default();
+    for CliLine {
+        bytes: line,
+        starts_on,
+        origin: line_origin,
+    } in cli_lines(bytes)
+    {
         if line.first() == Some(&0x03) {
             sql.clear();
             lines.clear();
+            origin = Origin::default();
             continue;
         }
         if sql.is_empty() && matches!(line.first(), Some(b'.' | b'#')) {
@@ -1116,19 +1250,31 @@ pub(crate) fn cli_batches(bytes: &[u8]) -> Vec<(Vec<u8>, Vec<usize>)> {
         let prior = sql.len();
         if !sql.is_empty() {
             sql.push(b'\n');
+            let after = origin.len.checked_sub(1).and_then(|last| origin.at(last));
+            origin.push_bytes(after.map_or(0, |at| at + 1), 1);
         }
         sql.extend_from_slice(&line);
+        origin.append(&line_origin);
         lines.push(starts_on);
         if sql[prior..].contains(&b';') && sql_is_complete(&sql) {
-            batches.push((std::mem::take(&mut sql), std::mem::take(&mut lines)));
+            batches.push(CliBatch {
+                text: std::mem::take(&mut sql),
+                lines: std::mem::take(&mut lines),
+                origin: std::mem::take(&mut origin),
+            });
         } else if all_whitespace(&sql) {
             sql.clear();
             lines.clear();
+            origin = Origin::default();
         }
     }
     // The CLI hands over what is left unless it is only spaces and comments, which hold no
     // statement to find.
-    batches.push((sql, lines));
+    batches.push(CliBatch {
+        text: sql,
+        lines,
+        origin,
+    });
     batches
 }
 
@@ -1160,11 +1306,28 @@ fn unicode_space_len(q: &[u8]) -> Option<usize> {
 /// where v1.5.5 repeated it until it replaced nothing; a second pass would replace nothing,
 /// because a space opens nothing and a unicode space after a `$` is read as part of a tag.
 pub(crate) fn strip_unicode_spaces(q: &[u8]) -> Vec<u8> {
+    strip_unicode_spaces_copies(q).0
+}
+
+/// [`strip_unicode_spaces`], with the runs of `q` it copied: each as its first byte in the
+/// result and in `q`. A replaced unicode space is a run of its own, from the space's first
+/// byte.
+pub(crate) fn strip_unicode_spaces_copies(q: &[u8]) -> (Vec<u8>, Vec<(usize, usize)>) {
     let mut out = Vec::new();
+    let mut copies: Vec<(usize, usize)> = Vec::new();
+    let mut copy = |out: &Vec<u8>, from: usize| {
+        if copies
+            .last()
+            .is_none_or(|&(to, at)| at + (out.len() - to) != from)
+        {
+            copies.push((out.len(), from));
+        }
+    };
     let mut pos = 0;
     while pos < q.len() {
         let rest = &q[pos..];
         if let Some(len) = unicode_space_len(rest) {
+            copy(&out, pos);
             out.push(b' ');
             pos += len;
             continue;
@@ -1200,16 +1363,17 @@ pub(crate) fn strip_unicode_spaces(q: &[u8]) -> Vec<u8> {
             }
             _ => pos + 1,
         };
+        copy(&out, pos);
         out.extend_from_slice(&q[pos..end]);
         pos = end;
     }
-    out
+    (out, copies)
 }
 
 /// Every place in a SQL file that says where DuckDB installs an extension from, and every
 /// place where it runs SQL that is not in the file, each with the file line it is on, read
 /// from the file's tokens as the DuckDB that runs it gave them: each batch
-/// [`cli_batches`] cuts, after [`strip_unicode_spaces`], read alone.
+/// [`cli_batches_mapped`] cuts, after [`strip_unicode_spaces`], read alone.
 fn scan_extension_sql(tokens: &FileTokens) -> Vec<(ExtensionSql, usize)> {
     let mut found = Vec::new();
     for batch in &tokens.batches {
@@ -2942,13 +3106,60 @@ mod extension_tests {
         );
     }
 
+    /// Every byte of a batch the CLI holds, after the parser's unicode-space pass, is found
+    /// in the file where the batch's origin says, except the `\n` between lines and a unicode
+    /// space the pass replaced (which comes from the space's first byte).
+    #[test]
+    fn a_batch_byte_is_found_in_the_file_where_its_origin_says() {
+        let files: [&[u8]; 6] = [
+            b"SELECT 1;\nSELECT 2;\n",
+            b".mode list\n# note\nSELECT 1;\n\x03junk\nSELECT 2;\n",
+            b"SELECT 1;\r\nSELECT\r\n 2;\r\n",
+            "\u{feff}SELECT 1;\nSELECT\u{a0}2;\n".as_bytes(),
+            // A NUL ends what the line keeps of its chunk, and the next line joins it.
+            b"SELECT 1;\0 dropped\nSELECT 2;\n",
+            b"-- a comment only\n\nSELECT 1\n;\n.print x\nSELECT 2",
+        ];
+        for file in files {
+            for batch in cli_batches_mapped(file) {
+                let (stripped, copies) = strip_unicode_spaces_copies(&batch.text);
+                let origin = batch.origin.through(&copies, stripped.len());
+                for (i, byte) in stripped.iter().enumerate() {
+                    if *byte == b'\n' || *byte == b' ' {
+                        continue;
+                    }
+                    let found = origin.at(i).map(|f| file[f]);
+                    assert_eq!(
+                        found,
+                        Some(*byte),
+                        "byte {i} of {:?} in {:?}",
+                        String::from_utf8_lossy(&stripped),
+                        String::from_utf8_lossy(file)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_nul_joins_the_next_line_and_the_origin_skips_what_it_dropped() {
+        let file = b"SELECT 1;\0 dropped\nSELECT 2;\n";
+        let batches = cli_batches_mapped(file);
+        let first = &batches[0];
+        assert_eq!(first.text, b"SELECT 1;SELECT 2;");
+        // The second `SELECT` starts at text byte 9, after the NUL and what it dropped.
+        assert_eq!(first.origin.at(9), Some(19));
+        assert_eq!(file[19], b'S');
+    }
+
     /// DuckDB 2.0's CLI reads a backtick as it reads a `"` when it decides whether the lines it
     /// holds end in a `;`, so a `.` or `#` line after an open backtick is SQL.
     #[test]
     fn a_backtick_holds_a_batch_open_across_lines_on_2_0() {
         let file = b"SELECT 1 AS `x;\n# `; INSTALL h3x FROM community;\n";
+        let first = &cli_batches_mapped(file)[0];
         assert_eq!(
-            cli_batches(file)[0],
+            (first.text.clone(), first.lines.clone()),
             (
                 b"SELECT 1 AS `x;\n# `; INSTALL h3x FROM community;".to_vec(),
                 vec![1, 2]

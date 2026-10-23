@@ -240,7 +240,8 @@ pub struct StatementInfo {
     pub reads: Vec<String>,
     /// `[start, end)` byte offsets into the step's `sql_text` — the exact source slice for
     /// this statement, so a viewer can render statements individually. `null` if the
-    /// lexical split didn't line up with the parsed statements.
+    /// statement could not be placed: DuckDB's tokens place it when DuckDB read the step, and the
+    /// lexical split does when sqlparser-rs did and the two count the statements alike.
     pub byte_range: Option<[usize; 2]>,
     /// Which reader read the statement: `duckdb`, `sqlparser` (chosen with
     /// `ARC_SQL_READER=sqlparser`, or reading a statement DuckDB's reading could not take),
@@ -737,21 +738,17 @@ fn build_step(
                 let statements = match crate::introspect::read_sql(&text) {
                     Ok(step_sql) => {
                         let read_by = step_sql.read_by;
+                        let ranges = step_sql.byte_ranges;
                         let list = step_sql.statements;
-                        // Attach each statement's source byte range. The lexical splitter
-                        // and the parser agree on count for well-formed SQL; if they ever
-                        // diverge, emit no ranges rather than misalign them.
-                        let ranges = crate::introspect::statement_byte_ranges(&text);
-                        let aligned = ranges.len() == list.len();
+                        // Each statement's source byte range comes with its reading: from
+                        // DuckDB's tokens when DuckDB read the step, else from the lexical
+                        // cut, dropped when that cut counts the statements differently.
                         list.into_iter()
                             .enumerate()
                             .map(|(i, a)| StatementInfo {
                                 produces: a.outputs.into_iter().collect(),
                                 reads: a.inputs.into_iter().collect(),
-                                byte_range: aligned.then(|| {
-                                    let (s, e) = ranges[i];
-                                    [s, e]
-                                }),
+                                byte_range: ranges.get(i).copied().flatten().map(|(s, e)| [s, e]),
                                 read_by: read_by.get(i).map(|r| r.as_str().to_string()),
                             })
                             .collect()
@@ -1053,6 +1050,67 @@ steps:
         // for a file because it happens to have no extension or because nothing
         // stats the filesystem to check.
         assert_eq!(by_name["build/out"].kind, "directory");
+    }
+
+    /// The contract of a one-step manifest whose SQL file holds `sql`, read with DuckDB's
+    /// recorded answers, as the step's statements.
+    fn statements_of(sql: &str) -> Vec<StatementInfo> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("models")).unwrap();
+        std::fs::write(dir.path().join("models/load.sql"), sql).unwrap();
+        let manifest = Manifest::from_yaml_str(
+            "name: test\nsteps:\n  - name: load\n    sql: models/load.sql\n",
+        )
+        .unwrap();
+        let graph = AssetGraph::build(&manifest, dir.path());
+        let entry = crate::introspect::test_reading::with(
+            crate::introspect::test_reading::recorded,
+            || {
+                build_step(
+                    &manifest.steps[0],
+                    dir.path(),
+                    &graph,
+                    &manifest,
+                    &HashMap::new(),
+                )
+            },
+        );
+        entry.sql.expect("a SQL step").statements
+    }
+
+    #[test]
+    fn a_semicolon_inside_a_dollar_quoted_string_does_not_drop_the_ranges() {
+        let sql = "SELECT $$a;b$$; CREATE TABLE t AS SELECT 1;";
+        let statements = statements_of(sql);
+        let slices: Vec<Option<&str>> = statements
+            .iter()
+            .map(|s| s.byte_range.map(|[start, end]| &sql[start..end]))
+            .collect();
+        assert_eq!(
+            slices,
+            [Some("SELECT $$a;b$$;"), Some("CREATE TABLE t AS SELECT 1;")],
+            "both statements keep a range, and it covers the statement's text"
+        );
+        assert!(
+            statements
+                .iter()
+                .all(|s| s.read_by.as_deref() == Some("duckdb")),
+            "DuckDB read both: {statements:?}"
+        );
+    }
+
+    #[test]
+    fn a_dot_command_before_a_statement_does_not_move_its_range() {
+        let sql = ".mode list\n# a note\nSELECT 1;\n-- c\nCREATE TABLE t AS\n  SELECT 2\n";
+        let ranges: Vec<_> = statements_of(sql).iter().map(|s| s.byte_range).collect();
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|r| r.map(|[start, end]| &sql[start..end]))
+                .collect::<Vec<_>>(),
+            [Some("SELECT 1;"), Some("CREATE TABLE t AS\n  SELECT 2")],
+            "the lexical cut would start the first range at the dot command"
+        );
     }
 
     #[test]

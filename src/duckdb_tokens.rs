@@ -5,7 +5,7 @@
 //! from it, through the same command line that runs the step, so the refusals read the
 //! file as that DuckDB reads it. What the command line does to a file before its parser
 //! sees it (dot commands, `#` lines, how lines batch into statements) is not in
-//! `sql_tokenize`, so the file is first cut into batches by `engine::cli_batches`, and each
+//! `sql_tokenize`, so the file is first cut into batches by `engine::cli_batches_mapped`, and each
 //! batch has the parser's unicode-space pass applied by `engine::strip_unicode_spaces`. Every
 //! batch's tokens come from one DuckDB process.
 //!
@@ -26,7 +26,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::duckdb_lineage::{Refusal, major};
-use crate::engine::{DuckDbProgram, Tok, cli_batches, strip_unicode_spaces};
+use crate::engine::{
+    DuckDbProgram, Origin, Tok, cli_batches_mapped, strip_unicode_spaces,
+    strip_unicode_spaces_copies,
+};
 
 /// A token as `sql_tokenize` gives it. `start` is a byte offset into the text asked
 /// about: on v2.0.0 a token after a two-byte `é` starts two bytes on, not one. `token_type`
@@ -72,6 +75,9 @@ pub(crate) struct BatchTokens {
     /// and with any byte that is not UTF-8 replaced, as DuckDB refuses a batch holding one
     /// and runs none of it.
     pub(crate) text: String,
+    /// Where each byte of `text` came from in the file; empty when it cannot be told, as
+    /// for a batch with a byte that is not UTF-8.
+    pub(crate) origin: Origin,
     pub(crate) tokens: Vec<Token>,
 }
 
@@ -288,15 +294,18 @@ pub(crate) fn tokenize_with(
     file: &[u8],
     ask: &mut dyn FnMut(&[String]) -> Result<Answer, Refusal>,
 ) -> Result<FileTokens, Refusal> {
-    let cut: Vec<(String, Vec<usize>)> = cli_batches(file)
+    let cut: Vec<(String, Vec<usize>, Origin)> = cli_batches_mapped(file)
         .into_iter()
-        .map(|(batch, lines)| (as_tokenized(&batch), lines))
+        .map(|batch| {
+            let (text, origin) = as_tokenized_mapped(&batch.text, &batch.origin);
+            (text, batch.lines, origin)
+        })
         .collect();
     // A text of spaces alone holds no token, and is not asked about: a file with no SQL,
     // empty or only dot commands and `#` lines, starts no DuckDB and has nothing to refuse.
     let asking: Vec<String> = cut
         .iter()
-        .map(|(text, _)| text.clone())
+        .map(|(text, ..)| text.clone())
         .filter(|text| !is_blank(text))
         .collect();
     let (version, mut asked_answers) = if asking.is_empty() {
@@ -307,7 +316,7 @@ pub(crate) fn tokenize_with(
     asked_answers.reverse();
     let answers: Vec<Vec<Token>> = cut
         .iter()
-        .map(|(text, _)| {
+        .map(|(text, ..)| {
             if is_blank(text) {
                 Vec::new()
             } else {
@@ -318,9 +327,10 @@ pub(crate) fn tokenize_with(
     let batches: Vec<BatchTokens> = cut
         .into_iter()
         .zip(answers)
-        .map(|((text, lines), tokens)| BatchTokens {
+        .map(|((text, lines, origin), tokens)| BatchTokens {
             lines,
             text,
+            origin,
             tokens,
         })
         .collect();
@@ -356,6 +366,19 @@ pub(crate) fn tokenize_with(
 /// have run.
 fn as_tokenized(batch: &[u8]) -> String {
     String::from_utf8_lossy(&strip_unicode_spaces(batch)).into_owned()
+}
+
+/// [`as_tokenized`], with where each byte of the text came from in the file, given where
+/// each byte of `batch` did.
+fn as_tokenized_mapped(batch: &[u8], origin: &Origin) -> (String, Origin) {
+    let (stripped, copies) = strip_unicode_spaces_copies(batch);
+    let text = String::from_utf8_lossy(&stripped).into_owned();
+    let origin = if text.len() == stripped.len() {
+        origin.through(&copies, stripped.len())
+    } else {
+        Origin::default()
+    };
+    (text, origin)
 }
 
 /// Whether `text` holds only the characters DuckDB's tokenizer skips between tokens
