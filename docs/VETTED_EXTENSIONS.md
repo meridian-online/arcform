@@ -6,7 +6,7 @@ The list arc enforces is `src/vetted_extensions.json`, compiled into the `arc` b
 
 ## The list
 
-Each extension below has a permissive licence, a build the community registry serves for `linux_amd64` and `osx_arm64`, and a statement that ran it on data and checked the result. The entries were taken from the community registry's descriptors at commit `066ab4d69cfd`. Their builds for DuckDB v2.0.0, the version arc is built against, were probed on both platforms on 2026-10-23, and each statement was run again on v2.0.0 on `osx_arm64`. Nine entries from the DuckDB 1.5 list are gone: `dta`, `zipfs`, `onager` and `stats_duck` have no v2.0.0 build in the registry, and `http_client`, `minijinja`, `rapidfuzz`, `stochastic` and `textplot` install from it but refuse to load, saying that from DuckDB 2.0 they are distributed from the Query.Farm repository instead.
+Each extension below has a permissive licence, a build the community registry serves for `linux_amd64` and `osx_arm64`, and a statement that ran it on data and checked the result. The entries were taken from the community registry's descriptors at commit `066ab4d69cfd`. Their builds for DuckDB v2.0.0, the version arc is built against, were probed on both platforms on 2026-10-23, and each statement was run again on v2.0.0 on `osx_arm64`. Nine entries from the DuckDB 1.5 list are gone: `dta`, `mlpack`, `onager` and `stats_duck` have no v2.0.0 build in the registry, and `http_client`, `minijinja`, `rapidfuzz`, `stochastic` and `textplot` install from it but refuse to load, saying that from DuckDB 2.0 they are distributed from the Query.Farm repository instead.
 
 | extension | licence | repository | DuckDB version | what was run |
 |---|---|---|---|---|

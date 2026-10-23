@@ -245,6 +245,17 @@ fn an_extension_the_registry_serves_and_the_list_leaves_out_is_refused_by_name()
 }
 
 #[test]
+fn an_extension_the_list_dropped_for_duckdb_2_is_refused_by_name() {
+    let run = Protocol::steps(&[("s", "INSTALL mlpack FROM community;\n")]).run(VETTED_ON);
+    run.assert_refused("mlpack");
+    assert!(
+        run.stderr.contains("mlpack is not on the vetted list"),
+        "the refusal should name mlpack:\n{}",
+        run.stderr
+    );
+}
+
+#[test]
 fn any_letter_case_and_force_install_are_refused_as_install_is() {
     for sql in [
         "install anofox_forecast from community;",
@@ -1502,8 +1513,8 @@ fn steps_and_sql_hooks(steps: &[(&str, &str)]) -> Protocol {
 
 /// What `arc run` printed to stderr for each Protocol in
 /// [`a_protocol_whose_steps_rewrite_no_sql_file_prints_what_it_printed_before`] on 20698d9,
-/// the commit the check just before each step or hook runs was added to, byte for byte:
-/// recorded by running that commit's binary on the same fake engine.
+/// the commit the check just before each step or hook runs was added to. The strings are that
+/// commit's output with the extension name and versions moved to the 2.0 vetted list.
 const NO_REWRITE_BEFORE_STDERR: [&str; 3] = [
     "",
     "\u{1b}[33mwarning:\u{1b}[39m zipfs is vetted on DuckDB v2.0.0, and this engine is DuckDB v2.0.1; running it anyway (https://github.com/meridian-online/arcform/blob/main/docs/VETTED_EXTENSIONS.md)\n\
@@ -3101,7 +3112,7 @@ fn the_record_names_each_extension_the_sql_installs_as_the_real_duckdb_reports_i
 }
 
 /// A fake engine reporting DuckDB v2.0.2 that answers the question for the run record.
-const REPORTS_V153: &str = "case \"$1\" in\n\
+const REPORTS_V202: &str = "case \"$1\" in\n\
 --version) echo 'v2.0.2 (fake) 0000000000' ;;\n\
 -noheader) case \"$4\" in *'version()'*) printf 'arc-answer:version\\tv2.0.2\\narc-answer:platform\\tfake_amd64\\n' ;; esac ;;\n\
 esac\n";
@@ -3115,7 +3126,7 @@ fn the_record_gives_the_duckdb_the_steps_ran_on_beside_the_library_arc_is_linked
     assert_ne!(linked, "v2.0.2", "the fake engine is another DuckDB");
 
     let protocol = Protocol::steps(&[("s", "CREATE TABLE t AS SELECT 1;\n")]);
-    let run = protocol.run_on(REPORTS_V153, &[]);
+    let run = protocol.run_on(REPORTS_V202, &[]);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     let calls: Vec<&str> = run
         .engine_calls
@@ -3139,7 +3150,7 @@ fn the_record_gives_the_duckdb_the_steps_ran_on_beside_the_library_arc_is_linked
         "name: vetted\ndb: vetted.duckdb\nsteps:\n  - name: c\n    command: echo hi\n",
         &[],
     );
-    let run = commands.run_on(REPORTS_V153, &[]);
+    let run = commands.run_on(REPORTS_V202, &[]);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(run.engine_calls, Vec::<String>::new(), "no call");
     let engine = &commands.record()["run"]["engine"];
