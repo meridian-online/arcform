@@ -58,6 +58,24 @@ struct Fixture {
     b_id: String,
 }
 
+/// Block until the clock is in a later millisecond than the one a history id
+/// (`<millis>-<seq>-<kind>`) was minted in.
+fn wait_past_millisecond_of(id: &str) {
+    let recorded: u128 = id
+        .split('-')
+        .next()
+        .and_then(|ms| ms.parse().ok())
+        .unwrap_or_else(|| panic!("history id {id:?} does not start with milliseconds"));
+    while std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        <= recorded
+    {
+        std::thread::yield_now();
+    }
+}
+
 fn setup() -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
@@ -70,15 +88,32 @@ fn setup() -> Fixture {
     // A save then a checkpoint: a checkpoint is never merged into the save
     // before it, so each file keeps both entries however fast this runs.
     let id = |e: Option<arcform::spec::HistoryEntry>| e.expect("recorded").id;
+    //
+    // Ids are `<millis>-<seq>-<kind>` with the sequence counted per file, so
+    // they are unique within one file's history, not across files. Each file's
+    // entries therefore start in a later millisecond than the previous file's
+    // last entry, or a fast machine gives two files the same id and the tests
+    // cannot tell them apart.
     let spec_ids = [
         id(history.record_save(&dir, SPEC_V1).unwrap()),
         id(history.record_checkpoint(&dir, SPEC_V2).unwrap()),
     ];
+    wait_past_millisecond_of(&spec_ids[1]);
     let a_ids = [
         id(history.record_save_for_file(&a, A_V1).unwrap()),
         id(history.record_checkpoint_for_file(&a, A_V2).unwrap()),
     ];
+    wait_past_millisecond_of(&a_ids[1]);
     let b_id = id(history.record_save_for_file(&b, B_V1).unwrap());
+
+    let mut all: Vec<&String> = spec_ids.iter().chain(&a_ids).chain([&b_id]).collect();
+    all.sort();
+    all.dedup();
+    assert_eq!(
+        all.len(),
+        5,
+        "the fixture's five history ids must be distinct: {spec_ids:?} {a_ids:?} {b_id:?}"
+    );
 
     fs::write(dir.join(MANIFEST_FILENAME), SPEC_NOW).unwrap();
     fs::write(&a, A_NOW).unwrap();
