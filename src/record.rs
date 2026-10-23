@@ -850,8 +850,10 @@ fn filter_rows_query(from: &str, condition: &str) -> String {
 /// gives `FROM 'orders.csv'` the tree of a table called `orders.csv`, and its
 /// text opens with the quote at the location DuckDB gives.
 ///
-/// The condition is not cut out of the tree, which says where a node starts and
-/// not where it ends, and holds no node for a parenthesis. It is each text
+/// The condition is not cut out of the tree. DuckDB 2.0 gives a node its start
+/// and its length, but the tree holds no node for a parenthesis, so a condition
+/// that opens or closes with one would be cut short, and a comment inside it is in
+/// no node at all. It is each text
 /// [`conditions`] offers, tried in turn, and the first DuckDB reads to the same
 /// statement is taken: so the condition is the text as typed, its parentheses,
 /// strings and comments kept, and DuckDB decides where a string or a comment

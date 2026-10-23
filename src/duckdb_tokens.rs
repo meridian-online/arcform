@@ -781,14 +781,14 @@ pub(crate) mod recorded {
     }
 
     /// The DuckDB `ARC_DUCKDB_RECORD_BIN` names, if it is set.
-    pub(crate) fn preview() -> Option<DuckDbProgram> {
+    pub(crate) fn record_bin() -> Option<DuckDbProgram> {
         std::env::var_os(BIN_ENV).map(|bin| DuckDbProgram::Told(bin.into()))
     }
 
     /// The DuckDB `ARC_DUCKDB_RECORD_BIN` names, for a test that is `#[ignore]`d because
     /// it needs one.
-    pub(crate) fn preview_program() -> DuckDbProgram {
-        preview().unwrap_or_else(|| {
+    pub(crate) fn record_program() -> DuckDbProgram {
+        record_bin().unwrap_or_else(|| {
             panic!(
                 "{BIN_ENV} must name a DuckDB 2.0 build: this test is #[ignore]d so an \
                  ordinary run skips it, and running it with --include-ignored says one is \
@@ -804,7 +804,7 @@ pub(crate) mod recorded {
 
     /// The tokens of `texts`, as [`tokenize_with`] asks for them.
     pub(crate) fn ask(texts: &[String]) -> Result<Answer, Refusal> {
-        if let Some(program) = preview() {
+        if let Some(program) = record_bin() {
             let answer = Process { program }.ask_texts(texts)?;
             if std::env::var_os(RECORD_ENV).is_some() {
                 record(&answer.0, texts, &answer.1);
@@ -876,7 +876,7 @@ pub(crate) mod recorded {
 
 #[cfg(test)]
 mod tests {
-    use super::recorded::{preview_program, recording, tokenize};
+    use super::recorded::{record_program, recording, tokenize};
     use super::*;
 
     fn word(text: &str) -> Tok {
@@ -1185,7 +1185,7 @@ mod tests {
     fn each_text_reaches_duckdb_byte_for_byte() {
         let text = "SELECT 'a\r\n.quit\n''é';\r\nINSTALL x;".to_string();
         let process = Process {
-            program: preview_program(),
+            program: record_program(),
         };
         let (_, answers) = process.ask_texts(std::slice::from_ref(&text)).unwrap();
         let words: Vec<&str> = answers[0].iter().map(|t| t.word.as_str()).collect();
@@ -1219,7 +1219,7 @@ mod tests {
     #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build \
                 job runs it"]
     fn a_text_whose_spans_overlap_is_read_from_its_words() {
-        let tokens = tokenize_file(&preview_program(), b"SELECT $(1);").unwrap();
+        let tokens = tokenize_file(&record_program(), b"SELECT $(1);").unwrap();
         let words: Vec<&str> = tokens.batches[0]
             .tokens
             .iter()
@@ -1261,7 +1261,7 @@ mod tests {
     #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build \
                 job runs it"]
     fn a_token_starts_at_a_byte_offset() {
-        let tokens = tokenize_file(&preview_program(), "SELECT 'é', x;".as_bytes()).unwrap();
+        let tokens = tokenize_file(&record_program(), "SELECT 'é', x;".as_bytes()).unwrap();
         let starts: Vec<(usize, &str)> = tokens.batches[0]
             .tokens
             .iter()
@@ -1279,7 +1279,7 @@ mod tests {
                 job runs it"]
     fn the_recorded_tokens_are_what_duckdb_answers() {
         let process = Process {
-            program: preview_program(),
+            program: record_program(),
         };
         let texts: Vec<String> = recording().tokens.keys().cloned().collect();
         let (version, answers) = process.ask_texts(&texts).unwrap();

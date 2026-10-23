@@ -11,6 +11,12 @@
 //! The recorded steps in `src/duckdb_lineage.rs` are held to the same comparison by the
 //! parity tests in `src/introspect.rs`, which read them from recorded answers.
 //!
+//! The comparison is of names only: the contract records what a statement produces and
+//! reads by name, and not the kind of each (a file, a glob pattern, a directory) or the
+//! table functions arc could not read. Those are compared, reader against reader, by
+//! the parity tests in `src/introspect.rs`, on the recorded steps alone; over the files
+//! here they are an accepted limit of this gate.
+//!
 //! The DuckDB reader asks a DuckDB 2.0 command line, named by `ARC_DUCKDB_RECORD_BIN`, so
 //! the test is `#[ignore]`d and an ordinary run skips it; `ci.yml`'s build job runs it on
 //! the v2.0.0 release command line with `--include-ignored`.
@@ -22,57 +28,152 @@ use std::process::Command;
 
 const RECORD_ENV: &str = "ARC_DUCKDB_RECORD_BIN";
 
-/// The differences between the two readings that are expected: the file, the statement
-/// (counting from 1, or 0 for every statement of a file sqlparser-rs cannot parse at
-/// all), and why. Any other difference fails the test, and so does an entry here that no
-/// longer differs.
-const EXPECTED: &[(&str, usize, &str)] = &[
-    (
-        "examples/brewtrend/models/trending.sql",
-        4,
-        "DuckDB gives no tree for a PIVOT, so the DuckDB reader reads `CREATE TABLE … AS \
-         WITH … PIVOT` as unread, keeping only the table it creates; an unread statement \
-         is sqlparser-rs's to read once DuckDB's reading is the default",
-    ),
-    (
-        "examples/code-lists/models/catalog.sql",
-        0,
-        "sqlparser-rs cannot parse the options of `ATTACH 'ducklake:…' AS open (DATA_PATH …)`",
-    ),
-    (
-        "examples/code-lists/models/load.sql",
-        0,
-        "sqlparser-rs cannot parse `trim(x, chr(13))`, DuckDB's two-argument trim",
-    ),
-    (
-        "examples/code-lists/models/validate.sql",
-        0,
-        "sqlparser-rs cannot parse the options of `ATTACH 'ducklake:…' AS open (DATA_PATH …)`",
-    ),
-    (
-        "tests/fixtures/open_analytics/edgar_gleif/models/load.sql",
-        5,
-        "DuckDB reads `gleif` in the `EXISTS (SELECT 1 FROM gleif …)` of the WHERE; \
-         sqlparser-rs reads no table inside an EXISTS",
-    ),
-    (
-        "tests/fixtures/open_analytics/edgar_gleif/models/load.sql",
-        6,
-        "DuckDB reads `gleif` in the `EXISTS (SELECT 1 FROM gleif …)` of the WHERE; \
-         sqlparser-rs reads no table inside an EXISTS",
-    ),
-    (
-        "tests/fixtures/open_analytics/edgar_gleif/models/package.sql",
-        2,
-        "DuckDB reads `gleif` in the `NOT EXISTS (SELECT 1 FROM gleif …)` of the WHERE; \
-         sqlparser-rs reads no table inside an EXISTS",
-    ),
-    (
-        "tests/fixtures/open_analytics/edgar_gleif/models/tier.sql",
-        3,
-        "DuckDB reads `authoritative_d` in the `NOT EXISTS (SELECT 1 FROM authoritative_d \
-         …)` of the WHERE; sqlparser-rs reads no table inside an EXISTS",
-    ),
+/// A statement on which the two readings are expected to differ, and exactly how: the
+/// names only DuckDB's reading has and those only sqlparser-rs's has. The statement
+/// counts from 1. Any other difference on it fails the test, as does a row that no longer
+/// differs.
+struct Difference {
+    file: &'static str,
+    statement: usize,
+    duckdb_only_reads: &'static [&'static str],
+    sqlparser_only_reads: &'static [&'static str],
+    duckdb_only_produces: &'static [&'static str],
+    sqlparser_only_produces: &'static [&'static str],
+    reason: &'static str,
+}
+
+/// DuckDB reads the table an `EXISTS` reads, and sqlparser-rs does not.
+const EXISTS: &str = "DuckDB reads the table the `EXISTS (SELECT 1 FROM …)` of the WHERE \
+                      reads; sqlparser-rs reads no table inside an EXISTS, so DuckDB is right";
+
+const DIFFERENCES: &[Difference] = &[
+    Difference {
+        file: "examples/brewtrend/models/trending.sql",
+        statement: 4,
+        duckdb_only_reads: &[],
+        sqlparser_only_reads: &["categories"],
+        duckdb_only_produces: &[],
+        sqlparser_only_produces: &[],
+        reason: "sqlparser-rs is right here: DuckDB gives no tree for a PIVOT, so the DuckDB \
+                 reader reads `CREATE TABLE … AS WITH … PIVOT` as unread and keeps only the \
+                 table it creates. The row closes when an unread statement falls back to \
+                 sqlparser-rs, at the flip that makes DuckDB's reading the default",
+    },
+    Difference {
+        file: "tests/fixtures/open_analytics/edgar_gleif/models/load.sql",
+        statement: 5,
+        duckdb_only_reads: &["gleif"],
+        sqlparser_only_reads: &[],
+        duckdb_only_produces: &[],
+        sqlparser_only_produces: &[],
+        reason: EXISTS,
+    },
+    Difference {
+        file: "tests/fixtures/open_analytics/edgar_gleif/models/load.sql",
+        statement: 6,
+        duckdb_only_reads: &["gleif"],
+        sqlparser_only_reads: &[],
+        duckdb_only_produces: &[],
+        sqlparser_only_produces: &[],
+        reason: EXISTS,
+    },
+    Difference {
+        file: "tests/fixtures/open_analytics/edgar_gleif/models/package.sql",
+        statement: 2,
+        duckdb_only_reads: &["gleif"],
+        sqlparser_only_reads: &[],
+        duckdb_only_produces: &[],
+        sqlparser_only_produces: &[],
+        reason: EXISTS,
+    },
+    Difference {
+        file: "tests/fixtures/open_analytics/edgar_gleif/models/tier.sql",
+        statement: 3,
+        duckdb_only_reads: &["authoritative_d"],
+        sqlparser_only_reads: &[],
+        duckdb_only_produces: &[],
+        sqlparser_only_produces: &[],
+        reason: EXISTS,
+    },
+];
+
+/// A file sqlparser-rs cannot parse at all, so there is nothing to compare DuckDB's
+/// reading with: that reading is pinned instead, as each statement's produces and reads.
+/// The row holds while sqlparser-rs gives no statements for the file and DuckDB's
+/// reading is the one pinned; anything else fails the test.
+struct Unparsed {
+    file: &'static str,
+    reason: &'static str,
+    duckdb: &'static [(&'static [&'static str], &'static [&'static str])],
+}
+
+const NOTHING: (&[&str], &[&str]) = (&[], &[]);
+
+const UNPARSED: &[Unparsed] = &[
+    Unparsed {
+        file: "examples/code-lists/models/catalog.sql",
+        reason: "sqlparser-rs cannot parse the options of `ATTACH 'ducklake:…' AS open \
+                 (DATA_PATH …)`",
+        duckdb: &[
+            NOTHING,
+            NOTHING,
+            NOTHING,
+            NOTHING,
+            NOTHING,
+            NOTHING,
+            NOTHING,
+            (&["naics"], &[]),
+            (&["icd10cm"], &[]),
+            NOTHING,
+            NOTHING,
+        ],
+    },
+    Unparsed {
+        file: "examples/code-lists/models/load.sql",
+        reason: "sqlparser-rs cannot parse `trim(x, chr(13))`, DuckDB's two-argument trim",
+        duckdb: &[
+            NOTHING,
+            NOTHING,
+            NOTHING,
+            NOTHING,
+            (&["naics_raw"], &["data/naics/naics_structure.xlsx"]),
+            (&["icd10cm_raw"], &["data/icd10cm/icd10cm_order.txt"]),
+        ],
+    },
+    Unparsed {
+        file: "examples/code-lists/models/validate.sql",
+        reason: "sqlparser-rs cannot parse the options of `ATTACH 'ducklake:…' AS open \
+                 (DATA_PATH …)`",
+        duckdb: &[
+            NOTHING,
+            NOTHING,
+            NOTHING,
+            NOTHING,
+            NOTHING,
+            (&["baseline"], &[]),
+            (&["actual"], &["dist/icd10cm.parquet", "dist/naics.parquet"]),
+            (&["rowcount_check"], &["actual", "baseline"]),
+            (
+                &["ri_check"],
+                &["dist/icd10cm.parquet", "dist/naics.parquet"],
+            ),
+            (&["golden"], &[]),
+            (
+                &["golden_check"],
+                &["dist/icd10cm.parquet", "dist/naics.parquet", "golden"],
+            ),
+            (&["catalog_check"], &["actual", "icd10cm", "naics"]),
+            (
+                &[],
+                &[
+                    "catalog_check",
+                    "golden_check",
+                    "ri_check",
+                    "rowcount_check",
+                ],
+            ),
+        ],
+    },
 ];
 
 /// One statement as the contract records it: what it produces, and what it reads.
@@ -177,11 +278,20 @@ fn read(file: &Path, reader: Reader, duckdb: &OsString) -> Result<(Vec<Reading>,
     Ok((statements, stderr))
 }
 
-/// Whether [`EXPECTED`] holds `statement` of `file`.
-fn expects(file: &str, statement: usize) -> bool {
-    EXPECTED
-        .iter()
-        .any(|(f, n, _)| *f == file && *n == statement)
+fn set(names: &[&str]) -> BTreeSet<String> {
+    names.iter().map(ToString::to_string).collect()
+}
+
+/// Whether `difference` is exactly the one between `duckdb` and `sqlparser`.
+fn is_exactly(difference: &Difference, duckdb: &Reading, sqlparser: &Reading) -> bool {
+    let only = |a: &BTreeSet<String>, b: &BTreeSet<String>| -> BTreeSet<String> {
+        a.difference(b).cloned().collect()
+    };
+    let ((d_produces, d_reads), (s_produces, s_reads)) = (duckdb, sqlparser);
+    only(d_reads, s_reads) == set(difference.duckdb_only_reads)
+        && only(s_reads, d_reads) == set(difference.sqlparser_only_reads)
+        && only(d_produces, s_produces) == set(difference.duckdb_only_produces)
+        && only(s_produces, d_produces) == set(difference.sqlparser_only_produces)
 }
 
 fn show(reading: Option<&Reading>) -> String {
@@ -204,7 +314,7 @@ fn both_readers_read_every_sql_file_in_the_repo_alike() {
     assert!(!files.is_empty(), "no SQL files found");
 
     let mut failures = Vec::new();
-    let mut expected_seen = BTreeSet::new();
+    let mut seen = BTreeSet::new();
     for path in &files {
         let file = path
             .strip_prefix(root)
@@ -234,20 +344,57 @@ fn both_readers_read_every_sql_file_in_the_repo_alike() {
                 String::new()
             }
         };
+        if let Some(unparsed) = UNPARSED.iter().find(|u| u.file == file) {
+            let pinned: Vec<Reading> = unparsed
+                .duckdb
+                .iter()
+                .map(|(produces, reads)| (set(produces), set(reads)))
+                .collect();
+            // The row is seen either way: a reading that is not the pinned one fails here.
+            seen.insert((file.clone(), 0));
+            if !by_sqlparser.is_empty() || by_duckdb != pinned {
+                failures.push(format!(
+                    "{file} is in UNPARSED ({}), and its readings are not the ones pinned:\n    \
+                     DuckDB:     {by_duckdb:?}\n    pinned:     {pinned:?}\n    \
+                     sqlparser:  {by_sqlparser:?}{}",
+                    unparsed.reason,
+                    silent(&by_duckdb, &duckdb_stderr),
+                ));
+            }
+            continue;
+        }
         for i in 0..by_duckdb.len().max(by_sqlparser.len()) {
             let (d, s) = (by_duckdb.get(i), by_sqlparser.get(i));
             if d == s {
                 continue;
             }
             let statement = i + 1;
-            // A whole-file entry holds only while sqlparser-rs reads none of the file.
-            let whole_file = by_sqlparser.is_empty() && expects(&file, 0);
-            if whole_file || expects(&file, statement) {
-                expected_seen.insert((file.clone(), if whole_file { 0 } else { statement }));
+            let row = DIFFERENCES
+                .iter()
+                .find(|row| row.file == file && row.statement == statement);
+            if row.is_some() {
+                // Seen either way: a difference that is not the row's fails below.
+                seen.insert((file.clone(), statement));
+            }
+            if let (Some(row), Some(d), Some(s)) = (row, d, s)
+                && is_exactly(row, d, s)
+            {
                 continue;
             }
+            let tabled = match row {
+                Some(row) => format!(
+                    "\n    (DIFFERENCES expects DuckDB only to read {:?} and produce {:?}, and \
+                     sqlparser-rs only to read {:?} and produce {:?}: {})",
+                    row.duckdb_only_reads,
+                    row.duckdb_only_produces,
+                    row.sqlparser_only_reads,
+                    row.sqlparser_only_produces,
+                    row.reason
+                ),
+                None => String::new(),
+            };
             failures.push(format!(
-                "{file}, statement {statement}:\n    DuckDB:     {}{}\n    sqlparser:  {}{}",
+                "{file}, statement {statement}:\n    DuckDB:     {}{}\n    sqlparser:  {}{}{tabled}",
                 show(d),
                 silent(&by_duckdb, &duckdb_stderr),
                 show(s),
@@ -255,18 +402,22 @@ fn both_readers_read_every_sql_file_in_the_repo_alike() {
             ));
         }
     }
-    for (file, statement, reason) in EXPECTED {
-        if !expected_seen.contains(&(file.to_string(), *statement)) {
+    let rows = DIFFERENCES
+        .iter()
+        .map(|row| (row.file, row.statement, row.reason))
+        .chain(UNPARSED.iter().map(|row| (row.file, 0, row.reason)));
+    for (file, statement, reason) in rows {
+        if !seen.contains(&(file.to_string(), statement)) {
             failures.push(format!(
-                "{file}, statement {statement} is expected to differ ({reason}), and the \
-                 two readers now agree on it or it was not read; remove it from EXPECTED"
+                "{file}, statement {statement} (0: the whole file) is tabled ({reason}), and \
+                 the two readers now agree on it; remove its row"
             ));
         }
     }
     eprintln!("read {} SQL files with both readers", files.len());
     assert!(
         failures.is_empty(),
-        "the two readers differ on {} statement(s) the table does not explain:\n\n{}",
+        "{} difference(s) the tables do not explain:\n\n{}",
         failures.len(),
         failures.join("\n\n")
     );

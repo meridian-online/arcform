@@ -251,9 +251,10 @@ jobs:
       # tests/reader_parity.rs, which reads every SQL file in the repo with both readers,
       # and the token-cache test in tests/vetted_extensions.rs are #[ignore]d so the step
       # above reports them as ignored; run them here on the v2.0.0 release command line
-      # the install step put in $HOME/duckdb. Every job runs 2.0.0, so this is unconditional. The tests that read
-      # from captured answers ran above; with ARC_DUCKDB_RECORD_BIN set, the refusal tests
-      # here read live tokens instead, and one compares the captured tokens with them.
+      # the install step put in $HOME/duckdb. Every job runs 2.0.0, so this is
+      # unconditional. The tests that read from captured answers ran above; with
+      # ARC_DUCKDB_RECORD_BIN set, the refusal tests here read live tokens instead, and one
+      # compares the captured tokens with them.
       - name: test (DuckDB lineage reader and tokens, on the DuckDB 2.0 command line)
         run: |
           set -euo pipefail

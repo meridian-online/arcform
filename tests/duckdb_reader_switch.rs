@@ -2,11 +2,10 @@
 //! produces from DuckDB's own parse of it, through the real `arc` binary, and leaves every
 //! other run as it was.
 //!
-//! The tests that read a step with DuckDB's parse need a DuckDB 2.0 build, named by
+//! The tests that read a step with DuckDB's parse ask the DuckDB 2.0 command line named by
 //! `ARC_DUCKDB_RECORD_BIN`, and are `#[ignore]`d so an ordinary run skips them; `ci.yml`
-//! runs them on the v2.0.0 release command line with `--include-ignored`. A 2.0 build is outside
-//! the versions arc is tested on, so those runs set `ARC_ALLOW_UNTESTED_ENGINE` as well.
-//! The rest need the `duckdb` on PATH, a 1.x release, as any `arc run` does.
+//! runs them on the v2.0.0 release command line with `--include-ignored`. The rest run on
+//! the `duckdb` on PATH, as any `arc run` does.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -23,14 +22,14 @@ enum Reader {
     /// `ARC_SQL_READER` unset, on the `duckdb` found on PATH.
     Default,
     /// `ARC_SQL_READER=duckdb`, on the 2.0 build `ARC_DUCKDB_RECORD_BIN` names.
-    DuckDbPreview,
+    DuckDbRecord,
     /// `ARC_SQL_READER` set to `value`, on the `duckdb` found on PATH.
     Told(&'static str),
     /// `ARC_SQL_READER=duckdb`, on the executable at this path.
     Program(PathBuf),
 }
 
-fn preview() -> OsString {
+fn record_bin() -> OsString {
     std::env::var_os(RECORD_ENV).unwrap_or_else(|| {
         panic!(
             "{RECORD_ENV} must name a DuckDB 2.0 build: this test is #[ignore]d so an \
@@ -83,11 +82,10 @@ fn arc_run(project: &Path, reader: Reader) -> Run {
     }
     match reader {
         Reader::Default => {}
-        Reader::DuckDbPreview => {
+        Reader::DuckDbRecord => {
             command
                 .env("ARC_SQL_READER", "duckdb")
-                .env("ARC_DUCKDB_BIN", preview())
-                .env("ARC_ALLOW_UNTESTED_ENGINE", "1");
+                .env("ARC_DUCKDB_BIN", record_bin());
         }
         Reader::Told(value) => {
             command.env("ARC_SQL_READER", value);
@@ -190,11 +188,11 @@ const ASOF: &str = "CREATE TABLE r AS SELECT * EXCLUDE (a) FROM t ASOF LEFT JOIN
             runs it on the v2.0.0 release CLI with --include-ignored"]
 fn with_the_reader_set_a_step_is_read_from_duckdbs_parse() {
     let dir = project(&[("load", LOAD), ("asof", ASOF)]);
-    let run = arc_run(dir.path(), Reader::DuckDbPreview);
+    let run = arc_run(dir.path(), Reader::DuckDbRecord);
     assert_eq!(
         run.code,
         Some(0),
-        "arc run must exit 0 on the preview:\n{}",
+        "arc run must exit 0 on DuckDB 2.0:\n{}",
         run.printed()
     );
     assert!(
@@ -285,7 +283,7 @@ fn table_functions_are_read_as_with_the_reader_unset() {
     ];
     for (step, sql) in steps {
         let mut read = Vec::new();
-        for reader in [Reader::Default, Reader::DuckDbPreview] {
+        for reader in [Reader::Default, Reader::DuckDbRecord] {
             let dir = project(&[(step, sql)]);
             let run = arc_run(dir.path(), reader);
             let contract = read_contract(dir.path());
@@ -329,7 +327,7 @@ fn a_copy_from_a_query_records_its_file_and_the_querys_table() {
             "COPY (SELECT * FROM a WHERE x > 1) TO 'out.csv' (HEADER);\n",
         ),
     ]);
-    let run = arc_run(dir.path(), Reader::DuckDbPreview);
+    let run = arc_run(dir.path(), Reader::DuckDbRecord);
     assert_eq!(run.code, Some(0), "arc run must exit 0:\n{}", run.printed());
     assert!(
         dir.path().join("out.csv").is_file(),
@@ -414,7 +412,7 @@ fn a_pivot_joined_to_another_table_is_not_read_as_reading_its_first() {
         ("load", LOAD),
         ("pivot", "PIVOT t JOIN u USING (k) ON c USING sum(v);\n"),
     ]);
-    let run = arc_run(dir.path(), Reader::DuckDbPreview);
+    let run = arc_run(dir.path(), Reader::DuckDbRecord);
     assert_eq!(run.code, Some(0), "arc run must exit 0:\n{}", run.printed());
     let pivot = statements(&read_contract(dir.path()), "pivot");
     assert_eq!(pivot.len(), 1, "one statement: {pivot:?}");

@@ -18,7 +18,7 @@
 //! declares, and each table function it calls, with the arguments as written. What a
 //! statement that is not a query creates, inserts into or copies is taken from its
 //! words. A keyword is matched by its text and never by the part the tokenizer says the
-//! token plays, because on the 2.0 preview that part changes with what came before it in
+//! token plays, because on DuckDB 2.0 that part changes with what came before it in
 //! the same input: `INSERT` has come back as a column name, and a table after `FROM` as
 //! a plain identifier. A token's text and start do not change, and they are all the
 //! reader takes from a token.
@@ -213,7 +213,7 @@ pub(crate) fn read_step(duckdb: &DuckDbProgram, sql: &str) -> Result<StepReading
 }
 
 /// The two questions the reader asks. A DuckDB process answers them, and the tests
-/// answer them from what the preview answered.
+/// answer them from what DuckDB v2.0.0 answered.
 trait Ask {
     /// The DuckDB asked, for a refusal to name.
     fn program(&self) -> String;
@@ -2065,9 +2065,9 @@ mod tests {
         );
     }
 
-    /// The 2.0 preview prints a warning it logs into the JSON on stdout, which then
-    /// cannot be read; the 1.x `duckdb` on `PATH` prints none, so this checks the reader
-    /// asks with logging off, and the preview checks show what that buys.
+    /// DuckDB 2.0's preview builds printed a warning they logged into the JSON on stdout,
+    /// which then could not be read. This checks that the reader asks the `duckdb` on
+    /// `PATH` with logging off; the checks against a real DuckDB show what that buys.
     #[test]
     fn duckdb_is_asked_with_logging_off() {
         let duckdb = Process {
@@ -2124,7 +2124,7 @@ mod tests {
         );
     }
 
-    /// Answers made by hand, for what the preview does not answer when asked well.
+    /// Answers made by hand, for what DuckDB does not answer when asked well.
     struct Scripted {
         tokens: Result<Vec<Token>, String>,
         trees: Result<Vec<Value>, Refusal>,

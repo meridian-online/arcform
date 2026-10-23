@@ -2395,7 +2395,7 @@ mod tests {
 #[cfg(test)]
 mod extension_tests {
     use super::*;
-    use crate::duckdb_tokens::recorded::{self, preview_program};
+    use crate::duckdb_tokens::recorded::{self, record_program};
     use crate::duckdb_tokens::tokenize_file;
 
     /// [`super::scan_extension_sql`] on the tokens DuckDB v2.0.0 gives for `file`, as
@@ -3648,7 +3648,7 @@ mod extension_tests {
     /// `ARC_DUCKDB_RECORD_BIN` names gives for it.
     fn live(file: &[u8]) -> Vec<(ExtensionSql, usize)> {
         super::scan_extension_sql(
-            &tokenize_file(&preview_program(), file).expect("DuckDB gives the file's tokens"),
+            &tokenize_file(&record_program(), file).expect("DuckDB gives the file's tokens"),
         )
     }
 

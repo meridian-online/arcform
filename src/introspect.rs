@@ -1184,7 +1184,7 @@ mod tests {
     }
 
     // DuckDB reads `1_000` as 1000, which casts to true: measured on v1.5.5,
-    // `PER_THREAD_OUTPUT 1_000` wrote a directory, and the 2.0 preview's tokenizer gives
+    // `PER_THREAD_OUTPUT 1_000` wrote a directory, and DuckDB 2.0's tokenizer gives
     // `1_000` as one number. Rust's `f64` parse refuses the separator, so the number is
     // one the rule cannot read, and a value it cannot read leaves the option on.
     #[test]
