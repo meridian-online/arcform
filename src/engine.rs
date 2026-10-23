@@ -1709,10 +1709,11 @@ pub(crate) fn check_extension_installs(
 /// cannot read.
 fn not_read(source: &ProtocolSql, refusal: Refusal) -> Error {
     let reason = match refusal {
-        Refusal::NotRun { program, reason } => {
+        Refusal::NotStarted { program, reason } | Refusal::NotRun { program, reason } => {
             format!("DuckDB `{program}` did not answer: {reason}")
         }
         Refusal::Unreadable(reason) => reason,
+        not_2 @ Refusal::NotDuckDb2 { .. } => not_2.to_string(),
     };
     Error::SqlNotRead {
         place: source.place.clone(),

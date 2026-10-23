@@ -372,6 +372,12 @@ pub fn run_with_params(
 
     // Build the asset graph and validate dependency ordering.
     let asset_graph = AssetGraph::build(&manifest, dir);
+    // A step DuckDB's answer could not be read for is refused, as the refusals refuse a file
+    // whose tokens could not be read: the run does not read it with arc's own parser instead.
+    if !asset_graph.unreadable.is_empty() {
+        let refusals: Vec<String> = asset_graph.unreadable.iter().map(|u| u.refusal()).collect();
+        return Err(Error::SqlReader(refusals.join("\n")));
+    }
     // Who produces what — computed once, consulted both by staleness detection and by
     // the artifact hash each successful step records for the *next* run to compare.
     let all_produced = all_produced_assets(&asset_graph);
@@ -1856,6 +1862,43 @@ mod tests {
         run(dir.path(), &engine, &state, false).unwrap();
         // No preflight called for empty steps.
         assert!(engine.calls.borrow().is_empty());
+    }
+
+    // A step DuckDB answered for with an answer arc cannot read is refused before it runs:
+    // the run does not read it with arc's own parser in its place.
+    #[test]
+    fn a_step_duckdbs_answer_cannot_be_read_for_refuses_the_run() {
+        use crate::duckdb_lineage::Refusal;
+        use crate::introspect::test_reading;
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(
+            dir.path(),
+            "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n",
+            &[("models/s1.sql", "CREATE TABLE t AS SELECT 1;")],
+        );
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        let err = test_reading::with(
+            |_| Err(Refusal::Unreadable("binder: m".to_string())),
+            || run(dir.path(), &engine, &state, false),
+        )
+        .expect_err("the run is refused");
+        let message = err.to_string();
+        assert!(
+            matches!(err, Error::SqlReader(_))
+                && message.contains("step 's1' (models/s1.sql)")
+                && message.contains("binder: m"),
+            "{message}"
+        );
+        assert!(
+            !engine
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| matches!(call, crate::engine::mock::MockCall::Sql { .. })),
+            "no step ran: {:?}",
+            engine.calls.borrow()
+        );
     }
 
     // Steps execute in declared order against shared database.

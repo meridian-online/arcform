@@ -242,6 +242,11 @@ pub struct StatementInfo {
     /// this statement, so a viewer can render statements individually. `null` if the
     /// lexical split didn't line up with the parsed statements.
     pub byte_range: Option<[usize; 2]>,
+    /// Which reader read the statement: `duckdb`, `sqlparser` (chosen with
+    /// `ARC_SQL_READER=sqlparser`, or reading a statement DuckDB's reading could not take),
+    /// or `nothing`. Absent in a contract written before arc recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_by: Option<String>,
 }
 
 /// A step's terminal status.
@@ -729,8 +734,10 @@ fn build_step(
             Ok(bytes) => {
                 let text = String::from_utf8_lossy(&bytes).to_string();
                 let hash = crate::state::content_hash(&bytes);
-                let statements = match crate::introspect::extract_per_statement(&text) {
-                    Ok(list) => {
+                let statements = match crate::introspect::read_sql(&text) {
+                    Ok(step_sql) => {
+                        let read_by = step_sql.read_by;
+                        let list = step_sql.statements;
                         // Attach each statement's source byte range. The lexical splitter
                         // and the parser agree on count for well-formed SQL; if they ever
                         // diverge, emit no ranges rather than misalign them.
@@ -745,6 +752,7 @@ fn build_step(
                                     let (s, e) = ranges[i];
                                     [s, e]
                                 }),
+                                read_by: read_by.get(i).map(|r| r.as_str().to_string()),
                             })
                             .collect()
                     }

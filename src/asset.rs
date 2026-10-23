@@ -95,6 +95,30 @@ pub struct AssetGraph {
     pub steps: BTreeMap<String, StepAssets>,
     /// Warnings generated during graph construction (e.g. parse failures).
     pub warnings: Vec<String>,
+    /// Each SQL step a DuckDB 2 answered for with an answer arc could not read, which
+    /// sqlparser-rs read instead: `arc run` refuses it, and any other command warns.
+    pub unreadable: Vec<UnreadableStep>,
+}
+
+/// A SQL step DuckDB's answer could not be read for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableStep {
+    pub step: String,
+    pub file: String,
+    /// DuckDB's answer, and why it could not be read.
+    pub reason: String,
+}
+
+impl UnreadableStep {
+    /// The warning a command that reads the graph without running it prints.
+    pub fn warning(&self) -> String {
+        introspect::unreadable_warning(&self.step, &self.file, &self.reason)
+    }
+
+    /// The refusal `arc run` gives.
+    pub fn refusal(&self) -> String {
+        introspect::unreadable_refusal(&self.step, &self.file, &self.reason)
+    }
 }
 
 impl AssetGraph {
@@ -111,6 +135,7 @@ impl AssetGraph {
         let mut graph = AssetGraph {
             steps: BTreeMap::new(),
             warnings: Vec::new(),
+            unreadable: Vec::new(),
         };
 
         // Each (step, table function) pair where a SQL step calls a function with
@@ -132,6 +157,13 @@ impl AssetGraph {
                 match std::fs::read_to_string(&full_path) {
                     Ok(sql_content) => match introspect::read_sql(&sql_content) {
                         Ok(step_sql) => {
+                            if let Some(reason) = &step_sql.unreadable {
+                                graph.unreadable.push(UnreadableStep {
+                                    step: step.name.clone(),
+                                    file: sql_path.clone(),
+                                    reason: reason.clone(),
+                                });
+                            }
                             // A statement no reader could read reads nothing, and says so.
                             for unread in &step_sql.unread {
                                 graph
@@ -1034,6 +1066,70 @@ mod tests {
 
         let step_order: Vec<String> = vec!["load-customers".into(), "summary".into()];
         graph.validate_order(&step_order).unwrap();
+    }
+
+    // The graph's own tests read with sqlparser-rs; these read DuckDB v2.0.0's parse, from
+    // its recorded answers, as `arc run` reads a step by default.
+    #[test]
+    fn the_default_graph_reads_duckdbs_parse() {
+        use crate::introspect::test_reading;
+        let dir = tempfile::tempdir().unwrap();
+        let graph = test_reading::with(test_reading::recorded, || {
+            build_graph(
+                dir.path(),
+                vec![sql_step("asof", "models/asof.sql")],
+                HashMap::new(),
+                &[(
+                    "models/asof.sql",
+                    "CREATE TABLE r AS SELECT * EXCLUDE (a) FROM t ASOF LEFT JOIN u USING (k);",
+                )],
+            )
+        });
+        let step = graph.steps.get("asof").unwrap();
+        assert_eq!(step.produces, BTreeSet::from(["r".to_string()]));
+        assert_eq!(
+            step.reads,
+            BTreeSet::from(["t".to_string(), "u".to_string()]),
+            "DuckDB reads the ASOF join sqlparser-rs cannot parse"
+        );
+        assert_eq!(graph.warnings, [] as [String; 0]);
+        assert_eq!(graph.unreadable, []);
+    }
+
+    #[test]
+    fn a_step_duckdbs_answer_cannot_be_read_for_is_named() {
+        use crate::duckdb_lineage::Refusal;
+        use crate::introspect::test_reading;
+        let dir = tempfile::tempdir().unwrap();
+        let graph = test_reading::with(
+            |_| Err(Refusal::Unreadable("binder: m".to_string())),
+            || {
+                build_graph(
+                    dir.path(),
+                    vec![sql_step("load", "models/load.sql")],
+                    HashMap::new(),
+                    &[("models/load.sql", "CREATE TABLE r AS SELECT * FROM t;")],
+                )
+            },
+        );
+        assert_eq!(
+            graph.unreadable,
+            [UnreadableStep {
+                step: "load".to_string(),
+                file: "models/load.sql".to_string(),
+                reason: "binder: m".to_string(),
+            }]
+        );
+        assert_eq!(
+            graph.unreadable[0].warning(),
+            "arc read models/load.sql of step 'load' with its own parser, because DuckDB's \
+             answer for it could not be read: binder: m"
+        );
+        let step = graph.steps.get("load").unwrap();
+        assert!(
+            step.reads.contains("t"),
+            "sqlparser-rs read the step: {step:?}"
+        );
     }
 
     // SQL no reader can read produces a warning naming the statement, and reads nothing.

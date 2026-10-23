@@ -32,7 +32,6 @@ use sqlparser::parser::Parser;
 
 use crate::asset_kind::AssetKind;
 use crate::duckdb_lineage::{self, ArgValue, Relation, TableCall};
-use crate::engine::DuckDbProgram;
 
 /// Assets discovered from parsing a SQL file — four-set model.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -262,7 +261,8 @@ fn reader() -> Result<Reader, String> {
 }
 
 /// The DuckDB arc runs, which is the one asked for its parse.
-fn duckdb_program() -> Result<DuckDbProgram, String> {
+#[cfg(not(test))]
+fn duckdb_program() -> Result<crate::engine::DuckDbProgram, String> {
     crate::engine::duckdb_program().map_err(|e| e.to_string())
 }
 
@@ -272,7 +272,7 @@ fn duckdb_program() -> Result<DuckDbProgram, String> {
 /// the refusals, which refuse a DuckDB that is not a 2.x build; this asks for a tree.
 pub(crate) fn check_reader(has_sql: bool) -> Result<(), String> {
     if reader()? == Reader::DuckDb && has_sql {
-        duckdb_lineage::gives_trees(&duckdb_program()?).map_err(|refusal| {
+        gives_trees()?.map_err(|refusal| {
             format!(
                 "arc reads what each SQL step reads and produces from DuckDB 2's own parse, \
                  and {refusal}; {SQL_READER_ENV}={SQLPARSER_READER} reads the steps with \
@@ -283,13 +283,53 @@ pub(crate) fn check_reader(has_sql: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether the DuckDB arc runs gives a tree; `Err` when there is no such DuckDB to ask.
+#[cfg(not(test))]
+fn gives_trees() -> Result<Result<(), duckdb_lineage::Refusal>, String> {
+    Ok(duckdb_lineage::gives_trees(&duckdb_program()?))
+}
+
+/// The lib's tests read DuckDB's parse from [`test_reading`], and start no DuckDB here.
+#[cfg(test)]
+fn gives_trees() -> Result<Result<(), duckdb_lineage::Refusal>, String> {
+    Ok(Ok(()))
+}
+
 /// What each statement of a SQL step reads and produces, in source order, and the
 /// statements no reader could read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StepSql {
     pub statements: Vec<SqlAssets>,
+    /// Which reader read each statement, in the order of `statements`.
+    pub read_by: Vec<ReadBy>,
     /// Each statement neither reader could read, as it reads nothing; see [`unread_warning`].
     pub unread: Vec<UnreadStatement>,
+    /// Why DuckDB's answer for the step could not be read, when a DuckDB 2 answered and
+    /// sqlparser-rs read the whole step instead. `arc run` refuses such a step.
+    pub unreadable: Option<String>,
+}
+
+/// Which reader read a statement, as the run contract records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadBy {
+    /// DuckDB's reading.
+    DuckDb,
+    /// sqlparser-rs's: the reader chosen, or the one that read a statement DuckDB's reading
+    /// could not take.
+    Sqlparser,
+    /// Neither: the statement reads nothing, and draws [`unread_warning`].
+    Nothing,
+}
+
+impl ReadBy {
+    /// The name the run contract gives it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReadBy::DuckDb => "duckdb",
+            ReadBy::Sqlparser => "sqlparser",
+            ReadBy::Nothing => "nothing",
+        }
+    }
 }
 
 /// A statement of a SQL step that neither reader could read.
@@ -341,22 +381,119 @@ pub fn unread_warning(step: &str, file: &str, unread: &UnreadStatement) -> Strin
 /// DuckDB arc runs does not answer, or is not a 2.x build, the whole step is read by
 /// sqlparser-rs, and arc says so once in the process: `arc run` refuses before reading
 /// (see [`check_reader`]), so this is a command that reads the graph without running it.
+/// When a DuckDB 2 answered and its answer for this step could not be read, sqlparser-rs
+/// reads the step and [`StepSql::unreadable`] says why; see [`from_duckdb`].
 pub fn read_sql(sql: &str) -> Result<StepSql, String> {
     match reader()? {
         Reader::Sqlparser => Ok(sqlparser_step(sql)),
-        Reader::DuckDb => {
-            let reading = duckdb_program().and_then(|program| {
-                duckdb_lineage::read_step(&program, sql).map_err(|e| e.to_string())
-            });
-            Ok(match reading {
-                Ok(reading) => duckdb_step(&reading),
-                Err(reason) => {
-                    warn_once_no_duckdb(&reason);
-                    sqlparser_step(sql)
-                }
-            })
+        #[cfg(test)]
+        Reader::DuckDb if !test_reading::is_set() => Ok(sqlparser_step(sql)),
+        Reader::DuckDb => Ok(from_duckdb(sql, duckdb_reading(sql))),
+    }
+}
+
+/// DuckDB's reading of `sql`, from the DuckDB arc runs.
+#[cfg(not(test))]
+fn duckdb_reading(sql: &str) -> Result<duckdb_lineage::StepReading, duckdb_lineage::Refusal> {
+    let program =
+        crate::engine::duckdb_program().map_err(|e| duckdb_lineage::Refusal::NotStarted {
+            program: std::env::var_os(crate::engine::DUCKDB_BIN_ENV).map_or_else(
+                || "duckdb".to_string(),
+                |bin| bin.to_string_lossy().into_owned(),
+            ),
+            reason: e.to_string(),
+        })?;
+    duckdb_lineage::read_step(&program, sql)
+}
+
+/// DuckDB's reading of `sql`, as the test running gives it with [`test_reading::with`].
+#[cfg(test)]
+fn duckdb_reading(sql: &str) -> Result<duckdb_lineage::StepReading, duckdb_lineage::Refusal> {
+    test_reading::read(sql)
+}
+
+/// The reading the lib's tests give the default reader. A test that sets none reads with
+/// sqlparser-rs, so no lib test starts the `duckdb` on PATH and each reads the same way on
+/// every machine; a test that wants DuckDB's reading gives it from recorded answers.
+#[cfg(test)]
+pub(crate) mod test_reading {
+    use std::cell::RefCell;
+
+    use crate::duckdb_lineage::{Refusal, StepReading};
+
+    type Read = Box<dyn Fn(&str) -> Result<StepReading, Refusal>>;
+
+    thread_local! {
+        static READING: RefCell<Option<Read>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn is_set() -> bool {
+        READING.with(|reading| reading.borrow().is_some())
+    }
+
+    pub(super) fn read(sql: &str) -> Result<StepReading, Refusal> {
+        READING.with(|reading| (reading.borrow().as_ref().expect("a reading is set"))(sql))
+    }
+
+    /// Runs `body` with the default reader reading through `read`, on this thread.
+    pub(crate) fn with<T>(
+        read: impl Fn(&str) -> Result<StepReading, Refusal> + 'static,
+        body: impl FnOnce() -> T,
+    ) -> T {
+        READING.with(|reading| *reading.borrow_mut() = Some(Box::new(read)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        READING.with(|reading| *reading.borrow_mut() = None);
+        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+
+    /// DuckDB v2.0.0's reading of `sql`, from the recorded answers.
+    pub(crate) fn recorded(sql: &str) -> Result<StepReading, Refusal> {
+        Ok(crate::duckdb_lineage::recorded_steps::reading(sql))
+    }
+}
+
+/// The step's reading from DuckDB's answer. A DuckDB that could not be asked, or is not a
+/// 2.x build, leaves the step to sqlparser-rs, and arc says so once in the process; a DuckDB 2
+/// whose answer for this step could not be read leaves it to sqlparser-rs too, with the
+/// reason in [`StepSql::unreadable`], for the caller to name the step.
+fn from_duckdb(
+    sql: &str,
+    reading: Result<duckdb_lineage::StepReading, duckdb_lineage::Refusal>,
+) -> StepSql {
+    use duckdb_lineage::Refusal;
+    match reading {
+        Ok(reading) => duckdb_step(&reading),
+        Err(Refusal::Unreadable(reason)) => StepSql {
+            unreadable: Some(reason),
+            ..sqlparser_step(sql)
+        },
+        Err(
+            no_duckdb @ (Refusal::NotStarted { .. }
+            | Refusal::NotRun { .. }
+            | Refusal::NotDuckDb2 { .. }),
+        ) => {
+            warn_once_no_duckdb(&no_duckdb.to_string());
+            sqlparser_step(sql)
         }
     }
+}
+
+/// The warning for a step DuckDB's answer could not be read for, which sqlparser-rs read.
+pub fn unreadable_warning(step: &str, file: &str, reason: &str) -> String {
+    format!(
+        "arc read {file} of step '{step}' with its own parser, because DuckDB's answer for it \
+         could not be read: {reason}"
+    )
+}
+
+/// The refusal of a run for a step DuckDB's answer could not be read for: arc run reads
+/// each step with DuckDB's parse, and does not read one with its own in its place.
+pub fn unreadable_refusal(step: &str, file: &str, reason: &str) -> String {
+    format!(
+        "step '{step}' ({file}): arc reads what each SQL step reads and produces from DuckDB \
+         2's own parse, and DuckDB's answer for it could not be read: {reason}; \
+         {SQL_READER_ENV}={SQLPARSER_READER} reads the steps with arc's own parser instead"
+    )
 }
 
 /// Prints, the first time in the process, that the asset graph is sqlparser-rs's reading.
@@ -385,19 +522,27 @@ fn duckdb_step(reading: &duckdb_lineage::StepReading) -> StepSql {
     let mut step = StepSql::default();
     for (n, statement) in reading.statements.iter().enumerate() {
         let mut assets = duckdb_statement(statement);
+        let mut read_by = ReadBy::DuckDb;
         if matches!(
             statement.form,
             duckdb_lineage::Form::Unread(_) | duckdb_lineage::Form::NotParsed(_)
         ) {
             match sqlparser_per_statement(&statement.text) {
-                Ok(read) => read.into_iter().for_each(|other| merge(&mut assets, other)),
-                Err(_) => step.unread.push(UnreadStatement {
-                    statement: n + 1,
-                    line: statement.line,
-                }),
+                Ok(read) => {
+                    read.into_iter().for_each(|other| merge(&mut assets, other));
+                    read_by = ReadBy::Sqlparser;
+                }
+                Err(_) => {
+                    read_by = ReadBy::Nothing;
+                    step.unread.push(UnreadStatement {
+                        statement: n + 1,
+                        line: statement.line,
+                    });
+                }
             }
         }
         step.statements.push(assets);
+        step.read_by.push(read_by);
     }
     step
 }
@@ -408,8 +553,9 @@ fn duckdb_step(reading: &duckdb_lineage::StepReading) -> StepSql {
 fn sqlparser_step(sql: &str) -> StepSql {
     if let Ok(statements) = sqlparser_per_statement(sql) {
         return StepSql {
+            read_by: vec![ReadBy::Sqlparser; statements.len()],
             statements,
-            unread: Vec::new(),
+            ..StepSql::default()
         };
     }
     let mut step = StepSql::default();
@@ -423,9 +569,11 @@ fn sqlparser_step(sql: &str) -> StepSql {
                 let mut assets = SqlAssets::default();
                 read.into_iter().for_each(|other| merge(&mut assets, other));
                 step.statements.push(assets);
+                step.read_by.push(ReadBy::Sqlparser);
             }
             Err(_) => {
                 step.statements.push(SqlAssets::default());
+                step.read_by.push(ReadBy::Nothing);
                 step.unread.push(UnreadStatement {
                     statement: n + 1,
                     line: sql[..start].matches('\n').count() + 1,
@@ -434,16 +582,6 @@ fn sqlparser_step(sql: &str) -> StepSql {
         }
     }
     step
-}
-
-/// Parse a SQL string and extract assets **per statement**, in source order: [`read_sql`]'s
-/// statements, so a contract can record which tables each statement produces/reads.
-///
-/// `Err` only when [`SQL_READER_ENV`] names no reader.
-pub fn extract_per_statement(sql: &str) -> Result<Vec<SqlAssets>, Vec<String>> {
-    read_sql(sql)
-        .map(|step| step.statements)
-        .map_err(|e| vec![e])
 }
 
 /// sqlparser-rs's reading of each statement of `sql`, or its error when it cannot parse
@@ -611,7 +749,7 @@ fn record_table_call(call: &FunctionCall, assets: &mut SqlAssets) {
 /// skipping over single-quoted strings, double-quoted identifiers, `--` line comments,
 /// `/* … */` block comments, and `$tag$ … $tag$` dollar-quoted bodies so a `;` inside
 /// any of those never splits. Comment-only / whitespace-only segments are dropped, so
-/// on well-formed SQL the count matches [`extract_per_statement`]; the caller zips the
+/// on well-formed SQL the count matches [`read_sql`]'s; the caller zips the
 /// two and falls back to no ranges if they ever disagree. Ranges are trimmed of leading
 /// whitespace/comments and trailing whitespace.
 pub fn statement_byte_ranges(sql: &str) -> Vec<(usize, usize)> {
@@ -1124,7 +1262,7 @@ mod tests {
     use crate::duckdb_lineage::recorded_steps;
 
     /// What the rules make of DuckDB's reading of `sql`, from the answers DuckDB v2.0.0
-    /// gave for it: what [`extract_per_statement`] returns with `ARC_SQL_READER=duckdb`.
+    /// gave for it: what [`read_sql`] reads by default, before the fallback.
     fn read_by_duckdb(sql: &str) -> Vec<SqlAssets> {
         recorded_steps::read(sql)
             .iter()
@@ -1377,6 +1515,58 @@ mod tests {
             }],
             "the ASOF join sqlparser-rs cannot parse reads nothing and is listed"
         );
+    }
+
+    #[test]
+    fn a_duckdb_that_cannot_be_asked_leaves_the_step_to_sqlparser() {
+        use crate::duckdb_lineage::Refusal;
+        let sql = "CREATE TABLE r AS SELECT * FROM t;";
+        for refusal in [
+            Refusal::NotStarted {
+                program: "duckdb".to_string(),
+                reason: "No such file".to_string(),
+            },
+            Refusal::NotRun {
+                program: "duckdb".to_string(),
+                reason: "exit 1".to_string(),
+            },
+            Refusal::NotDuckDb2 {
+                version: "v1.5.6".to_string(),
+            },
+        ] {
+            let step = from_duckdb(sql, Err(refusal.clone()));
+            assert_eq!(step, sqlparser_step(sql), "{refusal:?}");
+            assert_eq!(step.unreadable, None, "{refusal:?}: no DuckDB 2 answered");
+        }
+    }
+
+    #[test]
+    fn an_answer_that_cannot_be_read_is_named_for_the_step() {
+        let sql = "CREATE TABLE r AS SELECT * FROM t;";
+        let step = from_duckdb(
+            sql,
+            Err(crate::duckdb_lineage::Refusal::Unreadable(
+                "binder: m".to_string(),
+            )),
+        );
+        assert_eq!(step.unreadable.as_deref(), Some("binder: m"));
+        assert_eq!(step.statements, sqlparser_step(sql).statements);
+        assert_eq!(step.read_by, [ReadBy::Sqlparser]);
+    }
+
+    #[test]
+    fn each_statement_says_which_reader_read_it() {
+        let step = read_by_default(
+            "SET VARIABLE m = (SELECT max(d) FROM events);\n\
+             SET threads TO 4;\n\
+             FORCE INSTALL spatial;\n\
+             DELETE FROM t USING u WHERE t.k = u.k;\n\
+             CREATE TABLE r AS PIVOT t ON c USING sum(v);",
+        );
+        use ReadBy::{DuckDb, Sqlparser};
+        assert_eq!(step.read_by, [DuckDb, DuckDb, DuckDb, Sqlparser, Sqlparser]);
+        let step = read_by_default("SELECT 1;\nCREATE TABL r AS SELECT 1;");
+        assert_eq!(step.read_by, [DuckDb, ReadBy::Nothing]);
     }
 
     #[test]

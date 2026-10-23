@@ -1669,6 +1669,9 @@ fn duckdb_statement_count(sql: &str) -> usize {
 fn made_by_a_step(dir: &Path, on: &str) -> Result<()> {
     let manifest = Manifest::load(dir)?;
     let graph = crate::asset::AssetGraph::build(&manifest, dir);
+    for unreadable in &graph.unreadable {
+        eprintln!("warning: {}", unreadable.warning());
+    }
     let wanted = on.to_lowercase();
     let made = graph.steps.values().any(|assets| {
         assets.produces.contains(&wanted)

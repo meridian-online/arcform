@@ -170,22 +170,30 @@ pub(crate) struct StepReading {
 /// Why a step was not read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Refusal {
-    /// The DuckDB named could not be run, or gave no version.
+    /// The DuckDB named could not be started: it is not there, or not a program.
+    NotStarted { program: String, reason: String },
+    /// The DuckDB named was started and exited with an error.
     NotRun { program: String, reason: String },
-    /// DuckDB answered something the reader cannot read, or the DuckDB named is not a 2.x
-    /// build, whose tokens arc reads.
+    /// The DuckDB asked answered with tokens from a version that is not 2.x, whose tokens
+    /// arc reads.
+    NotDuckDb2 { version: String },
+    /// DuckDB answered something the reader cannot read, such as an answer with no version.
     Unreadable(String),
 }
 
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Refusal::NotRun { program, reason } => {
+            Refusal::NotStarted { program, reason } | Refusal::NotRun { program, reason } => {
                 write!(
                     f,
                     "could not ask DuckDB `{program}` for its parse: {reason}"
                 )
             }
+            Refusal::NotDuckDb2 { version } => write!(
+                f,
+                "the tokens came from DuckDB {version}, and arc reads the tokens of a DuckDB 2.x"
+            ),
             Refusal::Unreadable(reason) => write!(f, "DuckDB's parse could not be read: {reason}"),
         }
     }
@@ -346,7 +354,13 @@ fn piece(
     })?;
     // A batch holds one `\n` between each two of its lines.
     let batch_line = sql[..first.start].matches('\n').count();
-    let line = lines.get(batch_line).copied().unwrap_or_default();
+    let line = lines.get(batch_line).copied().ok_or_else(|| {
+        Refusal::Unreadable(format!(
+            "a statement starts on line {} of a batch of {} lines",
+            batch_line + 1,
+            lines.len()
+        ))
+    })?;
     let tokens = words
         .iter()
         .map(|t| Token {
@@ -1984,7 +1998,7 @@ mod tests {
     }
 
     /// A DuckDB before 2.0 has no `sql_tokenize`. The answer is the recorded one with a 1.x
-    /// version, since the `duckdb` on `PATH` is a 2.x release. The rule is the one the
+    /// version, since the recorded answers are v2.0.0's. The rule is the one the
     /// refusals' tokens are held to, in `crate::duckdb_tokens`.
     #[test]
     fn a_duckdb_older_than_2_is_refused_naming_its_version() {
@@ -1994,7 +2008,7 @@ mod tests {
             .expect_err("a 1.x DuckDB is refused");
         let message = refusal.to_string();
         assert!(
-            matches!(&refusal, Refusal::Unreadable(_))
+            matches!(&refusal, Refusal::NotDuckDb2 { version } if version == "v1.5.6")
                 && message.contains("v1.5.6")
                 && message.contains("DuckDB 2.x"),
             "the refusal names the version found and says arc reads a 2.x: {message}"
@@ -2021,18 +2035,18 @@ mod tests {
         }
     }
 
-    /// The reader hands DuckDB each text written in hex digits. The `duckdb` on `PATH`
-    /// reads it back: a quote, a `;`, a backslash, a comment, a `\r` before a `\n` and a
+    /// The reader hands DuckDB each text written in hex digits. The DuckDB
+    /// `ARC_DUCKDB_RECORD_BIN` names reads it back: a quote, a `;`, a backslash, a comment, a `\r` before a `\n` and a
     /// line that would be a command to the DuckDB shell come back as the text sent.
     #[test]
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build job \
+                runs it on the v2.0.0 release CLI with --include-ignored"]
     fn duckdb_reads_the_step_back_as_the_text_sent() {
         let text = "it's; a \\ b\r\n-- not a comment\r\n.quit\n''";
-        let duckdb = Process {
-            program: DuckDbProgram::SearchPath,
-        };
+        let duckdb = live().0;
         let (answers, stderr) = duckdb
             .run(&format!("SELECT {} AS s;\n", hex_text(text)))
-            .expect("the duckdb on PATH runs");
+            .expect("the DuckDB named runs");
         assert_eq!(
             answers.first().map(|rows| &rows[0]["s"]),
             Some(&Value::from(text)),
@@ -2041,16 +2055,16 @@ mod tests {
     }
 
     /// DuckDB 2.0's preview builds printed a warning they logged into the JSON on stdout,
-    /// which then could not be read. This checks that the reader asks the `duckdb` on
-    /// `PATH` with logging off; the checks against a real DuckDB show what that buys.
+    /// which then could not be read. This checks that the reader asks the DuckDB
+    /// `ARC_DUCKDB_RECORD_BIN` names with logging off; the checks against a real DuckDB show what that buys.
     #[test]
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build job \
+                runs it on the v2.0.0 release CLI with --include-ignored"]
     fn duckdb_is_asked_with_logging_off() {
-        let duckdb = Process {
-            program: DuckDbProgram::SearchPath,
-        };
+        let duckdb = live().0;
         let (answers, stderr) = duckdb
             .run("SELECT current_setting('enable_logging')::BOOLEAN AS logging;\n")
-            .expect("the duckdb on PATH runs");
+            .expect("the DuckDB named runs");
         assert_eq!(
             answers.first().map(|rows| &rows[0]["logging"]),
             Some(&Value::from(false)),
@@ -2058,15 +2072,16 @@ mod tests {
         );
     }
 
-    /// A file with CRLF line ends, read by the `duckdb` on `PATH`. Its tokens and its trees
+    /// A file with CRLF line ends, read by the DuckDB `ARC_DUCKDB_RECORD_BIN` names. Its tokens and its trees
     /// reach DuckDB with each `\r`, so each start and place DuckDB gives is a byte of the
     /// text arc holds: the string after the `\r\n` inside the first statement's literal
     /// is still read as a file, and the second statement starts on line 3.
     #[test]
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build job \
+                runs it on the v2.0.0 release CLI with --include-ignored"]
     fn a_crlf_step_is_read_at_the_places_duckdb_gives() {
         let sql = "SELECT 'a\r\nb' AS s FROM 'data.csv';\r\nCREATE TABLE r AS SELECT * FROM t;\r\n";
-        let reading =
-            read_step(&DuckDbProgram::SearchPath, sql).expect("the duckdb on PATH reads it");
+        let reading = read_step(&live().0.program, sql).expect("the DuckDB named reads it");
         let s = reading.statements;
         assert_eq!(
             s.iter()
@@ -2105,7 +2120,7 @@ mod tests {
         )
         .expect_err("no such program");
         assert!(
-            matches!(&refusal, Refusal::NotRun { program, reason }
+            matches!(&refusal, Refusal::NotStarted { program, reason }
                 if program == "/nonexistent/duckdb" && reason.contains("No such file")),
             "the refusal names the program and why it did not run: {refusal:?}"
         );

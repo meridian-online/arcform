@@ -159,6 +159,10 @@ impl Process {
     /// the one for parsing the deprecated `PRAGMA threads = 4`, to stdout in the middle
     /// of the JSON it is printing, and the answer can no longer be read.
     fn output(&self, mode: &[&str], script: &str) -> Result<std::process::Output, Refusal> {
+        let not_started = |e: std::io::Error| Refusal::NotStarted {
+            program: self.program.display_name(),
+            reason: e.to_string(),
+        };
         let not_run = |e: std::io::Error| Refusal::NotRun {
             program: self.program.display_name(),
             reason: e.to_string(),
@@ -172,7 +176,7 @@ impl Process {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(not_run)?;
+            .map_err(not_started)?;
         // Written from a thread: DuckDB answers each statement as it reads it, and an
         // answer larger than the pipe would stall a write made from this thread.
         let mut stdin = child.stdin.take().expect("stdin is piped");
@@ -371,9 +375,7 @@ fn asked(
 ) -> Result<Answer, Refusal> {
     let (version, answers) = ask(texts)?;
     if major(&version) != Some(2) {
-        return Err(Refusal::Unreadable(format!(
-            "the tokens came from DuckDB {version}, and arc reads the tokens of a DuckDB 2.x"
-        )));
+        return Err(Refusal::NotDuckDb2 { version });
     }
     if answers.len() != texts.len() {
         return Err(Refusal::Unreadable(format!(
@@ -724,19 +726,55 @@ impl TokenCache {
 /// The tokens of `file` as `program` gives them, shared by everything in this process that
 /// reads a SQL file: the refusals and the asset graph read one answer for the same bytes,
 /// and a file read again unchanged is not asked about again. Each program has a cache of its
-/// own, and a failed question is not kept.
+/// own. A program that could not be started is not asked again in the process, so a command that
+/// reads many files with no DuckDB starts none after the first; any other failed question is
+/// not kept.
 ///
 /// The cache is not held while DuckDB is asked, so two threads asking about different files
 /// do not wait on each other; two asking about the same file at once may both ask.
 pub(crate) fn shared_tokens(program: &DuckDbProgram, file: &[u8]) -> Result<FileTokens, Refusal> {
-    static SHARED: Mutex<BTreeMap<String, TokenCache>> = Mutex::new(BTreeMap::new());
+    shared_tokens_with(program, file, |file| tokenize_file(program, file))
+}
+
+/// [`shared_tokens`], with `ask` asking `program` for a file's tokens.
+fn shared_tokens_with(
+    program: &DuckDbProgram,
+    file: &[u8],
+    ask: impl FnOnce(&[u8]) -> Result<FileTokens, Refusal>,
+) -> Result<FileTokens, Refusal> {
+    #[derive(Default)]
+    struct Shared {
+        caches: BTreeMap<String, TokenCache>,
+        not_run: BTreeMap<String, Refusal>,
+    }
+    static SHARED: Mutex<Option<Shared>> = Mutex::new(None);
     let name = program.display_name();
     let lock = || SHARED.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(known) = lock().get(&name).and_then(|cache| cache.known(file)) {
-        return Ok(known.clone());
+    {
+        let mut held = lock();
+        let shared = held.get_or_insert_with(Shared::default);
+        if let Some(refusal) = shared.not_run.get(&name) {
+            return Err(refusal.clone());
+        }
+        if let Some(known) = shared.caches.get(&name).and_then(|cache| cache.known(file)) {
+            return Ok(known.clone());
+        }
     }
-    let tokens = tokenize_file(program, file)?;
-    lock()
+    let tokens = match ask(file) {
+        Ok(tokens) => tokens,
+        Err(refusal) => {
+            if matches!(refusal, Refusal::NotStarted { .. }) {
+                let mut held = lock();
+                let shared = held.get_or_insert_with(Shared::default);
+                shared.not_run.insert(name, refusal.clone());
+            }
+            return Err(refusal);
+        }
+    };
+    let mut held = lock();
+    let shared = held.get_or_insert_with(Shared::default);
+    shared
+        .caches
         .entry(name)
         .or_default()
         .get(file, |_| Ok(tokens.clone()))
@@ -1091,6 +1129,43 @@ mod tests {
         assert_eq!(asked, vec!["SELECT 1;".to_string()]);
     }
 
+    /// A program that could not be started is not asked again in the process: with no DuckDB,
+    /// a command reading many files starts it once.
+    #[test]
+    fn a_program_that_could_not_be_started_is_not_asked_again() {
+        let program = DuckDbProgram::Told("/nonexistent/shared-tokens-test/duckdb".into());
+        let refused = shared_tokens_with(&program, b"SELECT 1;", |_| {
+            Err(Refusal::NotStarted {
+                program: program.display_name(),
+                reason: "No such file".to_string(),
+            })
+        });
+        assert!(
+            matches!(refused, Err(Refusal::NotStarted { .. })),
+            "{refused:?}"
+        );
+        let again = shared_tokens_with(&program, b"SELECT 2;", |_| {
+            panic!("a program that could not be started was asked again")
+        });
+        assert_eq!(again, refused, "the first refusal is given again");
+
+        // A program that ran and failed is asked again: the failure can be the file's.
+        let failing = DuckDbProgram::Told("/nonexistent/shared-tokens-test/failing".into());
+        let not_run = || {
+            Err(Refusal::NotRun {
+                program: "failing".to_string(),
+                reason: "exit 1".to_string(),
+            })
+        };
+        let _ = shared_tokens_with(&failing, b"SELECT 1;", |_| not_run());
+        let mut asked = false;
+        let _ = shared_tokens_with(&failing, b"SELECT 1;", |_| {
+            asked = true;
+            not_run()
+        });
+        assert!(asked, "a program that ran and failed is asked again");
+    }
+
     #[test]
     fn tokens_from_a_duckdb_that_is_not_2_x_are_refused() {
         for version in ["v1.5.6", "v3.0.0", ""] {
@@ -1103,7 +1178,7 @@ mod tests {
             assert!(
                 matches!(
                     tokenize_with(b"SELECT 1;", &mut ask),
-                    Err(Refusal::Unreadable(_))
+                    Err(Refusal::NotDuckDb2 { .. })
                 ),
                 "{version:?}"
             );

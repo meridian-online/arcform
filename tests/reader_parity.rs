@@ -11,7 +11,9 @@
 //! once with `ARC_SQL_READER=sqlparser`. The default reading is DuckDB's, with sqlparser-rs
 //! reading each statement DuckDB's reading cannot take, so a statement read by that fallback
 //! compares sqlparser-rs with itself; a default run that read a whole file with sqlparser-rs,
-//! because no DuckDB 2 answered, fails the gate.
+//! because no DuckDB 2 answered, fails the gate. Which statements take that fallback is
+//! pinned per file in `FALLBACK`, from the reader each contract statement names, so a
+//! statement DuckDB's reading stops taking fails the gate too.
 //! The recorded steps in `src/duckdb_lineage.rs` are held to the same comparison by the
 //! parity tests in `src/introspect.rs`, which read them from recorded answers.
 //!
@@ -153,8 +155,45 @@ const DIFFERENCES: &[Difference] = &[
     },
 ];
 
+/// The statements of each file the default reading does not read with DuckDB's parse alone,
+/// each with the reader the contract names for it: `sqlparser`, for a statement DuckDB's
+/// reading cannot take, or `nothing`, for one neither reader can read. A file not listed
+/// has every statement read by DuckDB. Any change fails the test, so a statement DuckDB's
+/// reading stops taking, which the comparison above would pass, is caught here.
+const FALLBACK: &[(&str, &[(usize, &str)])] = &[
+    // `CREATE FUNCTION`, a form the reader does not frame; a `CREATE TABLE … AS` holding a
+    // PIVOT DuckDB gives no tree for.
+    (
+        "examples/brewtrend/models/trending.sql",
+        &[(2, "sqlparser"), (4, "sqlparser")],
+    ),
+    // `ATTACH … (DATA_PATH …)`, which neither reads; two `DROP TABLE`s and two `CALL`s, forms
+    // the reader does not frame.
+    (
+        "examples/code-lists/models/catalog.sql",
+        &[
+            (5, "nothing"),
+            (6, "sqlparser"),
+            (7, "sqlparser"),
+            (10, "sqlparser"),
+            (11, "sqlparser"),
+        ],
+    ),
+    // `ATTACH … (DATA_PATH …, READ_ONLY)`, which neither reads.
+    ("examples/code-lists/models/validate.sql", &[(5, "nothing")]),
+    // `CREATE MACRO`, a form the reader does not frame.
+    (
+        "tests/fixtures/open_analytics/edgar_gleif/models/load.sql",
+        &[(1, "sqlparser")],
+    ),
+];
+
 /// One statement as the contract records it: what it produces, and what it reads.
 type Reading = (BTreeSet<String>, BTreeSet<String>);
+
+/// A reader's statements, which reader read each of them, and what `arc run` printed on
+/// stderr.
+type Read = (Vec<Reading>, Vec<String>, String);
 
 #[derive(Clone, Copy, Debug)]
 enum Reader {
@@ -194,7 +233,7 @@ fn sql_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// an `arc run` that stops before the step runs, and what that run printed on stderr. A
 /// reader that refuses the step gives no statements; one that cannot read a statement gives
 /// it reading nothing.
-fn read(file: &Path, reader: Reader, duckdb: &OsString) -> Result<(Vec<Reading>, String), String> {
+fn read(file: &Path, reader: Reader, duckdb: &OsString) -> Result<Read, String> {
     let dir = tempfile::tempdir().unwrap();
     std::fs::copy(file, dir.path().join("read.sql")).unwrap();
     std::fs::write(
@@ -252,7 +291,13 @@ fn read(file: &Path, reader: Reader, duckdb: &OsString) -> Result<(Vec<Reading>,
         .flatten()
         .map(|s| (names(&s["produces"]), names(&s["reads"])))
         .collect();
-    Ok((statements, stderr))
+    let read_by: Vec<String> = step["sql"]["statements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|s| s["read_by"].as_str().unwrap_or("absent").to_string())
+        .collect();
+    Ok((statements, read_by, stderr))
 }
 
 fn set(names: &[&str]) -> BTreeSet<String> {
@@ -292,6 +337,8 @@ fn both_readers_read_every_sql_file_in_the_repo_alike() {
 
     let mut failures = Vec::new();
     let mut seen = BTreeSet::new();
+    // Files the comparison did not reach, whose rows are not called stale.
+    let mut skipped = BTreeSet::new();
     for path in &files {
         let file = path
             .strip_prefix(root)
@@ -300,26 +347,47 @@ fn both_readers_read_every_sql_file_in_the_repo_alike() {
             .replace('\\', "/");
         let readings = read(path, Reader::DuckDb, &duckdb)
             .and_then(|by_duckdb| Ok((by_duckdb, read(path, Reader::Sqlparser, &duckdb)?)));
-        let ((by_duckdb, duckdb_stderr), (by_sqlparser, sqlparser_stderr)) = match readings {
-            Ok(both) => both,
-            Err(why) => {
-                failures.push(format!("{file}: {why}"));
-                continue;
-            }
-        };
+        let ((by_duckdb, read_by, duckdb_stderr), (by_sqlparser, _, sqlparser_stderr)) =
+            match readings {
+                Ok(both) => both,
+                Err(why) => {
+                    failures.push(format!("{file}: {why}"));
+                    skipped.insert(file.clone());
+                    continue;
+                }
+            };
         // A default run that read the file with sqlparser-rs would compare it with itself.
         if duckdb_stderr.contains(NO_DUCKDB) {
             failures.push(format!(
                 "{file}: the default run read the file with sqlparser-rs, as no DuckDB 2 \
                  answered:\n{duckdb_stderr}"
             ));
+            skipped.insert(file.clone());
             continue;
         }
         if by_duckdb.is_empty() && by_sqlparser.is_empty() {
             failures.push(format!(
                 "{file}: neither reader gave a statement:\n{duckdb_stderr}\n{sqlparser_stderr}"
             ));
+            skipped.insert(file.clone());
             continue;
+        }
+        let fell_back: Vec<(usize, String)> = read_by
+            .iter()
+            .enumerate()
+            .filter(|(_, by)| *by != "duckdb")
+            .map(|(i, by)| (i + 1, by.clone()))
+            .collect();
+        let pinned: Vec<(usize, String)> = FALLBACK
+            .iter()
+            .find(|(f, _)| *f == file)
+            .map(|(_, rows)| rows.iter().map(|(n, by)| (*n, by.to_string())).collect())
+            .unwrap_or_default();
+        if fell_back != pinned {
+            failures.push(format!(
+                "{file}: the statements the default reading does not read with DuckDB's parse \
+                 alone are {fell_back:?}, and FALLBACK pins {pinned:?}"
+            ));
         }
         // Why a reader gave no statements, when one gave none.
         let silent = |reading: &[Reading], stderr: &str| {
@@ -368,7 +436,20 @@ fn both_readers_read_every_sql_file_in_the_repo_alike() {
             ));
         }
     }
+    for (file, _) in FALLBACK {
+        if !files
+            .iter()
+            .any(|path| path.strip_prefix(root).is_ok_and(|p| p == Path::new(file)))
+        {
+            failures.push(format!(
+                "{file} is in FALLBACK and is not in the repo; remove its row"
+            ));
+        }
+    }
     for row in DIFFERENCES {
+        if skipped.contains(row.file) {
+            continue;
+        }
         if !seen.contains(&(row.file.to_string(), row.statement)) {
             failures.push(format!(
                 "{}, statement {} is tabled ({}), and the two readers now agree on it; remove \
