@@ -62,6 +62,7 @@ fn project() -> tempfile::TempDir {
 /// have leaves the table disagreeing with the file on disk.
 fn table_rows(project: &Path) -> usize {
     let out = Command::new("duckdb")
+        .env("DUCKDB_AGENT_MODE", "0")
         .arg(project.join("build/glob_read.db"))
         .args([
             "-noheader",

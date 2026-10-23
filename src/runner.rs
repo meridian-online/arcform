@@ -198,26 +198,21 @@ pub(crate) fn check_engine_version(
     }
     let oldest = semver::Version::parse(OLDEST_ENGINE).expect("OLDEST_ENGINE is a valid version");
     // By release, so a pre-release of the oldest release is untested, as any pre-release is,
-    // and not taken for one of the releases before it.
-    let older = (ver.major, ver.minor, ver.patch) < (oldest.major, oldest.minor, oldest.patch);
-    if allow_untested {
-        let mut warning = format!(
-            "engine DuckDB {ver} is outside the versions arc is tested on \
-             ({SUPPORTED_ENGINE_RANGE}); running anyway because {ALLOW_UNTESTED_ENGINE_ENV} is set"
-        );
-        if older {
-            warning.push_str("; ");
-            warning.push_str(&older_engine_risk(ver));
-        }
-        return Ok(vec![warning]);
-    }
-    if older {
+    // and not taken for one of the releases before it. No override reaches below the oldest
+    // engine: a database the 2.0 library arc links creates cannot be opened by a 1.x command
+    // line, and the two share it.
+    if (ver.major, ver.minor, ver.patch) < (oldest.major, oldest.minor, oldest.patch) {
         return Err(Error::EngineTooOld {
             found: ver.to_string(),
             oldest: OLDEST_ENGINE,
             range: SUPPORTED_ENGINE_RANGE,
-            override_var: ALLOW_UNTESTED_ENGINE_ENV,
         });
+    }
+    if allow_untested {
+        return Ok(vec![format!(
+            "engine DuckDB {ver} is outside the versions arc is tested on \
+             ({SUPPORTED_ENGINE_RANGE}); running anyway because {ALLOW_UNTESTED_ENGINE_ENV} is set"
+        )]);
     }
     Err(Error::UntestedEngine {
         found: ver.to_string(),
@@ -226,21 +221,33 @@ pub(crate) fn check_engine_version(
     })
 }
 
-/// What a run risks on `ver`, a DuckDB older than [`OLDEST_ENGINE`], as measured on the
-/// official command line run as arc runs a SQL step. 1.2.x runs the step's file and exits 0
-/// when a statement in it fails; a release before 1.2 refuses `-f` and runs nothing.
-fn older_engine_risk(ver: &semver::Version) -> String {
-    if (ver.major, ver.minor) < (1, 2) {
-        format!(
-            "DuckDB {ver} does not take `-f`, which arc runs a SQL step's file with, \
-             so every SQL step fails"
-        )
-    } else {
-        format!(
-            "on DuckDB {ver} a SQL step whose statement fails exits 0, so arc reports the \
-             failed step as passed and runs the steps after it"
-        )
+/// The notice for a run whose engine differs, in major and minor, from the DuckDB the
+/// Protocol's newest run record names (`previous`, its `run.engine.duckdb_cli`), or `None`.
+///
+/// Both versions are read as the engine check reads them: a development build of a release's
+/// own commit, which Homebrew's DuckDB prints, is that release. A previous version arc cannot
+/// read draws no notice. For a 1.x previous and a 2.x engine the notice goes on to name the
+/// four results DuckDB 2.0 changes without an error.
+pub(crate) fn engine_change_notice(
+    previous: Option<&str>,
+    current: &semver::Version,
+) -> Option<String> {
+    let previous = crate::engine::parse_engine_version(previous?)?.version;
+    if (previous.major, previous.minor) == (current.major, current.minor) {
+        return None;
     }
+    let mut notice = format!(
+        "this Protocol last ran on DuckDB {previous}, and this run uses DuckDB {current}; \
+         results can differ between them"
+    );
+    if previous.major == 1 && current.major == 2 {
+        notice.push_str(
+            "\nDuckDB 2.0 changes four results without an error: `~` and `!~` match part of a \
+             string; integer `//` and `%` by zero raise an error; `x -> …` lambdas are rejected; \
+             `ORDER BY` a non-integer literal is rejected",
+        );
+    }
+    Some(notice)
 }
 
 /// Each file beside the Protocol's file in `dir` whose name may be a copy a synced drive set
@@ -302,12 +309,14 @@ pub fn run_with_params(
     // hook's file just before it runs; and the pinned extensions each check installed and
     // found equal to their pins, hashed again when the run ends.
     let mut extensions = ExtensionRecheck::default();
+    // The engine this run's SQL steps use, when it has any and arc could read its version.
+    let mut engine_version: Option<semver::Version> = None;
 
     // If there are SQL steps, verify the engine is available and check its version.
     if manifest.has_sql_steps() {
         let info = engine.preflight()?;
-        let allow_untested =
-            std::env::var_os(ALLOW_UNTESTED_ENGINE_ENV).is_some_and(|v| !v.is_empty());
+        engine_version = info.version.clone();
+        let allow_untested = crate::engine::untested_engine_allowed();
         for warning in check_engine_version(
             info.version.as_ref(),
             manifest.engine_version.as_deref(),
@@ -317,9 +326,41 @@ pub fn run_with_params(
         }
         // Before anything is initialised, so a refused Protocol leaves no run behind.
         let sql = protocol_sql(&manifest, dir);
-        let installs = check_extension_installs(&sql, info.version.as_ref())?;
+        // A DuckDB that gives no tokens at all, as one built without its autocomplete
+        // extension does, is named with the fix, in place of the refusal of the first file
+        // it gave none for. The probe runs when that check fails, or when it asked DuckDB
+        // nothing, so a run whose files all read starts no DuckDB more than before.
+        let no_tokenizer = |error| Error::NoTokenizer {
+            which: engine.which(&info.printed),
+            error,
+        };
+        let installs = match check_extension_installs(&sql, info.version.as_ref(), engine) {
+            Err(refused @ Error::SqlNotRead { .. }) => {
+                return Err(engine.tokenizer_failure().map_or(refused, no_tokenizer));
+            }
+            Err(refused) => return Err(refused),
+            Ok(installs) if !installs.tokens.asked_duckdb() => {
+                if let Some(error) = engine.tokenizer_failure() {
+                    return Err(no_tokenizer(error));
+                }
+                installs
+            }
+            Ok(installs) => installs,
+        };
         for warning in &installs.warnings {
             eprintln!("{} {}", "warning:".yellow(), warning);
+        }
+        // A development build looks community extensions up under its commit hash, which
+        // the registry does not serve. The run goes on: the extension may be installed.
+        if let Some(dev_build) = &info.dev_build
+            && !installs.installed.is_empty()
+        {
+            eprintln!(
+                "{} this DuckDB build ({dev_build}) cannot download community extensions, and \
+                 DuckDB's own release build can. {}",
+                "warning:".yellow(),
+                crate::engine::release_install_fix()
+            );
         }
         // After the refusal above, so a refused Protocol installs nothing, and before the
         // state backend and the staleness check, so a run whose steps are fresh is checked
@@ -343,11 +384,22 @@ pub fn run_with_params(
     }
     // Which reader takes a SQL step's reads and produces. Refused here, before a step
     // runs, rather than as a warning on each step the reader cannot read.
-    crate::introspect::check_reader(manifest.has_sql_steps()).map_err(Error::SqlReader)?;
+    crate::introspect::check_reader().map_err(Error::SqlReader)?;
 
     if manifest.steps.is_empty() {
         println!("{}", "No steps defined.".dimmed());
         return Ok(());
+    }
+
+    // Build the asset graph, before anything is initialised, so a refused Protocol leaves no
+    // run behind. A step DuckDB's answer could not be read for is refused, as the refusals
+    // refuse a file whose tokens could not be read: the run does not read it with arc's own
+    // parser instead. A DuckDB 2 that gives no tree at all refuses here too, from the graph's
+    // own questions.
+    let asset_graph = AssetGraph::build(&manifest, dir);
+    if !asset_graph.unreadable.is_empty() {
+        let refusals: Vec<String> = asset_graph.unreadable.iter().map(|u| u.refusal()).collect();
+        return Err(Error::SqlReader(refusals.join("\n")));
     }
 
     // Resolve parameters: dotenv files → manifest defaults → CLI overrides.
@@ -370,11 +422,21 @@ pub fn run_with_params(
     // Initialise the state backend (creates tables if needed).
     state.init()?;
 
+    // A run on a different DuckDB than the Protocol's last says so once, before its first
+    // step. Read before this run writes its own record.
+    if let Some(current) = &engine_version
+        && let Some(previous) = contract::newest_contract_with_engine(&contract::runs_dir(dir))
+        && let Some(notice) =
+            engine_change_notice(previous.run.engine.duckdb_cli.as_deref(), current)
+    {
+        for line in notice.lines() {
+            eprintln!("{} {}", "warning:".yellow(), line);
+        }
+    }
+
     // Start a new run record.
     let run_id = state.start_run()?;
 
-    // Build the asset graph and validate dependency ordering.
-    let asset_graph = AssetGraph::build(&manifest, dir);
     // Who produces what — computed once, consulted both by staleness detection and by
     // the artifact hash each successful step records for the *next* run to compare.
     let all_produced = all_produced_assets(&asset_graph);
@@ -855,6 +917,9 @@ pub fn run_with_params(
                     }
                     | Error::ExtensionPinRefusedBeforeItRan {
                         step: Some(step), ..
+                    }
+                    | Error::SqlNotRead {
+                        step: Some(step), ..
                     } => {
                         failure_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
                         failure_env.insert("ARC_EXIT_CODE".to_string(), "refused".to_string());
@@ -908,6 +973,9 @@ pub fn run_with_params(
                         step: Some(step), ..
                     }
                     | Error::ExtensionPinRefusedBeforeItRan {
+                        step: Some(step), ..
+                    }
+                    | Error::SqlNotRead {
                         step: Some(step), ..
                     } => {
                         exit_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
@@ -1843,6 +1911,175 @@ mod tests {
         }
     }
 
+    fn write_record(runs: &Path, name: &str, duckdb_cli: Option<&str>) {
+        let record = serde_json::json!({
+            "contract_version": "b4/1",
+            "run": {
+                "run_id": name, "attempt_id": name,
+                "protocol": {"name": "t", "manifest_sha256": null, "dir": "."},
+                "engine": {"arc": "0", "duckdb": null, "duckdb_cli": duckdb_cli,
+                           "platform": null, "extensions": null},
+                "params": [], "started_at": null, "finished_at": null, "outcome": "success"
+            },
+            "assets": [], "steps": []
+        });
+        fs::create_dir_all(runs).unwrap();
+        fs::write(runs.join(format!("{name}.json")), record.to_string()).unwrap();
+    }
+
+    fn set_mtime(path: &Path, secs: u64) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    fn ver(s: &str) -> semver::Version {
+        semver::Version::parse(s).unwrap()
+    }
+
+    const ONE_SQL_STEP: &str = "name: t\nsteps:\n  - name: s\n    sql: s.sql\n";
+
+    #[test]
+    fn a_run_whose_tokens_read_asks_no_tokenizer_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path(), ONE_SQL_STEP, &[("s.sql", "SELECT 1;")]);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &MockStateBackend::new(), false).unwrap();
+        assert_eq!(*engine.probed.borrow(), 0);
+    }
+
+    #[test]
+    fn a_duckdb_whose_tokenizer_does_not_answer_is_refused_before_a_step_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path(), ONE_SQL_STEP, &[("s.sql", "SELECT 1;")]);
+        let engine = MockEngine::new();
+        *engine.tokens_failure.borrow_mut() = Some("it exited with 1".into());
+        *engine.tokenizer_failure.borrow_mut() =
+            Some("Extension Autoloading Error: the extension 'autocomplete'".into());
+        let refused = run(dir.path(), &engine, &MockStateBackend::new(), false).unwrap_err();
+        assert!(matches!(refused, Error::NoTokenizer { .. }), "{refused:?}");
+        assert_eq!(refused.exit_code(), 2);
+        assert!(
+            !engine
+                .calls
+                .borrow()
+                .iter()
+                .any(|c| matches!(c, MockCall::Sql { .. })),
+            "a step ran"
+        );
+        let message = refused.to_string();
+        assert!(
+            message.starts_with("the mock DuckDB cannot read SQL into tokens"),
+            "{message}"
+        );
+        assert!(!message.contains("could not read the tokens"), "{message}");
+    }
+
+    #[test]
+    fn a_tokenizer_failing_for_another_reason_is_refused_quoting_duckdb() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path(), ONE_SQL_STEP, &[("s.sql", "SELECT 1;")]);
+        let engine = MockEngine::new();
+        *engine.tokens_failure.borrow_mut() = Some("it exited with 1".into());
+        *engine.tokenizer_failure.borrow_mut() = Some("Out of Memory Error: no room".into());
+        let refused = run(dir.path(), &engine, &MockStateBackend::new(), false).unwrap_err();
+        assert!(matches!(refused, Error::NoTokenizer { .. }), "{refused:?}");
+        let message = refused.to_string();
+        assert!(
+            message.contains("said \"Out of Memory Error: no room\""),
+            "{message}"
+        );
+        assert!(!message.contains("built without"), "{message}");
+        assert!(message.contains("DUCKDB_VERSION=2.0.0"), "{message}");
+    }
+
+    #[test]
+    fn a_duckdb_whose_tokenizer_answers_keeps_the_refusal_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path(), ONE_SQL_STEP, &[("s.sql", "SELECT 1;")]);
+        let engine = MockEngine::new();
+        *engine.tokens_failure.borrow_mut() = Some("it printed nothing".into());
+        let refused = run(dir.path(), &engine, &MockStateBackend::new(), false).unwrap_err();
+        assert!(matches!(refused, Error::SqlNotRead { .. }), "{refused:?}");
+        assert_eq!(*engine.probed.borrow(), 1);
+    }
+
+    #[test]
+    fn a_run_with_no_sql_to_ask_about_probes_the_tokenizer_once() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path(), ONE_SQL_STEP, &[("s.sql", "")]);
+        let engine = MockEngine::new();
+        *engine.tokenizer_failure.borrow_mut() =
+            Some("Extension Autoloading Error: the extension 'autocomplete'".into());
+        let refused = run(dir.path(), &engine, &MockStateBackend::new(), false).unwrap_err();
+        assert!(matches!(refused, Error::NoTokenizer { .. }), "{refused:?}");
+        assert_eq!(*engine.probed.borrow(), 1);
+    }
+
+    #[test]
+    fn no_record_no_notice() {
+        assert_eq!(engine_change_notice(None, &ver("2.0.0")), None);
+    }
+
+    #[test]
+    fn same_minor_no_notice() {
+        assert_eq!(engine_change_notice(Some("v2.0.1"), &ver("2.0.3")), None);
+    }
+
+    #[test]
+    fn one_five_to_two_names_the_four_changes() {
+        let n = engine_change_notice(Some("v1.5.6"), &ver("2.0.0")).unwrap();
+        assert!(
+            n.contains("1.5.6") && n.contains("2.0.0") && n.contains("ORDER BY"),
+            "{n}"
+        );
+        assert!(n.starts_with(
+            "this Protocol last ran on DuckDB 1.5.6, and this run uses DuckDB 2.0.0; results can differ between them\n"
+        ));
+    }
+
+    #[test]
+    fn two_zero_to_two_one_has_no_four_changes_line() {
+        let n = engine_change_notice(Some("v2.0.0"), &ver("2.1.0")).unwrap();
+        assert!(!n.contains("four results") && !n.contains('\n'), "{n}");
+    }
+
+    #[test]
+    fn an_unparseable_previous_version_draws_no_notice() {
+        assert_eq!(
+            engine_change_notice(Some("not a version"), &ver("2.0.0")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_dev_build_of_a_release_compares_as_that_release() {
+        let dev = "v2.0.0-dev88614 (Development Version) d54cbbe3df";
+        let parsed = crate::engine::parse_engine_version(dev).unwrap().version;
+        assert_eq!(engine_change_notice(Some("v2.0.0"), &parsed), None);
+        assert_eq!(engine_change_notice(Some(dev), &ver("2.0.0")), None);
+    }
+
+    #[test]
+    fn a_truncated_newest_record_falls_back_to_an_older_1_x_record_and_notices() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = contract::runs_dir(dir.path());
+        write_record(&runs, "old", Some("v1.5.6"));
+        fs::write(
+            runs.join("new.json"),
+            "{\"contract_version\": \"b4/1\", \"run\": {",
+        )
+        .unwrap();
+        set_mtime(&runs.join("old.json"), 1_000);
+        set_mtime(&runs.join("new.json"), 2_000);
+        let previous = contract::newest_contract_with_engine(&runs).unwrap();
+        let n = engine_change_notice(previous.run.engine.duckdb_cli.as_deref(), &ver("2.0.0"));
+        assert!(n.unwrap().contains("1.5.6"));
+    }
+
     // Empty steps list exits successfully.
     #[test]
     fn test_run_empty_steps() {
@@ -1853,6 +2090,47 @@ mod tests {
         run(dir.path(), &engine, &state, false).unwrap();
         // No preflight called for empty steps.
         assert!(engine.calls.borrow().is_empty());
+    }
+
+    // A step DuckDB answered for with an answer arc cannot read is refused before it runs:
+    // the run does not read it with arc's own parser in its place. It is refused before the
+    // state backend is set up, as every other refusal before the run is, so it leaves no run
+    // row and no state tables behind.
+    #[test]
+    fn a_step_duckdbs_answer_cannot_be_read_for_refuses_the_run() {
+        use crate::duckdb_lineage::Refusal;
+        use crate::introspect::test_reading;
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(
+            dir.path(),
+            "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n",
+            &[("models/s1.sql", "CREATE TABLE t AS SELECT 1;")],
+        );
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        let err = test_reading::with(
+            |_| Err(Refusal::Unreadable("binder: m".to_string())),
+            || run(dir.path(), &engine, &state, false),
+        )
+        .expect_err("the run is refused");
+        let message = err.to_string();
+        assert!(
+            matches!(err, Error::SqlReader(_))
+                && message.contains("step 's1' (models/s1.sql)")
+                && message.contains("binder: m"),
+            "{message}"
+        );
+        assert!(
+            !engine
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| matches!(call, crate::engine::mock::MockCall::Sql { .. })),
+            "no step ran: {:?}",
+            engine.calls.borrow()
+        );
+        assert!(!*state.init_called.borrow(), "the state backend was set up");
+        assert!(state.runs.borrow().is_empty(), "a run was started");
     }
 
     // Steps execute in declared order against shared database.
@@ -3038,12 +3316,12 @@ mod tests {
     fn test_lrp_version_mismatch_blocks_execution() {
         let dir = tempfile::tempdir().unwrap();
         let yaml =
-            "name: test\nengine_version: '>=2.0'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+            "name: test\nengine_version: '>=2.1'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
 
         let engine = MockEngine::new();
-        // 1.3.0 is inside arc's range, so only the manifest's >=2.0 can refuse it.
-        engine.set_version(Some(semver::Version::new(1, 3, 0)));
+        // 2.0.0 is inside arc's range, so only the manifest's >=2.1 can refuse it.
+        engine.set_version(Some(semver::Version::new(2, 0, 0)));
         let state = MockStateBackend::new();
 
         let result = run(dir.path(), &engine, &state, false);
@@ -3060,21 +3338,21 @@ mod tests {
     fn test_lrp_error_contains_both_versions() {
         let dir = tempfile::tempdir().unwrap();
         let yaml =
-            "name: test\nengine_version: '>=2.0'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+            "name: test\nengine_version: '>=2.1'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
 
         let engine = MockEngine::new();
-        engine.set_version(Some(semver::Version::new(1, 3, 0)));
+        engine.set_version(Some(semver::Version::new(2, 0, 0)));
         let state = MockStateBackend::new();
 
         let err = run(dir.path(), &engine, &state, false).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains(">=2.0"),
+            msg.contains(">=2.1"),
             "error should contain constraint: {msg}"
         );
         assert!(
-            msg.contains("1.3.0"),
+            msg.contains("2.0.0"),
             "error should contain detected version: {msg}"
         );
     }
@@ -3083,7 +3361,7 @@ mod tests {
     // before any step runs, on either side of the range.
     #[test]
     fn test_lrp_no_version_constraint_still_meets_the_supported_range() {
-        for (major, minor, patch) in [(2, 0, 0), (1, 2, 2)] {
+        for (major, minor, patch) in [(3, 0, 0), (1, 5, 6)] {
             let dir = tempfile::tempdir().unwrap();
             let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
             setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
@@ -3114,7 +3392,7 @@ mod tests {
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
 
         let engine = MockEngine::new();
-        engine.set_version(Some(semver::Version::new(1, 3, 0)));
+        engine.set_version(Some(semver::Version::new(2, 0, 0)));
         let state = MockStateBackend::new();
 
         run(dir.path(), &engine, &state, false).unwrap();
@@ -3131,7 +3409,7 @@ mod tests {
     // of the oldest release, it is the untested one.
     #[test]
     fn test_check_engine_version_range_bounds() {
-        for ok in ["1.3.0", "1.5.4", "1.99.99"] {
+        for ok in ["2.0.0", "2.0.1", "2.99.99"] {
             assert!(
                 check_engine_version(Some(&v(ok)), None, false)
                     .unwrap()
@@ -3139,7 +3417,7 @@ mod tests {
                 "{ok} is in range and must pass without a warning"
             );
         }
-        for older in ["1.2.2", "1.2.0", "1.1.9"] {
+        for older in ["1.5.6", "1.99.99", "1.2.0"] {
             let err = check_engine_version(Some(&v(older)), None, false).unwrap_err();
             assert!(
                 matches!(&err, Error::EngineTooOld { found, oldest, .. }
@@ -3147,7 +3425,7 @@ mod tests {
                 "{older}: expected EngineTooOld, got {err:?}"
             );
         }
-        for refused in ["2.0.0", "3.1.0", "1.3.0-dev1"] {
+        for refused in ["3.0.0", "3.1.0", "2.0.0-dev1"] {
             let err = check_engine_version(Some(&v(refused)), None, false).unwrap_err();
             assert!(
                 matches!(err, Error::UntestedEngine { .. }),
@@ -3162,33 +3440,28 @@ mod tests {
     fn test_supported_range_starts_at_the_oldest_engine() {
         let range = semver::VersionReq::parse(SUPPORTED_ENGINE_RANGE).unwrap();
         assert!(range.matches(&v(OLDEST_ENGINE)), "{SUPPORTED_ENGINE_RANGE}");
-        assert!(!range.matches(&v("1.2.99")), "{SUPPORTED_ENGINE_RANGE}");
-        assert_eq!(OLDEST_ENGINE, "1.3.0");
+        assert!(!range.matches(&v("1.99.99")), "{SUPPORTED_ENGINE_RANGE}");
+        assert_eq!(OLDEST_ENGINE, "2.0.0");
     }
 
-    // The override runs an engine older than the oldest release, and its warning says what
-    // the run risks there: on 1.2.x a failed SQL step is reported as passed; before 1.2 the
-    // command line refuses `-f`. Above the range the warning names neither.
+    // The override lifts arc's range above the oldest release and never below it: a
+    // database the 2.0 library arc links creates cannot be opened by a 1.x command line, so
+    // a 1.x engine is refused with the override set, and the refusal names the way out.
     #[test]
-    fn test_check_engine_version_override_on_an_older_engine_names_the_risk() {
-        let warnings = check_engine_version(Some(&v("1.2.0")), None, true).unwrap();
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("1.2.0"), "{warnings:?}");
-        assert!(
-            warnings[0].contains("reports the failed step as passed"),
-            "{warnings:?}"
-        );
+    fn test_check_engine_version_override_does_not_reach_an_older_engine() {
+        for older in ["1.5.6", "1.2.0", "1.1.3"] {
+            let err = check_engine_version(Some(&v(older)), None, true).unwrap_err();
+            assert!(
+                matches!(&err, Error::EngineTooOld { found, .. } if found == older),
+                "{older}: expected EngineTooOld, got {err:?}"
+            );
+            assert!(err.to_string().contains("0.2.1"), "{err}");
+        }
 
-        let warnings = check_engine_version(Some(&v("1.1.3")), None, true).unwrap();
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("does not take `-f`"), "{warnings:?}");
-        assert!(!warnings[0].contains("as passed"), "{warnings:?}");
-
-        for not_older in ["2.0.0", "1.3.0-dev1"] {
+        for not_older in ["3.0.0", "2.0.0-dev1"] {
             let warnings = check_engine_version(Some(&v(not_older)), None, true).unwrap();
             assert_eq!(warnings.len(), 1, "{warnings:?}");
-            assert!(!warnings[0].contains("as passed"), "{warnings:?}");
-            assert!(!warnings[0].contains("`-f`"), "{warnings:?}");
+            assert!(warnings[0].contains(not_older), "{warnings:?}");
         }
     }
 
@@ -3196,10 +3469,10 @@ mod tests {
     // narrows; on an engine older than the oldest release, arc's own range refuses.
     #[test]
     fn test_check_engine_version_manifest_below_the_oldest_does_not_widen() {
-        let err = check_engine_version(Some(&v("1.2.0")), Some(">=1.0"), false).unwrap_err();
+        let err = check_engine_version(Some(&v("1.5.6")), Some(">=1.0"), false).unwrap_err();
         assert!(matches!(err, Error::EngineTooOld { .. }), "got {err:?}");
         assert!(
-            check_engine_version(Some(&v("1.5.4")), Some(">=1.0"), false)
+            check_engine_version(Some(&v("2.0.0")), Some(">=1.0"), false)
                 .unwrap()
                 .is_empty()
         );
@@ -3209,12 +3482,12 @@ mod tests {
     // comparator on the same major.minor.patch. The override runs it, with a warning.
     #[test]
     fn test_check_engine_version_pre_release_is_untested() {
-        let dev = v("1.6.0-dev123");
+        let dev = v("2.1.0-dev123");
         let err = check_engine_version(Some(&dev), None, false).unwrap_err();
         assert!(matches!(err, Error::UntestedEngine { .. }), "got {err:?}");
         let warnings = check_engine_version(Some(&dev), None, true).unwrap();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("1.6.0-dev123"), "{warnings:?}");
+        assert!(warnings[0].contains("2.1.0-dev123"), "{warnings:?}");
     }
 
     // The manifest's constraint is checked before arc's range and the override never
@@ -3222,14 +3495,14 @@ mod tests {
     #[test]
     fn test_check_engine_version_manifest_constraint_survives_the_override() {
         for allow in [false, true] {
-            let err = check_engine_version(Some(&v("1.5.4")), Some(">=1.6"), allow).unwrap_err();
+            let err = check_engine_version(Some(&v("2.0.0")), Some(">=2.1"), allow).unwrap_err();
             assert!(
                 matches!(&err, Error::VersionMismatch { required, found }
-                    if required == ">=1.6" && found == "1.5.4"),
+                    if required == ">=2.1" && found == "2.0.0"),
                 "allow={allow}: got {err:?}"
             );
         }
-        let err = check_engine_version(Some(&v("2.0.0")), Some("<2"), true).unwrap_err();
+        let err = check_engine_version(Some(&v("3.0.0")), Some("<3"), true).unwrap_err();
         assert!(matches!(err, Error::VersionMismatch { .. }), "got {err:?}");
     }
 
@@ -3252,14 +3525,14 @@ mod tests {
     fn test_lrp_version_satisfies_constraint() {
         let dir = tempfile::tempdir().unwrap();
         let yaml =
-            "name: test\nengine_version: '>=1.5'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+            "name: test\nengine_version: '>=2.0'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
 
         let engine = MockEngine::new();
-        engine.set_version(Some(semver::Version::new(1, 5, 2)));
+        engine.set_version(Some(semver::Version::new(2, 0, 2)));
         let state = MockStateBackend::new();
 
-        // Should succeed — 1.5.2 >= 1.5.
+        // Should succeed — 2.0.2 >= 2.0.
         run(dir.path(), &engine, &state, false).unwrap();
     }
 

@@ -82,7 +82,7 @@ fn a_model_using_lambda_colon_syntax_keeps_its_assets_in_the_graph() {
 
     // The negative outcome measured against the unpatched parser.
     assert!(
-        !stderr.contains("treating as opaque step"),
+        !stderr.contains("treating as opaque step") && !stderr.contains("could not read statement"),
         "the lambda-colon step must not degrade to opaque:\nstderr:\n{stderr}"
     );
 

@@ -6,11 +6,15 @@
 //! maintainer's `skills/README.md` is not a skill and stays out. The result is
 //! `$OUT_DIR/skills.rs`, a `static SKILLS: &[(&str, &[u8])]` of `<skill>/<path>` and bytes,
 //! sorted by path, which `src/skills.rs` includes.
+//!
+//! It also passes one linker flag for `bundled-duckdb` on Linux; see `link_bundled_duckdb`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 fn main() {
+    link_bundled_duckdb();
+
     let root = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("skills");
     // A directory here makes Cargo rerun this script when anything beneath it changes.
     println!("cargo:rerun-if-changed=skills");
@@ -37,6 +41,25 @@ fn main() {
 
     let dest = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("skills.rs");
     fs::write(dest, out).expect("write skills.rs");
+}
+
+// With `bundled-duckdb`, libduckdb-sys links DuckDB's static-extension autoregister
+// archive whole-archive, after libduckdb itself. That archive calls
+// `duckdb_register_static_extensions`, which libduckdb defines and nothing before it
+// references. GNU ld resolves archives in command-line order, so by the time it reads
+// the call it has already passed over the definition, and the link fails with an
+// undefined reference. rust-lld (the default linker for x86_64 Linux) and macOS's ld
+// look back and link it; GNU ld, the default for aarch64 Linux, does not. Naming the
+// symbol undefined up front makes GNU ld pull the definition in when it reads
+// libduckdb. `-u` is harmless to a linker that needs no help. Applies to arc's own
+// binaries and tests; a crate that links this library with `bundled-duckdb` on Linux
+// needs the same flag until libduckdb-sys orders the archives itself.
+fn link_bundled_duckdb() {
+    let bundled = std::env::var_os("CARGO_FEATURE_BUNDLED_DUCKDB").is_some();
+    let linux = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux");
+    if bundled && linux {
+        println!("cargo::rustc-link-arg=-Wl,-u,duckdb_register_static_extensions");
+    }
 }
 
 fn hidden(path: &Path) -> bool {

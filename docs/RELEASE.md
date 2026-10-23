@@ -38,7 +38,7 @@ The script reads `release.yml` without a YAML library, so it understands only th
 | `publish-crates` | `release` | Publishes `arcform-sqlparser` (from `vendor/sqlparser-0.55.0`) when crates.io's API answers 404 for its version; when that version is already there, `scripts/check_fork_published.py` requires the published crate to be this tree's fork file for file, and fails with a request to bump the fork's patch version if it is not. Then it publishes `arcform` (`cargo publish --locked --no-verify`, since the `build` legs have already built and tested this source and verifying would need a system libduckdb the runner lacks) when its version is not there either. Any answer other than 200 or 404 stops the job. |
 | `update-install-site` | `release` | Sends `scripts/install.sh` to `meridian-online/install` as an `update-install-script` dispatch carrying the tag and repository. |
 
-The Linux binaries are built on Ubuntu 22.04, so they need glibc 2.35 or later. Older systems build from source with `cargo install arcform --locked --features mcp,bundled-duckdb`.
+The Linux binaries are built on Ubuntu 22.04, so they need glibc 2.35 or later. Older systems build from source with `CXXFLAGS='-DDUCKDB_VERSION="v2.0.0"' cargo install arcform --locked --features mcp,bundled-duckdb`. The `CXXFLAGS` setting is needed until duckdb-rs fixes [#917](https://github.com/duckdb/duckdb-rs/issues/917); without it the bundled DuckDB reports a development version.
 
 ## The release, step by step
 

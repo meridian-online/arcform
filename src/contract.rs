@@ -240,8 +240,14 @@ pub struct StatementInfo {
     pub reads: Vec<String>,
     /// `[start, end)` byte offsets into the step's `sql_text` — the exact source slice for
     /// this statement, so a viewer can render statements individually. `null` if the
-    /// lexical split didn't line up with the parsed statements.
+    /// statement could not be placed: DuckDB's tokens place it when DuckDB read the step, and the
+    /// lexical split does when sqlparser-rs did and the two count the statements alike.
     pub byte_range: Option<[usize; 2]>,
+    /// Which reader read the statement: `duckdb`, `sqlparser` (chosen with
+    /// `ARC_SQL_READER=sqlparser`, or reading a statement DuckDB's reading could not take),
+    /// or `nothing`. Absent in a contract written before arc recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_by: Option<String>,
 }
 
 /// A step's terminal status.
@@ -522,6 +528,39 @@ pub fn build_contract(inp: ContractInputs) -> Contract {
     }
 }
 
+/// The `.json` files in `runs_dir`, newest first by modified time (empty if the directory is
+/// absent). A file whose modified time cannot be read sorts last.
+pub fn contracts_by_age(runs_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(runs_dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(Option<std::time::SystemTime>, PathBuf)> = entries
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("json"))
+        .map(|entry| {
+            (
+                entry.metadata().and_then(|m| m.modified()).ok(),
+                entry.path(),
+            )
+        })
+        .collect();
+    // Newest first; ties broken by name, later first, so the order is stable.
+    found.sort_by(|a, b| b.cmp(a));
+    found.into_iter().map(|(_, path)| path).collect()
+}
+
+/// The newest run record in `runs_dir` that reads as a contract and names the DuckDB it ran
+/// on (`run.engine.duckdb_cli`). A record that is unreadable, such as a truncated file, or
+/// names no engine, is skipped rather than an error, so a comparison is made against the
+/// newest record that can answer it. `None` when there is none.
+pub fn newest_contract_with_engine(runs_dir: &Path) -> Option<Contract> {
+    contracts_by_age(runs_dir).into_iter().find_map(|path| {
+        let text = std::fs::read_to_string(path).ok()?;
+        let contract: Contract = serde_json::from_str(&text).ok()?;
+        contract.run.engine.duckdb_cli.is_some().then_some(contract)
+    })
+}
+
 /// Write the contract to `<runs_dir>/<run_id>.json` (pretty-printed).
 pub fn write_contract(runs_dir: &Path, run_id: &str, contract: &Contract) -> std::io::Result<()> {
     let path = runs_dir.join(format!("{run_id}.json"));
@@ -779,22 +818,21 @@ fn build_step(
             Ok(bytes) => {
                 let text = String::from_utf8_lossy(&bytes).to_string();
                 let hash = crate::state::content_hash(&bytes);
-                let statements = match crate::introspect::extract_per_statement(&text) {
-                    Ok(list) => {
-                        // Attach each statement's source byte range. The lexical splitter
-                        // and the parser agree on count for well-formed SQL; if they ever
-                        // diverge, emit no ranges rather than misalign them.
-                        let ranges = crate::introspect::statement_byte_ranges(&text);
-                        let aligned = ranges.len() == list.len();
+                let statements = match crate::introspect::read_sql(&text) {
+                    Ok(step_sql) => {
+                        let read_by = step_sql.read_by;
+                        let ranges = step_sql.byte_ranges;
+                        let list = step_sql.statements;
+                        // Each statement's source byte range comes with its reading: from
+                        // DuckDB's tokens when DuckDB read the step, else from the lexical
+                        // cut, dropped when that cut counts the statements differently.
                         list.into_iter()
                             .enumerate()
                             .map(|(i, a)| StatementInfo {
                                 produces: a.outputs.into_iter().collect(),
                                 reads: a.inputs.into_iter().collect(),
-                                byte_range: aligned.then(|| {
-                                    let (s, e) = ranges[i];
-                                    [s, e]
-                                }),
+                                byte_range: ranges.get(i).copied().flatten().map(|(s, e)| [s, e]),
+                                read_by: read_by.get(i).map(|r| r.as_str().to_string()),
                             })
                             .collect()
                     }
@@ -1039,6 +1077,37 @@ fn days_to_date(days: u64) -> (u64, u64, u64) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn newest_contract_with_engine_skips_a_truncated_record_and_one_without_duckdb_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = |cli: serde_json::Value| {
+            serde_json::json!({
+                "contract_version": "b4/1",
+                "run": {"run_id": "r", "attempt_id": "r",
+                    "protocol": {"name": "t", "manifest_sha256": null, "dir": "."},
+                    "engine": {"arc": "0", "duckdb": null, "duckdb_cli": cli,
+                               "platform": null, "extensions": null},
+                    "params": [], "started_at": null, "finished_at": null, "outcome": "success"},
+                "assets": [], "steps": []
+            })
+            .to_string()
+        };
+        assert!(newest_contract_with_engine(dir.path()).is_none());
+        std::fs::write(dir.path().join("a.json"), record("v1.5.6".into())).unwrap();
+        std::fs::write(dir.path().join("b.json"), record(serde_json::Value::Null)).unwrap();
+        std::fs::write(dir.path().join("c.json"), "{\"run\": {").unwrap();
+        for (name, secs) in [("a.json", 1_000), ("b.json", 2_000), ("c.json", 3_000)] {
+            std::fs::File::options()
+                .write(true)
+                .open(dir.path().join(name))
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .unwrap();
+        }
+        let found = newest_contract_with_engine(dir.path()).unwrap();
+        assert_eq!(found.run.engine.duckdb_cli.as_deref(), Some("v1.5.6"));
+    }
+
     // `build_assets` classifies by `declared_kind` (carried from the SQL/operator
     // declaration), never by inspecting the name's shape — a File-kind produces
     // entry with no recognized extension, a Directory-kind entry with no operator
@@ -1095,6 +1164,67 @@ steps:
         // for a file because it happens to have no extension or because nothing
         // stats the filesystem to check.
         assert_eq!(by_name["build/out"].kind, "directory");
+    }
+
+    /// The contract of a one-step manifest whose SQL file holds `sql`, read with DuckDB's
+    /// recorded answers, as the step's statements.
+    fn statements_of(sql: &str) -> Vec<StatementInfo> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("models")).unwrap();
+        std::fs::write(dir.path().join("models/load.sql"), sql).unwrap();
+        let manifest = Manifest::from_yaml_str(
+            "name: test\nsteps:\n  - name: load\n    sql: models/load.sql\n",
+        )
+        .unwrap();
+        let graph = AssetGraph::build(&manifest, dir.path());
+        let entry = crate::introspect::test_reading::with(
+            crate::introspect::test_reading::recorded,
+            || {
+                build_step(
+                    &manifest.steps[0],
+                    dir.path(),
+                    &graph,
+                    &manifest,
+                    &HashMap::new(),
+                )
+            },
+        );
+        entry.sql.expect("a SQL step").statements
+    }
+
+    #[test]
+    fn a_semicolon_inside_a_dollar_quoted_string_does_not_drop_the_ranges() {
+        let sql = "SELECT $$a;b$$; CREATE TABLE t AS SELECT 1;";
+        let statements = statements_of(sql);
+        let slices: Vec<Option<&str>> = statements
+            .iter()
+            .map(|s| s.byte_range.map(|[start, end]| &sql[start..end]))
+            .collect();
+        assert_eq!(
+            slices,
+            [Some("SELECT $$a;b$$;"), Some("CREATE TABLE t AS SELECT 1;")],
+            "both statements keep a range, and it covers the statement's text"
+        );
+        assert!(
+            statements
+                .iter()
+                .all(|s| s.read_by.as_deref() == Some("duckdb")),
+            "DuckDB read both: {statements:?}"
+        );
+    }
+
+    #[test]
+    fn a_dot_command_before_a_statement_does_not_move_its_range() {
+        let sql = ".mode list\n# a note\nSELECT 1;\n-- c\nCREATE TABLE t AS\n  SELECT 2\n";
+        let ranges: Vec<_> = statements_of(sql).iter().map(|s| s.byte_range).collect();
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|r| r.map(|[start, end]| &sql[start..end]))
+                .collect::<Vec<_>>(),
+            [Some("SELECT 1;"), Some("CREATE TABLE t AS\n  SELECT 2")],
+            "the lexical cut would start the first range at the dot command"
+        );
     }
 
     #[test]

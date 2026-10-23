@@ -1,12 +1,11 @@
-//! End-to-end: `ARC_SQL_READER=duckdb` makes `arc run` take what each SQL step reads and
-//! produces from DuckDB's own parse of it, through the real `arc` binary, and leaves every
-//! other run as it was.
+//! End-to-end: `arc run` takes what each SQL step reads and produces from DuckDB's own
+//! parse of it, through the real `arc` binary; `ARC_SQL_READER=sqlparser` makes it take
+//! them from arc's own parser; a statement DuckDB's reading cannot take is read by arc's
+//! own, and one neither can read draws a warning naming the step; and a command that reads
+//! the graph with no DuckDB 2 to ask reads it with arc's own parser and says so once.
 //!
-//! The tests that read a step with DuckDB's parse need a DuckDB 2.0 build, named by
-//! `ARC_DUCKDB_PREVIEW_BIN`, and are `#[ignore]`d so an ordinary run skips them; `ci.yml`
-//! downloads the 2.0 preview and runs them with `--include-ignored`. A 2.0 build is outside
-//! the versions arc is tested on, so those runs set `ARC_ALLOW_UNTESTED_ENGINE` as well.
-//! The rest need the `duckdb` on PATH, a 1.x release, as any `arc run` does.
+//! The runs ask the DuckDB 2.0 command line `ARC_DUCKDB_RECORD_BIN` names when it is set,
+//! and the `duckdb` on PATH otherwise, as `ci.yml`'s build job and any `arc run` do.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -16,25 +15,24 @@ use std::process::Command;
 mod common;
 use common::strip_ansi;
 
-const PREVIEW_ENV: &str = "ARC_DUCKDB_PREVIEW_BIN";
+const RECORD_ENV: &str = "ARC_DUCKDB_RECORD_BIN";
 
 /// Which reader a run is told to use, and so which DuckDB it runs.
 enum Reader {
-    /// `ARC_SQL_READER` unset, on the `duckdb` found on PATH.
+    /// `ARC_SQL_READER` unset, on [`duckdb`].
     Default,
-    /// `ARC_SQL_READER=duckdb`, on the 2.0 build `ARC_DUCKDB_PREVIEW_BIN` names.
-    DuckDbPreview,
+    /// `ARC_SQL_READER=sqlparser`, on [`duckdb`].
+    Sqlparser,
     /// `ARC_SQL_READER` set to `value`, on the `duckdb` found on PATH.
     Told(&'static str),
+    /// `ARC_SQL_READER` unset, on the executable at this path.
+    Program(PathBuf),
 }
 
-fn preview() -> OsString {
-    std::env::var_os(PREVIEW_ENV).unwrap_or_else(|| {
-        panic!(
-            "{PREVIEW_ENV} must name a DuckDB 2.0 build: this test is #[ignore]d so an \
-             ordinary run skips it, and running it with --include-ignored says one is staged"
-        )
-    })
+/// The DuckDB 2.0 build `ARC_DUCKDB_RECORD_BIN` names, when it is set; else the runs use
+/// the `duckdb` on PATH.
+fn duckdb() -> Option<OsString> {
+    std::env::var_os(RECORD_ENV)
 }
 
 struct Run {
@@ -80,15 +78,19 @@ fn arc_run(project: &Path, reader: Reader) -> Run {
         command.env_remove(var);
     }
     match reader {
-        Reader::Default => {}
-        Reader::DuckDbPreview => {
-            command
-                .env("ARC_SQL_READER", "duckdb")
-                .env("ARC_DUCKDB_BIN", preview())
-                .env("ARC_ALLOW_UNTESTED_ENGINE", "1");
+        Reader::Default | Reader::Sqlparser => {
+            if let Some(bin) = duckdb() {
+                command.env("ARC_DUCKDB_BIN", bin);
+            }
+            if matches!(reader, Reader::Sqlparser) {
+                command.env("ARC_SQL_READER", "sqlparser");
+            }
         }
         Reader::Told(value) => {
             command.env("ARC_SQL_READER", value);
+        }
+        Reader::Program(path) => {
+            command.env("ARC_DUCKDB_BIN", path);
         }
     }
     let out = command.output().expect("spawn arc run");
@@ -178,23 +180,32 @@ const LOAD: &str = "CREATE TABLE t AS SELECT * FROM (VALUES (1, 10, 'p', 2)) AS 
 /// A step arc's own parser cannot parse and DuckDB's can.
 const ASOF: &str = "CREATE TABLE r AS SELECT * EXCLUDE (a) FROM t ASOF LEFT JOIN u USING (k);\n";
 
+/// A step both parse and read differently: arc's own parser reads no table inside an
+/// `EXISTS`.
+const EXISTS: &str = "CREATE TABLE e AS SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u);\n";
+
+/// The warning lines of a run's standard error.
+fn warnings(run: &Run) -> Vec<&str> {
+    run.stderr
+        .lines()
+        .filter(|l| l.starts_with("warning:"))
+        .collect()
+}
+
+/// The warning a command prints when no DuckDB 2 answered for the graph.
+const NO_DUCKDB: &str = "because no DuckDB 2 answered";
+
 #[test]
-#[ignore = "needs the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build job \
-            downloads the preview and passes --include-ignored"]
-fn with_the_reader_set_a_step_is_read_from_duckdbs_parse() {
+fn with_the_reader_unset_a_step_is_read_from_duckdbs_parse() {
     let dir = project(&[("load", LOAD), ("asof", ASOF)]);
-    let run = arc_run(dir.path(), Reader::DuckDbPreview);
+    let run = arc_run(dir.path(), Reader::Default);
     assert_eq!(
         run.code,
         Some(0),
-        "arc run must exit 0 on the preview:\n{}",
+        "arc run must exit 0 on DuckDB 2.0:\n{}",
         run.printed()
     );
-    assert!(
-        !run.printed().contains("could not parse"),
-        "the step was not read:\n{}",
-        run.printed()
-    );
+    assert_eq!(warnings(&run), [] as [&str; 0], "{}", run.printed());
 
     let r = graph_entry(&run.stdout, "r");
     assert!(
@@ -218,52 +229,204 @@ fn with_the_reader_set_a_step_is_read_from_duckdbs_parse() {
     );
 }
 
-/// What `arc run` printed for the Protocol above, with `ARC_SQL_READER` unset, on the
-/// commit this change is based on, `6550d3c`, on DuckDB v1.5.5: its standard output, and
-/// the warnings on its standard error. Neither names the version.
-const PRINTED_BEFORE: &str = "[1/2] load ...
-[2/2] asof ...
-
-Asset graph (2 nodes):
-  t [table, 1 row]
-      produced by  load
-  u [table, 1 row]
-      produced by  load
-
-\u{2713} 2/2 steps succeeded.
-";
-const WARNED_BEFORE: &[&str] = &["warning: could not parse asof.sql: sql parser error: \
-     Expected: JOIN, found: LEFT at Line: 1, Column: 52 \u{2014} treating as opaque step"];
-
 #[test]
-fn without_the_reader_set_a_step_is_read_as_before() {
-    let dir = project(&[("load", LOAD), ("asof", ASOF)]);
-    let run = arc_run(dir.path(), Reader::Default);
+fn sqlparser_forces_arcs_own_reading() {
+    let dir = project(&[("load", LOAD), ("exists", EXISTS), ("asof", ASOF)]);
+    let by_duckdb = arc_run(dir.path(), Reader::Default);
+    assert_eq!(by_duckdb.code, Some(0), "{}", by_duckdb.printed());
+    assert_eq!(
+        statements(&read_contract(dir.path()), "exists"),
+        [(
+            vec!["e".to_string()],
+            vec!["t".to_string(), "u".to_string()]
+        )],
+        "DuckDB's parse reads the table inside the EXISTS"
+    );
+
+    let dir = project(&[("load", LOAD), ("exists", EXISTS), ("asof", ASOF)]);
+    let run = arc_run(dir.path(), Reader::Sqlparser);
     assert_eq!(run.code, Some(0), "arc run must exit 0:\n{}", run.printed());
+    let contract = read_contract(dir.path());
     assert_eq!(
-        run.stdout, PRINTED_BEFORE,
-        "the standard output differs from what arc printed before"
-    );
-    let warnings: Vec<&str> = run
-        .stderr
-        .lines()
-        .filter(|l| l.starts_with("warning:"))
-        .collect();
-    assert_eq!(
-        warnings, WARNED_BEFORE,
-        "the warnings differ from what arc printed before"
+        statements(&contract, "exists"),
+        [(vec!["e".to_string()], vec!["t".to_string()])],
+        "arc's own parser reads no table inside an EXISTS"
     );
     assert_eq!(
-        statements(&read_contract(dir.path()), "asof"),
-        [] as [(Vec<String>, Vec<String>); 0],
-        "the run contract holds no statement of a step arc's own parser could not parse"
+        statements(&contract, "asof"),
+        [(Vec::new(), Vec::new())],
+        "arc's own parser cannot parse the ASOF join, which reads nothing"
+    );
+    assert_eq!(
+        warnings(&run),
+        [
+            "warning: could not read statement 1 of asof (asof.sql:1) \u{2014} treating it as \
+          reading nothing"
+        ],
+        "the statement arc's own parser cannot read is named"
     );
 }
 
 #[test]
-#[ignore = "needs the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build job \
-            downloads the preview and passes --include-ignored"]
-fn table_functions_are_read_as_with_the_reader_unset() {
+fn an_unread_pivot_join_draws_a_warning_naming_the_step() {
+    let dir = project(&[
+        ("load", LOAD),
+        (
+            "pivot",
+            "-- a pivot of two tables\nCREATE TABLE r AS PIVOT t JOIN u USING (k) ON c USING sum(v);\n",
+        ),
+    ]);
+    let run = arc_run(dir.path(), Reader::Default);
+    assert_eq!(run.code, Some(0), "arc run must exit 0:\n{}", run.printed());
+    assert_eq!(
+        warnings(&run),
+        [
+            "warning: could not read statement 1 of pivot (pivot.sql:2) \u{2014} treating it as \
+          reading nothing"
+        ],
+        "DuckDB gives the PIVOT no tree and arc's own parser cannot parse it"
+    );
+    assert_eq!(
+        statements(&read_contract(dir.path()), "pivot"),
+        [(vec!["r".to_string()], Vec::new())],
+        "the statement keeps the table its words make certain, and reads nothing"
+    );
+}
+
+#[test]
+fn a_bare_name_statement_reads_the_table() {
+    let dir = project(&[("load", LOAD), ("peek", "t;\n")]);
+    let run = arc_run(dir.path(), Reader::Default);
+    assert_eq!(run.code, Some(0), "arc run must exit 0:\n{}", run.printed());
+    assert_eq!(warnings(&run), [] as [&str; 0], "{}", run.printed());
+    assert_eq!(
+        statements(&read_contract(dir.path()), "peek"),
+        [(Vec::new(), vec!["t".to_string()])],
+        "DuckDB 2.0's command line runs `t;` as `SELECT * FROM t`"
+    );
+    assert!(
+        graph_entry(&run.stdout, "t").contains(&"feeds peek".to_string()),
+        "the printed graph shows t feeding peek:\n{}",
+        run.stdout
+    );
+}
+
+/// `arc sql record` reads the Protocol's graph to find the step that makes the table a
+/// filter is recorded on. With no `duckdb` on PATH it reads the graph with arc's own parser,
+/// and says so once, however many SQL steps there are.
+#[test]
+fn arc_sql_record_without_duckdb_on_path_reads_with_sqlparser_and_warns_once() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("shop");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("arcform.yaml"),
+        "name: shop\nengine: duckdb\ndb: shop.duckdb\nsteps:\n  \
+         - name: load_orders\n    sql: orders.sql\n  \
+         - name: load_customers\n    sql: customers.sql\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("orders.sql"),
+        "CREATE TABLE orders AS SELECT * FROM (VALUES (1, 50)) AS t(id, amount);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("customers.sql"),
+        "CREATE TABLE customers AS SELECT * FROM (VALUES (1)) AS t(id);\n",
+    )
+    .unwrap();
+    let empty = root.path().join("bin");
+    std::fs::create_dir_all(&empty).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .current_dir(&dir)
+        .env("PATH", &empty)
+        .env("ARCFORM_HISTORY_DIR", root.path().join("history"))
+        .env_remove("ARC_SQL_READER")
+        .env_remove("ARC_DUCKDB_BIN")
+        .args([
+            "sql",
+            "record",
+            "SELECT * FROM orders WHERE amount > 10",
+            "--name",
+            "big_orders",
+        ])
+        .output()
+        .expect("spawn arc");
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "arc sql record must succeed: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches(NO_DUCKDB).count(),
+        1,
+        "one warning says the graph is arc's own reading: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "warning: the asset graph is arc's own reading of the SQL, because no DuckDB 2 \
+             answered (could not ask DuckDB `duckdb` for its parse:"
+        ),
+        "the warning says why: {stderr}"
+    );
+    assert!(
+        std::fs::read_to_string(dir.join("arcform.yaml"))
+            .unwrap()
+            .contains("big_orders"),
+        "the step was recorded on the table arc's own parser found"
+    );
+}
+
+/// A stand-in `duckdb` that reports `version` and answers nothing else, so the test needs
+/// no particular DuckDB on PATH.
+fn fake_duckdb(dir: &Path, version: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("fake-duckdb");
+    std::fs::write(
+        &bin,
+        format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '{version} (fake) 0000000000'; fi\nexit 0\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+#[test]
+fn arc_run_without_a_duckdb_2_is_refused_before_a_step_runs() {
+    // A 1.x command line is refused by its version; a 2.0 one that answers nothing, by the
+    // first question arc asks of it, for the step's tokens.
+    for (version, says) in [
+        ("v1.5.6", vec!["DuckDB 1.5.6", ">=2.0, <3"]),
+        ("v2.0.0", vec!["could not read the tokens", "no version"]),
+    ] {
+        let engines = tempfile::tempdir().unwrap();
+        let bin = fake_duckdb(engines.path(), version);
+        let dir = project(&[("load", LOAD)]);
+        let run = arc_run(dir.path(), Reader::Program(bin));
+        assert!(
+            run.code.is_some_and(|code| code != 0),
+            "{version}: arc run must refuse:\n{}",
+            run.printed()
+        );
+        for word in says {
+            assert!(
+                run.stderr.contains(word),
+                "{version}: the refusal must name {word:?}:\n{}",
+                run.stderr
+            );
+        }
+        assert!(
+            !dir.path().join("reader.duckdb").exists() && !run.stdout.contains("] load"),
+            "{version}: a step ran:\n{}",
+            run.printed()
+        );
+    }
+}
+
+#[test]
+fn table_functions_are_read_alike_by_either_reader() {
     let steps = [
         (
             "xlsx",
@@ -278,7 +441,7 @@ fn table_functions_are_read_as_with_the_reader_unset() {
     ];
     for (step, sql) in steps {
         let mut read = Vec::new();
-        for reader in [Reader::Default, Reader::DuckDbPreview] {
+        for reader in [Reader::Sqlparser, Reader::Default] {
             let dir = project(&[(step, sql)]);
             let run = arc_run(dir.path(), reader);
             let contract = read_contract(dir.path());
@@ -309,8 +472,6 @@ fn table_functions_are_read_as_with_the_reader_unset() {
 }
 
 #[test]
-#[ignore = "needs the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build job \
-            downloads the preview and passes --include-ignored"]
 fn a_copy_from_a_query_records_its_file_and_the_querys_table() {
     let dir = project(&[
         (
@@ -322,7 +483,7 @@ fn a_copy_from_a_query_records_its_file_and_the_querys_table() {
             "COPY (SELECT * FROM a WHERE x > 1) TO 'out.csv' (HEADER);\n",
         ),
     ]);
-    let run = arc_run(dir.path(), Reader::DuckDbPreview);
+    let run = arc_run(dir.path(), Reader::Default);
     assert_eq!(run.code, Some(0), "arc run must exit 0:\n{}", run.printed());
     assert!(
         dir.path().join("out.csv").is_file(),
@@ -341,41 +502,9 @@ fn a_copy_from_a_query_records_its_file_and_the_querys_table() {
     );
 }
 
-/// What `duckdb` on PATH reports as its version: `v1.5.5`.
-fn version_on_path() -> String {
-    let out = Command::new("duckdb")
-        .args(["-no-init", "-csv", "-noheader", "-c", "SELECT version()"])
-        .output()
-        .expect("a duckdb on PATH");
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
 #[test]
-fn with_the_reader_set_a_duckdb_before_2_is_refused_before_a_step_runs() {
-    let version = version_on_path();
-    assert!(
-        version.starts_with("v1."),
-        "the duckdb on PATH is {version}, and this test needs a 1.x"
-    );
-    let dir = project(&[("load", LOAD)]);
-    let run = arc_run(dir.path(), Reader::Told("duckdb"));
-    assert_eq!(run.code, Some(1), "arc run must refuse:\n{}", run.printed());
-    assert!(
-        run.stderr.contains(&format!("is DuckDB {version}"))
-            && run.stderr.contains("needs a DuckDB 2.0 build"),
-        "the refusal must name {version} and ask for a 2.0 build:\n{}",
-        run.stderr
-    );
-    assert!(
-        !dir.path().join("reader.duckdb").exists() && !run.stdout.contains("] load"),
-        "a step ran:\n{}",
-        run.printed()
-    );
-}
-
-#[test]
-fn a_reader_arc_does_not_have_is_refused_naming_the_one_it_has() {
-    for value in ["sqlparser", "DuckDB", ""] {
+fn a_reader_arc_does_not_have_is_refused_naming_the_ones_it_has() {
+    for value in ["DuckDB", "sqlparser-rs", ""] {
         let dir = project(&[("load", LOAD)]);
         let run = arc_run(dir.path(), Reader::Told(value));
         assert_eq!(
@@ -386,8 +515,9 @@ fn a_reader_arc_does_not_have_is_refused_naming_the_one_it_has() {
         );
         assert!(
             run.stderr.contains(&format!("ARC_SQL_READER is '{value}'"))
-                && run.stderr.contains("`duckdb`"),
-            "ARC_SQL_READER={value:?}: the refusal must name the value and the one it takes:\n{}",
+                && run.stderr.contains("`duckdb`")
+                && run.stderr.contains("`sqlparser`"),
+            "ARC_SQL_READER={value:?}: the refusal must name the value and the two it takes:\n{}",
             run.stderr
         );
         assert!(
@@ -398,14 +528,12 @@ fn a_reader_arc_does_not_have_is_refused_naming_the_one_it_has() {
 }
 
 #[test]
-#[ignore = "needs the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build job \
-            downloads the preview and passes --include-ignored"]
 fn a_pivot_joined_to_another_table_is_not_read_as_reading_its_first() {
     let dir = project(&[
         ("load", LOAD),
         ("pivot", "PIVOT t JOIN u USING (k) ON c USING sum(v);\n"),
     ]);
-    let run = arc_run(dir.path(), Reader::DuckDbPreview);
+    let run = arc_run(dir.path(), Reader::Default);
     assert_eq!(run.code, Some(0), "arc run must exit 0:\n{}", run.printed());
     let pivot = statements(&read_contract(dir.path()), "pivot");
     assert_eq!(pivot.len(), 1, "one statement: {pivot:?}");

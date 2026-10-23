@@ -40,6 +40,7 @@ mod bridge;
 mod cli;
 mod contract;
 mod duckdb_lineage;
+mod duckdb_tokens;
 mod edit;
 mod engine;
 mod error;

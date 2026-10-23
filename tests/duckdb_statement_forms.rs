@@ -50,7 +50,8 @@ impl Run {
     fn assert_not_opaque(&self) {
         assert!(
             !self.stderr.contains("could not parse")
-                && !self.stderr.contains("treating as opaque step"),
+                && !self.stderr.contains("treating as opaque step")
+                && !self.stderr.contains("could not read statement"),
             "must not degrade to an opaque step:\nstderr:\n{}",
             self.stderr
         );
@@ -166,7 +167,7 @@ fn assert_wired(label: &str, first_stmt: &str) -> Run {
 
 #[test]
 fn install_from_community() {
-    assert_wired("install_from_community", "INSTALL mlpack FROM community;");
+    assert_wired("install_from_community", "INSTALL zipfs FROM community;");
 }
 
 #[test]
@@ -201,7 +202,7 @@ fn install_from_a_url_that_does_not_resolve() {
 fn force_install_from_community() {
     assert_wired(
         "force_install_from_community",
-        "FORCE INSTALL mlpack FROM community;",
+        "FORCE INSTALL zipfs FROM community;",
     );
 }
 
@@ -294,7 +295,7 @@ fn set_variable_with_a_typed_value() {
 #[test]
 fn postgres_still_refuses_the_new_forms() {
     let cases = [
-        ("INSTALL … FROM", "INSTALL mlpack FROM community;"),
+        ("INSTALL … FROM", "INSTALL zipfs FROM community;"),
         ("FORCE INSTALL", "FORCE INSTALL spatial;"),
         (
             "empty QUOTE",

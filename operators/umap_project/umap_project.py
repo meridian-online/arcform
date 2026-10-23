@@ -3,7 +3,7 @@
 # dependencies = [
 #   "umap-learn>=0.5,<0.6",
 #   "numpy>=1.26,<3",
-#   "duckdb>=1,<2",
+#   "duckdb>=2,<3",
 # ]
 # ///
 """umap_project — arcform typed Python operator (uv-run).

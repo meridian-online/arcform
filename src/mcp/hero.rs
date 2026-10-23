@@ -289,24 +289,9 @@ fn list_contracts(runs: &Path) -> BTreeSet<PathBuf> {
 /// The newest `.json` contract in `runs` that was not in `exclude` — i.e. the one this
 /// run just wrote.
 fn newest_new_contract(runs: &Path, exclude: &BTreeSet<PathBuf>) -> Option<PathBuf> {
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    let entries = std::fs::read_dir(runs).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") || exclude.contains(&path) {
-            continue;
-        }
-        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
-            continue;
-        };
-        if best
-            .as_ref()
-            .is_none_or(|(best_time, _)| modified >= *best_time)
-        {
-            best = Some((modified, path));
-        }
-    }
-    best.map(|(_, path)| path)
+    crate::contract::contracts_by_age(runs)
+        .into_iter()
+        .find(|path| !exclude.contains(path))
 }
 
 fn protocol_run_schema() -> Value {
