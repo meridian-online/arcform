@@ -27,7 +27,9 @@ BINARY="arc"
 # the `duckdb` command for a protocol's SQL steps, so a user needs it on PATH.
 DUCKDB_RECOMMENDED="v2.0.0"
 DUCKDB_INSTALLER_URL="https://install.duckdb.org"
-SOURCE_INSTALL="cargo install arcform --locked --features mcp,bundled-duckdb"
+# CXXFLAGS makes the bundled DuckDB report the release, which libduckdb-sys's vendored
+# development source does not (duckdb/duckdb-rs#917); drop it when duckdb-rs fixes that.
+SOURCE_INSTALL="CXXFLAGS='-DDUCKDB_VERSION=\"${DUCKDB_RECOMMENDED}\"' cargo install arcform --locked --features mcp,bundled-duckdb"
 # FOR TESTS ONLY, not a user setting: --self-test sets this, inside a subshell,
 # to a file:// tree laid out as a release is, so the install path runs without
 # the network. It is cleared here rather than read from the environment, so a

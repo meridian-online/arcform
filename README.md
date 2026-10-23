@@ -13,8 +13,10 @@ curl -fsSL https://install.meridian.online/arc | bash
 This installs a release build for macOS (Apple silicon and Intel) or Linux (x86_64 and aarch64, glibc 2.35 or later) and links `arc` into `~/.local/bin`. When no `duckdb` is on `PATH`, or the one there cannot read SQL into tokens, it then installs DuckDB's v2.0.0 release build with DuckDB's own installer, into `~/.duckdb/cli/2.0.0`, and says what to put on `PATH` if another `duckdb` comes first. Set `ARC_SKIP_DUCKDB=1` (`curl -fsSL https://install.meridian.online/arc | ARC_SKIP_DUCKDB=1 bash`) to leave DuckDB alone. To build from source instead:
 
 ```sh
-cargo install arcform --locked --features mcp,bundled-duckdb
+CXXFLAGS='-DDUCKDB_VERSION="v2.0.0"' cargo install arcform --locked --features mcp,bundled-duckdb
 ```
+
+The `CXXFLAGS` setting is needed until duckdb-rs fixes [#917](https://github.com/duckdb/duckdb-rs/issues/917): without it the bundled DuckDB reports a development version.
 
 What arc needs beside it:
 

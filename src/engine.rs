@@ -2641,19 +2641,21 @@ pub mod mock {
 mod tests {
     use super::*;
 
-    // The DuckDB compiled into a bundled build reports the release, not the development
-    // version libduckdb-sys vendors (duckdb/duckdb-rs#917); CI's `bundled` job and the
-    // release workflow define DUCKDB_VERSION at build. Remove with the workaround.
-    #[cfg(feature = "bundled-duckdb")]
+    // Every arc build must link a DuckDB that reports the release, not a development
+    // version. libduckdb-sys vendors a development DuckDB for the bundled build
+    // (duckdb/duckdb-rs#917); CI's `bundled` job and the release workflow define
+    // DUCKDB_VERSION at build. Remove this note with the workaround.
     #[test]
-    fn bundled_duckdb_reports_the_release_version() {
+    fn the_linked_duckdb_reports_the_release_version() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
         let version: String = conn
             .query_row("SELECT version()", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
             version, DUCKDB_RECOMMENDED,
-            "build the bundled DuckDB with CXXFLAGS=-DDUCKDB_VERSION=\"<release>\""
+            "link DuckDB's release library (DUCKDB_LIB_DIR); a development build such as \
+             Homebrew's 2.0.0 library reports a development version. For a bundled build, \
+             set CXXFLAGS='-DDUCKDB_VERSION=\"{DUCKDB_RECOMMENDED}\"'"
         );
     }
 
