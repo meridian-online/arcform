@@ -24,7 +24,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::duckdb_lineage::Refusal;
+use crate::duckdb_lineage::{Refusal, major};
 use crate::engine::{DuckDbProgram, Tok, cli_batches, strip_unicode_spaces};
 
 /// A token as `sql_tokenize` gives it. `start` is a byte offset into the text asked
@@ -139,7 +139,7 @@ impl Process {
         }
         let unreadable = |reason: String| {
             Refusal::Unreadable(format!(
-                "its tokens could not be read: {reason}; {}",
+                "DuckDB's answer could not be read as tokens: {reason}; {}",
                 stderr.trim()
             ))
         };
@@ -324,8 +324,29 @@ pub(crate) fn tokenize_with(
         .into_iter()
         .map(|(batch, lines)| (as_tokenized(&batch), lines))
         .collect();
-    let texts: Vec<String> = cut.iter().map(|(text, _)| text.clone()).collect();
-    let (version, answers) = asked(ask, &texts)?;
+    // A text of spaces alone holds no token, and is not asked about: a file with no SQL,
+    // empty or only dot commands and `#` lines, starts no DuckDB and has nothing to refuse.
+    let asking: Vec<String> = cut
+        .iter()
+        .map(|(text, _)| text.clone())
+        .filter(|text| !is_blank(text))
+        .collect();
+    let (version, mut asked_answers) = if asking.is_empty() {
+        (String::new(), Vec::new())
+    } else {
+        asked(ask, &asking)?
+    };
+    asked_answers.reverse();
+    let answers: Vec<Vec<Token>> = cut
+        .iter()
+        .map(|(text, _)| {
+            if is_blank(text) {
+                Vec::new()
+            } else {
+                asked_answers.pop().unwrap_or_default()
+            }
+        })
+        .collect();
     let batches: Vec<BatchTokens> = cut
         .into_iter()
         .zip(answers)
@@ -369,13 +390,27 @@ fn as_tokenized(batch: &[u8]) -> String {
     String::from_utf8_lossy(&strip_unicode_spaces(batch)).into_owned()
 }
 
-/// Asks `ask` about `texts`, and refuses an answer that does not hold one token list per
-/// text, or a token that starts off its text.
+/// Whether `text` holds only the characters DuckDB's tokenizer skips between tokens
+/// (`StringUtil::CharacterIsSpace`, `src/include/duckdb/common/string_util.hpp`): it holds
+/// no token.
+fn is_blank(text: &str) -> bool {
+    text.bytes()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r'))
+}
+
+/// Asks `ask` about `texts`, and refuses an answer from a DuckDB that is not a 2.x build,
+/// whose tokenizer arc reads by, an answer that does not hold one token list per text, or a
+/// token that starts off its text.
 fn asked(
     ask: &mut dyn FnMut(&[String]) -> Result<Answer, Refusal>,
     texts: &[String],
 ) -> Result<Answer, Refusal> {
     let (version, answers) = ask(texts)?;
+    if major(&version) != Some(2) {
+        return Err(Refusal::Unreadable(format!(
+            "the tokens came from DuckDB {version}, and arc reads the tokens of a DuckDB 2.x"
+        )));
+    }
     if answers.len() != texts.len() {
         return Err(Refusal::Unreadable(format!(
             "{} token lists for {} texts",
@@ -446,14 +481,13 @@ impl Lines<'_> {
     /// before it. A batch holds one `\n` between each two of its lines.
     fn at(&mut self, start: usize) -> usize {
         let start = start.min(self.text.len());
+        let newlines = |span: &[u8]| span.iter().filter(|&&b| b == b'\n').count();
         if start < self.at {
-            self.at = 0;
-            self.line = 1;
+            // A start before the last one, as after a `$` read as an operator: step back.
+            self.line -= newlines(&self.text[start..self.at]);
+        } else {
+            self.line += newlines(&self.text[self.at..start]);
         }
-        self.line += self.text[self.at..start]
-            .iter()
-            .filter(|&&b| b == b'\n')
-            .count();
         self.at = start;
         self.line
     }
@@ -545,7 +579,9 @@ fn e_unescape(raw: &str) -> String {
 }
 
 /// A dollar-quoted string's text: what lies between its `$tag$` and the closing one, or to
-/// the end of its text when it is left open.
+/// the end of its text when it is left open, as DuckDB 2.0's `StringLiteralMatcher` finds
+/// the tag (`TryGetDollarQuoteDelimiterLength`) and strips it (`StripStringLiteral`), in
+/// `src/include/duckdb/parser/peg/matcher/string_literal_matcher.hpp`.
 fn dollar_body(word: &str) -> Option<&str> {
     let rest = word.strip_prefix('$')?;
     let close = rest.find('$')?;
@@ -628,6 +664,9 @@ pub(crate) fn to_tok(batch: &[u8], tokens: &[Token]) -> Vec<(Tok, usize)> {
             ));
             continue;
         }
+        // DuckDB 2.0 takes `"` or a backtick as an identifier's quotes, a doubled one inside
+        // as one (`Tokenizer::IsQuotedIdentifierDelimiter`,
+        // `src/parser/peg/tokenizer/base_tokenizer.cpp`).
         if let Some(delimiter) = word.chars().next().filter(|c| matches!(c, '"' | '`')) {
             let body = &word[1..];
             let body = match body.strip_suffix(delimiter) {
@@ -763,7 +802,8 @@ pub(crate) mod recorded {
         tokenize_with(file, &mut ask)
     }
 
-    fn ask(texts: &[String]) -> Result<Answer, Refusal> {
+    /// The tokens of `texts`, as [`tokenize_with`] asks for them.
+    pub(crate) fn ask(texts: &[String]) -> Result<Answer, Refusal> {
         if let Some(program) = preview() {
             let answer = Process { program }.ask_texts(texts)?;
             if std::env::var_os(RECORD_ENV).is_some() {
@@ -1025,6 +1065,64 @@ mod tests {
                 "{file:?}: {tokens:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_file_with_no_sql_text_starts_no_duckdb() {
+        let mut fails = |_: &[String]| -> Result<Answer, Refusal> {
+            panic!("a file with no SQL text asks DuckDB nothing")
+        };
+        for file in ["", "  \n\t\r\n", ".mode list\n", "# a note\n.print hi\n"] {
+            let tokens = tokenize_with(file.as_bytes(), &mut fails).expect("nothing to ask");
+            assert!(
+                tokens.batches.iter().all(|b| b.tokens.is_empty()),
+                "{file:?}"
+            );
+        }
+        // Only the text holding SQL is asked about.
+        let mut asked = Vec::new();
+        let mut ask = |texts: &[String]| {
+            asked.extend(texts.iter().cloned());
+            Ok((
+                "v2.0.0".to_string(),
+                texts.iter().map(|_| Vec::new()).collect(),
+            ))
+        };
+        tokenize_with(b".mode list\nSELECT 1;\n", &mut ask).unwrap();
+        assert_eq!(asked, vec!["SELECT 1;".to_string()]);
+    }
+
+    #[test]
+    fn tokens_from_a_duckdb_that_is_not_2_x_are_refused() {
+        for version in ["v1.5.6", "v3.0.0", ""] {
+            let mut ask = |texts: &[String]| {
+                Ok((
+                    version.to_string(),
+                    texts.iter().map(|_| Vec::new()).collect(),
+                ))
+            };
+            assert!(
+                matches!(
+                    tokenize_with(b"SELECT 1;", &mut ask),
+                    Err(Refusal::Unreadable(_))
+                ),
+                "{version:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_after_a_start_that_steps_back_is_counted_from_where_it_was() {
+        let text = b"a\nb\nc\nd";
+        let mut lines = Lines {
+            text,
+            at: 0,
+            line: 1,
+        };
+        assert_eq!(lines.at(6), 4);
+        assert_eq!(lines.at(2), 2);
+        assert_eq!(lines.at(4), 3);
+        assert_eq!(lines.at(0), 1);
     }
 
     #[test]

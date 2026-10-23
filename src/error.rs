@@ -189,7 +189,7 @@ pub enum Error {
     // a file from those tokens alone, so the file is refused rather than read some other
     // way; nothing in it ran. `step` is `None` for a hook.
     #[error(
-        "{place} ({file}) was refused and did not run: arc could not read its SQL, because DuckDB gave no tokens for it that arc can read: {reason}\n\
+        "{place} ({file}) was refused and did not run: arc could not read the tokens of its SQL from DuckDB: {reason}\n\
          arc reads each SQL file's tokens from the DuckDB that runs it, to check what the file installs, and runs no file it could not read. See {}",
         crate::engine::VETTED_EXTENSIONS_DOC
     )]

@@ -290,7 +290,7 @@ fn read_step_with(ask: &mut dyn Ask, sql: &str) -> Result<StepReading, Refusal> 
 }
 
 /// The major version in `v2.0.0-alpha43569`.
-fn major(version: &str) -> Option<u64> {
+pub(crate) fn major(version: &str) -> Option<u64> {
     let version = version.strip_prefix('v').unwrap_or(version);
     version
         .split('.')

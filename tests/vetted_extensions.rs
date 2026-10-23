@@ -2985,6 +2985,29 @@ fn no_tokens_from_duckdb_stops_the_run_naming_the_step() {
     assert_eq!(run.started(), Vec::<String>::new(), "no step ran");
 }
 
+/// A file with no SQL in it, empty or only dot commands and `#` lines, has nothing to
+/// refuse, and its tokens are not asked for: a DuckDB that would give none refuses nothing.
+#[test]
+fn a_file_with_no_sql_is_not_asked_about() {
+    let protocol = Protocol::steps(&[("empty", ""), ("dots", ".mode list\n# a note\n")]);
+    let engine = protocol.root.path().join("duckdb");
+    script(
+        &engine,
+        &format!(
+            "echo \"$*\" >> '{}'\nif [ \"$1\" = \"--version\" ]; then echo 'v{VETTED_ON} (fake) 0000000000'; fi\nif [ \"$1\" = \"-no-init\" ]; then exit 1; fi\nexit 0\n",
+            protocol.root.path().join("duckdb.log").display()
+        ),
+    );
+    let run = run_on_engine(&protocol, &engine);
+    assert_eq!(run.code, Some(0), "nothing to refuse:\n{}", run.stderr);
+    assert!(
+        !run.engine_calls.iter().any(|c| c.starts_with("-no-init")),
+        "no token question: {:?}",
+        run.engine_calls
+    );
+    assert_eq!(run.started(), vec!["empty.sql", "dots.sql"]);
+}
+
 /// A file is asked about once for each text it holds: the check before the run and the
 /// check just before each step read one answer, and a second file with the same text reads
 /// the first file's.
