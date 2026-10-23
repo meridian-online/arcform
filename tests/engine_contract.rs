@@ -743,7 +743,7 @@ fn the_override_runs_an_untested_engine_with_a_warning_and_keeps_the_manifest_co
 fn assert_no_tokenizer_refusal(stderr: &str, names: &str) {
     for needle in [
         names,
-        "v2.0.0-dev88614 (Development Version) d54cbbe3df",
+        "which prints `v2.0.0-dev88614 (Development Version) d54cbbe3df`, cannot read",
         "cannot read SQL into tokens",
         "autocomplete extension",
         "check what each SQL step installs",

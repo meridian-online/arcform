@@ -161,6 +161,13 @@ duckdb_tokenizes() {
     -c "SELECT count(*) FROM sql_tokenize('SELECT 1');" < /dev/null > /dev/null 2>&1
 }
 
+# The version the duckdb at $1 prints, `v2.0.0`, or nothing; run as the probe
+# runs it.
+duckdb_version_of() {
+  DUCKDB_AGENT_MODE=0 "$1" -no-init --version < /dev/null 2> /dev/null \
+    | awk 'NR == 1 {print $1}' || true
+}
+
 # What to do about DuckDB: "optout" when ARC_SKIP_DUCKDB is set, "missing" when
 # no duckdb is on PATH, "lacking" when the one on PATH cannot read SQL into
 # tokens, and "keep" when it can.
@@ -202,17 +209,37 @@ ensure_duckdb() {
       return 0
       ;;
     optout)
-      info "ARC_SKIP_DUCKDB is set, so DuckDB was left alone. arc runs a protocol's SQL steps with DuckDB's release build, ${DUCKDB_RECOMMENDED}; to install it: ${ed_manual}"
+      if [ -z "$ed_bin" ]; then
+        warn "the duckdb command is not on your PATH, and ARC_SKIP_DUCKDB is set, so DuckDB was left alone. arc runs a protocol's SQL steps with DuckDB's release build, ${DUCKDB_RECOMMENDED}; to install it: ${ed_manual}"
+      else
+        info "ARC_SKIP_DUCKDB is set, so DuckDB was left alone. arc runs a protocol's SQL steps with DuckDB's release build, ${DUCKDB_RECOMMENDED}; to install it: ${ed_manual}"
+      fi
       return 0
       ;;
     missing)
       info "no duckdb is on your PATH, and arc runs a protocol's SQL steps with it, so this installs DuckDB's release build, ${DUCKDB_RECOMMENDED}, with DuckDB's own installer. Set ARC_SKIP_DUCKDB=1 to skip this."
       ;;
     lacking)
-      info "the duckdb on your PATH, ${ed_bin}, cannot read SQL into tokens, because it was built without DuckDB's autocomplete extension, and arc needs those tokens to check what each SQL step installs. So this installs DuckDB's release build, ${DUCKDB_RECOMMENDED}, with DuckDB's own installer, and leaves ${ed_bin} as it is. Set ARC_SKIP_DUCKDB=1 to skip this."
+      # A DuckDB before 2.0 has no sql_tokenize at all, whatever it was built
+      # with, so it is named by its version rather than its build.
+      ed_found="$(duckdb_version_of "$ed_bin")"
+      case "$ed_found" in
+        v0.* | v1.* | 0.* | 1.*)
+          ed_why="is DuckDB ${ed_found}, older than the 2.0 arc needs"
+          ;;
+        *)
+          ed_why="cannot read SQL into tokens, because it was built without DuckDB's autocomplete extension, and arc needs those tokens to check what each SQL step installs"
+          ;;
+      esac
+      info "the duckdb on your PATH, ${ed_bin}, ${ed_why}. So this installs DuckDB's release build, ${DUCKDB_RECOMMENDED}, with DuckDB's own installer, and leaves ${ed_bin} as it is. Set ARC_SKIP_DUCKDB=1 to skip this."
       ;;
   esac
-  ed_tmp="$(mktemp -d)"
+  # Guarded: under set -e a failed mktemp would end the script after arc was
+  # installed, as though the install had failed.
+  if ! ed_tmp="$(mktemp -d 2> /dev/null)" || [ -z "$ed_tmp" ]; then
+    warn "could not make a temporary directory for DuckDB's installer. arc is installed; install DuckDB yourself: ${ed_manual}"
+    return 0
+  fi
   if ! duckdb_installer > "${ed_tmp}/duckdb-install.sh"; then
     rm -rf "$ed_tmp"
     warn "could not download DuckDB's installer from ${DUCKDB_INSTALLER_URL}. arc is installed; install DuckDB yourself: ${ed_manual}"
@@ -428,10 +455,12 @@ st_duckdb() {
   st_dd="$(mktemp -d)"
   # The tools ensure_duckdb and the stand-ins use, and no duckdb, so "no
   # duckdb on PATH" holds whatever this machine has in /usr/bin.
-  mkdir -p "${st_dd}/tools" "${st_dd}/good" "${st_dd}/lacking"
-  for st_tool in sh cat cp mkdir mktemp rm; do
+  mkdir -p "${st_dd}/tools" "${st_dd}/no-mktemp" "${st_dd}/good" "${st_dd}/lacking" "${st_dd}/old"
+  for st_tool in sh cat cp mkdir rm awk; do
     ln -s "$(command -v "$st_tool")" "${st_dd}/tools/${st_tool}"
+    ln -s "$(command -v "$st_tool")" "${st_dd}/no-mktemp/${st_tool}"
   done
+  ln -s "$(command -v mktemp)" "${st_dd}/tools/mktemp"
   st_tools="${st_dd}/tools"
   # A duckdb that reads SQL into tokens, and one built without the
   # autocomplete extension, each logging how it was run. The single quotes are
@@ -440,9 +469,13 @@ st_duckdb() {
   printf '#!/bin/sh\nprintf "agent=%%s args=%%s\\n" "${DUCKDB_AGENT_MODE:-unset}" "$*" >> "%s"\nexit 0\n' \
     "${st_dd}/good.log" > "${st_dd}/good/duckdb"
   # shellcheck disable=SC2016
-  printf '#!/bin/sh\nprintf "agent=%%s args=%%s\\n" "${DUCKDB_AGENT_MODE:-unset}" "$*" >> "%s"\ncase "$*" in\n  *sql_tokenize*)\n    echo "Extension Autoloading Error: the required extension autocomplete could not be installed" >&2\n    exit 1\n    ;;\nesac\nexit 0\n' \
+  printf '#!/bin/sh\nprintf "agent=%%s args=%%s\\n" "${DUCKDB_AGENT_MODE:-unset}" "$*" >> "%s"\ncase "$*" in\n  *--version*) echo "v2.0.0-dev88614 (Development Version) d54cbbe3df" ;;\n  *sql_tokenize*)\n    echo "Extension Autoloading Error: the required extension autocomplete could not be installed" >&2\n    exit 1\n    ;;\nesac\nexit 0\n' \
     "${st_dd}/lacking.log" > "${st_dd}/lacking/duckdb"
-  chmod +x "${st_dd}/good/duckdb" "${st_dd}/lacking/duckdb"
+  # A DuckDB 1.x, which has no sql_tokenize at all.
+  # shellcheck disable=SC2016
+  printf '#!/bin/sh\ncase "$*" in\n  *--version*) echo "v1.5.6 (Variegata) 0000000000" ;;\n  *sql_tokenize*)\n    echo "Catalog Error: Table Function with name sql_tokenize does not exist!" >&2\n    exit 1\n    ;;\nesac\nexit 0\n' \
+    > "${st_dd}/old/duckdb"
+  chmod +x "${st_dd}/good/duckdb" "${st_dd}/lacking/duckdb" "${st_dd}/old/duckdb"
   # DuckDB's installer: logs the version it was asked for, and puts the good
   # stand-in where the real one puts that version.
   # shellcheck disable=SC2016
@@ -478,6 +511,16 @@ st_duckdb() {
   st_contains "duckdb lacking the tokenizer: gives the PATH line" "$st_line" "${st_dd}/lacking.out"
   st_contains "duckdb lacking the tokenizer: gives ARC_DUCKDB_BIN" "$st_bin" "${st_dd}/lacking.out"
 
+  # A DuckDB 1.x on PATH: installed beside it, named by its version, not taken
+  # for a build without the autocomplete extension.
+  st_duckdb_run old "${st_dd}/old:${st_tools}" ""
+  st_equal "duckdb 1.x: exits 0 ($(cat "${st_dd}/old.out"))" "0" "$st_rc"
+  st_equal "duckdb 1.x: DuckDB's installer runs once" \
+    "$st_v" "$(cat "${st_dd}/home-old/installer.log" 2> /dev/null)"
+  st_contains "duckdb 1.x: named by its version" \
+    "${st_dd}/old/duckdb, is DuckDB v1.5.6, older than the 2.0 arc needs" "${st_dd}/old.out"
+  st_lacks "duckdb 1.x: not said to lack the autocomplete extension" "autocomplete" "${st_dd}/old.out"
+
   # A duckdb that reads SQL into tokens: left alone, and nothing said.
   st_duckdb_run good "${st_dd}/good:${st_tools}" ""
   st_equal "working duckdb: exits 0" "0" "$st_rc"
@@ -492,6 +535,18 @@ st_duckdb() {
   st_nothing_installed "ARC_SKIP_DUCKDB=1" "${st_dd}/home-optout"
   st_contains "ARC_SKIP_DUCKDB=1: says DuckDB was left alone" \
     "ARC_SKIP_DUCKDB is set, so DuckDB was left alone" "${st_dd}/optout.out"
+  st_contains "ARC_SKIP_DUCKDB=1 with no duckdb: still warns it is not on PATH" \
+    "warning: the duckdb command is not on your PATH" "${st_dd}/optout.out"
+
+  # Opted out with a duckdb there: no warning, only the note.
+  st_duckdb_run optout-good "${st_dd}/good:${st_tools}" 1
+  st_lacks "ARC_SKIP_DUCKDB=1 with a duckdb: no warning" "warning:" "${st_dd}/optout-good.out"
+
+  # mktemp failing after arc is installed: a warning, not an abort.
+  st_duckdb_run no-mktemp "${st_dd}/no-mktemp" ""
+  st_equal "mktemp failing: exits 0 ($(cat "${st_dd}/no-mktemp.out"))" "0" "$st_rc"
+  st_contains "mktemp failing: says arc is installed and how to install DuckDB" \
+    "arc is installed; install DuckDB yourself: curl https://install.duckdb.org | DUCKDB_VERSION=${st_v} sh" "${st_dd}/no-mktemp.out"
 
   # Installed where PATH already looks: no PATH line, since arc finds it.
   st_duckdb_run onpath "${st_tools}:${st_dd}/home-onpath/.duckdb/cli/${st_v}" ""

@@ -333,20 +333,20 @@ pub fn run_with_params(
         // extension does, is named with the fix, in place of the refusal of the first file
         // it gave none for. The probe runs when that check fails, or when it asked DuckDB
         // nothing, so a run whose files all read starts no DuckDB more than before.
-        let no_tokenizer = || Error::NoTokenizer {
+        let no_tokenizer = |error| Error::NoTokenizer {
             which: engine.which(&info.printed),
+            error,
         };
         let installs = match check_extension_installs(&sql, info.version.as_ref(), engine) {
             Err(refused @ Error::SqlNotRead { .. }) => {
-                return Err(if engine.tokenizer_answers() {
-                    refused
-                } else {
-                    no_tokenizer()
-                });
+                return Err(engine.tokenizer_failure().map_or(refused, no_tokenizer));
             }
             Err(refused) => return Err(refused),
-            Ok(installs) if !installs.tokens.asked_duckdb() && !engine.tokenizer_answers() => {
-                return Err(no_tokenizer());
+            Ok(installs) if !installs.tokens.asked_duckdb() => {
+                if let Some(error) = engine.tokenizer_failure() {
+                    return Err(no_tokenizer(error));
+                }
+                installs
             }
             Ok(installs) => installs,
         };
@@ -1958,7 +1958,8 @@ mod tests {
         setup_project(dir.path(), ONE_SQL_STEP, &[("s.sql", "SELECT 1;")]);
         let engine = MockEngine::new();
         *engine.tokens_failure.borrow_mut() = Some("it exited with 1".into());
-        *engine.tokenizer.borrow_mut() = false;
+        *engine.tokenizer_failure.borrow_mut() =
+            Some("Extension Autoloading Error: the extension 'autocomplete'".into());
         let refused = run(dir.path(), &engine, &MockStateBackend::new(), false).unwrap_err();
         assert!(matches!(refused, Error::NoTokenizer { .. }), "{refused:?}");
         assert_eq!(refused.exit_code(), 2);
@@ -1972,10 +1973,28 @@ mod tests {
         );
         let message = refused.to_string();
         assert!(
-            message.starts_with("the mock DuckDB () cannot read SQL into tokens"),
+            message.starts_with("the mock DuckDB cannot read SQL into tokens"),
             "{message}"
         );
         assert!(!message.contains("could not read the tokens"), "{message}");
+    }
+
+    #[test]
+    fn a_tokenizer_failing_for_another_reason_is_refused_quoting_duckdb() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path(), ONE_SQL_STEP, &[("s.sql", "SELECT 1;")]);
+        let engine = MockEngine::new();
+        *engine.tokens_failure.borrow_mut() = Some("it exited with 1".into());
+        *engine.tokenizer_failure.borrow_mut() = Some("Out of Memory Error: no room".into());
+        let refused = run(dir.path(), &engine, &MockStateBackend::new(), false).unwrap_err();
+        assert!(matches!(refused, Error::NoTokenizer { .. }), "{refused:?}");
+        let message = refused.to_string();
+        assert!(
+            message.contains("said: Out of Memory Error: no room"),
+            "{message}"
+        );
+        assert!(!message.contains("built without"), "{message}");
+        assert!(message.contains("DUCKDB_VERSION=2.0.0"), "{message}");
     }
 
     #[test]
@@ -1994,7 +2013,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         setup_project(dir.path(), ONE_SQL_STEP, &[("s.sql", "")]);
         let engine = MockEngine::new();
-        *engine.tokenizer.borrow_mut() = false;
+        *engine.tokenizer_failure.borrow_mut() =
+            Some("Extension Autoloading Error: the extension 'autocomplete'".into());
         let refused = run(dir.path(), &engine, &MockStateBackend::new(), false).unwrap_err();
         assert!(matches!(refused, Error::NoTokenizer { .. }), "{refused:?}");
         assert_eq!(*engine.probed.borrow(), 1);

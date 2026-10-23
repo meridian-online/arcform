@@ -195,23 +195,33 @@ impl Process {
     }
 }
 
-/// Whether `program` answers `sql_tokenize` at all, asked for the tokens of `SELECT 1`.
+/// What `program` said when asked for the tokens of `SELECT 1`, when it could not answer
+/// `sql_tokenize` at all; `None` when it answered.
 ///
-/// `false` only when DuckDB ran and exited with an error, as a build without DuckDB's
+/// A failure is DuckDB running and exiting with an error, as a build without DuckDB's
 /// autocomplete extension does: `sql_tokenize` lives in that extension, and such a build
-/// fails to autoload it. A DuckDB that could not be started, or that exits cleanly with an
-/// answer arc cannot read, is not this failure, and the check that asked it first says so.
-pub(crate) fn tokenizer_answers(program: &DuckDbProgram) -> bool {
+/// fails to autoload it. The failure is DuckDB's standard error, or its exit status when it
+/// printed none. A DuckDB that could not be started, or that exits cleanly with an answer
+/// arc cannot read, is not this failure, and the check that asked it first says so.
+pub(crate) fn tokenizer_failure(program: &DuckDbProgram) -> Option<String> {
     let process = Process {
         program: program.clone(),
     };
-    match process.output(
-        &["-list", "-noheader"],
-        &format!("SELECT '{MARK}' || count(*) FROM sql_tokenize('SELECT 1');\n"),
-    ) {
-        Ok(output) => output.status.success(),
-        Err(_) => true,
+    let output = process
+        .output(
+            &["-list", "-noheader"],
+            &format!("SELECT '{MARK}' || count(*) FROM sql_tokenize('SELECT 1');\n"),
+        )
+        .ok()?;
+    if output.status.success() {
+        return None;
     }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Some(if stderr.is_empty() {
+        format!("it exited with {} and printed nothing", output.status)
+    } else {
+        stderr
+    })
 }
 
 /// What arc prints before each line of its own in a token answer, which no token's span

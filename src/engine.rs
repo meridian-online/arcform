@@ -128,11 +128,11 @@ pub trait Engine {
     /// from these alone, so a failure here refuses the file.
     fn tokenize(&self, file: &[u8]) -> std::result::Result<FileTokens, Refusal>;
 
-    /// Whether the DuckDB the steps run on can be asked for tokens at all: `false` only when
-    /// it refuses `sql_tokenize` on `SELECT 1`, as a build without DuckDB's autocomplete
-    /// extension does. A DuckDB that cannot be started, or answers in a way arc cannot read,
-    /// is left to the check that asked it first.
-    fn tokenizer_answers(&self) -> bool;
+    /// What the DuckDB the steps run on said when it could not answer `sql_tokenize` on
+    /// `SELECT 1` at all, as a build without DuckDB's autocomplete extension cannot; `None`
+    /// when it answered. A DuckDB that cannot be started, or answers in a way arc cannot
+    /// read, is `None`, left to the check that asked it first.
+    fn tokenizer_failure(&self) -> Option<String>;
 
     /// The DuckDB the steps run on, as a person can find it, with the version `printed`.
     fn which(&self, printed: &str) -> String;
@@ -387,32 +387,45 @@ pub(crate) fn release_install_fix() -> String {
     )
 }
 
-/// Why a DuckDB whose tokenizer does not answer cannot be read, naming it as `which` does.
-pub(crate) fn no_tokenizer_cause(which: &str) -> String {
-    format!(
-        "{which} cannot read SQL into tokens, because it was built without DuckDB's \
-         autocomplete extension. arc needs those tokens to check what each SQL step installs."
-    )
+/// Why a DuckDB whose tokenizer does not answer cannot be read, naming it as `which` does,
+/// from `error`, what it said. Built without DuckDB's autocomplete extension is said as fact
+/// only when DuckDB's error names that extension or `sql_tokenize`; any other error is
+/// quoted.
+pub(crate) fn no_tokenizer_cause(which: &str, error: &str) -> String {
+    let lower = error.to_lowercase();
+    let why = if lower.contains("autocomplete") || lower.contains("sql_tokenize") {
+        "cannot read SQL into tokens, because it was built without DuckDB's autocomplete \
+         extension"
+            .to_string()
+    } else {
+        format!("could not answer DuckDB's tokenizer, `sql_tokenize`, and said: {error}")
+    };
+    format!("{which} {why}. arc needs those tokens to check what each SQL step installs.")
 }
 
-/// The DuckDB `program` names, as a person can find it, with the version it printed:
-/// the path `ARC_DUCKDB_BIN` gives, or the file the search path finds for `duckdb`.
+/// The DuckDB `program` names, as a person can find it, with the version it printed, as
+/// the subject of a sentence: the path `ARC_DUCKDB_BIN` gives, or the file the search path
+/// finds for `duckdb`. A printed version holds brackets of its own, so it is quoted:
+/// "the duckdb on PATH, `/usr/bin/duckdb`, which prints `v2.0.0 (Cyanoptera) d54cbbe3df`,".
 pub(crate) fn which_duckdb(program: &DuckDbProgram, printed: &str) -> String {
-    let named = match program {
-        DuckDbProgram::Told(path) => {
-            format!("the DuckDB {DUCKDB_BIN_ENV} names, {}", path.display())
-        }
-        DuckDbProgram::SearchPath => match on_search_path("duckdb") {
-            Some(path) => format!("the duckdb on PATH, {}", path.display()),
-            None => "the duckdb on PATH".to_string(),
-        },
+    let path = match program {
+        DuckDbProgram::Told(path) => Some(path.clone()),
+        DuckDbProgram::SearchPath => on_search_path("duckdb"),
     };
-    let printed = printed.trim();
-    if printed.is_empty() {
-        named
-    } else {
-        format!("{named} ({printed})")
+    let mut which = match program {
+        DuckDbProgram::Told(_) => format!("the DuckDB {DUCKDB_BIN_ENV} names"),
+        DuckDbProgram::SearchPath => "the duckdb on PATH".to_string(),
+    };
+    if let Some(path) = &path {
+        which.push_str(&format!(", `{}`", path.display()));
     }
+    let printed = printed.trim();
+    if !printed.is_empty() {
+        which.push_str(&format!(", which prints `{printed}`,"));
+    } else if path.is_some() {
+        which.push(',');
+    }
+    which
 }
 
 /// The first file called `name` on `PATH` that the user may run, as the operating system
@@ -791,10 +804,8 @@ impl Engine for DuckDbEngine {
         }
     }
 
-    fn tokenizer_answers(&self) -> bool {
-        duckdb_program().map_or(true, |program| {
-            crate::duckdb_tokens::tokenizer_answers(&program)
-        })
+    fn tokenizer_failure(&self) -> Option<String> {
+        crate::duckdb_tokens::tokenizer_failure(&duckdb_program().ok()?)
     }
 
     fn which(&self, printed: &str) -> String {
@@ -2338,9 +2349,10 @@ pub mod mock {
         pub tokenized: RefCell<usize>,
         /// If set, `tokenize` fails with this reason.
         pub tokens_failure: RefCell<Option<String>>,
-        /// Whether `tokenizer_answers` says the tokenizer answers; `true` unless set.
-        pub tokenizer: RefCell<bool>,
-        /// How many times `tokenizer_answers` was asked.
+        /// What `tokenizer_failure` says the DuckDB said; `None`, a tokenizer that answers,
+        /// unless set.
+        pub tokenizer_failure: RefCell<Option<String>>,
+        /// How many times `tokenizer_failure` was asked.
         pub probed: RefCell<usize>,
     }
 
@@ -2381,7 +2393,7 @@ pub mod mock {
                 loads: RefCell::new(HashMap::new()),
                 tokenized: RefCell::new(0),
                 tokens_failure: RefCell::new(None),
-                tokenizer: RefCell::new(true),
+                tokenizer_failure: RefCell::new(None),
                 probed: RefCell::new(0),
             }
         }
@@ -2587,13 +2599,13 @@ pub mod mock {
             })
         }
 
-        fn tokenizer_answers(&self) -> bool {
+        fn tokenizer_failure(&self) -> Option<String> {
             *self.probed.borrow_mut() += 1;
-            *self.tokenizer.borrow()
+            self.tokenizer_failure.borrow().clone()
         }
 
-        fn which(&self, printed: &str) -> String {
-            format!("the mock DuckDB ({printed})")
+        fn which(&self, _printed: &str) -> String {
+            "the mock DuckDB".to_string()
         }
 
         fn report(&self, extensions: &[String]) -> EngineReport {
@@ -2619,6 +2631,49 @@ mod tests {
     }
 
     // A development build of a release's own commit is that release.
+    #[test]
+    fn a_tokenizer_error_naming_autocomplete_or_sql_tokenize_is_said_as_a_missing_extension() {
+        for error in [
+            "Extension Autoloading Error: the required extension 'autocomplete'",
+            "Catalog Error: Table Function with name sql_tokenize does not exist!",
+        ] {
+            assert_eq!(
+                no_tokenizer_cause("the duckdb on PATH", error),
+                "the duckdb on PATH cannot read SQL into tokens, because it was built without \
+                 DuckDB's autocomplete extension. arc needs those tokens to check what each SQL \
+                 step installs.",
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn any_other_tokenizer_error_is_quoted_rather_than_named() {
+        assert_eq!(
+            no_tokenizer_cause(
+                "the duckdb on PATH",
+                "Out of Memory Error: could not allocate"
+            ),
+            "the duckdb on PATH could not answer DuckDB's tokenizer, `sql_tokenize`, and said: \
+             Out of Memory Error: could not allocate. arc needs those tokens to check what each \
+             SQL step installs."
+        );
+    }
+
+    #[test]
+    fn a_told_duckdb_is_named_by_its_path_with_its_printed_version_quoted() {
+        let told = DuckDbProgram::Told(PathBuf::from("/opt/duckdb"));
+        assert_eq!(
+            which_duckdb(&told, "v2.0.0-dev88614 (Development Version) d54cbbe3df\n"),
+            "the DuckDB ARC_DUCKDB_BIN names, `/opt/duckdb`, which prints \
+             `v2.0.0-dev88614 (Development Version) d54cbbe3df`,"
+        );
+        assert_eq!(
+            which_duckdb(&told, ""),
+            "the DuckDB ARC_DUCKDB_BIN names, `/opt/duckdb`,"
+        );
+    }
+
     #[test]
     fn a_dev_build_of_a_release_commit_parses_as_the_release() {
         let parsed =

@@ -520,13 +520,12 @@ fn warn_once_no_duckdb(refusal: &duckdb_lineage::Refusal) {
 #[cfg(not(test))]
 fn no_tokenizer_named() -> Option<String> {
     let program = crate::engine::duckdb_program().ok()?;
-    if crate::duckdb_tokens::tokenizer_answers(&program) {
-        return None;
-    }
+    let error = crate::duckdb_tokens::tokenizer_failure(&program)?;
     let printed = crate::engine::printed_version(&program);
-    Some(no_tokenizer_warning(&crate::engine::which_duckdb(
-        &program, &printed,
-    )))
+    Some(no_tokenizer_warning(
+        &crate::engine::which_duckdb(&program, &printed),
+        &error,
+    ))
 }
 
 /// The lib's tests start no DuckDB, so none is found to lack a tokenizer.
@@ -535,11 +534,12 @@ fn no_tokenizer_named() -> Option<String> {
     None
 }
 
-/// The words of the warning for a DuckDB, named by `which`, whose tokenizer does not answer.
-pub(crate) fn no_tokenizer_warning(which: &str) -> String {
+/// The words of the warning for a DuckDB, named by `which`, whose tokenizer does not answer,
+/// saying `error`.
+pub(crate) fn no_tokenizer_warning(which: &str, error: &str) -> String {
     format!(
         "{} The asset graph is arc's own reading of the SQL instead. {}",
-        crate::engine::no_tokenizer_cause(which),
+        crate::engine::no_tokenizer_cause(which, error),
         crate::engine::release_install_fix()
     )
 }
@@ -1744,8 +1744,11 @@ mod tests {
     #[test]
     fn the_no_tokenizer_warning_names_the_cause_and_the_fix() {
         assert_eq!(
-            no_tokenizer_warning("the duckdb on PATH, /usr/bin/duckdb (v2.0.0)"),
-            "the duckdb on PATH, /usr/bin/duckdb (v2.0.0) cannot read SQL into tokens, because \
+            no_tokenizer_warning(
+                "the duckdb on PATH, `/usr/bin/duckdb`, which prints `v2.0.0`,",
+                "Catalog Error: Table Function with name sql_tokenize does not exist!"
+            ),
+            "the duckdb on PATH, `/usr/bin/duckdb`, which prints `v2.0.0`, cannot read SQL into tokens, because \
              it was built without DuckDB's autocomplete extension. arc needs those tokens to \
              check what each SQL step installs. The asset graph is arc's own reading of the SQL \
              instead. Install DuckDB's release build with DuckDB's own installer, pinned to the \
