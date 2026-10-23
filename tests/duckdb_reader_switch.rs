@@ -3,7 +3,7 @@
 //! other run as it was.
 //!
 //! The tests that read a step with DuckDB's parse need a DuckDB 2.0 build, named by
-//! `ARC_DUCKDB_PREVIEW_BIN`, and are `#[ignore]`d so an ordinary run skips them; `ci.yml`
+//! `ARC_DUCKDB_RECORD_BIN`, and are `#[ignore]`d so an ordinary run skips them; `ci.yml`
 //! runs them on the v2.0.0 release command line with `--include-ignored`. A 2.0 build is outside
 //! the versions arc is tested on, so those runs set `ARC_ALLOW_UNTESTED_ENGINE` as well.
 //! The rest need the `duckdb` on PATH, a 1.x release, as any `arc run` does.
@@ -16,13 +16,13 @@ use std::process::Command;
 mod common;
 use common::strip_ansi;
 
-const PREVIEW_ENV: &str = "ARC_DUCKDB_PREVIEW_BIN";
+const RECORD_ENV: &str = "ARC_DUCKDB_RECORD_BIN";
 
 /// Which reader a run is told to use, and so which DuckDB it runs.
 enum Reader {
     /// `ARC_SQL_READER` unset, on the `duckdb` found on PATH.
     Default,
-    /// `ARC_SQL_READER=duckdb`, on the 2.0 build `ARC_DUCKDB_PREVIEW_BIN` names.
+    /// `ARC_SQL_READER=duckdb`, on the 2.0 build `ARC_DUCKDB_RECORD_BIN` names.
     DuckDbPreview,
     /// `ARC_SQL_READER` set to `value`, on the `duckdb` found on PATH.
     Told(&'static str),
@@ -31,9 +31,9 @@ enum Reader {
 }
 
 fn preview() -> OsString {
-    std::env::var_os(PREVIEW_ENV).unwrap_or_else(|| {
+    std::env::var_os(RECORD_ENV).unwrap_or_else(|| {
         panic!(
-            "{PREVIEW_ENV} must name a DuckDB 2.0 build: this test is #[ignore]d so an \
+            "{RECORD_ENV} must name a DuckDB 2.0 build: this test is #[ignore]d so an \
              ordinary run skips it, and running it with --include-ignored says one is staged"
         )
     })
@@ -186,7 +186,7 @@ const LOAD: &str = "CREATE TABLE t AS SELECT * FROM (VALUES (1, 10, 'p', 2)) AS 
 const ASOF: &str = "CREATE TABLE r AS SELECT * EXCLUDE (a) FROM t ASOF LEFT JOIN u USING (k);\n";
 
 #[test]
-#[ignore = "needs the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build job \
+#[ignore = "needs the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build job \
             runs it on the v2.0.0 release CLI with --include-ignored"]
 fn with_the_reader_set_a_step_is_read_from_duckdbs_parse() {
     let dir = project(&[("load", LOAD), ("asof", ASOF)]);
@@ -268,7 +268,7 @@ fn without_the_reader_set_a_step_is_read_as_before() {
 }
 
 #[test]
-#[ignore = "needs the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build job \
+#[ignore = "needs the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build job \
             runs it on the v2.0.0 release CLI with --include-ignored"]
 fn table_functions_are_read_as_with_the_reader_unset() {
     let steps = [
@@ -316,7 +316,7 @@ fn table_functions_are_read_as_with_the_reader_unset() {
 }
 
 #[test]
-#[ignore = "needs the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build job \
+#[ignore = "needs the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build job \
             runs it on the v2.0.0 release CLI with --include-ignored"]
 fn a_copy_from_a_query_records_its_file_and_the_querys_table() {
     let dir = project(&[
@@ -407,7 +407,7 @@ fn a_reader_arc_does_not_have_is_refused_naming_the_one_it_has() {
 }
 
 #[test]
-#[ignore = "needs the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build job \
+#[ignore = "needs the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build job \
             runs it on the v2.0.0 release CLI with --include-ignored"]
 fn a_pivot_joined_to_another_table_is_not_read_as_reading_its_first() {
     let dir = project(&[

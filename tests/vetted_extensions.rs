@@ -199,10 +199,10 @@ impl Protocol {
 }
 
 /// The real DuckDB command line a fake engine hands arc's token questions to: the one
-/// `ARC_DUCKDB_PREVIEW_BIN` names, else `duckdb` on the search path. arc reads a SQL file's
+/// `ARC_DUCKDB_RECORD_BIN` names, else `duckdb` on the search path. arc reads a SQL file's
 /// tokens from the DuckDB that runs it, and asks with `-no-init` first.
 fn real_duckdb() -> PathBuf {
-    if let Some(bin) = std::env::var_os("ARC_DUCKDB_PREVIEW_BIN") {
+    if let Some(bin) = std::env::var_os("ARC_DUCKDB_RECORD_BIN") {
         return PathBuf::from(bin);
     }
     std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
@@ -3014,11 +3014,11 @@ fn a_file_with_no_sql_is_not_asked_about() {
 /// check just before each step read one answer, and a second file with the same text reads
 /// the first file's.
 #[test]
-#[ignore = "runs the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build job runs it"]
+#[ignore = "runs the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build job runs it"]
 fn a_file_read_again_unchanged_is_not_asked_again() {
-    let real = std::env::var_os("ARC_DUCKDB_PREVIEW_BIN")
+    let real = std::env::var_os("ARC_DUCKDB_RECORD_BIN")
         .map(PathBuf::from)
-        .expect("ARC_DUCKDB_PREVIEW_BIN names a DuckDB 2.0 build");
+        .expect("ARC_DUCKDB_RECORD_BIN names a DuckDB 2.0 build");
     let protocol = Protocol::steps(&[
         ("a", "CREATE OR REPLACE TABLE a AS SELECT 1 AS x;\n"),
         ("b", "CREATE OR REPLACE TABLE b AS SELECT 2 AS x;\n"),

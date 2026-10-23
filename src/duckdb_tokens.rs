@@ -745,10 +745,10 @@ impl TokenCache {
 }
 
 /// Tokens for the tests, recorded from the DuckDB v2.0.0 command line, or asked of the one
-/// `ARC_DUCKDB_PREVIEW_BIN` names when it is set.
+/// `ARC_DUCKDB_RECORD_BIN` names when it is set.
 ///
 /// A test that reads a text the recording does not hold fails, naming the text. To record
-/// it, run the tests with `ARC_DUCKDB_PREVIEW_BIN` naming DuckDB v2.0.0 and
+/// it, run the tests with `ARC_DUCKDB_RECORD_BIN` naming DuckDB v2.0.0 and
 /// `ARC_RECORD_TOKENS=1`, which adds each text the tests ask about to
 /// `src/duckdb_tokens_recorded.json`. The ignored test
 /// `the_recorded_tokens_are_what_duckdb_answers` compares the recording with what that
@@ -760,7 +760,7 @@ pub(crate) mod recorded {
 
     /// Names the DuckDB 2.0 build the ignored tests ask. `ci.yml` points it at the v2.0.0
     /// release CLI and sets it.
-    pub(crate) const PREVIEW_ENV: &str = "ARC_DUCKDB_PREVIEW_BIN";
+    pub(crate) const BIN_ENV: &str = "ARC_DUCKDB_RECORD_BIN";
     const RECORD_ENV: &str = "ARC_RECORD_TOKENS";
     const RECORDED: &str = include_str!("duckdb_tokens_recorded.json");
     const RECORDING: &str = concat!(
@@ -780,24 +780,24 @@ pub(crate) mod recorded {
         LOADED.get_or_init(|| serde_json::from_str(RECORDED).expect("the recording is JSON"))
     }
 
-    /// The DuckDB `ARC_DUCKDB_PREVIEW_BIN` names, if it is set.
+    /// The DuckDB `ARC_DUCKDB_RECORD_BIN` names, if it is set.
     pub(crate) fn preview() -> Option<DuckDbProgram> {
-        std::env::var_os(PREVIEW_ENV).map(|bin| DuckDbProgram::Told(bin.into()))
+        std::env::var_os(BIN_ENV).map(|bin| DuckDbProgram::Told(bin.into()))
     }
 
-    /// The DuckDB `ARC_DUCKDB_PREVIEW_BIN` names, for a test that is `#[ignore]`d because
+    /// The DuckDB `ARC_DUCKDB_RECORD_BIN` names, for a test that is `#[ignore]`d because
     /// it needs one.
     pub(crate) fn preview_program() -> DuckDbProgram {
         preview().unwrap_or_else(|| {
             panic!(
-                "{PREVIEW_ENV} must name a DuckDB 2.0 build: this test is #[ignore]d so an \
+                "{BIN_ENV} must name a DuckDB 2.0 build: this test is #[ignore]d so an \
                  ordinary run skips it, and running it with --include-ignored says one is \
                  staged"
             )
         })
     }
 
-    /// `file`'s tokens, from the recording or the DuckDB `ARC_DUCKDB_PREVIEW_BIN` names.
+    /// `file`'s tokens, from the recording or the DuckDB `ARC_DUCKDB_RECORD_BIN` names.
     pub(crate) fn tokenize(file: &[u8]) -> Result<FileTokens, Refusal> {
         tokenize_with(file, &mut ask)
     }
@@ -818,7 +818,7 @@ pub(crate) mod recorded {
                 let recorded = recording.tokens.get(text).unwrap_or_else(|| {
                     panic!(
                         "no tokens are recorded for {text:?}: run the tests with \
-                         {PREVIEW_ENV} naming DuckDB v2.0.0 and {RECORD_ENV}=1 to record them"
+                         {BIN_ENV} naming DuckDB v2.0.0 and {RECORD_ENV}=1 to record them"
                     )
                 });
                 recorded
@@ -1180,7 +1180,7 @@ mod tests {
     /// A `\r` before a `\n`, a line opening with `.` and a quote reach DuckDB as written,
     /// so each token starts where it starts in the text arc holds.
     #[test]
-    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build \
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build \
                 job runs it"]
     fn each_text_reaches_duckdb_byte_for_byte() {
         let text = "SELECT 'a\r\n.quit\n''é';\r\nINSTALL x;".to_string();
@@ -1216,7 +1216,7 @@ mod tests {
     /// A `$` DuckDB reads as an operator leaves the start of the token after it on itself,
     /// so those spans overlap and the text's words are asked for instead.
     #[test]
-    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build \
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build \
                 job runs it"]
     fn a_text_whose_spans_overlap_is_read_from_its_words() {
         let tokens = tokenize_file(&preview_program(), b"SELECT $(1);").unwrap();
@@ -1258,7 +1258,7 @@ mod tests {
     /// `start` is a byte offset into the text asked about: the token after a two-byte `é`
     /// starts two bytes on.
     #[test]
-    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build \
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build \
                 job runs it"]
     fn a_token_starts_at_a_byte_offset() {
         let tokens = tokenize_file(&preview_program(), "SELECT 'é', x;".as_bytes()).unwrap();
@@ -1275,7 +1275,7 @@ mod tests {
 
     /// Each text the recording holds is tokenised as DuckDB tokenises it now.
     #[test]
-    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build \
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build \
                 job runs it"]
     fn the_recorded_tokens_are_what_duckdb_answers() {
         let process = Process {

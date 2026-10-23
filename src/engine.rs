@@ -3645,7 +3645,7 @@ mod extension_tests {
     // ---- read from DuckDB 2.0's own tokens ----
 
     /// The findings in `file`, with their lines, read from the tokens the DuckDB
-    /// `ARC_DUCKDB_PREVIEW_BIN` names gives for it.
+    /// `ARC_DUCKDB_RECORD_BIN` names gives for it.
     fn live(file: &[u8]) -> Vec<(ExtensionSql, usize)> {
         super::scan_extension_sql(
             &tokenize_file(&preview_program(), file).expect("DuckDB gives the file's tokens"),
@@ -3653,7 +3653,7 @@ mod extension_tests {
     }
 
     #[test]
-    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build \
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build \
                 job runs it"]
     fn an_install_in_sql_duckdb_cannot_parse_is_still_refused() {
         assert_eq!(
@@ -3663,7 +3663,7 @@ mod extension_tests {
     }
 
     #[test]
-    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build \
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build \
                 job runs it"]
     fn an_install_inside_a_nested_comment_is_not_refused() {
         assert_eq!(
@@ -3673,7 +3673,7 @@ mod extension_tests {
     }
 
     #[test]
-    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build \
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build \
                 job runs it"]
     fn a_switch_name_in_an_e_string_with_an_escaped_quote_is_refused() {
         assert_eq!(
@@ -3686,7 +3686,7 @@ mod extension_tests {
     }
 
     #[test]
-    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build \
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build \
                 job runs it"]
     fn crlf_bom_and_zero_width_space_files_are_read_as_lf() {
         let lf = "SELECT 1;\n\nINSTALL h3x FROM community;\n";
@@ -3704,7 +3704,7 @@ mod extension_tests {
     }
 
     #[test]
-    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build \
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build \
                 job runs it"]
     fn a_five_megabyte_values_list_is_tokenised_within_thirty_seconds() {
         let mut sql = String::from("INSERT INTO t VALUES ");

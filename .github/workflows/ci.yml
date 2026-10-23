@@ -247,20 +247,22 @@ jobs:
       # The reader in src/duckdb_lineage.rs asks a DuckDB 2.0 command line for its parse of
       # a step, and the refusals in src/engine.rs read each SQL file's tokens from one
       # (src/duckdb_tokens.rs). Their tests that start DuckDB, the `arc run` tests with
-      # ARC_SQL_READER=duckdb in tests/duckdb_reader_switch.rs, and the token-cache test in
-      # tests/vetted_extensions.rs are #[ignore]d so the step above reports them as
-      # ignored; run them here on the v2.0.0 release command line the install step put in
-      # $HOME/duckdb. Every job runs 2.0.0, so this is unconditional. The tests that read
-      # from captured answers ran above; with ARC_DUCKDB_PREVIEW_BIN set, the refusal tests
+      # ARC_SQL_READER=duckdb in tests/duckdb_reader_switch.rs, the parity gate in
+      # tests/reader_parity.rs, which reads every SQL file in the repo with both readers,
+      # and the token-cache test in tests/vetted_extensions.rs are #[ignore]d so the step
+      # above reports them as ignored; run them here on the v2.0.0 release command line
+      # the install step put in $HOME/duckdb. Every job runs 2.0.0, so this is unconditional. The tests that read
+      # from captured answers ran above; with ARC_DUCKDB_RECORD_BIN set, the refusal tests
       # here read live tokens instead, and one compares the captured tokens with them.
       - name: test (DuckDB lineage reader and tokens, on the DuckDB 2.0 command line)
         run: |
           set -euo pipefail
           "$HOME/duckdb/duckdb" --version
-          export ARC_DUCKDB_PREVIEW_BIN="$HOME/duckdb/duckdb"
+          export ARC_DUCKDB_RECORD_BIN="$HOME/duckdb/duckdb"
           cargo test --workspace --lib duckdb_lineage -- --include-ignored --nocapture
           cargo test --workspace --lib -- --include-ignored duckdb_tokens engine::extension_tests
           cargo test --workspace --test duckdb_reader_switch -- --include-ignored
+          cargo test --workspace --test reader_parity -- --include-ignored
           cargo test --workspace --test vetted_extensions -- --include-ignored a_file_read_again_unchanged_is_not_asked_again
 
       # `uv` — and unlike the subtoken extension, it is cheap enough to belong on

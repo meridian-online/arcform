@@ -1005,7 +1005,7 @@ mod tests {
     use super::*;
     use crate::duckdb_lineage::recorded_steps;
 
-    /// What the rules make of DuckDB's reading of `sql`, from the answers the 2.0 preview
+    /// What the rules make of DuckDB's reading of `sql`, from the answers DuckDB v2.0.0
     /// gave for it: what [`extract_per_statement`] returns with `ARC_SQL_READER=duckdb`.
     fn read_by_duckdb(sql: &str) -> Vec<SqlAssets> {
         recorded_steps::read(sql)
@@ -1114,6 +1114,73 @@ mod tests {
             assert_eq!(read[0].kinds.get(file), Some(&kind), "{sql}");
             assert_eq!(read[0].inputs, set(&["a"]), "{sql}");
         }
+    }
+
+    #[test]
+    fn the_reader_mapping_cases_are_read_by_the_same_rules_under_either_reader() {
+        use AssetKind::{File, Pattern, Table};
+        // Each step, what it reads with the kind of each, and the table it makes.
+        type Case = (
+            &'static str,
+            &'static [(&'static str, AssetKind)],
+            &'static str,
+        );
+        let cases: [Case; 6] = [
+            // Each path in a list is a file the reader reads.
+            (
+                recorded_steps::READ_JSON_LIST,
+                &[("a.json", File), ("b.json", File)],
+                "j",
+            ),
+            // A named argument's string is an option, not a path.
+            (recorded_steps::READ_CSV_NAMED, &[("x.csv", File)], "c"),
+            (
+                recorded_steps::STRING_ARGUMENT,
+                &[("data/in.parquet", File)],
+                "p",
+            ),
+            // A call with no string or quoted name is a table macro, read under its name.
+            (
+                recorded_steps::EXPRESSION_ARGUMENT,
+                &[("recent", Table)],
+                "w",
+            ),
+            // A table is named in lower case, quoted or not.
+            (
+                recorded_steps::MIXED_CASE,
+                &[("mytable", Table), ("other", Table)],
+                "out",
+            ),
+            (recorded_steps::GLOB, &[("data/*.csv", Pattern)], "d"),
+        ];
+        for (sql, inputs, output) in cases {
+            let read = read_by_duckdb(sql);
+            assert_eq!(read, read_by_sqlparser(sql), "{sql}");
+            assert_eq!(read.len(), 1, "{sql}");
+            let names: Vec<&str> = inputs.iter().map(|(name, _)| *name).collect();
+            assert_eq!(read[0].inputs, set(&names), "reads of {sql}");
+            for (name, kind) in inputs {
+                assert_eq!(read[0].kinds.get(*name), Some(kind), "{name} in {sql}");
+            }
+            assert_eq!(read[0].outputs, set(&[output]), "produces of {sql}");
+            assert_eq!(read[0].unread_table_functions, set(&[]), "{sql}");
+        }
+    }
+
+    /// DuckDB 2.0 reads a statement of a bare name as `FROM` that name; sqlparser-rs
+    /// cannot parse it, so here DuckDB's reading is the one that holds.
+    #[test]
+    fn duckdb_reads_a_bare_name_as_a_read_of_that_table() {
+        let sql = recorded_steps::BARE_NAME;
+        assert!(
+            sqlparser_per_statement(sql).is_err(),
+            "sqlparser parses {sql:?} now; compare the two readings instead"
+        );
+        let read = read_by_duckdb(sql);
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].inputs, set(&["tbl"]), "{sql}");
+        assert_eq!(read[0].kinds.get("tbl"), Some(&AssetKind::Table));
+        assert_eq!(read[0].outputs, set(&[]), "{sql}");
     }
 
     // DuckDB reads `1_000` as 1000, which casts to true: measured on v1.5.5,
