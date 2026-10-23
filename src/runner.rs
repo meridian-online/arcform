@@ -1912,6 +1912,15 @@ mod tests {
         fs::write(runs.join(format!("{name}.json")), record.to_string()).unwrap();
     }
 
+    fn set_mtime(path: &Path, secs: u64) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    }
+
     fn ver(s: &str) -> semver::Version {
         semver::Version::parse(s).unwrap()
     }
@@ -1965,12 +1974,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runs = contract::runs_dir(dir.path());
         write_record(&runs, "old", Some("v1.5.6"));
-        std::thread::sleep(Duration::from_millis(20));
         fs::write(
             runs.join("new.json"),
             "{\"contract_version\": \"b4/1\", \"run\": {",
         )
         .unwrap();
+        set_mtime(&runs.join("old.json"), 1_000);
+        set_mtime(&runs.join("new.json"), 2_000);
         let previous = contract::newest_contract(&runs).unwrap();
         let n = engine_change_notice(previous.run.engine.duckdb_cli.as_deref(), &ver("2.0.0"));
         assert!(n.unwrap().contains("1.5.6"));

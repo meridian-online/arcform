@@ -1044,10 +1044,16 @@ mod tests {
         };
         assert!(newest_contract(dir.path()).is_none());
         std::fs::write(dir.path().join("a.json"), record("v1.5.6".into())).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(dir.path().join("b.json"), record(serde_json::Value::Null)).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(dir.path().join("c.json"), "{\"run\": {").unwrap();
+        for (name, secs) in [("a.json", 1_000), ("b.json", 2_000), ("c.json", 3_000)] {
+            std::fs::File::options()
+                .write(true)
+                .open(dir.path().join(name))
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .unwrap();
+        }
         let found = newest_contract(dir.path()).unwrap();
         assert_eq!(found.run.engine.duckdb_cli.as_deref(), Some("v1.5.6"));
     }
