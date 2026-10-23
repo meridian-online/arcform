@@ -244,8 +244,9 @@ pub enum Error {
     #[error("DuckDB could not {what}: {reason}")]
     EngineQuery { what: String, reason: String },
 
-    // `ARC_SQL_READER` names no reader, or names DuckDB's parse and the DuckDB arc runs
-    // cannot give it. The message names the variable and what it takes.
+    // `ARC_SQL_READER` names no reader, or chooses DuckDB's parse, as it does unset, and the
+    // DuckDB arc runs is not a 2.x build that gives it. The message names the variable and
+    // what it takes.
     #[error("{0}")]
     SqlReader(String),
 

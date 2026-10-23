@@ -677,11 +677,16 @@ impl Engine for DuckDbEngine {
 
     fn tokenize(&self, file: &[u8]) -> std::result::Result<FileTokens, Refusal> {
         match duckdb_program() {
-            Ok(program) => crate::duckdb_tokens::tokenize_file(&program, file),
-            // A file with no SQL asks nothing, so it has nothing to refuse even then.
+            // The asset graph reads the same answer for the same bytes.
+            Ok(program) => crate::duckdb_tokens::shared_tokens(&program, file),
+            // A file with no SQL asks nothing, so it has nothing to refuse even then. The
+            // program named is the one `ARC_DUCKDB_BIN` gives, which is what failed.
             Err(e) => crate::duckdb_tokens::tokenize_with(file, &mut |_| {
                 Err(Refusal::NotRun {
-                    program: DuckDbProgram::SearchPath.display_name(),
+                    program: std::env::var_os(DUCKDB_BIN_ENV).map_or_else(
+                        || DuckDbProgram::SearchPath.display_name(),
+                        |bin| bin.to_string_lossy().into_owned(),
+                    ),
                     reason: e.to_string(),
                 })
             }),
@@ -1708,7 +1713,6 @@ fn not_read(source: &ProtocolSql, refusal: Refusal) -> Error {
             format!("DuckDB `{program}` did not answer: {reason}")
         }
         Refusal::Unreadable(reason) => reason,
-        other => other.to_string(),
     };
     Error::SqlNotRead {
         place: source.place.clone(),

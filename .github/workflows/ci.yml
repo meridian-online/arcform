@@ -246,15 +246,16 @@ jobs:
 
       # The reader in src/duckdb_lineage.rs asks a DuckDB 2.0 command line for its parse of
       # a step, and the refusals in src/engine.rs read each SQL file's tokens from one
-      # (src/duckdb_tokens.rs). Their tests that start DuckDB, the `arc run` tests with
-      # ARC_SQL_READER=duckdb in tests/duckdb_reader_switch.rs, the parity gate in
+      # (src/duckdb_tokens.rs). Their tests that start a named DuckDB, the parity gate in
       # tests/reader_parity.rs, which reads every SQL file in the repo with both readers,
       # and the token-cache test in tests/vetted_extensions.rs are #[ignore]d so the step
       # above reports them as ignored; run them here on the v2.0.0 release command line
       # the install step put in $HOME/duckdb. Every job runs 2.0.0, so this is
       # unconditional. The tests that read from captured answers ran above; with
       # ARC_DUCKDB_RECORD_BIN set, the refusal tests here read live tokens instead, and one
-      # compares the captured tokens with them.
+      # compares the captured tokens with them. The `arc run` tests in
+      # tests/duckdb_reader_switch.rs ran above on the duckdb on PATH, and run again here on
+      # the one ARC_DUCKDB_RECORD_BIN names.
       - name: test (DuckDB lineage reader and tokens, on the DuckDB 2.0 command line)
         run: |
           set -euo pipefail

@@ -1,9 +1,10 @@
 //! SQL introspection: what a SQL step reads and produces.
 //!
-//! Two readers take a step apart. By default sqlparser-rs parses it with its DuckDB
-//! dialect. With `ARC_SQL_READER=duckdb` DuckDB's own parse is read instead, through
-//! [`crate::duckdb_lineage`], from the DuckDB arc runs, which has to be a 2.0 build. Either
-//! reader's statements pass through the same rules here: which table function reads a
+//! Two readers take a step apart. By default DuckDB's own parse is read, through
+//! [`crate::duckdb_lineage`], from the DuckDB arc runs, which has to be a 2.x build; a
+//! statement that reading cannot read is parsed by sqlparser-rs with its DuckDB dialect.
+//! `ARC_SQL_READER=sqlparser` has sqlparser-rs read every statement. Either reader's
+//! statements pass through the same rules here: which table function reads a
 //! file, which reads no table, which one's arguments arc does not read, and whether a
 //! `COPY … TO` writes a file or a directory.
 //!
@@ -227,27 +228,34 @@ fn cast_string_to_bool(s: &str) -> Option<bool> {
     }
 }
 
-/// Names the reader that takes a SQL step's reads and produces. Unset, sqlparser-rs
-/// reads the step; `duckdb` reads DuckDB's own parse of it.
+/// Names the reader that takes a SQL step's reads and produces. Unset or `duckdb`, DuckDB's
+/// own parse is read, with sqlparser-rs reading each statement DuckDB's reading cannot;
+/// `sqlparser` has sqlparser-rs read every statement, a way round a mapping bug in DuckDB's
+/// reading while it is fixed.
 pub(crate) const SQL_READER_ENV: &str = "ARC_SQL_READER";
 
-/// The value of [`SQL_READER_ENV`] that chooses DuckDB's parse.
+/// The value of [`SQL_READER_ENV`] that chooses DuckDB's parse, as unset does.
 const DUCKDB_READER: &str = "duckdb";
+
+/// The value of [`SQL_READER_ENV`] that chooses sqlparser-rs for every statement.
+const SQLPARSER_READER: &str = "sqlparser";
 
 /// Which reader [`SQL_READER_ENV`] chooses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reader {
-    Sqlparser,
     DuckDb,
+    Sqlparser,
 }
 
 fn reader() -> Result<Reader, String> {
     match std::env::var_os(SQL_READER_ENV) {
-        None => Ok(Reader::Sqlparser),
+        None => Ok(Reader::DuckDb),
         Some(value) if value == DUCKDB_READER => Ok(Reader::DuckDb),
+        Some(value) if value == SQLPARSER_READER => Ok(Reader::Sqlparser),
         Some(value) => Err(format!(
-            "{SQL_READER_ENV} is '{}', and the one value it takes is `{DUCKDB_READER}`, which \
-             reads a SQL step with DuckDB's own parser; unset it to read steps with arc's own",
+            "{SQL_READER_ENV} is '{}', and the values it takes are `{DUCKDB_READER}`, which \
+             reads a SQL step with DuckDB's own parser as arc does with it unset, and \
+             `{SQLPARSER_READER}`, which reads it with arc's own",
             value.to_string_lossy()
         )),
     }
@@ -258,81 +266,188 @@ fn duckdb_program() -> Result<DuckDbProgram, String> {
     crate::engine::duckdb_program().map_err(|e| e.to_string())
 }
 
-/// Refuses a run, before a step runs, when [`SQL_READER_ENV`] names no reader, or names
-/// DuckDB's and the DuckDB arc runs is not a 2.0 build that gives its parse. The DuckDB is
-/// asked only when the Protocol has a SQL step for it to read.
-pub(crate) fn check_reader(has_sql_steps: bool) -> Result<(), String> {
-    if reader()? == Reader::DuckDb && has_sql_steps {
-        duckdb_lineage::read_step(&duckdb_program()?, "")
-            .map_err(|refusal| format!("{SQL_READER_ENV}={DUCKDB_READER}: {refusal}"))?;
+/// Refuses a run, before a step runs, when [`SQL_READER_ENV`] names no reader, or chooses
+/// DuckDB's and the DuckDB arc runs gives no parse. The DuckDB is asked only when `has_sql`:
+/// a SQL step's file holds a statement for it to read. Its tokens have been read by then, by
+/// the refusals, which refuse a DuckDB that is not a 2.x build; this asks for a tree.
+pub(crate) fn check_reader(has_sql: bool) -> Result<(), String> {
+    if reader()? == Reader::DuckDb && has_sql {
+        duckdb_lineage::gives_trees(&duckdb_program()?).map_err(|refusal| {
+            format!(
+                "arc reads what each SQL step reads and produces from DuckDB 2's own parse, \
+                 and {refusal}; {SQL_READER_ENV}={SQLPARSER_READER} reads the steps with \
+                 arc's own parser instead"
+            )
+        })?;
     }
     Ok(())
 }
 
-/// DuckDB's reading of each statement of `sql`, as [`SqlAssets`].
-fn read_with_duckdb(sql: &str) -> Result<Vec<SqlAssets>, Vec<String>> {
-    let program = duckdb_program().map_err(|e| vec![e])?;
-    let reading = duckdb_lineage::read_step(&program, sql).map_err(|e| vec![e.to_string()])?;
-    Ok(reading.statements.iter().map(duckdb_statement).collect())
+/// What each statement of a SQL step reads and produces, in source order, and the
+/// statements no reader could read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StepSql {
+    pub statements: Vec<SqlAssets>,
+    /// Each statement neither reader could read, as it reads nothing; see [`unread_warning`].
+    pub unread: Vec<UnreadStatement>,
 }
 
-/// Parse a SQL string and extract the assets it produces and consumes.
-///
-/// Returns `Ok(SqlAssets)` on success, or `Err(warnings)` if the SQL
-/// cannot be parsed. The caller should treat parse failures as opaque
-/// steps (warn, don't block).
-pub fn extract_assets(sql: &str) -> Result<SqlAssets, Vec<String>> {
-    if reader().map_err(|e| vec![e])? == Reader::DuckDb {
-        // DuckDB's reading leaves a `WITH` name out of the reads of the statement it is
-        // in scope in, so nothing is filtered here.
+/// A statement of a SQL step that neither reader could read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadStatement {
+    /// Its place among the step's statements, counting from 1.
+    pub statement: usize,
+    /// The line of the file it starts on, counting from 1.
+    pub line: usize,
+}
+
+impl StepSql {
+    /// The step's statements as one set: what any of them produces, reads, holds as a
+    /// `WITH` name or drops. A `WITH` name is left out of the reads of the statement it is
+    /// declared in, and only of that one.
+    pub fn merged(&self) -> SqlAssets {
         let mut assets = SqlAssets::default();
-        for statement in read_with_duckdb(sql)? {
-            assets.outputs.extend(statement.outputs);
-            assets.inputs.extend(statement.inputs);
-            assets.kinds.extend(statement.kinds);
-            assets
-                .unread_table_functions
-                .extend(statement.unread_table_functions);
+        for statement in &self.statements {
+            merge(&mut assets, statement.clone());
         }
-        return Ok(assets);
+        assets
     }
-
-    let dialect = DuckDbDialect {};
-    let statements = Parser::parse_sql(&dialect, sql).map_err(|e| vec![e.to_string()])?;
-
-    let mut assets = SqlAssets::default();
-
-    for stmt in &statements {
-        extract_from_statement(stmt, &mut assets);
-    }
-
-    // CTE filtering: CTE names were collected in `internal` during parsing.
-    // Remove them from `inputs` — a CTE reference in FROM is step-internal,
-    // not an external dependency.
-    for cte_name in &assets.internal {
-        assets.inputs.remove(cte_name);
-    }
-
-    Ok(assets)
 }
 
-/// Parse a SQL string and extract assets **per statement**, in source order.
+fn merge(into: &mut SqlAssets, from: SqlAssets) {
+    into.outputs.extend(from.outputs);
+    into.inputs.extend(from.inputs);
+    into.internal.extend(from.internal);
+    into.destroys.extend(from.destroys);
+    into.kinds.extend(from.kinds);
+    into.unread_table_functions
+        .extend(from.unread_table_functions);
+}
+
+/// The warning for a statement of `step`, in `file`, that no reader could read. Both
+/// readers' paths give it in these words.
+pub fn unread_warning(step: &str, file: &str, unread: &UnreadStatement) -> String {
+    format!(
+        "could not read statement {} of {step} ({file}:{}) \u{2014} treating it as reading \
+         nothing",
+        unread.statement, unread.line
+    )
+}
+
+/// What each statement of `sql` reads and produces, by the reader [`SQL_READER_ENV`]
+/// chooses. `Err` only when it names no reader.
 ///
-/// Like [`extract_assets`] but returns one [`SqlAssets`] per top-level statement
-/// instead of a single merged set — so a contract can record which tables each
-/// statement produces/reads. CTE names are filtered out of `inputs` per statement,
-/// exactly as the merged path does.
+/// With DuckDB's reader, a statement it cannot read is read by sqlparser-rs. When the
+/// DuckDB arc runs does not answer, or is not a 2.x build, the whole step is read by
+/// sqlparser-rs, and arc says so once in the process: `arc run` refuses before reading
+/// (see [`check_reader`]), so this is a command that reads the graph without running it.
+pub fn read_sql(sql: &str) -> Result<StepSql, String> {
+    match reader()? {
+        Reader::Sqlparser => Ok(sqlparser_step(sql)),
+        Reader::DuckDb => {
+            let reading = duckdb_program().and_then(|program| {
+                duckdb_lineage::read_step(&program, sql).map_err(|e| e.to_string())
+            });
+            Ok(match reading {
+                Ok(reading) => duckdb_step(&reading),
+                Err(reason) => {
+                    warn_once_no_duckdb(&reason);
+                    sqlparser_step(sql)
+                }
+            })
+        }
+    }
+}
+
+/// Prints, the first time in the process, that the asset graph is sqlparser-rs's reading.
+fn warn_once_no_duckdb(reason: &str) {
+    use owo_colors::OwoColorize;
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!("{} {}", "warning:".yellow(), no_duckdb_warning(reason));
+    });
+}
+
+/// The words of [`warn_once_no_duckdb`]'s warning.
+pub(crate) fn no_duckdb_warning(reason: &str) -> String {
+    format!(
+        "the asset graph is arc's own reading of the SQL, because no DuckDB 2 answered \
+         ({reason})"
+    )
+}
+
+/// DuckDB's reading of a step, with sqlparser-rs reading each statement DuckDB's reading
+/// cannot: one of a form the reader does not frame, one holding a query DuckDB gives no
+/// tree for, and one DuckDB cannot parse. What DuckDB's words made certain is kept beside
+/// sqlparser-rs's reading; a statement sqlparser-rs cannot parse either reads nothing else,
+/// and is listed in [`StepSql::unread`].
+fn duckdb_step(reading: &duckdb_lineage::StepReading) -> StepSql {
+    let mut step = StepSql::default();
+    for (n, statement) in reading.statements.iter().enumerate() {
+        let mut assets = duckdb_statement(statement);
+        if matches!(
+            statement.form,
+            duckdb_lineage::Form::Unread(_) | duckdb_lineage::Form::NotParsed(_)
+        ) {
+            match sqlparser_per_statement(&statement.text) {
+                Ok(read) => read.into_iter().for_each(|other| merge(&mut assets, other)),
+                Err(_) => step.unread.push(UnreadStatement {
+                    statement: n + 1,
+                    line: statement.line,
+                }),
+            }
+        }
+        step.statements.push(assets);
+    }
+    step
+}
+
+/// sqlparser-rs's reading of a step. A step it cannot parse whole is cut where
+/// [`statement_byte_ranges`] cuts it and each statement is read alone, so a statement it
+/// cannot parse reads nothing and the others are still read.
+fn sqlparser_step(sql: &str) -> StepSql {
+    if let Ok(statements) = sqlparser_per_statement(sql) {
+        return StepSql {
+            statements,
+            unread: Vec::new(),
+        };
+    }
+    let mut step = StepSql::default();
+    for (n, (start, end)) in statement_byte_ranges(sql).into_iter().enumerate() {
+        match sql
+            .get(start..end)
+            .ok_or_else(Vec::new)
+            .and_then(sqlparser_per_statement)
+        {
+            Ok(read) => {
+                let mut assets = SqlAssets::default();
+                read.into_iter().for_each(|other| merge(&mut assets, other));
+                step.statements.push(assets);
+            }
+            Err(_) => {
+                step.statements.push(SqlAssets::default());
+                step.unread.push(UnreadStatement {
+                    statement: n + 1,
+                    line: sql[..start].matches('\n').count() + 1,
+                });
+            }
+        }
+    }
+    step
+}
+
+/// Parse a SQL string and extract assets **per statement**, in source order: [`read_sql`]'s
+/// statements, so a contract can record which tables each statement produces/reads.
 ///
-/// Returns `Ok(Vec<SqlAssets>)` on success, or `Err(warnings)` if the SQL cannot be
-/// parsed (caller treats a parse failure as an opaque step).
+/// `Err` only when [`SQL_READER_ENV`] names no reader.
 pub fn extract_per_statement(sql: &str) -> Result<Vec<SqlAssets>, Vec<String>> {
-    if reader().map_err(|e| vec![e])? == Reader::DuckDb {
-        return read_with_duckdb(sql);
-    }
-    sqlparser_per_statement(sql)
+    read_sql(sql)
+        .map(|step| step.statements)
+        .map_err(|e| vec![e])
 }
 
-/// [`extract_per_statement`] with sqlparser-rs as the reader.
+/// sqlparser-rs's reading of each statement of `sql`, or its error when it cannot parse
+/// the whole of it. CTE names are filtered out of each statement's `inputs`.
 fn sqlparser_per_statement(sql: &str) -> Result<Vec<SqlAssets>, Vec<String>> {
     let dialect = DuckDbDialect {};
     let statements = Parser::parse_sql(&dialect, sql).map_err(|e| vec![e.to_string()])?;
@@ -383,6 +498,9 @@ fn duckdb_statement(statement: &duckdb_lineage::Statement) -> SqlAssets {
     for call in &statement.calls {
         record_table_call(&duckdb_call(call), &mut assets);
     }
+    // DuckDB's reading leaves a `WITH` name out of the reads of the statement it is in scope
+    // in; it is the step's own, as sqlparser-rs's reading records it.
+    assets.internal.extend(statement.with.iter().cloned());
     assets
 }
 
@@ -1014,6 +1132,16 @@ mod tests {
             .collect()
     }
 
+    /// What sqlparser-rs reads in `sql`, as one set. The tests of the mapping read with it
+    /// directly, so none of them starts a DuckDB.
+    fn sqlparser_assets(sql: &str) -> Result<SqlAssets, Vec<String>> {
+        let mut assets = SqlAssets::default();
+        for statement in sqlparser_per_statement(sql)? {
+            merge(&mut assets, statement);
+        }
+        Ok(assets)
+    }
+
     fn read_by_sqlparser(sql: &str) -> Vec<SqlAssets> {
         sqlparser_per_statement(sql).unwrap_or_else(|e| panic!("sqlparser refused {sql:?}: {e:?}"))
     }
@@ -1183,6 +1311,96 @@ mod tests {
         assert_eq!(read[0].outputs, set(&[]), "{sql}");
     }
 
+    /// What the default reader makes of `sql`, from the answers DuckDB v2.0.0 gave for it:
+    /// DuckDB's reading, with sqlparser-rs reading each statement it cannot.
+    fn read_by_default(sql: &str) -> StepSql {
+        duckdb_step(&recorded_steps::reading(sql))
+    }
+
+    #[test]
+    fn a_statement_duckdbs_reading_cannot_take_is_read_by_sqlparser() {
+        let sql = "SET VARIABLE m = (SELECT max(d) FROM events);\n\
+                   SET threads TO 4;\n\
+                   FORCE INSTALL spatial;\n\
+                   DELETE FROM t USING u WHERE t.k = u.k;\n\
+                   CREATE TABLE r AS PIVOT t ON c USING sum(v);";
+        let step = read_by_default(sql);
+        assert_eq!(
+            step.unread,
+            [],
+            "sqlparser-rs reads each statement DuckDB's cannot"
+        );
+        let by_sqlparser = read_by_sqlparser(sql);
+        assert_eq!(
+            step.statements[3], by_sqlparser[3],
+            "the DELETE, which DuckDB's reading does not frame, is sqlparser-rs's reading"
+        );
+        assert_eq!(step.statements[4].outputs, set(&["r"]));
+        assert_eq!(
+            step.statements[4].inputs,
+            set(&["t"]),
+            "the PIVOT DuckDB gives no tree for reads its table, as sqlparser-rs reads it"
+        );
+    }
+
+    #[test]
+    fn a_statement_neither_reader_can_read_is_listed_with_its_line() {
+        let sql = "SELECT 1;\nCREATE TABL r AS SELECT 1;";
+        let step = read_by_default(sql);
+        assert_eq!(
+            step.unread,
+            [UnreadStatement {
+                statement: 2,
+                line: 2
+            }],
+            "the statement DuckDB and sqlparser-rs both refuse"
+        );
+        assert_eq!(step.statements.len(), 2);
+        assert_eq!(step.statements[1], SqlAssets::default(), "it reads nothing");
+    }
+
+    #[test]
+    fn sqlparser_reads_each_statement_of_a_step_it_cannot_parse_whole() {
+        let sql = "SELECT * FROM a;\n\n\
+                   CREATE TABLE r AS SELECT * EXCLUDE (a) FROM t ASOF LEFT JOIN u USING (k);\n\
+                   CREATE TABLE s AS SELECT * FROM b;";
+        let step = sqlparser_step(sql);
+        let reads: Vec<BTreeSet<String>> =
+            step.statements.iter().map(|s| s.inputs.clone()).collect();
+        assert_eq!(reads, [set(&["a"]), set(&[]), set(&["b"])]);
+        assert_eq!(step.statements[2].outputs, set(&["s"]));
+        assert_eq!(
+            step.unread,
+            [UnreadStatement {
+                statement: 2,
+                line: 3
+            }],
+            "the ASOF join sqlparser-rs cannot parse reads nothing and is listed"
+        );
+    }
+
+    #[test]
+    fn the_unread_statement_warning_names_the_step_the_file_and_the_line() {
+        let unread = UnreadStatement {
+            statement: 2,
+            line: 7,
+        };
+        assert_eq!(
+            unread_warning("load", "models/load.sql", &unread),
+            "could not read statement 2 of load (models/load.sql:7) \u{2014} treating it as \
+             reading nothing"
+        );
+    }
+
+    #[test]
+    fn the_no_duckdb_warning_says_whose_reading_the_graph_is() {
+        assert_eq!(
+            no_duckdb_warning("no such file"),
+            "the asset graph is arc's own reading of the SQL, because no DuckDB 2 answered \
+             (no such file)"
+        );
+    }
+
     // DuckDB reads `1_000` as 1000, which casts to true: measured on v1.5.5,
     // `PER_THREAD_OUTPUT 1_000` wrote a directory, and DuckDB 2.0's tokenizer gives
     // `1_000` as one number. Rust's `f64` parse refuses the separator, so the number is
@@ -1214,7 +1432,7 @@ mod tests {
     #[test]
     fn test_create_table_output() {
         let sql = "CREATE TABLE customers (id INT, name TEXT);";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(assets.outputs.contains("customers"));
         assert!(assets.inputs.is_empty());
     }
@@ -1223,7 +1441,7 @@ mod tests {
     #[test]
     fn test_create_view_output() {
         let sql = "CREATE VIEW active_customers AS SELECT * FROM customers WHERE active = true;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(assets.outputs.contains("active_customers"));
         assert!(assets.inputs.contains("customers"));
     }
@@ -1232,7 +1450,7 @@ mod tests {
     #[test]
     fn test_ctas_output_and_inputs() {
         let sql = "CREATE TABLE summary AS SELECT count(*) AS total FROM orders;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(assets.outputs.contains("summary"));
         assert!(assets.inputs.contains("orders"));
     }
@@ -1241,7 +1459,7 @@ mod tests {
     #[test]
     fn test_multiple_creates() {
         let sql = "CREATE TABLE foo (id INT);\nCREATE TABLE bar (id INT);\nCREATE VIEW baz AS SELECT * FROM foo;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert_eq!(
             assets.outputs,
             BTreeSet::from(["foo".into(), "bar".into(), "baz".into()])
@@ -1253,7 +1471,7 @@ mod tests {
     #[test]
     fn test_from_clause_inputs() {
         let sql = "SELECT * FROM customers;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(assets.inputs.contains("customers"));
         assert!(assets.outputs.is_empty());
     }
@@ -1262,7 +1480,7 @@ mod tests {
     #[test]
     fn test_join_inputs() {
         let sql = "SELECT c.name, o.total FROM customers c JOIN orders o ON c.id = o.customer_id;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(assets.inputs.contains("customers"));
         assert!(assets.inputs.contains("orders"));
     }
@@ -1271,7 +1489,7 @@ mod tests {
     #[test]
     fn test_subquery_inputs() {
         let sql = "SELECT * FROM (SELECT * FROM raw_data) sub;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(assets.inputs.contains("raw_data"));
     }
 
@@ -1279,7 +1497,7 @@ mod tests {
     #[test]
     fn test_insert_into_output() {
         let sql = "INSERT INTO summary SELECT count(*) FROM customers;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(assets.outputs.contains("summary"));
         assert!(assets.inputs.contains("customers"));
     }
@@ -1288,7 +1506,7 @@ mod tests {
     #[test]
     fn test_copy_to_file() {
         let sql = "COPY customers TO 'customers.csv';";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(assets.inputs.contains("customers"));
     }
 
@@ -1296,7 +1514,7 @@ mod tests {
     #[test]
     fn test_unparseable_sql() {
         let sql = "THIS IS NOT VALID SQL AT ALL %%%";
-        let result = extract_assets(sql);
+        let result = sqlparser_assets(sql);
         assert!(result.is_err());
     }
 
@@ -1304,7 +1522,7 @@ mod tests {
     #[test]
     fn test_union_all_inputs() {
         let sql = "SELECT * FROM customers UNION ALL SELECT * FROM archived_customers;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(assets.inputs.contains("customers"));
         assert!(assets.inputs.contains("archived_customers"));
     }
@@ -1313,7 +1531,7 @@ mod tests {
     #[test]
     fn test_ctas_union_inputs() {
         let sql = "CREATE TABLE all_customers AS SELECT * FROM customers UNION ALL SELECT * FROM archived_customers;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(assets.outputs.contains("all_customers"));
         assert!(assets.inputs.contains("customers"));
         assert!(assets.inputs.contains("archived_customers"));
@@ -1323,7 +1541,7 @@ mod tests {
     #[test]
     fn test_except_inputs() {
         let sql = "SELECT id FROM customers EXCEPT SELECT id FROM blocklist;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(assets.inputs.contains("customers"));
         assert!(assets.inputs.contains("blocklist"));
     }
@@ -1333,7 +1551,7 @@ mod tests {
     fn test_cte_internal_not_inputs() {
         let sql =
             "WITH recent AS (SELECT * FROM orders WHERE date > '2026-01-01') SELECT * FROM recent;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(
             assets.inputs.contains("orders"),
             "real table should be in inputs"
@@ -1352,7 +1570,7 @@ mod tests {
     #[test]
     fn test_qualified_name() {
         let sql = "CREATE TABLE main.customers (id INT);";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(assets.outputs.contains("customers"));
     }
 
@@ -1362,7 +1580,7 @@ mod tests {
         // sqlparser may reject empty input, so use a comment-only file
         let sql = "-- just a comment";
         // This may either parse as empty or error — both are acceptable
-        let result = extract_assets(sql);
+        let result = sqlparser_assets(sql);
         // An Err is also acceptable — comment-only input is treated as opaque.
         if let Ok(assets) = result {
             assert!(assets.outputs.is_empty());
@@ -1374,7 +1592,7 @@ mod tests {
     #[test]
     fn test_nested_ctes_in_internal() {
         let sql = "WITH a AS (SELECT * FROM raw_data), b AS (SELECT * FROM a) SELECT * FROM b;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(
             assets.internal.contains("a"),
             "CTE 'a' should be in internal"
@@ -1401,7 +1619,7 @@ mod tests {
     #[test]
     fn test_cte_shadows_real_table() {
         let sql = "WITH customers AS (SELECT * FROM raw_customers) SELECT * FROM customers;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(
             assets.internal.contains("customers"),
             "CTE 'customers' should be in internal"
@@ -1420,7 +1638,7 @@ mod tests {
     #[test]
     fn test_drop_table_destroys() {
         let sql = "DROP TABLE foo;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(
             assets.destroys.contains("foo"),
             "dropped table should be in destroys"
@@ -1433,7 +1651,7 @@ mod tests {
     #[test]
     fn test_drop_view_destroys() {
         let sql = "DROP VIEW IF EXISTS my_view;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(
             assets.destroys.contains("my_view"),
             "dropped view should be in destroys"
@@ -1444,7 +1662,7 @@ mod tests {
     #[test]
     fn test_drop_then_create() {
         let sql = "DROP TABLE IF EXISTS foo; CREATE TABLE foo AS SELECT * FROM bar;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(
             assets.destroys.contains("foo"),
             "dropped table should be in destroys"
@@ -1463,7 +1681,7 @@ mod tests {
     #[test]
     fn test_alter_table_outputs_only() {
         let sql = "ALTER TABLE customers ADD COLUMN email TEXT;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(
             assets.outputs.contains("customers"),
             "altered table should be in outputs"
@@ -1475,7 +1693,7 @@ mod tests {
     #[test]
     fn test_merge_into() {
         let sql = "MERGE INTO target USING source ON target.id = source.id WHEN MATCHED THEN UPDATE SET target.name = source.name;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(
             assets.outputs.contains("target"),
             "merge target should be in outputs"
@@ -1490,7 +1708,7 @@ mod tests {
     #[test]
     fn test_create_or_replace() {
         let sql = "CREATE OR REPLACE TABLE foo AS SELECT * FROM bar;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(
             assets.outputs.contains("foo"),
             "replaced table should be in outputs"
@@ -1507,7 +1725,7 @@ mod tests {
         // sqlparser-rs 0.55 supports PIVOT syntax
         let sql =
             "SELECT * FROM monthly_sales PIVOT (SUM(amount) FOR month IN ('Jan', 'Feb', 'Mar'));";
-        let result = extract_assets(sql);
+        let result = sqlparser_assets(sql);
         match result {
             Ok(assets) => {
                 assert!(
@@ -1525,7 +1743,7 @@ mod tests {
     #[test]
     fn test_unpivot_source_table() {
         let sql = "SELECT * FROM quarterly_report UNPIVOT (value FOR quarter IN (q1, q2, q3, q4));";
-        let result = extract_assets(sql);
+        let result = sqlparser_assets(sql);
         match result {
             Ok(assets) => {
                 assert!(
@@ -1543,7 +1761,7 @@ mod tests {
     #[test]
     fn test_recursive_cte() {
         let sql = "WITH RECURSIVE tree AS (SELECT id, parent_id FROM nodes WHERE parent_id IS NULL UNION ALL SELECT n.id, n.parent_id FROM nodes n JOIN tree t ON n.parent_id = t.id) SELECT * FROM tree;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(
             assets.internal.contains("tree"),
             "recursive CTE should be in internal"
@@ -1562,7 +1780,7 @@ mod tests {
     #[test]
     fn test_cte_with_subquery() {
         let sql = "WITH a AS (SELECT * FROM (SELECT * FROM raw) sub) SELECT * FROM a;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(assets.internal.contains("a"), "CTE should be in internal");
         assert!(
             assets.inputs.contains("raw"),
@@ -1575,7 +1793,7 @@ mod tests {
     #[test]
     fn test_alter_view_outputs_and_inputs() {
         let sql = "ALTER VIEW active_customers AS SELECT * FROM customers WHERE active = true;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(
             assets.outputs.contains("active_customers"),
             "altered view should be in outputs"
@@ -1590,7 +1808,7 @@ mod tests {
     #[test]
     fn test_drop_multiple_tables() {
         let sql = "DROP TABLE foo, bar, baz;";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(assets.destroys.contains("foo"));
         assert!(assets.destroys.contains("bar"));
         assert!(assets.destroys.contains("baz"));
@@ -1600,7 +1818,7 @@ mod tests {
     #[test]
     fn test_read_parquet_lifts_path() {
         let sql = "CREATE TABLE t AS SELECT * FROM read_parquet('build/edgar.parquet');";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(
             assets.inputs.contains("build/edgar.parquet"),
             "path is the input"
@@ -1616,7 +1834,7 @@ mod tests {
     #[test]
     fn test_read_csv_preserves_case() {
         let sql = "SELECT * FROM read_csv('Data/Raw/GLEIF.csv');";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(
             assets.inputs.contains("Data/Raw/GLEIF.csv"),
             "path case preserved"
@@ -1628,7 +1846,7 @@ mod tests {
     #[test]
     fn test_read_json_list_and_options() {
         let sql = "CREATE TABLE brew AS SELECT * FROM read_json(['a/30d.json', 'a/90d.json'], format = 'array');";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(assets.inputs.contains("a/30d.json"), "first path lifted");
         assert!(assets.inputs.contains("a/90d.json"), "second path lifted");
         assert!(
@@ -1654,7 +1872,7 @@ mod tests {
             ("ST_Read", "data/shapes.shp"),
         ] {
             let sql = format!("CREATE TABLE r AS SELECT * FROM {reader}('{path}');");
-            let assets = extract_assets(&sql).unwrap();
+            let assets = sqlparser_assets(&sql).unwrap();
             assert!(
                 assets.inputs.contains(path),
                 "{reader}: path {path} should be the input, got {:?}",
@@ -1678,7 +1896,7 @@ mod tests {
             ("ST_Read", "data/[a-z].shp"),
         ] {
             let sql = format!("CREATE TABLE r AS SELECT * FROM {reader}('{pattern}');");
-            let assets = extract_assets(&sql).unwrap();
+            let assets = sqlparser_assets(&sql).unwrap();
             assert_eq!(
                 assets.kinds.get(pattern),
                 Some(&AssetKind::Pattern),
@@ -1700,7 +1918,7 @@ mod tests {
             "duckdb_secrets()",
         ] {
             let sql = format!("CREATE TABLE c AS SELECT * FROM {call};");
-            let assets = extract_assets(&sql).unwrap();
+            let assets = sqlparser_assets(&sql).unwrap();
             assert!(
                 assets.inputs.is_empty(),
                 "{call}: no table should be read, got {:?}",
@@ -1713,7 +1931,7 @@ mod tests {
     #[test]
     fn test_glob_function_lifts_pattern_not_table_name() {
         let sql = "CREATE TABLE c AS SELECT * FROM glob('data/*.csv');";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(assets.inputs.contains("data/*.csv"), "pattern is the input");
         assert!(!assets.inputs.contains("glob"), "fn name is not an input");
         assert_eq!(assets.kinds.get("data/*.csv"), Some(&AssetKind::Pattern));
@@ -1726,7 +1944,7 @@ mod tests {
     #[test]
     fn test_table_function_with_quoted_identifier_args_is_unread_not_recorded() {
         let sql = r#"CREATE TABLE fitted AS SELECT * FROM mlpack_random_forest_train("X", "Y", "params", "model");"#;
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(
             !assets.inputs.contains("mlpack_random_forest_train"),
             "the function's name is not a table, got {:?}",
@@ -1758,7 +1976,7 @@ mod tests {
             "SELECT * FROM my_ext_scan(3, source := 'orders');",
             "SELECT * FROM my_ext.my_ext_scan('orders');",
         ] {
-            let assets = extract_assets(sql).unwrap();
+            let assets = sqlparser_assets(sql).unwrap();
             assert!(
                 assets.inputs.is_empty(),
                 "{sql}: records no input, got {:?}",
@@ -1777,7 +1995,7 @@ mod tests {
     #[test]
     fn test_unread_table_functions_are_a_set_of_names() {
         let sql = "SELECT * FROM my_scan('a'); SELECT * FROM my_scan('b'); SELECT * FROM other_scan('c');";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert_eq!(
             assets.unread_table_functions,
             BTreeSet::from(["my_scan".to_string(), "other_scan".to_string()])
@@ -1806,7 +2024,7 @@ mod tests {
             ("SELECT * FROM my_ext_scan([1, 2]);", Some("my_ext_scan")),
             ("SELECT * FROM my_ext_scan(1 + 2, -3);", Some("my_ext_scan")),
         ] {
-            let assets = extract_assets(sql).unwrap();
+            let assets = sqlparser_assets(sql).unwrap();
             assert!(
                 assets.unread_table_functions.is_empty(),
                 "{sql}: not unread, got {:?}",
@@ -1855,7 +2073,7 @@ mod tests {
                 &["edges"],
             ),
         ] {
-            let assets = extract_assets(sql).unwrap();
+            let assets = sqlparser_assets(sql).unwrap();
             assert_eq!(assets.inputs, set(reads), "{sql}: the subquery's tables");
             assert!(
                 assets.unread_table_functions.is_empty(),
@@ -1874,7 +2092,7 @@ mod tests {
             SELECT d.node_id, CASE WHEN isinf(d.distance) THEN NULL ELSE d.distance END AS distance, c.component \
             FROM onager_pth_dijkstra((SELECT src, dst, w FROM edges), directed := false, source := 0) d \
             JOIN onager_cmm_components((SELECT src, dst FROM edges)) c USING (node_id);";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert_eq!(assets.inputs, set(&["edges"]));
         assert_eq!(assets.outputs, set(&["result"]));
         assert!(assets.unread_table_functions.is_empty());
@@ -1888,7 +2106,7 @@ mod tests {
             "CREATE TABLE r AS SELECT * FROM summary((SELECT src, dst FROM edges WHERE kind = 'road'));",
             r#"CREATE TABLE r AS SELECT * FROM summary((SELECT "src" FROM edges));"#,
         ] {
-            let assets = extract_assets(sql).unwrap();
+            let assets = sqlparser_assets(sql).unwrap();
             assert_eq!(assets.inputs, set(&["edges"]), "{sql}");
             assert!(
                 assets.unread_table_functions.is_empty(),
@@ -1907,7 +2125,7 @@ mod tests {
             r#"CREATE TABLE m AS SELECT * FROM my_ext_fit((SELECT x, y FROM train), "model");"#,
             "CREATE TABLE m AS SELECT * FROM my_ext_fit((SELECT x, y FROM train), target := 'model');",
         ] {
-            let assets = extract_assets(sql).unwrap();
+            let assets = sqlparser_assets(sql).unwrap();
             assert_eq!(
                 assets.inputs,
                 set(&["train"]),
@@ -1925,7 +2143,7 @@ mod tests {
     #[test]
     fn test_copy_to_produces_file() {
         let sql = "COPY ranking TO 'data/ranking.parquet';";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(assets.inputs.contains("ranking"), "table is read");
         assert!(
             assets.outputs.contains("data/ranking.parquet"),
@@ -1938,7 +2156,7 @@ mod tests {
     #[test]
     fn test_copy_from_query_produces_file() {
         let sql = "COPY (SELECT * FROM a WHERE x > 1) TO 'out.csv' (HEADER);";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert_eq!(
             assets.inputs,
             BTreeSet::from(["a".to_string()]),
@@ -1959,7 +2177,7 @@ mod tests {
         let sql = "COPY (WITH c AS (SELECT * FROM a) \
                    SELECT * FROM c JOIN b ON c.x = b.x) \
                    TO 'out.csv';";
-        let assets = extract_per_statement(sql).unwrap().remove(0);
+        let assets = sqlparser_per_statement(sql).unwrap().remove(0);
         assert_eq!(
             assets.inputs,
             ["a", "b"].map(str::to_string).into_iter().collect(),
@@ -1989,9 +2207,9 @@ mod tests {
                 AssetKind::Directory,
             ),
         ] {
-            let from_table = extract_assets(&format!("COPY a TO 'out' {options};")).unwrap();
+            let from_table = sqlparser_assets(&format!("COPY a TO 'out' {options};")).unwrap();
             let from_query =
-                extract_assets(&format!("COPY (SELECT * FROM a) TO 'out' {options};")).unwrap();
+                sqlparser_assets(&format!("COPY (SELECT * FROM a) TO 'out' {options};")).unwrap();
             assert_eq!(
                 from_table.kinds.get("out"),
                 Some(&expected),
@@ -2009,7 +2227,7 @@ mod tests {
     // and writes nothing arc can track.
     #[test]
     fn test_copy_from_query_to_stdout_produces_nothing() {
-        let assets = extract_assets("COPY (SELECT * FROM a) TO STDOUT;").unwrap();
+        let assets = sqlparser_assets("COPY (SELECT * FROM a) TO STDOUT;").unwrap();
         assert_eq!(assets.inputs, BTreeSet::from(["a".to_string()]));
         assert!(
             assets.outputs.is_empty(),
@@ -2023,7 +2241,7 @@ mod tests {
     // read from the statement — and this change leaves that as it is.
     #[test]
     fn test_copy_table_forms_record_what_they_recorded_before() {
-        let to = extract_assets("COPY a TO 'out.csv' (HEADER);").unwrap();
+        let to = sqlparser_assets("COPY a TO 'out.csv' (HEADER);").unwrap();
         assert_eq!(to.inputs, BTreeSet::from(["a".to_string()]), "TO: reads");
         assert_eq!(
             to.outputs,
@@ -2032,7 +2250,7 @@ mod tests {
         );
         assert_eq!(to.kinds.get("out.csv"), Some(&AssetKind::File));
 
-        let from = extract_assets("COPY a FROM 'in.csv';").unwrap();
+        let from = sqlparser_assets("COPY a FROM 'in.csv';").unwrap();
         assert_eq!(
             from.inputs,
             BTreeSet::from(["a".to_string()]),
@@ -2057,7 +2275,7 @@ mod tests {
         // subquery) still records its own name — it may read tables named in its own definition,
         // which this layer cannot see, so the name is the only handle lineage has on it.
         let sql = "SELECT * FROM recent();";
-        let assets = extract_assets(sql).unwrap();
+        let assets = sqlparser_assets(sql).unwrap();
         assert!(
             assets.inputs.contains("recent"),
             "a table macro called with no string or quoted identifier still records its name"
@@ -2073,7 +2291,7 @@ mod tests {
         assert_eq!(&sql[ranges[0].0..ranges[0].1], "CREATE TABLE foo (id INT);");
         assert_eq!(&sql[ranges[1].0..ranges[1].1], "SELECT * FROM foo;");
         // Ranges align 1:1 with the parsed statements.
-        assert_eq!(ranges.len(), extract_per_statement(sql).unwrap().len());
+        assert_eq!(ranges.len(), sqlparser_per_statement(sql).unwrap().len());
     }
 
     // Byte ranges: a `;` inside a string literal must not split the statement.
@@ -2126,7 +2344,7 @@ mod tests {
     #[test]
     fn test_pivot_statement_lifts_source() {
         let sql = "PIVOT monthly_sales ON month USING SUM(amount) GROUP BY country;";
-        let assets = extract_assets(sql).expect("statement-form PIVOT must parse");
+        let assets = sqlparser_assets(sql).expect("statement-form PIVOT must parse");
         assert!(
             assets.inputs.contains("monthly_sales"),
             "pivot source should be an input, got {:?}",
@@ -2139,7 +2357,7 @@ mod tests {
     fn test_pivot_statement_as_ctas_body() {
         let sql =
             "CREATE OR REPLACE TABLE installs AS PIVOT wide_sales ON days USING SUM(installs);";
-        let assets = extract_assets(sql).expect("CTAS over a PIVOT must parse");
+        let assets = sqlparser_assets(sql).expect("CTAS over a PIVOT must parse");
         assert!(
             assets.outputs.contains("installs"),
             "CTAS output discovered"
@@ -2158,7 +2376,7 @@ mod tests {
         let sql = "CREATE OR REPLACE TABLE installs AS \
                    WITH install_counts AS (SELECT category, name, days, installs FROM categories) \
                    PIVOT install_counts ON days USING SUM(installs);";
-        let assets = extract_assets(sql).expect("brewtrend-shape PIVOT must parse");
+        let assets = sqlparser_assets(sql).expect("brewtrend-shape PIVOT must parse");
         assert!(assets.outputs.contains("installs"), "output discovered");
         assert!(
             assets.inputs.contains("categories"),
@@ -2179,7 +2397,7 @@ mod tests {
     #[test]
     fn test_unpivot_statement_lifts_source() {
         let sql = "UNPIVOT quarterly_report ON q1, q2, q3, q4 INTO NAME quarter VALUE amount;";
-        let assets = extract_assets(sql).expect("statement-form UNPIVOT must parse");
+        let assets = sqlparser_assets(sql).expect("statement-form UNPIVOT must parse");
         assert!(
             assets.inputs.contains("quarterly_report"),
             "unpivot source should be an input, got {:?}",
@@ -2191,7 +2409,7 @@ mod tests {
     #[test]
     fn test_unpivot_statement_shorthand() {
         let sql = "UNPIVOT sensor_readings ON temp, humidity, pressure;";
-        let assets = extract_assets(sql).expect("shorthand UNPIVOT must parse");
+        let assets = sqlparser_assets(sql).expect("shorthand UNPIVOT must parse");
         assert!(assets.inputs.contains("sensor_readings"), "source lifted");
     }
 
@@ -2200,7 +2418,7 @@ mod tests {
     #[test]
     fn test_multi_option_copy() {
         let sql = "COPY ranking TO 'data/ranking.parquet' (FORMAT parquet, COMPRESSION zstd);";
-        let assets = extract_assets(sql).expect("multi-option COPY must parse");
+        let assets = sqlparser_assets(sql).expect("multi-option COPY must parse");
         assert!(assets.inputs.contains("ranking"), "table is read");
         assert!(
             assets.outputs.contains("data/ranking.parquet"),
@@ -2213,7 +2431,7 @@ mod tests {
     #[test]
     fn test_copy_partition_by() {
         let sql = "COPY orders TO 'out/orders' (FORMAT parquet, PARTITION_BY (year, month), OVERWRITE_OR_IGNORE);";
-        let assets = extract_assets(sql).expect("COPY with PARTITION_BY must parse");
+        let assets = sqlparser_assets(sql).expect("COPY with PARTITION_BY must parse");
         assert!(assets.inputs.contains("orders"), "table is read");
         assert!(
             assets.outputs.contains("out/orders"),
@@ -2235,7 +2453,7 @@ mod tests {
     #[test]
     fn test_copy_without_a_directory_writing_option_is_a_file() {
         let sql = "COPY orders TO 'out/orders.parquet' (FORMAT parquet);";
-        let assets = extract_assets(sql).expect("plain COPY must parse");
+        let assets = sqlparser_assets(sql).expect("plain COPY must parse");
         assert_eq!(
             assets.kinds.get("out/orders.parquet"),
             Some(&AssetKind::File)
@@ -2251,14 +2469,14 @@ mod tests {
     #[test]
     fn test_per_thread_output_target_is_a_directory() {
         let sql = "COPY orders TO 'out/pto' (FORMAT parquet, PER_THREAD_OUTPUT true);";
-        let assets = extract_assets(sql).expect("PER_THREAD_OUTPUT COPY must parse");
+        let assets = sqlparser_assets(sql).expect("PER_THREAD_OUTPUT COPY must parse");
         assert_eq!(assets.kinds.get("out/pto"), Some(&AssetKind::Directory));
     }
 
     #[test]
     fn test_per_thread_output_bare_flag_is_a_directory() {
         let sql = "COPY orders TO 'out/pto' (FORMAT parquet, PER_THREAD_OUTPUT);";
-        let assets = extract_assets(sql).expect("bare-flag COPY must parse");
+        let assets = sqlparser_assets(sql).expect("bare-flag COPY must parse");
         assert_eq!(assets.kinds.get("out/pto"), Some(&AssetKind::Directory));
     }
 
@@ -2268,7 +2486,7 @@ mod tests {
     #[test]
     fn test_per_thread_output_false_is_a_file() {
         let sql = "COPY orders TO 'out/one.parquet' (FORMAT parquet, PER_THREAD_OUTPUT false);";
-        let assets = extract_assets(sql).expect("PER_THREAD_OUTPUT false COPY must parse");
+        let assets = sqlparser_assets(sql).expect("PER_THREAD_OUTPUT false COPY must parse");
         assert_eq!(assets.kinds.get("out/one.parquet"), Some(&AssetKind::File));
     }
 
@@ -2284,7 +2502,7 @@ mod tests {
             let sql = format!(
                 "COPY orders TO 'out/one.parquet' (FORMAT parquet, PER_THREAD_OUTPUT {arg});"
             );
-            let assets = extract_assets(&sql).expect("COPY must parse");
+            let assets = sqlparser_assets(&sql).expect("COPY must parse");
             assert_eq!(
                 assets.kinds.get("out/one.parquet"),
                 Some(&AssetKind::File),
@@ -2301,7 +2519,7 @@ mod tests {
         for arg in ["1", "'true'", "'yes'", "'t'", "'Y'"] {
             let sql =
                 format!("COPY orders TO 'out/pto' (FORMAT parquet, PER_THREAD_OUTPUT {arg});");
-            let assets = extract_assets(&sql).expect("COPY must parse");
+            let assets = sqlparser_assets(&sql).expect("COPY must parse");
             assert_eq!(
                 assets.kinds.get("out/pto"),
                 Some(&AssetKind::Directory),
@@ -2317,21 +2535,21 @@ mod tests {
     #[test]
     fn test_file_size_bytes_zero_is_still_a_directory() {
         let sql = "COPY orders TO 'out/sized' (FORMAT parquet, FILE_SIZE_BYTES 0);";
-        let assets = extract_assets(sql).expect("FILE_SIZE_BYTES 0 COPY must parse");
+        let assets = sqlparser_assets(sql).expect("FILE_SIZE_BYTES 0 COPY must parse");
         assert_eq!(assets.kinds.get("out/sized"), Some(&AssetKind::Directory));
     }
 
     #[test]
     fn test_file_size_bytes_target_is_a_directory() {
         let sql = "COPY orders TO 'out/sized' (FORMAT parquet, FILE_SIZE_BYTES '1MB');";
-        let assets = extract_assets(sql).expect("FILE_SIZE_BYTES COPY must parse");
+        let assets = sqlparser_assets(sql).expect("FILE_SIZE_BYTES COPY must parse");
         assert_eq!(assets.kinds.get("out/sized"), Some(&AssetKind::Directory));
     }
 
     #[test]
     fn test_row_groups_per_file_target_is_a_directory() {
         let sql = "COPY orders TO 'out/rgpf' (FORMAT parquet, ROW_GROUPS_PER_FILE 1);";
-        let assets = extract_assets(sql).expect("ROW_GROUPS_PER_FILE COPY must parse");
+        let assets = sqlparser_assets(sql).expect("ROW_GROUPS_PER_FILE COPY must parse");
         assert_eq!(assets.kinds.get("out/rgpf"), Some(&AssetKind::Directory));
     }
 
@@ -2347,7 +2565,7 @@ mod tests {
             "COPY orders TO 'out/o.parquet' (FORMAT parquet, OVERWRITE_OR_IGNORE);",
             "COPY orders TO 'out/o.parquet' (FORMAT parquet, ROW_GROUP_SIZE 100000);",
         ] {
-            let assets = extract_assets(sql).expect("COPY must parse");
+            let assets = sqlparser_assets(sql).expect("COPY must parse");
             assert_eq!(
                 assets.kinds.get("out/o.parquet"),
                 Some(&AssetKind::File),
@@ -2369,7 +2587,7 @@ mod tests {
     fn test_lambda_colon_single_param_does_not_block_introspection() {
         let sql = "CREATE TABLE bumped AS \
                    SELECT list_transform([x], lambda c: c + 1) AS y FROM source_table;";
-        let assets = extract_assets(sql).expect("lambda colon syntax must parse");
+        let assets = sqlparser_assets(sql).expect("lambda colon syntax must parse");
         assert!(assets.outputs.contains("bumped"), "CTAS output discovered");
         assert!(
             assets.inputs.contains("source_table"),
@@ -2383,7 +2601,7 @@ mod tests {
     fn test_lambda_colon_multi_param_does_not_block_introspection() {
         let sql = "CREATE TABLE totals AS \
                    SELECT list_reduce(xs, lambda acc, v: acc + v) AS total FROM source_table;";
-        let assets = extract_assets(sql).expect("multi-param lambda colon syntax must parse");
+        let assets = sqlparser_assets(sql).expect("multi-param lambda colon syntax must parse");
         assert!(assets.outputs.contains("totals"));
         assert!(assets.inputs.contains("source_table"));
     }

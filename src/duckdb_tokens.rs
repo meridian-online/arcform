@@ -19,6 +19,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::process::Stdio;
+use std::sync::{Mutex, PoisonError};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -48,12 +49,6 @@ impl Token {
 
 fn is_comment(word: &str) -> bool {
     word.starts_with("--") || word.starts_with("/*")
-}
-
-/// The reader's first answer: the version, and the tokens or the error DuckDB gave instead.
-pub(crate) struct Tokenized {
-    pub(crate) version: String,
-    pub(crate) tokens: Result<Vec<Token>, String>,
 }
 
 /// A file's tokens, batch by batch, as one DuckDB answered them.
@@ -86,31 +81,6 @@ pub(crate) struct Process {
 }
 
 impl Process {
-    /// The version and the tokens of `sql`, as the reader asks for them.
-    pub(crate) fn tokens(&self, sql: &str) -> Result<Tokenized, Refusal> {
-        let script = format!(
-            "SELECT version() AS version;\n\
-             SELECT start, token_type, word FROM sql_tokenize({});\n",
-            literal(sql)
-        );
-        let (answers, stderr) = self.run(&script)?;
-        let version = answers
-            .first()
-            .and_then(|rows| rows.get(0)?.get("version")?.as_str())
-            .ok_or_else(|| Refusal::NotRun {
-                program: self.program.display_name(),
-                reason: format!("it gave no version: {}", stderr.trim()),
-            })?;
-        let tokens = match answers.get(1) {
-            Some(rows) => serde_json::from_value(rows.clone()).map_err(|e| e.to_string()),
-            None => Err(stderr.trim().to_string()),
-        };
-        Ok(Tokenized {
-            version: version.to_string(),
-            tokens,
-        })
-    }
-
     /// The version, and the tokens of each of `texts` in order, from one process.
     ///
     /// Each text is its own `SELECT` from `sql_tokenize`, after a line marking which text
@@ -294,12 +264,6 @@ pub(crate) fn hex_text(text: &str) -> String {
     }
     hex.push_str("'))");
     hex
-}
-
-/// `text` as a SQL string literal, as the reader sends a step. The DuckDB command line
-/// drops a `\r` before a `\n` in it; [`hex_text`] keeps every byte.
-pub(crate) fn literal(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "''"))
 }
 
 /// What a question for the tokens of several texts answers: the version, and each text's
@@ -742,6 +706,41 @@ impl TokenCache {
             std::collections::hash_map::Entry::Vacant(new) => new.insert(ask(bytes)?),
         })
     }
+
+    /// Whether a file this holds has a token, so a statement for a reader to read.
+    pub(crate) fn holds_sql(&self) -> bool {
+        self.files
+            .values()
+            .any(|file| file.batches.iter().any(|batch| !batch.tokens.is_empty()))
+    }
+
+    /// The tokens of `bytes` when they have been asked about before.
+    fn known(&self, bytes: &[u8]) -> Option<&FileTokens> {
+        let key: [u8; 32] = Sha256::digest(bytes).into();
+        self.files.get(&key)
+    }
+}
+
+/// The tokens of `file` as `program` gives them, shared by everything in this process that
+/// reads a SQL file: the refusals and the asset graph read one answer for the same bytes,
+/// and a file read again unchanged is not asked about again. Each program has a cache of its
+/// own, and a failed question is not kept.
+///
+/// The cache is not held while DuckDB is asked, so two threads asking about different files
+/// do not wait on each other; two asking about the same file at once may both ask.
+pub(crate) fn shared_tokens(program: &DuckDbProgram, file: &[u8]) -> Result<FileTokens, Refusal> {
+    static SHARED: Mutex<BTreeMap<String, TokenCache>> = Mutex::new(BTreeMap::new());
+    let name = program.display_name();
+    let lock = || SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(known) = lock().get(&name).and_then(|cache| cache.known(file)) {
+        return Ok(known.clone());
+    }
+    let tokens = tokenize_file(program, file)?;
+    lock()
+        .entry(name)
+        .or_default()
+        .get(file, |_| Ok(tokens.clone()))
+        .cloned()
 }
 
 /// Tokens for the tests, recorded from the DuckDB v2.0.0 command line, or asked of the one

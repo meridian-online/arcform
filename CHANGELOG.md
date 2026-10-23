@@ -11,6 +11,7 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Changed
 
+- **The asset graph is read from DuckDB 2.0's own parse of each SQL step.** What each statement reads and produces comes from the DuckDB command line the step runs on, from the same tokens the extension refusals read. A statement DuckDB's reading cannot take, such as a `DROP` or a `PIVOT` DuckDB gives no tree for, is read by arc's own parser; one neither can read draws `could not read statement <n> of <step> (<file>:<line>) — treating it as reading nothing`, and the other statements of the step are still read, where before the whole step was opaque. `ARC_SQL_READER=sqlparser` reads every statement with arc's own parser. A command that reads the graph without running it, such as `arc sql record`, reads it with arc's own parser when no DuckDB 2 answers, and says so once. A statement of a bare name, `tbl;`, which DuckDB 2.0's command line runs as `SELECT * FROM tbl`, reads `tbl`.
 - **`arc sql record` makes a table of a `DESCRIBE`, a `SHOW` or a `SUMMARIZE`, as it does of a `SELECT`.** DuckDB 2.0 parses and runs `CREATE TABLE … AS DESCRIBE …`, so the recorded step opens with the `CREATE OR REPLACE TABLE` line and makes a table of the step's name; on DuckDB 1.5 the statement was written as typed.
 
 ### Removed

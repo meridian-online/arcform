@@ -50,7 +50,8 @@ impl Run {
     fn assert_not_opaque(&self) {
         assert!(
             !self.stderr.contains("could not parse")
-                && !self.stderr.contains("treating as opaque step"),
+                && !self.stderr.contains("treating as opaque step")
+                && !self.stderr.contains("could not read statement"),
             "must not degrade to an opaque step:\nstderr:\n{}",
             self.stderr
         );

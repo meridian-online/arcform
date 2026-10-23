@@ -279,6 +279,9 @@ pub fn run_with_params(
     // hook's file just before it runs; and the pinned extensions each check installed and
     // found equal to their pins, hashed again when the run ends.
     let mut extensions = ExtensionRecheck::default();
+    // Whether a SQL file holds a statement for DuckDB's reading to read, from the tokens the
+    // check below reads.
+    let mut reads_sql = false;
 
     // If there are SQL steps, verify the engine is available and check its version.
     if manifest.has_sql_steps() {
@@ -295,6 +298,7 @@ pub fn run_with_params(
         // Before anything is initialised, so a refused Protocol leaves no run behind.
         let sql = protocol_sql(&manifest, dir);
         let installs = check_extension_installs(&sql, info.version.as_ref(), engine)?;
+        reads_sql = installs.tokens.holds_sql();
         for warning in &installs.warnings {
             eprintln!("{} {}", "warning:".yellow(), warning);
         }
@@ -336,7 +340,7 @@ pub fn run_with_params(
     }
     // Which reader takes a SQL step's reads and produces. Refused here, before a step
     // runs, rather than as a warning on each step the reader cannot read.
-    crate::introspect::check_reader(manifest.has_sql_steps()).map_err(Error::SqlReader)?;
+    crate::introspect::check_reader(reads_sql).map_err(Error::SqlReader)?;
 
     if manifest.steps.is_empty() {
         println!("{}", "No steps defined.".dimmed());

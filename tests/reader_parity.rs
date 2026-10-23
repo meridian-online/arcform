@@ -7,7 +7,11 @@
 //! Each file is read as `arc run` reads a step: the file is the one SQL step of a
 //! Protocol whose first step fails, so nothing runs and the run's contract still records,
 //! for each statement of the step, what it produces and reads. That contract comes from
-//! `extract_per_statement`, once with `ARC_SQL_READER=duckdb` and once with sqlparser-rs.
+//! `extract_per_statement`, once with `ARC_SQL_READER` unset, arc's default reading, and
+//! once with `ARC_SQL_READER=sqlparser`. The default reading is DuckDB's, with sqlparser-rs
+//! reading each statement DuckDB's reading cannot take, so a statement read by that fallback
+//! compares sqlparser-rs with itself; a default run that read a whole file with sqlparser-rs,
+//! because no DuckDB 2 answered, fails the gate.
 //! The recorded steps in `src/duckdb_lineage.rs` are held to the same comparison by the
 //! parity tests in `src/introspect.rs`, which read them from recorded answers.
 //!
@@ -28,6 +32,10 @@ use std::process::Command;
 
 const RECORD_ENV: &str = "ARC_DUCKDB_RECORD_BIN";
 
+/// What the warning says when a command read the graph with sqlparser-rs because no DuckDB
+/// 2 answered.
+const NO_DUCKDB: &str = "because no DuckDB 2 answered";
+
 /// A statement on which the two readings are expected to differ, and exactly how: the
 /// names only DuckDB's reading has and those only sqlparser-rs's has. The statement
 /// counts from 1. Any other difference on it fails the test, as does a row that no longer
@@ -46,18 +54,66 @@ struct Difference {
 const EXISTS: &str = "DuckDB reads the table the `EXISTS (SELECT 1 FROM …)` of the WHERE \
                       reads; sqlparser-rs reads no table inside an EXISTS, so DuckDB is right";
 
+/// DuckDB reads the tables the scalar subqueries in a select list read.
+const SCALAR: &str = "DuckDB reads the tables the scalar subqueries `(SELECT … FROM t)` of the \
+                      select list read; sqlparser-rs reads no table inside one, so DuckDB is right";
+
+/// A `CREATE TABLE name (columns) AS VALUES …`, which sqlparser-rs cannot parse.
+const COLUMNS_AS_VALUES: &str = "sqlparser-rs cannot parse `CREATE TABLE name (columns) AS \
+                                 VALUES …`, a column list without types, and reads the \
+                                 statement as reading nothing; DuckDB reads the table it makes";
+
 const DIFFERENCES: &[Difference] = &[
     Difference {
-        file: "examples/brewtrend/models/trending.sql",
-        statement: 4,
+        file: "examples/code-lists/models/load.sql",
+        statement: 6,
+        duckdb_only_reads: &["data/icd10cm/icd10cm_order.txt"],
+        sqlparser_only_reads: &[],
+        duckdb_only_produces: &["icd10cm_raw"],
+        sqlparser_only_produces: &[],
+        reason: "sqlparser-rs cannot parse `trim(x, chr(13))`, DuckDB's two-argument trim, and \
+                 reads the statement as reading nothing; DuckDB reads it",
+    },
+    Difference {
+        file: "examples/code-lists/models/validate.sql",
+        statement: 6,
         duckdb_only_reads: &[],
-        sqlparser_only_reads: &["categories"],
+        sqlparser_only_reads: &[],
+        duckdb_only_produces: &["baseline"],
+        sqlparser_only_produces: &[],
+        reason: COLUMNS_AS_VALUES,
+    },
+    Difference {
+        file: "examples/code-lists/models/validate.sql",
+        statement: 10,
+        duckdb_only_reads: &[],
+        sqlparser_only_reads: &[],
+        duckdb_only_produces: &["golden"],
+        sqlparser_only_produces: &[],
+        reason: COLUMNS_AS_VALUES,
+    },
+    Difference {
+        file: "examples/code-lists/models/validate.sql",
+        statement: 12,
+        duckdb_only_reads: &["actual", "icd10cm", "naics"],
+        sqlparser_only_reads: &[],
         duckdb_only_produces: &[],
         sqlparser_only_produces: &[],
-        reason: "sqlparser-rs is right here: DuckDB gives no tree for a PIVOT, so the DuckDB \
-                 reader reads `CREATE TABLE … AS WITH … PIVOT` as unread and keeps only the \
-                 table it creates. The row closes when an unread statement falls back to \
-                 sqlparser-rs, at the flip that makes DuckDB's reading the default",
+        reason: SCALAR,
+    },
+    Difference {
+        file: "examples/code-lists/models/validate.sql",
+        statement: 13,
+        duckdb_only_reads: &[
+            "catalog_check",
+            "golden_check",
+            "ri_check",
+            "rowcount_check",
+        ],
+        sqlparser_only_reads: &[],
+        duckdb_only_produces: &[],
+        sqlparser_only_produces: &[],
+        reason: SCALAR,
     },
     Difference {
         file: "tests/fixtures/open_analytics/edgar_gleif/models/load.sql",
@@ -94,85 +150,6 @@ const DIFFERENCES: &[Difference] = &[
         duckdb_only_produces: &[],
         sqlparser_only_produces: &[],
         reason: EXISTS,
-    },
-];
-
-/// A file sqlparser-rs cannot parse at all, so there is nothing to compare DuckDB's
-/// reading with: that reading is pinned instead, as each statement's produces and reads.
-/// The row holds while sqlparser-rs gives no statements for the file and DuckDB's
-/// reading is the one pinned; anything else fails the test.
-struct Unparsed {
-    file: &'static str,
-    reason: &'static str,
-    duckdb: &'static [(&'static [&'static str], &'static [&'static str])],
-}
-
-const NOTHING: (&[&str], &[&str]) = (&[], &[]);
-
-const UNPARSED: &[Unparsed] = &[
-    Unparsed {
-        file: "examples/code-lists/models/catalog.sql",
-        reason: "sqlparser-rs cannot parse the options of `ATTACH 'ducklake:…' AS open \
-                 (DATA_PATH …)`",
-        duckdb: &[
-            NOTHING,
-            NOTHING,
-            NOTHING,
-            NOTHING,
-            NOTHING,
-            NOTHING,
-            NOTHING,
-            (&["naics"], &[]),
-            (&["icd10cm"], &[]),
-            NOTHING,
-            NOTHING,
-        ],
-    },
-    Unparsed {
-        file: "examples/code-lists/models/load.sql",
-        reason: "sqlparser-rs cannot parse `trim(x, chr(13))`, DuckDB's two-argument trim",
-        duckdb: &[
-            NOTHING,
-            NOTHING,
-            NOTHING,
-            NOTHING,
-            (&["naics_raw"], &["data/naics/naics_structure.xlsx"]),
-            (&["icd10cm_raw"], &["data/icd10cm/icd10cm_order.txt"]),
-        ],
-    },
-    Unparsed {
-        file: "examples/code-lists/models/validate.sql",
-        reason: "sqlparser-rs cannot parse the options of `ATTACH 'ducklake:…' AS open \
-                 (DATA_PATH …)`",
-        duckdb: &[
-            NOTHING,
-            NOTHING,
-            NOTHING,
-            NOTHING,
-            NOTHING,
-            (&["baseline"], &[]),
-            (&["actual"], &["dist/icd10cm.parquet", "dist/naics.parquet"]),
-            (&["rowcount_check"], &["actual", "baseline"]),
-            (
-                &["ri_check"],
-                &["dist/icd10cm.parquet", "dist/naics.parquet"],
-            ),
-            (&["golden"], &[]),
-            (
-                &["golden_check"],
-                &["dist/icd10cm.parquet", "dist/naics.parquet", "golden"],
-            ),
-            (&["catalog_check"], &["actual", "icd10cm", "naics"]),
-            (
-                &[],
-                &[
-                    "catalog_check",
-                    "golden_check",
-                    "ri_check",
-                    "rowcount_check",
-                ],
-            ),
-        ],
     },
 ];
 
@@ -215,7 +192,8 @@ fn sql_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// What `reader` makes of each statement of the SQL file at `file`, from the contract of
 /// an `arc run` that stops before the step runs, and what that run printed on stderr. A
-/// reader that refuses the step, or cannot parse it, gives no statements.
+/// reader that refuses the step gives no statements; one that cannot read a statement gives
+/// it reading nothing.
 fn read(file: &Path, reader: Reader, duckdb: &OsString) -> Result<(Vec<Reading>, String), String> {
     let dir = tempfile::tempdir().unwrap();
     std::fs::copy(file, dir.path().join("read.sql")).unwrap();
@@ -238,12 +216,11 @@ fn read(file: &Path, reader: Reader, duckdb: &OsString) -> Result<(Vec<Reading>,
     }
     command.env("ARC_DUCKDB_BIN", duckdb);
     match reader {
-        Reader::DuckDb => {
-            command.env("ARC_SQL_READER", "duckdb");
+        // With `ARC_SQL_READER` unset, DuckDB's reading is arc's default.
+        Reader::DuckDb => {}
+        Reader::Sqlparser => {
+            command.env("ARC_SQL_READER", "sqlparser");
         }
-        // With `ARC_SQL_READER` unset, sqlparser-rs reads the step. When DuckDB's reading
-        // becomes the default, this sets `ARC_SQL_READER=sqlparser` instead.
-        Reader::Sqlparser => {}
     }
     let out = command.output().expect("spawn arc run");
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -330,6 +307,14 @@ fn both_readers_read_every_sql_file_in_the_repo_alike() {
                 continue;
             }
         };
+        // A default run that read the file with sqlparser-rs would compare it with itself.
+        if duckdb_stderr.contains(NO_DUCKDB) {
+            failures.push(format!(
+                "{file}: the default run read the file with sqlparser-rs, as no DuckDB 2 \
+                 answered:\n{duckdb_stderr}"
+            ));
+            continue;
+        }
         if by_duckdb.is_empty() && by_sqlparser.is_empty() {
             failures.push(format!(
                 "{file}: neither reader gave a statement:\n{duckdb_stderr}\n{sqlparser_stderr}"
@@ -344,25 +329,6 @@ fn both_readers_read_every_sql_file_in_the_repo_alike() {
                 String::new()
             }
         };
-        if let Some(unparsed) = UNPARSED.iter().find(|u| u.file == file) {
-            let pinned: Vec<Reading> = unparsed
-                .duckdb
-                .iter()
-                .map(|(produces, reads)| (set(produces), set(reads)))
-                .collect();
-            // The row is seen either way: a reading that is not the pinned one fails here.
-            seen.insert((file.clone(), 0));
-            if !by_sqlparser.is_empty() || by_duckdb != pinned {
-                failures.push(format!(
-                    "{file} is in UNPARSED ({}), and its readings are not the ones pinned:\n    \
-                     DuckDB:     {by_duckdb:?}\n    pinned:     {pinned:?}\n    \
-                     sqlparser:  {by_sqlparser:?}{}",
-                    unparsed.reason,
-                    silent(&by_duckdb, &duckdb_stderr),
-                ));
-            }
-            continue;
-        }
         for i in 0..by_duckdb.len().max(by_sqlparser.len()) {
             let (d, s) = (by_duckdb.get(i), by_sqlparser.get(i));
             if d == s {
@@ -402,15 +368,12 @@ fn both_readers_read_every_sql_file_in_the_repo_alike() {
             ));
         }
     }
-    let rows = DIFFERENCES
-        .iter()
-        .map(|row| (row.file, row.statement, row.reason))
-        .chain(UNPARSED.iter().map(|row| (row.file, 0, row.reason)));
-    for (file, statement, reason) in rows {
-        if !seen.contains(&(file.to_string(), statement)) {
+    for row in DIFFERENCES {
+        if !seen.contains(&(row.file.to_string(), row.statement)) {
             failures.push(format!(
-                "{file}, statement {statement} (0: the whole file) is tabled ({reason}), and \
-                 the two readers now agree on it; remove its row"
+                "{}, statement {} is tabled ({}), and the two readers now agree on it; remove \
+                 its row",
+                row.file, row.statement, row.reason
             ));
         }
     }

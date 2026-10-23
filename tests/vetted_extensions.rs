@@ -433,14 +433,17 @@ fn a_hook_is_read_as_a_step_is() {
 #[test]
 fn a_step_arc_cannot_parse_is_checked_too() {
     let unparseable = "CREATE TABLE b AS SELECT 1 +;\n";
-    // The same step with a vetted install: arc reports it cannot parse the step, and runs it.
+    // The same step with a vetted install: arc reports it cannot read the statement, and runs
+    // the step.
     let vetted = Protocol::steps(&[(
         "s",
         &format!("INSTALL zipfs FROM community;\n{unparseable}"),
     )])
     .run(VETTED_ON);
     assert!(
-        vetted.stderr.contains("could not parse"),
+        vetted
+            .stderr
+            .contains("could not read statement 2 of s (models/s.sql:2)"),
         "the step should be one arc cannot parse:\n{}",
         vetted.stderr
     );
@@ -1553,13 +1556,14 @@ fn steps_and_sql_hooks(steps: &[(&str, &str)]) -> Protocol {
 /// What `arc run` printed to stderr for each Protocol in
 /// [`a_protocol_whose_steps_rewrite_no_sql_file_prints_what_it_printed_before`] on 20698d9,
 /// the commit the check just before each step or hook runs was added to. The strings are that
-/// commit's output with the extension name and versions moved to the 2.0 vetted list.
+/// commit's output with the extension name and versions moved to the 2.0 vetted list, and the
+/// warning for a statement no reader can read in the words both readers now give it.
 const NO_REWRITE_BEFORE_STDERR: [&str; 3] = [
     "",
     "\u{1b}[33mwarning:\u{1b}[39m zipfs is vetted on DuckDB v2.0.0, and this engine is DuckDB v2.0.1; running it anyway (https://github.com/meridian-online/arcform/blob/main/docs/VETTED_EXTENSIONS.md)\n\
 \u{1b}[33mwarning:\u{1b}[39m zipfs has no pin under the extensions: key of arcform.yaml (for DuckDB v2.0.1), so arc runs whichever build DuckDB installs; `arc upgrade zipfs` pins the build the community registry serves (https://github.com/meridian-online/arcform/blob/main/docs/VETTED_EXTENSIONS.md)\n",
     "\u{1b}[33mwarning:\u{1b}[39m step 'b' (models/b.sql) can run or write SQL that is not in its file: IMPORT DATABASE on line 1. arc does not read the SQL a step builds or writes while it runs, for an extension that SQL installs; running it anyway (https://github.com/meridian-online/arcform/blob/main/docs/VETTED_EXTENSIONS.md)\n\
-\u{1b}[33mwarning:\u{1b}[39m could not parse models/b.sql: sql parser error: Expected: an SQL statement, found: IMPORT at Line: 1, Column: 1 — treating as opaque step\n",
+\u{1b}[33mwarning:\u{1b}[39m could not read statement 1 of b (models/b.sql:1) — treating it as reading nothing\n",
 ];
 
 /// The calls the engine received for the pinned Protocol in
@@ -3010,9 +3014,10 @@ fn a_file_with_no_sql_is_not_asked_about() {
     assert_eq!(run.started(), vec!["empty.sql", "dots.sql"]);
 }
 
-/// A file is asked about once for each text it holds: the check before the run and the
-/// check just before each step read one answer, and a second file with the same text reads
-/// the first file's.
+/// A file is asked for its tokens once for each text it holds: the check before the run, the
+/// check just before each step and the asset graph read one answer, and a second file with
+/// the same text reads the first file's. The asset graph's trees are a second question,
+/// asked with `-json`, and are not counted here.
 #[test]
 #[ignore = "runs the DuckDB 2.0 build ARC_DUCKDB_RECORD_BIN names; ci.yml's build job runs it"]
 fn a_file_read_again_unchanged_is_not_asked_again() {
@@ -3029,7 +3034,7 @@ fn a_file_read_again_unchanged_is_not_asked_again() {
     script(
         &engine,
         &format!(
-            "if [ \"$1\" = \"-no-init\" ]; then echo \"$*\" >> '{}'; fi\nexec '{}' \"$@\"\n",
+            "if [ \"$1\" = \"-no-init\" ] && [ \"$2\" = \"-list\" ]; then echo \"$*\" >> '{}'; fi\nexec '{}' \"$@\"\n",
             asked.display(),
             real.display()
         ),

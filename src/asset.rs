@@ -130,8 +130,15 @@ impl AssetGraph {
             if let Some(ref sql_path) = step.sql {
                 let full_path = manifest_dir.join(sql_path);
                 match std::fs::read_to_string(&full_path) {
-                    Ok(sql_content) => match introspect::extract_assets(&sql_content) {
-                        Ok(sql_assets) => {
+                    Ok(sql_content) => match introspect::read_sql(&sql_content) {
+                        Ok(step_sql) => {
+                            // A statement no reader could read reads nothing, and says so.
+                            for unread in &step_sql.unread {
+                                graph
+                                    .warnings
+                                    .push(introspect::unread_warning(&step.name, sql_path, unread));
+                            }
+                            let sql_assets = step_sql.merged();
                             for asset in &sql_assets.outputs {
                                 let kind = sql_assets
                                     .kinds
@@ -169,14 +176,13 @@ impl AssetGraph {
                                     .map(|function| (step.name.as_str(), function)),
                             );
                         }
-                        Err(warnings) => {
-                            // Warn on parse failure, treat as opaque.
-                            for w in warnings {
-                                graph.warnings.push(format!(
-                                    "could not parse {}: {} — treating as opaque step",
-                                    sql_path, w
-                                ));
-                            }
+                        Err(reason) => {
+                            // `ARC_SQL_READER` names no reader: `arc run` refuses before
+                            // this, and a command that reads the graph alone says so.
+                            graph.warnings.push(format!(
+                                "could not read {}: {} \u{2014} treating as opaque step",
+                                sql_path, reason
+                            ));
                         }
                     },
                     Err(e) => {
@@ -1030,7 +1036,7 @@ mod tests {
         graph.validate_order(&step_order).unwrap();
     }
 
-    // Unparseable SQL produces a warning, step is opaque.
+    // SQL no reader can read produces a warning naming the statement, and reads nothing.
     #[test]
     fn test_unparseable_sql_warns() {
         let dir = tempfile::tempdir().unwrap();
@@ -1045,10 +1051,13 @@ mod tests {
         assert!(step.produces.is_empty(), "opaque step has no outputs");
         assert!(step.reads.is_empty(), "opaque step has no inputs");
         assert!(!graph.warnings.is_empty(), "should have a warning");
-        assert!(
-            graph.warnings[0].contains("could not parse"),
-            "warning should mention parse failure: {}",
-            graph.warnings[0]
+        assert_eq!(
+            graph.warnings,
+            [
+                "could not read statement 1 of pivot (models/pivot.sql:1) \u{2014} treating it as \
+              reading nothing"
+            ],
+            "the warning names the statement no reader could read"
         );
     }
 
