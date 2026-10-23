@@ -8,9 +8,11 @@
 //!
 //! Every Protocol here runs on a fake engine: a shell script that reports a chosen version
 //! and appends each call's arguments to a log, so "no step ran" and "the step started" are
-//! read off the engine's own record. The vetted-list check reads SQL text and asks the
-//! engine its version alone; for the pin check the fake engine answers arc's platform and
-//! install calls as the DuckDB CLI does, from files under the test's own directory. Two
+//! read off the engine's own record. The vetted-list check reads each SQL file's tokens,
+//! which arc asks of the engine with `-no-init`; the fake hands that question, unlogged, to
+//! the real DuckDB command line, and itself answers arc's version question. For the pin
+//! check the fake engine answers arc's platform and install calls as the DuckDB CLI does,
+//! from files under the test's own directory. Two
 //! tests run the real DuckDB CLI instead: one holds arc's idea of what is a comment or a
 //! string to DuckDB's own, and one holds the pin check's calls to what DuckDB answers.
 #![cfg(unix)]
@@ -169,7 +171,8 @@ impl Protocol {
         fs::write(
             &engine,
             format!(
-                "#!/bin/sh\necho \"$*\" >> '{}'\n{body}exit 0\n",
+                "#!/bin/sh\n{}echo \"$*\" >> '{}'\n{body}exit 0\n",
+                tokens_from_real_duckdb(),
                 log.display()
             ),
         )
@@ -193,6 +196,29 @@ impl Protocol {
                 .unwrap_or_default(),
         }
     }
+}
+
+/// The real DuckDB command line a fake engine hands arc's token questions to: the one
+/// `ARC_DUCKDB_PREVIEW_BIN` names, else `duckdb` on the search path. arc reads a SQL file's
+/// tokens from the DuckDB that runs it, and asks with `-no-init` first.
+fn real_duckdb() -> PathBuf {
+    if let Some(bin) = std::env::var_os("ARC_DUCKDB_PREVIEW_BIN") {
+        return PathBuf::from(bin);
+    }
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join("duckdb"))
+        .find(|bin| bin.is_file())
+        .expect("a DuckDB 2.0 command line on PATH, to give arc the tokens of each SQL file")
+}
+
+/// The line a fake engine opens with: it hands a question for a SQL file's tokens, which
+/// arc asks with `-no-init` first, to [`real_duckdb`], unlogged, so what the fake logs is
+/// still the calls a run makes of its own engine.
+fn tokens_from_real_duckdb() -> String {
+    format!(
+        "if [ \"$1\" = \"-no-init\" ]; then exec '{}' \"$@\"; fi\n",
+        real_duckdb().display()
+    )
 }
 
 /// The version every entry on the list names today, so a run on it draws no warning.
@@ -2891,6 +2917,135 @@ fn arc_refuses_an_install_exactly_where_duckdb_would_run_it() {
         "arc and DuckDB disagree on what is SQL:\n{}",
         disagreements.join("\n")
     );
+}
+
+// ---- the tokens arc reads a SQL file from ----
+
+/// `arc run` in `protocol`'s directory on the engine at `engine`, with arc's history and
+/// databases kept under the test's own directory and `HOME` there too.
+fn run_on_engine(protocol: &Protocol, engine: &Path) -> Outcome {
+    let out = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .current_dir(protocol.project())
+        .arg("run")
+        .env("ARC_DUCKDB_BIN", engine)
+        .env("ARCFORM_HISTORY_DIR", protocol.root.path().join("history"))
+        .env("ARCFORM_DB_DIR", protocol.root.path().join("db"))
+        .env("HOME", protocol.root.path())
+        .env_remove("ARC_ALLOW_UNTESTED_ENGINE")
+        .env_remove("ARC_SQL_READER")
+        .output()
+        .expect("spawn arc");
+    let log = protocol.root.path().join("duckdb.log");
+    Outcome {
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        engine_calls: fs::read_to_string(&log)
+            .map(|s| s.lines().map(without_loaded_question).collect())
+            .unwrap_or_default(),
+    }
+}
+
+/// An executable shell script at `path` holding `body`.
+fn script(path: &Path, body: &str) {
+    fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// The refusals read a SQL file from the tokens the DuckDB that runs it gives; when it gives
+/// none, arc does not read the file some other way, and runs nothing.
+#[test]
+fn no_tokens_from_duckdb_stops_the_run_naming_the_step() {
+    let protocol = Protocol::steps(&[
+        ("load", "CREATE TABLE t AS SELECT 1;\n"),
+        ("after", "SELECT 1;\n"),
+    ]);
+    let engine = protocol.root.path().join("duckdb");
+    script(
+        &engine,
+        &format!(
+            "echo \"$*\" >> '{}'\nif [ \"$1\" = \"--version\" ]; then echo 'v{VETTED_ON} (fake) 0000000000'; exit 0; fi\necho 'no tokens here' >&2\nexit 1\n",
+            protocol.root.path().join("duckdb.log").display()
+        ),
+    );
+    let run = run_on_engine(&protocol, &engine);
+    assert_eq!(
+        run.code,
+        Some(2),
+        "refused as a step that could not be read:\n{}",
+        run.stderr
+    );
+    for needle in ["step 'load' (models/load.sql)", "tokens", "no tokens here"] {
+        assert!(
+            run.stderr.contains(needle),
+            "{needle:?} in:\n{}",
+            run.stderr
+        );
+    }
+    assert_eq!(run.started(), Vec::<String>::new(), "no step ran");
+}
+
+/// A file is asked about once for each text it holds: the check before the run and the
+/// check just before each step read one answer, and a second file with the same text reads
+/// the first file's.
+#[test]
+#[ignore = "runs the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build job runs it"]
+fn a_file_read_again_unchanged_is_not_asked_again() {
+    let real = std::env::var_os("ARC_DUCKDB_PREVIEW_BIN")
+        .map(PathBuf::from)
+        .expect("ARC_DUCKDB_PREVIEW_BIN names a DuckDB 2.0 build");
+    let protocol = Protocol::steps(&[
+        ("a", "CREATE OR REPLACE TABLE a AS SELECT 1 AS x;\n"),
+        ("b", "CREATE OR REPLACE TABLE b AS SELECT 2 AS x;\n"),
+        ("c", "CREATE OR REPLACE TABLE a AS SELECT 1 AS x;\n"),
+    ]);
+    let asked = protocol.root.path().join("asked.log");
+    let engine = protocol.root.path().join("duckdb");
+    script(
+        &engine,
+        &format!(
+            "if [ \"$1\" = \"-no-init\" ]; then echo \"$*\" >> '{}'; fi\nexec '{}' \"$@\"\n",
+            asked.display(),
+            real.display()
+        ),
+    );
+    let run = run_on_engine(&protocol, &engine);
+    assert_eq!(run.code, Some(0), "the run passes:\n{}", run.stderr);
+    let questions = fs::read_to_string(&asked).unwrap_or_default();
+    assert_eq!(
+        questions.lines().count(),
+        2,
+        "one question for each distinct text, not one for each read: {questions}"
+    );
+}
+
+/// Names DuckDB 2.0 reads differently from DuckDB 1.5, each refused as DuckDB 2.0 would
+/// install it: a backticked name, an `E'…'` name holding a backslash, which DuckDB installs
+/// as a path, and a name split over two lines.
+#[test]
+fn names_duckdb_2_reads_its_own_way_are_refused_as_it_reads_them() {
+    for (sql, refusal) in [
+        (
+            "INSTALL `anofox_forecast` FROM community;\n",
+            "installs anofox_forecast from the community registry",
+        ),
+        (
+            "INSTALL E'h3\\x78';\n",
+            "installs the extension at 'h3\\x78'",
+        ),
+        (
+            "INSTALL 'h3'\n'x' FROM community;\n",
+            "installs h3x from the community registry",
+        ),
+    ] {
+        let run = Protocol::steps(&[("s", sql)]).run(VETTED_ON);
+        run.assert_refused(sql);
+        assert!(
+            run.stderr.contains(refusal),
+            "{sql:?}: {refusal:?} in:\n{}",
+            run.stderr
+        );
+    }
 }
 
 // ---- what the run record names of the DuckDB the steps ran on ----

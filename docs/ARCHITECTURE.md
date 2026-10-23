@@ -12,6 +12,7 @@ src/
   runner.rs       # Step execution engine (~1150 lines, largest module)
   engine.rs       # SQL engine invocation (DuckDB CLI delegation)
   asset.rs        # Assets, SQL auto-discovery, dependency validation, case-collision gate
+  duckdb_tokens.rs # A SQL file's tokens, asked of the DuckDB that runs it (`sql_tokenize`); the refusals read these
   introspect.rs   # SQL introspection via sqlparser-rs
   precondition.rs # Typed step preconditions (modified_after, fresh, command, tool)
   state.rs        # Run state tracking (step config hash, artifact hash, staleness)

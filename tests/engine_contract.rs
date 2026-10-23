@@ -91,7 +91,8 @@ impl Fixture {
         fs::write(
             &bin,
             format!(
-                "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$1\" = \"--version\" ]; then echo '{line}'; fi\nexit 0\n",
+                "#!/bin/sh\n{}echo \"$*\" >> '{}'\nif [ \"$1\" = \"--version\" ]; then echo '{line}'; fi\nexit 0\n",
+                tokens_from_real_duckdb(),
                 log.display()
             ),
         )
@@ -111,6 +112,16 @@ impl Fixture {
             .map(|r| r.unwrap())
             .collect()
     }
+}
+
+/// The line a fake engine opens with: it hands a question for a SQL file's tokens, which
+/// arc asks with `-no-init` first, to [`real_duckdb`] by its path, unlogged, so what the fake logs is
+/// still the calls a run makes of its own engine.
+fn tokens_from_real_duckdb() -> String {
+    format!(
+        "if [ \"$1\" = \"-no-init\" ]; then exec '{}' \"$@\"; fi\n",
+        real_duckdb().display()
+    )
 }
 
 struct FakeEngine {

@@ -184,6 +184,22 @@ pub enum Error {
         refusals: Vec<String>,
     },
 
+    // The DuckDB the steps run on gave no tokens for a step's or hook's SQL file, or tokens
+    // arc cannot read, before the run or just before the step or hook ran. The refusals read
+    // a file from those tokens alone, so the file is refused rather than read some other
+    // way; nothing in it ran. `step` is `None` for a hook.
+    #[error(
+        "{place} ({file}) was refused and did not run: arc could not read its SQL, because DuckDB gave no tokens for it that arc can read: {reason}\n\
+         arc reads each SQL file's tokens from the DuckDB that runs it, to check what the file installs, and runs no file it could not read. See {}",
+        crate::engine::VETTED_EXTENSIONS_DOC
+    )]
+    SqlNotRead {
+        place: String,
+        step: Option<String>,
+        file: String,
+        reason: String,
+    },
+
     // A community extension that a step's or hook's SQL file installs, first found when the
     // file was read again just before it ran, is not the build `arcform.yaml` pins for this
     // DuckDB and platform, or arc could not install it to compare. Refused as
@@ -351,7 +367,8 @@ impl Error {
             | Error::PipelineTimeout { .. }
             | Error::ExtensionChanged { .. }
             | Error::ExtensionRefusedBeforeItRan { .. }
-            | Error::ExtensionPinRefusedBeforeItRan { .. } => 2,
+            | Error::ExtensionPinRefusedBeforeItRan { .. }
+            | Error::SqlNotRead { .. } => 2,
             _ => 1,
         }
     }
@@ -362,6 +379,7 @@ impl Error {
             self,
             Error::ExtensionRefusedBeforeItRan { .. }
                 | Error::ExtensionPinRefusedBeforeItRan { .. }
+                | Error::SqlNotRead { .. }
         )
     }
 }
@@ -621,6 +639,12 @@ mod exit_code_tests {
                 place: "step 's'".into(),
                 step: Some("s".into()),
                 refusals: vec!["anofox_forecast".into()],
+            },
+            Error::SqlNotRead {
+                place: "step 's'".into(),
+                step: Some("s".into()),
+                file: "models/s.sql".into(),
+                reason: "it printed nothing".into(),
             },
             Error::ExtensionPinRefusedBeforeItRan {
                 place: "hook on_success 'h'".into(),

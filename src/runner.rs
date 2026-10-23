@@ -294,7 +294,7 @@ pub fn run_with_params(
         }
         // Before anything is initialised, so a refused Protocol leaves no run behind.
         let sql = protocol_sql(&manifest, dir);
-        let installs = check_extension_installs(&sql, info.version.as_ref())?;
+        let installs = check_extension_installs(&sql, info.version.as_ref(), engine)?;
         for warning in &installs.warnings {
             eprintln!("{} {}", "warning:".yellow(), warning);
         }
@@ -848,6 +848,9 @@ pub fn run_with_params(
                     }
                     | Error::ExtensionPinRefusedBeforeItRan {
                         step: Some(step), ..
+                    }
+                    | Error::SqlNotRead {
+                        step: Some(step), ..
                     } => {
                         failure_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
                         failure_env.insert("ARC_EXIT_CODE".to_string(), "refused".to_string());
@@ -901,6 +904,9 @@ pub fn run_with_params(
                         step: Some(step), ..
                     }
                     | Error::ExtensionPinRefusedBeforeItRan {
+                        step: Some(step), ..
+                    }
+                    | Error::SqlNotRead {
                         step: Some(step), ..
                     } => {
                         exit_env.insert("ARC_FAILED_STEP".to_string(), step.clone());

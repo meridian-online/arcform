@@ -30,11 +30,13 @@ Each extension below has a permissive licence, a build the community registry se
 
 `FORCE INSTALL` is checked as `INSTALL` is, in any letter case, and so is an `INSTALL` that follows `EXPLAIN ANALYZE`, which DuckDB runs. A step whose SQL arc cannot otherwise parse is checked too.
 
-arc reads a SQL file as the DuckDB CLI reads a file given with `-f` with its default parser, which is how `arc run` runs a step. A statement that names the switch to the second parser is refused (above). The rules are copied from DuckDB v1.5.5's source, which is the same as v1.5.4's and v1.5.6's:
+arc reads a SQL file as the DuckDB CLI reads a file given with `-f` with its default parser, which is how `arc run` runs a step. A statement that names the switch to the second parser is refused (above). What the CLI does to the file before its parser sees it is arc's own reading, copied from DuckDB v1.5.5's source, which is the same as v1.5.4's and v1.5.6's; the tokens are DuckDB's own:
 
 - The CLI's lines and the batches it hands the parser. A line starting with `.` or `#` while no statement is open is a dot command or a comment, and is not SQL, whatever quote or comment it holds. A line starting with the byte `0x03` drops the lines held before it. A NUL byte drops the rest of the chunk the CLI read it in.
-- The parser's pre-pass, which reads a byte-order mark, a zero-width space (U+200B) and the other unicode spaces it knows as a space, except inside what it reads as a string or a comment.
-- The scanner's rules. A `--` comment ends at a line feed or a carriage return, a `/* */` comment nests, and two strings with a line end between them are one string. Text inside a comment or a string is not SQL.
+- The parser's pre-pass, which reads a byte-order mark, a zero-width space (U+200B) and the other unicode spaces it knows as a space, except inside what it reads as a string or a comment. DuckDB v2.0.0's pre-pass is the same.
+- The tokens. arc asks the DuckDB that runs the step for the tokens of each batch, with `sql_tokenize`, which runs nothing and tokenises SQL its parser cannot parse. A comment is not SQL, and neither is text inside a string. A `/* */` comment nests, a `` `name` `` is a quoted name as a `"name"` is, and two `'…'` strings with a line end between them, and no `/* */` comment, are one string. An `INSTALL` takes its name as written: `INSTALL E'a\x5fb'` installs a file called `a\x5fb`, so it is refused as an install by path.
+
+A file the DuckDB gives no tokens for, or tokens arc cannot read, is refused and does not run: arc exits 2, naming the step or hook and its file. An empty file, or one holding only dot commands and `#` lines, has no tokens and nothing to refuse. A file's tokens are asked for once for each text it holds: a file read again unchanged (below) is not asked about again.
 
 The refusal names the step or hook, the file and line, and what the statement installs, or the setting or parser switch it names. No variable lifts it.
 
@@ -61,7 +63,7 @@ This is not a boundary. A `command:` step can start a DuckDB of its own and inst
 
   The warning says arc does not read the SQL the step builds or writes, and not that the step installs anything. It reads shapes and is not a boundary: a path to `.duckdbrc` assembled from pieces, such as `'~/.duck' || 'dbrc'`, draws no warning. Neither does SQL held in a database. A view or a table macro holds SQL in a database, and a step that reads from it runs that SQL, in the database arc runs the step on or in one the step attaches: after `ATTACH 'lib.duckdb' AS lib;`, `FROM lib.v;` runs what the view `v` holds, and a view holding `FROM enable_peg_parser()` switches the parser for the statements after it, though the step's file does not name the switch.
 - What a DuckDB CLI dot command in a SQL file runs, such as the file `.read` names or the program `.shell` starts. arc skips the dot command's line, as DuckDB does.
-- A DuckDB version other than v2.0.0. The CLI's rules above were read from the source of v1.5.4, v1.5.5 and v1.5.6; the tests that run a real DuckDB CLI check them against v2.0.0, and another version's were not compared.
+- A DuckDB version other than v2.0.0. The CLI's rules above were read from the source of v1.5.4, v1.5.5 and v1.5.6; the tests that run a real DuckDB CLI check them against v2.0.0, and another version's were not compared. The tokens are the DuckDB's own, whichever version it is.
 
 ## The DuckDB version
 

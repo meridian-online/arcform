@@ -30,13 +30,11 @@
 
 use std::cmp::Ordering;
 use std::fmt;
-use std::io::Write;
 use std::ops::Range;
-use std::process::Stdio;
 
+use crate::duckdb_tokens::{Process, Token, Tokenized, literal};
 use crate::engine::DuckDbProgram;
 
-use serde::Deserialize;
 use serde_json::Value;
 
 /// A table as a statement names it, with its schema and catalog when it gives them.
@@ -214,28 +212,6 @@ pub(crate) fn read_step(duckdb: &DuckDbProgram, sql: &str) -> Result<StepReading
     )
 }
 
-/// A token as `sql_tokenize` gives it. `start` is a byte offset into the text asked
-/// about. `token_type` is kept for the record and read nowhere; see the module doc.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[cfg_attr(test, derive(serde::Serialize))]
-struct Token {
-    start: usize,
-    token_type: String,
-    word: String,
-}
-
-impl Token {
-    fn is_comment(&self) -> bool {
-        self.word.starts_with("--") || self.word.starts_with("/*")
-    }
-}
-
-/// The first answer: the version, and the tokens or the error DuckDB gave instead.
-struct Tokenized {
-    version: String,
-    tokens: Result<Vec<Token>, String>,
-}
-
 /// The two questions the reader asks. A DuckDB process answers them, and the tests
 /// answer them from what the preview answered.
 trait Ask {
@@ -246,37 +222,13 @@ trait Ask {
     fn trees(&mut self, texts: &[String]) -> Result<Vec<Value>, Refusal>;
 }
 
-struct Process {
-    program: DuckDbProgram,
-}
-
 impl Ask for Process {
     fn program(&self) -> String {
         self.program.display_name()
     }
 
     fn tokens(&mut self, sql: &str) -> Result<Tokenized, Refusal> {
-        let script = format!(
-            "SELECT version() AS version;\n\
-             SELECT start, token_type, word FROM sql_tokenize({});\n",
-            literal(sql)
-        );
-        let (answers, stderr) = self.run(&script)?;
-        let version = answers
-            .first()
-            .and_then(|rows| rows.get(0)?.get("version")?.as_str())
-            .ok_or_else(|| Refusal::NotRun {
-                program: self.program(),
-                reason: format!("it gave no version: {}", stderr.trim()),
-            })?;
-        let tokens = match answers.get(1) {
-            Some(rows) => serde_json::from_value(rows.clone()).map_err(|e| e.to_string()),
-            None => Err(stderr.trim().to_string()),
-        };
-        Ok(Tokenized {
-            version: version.to_string(),
-            tokens,
-        })
+        Process::tokens(self, sql)
     }
 
     fn trees(&mut self, texts: &[String]) -> Result<Vec<Value>, Refusal> {
@@ -299,51 +251,6 @@ impl Ask for Process {
             .ok_or_else(|| Refusal::Unreadable(format!("no trees: {}", stderr.trim())))?;
         Ok(rows.iter().map(|row| row["tree"].clone()).collect())
     }
-}
-
-impl Process {
-    /// Runs `script` and returns each result DuckDB printed, as JSON, with its stderr.
-    ///
-    /// Logging is turned off first. The 2.0 shell prints a warning DuckDB logs, such as
-    /// the one for parsing the deprecated `PRAGMA threads = 4`, to stdout in the middle
-    /// of the JSON it is printing, and the answer can no longer be read.
-    fn run(&self, script: &str) -> Result<(Vec<Value>, String), Refusal> {
-        let not_run = |e: std::io::Error| Refusal::NotRun {
-            program: self.program(),
-            reason: e.to_string(),
-        };
-        let mut child = self
-            .program
-            .command()
-            .args(["-no-init", "-json"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(not_run)?;
-        // Written from a thread: DuckDB answers each statement as it reads it, and an
-        // answer larger than the pipe would stall a write made from this thread.
-        let mut stdin = child.stdin.take().expect("stdin is piped");
-        let script = format!("SET enable_logging = false;\n{script}");
-        let writer = std::thread::spawn(move || stdin.write_all(script.as_bytes()));
-        let output = child.wait_with_output().map_err(not_run)?;
-        // A write cut short by DuckDB exiting shows in its stderr, which the caller reads.
-        let _ = writer.join();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let answers = serde_json::Deserializer::from_str(&stdout)
-            .into_iter::<Value>()
-            .map_while(Result::ok)
-            .collect();
-        Ok((
-            answers,
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        ))
-    }
-}
-
-/// `text` as a SQL string literal.
-fn literal(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "''"))
 }
 
 fn read_step_with(ask: &mut dyn Ask, sql: &str) -> Result<StepReading, Refusal> {

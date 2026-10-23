@@ -5,8 +5,13 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use crate::duckdb_lineage::Refusal;
+use crate::duckdb_tokens::{FileTokens, Token, TokenCache, to_tok};
 use crate::error::{Error, Result};
 use crate::manifest::{Manifest, Step};
+
+/// The tokens of each string a `query(…)` call is given, by its text: [`FileTokens::literals`].
+type Literals = BTreeMap<String, Vec<Token>>;
 
 /// Information about the detected engine, returned by preflight.
 #[derive(Debug, Clone)]
@@ -115,6 +120,11 @@ pub trait Engine {
     /// loads nothing. A question DuckDB does not answer gives a report with each value absent,
     /// since recording refuses no run.
     fn report(&self, extensions: &[String]) -> EngineReport;
+
+    /// The tokens the DuckDB the steps run on reads in the SQL file holding `file`, as
+    /// [`crate::duckdb_tokens::tokenize_file`] asks for them. The refusals read a SQL file
+    /// from these alone, so a failure here refuses the file.
+    fn tokenize(&self, file: &[u8]) -> std::result::Result<FileTokens, Refusal>;
 }
 
 /// What the DuckDB the steps run on reports, as [`Engine::report`] asks it. Each value is
@@ -663,6 +673,14 @@ impl Engine for DuckDbEngine {
         .map(|answers| read_report(&answers))
         .unwrap_or_default()
     }
+
+    fn tokenize(&self, file: &[u8]) -> std::result::Result<FileTokens, Refusal> {
+        let program = duckdb_program().map_err(|e| Refusal::NotRun {
+            program: std::env::var(DUCKDB_BIN_ENV).unwrap_or_else(|_| "duckdb".to_string()),
+            reason: e.to_string(),
+        })?;
+        crate::duckdb_tokens::tokenize_file(&program, file)
+    }
 }
 
 /// Run `install`, SQL that installs the extension `name`, and return the file DuckDB then
@@ -823,265 +841,20 @@ pub(crate) fn vetted_extensions() -> &'static [VettedExtension] {
     })
 }
 
-/// A token of DuckDB SQL, as much of one as the extension check reads.
+/// A token of DuckDB SQL, as much of one as the extension check reads:
+/// [`crate::duckdb_tokens::to_tok`] makes them from DuckDB's own tokens.
 #[derive(Debug, Clone, PartialEq)]
-enum Tok {
-    /// A keyword or an identifier; `quoted` for a `"double-quoted"` one, kept as written.
+pub(crate) enum Tok {
+    /// A keyword or an identifier; `quoted` for a `"double-quoted"` or `` `backticked` ``
+    /// one, kept as written.
     Word { text: String, quoted: bool },
-    /// A string constant: `'…'`, `E'…'`, `X'…'`, `$$…$$` or `$tag$…$tag$`.
-    Str(String),
+    /// A string constant: `'…'`, `E'…'`, `X'…'`, `$$…$$` or `$tag$…$tag$`. `raw` is the text
+    /// between the quotes as DuckDB's parser strips it, which is what an `INSTALL` takes as
+    /// its name; `text` is what the string evaluates to, which differs from `raw` only for
+    /// an `E'…'` string holding a backslash.
+    Str { text: String, raw: String },
     /// Any other character outside a comment: `;`, an operator, a digit, a parenthesis.
     Other(char),
-}
-
-/// How a quoted run treats a quote or a backslash inside it.
-#[derive(Clone, Copy, PartialEq)]
-enum Escapes {
-    /// `''` is one quote: `'…'` and `"…"`.
-    Doubled,
-    /// `''` and a backslash both escape: `E'…'`.
-    Backslash,
-    /// The first quote ends it: `X'…'` and `B'…'`.
-    None,
-}
-
-fn is_ident_start(ch: char) -> bool {
-    ch.is_alphabetic() || ch == '_' || !ch.is_ascii()
-}
-
-fn is_ident_char(ch: char) -> bool {
-    ch.is_alphanumeric() || ch == '_' || ch == '$' || !ch.is_ascii()
-}
-
-/// The characters DuckDB's scanner skips between tokens: space, tab, `\n`, `\r` and form
-/// feed. A vertical tab is not one of them, and neither is any character above ASCII: DuckDB
-/// reads those as part of a word, after its parser has replaced the few in
-/// [`unicode_space_len`] with a space.
-fn is_scanner_space(ch: char) -> bool {
-    matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{c}')
-}
-
-/// Count the `\n` in `c[from..to]`, the one line end every reader here counts.
-fn newlines(c: &[char], from: usize, to: usize) -> usize {
-    c[from..to].iter().filter(|&&ch| ch == '\n').count()
-}
-
-/// Where a `'…'` string goes on after its closing quote at `j - 1`, if it does: DuckDB
-/// reads `'anofox_'` and `'forecast'` as one string when all that separates them is
-/// whitespace holding a `\n` or a `\r`, and `--` comments. The spaces and comments before
-/// that line end are its own line's; after it, each comment has to end at a line end.
-fn quote_continues(c: &[char], mut j: usize) -> Option<usize> {
-    let comment_end = |j: usize| {
-        (j + 2..c.len())
-            .find(|&k| matches!(c[k], '\n' | '\r'))
-            .unwrap_or(c.len())
-    };
-    loop {
-        match c.get(j) {
-            Some(' ' | '\t' | '\u{c}') => j += 1,
-            Some('-') if c.get(j + 1) == Some(&'-') => j = comment_end(j),
-            Some('\n' | '\r') => break,
-            _ => return None,
-        }
-    }
-    loop {
-        match c.get(j) {
-            Some(&ch) if is_scanner_space(ch) => j += 1,
-            Some('-') if c.get(j + 1) == Some(&'-') => j = comment_end(j) + 1,
-            Some('\'') => return Some(j + 1),
-            _ => return None,
-        }
-    }
-}
-
-/// The character a backslash escape in an `E'…'` string stands for, as DuckDB's scanner
-/// decodes it, and how many characters after the backslash the escape spans: `\b`, `\f`,
-/// `\n`, `\r` and `\t`; one to three octal digits; `\x` and one or two hex digits. Any other
-/// character stands for itself, and a backslash at the end of the input for a backslash.
-/// DuckDB's CLI refuses a file whose SQL holds a `\u` or `\U` escape, so arc reads those as
-/// the letter, which can only turn a name the list holds into one it does not.
-fn e_escape(c: &[char], at: usize) -> (char, usize) {
-    let digits = |from: usize, radix: u32, most: usize| {
-        c.get(from..)
-            .unwrap_or_default()
-            .iter()
-            .take(most)
-            .take_while(|ch| ch.is_digit(radix))
-            .count()
-    };
-    let value = |from: usize, len: usize, radix: u32| {
-        c[from..from + len]
-            .iter()
-            .fold(0u32, |v, ch| v * radix + ch.to_digit(radix).unwrap_or(0))
-    };
-    let byte = |v: u32| char::from((v & 0xff) as u8);
-    let Some(&ch) = c.get(at) else {
-        return ('\\', 0);
-    };
-    match (ch, digits(at + 1, 16, 2)) {
-        ('0'..='7', _) => {
-            let len = digits(at, 8, 3);
-            (byte(value(at, len, 8)), len)
-        }
-        ('x', len @ 1..) => (byte(value(at + 1, len, 16)), len + 1),
-        ('b', _) => ('\u{8}', 1),
-        ('f', _) => ('\u{c}', 1),
-        ('n', _) => ('\n', 1),
-        ('r', _) => ('\r', 1),
-        ('t', _) => ('\t', 1),
-        (other, _) => (other, 1),
-    }
-}
-
-/// Read a quoted run from `*i`, just after its opening `quote`, to its closing quote or the
-/// end of the input, and leave `*i` after it. A `'…'` run goes on where
-/// [`quote_continues`] finds the next.
-fn read_quoted(
-    c: &[char],
-    i: &mut usize,
-    quote: char,
-    escapes: Escapes,
-    line: &mut usize,
-) -> String {
-    let mut text = String::new();
-    while *i < c.len() {
-        let ch = c[*i];
-        if escapes == Escapes::Backslash && ch == '\\' {
-            let (decoded, len) = e_escape(c, *i + 1);
-            *line += newlines(c, *i + 1, *i + 1 + len);
-            text.push(decoded);
-            *i += 1 + len;
-            continue;
-        }
-        if ch == quote {
-            if escapes != Escapes::None && c.get(*i + 1) == Some(&quote) {
-                text.push(quote);
-                *i += 2;
-                continue;
-            }
-            *i += 1;
-            let Some(next) = (quote == '\'').then(|| quote_continues(c, *i)).flatten() else {
-                return text;
-            };
-            *line += newlines(c, *i, next);
-            *i = next;
-            continue;
-        }
-        *line += usize::from(ch == '\n');
-        text.push(ch);
-        *i += 1;
-    }
-    text
-}
-
-/// The length of the `$tag$` or `$$` that opens a dollar-quoted string at `i`, if one does.
-/// A `$` followed by a digit is a parameter, and a `$` inside an identifier is part of it.
-fn dollar_tag_len(c: &[char], i: usize) -> Option<usize> {
-    let mut j = i + 1;
-    if c.get(j).is_some_and(|&ch| is_ident_start(ch)) {
-        while c.get(j).is_some_and(|&ch| is_ident_char(ch) && ch != '$') {
-            j += 1;
-        }
-    }
-    (c.get(j) == Some(&'$')).then_some(j + 1 - i)
-}
-
-/// Split DuckDB SQL into tokens, each with the line it starts on, and drop the comments.
-///
-/// `sql` is one batch, as [`cli_batches`] cuts it and [`strip_unicode_spaces`] leaves it.
-/// Each rule is DuckDB's own scanner's, `third_party/libpg_query/scan.l` in DuckDB v1.5.5:
-/// the characters in [`is_scanner_space`] are skipped; a `--` comment ends at `\n` or `\r`;
-/// a `/* */` comment nests; `''` is a quote inside `'…'`; a backslash escapes only inside
-/// `E'…'`; `$$…$$` and `$tag$…$tag$` are string constants; two `'…'` strings with a line
-/// end between them are one. Text left open at the end of the input runs to the end, where
-/// DuckDB refuses the statement rather than running it.
-///
-/// Every branch consumes the characters it matched before it calls a helper or loops, so the
-/// scan advances on each pass whatever a helper returns: a lexer that can stall would hang
-/// `arc run` on one bad edit and fill memory with tokens.
-fn lex_sql(sql: &str) -> Vec<(Tok, usize)> {
-    let c: Vec<char> = sql.chars().collect();
-    let n = c.len();
-    let mut out = Vec::new();
-    let mut i = 0;
-    let mut line = 1;
-    while i < n {
-        let ch = c[i];
-        let at = line;
-        if is_scanner_space(ch) {
-            line += usize::from(ch == '\n');
-            i += 1;
-        } else if ch == '-' && c.get(i + 1) == Some(&'-') {
-            i += 2;
-            while i < n && !matches!(c[i], '\n' | '\r') {
-                i += 1;
-            }
-        } else if ch == '/' && c.get(i + 1) == Some(&'*') {
-            let mut depth = 1usize;
-            i += 2;
-            while i < n && depth > 0 {
-                if c[i] == '/' && c.get(i + 1) == Some(&'*') {
-                    depth += 1;
-                    i += 2;
-                } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    line += usize::from(c[i] == '\n');
-                    i += 1;
-                }
-            }
-        } else if ch == '\'' || ch == '"' {
-            i += 1;
-            let text = read_quoted(&c, &mut i, ch, Escapes::Doubled, &mut line);
-            out.push((
-                if ch == '"' {
-                    Tok::Word { text, quoted: true }
-                } else {
-                    Tok::Str(text)
-                },
-                at,
-            ));
-        } else if let Some(tag_len) = (ch == '$').then(|| dollar_tag_len(&c, i)).flatten() {
-            let tag = &c[i..i + tag_len];
-            let body = i + tag_len;
-            let close = (body..n).find(|&k| c[k..].starts_with(tag));
-            let end = close.unwrap_or(n);
-            line += c[body..end].iter().filter(|&&ch| ch == '\n').count();
-            out.push((Tok::Str(c[body..end].iter().collect()), at));
-            i = close.map_or(n, |k| k + tag_len);
-        } else if is_ident_start(ch) {
-            let start = i;
-            i += 1;
-            while i < n && is_ident_char(c[i]) {
-                i += 1;
-            }
-            let text: String = c[start..i].iter().collect();
-            let prefixed = match text.as_str() {
-                "e" | "E" => Some(Escapes::Backslash),
-                "x" | "X" | "b" | "B" => Some(Escapes::None),
-                _ => None,
-            };
-            match prefixed {
-                Some(escapes) if c.get(i) == Some(&'\'') => {
-                    i += 1;
-                    let text = read_quoted(&c, &mut i, '\'', escapes, &mut line);
-                    out.push((Tok::Str(text), at));
-                }
-                _ => out.push((
-                    Tok::Word {
-                        text,
-                        quoted: false,
-                    },
-                    at,
-                )),
-            }
-        } else {
-            out.push((Tok::Other(ch), at));
-            i += 1;
-        }
-    }
-    out
 }
 
 /// Where one `INSTALL` asks DuckDB to fetch an extension from.
@@ -1142,13 +915,15 @@ enum ExtensionSql {
 
 // ---- A SQL file as DuckDB's CLI reads it ----
 //
-// `arc run` hands a SQL step to `duckdb <db> -f <file>`. What reaches DuckDB's scanner is not
+// `arc run` hands a SQL step to `duckdb <db> -f <file>`. What reaches DuckDB's tokenizer is not
 // the file: the CLI reads it a line at a time, skips some lines, and hands the parser one
-// batch of lines at a time; the parser then replaces some unicode spaces before its scanner
+// batch of lines at a time; the parser then replaces some unicode spaces before its tokenizer
 // runs. Each function below copies one of those steps from DuckDB v1.5.5's source, and
 // v1.5.4's and v1.5.6's are the same: `tools/shell/shell.cpp` for the CLI,
-// `src/parser/parser.cpp` for the pre-pass. A step is copied as far as it changes which text DuckDB reads as SQL, and no
-// further.
+// `src/parser/parser.cpp` for the pre-pass, whose `StripUnicodeSpaces` is unchanged in
+// v2.0.0. A step is copied as far as it changes which text DuckDB reads as SQL, and no
+// further. What DuckDB's tokenizer reads in each batch is asked of DuckDB itself, in
+// `crate::duckdb_tokens`.
 
 /// The lines DuckDB's CLI reads from a file, each with the file line it starts on, as
 /// `local_getline` reads them with `fgets`: a line ends at `\n`, and a NUL byte ends what the
@@ -1287,7 +1062,7 @@ fn sql_is_complete(z: &[u8]) -> bool {
 ///
 /// A dot command can itself run SQL or a program, such as `.read` and `.shell`; what it runs
 /// is not read here.
-fn cli_batches(bytes: &[u8]) -> Vec<(Vec<u8>, Vec<usize>)> {
+pub(crate) fn cli_batches(bytes: &[u8]) -> Vec<(Vec<u8>, Vec<usize>)> {
     let mut batches = Vec::new();
     let mut sql = Vec::new();
     let mut lines = Vec::new();
@@ -1333,17 +1108,17 @@ fn unicode_space_len(q: &[u8]) -> Option<usize> {
     }
 }
 
-/// A batch as DuckDB's scanner receives it: each unicode space in [`unicode_space_len`]
+/// A batch as DuckDB's tokenizer receives it: each unicode space in [`unicode_space_len`]
 /// replaced with a space, as the parser's `StripUnicodeSpaces` pre-pass does, except inside
-/// what the pre-pass reads as a string or a comment. That is not the scanner's reading: a
+/// what the pre-pass reads as a string or a comment. That is not the tokenizer's reading: a
 /// `'` or `"` opens a string until the next of the same quote, a `$` and a tag open a
 /// dollar-quoted string, a `--` comment ends at `\n` or `\r`, and `/* */` is not a comment.
 /// So a `'` inside a block comment opens a string for the pre-pass, and a U+200B after it
-/// stays, to be read by the scanner as part of a word.
+/// stays, to be read by the tokenizer as part of a word.
 ///
 /// DuckDB repeats the pass until it replaces nothing; one pass leaves nothing for a second,
 /// because a space opens nothing and a unicode space after a `$` is read as part of a tag.
-fn strip_unicode_spaces(q: &[u8]) -> Vec<u8> {
+pub(crate) fn strip_unicode_spaces(q: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut pos = 0;
     while pos < q.len() {
@@ -1391,20 +1166,20 @@ fn strip_unicode_spaces(q: &[u8]) -> Vec<u8> {
 }
 
 /// Every place in a SQL file that says where DuckDB installs an extension from, and every
-/// place where it runs SQL that is not in the file, each with the file line it is on. The
-/// file is read as DuckDB's CLI reads it: [`cli_batches`], then [`strip_unicode_spaces`],
-/// then [`lex_sql`], each batch alone.
-fn scan_extension_sql(file: &[u8]) -> Vec<(ExtensionSql, usize)> {
+/// place where it runs SQL that is not in the file, each with the file line it is on, read
+/// from the file's tokens as the DuckDB that runs it gave them: each batch
+/// [`cli_batches`] cuts, after [`strip_unicode_spaces`], read alone.
+fn scan_extension_sql(tokens: &FileTokens) -> Vec<(ExtensionSql, usize)> {
     let mut found = Vec::new();
-    for (batch, lines) in cli_batches(file) {
-        let batch = strip_unicode_spaces(&batch);
-        let toks = lex_sql(&String::from_utf8_lossy(&batch));
-        let run_time = scan_run_time_sql(&toks)
+    for batch in &tokens.batches {
+        let toks = to_tok(batch.text.as_bytes(), &batch.tokens);
+        let run_time = scan_run_time_sql(&toks, &tokens.literals)
             .into_iter()
             .map(|(shape, line)| (ExtensionSql::RunTime(shape), line));
         // A batch holds one `\n` between each two of its lines, and nothing else adds one.
+        let last = batch.lines.last().copied().unwrap_or(1);
         for (finding, line) in scan_tokens(&toks).into_iter().chain(run_time) {
-            found.push((finding, lines[line - 1]));
+            found.push((finding, batch.lines.get(line - 1).copied().unwrap_or(last)));
         }
     }
     found
@@ -1414,14 +1189,15 @@ fn scan_extension_sql(file: &[u8]) -> Vec<(ExtensionSql, usize)> {
 /// its line in the batch: a call in [`unread_calls`]; `IMPORT DATABASE` or `import_database`,
 /// in any letter case and whatever follows; and a string or a quoted name whose text holds
 /// `.duckdbrc` in any letter case, since macOS's default file system does not tell
-/// `.DuckDBrc` from `.duckdbrc`. `import_database` is one word to [`lex_sql`], as `_` is a
-/// word character, so `PRAGMA import_database('imp')` is looked for by its own name.
+/// `.DuckDBrc` from `.duckdbrc`. `import_database` is one word to DuckDB's tokenizer, as `_`
+/// is a word character, so `PRAGMA import_database('imp')` is looked for by its own name.
+/// A string is read both as it evaluates and as it is written.
 ///
 /// These are shapes, not a boundary: a path to `.duckdbrc` assembled from pieces is not among
 /// them. A step that writes over a later step's or hook's SQL file is not a shape either: that
 /// file is read again just before it runs, by [`ExtensionRecheck::check`].
-fn scan_run_time_sql(toks: &[(Tok, usize)]) -> Vec<(RunTimeSql, usize)> {
-    let mut found: Vec<(RunTimeSql, usize)> = unread_calls(toks)
+fn scan_run_time_sql(toks: &[(Tok, usize)], literals: &Literals) -> Vec<(RunTimeSql, usize)> {
+    let mut found: Vec<(RunTimeSql, usize)> = unread_calls(toks, literals)
         .into_iter()
         .map(|(name, line)| (RunTimeSql::Call(name), line))
         .collect();
@@ -1435,8 +1211,13 @@ fn scan_run_time_sql(toks: &[(Tok, usize)]) -> Vec<(RunTimeSql, usize)> {
             (Tok::Word { text, .. }, _) if text.eq_ignore_ascii_case("import_database") => {
                 RunTimeSql::ImportDatabase
             }
-            (Tok::Word { text, quoted: true } | Tok::Str(text), _)
-                if text.to_lowercase().contains(".duckdbrc") =>
+            (Tok::Word { text, quoted: true }, _) if text.to_lowercase().contains(".duckdbrc") => {
+                RunTimeSql::Duckdbrc
+            }
+            (Tok::Str { text, raw }, _)
+                if [text, raw]
+                    .iter()
+                    .any(|t| t.to_lowercase().contains(".duckdbrc")) =>
             {
                 RunTimeSql::Duckdbrc
             }
@@ -1451,7 +1232,8 @@ fn scan_run_time_sql(toks: &[(Tok, usize)]) -> Vec<(RunTimeSql, usize)> {
 /// function's name, with the line of the call. The name is read in any letter case, quoted or
 /// not and after a schema, as DuckDB runs `FROM "query"('SELECT 1')` and
 /// `FROM system.main.query('SELECT 1')`; a name a column list follows is not a call.
-fn unread_calls(toks: &[(Tok, usize)]) -> Vec<(&'static str, usize)> {
+/// `literals` holds the tokens of each string a `query(…)` call is given.
+fn unread_calls(toks: &[(Tok, usize)], literals: &Literals) -> Vec<(&'static str, usize)> {
     let mut found = Vec::new();
     for (k, (tok, line)) in toks.iter().enumerate() {
         let Tok::Word { text, .. } = tok else {
@@ -1466,7 +1248,7 @@ fn unread_calls(toks: &[(Tok, usize)]) -> Vec<(&'static str, usize)> {
         let [(Tok::Other('('), _), argument @ ..] = &toks[k + 1..] else {
             continue;
         };
-        if names_a_table(&toks[..k]) || reads_argument(name, argument) {
+        if names_a_table(&toks[..k]) || reads_argument(name, argument, literals) {
             continue;
         }
         found.push((name, *line));
@@ -1490,15 +1272,24 @@ fn names_a_table(before: &[(Tok, usize)]) -> bool {
 
 /// Whether arc reads the SQL a call to `name` runs, from the tokens after its `(`: one string
 /// literal and the `)`, whose text makes no call arc does not read. `query()` runs the literal
-/// as SQL, which DuckDB's parser reads after its unicode-space pass; the serialized SQL
-/// `json_execute_serialized_sql()` runs is read by [`serialized_calls`].
-fn reads_argument(name: &str, argument: &[(Tok, usize)]) -> bool {
-    let [(Tok::Str(literal), _), (Tok::Other(')'), _), ..] = argument else {
+/// as SQL, which DuckDB's parser reads after its unicode-space pass, and whose tokens
+/// `literals` holds; a literal it does not hold is read as making such a call. The
+/// serialized SQL `json_execute_serialized_sql()` runs is read by [`serialized_calls`].
+fn reads_argument(name: &str, argument: &[(Tok, usize)], literals: &Literals) -> bool {
+    let [
+        (Tok::Str { text: literal, .. }, _),
+        (Tok::Other(')'), _),
+        ..,
+    ] = argument
+    else {
         return false;
     };
     if name == "query" {
-        let literal = strip_unicode_spaces(literal.as_bytes());
-        unread_calls(&lex_sql(&String::from_utf8_lossy(&literal))).is_empty()
+        let literal =
+            String::from_utf8_lossy(&strip_unicode_spaces(literal.as_bytes())).into_owned();
+        literals.get(&literal).is_some_and(|tokens| {
+            unread_calls(&to_tok(literal.as_bytes(), tokens), literals).is_empty()
+        })
     } else {
         !serialized_calls(literal)
     }
@@ -1556,9 +1347,11 @@ fn scan_tokens(toks: &[(Tok, usize)]) -> Vec<(ExtensionSql, usize)> {
             Tok::Word { text, .. } => PARSER_SWITCHES
                 .iter()
                 .find(|name| text.eq_ignore_ascii_case(name)),
-            Tok::Str(text) => {
-                let text = text.to_ascii_lowercase();
-                PARSER_SWITCHES.iter().find(|name| text.contains(*name))
+            Tok::Str { text, raw } => {
+                let (text, raw) = (text.to_ascii_lowercase(), raw.to_ascii_lowercase());
+                PARSER_SWITCHES
+                    .iter()
+                    .find(|name| text.contains(*name) || raw.contains(*name))
             }
             Tok::Other(_) => None,
         };
@@ -1589,7 +1382,9 @@ fn scan_tokens(toks: &[(Tok, usize)]) -> Vec<(ExtensionSql, usize)> {
             {
                 text
             }
-            Some((Tok::Str(text), _)) => text,
+            // DuckDB installs the string as it is written: `INSTALL E'a\x5fb'` installs a
+            // file `a\x5fb`, so a backslash in it makes it a path.
+            Some((Tok::Str { raw, .. }, _)) => raw,
             _ => continue,
         };
         if name.contains(['.', '/', '\\']) {
@@ -1611,7 +1406,7 @@ fn scan_tokens(toks: &[(Tok, usize)]) -> Vec<(ExtensionSql, usize)> {
                     Tok::Word { text, .. } if text == "core" => InstallFrom::Core,
                     Tok::Word { text, .. } if text == "community" => InstallFrom::Community,
                     Tok::Word { text, .. } => InstallFrom::Alias(text.clone()),
-                    Tok::Str(address) => InstallFrom::Address(address.clone()),
+                    Tok::Str { text: address, .. } => InstallFrom::Address(address.clone()),
                     // `INSTALL x FROM;` does not parse, and DuckDB runs nothing of it.
                     Tok::Other(_) => continue,
                 }
@@ -1694,6 +1489,9 @@ pub(crate) struct ExtensionInstalls {
     /// community`, once, in the order the Protocol first installs it: what the run record
     /// names first, before each other extension a step's process reports it loaded.
     pub(crate) recorded: Vec<String>,
+    /// The tokens of each file the check read, which the check of each file just before it
+    /// runs reads again when the file has not changed.
+    pub(crate) tokens: TokenCache,
 }
 
 /// What the check reads in one SQL file: a line for each statement it refuses, each vetted
@@ -1716,9 +1514,9 @@ fn add_new(list: &mut Vec<String>, names: impl IntoIterator<Item = String>) {
     }
 }
 
-/// Check the SQL file `source` runs, holding `bytes`, as [`check_extension_installs`] checks
-/// each file.
-fn check_file(source: &ProtocolSql, bytes: &[u8]) -> FileCheck {
+/// Check the SQL file `source` runs, whose tokens are `tokens`, as
+/// [`check_extension_installs`] checks each file.
+fn check_file(source: &ProtocolSql, tokens: &FileTokens) -> FileCheck {
     let vetted = vetted_extensions();
     let mut found = FileCheck {
         refusals: Vec::new(),
@@ -1726,7 +1524,7 @@ fn check_file(source: &ProtocolSql, bytes: &[u8]) -> FileCheck {
         recorded: Vec::new(),
         shapes: Vec::new(),
     };
-    for (finding, line) in scan_extension_sql(bytes) {
+    for (finding, line) in scan_extension_sql(tokens) {
         let why = match finding {
             ExtensionSql::RunTime(shape) => {
                 found.shapes.push((shape, line));
@@ -1807,10 +1605,16 @@ fn check_file(source: &ProtocolSql, bytes: &[u8]) -> FileCheck {
 /// boundary: a `command:` step can start a DuckDB
 /// of its own and install what it likes, and a process an earlier step leaves running can
 /// write a file after the check just before it runs has read it.
+///
+/// Each file is read from the tokens `engine`'s DuckDB gives for it. A file it gives no
+/// tokens for, or tokens arc cannot read, is refused: arc does not fall back to a reading of
+/// its own.
 pub(crate) fn check_extension_installs(
     sql: &[ProtocolSql],
     engine_version: Option<&semver::Version>,
+    engine: &dyn Engine,
 ) -> Result<ExtensionInstalls> {
+    let mut tokens = TokenCache::default();
     let mut refusals = Vec::new();
     let mut installed: Vec<&VettedExtension> = Vec::new();
     let mut recorded = Vec::new();
@@ -1821,7 +1625,10 @@ pub(crate) fn check_extension_installs(
         let Ok(bytes) = std::fs::read(&source.path) else {
             continue;
         };
-        let found = check_file(source, &bytes);
+        let found = match tokens.get(&bytes, |file| engine.tokenize(file)) {
+            Ok(file_tokens) => check_file(source, file_tokens),
+            Err(refusal) => return Err(not_read(source, refusal)),
+        };
         refusals.extend(found.refusals);
         for entry in found.installed {
             if !installed.iter().any(|seen| seen.name == entry.name) {
@@ -1850,7 +1657,19 @@ pub(crate) fn check_extension_installs(
         warnings,
         installed: names,
         recorded,
+        tokens,
     })
+}
+
+/// The refusal of the SQL file `source` runs when DuckDB gave no tokens for it, or tokens arc
+/// cannot read.
+fn not_read(source: &ProtocolSql, refusal: Refusal) -> Error {
+    Error::SqlNotRead {
+        place: source.place.clone(),
+        step: source.step.clone(),
+        file: source.file.clone(),
+        reason: refusal.to_string(),
+    }
 }
 
 /// The check of each SQL step's and hook's file just before it runs, for a file a step
@@ -1873,6 +1692,8 @@ pub(crate) struct ExtensionRecheck {
     loaded: LoadedExtensions,
     /// Each warning printed so far.
     warned: HashSet<String>,
+    /// The tokens of each file a check has read, shared with the check before the run.
+    tokens: TokenCache,
     pins: ExtensionPins,
     engine_version: Option<semver::Version>,
 }
@@ -1894,6 +1715,7 @@ impl ExtensionRecheck {
             pinned,
             loaded: LoadedExtensions::default(),
             warned: installs.warnings.into_iter().chain(pin_warnings).collect(),
+            tokens: installs.tokens,
             pins: pins.clone(),
             engine_version: engine_version.cloned(),
         }
@@ -1936,7 +1758,10 @@ impl ExtensionRecheck {
         let Ok(bytes) = std::fs::read(&source.path) else {
             return Ok(Vec::new());
         };
-        let found = check_file(source, &bytes);
+        let found = match self.tokens.get(&bytes, |file| engine.tokenize(file)) {
+            Ok(file_tokens) => check_file(source, file_tokens),
+            Err(refusal) => return Err(not_read(source, refusal)),
+        };
         if !found.refusals.is_empty() {
             return Err(Error::ExtensionRefusedBeforeItRan {
                 place: source.place.clone(),
@@ -2183,6 +2008,10 @@ pub mod mock {
         /// What a SQL step's or hook's process reports it loaded when the step passes, by the
         /// file name of its SQL. A file not here reports nothing.
         pub loads: RefCell<HashMap<String, Vec<(String, ReportedExtension)>>>,
+        /// How many times `tokenize` was asked.
+        pub tokenized: RefCell<usize>,
+        /// If set, `tokenize` fails with this reason.
+        pub tokens_failure: RefCell<Option<String>>,
     }
 
     #[derive(Debug, Clone)]
@@ -2220,6 +2049,8 @@ pub mod mock {
                 report: RefCell::new(EngineReport::default()),
                 reported: RefCell::new(Vec::new()),
                 loads: RefCell::new(HashMap::new()),
+                tokenized: RefCell::new(0),
+                tokens_failure: RefCell::new(None),
             }
         }
 
@@ -2412,6 +2243,16 @@ pub mod mock {
             panic!("the mock engine was asked to force-install {name}, which arc run never does")
         }
 
+        /// The tokens DuckDB v2.0.0 gave for the file, as `crate::duckdb_tokens::recorded`
+        /// holds them.
+        fn tokenize(&self, file: &[u8]) -> std::result::Result<FileTokens, Refusal> {
+            *self.tokenized.borrow_mut() += 1;
+            if let Some(reason) = self.tokens_failure.borrow().clone() {
+                return Err(Refusal::Unreadable(reason));
+            }
+            crate::duckdb_tokens::recorded::tokenize(file)
+        }
+
         fn report(&self, extensions: &[String]) -> EngineReport {
             self.reported.borrow_mut().push(extensions.to_vec());
             self.report.borrow().clone()
@@ -2507,28 +2348,22 @@ mod tests {
 #[cfg(test)]
 mod extension_tests {
     use super::*;
+    use crate::duckdb_tokens::recorded::{self, preview_program};
+    use crate::duckdb_tokens::tokenize_file;
 
-    fn word(text: &str) -> Tok {
-        Tok::Word {
-            text: text.to_string(),
-            quoted: false,
-        }
+    /// [`super::scan_extension_sql`] on the tokens DuckDB v2.0.0 gives for `file`, as
+    /// [`recorded`] holds them.
+    fn scan_extension_sql(file: &[u8]) -> Vec<(ExtensionSql, usize)> {
+        super::scan_extension_sql(&recorded::tokenize(file).expect("tokens"))
     }
 
-    fn quoted(text: &str) -> Tok {
-        Tok::Word {
-            text: text.to_string(),
-            quoted: true,
-        }
-    }
-
-    fn string(text: &str) -> Tok {
-        Tok::Str(text.to_string())
-    }
-
-    /// The tokens of `sql`, without their lines.
-    fn toks(sql: &str) -> Vec<Tok> {
-        lex_sql(sql).into_iter().map(|(tok, _)| tok).collect()
+    /// [`super::check_extension_installs`], with the tokens DuckDB v2.0.0 gives for each
+    /// file, as [`recorded`] holds them.
+    fn check_extension_installs(
+        sql: &[ProtocolSql],
+        engine_version: Option<&semver::Version>,
+    ) -> Result<ExtensionInstalls> {
+        super::check_extension_installs(sql, engine_version, &mock::MockEngine::new())
     }
 
     /// The findings of `sql`, without their lines.
@@ -2544,119 +2379,6 @@ mod extension_tests {
             name: name.to_string(),
             from,
         }
-    }
-
-    // ---- the lexer, rule by rule ----
-
-    #[test]
-    fn lex_splits_words_strings_and_punctuation() {
-        assert_eq!(
-            toks("INSTALL x FROM 'a';"),
-            vec![
-                word("INSTALL"),
-                word("x"),
-                word("FROM"),
-                string("a"),
-                Tok::Other(';')
-            ]
-        );
-        assert_eq!(
-            toks("1 - 2 / _a é"),
-            vec![
-                Tok::Other('1'),
-                Tok::Other('-'),
-                Tok::Other('2'),
-                Tok::Other('/'),
-                word("_a"),
-                word("é")
-            ]
-        );
-        assert_eq!(toks("a$$b c1"), vec![word("a$$b"), word("c1")]);
-    }
-
-    #[test]
-    fn lex_drops_a_line_comment_to_the_end_of_its_line() {
-        assert_eq!(
-            lex_sql("-- INSTALL a\nINSTALL b"),
-            vec![(word("INSTALL"), 2), (word("b"), 2)]
-        );
-    }
-
-    #[test]
-    fn lex_nests_block_comments_as_duckdb_does() {
-        assert_eq!(
-            toks("/* /* */ INSTALL a; */ INSTALL b"),
-            vec![word("INSTALL"), word("b")]
-        );
-        assert_eq!(toks("/* a */ x /* b */"), vec![word("x")]);
-        assert_eq!(lex_sql("/*\n\n*/ x"), vec![(word("x"), 3)]);
-        assert_eq!(toks("/* open /* INSTALL a */ INSTALL b"), Vec::<Tok>::new());
-    }
-
-    #[test]
-    fn lex_reads_a_doubled_quote_as_one_and_a_backslash_as_itself() {
-        assert_eq!(toks("'it''s' x"), vec![string("it's"), word("x")]);
-        assert_eq!(toks(r"'a\' x"), vec![string(r"a\"), word("x")]);
-        assert_eq!(toks("'open"), vec![string("open")]);
-        assert_eq!(toks(r#""a""b" c"#), vec![quoted(r#"a"b"#), word("c")]);
-    }
-
-    #[test]
-    fn lex_honours_a_backslash_only_inside_an_e_string() {
-        assert_eq!(toks(r"E'a\'b' x"), vec![string("a'b"), word("x")]);
-        assert_eq!(toks(r"e'a\'b' x"), vec![string("a'b"), word("x")]);
-        assert_eq!(toks("E'a''b'"), vec![string("a'b")]);
-        assert_eq!(toks("e x"), vec![word("e"), word("x")]);
-        assert_eq!(
-            toks(r"ex'a\' x"),
-            vec![word("ex"), string(r"a\"), word("x")]
-        );
-        assert_eq!(
-            lex_sql("E'\\\n' x"),
-            vec![(string("\n"), 1), (word("x"), 2)]
-        );
-    }
-
-    #[test]
-    fn lex_ends_a_bit_or_hex_string_at_its_first_quote() {
-        assert_eq!(toks("X'ab''cd'"), vec![string("ab"), string("cd")]);
-        assert_eq!(toks("x'ab''cd'"), vec![string("ab"), string("cd")]);
-        assert_eq!(toks("B'01''10'"), vec![string("01"), string("10")]);
-        assert_eq!(toks("b'01''10'"), vec![string("01"), string("10")]);
-    }
-
-    #[test]
-    fn lex_reads_dollar_quoted_strings() {
-        assert_eq!(toks("$$ a ' b $$ x"), vec![string(" a ' b "), word("x")]);
-        assert_eq!(toks("$t$ $$ $t$ x"), vec![string(" $$ "), word("x")]);
-        assert_eq!(toks("$$ open"), vec![string(" open")]);
-        // `$1` is a parameter, so `$1a$` opens no string: a tag cannot start with a digit.
-        assert_eq!(
-            toks("$1a$ x"),
-            vec![Tok::Other('$'), Tok::Other('1'), word("a$"), word("x")]
-        );
-        assert_eq!(
-            toks("$1 $name x"),
-            vec![
-                Tok::Other('$'),
-                Tok::Other('1'),
-                Tok::Other('$'),
-                word("name"),
-                word("x")
-            ]
-        );
-        assert_eq!(
-            lex_sql("$$\n\n$$ x"),
-            vec![(string("\n\n"), 1), (word("x"), 3)]
-        );
-    }
-
-    #[test]
-    fn lex_counts_lines_inside_a_string() {
-        assert_eq!(
-            lex_sql("'a\nb' x\ny"),
-            vec![(string("a\nb"), 1), (word("x"), 2), (word("y"), 3)]
-        );
     }
 
     // ---- what the scan finds ----
@@ -3822,6 +3544,179 @@ mod extension_tests {
         assert_eq!(commands.len(), 6, "{commands:?}");
         // A path a dot command cannot be given in quotes is not asked about.
         assert_eq!(loaded_question(Path::new("/tmp/it's/loaded")), None);
+    }
+
+    // ---- read from DuckDB 2.0's own tokens ----
+
+    /// The findings in `file`, with their lines, read from the tokens the DuckDB
+    /// `ARC_DUCKDB_PREVIEW_BIN` names gives for it.
+    fn live(file: &[u8]) -> Vec<(ExtensionSql, usize)> {
+        super::scan_extension_sql(
+            &tokenize_file(&preview_program(), file).expect("DuckDB gives the file's tokens"),
+        )
+    }
+
+    #[test]
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build \
+                job runs it"]
+    fn an_install_in_sql_duckdb_cannot_parse_is_still_refused() {
+        assert_eq!(
+            live(b"selec 1 frm ;; INSTALL h3x FROM community;"),
+            vec![(install("h3x", InstallFrom::Community), 1)]
+        );
+    }
+
+    #[test]
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build \
+                job runs it"]
+    fn an_install_inside_a_nested_comment_is_not_refused() {
+        assert_eq!(
+            live(b"/* a /* INSTALL h3x FROM community; */ still */ SELECT 1;"),
+            vec![]
+        );
+    }
+
+    #[test]
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build \
+                job runs it"]
+    fn a_switch_name_in_an_e_string_with_an_escaped_quote_is_refused() {
+        assert_eq!(
+            live(br"SELECT E'it\'s allow_parser_override_extension';"),
+            vec![(
+                ExtensionSql::ParserSwitch("allow_parser_override_extension".into()),
+                1
+            )]
+        );
+    }
+
+    #[test]
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build \
+                job runs it"]
+    fn crlf_bom_and_zero_width_space_files_are_read_as_lf() {
+        let lf = "SELECT 1;\n\nINSTALL h3x FROM community;\n";
+        let refused = vec![(install("h3x", InstallFrom::Community), 3)];
+        assert_eq!(live(lf.as_bytes()), refused);
+        let zero_width = lf.replace("INSTALL", "\u{200b}INSTALL");
+        for file in [
+            lf.replace('\n', "\r\n"),
+            format!("\u{feff}{lf}"),
+            zero_width.clone(),
+            format!("\u{feff}{}", zero_width.replace('\n', "\r\n")),
+        ] {
+            assert_eq!(live(file.as_bytes()), refused, "{file:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "starts the DuckDB 2.0 build ARC_DUCKDB_PREVIEW_BIN names; ci.yml's build \
+                job runs it"]
+    fn a_five_megabyte_values_list_is_tokenised_within_ten_seconds() {
+        let mut sql = String::from("INSERT INTO t VALUES ");
+        let mut i = 0;
+        while sql.len() < 5_000_000 {
+            sql.push_str(&format!("({i}, 'name {i}', 'it''s'),"));
+            i += 1;
+        }
+        sql.push_str("(0, 'last', '');\nINSTALL h3x FROM community;\n");
+        let started = Instant::now();
+        let found = live(sql.as_bytes());
+        let took = started.elapsed();
+        assert_eq!(found, vec![(install("h3x", InstallFrom::Community), 2)]);
+        assert!(took < Duration::from_secs(10), "tokenising took {took:?}");
+    }
+
+    /// DuckDB 2.0 reads a backticked name as it reads a double-quoted one, and runs
+    /// `` INSTALL `h3x` FROM community ``.
+    #[test]
+    fn a_backticked_name_is_read_as_a_quoted_one() {
+        assert_eq!(
+            scan("INSTALL `h3x` FROM community;"),
+            vec![install("h3x", InstallFrom::Community)]
+        );
+        assert_eq!(
+            scan("SET `custom_extension_repository` = '/tmp/ext';"),
+            vec![ExtensionSql::Setting("custom_extension_repository".into())]
+        );
+    }
+
+    /// DuckDB 2.0 installs an `E'…'` name as it is written, escapes and all, so one holding
+    /// a backslash is a path: `INSTALL E'h3\x78'` installs a file called `h3\x78`.
+    #[test]
+    fn an_install_of_an_e_string_holding_a_backslash_is_a_path() {
+        assert_eq!(
+            scan(r"INSTALL E'h3\x78' FROM community;"),
+            vec![ExtensionSql::InstallPath(r"h3\x78".into())]
+        );
+        assert_eq!(
+            scan(r"INSTALL E'h3\x78';"),
+            vec![ExtensionSql::InstallPath(r"h3\x78".into())]
+        );
+        assert_eq!(
+            scan("INSTALL E'h3x' FROM community;"),
+            vec![install("h3x", InstallFrom::Community)]
+        );
+    }
+
+    /// A name split over two lines is one to DuckDB, so a vetted prefix does not pass it.
+    #[test]
+    fn a_name_continued_on_the_next_line_is_read_whole() {
+        assert_eq!(
+            scan("INSTALL 'h3'\n'x' FROM community;"),
+            vec![install("h3x", InstallFrom::Community)]
+        );
+        assert_eq!(
+            scan("INSTALL 'h3' -- note\r'x' FROM community;"),
+            vec![install("h3x", InstallFrom::Community)]
+        );
+    }
+
+    #[test]
+    fn a_file_duckdb_gives_no_tokens_for_is_refused_naming_its_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql = sources(dir.path(), &[("step 'load'", "SELECT 1;")]);
+        let engine = mock::MockEngine::new();
+        *engine.tokens_failure.borrow_mut() = Some("it printed nothing".into());
+        let refused =
+            super::check_extension_installs(&sql, Some(&v("2.0.0")), &engine).unwrap_err();
+        assert!(matches!(refused, Error::SqlNotRead { .. }), "{refused:?}");
+        assert_eq!(refused.exit_code(), 2);
+        let message = refused.to_string();
+        for needle in ["step 'load' (s0.sql)", "tokens", "it printed nothing"] {
+            assert!(message.contains(needle), "{needle:?} in {message}");
+        }
+        // The check just before the file runs refuses it too, as a step refused before it ran.
+        let mut recheck = ExtensionRecheck::default();
+        let refused = recheck.check(&engine, &sql[0]).unwrap_err();
+        assert!(refused.refused_before_it_ran(), "{refused:?}");
+    }
+
+    #[test]
+    fn the_check_before_each_file_runs_asks_again_only_for_a_file_that_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql = sources(
+            dir.path(),
+            &[("step 'a'", "SELECT 1;"), ("step 'b'", "SELECT 2;")],
+        );
+        let engine = mock::MockEngine::new();
+        let installs = super::check_extension_installs(&sql, Some(&v("2.0.0")), &engine).unwrap();
+        assert_eq!(*engine.tokenized.borrow(), 2);
+        let mut recheck = ExtensionRecheck::new(
+            installs,
+            Vec::new(),
+            Vec::new(),
+            &ExtensionPins::new(),
+            Some(&v("2.0.0")),
+        );
+        recheck.check(&engine, &sql[0]).unwrap();
+        recheck.check(&engine, &sql[1]).unwrap();
+        assert_eq!(*engine.tokenized.borrow(), 2, "neither file changed");
+        std::fs::write(&sql[1].path, "SELECT 3;").unwrap();
+        recheck.check(&engine, &sql[1]).unwrap();
+        assert_eq!(
+            *engine.tokenized.borrow(),
+            3,
+            "the file that changed is asked again"
+        );
     }
 
     #[test]
