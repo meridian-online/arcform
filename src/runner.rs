@@ -198,49 +198,26 @@ pub(crate) fn check_engine_version(
     }
     let oldest = semver::Version::parse(OLDEST_ENGINE).expect("OLDEST_ENGINE is a valid version");
     // By release, so a pre-release of the oldest release is untested, as any pre-release is,
-    // and not taken for one of the releases before it.
-    let older = (ver.major, ver.minor, ver.patch) < (oldest.major, oldest.minor, oldest.patch);
-    if allow_untested {
-        let mut warning = format!(
-            "engine DuckDB {ver} is outside the versions arc is tested on \
-             ({SUPPORTED_ENGINE_RANGE}); running anyway because {ALLOW_UNTESTED_ENGINE_ENV} is set"
-        );
-        if older {
-            warning.push_str("; ");
-            warning.push_str(&older_engine_risk(ver));
-        }
-        return Ok(vec![warning]);
-    }
-    if older {
+    // and not taken for one of the releases before it. No override reaches below the oldest
+    // engine: the library arc links cannot open a database an older command line shares.
+    if (ver.major, ver.minor, ver.patch) < (oldest.major, oldest.minor, oldest.patch) {
         return Err(Error::EngineTooOld {
             found: ver.to_string(),
             oldest: OLDEST_ENGINE,
             range: SUPPORTED_ENGINE_RANGE,
-            override_var: ALLOW_UNTESTED_ENGINE_ENV,
         });
+    }
+    if allow_untested {
+        return Ok(vec![format!(
+            "engine DuckDB {ver} is outside the versions arc is tested on \
+             ({SUPPORTED_ENGINE_RANGE}); running anyway because {ALLOW_UNTESTED_ENGINE_ENV} is set"
+        )]);
     }
     Err(Error::UntestedEngine {
         found: ver.to_string(),
         range: SUPPORTED_ENGINE_RANGE,
         override_var: ALLOW_UNTESTED_ENGINE_ENV,
     })
-}
-
-/// What a run risks on `ver`, a DuckDB older than [`OLDEST_ENGINE`], as measured on the
-/// official command line run as arc runs a SQL step. 1.2.x runs the step's file and exits 0
-/// when a statement in it fails; a release before 1.2 refuses `-f` and runs nothing.
-fn older_engine_risk(ver: &semver::Version) -> String {
-    if (ver.major, ver.minor) < (1, 2) {
-        format!(
-            "DuckDB {ver} does not take `-f`, which arc runs a SQL step's file with, \
-             so every SQL step fails"
-        )
-    } else {
-        format!(
-            "on DuckDB {ver} a SQL step whose statement fails exits 0, so arc reports the \
-             failed step as passed and runs the steps after it"
-        )
-    }
 }
 
 /// Each file beside the Protocol's file in `dir` whose name may be a copy a synced drive set
@@ -320,6 +297,22 @@ pub fn run_with_params(
         let installs = check_extension_installs(&sql, info.version.as_ref())?;
         for warning in &installs.warnings {
             eprintln!("{} {}", "warning:".yellow(), warning);
+        }
+        // A development build looks community extensions up under its commit hash, which
+        // the registry does not serve. The run goes on: the extension may be installed.
+        if let Some(dev_build) = &info.dev_build
+            && !installs.installed.is_empty()
+        {
+            eprintln!(
+                "{} this DuckDB build ({dev_build}) cannot download community extensions, and \
+                 DuckDB's own release binary (the install script's, or \
+                 github.com/duckdb/duckdb/releases/tag/v{}) can",
+                "warning:".yellow(),
+                info.version
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default()
+            );
         }
         // After the refusal above, so a refused Protocol installs nothing, and before the
         // state backend and the staleness check, so a run whose steps are fresh is checked
@@ -3038,12 +3031,12 @@ mod tests {
     fn test_lrp_version_mismatch_blocks_execution() {
         let dir = tempfile::tempdir().unwrap();
         let yaml =
-            "name: test\nengine_version: '>=2.0'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+            "name: test\nengine_version: '>=2.1'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
 
         let engine = MockEngine::new();
-        // 1.3.0 is inside arc's range, so only the manifest's >=2.0 can refuse it.
-        engine.set_version(Some(semver::Version::new(1, 3, 0)));
+        // 2.0.0 is inside arc's range, so only the manifest's >=2.1 can refuse it.
+        engine.set_version(Some(semver::Version::new(2, 0, 0)));
         let state = MockStateBackend::new();
 
         let result = run(dir.path(), &engine, &state, false);
@@ -3060,21 +3053,21 @@ mod tests {
     fn test_lrp_error_contains_both_versions() {
         let dir = tempfile::tempdir().unwrap();
         let yaml =
-            "name: test\nengine_version: '>=2.0'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+            "name: test\nengine_version: '>=2.1'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
 
         let engine = MockEngine::new();
-        engine.set_version(Some(semver::Version::new(1, 3, 0)));
+        engine.set_version(Some(semver::Version::new(2, 0, 0)));
         let state = MockStateBackend::new();
 
         let err = run(dir.path(), &engine, &state, false).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains(">=2.0"),
+            msg.contains(">=2.1"),
             "error should contain constraint: {msg}"
         );
         assert!(
-            msg.contains("1.3.0"),
+            msg.contains("2.0.0"),
             "error should contain detected version: {msg}"
         );
     }
@@ -3083,7 +3076,7 @@ mod tests {
     // before any step runs, on either side of the range.
     #[test]
     fn test_lrp_no_version_constraint_still_meets_the_supported_range() {
-        for (major, minor, patch) in [(2, 0, 0), (1, 2, 2)] {
+        for (major, minor, patch) in [(3, 0, 0), (1, 5, 6)] {
             let dir = tempfile::tempdir().unwrap();
             let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
             setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
@@ -3114,7 +3107,7 @@ mod tests {
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
 
         let engine = MockEngine::new();
-        engine.set_version(Some(semver::Version::new(1, 3, 0)));
+        engine.set_version(Some(semver::Version::new(2, 0, 0)));
         let state = MockStateBackend::new();
 
         run(dir.path(), &engine, &state, false).unwrap();
@@ -3131,7 +3124,7 @@ mod tests {
     // of the oldest release, it is the untested one.
     #[test]
     fn test_check_engine_version_range_bounds() {
-        for ok in ["1.3.0", "1.5.4", "1.99.99"] {
+        for ok in ["2.0.0", "2.0.1", "2.99.99"] {
             assert!(
                 check_engine_version(Some(&v(ok)), None, false)
                     .unwrap()
@@ -3139,7 +3132,7 @@ mod tests {
                 "{ok} is in range and must pass without a warning"
             );
         }
-        for older in ["1.2.2", "1.2.0", "1.1.9"] {
+        for older in ["1.5.6", "1.99.99", "1.2.0"] {
             let err = check_engine_version(Some(&v(older)), None, false).unwrap_err();
             assert!(
                 matches!(&err, Error::EngineTooOld { found, oldest, .. }
@@ -3147,7 +3140,7 @@ mod tests {
                 "{older}: expected EngineTooOld, got {err:?}"
             );
         }
-        for refused in ["2.0.0", "3.1.0", "1.3.0-dev1"] {
+        for refused in ["3.0.0", "3.1.0", "2.0.0-dev1"] {
             let err = check_engine_version(Some(&v(refused)), None, false).unwrap_err();
             assert!(
                 matches!(err, Error::UntestedEngine { .. }),
@@ -3162,33 +3155,28 @@ mod tests {
     fn test_supported_range_starts_at_the_oldest_engine() {
         let range = semver::VersionReq::parse(SUPPORTED_ENGINE_RANGE).unwrap();
         assert!(range.matches(&v(OLDEST_ENGINE)), "{SUPPORTED_ENGINE_RANGE}");
-        assert!(!range.matches(&v("1.2.99")), "{SUPPORTED_ENGINE_RANGE}");
-        assert_eq!(OLDEST_ENGINE, "1.3.0");
+        assert!(!range.matches(&v("1.99.99")), "{SUPPORTED_ENGINE_RANGE}");
+        assert_eq!(OLDEST_ENGINE, "2.0.0");
     }
 
-    // The override runs an engine older than the oldest release, and its warning says what
-    // the run risks there: on 1.2.x a failed SQL step is reported as passed; before 1.2 the
-    // command line refuses `-f`. Above the range the warning names neither.
+    // The override lifts arc's range above the oldest release and never below it: the
+    // library arc links cannot open a database an older command line shares, so a 1.x
+    // engine is refused with the override set, and the refusal names the way out.
     #[test]
-    fn test_check_engine_version_override_on_an_older_engine_names_the_risk() {
-        let warnings = check_engine_version(Some(&v("1.2.0")), None, true).unwrap();
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("1.2.0"), "{warnings:?}");
-        assert!(
-            warnings[0].contains("reports the failed step as passed"),
-            "{warnings:?}"
-        );
+    fn test_check_engine_version_override_does_not_reach_an_older_engine() {
+        for older in ["1.5.6", "1.2.0", "1.1.3"] {
+            let err = check_engine_version(Some(&v(older)), None, true).unwrap_err();
+            assert!(
+                matches!(&err, Error::EngineTooOld { found, .. } if found == older),
+                "{older}: expected EngineTooOld, got {err:?}"
+            );
+            assert!(err.to_string().contains("0.2.1"), "{err}");
+        }
 
-        let warnings = check_engine_version(Some(&v("1.1.3")), None, true).unwrap();
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("does not take `-f`"), "{warnings:?}");
-        assert!(!warnings[0].contains("as passed"), "{warnings:?}");
-
-        for not_older in ["2.0.0", "1.3.0-dev1"] {
+        for not_older in ["3.0.0", "2.0.0-dev1"] {
             let warnings = check_engine_version(Some(&v(not_older)), None, true).unwrap();
             assert_eq!(warnings.len(), 1, "{warnings:?}");
-            assert!(!warnings[0].contains("as passed"), "{warnings:?}");
-            assert!(!warnings[0].contains("`-f`"), "{warnings:?}");
+            assert!(warnings[0].contains(not_older), "{warnings:?}");
         }
     }
 
@@ -3196,10 +3184,10 @@ mod tests {
     // narrows; on an engine older than the oldest release, arc's own range refuses.
     #[test]
     fn test_check_engine_version_manifest_below_the_oldest_does_not_widen() {
-        let err = check_engine_version(Some(&v("1.2.0")), Some(">=1.0"), false).unwrap_err();
+        let err = check_engine_version(Some(&v("1.5.6")), Some(">=1.0"), false).unwrap_err();
         assert!(matches!(err, Error::EngineTooOld { .. }), "got {err:?}");
         assert!(
-            check_engine_version(Some(&v("1.5.4")), Some(">=1.0"), false)
+            check_engine_version(Some(&v("2.0.0")), Some(">=1.0"), false)
                 .unwrap()
                 .is_empty()
         );
@@ -3209,12 +3197,12 @@ mod tests {
     // comparator on the same major.minor.patch. The override runs it, with a warning.
     #[test]
     fn test_check_engine_version_pre_release_is_untested() {
-        let dev = v("1.6.0-dev123");
+        let dev = v("2.1.0-dev123");
         let err = check_engine_version(Some(&dev), None, false).unwrap_err();
         assert!(matches!(err, Error::UntestedEngine { .. }), "got {err:?}");
         let warnings = check_engine_version(Some(&dev), None, true).unwrap();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("1.6.0-dev123"), "{warnings:?}");
+        assert!(warnings[0].contains("2.1.0-dev123"), "{warnings:?}");
     }
 
     // The manifest's constraint is checked before arc's range and the override never
@@ -3222,14 +3210,14 @@ mod tests {
     #[test]
     fn test_check_engine_version_manifest_constraint_survives_the_override() {
         for allow in [false, true] {
-            let err = check_engine_version(Some(&v("1.5.4")), Some(">=1.6"), allow).unwrap_err();
+            let err = check_engine_version(Some(&v("2.0.0")), Some(">=2.1"), allow).unwrap_err();
             assert!(
                 matches!(&err, Error::VersionMismatch { required, found }
-                    if required == ">=1.6" && found == "1.5.4"),
+                    if required == ">=2.1" && found == "2.0.0"),
                 "allow={allow}: got {err:?}"
             );
         }
-        let err = check_engine_version(Some(&v("2.0.0")), Some("<2"), true).unwrap_err();
+        let err = check_engine_version(Some(&v("3.0.0")), Some("<3"), true).unwrap_err();
         assert!(matches!(err, Error::VersionMismatch { .. }), "got {err:?}");
     }
 
@@ -3252,14 +3240,14 @@ mod tests {
     fn test_lrp_version_satisfies_constraint() {
         let dir = tempfile::tempdir().unwrap();
         let yaml =
-            "name: test\nengine_version: '>=1.5'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+            "name: test\nengine_version: '>=2.0'\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
         setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
 
         let engine = MockEngine::new();
-        engine.set_version(Some(semver::Version::new(1, 5, 2)));
+        engine.set_version(Some(semver::Version::new(2, 0, 2)));
         let state = MockStateBackend::new();
 
-        // Should succeed — 1.5.2 >= 1.5.
+        // Should succeed — 2.0.2 >= 2.0.
         run(dir.path(), &engine, &state, false).unwrap();
     }
 

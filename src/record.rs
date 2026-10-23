@@ -976,9 +976,14 @@ fn quote_ident(name: &str) -> String {
 /// than given a list of the words: a list copied into the source would stay as it
 /// was when DuckDB's own grows. A database that cannot be opened gives the quoted
 /// name, which DuckDB reads as the table whatever the name.
+///
+/// The connection is never dropped: a thread's storage is torn down after DuckDB 2.0's own
+/// per-thread state, and closing a database then crashes the process. It is one small
+/// in-memory database for each thread that asks, kept until the process ends.
 fn from_ident(name: &str) -> String {
     thread_local! {
-        static READER: Option<duckdb::Connection> = duckdb::Connection::open_in_memory().ok();
+        static READER: Option<std::mem::ManuallyDrop<duckdb::Connection>> =
+            duckdb::Connection::open_in_memory().ok().map(std::mem::ManuallyDrop::new);
     }
     READER.with(|con| match con {
         Some(con) => from_ident_on(con, name),

@@ -19,8 +19,8 @@ use std::process::Command;
 
 const BIN_ENV: &str = "ARC_DUCKDB_BIN";
 const ALLOW_ENV: &str = "ARC_ALLOW_UNTESTED_ENGINE";
-const RANGE: &str = ">=1.3, <2";
-const OLDEST: &str = "1.3.0";
+const RANGE: &str = ">=2.0, <3";
+const OLDEST: &str = "2.0.0";
 const NAME: &str = "engine_contract";
 
 /// A project directory plus somewhere to put engines and PATH directories.
@@ -80,13 +80,18 @@ impl Fixture {
 
     /// A fake engine at `<dir>/<name>` reporting `version`, logging to `<dir>/<name>.log`.
     fn fake(&self, dir: &Path, name: &str, version: &str) -> FakeEngine {
+        self.fake_printing(dir, name, &format!("v{version} (fake) 0000000000"))
+    }
+
+    /// A fake engine whose `--version` prints `line` exactly.
+    fn fake_printing(&self, dir: &Path, name: &str, line: &str) -> FakeEngine {
         let bin = dir.join(name);
         let log = dir.join(format!("{name}.log"));
         // Builtins only: several tests run arc with a PATH that holds nothing else.
         fs::write(
             &bin,
             format!(
-                "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$1\" = \"--version\" ]; then echo 'v{version} (fake) 0000000000'; fi\nexit 0\n",
+                "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$1\" = \"--version\" ]; then echo '{line}'; fi\nexit 0\n",
                 log.display()
             ),
         )
@@ -191,7 +196,7 @@ fn real_duckdb() -> PathBuf {
 fn a_told_engine_runs_with_no_duckdb_on_the_search_path() {
     let fx = Fixture::new(None, "SELECT 42;");
     let empty = fx.dir("empty-path");
-    let told = fx.fake(&fx.dir("engine"), "told-duckdb", "1.5.4");
+    let told = fx.fake(&fx.dir("engine"), "told-duckdb", "2.0.0");
 
     let (code, stderr) = arc_run(
         &fx.project(),
@@ -251,7 +256,7 @@ fn a_told_real_duckdb_writes_the_table_with_no_duckdb_on_the_search_path() {
 fn unset_arc_runs_the_duckdb_on_the_search_path() {
     let fx = Fixture::new(None, "SELECT 42;");
     let on_path = fx.dir("path");
-    let duckdb = fx.fake(&on_path, "duckdb", "1.5.4");
+    let duckdb = fx.fake(&on_path, "duckdb", "2.0.0");
 
     let (code, stderr) = arc_run(
         &fx.project(),
@@ -272,7 +277,7 @@ fn unset_arc_runs_the_duckdb_on_the_search_path() {
 fn a_told_path_that_is_not_an_executable_file_is_refused_and_path_is_not_tried() {
     let fx = Fixture::new(None, "SELECT 42;");
     let on_path = fx.dir("path");
-    let decoy = fx.fake(&on_path, "duckdb", "1.5.4");
+    let decoy = fx.fake(&on_path, "duckdb", "2.0.0");
 
     let not_executable = fx.dir("engine").join("duckdb-no-x");
     fs::write(&not_executable, "#!/bin/sh\nexit 0\n").unwrap();
@@ -317,8 +322,8 @@ fn a_told_path_that_is_not_an_executable_file_is_refused_and_path_is_not_tried()
 fn preflight_and_sql_both_reach_the_told_engine() {
     let fx = Fixture::new(None, "SELECT 42;");
     let on_path = fx.dir("path");
-    let decoy = fx.fake(&on_path, "duckdb", "1.5.4");
-    let told = fx.fake(&fx.dir("engine"), "told-duckdb", "1.5.4");
+    let decoy = fx.fake(&on_path, "duckdb", "2.0.0");
+    let told = fx.fake(&fx.dir("engine"), "told-duckdb", "2.0.0");
 
     let (code, stderr) = arc_run(
         &fx.project(),
@@ -340,8 +345,8 @@ fn preflight_and_sql_both_reach_the_told_engine() {
 fn a_relative_told_path_resolves_against_the_working_directory_not_path() {
     let fx = Fixture::new(None, "SELECT 42;");
     let on_path = fx.dir("path");
-    let decoy = fx.fake(&on_path, "told-duckdb", "1.5.4");
-    let told = fx.fake(&fx.project(), "told-duckdb", "1.5.4");
+    let decoy = fx.fake(&on_path, "told-duckdb", "2.0.0");
+    let told = fx.fake(&fx.project(), "told-duckdb", "2.0.0");
 
     let (code, stderr) = arc_run(
         &fx.project(),
@@ -382,63 +387,183 @@ fn run_on_version(
 // step runs, and the message names the version, the range and the override.
 #[test]
 fn an_engine_outside_the_range_is_refused_before_a_step_runs() {
-    let (code, stderr, sql) = run_on_version(None, "2.0.0", false);
-    assert_eq!(code, Some(1), "2.0.0 must be refused:\n{stderr}");
-    assert_eq!(sql, 0, "a step ran on 2.0.0");
-    for needle in ["2.0.0", RANGE, ALLOW_ENV] {
+    let (code, stderr, sql) = run_on_version(None, "3.0.0", false);
+    assert_eq!(code, Some(1), "3.0.0 must be refused:\n{stderr}");
+    assert_eq!(sql, 0, "a step ran on 3.0.0");
+    for needle in ["3.0.0", RANGE, ALLOW_ENV] {
         assert!(stderr.contains(needle), "expected '{needle}':\n{stderr}");
     }
-
-    let (code, stderr, sql) = run_on_version(None, "1.5.4", false);
-    assert_eq!(code, Some(0), "1.5.4 must run:\n{stderr}");
-    assert_eq!(sql, 1);
 }
 
-// An engine older than the oldest release arc accepts is refused before a step runs, and
-// the message names the version found and the oldest release. With the override it runs,
-// and the warning says what that costs on the version found: a failed SQL step is reported
-// as passed.
 #[test]
-fn an_engine_older_than_the_oldest_release_is_refused_and_the_override_names_the_risk() {
-    let (code, stderr, sql) = run_on_version(None, "1.2.0", false);
-    assert_eq!(code, Some(1), "1.2.0 must be refused:\n{stderr}");
-    assert_eq!(sql, 0, "a step ran on 1.2.0");
-    for needle in ["DuckDB 1.2.0 is older than", OLDEST, ALLOW_ENV] {
-        assert!(stderr.contains(needle), "expected '{needle}':\n{stderr}");
-    }
-
-    let (code, stderr, sql) = run_on_version(None, "1.2.0", true);
-    assert_eq!(code, Some(0), "override must run 1.2.0:\n{stderr}");
-    assert_eq!(sql, 1);
-    let warning = stderr
-        .lines()
-        .find(|l| l.contains("warning:"))
-        .unwrap_or_else(|| panic!("no warning printed:\n{stderr}"));
-    assert!(
-        warning.contains("1.2.0") && warning.contains("reports the failed step as passed"),
-        "the warning must say a failed step is reported as passed on 1.2.0: {warning}"
-    );
-
+fn a_2_0_0_engine_runs() {
     let (code, stderr, sql) = run_on_version(None, OLDEST, false);
     assert_eq!(code, Some(0), "{OLDEST} must run:\n{stderr}");
     assert_eq!(sql, 1);
     assert!(!stderr.contains("warning:"), "stderr: {stderr}");
+    assert!(!stderr.contains(RANGE), "stderr: {stderr}");
+}
+
+#[test]
+fn a_2_7_3_engine_runs() {
+    let (code, stderr, sql) = run_on_version(None, "2.7.3", false);
+    assert_eq!(code, Some(0), "2.7.3 must run:\n{stderr}");
+    assert_eq!(sql, 1);
+    assert!(!stderr.contains("warning:"), "stderr: {stderr}");
+}
+
+// A 1.x engine cannot open a database the linked 2.0 library shares with it, so it is
+// refused, and the message names the release of arc that is for DuckDB 1.5.
+#[test]
+fn a_1_5_6_engine_is_refused_as_too_old_naming_0_2_1() {
+    let (code, stderr, sql) = run_on_version(None, "1.5.6", false);
+    assert_eq!(code, Some(1), "1.5.6 must be refused:\n{stderr}");
+    assert_eq!(sql, 0, "a step ran on 1.5.6");
+    for needle in ["1.5.6", RANGE, "0.2.1"] {
+        assert!(stderr.contains(needle), "expected '{needle}':\n{stderr}");
+    }
+}
+
+#[test]
+fn a_1_5_6_engine_is_refused_even_with_the_override_set() {
+    let (code, stderr, sql) = run_on_version(None, "1.5.6", true);
+    assert_eq!(code, Some(1), "1.5.6 must be refused:\n{stderr}");
+    assert_eq!(sql, 0, "a step ran on 1.5.6");
+    for needle in ["1.5.6", RANGE, "0.2.1"] {
+        assert!(stderr.contains(needle), "expected '{needle}':\n{stderr}");
+    }
+}
+
+#[test]
+fn a_3_0_0_engine_is_untested_and_the_override_lifts_it() {
+    let (code, stderr, sql) = run_on_version(None, "3.0.0", false);
+    assert_eq!(code, Some(1), "3.0.0 must be refused:\n{stderr}");
+    assert_eq!(sql, 0);
+    assert!(stderr.contains("outside the versions"), "stderr: {stderr}");
+
+    let (code, stderr, sql) = run_on_version(None, "3.0.0", true);
+    assert_eq!(code, Some(0), "override must run 3.0.0:\n{stderr}");
+    assert_eq!(sql, 1);
+}
+
+#[test]
+fn a_2_0_0_pre_release_is_untested() {
+    let (code, stderr, sql) = run_on_version(None, "2.0.0-alpha48730", false);
+    assert_eq!(code, Some(1), "a pre-release must be refused:\n{stderr}");
+    assert_eq!(sql, 0);
+    assert!(stderr.contains("2.0.0-alpha48730"), "stderr: {stderr}");
+}
+
+/// What Homebrew's DuckDB 2.0.0, built from the v2.0.0 commit, prints for `--version`.
+const HOMEBREW_2_0_0: &str = "v2.0.0-dev88614 (Development Version) d54cbbe3df";
+
+// Homebrew's build of the v2.0.0 commit calls itself a dev build, and is v2.0.0: arc's range
+// and a Protocol's `engine_version: ">=1.0"` both take it as that release.
+#[test]
+fn homebrews_dev_build_of_the_2_0_0_commit_runs_as_2_0_0() {
+    let fx = Fixture::new(Some(">=1.0"), "SELECT 42;");
+    let empty = fx.dir("empty-path");
+    let told = fx.fake_printing(&fx.dir("engine"), "told-duckdb", HOMEBREW_2_0_0);
+    let (code, stderr) = arc_run(
+        &fx.project(),
+        Run {
+            path: &empty,
+            told: Some(told.bin.as_os_str()),
+            allow_untested: false,
+        },
+    );
+    assert_eq!(code, Some(0), "the dev build must run:\n{stderr}");
+    assert_eq!(told.sql_calls(), 1);
+    assert!(!stderr.contains("warning:"), "stderr: {stderr}");
+}
+
+#[test]
+fn a_dev_build_of_another_commit_is_still_untested() {
+    let fx = Fixture::new(None, "SELECT 42;");
+    let empty = fx.dir("empty-path");
+    let told = fx.fake_printing(
+        &fx.dir("engine"),
+        "told-duckdb",
+        "v2.0.0-dev88614 (Development Version) 0123456789",
+    );
+    let (code, stderr) = arc_run(
+        &fx.project(),
+        Run {
+            path: &empty,
+            told: Some(told.bin.as_os_str()),
+            allow_untested: false,
+        },
+    );
+    assert_eq!(
+        code,
+        Some(1),
+        "an unknown dev build must be refused:\n{stderr}"
+    );
+    assert_eq!(told.sql_calls(), 0);
+    assert!(stderr.contains("2.0.0-dev88614"), "stderr: {stderr}");
+}
+
+/// A project whose one step installs a vetted community extension, run on a fake engine
+/// printing `line`; returns stderr.
+fn community_install_stderr(line: &str) -> String {
+    let fx = Fixture::new(None, "INSTALL mlpack FROM community;\nSELECT 42;");
+    let empty = fx.dir("empty-path");
+    let told = fx.fake_printing(&fx.dir("engine"), "told-duckdb", line);
+    let (code, stderr) = arc_run(
+        &fx.project(),
+        Run {
+            path: &empty,
+            told: Some(told.bin.as_os_str()),
+            allow_untested: false,
+        },
+    );
+    assert_eq!(code, Some(0), "the run must proceed:\n{stderr}");
+    assert_eq!(told.sql_calls(), 1);
+    stderr
+}
+
+#[test]
+fn a_release_build_of_a_protocol_installing_an_extension_draws_no_dev_build_warning() {
+    let stderr = community_install_stderr("v2.0.0 (Cyanoptera) d54cbbe3df");
+    assert!(!stderr.contains("community extensions"), "stderr: {stderr}");
+}
+
+#[test]
+fn a_dev_build_running_a_protocol_that_installs_a_community_extension_warns_before_the_first_step()
+{
+    let stderr = community_install_stderr(HOMEBREW_2_0_0);
+    let warning = stderr
+        .lines()
+        .find(|l| l.contains("cannot download community extensions"))
+        .unwrap_or_else(|| panic!("no dev-build warning:\n{stderr}"));
+    for needle in [
+        "v2.0.0-dev88614",
+        "github.com/duckdb/duckdb/releases/tag/v2.0.0",
+    ] {
+        assert!(warning.contains(needle), "expected '{needle}': {warning}");
+    }
+    assert_eq!(
+        stderr
+            .matches("cannot download community extensions")
+            .count(),
+        1,
+        "stderr: {stderr}"
+    );
 }
 
 // A manifest asking for a range that starts below the oldest release still loads, and runs
-// on an engine arc accepts; on an engine older than the oldest release, arc's own range
-// refuses it, not the manifest's.
+// on an engine arc accepts; on a 1.x engine, arc's own range refuses it, not the manifest's.
 #[test]
 fn a_manifest_that_starts_below_the_oldest_release_loads_and_does_not_widen_the_range() {
-    let (code, stderr, sql) = run_on_version(Some(">=1.2"), "1.5.4", false);
-    assert_eq!(code, Some(0), ">=1.2 on 1.5.4 must run:\n{stderr}");
+    let (code, stderr, sql) = run_on_version(Some(">=1.2"), "2.0.0", false);
+    assert_eq!(code, Some(0), ">=1.2 on 2.0.0 must run:\n{stderr}");
     assert_eq!(sql, 1);
 
-    let (code, stderr, sql) = run_on_version(Some(">=1.2"), "1.2.0", false);
-    assert_eq!(code, Some(1), ">=1.2 on 1.2.0 must be refused:\n{stderr}");
-    assert_eq!(sql, 0, "a step ran on 1.2.0");
+    let (code, stderr, sql) = run_on_version(Some(">=1.2"), "1.5.6", false);
+    assert_eq!(code, Some(1), ">=1.2 on 1.5.6 must be refused:\n{stderr}");
+    assert_eq!(sql, 0, "a step ran on 1.5.6");
     assert!(
-        stderr.contains("DuckDB 1.2.0 is older than") && stderr.contains(OLDEST),
+        stderr.contains("DuckDB 1.5.6 is older than") && stderr.contains(OLDEST),
         "arc's range must be the refusal: {stderr}"
     );
 }
@@ -486,20 +611,20 @@ fn a_failed_statement_on_a_real_duckdb_fails_the_run_and_stops_it() {
     assert_eq!(second, 0, "the second step ran after the first failed");
 }
 
-// A manifest's constraint narrows the range and does not replace it. `>=1.2`, the
-// constraint the Protocols in this repository state, does not switch the ceiling off.
+// A manifest's constraint narrows the range and does not replace it. `>=1.2` does not
+// switch the ceiling off.
 #[test]
 fn a_manifest_constraint_narrows_the_range_and_does_not_replace_it() {
-    let (code, stderr, sql) = run_on_version(Some(">=1.2"), "2.0.0", false);
-    assert_eq!(code, Some(1), ">=1.2 on 2.0.0 must be refused:\n{stderr}");
-    assert_eq!(sql, 0, "a step ran on 2.0.0");
+    let (code, stderr, sql) = run_on_version(Some(">=1.2"), "3.0.0", false);
+    assert_eq!(code, Some(1), ">=1.2 on 3.0.0 must be refused:\n{stderr}");
+    assert_eq!(sql, 0, "a step ran on 3.0.0");
     assert!(stderr.contains(RANGE), "stderr: {stderr}");
 
-    let (code, stderr, sql) = run_on_version(Some(">=1.6"), "1.5.4", false);
-    assert_eq!(code, Some(1), ">=1.6 on 1.5.4 must be refused:\n{stderr}");
-    assert_eq!(sql, 0, "a step ran on 1.5.4");
+    let (code, stderr, sql) = run_on_version(Some(">=2.1"), "2.0.0", false);
+    assert_eq!(code, Some(1), ">=2.1 on 2.0.0 must be refused:\n{stderr}");
+    assert_eq!(sql, 0, "a step ran on 2.0.0");
     assert!(
-        stderr.contains("requires >=1.6, found 1.5.4"),
+        stderr.contains("requires >=2.1, found 2.0.0"),
         "stderr: {stderr}"
     );
 }
@@ -508,31 +633,31 @@ fn a_manifest_constraint_narrows_the_range_and_does_not_replace_it() {
 // range, and lifts only arc's range: a manifest's own constraint still refuses.
 #[test]
 fn the_override_runs_an_untested_engine_with_a_warning_and_keeps_the_manifest_constraint() {
-    let (code, stderr, sql) = run_on_version(None, "2.0.0", true);
-    assert_eq!(code, Some(0), "override must run 2.0.0:\n{stderr}");
+    let (code, stderr, sql) = run_on_version(None, "3.0.0", true);
+    assert_eq!(code, Some(0), "override must run 3.0.0:\n{stderr}");
     assert_eq!(sql, 1);
     let warning = stderr
         .lines()
         .find(|l| l.contains("warning:"))
         .unwrap_or_else(|| panic!("no warning printed:\n{stderr}"));
     assert!(
-        warning.contains("2.0.0") && warning.contains(RANGE),
+        warning.contains("3.0.0") && warning.contains(RANGE),
         "the warning must name the version and the range: {warning}"
     );
 
-    let (code, stderr, sql) = run_on_version(Some(">=1.6"), "1.5.4", true);
-    assert_eq!(code, Some(1), "override must not lift >=1.6:\n{stderr}");
+    let (code, stderr, sql) = run_on_version(Some(">=2.1"), "2.0.0", true);
+    assert_eq!(code, Some(1), "override must not lift >=2.1:\n{stderr}");
     assert_eq!(sql, 0);
     assert!(
-        stderr.contains("requires >=1.6, found 1.5.4"),
+        stderr.contains("requires >=2.1, found 2.0.0"),
         "stderr: {stderr}"
     );
 
-    let (code, stderr, sql) = run_on_version(Some("<2"), "2.0.0", true);
-    assert_eq!(code, Some(1), "override must not lift <2:\n{stderr}");
+    let (code, stderr, sql) = run_on_version(Some("<3"), "3.0.0", true);
+    assert_eq!(code, Some(1), "override must not lift <3:\n{stderr}");
     assert_eq!(sql, 0);
     assert!(
-        stderr.contains("requires <2, found 2.0.0"),
+        stderr.contains("requires <3, found 3.0.0"),
         "stderr: {stderr}"
     );
 }

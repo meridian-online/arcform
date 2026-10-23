@@ -21,7 +21,7 @@ REPO="meridian-online/arcform"
 BINARY="arc"
 # The DuckDB release arc is built and tested against. arc's engine shells out to
 # the `duckdb` command for a protocol's SQL steps, so a user needs it on PATH.
-DUCKDB_RECOMMENDED="v1.5.6"
+DUCKDB_RECOMMENDED="v2.0.0"
 SOURCE_INSTALL="cargo install arcform --locked --features mcp,bundled-duckdb"
 # FOR TESTS ONLY, not a user setting: --self-test sets this, inside a subshell,
 # to a file:// tree laid out as a release is, so the install path runs without

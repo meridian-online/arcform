@@ -71,9 +71,9 @@ owo-colors = "4"
 sqlparser = { package = "arcform-sqlparser", version = "=0.55.0", path = "vendor/sqlparser-0.55.0", features = ["visitor"] }
 # Pinned exact: arc loads DuckDB extensions (finetype among them) into this library
 # in-process, and an extension loads only into the DuckDB version it was built for.
-# 1.10506.0 is DuckDB v1.5.6. Bump in lockstep with `DUCKDB_VERSION` in
+# 1.20000.0 is DuckDB v2.0.0. Bump in lockstep with `DUCKDB_VERSION` in
 # .github/workflows/ci.yml and the versions in src/vetted_extensions.json.
-duckdb = "=1.10506.0"
+duckdb = "=1.20000.0"
 semver = "1"
 sha2 = "0.10"
 humantime = "2"

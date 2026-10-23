@@ -15,12 +15,12 @@ env:
   # crate without the `bundled-duckdb` feature provides the C library and its headers.
   # The `bundled` job below builds DuckDB into the binary instead, as release binaries
   # are built. One version throughout: this pin, the exact `duckdb` crate version in
-  # Cargo.toml (1.10506.0 is v1.5.6) and the versions in src/vetted_extensions.json
+  # Cargo.toml (1.20000.0 is v2.0.0) and the versions in src/vetted_extensions.json
   # move together, because arc loads extensions into the linked library in-process and
   # an extension loads only into the version it was built for. The install step below
   # writes the *_DIR / LD_LIBRARY_PATH env vars that libduckdb-sys and the test
   # runtime read.
-  DUCKDB_VERSION: v1.5.6
+  DUCKDB_VERSION: v2.0.0
   # The finetype CLI release the build job installs, and the SHA-256 of its
   # x86_64-unknown-linux-gnu archive (the `.sha256` asset beside it on the release).
   # A new finetype release reaches CI only when these move, so a flag it drops fails
@@ -132,19 +132,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      # Two commits deep, so the DuckDB preview step below can diff this commit against
-      # its first parent: the base branch's tip for a pull request's merge commit, and
-      # the commit before for a push.
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.94"
           components: clippy
       - uses: Swatinem/rust-cache@v2
 
-      # Fetch the official DuckDB C library (libduckdb.so + duckdb.h/.hpp) and
+      # Fetch the official DuckDB C library (libduckdb.so + duckdb.h) and
       # point the linker, the bindings build script, and the test runtime at it.
       # AND the `duckdb` CLI: arc's engine shells out to the `duckdb` binary to
       # execute a protocol's steps, so the init_from_descriptor integration test
@@ -155,10 +150,10 @@ jobs:
           set -euo pipefail
           base="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}"
           mkdir -p "$HOME/duckdb"
-          curl -fsSL -o /tmp/libduckdb.zip "$base/libduckdb-linux-amd64.zip"
-          unzip -o /tmp/libduckdb.zip -d "$HOME/duckdb"
-          curl -fsSL -o /tmp/duckdb-cli.zip "$base/duckdb_cli-linux-amd64.zip"
-          unzip -o /tmp/duckdb-cli.zip -d "$HOME/duckdb"
+          curl -fsSL -o /tmp/duckdb-shared-libs.tar.gz "$base/duckdb-shared-libs-linux-amd64.tar.gz"
+          tar -xzf /tmp/duckdb-shared-libs.tar.gz -C "$HOME/duckdb"
+          curl -fsSL -o /tmp/duckdb-cli.tar.gz "$base/duckdb-cli-linux-amd64.tar.gz"
+          tar -xzf /tmp/duckdb-cli.tar.gz -C "$HOME/duckdb"
           chmod +x "$HOME/duckdb/duckdb"
           "$HOME/duckdb/duckdb" --version
           {
@@ -241,36 +236,6 @@ jobs:
 
       - name: test
         run: cargo test --workspace
-
-      # The reader in src/duckdb_lineage.rs asks a DuckDB 2.0 build for its parse of a
-      # step, and DUCKDB_VERSION above is a 1.x release, so its tests that start DuckDB
-      # are #[ignore]d and the step above reports them as ignored, as are the tests of
-      # `arc run` with ARC_SQL_READER=duckdb in tests/duckdb_reader_switch.rs. This step
-      # downloads the 2.0 preview and runs both when this commit changes the reader, the
-      # rules src/introspect.rs applies to what it reads, those tests or this workflow;
-      # the tests that read from captured answers ran above either way. The preview's
-      # address names no version and the build behind it moves, so a change elsewhere
-      # does not run them. The step prints the version it downloaded, and each lib test
-      # prints the version it asked.
-      - name: test (DuckDB lineage reader, on the DuckDB 2.0 preview)
-        run: |
-          set -euo pipefail
-          watched="src/duckdb_lineage.rs src/introspect.rs tests/duckdb_reader_switch.rs .github/workflows/ci.yml"
-          changed=$(git diff --name-only HEAD^1 HEAD -- $watched)
-          if [ -z "$changed" ]; then
-            echo "$watched are unchanged; the preview tests do not run."
-            exit 0
-          fi
-          dir="$RUNNER_TEMP/duckdb-preview"
-          mkdir -p "$dir"
-          curl -fsSL -o "$dir/cli.tar.gz" \
-            https://artifacts.duckdb.org/v2.0-cyanoptera/duckdb-cli-linux-amd64.tar.gz
-          tar -xzf "$dir/cli.tar.gz" -C "$dir"
-          "$dir/duckdb" --version
-          ARC_DUCKDB_PREVIEW_BIN="$dir/duckdb" \
-            cargo test --workspace --lib duckdb_lineage -- --include-ignored --nocapture
-          ARC_DUCKDB_PREVIEW_BIN="$dir/duckdb" \
-            cargo test --workspace --test duckdb_reader_switch -- --include-ignored
 
       # `uv` — and unlike the subtoken extension, it is cheap enough to belong on
       # the routine gate. `tests/uv_operator.rs` proves three of its four properties
@@ -367,8 +332,8 @@ jobs:
           set -euo pipefail
           base="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}"
           mkdir -p "$HOME/duckdb"
-          curl -fsSL -o /tmp/libduckdb.zip "$base/libduckdb-linux-amd64.zip"
-          unzip -o /tmp/libduckdb.zip -d "$HOME/duckdb"
+          curl -fsSL -o /tmp/duckdb-shared-libs.tar.gz "$base/duckdb-shared-libs-linux-amd64.tar.gz"
+          tar -xzf /tmp/duckdb-shared-libs.tar.gz -C "$HOME/duckdb"
           {
             echo "DUCKDB_LIB_DIR=$HOME/duckdb"
             echo "DUCKDB_INCLUDE_DIR=$HOME/duckdb"
@@ -462,8 +427,8 @@ jobs:
           set -euo pipefail
           base="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}"
           mkdir -p "$HOME/duckdb"
-          curl -fsSL -o /tmp/duckdb-cli.zip "$base/duckdb_cli-linux-amd64.zip"
-          unzip -o /tmp/duckdb-cli.zip -d "$HOME/duckdb"
+          curl -fsSL -o /tmp/duckdb-cli.tar.gz "$base/duckdb-cli-linux-amd64.tar.gz"
+          tar -xzf /tmp/duckdb-cli.tar.gz -C "$HOME/duckdb"
           chmod +x "$HOME/duckdb/duckdb"
           "$HOME/duckdb/duckdb" --version
           echo "$HOME/duckdb" >> "$GITHUB_PATH"
@@ -572,10 +537,10 @@ jobs:
           set -euo pipefail
           base="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}"
           mkdir -p "$HOME/duckdb"
-          curl -fsSL -o /tmp/libduckdb.zip "$base/libduckdb-linux-amd64.zip"
-          unzip -o /tmp/libduckdb.zip -d "$HOME/duckdb"
-          curl -fsSL -o /tmp/duckdb-cli.zip "$base/duckdb_cli-linux-amd64.zip"
-          unzip -o /tmp/duckdb-cli.zip -d "$HOME/duckdb"
+          curl -fsSL -o /tmp/duckdb-shared-libs.tar.gz "$base/duckdb-shared-libs-linux-amd64.tar.gz"
+          tar -xzf /tmp/duckdb-shared-libs.tar.gz -C "$HOME/duckdb"
+          curl -fsSL -o /tmp/duckdb-cli.tar.gz "$base/duckdb-cli-linux-amd64.tar.gz"
+          tar -xzf /tmp/duckdb-cli.tar.gz -C "$HOME/duckdb"
           chmod +x "$HOME/duckdb/duckdb"
           {
             echo "DUCKDB_LIB_DIR=$HOME/duckdb"

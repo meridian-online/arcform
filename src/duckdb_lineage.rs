@@ -2042,12 +2042,14 @@ mod tests {
         }
     }
 
-    /// A DuckDB before 2.0 has no `sql_tokenize`. The `duckdb` on `PATH` is the one
-    /// `ci.yml` pins, a 1.x release.
+    /// A DuckDB before 2.0 has no `sql_tokenize`. The answer is the recorded one with a 1.x
+    /// version, since the `duckdb` on `PATH` is a 2.x release.
     #[test]
     fn a_duckdb_older_than_2_is_refused_naming_its_version() {
-        let refusal =
-            read_step(OsStr::new("duckdb"), "SELECT 1;").expect_err("a 1.x DuckDB is refused");
+        let mut ask = Recorded::load();
+        ask.version = "v1.5.6".to_string();
+        let refusal = read_step_with(&mut ask, "WITH c AS (SELECT * FROM a) SELECT * FROM c;")
+            .expect_err("a 1.x DuckDB is refused");
         let Refusal::NotDuckDb2 { version, .. } = &refusal else {
             panic!("expected the version refusal, got {refusal:?}");
         };

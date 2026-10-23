@@ -14,6 +14,9 @@ pub struct EngineInfo {
     /// Parsed semantic version of the installed engine CLI,
     /// or None if version output was unparseable.
     pub version: Option<semver::Version>,
+    /// The version as the engine printed it (`v2.0.0-dev88614`) when it is a development
+    /// build of a release's commit, which `version` then names as that release.
+    pub dev_build: Option<String>,
 }
 
 /// Output captured from a step execution.
@@ -333,14 +336,18 @@ pub const DUCKDB_BIN_ENV: &str = "ARC_DUCKDB_BIN";
 /// The DuckDB versions arc is tested on. Enforced on every run with a SQL step, whether or
 /// not the manifest states an `engine_version:`; a manifest's constraint narrows this and
 /// never widens it. It starts at [`OLDEST_ENGINE`].
-pub const SUPPORTED_ENGINE_RANGE: &str = ">=1.3, <2";
+pub const SUPPORTED_ENGINE_RANGE: &str = ">=2.0, <3";
 
-/// The oldest DuckDB arc accepts, where [`SUPPORTED_ENGINE_RANGE`] starts: the first release
-/// whose command line, run as arc runs a SQL step, exits non-zero when a statement in the
-/// step's file fails. arc learns that a step failed from that exit status and nothing else,
-/// and on 1.2.x it is 0, so a failed step would be recorded as passed and the steps after it
-/// would run.
-pub const OLDEST_ENGINE: &str = "1.3.0";
+/// The oldest DuckDB arc accepts, where [`SUPPORTED_ENGINE_RANGE`] starts: the major release
+/// of the DuckDB library arc links. arc and its DuckDB command line open the same database
+/// file, and the 2.0 library cannot open a file a 1.x command line shares with it, so no
+/// override reaches below this. arc 0.2.1 is the release for DuckDB 1.5.
+pub const OLDEST_ENGINE: &str = "2.0.0";
+
+/// The commit of each DuckDB release arc knows, by release tag. A development build, such as
+/// Homebrew's, is built from a release's commit and prints a pre-release version with that
+/// commit after it; [`parse_engine_version`] takes it for the release when the two match.
+const RELEASE_COMMITS: [(&str, &str); 1] = [("2.0.0", "d54cbbe3df17e8e5ce68312f483b4155836112aa")];
 
 /// Set to any non-empty value, lifts [`SUPPORTED_ENGINE_RANGE`] for a person who accepts
 /// an engine arc was not tested on. The run warns, and a manifest's own `engine_version:`
@@ -565,8 +572,11 @@ impl Engine for DuckDbEngine {
         match (output, program) {
             (Ok(o), _) if o.status.success() => {
                 let stdout = String::from_utf8_lossy(&o.stdout);
-                let version = parse_version_output(&stdout);
-                Ok(EngineInfo { version })
+                let parsed = parse_engine_version(&stdout);
+                Ok(EngineInfo {
+                    version: parsed.as_ref().map(|p| p.version.clone()),
+                    dev_build: parsed.and_then(|p| p.dev_build),
+                })
             }
             (output, DuckDbProgram::Told(path)) => Err(Error::EngineBinInvalid {
                 var: DUCKDB_BIN_ENV,
@@ -656,23 +666,60 @@ fn install_and_name(name: &str, install: &str, what: &str) -> Result<Option<Path
         .map(PathBuf::from))
 }
 
+/// What [`parse_engine_version`] found, and the development build it took for a release.
+pub(crate) struct ParsedEngineVersion {
+    pub(crate) version: semver::Version,
+    /// The version as the engine printed it, `v2.0.0-dev88614`, when it is a development
+    /// build taken for the release in `version`.
+    pub(crate) dev_build: Option<String>,
+}
+
 /// Parse a version string from engine CLI output.
 ///
 /// Handles formats like:
-/// - "v1.5.2 (Variegata) 8a5851971f"
+/// - "v2.0.0 (Cyanoptera) d54cbbe3df"
 /// - "v0.10.0 1234abc"
 /// - "1.5.2"
 ///
+/// A development build of a release's own commit is that release: Homebrew's DuckDB 2.0.0
+/// prints `v2.0.0-dev88614 (Development Version) d54cbbe3df`, the commit of the v2.0.0 tag,
+/// and parses as 2.0.0, so arc's range and a Protocol's `engine_version:` see the release.
+/// A development build of any other commit keeps its pre-release.
+///
 /// Returns None if the version cannot be parsed.
-pub fn parse_version_output(output: &str) -> Option<semver::Version> {
+pub(crate) fn parse_engine_version(output: &str) -> Option<ParsedEngineVersion> {
     // Find the first token that looks like a version (with or without leading 'v').
     for token in output.split_whitespace() {
         let stripped = token.strip_prefix('v').unwrap_or(token);
         if let Ok(ver) = semver::Version::parse(stripped) {
-            return Some(ver);
+            if !ver.pre.is_empty() && printed_commit_is_release(output, &ver) {
+                let release = semver::Version::new(ver.major, ver.minor, ver.patch);
+                return Some(ParsedEngineVersion {
+                    version: release,
+                    dev_build: Some(token.to_string()),
+                });
+            }
+            return Some(ParsedEngineVersion {
+                version: ver,
+                dev_build: None,
+            });
         }
     }
     None
+}
+
+/// Whether the source id the engine prints after its version, the last word of `output`, is
+/// a prefix of the commit of the release tag for `ver`'s major, minor and patch. A prefix
+/// shorter than seven characters proves nothing and is not taken.
+fn printed_commit_is_release(output: &str, ver: &semver::Version) -> bool {
+    let Some(id) = output.split_whitespace().last() else {
+        return false;
+    };
+    let release = format!("{}.{}.{}", ver.major, ver.minor, ver.patch);
+    id.len() >= 7
+        && RELEASE_COMMITS
+            .iter()
+            .any(|(tag, commit)| *tag == release && commit.starts_with(id))
 }
 
 // ---- The community extensions a Protocol's SQL installs ----
@@ -2096,7 +2143,7 @@ pub mod mock {
         exec_count: RefCell<usize>,
         /// If true, preflight returns EngineNotFound.
         pub preflight_should_fail: RefCell<bool>,
-        /// Version to report from preflight. Defaults to 1.5.4, inside the range arc is
+        /// Version to report from preflight. Defaults to 2.0.0, inside the range arc is
         /// tested on, so a test that does not care about the version is not refused by it.
         pub version: RefCell<Option<semver::Version>>,
         /// Simulated stdout for command steps with capture_stdout=true.
@@ -2145,7 +2192,7 @@ pub mod mock {
                 fail_on_call: RefCell::new(None),
                 exec_count: RefCell::new(0),
                 preflight_should_fail: RefCell::new(false),
-                version: RefCell::new(Some(semver::Version::new(1, 5, 4))),
+                version: RefCell::new(Some(semver::Version::new(2, 0, 0))),
                 simulated_stdout: RefCell::new(None),
                 timeout_should_fire: RefCell::new(false),
                 platform: RefCell::new(Some("linux_amd64".to_string())),
@@ -2309,6 +2356,7 @@ pub mod mock {
             }
             Ok(EngineInfo {
                 version: self.version.borrow().clone(),
+                dev_build: None,
             })
         }
 
@@ -2355,33 +2403,64 @@ pub mod mock {
 mod tests {
     use super::*;
 
+    fn parse_version(output: &str) -> Option<semver::Version> {
+        parse_engine_version(output).map(|parsed| parsed.version)
+    }
+
     // Parse version with codename (standard DuckDB format).
     #[test]
     fn test_lrp_parse_version_with_codename() {
-        let version = parse_version_output("v1.5.2 (Variegata) 8a5851971f");
+        let version = parse_version("v1.5.2 (Variegata) 8a5851971f");
         assert_eq!(version.unwrap(), semver::Version::new(1, 5, 2));
+    }
+
+    // A development build of a release's own commit is that release.
+    #[test]
+    fn a_dev_build_of_a_release_commit_parses_as_the_release() {
+        let parsed =
+            parse_engine_version("v2.0.0-dev88614 (Development Version) d54cbbe3df").unwrap();
+        assert_eq!(parsed.version, semver::Version::new(2, 0, 0));
+        assert_eq!(parsed.dev_build.as_deref(), Some("v2.0.0-dev88614"));
+        let release = parse_engine_version("v2.0.0 (Cyanoptera) d54cbbe3df").unwrap();
+        assert_eq!(release.version, semver::Version::new(2, 0, 0));
+        assert!(release.dev_build.is_none());
+    }
+
+    // Another commit, a commit too short to tell, or another version keeps the pre-release.
+    #[test]
+    fn a_dev_build_of_any_other_commit_keeps_its_pre_release() {
+        for output in [
+            "v2.0.0-dev88614 (Development Version) 0123456789",
+            "v2.0.0-dev88614 (Development Version) d54cb",
+            "v2.0.1-dev88614 (Development Version) d54cbbe3df",
+            "v2.0.0-dev88614",
+        ] {
+            let parsed = parse_engine_version(output).unwrap();
+            assert!(!parsed.version.pre.is_empty(), "{output}");
+            assert!(parsed.dev_build.is_none(), "{output}");
+        }
     }
 
     // Parse version without codename.
     #[test]
     fn test_lrp_parse_version_without_codename() {
-        let version = parse_version_output("v0.10.0 1234abc");
+        let version = parse_version("v0.10.0 1234abc");
         assert_eq!(version.unwrap(), semver::Version::new(0, 10, 0));
     }
 
     // Parse bare version (no leading 'v').
     #[test]
     fn test_lrp_parse_bare_version() {
-        let version = parse_version_output("1.5.2");
+        let version = parse_version("1.5.2");
         assert_eq!(version.unwrap(), semver::Version::new(1, 5, 2));
     }
 
     // Unparseable output returns None.
     #[test]
     fn test_lrp_unparseable_version_returns_none() {
-        assert!(parse_version_output("not a version").is_none());
-        assert!(parse_version_output("").is_none());
-        assert!(parse_version_output("duckdb").is_none());
+        assert!(parse_version("not a version").is_none());
+        assert!(parse_version("").is_none());
+        assert!(parse_version("duckdb").is_none());
     }
 
     // MockEngine returns configurable version.
@@ -2389,14 +2468,14 @@ mod tests {
     fn test_lrp_mock_engine_configurable_version() {
         let engine = mock::MockEngine::new();
 
-        // Default is 1.5.4, inside the supported range.
+        // Default is 2.0.0, inside the supported range.
         let info = engine.preflight().unwrap();
-        assert_eq!(info.version.unwrap(), semver::Version::new(1, 5, 4));
+        assert_eq!(info.version.unwrap(), semver::Version::new(2, 0, 0));
 
         // Set custom version.
-        engine.set_version(Some(semver::Version::new(1, 3, 0)));
+        engine.set_version(Some(semver::Version::new(2, 1, 0)));
         let info = engine.preflight().unwrap();
-        assert_eq!(info.version.unwrap(), semver::Version::new(1, 3, 0));
+        assert_eq!(info.version.unwrap(), semver::Version::new(2, 1, 0));
 
         // Set None (unparseable).
         engine.set_version(None);

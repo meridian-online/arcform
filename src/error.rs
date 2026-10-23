@@ -128,18 +128,19 @@ pub enum Error {
     },
 
     // Older than the oldest DuckDB arc accepts. Said apart from `UntestedEngine`, because
-    // what is wrong with an older engine is known rather than untested.
+    // what is wrong with an older engine is known rather than untested, and no override
+    // lifts it.
     #[error(
         "engine DuckDB {found} is older than {oldest}, the oldest DuckDB arc accepts ({range}): \
-         {oldest} is the first release whose command line exits non-zero when a statement in a \
-         SQL step fails, which is how arc learns that a step failed; upgrade DuckDB, or set \
-         {override_var}=1 to run on {found} at your own risk"
+         the database file is shared with the DuckDB 2.0 library arc links, and that library \
+         cannot open a file a DuckDB 1.x command line shares with it; use DuckDB {oldest} or \
+         later, or install arc 0.2.1, the release for DuckDB 1.5 (`cargo install arcform \
+         --version 0.2.1`)"
     )]
     EngineTooOld {
         found: String,
         oldest: &'static str,
         range: &'static str,
-        override_var: &'static str,
     },
 
     // A Protocol's SQL installs a DuckDB extension from somewhere arc has not vetted. One
@@ -573,15 +574,14 @@ mod exit_code_tests {
                 reason: "no such file".into(),
             },
             Error::UntestedEngine {
-                found: "2.0.0".into(),
+                found: "3.0.0".into(),
                 range: crate::engine::SUPPORTED_ENGINE_RANGE,
                 override_var: "ARC_ALLOW_UNTESTED_ENGINE",
             },
             Error::EngineTooOld {
-                found: "1.2.0".into(),
+                found: "1.5.6".into(),
                 oldest: crate::engine::OLDEST_ENGINE,
                 range: crate::engine::SUPPORTED_ENGINE_RANGE,
-                override_var: "ARC_ALLOW_UNTESTED_ENGINE",
             },
             Error::StateBackend("locked".into()),
             Error::ExtensionPinRefused {
