@@ -113,7 +113,7 @@ const EXPORTED: [(&str, &str); 46] = [
 
 /// Every module file in the crate. Frozen so a new one cannot be added without
 /// passing under the checks below.
-const MODULE_FILES: [&str; 40] = [
+const MODULE_FILES: [&str; 41] = [
     "asset.rs",
     "asset_kind.rs",
     "bridge.rs",
@@ -121,6 +121,9 @@ const MODULE_FILES: [&str; 40] = [
     "contract.rs",
     // Reads a DuckDB SQL step from DuckDB 2.0's own parse of it. Private to the crate.
     "duckdb_lineage.rs",
+    // A SQL file's tokens, asked of the DuckDB command line that runs it. Private to the
+    // crate.
+    "duckdb_tokens.rs",
     "edit.rs",
     "engine.rs",
     "error.rs",

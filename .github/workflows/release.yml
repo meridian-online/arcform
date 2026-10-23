@@ -15,6 +15,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The DuckDB release the binaries report; scripts/check_duckdb_version.py checks it
+  # against the version Cargo.lock links.
+  DUCKDB_VERSION: v2.0.0
 
 # This file is read by scripts/check_release_tag.py (`--wiring` and
 # `--release-rehearsal`, run by ci.yml on every pull request) without a YAML
@@ -77,6 +80,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
+
+      # Stopgap for duckdb/duckdb-rs#917: libduckdb-sys vendors DuckDB with a development
+      # version ("v2.0.0-dev..."), so the bundled DuckDB would look its extensions up under
+      # a commit hash and refuse the release ones. `cc` reads CXXFLAGS, splits it on
+      # whitespace and passes each piece to the compiler without a shell, so the quotes
+      # stay and the macro is a C string. Remove this step when duckdb-rs ships the fix.
+      - name: Define DuckDB's version for the bundled build
+        shell: bash
+        run: echo "CXXFLAGS=${CXXFLAGS:-} -DDUCKDB_VERSION=\"${DUCKDB_VERSION}\"" >> "$GITHUB_ENV"
 
       - name: Build
         shell: bash

@@ -850,8 +850,10 @@ fn filter_rows_query(from: &str, condition: &str) -> String {
 /// gives `FROM 'orders.csv'` the tree of a table called `orders.csv`, and its
 /// text opens with the quote at the location DuckDB gives.
 ///
-/// The condition is not cut out of the tree, which says where a node starts and
-/// not where it ends, and holds no node for a parenthesis. It is each text
+/// The condition is not cut out of the tree. DuckDB 2.0 gives a node its start
+/// and its length, but the tree holds no node for a parenthesis, so a condition
+/// that opens or closes with one would be cut short, and a comment inside it is in
+/// no node at all. It is each text
 /// [`conditions`] offers, tried in turn, and the first DuckDB reads to the same
 /// statement is taken: so the condition is the text as typed, its parentheses,
 /// strings and comments kept, and DuckDB decides where a string or a comment
@@ -976,9 +978,14 @@ fn quote_ident(name: &str) -> String {
 /// than given a list of the words: a list copied into the source would stay as it
 /// was when DuckDB's own grows. A database that cannot be opened gives the quoted
 /// name, which DuckDB reads as the table whatever the name.
+///
+/// The connection is never dropped: a thread's storage is torn down after DuckDB 2.0's own
+/// per-thread state, and closing a database then crashes the process. It is one small
+/// in-memory database for each thread that asks, kept until the process ends.
 fn from_ident(name: &str) -> String {
     thread_local! {
-        static READER: Option<duckdb::Connection> = duckdb::Connection::open_in_memory().ok();
+        static READER: Option<std::mem::ManuallyDrop<duckdb::Connection>> =
+            duckdb::Connection::open_in_memory().ok().map(std::mem::ManuallyDrop::new);
     }
     READER.with(|con| match con {
         Some(con) => from_ident_on(con, name),
@@ -1169,7 +1176,7 @@ struct Statement {
     text: String,
     /// DuckDB's tree of `text`.
     tree: serde_json::Value,
-    /// `tree` with no `query_location`: what [`Statement::reads_as`] compares.
+    /// `tree` with no locations ([`unlocated`]): what [`Statement::reads_as`] compares.
     shape: serde_json::Value,
     /// The in-memory database `tree` was asked on.
     con: duckdb::Connection,
@@ -1201,8 +1208,8 @@ impl Statement {
     }
 
     /// Whether DuckDB reads `text` as this statement: whether its tree equals
-    /// this one with each node's `query_location` left out, since a location
-    /// says where a node is written and not what it is. A text DuckDB cannot
+    /// this one with each node's location left out ([`unlocated`]), since a
+    /// location says where a node is written and not what it is. A text DuckDB cannot
     /// parse, or does not serialize, gives an error in place of a tree, which
     /// is not this statement's.
     fn reads_as(&self, text: &str) -> bool {
@@ -1221,12 +1228,14 @@ fn tree(con: &duckdb::Connection, text: &str) -> Option<serde_json::Value> {
         .and_then(|tree| serde_json::from_str(&tree).ok())
 }
 
-/// `tree` with each `query_location` key left out, at every depth.
+/// `tree` with each `query_location` and `query_location_length` key left out, at
+/// every depth: DuckDB 2.0 gives a node the length of its text as well as where it
+/// starts, and `"order"` is longer than `order`, or `*` than nothing.
 fn unlocated(tree: &serde_json::Value) -> serde_json::Value {
     match tree {
         serde_json::Value::Object(node) => node
             .iter()
-            .filter(|(key, _)| *key != "query_location")
+            .filter(|(key, _)| !matches!(key.as_str(), "query_location" | "query_location_length"))
             .map(|(key, value)| (key.clone(), unlocated(value)))
             .collect(),
         serde_json::Value::Array(items) => items.iter().map(unlocated).collect(),
@@ -1556,12 +1565,12 @@ pub(crate) fn record_sql_step(dir: &Path, step: &SqlStep) -> Result<(PathBuf, Va
 /// front of the statement is text DuckDB parses, the line is written first, so
 /// the step makes a table of the step's name when it runs: a bare `SELECT` runs
 /// and prints its rows and makes no table. That is each `SELECT` DuckDB reads, a
-/// `WITH` and a statement that opens with `FROM` among them. A statement the line
-/// cannot go in front of — a `CREATE TABLE`, an `UPDATE`, a `DESCRIBE` — is
-/// written as typed, and what it makes, it makes itself. It is DuckDB's parse of
-/// the line and the statement together that decides, and not whether DuckDB
-/// gives the statement a tree: it gives one for a `DESCRIBE`, which the line
-/// cannot go in front of.
+/// `WITH` and a statement that opens with `FROM` among them, and on DuckDB 2.0 a
+/// `DESCRIBE`, a `SHOW` and a `SUMMARIZE` too. A statement the line cannot go in
+/// front of — a `CREATE TABLE`, an `UPDATE`, an `INSERT` — is written as typed, and
+/// what it makes, it makes itself. It is DuckDB's parse of the line and the
+/// statement together that decides, and not whether DuckDB gives the statement a
+/// tree: DuckDB 1.5 gave one for a `DESCRIBE` and refused the line in front of it.
 ///
 /// No `-- generated:` line is written: that line licenses [`amend_step_sql`] to
 /// rewrite a file, and the statement is the analyst's own text. So a statement
@@ -1790,6 +1799,9 @@ fn duckdb_statement_count(sql: &str) -> usize {
 fn made_by_a_step(dir: &Path, on: &str) -> Result<()> {
     let manifest = Manifest::load(dir)?;
     let graph = crate::asset::AssetGraph::build(&manifest, dir);
+    for unreadable in &graph.unreadable {
+        eprintln!("warning: {}", unreadable.warning());
+    }
     let wanted = on.to_lowercase();
     let made = graph.steps.values().any(|assets| {
         assets.produces.contains(&wanted)
@@ -2033,9 +2045,18 @@ mod tests {
             ),
             // A final newline the statement has is the one it keeps.
             ("SELECT 1\n", "CREATE OR REPLACE TABLE \"t\" AS\nSELECT 1\n"),
+            // DuckDB 2.0 parses `CREATE TABLE … AS DESCRIBE …` and `… AS SHOW TABLES`,
+            // and runs them, so these get the line too.
+            (
+                "DESCRIBE orders",
+                "CREATE OR REPLACE TABLE \"t\" AS\nDESCRIBE orders\n",
+            ),
+            (
+                "SHOW TABLES\n",
+                "CREATE OR REPLACE TABLE \"t\" AS\nSHOW TABLES\n",
+            ),
             // A statement the line cannot go in front of is written as typed, with
-            // one final newline: DuckDB gives a tree for `DESCRIBE` and the line
-            // before it is a parser error.
+            // one final newline: the line before it is a parser error.
             (
                 "CREATE TABLE t2 AS SELECT 1",
                 "CREATE TABLE t2 AS SELECT 1\n",
@@ -2044,8 +2065,10 @@ mod tests {
                 "UPDATE orders SET amount = 0",
                 "UPDATE orders SET amount = 0\n",
             ),
-            ("DESCRIBE orders", "DESCRIBE orders\n"),
-            ("SHOW TABLES\n", "SHOW TABLES\n"),
+            (
+                "INSERT INTO orders VALUES (1)\n",
+                "INSERT INTO orders VALUES (1)\n",
+            ),
         ] {
             assert_eq!(
                 sql_step_contents("t", sql).expect("the statement is recorded"),
@@ -2067,16 +2090,22 @@ mod tests {
     fn a_statement_written_as_typed_never_opens_with_the_generated_line() {
         for sql in [
             "-- generated: mine\nUPDATE orders SET amount = 0",
-            "  -- generated: mine\nDESCRIBE orders",
+            "  -- generated: mine\nINSERT INTO orders VALUES (1)",
         ] {
             let refusal = sql_step_contents("t", sql)
                 .expect_err("refused")
                 .to_string();
             assert!(refusal.contains("-- generated:"), "{sql:?}: {refusal}");
         }
-        // A `SELECT`'s file opens with the line arc adds, so it never reads so.
-        let contents = sql_step_contents("t", "-- generated: mine\nSELECT 1").unwrap();
-        assert!(!sql_is_generated(&contents), "{contents:?}");
+        // A `SELECT`'s file, and on DuckDB 2.0 a `DESCRIBE`'s, opens with the line arc
+        // adds, so it never reads so.
+        for sql in [
+            "-- generated: mine\nSELECT 1",
+            "-- generated: mine\nDESCRIBE orders",
+        ] {
+            let contents = sql_step_contents("t", sql).unwrap();
+            assert!(!sql_is_generated(&contents), "{contents:?}");
+        }
     }
 
     #[test]

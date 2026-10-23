@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = ["splink>=4,<5", "duckdb>=1,<2", "pandas", "pydantic>=2"]
+# dependencies = ["splink>=4,<5", "duckdb>=2,<3", "pandas", "pydantic>=2"]
 # ///
 """
 splink_resolve — arcform typed Python operator (uv-run).

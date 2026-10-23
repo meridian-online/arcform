@@ -55,7 +55,7 @@ fn the_exported_schema_describes_the_spec_it_loaded() {
 
     assert_eq!(manifest.name, "brewtrend");
     assert_eq!(manifest.engine, "duckdb");
-    assert_eq!(manifest.engine_version.as_deref(), Some(">=1.2"));
+    assert_eq!(manifest.engine_version.as_deref(), Some(">=2.0"));
     assert_eq!(manifest.db.as_deref(), Some("trends.db"));
 
     // Declared parameters, in declaration order.

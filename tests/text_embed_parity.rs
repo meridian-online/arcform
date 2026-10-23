@@ -462,7 +462,7 @@ fn the_rows_that_carry_no_signal_are_counted_on_stderr() {
         .query_row(
             &format!(
                 "SELECT count(*) FROM read_parquet('{}') WHERE \
-                 list_sum(list_transform(subtoken_embed(coalesce(description, '')), x -> abs(x))) = 0",
+                 list_sum(list_transform(subtoken_embed(coalesce(description, '')), lambda x: abs(x))) = 0",
                 corpus_path.display()
             ),
             [],
@@ -525,7 +525,7 @@ fn the_corpus_still_contains_the_shapes_it_was_built_from() {
     let is_zero = |text: &str| -> bool {
         conn.query_row(
             &format!(
-                "SELECT list_sum(list_transform(subtoken_embed({}), x -> abs(x))) = 0",
+                "SELECT list_sum(list_transform(subtoken_embed({}), lambda x: abs(x))) = 0",
                 sql_lit(text)
             ),
             [],

@@ -190,7 +190,7 @@ what this operator pins is the code, not the environment.** Three things are fro
    ordered by it. Parquet bytes follow row order.
 
 What is **not** pinned is the dependency set. The PEP-723 header bounds every direct
-dependency at both ends — `umap-learn>=0.5,<0.6`, `numpy>=1.26,<3`, `duckdb>=1,<2` —
+dependency at both ends — `umap-learn>=0.5,<0.6`, `numpy>=1.26,<3`, `duckdb>=2,<3` —
 but a resolve inside those bounds can still pick a newer umap-learn, a newer numba
 underneath it, or a newer DuckDB, and any of the three can move the output: UMAP's
 layout optimisation is floating-point, and DuckDB writes its own version into the

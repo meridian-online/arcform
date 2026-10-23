@@ -43,7 +43,7 @@ env:
   SUBTOKEN_REF: 27e6aaa6442ca7bdf5b91fe701ba258399959f37
   # Matches ci.yml's build job — arcform's own crate still links a system DuckDB to
   # compile and run its tests, independent of the extension under test.
-  DUCKDB_VERSION: v1.5.6
+  DUCKDB_VERSION: v2.0.0
 
 jobs:
   # Unconditional: this job always builds its own artifact and always runs every test
@@ -94,10 +94,10 @@ jobs:
           set -euo pipefail
           base="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}"
           mkdir -p "$HOME/duckdb"
-          curl -fsSL -o /tmp/libduckdb.zip "$base/libduckdb-linux-amd64.zip"
-          unzip -o /tmp/libduckdb.zip -d "$HOME/duckdb"
-          curl -fsSL -o /tmp/duckdb-cli.zip "$base/duckdb_cli-linux-amd64.zip"
-          unzip -o /tmp/duckdb-cli.zip -d "$HOME/duckdb"
+          curl -fsSL -o /tmp/duckdb-shared-libs.tar.gz "$base/duckdb-shared-libs-linux-amd64.tar.gz"
+          tar -xzf /tmp/duckdb-shared-libs.tar.gz -C "$HOME/duckdb"
+          curl -fsSL -o /tmp/duckdb-cli.tar.gz "$base/duckdb-cli-linux-amd64.tar.gz"
+          tar -xzf /tmp/duckdb-cli.tar.gz -C "$HOME/duckdb"
           chmod +x "$HOME/duckdb/duckdb"
           "$HOME/duckdb/duckdb" --version
           {
