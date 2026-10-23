@@ -161,6 +161,27 @@ duckdb_tokenizes() {
     -c "SELECT count(*) FROM sql_tokenize('SELECT 1');" < /dev/null > /dev/null 2>&1
 }
 
+# What the duckdb at $1 prints on stderr for the probe duckdb_tokenizes runs,
+# all of it; nothing when it printed nothing.
+duckdb_probe_error() {
+  DUCKDB_AGENT_MODE=0 "$1" -no-init -noheader -list \
+    -c "SELECT count(*) FROM sql_tokenize('SELECT 1');" < /dev/null 2>&1 > /dev/null || true
+}
+
+# Whether the error in $1 names DuckDB's autocomplete extension or
+# sql_tokenize, in any case: the rule arc says "built without the autocomplete
+# extension" by.
+names_tokenizer() {
+  printf '%s\n' "$1" | awk '
+    { l = tolower($0); if (index(l, "autocomplete") || index(l, "sql_tokenize")) found = 1 }
+    END { exit !found }'
+}
+
+# The first line of $1 that is not blank, its ends trimmed.
+first_line() {
+  printf '%s\n' "$1" | awk 'NF { sub(/^[ \t]+/, ""); sub(/[ \t\r]+$/, ""); print; exit }'
+}
+
 # The version the duckdb at $1 prints, `v2.0.0`, or nothing; run as the probe
 # runs it.
 duckdb_version_of() {
@@ -228,7 +249,20 @@ ensure_duckdb() {
           ed_why="is DuckDB ${ed_found}, older than the 2.0 arc needs"
           ;;
         *)
-          ed_why="cannot read SQL into tokens, because it was built without DuckDB's autocomplete extension, and arc needs those tokens to check what each SQL step installs"
+          # Said as a missing extension only when DuckDB's error says so, as
+          # arc says it; any other failure is quoted, its first line.
+          ed_error="$(duckdb_probe_error "$ed_bin")"
+          if names_tokenizer "$ed_error"; then
+            ed_why="cannot read SQL into tokens, because it was built without DuckDB's autocomplete extension, and arc needs those tokens to check what each SQL step installs"
+          else
+            ed_said="$(first_line "$ed_error")"
+            if [ -n "$ed_said" ]; then
+              ed_said="said \"${ed_said}\""
+            else
+              ed_said="printed no error"
+            fi
+            ed_why="failed arc's tokenizer probe, \`SELECT count(*) FROM sql_tokenize('SELECT 1')\`, and ${ed_said}; arc needs SQL tokens from it to check what each SQL step installs"
+          fi
           ;;
       esac
       info "the duckdb on your PATH, ${ed_bin}, ${ed_why}. So this installs DuckDB's release build, ${DUCKDB_RECOMMENDED}, with DuckDB's own installer, and leaves ${ed_bin} as it is. Set ARC_SKIP_DUCKDB=1 to skip this."
@@ -455,7 +489,7 @@ st_duckdb() {
   st_dd="$(mktemp -d)"
   # The tools ensure_duckdb and the stand-ins use, and no duckdb, so "no
   # duckdb on PATH" holds whatever this machine has in /usr/bin.
-  mkdir -p "${st_dd}/tools" "${st_dd}/no-mktemp" "${st_dd}/good" "${st_dd}/lacking" "${st_dd}/old"
+  mkdir -p "${st_dd}/tools" "${st_dd}/no-mktemp" "${st_dd}/good" "${st_dd}/lacking" "${st_dd}/old" "${st_dd}/failing" "${st_dd}/silent"
   for st_tool in sh cat cp mkdir rm awk; do
     ln -s "$(command -v "$st_tool")" "${st_dd}/tools/${st_tool}"
     ln -s "$(command -v "$st_tool")" "${st_dd}/no-mktemp/${st_tool}"
@@ -475,7 +509,16 @@ st_duckdb() {
   # shellcheck disable=SC2016
   printf '#!/bin/sh\ncase "$*" in\n  *--version*) echo "v1.5.6 (Variegata) 0000000000" ;;\n  *sql_tokenize*)\n    echo "Catalog Error: Table Function with name sql_tokenize does not exist!" >&2\n    exit 1\n    ;;\nesac\nexit 0\n' \
     > "${st_dd}/old/duckdb"
-  chmod +x "${st_dd}/good/duckdb" "${st_dd}/lacking/duckdb" "${st_dd}/old/duckdb"
+  # A DuckDB 2.x whose probe fails for another reason, with DuckDB's
+  # several-line error: its message, a blank line, then LINE 1: and a caret.
+  # shellcheck disable=SC2016
+  printf '#!/bin/sh\ncase "$*" in\n  *--version*) echo "v2.0.0 (Cyanoptera) d54cbbe3df" ;;\n  *sql_tokenize*)\n    printf "IO Error: Could not open the temporary directory\\n\\nLINE 1: SELECT count(*)\\n        ^\\n" >&2\n    exit 1\n    ;;\nesac\nexit 0\n' \
+    > "${st_dd}/failing/duckdb"
+  # A DuckDB 2.x whose probe fails and prints nothing.
+  # shellcheck disable=SC2016
+  printf '#!/bin/sh\ncase "$*" in\n  *--version*) echo "v2.0.0 (Cyanoptera) d54cbbe3df" ;;\n  *sql_tokenize*) exit 1 ;;\nesac\nexit 0\n' \
+    > "${st_dd}/silent/duckdb"
+  chmod +x "${st_dd}/good/duckdb" "${st_dd}/lacking/duckdb" "${st_dd}/old/duckdb" "${st_dd}/failing/duckdb" "${st_dd}/silent/duckdb"
   # DuckDB's installer: logs the version it was asked for, and puts the good
   # stand-in where the real one puts that version.
   # shellcheck disable=SC2016
@@ -510,6 +553,25 @@ st_duckdb() {
     "${st_dd}/lacking/duckdb still comes first on your PATH" "${st_dd}/lacking.out"
   st_contains "duckdb lacking the tokenizer: gives the PATH line" "$st_line" "${st_dd}/lacking.out"
   st_contains "duckdb lacking the tokenizer: gives ARC_DUCKDB_BIN" "$st_bin" "${st_dd}/lacking.out"
+
+  # A DuckDB 2.x whose probe fails with an error naming neither the extension
+  # nor sql_tokenize: installed beside it, not said to lack the extension, and
+  # the first line of its error quoted.
+  st_duckdb_run failing "${st_dd}/failing:${st_tools}" ""
+  st_equal "duckdb failing the probe: exits 0 ($(cat "${st_dd}/failing.out"))" "0" "$st_rc"
+  st_equal "duckdb failing the probe: DuckDB's installer runs once" \
+    "$st_v" "$(cat "${st_dd}/home-failing/installer.log" 2> /dev/null)"
+  st_contains "duckdb failing the probe: says the probe failed, quoting the first line" \
+    "${st_dd}/failing/duckdb, failed arc's tokenizer probe, \`SELECT count(*) FROM sql_tokenize('SELECT 1')\`, and said \"IO Error: Could not open the temporary directory\"; arc needs" "${st_dd}/failing.out"
+  st_lacks "duckdb failing the probe: not said to lack the autocomplete extension" "autocomplete" "${st_dd}/failing.out"
+  st_lacks "duckdb failing the probe: quotes only the first line" "LINE 1" "${st_dd}/failing.out"
+
+  # A DuckDB 2.x whose probe fails and prints nothing: said so.
+  st_duckdb_run silent "${st_dd}/silent:${st_tools}" ""
+  st_equal "duckdb failing the probe silently: exits 0 ($(cat "${st_dd}/silent.out"))" "0" "$st_rc"
+  st_contains "duckdb failing the probe silently: says it printed no error" \
+    "${st_dd}/silent/duckdb, failed arc's tokenizer probe, \`SELECT count(*) FROM sql_tokenize('SELECT 1')\`, and printed no error" "${st_dd}/silent.out"
+  st_lacks "duckdb failing the probe silently: not said to lack the autocomplete extension" "autocomplete" "${st_dd}/silent.out"
 
   # A DuckDB 1.x on PATH: installed beside it, named by its version, not taken
   # for a build without the autocomplete extension.

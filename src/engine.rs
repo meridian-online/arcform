@@ -361,8 +361,8 @@ pub const SUPPORTED_ENGINE_RANGE: &str = ">=2.0, <3";
 
 /// The oldest DuckDB arc accepts, where [`SUPPORTED_ENGINE_RANGE`] starts: the major release
 /// of the DuckDB library arc links. arc links DuckDB 2.0, and a database file it creates
-/// carries storage version 2.0, which a 1.x DuckDB refuses to open, so no override reaches
-/// below this. arc 0.2.1 is the release for DuckDB 1.5.
+/// carries a storage version a 1.x DuckDB refuses to open, so no override reaches below
+/// this. arc 0.2.1 is the release for DuckDB 1.5.
 pub const OLDEST_ENGINE: &str = "2.0.0";
 
 /// The DuckDB release arc is tested on, which a message naming DuckDB's installer pins.
@@ -390,7 +390,8 @@ pub(crate) fn release_install_fix() -> String {
 /// Why a DuckDB whose tokenizer does not answer cannot be read, naming it as `which` does,
 /// from `error`, what it said. Built without DuckDB's autocomplete extension is said as fact
 /// only when DuckDB's error names that extension or `sql_tokenize`; any other error is
-/// quoted.
+/// quoted, on one line: DuckDB's error can run to several (its message, a blank line, then
+/// `LINE 1:` and a caret), and the refusal and the warning that quote it are one line each.
 pub(crate) fn no_tokenizer_cause(which: &str, error: &str) -> String {
     let lower = error.to_lowercase();
     let why = if lower.contains("autocomplete") || lower.contains("sql_tokenize") {
@@ -398,9 +399,21 @@ pub(crate) fn no_tokenizer_cause(which: &str, error: &str) -> String {
          extension"
             .to_string()
     } else {
-        format!("could not answer DuckDB's tokenizer, `sql_tokenize`, and said: {error}")
+        format!(
+            "could not answer DuckDB's tokenizer, `sql_tokenize`, and said \"{}\"",
+            one_line(error)
+        )
     };
     format!("{which} {why}. arc needs those tokens to check what each SQL step installs.")
+}
+
+/// `text` on one line: each line trimmed, blank lines dropped, and the rest joined by a space.
+fn one_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The DuckDB `program` names, as a person can find it, with the version it printed, as
@@ -473,6 +486,13 @@ const RELEASE_COMMITS: [(&str, &str); 1] = [("2.0.0", "d54cbbe3df17e8e5ce68312f4
 /// an engine arc was not tested on. The run warns, and a manifest's own `engine_version:`
 /// still refuses what it refused before.
 pub const ALLOW_UNTESTED_ENGINE_ENV: &str = "ARC_ALLOW_UNTESTED_ENGINE";
+
+/// Whether [`ALLOW_UNTESTED_ENGINE_ENV`] is set to a non-empty value. The engine check and the
+/// check on the version a token answer came from both read it here, so the one variable lifts
+/// both: a DuckDB 3.x the override runs is also one whose tokens arc reads.
+pub(crate) fn untested_engine_allowed() -> bool {
+    std::env::var_os(ALLOW_UNTESTED_ENGINE_ENV).is_some_and(|v| !v.is_empty())
+}
 
 /// The DuckDB executable arc runs: the one `ARC_DUCKDB_BIN` names when it is set, else
 /// `duckdb` found on the search path.
@@ -2086,7 +2106,9 @@ impl ExtensionRecheck {
     /// what [`check_extension_installs`] refuses in a file, and check each vetted community
     /// extension it installs that no check has found against its pin, as
     /// [`check_extension_pins`] does. Returns each warning those two give that the run has not
-    /// printed. A file arc cannot read is left to the engine, which reads it next.
+    /// printed. A file arc cannot open is left to the engine, which reports it when it runs
+    /// the file next; a file whose tokens DuckDB does not give, or gives in a form arc cannot
+    /// read, is refused with [`Error::SqlNotRead`].
     pub(crate) fn check(
         &mut self,
         engine: &dyn Engine,
@@ -2654,10 +2676,34 @@ mod tests {
                 "the duckdb on PATH",
                 "Out of Memory Error: could not allocate"
             ),
-            "the duckdb on PATH could not answer DuckDB's tokenizer, `sql_tokenize`, and said: \
-             Out of Memory Error: could not allocate. arc needs those tokens to check what each \
-             SQL step installs."
+            "the duckdb on PATH could not answer DuckDB's tokenizer, `sql_tokenize`, and said \
+             \"Out of Memory Error: could not allocate\". arc needs those tokens to check what \
+             each SQL step installs."
         );
+    }
+
+    // DuckDB's error can run to several lines; the one-line refusal and warning quote it on
+    // one, and the sentence goes on after it.
+    #[test]
+    fn a_multi_line_tokenizer_error_is_quoted_on_one_line() {
+        let error =
+            "Parser Error: syntax error at or near \"x\"\n\nLINE 1: SELECT x\n               ^\n";
+        let cause = no_tokenizer_cause("the duckdb on PATH", error);
+        assert_eq!(
+            cause,
+            "the duckdb on PATH could not answer DuckDB's tokenizer, `sql_tokenize`, and said \
+             \"Parser Error: syntax error at or near \"x\" LINE 1: SELECT x ^\". arc needs those \
+             tokens to check what each SQL step installs."
+        );
+        assert!(!cause.contains('\n'), "{cause}");
+        let warning = crate::introspect::no_tokenizer_warning("the duckdb on PATH", error);
+        assert!(!warning.contains('\n'), "{warning}");
+        let refusal = crate::error::Error::NoTokenizer {
+            which: "the duckdb on PATH".to_string(),
+            error: error.to_string(),
+        }
+        .to_string();
+        assert!(!refusal.contains('\n'), "{refusal}");
     }
 
     #[test]

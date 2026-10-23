@@ -199,7 +199,8 @@ pub(crate) fn check_engine_version(
     let oldest = semver::Version::parse(OLDEST_ENGINE).expect("OLDEST_ENGINE is a valid version");
     // By release, so a pre-release of the oldest release is untested, as any pre-release is,
     // and not taken for one of the releases before it. No override reaches below the oldest
-    // engine: the library arc links cannot open a database an older command line shares.
+    // engine: a database the 2.0 library arc links creates cannot be opened by a 1.x command
+    // line, and the two share it.
     if (ver.major, ver.minor, ver.patch) < (oldest.major, oldest.minor, oldest.patch) {
         return Err(Error::EngineTooOld {
             found: ver.to_string(),
@@ -308,9 +309,6 @@ pub fn run_with_params(
     // hook's file just before it runs; and the pinned extensions each check installed and
     // found equal to their pins, hashed again when the run ends.
     let mut extensions = ExtensionRecheck::default();
-    // Whether a SQL file holds a statement for DuckDB's reading to read, from the tokens the
-    // check below reads.
-    let mut reads_sql = false;
     // The engine this run's SQL steps use, when it has any and arc could read its version.
     let mut engine_version: Option<semver::Version> = None;
 
@@ -318,8 +316,7 @@ pub fn run_with_params(
     if manifest.has_sql_steps() {
         let info = engine.preflight()?;
         engine_version = info.version.clone();
-        let allow_untested =
-            std::env::var_os(ALLOW_UNTESTED_ENGINE_ENV).is_some_and(|v| !v.is_empty());
+        let allow_untested = crate::engine::untested_engine_allowed();
         for warning in check_engine_version(
             info.version.as_ref(),
             manifest.engine_version.as_deref(),
@@ -350,7 +347,6 @@ pub fn run_with_params(
             }
             Ok(installs) => installs,
         };
-        reads_sql = installs.tokens.holds_sql();
         for warning in &installs.warnings {
             eprintln!("{} {}", "warning:".yellow(), warning);
         }
@@ -388,11 +384,22 @@ pub fn run_with_params(
     }
     // Which reader takes a SQL step's reads and produces. Refused here, before a step
     // runs, rather than as a warning on each step the reader cannot read.
-    crate::introspect::check_reader(reads_sql).map_err(Error::SqlReader)?;
+    crate::introspect::check_reader().map_err(Error::SqlReader)?;
 
     if manifest.steps.is_empty() {
         println!("{}", "No steps defined.".dimmed());
         return Ok(());
+    }
+
+    // Build the asset graph, before anything is initialised, so a refused Protocol leaves no
+    // run behind. A step DuckDB's answer could not be read for is refused, as the refusals
+    // refuse a file whose tokens could not be read: the run does not read it with arc's own
+    // parser instead. A DuckDB 2 that gives no tree at all refuses here too, from the graph's
+    // own questions.
+    let asset_graph = AssetGraph::build(&manifest, dir);
+    if !asset_graph.unreadable.is_empty() {
+        let refusals: Vec<String> = asset_graph.unreadable.iter().map(|u| u.refusal()).collect();
+        return Err(Error::SqlReader(refusals.join("\n")));
     }
 
     // Resolve parameters: dotenv files → manifest defaults → CLI overrides.
@@ -430,14 +437,6 @@ pub fn run_with_params(
     // Start a new run record.
     let run_id = state.start_run()?;
 
-    // Build the asset graph and validate dependency ordering.
-    let asset_graph = AssetGraph::build(&manifest, dir);
-    // A step DuckDB's answer could not be read for is refused, as the refusals refuse a file
-    // whose tokens could not be read: the run does not read it with arc's own parser instead.
-    if !asset_graph.unreadable.is_empty() {
-        let refusals: Vec<String> = asset_graph.unreadable.iter().map(|u| u.refusal()).collect();
-        return Err(Error::SqlReader(refusals.join("\n")));
-    }
     // Who produces what — computed once, consulted both by staleness detection and by
     // the artifact hash each successful step records for the *next* run to compare.
     let all_produced = all_produced_assets(&asset_graph);
@@ -1990,7 +1989,7 @@ mod tests {
         assert!(matches!(refused, Error::NoTokenizer { .. }), "{refused:?}");
         let message = refused.to_string();
         assert!(
-            message.contains("said: Out of Memory Error: no room"),
+            message.contains("said \"Out of Memory Error: no room\""),
             "{message}"
         );
         assert!(!message.contains("built without"), "{message}");
@@ -2094,7 +2093,9 @@ mod tests {
     }
 
     // A step DuckDB answered for with an answer arc cannot read is refused before it runs:
-    // the run does not read it with arc's own parser in its place.
+    // the run does not read it with arc's own parser in its place. It is refused before the
+    // state backend is set up, as every other refusal before the run is, so it leaves no run
+    // row and no state tables behind.
     #[test]
     fn a_step_duckdbs_answer_cannot_be_read_for_refuses_the_run() {
         use crate::duckdb_lineage::Refusal;
@@ -2128,6 +2129,8 @@ mod tests {
             "no step ran: {:?}",
             engine.calls.borrow()
         );
+        assert!(!*state.init_called.borrow(), "the state backend was set up");
+        assert!(state.runs.borrow().is_empty(), "a run was started");
     }
 
     // Steps execute in declared order against shared database.
@@ -3441,9 +3444,9 @@ mod tests {
         assert_eq!(OLDEST_ENGINE, "2.0.0");
     }
 
-    // The override lifts arc's range above the oldest release and never below it: the
-    // library arc links cannot open a database an older command line shares, so a 1.x
-    // engine is refused with the override set, and the refusal names the way out.
+    // The override lifts arc's range above the oldest release and never below it: a
+    // database the 2.0 library arc links creates cannot be opened by a 1.x command line, so
+    // a 1.x engine is refused with the override set, and the refusal names the way out.
     #[test]
     fn test_check_engine_version_override_does_not_reach_an_older_engine() {
         for older in ["1.5.6", "1.2.0", "1.1.3"] {

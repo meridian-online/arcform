@@ -9,7 +9,7 @@ use crate::edit::{
     ATTRIBUTES_FILENAME, IGNORE_FILENAME, IgnoreList, MergeRule, write_ignore_list,
     write_merge_rule,
 };
-use crate::engine::{ALLOW_UNTESTED_ENGINE_ENV, DuckDbEngine, Engine};
+use crate::engine::{DuckDbEngine, Engine};
 use crate::error::{Error, Result};
 use crate::manifest::Manifest;
 use crate::registry::transport::GitTarballTransport;
@@ -849,7 +849,7 @@ pub fn upgrade_extension(
             "arc could not read this engine's DuckDB version, which a pin is for".to_string(),
         ));
     };
-    let allow_untested = std::env::var_os(ALLOW_UNTESTED_ENGINE_ENV).is_some_and(|v| !v.is_empty());
+    let allow_untested = crate::engine::untested_engine_allowed();
     let warnings = crate::runner::check_engine_version(
         Some(&found),
         manifest.engine_version.as_deref(),

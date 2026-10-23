@@ -6,7 +6,8 @@
 //! the tree of a `SELECT`. For a statement that is not a `SELECT` it answers `not
 //! implemented`, which also says the statement parsed; for text it cannot parse it
 //! answers `parser`, with its own message. DuckDB 1.x has no `sql_tokenize`, so the
-//! reader reads the tokens of a 2.x build and refuses any other.
+//! reader reads the tokens of a 2.x build and refuses any other (a later major too, when
+//! `ARC_ALLOW_UNTESTED_ENGINE` is set).
 //!
 //! The reader asks twice, through the DuckDB command line, as `arc run` runs a step.
 //! First for the step's tokens, which come from [`crate::duckdb_tokens`]: the file cut into
@@ -178,8 +179,8 @@ pub(crate) enum Refusal {
     NotStarted { program: String, reason: String },
     /// The DuckDB named was started and exited with an error.
     NotRun { program: String, reason: String },
-    /// The DuckDB asked answered with tokens from a version that is not 2.x, whose tokens
-    /// arc reads.
+    /// The DuckDB asked answered with tokens from a version whose tokens arc does not read:
+    /// one that is not 2.x, or, with `ARC_ALLOW_UNTESTED_ENGINE` set, one before 2.
     NotDuckDb2 { version: String },
     /// DuckDB answered something the reader cannot read, such as an answer with no version.
     Unreadable(String),
@@ -196,7 +197,9 @@ impl fmt::Display for Refusal {
             }
             Refusal::NotDuckDb2 { version } => write!(
                 f,
-                "the tokens came from DuckDB {version}, and arc reads the tokens of a DuckDB 2.x"
+                "the tokens came from DuckDB {version}, and arc reads the tokens of a DuckDB 2.x, \
+                 or of a later one when {} is set",
+                crate::engine::ALLOW_UNTESTED_ENGINE_ENV
             ),
             Refusal::Unreadable(reason) => write!(f, "DuckDB's parse could not be read: {reason}"),
         }
@@ -206,36 +209,38 @@ impl fmt::Display for Refusal {
 impl std::error::Error for Refusal {}
 
 /// Reads a step with `duckdb`, the program the steps run on.
+///
+/// A reading is kept by the program's name and the SHA-256 of `sql`, beside the tokens
+/// [`shared_tokens`] keeps, so a step read again unchanged in the process, as `arc run` reads
+/// each step for the asset graph before its first step and again for the run contract after
+/// its last, asks DuckDB for no trees the second time. A refused reading is not kept.
 pub(crate) fn read_step(duckdb: &DuckDbProgram, sql: &str) -> Result<StepReading, Refusal> {
-    read_step_with(
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    use std::sync::{Mutex, PoisonError};
+    type Key = (String, [u8; 32]);
+    static READINGS: Mutex<Option<HashMap<Key, StepReading>>> = Mutex::new(None);
+    let key: Key = (duckdb.display_name(), Sha256::digest(sql.as_bytes()).into());
+    let lock = || READINGS.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(known) = lock().get_or_insert_with(HashMap::new).get(&key) {
+        return Ok(known.clone());
+    }
+    let reading = read_step_with(
         &mut Process {
             program: duckdb.clone(),
         },
         sql,
-    )
+    )?;
+    lock()
+        .get_or_insert_with(HashMap::new)
+        .insert(key, reading.clone());
+    Ok(reading)
 }
 
-/// Whether `duckdb` gives the tree of a query: the reader's second question. Its first, for
-/// a file's tokens, is the one the refusals ask of the same program before a run, which
-/// refuses a DuckDB that is not a 2.x build.
-pub(crate) fn gives_trees(duckdb: &DuckDbProgram) -> Result<(), Refusal> {
-    gives_trees_with(&mut Process {
-        program: duckdb.clone(),
-    })
-}
-
-fn gives_trees_with(ask: &mut dyn Ask) -> Result<(), Refusal> {
-    let trees = ask.trees(&["SELECT 1".to_string()])?;
-    match trees.first().map(answer) {
-        Some(Answer::Tree(_)) => Ok(()),
-        Some(Answer::Parser(reason) | Answer::Other(reason)) => Err(Refusal::Unreadable(format!(
-            "no tree for `SELECT 1`: {reason}"
-        ))),
-        Some(Answer::NotImplemented) | None => {
-            Err(Refusal::Unreadable("no tree for `SELECT 1`".to_string()))
-        }
-    }
-}
+/// The text whose tree ends every question for a step's trees: a DuckDB that gives none for
+/// it gives the reader nothing to read, and the step is refused as unreadable rather than
+/// read statement by statement with arc's own parser. It costs no process of its own.
+const GIVES_A_TREE: &str = "SELECT 1";
 
 /// The two questions the reader asks. A DuckDB process answers them, and the tests
 /// answer them from what DuckDB v2.0.0 answered.
@@ -285,13 +290,43 @@ fn read_step_with(ask: &mut dyn Ask, sql: &str) -> Result<StepReading, Refusal> 
 
     let mut texts: Vec<String> = pieces.iter().map(|p| p.text.clone()).collect();
     texts.extend(frames.iter().filter_map(|f| f.query.clone()));
-    let trees = ask.trees(&texts)?;
+    // A step with no statement asks nothing. One with any also asks for the tree of
+    // `GIVES_A_TREE`, so a DuckDB that answered the step's tokens and gives no trees is
+    // refused here, before any step runs, in the same process.
+    if texts.is_empty() {
+        return Ok(StepReading {
+            duckdb_version: file.version,
+            statements: Vec::new(),
+        });
+    }
+    texts.push(GIVES_A_TREE.to_string());
+    // The tokens came from this DuckDB, so a trees question it could not start or run is an
+    // answer for the step that could not be read, not a DuckDB that is not there.
+    let trees = ask.trees(&texts).map_err(|refusal| match refusal {
+        Refusal::NotStarted { .. } | Refusal::NotRun { .. } => {
+            Refusal::Unreadable(format!("no trees: {refusal}"))
+        }
+        other => other,
+    })?;
     if trees.len() != texts.len() {
         return Err(Refusal::Unreadable(format!(
             "{} answers for {} texts",
             trees.len(),
             texts.len()
         )));
+    }
+    if let Some(last) = trees.last() {
+        match answer(last) {
+            Answer::Tree(_) => {}
+            Answer::Parser(reason) | Answer::Other(reason) => {
+                return Err(Refusal::Unreadable(format!(
+                    "no tree for `{GIVES_A_TREE}`: {reason}"
+                )));
+            }
+            Answer::NotImplemented => {
+                return Err(Refusal::Unreadable(format!("no tree for `{GIVES_A_TREE}`")));
+            }
+        }
     }
     let (own, held) = trees.split_at(pieces.len());
     let mut held = held.iter();
@@ -2193,13 +2228,86 @@ mod tests {
         assert_eq!(shape(&s[1]), expect(Form::CreateTable, &["t"], &["r"]));
     }
 
+    /// A DuckDB that answered the step's tokens and gives no tree for `SELECT 1` gives the
+    /// reader nothing to read: the step is refused as unreadable, from the step's own question.
     #[test]
-    fn a_duckdb_that_gives_a_tree_is_one_the_reader_can_ask() {
-        assert_eq!(gives_trees_with(&mut Recorded::load()), Ok(()));
-        let refusal = gives_trees(&DuckDbProgram::Told("true".into()))
-            .expect_err("a program that prints nothing gives no tree");
+    fn a_duckdb_that_gives_no_tree_for_select_1_refuses_the_step() {
+        let parser =
+            serde_json::json!({"error": true, "error_type": "parser", "error_message": "p"});
+        let not_implemented = serde_json::json!({"error": true, "error_type": "not implemented"});
+        for (sentinel, reason) in [
+            (parser, "no tree for `SELECT 1`: p"),
+            (not_implemented, "no tree for `SELECT 1`"),
+        ] {
+            let refusal = read_step_with(
+                &mut Scripted {
+                    tokens: Ok(vec![token(0, "x")]),
+                    trees: Ok(vec![
+                        serde_json::json!({"error": true, "error_type": "not implemented"}),
+                    ]),
+                    sentinel: Some(sentinel),
+                },
+                "x",
+            )
+            .expect_err("no tree for SELECT 1 refuses");
+            assert!(
+                matches!(&refusal, Refusal::Unreadable(r) if r == reason),
+                "expected {reason:?}, got {refusal:?}"
+            );
+        }
+        // A step of no statement asks for no tree, so asks nothing of a DuckDB with none.
+        let reading = read_step_with(
+            &mut Scripted {
+                tokens: Ok(vec![]),
+                trees: Err(Refusal::Unreadable("asked".to_string())),
+                sentinel: None,
+            },
+            "",
+        )
+        .expect("nothing to ask");
+        assert!(reading.statements.is_empty());
+    }
+
+    /// A trees question that could not start or run the DuckDB that just gave the tokens
+    /// is an unreadable answer for the step, which `arc run` refuses, not a missing DuckDB.
+    #[test]
+    fn a_trees_question_that_could_not_run_refuses_the_step() {
+        for failed in [
+            Refusal::NotStarted {
+                program: "d".to_string(),
+                reason: "gone".to_string(),
+            },
+            Refusal::NotRun {
+                program: "d".to_string(),
+                reason: "exit 1".to_string(),
+            },
+        ] {
+            let refusal = read_step_with(
+                &mut Scripted {
+                    tokens: Ok(vec![token(0, "x")]),
+                    trees: Err(failed),
+                    sentinel: None,
+                },
+                "x",
+            )
+            .expect_err("refused");
+            assert!(
+                matches!(&refusal, Refusal::Unreadable(r) if r.starts_with("no trees: ")),
+                "{refusal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_program_that_prints_no_trees_is_refused() {
+        let mut ask = Scripted {
+            tokens: Ok(vec![token(0, "x")]),
+            trees: Ok(vec![]),
+            sentinel: None,
+        };
+        let refusal = read_step_with(&mut ask, "x").expect_err("no trees");
         assert!(
-            matches!(&refusal, Refusal::Unreadable(reason) if reason.contains("no trees")),
+            matches!(&refusal, Refusal::Unreadable(r) if r.contains("0 answers for 2 texts")),
             "{refusal:?}"
         );
     }
@@ -2245,10 +2353,13 @@ mod tests {
         );
     }
 
-    /// Answers made by hand, for what DuckDB does not answer when asked well.
+    /// Answers made by hand, for what DuckDB does not answer when asked well. The tree of
+    /// `SELECT 1` the reader asks last is added to `trees` when they are given: the
+    /// `sentinel` given, else the tree DuckDB gives.
     struct Scripted {
         tokens: Result<Vec<Token>, String>,
         trees: Result<Vec<Value>, Refusal>,
+        sentinel: Option<Value>,
     }
 
     impl Ask for Scripted {
@@ -2262,8 +2373,16 @@ mod tests {
             })
         }
 
-        fn trees(&mut self, _: &[String]) -> Result<Vec<Value>, Refusal> {
-            self.trees.clone()
+        fn trees(&mut self, texts: &[String]) -> Result<Vec<Value>, Refusal> {
+            let mut trees = self.trees.clone()?;
+            if texts.last().map(String::as_str) == Some(GIVES_A_TREE) && !trees.is_empty() {
+                trees.push(
+                    self.sentinel
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!({"error": false, "statements": []})),
+                );
+            }
+            Ok(trees)
         }
     }
 
@@ -2294,13 +2413,20 @@ mod tests {
                 Ok(vec![]),
                 "byte 9",
             ),
-            (x(), Ok(vec![tree.clone(), tree]), "2 answers for 1 texts"),
+            (x(), Ok(vec![tree.clone(), tree]), "3 answers for 2 texts"),
             (x(), Ok(vec![other]), "binder: m"),
             (x(), Err(failed), "no trees: m"),
         ];
         for (tokens, trees, reason) in cases {
-            let refusal = read_step_with(&mut Scripted { tokens, trees }, "x")
-                .expect_err("an unreadable answer refuses");
+            let refusal = read_step_with(
+                &mut Scripted {
+                    tokens,
+                    trees,
+                    sentinel: None,
+                },
+                "x",
+            )
+            .expect_err("an unreadable answer refuses");
             assert!(
                 matches!(&refusal, Refusal::Unreadable(r) if r.contains(reason)),
                 "expected a refusal holding {reason:?}, got {refusal:?}"

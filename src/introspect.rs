@@ -260,39 +260,12 @@ fn reader() -> Result<Reader, String> {
     }
 }
 
-/// The DuckDB arc runs, which is the one asked for its parse.
-#[cfg(not(test))]
-fn duckdb_program() -> Result<crate::engine::DuckDbProgram, String> {
-    crate::engine::duckdb_program().map_err(|e| e.to_string())
-}
-
-/// Refuses a run, before a step runs, when [`SQL_READER_ENV`] names no reader, or chooses
-/// DuckDB's and the DuckDB arc runs gives no parse. The DuckDB is asked only when `has_sql`:
-/// a SQL step's file holds a statement for it to read. Its tokens have been read by then, by
-/// the refusals, which refuse a DuckDB that is not a 2.x build; this asks for a tree.
-pub(crate) fn check_reader(has_sql: bool) -> Result<(), String> {
-    if reader()? == Reader::DuckDb && has_sql {
-        gives_trees()?.map_err(|refusal| {
-            format!(
-                "arc reads what each SQL step reads and produces from DuckDB 2's own parse, \
-                 and {refusal}; {SQL_READER_ENV}={SQLPARSER_READER} reads the steps with \
-                 arc's own parser instead"
-            )
-        })?;
-    }
-    Ok(())
-}
-
-/// Whether the DuckDB arc runs gives a tree; `Err` when there is no such DuckDB to ask.
-#[cfg(not(test))]
-fn gives_trees() -> Result<Result<(), duckdb_lineage::Refusal>, String> {
-    Ok(duckdb_lineage::gives_trees(&duckdb_program()?))
-}
-
-/// The lib's tests read DuckDB's parse from [`test_reading`], and start no DuckDB here.
-#[cfg(test)]
-fn gives_trees() -> Result<Result<(), duckdb_lineage::Refusal>, String> {
-    Ok(Ok(()))
+/// Refuses a run, before a step runs, when [`SQL_READER_ENV`] names no reader. Whether the
+/// DuckDB arc runs gives a parse is asked in the asset graph's own questions, which `arc run`
+/// asks before its first step: a DuckDB 2 that gives no tree refuses each SQL step that holds
+/// a statement as unreadable (see [`StepSql::unreadable`]), and starts no process of its own.
+pub(crate) fn check_reader() -> Result<(), String> {
+    reader().map(|_| ())
 }
 
 /// What each statement of a SQL step reads and produces, in source order, and the
@@ -500,20 +473,64 @@ pub fn unreadable_refusal(step: &str, file: &str, reason: &str) -> String {
     )
 }
 
-/// Prints, the first time in the process, that the asset graph is sqlparser-rs's reading.
-/// When DuckDB ran and failed, it is asked once whether it tokenises at all, and a DuckDB
-/// that does not, as one built without its autocomplete extension, is named with the fix.
+/// Prints that the asset graph is sqlparser-rs's reading: once for each cause, and again
+/// when the same cause outlasts [`crate::duckdb_tokens::NOT_STARTED_LIFETIME`], so a command
+/// reading many files says it once and a long-lived `arc mcp` says it again when the cause
+/// changes or persists. When DuckDB ran and failed, it is asked whether it tokenises at
+/// all, and a DuckDB that does not, as one built without its autocomplete extension, is
+/// named with the fix.
 fn warn_once_no_duckdb(refusal: &duckdb_lineage::Refusal) {
     use owo_colors::OwoColorize;
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| {
-        let warning = match refusal {
-            duckdb_lineage::Refusal::NotRun { .. } => no_tokenizer_named(),
-            _ => None,
+    static SAID: std::sync::Mutex<Option<(String, std::time::Instant)>> =
+        std::sync::Mutex::new(None);
+    let cause = no_duckdb_cause(refusal);
+    let now = std::time::Instant::now();
+    {
+        let mut said = SAID
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !no_duckdb_warning_due(
+            said.as_ref(),
+            &cause,
+            now,
+            crate::duckdb_tokens::NOT_STARTED_LIFETIME,
+        ) {
+            return;
         }
-        .unwrap_or_else(|| no_duckdb_warning(&refusal.to_string()));
-        eprintln!("{} {warning}", "warning:".yellow());
-    });
+        *said = Some((cause, now));
+    }
+    let warning = match refusal {
+        duckdb_lineage::Refusal::NotRun { .. } => no_tokenizer_named(),
+        _ => None,
+    }
+    .unwrap_or_else(|| no_duckdb_warning(&refusal.to_string()));
+    eprintln!("{} {warning}", "warning:".yellow());
+}
+
+/// What a no-DuckDB warning is said once for: the kind of failure and the program, or the
+/// version that answered. Not the reason, which can differ from file to file.
+fn no_duckdb_cause(refusal: &duckdb_lineage::Refusal) -> String {
+    use duckdb_lineage::Refusal;
+    match refusal {
+        Refusal::NotStarted { program, .. } => format!("not started: {program}"),
+        Refusal::NotRun { program, .. } => format!("not run: {program}"),
+        Refusal::NotDuckDb2 { version } => format!("version: {version}"),
+        Refusal::Unreadable(_) => "unreadable".to_string(),
+    }
+}
+
+/// Whether the no-DuckDB warning for `cause` is due at `now`, given the last one `said`
+/// and when: when none was said, the cause changed, or `lifetime` has passed since.
+fn no_duckdb_warning_due(
+    said: Option<&(String, std::time::Instant)>,
+    cause: &str,
+    now: std::time::Instant,
+    lifetime: std::time::Duration,
+) -> bool {
+    match said {
+        None => true,
+        Some((last, at)) => last != cause || now.saturating_duration_since(*at) >= lifetime,
+    }
 }
 
 /// [`no_tokenizer_warning`] for the DuckDB arc runs, when its tokenizer does not answer.
@@ -1343,6 +1360,48 @@ fn path_literals(expr: &Expr, paths: &mut Vec<String>) {
 mod tests {
     use super::*;
     use crate::duckdb_lineage::recorded_steps;
+
+    /// The no-DuckDB warning is said once for a cause, again when the cause changes, and
+    /// again for the same cause once the lifetime has passed.
+    #[test]
+    fn the_no_duckdb_warning_repeats_on_a_new_cause_or_after_its_lifetime() {
+        let lifetime = std::time::Duration::from_millis(30);
+        let start = std::time::Instant::now();
+        let said = ("not started: duckdb".to_string(), start);
+        assert!(no_duckdb_warning_due(
+            None,
+            "not started: duckdb",
+            start,
+            lifetime
+        ));
+        assert!(!no_duckdb_warning_due(
+            Some(&said),
+            "not started: duckdb",
+            start + lifetime / 2,
+            lifetime
+        ));
+        assert!(no_duckdb_warning_due(
+            Some(&said),
+            "not run: duckdb",
+            start + lifetime / 2,
+            lifetime
+        ));
+        assert!(no_duckdb_warning_due(
+            Some(&said),
+            "not started: duckdb",
+            start + lifetime,
+            lifetime
+        ));
+        let not_started = |reason: &str| duckdb_lineage::Refusal::NotStarted {
+            program: "duckdb".to_string(),
+            reason: reason.to_string(),
+        };
+        assert_eq!(
+            no_duckdb_cause(&not_started("No such file")),
+            no_duckdb_cause(&not_started("Permission denied")),
+            "the cause is the failure and the program, not the reason"
+        );
+    }
 
     /// What the rules make of DuckDB's reading of `sql`, from the answers DuckDB v2.0.0
     /// gave for it: what [`read_sql`] reads by default, before the fallback.

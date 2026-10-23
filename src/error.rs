@@ -367,6 +367,13 @@ impl Error {
     ///   is the bucket a step forced to re-run by a corrected staleness decision lands
     ///   in if that re-run then fails for a real reason.
     ///
+    /// Two refusals made before any step runs are 2 all the same, by design. `SqlNotRead` is
+    /// shared by the check before the run and the check just before a step or hook (where 2
+    /// is plain), so a file DuckDB gives no readable tokens for exits 2 whichever check found
+    /// it. `NoTokenizer`, a DuckDB that gives no tokens for any file, is said in place of the
+    /// first `SqlNotRead` it would otherwise be, and keeps that code. Other refusals before
+    /// the run, such as `ExtensionRefused`, are 1. `docs/ARCHITECTURE.md` states both.
+    ///
     /// Kept distinguishable on purpose: a mutation test on the staleness gate that
     /// reverts the fix and finds the run still exits 1 either way would prove nothing —
     /// see [`crate::runner`]'s `is_hash_stale`, the gate this distinction exists for.

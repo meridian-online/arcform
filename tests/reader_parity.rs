@@ -7,7 +7,7 @@
 //! Each file is read as `arc run` reads a step: the file is the one SQL step of a
 //! Protocol whose first step fails, so nothing runs and the run's contract still records,
 //! for each statement of the step, what it produces and reads. That contract comes from
-//! `extract_per_statement`, once with `ARC_SQL_READER` unset, arc's default reading, and
+//! `introspect::read_sql`, once with `ARC_SQL_READER` unset, arc's default reading, and
 //! once with `ARC_SQL_READER=sqlparser`. The default reading is DuckDB's, with sqlparser-rs
 //! reading each statement DuckDB's reading cannot take, so a statement read by that fallback
 //! compares sqlparser-rs with itself; a default run that read a whole file with sqlparser-rs,

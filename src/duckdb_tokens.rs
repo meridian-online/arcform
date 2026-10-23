@@ -418,15 +418,15 @@ fn is_blank(text: &str) -> bool {
         .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r'))
 }
 
-/// Asks `ask` about `texts`, and refuses an answer from a DuckDB that is not a 2.x build,
-/// whose tokenizer arc reads by, an answer that does not hold one token list per text, or a
-/// token that starts off its text.
+/// Asks `ask` about `texts`, and refuses an answer from a DuckDB whose tokens arc does not
+/// read (see [`tokens_accepted_from`]), an answer that does not hold one token list per text,
+/// or a token that starts off its text.
 fn asked(
     ask: &mut dyn FnMut(&[String]) -> Result<Answer, Refusal>,
     texts: &[String],
 ) -> Result<Answer, Refusal> {
     let (version, answers) = ask(texts)?;
-    if major(&version) != Some(2) {
+    if !tokens_accepted_from(&version, crate::engine::untested_engine_allowed()) {
         return Err(Refusal::NotDuckDb2 { version });
     }
     if answers.len() != texts.len() {
@@ -446,6 +446,18 @@ fn asked(
         }
     }
     Ok((version, answers))
+}
+
+/// Whether arc reads the tokens of a DuckDB that reports `version`: a 2.x build, whose
+/// tokenizer arc reads by, or, when `allow_untested` (`ARC_ALLOW_UNTESTED_ENGINE` is set), a
+/// later major, which the engine check runs under the same override at the user's risk. Below
+/// 2 is refused either way, as the engine check refuses it: a 1.x has no `sql_tokenize`.
+pub(crate) fn tokens_accepted_from(version: &str, allow_untested: bool) -> bool {
+    match major(version) {
+        Some(2) => true,
+        Some(later) if later > 2 => allow_untested,
+        _ => false,
+    }
 }
 
 /// Adds to `pending` each string a `query(…)` call in `tokens` is given that is not in
@@ -761,13 +773,6 @@ impl TokenCache {
         })
     }
 
-    /// Whether a file this holds has a token, so a statement for a reader to read.
-    pub(crate) fn holds_sql(&self) -> bool {
-        self.files
-            .values()
-            .any(|file| file.batches.iter().any(|batch| !batch.tokens.is_empty()))
-    }
-
     /// Whether a DuckDB was asked for a file this holds: a file with no SQL in it, empty or
     /// only dot commands and `#` lines, is held without asking one.
     pub(crate) fn asked_duckdb(&self) -> bool {
@@ -784,26 +789,37 @@ impl TokenCache {
 /// The tokens of `file` as `program` gives them, shared by everything in this process that
 /// reads a SQL file: the refusals and the asset graph read one answer for the same bytes,
 /// and a file read again unchanged is not asked about again. Each program has a cache of its
-/// own. A program that could not be started is not asked again in the process, so a command that
-/// reads many files with no DuckDB starts none after the first; any other failed question is
-/// not kept.
+/// own. A program that could not be started is not asked again for [`NOT_STARTED_LIFETIME`],
+/// so a command that reads many files with no DuckDB starts none after the first, and a
+/// long-lived `arc mcp` started before DuckDB was installed finds it once it is; any other
+/// failed question is not kept.
 ///
 /// The cache is not held while DuckDB is asked, so two threads asking about different files
 /// do not wait on each other; two asking about the same file at once may both ask.
 pub(crate) fn shared_tokens(program: &DuckDbProgram, file: &[u8]) -> Result<FileTokens, Refusal> {
-    shared_tokens_with(program, file, |file| tokenize_file(program, file))
+    shared_tokens_with(program, file, NOT_STARTED_LIFETIME, |file| {
+        tokenize_file(program, file)
+    })
 }
 
-/// [`shared_tokens`], with `ask` asking `program` for a file's tokens.
+/// How long [`shared_tokens`] remembers that a program could not be started, and how long
+/// the asset graph's once-per-cause warning of no DuckDB stays said. An `arc run` is one
+/// process that asks before its first step, so it sees one answer; a long-lived `arc mcp`
+/// asks again after this.
+pub(crate) const NOT_STARTED_LIFETIME: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// [`shared_tokens`], with `ask` asking `program` for a file's tokens, and a program that
+/// could not be started remembered for `lifetime`.
 fn shared_tokens_with(
     program: &DuckDbProgram,
     file: &[u8],
+    lifetime: std::time::Duration,
     ask: impl FnOnce(&[u8]) -> Result<FileTokens, Refusal>,
 ) -> Result<FileTokens, Refusal> {
     #[derive(Default)]
     struct Shared {
         caches: BTreeMap<String, TokenCache>,
-        not_run: BTreeMap<String, Refusal>,
+        not_run: BTreeMap<String, (Refusal, std::time::Instant)>,
     }
     static SHARED: Mutex<Option<Shared>> = Mutex::new(None);
     let name = program.display_name();
@@ -811,8 +827,12 @@ fn shared_tokens_with(
     {
         let mut held = lock();
         let shared = held.get_or_insert_with(Shared::default);
-        if let Some(refusal) = shared.not_run.get(&name) {
-            return Err(refusal.clone());
+        match shared.not_run.get(&name) {
+            Some((refusal, when)) if when.elapsed() < lifetime => return Err(refusal.clone()),
+            Some(_) => {
+                shared.not_run.remove(&name);
+            }
+            None => {}
         }
         if let Some(known) = shared.caches.get(&name).and_then(|cache| cache.known(file)) {
             return Ok(known.clone());
@@ -824,7 +844,9 @@ fn shared_tokens_with(
             if matches!(refusal, Refusal::NotStarted { .. }) {
                 let mut held = lock();
                 let shared = held.get_or_insert_with(Shared::default);
-                shared.not_run.insert(name, refusal.clone());
+                shared
+                    .not_run
+                    .insert(name, (refusal.clone(), std::time::Instant::now()));
             }
             return Err(refusal);
         }
@@ -1192,7 +1214,7 @@ mod tests {
     #[test]
     fn a_program_that_could_not_be_started_is_not_asked_again() {
         let program = DuckDbProgram::Told("/nonexistent/shared-tokens-test/duckdb".into());
-        let refused = shared_tokens_with(&program, b"SELECT 1;", |_| {
+        let refused = shared_tokens_with(&program, b"SELECT 1;", NOT_STARTED_LIFETIME, |_| {
             Err(Refusal::NotStarted {
                 program: program.display_name(),
                 reason: "No such file".to_string(),
@@ -1202,7 +1224,7 @@ mod tests {
             matches!(refused, Err(Refusal::NotStarted { .. })),
             "{refused:?}"
         );
-        let again = shared_tokens_with(&program, b"SELECT 2;", |_| {
+        let again = shared_tokens_with(&program, b"SELECT 2;", NOT_STARTED_LIFETIME, |_| {
             panic!("a program that could not be started was asked again")
         });
         assert_eq!(again, refused, "the first refusal is given again");
@@ -1215,13 +1237,69 @@ mod tests {
                 reason: "exit 1".to_string(),
             })
         };
-        let _ = shared_tokens_with(&failing, b"SELECT 1;", |_| not_run());
+        let _ = shared_tokens_with(&failing, b"SELECT 1;", NOT_STARTED_LIFETIME, |_| not_run());
         let mut asked = false;
-        let _ = shared_tokens_with(&failing, b"SELECT 1;", |_| {
+        let _ = shared_tokens_with(&failing, b"SELECT 1;", NOT_STARTED_LIFETIME, |_| {
             asked = true;
             not_run()
         });
         assert!(asked, "a program that ran and failed is asked again");
+    }
+
+    /// A program that could not be started is asked again once its refusal's lifetime has
+    /// passed, so a long-lived process finds a DuckDB installed after it started.
+    #[test]
+    fn a_program_that_could_not_be_started_is_asked_again_after_the_lifetime() {
+        let lifetime = std::time::Duration::from_millis(200);
+        let program = DuckDbProgram::Told("/nonexistent/shared-tokens-test/later".into());
+        let not_started = || {
+            Err(Refusal::NotStarted {
+                program: "later".to_string(),
+                reason: "No such file".to_string(),
+            })
+        };
+        let _ = shared_tokens_with(&program, b"SELECT 1;", lifetime, |_| not_started());
+        let within = shared_tokens_with(&program, b"SELECT 1;", lifetime, |_| {
+            panic!("asked again within the lifetime")
+        });
+        assert!(
+            matches!(within, Err(Refusal::NotStarted { .. })),
+            "{within:?}"
+        );
+        std::thread::sleep(lifetime + std::time::Duration::from_millis(50));
+        let mut asked = false;
+        let after = shared_tokens_with(&program, b"SELECT 1;", lifetime, |file| {
+            asked = true;
+            tokenize_with(file, &mut |texts| {
+                Ok((
+                    "v2.0.0".to_string(),
+                    texts.iter().map(|_| Vec::new()).collect(),
+                ))
+            })
+        });
+        assert!(asked, "asked again once the lifetime passed");
+        assert!(after.is_ok(), "the DuckDB now there answers: {after:?}");
+    }
+
+    #[test]
+    fn a_later_major_is_read_only_under_the_override_and_below_2_never() {
+        for (version, plain, allowed) in [
+            ("v2.0.0", true, true),
+            ("v2.1.0-dev12", true, true),
+            ("v3.0.0", false, true),
+            ("v10.2.0", false, true),
+            ("v1.5.6", false, false),
+            ("v0.10.0", false, false),
+            ("", false, false),
+            ("unknown", false, false),
+        ] {
+            assert_eq!(tokens_accepted_from(version, false), plain, "{version:?}");
+            assert_eq!(
+                tokens_accepted_from(version, true),
+                allowed,
+                "{version:?} allowed"
+            );
+        }
     }
 
     #[test]

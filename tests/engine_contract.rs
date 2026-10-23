@@ -130,6 +130,84 @@ impl Fixture {
         FakeEngine { bin, log }
     }
 
+    /// A fake engine whose `--version` prints `v<version> (fake) 0000000000` and whose
+    /// token answers, from [`real_duckdb`], name `v<version>` as the version that answered:
+    /// a DuckDB of that version, as far as arc's questions can tell.
+    fn fake_answering_as(&self, dir: &Path, name: &str, version: &str) -> FakeEngine {
+        let bin = dir.join(name);
+        let log = dir.join(format!("{name}.log"));
+        // Builtins only: several tests run arc with a PATH that holds nothing else.
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh
+if [ \"$1\" = \"-no-init\" ]; then
+  '{}' \"$@\" | while IFS= read -r line; do
+    \
+                 case \"$line\" in
+      arc-tokens:version:*) echo 'arc-tokens:version:v{version}' ;;
+      \
+                 *) printf '%s\\n' \"$line\" ;;
+    esac
+  done
+  exit 0
+fi
+\
+                 echo \"$*\" >> '{}'
+if [ \"$1\" = \"--version\" ]; then echo 'v{version} (fake) 0000000000'; fi
+exit 0
+",
+                real_duckdb().display(),
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        FakeEngine { bin, log }
+    }
+
+    /// A fake engine whose `--version` prints `line`, whose token answers come from
+    /// [`real_duckdb`], and which prints nothing for a question for trees (`-no-init -json`):
+    /// a DuckDB 2 that gives tokens and no trees.
+    fn fake_without_trees(&self, dir: &Path, name: &str, line: &str) -> FakeEngine {
+        let bin = dir.join(name);
+        let log = dir.join(format!("{name}.log"));
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh
+if [ \"$1\" = \"-no-init\" ] && [ \"$2\" = \"-json\" ]; then exit 0; fi
+{}\
+                 echo \"$*\" >> '{}'
+if [ \"$1\" = \"--version\" ]; then echo '{line}'; fi
+exit 0
+",
+                tokens_from_real_duckdb(),
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        FakeEngine { bin, log }
+    }
+
+    /// Every DuckDB database file under the data folder `arc_run` points the project at.
+    fn databases(&self) -> Vec<PathBuf> {
+        fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, found);
+                } else if path.extension().is_some_and(|e| e == "duckdb") {
+                    found.push(path);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(&self.root.path().join("db"), &mut found);
+        found
+    }
+
     /// `(steps_executed, outcome)` of every row in the run record.
     fn run_records(&self) -> Vec<(i64, String)> {
         let conn = duckdb::Connection::open(self.database()).unwrap();
@@ -523,6 +601,85 @@ fn a_3_0_0_engine_is_untested_and_the_override_lifts_it() {
     let (code, stderr, sql) = run_on_version(None, "3.0.0", true);
     assert_eq!(code, Some(0), "override must run 3.0.0:\n{stderr}");
     assert_eq!(sql, 1);
+}
+
+// The override lifts the range for a 3.x, and arc reads the tokens a 3.x gives under it;
+// without the override the same engine is refused as untested, and a 1.x is refused either
+// way.
+#[test]
+fn the_override_runs_a_3_x_whose_tokens_name_3_x_and_never_a_1_x() {
+    let run = |version: &str, allow: bool| {
+        let fx = Fixture::new(None, "CREATE TABLE t AS SELECT 42 AS x;");
+        let empty = fx.dir("empty-path");
+        let told = fx.fake_answering_as(&fx.dir("engine"), "told-duckdb", version);
+        let (code, stderr) = arc_run(
+            &fx.project(),
+            Run {
+                path: &empty,
+                told: Some(told.bin.as_os_str()),
+                allow_untested: allow,
+            },
+        );
+        (code, stderr, told.sql_calls())
+    };
+
+    let (code, stderr, sql) = run("3.0.0", true);
+    assert_eq!(code, Some(0), "the override runs 3.0.0:\n{stderr}");
+    assert_eq!(sql, 1, "the step ran");
+    assert!(!stderr.contains("the tokens came from"), "{stderr}");
+
+    let (code, stderr, sql) = run("3.0.0", false);
+    assert_eq!(
+        code,
+        Some(1),
+        "3.0.0 is refused without the override:\n{stderr}"
+    );
+    assert_eq!(sql, 0);
+    assert!(stderr.contains("outside the versions"), "{stderr}");
+
+    for allow in [false, true] {
+        let (code, stderr, sql) = run("1.5.6", allow);
+        assert_eq!(
+            code,
+            Some(1),
+            "1.5.6 is refused (override {allow}):\n{stderr}"
+        );
+        assert_eq!(sql, 0);
+        assert!(stderr.contains("0.2.1"), "{stderr}");
+    }
+}
+
+// A DuckDB 2 that gives tokens and no trees is refused before any step runs, naming the
+// step, from the asset graph's own question, and before the run's state is set up: the
+// refused run leaves no database behind.
+#[test]
+fn a_duckdb_that_gives_no_trees_is_refused_before_a_step_and_leaves_no_run() {
+    let fx = Fixture::new(None, "CREATE TABLE t AS SELECT 42 AS x;");
+    let empty = fx.dir("empty-path");
+    let told = fx.fake_without_trees(&fx.dir("engine"), "told-duckdb", "v2.0.0 (fake) 0000000000");
+    let (code, stderr) = arc_run(
+        &fx.project(),
+        Run {
+            path: &empty,
+            told: Some(told.bin.as_os_str()),
+            allow_untested: false,
+        },
+    );
+    assert_eq!(code, Some(1), "refused:\n{stderr}");
+    assert_eq!(told.sql_calls(), 0, "calls: {:?}", told.calls());
+    for needle in [
+        "step 's1'",
+        "could not be read",
+        "no trees",
+        "ARC_SQL_READER=sqlparser",
+    ] {
+        assert!(stderr.contains(needle), "expected {needle:?}:\n{stderr}");
+    }
+    assert_eq!(
+        fx.databases(),
+        Vec::<PathBuf>::new(),
+        "a refused run leaves no database"
+    );
 }
 
 #[test]
