@@ -22,6 +22,8 @@ pub struct EngineInfo {
     /// The version as the engine printed it (`v2.0.0-dev88614`) when it is a development
     /// build of a release's commit, which `version` then names as that release.
     pub dev_build: Option<String>,
+    /// What the engine's `--version` printed, trimmed, for a message naming it.
+    pub printed: String,
 }
 
 /// Output captured from a step execution.
@@ -125,6 +127,15 @@ pub trait Engine {
     /// [`crate::duckdb_tokens::tokenize_file`] asks for them. The refusals read a SQL file
     /// from these alone, so a failure here refuses the file.
     fn tokenize(&self, file: &[u8]) -> std::result::Result<FileTokens, Refusal>;
+
+    /// Whether the DuckDB the steps run on can be asked for tokens at all: `false` only when
+    /// it refuses `sql_tokenize` on `SELECT 1`, as a build without DuckDB's autocomplete
+    /// extension does. A DuckDB that cannot be started, or answers in a way arc cannot read,
+    /// is left to the check that asked it first.
+    fn tokenizer_answers(&self) -> bool;
+
+    /// The DuckDB the steps run on, as a person can find it, with the version `printed`.
+    fn which(&self, printed: &str) -> String;
 }
 
 /// What the DuckDB the steps run on reports, as [`Engine::report`] asks it. Each value is
@@ -353,6 +364,92 @@ pub const SUPPORTED_ENGINE_RANGE: &str = ">=2.0, <3";
 /// carries storage version 2.0, which a 1.x DuckDB refuses to open, so no override reaches
 /// below this. arc 0.2.1 is the release for DuckDB 1.5.
 pub const OLDEST_ENGINE: &str = "2.0.0";
+
+/// The DuckDB release arc is tested on, which a message naming DuckDB's installer pins.
+/// `scripts/check_duckdb_version.py` fails when it differs from the version Cargo.lock links,
+/// as it does for `DUCKDB_RECOMMENDED` in `scripts/install.sh` and CI's `DUCKDB_VERSION`.
+pub const DUCKDB_RECOMMENDED: &str = "v2.0.0";
+
+/// How to install DuckDB's release build, which has the autocomplete extension arc reads
+/// tokens from and downloads community extensions, pinned to [`DUCKDB_RECOMMENDED`]: DuckDB's
+/// own installer, then the `PATH` entry or [`DUCKDB_BIN_ENV`] that has arc run it.
+///
+/// The installer always puts a pinned version in `~/.duckdb/cli/<version>`; it moves
+/// `~/.duckdb/cli/latest` there only while that version is DuckDB's newest release, so the
+/// directory named is the version's own.
+pub(crate) fn release_install_fix() -> String {
+    let version = DUCKDB_RECOMMENDED.trim_start_matches('v');
+    let dir = format!("~/.duckdb/cli/{version}");
+    format!(
+        "Install DuckDB's release build with DuckDB's own installer, pinned to the version arc \
+         is tested on: `curl https://install.duckdb.org | DUCKDB_VERSION={version} sh`, which \
+         installs it to {dir}. Then put {dir} first on PATH, or set {DUCKDB_BIN_ENV}={dir}/duckdb."
+    )
+}
+
+/// Why a DuckDB whose tokenizer does not answer cannot be read, naming it as `which` does.
+pub(crate) fn no_tokenizer_cause(which: &str) -> String {
+    format!(
+        "{which} cannot read SQL into tokens, because it was built without DuckDB's \
+         autocomplete extension. arc needs those tokens to check what each SQL step installs."
+    )
+}
+
+/// The DuckDB `program` names, as a person can find it, with the version it printed:
+/// the path `ARC_DUCKDB_BIN` gives, or the file the search path finds for `duckdb`.
+pub(crate) fn which_duckdb(program: &DuckDbProgram, printed: &str) -> String {
+    let named = match program {
+        DuckDbProgram::Told(path) => {
+            format!("the DuckDB {DUCKDB_BIN_ENV} names, {}", path.display())
+        }
+        DuckDbProgram::SearchPath => match on_search_path("duckdb") {
+            Some(path) => format!("the duckdb on PATH, {}", path.display()),
+            None => "the duckdb on PATH".to_string(),
+        },
+    };
+    let printed = printed.trim();
+    if printed.is_empty() {
+        named
+    } else {
+        format!("{named} ({printed})")
+    }
+}
+
+/// The first file called `name` on `PATH` that the user may run, as the operating system
+/// would find it.
+fn on_search_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| {
+            std::fs::metadata(candidate).is_ok_and(|meta| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    meta.is_file() && meta.permissions().mode() & 0o111 != 0
+                }
+                #[cfg(not(unix))]
+                {
+                    meta.is_file()
+                }
+            })
+        })
+}
+
+/// What `program --version` printed, trimmed, or nothing when it printed nothing or failed.
+// Read by the graph-only warning, which the lib's tests do not start a DuckDB for.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn printed_version(program: &DuckDbProgram) -> String {
+    program
+        .command()
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
 
 /// The commit of each DuckDB release arc knows, by release tag. A development build, such as
 /// Homebrew's, is built from a release's commit and prints a pre-release version with that
@@ -607,6 +704,7 @@ impl Engine for DuckDbEngine {
                 Ok(EngineInfo {
                     version: parsed.as_ref().map(|p| p.version.clone()),
                     dev_build: parsed.and_then(|p| p.dev_build),
+                    printed: stdout.trim().to_string(),
                 })
             }
             (output, DuckDbProgram::Told(path)) => Err(Error::EngineBinInvalid {
@@ -691,6 +789,19 @@ impl Engine for DuckDbEngine {
                 })
             }),
         }
+    }
+
+    fn tokenizer_answers(&self) -> bool {
+        duckdb_program().map_or(true, |program| {
+            crate::duckdb_tokens::tokenizer_answers(&program)
+        })
+    }
+
+    fn which(&self, printed: &str) -> String {
+        duckdb_program().map_or_else(
+            |_| "the DuckDB arc runs".to_string(),
+            |program| which_duckdb(&program, printed),
+        )
     }
 }
 
@@ -2227,6 +2338,10 @@ pub mod mock {
         pub tokenized: RefCell<usize>,
         /// If set, `tokenize` fails with this reason.
         pub tokens_failure: RefCell<Option<String>>,
+        /// Whether `tokenizer_answers` says the tokenizer answers; `true` unless set.
+        pub tokenizer: RefCell<bool>,
+        /// How many times `tokenizer_answers` was asked.
+        pub probed: RefCell<usize>,
     }
 
     #[derive(Debug, Clone)]
@@ -2266,6 +2381,8 @@ pub mod mock {
                 loads: RefCell::new(HashMap::new()),
                 tokenized: RefCell::new(0),
                 tokens_failure: RefCell::new(None),
+                tokenizer: RefCell::new(true),
+                probed: RefCell::new(0),
             }
         }
 
@@ -2423,6 +2540,7 @@ pub mod mock {
             Ok(EngineInfo {
                 version: self.version.borrow().clone(),
                 dev_build: None,
+                printed: String::new(),
             })
         }
 
@@ -2467,6 +2585,15 @@ pub mod mock {
                 Some(reason) => Err(Refusal::Unreadable(reason.clone())),
                 None => crate::duckdb_tokens::recorded::ask(texts),
             })
+        }
+
+        fn tokenizer_answers(&self) -> bool {
+            *self.probed.borrow_mut() += 1;
+            *self.tokenizer.borrow()
+        }
+
+        fn which(&self, printed: &str) -> String {
+            format!("the mock DuckDB ({printed})")
         }
 
         fn report(&self, extensions: &[String]) -> EngineReport {

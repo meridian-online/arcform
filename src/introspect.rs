@@ -476,7 +476,7 @@ fn from_duckdb(
             | Refusal::NotRun { .. }
             | Refusal::NotDuckDb2 { .. }),
         ) => {
-            warn_once_no_duckdb(&no_duckdb.to_string());
+            warn_once_no_duckdb(&no_duckdb);
             sqlparser_step(sql)
         }
     }
@@ -501,12 +501,47 @@ pub fn unreadable_refusal(step: &str, file: &str, reason: &str) -> String {
 }
 
 /// Prints, the first time in the process, that the asset graph is sqlparser-rs's reading.
-fn warn_once_no_duckdb(reason: &str) {
+/// When DuckDB ran and failed, it is asked once whether it tokenises at all, and a DuckDB
+/// that does not, as one built without its autocomplete extension, is named with the fix.
+fn warn_once_no_duckdb(refusal: &duckdb_lineage::Refusal) {
     use owo_colors::OwoColorize;
     static WARNED: std::sync::Once = std::sync::Once::new();
     WARNED.call_once(|| {
-        eprintln!("{} {}", "warning:".yellow(), no_duckdb_warning(reason));
+        let warning = match refusal {
+            duckdb_lineage::Refusal::NotRun { .. } => no_tokenizer_named(),
+            _ => None,
+        }
+        .unwrap_or_else(|| no_duckdb_warning(&refusal.to_string()));
+        eprintln!("{} {warning}", "warning:".yellow());
     });
+}
+
+/// [`no_tokenizer_warning`] for the DuckDB arc runs, when its tokenizer does not answer.
+#[cfg(not(test))]
+fn no_tokenizer_named() -> Option<String> {
+    let program = crate::engine::duckdb_program().ok()?;
+    if crate::duckdb_tokens::tokenizer_answers(&program) {
+        return None;
+    }
+    let printed = crate::engine::printed_version(&program);
+    Some(no_tokenizer_warning(&crate::engine::which_duckdb(
+        &program, &printed,
+    )))
+}
+
+/// The lib's tests start no DuckDB, so none is found to lack a tokenizer.
+#[cfg(test)]
+fn no_tokenizer_named() -> Option<String> {
+    None
+}
+
+/// The words of the warning for a DuckDB, named by `which`, whose tokenizer does not answer.
+pub(crate) fn no_tokenizer_warning(which: &str) -> String {
+    format!(
+        "{} The asset graph is arc's own reading of the SQL instead. {}",
+        crate::engine::no_tokenizer_cause(which),
+        crate::engine::release_install_fix()
+    )
 }
 
 /// The words of [`warn_once_no_duckdb`]'s warning.
@@ -1703,6 +1738,20 @@ mod tests {
             unread_warning("load", "models/load.sql", &unread),
             "could not read statement 2 of load (models/load.sql:7) \u{2014} treating it as \
              reading nothing"
+        );
+    }
+
+    #[test]
+    fn the_no_tokenizer_warning_names_the_cause_and_the_fix() {
+        assert_eq!(
+            no_tokenizer_warning("the duckdb on PATH, /usr/bin/duckdb (v2.0.0)"),
+            "the duckdb on PATH, /usr/bin/duckdb (v2.0.0) cannot read SQL into tokens, because \
+             it was built without DuckDB's autocomplete extension. arc needs those tokens to \
+             check what each SQL step installs. The asset graph is arc's own reading of the SQL \
+             instead. Install DuckDB's release build with DuckDB's own installer, pinned to the \
+             version arc is tested on: `curl https://install.duckdb.org | DUCKDB_VERSION=2.0.0 \
+             sh`, which installs it to ~/.duckdb/cli/2.0.0. Then put ~/.duckdb/cli/2.0.0 first \
+             on PATH, or set ARC_DUCKDB_BIN=~/.duckdb/cli/2.0.0/duckdb."
         );
     }
 

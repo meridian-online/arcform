@@ -2963,8 +2963,14 @@ fn script(path: &Path, body: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// The shell lines a fake DuckDB opens with to answer arc's probe for a tokenizer, the
+/// tokens of `SELECT 1`, as a DuckDB with its autocomplete extension does; it fails any other
+/// question it is asked on standard input as the lines after it say. Builtins only.
+const ANSWERS_THE_PROBE: &str = "if [ \"$1\" = \"-no-init\" ]; then while IFS= read -r line; do case \"$line\" in *\"sql_tokenize('SELECT 1')\"*) echo 'arc-tokens:1'; exit 0;; esac; done; fi\n";
+
 /// The refusals read a SQL file from the tokens the DuckDB that runs it gives; when it gives
-/// none, arc does not read the file some other way, and runs nothing.
+/// none, arc does not read the file some other way, and runs nothing. The DuckDB answers the
+/// probe for a tokenizer, so the refusal is the file's, not one naming a missing tokenizer.
 #[test]
 fn no_tokens_from_duckdb_stops_the_run_naming_the_step() {
     let protocol = Protocol::steps(&[
@@ -2975,7 +2981,7 @@ fn no_tokens_from_duckdb_stops_the_run_naming_the_step() {
     script(
         &engine,
         &format!(
-            "echo \"$*\" >> '{}'\nif [ \"$1\" = \"--version\" ]; then echo 'v{VETTED_ON} (fake) 0000000000'; exit 0; fi\necho 'no tokens here' >&2\nexit 1\n",
+            "echo \"$*\" >> '{}'\nif [ \"$1\" = \"--version\" ]; then echo 'v{VETTED_ON} (fake) 0000000000'; exit 0; fi\n{ANSWERS_THE_PROBE}echo 'no tokens here' >&2\nexit 1\n",
             protocol.root.path().join("duckdb.log").display()
         ),
     );
@@ -2997,7 +3003,8 @@ fn no_tokens_from_duckdb_stops_the_run_naming_the_step() {
 }
 
 /// A file with no SQL in it, empty or only dot commands and `#` lines, has nothing to
-/// refuse, and its tokens are not asked for: a DuckDB that would give none refuses nothing.
+/// refuse, and its tokens are not asked for: a DuckDB that would give none for a file refuses
+/// nothing. The one question arc asks is its probe for a tokenizer, which the DuckDB answers.
 #[test]
 fn a_file_with_no_sql_is_not_asked_about() {
     let protocol = Protocol::steps(&[("empty", ""), ("dots", ".mode list\n# a note\n")]);
@@ -3005,15 +3012,19 @@ fn a_file_with_no_sql_is_not_asked_about() {
     script(
         &engine,
         &format!(
-            "echo \"$*\" >> '{}'\nif [ \"$1\" = \"--version\" ]; then echo 'v{VETTED_ON} (fake) 0000000000'; fi\nif [ \"$1\" = \"-no-init\" ]; then exit 1; fi\nexit 0\n",
+            "echo \"$*\" >> '{}'\nif [ \"$1\" = \"--version\" ]; then echo 'v{VETTED_ON} (fake) 0000000000'; fi\n{ANSWERS_THE_PROBE}if [ \"$1\" = \"-no-init\" ]; then exit 1; fi\nexit 0\n",
             protocol.root.path().join("duckdb.log").display()
         ),
     );
     let run = run_on_engine(&protocol, &engine);
     assert_eq!(run.code, Some(0), "nothing to refuse:\n{}", run.stderr);
-    assert!(
-        !run.engine_calls.iter().any(|c| c.starts_with("-no-init")),
-        "no token question: {:?}",
+    assert_eq!(
+        run.engine_calls
+            .iter()
+            .filter(|c| c.starts_with("-no-init"))
+            .count(),
+        1,
+        "the probe alone, and no token question: {:?}",
         run.engine_calls
     );
     assert_eq!(run.started(), vec!["empty.sql", "dots.sql"]);

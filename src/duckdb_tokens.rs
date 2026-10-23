@@ -195,6 +195,25 @@ impl Process {
     }
 }
 
+/// Whether `program` answers `sql_tokenize` at all, asked for the tokens of `SELECT 1`.
+///
+/// `false` only when DuckDB ran and exited with an error, as a build without DuckDB's
+/// autocomplete extension does: `sql_tokenize` lives in that extension, and such a build
+/// fails to autoload it. A DuckDB that could not be started, or that exits cleanly with an
+/// answer arc cannot read, is not this failure, and the check that asked it first says so.
+pub(crate) fn tokenizer_answers(program: &DuckDbProgram) -> bool {
+    let process = Process {
+        program: program.clone(),
+    };
+    match process.output(
+        &["-list", "-noheader"],
+        &format!("SELECT '{MARK}' || count(*) FROM sql_tokenize('SELECT 1');\n"),
+    ) {
+        Ok(output) => output.status.success(),
+        Err(_) => true,
+    }
+}
+
 /// What arc prints before each line of its own in a token answer, which no token's span
 /// line can start with.
 const MARK: &str = "arc-tokens:";
@@ -737,6 +756,12 @@ impl TokenCache {
         self.files
             .values()
             .any(|file| file.batches.iter().any(|batch| !batch.tokens.is_empty()))
+    }
+
+    /// Whether a DuckDB was asked for a file this holds: a file with no SQL in it, empty or
+    /// only dot commands and `#` lines, is held without asking one.
+    pub(crate) fn asked_duckdb(&self) -> bool {
+        self.files.values().any(|file| !file.version.is_empty())
     }
 
     /// The tokens of `bytes` when they have been asked about before.

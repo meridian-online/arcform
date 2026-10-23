@@ -7,10 +7,14 @@
 # arc archive from the GitHub release, checks it against the release's .sha256
 # sidecar, unpacks it into ~/.arcform/cli/<version>, points
 # ~/.arcform/cli/latest at that directory, and links `arc` into ~/.local/bin.
+# Then, unless ARC_SKIP_DUCKDB=1 is set, it installs DuckDB's release build
+# with DuckDB's own installer when no `duckdb` is on PATH, or the one on PATH
+# cannot read SQL into tokens (a build without DuckDB's autocomplete extension).
 #
 # Usage:
 #   curl -fsSL https://install.meridian.online/arc | bash
 #   curl -fsSL https://install.meridian.online/arc | bash -s -- v0.2.0
+#   curl -fsSL https://install.meridian.online/arc | ARC_SKIP_DUCKDB=1 bash
 #   sh scripts/install.sh --self-test    # no network, nothing installed
 #
 # POSIX sh rather than bash, so it runs the same under dash, bash and zsh's sh.
@@ -22,6 +26,7 @@ BINARY="arc"
 # The DuckDB release arc is built and tested against. arc's engine shells out to
 # the `duckdb` command for a protocol's SQL steps, so a user needs it on PATH.
 DUCKDB_RECOMMENDED="v2.0.0"
+DUCKDB_INSTALLER_URL="https://install.duckdb.org"
 SOURCE_INSTALL="cargo install arcform --locked --features mcp,bundled-duckdb"
 # FOR TESTS ONLY, not a user setting: --self-test sets this, inside a subshell,
 # to a file:// tree laid out as a release is, so the install path runs without
@@ -145,8 +150,98 @@ post_install_warnings() {
       fi
       ;;
   esac
-  if ! command -v duckdb > /dev/null 2>&1; then
-    warn "the duckdb command is not on your PATH. arc runs a protocol's SQL steps with it, so install DuckDB ${DUCKDB_RECOMMENDED}: https://duckdb.org/docs/installation/"
+}
+
+# Whether the duckdb at $1 can read SQL into tokens. arc reads each SQL step's
+# tokens from DuckDB's `sql_tokenize`, which lives in DuckDB's autocomplete
+# extension; a build without it fails this. Agent mode off and no ~/.duckdbrc,
+# as arc asks it.
+duckdb_tokenizes() {
+  DUCKDB_AGENT_MODE=0 "$1" -no-init -noheader -list \
+    -c "SELECT count(*) FROM sql_tokenize('SELECT 1');" < /dev/null > /dev/null 2>&1
+}
+
+# What to do about DuckDB: "optout" when ARC_SKIP_DUCKDB is set, "missing" when
+# no duckdb is on PATH, "lacking" when the one on PATH cannot read SQL into
+# tokens, and "keep" when it can.
+duckdb_decision() {
+  case "${ARC_SKIP_DUCKDB:-}" in
+    '' | 0) ;;
+    *)
+      echo optout
+      return 0
+      ;;
+  esac
+  dd_bin="$(command -v duckdb 2> /dev/null || true)"
+  if [ -z "$dd_bin" ]; then
+    echo missing
+  elif duckdb_tokenizes "$dd_bin"; then
+    echo keep
+  else
+    echo lacking
+  fi
+}
+
+# DuckDB's own installer script, on stdout. The self-test replaces this with a
+# stand-in, so it runs without the network.
+duckdb_installer() {
+  curl -fsSL --proto '=https' --tlsv1.2 "$DUCKDB_INSTALLER_URL"
+}
+
+# Install DuckDB's release build, pinned to DUCKDB_RECOMMENDED, when arc could
+# not run SQL steps on the duckdb this machine has; then say where it went and,
+# when another duckdb comes first on PATH, how to have arc run this one.
+ensure_duckdb() {
+  ed_decision="$(duckdb_decision)"
+  ed_version="${DUCKDB_RECOMMENDED#v}"
+  ed_dir="${HOME}/.duckdb/cli/${ed_version}"
+  ed_manual="curl https://install.duckdb.org | DUCKDB_VERSION=${ed_version} sh"
+  ed_bin="$(command -v duckdb 2> /dev/null || true)"
+  case "$ed_decision" in
+    keep)
+      return 0
+      ;;
+    optout)
+      info "ARC_SKIP_DUCKDB is set, so DuckDB was left alone. arc runs a protocol's SQL steps with DuckDB's release build, ${DUCKDB_RECOMMENDED}; to install it: ${ed_manual}"
+      return 0
+      ;;
+    missing)
+      info "no duckdb is on your PATH, and arc runs a protocol's SQL steps with it, so this installs DuckDB's release build, ${DUCKDB_RECOMMENDED}, with DuckDB's own installer. Set ARC_SKIP_DUCKDB=1 to skip this."
+      ;;
+    lacking)
+      info "the duckdb on your PATH, ${ed_bin}, cannot read SQL into tokens, because it was built without DuckDB's autocomplete extension, and arc needs those tokens to check what each SQL step installs. So this installs DuckDB's release build, ${DUCKDB_RECOMMENDED}, with DuckDB's own installer, and leaves ${ed_bin} as it is. Set ARC_SKIP_DUCKDB=1 to skip this."
+      ;;
+  esac
+  ed_tmp="$(mktemp -d)"
+  if ! duckdb_installer > "${ed_tmp}/duckdb-install.sh"; then
+    rm -rf "$ed_tmp"
+    warn "could not download DuckDB's installer from ${DUCKDB_INSTALLER_URL}. arc is installed; install DuckDB yourself: ${ed_manual}"
+    return 0
+  fi
+  if ! DUCKDB_VERSION="$ed_version" sh "${ed_tmp}/duckdb-install.sh"; then
+    rm -rf "$ed_tmp"
+    warn "DuckDB's installer failed. arc is installed; install DuckDB yourself: ${ed_manual}"
+    return 0
+  fi
+  rm -rf "$ed_tmp"
+  if [ ! -x "${ed_dir}/duckdb" ]; then
+    warn "DuckDB's installer finished, but put no duckdb at ${ed_dir}/duckdb. Install DuckDB yourself: ${ed_manual}"
+    return 0
+  fi
+  echo ""
+  info "installed DuckDB's release build, ${DUCKDB_RECOMMENDED}, at ${ed_dir}/duckdb"
+  # DuckDB's installer may also link ~/.local/bin/duckdb, which can already be
+  # on PATH: whichever duckdb comes first, arc runs it, so the hint is for one
+  # that cannot read SQL into tokens, or for none.
+  ed_first="$(command -v duckdb 2> /dev/null || true)"
+  if [ -z "$ed_first" ] || ! duckdb_tokenizes "$ed_first"; then
+    if [ -n "$ed_first" ]; then
+      warn "${ed_first} still comes first on your PATH, and arc refuses SQL steps on it. Have arc run the release build by adding this line to your shell's startup file (~/.zshrc, ~/.bashrc):"
+    else
+      warn "${ed_dir} is not on your PATH, so arc will not find duckdb yet. Add this line to your shell's startup file (~/.zshrc, ~/.bashrc):"
+    fi
+    warn "  export PATH=\"\$HOME/.duckdb/cli/${ed_version}:\$PATH\""
+    warn "or set ARC_DUCKDB_BIN=\$HOME/.duckdb/cli/${ed_version}/duckdb for arc alone."
   fi
 }
 
@@ -232,6 +327,7 @@ main() {
   fi
   echo ""
   post_install_warnings "$local_bin" "$linked"
+  ensure_duckdb
 }
 
 # ---------------------------------------------------------------------------
@@ -272,11 +368,136 @@ st_install() {
   (
     set -e
     HOME="$1"
+    ARC_SKIP_DUCKDB=1
     ARC_INSTALL_BASE_URL="file://$2"
     main v0.0.1
   ) > "$3" 2>&1
   st_rc=$?
   set -e
+}
+
+# st_contains LABEL NEEDLE FILE: FILE holds NEEDLE.
+st_contains() {
+  case "$(cat "$3" 2> /dev/null)" in
+    *"$2"*) st_pass ;;
+    *) st_fail "$1: no '$2' in: $(cat "$3" 2> /dev/null)" ;;
+  esac
+}
+
+# st_lacks LABEL NEEDLE FILE: FILE does not hold NEEDLE.
+st_lacks() {
+  case "$(cat "$3" 2> /dev/null)" in
+    *"$2"*) st_fail "$1: '$2' in: $(cat "$3")" ;;
+    *) st_pass ;;
+  esac
+}
+
+# st_nothing_installed LABEL HOME: neither DuckDB's installer nor its files.
+st_nothing_installed() {
+  if [ -e "$2/installer.log" ] || [ -e "$2/.duckdb" ]; then
+    st_fail "$1: DuckDB was installed"
+  else
+    st_pass
+  fi
+}
+
+# st_duckdb_run CASE PATH SKIP: ensure_duckdb with HOME=<tree>/home-CASE, PATH
+# and ARC_SKIP_DUCKDB as given, and DuckDB's installer replaced by the
+# stand-in; its output in <tree>/CASE.out and its exit status in st_rc.
+st_duckdb_run() {
+  mkdir -p "${st_dd}/home-$1"
+  set +e
+  (
+    set -e
+    HOME="${st_dd}/home-$1"
+    export HOME
+    PATH="$2"
+    ARC_SKIP_DUCKDB="$3"
+    duckdb_installer() { cat "${st_dd}/installer.sh"; }
+    ensure_duckdb
+  ) > "${st_dd}/$1.out" 2>&1
+  st_rc=$?
+  set -e
+}
+
+# After arc is installed: DuckDB's release build is installed when no duckdb
+# is on PATH, or the one there cannot read SQL into tokens; a duckdb that can
+# is left alone, and so is everything when ARC_SKIP_DUCKDB is set. The duckdbs
+# and DuckDB's installer are stand-ins, so nothing touches the network.
+st_duckdb() {
+  st_dd="$(mktemp -d)"
+  # The tools ensure_duckdb and the stand-ins use, and no duckdb, so "no
+  # duckdb on PATH" holds whatever this machine has in /usr/bin.
+  mkdir -p "${st_dd}/tools" "${st_dd}/good" "${st_dd}/lacking"
+  for st_tool in sh cat cp mkdir mktemp rm; do
+    ln -s "$(command -v "$st_tool")" "${st_dd}/tools/${st_tool}"
+  done
+  st_tools="${st_dd}/tools"
+  # A duckdb that reads SQL into tokens, and one built without the
+  # autocomplete extension, each logging how it was run. The single quotes are
+  # the stand-ins' own expansions, written as they are.
+  # shellcheck disable=SC2016
+  printf '#!/bin/sh\nprintf "agent=%%s args=%%s\\n" "${DUCKDB_AGENT_MODE:-unset}" "$*" >> "%s"\nexit 0\n' \
+    "${st_dd}/good.log" > "${st_dd}/good/duckdb"
+  # shellcheck disable=SC2016
+  printf '#!/bin/sh\nprintf "agent=%%s args=%%s\\n" "${DUCKDB_AGENT_MODE:-unset}" "$*" >> "%s"\ncase "$*" in\n  *sql_tokenize*)\n    echo "Extension Autoloading Error: the required extension autocomplete could not be installed" >&2\n    exit 1\n    ;;\nesac\nexit 0\n' \
+    "${st_dd}/lacking.log" > "${st_dd}/lacking/duckdb"
+  chmod +x "${st_dd}/good/duckdb" "${st_dd}/lacking/duckdb"
+  # DuckDB's installer: logs the version it was asked for, and puts the good
+  # stand-in where the real one puts that version.
+  # shellcheck disable=SC2016
+  printf '#!/bin/sh\nprintf "%%s\\n" "$DUCKDB_VERSION" >> "$HOME/installer.log"\nmkdir -p "$HOME/.duckdb/cli/$DUCKDB_VERSION"\ncp "%s" "$HOME/.duckdb/cli/$DUCKDB_VERSION/duckdb"\n' \
+    "${st_dd}/good/duckdb" > "${st_dd}/installer.sh"
+  st_v="${DUCKDB_RECOMMENDED#v}"
+  st_line="export PATH=\"\$HOME/.duckdb/cli/${st_v}:\$PATH\""
+  st_bin="ARC_DUCKDB_BIN=\$HOME/.duckdb/cli/${st_v}/duckdb"
+
+  # No duckdb on PATH: installed, pinned, and the PATH line given.
+  st_duckdb_run missing "$st_tools" ""
+  st_equal "duckdb missing: exits 0 ($(cat "${st_dd}/missing.out"))" "0" "$st_rc"
+  st_equal "duckdb missing: DuckDB's installer runs once, pinned without the v" \
+    "$st_v" "$(cat "${st_dd}/home-missing/installer.log" 2> /dev/null)"
+  st_contains "duckdb missing: says what was installed where" \
+    "installed DuckDB's release build, ${DUCKDB_RECOMMENDED}, at ${st_dd}/home-missing/.duckdb/cli/${st_v}/duckdb" "${st_dd}/missing.out"
+  st_contains "duckdb missing: gives the PATH line" "$st_line" "${st_dd}/missing.out"
+  st_contains "duckdb missing: gives ARC_DUCKDB_BIN" "$st_bin" "${st_dd}/missing.out"
+  st_contains "duckdb missing: names the opt-out" "ARC_SKIP_DUCKDB=1" "${st_dd}/missing.out"
+
+  # A duckdb on PATH without the tokenizer: the release build is installed
+  # beside it, it is named, and so is how to have arc run the release build.
+  st_duckdb_run lacking "${st_dd}/lacking:${st_tools}" ""
+  st_equal "duckdb lacking the tokenizer: exits 0 ($(cat "${st_dd}/lacking.out"))" "0" "$st_rc"
+  st_equal "duckdb lacking the tokenizer: DuckDB's installer runs once" \
+    "$st_v" "$(cat "${st_dd}/home-lacking/installer.log" 2> /dev/null)"
+  st_contains "duckdb lacking the tokenizer: probed out of agent mode, with -no-init" \
+    "agent=0 args=-no-init" "${st_dd}/lacking.log"
+  st_contains "duckdb lacking the tokenizer: names it and why" \
+    "${st_dd}/lacking/duckdb, cannot read SQL into tokens, because it was built without DuckDB's autocomplete extension" "${st_dd}/lacking.out"
+  st_contains "duckdb lacking the tokenizer: says it still comes first" \
+    "${st_dd}/lacking/duckdb still comes first on your PATH" "${st_dd}/lacking.out"
+  st_contains "duckdb lacking the tokenizer: gives the PATH line" "$st_line" "${st_dd}/lacking.out"
+  st_contains "duckdb lacking the tokenizer: gives ARC_DUCKDB_BIN" "$st_bin" "${st_dd}/lacking.out"
+
+  # A duckdb that reads SQL into tokens: left alone, and nothing said.
+  st_duckdb_run good "${st_dd}/good:${st_tools}" ""
+  st_equal "working duckdb: exits 0" "0" "$st_rc"
+  st_nothing_installed "working duckdb" "${st_dd}/home-good"
+  st_equal "working duckdb: nothing said" "" "$(cat "${st_dd}/good.out")"
+  st_contains "working duckdb: probed out of agent mode, with -no-init" \
+    "agent=0 args=-no-init" "${st_dd}/good.log"
+
+  # Opted out, with no duckdb at all: nothing installed, and the opt-out named.
+  st_duckdb_run optout "$st_tools" 1
+  st_equal "ARC_SKIP_DUCKDB=1: exits 0" "0" "$st_rc"
+  st_nothing_installed "ARC_SKIP_DUCKDB=1" "${st_dd}/home-optout"
+  st_contains "ARC_SKIP_DUCKDB=1: says DuckDB was left alone" \
+    "ARC_SKIP_DUCKDB is set, so DuckDB was left alone" "${st_dd}/optout.out"
+
+  # Installed where PATH already looks: no PATH line, since arc finds it.
+  st_duckdb_run onpath "${st_tools}:${st_dd}/home-onpath/.duckdb/cli/${st_v}" ""
+  st_equal "installed onto PATH: exits 0" "0" "$st_rc"
+  st_lacks "installed onto PATH: no PATH line" "export PATH=" "${st_dd}/onpath.out"
+  rm -rf "$st_dd"
 }
 
 # The install itself: main() against a file:// release tree laid out as
@@ -306,6 +527,7 @@ st_end_to_end() {
   (
     set -e
     HOME="$st_home"
+    ARC_SKIP_DUCKDB=1
     ARC_INSTALL_BASE_URL="file://${st_site}"
     main "$st_version"
   ) > "${st_e2e}/install.log" 2>&1
@@ -316,6 +538,8 @@ st_end_to_end() {
     "$(cd "${st_home}/.arcform/cli/${st_version}" 2> /dev/null && pwd -P)" \
     "$(cd "${st_home}/.arcform/cli/latest" 2> /dev/null && pwd -P)"
   st_equal "end to end: ~/.local/bin/arc runs" "arc 0.0.1" "$("${st_home}/.local/bin/arc" --version 2>&1)"
+  st_contains "end to end: ARC_SKIP_DUCKDB leaves DuckDB alone and says so" \
+    "ARC_SKIP_DUCKDB is set, so DuckDB was left alone" "${st_e2e}/install.log"
 
   # Someone else's `arc` in ~/.local/bin, a regular file: left byte for byte, with
   # a warning, and the install still succeeds.
@@ -364,6 +588,7 @@ st_end_to_end() {
   (
     set -e
     HOME="$st_home2"
+    ARC_SKIP_DUCKDB=1
     ARC_INSTALL_BASE_URL="file://${st_site}"
     main "$st_version"
   ) > "${st_e2e}/tampered.log" 2>&1
@@ -435,6 +660,7 @@ v0.3.0"; do
   rm -rf "$st_dir"
 
   st_end_to_end
+  st_duckdb
 
   # A real install ignores ARC_INSTALL_BASE_URL from the environment: a fresh
   # run of this script, with it exported, still downloads from GitHub over HTTPS.

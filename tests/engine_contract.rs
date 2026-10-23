@@ -22,6 +22,14 @@ const ALLOW_ENV: &str = "ARC_ALLOW_UNTESTED_ENGINE";
 const RANGE: &str = ">=2.0, <3";
 const OLDEST: &str = "2.0.0";
 const NAME: &str = "engine_contract";
+/// The command arc names for installing DuckDB's release build.
+const INSTALLER: &str = "curl https://install.duckdb.org | DUCKDB_VERSION=2.0.0 sh";
+/// What Homebrew's DuckDB 2.0.0, built without the autocomplete extension, says when it is
+/// asked for `sql_tokenize`.
+const NO_AUTOCOMPLETE: &str = "Extension Autoloading Error: An error occurred while trying to \
+    automatically install the required extension 'autocomplete': Failed to install local \
+    extension \"autocomplete\", no access to the file at PATH \
+    \"/tmp/build/repository/d54cbbe3df/osx_arm64/autocomplete.duckdb_extension\"";
 
 /// A project directory plus somewhere to put engines and PATH directories.
 struct Fixture {
@@ -94,6 +102,27 @@ impl Fixture {
                 "#!/bin/sh\n{}echo \"$*\" >> '{}'\nif [ \"$1\" = \"--version\" ]; then echo '{line}'; fi\nexit 0\n",
                 tokens_from_real_duckdb(),
                 log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        FakeEngine { bin, log }
+    }
+
+    /// A fake engine whose `--version` prints `line` and which, like a DuckDB built without
+    /// its autocomplete extension, fails every question arc asks it on standard input
+    /// (`-no-init`, as the token questions and the tokenizer probe are asked) with the error
+    /// such a build gives for `sql_tokenize`.
+    fn fake_without_tokenizer(&self, dir: &Path, name: &str, line: &str) -> FakeEngine {
+        let bin = dir.join(name);
+        let log = dir.join(format!("{name}.log"));
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$1\" = \"--version\" ]; then echo '{line}'; exit 0; fi\n\
+                 if [ \"$1\" = \"-no-init\" ]; then echo 'Error: {}' >&2; exit 1; fi\nexit 0\n",
+                log.display(),
+                NO_AUTOCOMPLETE.replace('\'', ""),
             ),
         )
         .unwrap();
@@ -586,10 +615,7 @@ fn a_dev_build_running_a_protocol_that_installs_a_community_extension_warns_befo
         .lines()
         .find(|l| l.contains("cannot download community extensions"))
         .unwrap_or_else(|| panic!("no dev-build warning:\n{stderr}"));
-    for needle in [
-        "v2.0.0-dev88614",
-        "github.com/duckdb/duckdb/releases/tag/v2.0.0",
-    ] {
+    for needle in ["v2.0.0-dev88614", INSTALLER] {
         assert!(warning.contains(needle), "expected '{needle}': {warning}");
     }
     assert_eq!(
@@ -710,4 +736,168 @@ fn the_override_runs_an_untested_engine_with_a_warning_and_keeps_the_manifest_co
         stderr.contains("requires <3, found 3.0.0"),
         "stderr: {stderr}"
     );
+}
+
+/// The refusal of a run on a DuckDB that cannot read SQL into tokens, checked for what it
+/// must say and must not.
+fn assert_no_tokenizer_refusal(stderr: &str, names: &str) {
+    for needle in [
+        names,
+        "v2.0.0-dev88614 (Development Version) d54cbbe3df",
+        "cannot read SQL into tokens",
+        "autocomplete extension",
+        "check what each SQL step installs",
+        INSTALLER,
+        "~/.duckdb/cli/2.0.0",
+        "ARC_DUCKDB_BIN=~/.duckdb/cli/2.0.0/duckdb",
+        "No step was run.",
+    ] {
+        assert!(stderr.contains(needle), "expected {needle:?}:\n{stderr}");
+    }
+    assert!(
+        !stderr.contains("could not read the tokens"),
+        "the old wording: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("cannot read SQL into tokens").count(),
+        1,
+        "one message: {stderr}"
+    );
+}
+
+// A DuckDB built without its autocomplete extension, as Homebrew's 2.0.0 is, has no
+// `sql_tokenize`, and arc reads every SQL step's tokens from it. The run is refused before a
+// step runs, naming the DuckDB, why, and DuckDB's own installer as the way out.
+#[test]
+fn a_duckdb_without_the_tokenizer_is_refused_naming_the_installer() {
+    let fx = Fixture::with_steps(None, &["SELECT 42;", "SELECT 43;"]);
+    let empty = fx.dir("empty-path");
+    let told = fx.fake_without_tokenizer(&fx.dir("engine"), "told-duckdb", HOMEBREW_2_0_0);
+    let (code, stderr) = arc_run(
+        &fx.project(),
+        Run {
+            path: &empty,
+            told: Some(told.bin.as_os_str()),
+            allow_untested: false,
+        },
+    );
+    assert_eq!(code, Some(2), "refused:\n{stderr}");
+    assert_eq!(told.sql_calls(), 0, "calls: {:?}", told.calls());
+    assert!(
+        !told.calls().iter().any(|c| c.contains(" -f ")),
+        "a step ran: {:?}",
+        told.calls()
+    );
+    assert_no_tokenizer_refusal(&stderr, &told.bin.display().to_string());
+}
+
+// The `duckdb` on PATH is named by the file the search path finds.
+#[test]
+fn a_duckdb_on_path_without_the_tokenizer_is_refused_naming_where_it_is() {
+    let fx = Fixture::new(None, "SELECT 42;");
+    let on_path = fx.dir("path");
+    let engine = fx.fake_without_tokenizer(&on_path, "duckdb", HOMEBREW_2_0_0);
+    let (code, stderr) = arc_run(
+        &fx.project(),
+        Run {
+            path: &on_path,
+            told: None,
+            allow_untested: false,
+        },
+    );
+    assert_eq!(code, Some(2), "refused:\n{stderr}");
+    assert_eq!(engine.sql_calls(), 0, "calls: {:?}", engine.calls());
+    assert_no_tokenizer_refusal(&stderr, &engine.bin.display().to_string());
+}
+
+// A Protocol whose SQL holds nothing to tokenise before the run, such as a step whose file
+// an earlier step writes, is still checked before its first step: the probe asks DuckDB for
+// the tokens of `SELECT 1`.
+#[test]
+fn a_protocol_with_no_sql_to_read_yet_is_still_refused_before_a_step_runs() {
+    let fx = Fixture::new(None, "");
+    let empty = fx.dir("empty-path");
+    let told = fx.fake_without_tokenizer(&fx.dir("engine"), "told-duckdb", HOMEBREW_2_0_0);
+    let (code, stderr) = arc_run(
+        &fx.project(),
+        Run {
+            path: &empty,
+            told: Some(told.bin.as_os_str()),
+            allow_untested: false,
+        },
+    );
+    assert_eq!(code, Some(2), "refused:\n{stderr}");
+    assert_eq!(told.sql_calls(), 0, "calls: {:?}", told.calls());
+    assert_no_tokenizer_refusal(&stderr, &told.bin.display().to_string());
+}
+
+// On a DuckDB whose tokenizer answers, the same empty file runs: the probe passes.
+#[test]
+fn a_protocol_with_no_sql_to_read_yet_runs_on_a_duckdb_that_tokenises() {
+    let fx = Fixture::new(None, "");
+    let empty = fx.dir("empty-path");
+    let told = fx.fake(&fx.dir("engine"), "told-duckdb", "2.0.0");
+    let (code, stderr) = arc_run(
+        &fx.project(),
+        Run {
+            path: &empty,
+            told: Some(told.bin.as_os_str()),
+            allow_untested: false,
+        },
+    );
+    assert_eq!(code, Some(0), "runs:\n{stderr}");
+    assert_eq!(told.sql_calls(), 1, "calls: {:?}", told.calls());
+    assert!(!stderr.contains("cannot read SQL into tokens"), "{stderr}");
+}
+
+// Outside a run, a command that reads the asset graph reads it with arc's own parser when
+// DuckDB gives no tokens, and its one warning names the missing tokenizer and the fix.
+#[test]
+fn a_graph_only_command_on_a_duckdb_without_the_tokenizer_warns_naming_the_fix() {
+    let fx = Fixture::new(
+        None,
+        "CREATE TABLE orders AS SELECT * FROM (VALUES (1, 50)) AS t(id, amount);\n",
+    );
+    let empty = fx.dir("empty-path");
+    let told = fx.fake_without_tokenizer(&fx.dir("engine"), "told-duckdb", HOMEBREW_2_0_0);
+    let out = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .current_dir(fx.project())
+        .env("PATH", &empty)
+        .env("ARCFORM_DB_DIR", fx.project().with_file_name("db"))
+        .env("ARCFORM_HISTORY_DIR", fx.dir("history"))
+        .env(BIN_ENV, &told.bin)
+        .env_remove("ARC_SQL_READER")
+        .env("NO_COLOR", "1")
+        .args([
+            "sql",
+            "record",
+            "SELECT * FROM orders WHERE amount > 10",
+            "--name",
+            "big_orders",
+        ])
+        .output()
+        .expect("spawn arc");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "arc sql record succeeds: {stderr}");
+    let warnings: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("cannot read SQL into tokens"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "one warning: {stderr}");
+    for needle in [
+        "warning:",
+        told.bin.display().to_string().as_str(),
+        "v2.0.0-dev88614",
+        "autocomplete extension",
+        "arc's own reading",
+        INSTALLER,
+        "ARC_DUCKDB_BIN=~/.duckdb/cli/2.0.0/duckdb",
+    ] {
+        assert!(
+            warnings[0].contains(needle),
+            "expected {needle:?}: {}",
+            warnings[0]
+        );
+    }
+    assert!(!stderr.contains("no DuckDB 2 answered"), "{stderr}");
 }

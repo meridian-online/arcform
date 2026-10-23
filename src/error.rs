@@ -200,6 +200,17 @@ pub enum Error {
         reason: String,
     },
 
+    // The DuckDB the steps run on gives no tokens at all, not even for `SELECT 1`: it was
+    // built without DuckDB's autocomplete extension, where `sql_tokenize` lives. Refused
+    // before any step runs, in place of the refusal of the first file it gave none for, so
+    // the message names the cause and the fix. `which` names the DuckDB and its version.
+    #[error(
+        "{} No step was run. {}",
+        crate::engine::no_tokenizer_cause(which),
+        crate::engine::release_install_fix()
+    )]
+    NoTokenizer { which: String },
+
     // A community extension that a step's or hook's SQL file installs, first found when the
     // file was read again just before it ran, is not the build `arcform.yaml` pins for this
     // DuckDB and platform, or arc could not install it to compare. Refused as
@@ -369,7 +380,8 @@ impl Error {
             | Error::ExtensionChanged { .. }
             | Error::ExtensionRefusedBeforeItRan { .. }
             | Error::ExtensionPinRefusedBeforeItRan { .. }
-            | Error::SqlNotRead { .. } => 2,
+            | Error::SqlNotRead { .. }
+            | Error::NoTokenizer { .. } => 2,
             _ => 1,
         }
     }

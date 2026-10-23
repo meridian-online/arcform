@@ -329,7 +329,27 @@ pub fn run_with_params(
         }
         // Before anything is initialised, so a refused Protocol leaves no run behind.
         let sql = protocol_sql(&manifest, dir);
-        let installs = check_extension_installs(&sql, info.version.as_ref(), engine)?;
+        // A DuckDB that gives no tokens at all, as one built without its autocomplete
+        // extension does, is named with the fix, in place of the refusal of the first file
+        // it gave none for. The probe runs when that check fails, or when it asked DuckDB
+        // nothing, so a run whose files all read starts no DuckDB more than before.
+        let no_tokenizer = || Error::NoTokenizer {
+            which: engine.which(&info.printed),
+        };
+        let installs = match check_extension_installs(&sql, info.version.as_ref(), engine) {
+            Err(refused @ Error::SqlNotRead { .. }) => {
+                return Err(if engine.tokenizer_answers() {
+                    refused
+                } else {
+                    no_tokenizer()
+                });
+            }
+            Err(refused) => return Err(refused),
+            Ok(installs) if !installs.tokens.asked_duckdb() && !engine.tokenizer_answers() => {
+                return Err(no_tokenizer());
+            }
+            Ok(installs) => installs,
+        };
         reads_sql = installs.tokens.holds_sql();
         for warning in &installs.warnings {
             eprintln!("{} {}", "warning:".yellow(), warning);
@@ -341,13 +361,9 @@ pub fn run_with_params(
         {
             eprintln!(
                 "{} this DuckDB build ({dev_build}) cannot download community extensions, and \
-                 DuckDB's own release binary (the install script's, or \
-                 github.com/duckdb/duckdb/releases/tag/v{}) can",
+                 DuckDB's own release build can. {}",
                 "warning:".yellow(),
-                info.version
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_default()
+                crate::engine::release_install_fix()
             );
         }
         // After the refusal above, so a refused Protocol installs nothing, and before the
@@ -1923,6 +1939,65 @@ mod tests {
 
     fn ver(s: &str) -> semver::Version {
         semver::Version::parse(s).unwrap()
+    }
+
+    const ONE_SQL_STEP: &str = "name: t\nsteps:\n  - name: s\n    sql: s.sql\n";
+
+    #[test]
+    fn a_run_whose_tokens_read_asks_no_tokenizer_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path(), ONE_SQL_STEP, &[("s.sql", "SELECT 1;")]);
+        let engine = MockEngine::new();
+        run(dir.path(), &engine, &MockStateBackend::new(), false).unwrap();
+        assert_eq!(*engine.probed.borrow(), 0);
+    }
+
+    #[test]
+    fn a_duckdb_whose_tokenizer_does_not_answer_is_refused_before_a_step_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path(), ONE_SQL_STEP, &[("s.sql", "SELECT 1;")]);
+        let engine = MockEngine::new();
+        *engine.tokens_failure.borrow_mut() = Some("it exited with 1".into());
+        *engine.tokenizer.borrow_mut() = false;
+        let refused = run(dir.path(), &engine, &MockStateBackend::new(), false).unwrap_err();
+        assert!(matches!(refused, Error::NoTokenizer { .. }), "{refused:?}");
+        assert_eq!(refused.exit_code(), 2);
+        assert!(
+            !engine
+                .calls
+                .borrow()
+                .iter()
+                .any(|c| matches!(c, MockCall::Sql { .. })),
+            "a step ran"
+        );
+        let message = refused.to_string();
+        assert!(
+            message.starts_with("the mock DuckDB () cannot read SQL into tokens"),
+            "{message}"
+        );
+        assert!(!message.contains("could not read the tokens"), "{message}");
+    }
+
+    #[test]
+    fn a_duckdb_whose_tokenizer_answers_keeps_the_refusal_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path(), ONE_SQL_STEP, &[("s.sql", "SELECT 1;")]);
+        let engine = MockEngine::new();
+        *engine.tokens_failure.borrow_mut() = Some("it printed nothing".into());
+        let refused = run(dir.path(), &engine, &MockStateBackend::new(), false).unwrap_err();
+        assert!(matches!(refused, Error::SqlNotRead { .. }), "{refused:?}");
+        assert_eq!(*engine.probed.borrow(), 1);
+    }
+
+    #[test]
+    fn a_run_with_no_sql_to_ask_about_probes_the_tokenizer_once() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path(), ONE_SQL_STEP, &[("s.sql", "")]);
+        let engine = MockEngine::new();
+        *engine.tokenizer.borrow_mut() = false;
+        let refused = run(dir.path(), &engine, &MockStateBackend::new(), false).unwrap_err();
+        assert!(matches!(refused, Error::NoTokenizer { .. }), "{refused:?}");
+        assert_eq!(*engine.probed.borrow(), 1);
     }
 
     #[test]
