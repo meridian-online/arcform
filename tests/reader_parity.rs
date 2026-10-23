@@ -140,7 +140,8 @@ fn read(file: &Path, reader: Reader, duckdb: &OsString) -> Result<(Vec<Reading>,
         Reader::DuckDb => {
             command.env("ARC_SQL_READER", "duckdb");
         }
-        // With `ARC_SQL_READER` unset, sqlparser-rs reads the step.
+        // With `ARC_SQL_READER` unset, sqlparser-rs reads the step. When DuckDB's reading
+        // becomes the default, this sets `ARC_SQL_READER=sqlparser` instead.
         Reader::Sqlparser => {}
     }
     let out = command.output().expect("spawn arc run");
