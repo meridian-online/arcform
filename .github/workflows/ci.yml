@@ -15,11 +15,14 @@ env:
   # crate without the `bundled-duckdb` feature provides the C library and its headers.
   # The `bundled` job below builds DuckDB into the binary instead, as release binaries
   # are built. One version throughout: this pin, the exact `duckdb` crate version in
-  # Cargo.toml (1.20000.0 is v2.0.0) and the versions in src/vetted_extensions.json
-  # move together, because arc loads extensions into the linked library in-process and
-  # an extension loads only into the version it was built for. The install step below
-  # writes the *_DIR / LD_LIBRARY_PATH env vars that libduckdb-sys and the test
-  # runtime read.
+  # Cargo.toml (1.20000.0 is v2.0.0), the pin in text-embed-parity.yml, install.sh's
+  # recommendation and the versions in src/vetted_extensions.json move together,
+  # because arc loads extensions into the linked library in-process and an extension
+  # loads only into the version it was built for. scripts/check_duckdb_version.py,
+  # run in `release-guard`, checks that these pins agree with the libduckdb-sys
+  # version Cargo.lock links. Development builds do not enable libduckdb-sys's
+  # `bundled` feature, so the install step below writes the *_DIR / LD_LIBRARY_PATH
+  # env vars that libduckdb-sys and the test runtime read.
   DUCKDB_VERSION: v2.0.0
   # The finetype CLI release the build job installs, and the SHA-256 of its
   # x86_64-unknown-linux-gnu archive (the `.sha256` asset beside it on the release).
@@ -107,6 +110,10 @@ jobs:
         run: python3 scripts/check_release_tag.py --self-test
       - name: The published-fork check detects a changed source
         run: python3 scripts/check_fork_published.py --self-test
+      - name: Every pinned DuckDB version is the one Cargo.lock links
+        run: python3 -I scripts/check_duckdb_version.py
+      - name: The DuckDB version check detects each pin that disagrees
+        run: python3 -I scripts/check_duckdb_version_selftest.py
 
   # scripts/install.sh is what `curl … | bash` runs on a stranger's machine, and
   # release.yml sends it to the install site on every tag, so it is checked here
