@@ -554,32 +554,28 @@ fn duckdb_step(reading: &duckdb_lineage::StepReading) -> StepSql {
 
 /// [`statement_byte_ranges`] on each batch the DuckDB command line cuts from `sql`, mapped
 /// back to `sql`'s bytes, so a dot command, a `#` line or any other line the command line
-/// drops is in no range.
-fn batched_byte_ranges(sql: &str) -> Vec<(usize, usize)> {
+/// drops is in no range. `None` when a batch or a statement cannot be placed in `sql`.
+fn batched_byte_ranges(sql: &str) -> Option<Vec<(usize, usize)>> {
     let mut ranges = Vec::new();
     for batch in crate::engine::cli_batches_mapped(sql.as_bytes()) {
-        let Ok(text) = String::from_utf8(batch.text) else {
-            return Vec::new();
-        };
+        // A NUL can cut a character in two, leaving a batch that is not UTF-8.
+        let text = String::from_utf8(batch.text).ok()?;
         for (start, end) in statement_byte_ranges(&text) {
             let placed = batch
                 .origin
                 .at(start)
                 .zip(batch.origin.at(end - 1).map(|last| last + 1));
-            match placed {
-                Some(range) => ranges.push(range),
-                None => return Vec::new(),
-            }
+            ranges.push(placed?);
         }
     }
-    ranges
+    Some(ranges)
 }
 
 /// The ranges [`batched_byte_ranges`] cuts in `sql`, one per statement of a step that has
 /// `count`. A cut that counts statements differently from the reader gives none, rather than
 /// ranges misaligned with the statements.
 fn lexical_ranges(sql: &str, count: usize) -> Vec<Option<(usize, usize)>> {
-    let ranges = batched_byte_ranges(sql);
+    let ranges = batched_byte_ranges(sql).unwrap_or_default();
     if ranges.len() == count {
         ranges.into_iter().map(Some).collect()
     } else {
@@ -600,8 +596,14 @@ fn sqlparser_step(sql: &str) -> StepSql {
         };
     }
     let mut step = StepSql::default();
-    for (n, (start, end)) in batched_byte_ranges(sql).into_iter().enumerate() {
-        step.byte_ranges.push(Some((start, end)));
+    // A step the command line's batches cannot place is still cut where the plain lexical cut
+    // cuts it, so no statement goes unread; its statements have no range.
+    let (cut, placed) = match batched_byte_ranges(sql) {
+        Some(ranges) => (ranges, true),
+        None => (statement_byte_ranges(sql), false),
+    };
+    for (n, (start, end)) in cut.into_iter().enumerate() {
+        step.byte_ranges.push(placed.then_some((start, end)));
         match sql
             .get(start..end)
             .ok_or_else(Vec::new)
@@ -1528,6 +1530,23 @@ mod tests {
             .map(|r| r.map(|(start, end)| &sql[start..end]))
             .collect();
         assert_eq!(slices, [Some("SELECT 1;"), Some("SELECT 2;")]);
+    }
+
+    #[test]
+    fn a_step_the_batches_cannot_place_is_still_read_and_has_no_ranges() {
+        // A NUL ends what the command line keeps of its 99-byte chunk, which here ends
+        // inside the `\u{e9}`: the second batch is not UTF-8 and cannot be placed.
+        let sql = format!(
+            "SELECT * FROM t;\nSELECT * FROM u;\n{}\0{}\u{e9};\n",
+            "x".repeat(50),
+            "y".repeat(47)
+        );
+        assert_eq!(batched_byte_ranges(&sql), None);
+        let step = sqlparser_step(&sql);
+        assert_eq!(step.statements.len(), 3, "{step:?}");
+        assert!(step.statements[0].inputs.contains("t"));
+        assert!(step.statements[1].inputs.contains("u"));
+        assert_eq!(step.byte_ranges, [None, None, None]);
     }
 
     #[test]
