@@ -552,11 +552,34 @@ fn duckdb_step(reading: &duckdb_lineage::StepReading) -> StepSql {
     step
 }
 
-/// The ranges [`statement_byte_ranges`] cuts in `sql`, one per statement of a step that has
+/// [`statement_byte_ranges`] on each batch the DuckDB command line cuts from `sql`, mapped
+/// back to `sql`'s bytes, so a dot command, a `#` line or any other line the command line
+/// drops is in no range.
+fn batched_byte_ranges(sql: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for batch in crate::engine::cli_batches_mapped(sql.as_bytes()) {
+        let Ok(text) = String::from_utf8(batch.text) else {
+            return Vec::new();
+        };
+        for (start, end) in statement_byte_ranges(&text) {
+            let placed = batch
+                .origin
+                .at(start)
+                .zip(batch.origin.at(end - 1).map(|last| last + 1));
+            match placed {
+                Some(range) => ranges.push(range),
+                None => return Vec::new(),
+            }
+        }
+    }
+    ranges
+}
+
+/// The ranges [`batched_byte_ranges`] cuts in `sql`, one per statement of a step that has
 /// `count`. A cut that counts statements differently from the reader gives none, rather than
 /// ranges misaligned with the statements.
 fn lexical_ranges(sql: &str, count: usize) -> Vec<Option<(usize, usize)>> {
-    let ranges = statement_byte_ranges(sql);
+    let ranges = batched_byte_ranges(sql);
     if ranges.len() == count {
         ranges.into_iter().map(Some).collect()
     } else {
@@ -577,7 +600,7 @@ fn sqlparser_step(sql: &str) -> StepSql {
         };
     }
     let mut step = StepSql::default();
-    for (n, (start, end)) in statement_byte_ranges(sql).into_iter().enumerate() {
+    for (n, (start, end)) in batched_byte_ranges(sql).into_iter().enumerate() {
         step.byte_ranges.push(Some((start, end)));
         match sql
             .get(start..end)
@@ -773,7 +796,8 @@ fn record_table_call(call: &FunctionCall, assets: &mut SqlAssets) {
 /// whitespace/comments and trailing whitespace.
 ///
 /// This is the fallback cut: [`read_sql`] places a statement by DuckDB's own tokens when
-/// DuckDB answers, and gives these ranges only when it does not.
+/// DuckDB answers, and otherwise cuts each batch of the command line with this and maps the
+/// ranges back to the file ([`batched_byte_ranges`]).
 pub fn statement_byte_ranges(sql: &str) -> Vec<(usize, usize)> {
     let bytes = sql.as_bytes();
     let n = bytes.len();
@@ -1492,6 +1516,20 @@ mod tests {
         );
     }
 
+    /// `ARC_SQL_READER=sqlparser` reads through `sqlparser_step`, as a lib test with no
+    /// recorded reading does.
+    #[test]
+    fn the_sqlparser_reader_places_ranges_past_the_lines_the_command_line_drops() {
+        let sql = ".mode list\n# note\nSELECT 1;\r\n.print x\nSELECT 2;\n";
+        let step = read_sql(sql).unwrap();
+        let slices: Vec<_> = step
+            .byte_ranges
+            .iter()
+            .map(|r| r.map(|(start, end)| &sql[start..end]))
+            .collect();
+        assert_eq!(slices, [Some("SELECT 1;"), Some("SELECT 2;")]);
+    }
+
     #[test]
     fn lexical_ranges_are_dropped_when_the_cut_counts_statements_differently() {
         assert_eq!(lexical_ranges("SELECT 1; SELECT 2;", 3), [None; 3]);
@@ -1513,7 +1551,12 @@ mod tests {
         assert_eq!(
             statement_byte_ranges(sql),
             [(0, 27)],
-            "the lexical cut starts at the dot command"
+            "the lexical cut of the whole file starts at the dot command"
+        );
+        assert_eq!(
+            sqlparser_step(sql).byte_ranges,
+            [Some((11, 27))],
+            "the fallback cuts the command line's batches, so it does not"
         );
     }
 

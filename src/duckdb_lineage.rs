@@ -301,8 +301,8 @@ fn read_step_with(ask: &mut dyn Ask, sql: &str) -> Result<StepReading, Refusal> 
         let query = frame.query.clone().map(|text| (text, held.next()));
         statements.push(read_statement(piece, frame, tree, query)?);
     }
-    // A unicode space the parser replaced with a space ends a range inside its character,
-    // which the range keeps whole.
+    // Defensive: a range ends on the `;` or on trimmed text, so it ends on a character
+    // boundary. If a mapping ever ends one inside a character, the range keeps it whole.
     for statement in &mut statements {
         statement.byte_range = statement.byte_range.and_then(|(start, mut end)| {
             while end <= sql.len() && !sql.is_char_boundary(end) {

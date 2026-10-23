@@ -1422,6 +1422,7 @@ fn the_real_duckdb_answers_the_pin_check_from_the_file_it_holds() {
     let home = tempfile::tempdir().unwrap();
     let ask = |args: &[&str]| {
         let out = Command::new("duckdb")
+            .env("DUCKDB_AGENT_MODE", "0")
             .args(args)
             .env("HOME", home.path())
             .output()
@@ -2051,6 +2052,7 @@ fn each_setting_that_moves_where_duckdb_keeps_extensions_is_refused_before_a_ste
 fn every_setting_duckdb_lists_that_moves_where_it_keeps_extensions_is_refused() {
     let home = tempfile::tempdir().unwrap();
     let out = Command::new("duckdb")
+        .env("DUCKDB_AGENT_MODE", "0")
         .args([
             "-noheader",
             "-list",
@@ -2614,6 +2616,7 @@ fn duckdb_runs(scratch: &Path, label: &str, sql: &str) -> (PathBuf, String) {
     let file = scratch.join(format!("{label}.sql"));
     fs::write(&file, sql).unwrap();
     let out = Command::new("duckdb")
+        .env("DUCKDB_AGENT_MODE", "0")
         .arg(&db)
         .arg("-f")
         .arg(&file)
@@ -2782,6 +2785,7 @@ fn arc_refuses_an_install_exactly_where_duckdb_would_run_it() {
             &case.replace("@@", "CREATE TABLE probe AS SELECT 1"),
         );
         let probe = Command::new("duckdb")
+            .env("DUCKDB_AGENT_MODE", "0")
             .arg(&db)
             .args(["-csv", "-noheader", "-c"])
             .arg("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'probe'")
@@ -2861,6 +2865,7 @@ fn arc_refuses_an_install_exactly_where_duckdb_would_run_it() {
         let db = home.path().join("route.duckdb");
         let duckdb = |args: &[&std::ffi::OsStr]| {
             Command::new("duckdb")
+                .env("DUCKDB_AGENT_MODE", "0")
                 .args(args)
                 .current_dir(home.path())
                 .env("HOME", home.path())
@@ -3136,6 +3141,7 @@ fn the_record_names_each_extension_the_sql_installs_as_the_real_duckdb_reports_i
     let home = tempfile::tempdir().unwrap();
     let ask = |args: &[&str]| {
         let out = Command::new("duckdb")
+            .env("DUCKDB_AGENT_MODE", "0")
             .args(args)
             .env("HOME", home.path())
             .output()
@@ -3511,6 +3517,7 @@ impl LoadedHome {
         fs::create_dir_all(&home).unwrap();
         let ask = |home: Option<&Path>, sql: &str| {
             let mut duckdb = Command::new(&duckdb);
+            duckdb.env("DUCKDB_AGENT_MODE", "0");
             duckdb.args(["-init", "/dev/null", "-noheader", "-list", "-c", sql]);
             if let Some(home) = home {
                 duckdb.env("HOME", home);
@@ -3577,6 +3584,7 @@ impl LoadedHome {
     /// The record's entry for httpfs, as DuckDB reports the copy under this home.
     fn httpfs(&self) -> serde_json::Value {
         let out = Command::new(&self.duckdb)
+        .env("DUCKDB_AGENT_MODE", "0")
             .args(["-init", "/dev/null", "-noheader", "-list", "-c"])
             .arg("SELECT installed_from, extension_version FROM duckdb_extensions() WHERE extension_name = 'httpfs';")
             .env("HOME", self.home())
