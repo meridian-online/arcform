@@ -500,8 +500,9 @@ impl Engine for DuckDbEngine {
             .arg("-f")
             .arg(sql_path)
             .args(question)
-            // Applied after `command()` on purpose: a manifest or step `env:` that sets
-            // `DUCKDB_AGENT_MODE` is the author's explicit choice, and the exit status still shows failure.
+            // Every name arc adds here starts `ARC_` (a parameter is `ARC_PARAM_<NAME>`), so
+            // nothing a Protocol declares sets `PATH` or `DUCKDB_AGENT_MODE` for the step: it
+            // runs the DuckDB arc asked for the version and the file's tokens.
             .envs(env)
             .stdout(Stdio::inherit())
             .stderr(Stdio::piped())
@@ -789,29 +790,42 @@ const EXTENSION_REPOSITORY_SETTINGS: [&str; 2] = [
 /// `extension_directory`, the list `extension_directories`, and `home_directory`, under which
 /// DuckDB keeps them when neither of the others is set. A step that sets one installs to a
 /// directory the check of each pinned extension does not read, and a second DuckDB does not
-/// find the file there. DuckDB v1.5.5's `duckdb_settings()` lists these three and no other
-/// that moves it, and a test holds the list to what the DuckDB CLI it runs lists.
+/// find the file there. DuckDB v2.0.0's `duckdb_settings()` lists `extension_directories` and
+/// `home_directory` and no other that moves it; it no longer lists the deprecated
+/// `extension_directory`, which it still sets. A test holds the list to what the DuckDB CLI it
+/// runs lists.
 const EXTENSION_DIRECTORY_SETTINGS: [&str; 3] = [
     "extension_directory",
     "extension_directories",
     "home_directory",
 ];
 
-/// What switches DuckDB to its second parser. The DuckDB CLI loads the `autocomplete`
-/// extension, whose parser replaces the default one once `allow_parser_override_extension` is
-/// `'fallback'` or `'strict'`, and `enable_peg_parser()` sets it to `'strict'`. That parser
-/// reads comments and strings by rules of its own: a block comment does not nest, and a
-/// backslash escapes nothing inside `E'…'`. arc reads SQL by the default parser's rules, so a
-/// statement naming either is refused, whatever value it sets. Everything before the switch
-/// is read by the default rules, the only ones in force until it runs.
+/// The settings that hand a step's SQL to a parser other than DuckDB's own, whose comments and
+/// strings arc does not read. In DuckDB v2.0.0, `allow_parser_override_extension` set to
+/// `'fallback'` or `'strict'` lets an extension that registers a `parser_override` claim each
+/// batch the CLI hands over (`src/main/parse_iterator.cpp:39-74`), and `current_dialect` hands
+/// the batches after it to a dialect an extension registers, with a tokenizer of the dialect's
+/// own (`src/main/parser_context.cpp:27-34`,
+/// `src/include/duckdb/parser/peg/dialect_extension.hpp:73`), which can escape with a
+/// backslash or quote with another character
+/// (`src/include/duckdb/parser/peg/tokenizer/tokenizer.hpp:62-66`). No extension in v2.0.0's
+/// tree registers either. A statement naming one is refused, whatever value it sets.
+/// Everything before the switch is read by DuckDB's own rules, the only ones in force until
+/// it runs: v2.0.0 resolves the override once per batch, before its first statement, and
+/// tokenises each batch once, before any of it runs (`src/main/parse_iterator.cpp:42-43`,
+/// `137-147`).
 ///
-/// A string naming either is refused too: `query('FROM enable_peg_parser()')` runs the SQL a
-/// string holds.
-const PARSER_SWITCHES: [&str; 2] = ["enable_peg_parser", "allow_parser_override_extension"];
+/// A string naming one is refused too, as SQL a step can write to a file DuckDB runs later,
+/// such as `~/.duckdbrc`. DuckDB 2.0 removed `enable_peg_parser()`, which switched 1.5 to its
+/// second parser: its PEG parser is the only one, and the name is a catalog error.
+const PARSER_SWITCHES: [&str; 2] = ["allow_parser_override_extension", "current_dialect"];
 
 /// The functions that run SQL held in their argument: `query()` a `SELECT` in a string, and
 /// `json_execute_serialized_sql()` one serialized as JSON. A step can assemble that argument
-/// while it runs, as `'FROM enable_' || 'peg_parser()'`, and arc reads only its text.
+/// while it runs, as `'FROM ' || 'secret_table'`, and arc reads only its text. In v2.0.0 each
+/// takes a single `SELECT` alone (`src/function/table/query_function.cpp:90-93`,
+/// `extension/json/json_functions/json_serialize_sql.cpp:170-203`), and no function a
+/// `SELECT` calls sets a setting, so what they run cannot be an `INSTALL` or a parser switch.
 const RUNS_SQL: [&str; 2] = ["query", "json_execute_serialized_sql"];
 
 /// The words after which a name is one a statement declares or writes to, and a column list
@@ -922,17 +936,23 @@ enum ExtensionSql {
 //
 // `arc run` hands a SQL step to `duckdb <db> -f <file>`. What reaches DuckDB's tokenizer is not
 // the file: the CLI reads it a line at a time, skips some lines, and hands the parser one
-// batch of lines at a time; the parser then replaces some unicode spaces before its tokenizer
-// runs. Each function below copies one of those steps from DuckDB v1.5.5's source, and
-// v1.5.4's and v1.5.6's are the same: `tools/shell/shell.cpp` for the CLI,
-// `src/parser/parser.cpp` for the pre-pass, whose `StripUnicodeSpaces` is unchanged in
-// v2.0.0. A step is copied as far as it changes which text DuckDB reads as SQL, and no
-// further. What DuckDB's tokenizer reads in each batch is asked of DuckDB itself, in
-// `crate::duckdb_tokens`.
+// batch of lines at a time (`ShellState::ProcessInput`, `tools/shell/shell.cpp:3135-3266`);
+// the parser then replaces some unicode spaces before its tokenizer runs over the whole batch
+// (`ShellState::ExecuteSQL`, `shell.cpp:1082-1132`, and `src/main/parse_iterator.cpp:18-20`,
+// `137-147`). Each function below copies one of those steps from DuckDB v2.0.0's source, cited
+// by file and line, and says where it differs from v1.5.5's. A step is copied as far as it
+// changes which text DuckDB reads as SQL, and no further. What DuckDB's tokenizer reads in
+// each batch is asked of DuckDB itself, in `crate::duckdb_tokens`.
+//
+// Two things v2.0.0 adds change no rule here. A batch that is not valid UTF-8 is refused
+// before any of it runs (`src/parser/parser.cpp:78-89`, `240-247`), and the CLI stops at it;
+// arc reads the batch and those after it all the same, which refuses more and never less.
+// And the CLI runs a bare name as `SELECT * FROM name` (`SET active_grammar_extensions`,
+// `shell.cpp:1313`), which changes what a batch's statements are and not its tokens.
 
 /// The lines DuckDB's CLI reads from a file, each with the file line it starts on, as
-/// `local_getline` reads them with `fgets`: a line ends at `\n`, and a NUL byte ends what the
-/// line keeps of the `fgets` chunk it is in. The rest of that chunk is dropped, and the next
+/// `local_getline` reads them with `fgets` (`tools/shell/shell.cpp:531-562`, as in v1.5.5): a
+/// line ends at `\n`, and a NUL byte ends what the line keeps of the `fgets` chunk it is in. The rest of that chunk is dropped, and the next
 /// chunk joins the line, which for a short line is the next line of the file. A chunk holds
 /// the room left in a buffer that starts at 100 bytes and grows to twice its size and 100
 /// more whenever 100 bytes are not left, less one byte for the NUL `fgets` writes.
@@ -967,15 +987,16 @@ fn cli_lines(bytes: &[u8]) -> Vec<(Vec<u8>, usize)> {
     lines
 }
 
-/// A space to the CLI's own tests of a line: DuckDB's `CharacterIsSpace`, which unlike its
-/// scanner counts a vertical tab.
+/// A space to the CLI's own tests of a line: DuckDB's `CharacterIsSpace`
+/// (`tools/shell/shell.cpp:430-432`, `src/include/duckdb/common/string_util.hpp:55-57`), which
+/// counts a vertical tab where `SQLIsComplete` does not.
 fn is_cli_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
 }
 
-/// Whether `z` holds only spaces and comments, as the CLI's `_all_whitespace` reads it: a
-/// `/* */` comment does not nest, and one left open is not whitespace; a `--` comment runs
-/// to `\n`.
+/// Whether `z` holds only spaces and comments, as the CLI's `_all_whitespace` reads it
+/// (`tools/shell/shell.cpp:2879-2907`, as in v1.5.5): a `/* */` comment does not nest, and one
+/// left open is not whitespace; a `--` comment runs to `\n`.
 fn all_whitespace(z: &[u8]) -> bool {
     let mut i = 0;
     while let Some(&b) = z.get(i) {
@@ -1002,10 +1023,15 @@ fn is_tag_byte(b: u8, first: bool) -> bool {
 }
 
 /// Whether the CLI hands the lines it holds to the parser now, as its `SQLIsComplete` reads
-/// them: when they end in a `;` outside a string or comment. This is not the scanner's
-/// reading: a `/* */` comment does not nest, a backslash escapes nothing, a `--` comment runs
-/// to `\n` alone, and a `$tag$` opens anywhere, inside a word too. Each difference moves
-/// where a batch ends, and so which lines after it are read as SQL.
+/// them (`tools/shell/shell.cpp:2939-3061`): when they end in a `;` outside a string, a quoted
+/// name or a comment. This is not the tokenizer's reading: a `/* */` comment does not nest, a
+/// backslash escapes nothing, a `--` comment runs to `\n` alone, and a `$tag$` opens
+/// anywhere, inside a word too. Each difference moves where a batch ends, and so which lines
+/// after it are read as SQL.
+///
+/// v2.0.0 reads a backtick as it reads a `'` or a `"`, running to the next backtick
+/// (`shell.cpp:3036-3050`), where v1.5.5 left the case commented out: on 2.0,
+/// ``SELECT 1 AS `x;`` holds the batch open, and a `.` or `#` line after it is SQL.
 fn sql_is_complete(z: &[u8]) -> bool {
     let mut semicolon = false;
     let mut i = 0;
@@ -1043,7 +1069,7 @@ fn sql_is_complete(z: &[u8]) -> bool {
                     (i + 1, Some(false))
                 }
             }
-            b'\'' | b'"' => match rest.iter().position(|&q| q == b) {
+            b'\'' | b'"' | b'`' => match rest.iter().position(|&q| q == b) {
                 Some(k) => (i + 1 + k + 1, None),
                 None => return false,
             },
@@ -1058,12 +1084,14 @@ fn sql_is_complete(z: &[u8]) -> bool {
 }
 
 /// The batches of SQL DuckDB's CLI hands its parser from a file, each with the file line
-/// each of its lines starts on, as the CLI's `ProcessInput` cuts them. A line whose first
-/// byte is `\x03` drops the lines held so far. A line starting with `.` or `#` while no line
-/// is held is a dot command or a comment, and is not SQL, whatever quote or comment it opens.
-/// Any other line is held, and the lines held go to the parser together once a line holding
-/// a `;` completes them by [`sql_is_complete`], or at the end of the file. Lines that hold
-/// only spaces and comments are dropped.
+/// each of its lines starts on, as the CLI's `ProcessInput` cuts them
+/// (`tools/shell/shell.cpp:3135-3266`; for a file, as in v1.5.5). A line whose first byte is
+/// `\x03` drops the lines held so far (`shell.cpp:3174-3187`). A line starting with `.` or
+/// `#` while no line is held is a dot command or a comment, and is not SQL, whatever quote or
+/// comment it opens (`shell.cpp:3206-3221`). Any other line is held, and the lines held go to
+/// the parser together once a line holding a `;` completes them by [`sql_is_complete`]
+/// (`shell.cpp:3244`), or at the end of the file (`shell.cpp:3260-3262`). Lines that hold only
+/// spaces and comments are dropped (`shell.cpp:3200-3205`, `3253-3258`).
 ///
 /// A dot command can itself run SQL or a program, such as `.read` and `.shell`; what it runs
 /// is not read here.
@@ -1114,14 +1142,16 @@ fn unicode_space_len(q: &[u8]) -> Option<usize> {
 }
 
 /// A batch as DuckDB's tokenizer receives it: each unicode space in [`unicode_space_len`]
-/// replaced with a space, as the parser's `StripUnicodeSpaces` pre-pass does, except inside
-/// what the pre-pass reads as a string or a comment. That is not the tokenizer's reading: a
+/// replaced with a space, as the parser's `StripUnicodeSpaces` pre-pass does
+/// (`src/parser/parser.cpp:51-200`, unchanged from v1.5.5), except inside what the pre-pass
+/// reads as a string or a comment. That is not the tokenizer's reading: a
 /// `'` or `"` opens a string until the next of the same quote, a `$` and a tag open a
 /// dollar-quoted string, a `--` comment ends at `\n` or `\r`, and `/* */` is not a comment.
 /// So a `'` inside a block comment opens a string for the pre-pass, and a U+200B after it
 /// stays, to be read by the tokenizer as part of a word.
 ///
-/// DuckDB repeats the pass until it replaces nothing; one pass leaves nothing for a second,
+/// v2.0.0 makes the pass once (`Parser::NormalizeSQLString`, `src/parser/parser.cpp:240-247`),
+/// where v1.5.5 repeated it until it replaced nothing; a second pass would replace nothing,
 /// because a space opens nothing and a unicode space after a `$` is read as part of a tag.
 pub(crate) fn strip_unicode_spaces(q: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -2852,31 +2882,80 @@ mod extension_tests {
         }
     }
 
+    /// DuckDB 2.0 has no `enable_peg_parser()`: its PEG parser is the only one, and
+    /// `CALL enable_peg_parser();` is a catalog error. Naming it switches nothing.
     #[test]
-    fn scan_finds_a_parser_switch_in_any_form() {
+    fn naming_enable_peg_parser_is_no_longer_refused() {
+        for sql in [
+            "SELECT 'enable_peg_parser';",
+            "CALL enable_peg_parser();",
+            "FROM query('FROM ENABLE_PEG_PARSER()');",
+        ] {
+            assert_eq!(scan(sql), vec![], "{sql}");
+        }
+    }
+
+    #[test]
+    fn setting_allow_parser_override_extension_is_still_refused() {
         let switch = |name: &str| ExtensionSql::ParserSwitch(name.into());
-        assert_eq!(
-            scan("CALL enable_peg_parser();\nFROM Enable_Peg_Parser();"),
-            vec![switch("enable_peg_parser"), switch("enable_peg_parser")]
-        );
         assert_eq!(
             scan(
                 r#"SET allow_parser_override_extension = 'fallback'; PRAGMA ALLOW_PARSER_OVERRIDE_EXTENSION='strict'; SET GLOBAL "allow_parser_override_extension" TO 'default';"#
             ),
             vec![switch("allow_parser_override_extension"); 3]
         );
-        // A string DuckDB runs as SQL, with its escapes read.
+        // A string, with its escapes read.
         assert_eq!(
             scan(
-                r"FROM query('FROM ENABLE_PEG_PARSER()'); FROM query(E'FROM enable\x5fpeg_parser()');"
+                r"SELECT 'ALLOW_PARSER_OVERRIDE_EXTENSION', E'allow\x5fparser_override_extension';"
             ),
-            vec![switch("enable_peg_parser"); 2]
+            vec![switch("allow_parser_override_extension"); 2]
         );
-        // In a comment, inside a longer name, and the function that switches back.
+        // In a comment, and inside a longer name.
         assert_eq!(
             scan(
-                "-- CALL enable_peg_parser();\n/* SET allow_parser_override_extension = 'strict'; */ CALL disable_peg_parser(); SELECT my_enable_peg_parser;"
+                "-- SET allow_parser_override_extension = 'strict';\n/* SET current_dialect = 'x'; */ SELECT my_allow_parser_override_extension;"
             ),
+            vec![]
+        );
+    }
+
+    /// DuckDB 2.0's `current_dialect` hands the parser to a dialect an extension registers,
+    /// with a tokenizer of the dialect's own, so it is refused as the parser override is.
+    #[test]
+    fn setting_current_dialect_is_refused() {
+        let switch = |name: &str| ExtensionSql::ParserSwitch(name.into());
+        assert_eq!(
+            scan(
+                "SET current_dialect = 'x'; RESET Current_Dialect; SET LOCAL \"current_dialect\" TO 'y';"
+            ),
+            vec![switch("current_dialect"); 3]
+        );
+    }
+
+    /// DuckDB 2.0's CLI reads a backtick as it reads a `"` when it decides whether the lines it
+    /// holds end in a `;`, so a `.` or `#` line after an open backtick is SQL.
+    #[test]
+    fn a_backtick_holds_a_batch_open_across_lines_on_2_0() {
+        let file = b"SELECT 1 AS `x;\n# `; INSTALL h3x FROM community;\n";
+        assert_eq!(
+            cli_batches(file)[0],
+            (
+                b"SELECT 1 AS `x;\n# `; INSTALL h3x FROM community;".to_vec(),
+                vec![1, 2]
+            )
+        );
+        assert_eq!(
+            scan_extension_sql(file),
+            vec![(install("h3x", InstallFrom::Community), 2)]
+        );
+        assert_eq!(
+            scan_extension_sql(b"SELECT 1 AS `;\n.print`; INSTALL h3x FROM community;"),
+            vec![(install("h3x", InstallFrom::Community), 2)]
+        );
+        // Inside a string a backtick opens nothing, and the `#` line after is not SQL.
+        assert_eq!(
+            scan_extension_sql(b"SELECT '`';\n# INSTALL h3x FROM community;"),
             vec![]
         );
     }
@@ -3233,7 +3312,7 @@ mod extension_tests {
                 ),
                 (
                     "step 'b'",
-                    "INSTALL '/tmp/m.duckdb_extension';\nSET custom_extension_repository = '/tmp';\nCALL enable_peg_parser();",
+                    "INSTALL '/tmp/m.duckdb_extension';\nSET custom_extension_repository = '/tmp';\nSET allow_parser_override_extension = 'strict';",
                 ),
             ],
         );
@@ -3245,7 +3324,7 @@ mod extension_tests {
                 "hook on_init 'h' (s1.sql, line 3) installs zipfs from the address 'https://x.org/e'",
                 "step 'b' (s2.sql, line 1) installs the extension at '/tmp/m.duckdb_extension'",
                 "step 'b' (s2.sql, line 2) names the setting custom_extension_repository, which moves where DuckDB installs an extension from",
-                "step 'b' (s2.sql, line 3) names enable_peg_parser, which switches DuckDB to a second parser whose comments and strings arc does not read",
+                "step 'b' (s2.sql, line 3) names allow_parser_override_extension, which switches DuckDB to a second parser whose comments and strings arc does not read",
             ]
         );
     }

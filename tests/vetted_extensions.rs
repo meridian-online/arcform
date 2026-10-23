@@ -371,7 +371,6 @@ fn the_extension_directory_setting_is_refused_as_a_repository_setting_is() {
 #[test]
 fn a_parser_switch_is_refused_by_name() {
     for (sql, named) in [
-        ("CALL enable_peg_parser();", "names enable_peg_parser"),
         (
             "SET allow_parser_override_extension = 'fallback';",
             "names allow_parser_override_extension",
@@ -380,6 +379,7 @@ fn a_parser_switch_is_refused_by_name() {
             "SET allow_parser_override_extension = 'strict';",
             "names allow_parser_override_extension",
         ),
+        ("SET current_dialect = 'x';", "names current_dialect"),
     ] {
         let run = Protocol::steps(&[("s", sql)]).run(VETTED_ON);
         run.assert_refused(sql);
@@ -2615,10 +2615,17 @@ fn between<'a>(text: &'a str, before: &str, after: &str) -> Option<&'a str> {
 
 /// Each case in `ran` holds `@@` where a statement goes. DuckDB runs the case with `@@` as a
 /// `CREATE TABLE`, and arc reads it with `@@` as an unvetted `INSTALL`: arc has to refuse
-/// exactly the cases in which DuckDB ran the statement, for the `INSTALL` or for a switch to
-/// DuckDB's second parser before it. The cases hold each rule arc copies from DuckDB's CLI,
-/// its parser's pre-pass and its scanner, at least one input each rule changes the reading
-/// of, and each form of the switch.
+/// exactly the cases in which DuckDB ran the statement. The cases hold each rule arc copies
+/// from DuckDB's CLI and its parser's pre-pass, and at least one input each rule, or DuckDB's
+/// tokens, changes the reading of.
+///
+/// DuckDB 2.0 removed the cases this test held for a switch to a second parser before
+/// `@@`. Its PEG parser is the only one, with no `enable_peg_parser()` (a catalog error on
+/// v2.0.0), and it nests `/* */` comments and escapes inside `E'…'` with no switch, so
+/// `/* /* */ @@; -- */` and `E'\' ; @@; --'` run nothing; and no extension in v2.0.0 claims
+/// the parser once `allow_parser_override_extension` is set (none registers a
+/// `parser_override`), so after it the same text still runs nothing. arc refuses that setting
+/// by name all the same, which `a_parser_switch_is_refused_by_name` checks.
 ///
 /// Each case in `names` holds `@@` where the repository goes. DuckDB installs from a
 /// directory that is not there, and its error names the extension it tried to fetch; arc
@@ -2688,6 +2695,10 @@ fn arc_refuses_an_install_exactly_where_duckdb_would_run_it() {
         // on the line just read.
         "SELECT ';\n.print'; @@;",
         "SELECT 1 AS \";\n.print\"; @@;",
+        // DuckDB 2.0's CLI reads a backtick as it reads a `"`.
+        "SELECT 1 AS `;\n.print`; @@;",
+        "SELECT 1 AS `x;\n# `; @@;",
+        "SELECT '`';\n# '; @@;",
         "SELECT 1 /* ;\n.print */; @@;",
         "SELECT -- ;\n.5; @@;",
         "SELECT 1; -- note\n.print '\n@@;",
@@ -2713,17 +2724,9 @@ fn arc_refuses_an_install_exactly_where_duckdb_would_run_it() {
         ".bail off\nSELECT 1 /* /* */ ;\n@@; -- */",
         // A NUL byte drops the rest of the chunk the CLI read it in.
         "SELECT 1; \0/*\n@@; -- */",
-        // After DuckDB's second parser is switched on, a block comment does not nest and a
-        // backslash escapes nothing inside E'...'. arc refuses the switch.
-        "CALL enable_peg_parser();\n/* /* */ @@; -- */",
-        "CALL enable_peg_parser();\nSELECT E'\\' ; @@; --';",
-        "FROM enable_peg_parser();\n/* /* */ @@; -- */",
-        "SET allow_parser_override_extension = 'fallback';\n/* /* */ @@; -- */",
-        "SET allow_parser_override_extension = 'strict';\n/* /* */ @@; -- */",
-        "PRAGMA allow_parser_override_extension = 'strict';\n/* /* */ @@; -- */",
-        "FROM query('FROM enable_peg_parser()');\n/* /* */ @@; -- */",
-        // ... and a switch in a comment switches nothing.
-        "-- CALL enable_peg_parser();\n/* /* */ @@; -- */",
+        // A block comment nests and an E'...' string escapes, and a switch named in a comment
+        // is not refused.
+        "-- SET allow_parser_override_extension = 'strict';\n/* /* */ @@; -- */",
         "/* SET allow_parser_override_extension = 'strict'; */\nSELECT E'\\' ; @@; --';",
     ]
     .map(String::from)
@@ -2809,27 +2812,13 @@ fn arc_refuses_an_install_exactly_where_duckdb_would_run_it() {
     }
     // SQL a step builds or writes while it runs, which DuckDB runs and arc warns on and does
     // not refuse. Each route is its step files, with what the probe reads after each.
-    let serialized = Command::new("duckdb")
-        .args(["-init", "/dev/null", "-noheader", "-list", "-c"])
-        .arg("SELECT json_serialize_sql('FROM query(''FROM enable_'' || ''peg_parser()'')')")
-        .output()
-        .expect("the DuckDB CLI on PATH");
-    let serialized = String::from_utf8_lossy(&serialized.stdout)
-        .trim()
-        .replace('\'', "''");
+    //
+    // DuckDB 2.0 removed the routes through `query()` and `json_execute_serialized_sql()`:
+    // each runs a single `SELECT` alone (`query('CREATE TABLE …')` is "Expected a single
+    // SELECT statement" on v2.0.0, `src/function/table/query_function.cpp:90-93`), and the
+    // `SELECT` that switched 1.5's parser, `FROM enable_peg_parser()`, is gone, so neither can
+    // run `@@` or change how the lines after it are read. arc still warns on both.
     let routes: Vec<(&str, Vec<String>, &[&str])> = vec![
-        (
-            "query() on an assembled string",
-            vec!["FROM query('FROM enable_' || 'peg_parser()');\n/* /* */ @@; -- */".into()],
-            &["1"],
-        ),
-        (
-            "query() serialized as JSON, on an assembled string",
-            vec![format!(
-                "FROM json_execute_serialized_sql('{serialized}');\n/* /* */ @@; -- */"
-            )],
-            &["1"],
-        ),
         (
             "IMPORT DATABASE of files the step wrote",
             vec!["EXPORT DATABASE 'imp';\nCOPY (SELECT '@@;') TO 'imp/schema.sql' (HEADER false, QUOTE '');\nIMPORT DATABASE 'imp';".into()],

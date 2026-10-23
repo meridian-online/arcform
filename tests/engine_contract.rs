@@ -282,6 +282,45 @@ fn unset_arc_runs_the_duckdb_on_the_search_path() {
     assert_eq!(duckdb.sql_calls(), 1, "calls: {:?}", duckdb.calls());
 }
 
+// A Protocol cannot change which DuckDB runs its SQL step: what arc adds to a step's
+// environment is named `ARC_…`, so a parameter called `PATH` reaches the step as
+// `ARC_PARAM_PATH`. The step runs the `duckdb` arc's own search path finds, the one arc asked
+// for the version and the file's tokens, so the refusals read the file as the DuckDB that
+// runs it reads it.
+#[test]
+fn a_parameter_called_path_does_not_change_which_duckdb_runs_the_step() {
+    let fx = Fixture::new(None, "SELECT 42;");
+    let on_path = fx.dir("path");
+    let duckdb = fx.fake(&on_path, "duckdb", "2.0.0");
+    let elsewhere = fx.dir("elsewhere");
+    let other = fx.fake(&elsewhere, "duckdb", "2.0.0");
+    let manifest = fx.project().join("arcform.yaml");
+    let text = fs::read_to_string(&manifest).unwrap();
+    fs::write(
+        &manifest,
+        text.replace(
+            "steps:\n",
+            &format!(
+                "params:\n  PATH:\n    default: \"{}\"\nsteps:\n",
+                elsewhere.display()
+            ),
+        ),
+    )
+    .unwrap();
+
+    let (code, stderr) = arc_run(
+        &fx.project(),
+        Run {
+            path: &on_path,
+            told: None,
+            allow_untested: false,
+        },
+    );
+    assert_eq!(code, Some(0), "the step must run:\n{stderr}");
+    assert_eq!(duckdb.sql_calls(), 1, "calls: {:?}", duckdb.calls());
+    assert_eq!(other.calls(), Vec::<String>::new());
+}
+
 // A told path that is not an executable file refuses the run, naming the variable
 // and the path, and the working `duckdb` on the search path is never started.
 #[test]
