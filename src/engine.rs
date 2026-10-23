@@ -490,6 +490,8 @@ impl Engine for DuckDbEngine {
             .arg("-f")
             .arg(sql_path)
             .args(question)
+            // Applied after `command()` on purpose: a manifest or step `env:` that sets
+            // `DUCKDB_AGENT_MODE` is the author's explicit choice, and the exit status still shows failure.
             .envs(env)
             .stdout(Stdio::inherit())
             .stderr(Stdio::piped())

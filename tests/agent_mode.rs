@@ -39,7 +39,7 @@ fn arc_run_as_agent(dir: &Path, configure: impl FnOnce(&mut Command)) -> Output 
     let mut command = Command::new(env!("CARGO_BIN_EXE_arc"));
     command
         .current_dir(dir)
-        .env("ARCFORM_DB_DIR", std::env::temp_dir().join("arc-tests-db"))
+        .env("ARCFORM_DB_DIR", dir.join("db"))
         .env("AI_AGENT", "x")
         .env("CLAUDECODE", "1")
         .env_remove("DUCKDB_AGENT_MODE")
@@ -74,7 +74,7 @@ fn a_failing_step_under_an_agent_reports_duckdbs_error_text_not_json() {
     let out = arc_run_as_agent(dir.path(), |_| {});
     let stderr = text(&out.stderr);
     assert!(!out.status.success(), "the step fails");
-    assert!(stderr.contains('s'), "{stderr}");
+    assert!(stderr.contains("step 's' failed"), "{stderr}");
     assert!(stderr.contains("Catalog Error"), "{stderr}");
     assert!(!stderr.contains("{\"exception_type\""), "{stderr}");
 }
