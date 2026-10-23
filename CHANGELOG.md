@@ -9,6 +9,10 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ## [Unreleased]
 
+### Changed
+
+- **`arc sql record` makes a table of a `DESCRIBE`, a `SHOW` or a `SUMMARIZE`, as it does of a `SELECT`.** DuckDB 2.0 parses and runs `CREATE TABLE … AS DESCRIBE …`, so the recorded step opens with the `CREATE OR REPLACE TABLE` line and makes a table of the step's name; on DuckDB 1.5 the statement was written as typed.
+
 ### Removed
 
 - **Nine extensions leave the vetted list, which is re-vetted on DuckDB v2.0.0.** `dta`, `mlpack`, `onager` and `stats_duck` have no v2.0.0 build in the community registry. `http_client`, `minijinja`, `rapidfuzz`, `stochastic` and `textplot` have one, but it refuses to load: from DuckDB 2.0 those five are distributed from the Query.Farm repository, which arc does not allow a Protocol to install from. A Protocol that installs any of the nine `FROM community` is refused. The seven that stay are `finetype`, `h3`, `splink_udfs`, `subtoken`, `us_address_standardizer`, `webbed` and `zipfs`, each re-run on v2.0.0, and their entries now name v2.0.0.
