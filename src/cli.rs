@@ -132,7 +132,7 @@ pub enum Commands {
     /// and the file as it was is a checkpoint in `arc history`. A Protocol that runs on
     /// several platforms is upgraded on each.
     Upgrade {
-        /// The extension, as the vetted list names it: `mlpack`.
+        /// The extension, as the vetted list names it: `zipfs`.
         name: String,
 
         /// Protocol directory (where arcform.yaml lives).

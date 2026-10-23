@@ -2644,8 +2644,8 @@ mod extension_tests {
     #[test]
     fn scan_reads_where_each_install_fetches_from() {
         assert_eq!(
-            scan("INSTALL mlpack FROM community;"),
-            vec![install("mlpack", InstallFrom::Community)]
+            scan("INSTALL zipfs FROM community;"),
+            vec![install("zipfs", InstallFrom::Community)]
         );
         assert_eq!(
             scan("INSTALL spatial FROM core; INSTALL excel; INSTALL x VERSION 'v1';"),
@@ -2656,13 +2656,13 @@ mod extension_tests {
             ]
         );
         assert_eq!(
-            scan("INSTALL mlpack FROM core_nightly;"),
-            vec![install("mlpack", InstallFrom::Alias("core_nightly".into()))]
+            scan("INSTALL zipfs FROM core_nightly;"),
+            vec![install("zipfs", InstallFrom::Alias("core_nightly".into()))]
         );
         assert_eq!(
-            scan("INSTALL mlpack FROM 'https://example.org/ext';"),
+            scan("INSTALL zipfs FROM 'https://example.org/ext';"),
             vec![install(
-                "mlpack",
+                "zipfs",
                 InstallFrom::Address("https://example.org/ext".into())
             )]
         );
@@ -2671,16 +2671,16 @@ mod extension_tests {
     #[test]
     fn scan_compares_a_repository_as_written() {
         assert_eq!(
-            scan("INSTALL mlpack FROM Community;"),
-            vec![install("mlpack", InstallFrom::Alias("Community".into()))]
+            scan("INSTALL zipfs FROM Community;"),
+            vec![install("zipfs", InstallFrom::Alias("Community".into()))]
         );
         assert_eq!(
-            scan(r#"INSTALL mlpack FROM "community";"#),
-            vec![install("mlpack", InstallFrom::Community)]
+            scan(r#"INSTALL zipfs FROM "community";"#),
+            vec![install("zipfs", InstallFrom::Community)]
         );
         assert_eq!(
-            scan("INSTALL mlpack FROM 'community';"),
-            vec![install("mlpack", InstallFrom::Address("community".into()))]
+            scan("INSTALL zipfs FROM 'community';"),
+            vec![install("zipfs", InstallFrom::Address("community".into()))]
         );
     }
 
@@ -2691,9 +2691,9 @@ mod extension_tests {
             vec![install("anofox_forecast", InstallFrom::Community)]
         );
         assert_eq!(
-            scan(r#"INSTALL "MLPACK" FROM community; INSTALL 'Rapidfuzz' FROM community;"#),
+            scan(r#"INSTALL "ZIPFS" FROM community; INSTALL 'Rapidfuzz' FROM community;"#),
             vec![
-                install("mlpack", InstallFrom::Community),
+                install("zipfs", InstallFrom::Community),
                 install("rapidfuzz", InstallFrom::Community)
             ]
         );
@@ -2714,9 +2714,9 @@ mod extension_tests {
     #[test]
     fn scan_reads_a_name_holding_a_path_character_as_a_path() {
         assert_eq!(
-            scan("INSTALL '/tmp/ext/mlpack.duckdb_extension';"),
+            scan("INSTALL '/tmp/ext/zipfs.duckdb_extension';"),
             vec![ExtensionSql::InstallPath(
-                "/tmp/ext/mlpack.duckdb_extension".into()
+                "/tmp/ext/zipfs.duckdb_extension".into()
             )]
         );
         assert_eq!(
@@ -2736,7 +2736,7 @@ mod extension_tests {
         assert_eq!(scan("SELECT install FROM community;"), vec![]);
         assert_eq!(scan(r#"SELECT "install" x FROM community;"#), vec![]);
         assert_eq!(scan("INSTALL x FROM; INSTALL; INSTALL"), vec![]);
-        assert_eq!(scan("LOAD mlpack; LOAD '/tmp/x.duckdb_extension';"), vec![]);
+        assert_eq!(scan("LOAD zipfs; LOAD '/tmp/x.duckdb_extension';"), vec![]);
         assert_eq!(
             scan(
                 "-- INSTALL a FROM community;\n/* INSTALL b FROM community; */ SELECT 'INSTALL c FROM community';"
@@ -2748,10 +2748,10 @@ mod extension_tests {
     #[test]
     fn scan_finds_a_repository_setting_in_any_form() {
         assert_eq!(
-            scan("SET custom_extension_repository = '/tmp/ext'; INSTALL mlpack;"),
+            scan("SET custom_extension_repository = '/tmp/ext'; INSTALL zipfs;"),
             vec![
                 ExtensionSql::Setting("custom_extension_repository".into()),
-                install("mlpack", InstallFrom::Core)
+                install("zipfs", InstallFrom::Core)
             ]
         );
         assert_eq!(
@@ -2791,7 +2791,7 @@ mod extension_tests {
             &[("step 'a'", "SELECT 1;\nSET extension_directory = 'ext';")],
         );
         assert_eq!(
-            refusals(check_extension_installs(&sql, Some(&v("1.5.6")))),
+            refusals(check_extension_installs(&sql, Some(&v("2.0.0")))),
             vec![
                 "step 'a' (s0.sql, line 2) names the setting extension_directory, which moves where DuckDB keeps the extensions it installs"
             ]
@@ -2804,10 +2804,10 @@ mod extension_tests {
         let sql = sources(
             dir.path(),
             &[
-                ("step 'a'", "INSTALL onager FROM community; INSTALL excel;"),
+                ("step 'a'", "INSTALL webbed FROM community; INSTALL excel;"),
                 (
                     "step 'b'",
-                    "FORCE INSTALL mlpack FROM community; INSTALL onager FROM community;",
+                    "FORCE INSTALL zipfs FROM community; INSTALL webbed FROM community;",
                 ),
                 (
                     "hook on_exit 'h'",
@@ -2816,10 +2816,10 @@ mod extension_tests {
             ],
         );
         assert_eq!(
-            check_extension_installs(&sql, Some(&v("1.5.6")))
+            check_extension_installs(&sql, Some(&v("2.0.0")))
                 .unwrap()
                 .installed,
-            vec!["onager".to_string(), "mlpack".to_string()]
+            vec!["webbed".to_string(), "zipfs".to_string()]
         );
     }
 
@@ -2871,46 +2871,46 @@ mod extension_tests {
     #[test]
     fn a_pin_equal_to_the_installed_file_passes_and_is_kept_for_the_end() {
         let dir = tempfile::tempdir().unwrap();
-        let (path, hash) = installed_file(dir.path(), "mlpack", b"build one");
+        let (path, hash) = installed_file(dir.path(), "zipfs", b"build one");
         let engine = mock::MockEngine::new();
-        engine.set_install("mlpack", Ok(Some(path.clone())));
+        engine.set_install("zipfs", Ok(Some(path.clone())));
         let (pinned, warnings) = check_extension_pins(
             &engine,
-            &["mlpack".into()],
-            &pins(&[("mlpack", "v1.5.6", "linux_amd64", &hash)]),
-            Some(&v("1.5.6")),
+            &["zipfs".into()],
+            &pins(&[("zipfs", "v2.0.0", "linux_amd64", &hash)]),
+            Some(&v("2.0.0")),
         )
         .unwrap();
         assert_eq!(warnings, Vec::<String>::new());
         assert_eq!(
             pinned,
             vec![PinnedExtension {
-                name: "mlpack".into(),
-                version: "v1.5.6".into(),
+                name: "zipfs".into(),
+                version: "v2.0.0".into(),
                 platform: "linux_amd64".into(),
                 pin: hash,
                 path,
             }]
         );
-        assert_eq!(calls(&engine), vec!["platform", "install mlpack"]);
+        assert_eq!(calls(&engine), vec!["platform", "install zipfs"]);
     }
 
     #[test]
     fn a_pin_that_differs_is_refused_naming_each_part() {
         let dir = tempfile::tempdir().unwrap();
-        let (path, hash) = installed_file(dir.path(), "mlpack", b"build two");
+        let (path, hash) = installed_file(dir.path(), "zipfs", b"build two");
         let engine = mock::MockEngine::new();
-        engine.set_install("mlpack", Ok(Some(path.clone())));
+        engine.set_install("zipfs", Ok(Some(path.clone())));
         let refused = pin_refusals(check_extension_pins(
             &engine,
-            &["mlpack".into()],
-            &pins(&[("mlpack", "v1.5.6", "linux_amd64", PIN_A)]),
-            Some(&v("1.5.6")),
+            &["zipfs".into()],
+            &pins(&[("zipfs", "v2.0.0", "linux_amd64", PIN_A)]),
+            Some(&v("2.0.0")),
         ));
         assert_eq!(
             refused,
             vec![format!(
-                "mlpack on DuckDB v1.5.6, linux_amd64: pinned {PIN_A}, and the installed file {} hashes to {hash}; `arc upgrade mlpack` installs the build the community registry serves and pins it",
+                "zipfs on DuckDB v2.0.0, linux_amd64: pinned {PIN_A}, and the installed file {} hashes to {hash}; `arc upgrade zipfs` installs the build the community registry serves and pins it",
                 path.display()
             )]
         );
@@ -2918,52 +2918,52 @@ mod extension_tests {
 
     #[test]
     fn an_install_that_fails_or_names_no_file_is_refused_and_not_warned() {
-        let pinned = pins(&[("mlpack", "v1.5.6", "linux_amd64", PIN_A)]);
+        let pinned = pins(&[("zipfs", "v2.0.0", "linux_amd64", PIN_A)]);
         let engine = mock::MockEngine::new();
-        engine.set_install("mlpack", Err("HTTP 404".into()));
+        engine.set_install("zipfs", Err("HTTP 404".into()));
         let failed = pin_refusals(check_extension_pins(
             &engine,
-            &["mlpack".into()],
+            &["zipfs".into()],
             &pinned,
-            Some(&v("1.5.6")),
+            Some(&v("2.0.0")),
         ));
         assert_eq!(failed.len(), 1, "{failed:?}");
         assert!(
             failed[0]
-                .starts_with("mlpack on DuckDB v1.5.6, linux_amd64: arc could not install mlpack")
+                .starts_with("zipfs on DuckDB v2.0.0, linux_amd64: arc could not install zipfs")
                 && failed[0].contains("HTTP 404"),
             "{failed:?}"
         );
 
         let engine = mock::MockEngine::new();
-        engine.set_install("mlpack", Ok(None));
+        engine.set_install("zipfs", Ok(None));
         let no_file = pin_refusals(check_extension_pins(
             &engine,
-            &["mlpack".into()],
+            &["zipfs".into()],
             &pinned,
-            Some(&v("1.5.6")),
+            Some(&v("2.0.0")),
         ));
         assert_eq!(
             no_file,
             vec![
-                "mlpack on DuckDB v1.5.6, linux_amd64: DuckDB named no installed file for mlpack after installing it"
+                "zipfs on DuckDB v2.0.0, linux_amd64: DuckDB named no installed file for zipfs after installing it"
             ]
         );
 
         let engine = mock::MockEngine::new();
         engine.set_install(
-            "mlpack",
-            Ok(Some(PathBuf::from("/nonexistent/mlpack.duckdb_extension"))),
+            "zipfs",
+            Ok(Some(PathBuf::from("/nonexistent/zipfs.duckdb_extension"))),
         );
         let unreadable = pin_refusals(check_extension_pins(
             &engine,
-            &["mlpack".into()],
+            &["zipfs".into()],
             &pinned,
-            Some(&v("1.5.6")),
+            Some(&v("2.0.0")),
         ));
         assert!(
             unreadable[0]
-                .contains("could not read the installed file /nonexistent/mlpack.duckdb_extension"),
+                .contains("could not read the installed file /nonexistent/zipfs.duckdb_extension"),
             "{unreadable:?}"
         );
     }
@@ -2974,14 +2974,14 @@ mod extension_tests {
         *engine.platform.borrow_mut() = None;
         let refused = pin_refusals(check_extension_pins(
             &engine,
-            &["mlpack".into(), "onager".into()],
-            &pins(&[("mlpack", "v1.5.6", "linux_amd64", PIN_A)]),
-            Some(&v("1.5.6")),
+            &["zipfs".into(), "webbed".into()],
+            &pins(&[("zipfs", "v2.0.0", "linux_amd64", PIN_A)]),
+            Some(&v("2.0.0")),
         ));
         assert_eq!(refused.len(), 1, "{refused:?}");
         assert!(
             refused[0]
-                .starts_with("mlpack has a pin for DuckDB v1.5.6, and arc could not choose it"),
+                .starts_with("zipfs has a pin for DuckDB v2.0.0, and arc could not choose it"),
             "{refused:?}"
         );
         assert_eq!(calls(&engine), vec!["platform"]);
@@ -2991,7 +2991,7 @@ mod extension_tests {
     fn an_extension_with_no_pin_for_this_version_and_platform_warns_once_and_asks_only_what_it_needs()
      {
         let tail = format!(
-            ", so arc runs whichever build DuckDB installs; `arc upgrade mlpack` pins the build the community registry serves ({VETTED_EXTENSIONS_DOC})"
+            ", so arc runs whichever build DuckDB installs; `arc upgrade zipfs` pins the build the community registry serves ({VETTED_EXTENSIONS_DOC})"
         );
         // (label, pins, version, the warning's place, the calls DuckDB receives)
         type Case = (
@@ -3005,27 +3005,27 @@ mod extension_tests {
             (
                 "no key",
                 pins(&[]),
-                Some(v("1.5.6")),
-                "for DuckDB v1.5.6",
+                Some(v("2.0.0")),
+                "for DuckDB v2.0.0",
                 vec![],
             ),
             (
                 "another version",
-                pins(&[("mlpack", "v1.5.4", "linux_amd64", PIN_A)]),
-                Some(v("1.5.6")),
-                "for DuckDB v1.5.6",
+                pins(&[("zipfs", "v2.0.1", "linux_amd64", PIN_A)]),
+                Some(v("2.0.0")),
+                "for DuckDB v2.0.0",
                 vec![],
             ),
             (
                 "another platform",
-                pins(&[("mlpack", "v1.5.6", "osx_arm64", PIN_A)]),
-                Some(v("1.5.6")),
-                "for DuckDB v1.5.6 on linux_amd64",
+                pins(&[("zipfs", "v2.0.0", "osx_arm64", PIN_A)]),
+                Some(v("2.0.0")),
+                "for DuckDB v2.0.0 on linux_amd64",
                 vec!["platform"],
             ),
             (
                 "no version",
-                pins(&[("mlpack", "v1.5.6", "linux_amd64", PIN_A)]),
+                pins(&[("zipfs", "v2.0.0", "linux_amd64", PIN_A)]),
                 None,
                 "arc could not read this engine's DuckDB version to choose one",
                 vec![],
@@ -3034,12 +3034,12 @@ mod extension_tests {
         for (label, pins, version, place, asked) in cases {
             let engine = mock::MockEngine::new();
             let (pinned, warnings) =
-                check_extension_pins(&engine, &["mlpack".into()], &pins, version.as_ref()).unwrap();
+                check_extension_pins(&engine, &["zipfs".into()], &pins, version.as_ref()).unwrap();
             assert!(pinned.is_empty(), "[{label}]");
             assert_eq!(
                 warnings,
                 vec![format!(
-                    "mlpack has no pin under the extensions: key of arcform.yaml ({place}){tail}"
+                    "zipfs has no pin under the extensions: key of arcform.yaml ({place}){tail}"
                 )],
                 "[{label}]"
             );
@@ -3053,8 +3053,8 @@ mod extension_tests {
         let (pinned, warnings) = check_extension_pins(
             &engine,
             &[],
-            &pins(&[("mlpack", "v1.5.6", "linux_amd64", PIN_A)]),
-            Some(&v("1.5.6")),
+            &pins(&[("zipfs", "v2.0.0", "linux_amd64", PIN_A)]),
+            Some(&v("2.0.0")),
         )
         .unwrap();
         assert!(pinned.is_empty() && warnings.is_empty());
@@ -3064,19 +3064,19 @@ mod extension_tests {
     #[test]
     fn the_end_of_the_run_fails_on_a_file_that_changed_and_passes_one_that_did_not() {
         let dir = tempfile::tempdir().unwrap();
-        let (path, hash) = installed_file(dir.path(), "mlpack", b"build one");
-        let (other, other_hash) = installed_file(dir.path(), "onager", b"build one");
+        let (path, hash) = installed_file(dir.path(), "zipfs", b"build one");
+        let (other, other_hash) = installed_file(dir.path(), "webbed", b"build one");
         let pinned = vec![
             PinnedExtension {
-                name: "mlpack".into(),
-                version: "v1.5.6".into(),
+                name: "zipfs".into(),
+                version: "v2.0.0".into(),
                 platform: "linux_amd64".into(),
                 pin: hash.clone(),
                 path: path.clone(),
             },
             PinnedExtension {
-                name: "onager".into(),
-                version: "v1.5.6".into(),
+                name: "webbed".into(),
+                version: "v2.0.0".into(),
                 platform: "linux_amd64".into(),
                 pin: other_hash,
                 path: other,
@@ -3089,7 +3089,7 @@ mod extension_tests {
             Err(Error::ExtensionChanged { changes }) => assert_eq!(
                 changes,
                 vec![format!(
-                    "mlpack on DuckDB v1.5.6, linux_amd64: pinned {hash}, and when the run ended {} hashed to {found}",
+                    "zipfs on DuckDB v2.0.0, linux_amd64: pinned {hash}, and when the run ended {} hashed to {found}",
                     path.display()
                 )]
             ),
@@ -3339,7 +3339,7 @@ mod extension_tests {
                 ),
                 (
                     "hook on_exit 'h'",
-                    "INSTALL mlpack FROM community;\nPRAGMA import_database('imp');",
+                    "INSTALL zipfs FROM community;\nPRAGMA import_database('imp');",
                 ),
             ],
         );
@@ -3347,12 +3347,12 @@ mod extension_tests {
             ". arc does not read the SQL a step builds or writes while it runs, for an extension that SQL installs; running it anyway ({VETTED_EXTENSIONS_DOC})"
         );
         assert_eq!(
-            check_extension_installs(&sql, Some(&v("1.5.4")))
+            check_extension_installs(&sql, Some(&v("2.0.1")))
                 .unwrap()
                 .warnings,
             vec![
                 format!(
-                    "mlpack is vetted on DuckDB v1.5.6, and this engine is DuckDB v1.5.4; running it anyway ({VETTED_EXTENSIONS_DOC})"
+                    "zipfs is vetted on DuckDB v2.0.0, and this engine is DuckDB v2.0.1; running it anyway ({VETTED_EXTENSIONS_DOC})"
                 ),
                 format!(
                     "step 'a' (s0.sql) can run or write SQL that is not in its file: IMPORT DATABASE on line 1, query() on line 2, .duckdbrc on line 3{tail}"
@@ -3381,7 +3381,7 @@ mod extension_tests {
             ],
         );
         assert_eq!(
-            refusals(check_extension_installs(&sql, Some(&v("1.5.6")))),
+            refusals(check_extension_installs(&sql, Some(&v("2.0.0")))),
             vec![
                 "step 'b' (s1.sql, line 1) installs anofox_forecast from the community registry, and anofox_forecast is not on the vetted list"
             ]
@@ -3419,7 +3419,7 @@ mod extension_tests {
 
     #[test]
     fn a_plain_extension_name_is_letters_digits_and_underscores() {
-        for name in ["mlpack", "splink_udfs", "h3", "us_address_standardizer"] {
+        for name in ["zipfs", "splink_udfs", "h3", "us_address_standardizer"] {
             assert!(is_plain_extension_name(name), "{name}");
         }
         for name in ["", "x'y", "a.b", "a b", "a;b", "a-b", "ä"] {
@@ -3455,7 +3455,7 @@ mod extension_tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), names.len(), "a name appears twice: {names:?}");
-        assert!(names.contains(&"mlpack"), "{names:?}");
+        assert!(names.contains(&"zipfs"), "{names:?}");
         assert!(!names.contains(&"anofox_forecast"), "{names:?}");
         assert!(
             vetted_extensions()
@@ -3474,7 +3474,7 @@ mod extension_tests {
                 ("step 'a'", "INSTALL anofox_forecast FROM community;"),
                 (
                     "hook on_init 'h'",
-                    "SELECT 1;\nINSTALL mlpack FROM core_nightly;\nINSTALL mlpack FROM 'https://x.org/e';",
+                    "SELECT 1;\nINSTALL zipfs FROM core_nightly;\nINSTALL zipfs FROM 'https://x.org/e';",
                 ),
                 (
                     "step 'b'",
@@ -3483,11 +3483,11 @@ mod extension_tests {
             ],
         );
         assert_eq!(
-            refusals(check_extension_installs(&sql, Some(&v("1.5.6")))),
+            refusals(check_extension_installs(&sql, Some(&v("2.0.0")))),
             vec![
                 "step 'a' (s0.sql, line 1) installs anofox_forecast from the community registry, and anofox_forecast is not on the vetted list",
-                "hook on_init 'h' (s1.sql, line 2) installs mlpack from the repository core_nightly; a community extension is installed FROM community",
-                "hook on_init 'h' (s1.sql, line 3) installs mlpack from the address 'https://x.org/e'",
+                "hook on_init 'h' (s1.sql, line 2) installs zipfs from the repository core_nightly; a community extension is installed FROM community",
+                "hook on_init 'h' (s1.sql, line 3) installs zipfs from the address 'https://x.org/e'",
                 "step 'b' (s2.sql, line 1) installs the extension at '/tmp/m.duckdb_extension'",
                 "step 'b' (s2.sql, line 2) names the setting custom_extension_repository, which moves where DuckDB installs an extension from",
                 "step 'b' (s2.sql, line 3) names enable_peg_parser, which switches DuckDB to a second parser whose comments and strings arc does not read",
@@ -3501,12 +3501,12 @@ mod extension_tests {
         let sql = sources(
             dir.path(),
             &[
-                ("step 'a'", "INSTALL mlpack FROM community;"),
+                ("step 'a'", "INSTALL zipfs FROM community;"),
                 ("step 'b'", "INSTALL anofox_forecast FROM community;"),
             ],
         );
         assert_eq!(
-            refusals(check_extension_installs(&sql, Some(&v("1.5.4")))).len(),
+            refusals(check_extension_installs(&sql, Some(&v("2.0.1")))).len(),
             1
         );
     }
@@ -3518,7 +3518,7 @@ mod extension_tests {
             dir.path(),
             &[(
                 "step 'a'",
-                "INSTALL spatial FROM core; INSTALL excel; LOAD mlpack;",
+                "INSTALL spatial FROM core; INSTALL excel; LOAD zipfs;",
             )],
         );
         sql.push(ProtocolSql {
@@ -3528,7 +3528,7 @@ mod extension_tests {
             path: dir.path().join("later.sql"),
         });
         assert_eq!(
-            check_extension_installs(&sql, Some(&v("1.5.4")))
+            check_extension_installs(&sql, Some(&v("2.0.1")))
                 .unwrap()
                 .warnings,
             Vec::<String>::new()
@@ -3541,26 +3541,26 @@ mod extension_tests {
         let sql = sources(
             dir.path(),
             &[
-                ("step 'a'", "INSTALL mlpack FROM community; LOAD mlpack;"),
-                ("step 'b'", "FORCE INSTALL mlpack FROM community;"),
+                ("step 'a'", "INSTALL zipfs FROM community; LOAD zipfs;"),
+                ("step 'b'", "FORCE INSTALL zipfs FROM community;"),
                 ("step 'c'", "INSTALL h3 FROM community;"),
             ],
         );
         assert_eq!(
-            check_extension_installs(&sql, Some(&v("1.5.4")))
+            check_extension_installs(&sql, Some(&v("2.0.1")))
                 .unwrap()
                 .warnings,
             vec![
                 format!(
-                    "mlpack is vetted on DuckDB v1.5.6, and this engine is DuckDB v1.5.4; running it anyway ({VETTED_EXTENSIONS_DOC})"
+                    "zipfs is vetted on DuckDB v2.0.0, and this engine is DuckDB v2.0.1; running it anyway ({VETTED_EXTENSIONS_DOC})"
                 ),
                 format!(
-                    "h3 is vetted on DuckDB v1.5.6, and this engine is DuckDB v1.5.4; running it anyway ({VETTED_EXTENSIONS_DOC})"
+                    "h3 is vetted on DuckDB v2.0.0, and this engine is DuckDB v2.0.1; running it anyway ({VETTED_EXTENSIONS_DOC})"
                 ),
             ]
         );
         assert_eq!(
-            check_extension_installs(&sql, Some(&v("1.5.6")))
+            check_extension_installs(&sql, Some(&v("2.0.0")))
                 .unwrap()
                 .warnings,
             Vec::<String>::new(),
@@ -3569,7 +3569,7 @@ mod extension_tests {
         assert_eq!(
             check_extension_installs(&sql[..1], None).unwrap().warnings,
             vec![format!(
-                "mlpack is vetted on DuckDB v1.5.6, and arc could not read this engine's version; running it anyway ({VETTED_EXTENSIONS_DOC})"
+                "zipfs is vetted on DuckDB v2.0.0, and arc could not read this engine's version; running it anyway ({VETTED_EXTENSIONS_DOC})"
             )]
         );
     }
@@ -3619,13 +3619,13 @@ mod extension_tests {
     #[test]
     fn the_report_reads_each_tagged_answer_and_skips_the_rest() {
         let answers: Vec<String> = [
-            "version\tv1.5.4",
+            "version\tv2.0.1",
             "platform\tlinux_amd64",
-            "extension\tmlpack\tcommunity\tv1.5.6\t/x/mlpack.duckdb_extension",
+            "extension\tzipfs\tcommunity\tv2.0.0\t/x/zipfs.duckdb_extension",
             // DuckDB gives no repository and no version for a file with no `.info` beside it,
             // and a tab in the path stays in it.
             "extension\thttpfs\t\t\t/x/a\tb/httpfs.duckdb_extension",
-            "extension\tjson\tcore\tv1.5.4\t",
+            "extension\tjson\tcore\tv2.0.1\t",
             // Too few fields, an answer to another question, and a tag arc does not ask for.
             "extension\tshort\tcore",
             "linux_amd64",
@@ -3634,15 +3634,15 @@ mod extension_tests {
         .map(String::from)
         .to_vec();
         let report = read_report(&answers);
-        assert_eq!(report.version.as_deref(), Some("v1.5.4"));
+        assert_eq!(report.version.as_deref(), Some("v2.0.1"));
         assert_eq!(report.platform.as_deref(), Some("linux_amd64"));
         let expected: HashMap<String, ReportedExtension> = [
             (
-                "mlpack",
+                "zipfs",
                 ReportedExtension {
-                    path: Some("/x/mlpack.duckdb_extension".into()),
+                    path: Some("/x/zipfs.duckdb_extension".into()),
                     repository: Some("community".into()),
-                    version: Some("v1.5.6".into()),
+                    version: Some("v2.0.0".into()),
                 },
             ),
             (
@@ -3658,7 +3658,7 @@ mod extension_tests {
                 ReportedExtension {
                     path: None,
                     repository: Some("core".into()),
-                    version: Some("v1.5.4".into()),
+                    version: Some("v2.0.1".into()),
                 },
             ),
         ]
@@ -3679,30 +3679,30 @@ mod extension_tests {
             &[
                 (
                     "step 'a'",
-                    "INSTALL httpfs; INSTALL mlpack FROM community; INSTALL httpfs FROM core;",
+                    "INSTALL httpfs; INSTALL zipfs FROM community; INSTALL httpfs FROM core;",
                 ),
                 (
                     "step 'b'",
-                    "FORCE INSTALL mlpack FROM community; INSTALL spatial; LOAD json;",
+                    "FORCE INSTALL zipfs FROM community; INSTALL spatial; LOAD json;",
                 ),
             ],
         );
-        let installs = check_extension_installs(&sql, Some(&v("1.5.6"))).unwrap();
-        assert_eq!(installs.recorded, vec!["httpfs", "mlpack", "spatial"]);
-        assert_eq!(installs.installed, vec!["mlpack"]);
+        let installs = check_extension_installs(&sql, Some(&v("2.0.0"))).unwrap();
+        assert_eq!(installs.recorded, vec!["httpfs", "zipfs", "spatial"]);
+        assert_eq!(installs.installed, vec!["zipfs"]);
     }
 
     #[test]
     fn the_check_before_a_file_runs_records_what_it_installs_that_no_check_found() {
         let dir = tempfile::tempdir().unwrap();
         let before = sources(dir.path(), &[("step 'a'", "INSTALL httpfs;")]);
-        let installs = check_extension_installs(&before, Some(&v("1.5.6"))).unwrap();
+        let installs = check_extension_installs(&before, Some(&v("2.0.0"))).unwrap();
         let mut recheck = ExtensionRecheck::new(
             installs,
             Vec::new(),
             Vec::new(),
             &ExtensionPins::new(),
-            Some(&v("1.5.6")),
+            Some(&v("2.0.0")),
         );
         assert_eq!(recheck.recorded(), ["httpfs"]);
         let engine = mock::MockEngine::new();
@@ -3719,11 +3719,11 @@ mod extension_tests {
             dir.path(),
             &[(
                 "step 'c'",
-                "INSTALL httpfs; INSTALL excel; INSTALL mlpack FROM community;",
+                "INSTALL httpfs; INSTALL excel; INSTALL zipfs FROM community;",
             )],
         );
         recheck.check(&engine, &passed[0]).unwrap();
-        assert_eq!(recheck.recorded(), ["httpfs", "excel", "mlpack"]);
+        assert_eq!(recheck.recorded(), ["httpfs", "excel", "zipfs"]);
     }
 
     // ---- Which extensions a SQL step's own process loaded ----
@@ -3740,21 +3740,21 @@ mod extension_tests {
     fn the_extensions_a_run_loaded_are_each_named_once_with_what_the_first_report_gave() {
         let mut loaded = LoadedExtensions::default();
         loaded.add(vec![
-            ("fts".into(), reported("core", "v1.5.6", "/a/fts")),
+            ("fts".into(), reported("core", "v2.0.0", "/a/fts")),
             ("json".into(), reported("", "", BUILT_IN)),
         ]);
         loaded.add(vec![
-            ("httpfs".into(), reported("core", "v1.5.6", "/a/httpfs")),
+            ("httpfs".into(), reported("core", "v2.0.0", "/a/httpfs")),
             ("fts".into(), reported("community", "0000000", "/b/fts")),
         ]);
         assert_eq!(
             loaded.iter().cloned().collect::<Vec<_>>(),
             vec![
-                ("fts".to_string(), reported("core", "v1.5.6", "/a/fts")),
+                ("fts".to_string(), reported("core", "v2.0.0", "/a/fts")),
                 ("json".to_string(), reported("", "", BUILT_IN)),
                 (
                     "httpfs".to_string(),
-                    reported("core", "v1.5.6", "/a/httpfs")
+                    reported("core", "v2.0.0", "/a/httpfs")
                 ),
             ]
         );
@@ -3762,10 +3762,10 @@ mod extension_tests {
 
     #[test]
     fn the_answer_a_steps_process_writes_is_read_in_order_and_nothing_else_is() {
-        let answer = "arc-answer:extension\tfts\tcore\tv1.5.6\t/x/fts.duckdb_extension\n\
+        let answer = "arc-answer:extension\tfts\tcore\tv2.0.0\t/x/fts.duckdb_extension\n\
                       arc-answer:extension\tparquet\t\t\t(BUILT-IN)\n\
                       extension\tunmarked\tcore\tv1\t/x/unmarked\n\
-                      arc-answer:version\tv1.5.6\n\
+                      arc-answer:version\tv2.0.0\n\
                       arc-answer:extension\tshort\tcore\n\
                       arc-answer:extension\thttpfs\t\t\t/x/a\tb\n";
         assert_eq!(
@@ -3773,7 +3773,7 @@ mod extension_tests {
             vec![
                 (
                     "fts".to_string(),
-                    reported("core", "v1.5.6", "/x/fts.duckdb_extension")
+                    reported("core", "v2.0.0", "/x/fts.duckdb_extension")
                 ),
                 ("parquet".to_string(), reported("", "", BUILT_IN)),
                 ("httpfs".to_string(), reported("", "", "/x/a\tb")),

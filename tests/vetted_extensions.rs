@@ -196,7 +196,7 @@ impl Protocol {
 }
 
 /// The version every entry on the list names today, so a run on it draws no warning.
-const VETTED_ON: &str = "1.5.6";
+const VETTED_ON: &str = "2.0.0";
 
 /// What each warning about SQL a step builds or writes while it runs holds, and no other
 /// message arc prints.
@@ -265,11 +265,11 @@ fn any_letter_case_and_force_install_are_refused_as_install_is() {
 fn an_install_from_an_address_or_another_repository_is_refused_by_name() {
     for (sql, named) in [
         (
-            "INSTALL mlpack FROM 'https://example.org/ext';",
+            "INSTALL zipfs FROM 'https://example.org/ext';",
             "from the address 'https://example.org/ext'",
         ),
         (
-            "INSTALL mlpack FROM core_nightly;",
+            "INSTALL zipfs FROM core_nightly;",
             "from the repository core_nightly",
         ),
     ] {
@@ -287,12 +287,12 @@ fn an_install_from_an_address_or_another_repository_is_refused_by_name() {
 fn a_repository_setting_and_an_install_by_path_are_refused_by_name() {
     for (sql, named) in [
         (
-            "SET custom_extension_repository = '/tmp/ext'; INSTALL mlpack;",
+            "SET custom_extension_repository = '/tmp/ext'; INSTALL zipfs;",
             "names the setting custom_extension_repository",
         ),
         (
-            "INSTALL '/tmp/ext/mlpack.duckdb_extension';",
-            "installs the extension at '/tmp/ext/mlpack.duckdb_extension'",
+            "INSTALL '/tmp/ext/zipfs.duckdb_extension';",
+            "installs the extension at '/tmp/ext/zipfs.duckdb_extension'",
         ),
     ] {
         let run = Protocol::steps(&[("s", sql)]).run(VETTED_ON);
@@ -386,7 +386,7 @@ fn a_step_arc_cannot_parse_is_checked_too() {
     // The same step with a vetted install: arc reports it cannot parse the step, and runs it.
     let vetted = Protocol::steps(&[(
         "s",
-        &format!("INSTALL mlpack FROM community;\n{unparseable}"),
+        &format!("INSTALL zipfs FROM community;\n{unparseable}"),
     )])
     .run(VETTED_ON);
     assert!(
@@ -417,13 +417,18 @@ fn a_step_arc_cannot_parse_is_checked_too() {
 #[test]
 fn a_vetted_community_install_starts_its_step() {
     let run =
-        Protocol::steps(&[("s", "INSTALL mlpack FROM community; LOAD mlpack;\n")]).run(VETTED_ON);
+        Protocol::steps(&[("s", "INSTALL zipfs FROM community; LOAD zipfs;\n")]).run(VETTED_ON);
     run.assert_not_refused("vetted", &["s.sql"]);
 }
 
 #[test]
 fn each_extension_the_proofs_added_starts_its_step() {
-    for name in ["finetype", "minijinja", "onager", "splink_udfs"] {
+    for name in [
+        "finetype",
+        "webbed",
+        "us_address_standardizer",
+        "splink_udfs",
+    ] {
         let sql = format!("INSTALL {name} FROM community; LOAD {name};\n");
         Protocol::steps(&[("s", &sql)])
             .run(VETTED_ON)
@@ -449,7 +454,7 @@ fn an_install_from_duckdbs_own_repository_and_a_load_are_not_checked() {
     for sql in [
         "INSTALL excel;",
         "INSTALL spatial FROM core;",
-        "LOAD mlpack;",
+        "LOAD zipfs;",
     ] {
         Protocol::steps(&[("s", sql)])
             .run(VETTED_ON)
@@ -460,19 +465,19 @@ fn an_install_from_duckdbs_own_repository_and_a_load_are_not_checked() {
 #[test]
 fn a_vetted_extension_on_a_version_its_entry_does_not_name_warns_once_and_runs() {
     let run = Protocol::steps(&[
-        ("a", "INSTALL mlpack FROM community;\n"),
-        ("b", "FORCE INSTALL mlpack FROM community; LOAD mlpack;\n"),
+        ("a", "INSTALL zipfs FROM community;\n"),
+        ("b", "FORCE INSTALL zipfs FROM community; LOAD zipfs;\n"),
     ])
-    .run("1.5.4");
+    .run("2.0.1");
     // The warning about the version the entry names; the one about a missing pin is
     // another's.
     let warnings: Vec<&str> = run
         .stderr
         .lines()
-        .filter(|l| l.contains("warning:") && l.contains("mlpack") && !l.contains("no pin"))
+        .filter(|l| l.contains("warning:") && l.contains("zipfs") && !l.contains("no pin"))
         .collect();
     assert_eq!(warnings.len(), 1, "one warning:\n{}", run.stderr);
-    for needle in ["mlpack", "v1.5.4", "v1.5.6"] {
+    for needle in ["zipfs", "v2.0.1", "v2.0.0"] {
         assert!(
             warnings[0].contains(needle),
             "the warning should name {needle:?}: {}",
@@ -512,12 +517,12 @@ fn a_protocol_with_no_install_prints_what_it_printed_before() {
             ),
             (
                 "models/transform.sql".into(),
-                "-- a comment\nCREATE TABLE b AS SELECT x FROM a;\nLOAD mlpack;\n",
+                "-- a comment\nCREATE TABLE b AS SELECT x FROM a;\nLOAD zipfs;\n",
             ),
             ("models/setup.sql".into(), "SELECT 1;\n"),
         ],
     );
-    let run = protocol.run("1.5.4");
+    let run = protocol.run("2.0.1");
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(run.stderr, "", "nothing on stderr");
     assert_eq!(run.stdout, BEFORE_STDOUT);
@@ -802,14 +807,14 @@ fn a_protocol_with_none_of_the_shapes_prints_what_it_printed_before() {
 const PLATFORM: &str = "linux_amd64";
 
 /// The step every Protocol below runs first.
-const INSTALLS_MLPACK: &str = "INSTALL mlpack FROM community; LOAD mlpack;\n";
+const INSTALLS_ZIPFS: &str = "INSTALL zipfs FROM community; LOAD zipfs;\n";
 
-/// What the fake engine does with an `INSTALL mlpack FROM community`, and with the
-/// `FORCE INSTALL mlpack FROM community; LOAD mlpack;` of `arc upgrade`.
+/// What the fake engine does with an `INSTALL zipfs FROM community`, and with the
+/// `FORCE INSTALL zipfs FROM community; LOAD zipfs;` of `arc upgrade`.
 #[derive(Clone, Copy)]
 enum Registry {
     /// Copies the served build in, as DuckDB fetches it, and names the installed file: an
-    /// `INSTALL` when mlpack is not installed, and a `FORCE INSTALL` whether or not it is.
+    /// `INSTALL` when zipfs is not installed, and a `FORCE INSTALL` whether or not it is.
     Serves,
     /// Exits 1, as DuckDB does when the registry serves nothing for the name.
     Fails,
@@ -820,8 +825,8 @@ enum Registry {
     LoadFails,
 }
 
-/// A Protocol whose SQL installs mlpack, on a fake DuckDB v1.5.6 that keeps its extensions
-/// in `<root>/extensions/v1.5.6/linux_amd64` and answers arc's platform and install calls
+/// A Protocol whose SQL installs zipfs, on a fake DuckDB v2.0.0 that keeps its extensions
+/// in `<root>/extensions/v2.0.0/linux_amd64` and answers arc's platform and install calls
 /// as the DuckDB CLI does, each value after `arc-answer:`.
 struct Pinned {
     protocol: Protocol,
@@ -829,21 +834,18 @@ struct Pinned {
 
 impl Pinned {
     /// `arcform.yaml` holding the steps and hooks in `yaml`, then `extensions`, with
-    /// `models/s.sql` installing mlpack and `models/setup.sql` selecting 1.
+    /// `models/s.sql` installing zipfs and `models/setup.sql` selecting 1.
     fn new(yaml: &str, extensions: &str) -> Self {
         let protocol = Protocol::with(
             &format!("name: pinned\ndb: pinned.duckdb\n{yaml}{extensions}"),
             &[
-                ("models/s.sql".into(), INSTALLS_MLPACK),
+                ("models/s.sql".into(), INSTALLS_ZIPFS),
                 ("models/setup.sql".into(), "SELECT 1;\n"),
             ],
         );
         fs::create_dir_all(protocol.root.path().join("registry")).unwrap();
         fs::write(
-            protocol
-                .root
-                .path()
-                .join("registry/mlpack.duckdb_extension"),
+            protocol.root.path().join("registry/zipfs.duckdb_extension"),
             SERVED,
         )
         .unwrap();
@@ -855,17 +857,17 @@ impl Pinned {
         fs::write(self.protocol.project().join("arcform.yaml"), yaml).unwrap();
     }
 
-    /// One SQL step installing mlpack, pinned to `pin` for v1.5.6 on [`PLATFORM`].
+    /// One SQL step installing zipfs, pinned to `pin` for v2.0.0 on [`PLATFORM`].
     fn step(pin: &str) -> Self {
         Self::new(
             "steps:\n  - name: s\n    sql: models/s.sql\n",
-            &pin_yaml("v1.5.6", PLATFORM, pin),
+            &pin_yaml("v2.0.0", PLATFORM, pin),
         )
     }
 
     fn installed(&self) -> PathBuf {
         self.protocol.root.path().join(format!(
-            "extensions/v1.5.6/{PLATFORM}/mlpack.duckdb_extension"
+            "extensions/v2.0.0/{PLATFORM}/zipfs.duckdb_extension"
         ))
     }
 
@@ -873,7 +875,7 @@ impl Pinned {
         self.protocol
             .root
             .path()
-            .join("registry/mlpack.duckdb_extension")
+            .join("registry/zipfs.duckdb_extension")
     }
 
     /// Put the served build where DuckDB keeps it, as an earlier install would.
@@ -918,9 +920,9 @@ impl Pinned {
         self.arc(registry, &["upgrade", name])
     }
 
-    /// `arc <args>` on the fake DuckDB v1.5.6, whose registry does as `registry` says.
+    /// `arc <args>` on the fake DuckDB v2.0.0, whose registry does as `registry` says.
     fn arc(&self, registry: Registry, args: &[&str]) -> Outcome {
-        self.arc_on_version(registry, "1.5.6", args)
+        self.arc_on_version(registry, "2.0.0", args)
     }
 
     /// `arc <args>` on a fake DuckDB that reports `version`, keeping its extensions where
@@ -957,17 +959,17 @@ impl Pinned {
              --version) echo 'v{version} (fake) 0000000000' ;;\n\
              -noheader) case \"$4\" in\n\
              *pragma_platform*) echo 'arc-answer:{PLATFORM}' ;;\n\
-             'INSTALL mlpack FROM community;'*) {install} ;;\n\
-             'FORCE INSTALL mlpack FROM community; LOAD mlpack;'*) {force} ;;\n\
+             'INSTALL zipfs FROM community;'*) {install} ;;\n\
+             'FORCE INSTALL zipfs FROM community; LOAD zipfs;'*) {force} ;;\n\
              esac ;;\n\
              esac\n"
         )
     }
 }
 
-/// `extensions:` pinning mlpack to `pin` for `version` on `platform`.
+/// `extensions:` pinning zipfs to `pin` for `version` on `platform`.
 fn pin_yaml(version: &str, platform: &str, pin: &str) -> String {
-    format!("extensions:\n  mlpack:\n    {version}:\n      {platform}: {pin}\n")
+    format!("extensions:\n  zipfs:\n    {version}:\n      {platform}: {pin}\n")
 }
 
 fn sha256(path: &Path) -> String {
@@ -988,16 +990,16 @@ fn served_pin() -> String {
 const OTHER_PIN: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 impl Outcome {
-    /// The warnings naming mlpack.
-    fn mlpack_warnings(&self) -> Vec<&str> {
+    /// The warnings naming zipfs.
+    fn zipfs_warnings(&self) -> Vec<&str> {
         self.stderr
             .lines()
-            .filter(|l| l.contains("warning:") && l.contains("mlpack"))
+            .filter(|l| l.contains("warning:") && l.contains("zipfs"))
             .collect()
     }
 
     /// The engine calls with the SQL arc sent in place of each `-c` call's text: `platform`,
-    /// `install mlpack`, or `force install and load mlpack`. The question for the run record
+    /// `install zipfs`, or `force install and load zipfs`. The question for the run record
     /// that [`is_report`] names is left out: it comes after the last step and hook, and
     /// installs nothing.
     fn calls(&self) -> Vec<String> {
@@ -1007,10 +1009,10 @@ impl Outcome {
             .map(|call| {
                 if call.contains("pragma_platform") {
                     "platform".to_string()
-                } else if call.contains("FORCE INSTALL mlpack FROM community; LOAD mlpack;") {
-                    "force install and load mlpack".to_string()
-                } else if call.contains("INSTALL mlpack FROM community") {
-                    "install mlpack".to_string()
+                } else if call.contains("FORCE INSTALL zipfs FROM community; LOAD zipfs;") {
+                    "force install and load zipfs".to_string()
+                } else if call.contains("INSTALL zipfs FROM community") {
+                    "install zipfs".to_string()
                 } else if let Some(sql) = call.split(" -f ").nth(1) {
                     sql.rsplit('/').next().unwrap().to_string()
                 } else {
@@ -1034,7 +1036,7 @@ fn a_pinned_extension_equal_to_its_pin_runs_and_changes_nothing() {
         let run = pinned.run(Registry::Serves, &[]);
         assert_eq!(run.code, Some(0), "[{label}] {}", run.stderr);
         assert!(run.stdout.contains(ran), "[{label}] {}", run.stdout);
-        assert_eq!(run.mlpack_warnings(), Vec::<&str>::new(), "[{label}]");
+        assert_eq!(run.zipfs_warnings(), Vec::<&str>::new(), "[{label}]");
         assert_eq!(
             pinned.manifest(),
             manifest,
@@ -1053,7 +1055,7 @@ fn a_pinned_extension_not_installed_is_installed_and_compared_before_any_step_or
     let yaml = "steps:\n  - name: s\n    sql: models/s.sql\nhooks:\n  on_init:\n    name: setup\n    sql: models/setup.sql\n";
     let pin = served_pin();
 
-    let equal = Pinned::new(yaml, &pin_yaml("v1.5.6", PLATFORM, &pin));
+    let equal = Pinned::new(yaml, &pin_yaml("v2.0.0", PLATFORM, &pin));
     assert!(!equal.installed().exists());
     let run = equal.run(Registry::Serves, &[]);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
@@ -1062,7 +1064,7 @@ fn a_pinned_extension_not_installed_is_installed_and_compared_before_any_step_or
         vec![
             "--version",
             "platform",
-            "install mlpack",
+            "install zipfs",
             "setup.sql",
             "s.sql"
         ],
@@ -1074,15 +1076,15 @@ fn a_pinned_extension_not_installed_is_installed_and_compared_before_any_step_or
         "arc installed the served build"
     );
 
-    let differs = Pinned::new(yaml, &pin_yaml("v1.5.6", PLATFORM, OTHER_PIN));
+    let differs = Pinned::new(yaml, &pin_yaml("v2.0.0", PLATFORM, OTHER_PIN));
     let run = differs.run(Registry::Serves, &[]);
     assert_eq!(run.code, Some(1), "{}", run.stderr);
     assert_eq!(
         run.calls(),
-        vec!["--version", "platform", "install mlpack"],
+        vec!["--version", "platform", "install zipfs"],
         "no step or hook reached the engine"
     );
-    for needle in ["mlpack", OTHER_PIN, &pin, "`arc upgrade mlpack`"] {
+    for needle in ["zipfs", OTHER_PIN, &pin, "`arc upgrade zipfs`"] {
         assert!(
             run.stderr.contains(needle),
             "the refusal should name {needle:?}:\n{}",
@@ -1096,7 +1098,7 @@ fn a_changed_installed_file_refuses_a_fresh_run_and_a_forced_one_before_on_init(
     let pin = served_pin();
     let pinned = Pinned::new(
         "steps:\n  - name: s\n    sql: models/s.sql\nhooks:\n  on_init:\n    name: mark\n    command: touch init_ran\n",
-        &pin_yaml("v1.5.6", PLATFORM, &pin),
+        &pin_yaml("v2.0.0", PLATFORM, &pin),
     );
     pinned.install();
     let first = pinned.run(Registry::Serves, &[]);
@@ -1117,7 +1119,7 @@ fn a_changed_installed_file_refuses_a_fresh_run_and_a_forced_one_before_on_init(
         let run = pinned.run(Registry::Serves, args);
         assert_eq!(run.code, Some(1), "{args:?}: {}", run.stderr);
         let installed = pinned.installed().display().to_string();
-        for needle in ["mlpack", "v1.5.6", PLATFORM, &pin, &found, &installed] {
+        for needle in ["zipfs", "v2.0.0", PLATFORM, &pin, &found, &installed] {
             assert!(
                 run.stderr.contains(needle),
                 "{args:?}: the refusal should name {needle:?}:\n{}",
@@ -1145,7 +1147,7 @@ fn a_pinned_extension_duckdb_cannot_install_or_name_is_refused_and_not_warned() 
         let pinned = Pinned::step(OTHER_PIN);
         let run = pinned.run(registry, &[]);
         assert_eq!(run.code, Some(1), "{}", run.stderr);
-        assert!(run.stderr.contains("mlpack"), "{}", run.stderr);
+        assert!(run.stderr.contains("zipfs"), "{}", run.stderr);
         assert!(
             run.stderr.contains("no step or hook was run"),
             "{}",
@@ -1157,7 +1159,7 @@ fn a_pinned_extension_duckdb_cannot_install_or_name_is_refused_and_not_warned() 
             run.stderr
         );
         assert_eq!(
-            run.mlpack_warnings(),
+            run.zipfs_warnings(),
             Vec::<&str>::new(),
             "no warning instead"
         );
@@ -1179,20 +1181,20 @@ fn an_extension_with_no_pin_for_this_engine_warns_once_and_runs() {
         ("no extensions: key", String::new()),
         (
             "another version alone",
-            pin_yaml("v1.5.4", PLATFORM, OTHER_PIN),
+            pin_yaml("v2.0.1", PLATFORM, OTHER_PIN),
         ),
         (
             "another platform alone",
-            pin_yaml("v1.5.6", "osx_arm64", OTHER_PIN),
+            pin_yaml("v2.0.0", "osx_arm64", OTHER_PIN),
         ),
     ] {
         let pinned = Pinned::new("steps:\n  - name: s\n    sql: models/s.sql\n", &extensions);
         let manifest = pinned.manifest();
         let run = pinned.run(Registry::Serves, &[]);
         assert_eq!(run.code, Some(0), "[{label}] {}", run.stderr);
-        let warnings = run.mlpack_warnings();
+        let warnings = run.zipfs_warnings();
         assert_eq!(warnings.len(), 1, "[{label}] one warning:\n{}", run.stderr);
-        for needle in ["extensions: key of arcform.yaml", "`arc upgrade mlpack`"] {
+        for needle in ["extensions: key of arcform.yaml", "`arc upgrade zipfs`"] {
             assert!(
                 warnings[0].contains(needle),
                 "[{label}] the warning should name {needle:?}: {}",
@@ -1201,7 +1203,7 @@ fn an_extension_with_no_pin_for_this_engine_warns_once_and_runs() {
         }
         assert_eq!(run.started(), vec!["s.sql"], "[{label}]");
         assert!(
-            !run.calls().contains(&"install mlpack".to_string()),
+            !run.calls().contains(&"install zipfs".to_string()),
             "[{label}] arc installs nothing it has no pin for"
         );
         assert_eq!(
@@ -1217,13 +1219,13 @@ fn a_platform_duckdb_will_not_report_refuses_the_run_with_duckdbs_own_message() 
     let pinned = Pinned::step(&served_pin());
     let run = pinned.protocol.run_on(
         "case \"$1\" in\n\
-         --version) echo 'v1.5.6 (fake) 0000000000' ;;\n\
+         --version) echo 'v2.0.0 (fake) 0000000000' ;;\n\
          -noheader) echo 'Catalog Error: no pragma_platform here' >&2; exit 1 ;;\n\
          esac\n",
         &[],
     );
     assert_eq!(run.code, Some(1), "{}", run.stderr);
-    for needle in ["mlpack", "Catalog Error: no pragma_platform here"] {
+    for needle in ["zipfs", "Catalog Error: no pragma_platform here"] {
         assert!(
             run.stderr.contains(needle),
             "the refusal should name {needle:?}:\n{}",
@@ -1242,7 +1244,7 @@ fn a_step_that_replaces_a_pinned_file_fails_the_run_when_it_ends() {
         format!(
             "name: pinned\ndb: pinned.duckdb\nsteps:\n  - name: s\n    sql: models/s.sql\n  - name: replace\n    command: \"printf x >> '{}'{exit}\"\n{}",
             pinned.installed().display(),
-            pin_yaml("v1.5.6", PLATFORM, &pin)
+            pin_yaml("v2.0.0", PLATFORM, &pin)
         )
     };
     pinned.write_manifest(&replace(""));
@@ -1255,7 +1257,7 @@ fn a_step_that_replaces_a_pinned_file_fails_the_run_when_it_ends() {
         run.stdout
     );
     let found = sha256(&pinned.installed());
-    for needle in ["mlpack", "changed during the run", &pin, &found] {
+    for needle in ["zipfs", "changed during the run", &pin, &found] {
         assert!(
             run.stderr.contains(needle),
             "the failure should name {needle:?}:\n{}",
@@ -1314,7 +1316,7 @@ fn a_step_that_replaces_a_pinned_file_fails_the_run_when_it_ends() {
     pinned.write_manifest(&format!(
         "name: pinned\ndb: pinned.duckdb\nsteps:\n  - name: s\n    sql: models/s.sql\nhooks:\n  on_init:\n    name: replace\n    command: \"printf x >> '{}'; exit 3\"\n{}",
         pinned.installed().display(),
-        pin_yaml("v1.5.6", PLATFORM, &pin)
+        pin_yaml("v2.0.0", PLATFORM, &pin)
     ));
     let run = pinned.run(Registry::Serves, &[]);
     assert_eq!(run.code, Some(2), "{}", run.stderr);
@@ -1390,7 +1392,7 @@ fn the_real_duckdb_answers_the_pin_check_from_the_file_it_holds() {
         "SELECT platform FROM pragma_platform();",
     ]);
     let installed = home.path().join(format!(
-        ".duckdb/extensions/{version}/{platform}/mlpack.duckdb_extension"
+        ".duckdb/extensions/{version}/{platform}/zipfs.duckdb_extension"
     ));
     fs::create_dir_all(installed.parent().unwrap()).unwrap();
     fs::write(&installed, b"not an extension").unwrap();
@@ -1402,7 +1404,7 @@ fn the_real_duckdb_answers_the_pin_check_from_the_file_it_holds() {
                 "name: real\nsteps:\n  - name: s\n    sql: models/s.sql\nhooks:\n  on_init:\n    name: mark\n    command: touch init_ran\n{}",
                 pin_yaml(&version, &platform, pin)
             ),
-            &[("models/s.sql".into(), "INSTALL mlpack FROM community;\n")],
+            &[("models/s.sql".into(), "INSTALL zipfs FROM community;\n")],
         );
         let out = Command::new(env!("CARGO_BIN_EXE_arc"))
             .current_dir(protocol.project())
@@ -1431,7 +1433,7 @@ fn the_real_duckdb_answers_the_pin_check_from_the_file_it_holds() {
     assert_eq!(code, Some(1), "{stderr}");
     let path = installed.display().to_string();
     for needle in [
-        "mlpack",
+        "zipfs",
         version.as_str(),
         platform.as_str(),
         OTHER_PIN,
@@ -1504,8 +1506,8 @@ fn steps_and_sql_hooks(steps: &[(&str, &str)]) -> Protocol {
 /// recorded by running that commit's binary on the same fake engine.
 const NO_REWRITE_BEFORE_STDERR: [&str; 3] = [
     "",
-    "\u{1b}[33mwarning:\u{1b}[39m mlpack is vetted on DuckDB v1.5.6, and this engine is DuckDB v1.5.4; running it anyway (https://github.com/meridian-online/arcform/blob/main/docs/VETTED_EXTENSIONS.md)\n\
-\u{1b}[33mwarning:\u{1b}[39m mlpack has no pin under the extensions: key of arcform.yaml (for DuckDB v1.5.4), so arc runs whichever build DuckDB installs; `arc upgrade mlpack` pins the build the community registry serves (https://github.com/meridian-online/arcform/blob/main/docs/VETTED_EXTENSIONS.md)\n",
+    "\u{1b}[33mwarning:\u{1b}[39m zipfs is vetted on DuckDB v2.0.0, and this engine is DuckDB v2.0.1; running it anyway (https://github.com/meridian-online/arcform/blob/main/docs/VETTED_EXTENSIONS.md)\n\
+\u{1b}[33mwarning:\u{1b}[39m zipfs has no pin under the extensions: key of arcform.yaml (for DuckDB v2.0.1), so arc runs whichever build DuckDB installs; `arc upgrade zipfs` pins the build the community registry serves (https://github.com/meridian-online/arcform/blob/main/docs/VETTED_EXTENSIONS.md)\n",
     "\u{1b}[33mwarning:\u{1b}[39m step 'b' (models/b.sql) can run or write SQL that is not in its file: IMPORT DATABASE on line 1. arc does not read the SQL a step builds or writes while it runs, for an extension that SQL installs; running it anyway (https://github.com/meridian-online/arcform/blob/main/docs/VETTED_EXTENSIONS.md)\n\
 \u{1b}[33mwarning:\u{1b}[39m could not parse models/b.sql: sql parser error: Expected: an SQL statement, found: IMPORT at Line: 1, Column: 1 — treating as opaque step\n",
 ];
@@ -1516,7 +1518,7 @@ const NO_REWRITE_BEFORE_STDERR: [&str; 3] = [
 const NO_REWRITE_BEFORE_CALLS: [&str; 8] = [
     "--version",
     "platform",
-    "install mlpack",
+    "install zipfs",
     "on_init.sql",
     "s.sql",
     "t.sql",
@@ -1538,10 +1540,10 @@ fn a_protocol_whose_steps_rewrite_no_sql_file_prints_what_it_printed_before() {
         (
             "a vetted extension on a version its entry does not name",
             steps_and_sql_hooks(&[
-                ("a", "INSTALL mlpack FROM community;\n"),
-                ("b", "FORCE INSTALL mlpack FROM community; LOAD mlpack;\n"),
+                ("a", "INSTALL zipfs FROM community;\n"),
+                ("b", "FORCE INSTALL zipfs FROM community; LOAD zipfs;\n"),
             ]),
-            "1.5.4",
+            "2.0.1",
         ),
         (
             "IMPORT DATABASE",
@@ -1572,11 +1574,11 @@ fn a_protocol_whose_steps_rewrite_no_sql_file_prints_what_it_printed_before() {
         &format!(
             "steps:\n  - name: s\n    sql: models/s.sql\n  - name: t\n    sql: models/t.sql\n{SQL_HOOKS}"
         ),
-        &pin_yaml("v1.5.6", PLATFORM, &served_pin()),
+        &pin_yaml("v2.0.0", PLATFORM, &served_pin()),
     );
     fs::write(
         pinned.protocol.project().join("models/t.sql"),
-        INSTALLS_MLPACK,
+        INSTALLS_ZIPFS,
     )
     .unwrap();
     for (path, sql) in sql_hook_files() {
@@ -1767,30 +1769,30 @@ fn a_file_written_where_there_was_none_is_checked_just_before_its_step_runs() {
     // A pinned extension first found in such a file is checked against its pin there.
     let pinned = Pinned::new(
         "steps:\n  - name: a\n    sql: models/a.sql\n  - name: b\n    sql: models/b.sql\n",
-        &pin_yaml("v1.5.6", PLATFORM, OTHER_PIN),
+        &pin_yaml("v2.0.0", PLATFORM, OTHER_PIN),
     );
     let project = pinned.protocol.project();
     fs::write(project.join("models/a.sql"), "SELECT 1;\n").unwrap();
     let b = project.join("models/b.sql");
     assert!(!b.exists());
     let writes_b = format!(
-        "case \"$3\" in */models/a.sql) printf 'INSTALL mlpack FROM community;\\n' > '{}' ;; esac\n",
+        "case \"$3\" in */models/a.sql) printf 'INSTALL zipfs FROM community;\\n' > '{}' ;; esac\n",
         b.display()
     );
     let run = pinned.protocol.arc_on(
         &format!(
             "{writes_b}{}",
-            pinned.fake_engine(Registry::Serves, "1.5.6")
+            pinned.fake_engine(Registry::Serves, "2.0.0")
         ),
         &["run"],
     );
     assert_eq!(run.code, Some(2), "{}", run.stderr);
     assert_eq!(
         run.calls(),
-        vec!["--version", "a.sql", "platform", "install mlpack"],
-        "mlpack was compared with its pin after a ran, and b did not reach the engine"
+        vec!["--version", "a.sql", "platform", "install zipfs"],
+        "zipfs was compared with its pin after a ran, and b did not reach the engine"
     );
-    for needle in ["step 'b'", "mlpack", OTHER_PIN, &served_pin()] {
+    for needle in ["step 'b'", "zipfs", OTHER_PIN, &served_pin()] {
         assert!(
             run.stderr.contains(needle),
             "the refusal should name {needle:?}:\n{}",
@@ -2016,10 +2018,16 @@ fn every_setting_duckdb_lists_that_moves_where_it_keeps_extensions_is_refused() 
         .filter(|name| !name.is_empty())
         .map(str::to_string)
         .collect();
+    // DuckDB 2.0 deprecates `extension_directory` and no longer lists it, though it still
+    // sets it, so it is checked here by name beside the settings DuckDB lists.
     assert!(
-        listed.iter().any(|name| name == "extension_directory"),
-        "DuckDB should list extension_directory: {listed:?}"
+        listed.iter().any(|name| name == "extension_directories"),
+        "DuckDB should list extension_directories: {listed:?}"
     );
+    let mut listed = listed;
+    if !listed.iter().any(|name| name == "extension_directory") {
+        listed.push("extension_directory".to_string());
+    }
     let not_refused: Vec<&String> = listed
         .iter()
         .filter(|name| {
@@ -2035,7 +2043,7 @@ fn every_setting_duckdb_lists_that_moves_where_it_keeps_extensions_is_refused() 
 
 // ---- arc upgrade ----
 
-/// A pin for mlpack on another platform, which no file here hashes to.
+/// A pin for zipfs on another platform, which no file here hashes to.
 const OSX_PIN: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
 /// A pin for h3, which no Protocol here installs.
@@ -2048,8 +2056,8 @@ impl Outcome {
     fn assert_upgrade_refused(&self, label: &str, pinned: &Pinned, manifest: &[u8]) {
         assert_ne!(self.code, Some(0), "[{label}] arc upgrade should refuse");
         assert!(
-            self.stderr.contains("mlpack"),
-            "[{label}] the refusal should name mlpack:\n{}",
+            self.stderr.contains("zipfs"),
+            "[{label}] the refusal should name zipfs:\n{}",
             self.stderr
         );
         assert_eq!(
@@ -2087,7 +2095,7 @@ fn arc_upgrade_writes_a_first_pin_for_the_build_the_registry_serves() {
     let pinned = Pinned::new(ONE_STEP, "");
     let before = pinned.manifest();
 
-    let up = pinned.upgrade(Registry::Serves, "mlpack");
+    let up = pinned.upgrade(Registry::Serves, "zipfs");
     assert_eq!(up.code, Some(0), "{}", up.stderr);
     let pin = served_pin();
     assert_eq!(
@@ -2097,14 +2105,14 @@ fn arc_upgrade_writes_a_first_pin_for_the_build_the_registry_serves() {
     );
     let mut expected = before.clone();
     expected.extend_from_slice(
-        format!("extensions:\n  mlpack:\n    v1.5.6:\n      {PLATFORM}: {pin}\n").as_bytes(),
+        format!("extensions:\n  zipfs:\n    v2.0.0:\n      {PLATFORM}: {pin}\n").as_bytes(),
     );
     assert_eq!(
         String::from_utf8(pinned.manifest()).unwrap(),
         String::from_utf8(expected).unwrap(),
         "the pin is added after the last line, and each byte before it is as it was"
     );
-    for needle in ["mlpack", "v1.5.6", PLATFORM, &pin] {
+    for needle in ["zipfs", "v2.0.0", PLATFORM, &pin] {
         assert!(
             up.stdout.contains(needle),
             "the output should name {needle:?}:\n{}",
@@ -2113,7 +2121,7 @@ fn arc_upgrade_writes_a_first_pin_for_the_build_the_registry_serves() {
     }
     assert_eq!(
         up.calls(),
-        vec!["--version", "platform", "force install and load mlpack"]
+        vec!["--version", "platform", "force install and load zipfs"]
     );
 
     let history = pinned.history();
@@ -2142,16 +2150,16 @@ fn arc_upgrade_writes_a_first_pin_for_the_build_the_registry_serves() {
 
 impl Pinned {
     /// The next `arc run` checks the pin `arc upgrade` wrote, runs the step with no warning
-    /// naming mlpack, and leaves `arcform.yaml` as `arc upgrade` left it.
+    /// naming zipfs, and leaves `arcform.yaml` as `arc upgrade` left it.
     fn assert_next_run_is_pinned(&self, label: &str) {
         let manifest = self.manifest();
         let run = self.run(Registry::Serves, &[]);
         assert_eq!(run.code, Some(0), "[{label}] {}", run.stderr);
         assert_eq!(run.started(), vec!["s.sql"], "[{label}]");
-        assert_eq!(run.mlpack_warnings(), Vec::<&str>::new(), "[{label}]");
+        assert_eq!(run.zipfs_warnings(), Vec::<&str>::new(), "[{label}]");
         assert_eq!(
             run.calls(),
-            vec!["--version", "platform", "install mlpack", "s.sql"],
+            vec!["--version", "platform", "install zipfs", "s.sql"],
             "[{label}] arc run checked the pin"
         );
         assert_eq!(
@@ -2165,13 +2173,13 @@ impl Pinned {
 #[test]
 fn arc_upgrade_replaces_one_pin_and_keeps_every_other_byte() {
     let extensions = format!(
-        "extensions:\n  # the builds this Protocol was run on\n  mlpack:\n    v1.5.6:\n      osx_arm64: {OSX_PIN}\n      {PLATFORM}: {OTHER_PIN}  # the build before\n  h3:\n    v1.5.6:\n      {PLATFORM}: {H3_PIN}\n"
+        "extensions:\n  # the builds this Protocol was run on\n  zipfs:\n    v2.0.0:\n      osx_arm64: {OSX_PIN}\n      {PLATFORM}: {OTHER_PIN}  # the build before\n  h3:\n    v2.0.0:\n      {PLATFORM}: {H3_PIN}\n"
     );
     let pinned = Pinned::new(ONE_STEP, &extensions);
     let before = String::from_utf8(pinned.manifest()).unwrap();
     assert_eq!(before.matches(OTHER_PIN).count(), 1);
 
-    let up = pinned.upgrade(Registry::Serves, "mlpack");
+    let up = pinned.upgrade(Registry::Serves, "zipfs");
     assert_eq!(up.code, Some(0), "{}", up.stderr);
     let pin = served_pin();
     assert_eq!(
@@ -2193,7 +2201,7 @@ fn arc_upgrade_replaces_one_pin_and_keeps_every_other_byte() {
 #[test]
 fn arc_upgrade_pins_the_served_build_and_not_a_changed_file() {
     let pinned = Pinned::new(ONE_STEP, "");
-    let up = pinned.upgrade(Registry::Serves, "mlpack");
+    let up = pinned.upgrade(Registry::Serves, "zipfs");
     assert_eq!(up.code, Some(0), "{}", up.stderr);
     let pinned_manifest = pinned.manifest();
 
@@ -2205,7 +2213,7 @@ fn arc_upgrade_pins_the_served_build_and_not_a_changed_file() {
     assert_eq!(refused.code, Some(1), "{}", refused.stderr);
     assert!(refused.stderr.contains(&changed), "{}", refused.stderr);
 
-    let up = pinned.upgrade(Registry::Serves, "mlpack");
+    let up = pinned.upgrade(Registry::Serves, "zipfs");
     assert_eq!(up.code, Some(0), "{}", up.stderr);
     let pin = served_pin();
     assert_eq!(
@@ -2277,7 +2285,7 @@ fn arc_upgrade_refuses_when_duckdb_cannot_install_load_or_answer() {
         ),
         ("names no file", Registry::NamesNoFile, None),
     ] {
-        let up = pinned.upgrade(registry, "mlpack");
+        let up = pinned.upgrade(registry, "zipfs");
         up.assert_upgrade_refused(label, &pinned, &manifest);
         if let Some(reason) = reason {
             assert!(
@@ -2297,13 +2305,13 @@ fn arc_upgrade_refuses_when_duckdb_cannot_install_load_or_answer() {
         (
             "no platform",
             "case \"$1\" in\n\
-             --version) echo 'v1.5.6 (fake) 0000000000' ;;\n\
+             --version) echo 'v2.0.0 (fake) 0000000000' ;;\n\
              -noheader) echo 'Catalog Error: no pragma_platform here' >&2; exit 1 ;;\n\
              esac\n",
             vec!["--version", "platform"],
         ),
     ] {
-        let up = pinned.protocol.arc_on(body, &["upgrade", "mlpack"]);
+        let up = pinned.protocol.arc_on(body, &["upgrade", "zipfs"]);
         up.assert_upgrade_refused(label, &pinned, &manifest);
         assert_eq!(up.calls(), calls, "[{label}] nothing is installed");
     }
@@ -2317,14 +2325,14 @@ fn arc_upgrade_refuses_when_duckdb_cannot_install_load_or_answer() {
 fn arc_upgrade_checks_the_engine_version_as_arc_run_does() {
     // On the version the entry names, arc upgrade prints no warning.
     let pinned = Pinned::new(ONE_STEP, "");
-    let up = pinned.upgrade(Registry::Serves, "mlpack");
+    let up = pinned.upgrade(Registry::Serves, "zipfs");
     assert_eq!(up.code, Some(0), "{}", up.stderr);
     assert!(!up.stderr.contains("warning:"), "{}", up.stderr);
 
     // On a version inside arc's range that the entry does not name, it prints the warning
     // arc run prints, and pins the build for that version.
     let pinned = Pinned::new(ONE_STEP, "");
-    let up = pinned.arc_on_version(Registry::Serves, "1.5.4", &["upgrade", "mlpack"]);
+    let up = pinned.arc_on_version(Registry::Serves, "2.0.1", &["upgrade", "zipfs"]);
     assert_eq!(up.code, Some(0), "{}", up.stderr);
     let warnings: Vec<&str> = up
         .stderr
@@ -2333,8 +2341,8 @@ fn arc_upgrade_checks_the_engine_version_as_arc_run_does() {
         .collect();
     assert_eq!(warnings.len(), 1, "one warning:\n{}", up.stderr);
     for needle in [
-        "mlpack is vetted on DuckDB v1.5.6",
-        "this engine is DuckDB v1.5.4",
+        "zipfs is vetted on DuckDB v2.0.0",
+        "this engine is DuckDB v2.0.1",
     ] {
         assert!(
             warnings[0].contains(needle),
@@ -2345,7 +2353,7 @@ fn arc_upgrade_checks_the_engine_version_as_arc_run_does() {
     let manifest = String::from_utf8(pinned.manifest()).unwrap();
     assert!(
         manifest.ends_with(&format!(
-            "extensions:\n  mlpack:\n    v1.5.4:\n      {PLATFORM}: {}\n",
+            "extensions:\n  zipfs:\n    v2.0.1:\n      {PLATFORM}: {}\n",
             served_pin()
         )),
         "{manifest}"
@@ -2357,19 +2365,19 @@ fn arc_upgrade_checks_the_engine_version_as_arc_run_does() {
         (
             "outside arc's range",
             ONE_STEP.to_string(),
-            "2.0.0",
-            ">=1.3, <2",
+            "1.5.6",
+            ">=2.0, <3",
         ),
         (
             "outside the manifest's",
-            format!("engine_version: '>=1.6'\n{ONE_STEP}"),
-            "1.5.6",
-            ">=1.6",
+            format!("engine_version: '>=2.1'\n{ONE_STEP}"),
+            "2.0.0",
+            ">=2.1",
         ),
     ] {
         let pinned = Pinned::new(&yaml, "");
         let manifest = pinned.manifest();
-        let up = pinned.arc_on_version(Registry::Serves, version, &["upgrade", "mlpack"]);
+        let up = pinned.arc_on_version(Registry::Serves, version, &["upgrade", "zipfs"]);
         assert_eq!(up.code, Some(1), "[{label}] {}", up.stderr);
         assert!(
             up.stderr.contains(needle),
@@ -2469,8 +2477,8 @@ fn held_entries() -> Vec<Entry> {
 fn the_page_and_the_list_arc_holds_are_the_same_list() {
     let page = page_entries();
     let held = held_entries();
-    assert_eq!(page.len(), 16, "sixteen rows on the page: {page:?}");
-    assert_eq!(held.len(), 16, "sixteen entries arc holds: {held:?}");
+    assert_eq!(page.len(), 7, "seven rows on the page: {page:?}");
+    assert_eq!(held.len(), 7, "seven entries arc holds: {held:?}");
     let page: BTreeSet<Entry> = page.into_iter().collect();
     let held: BTreeSet<Entry> = held.into_iter().collect();
     assert_eq!(
@@ -2523,7 +2531,7 @@ fn every_licence_on_the_list_is_permissive() {
 fn a_licence_of_names_joined_by_or_is_permissive_when_each_name_is() {
     assert_eq!(
         licence_refusals(&[
-            ("onager", "MIT OR Apache-2.0"),
+            ("dual", "MIT OR Apache-2.0"),
             ("swapped", "Apache-2.0 OR MIT"),
             ("plain", "BSD-3-Clause"),
         ]),
@@ -2925,7 +2933,7 @@ fn install_record(name: &str, repository: &str, version: &str) -> Vec<u8> {
 /// SQL installs, and the record holds each one's hash with the repository and version DuckDB
 /// reports. Offline: each file is planted where DuckDB keeps it, so the step's `INSTALL`
 /// finds it and installs nothing, and neither file is an extension, so nothing loads it.
-/// mlpack has the install record DuckDB writes beside a file it fetched, and httpfs has none,
+/// zipfs has the install record DuckDB writes beside a file it fetched, and httpfs has none,
 /// so DuckDB reports a repository and a version for the first and neither for the second.
 #[test]
 fn the_record_names_each_extension_the_sql_installs_as_the_real_duckdb_reports_it() {
@@ -2958,20 +2966,16 @@ fn the_record_names_each_extension_the_sql_installs_as_the_real_duckdb_reports_i
         .path()
         .join(format!(".duckdb/extensions/{version}/{platform}"));
     fs::create_dir_all(&dir).unwrap();
-    let mlpack = dir.join("mlpack.duckdb_extension");
+    let zipfs = dir.join("zipfs.duckdb_extension");
     let httpfs = dir.join("httpfs.duckdb_extension");
-    fs::write(&mlpack, b"not an extension").unwrap();
+    fs::write(&zipfs, b"not an extension").unwrap();
     fs::write(&httpfs, b"not httpfs either").unwrap();
     fs::write(
-        dir.join("mlpack.duckdb_extension.info"),
-        install_record(
-            "mlpack",
-            "http://community-extensions.duckdb.org",
-            "0123abc",
-        ),
+        dir.join("zipfs.duckdb_extension.info"),
+        install_record("zipfs", "http://community-extensions.duckdb.org", "0123abc"),
     )
     .unwrap();
-    let (mlpack_hash, httpfs_hash) = (sha256(&mlpack), sha256(&httpfs));
+    let (zipfs_hash, httpfs_hash) = (sha256(&zipfs), sha256(&httpfs));
     let planted: BTreeSet<_> = fs::read_dir(&dir)
         .unwrap()
         .map(|e| e.unwrap().file_name())
@@ -2983,12 +2987,12 @@ fn the_record_names_each_extension_the_sql_installs_as_the_real_duckdb_reports_i
             "-noheader",
             "-list",
             "-c",
-            "SELECT extension_name, installed_from, extension_version, install_path FROM duckdb_extensions() WHERE extension_name IN ('mlpack', 'httpfs') ORDER BY extension_name;",
+            "SELECT extension_name, installed_from, extension_version, install_path FROM duckdb_extensions() WHERE extension_name IN ('zipfs', 'httpfs') ORDER BY extension_name;",
         ]),
         format!(
-            "httpfs|||{}\nmlpack|community|0123abc|{}",
+            "httpfs|||{}\nzipfs|community|0123abc|{}",
             httpfs.display(),
-            mlpack.display()
+            zipfs.display()
         )
     );
 
@@ -3011,9 +3015,9 @@ fn the_record_names_each_extension_the_sql_installs_as_the_real_duckdb_reports_i
     };
     let installs = [(
         "models/s.sql".to_string(),
-        "INSTALL mlpack FROM community;\nINSTALL httpfs;\n",
+        "INSTALL zipfs FROM community;\nINSTALL httpfs;\n",
     )];
-    for (label, pin) in [("pinned", Some(&mlpack_hash)), ("no pin", None)] {
+    for (label, pin) in [("pinned", Some(&zipfs_hash)), ("no pin", None)] {
         let extensions = pin.map_or(String::new(), |pin| pin_yaml(&version, &platform, pin));
         let (code, stderr, record) = run(
             &format!("name: real\nsteps:\n  - name: s\n    sql: models/s.sql\n{extensions}"),
@@ -3021,7 +3025,7 @@ fn the_record_names_each_extension_the_sql_installs_as_the_real_duckdb_reports_i
         );
         assert_eq!(code, Some(0), "[{label}] {stderr}");
         assert_eq!(
-            stderr.contains("mlpack has no pin"),
+            stderr.contains("zipfs has no pin"),
             pin.is_none(),
             "[{label}] the warning for an extension with no pin:\n{stderr}"
         );
@@ -3032,10 +3036,10 @@ fn the_record_names_each_extension_the_sql_installs_as_the_real_duckdb_reports_i
             engine["extensions"],
             serde_json::json!([
                 {
-                    "name": "mlpack",
+                    "name": "zipfs",
                     "repository": "community",
                     "version": "0123abc",
-                    "sha256": mlpack_hash,
+                    "sha256": zipfs_hash,
                 },
                 {
                     "name": "httpfs",
@@ -3054,8 +3058,8 @@ fn the_record_names_each_extension_the_sql_installs_as_the_real_duckdb_reports_i
             );
         }
         assert_eq!(
-            (sha256(&mlpack), sha256(&httpfs)),
-            (mlpack_hash.clone(), httpfs_hash.clone()),
+            (sha256(&zipfs), sha256(&httpfs)),
+            (zipfs_hash.clone(), httpfs_hash.clone()),
             "[{label}] the files are as they were"
         );
         let now: BTreeSet<_> = fs::read_dir(&dir)
@@ -3096,10 +3100,10 @@ fn the_record_names_each_extension_the_sql_installs_as_the_real_duckdb_reports_i
     );
 }
 
-/// A fake engine reporting DuckDB v1.5.3 that answers the question for the run record.
+/// A fake engine reporting DuckDB v2.0.2 that answers the question for the run record.
 const REPORTS_V153: &str = "case \"$1\" in\n\
---version) echo 'v1.5.3 (fake) 0000000000' ;;\n\
--noheader) case \"$4\" in *'version()'*) printf 'arc-answer:version\\tv1.5.3\\narc-answer:platform\\tfake_amd64\\n' ;; esac ;;\n\
+--version) echo 'v2.0.2 (fake) 0000000000' ;;\n\
+-noheader) case \"$4\" in *'version()'*) printf 'arc-answer:version\\tv2.0.2\\narc-answer:platform\\tfake_amd64\\n' ;; esac ;;\n\
 esac\n";
 
 #[test]
@@ -3108,7 +3112,7 @@ fn the_record_gives_the_duckdb_the_steps_ran_on_beside_the_library_arc_is_linked
         .unwrap()
         .query_row("SELECT version()", [], |r| r.get(0))
         .unwrap();
-    assert_ne!(linked, "v1.5.3", "the fake engine is another DuckDB");
+    assert_ne!(linked, "v2.0.2", "the fake engine is another DuckDB");
 
     let protocol = Protocol::steps(&[("s", "CREATE TABLE t AS SELECT 1;\n")]);
     let run = protocol.run_on(REPORTS_V153, &[]);
@@ -3126,7 +3130,7 @@ fn the_record_gives_the_duckdb_the_steps_ran_on_beside_the_library_arc_is_linked
     let engine = &protocol.record()["run"]["engine"];
     assert_eq!(engine["arc"], env!("CARGO_PKG_VERSION"));
     assert_eq!(engine["duckdb"], linked.as_str());
-    assert_eq!(engine["duckdb_cli"], "v1.5.3");
+    assert_eq!(engine["duckdb_cli"], "v2.0.2");
     assert_eq!(engine["platform"], "fake_amd64");
     assert_eq!(engine["extensions"], serde_json::json!([]));
 
@@ -3146,14 +3150,14 @@ fn the_record_gives_the_duckdb_the_steps_ran_on_beside_the_library_arc_is_linked
 }
 
 /// The Protocols in [`recording_what_duckdb_does_not_give_changes_nothing_about_the_run`]:
-/// step `s` installs mlpack from the community registry and httpfs from DuckDB's own
+/// step `s` installs zipfs from the community registry and httpfs from DuckDB's own
 /// repository, and then, in the second, step `f` fails.
 fn installs_two(fails: bool) -> Protocol {
     let mut yaml =
         String::from("name: rec\ndb: rec.duckdb\nsteps:\n  - name: s\n    sql: models/s.sql\n");
     let mut files = vec![(
         "models/s.sql".to_string(),
-        "INSTALL mlpack FROM community;\nINSTALL httpfs;\nCREATE TABLE t AS SELECT 1;\n",
+        "INSTALL zipfs FROM community;\nINSTALL httpfs;\nCREATE TABLE t AS SELECT 1;\n",
     )];
     if fails {
         yaml.push_str("  - name: f\n    sql: models/f.sql\n");
@@ -3176,7 +3180,7 @@ Asset graph (1 node):\n\
 \x20\x20\x20\x20\x20\x20produced by  s\n\
 \n\
 \u{1b}[32m✓\u{1b}[39m 1/1 steps succeeded.\n",
-        "\u{1b}[33mwarning:\u{1b}[39m mlpack has no pin under the extensions: key of arcform.yaml (for DuckDB v1.5.6), so arc runs whichever build DuckDB installs; `arc upgrade mlpack` pins the build the community registry serves (https://github.com/meridian-online/arcform/blob/main/docs/VETTED_EXTENSIONS.md)\n",
+        "\u{1b}[33mwarning:\u{1b}[39m zipfs has no pin under the extensions: key of arcform.yaml (for DuckDB v2.0.0), so arc runs whichever build DuckDB installs; `arc upgrade zipfs` pins the build the community registry serves (https://github.com/meridian-online/arcform/blob/main/docs/VETTED_EXTENSIONS.md)\n",
         "success",
     ),
     (
@@ -3187,7 +3191,7 @@ Asset graph (1 node):\n\
 Asset graph (1 node):\n\
 \x20\x20t [table]\n\
 \x20\x20\x20\x20\x20\x20produced by  s\n",
-        "\u{1b}[33mwarning:\u{1b}[39m mlpack has no pin under the extensions: key of arcform.yaml (for DuckDB v1.5.6), so arc runs whichever build DuckDB installs; `arc upgrade mlpack` pins the build the community registry serves (https://github.com/meridian-online/arcform/blob/main/docs/VETTED_EXTENSIONS.md)\n\
+        "\u{1b}[33mwarning:\u{1b}[39m zipfs has no pin under the extensions: key of arcform.yaml (for DuckDB v2.0.0), so arc runs whichever build DuckDB installs; `arc upgrade zipfs` pins the build the community registry serves (https://github.com/meridian-online/arcform/blob/main/docs/VETTED_EXTENSIONS.md)\n\
 Binder Error: f fails\n\
 error: step 'f' failed (exit code 1):\n\
 Binder Error: f fails\n\
@@ -3216,11 +3220,11 @@ fn recording_what_duckdb_does_not_give_changes_nothing_about_the_run() {
             );
             let protocol = installs_two(fails);
             let root = protocol.root.path();
-            let (mlpack, httpfs) = (
-                root.join("mlpack.duckdb_extension"),
+            let (zipfs, httpfs) = (
+                root.join("zipfs.duckdb_extension"),
                 root.join("httpfs.duckdb_extension"),
             );
-            fs::write(&mlpack, b"mlpack's build").unwrap();
+            fs::write(&zipfs, b"zipfs's build").unwrap();
             fs::write(&httpfs, b"httpfs's build").unwrap();
             let line = |name: &str, repository: &str, version: &str, path: &Path| {
                 format!(
@@ -3231,16 +3235,16 @@ fn recording_what_duckdb_does_not_give_changes_nothing_about_the_run() {
             let answer = match arm {
                 "answers in full" => format!(
                     "printf '{}{}'",
-                    line("mlpack", "community", "v1.5.6", &mlpack),
+                    line("zipfs", "community", "v2.0.0", &zipfs),
                     line("httpfs", "core", "827222f", &httpfs)
                 ),
                 "names no file" => format!(
                     "printf '{}'",
-                    line("mlpack", "community", "v1.5.6", Path::new(""))
+                    line("zipfs", "community", "v2.0.0", Path::new(""))
                 ),
                 "names a path arc cannot read" => format!(
                     "printf '{}{}'",
-                    line("mlpack", "community", "v1.5.6", &root.join("gone")),
+                    line("zipfs", "community", "v2.0.0", &root.join("gone")),
                     line("httpfs", "core", "827222f", root)
                 ),
                 _ => "echo 'Catalog Error: no duckdb_extensions here' >&2; exit 1".to_string(),
@@ -3248,8 +3252,8 @@ fn recording_what_duckdb_does_not_give_changes_nothing_about_the_run() {
             let run = protocol.run_on(
                 &format!(
                     "case \"$1\" in\n\
-                     --version) echo 'v1.5.6 (fake) 0000000000' ;;\n\
-                     -noheader) case \"$4\" in *'version()'*) printf 'arc-answer:version\\tv1.5.6\\narc-answer:platform\\tlinux_amd64\\n'; {answer} ;; esac ;;\n\
+                     --version) echo 'v2.0.0 (fake) 0000000000' ;;\n\
+                     -noheader) case \"$4\" in *'version()'*) printf 'arc-answer:version\\tv2.0.0\\narc-answer:platform\\tlinux_amd64\\n'; {answer} ;; esac ;;\n\
                      esac\n\
                      case \"$3\" in */models/f.sql) echo 'Binder Error: f fails' >&2; exit 1 ;; esac\n"
                 ),
@@ -3266,14 +3270,14 @@ fn recording_what_duckdb_does_not_give_changes_nothing_about_the_run() {
             assert_eq!(record["run"]["outcome"], outcome, "[{label}]");
             let hashes = if arm == "answers in full" {
                 [
-                    serde_json::json!(sha256(&mlpack)),
+                    serde_json::json!(sha256(&zipfs)),
                     serde_json::json!(sha256(&httpfs)),
                 ]
             } else {
                 [serde_json::Value::Null, serde_json::Value::Null]
             };
             let extensions = &record["run"]["engine"]["extensions"];
-            for (k, name) in ["mlpack", "httpfs"].into_iter().enumerate() {
+            for (k, name) in ["zipfs", "httpfs"].into_iter().enumerate() {
                 assert_eq!(extensions[k]["name"], name, "[{label}] {extensions}");
                 assert_eq!(extensions[k]["sha256"], hashes[k], "[{label}] {name}");
             }
