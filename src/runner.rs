@@ -220,6 +220,35 @@ pub(crate) fn check_engine_version(
     })
 }
 
+/// The notice for a run whose engine differs, in major and minor, from the DuckDB the
+/// Protocol's newest run record names (`previous`, its `run.engine.duckdb_cli`), or `None`.
+///
+/// Both versions are read as the engine check reads them: a development build of a release's
+/// own commit, which Homebrew's DuckDB prints, is that release. A previous version arc cannot
+/// read draws no notice. For a 1.x previous and a 2.x engine the notice goes on to name the
+/// four results DuckDB 2.0 changes without an error.
+pub(crate) fn engine_change_notice(
+    previous: Option<&str>,
+    current: &semver::Version,
+) -> Option<String> {
+    let previous = crate::engine::parse_engine_version(previous?)?.version;
+    if (previous.major, previous.minor) == (current.major, current.minor) {
+        return None;
+    }
+    let mut notice = format!(
+        "this Protocol last ran on DuckDB {previous}, and this run uses DuckDB {current}; \
+         results can differ between them"
+    );
+    if previous.major == 1 && current.major == 2 {
+        notice.push_str(
+            "\nDuckDB 2.0 changes four results without an error: `~` and `!~` match part of a \
+             string; integer `//` and `%` by zero raise an error; `x -> …` lambdas are rejected; \
+             `ORDER BY` a non-integer literal is rejected",
+        );
+    }
+    Some(notice)
+}
+
 /// Each file beside the Protocol's file in `dir` whose name may be a copy a synced drive set
 /// aside, sorted by name, with the warning a run prints for it.
 ///
@@ -282,10 +311,13 @@ pub fn run_with_params(
     // Whether a SQL file holds a statement for DuckDB's reading to read, from the tokens the
     // check below reads.
     let mut reads_sql = false;
+    // The engine this run's SQL steps use, when it has any and arc could read its version.
+    let mut engine_version: Option<semver::Version> = None;
 
     // If there are SQL steps, verify the engine is available and check its version.
     if manifest.has_sql_steps() {
         let info = engine.preflight()?;
+        engine_version = info.version.clone();
         let allow_untested =
             std::env::var_os(ALLOW_UNTESTED_ENGINE_ENV).is_some_and(|v| !v.is_empty());
         for warning in check_engine_version(
@@ -366,6 +398,18 @@ pub fn run_with_params(
 
     // Initialise the state backend (creates tables if needed).
     state.init()?;
+
+    // A run on a different DuckDB than the Protocol's last says so once, before its first
+    // step. Read before this run writes its own record.
+    if let Some(current) = &engine_version
+        && let Some(previous) = contract::newest_contract(&contract::runs_dir(dir))
+        && let Some(notice) =
+            engine_change_notice(previous.run.engine.duckdb_cli.as_deref(), current)
+    {
+        for line in notice.lines() {
+            eprintln!("{} {}", "warning:".yellow(), line);
+        }
+    }
 
     // Start a new run record.
     let run_id = state.start_run()?;
@@ -1850,6 +1894,86 @@ mod tests {
             }
             fs::write(full, content).unwrap();
         }
+    }
+
+    fn write_record(runs: &Path, name: &str, duckdb_cli: Option<&str>) {
+        let record = serde_json::json!({
+            "contract_version": "b4/1",
+            "run": {
+                "run_id": name, "attempt_id": name,
+                "protocol": {"name": "t", "manifest_sha256": null, "dir": "."},
+                "engine": {"arc": "0", "duckdb": null, "duckdb_cli": duckdb_cli,
+                           "platform": null, "extensions": null},
+                "params": [], "started_at": null, "finished_at": null, "outcome": "success"
+            },
+            "assets": [], "steps": []
+        });
+        fs::create_dir_all(runs).unwrap();
+        fs::write(runs.join(format!("{name}.json")), record.to_string()).unwrap();
+    }
+
+    fn ver(s: &str) -> semver::Version {
+        semver::Version::parse(s).unwrap()
+    }
+
+    #[test]
+    fn no_record_no_notice() {
+        assert_eq!(engine_change_notice(None, &ver("2.0.0")), None);
+    }
+
+    #[test]
+    fn same_minor_no_notice() {
+        assert_eq!(engine_change_notice(Some("v2.0.1"), &ver("2.0.3")), None);
+    }
+
+    #[test]
+    fn one_five_to_two_names_the_four_changes() {
+        let n = engine_change_notice(Some("v1.5.6"), &ver("2.0.0")).unwrap();
+        assert!(
+            n.contains("1.5.6") && n.contains("2.0.0") && n.contains("ORDER BY"),
+            "{n}"
+        );
+        assert!(n.starts_with(
+            "this Protocol last ran on DuckDB 1.5.6, and this run uses DuckDB 2.0.0; results can differ between them\n"
+        ));
+    }
+
+    #[test]
+    fn two_zero_to_two_one_has_no_four_changes_line() {
+        let n = engine_change_notice(Some("v2.0.0"), &ver("2.1.0")).unwrap();
+        assert!(!n.contains("four results") && !n.contains('\n'), "{n}");
+    }
+
+    #[test]
+    fn an_unparseable_previous_version_draws_no_notice() {
+        assert_eq!(
+            engine_change_notice(Some("not a version"), &ver("2.0.0")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_dev_build_of_a_release_compares_as_that_release() {
+        let dev = "v2.0.0-dev88614 (Development Version) d54cbbe3df";
+        let parsed = crate::engine::parse_engine_version(dev).unwrap().version;
+        assert_eq!(engine_change_notice(Some("v2.0.0"), &parsed), None);
+        assert_eq!(engine_change_notice(Some(dev), &ver("2.0.0")), None);
+    }
+
+    #[test]
+    fn a_truncated_newest_record_falls_back_to_an_older_1_x_record_and_notices() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = contract::runs_dir(dir.path());
+        write_record(&runs, "old", Some("v1.5.6"));
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(
+            runs.join("new.json"),
+            "{\"contract_version\": \"b4/1\", \"run\": {",
+        )
+        .unwrap();
+        let previous = contract::newest_contract(&runs).unwrap();
+        let n = engine_change_notice(previous.run.engine.duckdb_cli.as_deref(), &ver("2.0.0"));
+        assert!(n.unwrap().contains("1.5.6"));
     }
 
     // Empty steps list exits successfully.

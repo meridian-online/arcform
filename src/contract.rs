@@ -478,6 +478,39 @@ pub fn build_contract(inp: ContractInputs) -> Contract {
     }
 }
 
+/// The `.json` files in `runs_dir`, newest first by modified time (empty if the directory is
+/// absent). A file whose modified time cannot be read sorts last.
+pub fn contracts_by_age(runs_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(runs_dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(Option<std::time::SystemTime>, PathBuf)> = entries
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("json"))
+        .map(|entry| {
+            (
+                entry.metadata().and_then(|m| m.modified()).ok(),
+                entry.path(),
+            )
+        })
+        .collect();
+    // Newest first; ties broken by name, later first, so the order is stable.
+    found.sort_by(|a, b| b.cmp(a));
+    found.into_iter().map(|(_, path)| path).collect()
+}
+
+/// The newest run record in `runs_dir` that reads as a contract and names the DuckDB it ran
+/// on (`run.engine.duckdb_cli`). A record that is unreadable, such as a truncated file, or
+/// names no engine, is skipped rather than an error, so a comparison is made against the
+/// newest record that can answer it. `None` when there is none.
+pub fn newest_contract(runs_dir: &Path) -> Option<Contract> {
+    contracts_by_age(runs_dir).into_iter().find_map(|path| {
+        let text = std::fs::read_to_string(path).ok()?;
+        let contract: Contract = serde_json::from_str(&text).ok()?;
+        contract.run.engine.duckdb_cli.is_some().then_some(contract)
+    })
+}
+
 /// Write the contract to `<runs_dir>/<run_id>.json` (pretty-printed).
 pub fn write_contract(runs_dir: &Path, run_id: &str, contract: &Contract) -> std::io::Result<()> {
     let path = runs_dir.join(format!("{run_id}.json"));
@@ -993,6 +1026,31 @@ fn days_to_date(days: u64) -> (u64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn newest_contract_skips_a_truncated_record_and_one_without_duckdb_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = |cli: serde_json::Value| {
+            serde_json::json!({
+                "contract_version": "b4/1",
+                "run": {"run_id": "r", "attempt_id": "r",
+                    "protocol": {"name": "t", "manifest_sha256": null, "dir": "."},
+                    "engine": {"arc": "0", "duckdb": null, "duckdb_cli": cli,
+                               "platform": null, "extensions": null},
+                    "params": [], "started_at": null, "finished_at": null, "outcome": "success"},
+                "assets": [], "steps": []
+            })
+            .to_string()
+        };
+        assert!(newest_contract(dir.path()).is_none());
+        std::fs::write(dir.path().join("a.json"), record("v1.5.6".into())).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir.path().join("b.json"), record(serde_json::Value::Null)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir.path().join("c.json"), "{\"run\": {").unwrap();
+        let found = newest_contract(dir.path()).unwrap();
+        assert_eq!(found.run.engine.duckdb_cli.as_deref(), Some("v1.5.6"));
+    }
 
     // `build_assets` classifies by `declared_kind` (carried from the SQL/operator
     // declaration), never by inspecting the name's shape — a File-kind produces
