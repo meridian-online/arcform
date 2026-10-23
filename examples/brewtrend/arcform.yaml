@@ -1,6 +1,6 @@
 name: brewtrend
 engine: duckdb
-engine_version: ">=1.2"
+engine_version: ">=2.0"
 db: trends.db
 
 # Runtime parameter — override with: arc run --param trend_threshold=25
