@@ -20,6 +20,7 @@ categories = ["command-line-utilities", "database"]
 # in the tree.
 include = [
     "/src/**",
+    "/build.rs",
     "/operators/gleif_ra_fetch/fetch_gleif_ra.py",
     "/operators/splink_resolve/resolve.py",
     "/operators/text_embed/text_embed.py",
