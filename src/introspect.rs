@@ -20,7 +20,6 @@
 //! files is thus *discovered from the SQL*, never hand-declared via `depends_on:`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
@@ -32,6 +31,7 @@ use sqlparser::parser::Parser;
 
 use crate::asset_kind::AssetKind;
 use crate::duckdb_lineage::{self, ArgValue, Relation, TableCall};
+use crate::engine::DuckDbProgram;
 
 /// Assets discovered from parsing a SQL file — four-set model.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -254,11 +254,8 @@ fn reader() -> Result<Reader, String> {
 }
 
 /// The DuckDB arc runs, which is the one asked for its parse.
-fn duckdb_program() -> Result<OsString, String> {
-    match crate::engine::duckdb_program().map_err(|e| e.to_string())? {
-        crate::engine::DuckDbProgram::Told(path) => Ok(path.into_os_string()),
-        crate::engine::DuckDbProgram::SearchPath => Ok(OsString::from("duckdb")),
-    }
+fn duckdb_program() -> Result<DuckDbProgram, String> {
+    crate::engine::duckdb_program().map_err(|e| e.to_string())
 }
 
 /// Refuses a run, before a step runs, when [`SQL_READER_ENV`] names no reader, or names

@@ -400,11 +400,29 @@ pub(crate) enum DuckDbProgram {
     SearchPath,
 }
 
+/// The variable the DuckDB 2.0 shell reads to decide it is being run by an agent. Set by
+/// the harness an agent works in (`AI_AGENT`, `CLAUDECODE` and the like), it turns the shell's
+/// output into markdown and adds a banner on stderr, which arc cannot read as DuckDB's
+/// answer. `0` turns it off.
+pub(crate) const AGENT_MODE_ENV: &str = "DUCKDB_AGENT_MODE";
+
 impl DuckDbProgram {
-    fn command(&self) -> Command {
-        match self {
+    /// A command for this DuckDB, run out of agent mode ([`AGENT_MODE_ENV`]). Every DuckDB
+    /// process arc starts itself is built here.
+    pub(crate) fn command(&self) -> Command {
+        let mut command = match self {
             DuckDbProgram::Told(path) => Command::new(path),
             DuckDbProgram::SearchPath => Command::new("duckdb"),
+        };
+        command.env(AGENT_MODE_ENV, "0");
+        command
+    }
+
+    /// The program as a person reads it: the path told, else `duckdb`.
+    pub(crate) fn display_name(&self) -> String {
+        match self {
+            DuckDbProgram::Told(path) => path.to_string_lossy().into_owned(),
+            DuckDbProgram::SearchPath => "duckdb".to_string(),
         }
     }
 }

@@ -29,11 +29,12 @@
 //! which applies the same rules to what arc's other reader returns.
 
 use std::cmp::Ordering;
-use std::ffi::OsStr;
 use std::fmt;
 use std::io::Write;
 use std::ops::Range;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+
+use crate::engine::DuckDbProgram;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -203,9 +204,14 @@ impl fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
-/// Reads a step with the DuckDB `duckdb` names: a path, or a name found on `PATH`.
-pub(crate) fn read_step(duckdb: &OsStr, sql: &str) -> Result<StepReading, Refusal> {
-    read_step_with(&mut Process { program: duckdb }, sql)
+/// Reads a step with `duckdb`, the program the steps run on.
+pub(crate) fn read_step(duckdb: &DuckDbProgram, sql: &str) -> Result<StepReading, Refusal> {
+    read_step_with(
+        &mut Process {
+            program: duckdb.clone(),
+        },
+        sql,
+    )
 }
 
 /// A token as `sql_tokenize` gives it. `start` is a byte offset into the text asked
@@ -240,13 +246,13 @@ trait Ask {
     fn trees(&mut self, texts: &[String]) -> Result<Vec<Value>, Refusal>;
 }
 
-struct Process<'a> {
-    program: &'a OsStr,
+struct Process {
+    program: DuckDbProgram,
 }
 
-impl Ask for Process<'_> {
+impl Ask for Process {
     fn program(&self) -> String {
-        self.program.to_string_lossy().into_owned()
+        self.program.display_name()
     }
 
     fn tokens(&mut self, sql: &str) -> Result<Tokenized, Refusal> {
@@ -295,7 +301,7 @@ impl Ask for Process<'_> {
     }
 }
 
-impl Process<'_> {
+impl Process {
     /// Runs `script` and returns each result DuckDB printed, as JSON, with its stderr.
     ///
     /// Logging is turned off first. The 2.0 shell prints a warning DuckDB logs, such as
@@ -306,7 +312,9 @@ impl Process<'_> {
             program: self.program(),
             reason: e.to_string(),
         };
-        let mut child = Command::new(self.program)
+        let mut child = self
+            .program
+            .command()
             .args(["-no-init", "-json"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1378,7 +1386,7 @@ mod tests {
 
     /// The preview `ARC_DUCKDB_PREVIEW_BIN` names. It prints the version it answered
     /// with, so a log says which build a test ran on.
-    struct Preview(Process<'static>);
+    struct Preview(Process);
 
     fn preview() -> Preview {
         let bin = std::env::var_os(PREVIEW_ENV).unwrap_or_else(|| {
@@ -1389,7 +1397,7 @@ mod tests {
             )
         });
         Preview(Process {
-            program: Box::leak(bin.into_boxed_os_str()),
+            program: DuckDbProgram::Told(bin.into()),
         })
     }
 
@@ -2091,7 +2099,7 @@ mod tests {
     fn duckdb_reads_the_step_back_as_the_text_sent() {
         let text = "it's; a \\ b\n-- not a comment\n.quit\n''";
         let duckdb = Process {
-            program: OsStr::new("duckdb"),
+            program: DuckDbProgram::SearchPath,
         };
         let (answers, stderr) = duckdb
             .run(&format!("SELECT {} AS s;\n", literal(text)))
@@ -2109,7 +2117,7 @@ mod tests {
     #[test]
     fn duckdb_is_asked_with_logging_off() {
         let duckdb = Process {
-            program: OsStr::new("duckdb"),
+            program: DuckDbProgram::SearchPath,
         };
         let (answers, stderr) = duckdb
             .run("SELECT current_setting('enable_logging')::BOOLEAN AS logging;\n")
@@ -2123,8 +2131,11 @@ mod tests {
 
     #[test]
     fn a_duckdb_that_cannot_be_run_is_named() {
-        let refusal =
-            read_step(OsStr::new("/nonexistent/duckdb"), "SELECT 1;").expect_err("no such program");
+        let refusal = read_step(
+            &DuckDbProgram::Told("/nonexistent/duckdb".into()),
+            "SELECT 1;",
+        )
+        .expect_err("no such program");
         assert!(
             matches!(&refusal, Refusal::NotRun { program, reason }
                 if program == "/nonexistent/duckdb" && reason.contains("No such file")),
@@ -2135,7 +2146,8 @@ mod tests {
     /// A program that runs and prints no version is not a DuckDB.
     #[test]
     fn a_program_that_gives_no_version_is_refused() {
-        let refusal = read_step(OsStr::new("true"), "SELECT 1;").expect_err("not a DuckDB");
+        let refusal =
+            read_step(&DuckDbProgram::Told("true".into()), "SELECT 1;").expect_err("not a DuckDB");
         assert!(
             matches!(&refusal, Refusal::NotRun { reason, .. } if reason.contains("gave no version")),
             "the refusal says no version came back: {refusal:?}"
