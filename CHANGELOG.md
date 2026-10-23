@@ -34,6 +34,7 @@ arc 0.2.2 moves arc onto DuckDB 2.0. arc is a single binary that runs a data pip
 
 ### Fixed
 
+- **The bundled build links on aarch64 Linux.** With `--features bundled-duckdb`, the DuckDB 2.0 crate links its extension-registration code after DuckDB itself, and GNU ld, the default linker there, failed with `undefined reference to duckdb_register_static_extensions`, so `cargo install arcform --features mcp,bundled-duckdb` failed on aarch64 Linux. arc's build now tells the linker to keep that function. A crate that links arcform's library with `bundled-duckdb` on Linux needs `-C link-arg=-Wl,-u,duckdb_register_static_extensions` until the DuckDB crate orders its archives itself.
 - **arc depends on opendal 0.58.2, in place of 0.58.0, which was yanked from crates.io.** A build with the `opendal` feature no longer warns about a yanked dependency.
 
 ### Removed

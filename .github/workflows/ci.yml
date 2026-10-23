@@ -509,6 +509,56 @@ jobs:
             exit 1
           fi
 
+  # The release binary for aarch64 Linux, which the `bundled` job above does not build.
+  # That target links with GNU ld, which resolves archives in order, where x86_64
+  # Linux links with rust-lld; build.rs carries the flag GNU ld needs to link the
+  # bundled DuckDB. Without this job a link failure there first shows on the tag.
+  bundled-aarch64-linux:
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mcp-bundled-duckdb-aarch64-linux
+
+      - name: Install the DuckDB CLI
+        run: |
+          set -euo pipefail
+          base="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}"
+          mkdir -p "$HOME/duckdb"
+          curl -fsSL -o /tmp/duckdb-cli.tar.gz "$base/duckdb-cli-linux-arm64.tar.gz"
+          tar -xzf /tmp/duckdb-cli.tar.gz -C "$HOME/duckdb"
+          chmod +x "$HOME/duckdb/duckdb"
+          "$HOME/duckdb/duckdb" --version
+          echo "$HOME/duckdb" >> "$GITHUB_PATH"
+
+      # As in the `bundled` job: the stopgap for duckdb/duckdb-rs#917.
+      - name: Define DuckDB's version for the bundled build
+        shell: bash
+        run: echo "CXXFLAGS=${CXXFLAGS:-} -DDUCKDB_VERSION=\"${DUCKDB_VERSION}\"" >> "$GITHUB_ENV"
+
+      # The binary release.yml builds for this target, and a SQL step run through it.
+      - name: the release binary links and runs a SQL step
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --features mcp,bundled-duckdb
+          bin="$PWD/target/release/arc"
+          "$bin" --version
+          if ldd "$bin" | grep -i duckdb; then
+            echo "target/release/arc links a shared libduckdb" >&2
+            exit 1
+          fi
+          work="$(mktemp -d)"
+          mkdir -p "$work/models"
+          printf 'CREATE OR REPLACE TABLE answer AS SELECT 42 AS n;\n' > "$work/models/answer.sql"
+          printf 'name: smoke\nengine: duckdb\ndb: smoke.duckdb\nsteps:\n  - name: answer\n    sql: models/answer.sql\n' > "$work/arcform.yaml"
+          (cd "$work" && "$bin" run)
+          test "$(duckdb -noheader -list "$work/smoke.duckdb" -c 'SELECT n FROM answer')" = 42
+
   # A mechanism can be added, wired in and shipped, and deleting its body leaves
   # `cargo test` green — which is how a change that does nothing reaches a merge
   # with every check above passing. This job answers the question the suite
