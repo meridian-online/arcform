@@ -1801,7 +1801,8 @@ fn fill_nulls_parameters() -> serde_json::Value {
                 "type": "string",
                 "description": "What each missing value is filled with: a SQL expression, recorded as written, \
                     such as a literal (`0`, `'unknown'`) or any expression, another column among them (`amount * 2`). \
-                    A value of a type DuckDB cannot combine with the column's fails the run.",
+                    A value of a wider type widens the column (`0.5` on an `INTEGER` column makes it a `DECIMAL`), \
+                    and a value of a type DuckDB cannot combine with the column's fails the run.",
                 "x-kind": "expression",
             }
         },
@@ -1988,8 +1989,9 @@ pub(crate) fn typed_arguments(
 
 /// `text` as the JSON number it writes, when it reads as a whole number: an
 /// `i64` where it fits, as `"+2"` and `"-1"` do; otherwise, where it is digits
-/// alone after an optional sign, a `u64` where that fits and a float beyond it.
-/// `None` for any other text, `"ten"`, `" 2"` or `"1e3"`.
+/// alone after an optional sign, a `u64` where that fits and a float beyond it,
+/// the largest finite float where the digits overflow even that. `None` for any
+/// other text, `"ten"`, `" 2"` or `"1e3"`.
 fn whole_number(text: &str) -> Option<serde_json::Value> {
     if let Ok(integer) = text.parse::<i64>() {
         return Some(integer.into());
@@ -1998,14 +2000,18 @@ fn whole_number(text: &str) -> Option<serde_json::Value> {
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    match text.parse::<u64>() {
-        Ok(integer) => Some(integer.into()),
-        Err(_) => text
-            .parse::<f64>()
-            .ok()
-            .and_then(serde_json::Number::from_f64)
-            .map(serde_json::Value::Number),
-    }
+    let integer = match text.parse::<u64>() {
+        Ok(integer) => return Some(integer.into()),
+        Err(_) => text.parse::<f64>().ok()?,
+    };
+    // Past about 309 digits the float is infinite, which JSON cannot hold; the
+    // largest finite float of the same sign stands in, still beyond any bound.
+    let finite = if integer.is_finite() {
+        integer
+    } else {
+        f64::MAX.copysign(integer)
+    };
+    serde_json::Number::from_f64(finite).map(serde_json::Value::Number)
 }
 
 impl Operation {
@@ -4634,6 +4640,11 @@ mod tests {
                 serde_json::json!(9_223_372_036_854_775_808_u64),
             ),
             ("100000000000000000000", serde_json::json!(1e20)),
+            (&"9".repeat(400), serde_json::json!(f64::MAX)),
+            (
+                &format!("-{}", "9".repeat(400)),
+                serde_json::json!(-f64::MAX),
+            ),
         ] {
             assert_eq!(
                 typed_arguments(LIMIT_ROWS, arguments(serde_json::json!({ "count": given })))["count"],
@@ -4670,6 +4681,10 @@ mod tests {
             ),
             (
                 serde_json::json!({ "count": 1e20 }),
+                "the argument `count` of `limit-rows` has a maximum of 9223372036854775807",
+            ),
+            (
+                serde_json::json!({ "count": f64::MAX }),
                 "the argument `count` of `limit-rows` has a maximum of 9223372036854775807",
             ),
             (
