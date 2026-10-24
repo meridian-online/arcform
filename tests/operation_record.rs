@@ -1262,6 +1262,71 @@ fn a_dedupe_key_or_order_that_is_not_one_window_is_refused_with_the_directory_un
     }
 }
 
+/// `arc operation record limit-rows` on `orders` as `top_orders`, with each of
+/// `args` as an `--arg`.
+fn record_limit(protocol: &Protocol, args: &[&str]) -> Output {
+    let mut command = vec![
+        "operation",
+        "record",
+        "limit-rows",
+        "--on",
+        "orders",
+        "--name",
+        "top_orders",
+    ];
+    for arg in args {
+        command.extend(["--arg", arg]);
+    }
+    protocol.arc(&command)
+}
+
+/// The model `limit-rows` writes for `count=2` and `order_by=amount desc`.
+const TOP_ORDERS_MODEL: &str = "-- generated: limit-rows on orders\nCREATE OR REPLACE TABLE \"top_orders\" AS\nSELECT *\nFROM orders\nORDER BY amount desc\nLIMIT 2;\n";
+
+#[test]
+fn record_limit_keeps_the_first_rows_in_the_order_given() {
+    let protocol = Protocol::new();
+    ok(
+        &record_limit(&protocol, &["count=2", "order_by=amount desc"]),
+        "arc operation record limit-rows",
+    );
+    assert_eq!(protocol.read("models/02_top_orders.sql"), TOP_ORDERS_MODEL);
+    ok(&protocol.arc(&["run"]), "arc run");
+    assert_eq!(protocol.ids("top_orders"), [3, 2]);
+}
+
+#[test]
+fn a_limit_count_that_is_not_a_whole_number_from_zero_or_an_order_the_limit_cannot_follow_is_refused_with_the_directory_untouched()
+ {
+    let protocol = Protocol::new();
+    let before = protocol.files();
+    for (args, named) in [
+        (
+            &["count=ten"][..],
+            &["the argument `count` of `limit-rows` is an integer"][..],
+        ),
+        (
+            &["count=-1"][..],
+            &["the argument `count` of `limit-rows` has a minimum of 0"][..],
+        ),
+        (
+            &["order_by=amount"][..],
+            &["`limit-rows` needs the argument `count`"][..],
+        ),
+        (
+            &["count=2", "order_by=amount LIMIT 1"][..],
+            &["the order `order_by` of `limit-rows`"][..],
+        ),
+        (
+            &["count=2", "order_by=amount OFFSET 2"][..],
+            &["the order `order_by` of `limit-rows`"][..],
+        ),
+    ] {
+        refused(&record_limit(&protocol, args), named);
+        assert_eq!(protocol.files(), before, "a refusal changed the directory");
+    }
+}
+
 // ------------------------------------------------- the directory `--dir` names
 
 #[test]
@@ -2097,6 +2162,45 @@ mod mcp {
             "the Protocol the agent recorded into differs from the one the terminal did"
         );
         assert_eq!(agent.read("models/02_by_amount.sql"), BY_AMOUNT_MODEL);
+    }
+
+    #[test]
+    fn the_tool_records_a_limit_as_the_terminal_does() {
+        let terminal = Protocol::new();
+        let agent = Protocol::new();
+        ok(
+            &record_limit(&terminal, &["count=2", "order_by=amount desc"]),
+            "arc operation record limit-rows",
+        );
+
+        let result = call_operation_record(
+            &agent.dir,
+            &agent.history,
+            json!({
+                "operation": "limit-rows",
+                "on": "orders",
+                "name": "top_orders",
+                "arguments": { "count": 2, "order_by": "amount desc" },
+            }),
+        );
+        assert_ne!(
+            result["isError"],
+            true,
+            "the call failed: {}",
+            text(&result)
+        );
+        assert_eq!(result["structuredContent"]["step"], "top_orders");
+        assert_eq!(
+            result["structuredContent"]["model"],
+            "models/02_top_orders.sql"
+        );
+
+        assert_eq!(
+            agent.files(),
+            terminal.files(),
+            "the Protocol the agent recorded into differs from the one the terminal did"
+        );
+        assert_eq!(agent.read("models/02_top_orders.sql"), TOP_ORDERS_MODEL);
     }
 
     #[test]

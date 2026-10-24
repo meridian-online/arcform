@@ -38,6 +38,7 @@ const DERIVE_COLUMN: &str = "derive-column";
 const CAST_COLUMN: &str = "cast-column";
 const SUMMARISE_ROWS: &str = "summarise-rows";
 const DEDUPE_ROWS: &str = "dedupe-rows";
+const LIMIT_ROWS: &str = "limit-rows";
 
 /// The operators the default build holds: the ten every build holds and the two
 /// `http-fetch` adds, which `cli` turns on.
@@ -232,6 +233,7 @@ fn list_prints_each_operation_with_a_sentence() {
         CAST_COLUMN,
         SUMMARISE_ROWS,
         DEDUPE_ROWS,
+        LIMIT_ROWS,
     ] {
         let line = line_opening_with(&text, op);
         assert!(
@@ -251,6 +253,7 @@ fn list_prints_each_operation_with_a_sentence() {
         CAST_COLUMN,
         SUMMARISE_ROWS,
         DEDUPE_ROWS,
+        LIMIT_ROWS,
     ] {
         let entry = entries
             .iter()
@@ -448,6 +451,7 @@ fn describe_prints_each_operator_in_the_five_keys_an_operation_is_described_in()
         CAST_COLUMN,
         SUMMARISE_ROWS,
         DEDUPE_ROWS,
+        LIMIT_ROWS,
     ]) {
         let out = arc(&["operation", "describe", op]);
         assert_eq!(
@@ -746,7 +750,8 @@ fn list_prints_the_operations_and_no_operator() {
             DERIVE_COLUMN,
             CAST_COLUMN,
             SUMMARISE_ROWS,
-            DEDUPE_ROWS
+            DEDUPE_ROWS,
+            LIMIT_ROWS
         ],
         "`arc operation list` prints the operations and nothing else:\n{text}"
     );

@@ -607,6 +607,10 @@ const SUMMARISE_ROWS: &str = "summarise-rows";
 /// written once as [`FILTER_ROWS`] is.
 const DEDUPE_ROWS: &str = "dedupe-rows";
 
+/// The long name of the operation that keeps a given number of a table's rows,
+/// the first in an order or as they come, written once as [`FILTER_ROWS`] is.
+const LIMIT_ROWS: &str = "limit-rows";
+
 /// One SQL operation arc holds: what it is called, what it does, what it reads
 /// and writes, and what it takes — described so that it can be recorded as a
 /// step by name. The catalogue holds the description and nothing that runs.
@@ -999,6 +1003,35 @@ const CATALOGUE: &[Operation] = &[
         sql: dedupe_rows_sql,
         recognised: None,
         checks: Some(dedupe_rows_checks),
+    },
+    Operation {
+        long_name: LIMIT_ROWS,
+        summary: "Keeps a given number of the rows of a table: the first in a SQL `ORDER BY` order, or the first that come.",
+        reads: &[
+            Role {
+                name: "table",
+                kind: "table",
+                list: false,
+                required: true,
+                of: None,
+                min_items: None,
+                description: "The table whose first rows are kept.",
+            },
+            Role {
+                name: "column",
+                kind: "column",
+                list: false,
+                required: false,
+                of: Some("table"),
+                min_items: None,
+                description: "A column the rows are ordered by, which `order_by` may name with others.",
+            },
+        ],
+        writes: &[STEP_TABLE],
+        parameters: limit_rows_parameters,
+        sql: limit_rows_sql,
+        recognised: None,
+        checks: Some(limit_rows_checks),
     },
 ];
 
@@ -1597,6 +1630,111 @@ fn dedupe_rows_checks(arguments: &serde_json::Map<String, serde_json::Value>) ->
     Ok(())
 }
 
+/// The `parameters` schema of [`LIMIT_ROWS`]: one required integer, `count`, at
+/// least `0`, and one optional string, `order_by`. Closed to any other key, as
+/// [`hide_column_parameters`] is.
+///
+/// `count` is a JSON integer, and [`Operation::admit`] holds it to its type and
+/// its `minimum`; the command line gives every `--arg` as a string, and
+/// [`typed_arguments`] turns one that reads as an integer into that integer
+/// first. `order_by` keeps [`sort_rows_parameters`]' annotation, an `order` with
+/// its `x-directions`, and is checked as that clause; [`limit_rows_checks`] then
+/// probes it with the `LIMIT` the step writes after it.
+fn limit_rows_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "count": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "How many rows the step keeps, a whole number from 0: the first this many in `order_by`'s order. \
+                    Without an order, the rows kept are whichever come first, which DuckDB does not promise \
+                    to be the same rows from one run to the next. A table with fewer rows keeps them all.",
+            },
+            "order_by": {
+                "type": "string",
+                "description": "Which rows are first: the order this SQL `ORDER BY` clause gives, recorded as written; \
+                    the step's table holds the rows kept in that order. Where rows tie on the order at the cut, \
+                    which of them are kept may differ from one run to the next. \
+                    The directions listed are the ones offered by word, not a limit.",
+                "x-kind": "order",
+                "x-directions": directions(),
+            }
+        },
+        "required": ["count"],
+    })
+}
+
+/// The SQL step of [`LIMIT_ROWS`]: a table named for the step, holding the first
+/// `count` rows of the table it is applied to, `ORDER BY` the order when one is
+/// given. The table read is written as [`from_ident`] writes it, the order as
+/// given, and the count from the JSON integer, so it is a number and nothing
+/// else. The `LIMIT` opens a line of its own, which ends a `--` comment the order
+/// closes with, so the comment cannot swallow the count.
+fn limit_rows_sql(recording: &Recording) -> String {
+    let order = match recording.arguments.get("order_by").and_then(|v| v.as_str()) {
+        Some(order_by) => format!("ORDER BY {order_by}\n"),
+        None => String::new(),
+    };
+    let count = recording
+        .arguments
+        .get("count")
+        .map_or_else(String::new, ToString::to_string);
+    format!(
+        "CREATE OR REPLACE TABLE {} AS\nSELECT *\nFROM {}\n{order}LIMIT {count};\n",
+        quote_ident(recording.name),
+        from_ident(recording.on),
+    )
+}
+
+/// Whether `order_by`, already admitted as an order, stays an order once the
+/// step's `LIMIT` follows it: DuckDB must read `SELECT 1 ORDER BY <order_by>`,
+/// a newline and `LIMIT 1`, the shape of the step, as one select whose modifiers
+/// are one `ORDER_MODIFIER` and then one `LIMIT_MODIFIER` with no `OFFSET`, and
+/// nothing else. An order that brings a `LIMIT` of its own, `amount LIMIT 1`,
+/// does not parse with the step's after it; one that brings an `OFFSET`,
+/// `amount OFFSET 2`, parses into the step's `LIMIT` and would skip rows. A
+/// constant is not refused: at the top of a statement `ORDER BY 2` orders by the
+/// second column, as it does in `sort-rows`. Without an order there is nothing to
+/// check.
+fn limit_rows_checks(arguments: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+    let Some(order_by) = arguments
+        .get("order_by")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(());
+    };
+    let probe = format!("SELECT 1 ORDER BY {order_by}\nLIMIT 1");
+    let limited = on_reader(|con| tree(con, &probe))
+        .flatten()
+        .is_some_and(|tree| {
+            let statements = tree["statements"].as_array().map(Vec::as_slice);
+            let Some([statement]) = statements else {
+                return false;
+            };
+            let node = &statement["node"];
+            let modifiers = node["modifiers"].as_array().map(Vec::as_slice);
+            node["type"] == "SELECT_NODE"
+                && matches!(
+                    modifiers,
+                    Some([order, limit])
+                        if order["type"] == "ORDER_MODIFIER"
+                            && limit["type"] == "LIMIT_MODIFIER"
+                            && limit["offset"].is_null()
+                )
+        });
+    if limited {
+        Ok(())
+    } else {
+        Err(refused(format!(
+            "the order `order_by` of `{LIMIT_ROWS}` does not read as one `ORDER BY` the step's \
+             `LIMIT` can follow; it brings a clause of its own, such as a `LIMIT` or an `OFFSET`: {order_by}"
+        )))
+    }
+}
+
 /// `name` as a double-quoted SQL identifier, a `"` inside it doubled. The step's
 /// own name is always quoted, so a name arc admits that would otherwise read as
 /// SQL — [`valid_step_name`] admits a `"` — cannot break out of the statement.
@@ -1723,6 +1861,36 @@ pub(crate) fn operations() -> &'static [Operation] {
 /// The match is exact: a long name is an identity, not a search term.
 pub(crate) fn operation(long_name: &str) -> Option<&'static Operation> {
     CATALOGUE.iter().find(|op| op.long_name == long_name)
+}
+
+/// `arguments` as the command line gives them, each a string, with each value
+/// the `parameters` of the operation `long_name` type `integer` turned into that
+/// integer where it reads as one, `"2"` as `2` and `"-1"` as `-1`. Any other
+/// value is left as given: a string that does not read as an integer, `"ten"`,
+/// stays a string for [`Operation::admit`] to refuse as the wrong type, naming
+/// the argument, and a `minimum` is admit's to hold, not this. An operation arc
+/// does not hold leaves the arguments as given, for [`record_operation`] to
+/// refuse. `arc mcp` passes JSON, whose integers are already integers, and does
+/// not call this.
+pub(crate) fn typed_arguments(
+    long_name: &str,
+    arguments: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let Some(op) = operation(long_name) else {
+        return arguments;
+    };
+    let schema = (op.parameters)();
+    arguments
+        .into_iter()
+        .map(|(key, value)| {
+            let integer = schema["properties"][key.as_str()]["type"] == "integer";
+            let parsed = value
+                .as_str()
+                .filter(|_| integer)
+                .and_then(|text| text.parse::<i64>().ok());
+            (key, parsed.map_or(value, serde_json::Value::from))
+        })
+        .collect()
 }
 
 impl Operation {
@@ -2302,7 +2470,8 @@ impl Operation {
     /// [`probed`]; one annotated as a `column`, a name and not SQL, is checked
     /// only to be a name at all, not empty or blank, since [`column_ident`]
     /// carries any other name as written. An argument the schema's
-    /// `dependentRequired` ties to others is refused without them, and the
+    /// `dependentRequired` ties to others is refused without them, a number below
+    /// its property's `minimum` is refused naming both, and the
     /// operation's own `checks`, when it has them, run last, on the arguments
     /// together.
     fn admit(&self, arguments: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
@@ -2359,9 +2528,22 @@ impl Operation {
             if let Some(ty) = property["type"].as_str()
                 && !is_of_type(value, ty)
             {
+                let article = if ty.starts_with(['a', 'e', 'i', 'o', 'u']) {
+                    "an"
+                } else {
+                    "a"
+                };
                 return Err(refused(format!(
-                    "the argument `{key}` of `{}` is a {ty}, not {value}",
+                    "the argument `{key}` of `{}` is {article} {ty}, not {value}",
                     self.long_name
+                )));
+            }
+            if let (Some(minimum), Some(given)) = (property["minimum"].as_f64(), value.as_f64())
+                && given < minimum
+            {
+                return Err(refused(format!(
+                    "the argument `{key}` of `{}` has a minimum of {}, not {value}",
+                    self.long_name, property["minimum"]
                 )));
             }
             if let Some(clause) = Clause::of(&property["x-kind"])
@@ -4246,6 +4428,152 @@ mod tests {
                 "{key:?} was refused with another message: {err}"
             );
         }
+    }
+
+    #[test]
+    fn the_limit_takes_a_count_of_at_least_zero_and_an_optional_order() {
+        let schema = limit_rows_parameters();
+        assert_eq!(schema["required"], serde_json::json!(["count"]));
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::json!(false),
+            "the schema is open to a key it does not name"
+        );
+        assert_eq!(schema["properties"]["count"]["type"], "integer");
+        assert_eq!(schema["properties"]["count"]["minimum"], 0);
+        assert_eq!(schema["properties"]["order_by"]["x-kind"], "order");
+        assert_eq!(
+            schema["properties"]["order_by"]["x-directions"],
+            sort_rows_parameters()["properties"]["order_by"]["x-directions"],
+            "the limit's order does not offer the directions a sort's does"
+        );
+    }
+
+    #[test]
+    fn the_limit_keeps_the_first_rows_in_the_order_or_as_they_come() {
+        for (given, query) in [
+            (
+                serde_json::json!({ "count": 2 }),
+                "SELECT *\nFROM orders\nLIMIT 2",
+            ),
+            (
+                serde_json::json!({ "count": 2, "order_by": "amount desc" }),
+                "SELECT *\nFROM orders\nORDER BY amount desc\nLIMIT 2",
+            ),
+            (
+                serde_json::json!({ "count": 0, "order_by": "amount -- c" }),
+                "SELECT *\nFROM orders\nORDER BY amount -- c\nLIMIT 0",
+            ),
+        ] {
+            let given = arguments(given);
+            let recording = Recording {
+                name: "top_orders",
+                on: "orders",
+                arguments: &given,
+            };
+            assert_eq!(
+                limit_rows_sql(&recording),
+                format!("CREATE OR REPLACE TABLE \"top_orders\" AS\n{query};\n")
+            );
+        }
+    }
+
+    #[test]
+    fn typed_arguments_turn_an_integer_argument_into_an_integer_and_leave_the_rest() {
+        let typed = typed_arguments(
+            LIMIT_ROWS,
+            arguments(serde_json::json!({ "count": "2", "order_by": "1" })),
+        );
+        assert_eq!(
+            serde_json::Value::Object(typed),
+            serde_json::json!({ "count": 2, "order_by": "1" })
+        );
+        for (operation, given) in [
+            (LIMIT_ROWS, serde_json::json!({ "count": "ten" })),
+            (LIMIT_ROWS, serde_json::json!({ "count": "2.5" })),
+            (FILTER_ROWS, serde_json::json!({ "where": "2" })),
+            ("no-such-operation", serde_json::json!({ "count": "2" })),
+        ] {
+            let typed = typed_arguments(operation, arguments(given.clone()));
+            assert_eq!(serde_json::Value::Object(typed), given, "{operation}");
+        }
+    }
+
+    #[test]
+    fn a_count_below_its_minimum_or_not_an_integer_is_refused_naming_count() {
+        let op = operation(LIMIT_ROWS).unwrap();
+        for (given, named) in [
+            (
+                serde_json::json!({ "count": -1 }),
+                "the argument `count` of `limit-rows` has a minimum of 0, not -1",
+            ),
+            (
+                serde_json::json!({ "count": "ten" }),
+                "the argument `count` of `limit-rows` is an integer",
+            ),
+            (
+                serde_json::json!({ "count": 2.5 }),
+                "the argument `count` of `limit-rows` is an integer",
+            ),
+            (
+                serde_json::json!({ "order_by": "amount" }),
+                "`limit-rows` needs the argument `count`",
+            ),
+        ] {
+            let err = op
+                .admit(&arguments(given.clone()))
+                .expect_err(named)
+                .to_string();
+            assert!(
+                err.contains(named),
+                "{given} was refused with another message: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_limit_order_is_admitted_unless_it_brings_a_clause_the_limit_cannot_follow() {
+        let op = operation(LIMIT_ROWS).unwrap();
+        for order_by in [
+            "amount desc",
+            "amount -- c",
+            "2 desc",
+            "amount, id desc NULLS LAST",
+        ] {
+            let admitted = op.admit(&arguments(
+                serde_json::json!({ "count": 2, "order_by": order_by }),
+            ));
+            assert!(admitted.is_ok(), "{order_by:?} was refused: {admitted:?}");
+        }
+        assert!(
+            op.admit(&arguments(serde_json::json!({ "count": 2 })))
+                .is_ok()
+        );
+        for order_by in [
+            "amount LIMIT 1",
+            "amount OFFSET 2",
+            "amount LIMIT 1 OFFSET 2",
+        ] {
+            let err = op
+                .admit(&arguments(
+                    serde_json::json!({ "count": 2, "order_by": order_by }),
+                ))
+                .expect_err(order_by)
+                .to_string();
+            assert!(
+                err.contains(
+                    "the order `order_by` of `limit-rows` does not read as one `ORDER BY` the step's `LIMIT` can follow"
+                ),
+                "{order_by:?} was refused with another message: {err}"
+            );
+        }
+        let err = op
+            .admit(&arguments(
+                serde_json::json!({ "count": 2, "order_by": "amount; DROP TABLE orders" }),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the order `order_by` holds a `;`"), "{err}");
     }
 
     #[test]
