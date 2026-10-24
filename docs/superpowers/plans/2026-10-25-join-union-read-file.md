@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Build and test environment, every command below: `export DUCKDB_LIB_DIR=/Volumes/Dev/duckdb-2.0.0 DYLD_LIBRARY_PATH=/Volumes/Dev/duckdb-2.0.0 PATH=/Volumes/Dev/duckdb-2.0.0:$PATH`. Never the `bundled-duckdb` feature. One cargo build at a time.
+- Build and test environment, every command below: `DUCKDB_LIB_DIR`, `DYLD_LIBRARY_PATH` and `PATH` pointed at the DuckDB 2.0.0 release libraries and CLI, as CLAUDE.md's Known issues describes. Never the `bundled-duckdb` feature. One cargo build at a time.
 - The ten existing operations record byte-identical models, headers and manifest lines; their existing tests are not edited except where a task names the edit.
 - Recording runs nothing and opens no protocol database (the in-memory parse database only).
 - Every refusal leaves the protocol directory untouched and names what was wrong.

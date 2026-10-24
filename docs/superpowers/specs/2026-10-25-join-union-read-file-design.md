@@ -88,7 +88,7 @@ Summary: joins a table to another on a key, keeping the rows the join's kind kee
 - `kind`: string, one of `left` (default), `inner`, `right`, `full`, `semi`, `anti`, `cross`.
 - `using`: array of column names (each `x-kind: column`, quoted by arc), at least one; the columns both tables share by name.
 - `condition`: string, `x-kind: condition`, a SQL condition naming both tables by their names; gated in a probe that reproduces its place, `… JOIN <other> ON <condition>`.
-- `prefix`: string; prepended to each column of `other` in the result. Default `<other>_`.
+- `prefix`: string; prepended to each column of `other` in the result. Default `<other>_`. Written into a DuckDB rename pattern (`AS '<prefix>\0'`), so `'` is doubled; a prefix that is empty, holds `\` or a control character is refused; the default built from a table name has its `\` escaped as `\\` and its `'` doubled. Refused with `semi` or `anti`, where it has no effect.
 
 Exactly one of `using` or `condition` is required for every kind but `cross`, which takes neither. Refused otherwise, naming the rule.
 
@@ -143,7 +143,7 @@ arc writes `path` as a single-quoted literal, `'` doubled, so the only gate is t
 
 **Notes on the record answer.** Recording returns notes alongside the model path; `arc mcp` returns them as `notes`, a list of sentences, and the command line prints each to stderr as `note: …`. Two:
 
-- the path is outside the Protocol's folder (absolute, or leaving it by `..`): the step works on this machine only;
+- the path is outside the Protocol's folder (absolute, starting with `~`, or leaving it by `..`): the step works on this machine only;
 - the path is remote (has a `scheme://` prefix): the data is read live at each run and no copy is kept; a snapshot is `http_fetch` or `opendal_fetch` followed by a `read-file` of what it wrote.
 
 The ten and the other two record no notes; the field is an empty list.
@@ -152,7 +152,7 @@ The ten and the other two record no notes; the field is an empty list.
 
 `AssetKind` gains `Remote`: a URL a step reads, named in the graph by the URL as written. Introspection marks a read path as `Remote` when it has a `scheme://` prefix (any scheme DuckDB reads through its file systems: `http`, `https`, `s3`, `gs`, `gcs`, `r2`, `az`, `azure`, `abfss`, `hf`, and any other `<scheme>://`), whether it reaches the SQL through `FROM '…'` or a reader function (`read_csv('https://…')`). A glob URL is `Remote`, not `Pattern`.
 
-Staleness: a `Remote` asset is never hashed, and a step that reads one is stale on every run. It is never checked as missing before a run. Its name in the description vocabulary and the run contract is `remote`; the role kinds the description test allows gain `remote`. Every match on `AssetKind` handles the variant: the runner's hashing and missing checks, the run contract, `protocol_files`, the operator kind names, the CLI's printing.
+Staleness: a `Remote` asset is never hashed, and a step that reads or produces one is stale on every run, through an explicit force-stale check that holds for every kind of step (a precondition-gated `command:` step included), not by leaving the asset out of the hash. `file://` is not remote: it names a local file and stays a path. It is never checked as missing before a run. Its name in the description vocabulary and the run contract is `remote`; the role kinds the description test allows gain `remote`. Every match on `AssetKind` handles the variant: the runner's hashing and missing checks, the run contract, `protocol_files`, the operator kind names, the CLI's printing.
 
 A URL written by hand in a manifest's `depends_on:`, `produces:` or `assets:` is `Remote` too: `default_kind_for_declared_name` gains the `scheme://` rule, so the runner never reads it from disk and the run contract falls back to the same kind. Such a step already reran every run (the URL was missing as a file); it now reruns without a missing-file warning. That is a behaviour change, with its own tests and a changelog line. `http_fetch`'s `url` stays a configuration value, not an asset: making it `Remote` would make every fetch step rerun on every run, and `fetch_cache` already handles its freshness. *(My calls.)*
 
