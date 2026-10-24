@@ -958,6 +958,27 @@ fn a_cast_of_a_column_the_table_lacks_records_and_fails_the_run() {
 }
 
 #[test]
+fn a_value_the_cast_cannot_convert_fails_the_run() {
+    // The step casts with `CAST`, not `TRY_CAST`, so a note such as 'abc' that
+    // is no integer fails the run rather than becoming a `NULL`.
+    let protocol = Protocol::new();
+    ok(
+        &record_cast(&protocol, "note", "INTEGER"),
+        "arc operation record cast-column",
+    );
+    let out = protocol.arc(&["run"]);
+    assert!(
+        !out.status.success(),
+        "arc run of a cast that cannot convert exited 0"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Could not convert string"),
+        "the failed run does not give DuckDB's conversion error:\n{stderr}"
+    );
+}
+
+#[test]
 fn a_type_that_is_not_one_is_refused_with_the_directory_untouched() {
     let protocol = Protocol::new();
     let before = protocol.files();
