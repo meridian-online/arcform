@@ -879,7 +879,7 @@ const CATALOGUE: &[Operation] = &[
                 required: false,
                 of: Some("table"),
                 min_items: None,
-                description: "The column the expression is on; the expression may name others.",
+                description: "The column added, which the `column` argument names.",
             },
         ],
         writes: &[STEP_TABLE],
@@ -1138,10 +1138,14 @@ fn rename_column_parameters() -> serde_json::Value {
 /// name (`id_1`) rather than refusing. `ALTER TABLE .. RENAME COLUMN` makes
 /// DuckDB refuse both when the step runs, and the run stops at the first
 /// statement that fails.
+///
+/// The two are one transaction, so a failed `ALTER` leaves no table made under
+/// the step's name with the column unrenamed: the run stops before the
+/// `COMMIT`, and DuckDB rolls the open transaction back as the run ends.
 fn rename_column_sql(recording: &Recording) -> String {
     let table = quote_ident(recording.name);
     format!(
-        "CREATE OR REPLACE TABLE {table} AS\nSELECT *\nFROM {};\nALTER TABLE {table} RENAME COLUMN {} TO {};\n",
+        "BEGIN TRANSACTION;\nCREATE OR REPLACE TABLE {table} AS\nSELECT *\nFROM {};\nALTER TABLE {table} RENAME COLUMN {} TO {};\nCOMMIT;\n",
         from_ident(recording.on),
         recording.column("column"),
         recording.column("to"),
@@ -1166,7 +1170,9 @@ fn derive_column_parameters() -> serde_json::Value {
                 "type": "string",
                 "description": "The name of the new column; a name, not SQL, \
                     so a name that needs quotes is given without them. \
-                    A name the table already has fails the run.",
+                    A name the table already has fails the run. \
+                    The step adds the column as `__arc_derived` first and then renames it, \
+                    so a table that already holds a column of that name is not one this operation can add to.",
                 "x-kind": "column",
             },
             "expression": {
@@ -1191,11 +1197,16 @@ fn derive_column_parameters() -> serde_json::Value {
 /// table already has gives the new one a suffixed name (`amount_1`) rather than
 /// refusing, and `ALTER TABLE .. RENAME COLUMN` makes DuckDB refuse it when the
 /// step runs. arc does not open the database when it records, so it cannot
-/// refuse the clash then.
+/// refuse the clash then. `__arc_derived` is a name the step reserves: a table
+/// that already holds a column called that is not one this operation can add to,
+/// since the select would suffix the new column and the `ALTER` rename the old.
+///
+/// The two are one transaction, as [`rename_column_sql`]'s are, so a clash leaves
+/// no table made under the step's name with the column under its temporary name.
 fn derive_column_sql(recording: &Recording) -> String {
     let table = quote_ident(recording.name);
     format!(
-        "CREATE OR REPLACE TABLE {table} AS\nSELECT *, {} AS __arc_derived\nFROM {};\nALTER TABLE {table} RENAME COLUMN __arc_derived TO {};\n",
+        "BEGIN TRANSACTION;\nCREATE OR REPLACE TABLE {table} AS\nSELECT *, {} AS __arc_derived\nFROM {};\nALTER TABLE {table} RENAME COLUMN __arc_derived TO {};\nCOMMIT;\n",
         recording.text("expression"),
         from_ident(recording.on),
         recording.column("column"),
@@ -2089,19 +2100,58 @@ struct Probe {
     /// The probe `value` is written into, ending in the [`SENTINEL`] alias.
     probe: fn(value: &str) -> String,
     /// Whether the select list DuckDB reads in the probe is the one the fragment
-    /// should give.
-    admits: fn(items: &[serde_json::Value]) -> bool,
+    /// should give: `Ok`, or what the fragment is instead, as a refusal says it
+    /// after the value's name.
+    admits: fn(items: &[serde_json::Value]) -> std::result::Result<(), &'static str>,
 }
 
+/// What a refusal says of a fragment whose probe is not the one select its kind
+/// gives, after the value's name.
+const NOT_ONE: &str = "is not one SQL";
+
 /// The probe of an `expression`: `SELECT <value> AS __arc_probe`, which must read
-/// as exactly one item, called [`SENTINEL`]. `1 FROM orders` and `a UNION SELECT
-/// b` are not a bare select, `amount, note` is two items, and `amount * 2 --
-/// double` leaves the one item without the alias.
+/// as exactly one item, called [`SENTINEL`], that is one value for each row
+/// ([`one_value_per_row`]). `1 FROM orders` and `a UNION SELECT b` are not a bare
+/// select, `amount, note` is two items, and `amount * 2 -- double` leaves the one
+/// item without the alias.
 const EXPRESSION: Probe = Probe {
     noun: "expression",
     probe: |value| format!("SELECT {value} AS {SENTINEL}"),
-    admits: |items| items.len() == 1 && items[0]["alias"] == SENTINEL,
+    admits: |items| match items {
+        [item] if item["alias"] == SENTINEL => one_value_per_row(item),
+        _ => Err(NOT_ONE),
+    },
 };
+
+/// Whether `node`, an item of DuckDB's tree, gives one value for each row it is
+/// written into: `Ok`, or why not. A star — `*`, `orders.*`, `* EXCLUDE (..)`,
+/// `COLUMNS(..)`, alone or inside a function — and a `*COLUMNS(..)` unpacked into
+/// a call read as one item in the probe but expand to several columns in the
+/// step; an `unnest` or an `unlist` gives several rows for one. A subquery is not
+/// looked inside: its star reads its own `FROM`, and it gives one value, so
+/// `EXISTS (SELECT * FROM orders)` is admitted. `count(*)` holds no star node.
+fn one_value_per_row(node: &serde_json::Value) -> std::result::Result<(), &'static str> {
+    match node {
+        serde_json::Value::Object(fields) => {
+            if node["class"] == "SUBQUERY" {
+                return Ok(());
+            }
+            if node["class"] == "STAR" || node["type"] == "OPERATOR_UNPACK" {
+                return Err("expands to several columns, where the step adds one");
+            }
+            if node["class"] == "FUNCTION"
+                && node["function_name"].as_str().is_some_and(|name| {
+                    name.eq_ignore_ascii_case("unnest") || name.eq_ignore_ascii_case("unlist")
+                })
+            {
+                return Err("changes the number of rows, where the step keeps every row");
+            }
+            fields.values().try_for_each(one_value_per_row)
+        }
+        serde_json::Value::Array(items) => items.iter().try_for_each(one_value_per_row),
+        _ => Ok(()),
+    }
+}
 
 impl Probe {
     /// The probe a value carrying this `x-kind` is gated in, or `None` when the
@@ -2119,10 +2169,14 @@ impl Probe {
 ///
 /// * it holds [`SENTINEL`], in any case, since a value that supplies the alias
 ///   itself could hide what follows it behind a comment and still pass;
-/// * DuckDB reads its probe as more than one statement, in the wording
-///   [`one_statement`] gives the same `;`;
+/// * DuckDB reads `SELECT <value>` as more than one statement, in the wording
+///   [`one_statement`] gives the same `;`. The value is counted on its own and
+///   not in its probe, since what the probe puts after it can stop a second
+///   statement from parsing — `amount; DROP TABLE orders AS __arc_probe` — and
+///   the `;` would then be refused as something else;
 /// * DuckDB cannot parse the probe, or reads it as anything but a bare select
-///   ([`bare_select`]) whose select list `probe.admits`.
+///   ([`bare_select`]) whose select list `probe.admits`, with the reason
+///   `admits` gives.
 fn probed(operation: &str, key: &str, probe: Probe, value: &str) -> Result<()> {
     if value.to_ascii_lowercase().contains(SENTINEL) {
         return Err(refused(format!(
@@ -2131,28 +2185,33 @@ fn probed(operation: &str, key: &str, probe: Probe, value: &str) -> Result<()> {
             probe.noun
         )));
     }
-    let text = (probe.probe)(value);
-    if duckdb_statement_count(&text) > 1 {
+    if duckdb_statement_count(&format!("SELECT {value}")) > 1 {
         return Err(second_statement(probe.noun, key, value));
     }
-    if probe_items(&text).is_some_and(|items| (probe.admits)(&items)) {
-        Ok(())
-    } else {
-        Err(refused(format!(
-            "the {noun} `{key}` of `{operation}` is not one SQL {noun}: {value}",
-            noun = probe.noun
-        )))
-    }
+    let noun = probe.noun;
+    let admitted = probe_items(&(probe.probe)(value))
+        .ok_or(NOT_ONE)
+        .and_then(|items| (probe.admits)(&items));
+    admitted.map_err(|reason| {
+        let reason = if reason == NOT_ONE {
+            format!("{NOT_ONE} {noun}")
+        } else {
+            reason.to_string()
+        };
+        refused(format!(
+            "the {noun} `{key}` of `{operation}` {reason}: {value}"
+        ))
+    })
 }
 
 /// The select list of `probe`, when DuckDB reads it as one statement whose tree
 /// [`bare_select`] accepts; `None` when DuckDB cannot parse it, reads more than
 /// one statement in it, or reads a select that does more than list its items. It
 /// is asked on the thread's [`on_reader`] database, and binds and runs nothing.
+/// The statements are counted in the tree itself: DuckDB gives a tree for each
+/// statement of a text that is all selects, and an error for a text that does not
+/// parse or holds anything else, so no second parse is needed.
 fn probe_items(probe: &str) -> Option<Vec<serde_json::Value>> {
-    if duckdb_statement_count(probe) != 1 {
-        return None;
-    }
     let tree = on_reader(|con| tree(con, probe))??;
     bare_select(&tree)?;
     tree["statements"][0]["node"]["select_list"]
@@ -3127,7 +3186,7 @@ mod tests {
         };
         assert_eq!(
             rename_column_sql(&recording),
-            "CREATE OR REPLACE TABLE \"relabelled\" AS\nSELECT *\nFROM orders;\nALTER TABLE \"relabelled\" RENAME COLUMN note TO \"order\";\n"
+            "BEGIN TRANSACTION;\nCREATE OR REPLACE TABLE \"relabelled\" AS\nSELECT *\nFROM orders;\nALTER TABLE \"relabelled\" RENAME COLUMN note TO \"order\";\nCOMMIT;\n"
         );
     }
 
@@ -3206,7 +3265,7 @@ mod tests {
         };
         assert_eq!(
             derive_column_sql(&recording),
-            "CREATE OR REPLACE TABLE \"doubled_orders\" AS\nSELECT *, amount * 2 AS __arc_derived\nFROM orders;\nALTER TABLE \"doubled_orders\" RENAME COLUMN __arc_derived TO \"order\";\n"
+            "BEGIN TRANSACTION;\nCREATE OR REPLACE TABLE \"doubled_orders\" AS\nSELECT *, amount * 2 AS __arc_derived\nFROM orders;\nALTER TABLE \"doubled_orders\" RENAME COLUMN __arc_derived TO \"order\";\nCOMMIT;\n"
         );
     }
 
@@ -3218,6 +3277,8 @@ mod tests {
             "upper(note)",
             "CASE WHEN amount > 100 THEN 'big' ELSE 'small' END",
             "regexp_replace(note, 'a', 'b')",
+            "EXISTS (SELECT * FROM orders)", // a star inside a subquery reads its own FROM
+            "count(*) OVER ()",              // `count(*)` holds no star
         ] {
             let admitted = op.admit(&arguments(
                 serde_json::json!({ "column": "derived", "expression": expression }),
@@ -3239,6 +3300,13 @@ mod tests {
             "amount AS __arc_probe -- c", // the alias supplied by the caller
             "1 UNION SELECT 2",           // a set operation, not a select
             "amount ORDER BY 1",          // a modifier
+            "*",
+            "orders.*",
+            "* EXCLUDE (amount)",
+            "* REPLACE (0 AS amount)",
+            "COLUMNS(*)",
+            "coalesce(COLUMNS('amount|id'), 0)",
+            "unnest([1, 2])",
         ] {
             let err = op
                 .admit(&arguments(
@@ -3268,16 +3336,46 @@ mod tests {
 
     #[test]
     fn a_second_statement_in_an_expression_keeps_the_wording_a_clause_gives_it() {
-        let err = probed(DERIVE_COLUMN, "expression", EXPRESSION, "amount; SELECT 2")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains(
-                "the expression `expression` holds a `;` outside a string or a comment, \
-                 which would end the step's statement and begin another"
+        for expression in ["amount; SELECT 2", "amount; DROP TABLE orders"] {
+            let err = probed(DERIVE_COLUMN, "expression", EXPRESSION, expression)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(
+                    "the expression `expression` holds a `;` outside a string or a comment, \
+                     which would end the step's statement and begin another"
+                ),
+                "{expression:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_star_or_an_unnest_is_refused_saying_what_it_would_do_to_the_step() {
+        for (expression, reason) in [
+            ("*", "expands to several columns"),
+            ("orders.*", "expands to several columns"),
+            ("* EXCLUDE (amount)", "expands to several columns"),
+            ("* REPLACE (0 AS amount)", "expands to several columns"),
+            ("COLUMNS(*)", "expands to several columns"),
+            (
+                "coalesce(COLUMNS('amount|id'), 0)",
+                "expands to several columns",
             ),
-            "{err}"
-        );
+            ("concat(*COLUMNS(*))", "expands to several columns"),
+            ("unnest([1, 2])", "changes the number of rows"),
+            ("UNLIST([1, 2]) + 1", "changes the number of rows"),
+        ] {
+            let err = probed(DERIVE_COLUMN, "expression", EXPRESSION, expression)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!(
+                    "the expression `expression` of `derive-column` {reason}"
+                )),
+                "{expression:?} was refused with another message: {err}"
+            );
+        }
     }
 
     #[test]

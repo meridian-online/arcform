@@ -721,7 +721,7 @@ fn record_rename_writes_the_model_and_arc_run_renames_the_column_in_place() {
     );
     assert_eq!(
         protocol.read("models/02_relabelled.sql"),
-        "-- generated: rename-column on orders\nCREATE OR REPLACE TABLE \"relabelled\" AS\nSELECT *\nFROM orders;\nALTER TABLE \"relabelled\" RENAME COLUMN note TO label;\n"
+        "-- generated: rename-column on orders\nBEGIN TRANSACTION;\nCREATE OR REPLACE TABLE \"relabelled\" AS\nSELECT *\nFROM orders;\nALTER TABLE \"relabelled\" RENAME COLUMN note TO label;\nCOMMIT;\n"
     );
     ok(&protocol.arc(&["run"]), "arc run");
     assert_eq!(
@@ -742,9 +742,15 @@ fn record_rename_writes_the_model_and_arc_run_renames_the_column_in_place() {
 
 #[test]
 fn a_rename_of_a_column_the_table_lacks_or_onto_one_it_has_records_and_fails_the_run() {
-    for (args, named) in [
-        (["column=nte", "to=label"], "nte"),
-        (["column=note", "to=id"], "id"),
+    for (args, message) in [
+        (
+            ["column=nte", "to=label"],
+            "does not have a column with name \"nte\"",
+        ),
+        (
+            ["column=note", "to=id"],
+            "Column with name \"id\" already exists",
+        ),
     ] {
         let protocol = Protocol::new();
         ok(
@@ -767,10 +773,26 @@ fn a_rename_of_a_column_the_table_lacks_or_onto_one_it_has_records_and_fails_the
         assert!(!out.status.success(), "arc run of {args:?} exited 0");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains(named),
-            "the failed run does not name {named}:\n{stderr}"
+            stderr.contains(message),
+            "the failed run does not say {message}:\n{stderr}"
+        );
+        assert!(
+            !table_exists(&protocol, "relabelled"),
+            "the failed run of {args:?} left relabelled made"
         );
     }
+}
+
+/// Whether the Protocol's database holds a table called `table`.
+fn table_exists(protocol: &Protocol, table: &str) -> bool {
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    db.query_row(
+        "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
+        [table],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap()
+        > 0
 }
 
 /// `arc operation record derive-column` on `orders` as `doubled_orders`, with
@@ -800,7 +822,7 @@ fn record_derive_writes_the_model_and_arc_run_adds_the_computed_column() {
     );
     assert_eq!(
         protocol.read("models/02_doubled_orders.sql"),
-        "-- generated: derive-column on orders\nCREATE OR REPLACE TABLE \"doubled_orders\" AS\nSELECT *, amount * 2 AS __arc_derived\nFROM orders;\nALTER TABLE \"doubled_orders\" RENAME COLUMN __arc_derived TO doubled;\n"
+        "-- generated: derive-column on orders\nBEGIN TRANSACTION;\nCREATE OR REPLACE TABLE \"doubled_orders\" AS\nSELECT *, amount * 2 AS __arc_derived\nFROM orders;\nALTER TABLE \"doubled_orders\" RENAME COLUMN __arc_derived TO doubled;\nCOMMIT;\n"
     );
     ok(&protocol.arc(&["run"]), "arc run");
     assert_eq!(
@@ -837,8 +859,12 @@ fn a_derive_onto_a_column_the_table_has_records_and_fails_the_run() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("amount"),
-        "the failed run does not name amount:\n{stderr}"
+        stderr.contains("Column with name \"amount\" already exists"),
+        "the failed run does not say amount already exists:\n{stderr}"
+    );
+    assert!(
+        !table_exists(&protocol, "doubled_orders"),
+        "the failed run left doubled_orders made"
     );
 }
 
@@ -846,10 +872,18 @@ fn a_derive_onto_a_column_the_table_has_records_and_fails_the_run() {
 fn an_expression_that_is_not_one_is_refused_with_the_directory_untouched() {
     let protocol = Protocol::new();
     let before = protocol.files();
-    for expression in ["1 FROM orders", "amount, note", "amount * 2 -- double"] {
+    for (expression, reason) in [
+        ("1 FROM orders", "is not one SQL expression"),
+        ("amount, note", "is not one SQL expression"),
+        ("amount * 2 -- double", "is not one SQL expression"),
+        ("* EXCLUDE (amount)", "expands to several columns"),
+        ("unnest([1, 2])", "changes the number of rows"),
+    ] {
         refused(
             &record_derive(&protocol, "doubled", expression),
-            &["the expression `expression` of `derive-column` is not one SQL expression"],
+            &[&format!(
+                "the expression `expression` of `derive-column` {reason}"
+            )],
         );
         assert_eq!(protocol.files(), before, "a refusal changed the directory");
     }
