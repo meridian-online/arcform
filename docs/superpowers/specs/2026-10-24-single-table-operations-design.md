@@ -37,7 +37,7 @@ The table read is written as `from_ident` writes it; a column name as `column_id
 | `derive-column` | `column` (name of the new column), `expression` (SQL expression), both required | `SELECT *, <expression> AS <column> FROM <t>` |
 | `cast-column` | `column` (name), `type` (SQL type), both required | `SELECT * REPLACE (CAST(<column> AS <type>) AS <column>) FROM <t>` |
 | `summarise-rows` | `aggregates` (select list, required), `group_by` (select list, optional) | `SELECT [<group_by>, ]<aggregates> FROM <t>[ GROUP BY ALL]` |
-| `dedupe-rows` | `key` (select list, optional), `order_by` (order, optional, needs `key`) | no key: `SELECT DISTINCT * FROM <t>`; key: `SELECT * FROM <t> QUALIFY row_number() OVER (PARTITION BY <key>[ ORDER BY <order_by>]) = 1` |
+| `dedupe-rows` | `key` (partition key) and `order_by` (order), given together or not at all | neither: `SELECT DISTINCT * FROM <t>`; both: `SELECT * FROM <t> QUALIFY row_number() OVER (PARTITION BY <key> ORDER BY <order_by>\n) = 1` |
 | `limit-rows` | `count` (integer ≥ 0, required), `order_by` (order, optional) | `SELECT * FROM <t>[ ORDER BY <order_by>] LIMIT <count>` |
 | `fill-nulls` | `column` (name), `value` (SQL expression), both required | `SELECT * REPLACE (coalesce(<column>, <value>) AS <column>) FROM <t>` |
 
@@ -48,10 +48,13 @@ Each clause starts its own line in the model, as the filter's and the sort's do.
 `Operation::admit` already checks required keys, closed schemas, JSON types and, through `x-kind`, a `condition` or an `order` as one statement. It grows:
 
 - `x-kind: column` — a name: refused when empty. Written through `column_ident`, so no gate on its characters is needed.
-- `x-kind: expression` — one SQL expression: DuckDB must read `SELECT (<value>)` as one statement whose tree is a bare select of one expression (no `FROM`, `WHERE`, `GROUP BY`, `HAVING`, `QUALIFY`, modifiers or CTEs). The parentheses stop a value that runs on into a clause of its own (`1 FROM other`).
-- `x-kind: select-list` — `SELECT <value>` must be one statement with that same bare shape and at least one item. That refuses `count(*) FROM other` and `a UNION SELECT b`.
-- `x-kind: type` — `SELECT CAST(NULL AS <value>)` must be one statement of that bare shape with one item.
-- `minimum` on an integer, and `dependentRequired` (`order_by` needs `key`), each with a message naming the argument.
+- Each SQL fragment is gated in a probe that reproduces what follows it in the step, so a trailing `--` comment, a comma list or a clause that runs on is caught where it would bite. The probe ends in a sentinel alias, `__arc_probe`, which a trailing comment swallows and a comma list displaces:
+  - `x-kind: expression` — `SELECT <value> AS __arc_probe` must be one statement whose tree is a bare select (no `FROM`, `WHERE`, `GROUP BY`, `HAVING`, `QUALIFY`, sample, modifiers or CTEs) of exactly one item, aliased `__arc_probe`. That refuses `1 FROM other`, `amount, note`, `amount * 2 -- double` and `a UNION SELECT b`.
+  - `x-kind: select-list` — `SELECT <value>, 1 AS __arc_probe` must be a bare select of at least two items, the last aliased `__arc_probe`.
+  - `x-kind: type` — `SELECT CAST(NULL AS <value>) AS __arc_probe` must be a bare select of one `CAST` item aliased `__arc_probe`.
+  - `x-kind: partition` (dedupe's `key`) — `SELECT row_number() OVER (PARTITION BY <value>) AS __arc_probe` must be a bare select of one item aliased `__arc_probe`; an alias in the key does not parse there and is refused.
+  - An `order` written anywhere but the statement's end (limit-rows before `LIMIT`, dedupe-rows inside `OVER`) is also checked as `SELECT 1 ORDER BY <value>` whose tree carries one `ORDER_MODIFIER` and no other modifier, so `amount LIMIT 1` is refused; and the step puts a newline after it, so a trailing comment ends there. `sort-rows`' existing gate is unchanged.
+- `minimum` on an integer, and `dependentRequired` (`key` and `order_by` each require the other), each with a message naming the argument.
 
 ## Integer arguments on the command line
 
@@ -62,7 +65,8 @@ Each clause starts its own line in the model, as the filter's and the sort's do.
 - Column arguments are plain names, not SQL (approach 2).
 - Each `column` role stays `required: false`, as it is on the filter and the sort: the catalogue's rule is that a step records from the table and arguments alone, and where an operation needs a column its argument carries it. The role's description says which argument names it.
 - `summarise-rows` uses `GROUP BY ALL`, so a grouping item may carry an alias (`date_trunc('month', at) AS month`).
-- `dedupe-rows` with a key keeps one row per key through `QUALIFY row_number()`, and an `order_by` without a `key` is refused rather than read as a sort.
+- `dedupe-rows` with a key keeps one row per key through `QUALIFY row_number()`, and the key and the order are given together: a key alone would keep an arbitrary row and make the step's table differ between runs, and an order alone would be a sort.
+- A fragment with a trailing `--` comment is refused rather than rewritten: the gate cannot tell a comment from text the step would lose.
 - `cast-column` uses `CAST`, so a value that does not convert fails the run, not the recording; `TRY_CAST` would hide it as a null.
 - `derive-column` onto a name the table already holds is not refused at record time: arc does not open the database, so the run reports the duplicate.
 

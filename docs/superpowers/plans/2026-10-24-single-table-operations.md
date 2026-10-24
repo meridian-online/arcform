@@ -22,7 +22,7 @@
 ## Review Focus
 
 1. A column name holding a space, a `"` or a reserved word (`order`) — written quoted, runs. Test in Task 1.
-2. A fragment that runs on into a clause of its own (`1 FROM other`, `count(*) FROM other`, `a UNION SELECT b`) — refused, directory untouched. Tests in Tasks 3 and 5.
+2. A fragment that runs on into a clause of its own, carries a trailing `--` comment or is a comma list where one item is expected (`1 FROM other`, `x -- c`, `a, b`) — refused, directory untouched. Tests in Tasks 3, 5, 6 and 8.
 3. A fragment holding `;` and a second statement — refused by every SQL-typed argument. Test in Task 3 (shared gate) and Task 5.
 4. `limit-rows` `count` given as `ten` or `-1` on the command line — refused naming `count`. Test in Task 7.
 5. An empty column name — refused naming the argument. Test in Task 1.
@@ -77,16 +77,17 @@ Expected: every test named passes; fmt and clippy are clean. CI on Linux is the 
 
 **Interfaces — produces:**
 - `fn bare_select(con_tree: &serde_json::Value) -> Option<usize>` — `Some(n)` when the tree's one statement is a `SELECT_NODE` with `from_table.type == "EMPTY"`, `where_clause`, `having`, `qualify`, `sample` null, `group_expressions`, `group_sets`, `modifiers` empty, `cte_map.map` empty; `n` = `select_list` length.
-- `Clause`-like gate for `x-kind: "expression"`: `SELECT (\n<v>\n)` must count one statement and `bare_select` give `Some(1)`; else refused ``the expression `<key>` … is not one SQL expression``. A `;` with a second statement keeps the existing multi-statement message.
+- `fn probe_items(probe: &str) -> Option<Vec<serde_json::Value>>` — the select list of `probe` when DuckDB reads it as one statement whose tree `bare_select` accepts; built on `bare_select`.
+- Gate for `x-kind: "expression"` (spec, "Gates on arguments"): `SELECT <v> AS __arc_probe` gives exactly one item whose `alias` is `__arc_probe`; else refused ``the expression `<key>` of `<op>` is not one SQL expression``. A `;` with a second statement keeps the existing multi-statement wording.
 - Schema `column` (x-kind column), `expression` (x-kind expression), both required. SQL `SELECT *, <expression> AS <column>\nFROM <t>`.
 
-- [ ] Unit: `amount * 2`, `upper(note)`, `CASE WHEN amount > 100 THEN 'big' ELSE 'small' END`, `regexp_replace(note, 'a', 'b')` admitted; `1 FROM orders`, `amount; DROP TABLE orders`, `1) FROM orders WHERE (1`, `` refused, naming `expression`.
+- [ ] Unit: `amount * 2`, `upper(note)`, `CASE WHEN amount > 100 THEN 'big' ELSE 'small' END`, `regexp_replace(note, 'a', 'b')` admitted; `1 FROM orders`, `amount; DROP TABLE orders`, `1) FROM orders WHERE (1`, `` refused, naming `expression`; also `amount, note` and `amount * 2 -- double`.
 - [ ] Integration: model bytes for `column=doubled`, `expression=amount * 2`; after run, `doubled` is `[100, 300, 600, 200]` by id.
 - [ ] Verify; commit.
 
 ### Task 4: `cast-column`
 
-**Interfaces:** gate `x-kind: "type"`: `SELECT CAST(NULL AS <v>)` one statement and `bare_select == Some(1)`, the item's class `CAST`. Schema `column`, `type`. SQL `SELECT * REPLACE (CAST(<column> AS <type>) AS <column>)\nFROM <t>`.
+**Interfaces:** gate `x-kind: "type"`: `SELECT CAST(NULL AS <v>) AS __arc_probe` gives one item, class `CAST`, alias `__arc_probe`. Schema `column`, `type`. SQL `SELECT * REPLACE (CAST(<column> AS <type>) AS <column>)\nFROM <t>`.
 
 - [ ] Unit: `VARCHAR`, `DECIMAL(10, 2)`, `INTEGER[]` admitted; `INTEGER) AS x, (1`, `INTEGER; DROP TABLE orders`, `` refused naming `type`.
 - [ ] Integration: `column=amount`, `type=VARCHAR`; after run `typeof(amount)` is `VARCHAR` and values `'50','150','300','100'`.
@@ -94,23 +95,23 @@ Expected: every test named passes; fmt and clippy are clean. CI on Linux is the 
 
 ### Task 5: `summarise-rows`, with the select-list gate
 
-**Interfaces:** gate `x-kind: "select-list"`: `SELECT <v>` one statement, `bare_select` gives `Some(n)` with `n >= 1`. Schema `aggregates` required, `group_by` optional. SQL with group: `SELECT <group_by>, <aggregates>\nFROM <t>\nGROUP BY ALL`; without: `SELECT <aggregates>\nFROM <t>`.
+**Interfaces:** gate `x-kind: "select-list"`: `SELECT <v>, 1 AS __arc_probe` gives at least two items, the last aliased `__arc_probe`. Schema `aggregates` required, `group_by` optional. SQL with group: `SELECT <group_by>, <aggregates>\nFROM <t>\nGROUP BY ALL`; without: `SELECT <aggregates>\nFROM <t>`.
 
-- [ ] Unit: `count(*) AS n, sum(amount) AS total` admitted; `count(*) FROM other`, `a UNION SELECT b`, `count(*); DROP TABLE orders` refused naming `aggregates`.
+- [ ] Unit: `count(*) AS n, sum(amount) AS total` admitted; `count(*) FROM other`, `a UNION SELECT b`, `count(*); DROP TABLE orders`, `count(*) AS n -- all` refused naming `aggregates`; `big -- by size` refused naming `group_by`.
 - [ ] Integration: fixture rows grouped by `amount > 100 AS big` with `count(*) AS n` gives `{false: 2, true: 2}`; without `group_by`, one row `n = 4`.
 - [ ] Verify; commit.
 
 ### Task 6: `dedupe-rows`, with `dependentRequired`
 
-**Interfaces:** `admit` reads `dependentRequired` (`{"order_by": ["key"]}`) and refuses ```<op>` takes `order_by` only with `key` ``. Schema `key` (select-list), `order_by` (order), both optional. SQL as the spec's table.
+**Interfaces:** `admit` reads `dependentRequired` (`{"key": ["order_by"], "order_by": ["key"]}`) and refuses ``…`<a>` needs `<b>` as well``. Gate `x-kind: "partition"` per the spec. `fn order_alone(key, value) -> Result<()>`: `SELECT 1 ORDER BY <v>` tree's `modifiers` is exactly one `ORDER_MODIFIER`; used by every operation whose order is not at the statement's end (here and Task 7). Schema `key` (partition), `order_by` (order), both optional. SQL as the spec's table, with a newline after the order.
 
-- [ ] Unit: `order_by` without `key` refused.
+- [ ] Unit: `order_by` without `key`, and `key` without `order_by`, refused; `key=note AS n` refused; `order_by=amount LIMIT 1` refused.
 - [ ] Integration: a fixture with a duplicated row: no key gives distinct rows; `key=note`, `order_by=amount desc` keeps the highest amount per note.
 - [ ] Verify; commit.
 
 ### Task 7: `limit-rows`, with integer arguments on the command line
 
-**Interfaces — produces:** `pub(crate) fn typed_arguments(long_name: &str, arguments: Map) -> Map` in `src/record.rs`: for an operation held, each string value whose property's `type` is `integer` and which parses as `i64` becomes that integer. Called in `src/cli.rs` right after `operation_arguments`. `admit` checks `minimum`. Schema `count` (`integer`, `minimum: 0`, required), `order_by` (order, optional). SQL `SELECT *\nFROM <t>\n[ORDER BY <o>\n]LIMIT <count>`.
+**Interfaces — produces:** `pub(crate) fn typed_arguments(long_name: &str, arguments: Map) -> Map` in `src/record.rs`: for an operation held, each string value whose property's `type` is `integer` and which parses as `i64` becomes that integer. Called in `src/cli.rs` right after `operation_arguments`. `admit` checks `minimum`; `order_by` also passes `order_alone` from Task 6, and the step puts a newline after it. Schema `count` (`integer`, `minimum: 0`, required), `order_by` (order, optional). SQL `SELECT *\nFROM <t>\n[ORDER BY <o>\n]LIMIT <count>`.
 
 - [ ] Unit: `typed_arguments` turns `"2"` into `2` for `limit-rows` and leaves `where` a string for `filter-rows`; `-1` refused naming `count` and `minimum`.
 - [ ] Integration: `--arg count=2 --arg order_by=amount desc` gives ids `[3, 2]`; `--arg count=ten` refused naming `count`; the MCP tool with `{"count": 2, …}` writes the same bytes as the terminal.
@@ -120,6 +121,7 @@ Expected: every test named passes; fmt and clippy are clean. CI on Linux is the 
 
 **Interfaces:** schema `column` (x-kind column), `value` (x-kind expression), both required. SQL `SELECT * REPLACE (coalesce(<column>, <value>) AS <column>)\nFROM <t>`.
 
+- [ ] Unit: `value=0 --` and `value=0) , (1` refused naming `value`.
 - [ ] Integration: a fixture with a null amount; `value=0` fills it and leaves the others.
 - [ ] Verify; commit.
 
