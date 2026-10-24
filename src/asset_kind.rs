@@ -37,22 +37,20 @@ pub enum AssetKind {
     /// A URL DuckDB reads or writes through one of its file systems (`https://`,
     /// `s3://`, `hf://`, and any other `scheme://`), named in the graph by the URL as
     /// written. Never hashed and never checked as missing: arc cannot read it from
-    /// disk, so a step reading one is stale on every run until a conditional check
-    /// (an ETag or Last-Modified comparison) exists.
+    /// disk, so a step reading or producing one is stale on every run until a
+    /// conditional check (an ETag or Last-Modified comparison) exists.
     Remote,
 }
 
 /// True when `path` is a URL: an ASCII letter, then letters, digits, `+`, `-` or
 /// `.`, then `://`. So `https://x.org/a.csv`, `s3://b/k/*.parquet` and `hf://datasets/x`
-/// are remote, while `data/a.csv`, `C:\a.csv` and `://x` are not. `file://` names a
-/// local file, so it is not remote either.
+/// are remote, while `data/a.csv`, `C:\a.csv` and `://x` are not. `file://` counts as
+/// remote too: arc never resolves the URL to a path, so forcing the step stale is the
+/// only answer that cannot report a false "unchanged".
 pub fn is_remote(path: &str) -> bool {
     let Some((scheme, _)) = path.split_once("://") else {
         return false;
     };
-    if scheme.eq_ignore_ascii_case("file") {
-        return false;
-    }
     let mut chars = scheme.chars();
     chars.next().is_some_and(|c| c.is_ascii_alphabetic())
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
@@ -151,17 +149,11 @@ mod tests {
             "https://x.org/a.csv",
             "s3://b/k/*.parquet",
             "hf://datasets/x",
+            "file:///abs/a.csv",
         ] {
             assert!(is_remote(yes), "{yes}");
         }
-        for no in [
-            "data/a.csv",
-            "/abs/a.csv",
-            "C:\\a.csv",
-            "file:///abs/a.csv",
-            "file.csv",
-            "://x",
-        ] {
+        for no in ["data/a.csv", "/abs/a.csv", "C:\\a.csv", "file.csv", "://x"] {
             assert!(!is_remote(no), "{no}");
         }
     }

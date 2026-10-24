@@ -7380,8 +7380,9 @@ steps:
         );
     }
 
-    /// A precondition-gated `command:` step reading `reads` and producing `produces`, in a directory where the
-    /// precondition is fresh, so only the artifact hash can send it back to work.
+    /// A precondition-gated `command:` step reading `reads` and producing `produces`,
+    /// in a directory where the precondition is fresh, so only the artifact hash can
+    /// send it back to work.
     fn gated_command(reads: &str, produces: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let yaml = format!(
@@ -7453,6 +7454,20 @@ steps:
                 "warm run {warm}: a remote output cannot be certified unchanged"
             );
         }
+    }
+
+    // A `file://` URL is remote too: arc never resolves it to a path, so a gated
+    // command step reading one must rerun rather than skip over a file that changed.
+    #[test]
+    fn test_a_gated_command_step_reading_a_file_url_reruns_when_warm() {
+        let dir = gated_command("file:///abs/in.csv", "out.txt");
+        let state = MockStateBackend::new();
+        executed_bodies(dir.path(), &state);
+        age_file(&dir.path().join("build/src/data.csv"), 0);
+        assert_eq!(
+            executed_bodies(dir.path(), &state),
+            vec!["pull-it".to_string()]
+        );
     }
 
     // The produced side of the same rule, on the same gated command step: it reads a
