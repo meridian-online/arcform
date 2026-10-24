@@ -103,17 +103,17 @@ Expected: every test named passes; fmt and clippy are clean. CI on Linux is the 
 
 ### Task 6: `dedupe-rows`, with `dependentRequired`
 
-**Interfaces:** `admit` reads `dependentRequired` (`{"key": ["order_by"], "order_by": ["key"]}`) and refuses ``…`<a>` needs `<b>` as well``. Gate `x-kind: "partition"` per the spec. `fn order_alone(key, value) -> Result<()>`: `SELECT 1 ORDER BY <v>` tree's `modifiers` is exactly one `ORDER_MODIFIER`; used by every operation whose order is not at the statement's end (here and Task 7). Schema `key` (partition), `order_by` (order), both optional. SQL as the spec's table, with a newline after the order.
+**Interfaces:** `admit` reads `dependentRequired` (`{"key": ["order_by"], "order_by": ["key"]}`) and refuses ``…`<a>` needs `<b>` as well``. `key` is `x-kind: "partition"`: it passes the `SELECT_LIST` probe (no star, no unnest, no `)` that closes the window, no clause), and the pair passes a `KEEP` probe that reproduces the step: `SELECT row_number() OVER (PARTITION BY <key> ORDER BY <order_by>\n) AS __arc_probe` must be a bare select of one `WINDOW` item, function `row_number`, alias `__arc_probe`, so an alias in the key, an order that closes the window or runs on into a frame or a `LIMIT`, and a trailing comment are refused. The order keeps `sort-rows`' `x-kind: "order"` annotation and `x-directions`. Schema `key`, `order_by`, both optional. SQL: neither `SELECT DISTINCT *\nFROM <t>`; both `SELECT *\nFROM <t>\nQUALIFY row_number() OVER (PARTITION BY <key> ORDER BY <order_by>\n) = 1`.
 
-- [ ] Unit: `order_by` without `key`, and `key` without `order_by`, refused; `key=note AS n`, `key=note ORDER BY amount` and `key=note) = 1 OR TRUE OR row_number() OVER (PARTITION BY note` refused; `order_by=amount LIMIT 1` refused.
-- [ ] Integration: a fixture with a duplicated row: no key gives distinct rows; `key=note`, `order_by=amount desc` keeps the highest amount per note.
+- [ ] Unit: `order_by` without `key`, and `key` without `order_by`, refused; `key=note AS n`, `key=note ORDER BY amount`, `key=note) = 1 OR TRUE OR row_number() OVER (PARTITION BY note`, `key=*` refused; `order_by=amount LIMIT 1`, `order_by=amount) = 1 OR (1`, `order_by=amount ROWS UNBOUNDED PRECEDING` refused.
+- [ ] Integration: a fixture with a duplicated row: neither gives distinct rows; `key=note`, `order_by=amount desc` keeps the highest amount per note (fixture with two rows per note, unique amounts).
 - [ ] Verify; commit.
 
 ### Task 7: `limit-rows`, with integer arguments on the command line
 
-**Interfaces — produces:** `pub(crate) fn typed_arguments(long_name: &str, arguments: Map) -> Map` in `src/record.rs`: for an operation held, each string value whose property's `type` is `integer` and which parses as `i64` becomes that integer. Called in `src/cli.rs` right after `operation_arguments`. `admit` checks `minimum`; `order_by` also passes `order_alone` from Task 6, and the step puts a newline after it. Schema `count` (`integer`, `minimum: 0`, required), `order_by` (order, optional). SQL `SELECT *\nFROM <t>\n[ORDER BY <o>\n]LIMIT <count>`.
+**Interfaces — produces:** `pub(crate) fn typed_arguments(long_name: &str, arguments: Map) -> Map` in `src/record.rs`: for an operation held, each string value whose property's `type` is `integer` and which parses as `i64` becomes that integer. Called in `src/cli.rs` right after `operation_arguments`. `admit` checks `minimum`. Schema `count` (`integer`, `minimum: 0`, required), `order_by` (`x-kind: "order"`, optional). The order passes a `LIMITED` probe that reproduces the step: `SELECT 1 ORDER BY <order_by>\nLIMIT 1` must be one statement whose tree's modifiers are exactly one `ORDER_MODIFIER` then one `LIMIT_MODIFIER` and nothing else. SQL `SELECT *\nFROM <t>\n[ORDER BY <o>\n]LIMIT <count>`.
 
-- [ ] Unit: `typed_arguments` turns `"2"` into `2` for `limit-rows` and leaves `where` a string for `filter-rows`; `-1` refused naming `count` and `minimum`.
+- [ ] Unit: `typed_arguments` turns `"2"` into `2` for `limit-rows` and leaves `where` a string for `filter-rows`; `-1` refused naming `count` and `minimum`; `order_by=amount LIMIT 1` and `order_by=amount -- c` handled (the first refused; the second harmless, the newline ends it — test the bytes).
 - [ ] Integration: `--arg count=2 --arg order_by=amount desc` gives ids `[3, 2]`; `--arg count=ten` refused naming `count`; the MCP tool with `{"count": 2, …}` writes the same bytes as the terminal.
 - [ ] Verify; commit.
 
