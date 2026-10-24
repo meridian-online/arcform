@@ -642,7 +642,8 @@ pub(crate) struct Operation {
     /// each value has passed its own, or `None` when each value checked alone is
     /// enough. It is for a gate no one value can be held to: [`DEDUPE_ROWS`]'
     /// `key` and `order_by` are written into one window, and are probed there
-    /// together.
+    /// together, and [`LIMIT_ROWS`]' `order_by` is followed by the step's
+    /// `LIMIT`, and is probed with it.
     checks: Option<Checks>,
 }
 
@@ -913,7 +914,7 @@ const CATALOGUE: &[Operation] = &[
                 required: false,
                 of: Some("table"),
                 min_items: None,
-                description: "A column the expression reads; the expression may name others.",
+                description: "A column the expression reads, which `expression` may name with others.",
             },
         ],
         writes: &[STEP_TABLE],
@@ -1261,7 +1262,8 @@ fn hide_column_parameters() -> serde_json::Value {
             "column": {
                 "type": "string",
                 "description": "The name of the column left out of the table, as the table names it; \
-                    a name, not SQL, so a name that needs quotes is given without them.",
+                    a name, not SQL, so a name that needs quotes is given without them. \
+                    A name the table does not have fails the run.",
                 "x-kind": "column",
             }
         },
@@ -1298,7 +1300,8 @@ fn rename_column_parameters() -> serde_json::Value {
             "column": {
                 "type": "string",
                 "description": "The name of the column renamed, as the table names it; \
-                    a name, not SQL, so a name that needs quotes is given without them.",
+                    a name, not SQL, so a name that needs quotes is given without them. \
+                    A name the table does not have fails the run.",
                 "x-kind": "column",
             },
             "to": {
@@ -1498,21 +1501,27 @@ fn summarise_rows_parameters() -> serde_json::Value {
 /// aggregated nor grouped, or when an item of `group_by` is an aggregate. The
 /// number of places is the number of items DuckDB reads in `group_by`'s own probe,
 /// asked again here through [`probe_items`], so it counts what the gate admitted
-/// and not commas. `GROUP BY ()` holds a window alone, `count(*) OVER ()`, to one
+/// and not commas; a `group_by` whose probe gives no items, which the gate would
+/// not have admitted, is grouped by `()`, so the function writes SQL for any
+/// recording and DuckDB judges it when the step runs. `GROUP BY ()` holds a window alone, `count(*) OVER ()`, to one
 /// row, and fails the run on a bare column, as a grouping would. arc does not
 /// open the database when it records, so neither failure can be refused then.
 fn summarise_rows_sql(recording: &Recording) -> String {
     let grouped = recording.arguments.get("group_by").and_then(|v| v.as_str());
     let (select, group_by) = match grouped {
         Some(group_by) => {
-            // The arguments are admitted before the SQL is written, so the probe
-            // reads; its last item is the sentinel, not one of `group_by`'s.
+            // The probe's first and last items are its own, not `group_by`'s. A
+            // `group_by` the gate has not admitted may give no probe at all, and
+            // is grouped by nothing, which DuckDB then refuses on its own terms.
             let items = probe_items(&(SELECT_LIST.probe)(group_by))
-                .expect("an admitted `group_by` reads as a select list")
-                .len()
-                - 1;
+                .map_or(0, |items| items.len().saturating_sub(2));
             let places: Vec<String> = (1..=items).map(|place| place.to_string()).collect();
-            (format!("{group_by}, "), places.join(", "))
+            let places = if places.is_empty() {
+                "()".to_string()
+            } else {
+                places.join(", ")
+            };
+            (format!("{group_by}, "), places)
         }
         None => (String::new(), "()".to_string()),
     };
@@ -1610,8 +1619,9 @@ fn dedupe_rows_window(key: &str, order_by: &str) -> String {
 /// which `PARTITION BY` does not take, does not parse; an order that closes the
 /// window, `amount) = 1 OR (1`, leaves an item that is not the window; and one
 /// that runs on into a frame or a `LIMIT` gives a frame that is not the default,
-/// or does not parse. Without either argument there is no window, and nothing to
-/// check.
+/// or does not parse. An order whose `;` ends the statement, `amount desc;`, is
+/// refused for the `;` first ([`ends_no_statement`]), in the words a clause's
+/// gives it. Without either argument there is no window, and nothing to check.
 ///
 /// A literal constant in either is refused too, naming the argument. Inside
 /// `OVER` a constant is the same value for every row, not a column's place as a
@@ -1626,6 +1636,7 @@ fn dedupe_rows_checks(arguments: &serde_json::Map<String, serde_json::Value>) ->
     let (Some(key), Some(order_by)) = (text("key"), text("order_by")) else {
         return Ok(());
     };
+    ends_no_statement("SELECT 1 ORDER BY ", "order", "order_by", order_by)?;
     let probe = format!("SELECT {} AS {SENTINEL}", dedupe_rows_window(key, order_by));
     let items = probe_items(&probe).filter(|_| !order_by.to_ascii_lowercase().contains(SENTINEL));
     let window = match items.as_deref() {
@@ -1736,7 +1747,8 @@ fn limit_rows_sql(recording: &Recording) -> String {
 /// nothing else. An order that brings a `LIMIT` of its own, `amount LIMIT 1`,
 /// does not parse with the step's after it; one that brings an `OFFSET`,
 /// `amount OFFSET 2`, parses into the step's `LIMIT` and would skip rows; and one
-/// that ends its statement, `amount desc;`, leaves the step's `LIMIT` a second. A
+/// that ends its statement, `amount desc;`, would leave the step's `LIMIT` a
+/// second, and is refused for its `;` first ([`ends_no_statement`]). A
 /// constant is not refused: at the top of a statement `ORDER BY 2` orders by the
 /// second column, as it does in `sort-rows`. Without an order there is nothing to
 /// check.
@@ -1747,6 +1759,7 @@ fn limit_rows_checks(arguments: &serde_json::Map<String, serde_json::Value>) -> 
     else {
         return Ok(());
     };
+    ends_no_statement("SELECT 1 ORDER BY ", "order", "order_by", order_by)?;
     let probe = format!("SELECT 1 ORDER BY {order_by}\nLIMIT 1");
     let limited = on_reader(|con| tree(con, &probe))
         .flatten()
@@ -2265,9 +2278,13 @@ pub(crate) struct OperationRequest<'a> {
 ///
 /// Refused, with the protocol's directory untouched: an operation arc does not
 /// hold; arguments the operation's `parameters` do not admit, whether one is
-/// missing, one is not taken or one is of the wrong type; a condition or an order
-/// DuckDB's own parser reads as more than one statement, or cannot parse at all
-/// (see [`one_statement`]); a table no step of the protocol makes; and a
+/// missing, one is not taken or one is of the wrong type; an argument given
+/// without the one it depends on; a number beyond its bounds; a condition or an
+/// order DuckDB's own parser reads as more than one statement, or cannot parse at
+/// all (see [`one_statement`]); a SQL fragment its probe refuses (see
+/// [`probed`]); what the operation's own `checks` refuse, such as a dedupe's key
+/// and order that do not read as one window; a table no step of the protocol
+/// makes; and a
 /// description that is empty or spans lines (see [`record_step`]). Each
 /// refusal's message names what was wrong.
 pub(crate) fn record_operation(
@@ -2587,8 +2604,8 @@ impl Operation {
     /// it is closed, and each value of the type the schema gives it. A value
     /// annotated with a clause `x-kind` — a `condition` or an `order` — is also
     /// checked as that clause, through [`one_statement`]; one annotated with a
-    /// probed `x-kind` — an `expression` — is checked in its probe, through
-    /// [`probed`]; one annotated as a `column`, a name and not SQL, is checked
+    /// probed `x-kind` — an `expression`, a `type`, a `select-list` or a
+    /// `partition` — is checked in its probe, through [`probed`]; one annotated as a `column`, a name and not SQL, is checked
     /// only to be a name at all, not empty or blank, since [`column_ident`]
     /// carries any other name as written. An argument the schema's
     /// `dependentRequired` ties to others is refused without them, a number below
@@ -2730,8 +2747,9 @@ fn is_of_type(value: &serde_json::Value, ty: &str) -> bool {
 /// probe [`one_statement`] parses it inside and the word a refusal calls it by.
 /// `filter-rows`' `where` is a `WHERE` condition; `sort-rows`' `order_by` is an
 /// `ORDER BY` order. A value whose `x-kind` names neither has no clause and is
-/// not parse-checked: a `column` is a name, not a clause, and [`Operation::admit`]
-/// checks it apart.
+/// not checked as one: a probed kind, such as an `expression`, is gated in its
+/// probe by [`probed`], and a `column` is a name, not SQL, which
+/// [`Operation::admit`] checks apart.
 struct Clause {
     /// The SQL keyword the value follows in the one-statement probe.
     keyword: &'static str,
@@ -2800,9 +2818,33 @@ fn one_statement(key: &str, clause: Clause, value: &str) -> Result<()> {
     }
 }
 
+/// Whether `value`, written after `opening` as the step writes it, leaves the
+/// statement it is written into whole: `Ok`, or the [`second_statement`] refusal
+/// when it holds a `;` outside every string and comment that ends the statement.
+/// DuckDB is asked twice, neither time binding or running anything: whether it
+/// reads `<opening><value>` as more than one statement, a `;` with SQL after it;
+/// and whether it reads two once a select is put on the line after, a `;` with
+/// nothing after it, which in the step would end the statement before the SQL
+/// the step writes after the value. A value with no such `;` does not parse with
+/// the select after it, and counts `0` there. [`probed`] asks it of each probed
+/// fragment after `SELECT `; [`dedupe_rows_checks`] and [`limit_rows_checks`] of
+/// an order after `SELECT 1 ORDER BY `, before they probe it where the step
+/// writes it, so `amount desc;` is refused for its `;`.
+fn ends_no_statement(opening: &str, noun: &str, key: &str, value: &str) -> Result<()> {
+    let written = format!("{opening}{value}");
+    if duckdb_statement_count(&written) > 1
+        || duckdb_statement_count(&format!("{written}\nSELECT 1")) > 1
+    {
+        return Err(second_statement(noun, key, value));
+    }
+    Ok(())
+}
+
 /// The refusal of a value whose probe DuckDB reads as more than one statement:
-/// a `;` outside every string and comment, with SQL after it. [`one_statement`]
-/// and [`probed`] give it in the one wording, `noun` saying what the value is.
+/// a `;` outside every string and comment, with SQL after it, or, where the step
+/// writes SQL after the value, with nothing after it. [`one_statement`] and
+/// [`ends_no_statement`] give it in the one wording, `noun` saying what the value
+/// is.
 fn second_statement(noun: &str, key: &str, value: &str) -> Error {
     refused(format!(
         "the {noun} `{key}` holds a `;` outside a string or a comment, which would end \
@@ -2835,16 +2877,21 @@ struct Probe {
 /// gives, after the value's name.
 const NOT_ONE: &str = "is not one SQL";
 
-/// The probe of an `expression`: `SELECT <value> AS __arc_probe`, which must read
-/// as exactly one item, called [`SENTINEL`], that is one value for each row
-/// ([`one_value_per_row`]). `1 FROM orders` and `a UNION SELECT b` are not a bare
-/// select, `amount, note` is two items, and `amount * 2 -- double` leaves the one
-/// item without the alias.
+/// The probe of an `expression`: `SELECT 1, <value> AS __arc_probe`, which must
+/// read as exactly two items, the probe's own `1` and then one called
+/// [`SENTINEL`] that is one value for each row ([`one_value_per_row`]). The value
+/// follows a comma, as it does in each step that writes one — `SELECT *, <value>`
+/// in `derive-column`, `coalesce(<column>, <value>)` in `fill-nulls` — so a
+/// leading `ALL`, which DuckDB reads as the select's own `SELECT ALL` when the
+/// value opens the list, does not parse here as it does not in the step.
+/// `1 FROM orders` and `a UNION SELECT b` are not a bare select, `amount, note`
+/// is three items, and `amount * 2 -- double` leaves the last item without the
+/// alias.
 const EXPRESSION: Probe = Probe {
     noun: "expression",
-    probe: |value| format!("SELECT {value} AS {SENTINEL}"),
+    probe: |value| format!("SELECT 1, {value} AS {SENTINEL}"),
     admits: |items| match items {
-        [item] if item["alias"] == SENTINEL => {
+        [_, item] if item["alias"] == SENTINEL => {
             one_value_per_row(item).map_err(|spread| match spread {
                 Spread::Columns => "expands to several columns, where the step adds one",
                 Spread::Rows => "changes the number of rows, where the step keeps every row",
@@ -2854,20 +2901,24 @@ const EXPRESSION: Probe = Probe {
     },
 };
 
-/// The probe of a `select-list`: `SELECT <value>, 1 AS __arc_probe`, which must
-/// read as at least two items, the last called [`SENTINEL`], each item before it
-/// one value for each row ([`one_value_per_row`]). The value may list several
-/// items, each with an alias. `count(*) FROM other` and `a UNION SELECT b` are not
-/// a bare select, and `count(*) AS n -- all` swallows the sentinel item. A star
-/// would widen the list to every column of the table, and an `unnest` would change
-/// the number of rows the step groups or summarises, so each is refused. The
-/// number of items DuckDB reads before the sentinel is the number
-/// [`summarise_rows_sql`] groups by.
+/// The probe of a `select-list`: `SELECT 1, <value>, 1 AS __arc_probe`, which
+/// must read as at least three items: the probe's own `1`, then the value's, each
+/// one value for each row ([`one_value_per_row`]), and last one called
+/// [`SENTINEL`]. The value may list several items, each with an alias. It follows
+/// a comma, as `summarise-rows`' `aggregates` does after a `group_by`, so a
+/// leading `ALL`, which DuckDB reads as the select's own `SELECT ALL` when the
+/// value opens the list, is refused; a list that opens the step's select could
+/// take one, but gains nothing by it. `count(*) FROM other` and
+/// `a UNION SELECT b` are not a bare select, and `count(*) AS n -- all` swallows
+/// the sentinel item. A star would widen the list to every column of the table,
+/// and an `unnest` would change the number of rows the step groups or
+/// summarises, so each is refused. The number of items DuckDB reads between the
+/// probe's own two is the number [`summarise_rows_sql`] groups by.
 const SELECT_LIST: Probe = Probe {
     noun: "select list",
-    probe: |value| format!("SELECT {value}, 1 AS {SENTINEL}"),
+    probe: |value| format!("SELECT 1, {value}, 1 AS {SENTINEL}"),
     admits: |items| match items {
-        [listed @ .., last] if !listed.is_empty() && last["alias"] == SENTINEL => listed
+        [_, listed @ .., last] if !listed.is_empty() && last["alias"] == SENTINEL => listed
             .iter()
             .try_for_each(one_value_per_row)
             .map_err(|spread| match spread {
@@ -2976,11 +3027,12 @@ impl Probe {
 ///
 /// * it holds [`SENTINEL`], in any case, since a value that supplies the alias
 ///   itself could hide what follows it behind a comment and still pass;
-/// * DuckDB reads `SELECT <value>` as more than one statement, in the wording
-///   [`one_statement`] gives the same `;`. The value is counted on its own and
-///   not in its probe, since what the probe puts after it can stop a second
-///   statement from parsing — `amount; DROP TABLE orders AS __arc_probe` — and
-///   the `;` would then be refused as something else;
+/// * it holds a `;` that ends `SELECT <value>`, with SQL after it or with
+///   nothing ([`ends_no_statement`]), in the wording [`one_statement`] gives the
+///   same `;`. The value is counted on its own and not in its probe, since what
+///   the probe puts after it can stop a second statement from parsing —
+///   `amount; DROP TABLE orders AS __arc_probe` — and the `;` would then be
+///   refused as something else;
 /// * DuckDB cannot parse the probe, or reads it as anything but a bare select
 ///   ([`bare_select`]) whose select list `probe.admits`, with the reason
 ///   `admits` gives.
@@ -2992,9 +3044,7 @@ fn probed(operation: &str, key: &str, probe: Probe, value: &str) -> Result<()> {
             probe.noun
         )));
     }
-    if duckdb_statement_count(&format!("SELECT {value}")) > 1 {
-        return Err(second_statement(probe.noun, key, value));
-    }
+    ends_no_statement("SELECT ", probe.noun, key, value)?;
     let noun = probe.noun;
     let admitted = probe_items(&(probe.probe)(value))
         .ok_or(NOT_ONE)
@@ -3020,26 +3070,27 @@ fn probed(operation: &str, key: &str, probe: Probe, value: &str) -> Result<()> {
 /// parse or holds anything else, so no second parse is needed.
 fn probe_items(probe: &str) -> Option<Vec<serde_json::Value>> {
     let tree = on_reader(|con| tree(con, probe))??;
-    bare_select(&tree)?;
+    if !bare_select(&tree) {
+        return None;
+    }
     tree["statements"][0]["node"]["select_list"]
         .as_array()
         .cloned()
 }
 
-/// The number of items in the select list of `tree`, DuckDB's tree of a text,
-/// when it is one statement that is a bare select: a `SELECT_NODE` that reads no
-/// table and has no `WHERE`, `GROUP BY`, `HAVING`, `QUALIFY`, sample, modifier
-/// (`ORDER BY`, `LIMIT`, `DISTINCT`) or CTE. `None` for any other tree, a parse
-/// error's included. A `GROUP BY ALL` leaves the grouping lists empty and is told
-/// by the node's aggregate handling, which a bare select leaves standard.
-fn bare_select(tree: &serde_json::Value) -> Option<usize> {
-    let statements = tree["statements"].as_array()?;
-    let [statement] = statements.as_slice() else {
-        return None;
+/// Whether `tree`, DuckDB's tree of a text, is one statement that is a bare
+/// select: a `SELECT_NODE` that reads no table and has no `WHERE`, `GROUP BY`,
+/// `HAVING`, `QUALIFY`, sample, modifier (`ORDER BY`, `LIMIT`, `DISTINCT`) or
+/// CTE. `false` for any other tree, a parse error's included. A `GROUP BY ALL`
+/// leaves the grouping lists empty and is told by the node's aggregate handling,
+/// which a bare select leaves standard.
+fn bare_select(tree: &serde_json::Value) -> bool {
+    let Some([statement]) = tree["statements"].as_array().map(Vec::as_slice) else {
+        return false;
     };
     let node = &statement["node"];
     let empty = |field: &serde_json::Value| field.as_array().is_some_and(Vec::is_empty);
-    let bare = node["type"] == "SELECT_NODE"
+    node["type"] == "SELECT_NODE"
         && node["from_table"]["type"] == "EMPTY"
         && ["where_clause", "having", "qualify", "sample"]
             .iter()
@@ -3048,11 +3099,7 @@ fn bare_select(tree: &serde_json::Value) -> Option<usize> {
             .iter()
             .all(|field| empty(&node[field]))
         && empty(&node["cte_map"]["map"])
-        && node["aggregate_handling"] == "STANDARD_HANDLING";
-    if !bare {
-        return None;
-    }
-    node["select_list"].as_array().map(Vec::len)
+        && node["aggregate_handling"] == "STANDARD_HANDLING"
 }
 
 /// The number of SQL statements DuckDB parses in `sql`, or `0` when DuckDB
@@ -4114,6 +4161,7 @@ mod tests {
             "COLUMNS(*)",
             "coalesce(COLUMNS('amount|id'), 0)",
             "unnest([1, 2])",
+            "ALL 1", // the select's own `ALL`, which does not parse after the step's `*,`
         ] {
             let err = op
                 .admit(&arguments(
@@ -4347,6 +4395,7 @@ mod tests {
             "count(*), orders.*",
             "COLUMNS('amount|id')",
             "unnest([1, 2]) AS u", // more rows for the summary
+            "ALL count(*)", // the select's own `ALL`, which does not parse after a `group_by`
         ] {
             let err = op
                 .admit(&arguments(serde_json::json!({ "aggregates": aggregates })))
@@ -4503,6 +4552,11 @@ mod tests {
             ("note", "amount) = 1 OR (1", "`order_by`"), // an order that closes the window
             ("note", "amount ROWS UNBOUNDED PRECEDING", "`order_by`"), // a frame
             ("note", "amount; DROP TABLE orders", "`order_by`"),
+            (
+                "note",
+                "amount desc;",
+                "the order `order_by` holds a `;` outside a string or a comment",
+            ), // a `;` that ends the step inside the window
             (
                 "1",
                 "amount",
@@ -4733,7 +4787,6 @@ mod tests {
             "amount LIMIT 1",
             "amount OFFSET 2",
             "amount LIMIT 1 OFFSET 2",
-            "amount desc;",
         ] {
             let err = op
                 .admit(&arguments(
@@ -4748,13 +4801,21 @@ mod tests {
                 "{order_by:?} was refused with another message: {err}"
             );
         }
-        let err = op
-            .admit(&arguments(
-                serde_json::json!({ "count": 2, "order_by": "amount; DROP TABLE orders" }),
-            ))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("the order `order_by` holds a `;`"), "{err}");
+        for order_by in ["amount; DROP TABLE orders", "amount desc;"] {
+            let err = op
+                .admit(&arguments(
+                    serde_json::json!({ "count": 2, "order_by": order_by }),
+                ))
+                .expect_err(order_by)
+                .to_string();
+            assert!(
+                err.contains(
+                    "the order `order_by` holds a `;` outside a string or a comment, \
+                     which would end the step's statement and begin another"
+                ),
+                "{order_by:?} was refused with another message: {err}"
+            );
+        }
     }
 
     #[test]
@@ -4821,6 +4882,8 @@ mod tests {
             ("0 --", "the expression `value` of `fill-nulls`"), // a comment that swallows the close
             ("0) , (1", "the expression `value` of `fill-nulls`"), // parentheses that close the coalesce
             ("0; DROP TABLE orders", "the expression `value` holds a `;`"),
+            ("0;", "the expression `value` holds a `;`"), // a `;` that ends the step early
+            ("ALL 0", "the expression `value` of `fill-nulls`"), // `ALL` does not parse in the coalesce
             (
                 "*",
                 "the expression `value` of `fill-nulls` expands to several columns",
@@ -4863,10 +4926,7 @@ mod tests {
             Some(2)
         );
         let con = duckdb::Connection::open_in_memory().unwrap();
-        assert_eq!(
-            bare_select(&tree(&con, "SELECT amount * 2, note").unwrap()),
-            Some(2)
-        );
+        assert!(bare_select(&tree(&con, "SELECT amount * 2, note").unwrap()));
         for probe in [
             "SELECT 1 FROM orders",
             "SELECT 1 WHERE true",
