@@ -60,6 +60,7 @@
 //! itself, when this promotion created it — is removed so no orphan survives
 //! a failed promotion.
 
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
 use crate::edit::{
@@ -1612,10 +1613,14 @@ fn dedupe_rows_window(key: &str, order_by: &str) -> String {
 /// or does not parse. Without either argument there is no window, and nothing to
 /// check.
 ///
-/// A constant in either is refused too, naming the argument. Inside `OVER` a
-/// number is a value, not a column's place as it is in `sort-rows`' order or
-/// `summarise-rows`' grouping: `key=1` would make the whole table one key, and
-/// `order_by=2 desc` would tie every row, so the row kept would be arbitrary.
+/// A literal constant in either is refused too, naming the argument. Inside
+/// `OVER` a constant is the same value for every row, not a column's place as a
+/// number is in `sort-rows`' order or `summarise-rows`' grouping: `key=1` would
+/// make the whole table one key, and `order_by=2 desc` or `order_by='x'` would tie
+/// every row, so the row kept would be arbitrary. Only a literal is refused, the
+/// likely mistake for a column's place; an order that is constant by other means,
+/// an uncorrelated subquery (`(SELECT max(id) FROM orders)`) or `1+0`, is the
+/// analyst's to avoid.
 fn dedupe_rows_checks(arguments: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
     let text = |key| arguments.get(key).and_then(serde_json::Value::as_str);
     let (Some(key), Some(order_by)) = (text("key"), text("order_by")) else {
@@ -1655,8 +1660,8 @@ fn dedupe_rows_checks(arguments: &serde_json::Map<String, serde_json::Value>) ->
     ] {
         if holds {
             return Err(refused(format!(
-                "the {noun} `{name}` of `{DEDUPE_ROWS}` holds a constant, and inside the window a \
-                 number is a value, not a column's place, so every row would tie: {value}"
+                "the {noun} `{name}` of `{DEDUPE_ROWS}` holds a constant, which inside the window \
+                 is the same value for every row, not a column, so every row would tie: {value}"
             )));
         }
     }
@@ -1664,11 +1669,12 @@ fn dedupe_rows_checks(arguments: &serde_json::Map<String, serde_json::Value>) ->
 }
 
 /// The `parameters` schema of [`LIMIT_ROWS`]: one required integer, `count`, at
-/// least `0`, and one optional string, `order_by`. Closed to any other key, as
+/// least `0` and at most the largest `BIGINT`, the type of DuckDB's `LIMIT`, and
+/// one optional string, `order_by`. Closed to any other key, as
 /// [`hide_column_parameters`] is.
 ///
-/// `count` is a JSON integer, and [`Operation::admit`] holds it to its type and
-/// its `minimum`; the command line gives every `--arg` as a string, and
+/// `count` is a JSON integer, and [`Operation::admit`] holds it to its type, its
+/// `minimum` and its `maximum`; the command line gives every `--arg` as a string, and
 /// [`typed_arguments`] turns one that reads as an integer into that integer
 /// first. `order_by` keeps [`sort_rows_parameters`]' annotation, an `order` with
 /// its `x-directions`, and is checked as that clause; [`limit_rows_checks`] then
@@ -1682,6 +1688,7 @@ fn limit_rows_parameters() -> serde_json::Value {
             "count": {
                 "type": "integer",
                 "minimum": 0,
+                "maximum": i64::MAX,
                 "description": "How many rows the step keeps, a whole number from 0: the first this many in `order_by`'s order. \
                     Without an order, the rows kept are whichever come first, which DuckDB does not promise \
                     to be the same rows from one run to the next. A table with fewer rows keeps them all.",
@@ -1728,7 +1735,8 @@ fn limit_rows_sql(recording: &Recording) -> String {
 /// are one `ORDER_MODIFIER` and then one `LIMIT_MODIFIER` with no `OFFSET`, and
 /// nothing else. An order that brings a `LIMIT` of its own, `amount LIMIT 1`,
 /// does not parse with the step's after it; one that brings an `OFFSET`,
-/// `amount OFFSET 2`, parses into the step's `LIMIT` and would skip rows. A
+/// `amount OFFSET 2`, parses into the step's `LIMIT` and would skip rows; and one
+/// that ends its statement, `amount desc;`, leaves the step's `LIMIT` a second. A
 /// constant is not refused: at the top of a statement `ORDER BY 2` orders by the
 /// second column, as it does in `sort-rows`. Without an order there is nothing to
 /// check.
@@ -1763,7 +1771,7 @@ fn limit_rows_checks(arguments: &serde_json::Map<String, serde_json::Value>) -> 
     } else {
         Err(refused(format!(
             "the order `order_by` of `{LIMIT_ROWS}` does not read as one `ORDER BY` the step's \
-             `LIMIT` can follow; it brings a clause of its own, such as a `LIMIT` or an `OFFSET`: {order_by}"
+             `LIMIT` can follow: {order_by}"
         )))
     }
 }
@@ -1953,7 +1961,10 @@ pub(crate) fn operation(long_name: &str) -> Option<&'static Operation> {
 /// integer where it reads as one, `"2"` as `2` and `"-1"` as `-1`. Any other
 /// value is left as given: a string that does not read as an integer, `"ten"`,
 /// stays a string for [`Operation::admit`] to refuse as the wrong type, naming
-/// the argument, and a `minimum` is admit's to hold, not this. An operation arc
+/// the argument, and a `minimum` or a `maximum` is admit's to hold, not this. A
+/// whole number written in digits alone that is too large for an `i64` is turned
+/// into the number it is, a `u64` or a float, so that admit refuses it as beyond
+/// the `maximum` rather than as a string. An operation arc
 /// does not hold leaves the arguments as given, for [`record_operation`] to
 /// refuse. `arc mcp` passes JSON, whose integers are already integers, and does
 /// not call this.
@@ -1969,13 +1980,32 @@ pub(crate) fn typed_arguments(
         .into_iter()
         .map(|(key, value)| {
             let integer = schema["properties"][key.as_str()]["type"] == "integer";
-            let parsed = value
-                .as_str()
-                .filter(|_| integer)
-                .and_then(|text| text.parse::<i64>().ok());
-            (key, parsed.map_or(value, serde_json::Value::from))
+            let parsed = value.as_str().filter(|_| integer).and_then(whole_number);
+            (key, parsed.unwrap_or(value))
         })
         .collect()
+}
+
+/// `text` as the JSON number it writes, when it reads as a whole number: an
+/// `i64` where it fits, as `"+2"` and `"-1"` do; otherwise, where it is digits
+/// alone after an optional sign, a `u64` where that fits and a float beyond it.
+/// `None` for any other text, `"ten"`, `" 2"` or `"1e3"`.
+fn whole_number(text: &str) -> Option<serde_json::Value> {
+    if let Ok(integer) = text.parse::<i64>() {
+        return Some(integer.into());
+    }
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    match text.parse::<u64>() {
+        Ok(integer) => Some(integer.into()),
+        Err(_) => text
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(serde_json::Value::Number),
+    }
 }
 
 impl Operation {
@@ -2556,7 +2586,9 @@ impl Operation {
     /// only to be a name at all, not empty or blank, since [`column_ident`]
     /// carries any other name as written. An argument the schema's
     /// `dependentRequired` ties to others is refused without them, a number below
-    /// its property's `minimum` is refused naming both, and the
+    /// its property's `minimum` or above its `maximum` is refused naming the
+    /// argument and the bound, before its type is checked, so a whole number too
+    /// large for an integer is refused as too large and not as no integer; and the
     /// operation's own `checks`, when it has them, run last, on the arguments
     /// together.
     fn admit(&self, arguments: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
@@ -2610,6 +2642,17 @@ impl Operation {
             let Some(property) = properties.get(key) else {
                 continue;
             };
+            for (bound, beyond, limit) in [
+                ("minimum", Ordering::Less, &property["minimum"]),
+                ("maximum", Ordering::Greater, &property["maximum"]),
+            ] {
+                if compare_numbers(value, limit) == Some(beyond) {
+                    return Err(refused(format!(
+                        "the argument `{key}` of `{}` has a {bound} of {limit}, not {value}",
+                        self.long_name
+                    )));
+                }
+            }
             if let Some(ty) = property["type"].as_str()
                 && !is_of_type(value, ty)
             {
@@ -2621,14 +2664,6 @@ impl Operation {
                 return Err(refused(format!(
                     "the argument `{key}` of `{}` is {article} {ty}, not {value}",
                     self.long_name
-                )));
-            }
-            if let (Some(minimum), Some(given)) = (property["minimum"].as_f64(), value.as_f64())
-                && given < minimum
-            {
-                return Err(refused(format!(
-                    "the argument `{key}` of `{}` has a minimum of {}, not {value}",
-                    self.long_name, property["minimum"]
                 )));
             }
             if let Some(clause) = Clause::of(&property["x-kind"])
@@ -2651,6 +2686,22 @@ impl Operation {
             }
         }
         self.checks.map_or(Ok(()), |checks| checks(arguments))
+    }
+}
+
+/// `value` compared with `bound`, two JSON numbers: exactly when both are
+/// integers, so a `maximum` of the largest `BIGINT` holds against one past it,
+/// and as floating point otherwise. `None` when either is not a number, as a
+/// bound a property does not set is not.
+fn compare_numbers(value: &serde_json::Value, bound: &serde_json::Value) -> Option<Ordering> {
+    let integer = |v: &serde_json::Value| {
+        v.as_i64()
+            .map(i128::from)
+            .or_else(|| v.as_u64().map(i128::from))
+    };
+    match (integer(value), integer(bound)) {
+        (Some(value), Some(bound)) => Some(value.cmp(&bound)),
+        _ => value.as_f64()?.partial_cmp(&bound.as_f64()?),
     }
 }
 
@@ -4398,6 +4449,8 @@ mod tests {
             ("lower(note), id", "amount, id desc NULLS LAST"),
             ("note", "amount desc -- the largest first"),
             ("note", "id * -1"),
+            // constant by other means than a literal, which is the analyst's to avoid
+            ("note", "(SELECT max(id) FROM orders)"),
         ] {
             let admitted = op.admit(&arguments(
                 serde_json::json!({ "key": key, "order_by": order_by }),
@@ -4526,6 +4579,7 @@ mod tests {
         );
         assert_eq!(schema["properties"]["count"]["type"], "integer");
         assert_eq!(schema["properties"]["count"]["minimum"], 0);
+        assert_eq!(schema["properties"]["count"]["maximum"], i64::MAX);
         assert_eq!(schema["properties"]["order_by"]["x-kind"], "order");
         assert_eq!(
             schema["properties"]["order_by"]["x-directions"],
@@ -4573,9 +4627,26 @@ mod tests {
             serde_json::Value::Object(typed),
             serde_json::json!({ "count": 2, "order_by": "1" })
         );
+        for (given, typed) in [
+            ("+2", serde_json::json!(2)),
+            (
+                "9223372036854775808",
+                serde_json::json!(9_223_372_036_854_775_808_u64),
+            ),
+            ("100000000000000000000", serde_json::json!(1e20)),
+        ] {
+            assert_eq!(
+                typed_arguments(LIMIT_ROWS, arguments(serde_json::json!({ "count": given })))["count"],
+                typed,
+                "{given:?}"
+            );
+        }
         for (operation, given) in [
             (LIMIT_ROWS, serde_json::json!({ "count": "ten" })),
             (LIMIT_ROWS, serde_json::json!({ "count": "2.5" })),
+            (LIMIT_ROWS, serde_json::json!({ "count": " 2" })),
+            (LIMIT_ROWS, serde_json::json!({ "count": "1e3" })),
+            (LIMIT_ROWS, serde_json::json!({ "count": "+" })),
             (FILTER_ROWS, serde_json::json!({ "where": "2" })),
             ("no-such-operation", serde_json::json!({ "count": "2" })),
         ] {
@@ -4591,6 +4662,15 @@ mod tests {
             (
                 serde_json::json!({ "count": -1 }),
                 "the argument `count` of `limit-rows` has a minimum of 0, not -1",
+            ),
+            (
+                serde_json::json!({ "count": 9_223_372_036_854_775_808_u64 }),
+                "the argument `count` of `limit-rows` has a maximum of 9223372036854775807, \
+                 not 9223372036854775808",
+            ),
+            (
+                serde_json::json!({ "count": 1e20 }),
+                "the argument `count` of `limit-rows` has a maximum of 9223372036854775807",
             ),
             (
                 serde_json::json!({ "count": "ten" }),
@@ -4638,6 +4718,7 @@ mod tests {
             "amount LIMIT 1",
             "amount OFFSET 2",
             "amount LIMIT 1 OFFSET 2",
+            "amount desc;",
         ] {
             let err = op
                 .admit(&arguments(

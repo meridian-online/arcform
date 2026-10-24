@@ -1091,6 +1091,25 @@ fn a_column_in_the_aggregates_that_is_not_grouped_records_and_fails_the_run() {
 }
 
 #[test]
+fn an_aggregate_in_the_group_by_records_and_fails_the_run() {
+    let protocol = Protocol::new();
+    ok(
+        &record_summary(&protocol, "count(*) AS n", Some("count(*) AS c")),
+        "arc operation record summarise-rows",
+    );
+    let out = protocol.arc(&["run"]);
+    assert!(
+        !out.status.success(),
+        "arc run of an aggregate in the grouping exited 0"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("GROUP BY clause cannot contain aggregates"),
+        "the failed run does not say the GROUP BY cannot hold an aggregate:\n{stderr}"
+    );
+}
+
+#[test]
 fn a_bare_column_summarised_over_the_whole_table_fails_the_run() {
     let protocol = Protocol::new();
     ok(
@@ -1308,6 +1327,14 @@ fn a_limit_count_that_is_not_a_whole_number_from_zero_or_an_order_the_limit_cann
         (
             &["count=-1"][..],
             &["the argument `count` of `limit-rows` has a minimum of 0"][..],
+        ),
+        (
+            &["count=9223372036854775808"][..],
+            &["the argument `count` of `limit-rows` has a maximum of 9223372036854775807"][..],
+        ),
+        (
+            &["count=100000000000000000000"][..],
+            &["the argument `count` of `limit-rows` has a maximum of 9223372036854775807"][..],
         ),
         (
             &["order_by=amount"][..],
