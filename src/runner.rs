@@ -1488,7 +1488,7 @@ fn is_hashable_kind(assets: &StepAssets, name: &str) -> bool {
 ///   to read; staleness comes from the producing step's own config hash and
 ///   downstream propagation.
 /// - `Remote` — not hashed, and never reported missing: arc does not read a URL from
-///   disk. A step that reads one is stale on every run instead, which
+///   disk. A step that reads or produces one is stale on every run instead, which
 ///   [`produced_artifact_hash`] enforces by withholding the hash.
 fn kind_is_hashed(kind: AssetKind) -> bool {
     match kind {
@@ -1838,13 +1838,16 @@ fn produced_artifact_hash(
     let step_assets = asset_graph.steps.get(&step.name);
     let mut names: Vec<&String> = Vec::new();
     if let Some(assets) = step_assets {
-        // A step reading a remote asset has nothing on disk to compare, so it is
-        // stale on every run: withhold the hash, whichever policy the step is held to.
-        // Hashing around the URL would instead let the step skip while the data behind
-        // it changes.
+        // A step reading or producing a remote asset has nothing on disk to compare, so
+        // it is stale on every run: withhold the hash, whichever policy the step is
+        // held to. This comes before the names are gathered, so a command step's
+        // habit of leaving unreadable names out of its hash never gets to apply.
+        // Hashing around the URL would instead let the step skip while the data
+        // behind it changes.
         if assets
             .reads
             .iter()
+            .chain(assets.produces.iter())
             .any(|n| declared_kind_of(assets, n) == AssetKind::Remote)
         {
             return None;
@@ -7377,13 +7380,13 @@ steps:
         );
     }
 
-    /// A precondition-gated `command:` step reading `reads`, in a directory where the
+    /// A precondition-gated `command:` step reading `reads` and producing `produces`, in a directory where the
     /// precondition is fresh, so only the artifact hash can send it back to work.
-    fn gated_command_reading(reads: &str) -> tempfile::TempDir {
+    fn gated_command(reads: &str, produces: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let yaml = format!(
             "name: test\nsteps:\n  - name: pull\n    command: \"pull-it\"\n    \
-             depends_on: [\"{reads}\"]\n    produces: [\"s3://bucket/out.parquet\"]\n    \
+             depends_on: [\"{reads}\"]\n    produces: [\"{produces}\"]\n    \
              preconditions:\n      - modified_after: {{ path: build/src/data.csv, period: 24h }}\n"
         );
         setup_project(dir.path(), &yaml, &[]);
@@ -7402,7 +7405,7 @@ steps:
     // runs the real DuckDB.)
     #[test]
     fn test_a_step_reading_a_remote_asset_is_stale_on_every_run() {
-        let dir = gated_command_reading("https://example.invalid/b.csv");
+        let dir = gated_command("https://example.invalid/b.csv", "out.txt");
         let state = MockStateBackend::new();
         // The first run executes (the precondition file is old) and records a baseline;
         // the runs after it are the ones that could settle into a skip.
@@ -7416,16 +7419,9 @@ steps:
             );
         }
 
-        let manifest = crate::manifest::Manifest::load(dir.path()).unwrap();
-        let graph = AssetGraph::build(&manifest, dir.path());
-        assert!(
-            missing_declared_produces(&manifest.steps[0], dir.path(), &graph).is_empty(),
-            "a URL is not a file arc could find missing"
-        );
-
         // The control: the same step reading a file settles to a skip, so the reruns
         // above are the URL and not the harness.
-        let control = gated_command_reading("in.csv");
+        let control = gated_command("in.csv", "out.txt");
         let control_state = MockStateBackend::new();
         executed_bodies(control.path(), &control_state);
         age_file(&control.path().join("build/src/data.csv"), 0);
@@ -7433,6 +7429,50 @@ steps:
             executed_bodies(control.path(), &control_state),
             Vec::<String>::new(),
             "control: a step reading a file that has not changed skips"
+        );
+    }
+
+    // A step whose only output is a remote COPY target has nothing on disk to settle
+    // against, so it reruns on a warm run too. The SQL is one the recorded DuckDB
+    // answers hold (`COPY t TO 's3://b/out.parquet'`).
+    #[test]
+    fn test_a_step_producing_only_a_remote_asset_reruns_when_warm() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql = crate::duckdb_lineage::recorded_steps::URL_COPY;
+        setup_project(
+            dir.path(),
+            "name: test\nsteps:\n  - name: send\n    sql: models/send.sql\n",
+            &[("models/send.sql", sql)],
+        );
+        let state = MockStateBackend::new();
+        assert_eq!(executed_bodies(dir.path(), &state), vec![sql.to_string()]);
+        for warm in 1..=2 {
+            assert_eq!(
+                executed_bodies(dir.path(), &state),
+                vec![sql.to_string()],
+                "warm run {warm}: a remote output cannot be certified unchanged"
+            );
+        }
+    }
+
+    // The produced side of the same rule, on the same gated command step: it reads a
+    // file that does not change, and only its remote output keeps it rerunning.
+    #[test]
+    fn test_a_gated_command_step_producing_a_remote_asset_reruns_when_warm() {
+        let dir = gated_command("in.csv", "s3://bucket/out.parquet");
+        let state = MockStateBackend::new();
+        executed_bodies(dir.path(), &state);
+        age_file(&dir.path().join("build/src/data.csv"), 0);
+        assert_eq!(
+            executed_bodies(dir.path(), &state),
+            vec!["pull-it".to_string()]
+        );
+
+        let manifest = crate::manifest::Manifest::load(dir.path()).unwrap();
+        let graph = AssetGraph::build(&manifest, dir.path());
+        assert!(
+            missing_declared_produces(&manifest.steps[0], dir.path(), &graph).is_empty(),
+            "a URL is not a file arc could find missing"
         );
     }
 

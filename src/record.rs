@@ -3654,7 +3654,7 @@ mod tests {
             .collect()
     }
 
-    /// The kinds a role may be of: the four kinds of asset arc records, a column,
+    /// The kinds a role may be of: the five kinds of asset arc records, a column,
     /// and `any`, for a role whose kind each value decides.
     const ROLE_KINDS: [&str; 7] = [
         "table",

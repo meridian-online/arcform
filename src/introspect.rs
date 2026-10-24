@@ -2382,16 +2382,19 @@ mod tests {
     // The fallback reader sees the same for a reader function and a COPY target.
     #[test]
     fn the_fallback_reader_reads_a_url_as_remote_too() {
-        for sql in [recorded_steps::URL_READER_GLOB, recorded_steps::URL_COPY] {
+        for (sql, url, reads) in [
+            (recorded_steps::URL_READER_GLOB, "s3://b/*.csv", true),
+            (recorded_steps::URL_COPY, "s3://b/out.parquet", false),
+        ] {
             let assets = sqlparser_assets(sql).unwrap();
-            assert!(
-                assets
-                    .kinds
-                    .iter()
-                    .any(|(name, kind)| name.contains("://") && *kind == AssetKind::Remote),
-                "{sql}: {:?}",
-                assets.kinds
-            );
+            assert_eq!(assets.kinds.get(url), Some(&AssetKind::Remote), "{sql}");
+            let (side, other) = if reads {
+                (&assets.inputs, &assets.outputs)
+            } else {
+                (&assets.outputs, &assets.inputs)
+            };
+            assert!(side.contains(url), "{sql}: {url} is on the expected side");
+            assert!(!other.contains(url), "{sql}: {url} is on one side only");
         }
     }
 

@@ -44,11 +44,15 @@ pub enum AssetKind {
 
 /// True when `path` is a URL: an ASCII letter, then letters, digits, `+`, `-` or
 /// `.`, then `://`. So `https://x.org/a.csv`, `s3://b/k/*.parquet` and `hf://datasets/x`
-/// are remote, while `data/a.csv`, `C:\a.csv` and `://x` are not.
+/// are remote, while `data/a.csv`, `C:\a.csv` and `://x` are not. `file://` names a
+/// local file, so it is not remote either.
 pub fn is_remote(path: &str) -> bool {
     let Some((scheme, _)) = path.split_once("://") else {
         return false;
     };
+    if scheme.eq_ignore_ascii_case("file") {
+        return false;
+    }
     let mut chars = scheme.chars();
     chars.next().is_some_and(|c| c.is_ascii_alphabetic())
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
@@ -58,8 +62,10 @@ pub fn is_remote(path: &str) -> bool {
 /// or SQL parser behind it to consult — a plain manifest string a human wrote, with
 /// no type syntax available.
 ///
-/// Decided on the two things such a string carries syntactically, and nothing else.
-/// A glob metacharacter means it can never resolve to one path, so the name is a
+/// Decided on the three things such a string carries syntactically, and nothing else.
+/// A `scheme://` prefix means it is a URL DuckDB reads through a file system, so the
+/// name is a [`AssetKind::Remote`], and that wins over a glob in the same string. A
+/// glob metacharacter means it can never resolve to one path, so the name is a
 /// [`AssetKind::Pattern`]. A TRAILING path separator means it can never be a regular
 /// file — `build/parts/` and `build/parts` name the same place, and only the first
 /// spelling says which of the two it is — so the name is a [`AssetKind::Directory`].
@@ -148,7 +154,14 @@ mod tests {
         ] {
             assert!(is_remote(yes), "{yes}");
         }
-        for no in ["data/a.csv", "/abs/a.csv", "C:\\a.csv", "file.csv", "://x"] {
+        for no in [
+            "data/a.csv",
+            "/abs/a.csv",
+            "C:\\a.csv",
+            "file:///abs/a.csv",
+            "file.csv",
+            "://x",
+        ] {
             assert!(!is_remote(no), "{no}");
         }
     }
