@@ -258,6 +258,7 @@ fn called_with_each_operator_and_operation_it_returns_what_arc_operation_describ
                 "summarise-rows",
                 "dedupe-rows",
                 "limit-rows",
+                "fill-nulls",
             ]
             .map(String::from),
         )
@@ -301,7 +302,8 @@ fn called_with_no_argument_it_lists_no_operator() {
             "cast-column",
             "summarise-rows",
             "dedupe-rows",
-            "limit-rows"
+            "limit-rows",
+            "fill-nulls"
         ],
         "the listing holds the operations alone, not the operators {operators:?}"
     );

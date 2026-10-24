@@ -1327,6 +1327,81 @@ fn a_limit_count_that_is_not_a_whole_number_from_zero_or_an_order_the_limit_cann
     }
 }
 
+/// `arc operation record fill-nulls` on `orders` as `filled_orders`, with
+/// `column` and `value` as given.
+fn record_fill(protocol: &Protocol, column: &str, value: &str) -> Output {
+    protocol.arc(&[
+        "operation",
+        "record",
+        "fill-nulls",
+        "--on",
+        "orders",
+        "--name",
+        "filled_orders",
+        "--arg",
+        &format!("column={column}"),
+        "--arg",
+        &format!("value={value}"),
+    ])
+}
+
+#[test]
+fn record_fill_writes_the_model_and_arc_run_fills_the_missing_values_alone() {
+    let protocol = holding("(1, 50, 'a'), (2, NULL, 'b'), (3, 300, 'c')");
+    ok(
+        &record_fill(&protocol, "amount", "0"),
+        "arc operation record fill-nulls",
+    );
+    assert_eq!(
+        protocol.read("models/02_filled_orders.sql"),
+        "-- generated: fill-nulls on orders\nCREATE OR REPLACE TABLE \"filled_orders\" AS\nSELECT * REPLACE (coalesce(amount, 0) AS amount)\nFROM orders;\n"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    assert_eq!(
+        columns(&protocol, "filled_orders"),
+        ["id", "amount", "note"],
+        "filled_orders holds every column of orders in its place"
+    );
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    let amounts: Vec<i32> = db
+        .prepare("SELECT amount FROM filled_orders ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(amounts, [50, 0, 300]);
+}
+
+#[test]
+fn a_fill_of_a_column_the_table_lacks_records_and_fails_the_run() {
+    let protocol = Protocol::new();
+    ok(
+        &record_fill(&protocol, "nope", "0"),
+        "arc operation record fill-nulls",
+    );
+    let out = protocol.arc(&["run"]);
+    assert!(!out.status.success(), "arc run of a misspelt fill exited 0");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("in REPLACE list not found"),
+        "the failed run does not say nope is not in the table:\n{stderr}"
+    );
+}
+
+#[test]
+fn a_fill_value_that_is_not_one_expression_is_refused_with_the_directory_untouched() {
+    let protocol = Protocol::new();
+    let before = protocol.files();
+    for value in ["0 --", "0) , (1", "0; DROP TABLE orders", "*"] {
+        refused(
+            &record_fill(&protocol, "amount", value),
+            &["the expression `value`"],
+        );
+        assert_eq!(protocol.files(), before, "a refusal changed the directory");
+    }
+}
+
 // ------------------------------------------------- the directory `--dir` names
 
 #[test]

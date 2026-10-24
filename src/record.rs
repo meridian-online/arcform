@@ -611,6 +611,10 @@ const DEDUPE_ROWS: &str = "dedupe-rows";
 /// the first in an order or as they come, written once as [`FILTER_ROWS`] is.
 const LIMIT_ROWS: &str = "limit-rows";
 
+/// The long name of the operation that fills a column's missing values, written
+/// once as [`FILTER_ROWS`] is.
+const FILL_NULLS: &str = "fill-nulls";
+
 /// One SQL operation arc holds: what it is called, what it does, what it reads
 /// and writes, and what it takes — described so that it can be recorded as a
 /// step by name. The catalogue holds the description and nothing that runs.
@@ -1032,6 +1036,35 @@ const CATALOGUE: &[Operation] = &[
         sql: limit_rows_sql,
         recognised: None,
         checks: Some(limit_rows_checks),
+    },
+    Operation {
+        long_name: FILL_NULLS,
+        summary: "Fills the missing values of one column of a table with a SQL expression, keeping every other column and every row.",
+        reads: &[
+            Role {
+                name: "table",
+                kind: "table",
+                list: false,
+                required: true,
+                of: None,
+                min_items: None,
+                description: "The table whose missing values are filled.",
+            },
+            Role {
+                name: "column",
+                kind: "column",
+                list: false,
+                required: false,
+                of: Some("table"),
+                min_items: None,
+                description: "The column whose missing values are filled, which the `column` argument names.",
+            },
+        ],
+        writes: &[STEP_TABLE],
+        parameters: fill_nulls_parameters,
+        sql: fill_nulls_sql,
+        recognised: None,
+        checks: None,
     },
 ];
 
@@ -1733,6 +1766,58 @@ fn limit_rows_checks(arguments: &serde_json::Map<String, serde_json::Value>) -> 
              `LIMIT` can follow; it brings a clause of its own, such as a `LIMIT` or an `OFFSET`: {order_by}"
         )))
     }
+}
+
+/// The `parameters` schema of [`FILL_NULLS`]: two required strings, `column`
+/// and `value`. Closed to any other key, as [`hide_column_parameters`] is.
+///
+/// `column` is a name, not SQL, written through [`column_ident`]. `value` is SQL,
+/// recorded as written, so `x-kind` marks it an expression and
+/// [`Operation::admit`] holds it to one, as it holds [`derive_column_parameters`]'
+/// `expression`: DuckDB must read it, in the probe [`EXPRESSION`] writes, as one
+/// item of a select that reads no table.
+fn fill_nulls_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "column": {
+                "type": "string",
+                "description": "The name of the column whose missing values are filled, as the table names it; \
+                    a name, not SQL, so a name that needs quotes is given without them. \
+                    A name the table does not have fails the run.",
+                "x-kind": "column",
+            },
+            "value": {
+                "type": "string",
+                "description": "What each missing value is filled with: a SQL expression, recorded as written, \
+                    such as a literal (`0`, `'unknown'`) or any expression, another column among them (`amount * 2`). \
+                    A value of a type DuckDB cannot combine with the column's fails the run.",
+                "x-kind": "expression",
+            }
+        },
+        "required": ["column", "value"],
+    })
+}
+
+/// The SQL step of [`FILL_NULLS`]: a table named for the step, holding every row
+/// and every column of the table it is applied to, the one named replaced in
+/// place by `REPLACE` with `coalesce(<column>, <value>)`, so a value already there
+/// is kept and a missing one filled. The table read is written as [`from_ident`]
+/// writes it, the value as given, and the column as [`column_ident`] does, twice.
+///
+/// One statement is enough, for the reason [`cast_column_sql`] gives: DuckDB
+/// fails the run when the column is not in the table (`Column "nope" in REPLACE
+/// list not found`), and arc does not open the database when it records.
+fn fill_nulls_sql(recording: &Recording) -> String {
+    let column = recording.column("column");
+    format!(
+        "CREATE OR REPLACE TABLE {} AS\nSELECT * REPLACE (coalesce({column}, {}) AS {column})\nFROM {};\n",
+        quote_ident(recording.name),
+        recording.text("value"),
+        from_ident(recording.on),
+    )
 }
 
 /// `name` as a double-quoted SQL identifier, a `"` inside it doubled. The step's
@@ -4574,6 +4659,92 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("the order `order_by` holds a `;`"), "{err}");
+    }
+
+    #[test]
+    fn the_fill_takes_a_required_column_and_value_and_no_other_key() {
+        let schema = fill_nulls_parameters();
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["column", "value"]),
+            "`column` and `value` are not the required parameters"
+        );
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::json!(false),
+            "the schema is open to a key it does not name"
+        );
+        assert_eq!(
+            schema["properties"].as_object().map(|p| p.len()),
+            Some(2),
+            "the schema takes a parameter besides `column` and `value`"
+        );
+        for (key, kind) in [("column", "column"), ("value", "expression")] {
+            let property = &schema["properties"][key];
+            assert_eq!(property["type"], "string", "`{key}` is not a string");
+            assert_eq!(property["x-kind"], kind, "`{key}` is not marked a {kind}");
+        }
+        let value = schema["properties"]["value"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            value.contains("SQL expression") && value.contains("fails the run"),
+            "`value` does not say it is SQL, or that a type DuckDB cannot combine fails the run: {value}"
+        );
+    }
+
+    #[test]
+    fn the_fill_replaces_the_column_with_its_coalesce_with_the_value() {
+        let arguments = arguments(serde_json::json!({ "column": "order", "value": "0" }));
+        let recording = Recording {
+            name: "filled_orders",
+            on: "orders",
+            arguments: &arguments,
+        };
+        assert_eq!(
+            fill_nulls_sql(&recording),
+            "CREATE OR REPLACE TABLE \"filled_orders\" AS\nSELECT * REPLACE (coalesce(\"order\", 0) AS \"order\")\nFROM orders;\n"
+        );
+    }
+
+    #[test]
+    fn a_fill_value_duckdb_reads_as_one_expression_is_admitted() {
+        let op = operation(FILL_NULLS).unwrap();
+        for value in ["0", "'unknown'", "id", "amount * 2", "NULL"] {
+            let admitted = op.admit(&arguments(
+                serde_json::json!({ "column": "amount", "value": value }),
+            ));
+            assert!(admitted.is_ok(), "{value:?} was refused: {admitted:?}");
+        }
+    }
+
+    #[test]
+    fn a_fill_value_that_is_not_one_expression_is_refused_naming_value() {
+        let op = operation(FILL_NULLS).unwrap();
+        for (value, named) in [
+            ("0 --", "the expression `value` of `fill-nulls`"), // a comment that swallows the close
+            ("0) , (1", "the expression `value` of `fill-nulls`"), // parentheses that close the coalesce
+            ("0; DROP TABLE orders", "the expression `value` holds a `;`"),
+            (
+                "*",
+                "the expression `value` of `fill-nulls` expands to several columns",
+            ),
+            (
+                "unnest([1])",
+                "the expression `value` of `fill-nulls` changes the number of rows",
+            ),
+        ] {
+            let err = op
+                .admit(&arguments(
+                    serde_json::json!({ "column": "amount", "value": value }),
+                ))
+                .expect_err(value)
+                .to_string();
+            assert!(
+                err.contains(named),
+                "{value:?} was refused with another message: {err}"
+            );
+        }
     }
 
     #[test]
