@@ -1487,10 +1487,13 @@ fn is_hashable_kind(assets: &StepAssets, name: &str) -> bool {
 /// - `Table` — not hashed. It is not a filesystem path at all, so there are no bytes
 ///   to read; staleness comes from the producing step's own config hash and
 ///   downstream propagation.
+/// - `Remote` — not hashed, and never reported missing: arc does not read a URL from
+///   disk. A step that reads one is stale on every run instead, which
+///   [`produced_artifact_hash`] enforces by withholding the hash.
 fn kind_is_hashed(kind: AssetKind) -> bool {
     match kind {
         AssetKind::File | AssetKind::Directory | AssetKind::Pattern => true,
-        AssetKind::Table => false,
+        AssetKind::Table | AssetKind::Remote => false,
     }
 }
 
@@ -1835,6 +1838,17 @@ fn produced_artifact_hash(
     let step_assets = asset_graph.steps.get(&step.name);
     let mut names: Vec<&String> = Vec::new();
     if let Some(assets) = step_assets {
+        // A step reading a remote asset has nothing on disk to compare, so it is
+        // stale on every run: withhold the hash, whichever policy the step is held to.
+        // Hashing around the URL would instead let the step skip while the data behind
+        // it changes.
+        if assets
+            .reads
+            .iter()
+            .any(|n| declared_kind_of(assets, n) == AssetKind::Remote)
+        {
+            return None;
+        }
         names.extend(
             assets
                 .produces
@@ -7363,6 +7377,65 @@ steps:
         );
     }
 
+    /// A precondition-gated `command:` step reading `reads`, in a directory where the
+    /// precondition is fresh, so only the artifact hash can send it back to work.
+    fn gated_command_reading(reads: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            "name: test\nsteps:\n  - name: pull\n    command: \"pull-it\"\n    \
+             depends_on: [\"{reads}\"]\n    produces: [\"s3://bucket/out.parquet\"]\n    \
+             preconditions:\n      - modified_after: {{ path: build/src/data.csv, period: 24h }}\n"
+        );
+        setup_project(dir.path(), &yaml, &[]);
+        fs::create_dir_all(dir.path().join("build/src")).unwrap();
+        fs::write(dir.path().join("build/src/data.csv"), b"a\n1\n").unwrap();
+        age_file(&dir.path().join("build/src/data.csv"), 48 * 3600);
+        fs::write(dir.path().join("in.csv"), b"a\n1\n").unwrap();
+        dir
+    }
+
+    // A URL a step reads is a `Remote` asset: nothing on disk to hash, so the step
+    // reruns on every run rather than settling into a skip, and the URL (read or
+    // produced) is never reported as a missing file. A command step is the hard case,
+    // because it leaves unreadable names out of its hash instead of withholding it.
+    // (A URL lifted from SQL is held to the same by `tests/remote_reads.rs`, which
+    // runs the real DuckDB.)
+    #[test]
+    fn test_a_step_reading_a_remote_asset_is_stale_on_every_run() {
+        let dir = gated_command_reading("https://example.invalid/b.csv");
+        let state = MockStateBackend::new();
+        // The first run executes (the precondition file is old) and records a baseline;
+        // the runs after it are the ones that could settle into a skip.
+        executed_bodies(dir.path(), &state);
+        age_file(&dir.path().join("build/src/data.csv"), 0);
+        for round in 1..=3 {
+            assert_eq!(
+                executed_bodies(dir.path(), &state),
+                vec!["pull-it".to_string()],
+                "warm run {round}: nothing changed, yet a step reading a URL must rerun"
+            );
+        }
+
+        let manifest = crate::manifest::Manifest::load(dir.path()).unwrap();
+        let graph = AssetGraph::build(&manifest, dir.path());
+        assert!(
+            missing_declared_produces(&manifest.steps[0], dir.path(), &graph).is_empty(),
+            "a URL is not a file arc could find missing"
+        );
+
+        // The control: the same step reading a file settles to a skip, so the reruns
+        // above are the URL and not the harness.
+        let control = gated_command_reading("in.csv");
+        let control_state = MockStateBackend::new();
+        executed_bodies(control.path(), &control_state);
+        age_file(&control.path().join("build/src/data.csv"), 0);
+        assert_eq!(
+            executed_bodies(control.path(), &control_state),
+            Vec::<String>::new(),
+            "control: a step reading a file that has not changed skips"
+        );
+    }
+
     /// A `umap_project` step that persists its fitted projection, staged in a
     /// directory with the fit and the input already on disk and a settled prior run
     /// recorded. Never executed — `run()` would spawn `uv` and fit a real UMAP — so
@@ -7961,6 +8034,7 @@ steps:
             AssetKind::Directory,
             AssetKind::Pattern,
             AssetKind::Table,
+            AssetKind::Remote,
         ] {
             let expected = match kind {
                 // File: its bytes. Directory: a manifest of its contents.
@@ -7968,6 +8042,8 @@ steps:
                 AssetKind::File | AssetKind::Directory | AssetKind::Pattern => true,
                 // Table: not a filesystem path, so there are no bytes to read.
                 AssetKind::Table => false,
+                // Remote: not on disk; the reading step reruns instead.
+                AssetKind::Remote => false,
             };
             assert_eq!(
                 kind_is_hashed(kind),

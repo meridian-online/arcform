@@ -81,7 +81,9 @@ fn is_glob(path: &str) -> bool {
 
 /// What a path a statement reads names: a glob pattern, or one file.
 fn read_path_kind(path: &str) -> AssetKind {
-    if is_glob(path) {
+    if crate::asset_kind::is_remote(path) {
+        AssetKind::Remote
+    } else if is_glob(path) {
         AssetKind::Pattern
     } else {
         AssetKind::File
@@ -129,9 +131,13 @@ enum CopyOptionValue {
     Other,
 }
 
-/// What a `COPY … TO 'filename'` writes, decided from the statement's own options
+/// What a `COPY … TO 'filename'` writes: a URL is remote, otherwise it is decided from
+/// the statement's own options
 /// against [`DIRECTORY_WRITING_COPY_OPTIONS`].
-fn copy_to_target_kind(options: &[(String, CopyOptionValue)]) -> AssetKind {
+fn copy_to_target_kind(target: &str, options: &[(String, CopyOptionValue)]) -> AssetKind {
+    if crate::asset_kind::is_remote(target) {
+        return AssetKind::Remote;
+    }
     let writes_a_directory = options.iter().any(|(name, value)| {
         DIRECTORY_WRITING_COPY_OPTIONS
             .iter()
@@ -717,7 +723,7 @@ fn duckdb_statement(statement: &duckdb_lineage::Statement) -> SqlAssets {
             }
             // The one file a statement produces is a `COPY … TO` target.
             Relation::File(path) => {
-                assets.record_output(path.clone(), copy_to_target_kind(&options))
+                assets.record_output(path.clone(), copy_to_target_kind(path, &options))
             }
         }
     }
@@ -1039,7 +1045,7 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
                                 .record_input(object_name_to_string(table_name), AssetKind::Table);
                             assets.record_output(
                                 filename.clone(),
-                                copy_to_target_kind(&sqlparser_copy_options(options)),
+                                copy_to_target_kind(filename, &sqlparser_copy_options(options)),
                             );
                         }
                         CopyTarget::Stdout => {
@@ -1065,7 +1071,7 @@ fn extract_from_statement(stmt: &Statement, assets: &mut SqlAssets) {
                     if let CopyTarget::File { filename } = target {
                         assets.record_output(
                             filename.clone(),
-                            copy_to_target_kind(&sqlparser_copy_options(options)),
+                            copy_to_target_kind(filename, &sqlparser_copy_options(options)),
                         );
                     }
                 }
@@ -1835,7 +1841,7 @@ mod tests {
         let value = duckdb_copy_option(&Some(ArgValue::Number("1_000".to_string())));
         assert_eq!(value, CopyOptionValue::Number("1_000".to_string()));
         assert_eq!(
-            copy_to_target_kind(&[("PER_THREAD_OUTPUT".to_string(), value)]),
+            copy_to_target_kind("out", &[("PER_THREAD_OUTPUT".to_string(), value)]),
             AssetKind::Directory,
             "PER_THREAD_OUTPUT 1_000 writes a directory"
         );
@@ -2348,6 +2354,44 @@ mod tests {
                 assets.inputs.is_empty(),
                 "{call}: no table should be read, got {:?}",
                 assets.inputs
+            );
+        }
+    }
+
+    // A URL DuckDB reads through a file system is a Remote node named by the URL,
+    // whether quoted bare, read through a reader (a glob URL included) or written by a
+    // COPY. Read through DuckDB, the default reader.
+    #[test]
+    fn a_url_read_or_written_is_a_remote_asset() {
+        for (sql, url, reads) in [
+            (recorded_steps::URL_BARE, "https://x.org/a.csv", true),
+            (recorded_steps::URL_READER_GLOB, "s3://b/*.csv", true),
+            (recorded_steps::URL_COPY, "s3://b/out.parquet", false),
+        ] {
+            let read = read_by_duckdb(sql);
+            assert_eq!(read.len(), 1, "{sql}");
+            assert_eq!(read[0].kinds.get(url), Some(&AssetKind::Remote), "{sql}");
+            let side = if reads {
+                &read[0].inputs
+            } else {
+                &read[0].outputs
+            };
+            assert!(side.contains(url), "{sql}: {url} is on the expected side");
+        }
+    }
+
+    // The fallback reader sees the same for a reader function and a COPY target.
+    #[test]
+    fn the_fallback_reader_reads_a_url_as_remote_too() {
+        for sql in [recorded_steps::URL_READER_GLOB, recorded_steps::URL_COPY] {
+            let assets = sqlparser_assets(sql).unwrap();
+            assert!(
+                assets
+                    .kinds
+                    .iter()
+                    .any(|(name, kind)| name.contains("://") && *kind == AssetKind::Remote),
+                "{sql}: {:?}",
+                assets.kinds
             );
         }
     }

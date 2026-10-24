@@ -1513,6 +1513,7 @@ mod with_schema_tests {
             AssetKind::Directory => "directory",
             AssetKind::Pattern => "pattern",
             AssetKind::Table => "table",
+            AssetKind::Remote => "remote",
         }
     }
 

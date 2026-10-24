@@ -3656,7 +3656,15 @@ mod tests {
 
     /// The kinds a role may be of: the four kinds of asset arc records, a column,
     /// and `any`, for a role whose kind each value decides.
-    const ROLE_KINDS: [&str; 6] = ["table", "file", "directory", "pattern", "column", "any"];
+    const ROLE_KINDS: [&str; 7] = [
+        "table",
+        "file",
+        "directory",
+        "pattern",
+        "remote",
+        "column",
+        "any",
+    ];
 
     // Every description, of an operation or of an operator, is read the same way
     // by a caller: the same five keys, and each role in `reads` and `writes` named

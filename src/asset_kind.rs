@@ -34,6 +34,24 @@ pub enum AssetKind {
     /// — staleness comes from the producing step's own config hash and downstream
     /// propagation.
     Table,
+    /// A URL DuckDB reads or writes through one of its file systems (`https://`,
+    /// `s3://`, `hf://`, and any other `scheme://`), named in the graph by the URL as
+    /// written. Never hashed and never checked as missing: arc cannot read it from
+    /// disk, so a step reading one is stale on every run until a conditional check
+    /// (an ETag or Last-Modified comparison) exists.
+    Remote,
+}
+
+/// True when `path` is a URL: an ASCII letter, then letters, digits, `+`, `-` or
+/// `.`, then `://`. So `https://x.org/a.csv`, `s3://b/k/*.parquet` and `hf://datasets/x`
+/// are remote, while `data/a.csv`, `C:\a.csv` and `://x` are not.
+pub fn is_remote(path: &str) -> bool {
+    let Some((scheme, _)) = path.split_once("://") else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 /// The default for a `produces:`, `depends_on:` or `assets:` name with no operator
@@ -81,7 +99,9 @@ pub enum AssetKind {
 /// **silent**: nothing prints, because `missing_declared_produces` reports the
 /// `produces:` side only.
 pub fn default_kind_for_declared_name(raw: &str) -> AssetKind {
-    if raw.contains(['*', '?', '[']) {
+    if is_remote(raw) {
+        AssetKind::Remote
+    } else if raw.contains(['*', '?', '[']) {
         AssetKind::Pattern
     } else if raw.ends_with(['/', std::path::MAIN_SEPARATOR]) {
         AssetKind::Directory
@@ -116,6 +136,27 @@ mod tests {
                 AssetKind::File,
                 "{name} carries no glob metacharacter"
             );
+        }
+    }
+
+    #[test]
+    fn is_remote_reads_a_scheme_prefix() {
+        for yes in [
+            "https://x.org/a.csv",
+            "s3://b/k/*.parquet",
+            "hf://datasets/x",
+        ] {
+            assert!(is_remote(yes), "{yes}");
+        }
+        for no in ["data/a.csv", "/abs/a.csv", "C:\\a.csv", "file.csv", "://x"] {
+            assert!(!is_remote(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn a_url_is_remote_even_when_it_looks_like_a_glob() {
+        for name in ["https://x.org/a.csv", "s3://b/*.parquet"] {
+            assert_eq!(default_kind_for_declared_name(name), AssetKind::Remote);
         }
     }
 
