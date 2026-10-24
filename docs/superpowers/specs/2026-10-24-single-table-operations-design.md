@@ -52,7 +52,8 @@ Each clause starts its own line in the model, as the filter's and the sort's do.
   - `x-kind: expression` — `SELECT <value> AS __arc_probe` must be one statement whose tree is a bare select (no `FROM`, `WHERE`, `GROUP BY`, `HAVING`, `QUALIFY`, sample, modifiers or CTEs) of exactly one item, aliased `__arc_probe`. That refuses `1 FROM other`, `amount, note`, `amount * 2 -- double` and `a UNION SELECT b`.
   - `x-kind: select-list` — `SELECT <value>, 1 AS __arc_probe` must be a bare select of at least two items, the last aliased `__arc_probe`.
   - `x-kind: type` — `SELECT CAST(NULL AS <value>) AS __arc_probe` must be a bare select of one `CAST` item aliased `__arc_probe`.
-  - `x-kind: partition` (dedupe's `key`) — `SELECT row_number() OVER (PARTITION BY <value>) AS __arc_probe` must be a bare select of one item aliased `__arc_probe`; an alias in the key does not parse there and is refused.
+  - `x-kind: partition` (dedupe's `key`) — passes the `select-list` probe, so a `)` that would close the window does not parse and a clause such as `ORDER BY` is not a bare select; and `SELECT row_number() OVER (PARTITION BY <value>) AS __arc_probe` must be a bare select of one item aliased `__arc_probe`, so an alias in the key, which `PARTITION BY` does not take, is refused.
+  - Any fragment holding `__arc_probe`, in any case, is refused, so a value cannot supply the sentinel itself.
   - An `order` written anywhere but the statement's end (limit-rows before `LIMIT`, dedupe-rows inside `OVER`) is also checked as `SELECT 1 ORDER BY <value>` whose tree carries one `ORDER_MODIFIER` and no other modifier, so `amount LIMIT 1` is refused; and the step puts a newline after it, so a trailing comment ends there. `sort-rows`' existing gate is unchanged.
 - `minimum` on an integer, and `dependentRequired` (`key` and `order_by` each require the other), each with a message naming the argument.
 
@@ -66,6 +67,7 @@ Each clause starts its own line in the model, as the filter's and the sort's do.
 - Each `column` role stays `required: false`, as it is on the filter and the sort: the catalogue's rule is that a step records from the table and arguments alone, and where an operation needs a column its argument carries it. The role's description says which argument names it.
 - `summarise-rows` uses `GROUP BY ALL`, so a grouping item may carry an alias (`date_trunc('month', at) AS month`).
 - `dedupe-rows` with a key keeps one row per key through `QUALIFY row_number()`, and the key and the order are given together: a key alone would keep an arbitrary row and make the step's table differ between runs, and an order alone would be a sort.
+- The row dedupe-rows keeps is fixed when the order is unique within each key; where two rows tie on the order, either may be kept. No tie-break over the whole row is added: the order is the analyst's statement of which row wins.
 - A fragment with a trailing `--` comment is refused rather than rewritten: the gate cannot tell a comment from text the step would lose.
 - `cast-column` uses `CAST`, so a value that does not convert fails the run, not the recording; `TRY_CAST` would hide it as a null.
 - `derive-column` onto a name the table already holds is not refused at record time: arc does not open the database, so the run reports the duplicate.

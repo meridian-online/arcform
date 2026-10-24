@@ -81,7 +81,7 @@ Expected: every test named passes; fmt and clippy are clean. CI on Linux is the 
 - Gate for `x-kind: "expression"` (spec, "Gates on arguments"): `SELECT <v> AS __arc_probe` gives exactly one item whose `alias` is `__arc_probe`; else refused ``the expression `<key>` of `<op>` is not one SQL expression``. A `;` with a second statement keeps the existing multi-statement wording.
 - Schema `column` (x-kind column), `expression` (x-kind expression), both required. SQL `SELECT *, <expression> AS <column>\nFROM <t>`.
 
-- [ ] Unit: `amount * 2`, `upper(note)`, `CASE WHEN amount > 100 THEN 'big' ELSE 'small' END`, `regexp_replace(note, 'a', 'b')` admitted; `1 FROM orders`, `amount; DROP TABLE orders`, `1) FROM orders WHERE (1`, `` refused, naming `expression`; also `amount, note` and `amount * 2 -- double`.
+- [ ] Unit: `amount * 2`, `upper(note)`, `CASE WHEN amount > 100 THEN 'big' ELSE 'small' END`, `regexp_replace(note, 'a', 'b')` admitted; `1 FROM orders`, `amount; DROP TABLE orders`, `1) FROM orders WHERE (1`, `` refused, naming `expression`; also `amount, note`, `amount * 2 -- double` and `amount AS __arc_probe -- c` (the sentinel typed by the caller).
 - [ ] Integration: model bytes for `column=doubled`, `expression=amount * 2`; after run, `doubled` is `[100, 300, 600, 200]` by id.
 - [ ] Verify; commit.
 
@@ -105,7 +105,7 @@ Expected: every test named passes; fmt and clippy are clean. CI on Linux is the 
 
 **Interfaces:** `admit` reads `dependentRequired` (`{"key": ["order_by"], "order_by": ["key"]}`) and refuses ``…`<a>` needs `<b>` as well``. Gate `x-kind: "partition"` per the spec. `fn order_alone(key, value) -> Result<()>`: `SELECT 1 ORDER BY <v>` tree's `modifiers` is exactly one `ORDER_MODIFIER`; used by every operation whose order is not at the statement's end (here and Task 7). Schema `key` (partition), `order_by` (order), both optional. SQL as the spec's table, with a newline after the order.
 
-- [ ] Unit: `order_by` without `key`, and `key` without `order_by`, refused; `key=note AS n` refused; `order_by=amount LIMIT 1` refused.
+- [ ] Unit: `order_by` without `key`, and `key` without `order_by`, refused; `key=note AS n`, `key=note ORDER BY amount` and `key=note) = 1 OR TRUE OR row_number() OVER (PARTITION BY note` refused; `order_by=amount LIMIT 1` refused.
 - [ ] Integration: a fixture with a duplicated row: no key gives distinct rows; `key=note`, `order_by=amount desc` keeps the highest amount per note.
 - [ ] Verify; commit.
 
