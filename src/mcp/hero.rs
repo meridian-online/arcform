@@ -398,14 +398,28 @@ fn operation_describe_schema() -> Value {
 /// The request is handed to the record path `arc operation record` takes, which
 /// writes the step's SQL from the operation's catalogue entry; nothing here names
 /// an operation or an argument. `dir` defaults to `.`, the server's working
-/// directory, as `--dir` does. `arguments` is an object, absent when the
+/// directory, as `--dir` does. `on` is a string, absent when `reads` names the
+/// table or the operation reads none, as `--on` is; `reads` is an object of each
+/// role the operation reads to a table name or a list of names, absent when `on`
+/// names the one table read. `arguments` is an object, absent when the
 /// operation takes none. `description` is a string, absent for a step with none,
-/// as `--description` is. A refusal is an error result naming what was wrong, with
-/// the Protocol's directory untouched.
+/// as `--description` is. The answer names the step and its model, with what the
+/// operation says of the recording under `notes`, empty when it says nothing. A
+/// refusal is an error result naming what was wrong, with the Protocol's
+/// directory untouched.
 fn operation_record(args: &Value) -> ToolResult {
     let dir = PathBuf::from(optional_string(args, "dir")?.unwrap_or("."));
     let operation = required_string(args, "operation")?;
-    let on = required_string(args, "on")?;
+    let on = optional_string(args, "on")?;
+    let reads = match args.get("reads") {
+        None | Some(Value::Null) => serde_json::Map::new(),
+        Some(Value::Object(reads)) => reads.clone(),
+        Some(other) => {
+            return Err(format!(
+                "`reads` must be an object of each role the operation reads, not {other}"
+            ));
+        }
+    };
     let name = required_string(args, "name")?;
     let arguments = match args.get("arguments") {
         None | Some(Value::Null) => serde_json::Map::new(),
@@ -425,15 +439,17 @@ fn operation_record(args: &Value) -> ToolResult {
     let request = crate::record::OperationRequest {
         long_name: operation,
         on,
+        reads: &reads,
         name,
         arguments: &arguments,
         description,
     };
-    let model =
+    let recorded =
         crate::record::record_operation(&dir, &request, &history).map_err(|e| e.to_string())?;
     Ok(ToolOutput::json(json!({
         "step": name,
-        "model": model.display().to_string(),
+        "model": recorded.model.display().to_string(),
+        "notes": recorded.notes,
     })))
 }
 
@@ -472,13 +488,14 @@ fn operation_record_schema() -> Value {
         "type": "object",
         "properties": {
             "operation": { "type": "string", "description": "The operation's long name (e.g. filter-rows), as operation_describe lists them." },
-            "on": { "type": "string", "description": "The table the operation is applied to: one a step of the Protocol makes." },
+            "on": { "type": "string", "description": "The table the operation is applied to, one a step of the Protocol makes: shorthand for `reads.table`, so give one or the other." },
+            "reads": { "type": "object", "description": "Each role the operation reads, as operation_describe lists them, to a table name or a list of names; `table` may be given as `on` instead.", "additionalProperties": { "anyOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }] } },
             "name": { "type": "string", "description": "The new step's name, which is also the name of the table it makes." },
             "arguments": { "type": "object", "description": "The operation's arguments, as the `parameters` JSON Schema operation_describe returns for it describes them." },
             "description": { "type": "string", "description": "One line saying what the step does and why, written on the step for the person who reads the Protocol next." },
             "dir": { "type": "string", "description": "Protocol directory (where arcform.yaml lives). Defaults to the current directory." }
         },
-        "required": ["operation", "on", "name"]
+        "required": ["operation", "name"]
     })
 }
 

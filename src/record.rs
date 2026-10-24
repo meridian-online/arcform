@@ -624,8 +624,9 @@ pub(crate) struct Operation {
     pub(crate) long_name: &'static str,
     /// One sentence saying what the operation does.
     pub(crate) summary: &'static str,
-    /// Each thing the operation reads, in the order a caller names them: a
-    /// table first.
+    /// Each thing the operation reads, in the order a caller names them:
+    /// nothing, or one required table called `table` first, which a request's
+    /// `on` fills.
     reads: &'static [Role],
     /// Each thing the operation's step writes.
     writes: &'static [Role],
@@ -645,22 +646,82 @@ pub(crate) struct Operation {
     /// together, and [`LIMIT_ROWS`]' `order_by` is followed by the step's
     /// `LIMIT`, and is probed with it.
     checks: Option<Checks>,
+    /// What a person is told once the step is recorded, a sentence each, from
+    /// the arguments it was recorded with, or `None` for an operation that has
+    /// nothing to say. A note is not a refusal: the step is recorded, and the
+    /// note says what the recording cannot show, such as a choice the step's
+    /// SQL makes that the caller may not have meant.
+    notes: Option<Notes>,
 }
 
 /// A check of an operation's arguments taken together: `Ok`, or the refusal.
 type Checks = fn(&serde_json::Map<String, serde_json::Value>) -> Result<()>;
 
+/// What is said of a recording once it is made: a sentence each, from the
+/// arguments it was made with.
+type Notes = fn(&serde_json::Map<String, serde_json::Value>) -> Vec<String>;
+
 /// What a statement read as an operation is read to: the table the operation
-/// is applied to, and its arguments.
-type Reading = (String, serde_json::Map<String, serde_json::Value>);
+/// is applied to, the tables it reads in its other roles, by role, and its
+/// arguments — the `on`, `reads` and `arguments` of an [`OperationRequest`].
+type Reading = (
+    String,
+    serde_json::Map<String, serde_json::Value>,
+    serde_json::Map<String, serde_json::Value>,
+);
 
 /// What an operation's SQL is written from: the new step's name, which is also
 /// the name of the table the step makes; the table the operation is applied to,
-/// as given; and the operation's arguments.
+/// as given; every table it reads, by role; and the operation's arguments.
 pub(crate) struct Recording<'a> {
     name: &'a str,
+    /// The table in the role `table`, as `reads` holds it, or `""` for an
+    /// operation that reads no table. Kept beside `reads` since each operation
+    /// that reads one table writes its SQL from this alone.
     on: &'a str,
+    /// Every table the operation reads, by role, as [`Operation::admit_reads`]
+    /// admitted them.
+    #[expect(
+        dead_code,
+        reason = "each operation arc holds today reads one table, from `on`"
+    )]
+    reads: &'a Reads,
     arguments: &'a serde_json::Map<String, serde_json::Value>,
+}
+
+/// The tables a request names for an operation to read, as
+/// [`Operation::admit_reads`] admits them: each role of kind `table` the
+/// request fills, in the order the operation reads them, with its tables in the
+/// order given — one for a single role, one or more for a list. A role the
+/// request leaves empty is absent.
+#[derive(Debug, Default)]
+pub(crate) struct Reads(Vec<(&'static str, Vec<String>)>);
+
+impl Reads {
+    /// The table in the single role `role`, or `""` when the role is not
+    /// filled. A required role is filled once the reads are admitted, so a
+    /// required table is present by then.
+    pub(crate) fn one(&self, role: &str) -> &str {
+        self.list(role).first().map_or("", String::as_str)
+    }
+
+    /// The tables in the role `role`, in the order given, or none when the role
+    /// is not filled.
+    pub(crate) fn list(&self, role: &str) -> &[String] {
+        self.0
+            .iter()
+            .find(|(name, _)| *name == role)
+            .map_or(&[], |(_, tables)| tables.as_slice())
+    }
+
+    /// Every table read, role by role in the operation's order, a list's in the
+    /// order given: the tables a step of the protocol must make, and the ones a
+    /// model's header names.
+    pub(crate) fn tables(&self) -> impl Iterator<Item = &str> {
+        self.0
+            .iter()
+            .flat_map(|(_, tables)| tables.iter().map(String::as_str))
+    }
 }
 
 impl Recording<'_> {
@@ -774,7 +835,7 @@ const STEP_TABLE: Role = Role {
 
 /// Every operation arc holds, in the order `arc operation list` prints them.
 ///
-/// An operation reads a table, then the column it is asked from. The column is
+/// Each of these reads a table, then the column it is asked from. The column is
 /// not required: `arc operation record` records a step from the table and the
 /// arguments alone.
 const CATALOGUE: &[Operation] = &[
@@ -806,6 +867,7 @@ const CATALOGUE: &[Operation] = &[
         sql: filter_rows_sql,
         recognised: Some(filter_rows_recognised),
         checks: None,
+        notes: None,
     },
     Operation {
         long_name: SORT_ROWS,
@@ -835,6 +897,7 @@ const CATALOGUE: &[Operation] = &[
         sql: sort_rows_sql,
         recognised: None,
         checks: None,
+        notes: None,
     },
     Operation {
         long_name: HIDE_COLUMN,
@@ -864,6 +927,7 @@ const CATALOGUE: &[Operation] = &[
         sql: hide_column_sql,
         recognised: None,
         checks: None,
+        notes: None,
     },
     Operation {
         long_name: RENAME_COLUMN,
@@ -893,6 +957,7 @@ const CATALOGUE: &[Operation] = &[
         sql: rename_column_sql,
         recognised: None,
         checks: None,
+        notes: None,
     },
     Operation {
         long_name: DERIVE_COLUMN,
@@ -922,6 +987,7 @@ const CATALOGUE: &[Operation] = &[
         sql: derive_column_sql,
         recognised: None,
         checks: None,
+        notes: None,
     },
     Operation {
         long_name: CAST_COLUMN,
@@ -951,6 +1017,7 @@ const CATALOGUE: &[Operation] = &[
         sql: cast_column_sql,
         recognised: None,
         checks: None,
+        notes: None,
     },
     Operation {
         long_name: SUMMARISE_ROWS,
@@ -980,6 +1047,7 @@ const CATALOGUE: &[Operation] = &[
         sql: summarise_rows_sql,
         recognised: None,
         checks: Some(summarise_rows_checks),
+        notes: None,
     },
     Operation {
         long_name: DEDUPE_ROWS,
@@ -1009,6 +1077,7 @@ const CATALOGUE: &[Operation] = &[
         sql: dedupe_rows_sql,
         recognised: None,
         checks: Some(dedupe_rows_checks),
+        notes: None,
     },
     Operation {
         long_name: LIMIT_ROWS,
@@ -1038,6 +1107,7 @@ const CATALOGUE: &[Operation] = &[
         sql: limit_rows_sql,
         recognised: None,
         checks: Some(limit_rows_checks),
+        notes: None,
     },
     Operation {
         long_name: FILL_NULLS,
@@ -1067,6 +1137,7 @@ const CATALOGUE: &[Operation] = &[
         sql: fill_nulls_sql,
         recognised: None,
         checks: None,
+        notes: None,
     },
 ];
 
@@ -1121,11 +1192,11 @@ fn filter_rows_query(from: &str, condition: &str) -> String {
     format!("SELECT *\nFROM {from}\nWHERE {condition}")
 }
 
-/// The table and the arguments of [`FILTER_ROWS`] when `statement` is a filter
-/// of a table: when DuckDB reads it as the query the operation's step writes,
-/// [`filter_rows_query`] of the table it reads and of some condition cut from
-/// its own text, and reads it as the same query with that condition inside
-/// parentheses. `None` when no condition is.
+/// The table and the arguments of [`FILTER_ROWS`], and no other read, when
+/// `statement` is a filter of a table: when DuckDB reads it as the query the
+/// operation's step writes, [`filter_rows_query`] of the table it reads and of
+/// some condition cut from its own text, and reads it as the same query with
+/// that condition inside parentheses. `None` when no condition is.
 ///
 /// The table is the one DuckDB's tree names, written back through
 /// [`from_ident_on`] as the step writes it, so a statement that reads a schema's
@@ -1168,7 +1239,8 @@ fn filter_rows_recognised(statement: &Statement) -> Option<Reading> {
             })
             .map(|condition| {
                 let arguments = [("where".to_string(), condition.into())];
-                (on.to_string(), arguments.into_iter().collect())
+                let reads = serde_json::Map::new();
+                (on.to_string(), reads, arguments.into_iter().collect())
             })
     })
 }
@@ -2039,6 +2111,47 @@ pub(crate) fn typed_arguments(
         .collect()
 }
 
+/// The `--read ROLE=TABLE` pairs the command line gives, in the order given, as
+/// the `reads` of a request for the operation `long_name`, through
+/// [`Operation::typed_reads`]. An operation arc does not hold reads no list
+/// role, so each role given once is a name and one given twice a list, for
+/// [`record_operation`] to refuse the operation. `arc mcp` passes JSON, whose
+/// lists are already lists, and does not call this.
+pub(crate) fn typed_reads(
+    long_name: &str,
+    pairs: &[(String, String)],
+) -> serde_json::Map<String, serde_json::Value> {
+    match operation(long_name) {
+        Some(op) => op.typed_reads(pairs),
+        None => reads_from_pairs(pairs, |_| false),
+    }
+}
+
+/// `pairs` as a `reads` map: the tables of each role for which `list` holds
+/// as a list of them, in order, one as a list of one; any other role's one
+/// table as its name, and two or more as a list, which
+/// [`Operation::admit_reads`] then refuses as a list for a single role, naming
+/// it, rather than one table silently winning.
+fn reads_from_pairs(
+    pairs: &[(String, String)],
+    list: impl Fn(&str) -> bool,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut reads = serde_json::Map::new();
+    for (role, table) in pairs {
+        match reads.get_mut(role) {
+            None if list(role) => {
+                reads.insert(role.clone(), serde_json::json!([table]));
+            }
+            None => {
+                reads.insert(role.clone(), table.as_str().into());
+            }
+            Some(serde_json::Value::Array(tables)) => tables.push(table.as_str().into()),
+            Some(one) => *one = serde_json::json!([one.take(), table]),
+        }
+    }
+    reads
+}
+
 /// `text` as the JSON number it writes, when it reads as a whole number: an
 /// `i64` where it fits, as `"+2"` and `"-1"` do; otherwise, where it is digits
 /// alone after an optional sign, a `u64` where that fits and a float beyond it,
@@ -2067,6 +2180,17 @@ fn whole_number(text: &str) -> Option<serde_json::Value> {
 }
 
 impl Operation {
+    /// The `--read ROLE=TABLE` pairs as this operation's `reads`, a list role's
+    /// as a list and any other's as a name: see [`reads_from_pairs`].
+    fn typed_reads(
+        &self,
+        pairs: &[(String, String)],
+    ) -> serde_json::Map<String, serde_json::Value> {
+        reads_from_pairs(pairs, |name| {
+            self.reads.iter().any(|role| role.name == name && role.list)
+        })
+    }
+
     /// The listing entry: the long name and the one line saying what it does.
     pub(crate) fn listing(&self) -> serde_json::Value {
         serde_json::json!({
@@ -2141,12 +2265,15 @@ pub(crate) fn describe(name: &str) -> Option<serde_json::Value> {
 // ------------------------------------------------ recognising a SQL statement
 
 /// What `sql`, one SQL statement, is read as: the operation arc holds that it
-/// is, as `operation`, `on` and `arguments` — the long name, the table the
-/// operation is applied to and its arguments, the three keys `arc mcp`'s
-/// `operation_record` takes under those names — or `operation` `null` when DuckDB
-/// parses the statement and arc reads it as none. `arc sql recognise` and `arc
-/// mcp`'s `sql_recognise` both answer from here, so the two cannot differ. Each
-/// operation in the catalogue says how a statement is read as it.
+/// is, as `operation`, `on`, `reads` and `arguments` — the long name, the table
+/// the operation is applied to, the tables it reads in its other roles and its
+/// arguments, the keys `arc mcp`'s `operation_record` takes under those names —
+/// or `operation` `null` when DuckDB parses the statement and arc reads it as
+/// none. `reads` is left out when the operation reads no table beside `on`, as
+/// each that reads one table does, so their answers hold the three keys alone;
+/// `operation_record` takes the answer as given either way. `arc sql recognise`
+/// and `arc mcp`'s `sql_recognise` both answer from here, so the two cannot
+/// differ. Each operation in the catalogue says how a statement is read as it.
 ///
 /// The reading is DuckDB's own parse, asked of the DuckDB library arc is linked
 /// with, so no `duckdb` executable is needed; it binds and runs nothing, and
@@ -2158,19 +2285,25 @@ pub(crate) fn describe(name: &str) -> Option<serde_json::Value> {
 /// DuckDB library that gives no tree.
 pub(crate) fn recognise(sql: &str) -> Result<serde_json::Value> {
     Ok(match read_as_operation(sql)? {
-        Some((operation, (on, arguments))) => serde_json::json!({
-            "operation": operation,
-            "on": on,
-            "arguments": arguments,
-        }),
+        Some((operation, (on, reads, arguments))) => {
+            let mut answer = serde_json::json!({
+                "operation": operation,
+                "on": on,
+                "arguments": arguments,
+            });
+            if !reads.is_empty() {
+                answer["reads"] = reads.into();
+            }
+            answer
+        }
         None => serde_json::json!({ "operation": null }),
     })
 }
 
 /// The operation `sql` is read as, by its long name, with the [`Reading`] —
-/// the table and the arguments — or `None` when it is read as none. The one
-/// reading [`recognise`] answers from and [`record_sql`] records on, refused as
-/// [`recognise`] describes.
+/// the table, the other reads and the arguments — or `None` when it is read as
+/// none. The one reading [`recognise`] answers from and [`record_sql`] records
+/// on, refused as [`recognise`] describes.
 fn read_as_operation(sql: &str) -> Result<Option<(&'static str, Reading)>> {
     match duckdb_statement_count(sql) {
         1 => {}
@@ -2289,8 +2422,14 @@ fn unlocated(tree: &serde_json::Value) -> serde_json::Value {
 pub(crate) struct OperationRequest<'a> {
     /// The operation's long name, as `arc operation list` lists it.
     pub(crate) long_name: &'a str,
-    /// The table the operation is applied to.
-    pub(crate) on: &'a str,
+    /// The table the operation is applied to: shorthand for the role `table`
+    /// in `reads`, so it is given there or here, not both. `None` when `reads`
+    /// names it, or the operation reads no table.
+    pub(crate) on: Option<&'a str>,
+    /// Each table the operation reads, by the name of the role it plays, as
+    /// `arc operation describe` lists them: a table name for a single role, a
+    /// list of names for a list. Empty when `on` names the one table read.
+    pub(crate) reads: &'a serde_json::Map<String, serde_json::Value>,
     /// The new step's name, which is also the name of the table it makes.
     pub(crate) name: &'a str,
     /// The operation's arguments.
@@ -2299,19 +2438,31 @@ pub(crate) struct OperationRequest<'a> {
     pub(crate) description: Option<&'a str>,
 }
 
-/// Record the operation `request.long_name`, applied to the table `request.on`,
-/// as a new step named `request.name` at the end of the protocol at `dir`, with
-/// `request.description` as its `description:` when one is given, and return
-/// the model's path relative to `dir`.
+/// What [`record_operation`] recorded.
+#[derive(Debug)]
+pub(crate) struct Recorded {
+    /// The model's path, relative to the protocol's directory.
+    pub(crate) model: PathBuf,
+    /// What the operation says of the recording, a sentence each, for the
+    /// caller to pass on: empty for an operation that says nothing.
+    pub(crate) notes: Vec<String>,
+}
+
+/// Record the operation `request.long_name`, reading the tables `request.on`
+/// and `request.reads` name, as a new step named `request.name` at the end of
+/// the protocol at `dir`, with `request.description` as its `description:`
+/// when one is given, and return the model's path relative to `dir`, with
+/// what the operation says of the recording.
 ///
 /// The operation's SQL is written from its catalogue entry, so a caller names no
 /// operation and no argument of its own: the command line and `arc mcp` hand
 /// over what they were given, and an operation added to the catalogue is
 /// recorded through both with no edit to either. The model's first line is the
-/// long name and the table, ` on ` between them, and nothing else, so the same
-/// request writes the same bytes whoever sends it; a description is the caller's
-/// own words, written on the step as given, so it too is the same whoever sends
-/// it. The step is recorded through
+/// long name and every table read, in role order, a list's in the order given,
+/// written as [`provenance`] writes it, and nothing else, so the same request
+/// writes the same bytes whoever sends it; a description is the caller's own
+/// words, written on the step as given, so it too is the same whoever sends it.
+/// The step is recorded through
 /// [`record_step_with_history`](crate::history::record_step_with_history), so
 /// each recording is a version of the protocol, and it runs nothing.
 ///
@@ -2322,43 +2473,81 @@ pub(crate) struct OperationRequest<'a> {
 /// order DuckDB's own parser reads as more than one statement, or cannot parse at
 /// all (see [`one_statement`]); a SQL fragment its probe refuses (see
 /// [`probed`]); what the operation's own `checks` refuse, such as a dedupe's key
-/// and order that do not read as one window; a table no step of the protocol
-/// makes; and a description that is empty or spans lines (see [`record_step`]).
-/// Each refusal's message names what was wrong.
+/// and order that do not read as one window; reads the operation does not admit
+/// (see [`Operation::admit_reads`]); a table, in any role, that no step of the
+/// protocol makes; and a description that is empty or spans lines (see
+/// [`record_step`]). Each refusal's message names what was wrong.
 pub(crate) fn record_operation(
     dir: &Path,
     request: &OperationRequest,
     history: &crate::history::LocalHistory,
-) -> Result<PathBuf> {
-    let OperationRequest {
-        long_name,
-        on,
-        name,
-        arguments,
-        description,
-    } = *request;
-    let Some(op) = operation(long_name) else {
+) -> Result<Recorded> {
+    let Some(op) = operation(request.long_name) else {
         let held: Vec<&str> = CATALOGUE.iter().map(|op| op.long_name).collect();
         return Err(refused(format!(
-            "no operation called `{long_name}`; the operations arc holds are {}",
+            "no operation called `{}`; the operations arc holds are {}",
+            request.long_name,
             held.join(", ")
         )));
     };
-    op.admit(arguments)?;
-    made_by_a_step(dir, on)?;
+    op.record(dir, request, history)
+}
 
-    let step = RecordedStep {
-        name: name.to_string(),
-        sql: (op.sql)(&Recording {
-            name,
+/// A model's provenance, the text after its [`GENERATED_MARKER`]: `long_name`,
+/// then ` on ` and every table `reads` holds, in role order, `, ` between them,
+/// or `long_name` alone for an operation that reads no table. The roles are
+/// left out, and the names are written as given, unquoted, so the line is for a
+/// person reading the model and not a format a program reads back: a name
+/// holding `, ` reads ambiguously in it. [`sql_is_generated`] reads the marker
+/// alone.
+fn provenance(long_name: &str, reads: &Reads) -> String {
+    let tables: Vec<&str> = reads.tables().collect();
+    if tables.is_empty() {
+        long_name.to_string()
+    } else {
+        format!("{long_name} on {}", tables.join(", "))
+    }
+}
+
+impl Operation {
+    /// [`record_operation`] for this operation, held or not, refused as that
+    /// describes: the arguments admitted, then the reads, then each table read
+    /// found among those a step makes, before anything is written.
+    fn record(
+        &self,
+        dir: &Path,
+        request: &OperationRequest,
+        history: &crate::history::LocalHistory,
+    ) -> Result<Recorded> {
+        let OperationRequest {
+            long_name: _,
             on,
+            reads,
+            name,
             arguments,
-        }),
-        provenance: format!("{} on {on}", op.long_name),
-        description: description.map(str::to_string),
-    };
-    let (sql_rel, _) = crate::history::record_step_with_history(dir, &step, history)?;
-    Ok(sql_rel)
+            description,
+        } = *request;
+        self.admit(arguments)?;
+        let reads = self.admit_reads(on, reads)?;
+        for table in reads.tables() {
+            made_by_a_step(dir, table)?;
+        }
+
+        let step = RecordedStep {
+            name: name.to_string(),
+            sql: (self.sql)(&Recording {
+                name,
+                on: reads.one("table"),
+                reads: &reads,
+                arguments,
+            }),
+            provenance: provenance(self.long_name, &reads),
+            description: description.map(str::to_string),
+        };
+        let (model, _) = crate::history::record_step_with_history(dir, &step, history)?;
+        let notes = self.notes.map(|notes| notes(arguments)).unwrap_or_default();
+        Ok(Recorded { model, notes })
+    }
 }
 
 // ----------------------------------------------- recording an operator step
@@ -2555,15 +2744,16 @@ pub(crate) fn record_sql(
         name,
         description,
     } = *request;
-    if let Some((long_name, (on, arguments))) = read_as_operation(sql)? {
+    if let Some((long_name, (on, reads, arguments))) = read_as_operation(sql)? {
         let operation = OperationRequest {
             long_name,
-            on: &on,
+            on: Some(&on),
+            reads: &reads,
             name,
             arguments: &arguments,
             description,
         };
-        let model = record_operation(dir, &operation, history)?;
+        let Recorded { model, .. } = record_operation(dir, &operation, history)?;
         return Ok(SqlRecorded {
             model,
             operation: Some((long_name, on)),
@@ -2748,6 +2938,130 @@ impl Operation {
             }
         }
         self.checks.map_or(Ok(()), |checks| checks(arguments))
+    }
+
+    /// The tables a request names for the operation to read, `on` and `reads`,
+    /// as [`Reads`]: `on` fills the role `table`, and each key of `reads` names
+    /// a role of kind `table` the operation reads, its value a table name for a
+    /// single role or a list of names for a list.
+    ///
+    /// Refused, each naming the role: `on` beside `reads.table`, since both
+    /// name the one table (`on` beside any other role is admitted); a role the
+    /// operation does not read; a role of another kind, such as the `column` a
+    /// table operation is asked from, which is supplied by where the operation
+    /// is asked from and not by the request; a value that is neither a name
+    /// nor a list of names; a list for a single role, and one name for a list;
+    /// a list shorter than its role's `min_items`; and a required role left
+    /// empty. An operation that reads no table refuses `on` and any role at
+    /// all. Whether a step makes each table is not asked here: see
+    /// [`made_by_a_step`].
+    fn admit_reads(
+        &self,
+        on: Option<&str>,
+        reads: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Reads> {
+        let long_name = self.long_name;
+        let tables: Vec<&Role> = self.reads.iter().filter(|r| r.kind == "table").collect();
+        if tables.is_empty() {
+            if on.is_some() || !reads.is_empty() {
+                return Err(refused(format!(
+                    "`{long_name}` reads no table, so it takes no `on` and no table in `reads`"
+                )));
+            }
+            return Ok(Reads::default());
+        }
+        if on.is_some() && reads.contains_key("table") {
+            return Err(refused(format!(
+                "`on` and `reads` both name the table `{long_name}` reads as `table`; give it in one"
+            )));
+        }
+        let read = || {
+            tables
+                .iter()
+                .map(|role| format!("`{}`", role.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        for role_name in reads.keys() {
+            match self.reads.iter().find(|r| r.name == role_name) {
+                None => {
+                    return Err(refused(format!(
+                        "`{long_name}` reads no role `{role_name}`; the tables it reads are in {}",
+                        read()
+                    )));
+                }
+                Some(role) if role.kind != "table" => {
+                    return Err(refused(format!(
+                        "the role `{role_name}` of `{long_name}` is a {}, which a request does \
+                         not fill; the tables it reads are in {}",
+                        role.kind,
+                        read()
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+
+        let mut admitted = Vec::new();
+        for role in tables {
+            let on = on
+                .filter(|_| role.name == "table")
+                .map(serde_json::Value::from);
+            let Some(value) = on.as_ref().or_else(|| reads.get(role.name)) else {
+                if role.required {
+                    let shorthand = if role.name == "table" {
+                        ": `on` is required, or `table` in `reads`"
+                    } else {
+                        ""
+                    };
+                    return Err(refused(format!(
+                        "`{long_name}` reads a table in the role `{}`, and none was given{shorthand}",
+                        role.name
+                    )));
+                }
+                continue;
+            };
+            let named = match value {
+                serde_json::Value::String(table) => Some((false, vec![table.clone()])),
+                serde_json::Value::Array(items) => items
+                    .iter()
+                    .map(|item| item.as_str().map(str::to_string))
+                    .collect::<Option<Vec<_>>>()
+                    .map(|tables| (true, tables)),
+                _ => None,
+            };
+            let Some((is_list, named)) = named else {
+                return Err(refused(format!(
+                    "the role `{}` of `{long_name}` takes a table name or a list of names, not \
+                     {value}",
+                    role.name
+                )));
+            };
+            if is_list && !role.list {
+                return Err(refused(format!(
+                    "the role `{}` of `{long_name}` reads one table, not a list: {value}",
+                    role.name
+                )));
+            }
+            if !is_list && role.list {
+                return Err(refused(format!(
+                    "the role `{}` of `{long_name}` reads a list of tables, not one name: give \
+                     [{value}]",
+                    role.name
+                )));
+            }
+            if let Some(min_items) = role.min_items
+                && (named.len() as u64) < min_items
+            {
+                return Err(refused(format!(
+                    "the role `{}` of `{long_name}` reads at least {min_items} tables, not {}",
+                    role.name,
+                    named.len()
+                )));
+            }
+            admitted.push((role.name, named));
+        }
+        Ok(Reads(admitted))
     }
 }
 
@@ -3670,7 +3984,8 @@ mod tests {
     // by a caller: the same five keys, and each role in `reads` and `writes` named
     // once, of a kind arc knows, with a sentence to print, an `of` that points back
     // at an earlier read that holds columns, and `min_items` on a list alone. An
-    // operation reads a table first; an operator may read nothing.
+    // operation reads nothing, or reads first one required table called `table`,
+    // which `on` fills; an operator may read nothing.
     #[test]
     fn every_description_names_each_role_once_in_the_one_shape() {
         for name in described_names() {
@@ -3703,11 +4018,24 @@ mod tests {
             let writes = description["writes"]
                 .as_array()
                 .expect("`writes` is a list");
-            if operation(name).is_some() {
+            if operation(name).is_some()
+                && let Some(first) = reads.first()
+            {
                 assert_eq!(
-                    reads.first().map(|r| &r["kind"]),
-                    Some(&serde_json::json!("table")),
-                    "`{name}` is an operation and does not read a table first"
+                    (
+                        &first["name"],
+                        &first["kind"],
+                        &first["list"],
+                        &first["required"]
+                    ),
+                    (
+                        &serde_json::json!("table"),
+                        &serde_json::json!("table"),
+                        &serde_json::json!(false),
+                        &serde_json::json!(true),
+                    ),
+                    "`{name}` is an operation that reads, and its first role is not one \
+                     required table called `table`: {first}"
                 );
             }
             for (direction, roles) in [("reads", reads), ("writes", writes)] {
@@ -4014,6 +4342,7 @@ mod tests {
         let recording = Recording {
             name: "no_note",
             on: "orders",
+            reads: &Reads::default(),
             arguments: &arguments,
         };
         assert_eq!(
@@ -4083,6 +4412,7 @@ mod tests {
         let recording = Recording {
             name: "relabelled",
             on: "orders",
+            reads: &Reads::default(),
             arguments: &arguments,
         };
         assert_eq!(
@@ -4162,6 +4492,7 @@ mod tests {
         let recording = Recording {
             name: "doubled_orders",
             on: "orders",
+            reads: &Reads::default(),
             arguments: &arguments,
         };
         assert_eq!(
@@ -4371,6 +4702,7 @@ mod tests {
         let recording = Recording {
             name: "order_counts",
             on: "orders",
+            reads: &Reads::default(),
             arguments: &grouped,
         };
         assert_eq!(
@@ -4381,6 +4713,7 @@ mod tests {
         let recording = Recording {
             name: "order_counts",
             on: "orders",
+            reads: &Reads::default(),
             arguments: &whole,
         };
         assert_eq!(
@@ -4394,6 +4727,7 @@ mod tests {
         let recording = Recording {
             name: "order_counts",
             on: "orders",
+            reads: &Reads::default(),
             arguments: &two,
         };
         assert!(
@@ -4554,6 +4888,7 @@ mod tests {
         let recording = Recording {
             name: "unique_orders",
             on: "orders",
+            reads: &Reads::default(),
             arguments: &whole,
         };
         assert_eq!(
@@ -4564,6 +4899,7 @@ mod tests {
         let recording = Recording {
             name: "unique_orders",
             on: "orders",
+            reads: &Reads::default(),
             arguments: &keyed,
         };
         assert_eq!(
@@ -4744,6 +5080,7 @@ mod tests {
             let recording = Recording {
                 name: "top_orders",
                 on: "orders",
+                reads: &Reads::default(),
                 arguments: &given,
             };
             assert_eq!(
@@ -4932,6 +5269,7 @@ mod tests {
         let recording = Recording {
             name: "filled_orders",
             on: "orders",
+            reads: &Reads::default(),
             arguments: &arguments,
         };
         assert_eq!(
@@ -5037,6 +5375,7 @@ mod tests {
             sql: |recording| recording.text("where").to_string(),
             recognised: None,
             checks: None,
+            notes: None,
         }
     }
 
@@ -5069,6 +5408,300 @@ mod tests {
 
     fn arguments(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
         value.as_object().expect("an object").clone()
+    }
+
+    /// The [`operation_taking`] test operation reading a table, then another
+    /// table, then a list of at least one table, then a column of the first: a
+    /// role of each shape [`Operation::admit_reads`] admits and refuses. Neither
+    /// table after the first is required, so a request may name either alone.
+    fn operation_reading() -> Operation {
+        Operation {
+            reads: &[
+                Role {
+                    name: "table",
+                    kind: "table",
+                    list: false,
+                    required: true,
+                    of: None,
+                    min_items: None,
+                    description: "The table first read.",
+                },
+                Role {
+                    name: "other",
+                    kind: "table",
+                    list: false,
+                    required: false,
+                    of: None,
+                    min_items: None,
+                    description: "One more table.",
+                },
+                Role {
+                    name: "others",
+                    kind: "table",
+                    list: true,
+                    required: false,
+                    of: None,
+                    min_items: Some(1),
+                    description: "A list of tables.",
+                },
+                Role {
+                    name: "column",
+                    kind: "column",
+                    list: false,
+                    required: false,
+                    of: Some("table"),
+                    min_items: None,
+                    description: "A column of the first table.",
+                },
+            ],
+            notes: Some(|_| vec!["The test operation read its tables.".to_string()]),
+            ..operation_taking(|| serde_json::json!({ "type": "object" }))
+        }
+    }
+
+    #[test]
+    fn on_alone_or_reads_table_alone_fills_the_table_role() {
+        let op = operation_reading();
+        for (on, given) in [
+            (Some("orders"), serde_json::json!({})),
+            (None, serde_json::json!({ "table": "orders" })),
+        ] {
+            let reads = op
+                .admit_reads(on, &arguments(given.clone()))
+                .unwrap_or_else(|e| panic!("on {on:?} with {given} is refused: {e}"));
+            assert_eq!(reads.one("table"), "orders");
+            assert_eq!(reads.tables().collect::<Vec<_>>(), ["orders"]);
+        }
+    }
+
+    #[test]
+    fn on_beside_reads_table_is_refused_naming_both() {
+        let err = operation_reading()
+            .admit_reads(
+                Some("orders"),
+                &arguments(serde_json::json!({ "table": "orders" })),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`on`") && err.contains("`table`"),
+            "the refusal does not name `on` and `table`: {err}"
+        );
+    }
+
+    #[test]
+    fn on_beside_another_role_is_admitted_and_every_table_is_read_in_role_order() {
+        let reads = operation_reading()
+            .admit_reads(
+                Some("orders"),
+                &arguments(serde_json::json!({ "others": ["a", "b"], "other": "customers" })),
+            )
+            .unwrap();
+        assert_eq!(reads.one("table"), "orders");
+        assert_eq!(reads.one("other"), "customers");
+        assert_eq!(reads.list("others"), ["a", "b"]);
+        assert_eq!(
+            reads.tables().collect::<Vec<_>>(),
+            ["orders", "customers", "a", "b"]
+        );
+        assert_eq!(reads.one("nope"), "", "a role not read gives no table");
+        assert!(
+            reads.list("nope").is_empty(),
+            "a role not read gives no list"
+        );
+    }
+
+    #[test]
+    fn each_read_the_operation_does_not_admit_is_refused_naming_its_role() {
+        let op = operation_reading();
+        for (on, given, named) in [
+            (None, serde_json::json!({}), ["`table`", "none was given"]),
+            (
+                Some("orders"),
+                serde_json::json!({ "nope": "x" }),
+                ["`nope`", "reads no role"],
+            ),
+            (
+                Some("orders"),
+                serde_json::json!({ "other": ["a", "b"] }),
+                ["`other`", "not a list"],
+            ),
+            (
+                Some("orders"),
+                serde_json::json!({ "others": "a" }),
+                ["`others`", "a list"],
+            ),
+            (
+                Some("orders"),
+                serde_json::json!({ "others": [] }),
+                ["`others`", "at least 1"],
+            ),
+            (
+                Some("orders"),
+                serde_json::json!({ "column": "x" }),
+                ["`column`", "a request does not fill"],
+            ),
+            (
+                Some("orders"),
+                serde_json::json!({ "other": 7 }),
+                ["`other`", "not 7"],
+            ),
+            (
+                Some("orders"),
+                serde_json::json!({ "others": ["a", 7] }),
+                ["`others`", "not [\"a\",7]"],
+            ),
+        ] {
+            let err = op
+                .admit_reads(on, &arguments(given.clone()))
+                .err()
+                .unwrap_or_else(|| panic!("on {on:?} with {given} was admitted"))
+                .to_string();
+            for name in named {
+                assert!(
+                    err.contains(name),
+                    "the refusal of {given} does not say {name}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_operation_that_reads_no_table_refuses_on_and_every_role() {
+        let op = operation_taking(|| serde_json::json!({ "type": "object" }));
+        let reads = op.admit_reads(None, &serde_json::Map::new()).unwrap();
+        assert_eq!(reads.tables().count(), 0);
+        for (on, given) in [
+            (Some("orders"), serde_json::json!({})),
+            (None, serde_json::json!({ "table": "orders" })),
+        ] {
+            let err = op
+                .admit_reads(on, &arguments(given.clone()))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("`test-op` reads no table"),
+                "on {on:?} with {given}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_command_line_gives_a_list_role_a_list_and_a_single_role_given_twice_a_list_to_refuse() {
+        let op = operation_reading();
+        let pairs = |given: &[(&str, &str)]| -> Vec<(String, String)> {
+            given
+                .iter()
+                .map(|(role, table)| (role.to_string(), table.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            serde_json::Value::Object(op.typed_reads(&pairs(&[
+                ("table", "orders"),
+                ("others", "a"),
+                ("other", "customers"),
+                ("others", "b"),
+            ]))),
+            serde_json::json!({ "table": "orders", "others": ["a", "b"], "other": "customers" })
+        );
+        assert_eq!(
+            serde_json::Value::Object(op.typed_reads(&pairs(&[("others", "a")]))),
+            serde_json::json!({ "others": ["a"] }),
+            "one value of a list role is a list of one"
+        );
+        let twice = op.typed_reads(&pairs(&[("other", "a"), ("other", "b")]));
+        assert_eq!(
+            serde_json::Value::Object(twice.clone()),
+            serde_json::json!({ "other": ["a", "b"] })
+        );
+        let err = op
+            .admit_reads(Some("orders"), &twice)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`other`"), "{err}");
+        assert_eq!(
+            serde_json::Value::Object(typed_reads("filter-rows", &pairs(&[("table", "orders")]))),
+            serde_json::json!({ "table": "orders" })
+        );
+    }
+
+    #[test]
+    fn the_header_names_every_table_read_in_role_order_and_none_when_none_is_read() {
+        let reads = operation_reading()
+            .admit_reads(
+                Some("orders"),
+                &arguments(serde_json::json!({ "other": "customers" })),
+            )
+            .unwrap();
+        assert_eq!(
+            provenance("test-op", &reads),
+            "test-op on orders, customers"
+        );
+        assert_eq!(provenance("test-op", &Reads::default()), "test-op");
+    }
+
+    /// A protocol at `dir` whose two steps make the tables `orders` and
+    /// `customers`.
+    fn shop_of_two_tables(dir: &Path) {
+        std::fs::create_dir_all(dir.join("models")).unwrap();
+        std::fs::write(
+            dir.join("arcform.yaml"),
+            "name: shop\nsteps:\n  - name: orders\n    sql: models/01_orders.sql\n  \
+             - name: customers\n    sql: models/02_customers.sql\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("models/01_orders.sql"),
+            "CREATE TABLE orders AS SELECT 1 AS id;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("models/02_customers.sql"),
+            "CREATE TABLE customers AS SELECT 1 AS id;\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_recording_checks_each_table_it_reads_names_them_all_and_carries_its_notes() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("shop");
+        shop_of_two_tables(&dir);
+        let history = crate::history::LocalHistory::at_root(root.path().join("history"));
+        let arguments = arguments(serde_json::json!({
+            "where": "CREATE OR REPLACE TABLE \"both\" AS SELECT 1 AS id;",
+        }));
+        let request = |reads| OperationRequest {
+            long_name: "test-op",
+            on: Some("orders"),
+            reads,
+            name: "both",
+            arguments: &arguments,
+            description: None,
+        };
+        let op = operation_reading();
+
+        let missing = serde_json::json!({ "others": ["customers", "missing"] });
+        let before = std::fs::read(dir.join("arcform.yaml")).unwrap();
+        let err = op
+            .record(&dir, &request(missing.as_object().unwrap()), &history)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`missing`"), "{err}");
+        assert_eq!(std::fs::read(dir.join("arcform.yaml")).unwrap(), before);
+        assert!(!dir.join("models/03_both.sql").exists());
+
+        let given = serde_json::json!({ "other": "customers" });
+        let recorded = op
+            .record(&dir, &request(given.as_object().unwrap()), &history)
+            .unwrap();
+        assert_eq!(recorded.model, Path::new("models/03_both.sql"));
+        assert_eq!(recorded.notes, ["The test operation read its tables."]);
+        let model = std::fs::read_to_string(dir.join(&recorded.model)).unwrap();
+        assert_eq!(
+            model.lines().next(),
+            Some("-- generated: test-op on orders, customers")
+        );
     }
 
     /// The two clauses arc parse-checks, named as [`Clause::of`] names them, for
@@ -5287,6 +5920,7 @@ mod tests {
             let step = hide_column_sql(&Recording {
                 name: "hidden",
                 on: "t",
+                reads: &Reads::default(),
                 arguments: &arguments,
             });
             con.execute_batch(&step).unwrap_or_else(|e| {
@@ -5355,6 +5989,7 @@ mod tests {
                 let step = rename_column_sql(&Recording {
                     name: "renamed",
                     on: "t",
+                    reads: &Reads::default(),
                     arguments: &arguments,
                 });
                 con.execute_batch(&step).unwrap_or_else(|e| {
@@ -5418,6 +6053,7 @@ mod tests {
                 let step = sql(&Recording {
                     name: "kept",
                     on: &word,
+                    reads: &Reads::default(),
                     arguments: &arguments,
                 });
                 con.execute_batch(&step).unwrap_or_else(|e| {

@@ -22,7 +22,11 @@
 //!      operation arc does not hold, a condition holding a `;` outside a string or
 //!      a comment, and a table no step makes are each refused with the directory
 //!      untouched and a message naming the fault; a `;` inside a string or a
-//!      comment, and any other condition, is recorded as written.
+//!      comment, and any other condition, is recorded as written;
+//!   6. **reads** — `--read table=orders` records the bytes `--on orders` does,
+//!      and the tool's `reads` beside `on` records as `on` alone does; `--on`
+//!      beside `--read table=`, and a `--read` with no `=`, are refused with
+//!      the directory untouched.
 //!
 //! Every recording is a version of the Protocol, so each run points
 //! `ARCFORM_HISTORY_DIR` at a directory of its own, outside the Protocol.
@@ -372,6 +376,62 @@ fn record_writes_one_generated_model_and_appends_one_step() {
         "recording added or removed a file other than the model"
     );
     assert_eq!(after, untouched, "recording changed a file it did not own");
+}
+
+// ------------------------------------------------------------------- reads
+
+#[test]
+fn a_read_of_the_table_role_records_the_bytes_on_records() {
+    let by_on = Protocol::new();
+    let by_read = Protocol::new();
+    ok(
+        &by_on.record_filter("amount > 100"),
+        "arc operation record --on",
+    );
+    ok(
+        &by_read.arc(&[
+            "operation",
+            "record",
+            "filter-rows",
+            "--read",
+            "table=orders",
+            "--name",
+            "big_orders",
+            "--arg",
+            "where=amount > 100",
+        ]),
+        "arc operation record --read",
+    );
+    assert_eq!(by_read.read("models/02_big_orders.sql"), BIG_ORDERS_MODEL);
+    assert_eq!(
+        by_read.files(),
+        by_on.files(),
+        "`--read table=orders` left other bytes than `--on orders`"
+    );
+}
+
+#[test]
+fn on_beside_a_read_of_the_table_role_or_a_read_with_no_role_is_refused_with_the_directory_untouched()
+ {
+    let cases: [(&[&str], &[&str]); 2] = [
+        (
+            &["--on", "orders", "--read", "table=orders"],
+            &["`on`", "`table`"],
+        ),
+        (
+            &["--on", "orders", "--read", "orders"],
+            &["`--read orders` must be ROLE=TABLE"],
+        ),
+    ];
+    for (args, named) in cases {
+        let protocol = Protocol::new();
+        let before = protocol.files();
+        let mut argv = vec!["operation", "record", "filter-rows"];
+        argv.extend_from_slice(args);
+        argv.extend_from_slice(&["--name", "big_orders", "--arg", "where=amount > 100"]);
+        refused(&protocol.arc(&argv), named);
+        assert_eq!(protocol.files(), before, "{args:?}: the directory changed");
+    }
 }
 
 // ------------------------------------------------------------- description
@@ -2156,6 +2216,44 @@ mod mcp {
     }
 
     #[test]
+    fn the_tool_records_on_beside_empty_reads_as_on_alone_and_says_it_has_no_notes() {
+        let terminal = Protocol::new();
+        let agent = Protocol::new();
+        ok(
+            &terminal.record_filter("amount > 100"),
+            "arc operation record",
+        );
+        let result = call_operation_record(
+            &agent.dir,
+            &agent.history,
+            json!({
+                "operation": "filter-rows",
+                "on": "orders",
+                "reads": {},
+                "name": "big_orders",
+                "arguments": { "where": "amount > 100" },
+            }),
+        );
+        assert_ne!(
+            result["isError"],
+            true,
+            "the call failed: {}",
+            text(&result)
+        );
+        assert_eq!(
+            result["structuredContent"],
+            json!({ "step": "big_orders", "model": "models/02_big_orders.sql", "notes": [] })
+        );
+        let (mut by_agent, mut by_terminal) = (agent.files(), terminal.files());
+        by_agent.remove(Path::new(LOG));
+        by_terminal.remove(Path::new(LOG));
+        assert_eq!(
+            by_agent, by_terminal,
+            "`on` beside an empty `reads` left other bytes than `on` from the terminal"
+        );
+    }
+
+    #[test]
     fn the_tool_writes_the_description_the_terminal_writes() {
         let terminal = Protocol::new();
         let agent = Protocol::new();
@@ -2220,8 +2318,8 @@ mod mcp {
             .collect();
         assert_eq!(
             required,
-            ["operation", "on", "name"],
-            "a description is never required"
+            ["operation", "name"],
+            "a description is never required, and `on` may be given as `reads.table`"
         );
     }
 

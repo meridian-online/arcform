@@ -14,7 +14,8 @@
 //!      with nothing on stdout;
 //!   4. **no executable** — the reading needs no `duckdb` on `PATH`;
 //!   5. **help** — `arc --help` and `arc sql recognise --help` say what it is;
-//!   6. **mcp** — `sql_recognise` answers what the command prints.
+//!   6. **mcp** — `sql_recognise` answers what the command prints, and its
+//!      answer for a filter, sent to `operation_record` as given, records.
 //!
 //! Every run happens in an empty directory: the verb reads no protocol.
 
@@ -404,6 +405,65 @@ mod mcp {
                 "sql_recognise {sql:?} answers what `arc sql recognise` prints"
             );
         }
+    }
+
+    #[test]
+    fn the_answer_for_a_filter_is_a_request_operation_record_records() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("shop");
+        std::fs::create_dir_all(dir.join("models")).unwrap();
+        std::fs::write(
+            dir.join("arcform.yaml"),
+            "name: shop\nsteps:\n  - name: load_orders\n    sql: models/01_orders.sql\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("models/01_orders.sql"),
+            "CREATE OR REPLACE TABLE orders AS SELECT 150 AS amount;\n",
+        )
+        .unwrap();
+
+        let answer = super::recognise("SELECT * FROM orders WHERE amount > 100");
+        let mut request = json!({ "name": "big_orders", "dir": dir.to_str().unwrap() });
+        for key in ["operation", "on", "reads", "arguments"] {
+            if let Some(value) = answer.get(key) {
+                request[key] = value.clone();
+            }
+        }
+        let mut child = Command::new(env!("CARGO_BIN_EXE_arc"))
+            .current_dir(root.path())
+            .env("ARCFORM_HISTORY_DIR", root.path().join("history"))
+            .arg("mcp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn arc mcp");
+        {
+            let mut stdin = child.stdin.take().expect("stdin is piped");
+            let call = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "operation_record", "arguments": request },
+            });
+            writeln!(stdin, "{call}").expect("write the request");
+        }
+        let out = child.wait_with_output().expect("wait for arc mcp");
+        let stdout = String::from_utf8(out.stdout).expect("stdout is UTF-8");
+        let response: Value = serde_json::from_str(stdout.lines().next().expect("a response"))
+            .expect("the response is JSON");
+        let result = &response["result"];
+        assert_eq!(
+            result["isError"], false,
+            "operation_record refused the answer {answer} sent as given: {result}"
+        );
+        let model = std::fs::read_to_string(dir.join("models/02_big_orders.sql"))
+            .expect("the model was written");
+        assert!(
+            model.starts_with("-- generated: filter-rows on orders\n"),
+            "the recorded model: {model}"
+        );
     }
 
     #[test]
