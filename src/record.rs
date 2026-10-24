@@ -583,6 +583,10 @@ const FILTER_ROWS: &str = "filter-rows";
 /// field reads `order by`: the verb comes first, the clause is what it writes.
 const SORT_ROWS: &str = "sort-rows";
 
+/// The long name of the operation that hides a column, written once as
+/// [`FILTER_ROWS`] is.
+const HIDE_COLUMN: &str = "hide-column";
+
 /// One SQL operation arc holds: what it is called, what it does, what it reads
 /// and writes, and what it takes — described so that it can be recorded as a
 /// step by name. The catalogue holds the description and nothing that runs.
@@ -629,6 +633,14 @@ impl Recording<'_> {
             .get(key)
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
+    }
+
+    /// The string argument `key` as a column name, written as [`column_ident`]
+    /// writes one: bare where DuckDB reads it bare as that column, quoted
+    /// otherwise. A column argument is a name, not SQL, so this is the one way
+    /// it reaches the step.
+    fn column(&self, key: &str) -> String {
+        column_ident(self.text(key))
     }
 }
 
@@ -781,6 +793,34 @@ const CATALOGUE: &[Operation] = &[
         writes: &[STEP_TABLE],
         parameters: sort_rows_parameters,
         sql: sort_rows_sql,
+        recognised: None,
+    },
+    Operation {
+        long_name: HIDE_COLUMN,
+        summary: "Leaves one column out of a table, keeping every other column and every row.",
+        reads: &[
+            Role {
+                name: "table",
+                kind: "table",
+                list: false,
+                required: true,
+                of: None,
+                min_items: None,
+                description: "The table a column is hidden from.",
+            },
+            Role {
+                name: "column",
+                kind: "column",
+                list: false,
+                required: false,
+                of: Some("table"),
+                min_items: None,
+                description: "The column hidden, which the `column` argument names.",
+            },
+        ],
+        writes: &[STEP_TABLE],
+        parameters: hide_column_parameters,
+        sql: hide_column_sql,
         recognised: None,
     },
 ];
@@ -955,6 +995,43 @@ fn sort_rows_sql(recording: &Recording) -> String {
     )
 }
 
+/// The `parameters` schema of [`HIDE_COLUMN`]: one required string, `column`.
+/// Closed to any other key, as [`filter_rows_parameters`] is.
+///
+/// `column` is a name, not SQL: `x-kind` says so, and the step writes it through
+/// [`column_ident`], so a name holding a space, a `"` or a reserved word is
+/// carried as that name and cannot break out of the `EXCLUDE`. An empty name is
+/// refused when the step is recorded ([`Operation::admit`]).
+fn hide_column_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "column": {
+                "type": "string",
+                "description": "The name of the column left out of the table, as the table names it; \
+                    a name, not SQL, so a name that needs quotes is given without them.",
+                "x-kind": "column",
+            }
+        },
+        "required": ["column"],
+    })
+}
+
+/// The SQL step of [`HIDE_COLUMN`]: a table named for the step, holding every
+/// row of the table it is applied to and every column but the one named. The
+/// table read is written as [`from_ident`] writes it, and the column as
+/// [`column_ident`] does.
+fn hide_column_sql(recording: &Recording) -> String {
+    format!(
+        "CREATE OR REPLACE TABLE {} AS\nSELECT * EXCLUDE ({})\nFROM {};\n",
+        quote_ident(recording.name),
+        recording.column("column"),
+        from_ident(recording.on),
+    )
+}
+
 /// `name` as a double-quoted SQL identifier, a `"` inside it doubled. The step's
 /// own name is always quoted, so a name arc admits that would otherwise read as
 /// SQL — [`valid_step_name`] admits a `"` — cannot break out of the statement.
@@ -996,10 +1073,7 @@ fn from_ident(name: &str) -> String {
 /// [`from_ident`] on a database already open, for a caller that writes more than
 /// one table in a row.
 fn from_ident_on(con: &duckdb::Connection, name: &str) -> String {
-    let plain = !name.is_empty()
-        && !name.as_bytes()[0].is_ascii_digit()
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
-    if plain && reads_bare_as_table(con, name) {
+    if is_plain(name) && reads_bare_as_table(con, name) {
         name.to_string()
     } else {
         quote_ident(name)
@@ -1014,6 +1088,64 @@ fn reads_bare_as_table(con: &duckdb::Connection, name: &str) -> bool {
     tree(con, &format!("SELECT * FROM {name}")).is_some_and(|tree| {
         let from = &tree["statements"][0]["node"]["from_table"];
         from["type"] == "BASE_TABLE" && from["table_name"] == name
+    })
+}
+
+/// A column name, written as it is read: the rule [`from_ident`] applies to a
+/// table, applied to a column. A name of only ASCII letters, digits and
+/// underscores that does not open with a digit, and that DuckDB reads bare as the
+/// column of that name, is written bare, so `amount` stays `amount`. Any other
+/// name is quoted through [`quote_ident`]: one holding a space, a `"` or a `)`,
+/// so it cannot break out of the clause it is written into, and a reserved word
+/// such as `order`, which DuckDB does not read bare as a column.
+///
+/// DuckDB is asked, on an in-memory database opened once for the thread and never
+/// dropped, for the reasons [`from_ident`] gives. A database that cannot be opened
+/// gives the quoted name, which DuckDB reads as the column whatever the name.
+fn column_ident(name: &str) -> String {
+    thread_local! {
+        static READER: Option<std::mem::ManuallyDrop<duckdb::Connection>> =
+            duckdb::Connection::open_in_memory().ok().map(std::mem::ManuallyDrop::new);
+    }
+    READER.with(|con| match con {
+        Some(con) => column_ident_on(con, name),
+        None => quote_ident(name),
+    })
+}
+
+/// [`column_ident`] on a database already open, for a caller that writes more
+/// than one column in a row.
+fn column_ident_on(con: &duckdb::Connection, name: &str) -> String {
+    if is_plain(name) && reads_bare_as_column(con, name) {
+        name.to_string()
+    } else {
+        quote_ident(name)
+    }
+}
+
+/// Whether `name` is of only ASCII letters, digits and underscores, and does not
+/// open with a digit: the names [`from_ident`] and [`column_ident`] ask DuckDB
+/// whether to write bare.
+fn is_plain(name: &str) -> bool {
+    !name.is_empty()
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Whether DuckDB, asked on `con`, reads `SELECT <name>` as a select of the
+/// column called `name` and of nothing else: it parses, and its tree's select
+/// list is one column reference whose one name is `name`. A reserved word gives
+/// a parser error in place of a tree, and a word DuckDB parses as anything else —
+/// a constant, a function of no arguments — gives a tree that holds no such
+/// reference.
+fn reads_bare_as_column(con: &duckdb::Connection, name: &str) -> bool {
+    tree(con, &format!("SELECT {name}")).is_some_and(|tree| {
+        let list = &tree["statements"][0]["node"]["select_list"];
+        list.as_array().is_some_and(|items| {
+            items.len() == 1
+                && items[0]["class"] == "COLUMN_REF"
+                && items[0]["column_names"] == serde_json::json!([name])
+        })
     })
 }
 
@@ -1600,7 +1732,9 @@ impl Operation {
     /// each required argument present, no argument the schema does not name when
     /// it is closed, and each value of the type the schema gives it. A value
     /// annotated with a clause `x-kind` — a `condition` or an `order` — is also
-    /// checked as that clause, through [`one_statement`].
+    /// checked as that clause, through [`one_statement`]; one annotated as a
+    /// `column`, a name and not a clause, is checked only to be a name at all, not
+    /// empty, since [`column_ident`] carries any other name as written.
     fn admit(&self, arguments: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
         let schema = (self.parameters)();
         let empty = serde_json::Map::new();
@@ -1650,6 +1784,12 @@ impl Operation {
             {
                 one_statement(key, clause, text)?;
             }
+            if property["x-kind"] == "column" && value.as_str() == Some("") {
+                return Err(refused(format!(
+                    "the column `{key}` of `{}` is empty",
+                    self.long_name
+                )));
+            }
         }
         Ok(())
     }
@@ -1674,7 +1814,8 @@ fn is_of_type(value: &serde_json::Value, ty: &str) -> bool {
 /// probe [`one_statement`] parses it inside and the word a refusal calls it by.
 /// `filter-rows`' `where` is a `WHERE` condition; `sort-rows`' `order_by` is an
 /// `ORDER BY` order. A value whose `x-kind` names neither has no clause and is
-/// not parse-checked.
+/// not parse-checked: a `column` is a name, not a clause, and [`Operation::admit`]
+/// checks it apart.
 struct Clause {
     /// The SQL keyword the value follows in the one-statement probe.
     keyword: &'static str,
@@ -2557,6 +2698,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_hide_takes_one_required_column_and_no_other_key() {
+        let schema = hide_column_parameters();
+        let column = &schema["properties"]["column"];
+
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["column"]),
+            "`column` is the one required parameter"
+        );
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::json!(false),
+            "the schema is closed to any other key"
+        );
+        assert_eq!(
+            schema["properties"].as_object().map(|p| p.len()),
+            Some(1),
+            "`column` is the one parameter"
+        );
+        assert_eq!(column["type"], "string", "`column` is a string");
+        assert_eq!(
+            column["x-kind"], "column",
+            "`column` does not say its value is a column name"
+        );
+        assert!(
+            column["description"]
+                .as_str()
+                .is_some_and(|d| !d.trim().is_empty()),
+            "`column` has no description: {column}"
+        );
+    }
+
+    #[test]
+    fn a_column_is_written_bare_only_when_duckdb_reads_it_bare_as_that_column() {
+        // A plain name DuckDB reads bare as the column is written bare.
+        assert_eq!(column_ident("amount"), "amount");
+        assert_eq!(column_ident("big_amount"), "big_amount");
+        // A reserved word, a name holding a space or a `"`, and one opening with a
+        // digit are quoted, each `"` doubled. Writing any of them bare reddens this.
+        assert_eq!(column_ident("order"), "\"order\"");
+        assert_eq!(column_ident("my col"), "\"my col\"");
+        assert_eq!(column_ident("a\"b"), "\"a\"\"b\"");
+        assert_eq!(column_ident("1st"), "\"1st\"");
+        // A plain word DuckDB parses as something other than a column — a
+        // constant — is quoted too, so it is read as the column it names.
+        assert_eq!(column_ident("true"), "\"true\"");
+    }
+
+    #[test]
+    fn the_hide_writes_the_column_into_an_exclude_of_every_column() {
+        let arguments = arguments(serde_json::json!({ "column": "note" }));
+        let recording = Recording {
+            name: "no_note",
+            on: "orders",
+            arguments: &arguments,
+        };
+        assert_eq!(
+            hide_column_sql(&recording),
+            "CREATE OR REPLACE TABLE \"no_note\" AS\nSELECT * EXCLUDE (note)\nFROM orders;\n"
+        );
+    }
+
+    #[test]
+    fn an_empty_column_is_refused_naming_the_argument_and_the_operation() {
+        let op = operation(HIDE_COLUMN).unwrap();
+        let err = op
+            .admit(&arguments(serde_json::json!({ "column": "" })))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("the column `column` of `hide-column` is empty"),
+            "{err}"
+        );
+        assert!(
+            op.admit(&arguments(serde_json::json!({ "column": "note" })))
+                .is_ok()
+        );
+    }
+
     // ------------------------------------------------- recording an operation
 
     /// An operation with the given `parameters`, whose SQL is its `where`.
@@ -2756,6 +2977,60 @@ mod tests {
         // as an ordinary name is. Quoting each keyword reddens each of these.
         assert_eq!(from_ident("data"), "data");
         assert_eq!(from_ident("Data"), "Data");
+    }
+
+    /// Each word `duckdb_keywords()` lists, as listed and in upper case, names a
+    /// column, and a hide of it is a step DuckDB runs that leaves out that column
+    /// and no other. A column written bare where DuckDB does not read it bare as
+    /// that column reddens this, with the word and the step it wrote.
+    #[test]
+    fn a_hide_of_a_column_named_with_each_keyword_duckdb_lists_leaves_out_that_column() {
+        let con = duckdb::Connection::open_in_memory().unwrap();
+        let listed: Vec<String> = con
+            .prepare("SELECT keyword_name FROM duckdb_keywords()")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|word| word.unwrap())
+            .collect();
+        for word in listed
+            .iter()
+            .flat_map(|word| [word.clone(), word.to_uppercase()])
+        {
+            let named = if word.eq_ignore_ascii_case("kept") {
+                "other"
+            } else {
+                "kept"
+            };
+            con.execute_batch(&format!(
+                "CREATE OR REPLACE TABLE t AS SELECT 7 AS \"{named}\", 8 AS \"{word}\""
+            ))
+            .unwrap_or_else(|e| panic!("DuckDB makes no column called {word:?}: {e}"));
+            let arguments = serde_json::json!({ "column": word })
+                .as_object()
+                .unwrap()
+                .clone();
+            let step = hide_column_sql(&Recording {
+                name: "hidden",
+                on: "t",
+                arguments: &arguments,
+            });
+            con.execute_batch(&step).unwrap_or_else(|e| {
+                panic!("hide-column of a column named {word:?} does not run:\n{step}\n{e}")
+            });
+            let columns: Vec<String> = con
+                .prepare("SELECT name FROM pragma_table_info('hidden')")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(|name| name.unwrap())
+                .collect();
+            assert_eq!(
+                columns,
+                [named],
+                "hide-column of a column named {word:?} left the wrong columns:\n{step}"
+            );
+        }
     }
 
     /// Each word `duckdb_keywords()` lists, as listed and in upper case, names a

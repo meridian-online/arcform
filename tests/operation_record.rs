@@ -626,6 +626,78 @@ fn arc_run_puts_the_rows_in_the_order_the_sort_stored() {
     );
 }
 
+/// The name of each column of `table` in the database `arc run` made, in the
+/// order the table holds them.
+fn columns(protocol: &Protocol, table: &str) -> Vec<String> {
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    db.prepare(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_name = ? ORDER BY ordinal_position",
+    )
+    .unwrap()
+    .query_map([table], |row| row.get(0))
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+#[test]
+fn record_hide_writes_the_model_and_arc_run_drops_the_column() {
+    let protocol = Protocol::new();
+    ok(
+        &protocol.record_on("hide-column", "orders", "no_note", "column=note"),
+        "arc operation record hide-column",
+    );
+    assert_eq!(
+        protocol.read("models/02_no_note.sql"),
+        "-- generated: hide-column on orders\nCREATE OR REPLACE TABLE \"no_note\" AS\nSELECT * EXCLUDE (note)\nFROM orders;\n"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    assert_eq!(
+        columns(&protocol, "no_note"),
+        ["id", "amount"],
+        "no_note holds every column of orders but note"
+    );
+    assert_eq!(
+        protocol.ids("no_note"),
+        [1, 2, 3, 4],
+        "no_note holds every row of orders"
+    );
+}
+
+#[test]
+fn a_column_named_with_a_reserved_word_is_hidden_written_in_quotes_and_runs() {
+    let protocol = Protocol::new();
+    std::fs::write(
+        protocol.dir.join("models/01_orders.sql"),
+        ORDERS_SQL.replacen("note)", "\"order\")", 1),
+    )
+    .unwrap();
+    ok(
+        &protocol.record_on("hide-column", "orders", "no_order", "column=order"),
+        "arc operation record hide-column",
+    );
+    assert_eq!(
+        protocol.read("models/02_no_order.sql"),
+        "-- generated: hide-column on orders\nCREATE OR REPLACE TABLE \"no_order\" AS\nSELECT * EXCLUDE (\"order\")\nFROM orders;\n",
+        "the column is written in quotes, as DuckDB reads it"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    assert_eq!(columns(&protocol, "orders"), ["id", "amount", "order"]);
+    assert_eq!(columns(&protocol, "no_order"), ["id", "amount"]);
+}
+
+#[test]
+fn an_empty_column_to_hide_is_refused_with_the_directory_untouched() {
+    let protocol = Protocol::new();
+    let before = protocol.files();
+    refused(
+        &protocol.record_on("hide-column", "orders", "no_note", "column="),
+        &["the column `column` of `hide-column` is empty"],
+    );
+    assert_eq!(protocol.files(), before, "a refusal changes nothing");
+}
+
 // ------------------------------------------------- the directory `--dir` names
 
 #[test]

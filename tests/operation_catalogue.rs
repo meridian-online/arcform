@@ -32,6 +32,7 @@ use serde_json::{Value, json};
 /// The long names the catalogue holds its operations under.
 const FILTER_ROWS: &str = "filter-rows";
 const SORT_ROWS: &str = "sort-rows";
+const HIDE_COLUMN: &str = "hide-column";
 
 /// The operators the default build holds: the ten every build holds and the two
 /// `http-fetch` adds, which `cli` turns on.
@@ -217,7 +218,7 @@ fn the_text_listing_and_the_json_listing_say_the_same_thing() {
 #[test]
 fn list_prints_sort_rows_beside_filter_rows_each_with_a_sentence() {
     let text = arc_ok(&["operation", "list"]);
-    for op in [FILTER_ROWS, SORT_ROWS] {
+    for op in [FILTER_ROWS, SORT_ROWS, HIDE_COLUMN] {
         let line = line_opening_with(&text, op);
         assert!(
             !description_after(line, op).is_empty(),
@@ -227,7 +228,7 @@ fn list_prints_sort_rows_beside_filter_rows_each_with_a_sentence() {
 
     let listing = arc_json(&["operation", "list", "--json"]);
     let entries = listing.as_array().expect("the listing is a JSON array");
-    for op in [FILTER_ROWS, SORT_ROWS] {
+    for op in [FILTER_ROWS, SORT_ROWS, HIDE_COLUMN] {
         let entry = entries
             .iter()
             .find(|e| e["long_name"] == op)
@@ -415,7 +416,10 @@ fn describe_reads_the_filters_table_then_a_column_of_it_and_writes_a_table() {
 
 #[test]
 fn describe_prints_each_operator_in_the_five_keys_an_operation_is_described_in() {
-    for op in operators().into_iter().chain([FILTER_ROWS, SORT_ROWS]) {
+    for op in operators()
+        .into_iter()
+        .chain([FILTER_ROWS, SORT_ROWS, HIDE_COLUMN])
+    {
         let out = arc(&["operation", "describe", op]);
         assert_eq!(
             out.status.code(),
@@ -705,7 +709,7 @@ fn list_prints_the_operations_and_no_operator() {
         .collect();
     assert_eq!(
         listed,
-        [FILTER_ROWS, SORT_ROWS],
+        [FILTER_ROWS, SORT_ROWS, HIDE_COLUMN],
         "`arc operation list` prints the operations and nothing else:\n{text}"
     );
 }
