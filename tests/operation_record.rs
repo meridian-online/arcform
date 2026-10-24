@@ -1252,6 +1252,10 @@ fn a_dedupe_key_or_order_that_is_not_one_window_is_refused_with_the_directory_un
             &["key=note", "order_by=amount LIMIT 1"][..],
             &["`key`", "`order_by`"][..],
         ),
+        (
+            &["key=note", "order_by=2 desc"][..],
+            &["the order `order_by`", "holds a constant"][..],
+        ),
     ] {
         refused(&record_dedupe(&protocol, args), named);
         assert_eq!(protocol.files(), before, "a refusal changed the directory");

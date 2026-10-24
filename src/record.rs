@@ -1545,32 +1545,56 @@ fn dedupe_rows_window(key: &str, order_by: &str) -> String {
 /// that runs on into a frame or a `LIMIT` gives a frame that is not the default,
 /// or does not parse. Without either argument there is no window, and nothing to
 /// check.
+///
+/// A constant in either is refused too, naming the argument. Inside `OVER` a
+/// number is a value, not a column's place as it is in `sort-rows`' order or
+/// `summarise-rows`' grouping: `key=1` would make the whole table one key, and
+/// `order_by=2 desc` would tie every row, so the row kept would be arbitrary.
 fn dedupe_rows_checks(arguments: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
     let text = |key| arguments.get(key).and_then(serde_json::Value::as_str);
     let (Some(key), Some(order_by)) = (text("key"), text("order_by")) else {
         return Ok(());
     };
     let probe = format!("SELECT {} AS {SENTINEL}", dedupe_rows_window(key, order_by));
-    let one_window = !order_by.to_ascii_lowercase().contains(SENTINEL)
-        && probe_items(&probe).is_some_and(|items| match items.as_slice() {
-            [item] => {
-                item["alias"] == SENTINEL
-                    && item["class"] == "WINDOW"
-                    && item["function_name"] == "row_number"
-                    && item["start"] == "UNBOUNDED_PRECEDING"
-                    && item["end"] == "CURRENT_ROW_RANGE"
-                    && item["exclude_clause"] == "NO_OTHER"
-            }
-            _ => false,
-        });
-    if one_window {
-        Ok(())
-    } else {
-        Err(refused(format!(
-            "the partition key `key` and the order `order_by` of `{DEDUPE_ROWS}` do not read as one \
-             `row_number()` window, `PARTITION BY` the key `ORDER BY` the order: {key} / {order_by}"
-        )))
+    let items = probe_items(&probe).filter(|_| !order_by.to_ascii_lowercase().contains(SENTINEL));
+    let window = match items.as_deref() {
+        Some([item])
+            if item["alias"] == SENTINEL
+                && item["class"] == "WINDOW"
+                && item["function_name"] == "row_number"
+                && item["start"] == "UNBOUNDED_PRECEDING"
+                && item["end"] == "CURRENT_ROW_RANGE"
+                && item["exclude_clause"] == "NO_OTHER" =>
+        {
+            item
+        }
+        _ => {
+            return Err(refused(format!(
+                "the partition key `key` and the order `order_by` of `{DEDUPE_ROWS}` do not read as one \
+                 `row_number()` window, `PARTITION BY` the key `ORDER BY` the order: {key} / {order_by}"
+            )));
+        }
+    };
+    let constant = |node: &serde_json::Value| node["class"] == "CONSTANT";
+    let mut partitions = window["partitions"].as_array().into_iter().flatten();
+    let mut orders = window["orders"].as_array().into_iter().flatten();
+    for (noun, name, value, holds) in [
+        ("partition key", "key", key, partitions.any(constant)),
+        (
+            "order",
+            "order_by",
+            order_by,
+            orders.any(|order| constant(&order["expression"])),
+        ),
+    ] {
+        if holds {
+            return Err(refused(format!(
+                "the {noun} `{name}` of `{DEDUPE_ROWS}` holds a constant, and inside the window a \
+                 number is a value, not a column's place, so every row would tie: {value}"
+            )));
+        }
     }
+    Ok(())
 }
 
 /// `name` as a double-quoted SQL identifier, a `"` inside it doubled. The step's
@@ -4106,7 +4130,7 @@ mod tests {
             ("note", "amount desc"),
             ("lower(note), id", "amount, id desc NULLS LAST"),
             ("note", "amount desc -- the largest first"),
-            ("note", "(SELECT max(id) FROM orders)"),
+            ("note", "id * -1"),
         ] {
             let admitted = op.admit(&arguments(
                 serde_json::json!({ "key": key, "order_by": order_by }),
@@ -4153,6 +4177,21 @@ mod tests {
             ("note", "amount) = 1 OR (1", "`order_by`"), // an order that closes the window
             ("note", "amount ROWS UNBOUNDED PRECEDING", "`order_by`"), // a frame
             ("note", "amount; DROP TABLE orders", "`order_by`"),
+            (
+                "1",
+                "amount",
+                "the partition key `key` of `dedupe-rows` holds a constant",
+            ),
+            (
+                "note",
+                "2 desc",
+                "the order `order_by` of `dedupe-rows` holds a constant",
+            ),
+            (
+                "note",
+                "'x'",
+                "the order `order_by` of `dedupe-rows` holds a constant",
+            ),
         ] {
             let err = op
                 .admit(&arguments(
