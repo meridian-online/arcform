@@ -95,7 +95,7 @@ Expected: every test named passes; fmt and clippy are clean. CI on Linux is the 
 
 ### Task 5: `summarise-rows`, with the select-list gate
 
-**Interfaces:** gate `x-kind: "select-list"`: `SELECT <v>, 1 AS __arc_probe` gives at least two items, the last aliased `__arc_probe`. Schema `aggregates` required, `group_by` optional. SQL with group: `SELECT <group_by>, <aggregates>\nFROM <t>\nGROUP BY ALL`; without: `SELECT <aggregates>\nFROM <t>`.
+**Interfaces:** gate `x-kind: "select-list"`: `SELECT <v>, 1 AS __arc_probe` gives at least two items, the last aliased `__arc_probe`. Each item also passes Task 3's star walk (no `STAR`/`OPERATOR_UNPACK` node outside a subquery), so `*` cannot widen a grouping into every column. Schema `aggregates` required, `group_by` optional. SQL with group: `SELECT <group_by>, <aggregates>\nFROM <t>\nGROUP BY ALL`; without: `SELECT <aggregates>\nFROM <t>`.
 
 - [ ] Unit: `count(*) AS n, sum(amount) AS total` admitted; `count(*) FROM other`, `a UNION SELECT b`, `count(*); DROP TABLE orders`, `count(*) AS n -- all` refused naming `aggregates`; `big -- by size` refused naming `group_by`.
 - [ ] Integration: fixture rows grouped by `amount > 100 AS big` with `count(*) AS n` gives `{false: 2, true: 2}`; without `group_by`, one row `n = 4`.
