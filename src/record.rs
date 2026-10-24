@@ -60,6 +60,7 @@
 //! itself, when this promotion created it — is removed so no orphan survives
 //! a failed promotion.
 
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
 use crate::edit::{
@@ -583,6 +584,38 @@ const FILTER_ROWS: &str = "filter-rows";
 /// field reads `order by`: the verb comes first, the clause is what it writes.
 const SORT_ROWS: &str = "sort-rows";
 
+/// The long name of the operation that hides a column, written once as
+/// [`FILTER_ROWS`] is.
+const HIDE_COLUMN: &str = "hide-column";
+
+/// The long name of the operation that renames a column, written once as
+/// [`FILTER_ROWS`] is.
+const RENAME_COLUMN: &str = "rename-column";
+
+/// The long name of the operation that adds a column computed from a SQL
+/// expression, written once as [`FILTER_ROWS`] is.
+const DERIVE_COLUMN: &str = "derive-column";
+
+/// The long name of the operation that converts a column to another type,
+/// written once as [`FILTER_ROWS`] is.
+const CAST_COLUMN: &str = "cast-column";
+
+/// The long name of the operation that summarises the rows of a table, in groups
+/// or as a whole, written once as [`FILTER_ROWS`] is.
+const SUMMARISE_ROWS: &str = "summarise-rows";
+
+/// The long name of the operation that keeps one row of each set of duplicates,
+/// written once as [`FILTER_ROWS`] is.
+const DEDUPE_ROWS: &str = "dedupe-rows";
+
+/// The long name of the operation that keeps a given number of a table's rows,
+/// the first in an order or as they come, written once as [`FILTER_ROWS`] is.
+const LIMIT_ROWS: &str = "limit-rows";
+
+/// The long name of the operation that fills a column's missing values, written
+/// once as [`FILTER_ROWS`] is.
+const FILL_NULLS: &str = "fill-nulls";
+
 /// One SQL operation arc holds: what it is called, what it does, what it reads
 /// and writes, and what it takes — described so that it can be recorded as a
 /// step by name. The catalogue holds the description and nothing that runs.
@@ -605,7 +638,17 @@ pub(crate) struct Operation {
     /// statement is not it. `None` in place of the reader for an operation no
     /// statement is read as yet.
     recognised: Option<fn(&Statement) -> Option<Reading>>,
+    /// A check of the arguments taken together, run by [`Operation::admit`] once
+    /// each value has passed its own, or `None` when each value checked alone is
+    /// enough. It is for a gate no one value can be held to: [`DEDUPE_ROWS`]'
+    /// `key` and `order_by` are written into one window, and are probed there
+    /// together, and [`LIMIT_ROWS`]' `order_by` is followed by the step's
+    /// `LIMIT`, and is probed with it.
+    checks: Option<Checks>,
 }
+
+/// A check of an operation's arguments taken together: `Ok`, or the refusal.
+type Checks = fn(&serde_json::Map<String, serde_json::Value>) -> Result<()>;
 
 /// What a statement read as an operation is read to: the table the operation
 /// is applied to, and its arguments.
@@ -629,6 +672,14 @@ impl Recording<'_> {
             .get(key)
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
+    }
+
+    /// The string argument `key` as a column name, written as [`column_ident`]
+    /// writes one: bare where DuckDB reads it bare as that column, quoted
+    /// otherwise. A column argument is a name, not SQL, so this is the one way
+    /// it reaches the step.
+    fn column(&self, key: &str) -> String {
+        column_ident(self.text(key))
     }
 }
 
@@ -754,6 +805,7 @@ const CATALOGUE: &[Operation] = &[
         parameters: filter_rows_parameters,
         sql: filter_rows_sql,
         recognised: Some(filter_rows_recognised),
+        checks: None,
     },
     Operation {
         long_name: SORT_ROWS,
@@ -782,6 +834,239 @@ const CATALOGUE: &[Operation] = &[
         parameters: sort_rows_parameters,
         sql: sort_rows_sql,
         recognised: None,
+        checks: None,
+    },
+    Operation {
+        long_name: HIDE_COLUMN,
+        summary: "Leaves one column out of a table, keeping every other column and every row.",
+        reads: &[
+            Role {
+                name: "table",
+                kind: "table",
+                list: false,
+                required: true,
+                of: None,
+                min_items: None,
+                description: "The table a column is hidden from.",
+            },
+            Role {
+                name: "column",
+                kind: "column",
+                list: false,
+                required: false,
+                of: Some("table"),
+                min_items: None,
+                description: "The column hidden, which the `column` argument names.",
+            },
+        ],
+        writes: &[STEP_TABLE],
+        parameters: hide_column_parameters,
+        sql: hide_column_sql,
+        recognised: None,
+        checks: None,
+    },
+    Operation {
+        long_name: RENAME_COLUMN,
+        summary: "Renames one column of a table, keeping every column in its place and every row.",
+        reads: &[
+            Role {
+                name: "table",
+                kind: "table",
+                list: false,
+                required: true,
+                of: None,
+                min_items: None,
+                description: "The table a column is renamed in.",
+            },
+            Role {
+                name: "column",
+                kind: "column",
+                list: false,
+                required: false,
+                of: Some("table"),
+                min_items: None,
+                description: "The column renamed, which the `column` argument names.",
+            },
+        ],
+        writes: &[STEP_TABLE],
+        parameters: rename_column_parameters,
+        sql: rename_column_sql,
+        recognised: None,
+        checks: None,
+    },
+    Operation {
+        long_name: DERIVE_COLUMN,
+        summary: "Adds one column to a table, computed for each row by a SQL expression, keeping every other column and every row.",
+        reads: &[
+            Role {
+                name: "table",
+                kind: "table",
+                list: false,
+                required: true,
+                of: None,
+                min_items: None,
+                description: "The table a column is added to.",
+            },
+            Role {
+                name: "column",
+                kind: "column",
+                list: false,
+                required: false,
+                of: Some("table"),
+                min_items: None,
+                description: "A column the expression reads, which `expression` may name with others.",
+            },
+        ],
+        writes: &[STEP_TABLE],
+        parameters: derive_column_parameters,
+        sql: derive_column_sql,
+        recognised: None,
+        checks: None,
+    },
+    Operation {
+        long_name: CAST_COLUMN,
+        summary: "Converts one column of a table to another type, keeping every other column and every row.",
+        reads: &[
+            Role {
+                name: "table",
+                kind: "table",
+                list: false,
+                required: true,
+                of: None,
+                min_items: None,
+                description: "The table a column is converted in.",
+            },
+            Role {
+                name: "column",
+                kind: "column",
+                list: false,
+                required: false,
+                of: Some("table"),
+                min_items: None,
+                description: "The column converted, which the `column` argument names.",
+            },
+        ],
+        writes: &[STEP_TABLE],
+        parameters: cast_column_parameters,
+        sql: cast_column_sql,
+        recognised: None,
+        checks: None,
+    },
+    Operation {
+        long_name: SUMMARISE_ROWS,
+        summary: "Summarises the rows of a table with SQL aggregates, one row for each group or one for the whole table.",
+        reads: &[
+            Role {
+                name: "table",
+                kind: "table",
+                list: false,
+                required: true,
+                of: None,
+                min_items: None,
+                description: "The table whose rows are summarised.",
+            },
+            Role {
+                name: "column",
+                kind: "column",
+                list: false,
+                required: false,
+                of: Some("table"),
+                min_items: None,
+                description: "A column the rows are grouped by or summarised over, which `group_by` or `aggregates` may name with others.",
+            },
+        ],
+        writes: &[STEP_TABLE],
+        parameters: summarise_rows_parameters,
+        sql: summarise_rows_sql,
+        recognised: None,
+        checks: Some(summarise_rows_checks),
+    },
+    Operation {
+        long_name: DEDUPE_ROWS,
+        summary: "Keeps one row of each set of duplicates in a table: one of each set of identical rows, or the first in an order of each key's rows.",
+        reads: &[
+            Role {
+                name: "table",
+                kind: "table",
+                list: false,
+                required: true,
+                of: None,
+                min_items: None,
+                description: "The table whose duplicate rows are dropped.",
+            },
+            Role {
+                name: "column",
+                kind: "column",
+                list: false,
+                required: false,
+                of: Some("table"),
+                min_items: None,
+                description: "A column the rows are told apart by, which `key` may name with others.",
+            },
+        ],
+        writes: &[STEP_TABLE],
+        parameters: dedupe_rows_parameters,
+        sql: dedupe_rows_sql,
+        recognised: None,
+        checks: Some(dedupe_rows_checks),
+    },
+    Operation {
+        long_name: LIMIT_ROWS,
+        summary: "Keeps a given number of the rows of a table: the first in a SQL `ORDER BY` order, or the first that come.",
+        reads: &[
+            Role {
+                name: "table",
+                kind: "table",
+                list: false,
+                required: true,
+                of: None,
+                min_items: None,
+                description: "The table whose first rows are kept.",
+            },
+            Role {
+                name: "column",
+                kind: "column",
+                list: false,
+                required: false,
+                of: Some("table"),
+                min_items: None,
+                description: "A column the rows are ordered by, which `order_by` may name with others.",
+            },
+        ],
+        writes: &[STEP_TABLE],
+        parameters: limit_rows_parameters,
+        sql: limit_rows_sql,
+        recognised: None,
+        checks: Some(limit_rows_checks),
+    },
+    Operation {
+        long_name: FILL_NULLS,
+        summary: "Fills the missing values of one column of a table with a SQL expression, keeping every other column and every row.",
+        reads: &[
+            Role {
+                name: "table",
+                kind: "table",
+                list: false,
+                required: true,
+                of: None,
+                min_items: None,
+                description: "The table whose missing values are filled.",
+            },
+            Role {
+                name: "column",
+                kind: "column",
+                list: false,
+                required: false,
+                of: Some("table"),
+                min_items: None,
+                description: "The column whose missing values are filled, which the `column` argument names.",
+            },
+        ],
+        writes: &[STEP_TABLE],
+        parameters: fill_nulls_parameters,
+        sql: fill_nulls_sql,
+        recognised: None,
+        checks: None,
     },
 ];
 
@@ -921,10 +1206,6 @@ fn conditions(text: &str) -> impl Iterator<Item = &str> {
 /// schema holds no `enum` and no `pattern` that would hold it to a column or to
 /// the directions listed.
 fn sort_rows_parameters() -> serde_json::Value {
-    let directions: Vec<serde_json::Value> = DIRECTIONS
-        .iter()
-        .map(|d| serde_json::json!({ "word": d.word, "sign": d.sign }))
-        .collect();
     serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -936,11 +1217,21 @@ fn sort_rows_parameters() -> serde_json::Value {
                     recorded as written; the order may name several columns, each with a direction. \
                     The directions listed are the ones offered by word, not a limit.",
                 "x-kind": "order",
-                "x-directions": directions,
+                "x-directions": directions(),
             }
         },
         "required": ["order_by"],
     })
+}
+
+/// The [`DIRECTIONS`] an order offers, as an `x-directions` annotation lists them:
+/// each a word and its sign. [`sort_rows_parameters`] and
+/// [`dedupe_rows_parameters`] annotate their `order_by` with it.
+fn directions() -> Vec<serde_json::Value> {
+    DIRECTIONS
+        .iter()
+        .map(|d| serde_json::json!({ "word": d.word, "sign": d.sign }))
+        .collect()
 }
 
 /// The SQL step of [`SORT_ROWS`]: a table named for the step, holding the rows of
@@ -952,6 +1243,641 @@ fn sort_rows_sql(recording: &Recording) -> String {
         quote_ident(recording.name),
         from_ident(recording.on),
         recording.text("order_by"),
+    )
+}
+
+/// The `parameters` schema of [`HIDE_COLUMN`]: one required string, `column`.
+/// Closed to any other key, as [`filter_rows_parameters`] is.
+///
+/// `column` is a name, not SQL: `x-kind` says so, and the step writes it through
+/// [`column_ident`], so a name holding a space, a `"` or a reserved word is
+/// carried as that name and cannot break out of the `EXCLUDE`. An empty name is
+/// refused when the step is recorded ([`Operation::admit`]).
+fn hide_column_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "column": {
+                "type": "string",
+                "description": "The name of the column left out of the table, as the table names it; \
+                    a name, not SQL, so a name that needs quotes is given without them. \
+                    A name the table does not have fails the run.",
+                "x-kind": "column",
+            }
+        },
+        "required": ["column"],
+    })
+}
+
+/// The SQL step of [`HIDE_COLUMN`]: a table named for the step, holding every
+/// row of the table it is applied to and every column but the one named. The
+/// table read is written as [`from_ident`] writes it, and the column as
+/// [`column_ident`] does.
+fn hide_column_sql(recording: &Recording) -> String {
+    format!(
+        "CREATE OR REPLACE TABLE {} AS\nSELECT * EXCLUDE ({})\nFROM {};\n",
+        quote_ident(recording.name),
+        recording.column("column"),
+        from_ident(recording.on),
+    )
+}
+
+/// The `parameters` schema of [`RENAME_COLUMN`]: two required strings, `column`
+/// and `to`. Closed to any other key, as [`hide_column_parameters`] is.
+///
+/// Both are names, not SQL: `x-kind` says so, and the step writes each through
+/// [`column_ident`], so a name holding a space, a `"` or a reserved word is
+/// carried as that name and cannot break out of the `RENAME`. An empty name in
+/// either is refused when the step is recorded ([`Operation::admit`]).
+fn rename_column_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "column": {
+                "type": "string",
+                "description": "The name of the column renamed, as the table names it; \
+                    a name, not SQL, so a name that needs quotes is given without them. \
+                    A name the table does not have fails the run.",
+                "x-kind": "column",
+            },
+            "to": {
+                "type": "string",
+                "description": "The name the column takes; a name, not SQL, \
+                    so a name that needs quotes is given without them.",
+                "x-kind": "column",
+            }
+        },
+        "required": ["column", "to"],
+    })
+}
+
+/// The SQL step of [`RENAME_COLUMN`]: a table named for the step, holding every
+/// row and every column of the table it is applied to, then an `ALTER TABLE` that
+/// renames the column named by `column` to `to`, in the place it held. The table
+/// read is written as [`from_ident`] writes it, and each column as
+/// [`column_ident`] does.
+///
+/// It is two statements and not `SELECT * RENAME (..)` because that clause is
+/// silent where a rename should fail: a `column` the table does not have renames
+/// nothing, and a `to` that names another column gives the column a suffixed
+/// name (`id_1`) rather than refusing. `ALTER TABLE .. RENAME COLUMN` makes
+/// DuckDB refuse both when the step runs, and the run stops at the first
+/// statement that fails.
+///
+/// The two are one transaction, so a failed `ALTER` leaves no table made under
+/// the step's name with the column unrenamed: the run stops before the
+/// `COMMIT`, and DuckDB rolls the open transaction back as the run ends.
+fn rename_column_sql(recording: &Recording) -> String {
+    let table = quote_ident(recording.name);
+    format!(
+        "BEGIN TRANSACTION;\nCREATE OR REPLACE TABLE {table} AS\nSELECT *\nFROM {};\nALTER TABLE {table} RENAME COLUMN {} TO {};\nCOMMIT;\n",
+        from_ident(recording.on),
+        recording.column("column"),
+        recording.column("to"),
+    )
+}
+
+/// The `parameters` schema of [`DERIVE_COLUMN`]: two required strings, `column`
+/// and `expression`. Closed to any other key, as [`hide_column_parameters`] is.
+///
+/// `column` is the name of the new column, not SQL, written through
+/// [`column_ident`] as [`rename_column_parameters`]' names are. `expression` is
+/// SQL, recorded as written, so `x-kind` marks it an expression and
+/// [`Operation::admit`] holds it to one: DuckDB must read it, in the probe
+/// [`EXPRESSION`] writes, as one item of a select that reads no table.
+fn derive_column_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "column": {
+                "type": "string",
+                "description": "The name of the new column; a name, not SQL, \
+                    so a name that needs quotes is given without them. \
+                    A name the table already has fails the run. \
+                    The step adds the column as `__arc_derived` first and then renames it, \
+                    so a table that already holds a column of that name is not one this operation can add to.",
+                "x-kind": "column",
+            },
+            "expression": {
+                "type": "string",
+                "description": "The SQL expression the new column holds for each row, \
+                    recorded as written; it may name any column of the table.",
+                "x-kind": "expression",
+            }
+        },
+        "required": ["column", "expression"],
+    })
+}
+
+/// The SQL step of [`DERIVE_COLUMN`]: a table named for the step, holding every
+/// row and every column of the table it is applied to and, last, the expression
+/// as a column called `__arc_derived`; then an `ALTER TABLE` that renames that
+/// column to `column`. The table read is written as [`from_ident`] writes it, the
+/// expression as given, and the column as [`column_ident`] does.
+///
+/// The new column is named by the `ALTER` and not by an alias in the select for
+/// the reason [`rename_column_sql`] gives: a select whose alias names a column the
+/// table already has gives the new one a suffixed name (`amount_1`) rather than
+/// refusing, and `ALTER TABLE .. RENAME COLUMN` makes DuckDB refuse it when the
+/// step runs. arc does not open the database when it records, so it cannot
+/// refuse the clash then. `__arc_derived` is a name the step reserves: a table
+/// that already holds a column called that is not one this operation can add to,
+/// since the select would suffix the new column and the `ALTER` rename the old.
+///
+/// The two are one transaction, as [`rename_column_sql`]'s are, so a clash leaves
+/// no table made under the step's name with the column under its temporary name.
+fn derive_column_sql(recording: &Recording) -> String {
+    let table = quote_ident(recording.name);
+    format!(
+        "BEGIN TRANSACTION;\nCREATE OR REPLACE TABLE {table} AS\nSELECT *, {} AS __arc_derived\nFROM {};\nALTER TABLE {table} RENAME COLUMN __arc_derived TO {};\nCOMMIT;\n",
+        recording.text("expression"),
+        from_ident(recording.on),
+        recording.column("column"),
+    )
+}
+
+/// The `parameters` schema of [`CAST_COLUMN`]: two required strings, `column`
+/// and `type`. Closed to any other key, as [`hide_column_parameters`] is.
+///
+/// `column` is a name, not SQL, written through [`column_ident`]. `type` is SQL,
+/// recorded as written, so `x-kind` marks it a type and [`Operation::admit`]
+/// holds it to one: DuckDB must read it, in the probe [`TYPE`] writes, as the one
+/// type of a `CAST`.
+fn cast_column_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "column": {
+                "type": "string",
+                "description": "The name of the column converted, as the table names it; \
+                    a name, not SQL, so a name that needs quotes is given without them. \
+                    A name the table does not have fails the run.",
+                "x-kind": "column",
+            },
+            "type": {
+                "type": "string",
+                "description": "The type the column is converted to: any DuckDB type, \
+                    written as SQL (`VARCHAR`, `DECIMAL(10, 2)`, `INTEGER[]`). \
+                    The conversion is a `CAST`, not a `TRY_CAST`, so a value that does not convert fails the run.",
+                "x-kind": "type",
+            }
+        },
+        "required": ["column", "type"],
+    })
+}
+
+/// The SQL step of [`CAST_COLUMN`]: a table named for the step, holding every
+/// row and every column of the table it is applied to, the one named converted
+/// in place by `REPLACE`. The table read is written as [`from_ident`] writes it,
+/// the type as given, and the column as [`column_ident`] does, twice.
+///
+/// One statement is enough: DuckDB fails the run when the column is not in the
+/// table (`Column "nope" in REPLACE list not found`), and arc does not open the
+/// database when it records, so it could not refuse the name then.
+fn cast_column_sql(recording: &Recording) -> String {
+    let column = recording.column("column");
+    format!(
+        "CREATE OR REPLACE TABLE {} AS\nSELECT * REPLACE (CAST({column} AS {}) AS {column})\nFROM {};\n",
+        quote_ident(recording.name),
+        recording.text("type"),
+        from_ident(recording.on),
+    )
+}
+
+/// The `parameters` schema of [`SUMMARISE_ROWS`]: a required string,
+/// `aggregates`, and an optional one, `group_by`. Closed to any other key, as
+/// [`hide_column_parameters`] is.
+///
+/// Both are SQL select lists, recorded as written, so `x-kind` marks each a
+/// `select-list` and [`Operation::admit`] holds it to one: DuckDB must read it, in
+/// the probe [`SELECT_LIST`] writes, as the items of a select that reads no
+/// table. Whether an item of `aggregates` is an aggregate is left to DuckDB when
+/// the step runs: arc does not sort functions into aggregates and others.
+fn summarise_rows_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "aggregates": {
+                "type": "string",
+                "description": "What each row of the summary holds: a SQL select list of aggregates, \
+                    recorded as written, each item of which may carry an alias \
+                    (`count(*) AS n, sum(amount) AS total`). \
+                    A column neither aggregated nor in `group_by` fails the run.",
+                "x-kind": "select-list",
+            },
+            "group_by": {
+                "type": "string",
+                "description": "What the rows are grouped by: a SQL select list, recorded as written, \
+                    each item of which may carry an alias (`date_trunc('month', at) AS month`). \
+                    The step groups by each item by its place (`GROUP BY 1, 2`) and gives one row for each group, \
+                    the items first, so an aggregate here fails the run, \
+                    and a constant (`2`, `'note'`) is refused, since it is the same value for every row and so groups nothing (alone, it would make the whole table one group); \
+                    without it, the step gives one row for the whole table (`GROUP BY ()`).",
+                "x-kind": "select-list",
+            }
+        },
+        "required": ["aggregates"],
+    })
+}
+
+/// The SQL step of [`SUMMARISE_ROWS`]: a table named for the step, holding the
+/// `group_by` items and then the `aggregates`, grouped by each `group_by` item by
+/// its place, `GROUP BY 1, 2, …`; or, without `group_by`, the `aggregates` alone
+/// grouped by nothing, `GROUP BY ()`, one row for the whole table. The table read
+/// is written as [`from_ident`] writes it, and both lists as given.
+///
+/// The grouping is written by place so that a grouping item may carry an alias
+/// and is not written twice, and so that it holds the `group_by` items and nothing
+/// else: DuckDB fails the run when an item of `aggregates` is a column neither
+/// aggregated nor grouped, or when an item of `group_by` is an aggregate. The
+/// number of places is the number of items DuckDB reads in `group_by`'s own probe,
+/// asked again here through [`probe_items`], so it counts what the gate admitted
+/// and not commas; a `group_by` whose probe gives no items, which the gate would
+/// not have admitted, is grouped by `()`, so the function writes SQL for any
+/// recording and DuckDB judges it when the step runs. `GROUP BY ()` holds a
+/// window alone, `count(*) OVER ()`, to one row, and fails the run on a bare
+/// column, as a grouping would. arc does not open the database when it records,
+/// so neither failure can be refused then.
+fn summarise_rows_sql(recording: &Recording) -> String {
+    let grouped = recording.arguments.get("group_by").and_then(|v| v.as_str());
+    let (select, group_by) = match grouped {
+        Some(group_by) => {
+            // The probe's first and last items are its own, not `group_by`'s. A
+            // `group_by` the gate has not admitted may give no probe at all, and
+            // is grouped by nothing, which DuckDB then refuses on its own terms.
+            let items = probe_items(&(SELECT_LIST.probe)(group_by))
+                .map_or(0, |items| items.len().saturating_sub(2));
+            let places: Vec<String> = (1..=items).map(|place| place.to_string()).collect();
+            let places = if places.is_empty() {
+                "()".to_string()
+            } else {
+                places.join(", ")
+            };
+            (format!("{group_by}, "), places)
+        }
+        None => (String::new(), "()".to_string()),
+    };
+    format!(
+        "CREATE OR REPLACE TABLE {} AS\nSELECT {select}{}\nFROM {}\nGROUP BY {group_by};\n",
+        quote_ident(recording.name),
+        recording.text("aggregates"),
+        from_ident(recording.on),
+    )
+}
+
+/// Whether each item of `group_by`, already admitted as a select list, is
+/// something that differs from row to row: an item DuckDB reads as a literal
+/// constant ([`is_constant`]), read in the [`SELECT_LIST`] probe the gate
+/// admitted, is refused naming `group_by`. The step groups by each item's place,
+/// so `group_by=2` writes `SELECT 2, … GROUP BY 1` and groups by the number `2`,
+/// not by the second column, and `group_by='note'` by the string: each is the
+/// same value for every row, so it groups nothing, and alone it would make the
+/// summary one row for the whole table. Only a literal is refused, the likely mistake for a column's place or
+/// name; an item constant by other means, `1+0`, is the analyst's to avoid.
+/// Without `group_by` there is no grouping, and nothing to check.
+fn summarise_rows_checks(arguments: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+    let Some(group_by) = arguments
+        .get("group_by")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(());
+    };
+    let items = probe_items(&(SELECT_LIST.probe)(group_by)).unwrap_or_default();
+    // The probe's first and last items are its own, not `group_by`'s.
+    let listed = items.get(1..items.len().saturating_sub(1)).unwrap_or(&[]);
+    if listed.iter().any(is_constant) {
+        return Err(refused(format!(
+            "the select list `group_by` of `{SUMMARISE_ROWS}` holds a constant, a number or a \
+             string that is the same value for every row, not a column, so it groups nothing \
+             (alone, it would make the whole table one group): {group_by}"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `node`, an item of DuckDB's tree, is a literal constant — a number,
+/// a string or `NULL` — which is the same value for every row it is written
+/// into. [`summarise_rows_checks`] and [`dedupe_rows_checks`] refuse one where it
+/// would group nothing or tie every row.
+fn is_constant(node: &serde_json::Value) -> bool {
+    node["class"] == "CONSTANT"
+}
+
+/// The `parameters` schema of [`DEDUPE_ROWS`]: two optional strings, `key` and
+/// `order_by`, given together or not at all. Closed to any other key, as
+/// [`hide_column_parameters`] is.
+///
+/// `dependentRequired` says each needs the other, and [`Operation::admit`] holds
+/// the arguments to it. A key alone would keep an arbitrary row of each key, so
+/// the step's table could differ from one run to the next; an order alone would
+/// be a sort. `key` is SQL, recorded as written, so `x-kind` marks it a
+/// `partition` and [`Operation::admit`] holds it to one: DuckDB must read it, in
+/// the probe [`PARTITION`] writes, as the items of a select that reads no table.
+/// `order_by` keeps [`sort_rows_parameters`]' annotation, an `order` with its
+/// `x-directions`, and is checked as that clause; [`dedupe_rows_checks`] then
+/// probes the two in the window the step writes.
+fn dedupe_rows_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "key": {
+                "type": "string",
+                "description": "What tells one row's duplicates from another's: a SQL list of expressions, \
+                    recorded as written, with no alias (`note`, `lower(note), id`). \
+                    The step keeps one row for each key, the first in `order_by`, \
+                    and `key` is given with `order_by` or not at all; \
+                    without both, the step keeps one of each set of rows identical in every column (`SELECT DISTINCT *`).",
+                "x-kind": "partition",
+            },
+            "order_by": {
+                "type": "string",
+                "description": "Which row of each key is kept: the first in the order this SQL `ORDER BY` clause gives, \
+                    recorded as written, given with `key` or not at all. \
+                    Where two rows of a key tie on the order, either may be kept. \
+                    The directions listed are the ones offered by word, not a limit.",
+                "x-kind": "order",
+                "x-directions": directions(),
+            }
+        },
+        "dependentRequired": {
+            "key": ["order_by"],
+            "order_by": ["key"],
+        },
+    })
+}
+
+/// The SQL step of [`DEDUPE_ROWS`]: a table named for the step. With `key` and
+/// `order_by`, it holds every column of the rows the [`dedupe_rows_window`] numbers
+/// first, one for each key; without them, one row of each set of rows identical in
+/// every column, `SELECT DISTINCT *`. The table read is written as [`from_ident`]
+/// writes it, and both arguments as given.
+///
+/// No tie-break over the whole row is added to the order: the order is the
+/// analyst's statement of which row is kept, and where two rows of a key tie on
+/// it, either may be.
+fn dedupe_rows_sql(recording: &Recording) -> String {
+    let from = from_ident(recording.on);
+    let query = match recording.arguments.get("key").and_then(|v| v.as_str()) {
+        Some(key) => format!(
+            "SELECT *\nFROM {from}\nQUALIFY {} = 1",
+            dedupe_rows_window(key, recording.text("order_by"))
+        ),
+        None => format!("SELECT DISTINCT *\nFROM {from}"),
+    };
+    format!(
+        "CREATE OR REPLACE TABLE {} AS\n{query};\n",
+        quote_ident(recording.name)
+    )
+}
+
+/// The window a keyed [`DEDUPE_ROWS`] step numbers each key's rows in:
+/// `row_number() OVER (PARTITION BY <key> ORDER BY <order_by>\n)`, both as given.
+/// The newline before the `)` ends a `--` comment the order closes with, so the
+/// comment cannot swallow the window's close. [`dedupe_rows_sql`] writes it into
+/// the step, and [`dedupe_rows_checks`] into the probe of the two arguments.
+fn dedupe_rows_window(key: &str, order_by: &str) -> String {
+    format!("row_number() OVER (PARTITION BY {key} ORDER BY {order_by}\n)")
+}
+
+/// Whether `key` and `order_by`, each already admitted on its own, read together
+/// as the one window the step writes: DuckDB must read
+/// `SELECT <window> AS __arc_probe`, the [`dedupe_rows_window`] of the two, as a
+/// bare select ([`bare_select`]) of one `WINDOW` item, the function `row_number`,
+/// called [`SENTINEL`], over the window's default frame. An alias in the key,
+/// which `PARTITION BY` does not take, does not parse; an order that closes the
+/// window, `amount) = 1 OR (1`, leaves an item that is not the window; and one
+/// that runs on into a frame or a `LIMIT` gives a frame that is not the default,
+/// or does not parse. An order whose `;` ends the statement, `amount desc;`, is
+/// refused for the `;` first ([`ends_no_statement`]), in the words a clause's
+/// gives it. Without either argument there is no window, and nothing to check.
+///
+/// A literal constant in either is refused too, naming the argument
+/// ([`is_constant`]). Inside `OVER` a constant is the same value for every row,
+/// not a column's place as a number is in `sort-rows`' order: `key=1` would
+/// make the whole table one key, and `order_by=2 desc` or `order_by='x'` would tie
+/// every row, so the row kept would be arbitrary. Only a literal is refused, the
+/// likely mistake for a column's place; an order that is constant by other means,
+/// an uncorrelated subquery (`(SELECT max(id) FROM orders)`) or `1+0`, is the
+/// analyst's to avoid.
+fn dedupe_rows_checks(arguments: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+    let text = |key| arguments.get(key).and_then(serde_json::Value::as_str);
+    let (Some(key), Some(order_by)) = (text("key"), text("order_by")) else {
+        return Ok(());
+    };
+    ends_no_statement("SELECT 1 ORDER BY ", "order", "order_by", order_by)?;
+    let probe = format!("SELECT {} AS {SENTINEL}", dedupe_rows_window(key, order_by));
+    let items = probe_items(&probe).filter(|_| !order_by.to_ascii_lowercase().contains(SENTINEL));
+    let window = match items.as_deref() {
+        Some([item])
+            if item["alias"] == SENTINEL
+                && item["class"] == "WINDOW"
+                && item["function_name"] == "row_number"
+                && item["start"] == "UNBOUNDED_PRECEDING"
+                && item["end"] == "CURRENT_ROW_RANGE"
+                && item["exclude_clause"] == "NO_OTHER" =>
+        {
+            item
+        }
+        _ => {
+            return Err(refused(format!(
+                "the partition key `key` and the order `order_by` of `{DEDUPE_ROWS}` do not read as one \
+                 `row_number()` window, `PARTITION BY` the key `ORDER BY` the order: {key} / {order_by}"
+            )));
+        }
+    };
+    let mut partitions = window["partitions"].as_array().into_iter().flatten();
+    let mut orders = window["orders"].as_array().into_iter().flatten();
+    for (noun, name, value, holds) in [
+        ("partition key", "key", key, partitions.any(is_constant)),
+        (
+            "order",
+            "order_by",
+            order_by,
+            orders.any(|order| is_constant(&order["expression"])),
+        ),
+    ] {
+        if holds {
+            return Err(refused(format!(
+                "the {noun} `{name}` of `{DEDUPE_ROWS}` holds a constant, which inside the window \
+                 is the same value for every row, not a column, so every row would tie: {value}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The `parameters` schema of [`LIMIT_ROWS`]: one required integer, `count`, at
+/// least `0` and at most the largest `BIGINT`, the type of DuckDB's `LIMIT`, and
+/// one optional string, `order_by`. Closed to any other key, as
+/// [`hide_column_parameters`] is.
+///
+/// `count` is a JSON integer, and [`Operation::admit`] holds it to its type, its
+/// `minimum` and its `maximum`; the command line gives every `--arg` as a string, and
+/// [`typed_arguments`] turns one that reads as an integer into that integer
+/// first. `order_by` keeps [`sort_rows_parameters`]' annotation, an `order` with
+/// its `x-directions`, and is checked as that clause; [`limit_rows_checks`] then
+/// probes it with the `LIMIT` the step writes after it.
+fn limit_rows_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "count": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": i64::MAX,
+                "description": "How many rows the step keeps, a whole number from 0: the first this many in `order_by`'s order. \
+                    Without an order, the rows kept are whichever come first, which DuckDB does not promise \
+                    to be the same rows from one run to the next. A table with fewer rows keeps them all.",
+            },
+            "order_by": {
+                "type": "string",
+                "description": "Which rows are first: the order this SQL `ORDER BY` clause gives, recorded as written; \
+                    the step's table holds the rows kept in that order. Where rows tie on the order at the cut, \
+                    which of them are kept may differ from one run to the next. \
+                    The directions listed are the ones offered by word, not a limit.",
+                "x-kind": "order",
+                "x-directions": directions(),
+            }
+        },
+        "required": ["count"],
+    })
+}
+
+/// The SQL step of [`LIMIT_ROWS`]: a table named for the step, holding the first
+/// `count` rows of the table it is applied to, `ORDER BY` the order when one is
+/// given. The table read is written as [`from_ident`] writes it, the order as
+/// given, and the count from the JSON integer, so it is a number and nothing
+/// else. The `LIMIT` opens a line of its own, which ends a `--` comment the order
+/// closes with, so the comment cannot swallow the count.
+fn limit_rows_sql(recording: &Recording) -> String {
+    let order = match recording.arguments.get("order_by").and_then(|v| v.as_str()) {
+        Some(order_by) => format!("ORDER BY {order_by}\n"),
+        None => String::new(),
+    };
+    let count = recording
+        .arguments
+        .get("count")
+        .map_or_else(String::new, ToString::to_string);
+    format!(
+        "CREATE OR REPLACE TABLE {} AS\nSELECT *\nFROM {}\n{order}LIMIT {count};\n",
+        quote_ident(recording.name),
+        from_ident(recording.on),
+    )
+}
+
+/// Whether `order_by`, already admitted as an order, stays an order once the
+/// step's `LIMIT` follows it: DuckDB must read `SELECT 1 ORDER BY <order_by>`,
+/// a newline and `LIMIT 1`, the shape of the step, as one select whose modifiers
+/// are one `ORDER_MODIFIER` and then one `LIMIT_MODIFIER` with no `OFFSET`, and
+/// nothing else. An order that brings a `LIMIT` of its own, `amount LIMIT 1`,
+/// does not parse with the step's after it; one that brings an `OFFSET`,
+/// `amount OFFSET 2`, parses into the step's `LIMIT` and would skip rows; and one
+/// that ends its statement, `amount desc;`, would leave the step's `LIMIT` a
+/// second, and is refused for its `;` first ([`ends_no_statement`]). A
+/// constant is not refused: at the top of a statement `ORDER BY 2` orders by the
+/// second column, as it does in `sort-rows`. Without an order there is nothing to
+/// check.
+fn limit_rows_checks(arguments: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+    let Some(order_by) = arguments
+        .get("order_by")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(());
+    };
+    ends_no_statement("SELECT 1 ORDER BY ", "order", "order_by", order_by)?;
+    let probe = format!("SELECT 1 ORDER BY {order_by}\nLIMIT 1");
+    let limited = on_reader(|con| tree(con, &probe))
+        .flatten()
+        .is_some_and(|tree| {
+            let statements = tree["statements"].as_array().map(Vec::as_slice);
+            let Some([statement]) = statements else {
+                return false;
+            };
+            let node = &statement["node"];
+            let modifiers = node["modifiers"].as_array().map(Vec::as_slice);
+            node["type"] == "SELECT_NODE"
+                && matches!(
+                    modifiers,
+                    Some([order, limit])
+                        if order["type"] == "ORDER_MODIFIER"
+                            && limit["type"] == "LIMIT_MODIFIER"
+                            && limit["offset"].is_null()
+                )
+        });
+    if limited {
+        Ok(())
+    } else {
+        Err(refused(format!(
+            "the order `order_by` of `{LIMIT_ROWS}` does not read as one `ORDER BY` the step's \
+             `LIMIT` can follow: {order_by}"
+        )))
+    }
+}
+
+/// The `parameters` schema of [`FILL_NULLS`]: two required strings, `column`
+/// and `value`. Closed to any other key, as [`hide_column_parameters`] is.
+///
+/// `column` is a name, not SQL, written through [`column_ident`]. `value` is SQL,
+/// recorded as written, so `x-kind` marks it an expression and
+/// [`Operation::admit`] holds it to one, as it holds [`derive_column_parameters`]'
+/// `expression`: DuckDB must read it, in the probe [`EXPRESSION`] writes, as one
+/// item of a select that reads no table.
+fn fill_nulls_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "column": {
+                "type": "string",
+                "description": "The name of the column whose missing values are filled, as the table names it; \
+                    a name, not SQL, so a name that needs quotes is given without them. \
+                    A name the table does not have fails the run.",
+                "x-kind": "column",
+            },
+            "value": {
+                "type": "string",
+                "description": "What each missing value is filled with: a SQL expression, recorded as written, \
+                    such as a literal (`0`, `'unknown'`) or any expression, another column among them (`amount * 2`). \
+                    A value of a wider type widens the column (`0.5` on an `INTEGER` column makes it a `DECIMAL`), \
+                    and a value of a type DuckDB cannot combine with the column's fails the run.",
+                "x-kind": "expression",
+            }
+        },
+        "required": ["column", "value"],
+    })
+}
+
+/// The SQL step of [`FILL_NULLS`]: a table named for the step, holding every row
+/// and every column of the table it is applied to, the one named replaced in
+/// place by `REPLACE` with `coalesce(<column>, <value>)`, so a value already there
+/// is kept and a missing one filled. The table read is written as [`from_ident`]
+/// writes it, the value as given, and the column as [`column_ident`] does, twice.
+///
+/// One statement is enough, for the reason [`cast_column_sql`] gives: DuckDB
+/// fails the run when the column is not in the table (`Column "nope" in REPLACE
+/// list not found`), and arc does not open the database when it records.
+fn fill_nulls_sql(recording: &Recording) -> String {
+    let column = recording.column("column");
+    format!(
+        "CREATE OR REPLACE TABLE {} AS\nSELECT * REPLACE (coalesce({column}, {}) AS {column})\nFROM {};\n",
+        quote_ident(recording.name),
+        recording.text("value"),
+        from_ident(recording.on),
     )
 }
 
@@ -974,32 +1900,18 @@ fn quote_ident(name: &str) -> String {
 /// reserved word such as `order`, which a step made under quotes and which
 /// `FROM order` would not parse.
 ///
-/// DuckDB is asked, on an in-memory database opened once for the thread, rather
-/// than given a list of the words: a list copied into the source would stay as it
-/// was when DuckDB's own grows. A database that cannot be opened gives the quoted
-/// name, which DuckDB reads as the table whatever the name.
-///
-/// The connection is never dropped: a thread's storage is torn down after DuckDB 2.0's own
-/// per-thread state, and closing a database then crashes the process. It is one small
-/// in-memory database for each thread that asks, kept until the process ends.
+/// DuckDB is asked, on the thread's [`with_reader`] database, rather than given a
+/// list of the words: a list copied into the source would stay as it was when
+/// DuckDB's own grows. A database that cannot be opened gives the quoted name,
+/// which DuckDB reads as the table whatever the name.
 fn from_ident(name: &str) -> String {
-    thread_local! {
-        static READER: Option<std::mem::ManuallyDrop<duckdb::Connection>> =
-            duckdb::Connection::open_in_memory().ok().map(std::mem::ManuallyDrop::new);
-    }
-    READER.with(|con| match con {
-        Some(con) => from_ident_on(con, name),
-        None => quote_ident(name),
-    })
+    with_reader(name, from_ident_on)
 }
 
 /// [`from_ident`] on a database already open, for a caller that writes more than
 /// one table in a row.
 fn from_ident_on(con: &duckdb::Connection, name: &str) -> String {
-    let plain = !name.is_empty()
-        && !name.as_bytes()[0].is_ascii_digit()
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
-    if plain && reads_bare_as_table(con, name) {
+    if is_plain(name) && reads_bare_as_table(con, name) {
         name.to_string()
     } else {
         quote_ident(name)
@@ -1017,6 +1929,75 @@ fn reads_bare_as_table(con: &duckdb::Connection, name: &str) -> bool {
     })
 }
 
+/// A column name, written as it is read: the rule [`from_ident`] applies to a
+/// table, applied to a column. A name of only ASCII letters, digits and
+/// underscores that does not open with a digit, and that DuckDB reads bare as the
+/// column of that name, is written bare, so `amount` stays `amount`. Any other
+/// name is quoted through [`quote_ident`]: one holding a space, a `"` or a `)`,
+/// so it cannot break out of the clause it is written into, and a reserved word
+/// such as `order`, which DuckDB does not read bare as a column.
+///
+/// DuckDB is asked, on the thread's [`with_reader`] database, as [`from_ident`]
+/// asks it. A database that cannot be opened gives the quoted name, which DuckDB
+/// reads as the column whatever the name.
+fn column_ident(name: &str) -> String {
+    with_reader(name, |con, name| {
+        if is_plain(name) && reads_bare_as_column(con, name) {
+            name.to_string()
+        } else {
+            quote_ident(name)
+        }
+    })
+}
+
+/// `write` of `name`, asked on an in-memory DuckDB database opened once for the
+/// thread, which [`from_ident`] and [`column_ident`] both ask whether a name reads
+/// bare; or `name` through [`quote_ident`] when the database cannot be opened.
+///
+/// The connection is never dropped: a thread's storage is torn down after DuckDB 2.0's own
+/// per-thread state, and closing a database then crashes the process. It is one small
+/// in-memory database for each thread that asks, kept until the process ends.
+fn with_reader(name: &str, write: impl FnOnce(&duckdb::Connection, &str) -> String) -> String {
+    on_reader(|con| write(con, name)).unwrap_or_else(|| quote_ident(name))
+}
+
+/// `ask` of the in-memory DuckDB database opened once for the thread, or `None`
+/// when the database cannot be opened. [`with_reader`] asks it of a name, and
+/// [`probe_items`] of a probe.
+fn on_reader<T>(ask: impl FnOnce(&duckdb::Connection) -> T) -> Option<T> {
+    thread_local! {
+        static READER: Option<std::mem::ManuallyDrop<duckdb::Connection>> =
+            duckdb::Connection::open_in_memory().ok().map(std::mem::ManuallyDrop::new);
+    }
+    READER.with(|con| con.as_ref().map(|con| ask(con)))
+}
+
+/// Whether `name` is of only ASCII letters, digits and underscores, and does not
+/// open with a digit: the names [`from_ident`] and [`column_ident`] ask DuckDB
+/// whether to write bare.
+fn is_plain(name: &str) -> bool {
+    !name.is_empty()
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Whether DuckDB, asked on `con`, reads `SELECT <name>` as a select of the
+/// column called `name` and of nothing else: it parses, and its tree's select
+/// list is one column reference whose one name is `name`. A reserved word gives
+/// a parser error in place of a tree, and a word DuckDB parses as anything else —
+/// a constant, a function of no arguments — gives a tree that holds no such
+/// reference.
+fn reads_bare_as_column(con: &duckdb::Connection, name: &str) -> bool {
+    tree(con, &format!("SELECT {name}")).is_some_and(|tree| {
+        let list = &tree["statements"][0]["node"]["select_list"];
+        list.as_array().is_some_and(|items| {
+            items.len() == 1
+                && items[0]["class"] == "COLUMN_REF"
+                && items[0]["column_names"] == serde_json::json!([name])
+        })
+    })
+}
+
 /// Every operation arc holds, in catalogue order.
 pub(crate) fn operations() -> &'static [Operation] {
     CATALOGUE
@@ -1026,6 +2007,63 @@ pub(crate) fn operations() -> &'static [Operation] {
 /// The match is exact: a long name is an identity, not a search term.
 pub(crate) fn operation(long_name: &str) -> Option<&'static Operation> {
     CATALOGUE.iter().find(|op| op.long_name == long_name)
+}
+
+/// `arguments` as the command line gives them, each a string, with each value
+/// the `parameters` of the operation `long_name` type `integer` turned into that
+/// integer where it reads as one, `"2"` as `2` and `"-1"` as `-1`. Any other
+/// value is left as given: a string that does not read as an integer, `"ten"`,
+/// stays a string for [`Operation::admit`] to refuse as the wrong type, naming
+/// the argument, and a `minimum` or a `maximum` is admit's to hold, not this. A
+/// whole number written in digits alone that is too large for an `i64` is turned
+/// into the number it is, a `u64` or a float, so that admit refuses it as beyond
+/// the `maximum` rather than as a string. An operation arc
+/// does not hold leaves the arguments as given, for [`record_operation`] to
+/// refuse. `arc mcp` passes JSON, whose integers are already integers, and does
+/// not call this.
+pub(crate) fn typed_arguments(
+    long_name: &str,
+    arguments: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let Some(op) = operation(long_name) else {
+        return arguments;
+    };
+    let schema = (op.parameters)();
+    arguments
+        .into_iter()
+        .map(|(key, value)| {
+            let integer = schema["properties"][key.as_str()]["type"] == "integer";
+            let parsed = value.as_str().filter(|_| integer).and_then(whole_number);
+            (key, parsed.unwrap_or(value))
+        })
+        .collect()
+}
+
+/// `text` as the JSON number it writes, when it reads as a whole number: an
+/// `i64` where it fits, as `"+2"` and `"-1"` do; otherwise, where it is digits
+/// alone after an optional sign, a `u64` where that fits and a float beyond it,
+/// the largest finite float where the digits overflow even that. `None` for any
+/// other text, `"ten"`, `" 2"` or `"1e3"`.
+fn whole_number(text: &str) -> Option<serde_json::Value> {
+    if let Ok(integer) = text.parse::<i64>() {
+        return Some(integer.into());
+    }
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let integer = match text.parse::<u64>() {
+        Ok(integer) => return Some(integer.into()),
+        Err(_) => text.parse::<f64>().ok()?,
+    };
+    // Past about 309 digits the float is infinite, which JSON cannot hold; the
+    // largest finite float of the same sign stands in, still beyond any bound.
+    let finite = if integer.is_finite() {
+        integer
+    } else {
+        f64::MAX.copysign(integer)
+    };
+    serde_json::Number::from_f64(finite).map(serde_json::Value::Number)
 }
 
 impl Operation {
@@ -1279,11 +2317,14 @@ pub(crate) struct OperationRequest<'a> {
 ///
 /// Refused, with the protocol's directory untouched: an operation arc does not
 /// hold; arguments the operation's `parameters` do not admit, whether one is
-/// missing, one is not taken or one is of the wrong type; a condition or an order
-/// DuckDB's own parser reads as more than one statement, or cannot parse at all
-/// (see [`one_statement`]); a table no step of the protocol makes; and a
-/// description that is empty or spans lines (see [`record_step`]). Each
-/// refusal's message names what was wrong.
+/// missing, one is not taken or one is of the wrong type; an argument given
+/// without the one it depends on; a number beyond its bounds; a condition or an
+/// order DuckDB's own parser reads as more than one statement, or cannot parse at
+/// all (see [`one_statement`]); a SQL fragment its probe refuses (see
+/// [`probed`]); what the operation's own `checks` refuse, such as a dedupe's key
+/// and order that do not read as one window; a table no step of the protocol
+/// makes; and a description that is empty or spans lines (see [`record_step`]).
+/// Each refusal's message names what was wrong.
 pub(crate) fn record_operation(
     dir: &Path,
     request: &OperationRequest,
@@ -1600,7 +2641,18 @@ impl Operation {
     /// each required argument present, no argument the schema does not name when
     /// it is closed, and each value of the type the schema gives it. A value
     /// annotated with a clause `x-kind` — a `condition` or an `order` — is also
-    /// checked as that clause, through [`one_statement`].
+    /// checked as that clause, through [`one_statement`]; one annotated with a
+    /// probed `x-kind` — an `expression`, a `type`, a `select-list` or a
+    /// `partition` — is checked in its probe, through [`probed`]; one annotated
+    /// as a `column`, a name and not SQL, is checked only to be a name at all,
+    /// not empty or blank, since [`column_ident`] carries any other name as
+    /// written. An argument the schema's
+    /// `dependentRequired` ties to others is refused without them, a number below
+    /// its property's `minimum` or above its `maximum` is refused naming the
+    /// argument and the bound, before its type is checked, so a whole number too
+    /// large for an integer is refused as too large and not as no integer; and the
+    /// operation's own `checks`, when it has them, run last, on the arguments
+    /// together.
     fn admit(&self, arguments: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
         let schema = (self.parameters)();
         let empty = serde_json::Map::new();
@@ -1633,15 +2685,46 @@ impl Operation {
                 )));
             }
         }
+        let dependent = schema["dependentRequired"]
+            .as_object()
+            .into_iter()
+            .flatten();
+        for (given, needs) in dependent.filter(|(given, _)| arguments.contains_key(*given)) {
+            let needs = needs.as_array().into_iter().flatten();
+            for needed in needs.filter_map(serde_json::Value::as_str) {
+                if !arguments.contains_key(needed) {
+                    return Err(refused(format!(
+                        "the argument `{given}` of `{}` needs `{needed}` as well, and none was given",
+                        self.long_name
+                    )));
+                }
+            }
+        }
         for (key, value) in arguments {
             let Some(property) = properties.get(key) else {
                 continue;
             };
+            for (bound, beyond, limit) in [
+                ("minimum", Ordering::Less, &property["minimum"]),
+                ("maximum", Ordering::Greater, &property["maximum"]),
+            ] {
+                if compare_numbers(value, limit) == Some(beyond) {
+                    return Err(refused(format!(
+                        "the argument `{key}` of `{}` has a {bound} of {limit}, not {value}",
+                        self.long_name
+                    )));
+                }
+            }
             if let Some(ty) = property["type"].as_str()
                 && !is_of_type(value, ty)
             {
+                let article = if ty.starts_with(['a', 'e', 'i', 'o', 'u']) {
+                    "an"
+                } else {
+                    "a"
+                };
                 return Err(refused(format!(
-                    "the argument `{key}` of `{}` is a {ty}, not {value}",
+                    "the argument `{key}` of `{}` is {article} {ty}, not {value}",
                     self.long_name
                 )));
             }
@@ -1650,8 +2733,37 @@ impl Operation {
             {
                 one_statement(key, clause, text)?;
             }
+            if let Some(probe) = Probe::of(&property["x-kind"])
+                && let Some(text) = value.as_str()
+            {
+                probed(self.long_name, key, probe, text)?;
+            }
+            if property["x-kind"] == "column"
+                && value.as_str().is_some_and(|name| name.trim().is_empty())
+            {
+                return Err(refused(format!(
+                    "the column `{key}` of `{}` is empty or blank",
+                    self.long_name
+                )));
+            }
         }
-        Ok(())
+        self.checks.map_or(Ok(()), |checks| checks(arguments))
+    }
+}
+
+/// `value` compared with `bound`, two JSON numbers: exactly when both are
+/// integers, so a `maximum` of the largest `BIGINT` holds against one past it,
+/// and as floating point otherwise. `None` when either is not a number, as a
+/// bound a property does not set is not.
+fn compare_numbers(value: &serde_json::Value, bound: &serde_json::Value) -> Option<Ordering> {
+    let integer = |v: &serde_json::Value| {
+        v.as_i64()
+            .map(i128::from)
+            .or_else(|| v.as_u64().map(i128::from))
+    };
+    match (integer(value), integer(bound)) {
+        (Some(value), Some(bound)) => Some(value.cmp(&bound)),
+        _ => value.as_f64()?.partial_cmp(&bound.as_f64()?),
     }
 }
 
@@ -1674,7 +2786,9 @@ fn is_of_type(value: &serde_json::Value, ty: &str) -> bool {
 /// probe [`one_statement`] parses it inside and the word a refusal calls it by.
 /// `filter-rows`' `where` is a `WHERE` condition; `sort-rows`' `order_by` is an
 /// `ORDER BY` order. A value whose `x-kind` names neither has no clause and is
-/// not parse-checked.
+/// not checked as one: a probed kind, such as an `expression`, is gated in its
+/// probe by [`probed`], and a `column` is a name, not SQL, which
+/// [`Operation::admit`] checks apart.
 struct Clause {
     /// The SQL keyword the value follows in the one-statement probe.
     keyword: &'static str,
@@ -1739,12 +2853,292 @@ fn one_statement(key: &str, clause: Clause, value: &str) -> Result<()> {
              record it as one: {value}",
             clause.noun
         ))),
-        _ => Err(refused(format!(
-            "the {} `{key}` holds a `;` outside a string or a comment, which would end \
-             the step's statement and begin another: {value}",
-            clause.noun
-        ))),
+        _ => Err(second_statement(clause.noun, key, value)),
     }
+}
+
+/// Whether `value`, written after `opening` as the step writes it, leaves the
+/// statement it is written into whole: `Ok`, or the [`second_statement`] refusal
+/// when it holds a `;` outside every string and comment that ends the statement.
+/// DuckDB is asked twice, neither time binding or running anything: whether it
+/// reads `<opening><value>` as more than one statement, a `;` with SQL after it;
+/// and whether it reads two once a select is put on the line after, a `;` with
+/// nothing after it, which in the step would end the statement before the SQL
+/// the step writes after the value. A value with no such `;` does not parse with
+/// the select after it, and counts `0` there. [`probed`] asks it of each probed
+/// fragment after `SELECT `; [`dedupe_rows_checks`] and [`limit_rows_checks`] of
+/// an order after `SELECT 1 ORDER BY `, before they probe it where the step
+/// writes it, so `amount desc;` is refused for its `;`.
+fn ends_no_statement(opening: &str, noun: &str, key: &str, value: &str) -> Result<()> {
+    let written = format!("{opening}{value}");
+    if duckdb_statement_count(&written) > 1
+        || duckdb_statement_count(&format!("{written}\nSELECT 1")) > 1
+    {
+        return Err(second_statement(noun, key, value));
+    }
+    Ok(())
+}
+
+/// The refusal of a value whose probe DuckDB reads as more than one statement:
+/// a `;` outside every string and comment, with SQL after it, or, where the step
+/// writes SQL after the value, with nothing after it. [`one_statement`] and
+/// [`ends_no_statement`] give it in the one wording, `noun` saying what the value
+/// is.
+fn second_statement(noun: &str, key: &str, value: &str) -> Error {
+    refused(format!(
+        "the {noun} `{key}` holds a `;` outside a string or a comment, which would end \
+         the step's statement and begin another: {value}"
+    ))
+}
+
+/// The alias each probe ends in. A trailing `--` comment swallows it and a comma
+/// list puts another item after it, so a probe whose last item is not called this
+/// is one in which the value did not stay where the step puts it.
+const SENTINEL: &str = "__arc_probe";
+
+/// A SQL fragment an annotated argument is, gated in a probe that reproduces what
+/// follows the fragment in the step: what a refusal calls it, the probe it is
+/// written into, and what the probe's select list must be for the fragment to be
+/// admitted. A `condition` and an `order` are gated as a [`Clause`] instead, by
+/// [`one_statement`] alone.
+struct Probe {
+    /// What a refusal calls the value.
+    noun: &'static str,
+    /// The probe `value` is written into, ending in the [`SENTINEL`] alias.
+    probe: fn(value: &str) -> String,
+    /// Whether the select list DuckDB reads in the probe is the one the fragment
+    /// should give: `Ok`, or what the fragment is instead, as a refusal says it
+    /// after the value's name.
+    admits: fn(items: &[serde_json::Value]) -> std::result::Result<(), &'static str>,
+}
+
+/// What a refusal says of a fragment whose probe is not the one select its kind
+/// gives, after the value's name.
+const NOT_ONE: &str = "is not one SQL";
+
+/// The probe of an `expression`: `SELECT 1, <value> AS __arc_probe`, which must
+/// read as exactly two items, the probe's own `1` and then one called
+/// [`SENTINEL`] that is one value for each row ([`one_value_per_row`]). The value
+/// follows a comma, as it does in each step that writes one — `SELECT *, <value>`
+/// in `derive-column`, `coalesce(<column>, <value>)` in `fill-nulls` — so a
+/// leading `ALL`, which DuckDB reads as the select's own `SELECT ALL` when the
+/// value opens the list, does not parse here as it does not in the step.
+/// `1 FROM orders` and `a UNION SELECT b` are not a bare select, `amount, note`
+/// is three items, and `amount * 2 -- double` leaves the last item without the
+/// alias.
+const EXPRESSION: Probe = Probe {
+    noun: "expression",
+    probe: |value| format!("SELECT 1, {value} AS {SENTINEL}"),
+    admits: |items| match items {
+        [_, item] if item["alias"] == SENTINEL => {
+            one_value_per_row(item).map_err(|spread| match spread {
+                Spread::Columns => "expands to several columns, where the step adds one",
+                Spread::Rows => "changes the number of rows, where the step keeps every row",
+            })
+        }
+        _ => Err(NOT_ONE),
+    },
+};
+
+/// The probe of a `select-list`: `SELECT 1, <value>, 1 AS __arc_probe`, which
+/// must read as at least three items: the probe's own `1`, then the value's, each
+/// one value for each row ([`one_value_per_row`]), and last one called
+/// [`SENTINEL`]. The value may list several items, each with an alias. It follows
+/// a comma, as `summarise-rows`' `aggregates` does after a `group_by`, so a
+/// leading `ALL`, which DuckDB reads as the select's own `SELECT ALL` when the
+/// value opens the list, is refused; a list that opens the step's select could
+/// take one, but gains nothing by it. `count(*) FROM other` and
+/// `a UNION SELECT b` are not a bare select, and `count(*) AS n -- all` swallows
+/// the sentinel item. A star would widen the list to every column of the table,
+/// and an `unnest` would change the number of rows the step groups or
+/// summarises, so each is refused. The number of items DuckDB reads between the
+/// probe's own two is the number [`summarise_rows_sql`] groups by.
+const SELECT_LIST: Probe = Probe {
+    noun: "select list",
+    probe: |value| format!("SELECT 1, {value}, 1 AS {SENTINEL}"),
+    admits: |items| match items {
+        [_, listed @ .., last] if !listed.is_empty() && last["alias"] == SENTINEL => listed
+            .iter()
+            .try_for_each(one_value_per_row)
+            .map_err(|spread| match spread {
+                Spread::Columns => {
+                    "has an item that expands to several columns, where each item gives one"
+                }
+                Spread::Rows => "changes the number of rows the step reads",
+            }),
+        _ => Err(NOT_ONE),
+    },
+};
+
+/// The probe of a `partition` key: the [`SELECT_LIST`] probe and its check, in
+/// the words of a partition key. A `)` that would close the window the key is
+/// written into does not parse in it, a clause such as `ORDER BY` is not a bare
+/// select, and a star or an `unnest` is refused as in a select list. An alias,
+/// which a select list takes and `PARTITION BY` does not, passes here and is
+/// refused by [`dedupe_rows_checks`], which probes the key in its window.
+const PARTITION: Probe = Probe {
+    noun: "partition key",
+    ..SELECT_LIST
+};
+
+/// The probe of a `type`: `SELECT CAST(NULL AS <value>) AS __arc_probe`, which
+/// must read as exactly one item, a `CAST`, called [`SENTINEL`], whose child is
+/// the probe's own `NULL`. `INTEGER) AS x, (1` closes the cast and adds an item,
+/// so the select lists two; `INTEGER) --` leaves the item without the alias; and
+/// `INTEGER)::DECIMAL(10,2` is one `CAST` item too, but of a cast, so the step
+/// would convert through `INTEGER` first. None is a type.
+const TYPE: Probe = Probe {
+    noun: "type",
+    probe: |value| format!("SELECT CAST(NULL AS {value}) AS {SENTINEL}"),
+    admits: |items| match items {
+        [item]
+            if item["alias"] == SENTINEL
+                && item["class"] == "CAST"
+                && item["child"]["class"] == "CONSTANT" =>
+        {
+            Ok(())
+        }
+        _ => Err(NOT_ONE),
+    },
+};
+
+/// Whether `node`, an item of DuckDB's tree, gives one value for each row it is
+/// written into: `Ok`, or why not. A star — `*`, `orders.*`, `* EXCLUDE (..)`,
+/// `COLUMNS(..)`, alone or inside a function — and a `*COLUMNS(..)` unpacked into
+/// a call read as one item in the probe but expand to several columns in the
+/// step; an `unnest`, an `unlist` or a `generate_subscripts` gives several rows
+/// for one, the last a row for each index of a list. A subquery is not
+/// looked inside: its star reads its own `FROM`, and it gives one value, so
+/// `EXISTS (SELECT * FROM orders)` is admitted. `count(*)` holds no star node.
+/// Each probe that walks an item says in its own words what the [`Spread`] would
+/// do to its step.
+fn one_value_per_row(node: &serde_json::Value) -> std::result::Result<(), Spread> {
+    match node {
+        serde_json::Value::Object(fields) => {
+            if node["class"] == "SUBQUERY" {
+                return Ok(());
+            }
+            if node["class"] == "STAR" || node["type"] == "OPERATOR_UNPACK" {
+                return Err(Spread::Columns);
+            }
+            if node["class"] == "FUNCTION"
+                && node["function_name"].as_str().is_some_and(|name| {
+                    ["unnest", "unlist", "generate_subscripts"]
+                        .iter()
+                        .any(|spreading| name.eq_ignore_ascii_case(spreading))
+                })
+            {
+                return Err(Spread::Rows);
+            }
+            fields.values().try_for_each(one_value_per_row)
+        }
+        serde_json::Value::Array(items) => items.iter().try_for_each(one_value_per_row),
+        _ => Ok(()),
+    }
+}
+
+/// How an item that is not one value for each row spreads, as
+/// [`one_value_per_row`] finds it.
+enum Spread {
+    /// A star or an unpacked `COLUMNS(..)`: one item in the probe, several
+    /// columns in the step.
+    Columns,
+    /// An `unnest`, an `unlist` or a `generate_subscripts`: several rows for one.
+    Rows,
+}
+
+impl Probe {
+    /// The probe a value carrying this `x-kind` is gated in, or `None` when the
+    /// annotation names no fragment arc probes.
+    fn of(x_kind: &serde_json::Value) -> Option<Probe> {
+        match x_kind.as_str() {
+            Some("expression") => Some(EXPRESSION),
+            Some("type") => Some(TYPE),
+            Some("select-list") => Some(SELECT_LIST),
+            Some("partition") => Some(PARTITION),
+            _ => None,
+        }
+    }
+}
+
+/// Whether `value`, the argument `key` of the operation `operation`, is the one
+/// fragment `probe` gates. Refused, the directory untouched, when:
+///
+/// * it holds [`SENTINEL`], in any case, since a value that supplies the alias
+///   itself could hide what follows it behind a comment and still pass;
+/// * it holds a `;` that ends `SELECT <value>`, with SQL after it or with
+///   nothing ([`ends_no_statement`]), in the wording [`one_statement`] gives the
+///   same `;`. The value is counted on its own and not in its probe, since what
+///   the probe puts after it can stop a second statement from parsing —
+///   `amount; DROP TABLE orders AS __arc_probe` — and the `;` would then be
+///   refused as something else;
+/// * DuckDB cannot parse the probe, or reads it as anything but a bare select
+///   ([`bare_select`]) whose select list `probe.admits`, with the reason
+///   `admits` gives.
+fn probed(operation: &str, key: &str, probe: Probe, value: &str) -> Result<()> {
+    if value.to_ascii_lowercase().contains(SENTINEL) {
+        return Err(refused(format!(
+            "the {} `{key}` of `{operation}` holds `{SENTINEL}`, the name arc's check of it \
+             reserves: {value}",
+            probe.noun
+        )));
+    }
+    ends_no_statement("SELECT ", probe.noun, key, value)?;
+    let noun = probe.noun;
+    let admitted = probe_items(&(probe.probe)(value))
+        .ok_or(NOT_ONE)
+        .and_then(|items| (probe.admits)(&items));
+    admitted.map_err(|reason| {
+        let reason = if reason == NOT_ONE {
+            format!("{NOT_ONE} {noun}")
+        } else {
+            reason.to_string()
+        };
+        refused(format!(
+            "the {noun} `{key}` of `{operation}` {reason}: {value}"
+        ))
+    })
+}
+
+/// The select list of `probe`, when DuckDB reads it as one statement whose tree
+/// [`bare_select`] accepts; `None` when DuckDB cannot parse it, reads more than
+/// one statement in it, or reads a select that does more than list its items. It
+/// is asked on the thread's [`on_reader`] database, and binds and runs nothing.
+/// The statements are counted in the tree itself: DuckDB gives a tree for each
+/// statement of a text that is all selects, and an error for a text that does not
+/// parse or holds anything else, so no second parse is needed.
+fn probe_items(probe: &str) -> Option<Vec<serde_json::Value>> {
+    let tree = on_reader(|con| tree(con, probe))??;
+    if !bare_select(&tree) {
+        return None;
+    }
+    tree["statements"][0]["node"]["select_list"]
+        .as_array()
+        .cloned()
+}
+
+/// Whether `tree`, DuckDB's tree of a text, is one statement that is a bare
+/// select: a `SELECT_NODE` that reads no table and has no `WHERE`, `GROUP BY`,
+/// `HAVING`, `QUALIFY`, sample, modifier (`ORDER BY`, `LIMIT`, `DISTINCT`) or
+/// CTE. `false` for any other tree, a parse error's included. A `GROUP BY ALL`
+/// leaves the grouping lists empty and is told by the node's aggregate handling,
+/// which a bare select leaves standard.
+fn bare_select(tree: &serde_json::Value) -> bool {
+    let Some([statement]) = tree["statements"].as_array().map(Vec::as_slice) else {
+        return false;
+    };
+    let node = &statement["node"];
+    let empty = |field: &serde_json::Value| field.as_array().is_some_and(Vec::is_empty);
+    node["type"] == "SELECT_NODE"
+        && node["from_table"]["type"] == "EMPTY"
+        && ["where_clause", "having", "qualify", "sample"]
+            .iter()
+            .all(|field| node[field].is_null())
+        && ["group_expressions", "group_sets", "modifiers"]
+            .iter()
+            .all(|field| empty(&node[field]))
+        && empty(&node["cte_map"]["map"])
+        && node["aggregate_handling"] == "STANDARD_HANDLING"
 }
 
 /// The number of SQL statements DuckDB parses in `sql`, or `0` when DuckDB
@@ -2557,6 +3951,1071 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_hide_takes_one_required_column_and_no_other_key() {
+        let schema = hide_column_parameters();
+        let column = &schema["properties"]["column"];
+
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["column"]),
+            "`column` is not the one required parameter"
+        );
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::json!(false),
+            "the schema is open to a key it does not name"
+        );
+        assert_eq!(
+            schema["properties"].as_object().map(|p| p.len()),
+            Some(1),
+            "the schema takes a parameter besides `column`"
+        );
+        assert_eq!(column["type"], "string", "`column` is not a string");
+        assert_eq!(
+            column["x-kind"], "column",
+            "`column` does not say its value is a column name"
+        );
+        assert!(
+            column["description"]
+                .as_str()
+                .is_some_and(|d| !d.trim().is_empty()),
+            "`column` has no description: {column}"
+        );
+    }
+
+    #[test]
+    fn a_column_is_written_bare_only_when_duckdb_reads_it_bare_as_that_column() {
+        // A plain name DuckDB reads bare as the column is written bare.
+        assert_eq!(column_ident("amount"), "amount");
+        assert_eq!(column_ident("big_amount"), "big_amount");
+        // A reserved word, a name holding a space or a `"`, and one opening with a
+        // digit are quoted, each `"` doubled. Writing any of them bare reddens this.
+        assert_eq!(column_ident("order"), "\"order\"");
+        assert_eq!(column_ident("my col"), "\"my col\"");
+        assert_eq!(column_ident("a\"b"), "\"a\"\"b\"");
+        assert_eq!(column_ident("1st"), "\"1st\"");
+        // A plain word DuckDB parses as something other than a column — a
+        // constant — is quoted too, so it is read as the column it names.
+        assert_eq!(column_ident("true"), "\"true\"");
+    }
+
+    #[test]
+    fn the_hide_writes_the_column_into_an_exclude_of_every_column() {
+        let arguments = arguments(serde_json::json!({ "column": "note" }));
+        let recording = Recording {
+            name: "no_note",
+            on: "orders",
+            arguments: &arguments,
+        };
+        assert_eq!(
+            hide_column_sql(&recording),
+            "CREATE OR REPLACE TABLE \"no_note\" AS\nSELECT * EXCLUDE (note)\nFROM orders;\n"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_blank_column_is_refused_naming_the_argument_and_the_operation() {
+        let op = operation(HIDE_COLUMN).unwrap();
+        for blank in ["", " "] {
+            let err = op
+                .admit(&arguments(serde_json::json!({ "column": blank })))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("the column `column` of `hide-column` is empty or blank"),
+                "{blank:?} was refused with another message: {err}"
+            );
+        }
+        assert!(
+            op.admit(&arguments(serde_json::json!({ "column": "note" })))
+                .is_ok(),
+            "a column with a name was refused"
+        );
+    }
+
+    #[test]
+    fn the_rename_takes_a_required_column_and_to_and_no_other_key() {
+        let schema = rename_column_parameters();
+
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["column", "to"]),
+            "`column` and `to` are not the required parameters"
+        );
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::json!(false),
+            "the schema is open to a key it does not name"
+        );
+        assert_eq!(
+            schema["properties"].as_object().map(|p| p.len()),
+            Some(2),
+            "the schema takes a parameter besides `column` and `to`"
+        );
+        for key in ["column", "to"] {
+            let property = &schema["properties"][key];
+            assert_eq!(property["type"], "string", "`{key}` is not a string");
+            assert_eq!(
+                property["x-kind"], "column",
+                "`{key}` does not say its value is a column name"
+            );
+            assert!(
+                property["description"]
+                    .as_str()
+                    .is_some_and(|d| !d.trim().is_empty()),
+                "`{key}` has no description: {property}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_rename_copies_the_table_then_renames_the_column_with_an_alter() {
+        let arguments = arguments(serde_json::json!({ "column": "note", "to": "order" }));
+        let recording = Recording {
+            name: "relabelled",
+            on: "orders",
+            arguments: &arguments,
+        };
+        assert_eq!(
+            rename_column_sql(&recording),
+            "BEGIN TRANSACTION;\nCREATE OR REPLACE TABLE \"relabelled\" AS\nSELECT *\nFROM orders;\nALTER TABLE \"relabelled\" RENAME COLUMN note TO \"order\";\nCOMMIT;\n"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_blank_new_name_is_refused_naming_the_argument_and_the_operation() {
+        let op = operation(RENAME_COLUMN).unwrap();
+        for blank in ["", " "] {
+            let err = op
+                .admit(&arguments(
+                    serde_json::json!({ "column": "note", "to": blank }),
+                ))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("the column `to` of `rename-column` is empty or blank"),
+                "{blank:?} was refused with another message: {err}"
+            );
+        }
+        assert!(
+            op.admit(&arguments(
+                serde_json::json!({ "column": "note", "to": "label" })
+            ))
+            .is_ok(),
+            "a rename to a name was refused"
+        );
+    }
+
+    #[test]
+    fn the_derive_takes_a_required_column_and_expression_and_no_other_key() {
+        let schema = derive_column_parameters();
+
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["column", "expression"]),
+            "`column` and `expression` are not the required parameters"
+        );
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::json!(false),
+            "the schema is open to a key it does not name"
+        );
+        assert_eq!(
+            schema["properties"].as_object().map(|p| p.len()),
+            Some(2),
+            "the schema takes a parameter besides `column` and `expression`"
+        );
+        for (key, kind) in [("column", "column"), ("expression", "expression")] {
+            let property = &schema["properties"][key];
+            assert_eq!(property["type"], "string", "`{key}` is not a string");
+            assert_eq!(property["x-kind"], kind, "`{key}` is not marked a {kind}");
+            assert!(
+                property["description"]
+                    .as_str()
+                    .is_some_and(|d| !d.trim().is_empty()),
+                "`{key}` has no description: {property}"
+            );
+        }
+        assert!(
+            schema["properties"]["column"]["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("new column")),
+            "`column` does not say it names the new column"
+        );
+    }
+
+    #[test]
+    fn the_derive_adds_the_expression_under_a_temporary_name_then_renames_it_with_an_alter() {
+        let arguments = arguments(serde_json::json!({
+            "column": "order",
+            "expression": "amount * 2",
+        }));
+        let recording = Recording {
+            name: "doubled_orders",
+            on: "orders",
+            arguments: &arguments,
+        };
+        assert_eq!(
+            derive_column_sql(&recording),
+            "BEGIN TRANSACTION;\nCREATE OR REPLACE TABLE \"doubled_orders\" AS\nSELECT *, amount * 2 AS __arc_derived\nFROM orders;\nALTER TABLE \"doubled_orders\" RENAME COLUMN __arc_derived TO \"order\";\nCOMMIT;\n"
+        );
+    }
+
+    #[test]
+    fn an_expression_duckdb_reads_as_one_item_of_a_bare_select_is_admitted() {
+        let op = operation(DERIVE_COLUMN).unwrap();
+        for expression in [
+            "amount * 2",
+            "upper(note)",
+            "CASE WHEN amount > 100 THEN 'big' ELSE 'small' END",
+            "regexp_replace(note, 'a', 'b')",
+            "EXISTS (SELECT * FROM orders)", // a star inside a subquery reads its own FROM
+            "count(*) OVER ()",              // `count(*)` holds no star
+        ] {
+            let admitted = op.admit(&arguments(
+                serde_json::json!({ "column": "derived", "expression": expression }),
+            ));
+            assert!(admitted.is_ok(), "{expression:?} was refused: {admitted:?}");
+        }
+    }
+
+    #[test]
+    fn what_is_not_one_expression_is_refused_naming_the_argument() {
+        let op = operation(DERIVE_COLUMN).unwrap();
+        for expression in [
+            "1 FROM orders",              // a select that reads a table
+            "amount; DROP TABLE orders",  // a second statement
+            "1) FROM orders WHERE (1",    // parentheses that close around the step
+            "",                           // nothing at all
+            "amount, note",               // two items
+            "amount * 2 -- double",       // a comment that swallows the alias
+            "amount AS __arc_probe -- c", // the alias supplied by the caller
+            "1 UNION SELECT 2",           // a set operation, not a select
+            "amount ORDER BY 1",          // a modifier
+            "*",
+            "orders.*",
+            "* EXCLUDE (amount)",
+            "* REPLACE (0 AS amount)",
+            "COLUMNS(*)",
+            "coalesce(COLUMNS('amount|id'), 0)",
+            "unnest([1, 2])",
+            "ALL 1", // the select's own `ALL`, which does not parse after the step's `*,`
+        ] {
+            let err = op
+                .admit(&arguments(
+                    serde_json::json!({ "column": "derived", "expression": expression }),
+                ))
+                .expect_err(expression)
+                .to_string();
+            assert!(
+                err.contains("`expression`"),
+                "{expression:?}: the refusal does not name the argument: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_expression_that_is_not_one_is_refused_in_the_expression_wording() {
+        let err = probed(DERIVE_COLUMN, "expression", EXPRESSION, "amount, note")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "the expression `expression` of `derive-column` is not one SQL expression"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_second_statement_in_an_expression_keeps_the_wording_a_clause_gives_it() {
+        for expression in ["amount; SELECT 2", "amount; DROP TABLE orders"] {
+            let err = probed(DERIVE_COLUMN, "expression", EXPRESSION, expression)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(
+                    "the expression `expression` holds a `;` outside a string or a comment, \
+                     which would end the step's statement and begin another"
+                ),
+                "{expression:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_star_or_an_unnest_is_refused_saying_what_it_would_do_to_the_step() {
+        for (expression, reason) in [
+            ("*", "expands to several columns"),
+            ("orders.*", "expands to several columns"),
+            ("* EXCLUDE (amount)", "expands to several columns"),
+            ("* REPLACE (0 AS amount)", "expands to several columns"),
+            ("COLUMNS(*)", "expands to several columns"),
+            (
+                "coalesce(COLUMNS('amount|id'), 0)",
+                "expands to several columns",
+            ),
+            ("concat(*COLUMNS(*))", "expands to several columns"),
+            ("unnest([1, 2])", "changes the number of rows"),
+            ("UNLIST([1, 2]) + 1", "changes the number of rows"),
+            (
+                "generate_subscripts([1, 2], 1)",
+                "changes the number of rows",
+            ),
+        ] {
+            let err = probed(DERIVE_COLUMN, "expression", EXPRESSION, expression)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!(
+                    "the expression `expression` of `derive-column` {reason}"
+                )),
+                "{expression:?} was refused with another message: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_type_duckdb_reads_as_the_one_type_of_a_cast_is_admitted() {
+        let op = operation(CAST_COLUMN).unwrap();
+        for type_name in ["VARCHAR", "DECIMAL(10, 2)", "INTEGER[]"] {
+            let admitted = op.admit(&arguments(
+                serde_json::json!({ "column": "amount", "type": type_name }),
+            ));
+            assert!(admitted.is_ok(), "{type_name:?} was refused: {admitted:?}");
+        }
+    }
+
+    #[test]
+    fn what_is_not_one_type_is_refused_naming_the_argument() {
+        let op = operation(CAST_COLUMN).unwrap();
+        for type_name in [
+            "INTEGER) AS x, (1",
+            "INTEGER; DROP TABLE orders",
+            "",
+            "INTEGER) AS __arc_probe -- c",
+            "INTEGER) -- c",
+            "INTEGER)::DECIMAL(10,2",
+            "INTEGER)::VARCHAR::DECIMAL(10,2",
+            "INTEGER)::VARCHAR(1",
+        ] {
+            let err = op
+                .admit(&arguments(
+                    serde_json::json!({ "column": "amount", "type": type_name }),
+                ))
+                .expect_err(type_name)
+                .to_string();
+            assert!(
+                err.contains("`type`"),
+                "{type_name:?}: the refusal does not name the argument: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_summary_takes_a_required_aggregates_an_optional_group_by_and_no_other_key() {
+        let schema = summarise_rows_parameters();
+
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["aggregates"]),
+            "`aggregates` is not the one required parameter"
+        );
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::json!(false),
+            "the schema is open to a key it does not name"
+        );
+        assert_eq!(
+            schema["properties"].as_object().map(|p| p.len()),
+            Some(2),
+            "the schema takes a parameter besides `aggregates` and `group_by`"
+        );
+        for key in ["aggregates", "group_by"] {
+            let property = &schema["properties"][key];
+            assert_eq!(property["type"], "string", "`{key}` is not a string");
+            assert_eq!(
+                property["x-kind"], "select-list",
+                "`{key}` is not marked a select list"
+            );
+            assert!(
+                property["description"]
+                    .as_str()
+                    .is_some_and(|d| d.contains("select list") && d.contains("alias")),
+                "`{key}` does not say it is a select list that may carry aliases: {property}"
+            );
+        }
+        assert!(
+            schema["properties"]["group_by"]["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("GROUP BY 1, 2") && d.contains("GROUP BY ()")),
+            "`group_by` does not say how the step groups with and without it"
+        );
+    }
+
+    #[test]
+    fn the_summary_groups_by_the_places_of_its_group_by_or_by_nothing_without_one() {
+        let grouped = arguments(serde_json::json!({
+            "group_by": "amount > 100 AS big",
+            "aggregates": "count(*) AS n",
+        }));
+        let recording = Recording {
+            name: "order_counts",
+            on: "orders",
+            arguments: &grouped,
+        };
+        assert_eq!(
+            summarise_rows_sql(&recording),
+            "CREATE OR REPLACE TABLE \"order_counts\" AS\nSELECT amount > 100 AS big, count(*) AS n\nFROM orders\nGROUP BY 1;\n"
+        );
+        let whole = arguments(serde_json::json!({ "aggregates": "count(*) AS n" }));
+        let recording = Recording {
+            name: "order_counts",
+            on: "orders",
+            arguments: &whole,
+        };
+        assert_eq!(
+            summarise_rows_sql(&recording),
+            "CREATE OR REPLACE TABLE \"order_counts\" AS\nSELECT count(*) AS n\nFROM orders\nGROUP BY ();\n"
+        );
+        let two = arguments(serde_json::json!({
+            "group_by": "amount > 100 AS big, concat(note, ',') AS tagged",
+            "aggregates": "count(*) AS n",
+        }));
+        let recording = Recording {
+            name: "order_counts",
+            on: "orders",
+            arguments: &two,
+        };
+        assert!(
+            summarise_rows_sql(&recording).contains("\nGROUP BY 1, 2;\n"),
+            "a group_by of two items, one holding a comma in a string, is not grouped by two places"
+        );
+    }
+
+    #[test]
+    fn a_select_list_duckdb_reads_as_the_items_of_a_bare_select_is_admitted() {
+        let op = operation(SUMMARISE_ROWS).unwrap();
+        for (aggregates, group_by) in [
+            ("count(*) AS n, sum(amount) AS total", None),
+            ("count(*)", Some("note")),
+            ("count(*) AS n", Some("amount > 100 AS big, note")),
+            (
+                "count(*) AS n",
+                Some("date_trunc('month', DATE '2026-01-02') AS month"),
+            ),
+            ("max(amount) FILTER (WHERE id > 1) AS top", None),
+            ("count(*) AS n", Some("(SELECT max(id) FROM orders) AS m")),
+        ] {
+            let mut given = serde_json::json!({ "aggregates": aggregates });
+            if let Some(group_by) = group_by {
+                given["group_by"] = group_by.into();
+            }
+            let admitted = op.admit(&arguments(given));
+            assert!(
+                admitted.is_ok(),
+                "{aggregates:?} by {group_by:?} was refused: {admitted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn what_is_not_one_select_list_is_refused_naming_the_argument() {
+        let op = operation(SUMMARISE_ROWS).unwrap();
+        for aggregates in [
+            "count(*) FROM other",             // a select that reads a table
+            "a UNION SELECT b",                // a set operation, not a select
+            "count(*); DROP TABLE orders",     // a second statement
+            "count(*) AS n -- all",            // a comment that swallows the sentinel item
+            "",                                // nothing at all
+            "count(*) AS n, 1 AS __arc_probe", // the sentinel supplied by the caller
+            "*",                               // a star that widens the list to every column
+            "count(*), orders.*",
+            "COLUMNS('amount|id')",
+            "unnest([1, 2]) AS u", // more rows for the summary
+            "ALL count(*)", // the select's own `ALL`, which does not parse after a `group_by`
+        ] {
+            let err = op
+                .admit(&arguments(serde_json::json!({ "aggregates": aggregates })))
+                .expect_err(aggregates)
+                .to_string();
+            assert!(
+                err.contains("`aggregates`"),
+                "{aggregates:?}: the refusal does not name the argument: {err}"
+            );
+        }
+        for group_by in ["big -- by size", "*", "unnest([1, 2])", "note FROM other"] {
+            let err = op
+                .admit(&arguments(serde_json::json!({
+                    "aggregates": "count(*) AS n",
+                    "group_by": group_by,
+                })))
+                .expect_err(group_by)
+                .to_string();
+            assert!(
+                err.contains("`group_by`"),
+                "{group_by:?}: the refusal does not name the argument: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_constant_in_the_group_by_is_refused_naming_group_by() {
+        let op = operation(SUMMARISE_ROWS).unwrap();
+        for group_by in ["2", "'note'", "note, 2"] {
+            let err = op
+                .admit(&arguments(serde_json::json!({
+                    "aggregates": "count(*) AS n",
+                    "group_by": group_by,
+                })))
+                .expect_err(group_by)
+                .to_string();
+            assert!(
+                err.contains(
+                    "the select list `group_by` of `summarise-rows` holds a constant, \
+                     a number or a string that is the same value for every row, not a column, \
+                     so it groups nothing (alone, it would make the whole table one group)"
+                ),
+                "{group_by:?} was refused with another message: {err}"
+            );
+        }
+        for group_by in ["note", "amount > 100 AS big", "amount + 0"] {
+            let admitted = op.admit(&arguments(serde_json::json!({
+                "aggregates": "count(*) AS n",
+                "group_by": group_by,
+            })));
+            assert!(admitted.is_ok(), "{group_by:?} was refused: {admitted:?}");
+        }
+    }
+
+    #[test]
+    fn a_select_list_that_is_not_one_is_refused_in_the_select_list_wording() {
+        for (list, reason) in [
+            ("count(*) AS n -- all", "is not one SQL select list"),
+            ("note, *", "has an item that expands to several columns"),
+            ("unnest([1, 2])", "changes the number of rows"),
+            (
+                "generate_subscripts([1, 2], 1) AS i",
+                "changes the number of rows",
+            ),
+        ] {
+            let err = probed(SUMMARISE_ROWS, "group_by", SELECT_LIST, list)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!(
+                    "the select list `group_by` of `summarise-rows` {reason}"
+                )),
+                "{list:?} was refused with another message: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dedupe_takes_a_key_and_an_order_each_needing_the_other_and_no_other_key() {
+        let schema = dedupe_rows_parameters();
+
+        assert_eq!(
+            schema.get("required"),
+            None,
+            "the dedupe requires an argument, where both are optional"
+        );
+        assert_eq!(
+            schema["dependentRequired"],
+            serde_json::json!({ "key": ["order_by"], "order_by": ["key"] }),
+            "`key` and `order_by` do not each need the other"
+        );
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::json!(false),
+            "the schema is open to a key it does not name"
+        );
+        assert_eq!(schema["properties"]["key"]["x-kind"], "partition");
+        assert_eq!(schema["properties"]["order_by"]["x-kind"], "order");
+        assert_eq!(
+            schema["properties"]["order_by"]["x-directions"],
+            sort_rows_parameters()["properties"]["order_by"]["x-directions"],
+            "the dedupe's order does not offer the directions a sort's does"
+        );
+    }
+
+    #[test]
+    fn the_dedupe_keeps_distinct_rows_or_the_first_of_each_key() {
+        let whole = arguments(serde_json::json!({}));
+        let recording = Recording {
+            name: "unique_orders",
+            on: "orders",
+            arguments: &whole,
+        };
+        assert_eq!(
+            dedupe_rows_sql(&recording),
+            "CREATE OR REPLACE TABLE \"unique_orders\" AS\nSELECT DISTINCT *\nFROM orders;\n"
+        );
+        let keyed = arguments(serde_json::json!({ "key": "note", "order_by": "amount desc" }));
+        let recording = Recording {
+            name: "unique_orders",
+            on: "orders",
+            arguments: &keyed,
+        };
+        assert_eq!(
+            dedupe_rows_sql(&recording),
+            "CREATE OR REPLACE TABLE \"unique_orders\" AS\nSELECT *\nFROM orders\nQUALIFY row_number() OVER (PARTITION BY note ORDER BY amount desc\n) = 1;\n"
+        );
+    }
+
+    #[test]
+    fn a_key_and_an_order_that_read_as_one_window_are_admitted() {
+        let op = operation(DEDUPE_ROWS).unwrap();
+        for (key, order_by) in [
+            ("note", "amount desc"),
+            ("lower(note), id", "amount, id desc NULLS LAST"),
+            ("note", "amount desc -- the largest first"),
+            ("note", "id * -1"),
+            // constant by other means than a literal, which is the analyst's to avoid
+            ("note", "(SELECT max(id) FROM orders)"),
+        ] {
+            let admitted = op.admit(&arguments(
+                serde_json::json!({ "key": key, "order_by": order_by }),
+            ));
+            assert!(
+                admitted.is_ok(),
+                "{key:?} by {order_by:?} was refused: {admitted:?}"
+            );
+        }
+        assert!(op.admit(&arguments(serde_json::json!({}))).is_ok());
+    }
+
+    #[test]
+    fn a_key_or_an_order_given_alone_is_refused_naming_both() {
+        let op = operation(DEDUPE_ROWS).unwrap();
+        for (given, needed) in [("key", "order_by"), ("order_by", "key")] {
+            let err = op
+                .admit(&arguments(serde_json::json!({ (given): "note" })))
+                .expect_err(given)
+                .to_string();
+            assert!(
+                err.contains(&format!(
+                    "`{given}` of `dedupe-rows` needs `{needed}` as well"
+                )),
+                "{given} alone was refused with another message: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_or_an_order_that_does_not_stay_in_the_window_is_refused() {
+        let op = operation(DEDUPE_ROWS).unwrap();
+        for (key, order_by, named) in [
+            ("note AS n", "amount", "`order_by`"), // an alias, which PARTITION BY does not take
+            ("note ORDER BY amount", "amount", "`key`"), // a clause of the key's own
+            (
+                "note) = 1 OR TRUE OR row_number() OVER (PARTITION BY note",
+                "amount",
+                "`key`",
+            ), // a key that closes the window
+            ("*", "amount", "`key`"),              // every column at once
+            ("note -- by note", "amount", "`key`"), // a comment that swallows the order
+            ("note", "amount LIMIT 1", "`order_by`"), // a clause after the order
+            ("note", "amount) = 1 OR (1", "`order_by`"), // an order that closes the window
+            ("note", "amount ROWS UNBOUNDED PRECEDING", "`order_by`"), // a frame
+            ("note", "amount; DROP TABLE orders", "`order_by`"),
+            (
+                "note",
+                "amount desc;",
+                "the order `order_by` holds a `;` outside a string or a comment",
+            ), // a `;` that ends the step inside the window
+            (
+                "1",
+                "amount",
+                "the partition key `key` of `dedupe-rows` holds a constant",
+            ),
+            (
+                "note",
+                "2 desc",
+                "the order `order_by` of `dedupe-rows` holds a constant",
+            ),
+            (
+                "note",
+                "'x'",
+                "the order `order_by` of `dedupe-rows` holds a constant",
+            ),
+        ] {
+            let err = op
+                .admit(&arguments(
+                    serde_json::json!({ "key": key, "order_by": order_by }),
+                ))
+                .expect_err(key)
+                .to_string();
+            assert!(
+                err.contains(named),
+                "{key:?} by {order_by:?}: the refusal does not name {named}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pair_that_is_not_one_window_is_refused_naming_both_arguments() {
+        for (key, order_by) in [
+            ("note AS n", "amount"),
+            ("note", "amount LIMIT 1"),
+            ("note", "amount) = 1 OR (1"),
+            ("note", "amount ROWS UNBOUNDED PRECEDING"),
+            ("note", "amount\n) AS __arc_probe --"),
+        ] {
+            let err = dedupe_rows_checks(&arguments(
+                serde_json::json!({ "key": key, "order_by": order_by }),
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains(
+                    "the partition key `key` and the order `order_by` of `dedupe-rows` do not read as one `row_number()` window"
+                ),
+                "{key:?} by {order_by:?} was refused with another message: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_partition_key_that_is_not_one_is_refused_in_the_partition_key_wording() {
+        for (key, reason) in [
+            ("note -- by note", "is not one SQL partition key"),
+            ("note, *", "has an item that expands to several columns"),
+            ("unnest([1, 2])", "changes the number of rows"),
+        ] {
+            let err = probed(DEDUPE_ROWS, "key", PARTITION, key)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!(
+                    "the partition key `key` of `dedupe-rows` {reason}"
+                )),
+                "{key:?} was refused with another message: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_limit_takes_a_count_of_at_least_zero_and_an_optional_order() {
+        let schema = limit_rows_parameters();
+        assert_eq!(schema["required"], serde_json::json!(["count"]));
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::json!(false),
+            "the schema is open to a key it does not name"
+        );
+        assert_eq!(schema["properties"]["count"]["type"], "integer");
+        assert_eq!(schema["properties"]["count"]["minimum"], 0);
+        assert_eq!(schema["properties"]["count"]["maximum"], i64::MAX);
+        assert_eq!(schema["properties"]["order_by"]["x-kind"], "order");
+        assert_eq!(
+            schema["properties"]["order_by"]["x-directions"],
+            sort_rows_parameters()["properties"]["order_by"]["x-directions"],
+            "the limit's order does not offer the directions a sort's does"
+        );
+    }
+
+    #[test]
+    fn the_limit_keeps_the_first_rows_in_the_order_or_as_they_come() {
+        for (given, query) in [
+            (
+                serde_json::json!({ "count": 2 }),
+                "SELECT *\nFROM orders\nLIMIT 2",
+            ),
+            (
+                serde_json::json!({ "count": 2, "order_by": "amount desc" }),
+                "SELECT *\nFROM orders\nORDER BY amount desc\nLIMIT 2",
+            ),
+            (
+                serde_json::json!({ "count": 0, "order_by": "amount -- c" }),
+                "SELECT *\nFROM orders\nORDER BY amount -- c\nLIMIT 0",
+            ),
+        ] {
+            let given = arguments(given);
+            let recording = Recording {
+                name: "top_orders",
+                on: "orders",
+                arguments: &given,
+            };
+            assert_eq!(
+                limit_rows_sql(&recording),
+                format!("CREATE OR REPLACE TABLE \"top_orders\" AS\n{query};\n")
+            );
+        }
+    }
+
+    #[test]
+    fn typed_arguments_turn_an_integer_argument_into_an_integer_and_leave_the_rest() {
+        let typed = typed_arguments(
+            LIMIT_ROWS,
+            arguments(serde_json::json!({ "count": "2", "order_by": "1" })),
+        );
+        assert_eq!(
+            serde_json::Value::Object(typed),
+            serde_json::json!({ "count": 2, "order_by": "1" })
+        );
+        for (given, typed) in [
+            ("+2", serde_json::json!(2)),
+            (
+                "9223372036854775808",
+                serde_json::json!(9_223_372_036_854_775_808_u64),
+            ),
+            ("100000000000000000000", serde_json::json!(1e20)),
+            (&"9".repeat(400), serde_json::json!(f64::MAX)),
+            (
+                &format!("-{}", "9".repeat(400)),
+                serde_json::json!(-f64::MAX),
+            ),
+        ] {
+            assert_eq!(
+                typed_arguments(LIMIT_ROWS, arguments(serde_json::json!({ "count": given })))["count"],
+                typed,
+                "{given:?}"
+            );
+        }
+        for (operation, given) in [
+            (LIMIT_ROWS, serde_json::json!({ "count": "ten" })),
+            (LIMIT_ROWS, serde_json::json!({ "count": "2.5" })),
+            (LIMIT_ROWS, serde_json::json!({ "count": " 2" })),
+            (LIMIT_ROWS, serde_json::json!({ "count": "1e3" })),
+            (LIMIT_ROWS, serde_json::json!({ "count": "+" })),
+            (FILTER_ROWS, serde_json::json!({ "where": "2" })),
+            ("no-such-operation", serde_json::json!({ "count": "2" })),
+        ] {
+            let typed = typed_arguments(operation, arguments(given.clone()));
+            assert_eq!(serde_json::Value::Object(typed), given, "{operation}");
+        }
+    }
+
+    #[test]
+    fn a_count_below_its_minimum_or_not_an_integer_is_refused_naming_count() {
+        let op = operation(LIMIT_ROWS).unwrap();
+        for (given, named) in [
+            (
+                serde_json::json!({ "count": -1 }),
+                "the argument `count` of `limit-rows` has a minimum of 0, not -1",
+            ),
+            (
+                serde_json::json!({ "count": 9_223_372_036_854_775_808_u64 }),
+                "the argument `count` of `limit-rows` has a maximum of 9223372036854775807, \
+                 not 9223372036854775808",
+            ),
+            (
+                serde_json::json!({ "count": 1e20 }),
+                "the argument `count` of `limit-rows` has a maximum of 9223372036854775807",
+            ),
+            (
+                serde_json::json!({ "count": f64::MAX }),
+                "the argument `count` of `limit-rows` has a maximum of 9223372036854775807",
+            ),
+            (
+                serde_json::json!({ "count": "ten" }),
+                "the argument `count` of `limit-rows` is an integer",
+            ),
+            (
+                serde_json::json!({ "count": 2.5 }),
+                "the argument `count` of `limit-rows` is an integer",
+            ),
+            (
+                serde_json::json!({ "order_by": "amount" }),
+                "`limit-rows` needs the argument `count`",
+            ),
+        ] {
+            let err = op
+                .admit(&arguments(given.clone()))
+                .expect_err(named)
+                .to_string();
+            assert!(
+                err.contains(named),
+                "{given} was refused with another message: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_limit_order_is_admitted_unless_it_brings_a_clause_the_limit_cannot_follow() {
+        let op = operation(LIMIT_ROWS).unwrap();
+        for order_by in [
+            "amount desc",
+            "amount -- c",
+            "2 desc",
+            "amount, id desc NULLS LAST",
+        ] {
+            let admitted = op.admit(&arguments(
+                serde_json::json!({ "count": 2, "order_by": order_by }),
+            ));
+            assert!(admitted.is_ok(), "{order_by:?} was refused: {admitted:?}");
+        }
+        assert!(
+            op.admit(&arguments(serde_json::json!({ "count": 2 })))
+                .is_ok()
+        );
+        for order_by in [
+            "amount LIMIT 1",
+            "amount OFFSET 2",
+            "amount LIMIT 1 OFFSET 2",
+        ] {
+            let err = op
+                .admit(&arguments(
+                    serde_json::json!({ "count": 2, "order_by": order_by }),
+                ))
+                .expect_err(order_by)
+                .to_string();
+            assert!(
+                err.contains(
+                    "the order `order_by` of `limit-rows` does not read as one `ORDER BY` the step's `LIMIT` can follow"
+                ),
+                "{order_by:?} was refused with another message: {err}"
+            );
+        }
+        for order_by in ["amount; DROP TABLE orders", "amount desc;"] {
+            let err = op
+                .admit(&arguments(
+                    serde_json::json!({ "count": 2, "order_by": order_by }),
+                ))
+                .expect_err(order_by)
+                .to_string();
+            assert!(
+                err.contains(
+                    "the order `order_by` holds a `;` outside a string or a comment, \
+                     which would end the step's statement and begin another"
+                ),
+                "{order_by:?} was refused with another message: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_fill_takes_a_required_column_and_value_and_no_other_key() {
+        let schema = fill_nulls_parameters();
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["column", "value"]),
+            "`column` and `value` are not the required parameters"
+        );
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::json!(false),
+            "the schema is open to a key it does not name"
+        );
+        assert_eq!(
+            schema["properties"].as_object().map(|p| p.len()),
+            Some(2),
+            "the schema takes a parameter besides `column` and `value`"
+        );
+        for (key, kind) in [("column", "column"), ("value", "expression")] {
+            let property = &schema["properties"][key];
+            assert_eq!(property["type"], "string", "`{key}` is not a string");
+            assert_eq!(property["x-kind"], kind, "`{key}` is not marked a {kind}");
+        }
+        let value = schema["properties"]["value"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            value.contains("SQL expression") && value.contains("fails the run"),
+            "`value` does not say it is SQL, or that a type DuckDB cannot combine fails the run: {value}"
+        );
+    }
+
+    #[test]
+    fn the_fill_replaces_the_column_with_its_coalesce_with_the_value() {
+        let arguments = arguments(serde_json::json!({ "column": "order", "value": "0" }));
+        let recording = Recording {
+            name: "filled_orders",
+            on: "orders",
+            arguments: &arguments,
+        };
+        assert_eq!(
+            fill_nulls_sql(&recording),
+            "CREATE OR REPLACE TABLE \"filled_orders\" AS\nSELECT * REPLACE (coalesce(\"order\", 0) AS \"order\")\nFROM orders;\n"
+        );
+    }
+
+    #[test]
+    fn a_fill_value_duckdb_reads_as_one_expression_is_admitted() {
+        let op = operation(FILL_NULLS).unwrap();
+        for value in ["0", "'unknown'", "id", "amount * 2", "NULL"] {
+            let admitted = op.admit(&arguments(
+                serde_json::json!({ "column": "amount", "value": value }),
+            ));
+            assert!(admitted.is_ok(), "{value:?} was refused: {admitted:?}");
+        }
+    }
+
+    #[test]
+    fn a_fill_value_that_is_not_one_expression_is_refused_naming_value() {
+        let op = operation(FILL_NULLS).unwrap();
+        for (value, named) in [
+            ("0 --", "the expression `value` of `fill-nulls`"), // a comment that swallows the close
+            ("0) , (1", "the expression `value` of `fill-nulls`"), // parentheses that close the coalesce
+            ("0; DROP TABLE orders", "the expression `value` holds a `;`"),
+            ("0;", "the expression `value` holds a `;`"), // a `;` that ends the step early
+            ("ALL 0", "the expression `value` of `fill-nulls`"), // `ALL` does not parse in the coalesce
+            (
+                "*",
+                "the expression `value` of `fill-nulls` expands to several columns",
+            ),
+            (
+                "unnest([1])",
+                "the expression `value` of `fill-nulls` changes the number of rows",
+            ),
+        ] {
+            let err = op
+                .admit(&arguments(
+                    serde_json::json!({ "column": "amount", "value": value }),
+                ))
+                .expect_err(value)
+                .to_string();
+            assert!(
+                err.contains(named),
+                "{value:?} was refused with another message: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fragment_holding_the_sentinel_in_any_case_is_refused() {
+        for expression in ["__arc_probe", "amount AS __ARC_PROBE", "'__Arc_Probe'"] {
+            let err = probed(DERIVE_COLUMN, "expression", EXPRESSION, expression)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("holds `__arc_probe`"),
+                "{expression:?} was refused with another message: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_probe_is_bare_only_when_it_lists_items_and_does_nothing_else() {
+        assert_eq!(
+            probe_items("SELECT 1 AS a, 2 AS b").map(|i| i.len()),
+            Some(2)
+        );
+        let con = duckdb::Connection::open_in_memory().unwrap();
+        assert!(bare_select(&tree(&con, "SELECT amount * 2, note").unwrap()));
+        for probe in [
+            "SELECT 1 FROM orders",
+            "SELECT 1 WHERE true",
+            "SELECT 1 GROUP BY 1",
+            "SELECT 1 GROUP BY ALL",
+            "SELECT 1 HAVING true",
+            "SELECT 1 QUALIFY true",
+            "SELECT 1 USING SAMPLE 1",
+            "SELECT 1 ORDER BY 1",
+            "SELECT 1 LIMIT 1",
+            "SELECT DISTINCT 1",
+            "WITH c AS (SELECT 1) SELECT 1",
+            "SELECT 1 UNION SELECT 2",
+            "SELECT 1; SELECT 2",
+            "SELECT 1)",
+            "DROP TABLE orders",
+        ] {
+            assert!(probe_items(probe).is_none(), "{probe:?} was read as bare");
+        }
+    }
+
     // ------------------------------------------------- recording an operation
 
     /// An operation with the given `parameters`, whose SQL is its `where`.
@@ -2569,7 +5028,35 @@ mod tests {
             parameters,
             sql: |recording| recording.text("where").to_string(),
             recognised: None,
+            checks: None,
         }
+    }
+
+    #[test]
+    fn an_argument_given_without_one_it_depends_on_is_refused_naming_both() {
+        let op = operation_taking(|| {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "from": { "type": "string" }, "to": { "type": "string" } },
+                "dependentRequired": { "from": ["to"] },
+            })
+        });
+        assert!(
+            op.admit(&arguments(serde_json::json!({ "to": "b" })))
+                .is_ok()
+        );
+        assert!(
+            op.admit(&arguments(serde_json::json!({ "from": "a", "to": "b" })))
+                .is_ok()
+        );
+        let err = op
+            .admit(&arguments(serde_json::json!({ "from": "a" })))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("the argument `from` of `test-op` needs `to` as well"),
+            "the refusal does not name both arguments: {err}"
+        );
     }
 
     fn arguments(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
@@ -2756,6 +5243,128 @@ mod tests {
         // as an ordinary name is. Quoting each keyword reddens each of these.
         assert_eq!(from_ident("data"), "data");
         assert_eq!(from_ident("Data"), "Data");
+    }
+
+    /// Each word `duckdb_keywords()` lists, as listed and in upper case, names a
+    /// column, and a hide of it is a step DuckDB runs that leaves out that column
+    /// and no other. A column written bare where DuckDB does not read it bare as
+    /// that column reddens this, with the word and the step it wrote.
+    #[test]
+    fn a_hide_of_a_column_named_with_each_keyword_duckdb_lists_leaves_out_that_column() {
+        let con = duckdb::Connection::open_in_memory().unwrap();
+        let listed: Vec<String> = con
+            .prepare("SELECT keyword_name FROM duckdb_keywords()")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|word| word.unwrap())
+            .collect();
+        for word in listed
+            .iter()
+            .flat_map(|word| [word.clone(), word.to_uppercase()])
+        {
+            let named = if word.eq_ignore_ascii_case("kept") {
+                "other"
+            } else {
+                "kept"
+            };
+            con.execute_batch(&format!(
+                "CREATE OR REPLACE TABLE t AS SELECT 7 AS \"{named}\", 8 AS \"{word}\""
+            ))
+            .unwrap_or_else(|e| panic!("DuckDB makes no column called {word:?}: {e}"));
+            let arguments = serde_json::json!({ "column": word })
+                .as_object()
+                .unwrap()
+                .clone();
+            let step = hide_column_sql(&Recording {
+                name: "hidden",
+                on: "t",
+                arguments: &arguments,
+            });
+            con.execute_batch(&step).unwrap_or_else(|e| {
+                panic!("hide-column of a column named {word:?} does not run:\n{step}\n{e}")
+            });
+            let columns: Vec<String> = con
+                .prepare("SELECT name FROM pragma_table_info('hidden')")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(|name| name.unwrap())
+                .collect();
+            assert_eq!(
+                columns,
+                [named],
+                "hide-column of a column named {word:?} left the wrong columns:\n{step}"
+            );
+        }
+    }
+
+    /// Each word `duckdb_keywords()` lists, as listed and in upper case, names a
+    /// column, and a rename of it is a step DuckDB runs: with the word as the old
+    /// name, from a table made with it, and as the new name, for a column called
+    /// something else. Either way the columns that result are the two, the renamed
+    /// one in its place. A name written bare where DuckDB does not read it bare as
+    /// that column reddens this, with the word and the step it wrote.
+    #[test]
+    fn a_rename_of_a_column_named_with_each_keyword_duckdb_lists_renames_that_column() {
+        let con = duckdb::Connection::open_in_memory().unwrap();
+        let listed: Vec<String> = con
+            .prepare("SELECT keyword_name FROM duckdb_keywords()")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|word| word.unwrap())
+            .collect();
+        for word in listed
+            .iter()
+            .flat_map(|word| [word.clone(), word.to_uppercase()])
+        {
+            let other = if word.eq_ignore_ascii_case("kept") {
+                "other"
+            } else {
+                "kept"
+            };
+            // (the table's columns, the column renamed, its new name, the result)
+            let cases = [
+                (
+                    [word.as_str(), other],
+                    word.as_str(),
+                    "fresh",
+                    ["fresh", other],
+                ),
+                ([other, "old"], "old", word.as_str(), [other, word.as_str()]),
+            ];
+            for (made, column, to, expected) in cases {
+                con.execute_batch(&format!(
+                    "CREATE OR REPLACE TABLE t AS SELECT 7 AS \"{}\", 8 AS \"{}\"",
+                    made[0], made[1]
+                ))
+                .unwrap_or_else(|e| panic!("DuckDB makes no column called {word:?}: {e}"));
+                let arguments = serde_json::json!({ "column": column, "to": to })
+                    .as_object()
+                    .unwrap()
+                    .clone();
+                let step = rename_column_sql(&Recording {
+                    name: "renamed",
+                    on: "t",
+                    arguments: &arguments,
+                });
+                con.execute_batch(&step).unwrap_or_else(|e| {
+                    panic!("rename-column of {column:?} to {to:?} does not run:\n{step}\n{e}")
+                });
+                let columns: Vec<String> = con
+                    .prepare("SELECT name FROM pragma_table_info('renamed')")
+                    .unwrap()
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .map(|name| name.unwrap())
+                    .collect();
+                assert_eq!(
+                    columns, expected,
+                    "rename-column of {column:?} to {to:?} left the wrong columns:\n{step}"
+                );
+            }
+        }
     }
 
     /// Each word `duckdb_keywords()` lists, as listed and in upper case, names a
