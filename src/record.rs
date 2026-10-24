@@ -943,7 +943,7 @@ const CATALOGUE: &[Operation] = &[
                 required: false,
                 of: Some("table"),
                 min_items: None,
-                description: "A column the rows are grouped by or summarised over; the arguments may name others.",
+                description: "A column the rows are grouped by or summarised over, which `group_by` or `aggregates` may name with others.",
             },
         ],
         writes: &[STEP_TABLE],
@@ -1346,15 +1346,17 @@ fn summarise_rows_parameters() -> serde_json::Value {
                 "type": "string",
                 "description": "What each row of the summary holds: a SQL select list of aggregates, \
                     recorded as written, each item of which may carry an alias \
-                    (`count(*) AS n, sum(amount) AS total`).",
+                    (`count(*) AS n, sum(amount) AS total`). \
+                    A column neither aggregated nor in `group_by` fails the run.",
                 "x-kind": "select-list",
             },
             "group_by": {
                 "type": "string",
                 "description": "What the rows are grouped by: a SQL select list, recorded as written, \
                     each item of which may carry an alias (`date_trunc('month', at) AS month`). \
-                    The step groups by every item (`GROUP BY ALL`) and gives one row for each group, \
-                    the items first; without it, the step gives one row for the whole table.",
+                    The step groups by each item by its place (`GROUP BY 1, 2`) and gives one row for each group, \
+                    the items first, so an aggregate here fails the run; \
+                    without it, the step gives one row for the whole table (`GROUP BY ()`).",
                 "x-kind": "select-list",
             }
         },
@@ -1363,32 +1365,40 @@ fn summarise_rows_parameters() -> serde_json::Value {
 }
 
 /// The SQL step of [`SUMMARISE_ROWS`]: a table named for the step, holding the
-/// `group_by` items and then the `aggregates`, grouped by every `group_by` item
-/// through `GROUP BY ALL`; or, without `group_by`, the `aggregates` alone over the
-/// whole table, one row. The table read is written as [`from_ident`] writes it,
-/// and both lists as given.
+/// `group_by` items and then the `aggregates`, grouped by each `group_by` item by
+/// its place, `GROUP BY 1, 2, …`; or, without `group_by`, the `aggregates` alone
+/// grouped by nothing, `GROUP BY ()`, one row for the whole table. The table read
+/// is written as [`from_ident`] writes it, and both lists as given.
 ///
-/// `GROUP BY ALL` groups by every item of the select list that holds no
-/// aggregate, so a grouping item may carry an alias, and the grouping is not
-/// written twice. Its one statement is enough: DuckDB fails the run when an item
-/// of `aggregates` is neither an aggregate nor grouped, and arc does not open the
-/// database when it records.
+/// The grouping is written by place so that a grouping item may carry an alias
+/// and is not written twice, and so that it holds the `group_by` items and nothing
+/// else: DuckDB fails the run when an item of `aggregates` is a column neither
+/// aggregated nor grouped, or when an item of `group_by` is an aggregate. The
+/// number of places is the number of items DuckDB reads in `group_by`'s own probe,
+/// asked again here through [`probe_items`], so it counts what the gate admitted
+/// and not commas. `GROUP BY ()` holds a window alone, `count(*) OVER ()`, to one
+/// row, and fails the run on a bare column, as a grouping would. arc does not
+/// open the database when it records, so neither failure can be refused then.
 fn summarise_rows_sql(recording: &Recording) -> String {
-    let query = match recording.arguments.get("group_by").and_then(|v| v.as_str()) {
-        Some(group_by) => format!(
-            "SELECT {group_by}, {}\nFROM {}\nGROUP BY ALL",
-            recording.text("aggregates"),
-            from_ident(recording.on),
-        ),
-        None => format!(
-            "SELECT {}\nFROM {}",
-            recording.text("aggregates"),
-            from_ident(recording.on),
-        ),
+    let grouped = recording.arguments.get("group_by").and_then(|v| v.as_str());
+    let (select, group_by) = match grouped {
+        Some(group_by) => {
+            // The arguments are admitted before the SQL is written, so the probe
+            // reads; its last item is the sentinel, not one of `group_by`'s.
+            let items = probe_items(&(SELECT_LIST.probe)(group_by))
+                .expect("an admitted `group_by` reads as a select list")
+                .len()
+                - 1;
+            let places: Vec<String> = (1..=items).map(|place| place.to_string()).collect();
+            (format!("{group_by}, "), places.join(", "))
+        }
+        None => (String::new(), "()".to_string()),
     };
     format!(
-        "CREATE OR REPLACE TABLE {} AS\n{query};\n",
-        quote_ident(recording.name)
+        "CREATE OR REPLACE TABLE {} AS\nSELECT {select}{}\nFROM {}\nGROUP BY {group_by};\n",
+        quote_ident(recording.name),
+        recording.text("aggregates"),
+        from_ident(recording.on),
     )
 }
 
@@ -2313,7 +2323,9 @@ const EXPRESSION: Probe = Probe {
 /// items, each with an alias. `count(*) FROM other` and `a UNION SELECT b` are not
 /// a bare select, and `count(*) AS n -- all` swallows the sentinel item. A star
 /// would widen the list to every column of the table, and an `unnest` would change
-/// the number of rows the step groups or summarises, so each is refused.
+/// the number of rows the step groups or summarises, so each is refused. The
+/// number of items DuckDB reads before the sentinel is the number
+/// [`summarise_rows_sql`] groups by.
 const SELECT_LIST: Probe = Probe {
     noun: "select list",
     probe: |value| format!("SELECT {value}, 1 AS {SENTINEL}"),
@@ -2356,7 +2368,8 @@ const TYPE: Probe = Probe {
 /// written into: `Ok`, or why not. A star — `*`, `orders.*`, `* EXCLUDE (..)`,
 /// `COLUMNS(..)`, alone or inside a function — and a `*COLUMNS(..)` unpacked into
 /// a call read as one item in the probe but expand to several columns in the
-/// step; an `unnest` or an `unlist` gives several rows for one. A subquery is not
+/// step; an `unnest`, an `unlist` or a `generate_subscripts` gives several rows
+/// for one, the last a row for each index of a list. A subquery is not
 /// looked inside: its star reads its own `FROM`, and it gives one value, so
 /// `EXISTS (SELECT * FROM orders)` is admitted. `count(*)` holds no star node.
 /// Each probe that walks an item says in its own words what the [`Spread`] would
@@ -2372,7 +2385,9 @@ fn one_value_per_row(node: &serde_json::Value) -> std::result::Result<(), Spread
             }
             if node["class"] == "FUNCTION"
                 && node["function_name"].as_str().is_some_and(|name| {
-                    name.eq_ignore_ascii_case("unnest") || name.eq_ignore_ascii_case("unlist")
+                    ["unnest", "unlist", "generate_subscripts"]
+                        .iter()
+                        .any(|spreading| name.eq_ignore_ascii_case(spreading))
                 })
             {
                 return Err(Spread::Rows);
@@ -2390,7 +2405,7 @@ enum Spread {
     /// A star or an unpacked `COLUMNS(..)`: one item in the probe, several
     /// columns in the step.
     Columns,
-    /// An `unnest` or an `unlist`: several rows for one.
+    /// An `unnest`, an `unlist` or a `generate_subscripts`: several rows for one.
     Rows,
 }
 
@@ -3608,6 +3623,10 @@ mod tests {
             ("concat(*COLUMNS(*))", "expands to several columns"),
             ("unnest([1, 2])", "changes the number of rows"),
             ("UNLIST([1, 2]) + 1", "changes the number of rows"),
+            (
+                "generate_subscripts([1, 2], 1)",
+                "changes the number of rows",
+            ),
         ] {
             let err = probed(DERIVE_COLUMN, "expression", EXPRESSION, expression)
                 .unwrap_err()
@@ -3694,13 +3713,13 @@ mod tests {
         assert!(
             schema["properties"]["group_by"]["description"]
                 .as_str()
-                .is_some_and(|d| d.contains("GROUP BY ALL")),
-            "`group_by` does not say the step groups by every item"
+                .is_some_and(|d| d.contains("GROUP BY 1, 2") && d.contains("GROUP BY ()")),
+            "`group_by` does not say how the step groups with and without it"
         );
     }
 
     #[test]
-    fn the_summary_groups_by_all_when_given_a_group_by_and_reads_the_whole_table_without() {
+    fn the_summary_groups_by_the_places_of_its_group_by_or_by_nothing_without_one() {
         let grouped = arguments(serde_json::json!({
             "group_by": "amount > 100 AS big",
             "aggregates": "count(*) AS n",
@@ -3712,7 +3731,7 @@ mod tests {
         };
         assert_eq!(
             summarise_rows_sql(&recording),
-            "CREATE OR REPLACE TABLE \"order_counts\" AS\nSELECT amount > 100 AS big, count(*) AS n\nFROM orders\nGROUP BY ALL;\n"
+            "CREATE OR REPLACE TABLE \"order_counts\" AS\nSELECT amount > 100 AS big, count(*) AS n\nFROM orders\nGROUP BY 1;\n"
         );
         let whole = arguments(serde_json::json!({ "aggregates": "count(*) AS n" }));
         let recording = Recording {
@@ -3722,7 +3741,20 @@ mod tests {
         };
         assert_eq!(
             summarise_rows_sql(&recording),
-            "CREATE OR REPLACE TABLE \"order_counts\" AS\nSELECT count(*) AS n\nFROM orders;\n"
+            "CREATE OR REPLACE TABLE \"order_counts\" AS\nSELECT count(*) AS n\nFROM orders\nGROUP BY ();\n"
+        );
+        let two = arguments(serde_json::json!({
+            "group_by": "amount > 100 AS big, concat(note, ',') AS tagged",
+            "aggregates": "count(*) AS n",
+        }));
+        let recording = Recording {
+            name: "order_counts",
+            on: "orders",
+            arguments: &two,
+        };
+        assert!(
+            summarise_rows_sql(&recording).contains("\nGROUP BY 1, 2;\n"),
+            "a group_by of two items, one holding a comma in a string, is not grouped by two places"
         );
     }
 
@@ -3797,6 +3829,10 @@ mod tests {
             ("count(*) AS n -- all", "is not one SQL select list"),
             ("note, *", "has an item that expands to several columns"),
             ("unnest([1, 2])", "changes the number of rows"),
+            (
+                "generate_subscripts([1, 2], 1) AS i",
+                "changes the number of rows",
+            ),
         ] {
             let err = probed(SUMMARISE_ROWS, "group_by", SELECT_LIST, list)
                 .unwrap_err()

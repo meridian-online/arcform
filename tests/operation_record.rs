@@ -1005,7 +1005,7 @@ fn record_summary_writes_the_grouped_model_and_arc_run_gives_one_row_for_each_gr
     );
     assert_eq!(
         protocol.read("models/02_order_counts.sql"),
-        "-- generated: summarise-rows on orders\nCREATE OR REPLACE TABLE \"order_counts\" AS\nSELECT amount > 100 AS big, count(*) AS n\nFROM orders\nGROUP BY ALL;\n"
+        "-- generated: summarise-rows on orders\nCREATE OR REPLACE TABLE \"order_counts\" AS\nSELECT amount > 100 AS big, count(*) AS n\nFROM orders\nGROUP BY 1;\n"
     );
     ok(&protocol.arc(&["run"]), "arc run");
     let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
@@ -1028,7 +1028,7 @@ fn record_summary_without_a_group_by_gives_one_row_for_the_whole_table() {
     );
     assert_eq!(
         protocol.read("models/02_order_counts.sql"),
-        "-- generated: summarise-rows on orders\nCREATE OR REPLACE TABLE \"order_counts\" AS\nSELECT count(*) AS n\nFROM orders;\n"
+        "-- generated: summarise-rows on orders\nCREATE OR REPLACE TABLE \"order_counts\" AS\nSELECT count(*) AS n\nFROM orders\nGROUP BY ();\n"
     );
     ok(&protocol.arc(&["run"]), "arc run");
     let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
@@ -1040,6 +1040,88 @@ fn record_summary_without_a_group_by_gives_one_row_for_the_whole_table() {
         .map(Result::unwrap)
         .collect();
     assert_eq!(rows, [4]);
+}
+
+#[test]
+fn a_group_by_of_two_items_is_grouped_by_both_places() {
+    let protocol = Protocol::new();
+    ok(
+        &record_summary(
+            &protocol,
+            "count(*) AS n",
+            Some("amount > 100 AS big, note"),
+        ),
+        "arc operation record summarise-rows",
+    );
+    assert!(
+        protocol
+            .read("models/02_order_counts.sql")
+            .contains("\nGROUP BY 1, 2;\n"),
+        "the model does not group by both places"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    let rows: i64 = db
+        .query_row("SELECT count(*) FROM order_counts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 4, "each (big, note) pair of orders is its own group");
+}
+
+#[test]
+fn a_column_in_the_aggregates_that_is_not_grouped_records_and_fails_the_run() {
+    let protocol = Protocol::new();
+    ok(
+        &record_summary(
+            &protocol,
+            "count(*) AS n, note",
+            Some("amount > 100 AS big"),
+        ),
+        "arc operation record summarise-rows",
+    );
+    let out = protocol.arc(&["run"]);
+    assert!(
+        !out.status.success(),
+        "arc run of an ungrouped column exited 0"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("GROUP BY"),
+        "the failed run does not say note is not in the GROUP BY:\n{stderr}"
+    );
+}
+
+#[test]
+fn a_bare_column_summarised_over_the_whole_table_fails_the_run() {
+    let protocol = Protocol::new();
+    ok(
+        &record_summary(&protocol, "note", None),
+        "arc operation record summarise-rows",
+    );
+    let out = protocol.arc(&["run"]);
+    assert!(!out.status.success(), "arc run of a bare column exited 0");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("GROUP BY"),
+        "the failed run does not say note is not grouped:\n{stderr}"
+    );
+}
+
+#[test]
+fn a_window_summarised_over_the_whole_table_gives_one_row() {
+    let protocol = Protocol::new();
+    ok(
+        &record_summary(&protocol, "count(*) OVER () AS n", None),
+        "arc operation record summarise-rows",
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    let rows: i64 = db
+        .query_row("SELECT count(*) FROM order_counts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        rows, 1,
+        "a window over the whole table gave a row for each row"
+    );
 }
 
 #[test]
