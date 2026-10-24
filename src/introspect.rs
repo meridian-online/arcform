@@ -132,8 +132,7 @@ enum CopyOptionValue {
 }
 
 /// What a `COPY … TO 'filename'` writes: a URL is remote, otherwise it is decided from
-/// the statement's own options
-/// against [`DIRECTORY_WRITING_COPY_OPTIONS`].
+/// the statement's own options against [`DIRECTORY_WRITING_COPY_OPTIONS`].
 fn copy_to_target_kind(target: &str, options: &[(String, CopyOptionValue)]) -> AssetKind {
     if crate::asset_kind::is_remote(target) {
         return AssetKind::Remote;
