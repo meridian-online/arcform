@@ -721,7 +721,7 @@ fn record_rename_writes_the_model_and_arc_run_renames_the_column_in_place() {
     );
     assert_eq!(
         protocol.read("models/02_relabelled.sql"),
-        "-- generated: rename-column on orders\nCREATE OR REPLACE TABLE \"relabelled\" AS\nSELECT * RENAME (note AS label)\nFROM orders;\n"
+        "-- generated: rename-column on orders\nCREATE OR REPLACE TABLE \"relabelled\" AS\nSELECT *\nFROM orders;\nALTER TABLE \"relabelled\" RENAME COLUMN note TO label;\n"
     );
     ok(&protocol.arc(&["run"]), "arc run");
     assert_eq!(
@@ -738,6 +738,39 @@ fn record_rename_writes_the_model_and_arc_run_renames_the_column_in_place() {
         .map(Result::unwrap)
         .collect();
     assert_eq!(labels, ["a;b", "abc", "xyz", "a"], "the values were kept");
+}
+
+#[test]
+fn a_rename_of_a_column_the_table_lacks_or_onto_one_it_has_records_and_fails_the_run() {
+    for (args, named) in [
+        (["column=nte", "to=label"], "nte"),
+        (["column=note", "to=id"], "id"),
+    ] {
+        let protocol = Protocol::new();
+        ok(
+            &protocol.arc(&[
+                "operation",
+                "record",
+                "rename-column",
+                "--on",
+                "orders",
+                "--name",
+                "relabelled",
+                "--arg",
+                args[0],
+                "--arg",
+                args[1],
+            ]),
+            "arc operation record rename-column",
+        );
+        let out = protocol.arc(&["run"]);
+        assert!(!out.status.success(), "arc run of {args:?} exited 0");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(named),
+            "the failed run does not name {named}:\n{stderr}"
+        );
+    }
 }
 
 // ------------------------------------------------- the directory `--dir` names

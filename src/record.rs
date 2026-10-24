@@ -1095,16 +1095,24 @@ fn rename_column_parameters() -> serde_json::Value {
 }
 
 /// The SQL step of [`RENAME_COLUMN`]: a table named for the step, holding every
-/// row and every column of the table it is applied to, the one named by `column`
-/// under the name `to` and in the place it held. The table read is written as
-/// [`from_ident`] writes it, and each column as [`column_ident`] does.
+/// row and every column of the table it is applied to, then an `ALTER TABLE` that
+/// renames the column named by `column` to `to`, in the place it held. The table
+/// read is written as [`from_ident`] writes it, and each column as
+/// [`column_ident`] does.
+///
+/// It is two statements and not `SELECT * RENAME (..)` because that clause is
+/// silent where a rename should fail: a `column` the table does not have renames
+/// nothing, and a `to` that names another column gives the column a suffixed
+/// name (`id_1`) rather than refusing. `ALTER TABLE .. RENAME COLUMN` makes
+/// DuckDB refuse both when the step runs, and the run stops at the first
+/// statement that fails.
 fn rename_column_sql(recording: &Recording) -> String {
+    let table = quote_ident(recording.name);
     format!(
-        "CREATE OR REPLACE TABLE {} AS\nSELECT * RENAME ({} AS {})\nFROM {};\n",
-        quote_ident(recording.name),
+        "CREATE OR REPLACE TABLE {table} AS\nSELECT *\nFROM {};\nALTER TABLE {table} RENAME COLUMN {} TO {};\n",
+        from_ident(recording.on),
         recording.column("column"),
         recording.column("to"),
-        from_ident(recording.on),
     )
 }
 
@@ -2891,7 +2899,7 @@ mod tests {
     }
 
     #[test]
-    fn the_rename_writes_both_names_into_a_rename_of_every_column() {
+    fn the_rename_copies_the_table_then_renames_the_column_with_an_alter() {
         let arguments = arguments(serde_json::json!({ "column": "note", "to": "order" }));
         let recording = Recording {
             name: "relabelled",
@@ -2900,7 +2908,7 @@ mod tests {
         };
         assert_eq!(
             rename_column_sql(&recording),
-            "CREATE OR REPLACE TABLE \"relabelled\" AS\nSELECT * RENAME (note AS \"order\")\nFROM orders;\n"
+            "CREATE OR REPLACE TABLE \"relabelled\" AS\nSELECT *\nFROM orders;\nALTER TABLE \"relabelled\" RENAME COLUMN note TO \"order\";\n"
         );
     }
 
@@ -3180,6 +3188,74 @@ mod tests {
                 [named],
                 "hide-column of a column named {word:?} left the wrong columns:\n{step}"
             );
+        }
+    }
+
+    /// Each word `duckdb_keywords()` lists, as listed and in upper case, names a
+    /// column, and a rename of it is a step DuckDB runs: with the word as the old
+    /// name, from a table made with it, and as the new name, for a column called
+    /// something else. Either way the columns that result are the two, the renamed
+    /// one in its place. A name written bare where DuckDB does not read it bare as
+    /// that column reddens this, with the word and the step it wrote.
+    #[test]
+    fn a_rename_of_a_column_named_with_each_keyword_duckdb_lists_renames_that_column() {
+        let con = duckdb::Connection::open_in_memory().unwrap();
+        let listed: Vec<String> = con
+            .prepare("SELECT keyword_name FROM duckdb_keywords()")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|word| word.unwrap())
+            .collect();
+        for word in listed
+            .iter()
+            .flat_map(|word| [word.clone(), word.to_uppercase()])
+        {
+            let other = if word.eq_ignore_ascii_case("kept") {
+                "other"
+            } else {
+                "kept"
+            };
+            // (the table's columns, the column renamed, its new name, the result)
+            let cases = [
+                (
+                    [word.as_str(), other],
+                    word.as_str(),
+                    "fresh",
+                    ["fresh", other],
+                ),
+                ([other, "old"], "old", word.as_str(), [other, word.as_str()]),
+            ];
+            for (made, column, to, expected) in cases {
+                con.execute_batch(&format!(
+                    "CREATE OR REPLACE TABLE t AS SELECT 7 AS \"{}\", 8 AS \"{}\"",
+                    made[0], made[1]
+                ))
+                .unwrap_or_else(|e| panic!("DuckDB makes no column called {word:?}: {e}"));
+                let arguments = serde_json::json!({ "column": column, "to": to })
+                    .as_object()
+                    .unwrap()
+                    .clone();
+                let step = rename_column_sql(&Recording {
+                    name: "renamed",
+                    on: "t",
+                    arguments: &arguments,
+                });
+                con.execute_batch(&step).unwrap_or_else(|e| {
+                    panic!("rename-column of {column:?} to {to:?} does not run:\n{step}\n{e}")
+                });
+                let columns: Vec<String> = con
+                    .prepare("SELECT name FROM pragma_table_info('renamed')")
+                    .unwrap()
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .map(|name| name.unwrap())
+                    .collect();
+                assert_eq!(
+                    columns, expected,
+                    "rename-column of {column:?} to {to:?} left the wrong columns:\n{step}"
+                );
+            }
         }
     }
 
