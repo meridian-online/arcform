@@ -616,6 +616,10 @@ const LIMIT_ROWS: &str = "limit-rows";
 /// once as [`FILTER_ROWS`] is.
 const FILL_NULLS: &str = "fill-nulls";
 
+/// The long name of the operation that joins a table to another, written once
+/// as [`FILTER_ROWS`] is.
+const JOIN_TABLES: &str = "join-tables";
+
 /// One SQL operation arc holds: what it is called, what it does, what it reads
 /// and writes, and what it takes — described so that it can be recorded as a
 /// step by name. The catalogue holds the description and nothing that runs.
@@ -646,6 +650,11 @@ pub(crate) struct Operation {
     /// together, and [`LIMIT_ROWS`]' `order_by` is followed by the step's
     /// `LIMIT`, and is probed with it.
     checks: Option<Checks>,
+    /// A check of the tables read taken together, run by the record path once
+    /// [`Operation::admit_reads`] has admitted them, or `None` when each role
+    /// admitted alone is enough. [`JOIN_TABLES`] refuses one table in both its
+    /// roles.
+    reads_checks: Option<fn(&Reads) -> Result<()>>,
     /// What a person is told once the step is recorded, a sentence each, from
     /// the arguments it was recorded with, or `None` for an operation that has
     /// nothing to say. A note is not a refusal: the step is recorded, and the
@@ -681,10 +690,6 @@ pub(crate) struct Recording<'a> {
     on: &'a str,
     /// Every table the operation reads, by role, as [`Operation::admit_reads`]
     /// admitted them.
-    #[expect(
-        dead_code,
-        reason = "each operation arc holds today reads one table, from `on`"
-    )]
     reads: &'a Reads,
     arguments: &'a serde_json::Map<String, serde_json::Value>,
 }
@@ -835,9 +840,9 @@ const STEP_TABLE: Role = Role {
 
 /// Every operation arc holds, in the order `arc operation list` prints them.
 ///
-/// Each of these reads a table, then the column it is asked from. The column is
-/// not required: `arc operation record` records a step from the table and the
-/// arguments alone.
+/// Each of these reads a table, then the column it is asked from, and a join
+/// the table it is joined to after them. The column is not required: `arc
+/// operation record` records a step from the tables and the arguments alone.
 const CATALOGUE: &[Operation] = &[
     Operation {
         long_name: FILTER_ROWS,
@@ -867,6 +872,7 @@ const CATALOGUE: &[Operation] = &[
         sql: filter_rows_sql,
         recognised: Some(filter_rows_recognised),
         checks: None,
+        reads_checks: None,
         notes: None,
     },
     Operation {
@@ -897,6 +903,7 @@ const CATALOGUE: &[Operation] = &[
         sql: sort_rows_sql,
         recognised: None,
         checks: None,
+        reads_checks: None,
         notes: None,
     },
     Operation {
@@ -927,6 +934,7 @@ const CATALOGUE: &[Operation] = &[
         sql: hide_column_sql,
         recognised: None,
         checks: None,
+        reads_checks: None,
         notes: None,
     },
     Operation {
@@ -957,6 +965,7 @@ const CATALOGUE: &[Operation] = &[
         sql: rename_column_sql,
         recognised: None,
         checks: None,
+        reads_checks: None,
         notes: None,
     },
     Operation {
@@ -987,6 +996,7 @@ const CATALOGUE: &[Operation] = &[
         sql: derive_column_sql,
         recognised: None,
         checks: None,
+        reads_checks: None,
         notes: None,
     },
     Operation {
@@ -1017,6 +1027,7 @@ const CATALOGUE: &[Operation] = &[
         sql: cast_column_sql,
         recognised: None,
         checks: None,
+        reads_checks: None,
         notes: None,
     },
     Operation {
@@ -1047,6 +1058,7 @@ const CATALOGUE: &[Operation] = &[
         sql: summarise_rows_sql,
         recognised: None,
         checks: Some(summarise_rows_checks),
+        reads_checks: None,
         notes: None,
     },
     Operation {
@@ -1077,6 +1089,7 @@ const CATALOGUE: &[Operation] = &[
         sql: dedupe_rows_sql,
         recognised: None,
         checks: Some(dedupe_rows_checks),
+        reads_checks: None,
         notes: None,
     },
     Operation {
@@ -1107,6 +1120,7 @@ const CATALOGUE: &[Operation] = &[
         sql: limit_rows_sql,
         recognised: None,
         checks: Some(limit_rows_checks),
+        reads_checks: None,
         notes: None,
     },
     Operation {
@@ -1137,6 +1151,47 @@ const CATALOGUE: &[Operation] = &[
         sql: fill_nulls_sql,
         recognised: None,
         checks: None,
+        reads_checks: None,
+        notes: None,
+    },
+    Operation {
+        long_name: JOIN_TABLES,
+        summary: "Joins a table to another on a key, keeping the rows the join's kind keeps.",
+        reads: &[
+            Role {
+                name: "table",
+                kind: "table",
+                list: false,
+                required: true,
+                of: None,
+                min_items: None,
+                description: "The table joined to `other`, whose columns keep their names.",
+            },
+            Role {
+                name: "column",
+                kind: "column",
+                list: false,
+                required: false,
+                of: Some("table"),
+                min_items: None,
+                description: "A column the join may be on, which `using` or `condition` may name with others.",
+            },
+            Role {
+                name: "other",
+                kind: "table",
+                list: false,
+                required: true,
+                of: None,
+                min_items: None,
+                description: "The table joined to `table`, whose columns come through under `prefix`.",
+            },
+        ],
+        writes: &[STEP_TABLE],
+        parameters: join_tables_parameters,
+        sql: join_tables_sql,
+        recognised: None,
+        checks: Some(join_tables_checks),
+        reads_checks: Some(join_tables_reads_checks),
         notes: None,
     },
 ];
@@ -1953,6 +2008,219 @@ fn fill_nulls_sql(recording: &Recording) -> String {
     )
 }
 
+/// The kinds of join [`JOIN_TABLES`] writes, in the order its `kind` lists
+/// them, each as its own SQL keyword in upper case. The first is the default.
+const JOIN_KINDS: [&str; 7] = ["left", "inner", "right", "full", "semi", "anti", "cross"];
+
+/// The `parameters` schema of [`JOIN_TABLES`]: `kind`, one of [`JOIN_KINDS`],
+/// `left` by default; `using`, a list of at least one column name; `condition`,
+/// a SQL condition; and `prefix`. None is required, and which of `using` and
+/// `condition` a join takes is [`join_tables_checks`]' to hold. Closed to any
+/// other key, as [`hide_column_parameters`] is.
+///
+/// Each item of `using` is a name, not SQL, written through [`column_ident`],
+/// and [`Operation::admit`] checks it as it checks a `column`. `condition` is
+/// annotated as a `condition`, so admit holds it to one statement as it holds
+/// `filter-rows`' `where`. `prefix` is written into a DuckDB rename pattern,
+/// `AS '<prefix>\0'`, so [`join_tables_checks`] refuses what the pattern cannot
+/// carry.
+fn join_tables_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": JOIN_KINDS,
+                "default": JOIN_KINDS[0],
+                "description": "Which rows the join keeps: `left` every row of `table`, `inner` the rows that match, \
+                    `right` every row of `other`, `full` every row of both, `semi` the rows of `table` that match \
+                    and `anti` those that do not, each with `table`'s columns alone, and `cross` every row of \
+                    `table` with every row of `other`, on no key.",
+            },
+            "using": {
+                "type": "array",
+                "items": { "type": "string", "x-kind": "column" },
+                "minItems": 1,
+                "description": "The columns the join is on, which both tables hold under the same name: \
+                    names, not SQL, so a name that needs quotes is given without them. \
+                    On the command line a comma separates them (`using=a,b`), so a name holding a comma \
+                    can be given through `arc mcp` alone. Every kind but `cross` takes this or `condition`.",
+            },
+            "condition": {
+                "type": "string",
+                "description": "When a row of `table` matches a row of `other`: any SQL condition naming both \
+                    tables by their names (`orders.customer_id = customers.id`), recorded as written. \
+                    Every kind but `cross` takes this or `using`.",
+                "x-kind": "condition",
+            },
+            "prefix": {
+                "type": "string",
+                "description": "What each column of `other` is renamed with, put before its name; `<other>_` by default. \
+                    The step cannot know which names clash, so the rule is fixed: `table`'s columns keep their names, \
+                    every column of `other` comes through prefixed, and the `using` keys appear once, bare, first. \
+                    A prefix that is empty or holds a `\\` or a control character is refused, and `semi` and `anti`, \
+                    which keep `table`'s columns alone, take none.",
+            }
+        },
+    })
+}
+
+/// The SQL step of [`JOIN_TABLES`]: a table named for the step, made by the
+/// join of the table it is applied to, `t`, to the table in `other`, `o`, of
+/// the `kind` given, `left` without one. Both tables are written as
+/// [`from_ident`] writes them, the keys of `using` as [`column_ident`] does, and
+/// the condition as given.
+///
+/// - `using`, on `left`, `inner`, `right` and `full`: `SELECT <keys>,
+///   COLUMNS(t.* EXCLUDE (<keys>)), COLUMNS(o.* EXCLUDE (<keys>)) AS
+///   '<prefix>\0' … USING (<keys>)`. The bare keys come first because on a
+///   `right` or `full` join `t.*` gives a null key for a row only `other`
+///   holds, and the bare key is DuckDB's coalesced one.
+/// - `condition`, on the same four: `SELECT t.*, COLUMNS(o.*) AS '<prefix>\0'
+///   … ON <condition>`.
+/// - `semi` and `anti`, on either: `SELECT t.*`, `table`'s columns alone.
+/// - `cross`: `SELECT t.*, COLUMNS(o.*) AS '<prefix>\0' … CROSS JOIN o`.
+///
+/// `COLUMNS(t.*)` names the table as `FROM` writes it, so a quoted name is
+/// quoted in both. The prefix is [`join_prefix`].
+fn join_tables_sql(recording: &Recording) -> String {
+    let kind = recording
+        .arguments
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(JOIN_KINDS[0]);
+    let other = recording.reads.one("other");
+    let (t, o) = (from_ident(recording.on), from_ident(other));
+    let keys = recording
+        .arguments
+        .get("using")
+        .and_then(serde_json::Value::as_array)
+        .map(|keys| {
+            keys.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(column_ident)
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
+    let on = match &keys {
+        Some(keys) => format!(" USING ({keys})"),
+        None if kind == "cross" => String::new(),
+        None => format!(" ON {}", recording.text("condition")),
+    };
+    let prefix = join_prefix(recording.arguments.get("prefix"), other);
+    let select = match (kind, &keys) {
+        ("semi" | "anti", _) => format!("{t}.*"),
+        (_, Some(keys)) => format!(
+            "{keys}, COLUMNS({t}.* EXCLUDE ({keys})), COLUMNS({o}.* EXCLUDE ({keys})) AS '{prefix}\\0'"
+        ),
+        (_, None) => format!("{t}.*, COLUMNS({o}.*) AS '{prefix}\\0'"),
+    };
+    format!(
+        "CREATE OR REPLACE TABLE {} AS\nSELECT {select}\nFROM {t}\n{} JOIN {o}{on};\n",
+        quote_ident(recording.name),
+        kind.to_ascii_uppercase(),
+    )
+}
+
+/// The prefix of a [`JOIN_TABLES`] step as it is written inside the single
+/// quotes of DuckDB's rename pattern `'<prefix>\0'`: the `prefix` given, its
+/// `'` doubled, or `<other>_` without one, its `\` written `\\`, which the
+/// pattern reads as one `\`, and its `'` doubled. A given prefix holding a
+/// `\` is refused by [`join_tables_checks`] rather than escaped, so a prefix
+/// reads the same in the arguments and in the step.
+fn join_prefix(given: Option<&serde_json::Value>, other: &str) -> String {
+    match given.and_then(serde_json::Value::as_str) {
+        Some(prefix) => prefix.replace('\'', "''"),
+        None => format!("{other}_")
+            .replace('\\', "\\\\")
+            .replace('\'', "''"),
+    }
+}
+
+/// Whether the arguments of [`JOIN_TABLES`] make one join: exactly one of
+/// `using` and `condition` for every kind but `cross`, which takes neither; no
+/// `prefix` on `semi` or `anti`, which keep `table`'s columns alone; a `prefix`
+/// that is not empty and holds no `\` or control character, which the rename
+/// pattern it is written into cannot carry as written; and a `condition` that,
+/// once [`Operation::admit`] has held it to one statement, leaves `… JOIN <other>
+/// ON <condition>` whole ([`ends_no_statement`]), so `a = b;` is refused for
+/// the `;` that would end the step early.
+fn join_tables_checks(arguments: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+    let text = |key| arguments.get(key).and_then(serde_json::Value::as_str);
+    let kind = text("kind").unwrap_or(JOIN_KINDS[0]);
+    let keyed = [arguments.contains_key("using"), text("condition").is_some()];
+    let rule = "exactly one of `using` or `condition` is required for every kind but `cross`, \
+                which takes neither";
+    match (kind, keyed) {
+        ("cross", [false, false]) => {}
+        ("cross", _) => {
+            return Err(refused(format!(
+                "a `cross` join of `{JOIN_TABLES}` pairs every row of each table and is on no key: {rule}"
+            )));
+        }
+        (_, [true, false] | [false, true]) => {}
+        (_, keyed) => {
+            let given = if keyed[0] {
+                "both were given"
+            } else {
+                "neither was given"
+            };
+            return Err(refused(format!(
+                "a `{kind}` join of `{JOIN_TABLES}` is on one key, and {given}: {rule}"
+            )));
+        }
+    }
+    if let Some(prefix) = text("prefix") {
+        if matches!(kind, "semi" | "anti") {
+            return Err(refused(format!(
+                "the `prefix` of `{JOIN_TABLES}` has no effect on a `{kind}` join, which keeps \
+                 `table`'s columns alone: {prefix}"
+            )));
+        }
+        let fault = if prefix.is_empty() {
+            Some("is empty")
+        } else if prefix.contains('\\') {
+            Some("holds a `\\`")
+        } else if prefix.chars().any(char::is_control) {
+            Some("holds a control character")
+        } else {
+            None
+        };
+        if let Some(fault) = fault {
+            return Err(refused(format!(
+                "the `prefix` of `{JOIN_TABLES}` {fault}, which the rename pattern \
+                 `AS '<prefix>\\0'` it is written into cannot carry: {prefix:?}"
+            )));
+        }
+    }
+    if let Some(condition) = text("condition") {
+        ends_no_statement(
+            "SELECT 1 FROM a JOIN b ON ",
+            "condition",
+            "condition",
+            condition,
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether the tables [`JOIN_TABLES`] reads make one join: `table` and `other`
+/// are not one table, in any case, as [`made_by_a_step`] compares names. A
+/// table joined to itself needs an alias for each side, which a condition would
+/// have to name and arc does not write.
+fn join_tables_reads_checks(reads: &Reads) -> Result<()> {
+    let (table, other) = (reads.one("table"), reads.one("other"));
+    if table.to_lowercase() == other.to_lowercase() {
+        return Err(refused(format!(
+            "`{JOIN_TABLES}` reads `{other}` as both `table` and `other`; a table is not joined \
+             to itself, since each side would need an alias"
+        )));
+    }
+    Ok(())
+}
+
 /// `name` as a double-quoted SQL identifier, a `"` inside it doubled. The step's
 /// own name is always quoted, so a name arc admits that would otherwise read as
 /// SQL — [`valid_step_name`] admits a `"` — cannot break out of the statement.
@@ -2089,7 +2357,11 @@ pub(crate) fn operation(long_name: &str) -> Option<&'static Operation> {
 /// the argument, and a `minimum` or a `maximum` is admit's to hold, not this. A
 /// whole number written in digits alone that is too large for an `i64` is turned
 /// into the number it is, a `u64` or a float, so that admit refuses it as beyond
-/// the `maximum` rather than as a string. An operation arc
+/// the `maximum` rather than as a string. A value of type `array` whose items
+/// are strings is split on each `,` into that list, each item trimmed, so
+/// `using=a, b` gives `["a", "b"]`; an empty item, `a,,b`, is kept for admit to
+/// refuse, and a string holding a comma cannot be given as one item here, only
+/// through `arc mcp`. An operation arc
 /// does not hold leaves the arguments as given, for [`record_operation`] to
 /// refuse. `arc mcp` passes JSON, whose integers are already integers, and does
 /// not call this.
@@ -2104,9 +2376,17 @@ pub(crate) fn typed_arguments(
     arguments
         .into_iter()
         .map(|(key, value)| {
-            let integer = schema["properties"][key.as_str()]["type"] == "integer";
-            let parsed = value.as_str().filter(|_| integer).and_then(whole_number);
-            (key, parsed.unwrap_or(value))
+            let property = &schema["properties"][key.as_str()];
+            let typed = match value.as_str() {
+                Some(text) if property["type"] == "integer" => whole_number(text),
+                Some(text)
+                    if property["type"] == "array" && property["items"]["type"] == "string" =>
+                {
+                    Some(text.split(',').map(str::trim).collect::<Vec<_>>().into())
+                }
+                _ => None,
+            };
+            (key, typed.unwrap_or(value))
         })
         .collect()
 }
@@ -2474,7 +2754,8 @@ pub(crate) struct Recorded {
 /// all (see [`one_statement`]); a SQL fragment its probe refuses (see
 /// [`probed`]); what the operation's own `checks` refuse, such as a dedupe's key
 /// and order that do not read as one window; reads the operation does not admit
-/// (see [`Operation::admit_reads`]); a table, in any role, that no step of the
+/// (see [`Operation::admit_reads`]), and what its own `reads_checks` refuse,
+/// such as a join of a table to itself; a table, in any role, that no step of the
 /// protocol makes; and a description that is empty or spans lines (see
 /// [`record_step`]). Each refusal's message names what was wrong.
 pub(crate) fn record_operation(
@@ -2511,8 +2792,9 @@ fn provenance(long_name: &str, reads: &Reads) -> String {
 
 impl Operation {
     /// [`record_operation`] for this operation, held or not, refused as that
-    /// describes: the arguments admitted, then the reads, then each table read
-    /// found among those a step makes, before anything is written.
+    /// describes: the arguments admitted, then the reads, then the operation's
+    /// own `reads_checks` of them, then each table read found among those a
+    /// step makes, before anything is written.
     fn record(
         &self,
         dir: &Path,
@@ -2529,6 +2811,9 @@ impl Operation {
         } = *request;
         self.admit(arguments)?;
         let reads = self.admit_reads(on, reads)?;
+        if let Some(reads_checks) = self.reads_checks {
+            reads_checks(&reads)?;
+        }
         for table in reads.tables() {
             made_by_a_step(dir, table)?;
         }
@@ -2837,7 +3122,9 @@ impl Operation {
     /// as a `column`, a name and not SQL, is checked only to be a name at all,
     /// not empty or blank, since [`column_ident`] carries any other name as
     /// written. An argument the schema's
-    /// `dependentRequired` ties to others is refused without them, a number below
+    /// `dependentRequired` ties to others is refused without them, a value outside
+    /// its property's `enum` is refused naming those it takes, a list is held to
+    /// its property's `minItems` and `items` ([`Operation::admit_items`]), a number below
     /// its property's `minimum` or above its `maximum` is refused naming the
     /// argument and the bound, before its type is checked, so a whole number too
     /// large for an integer is refused as too large and not as no integer; and the
@@ -2908,15 +3195,30 @@ impl Operation {
             if let Some(ty) = property["type"].as_str()
                 && !is_of_type(value, ty)
             {
-                let article = if ty.starts_with(['a', 'e', 'i', 'o', 'u']) {
-                    "an"
-                } else {
-                    "a"
-                };
                 return Err(refused(format!(
-                    "the argument `{key}` of `{}` is {article} {ty}, not {value}",
-                    self.long_name
+                    "the argument `{key}` of `{}` is {} {ty}, not {value}",
+                    self.long_name,
+                    article(ty)
                 )));
+            }
+            if let Some(allowed) = property["enum"].as_array()
+                && !allowed.contains(value)
+            {
+                let allowed: Vec<String> = allowed
+                    .iter()
+                    .map(|v| {
+                        v.as_str()
+                            .map_or_else(|| v.to_string(), |v| format!("`{v}`"))
+                    })
+                    .collect();
+                return Err(refused(format!(
+                    "the argument `{key}` of `{}` is one of {}, not {value}",
+                    self.long_name,
+                    allowed.join(", ")
+                )));
+            }
+            if let Some(items) = value.as_array() {
+                self.admit_items(key, property, items)?;
             }
             if let Some(clause) = Clause::of(&property["x-kind"])
                 && let Some(text) = value.as_str()
@@ -2938,6 +3240,45 @@ impl Operation {
             }
         }
         self.checks.map_or(Ok(()), |checks| checks(arguments))
+    }
+
+    /// Whether `items`, the list given for the argument `key`, is what its
+    /// `property` admits: at least its `minItems`, each item of the type its
+    /// `items` gives, and each item its `items` annotates as a `column` a name,
+    /// not empty or blank, as [`Operation::admit`] checks a `column` argument.
+    fn admit_items(
+        &self,
+        key: &str,
+        property: &serde_json::Value,
+        items: &[serde_json::Value],
+    ) -> Result<()> {
+        let long_name = self.long_name;
+        let shape = &property["items"];
+        if let Some(min_items) = property["minItems"].as_u64()
+            && (items.len() as u64) < min_items
+        {
+            return Err(refused(format!(
+                "the list `{key}` of `{long_name}` is shorter than its `minItems` of {min_items}: {}",
+                serde_json::Value::from(items)
+            )));
+        }
+        for item in items {
+            if let Some(ty) = shape["type"].as_str()
+                && !is_of_type(item, ty)
+            {
+                return Err(refused(format!(
+                    "each item of the argument `{key}` of `{long_name}` is {} {ty}, not {item}",
+                    article(ty)
+                )));
+            }
+            if shape["x-kind"] == "column" && item.as_str().is_some_and(|n| n.trim().is_empty()) {
+                return Err(refused(format!(
+                    "the column `{key}` of `{long_name}` holds a name that is empty or blank: {}",
+                    serde_json::Value::from(items)
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// The tables a request names for the operation to read, `on` and `reads`,
@@ -3010,7 +3351,7 @@ impl Operation {
             let Some(value) = on.as_ref().or_else(|| reads.get(role.name)) else {
                 if role.required {
                     let shorthand = if role.name == "table" {
-                        ": `on` is required, or `table` in `reads`"
+                        ": `on` is required (`--on`), or `table` in `reads` (`--read table=`)"
                     } else {
                         ""
                     };
@@ -3078,6 +3419,15 @@ fn compare_numbers(value: &serde_json::Value, bound: &serde_json::Value) -> Opti
     match (integer(value), integer(bound)) {
         (Some(value), Some(bound)) => Some(value.cmp(&bound)),
         _ => value.as_f64()?.partial_cmp(&bound.as_f64()?),
+    }
+}
+
+/// The indefinite article a refusal puts before the JSON Schema type `ty`.
+fn article(ty: &str) -> &'static str {
+    if ty.starts_with(['a', 'e', 'i', 'o', 'u']) {
+        "an"
+    } else {
+        "a"
     }
 }
 
@@ -5321,6 +5671,284 @@ mod tests {
     }
 
     #[test]
+    fn the_join_reads_a_table_a_column_of_it_and_another_table_and_takes_four_keys() {
+        let op = operation(JOIN_TABLES).expect("the join is held");
+        let description = op.description();
+        let reads: Vec<(&str, &str, bool)> = description["reads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|role| {
+                (
+                    role["name"].as_str().unwrap(),
+                    role["kind"].as_str().unwrap(),
+                    role["required"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            reads,
+            [
+                ("table", "table", true),
+                ("column", "column", false),
+                ("other", "table", true)
+            ]
+        );
+        assert_eq!(description["reads"][1]["of"], "table");
+        assert_eq!(description["writes"][0]["name"], STEP_TABLE.name);
+
+        let schema = join_tables_parameters();
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+        let mut keys: Vec<&str> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["condition", "kind", "prefix", "using"]);
+        let kind = &schema["properties"]["kind"];
+        assert_eq!(
+            kind["enum"],
+            serde_json::json!(["left", "inner", "right", "full", "semi", "anti", "cross"])
+        );
+        assert_eq!(kind["default"], "left");
+        let using = &schema["properties"]["using"];
+        assert_eq!(
+            (
+                &using["type"],
+                &using["minItems"],
+                &using["items"]["x-kind"]
+            ),
+            (
+                &serde_json::json!("array"),
+                &serde_json::json!(1),
+                &serde_json::json!("column")
+            )
+        );
+        assert_eq!(schema["properties"]["condition"]["x-kind"], "condition");
+        let prefix = schema["properties"]["prefix"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            prefix.contains("keep their names") && prefix.contains("once"),
+            "`prefix` does not state what a clashing column becomes: {prefix}"
+        );
+    }
+
+    /// The SQL [`join_tables_sql`] writes for a join of `on` to `other`, as the
+    /// step `joined`, with `given` as its arguments.
+    fn join_sql(on: &str, other: &str, given: serde_json::Value) -> String {
+        let arguments = arguments(given);
+        let reads = Reads(vec![
+            ("table", vec![on.to_string()]),
+            ("other", vec![other.to_string()]),
+        ]);
+        join_tables_sql(&Recording {
+            name: "joined",
+            on,
+            reads: &reads,
+            arguments: &arguments,
+        })
+    }
+
+    #[test]
+    fn the_join_writes_each_kind_with_its_key_and_the_other_tables_columns_prefixed() {
+        let head = "CREATE OR REPLACE TABLE \"joined\" AS\n";
+        for (given, query) in [
+            (
+                serde_json::json!({ "using": ["customer_id"] }),
+                "SELECT customer_id, COLUMNS(orders.* EXCLUDE (customer_id)), COLUMNS(customers.* EXCLUDE (customer_id)) AS 'customers_\\0'\nFROM orders\nLEFT JOIN customers USING (customer_id)",
+            ),
+            (
+                serde_json::json!({ "kind": "full", "using": ["customer_id", "region"] }),
+                "SELECT customer_id, region, COLUMNS(orders.* EXCLUDE (customer_id, region)), COLUMNS(customers.* EXCLUDE (customer_id, region)) AS 'customers_\\0'\nFROM orders\nFULL JOIN customers USING (customer_id, region)",
+            ),
+            (
+                serde_json::json!({ "kind": "inner", "condition": "orders.customer_id = customers.id" }),
+                "SELECT orders.*, COLUMNS(customers.*) AS 'customers_\\0'\nFROM orders\nINNER JOIN customers ON orders.customer_id = customers.id",
+            ),
+            (
+                serde_json::json!({ "kind": "semi", "condition": "orders.customer_id = customers.id" }),
+                "SELECT orders.*\nFROM orders\nSEMI JOIN customers ON orders.customer_id = customers.id",
+            ),
+            (
+                serde_json::json!({ "kind": "anti", "using": ["customer_id"] }),
+                "SELECT orders.*\nFROM orders\nANTI JOIN customers USING (customer_id)",
+            ),
+            (
+                serde_json::json!({ "kind": "cross" }),
+                "SELECT orders.*, COLUMNS(customers.*) AS 'customers_\\0'\nFROM orders\nCROSS JOIN customers",
+            ),
+            (
+                serde_json::json!({ "using": ["customer_id"], "prefix": "c_" }),
+                "SELECT customer_id, COLUMNS(orders.* EXCLUDE (customer_id)), COLUMNS(customers.* EXCLUDE (customer_id)) AS 'c_\\0'\nFROM orders\nLEFT JOIN customers USING (customer_id)",
+            ),
+            (
+                serde_json::json!({ "kind": "cross", "prefix": "o's_" }),
+                "SELECT orders.*, COLUMNS(customers.*) AS 'o''s_\\0'\nFROM orders\nCROSS JOIN customers",
+            ),
+        ] {
+            assert_eq!(
+                join_sql("orders", "customers", given.clone()),
+                format!("{head}{query};\n"),
+                "{given}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_join_quotes_a_table_and_a_key_that_need_it_and_escapes_a_default_prefix() {
+        assert_eq!(
+            join_sql(
+                "my orders",
+                "customers",
+                serde_json::json!({ "using": ["customer id"] })
+            ),
+            "CREATE OR REPLACE TABLE \"joined\" AS\nSELECT \"customer id\", COLUMNS(\"my orders\".* EXCLUDE (\"customer id\")), COLUMNS(customers.* EXCLUDE (\"customer id\")) AS 'customers_\\0'\nFROM \"my orders\"\nLEFT JOIN customers USING (\"customer id\");\n"
+        );
+        for (other, prefix) in [("c\\x", "c\\\\x_"), ("o'k", "o''k_")] {
+            assert_eq!(
+                join_sql("orders", other, serde_json::json!({ "kind": "cross" })),
+                format!(
+                    "CREATE OR REPLACE TABLE \"joined\" AS\nSELECT orders.*, COLUMNS({}.*) AS '{prefix}\\0'\nFROM orders\nCROSS JOIN {};\n",
+                    quote_ident(other),
+                    quote_ident(other)
+                ),
+                "the default prefix of {other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_join_given_the_wrong_key_kind_or_prefix_is_refused_naming_it() {
+        let op = operation(JOIN_TABLES).unwrap();
+        let on = "orders.customer_id = customers.id";
+        for (given, named) in [
+            (
+                serde_json::json!({ "using": ["id"], "prefix": "" }),
+                "the `prefix` of `join-tables` is empty",
+            ),
+            (
+                serde_json::json!({ "using": ["id"], "prefix": "a\\1" }),
+                "the `prefix` of `join-tables` holds a `\\`",
+            ),
+            (
+                serde_json::json!({ "using": ["id"], "prefix": "a\nb" }),
+                "the `prefix` of `join-tables` holds a control character",
+            ),
+            (
+                serde_json::json!({ "using": ["id"], "condition": on }),
+                "exactly one of `using` or `condition`",
+            ),
+            (
+                serde_json::json!({ "kind": "left" }),
+                "exactly one of `using` or `condition`",
+            ),
+            (
+                serde_json::json!({ "kind": "cross", "using": ["id"] }),
+                "`cross`, which takes neither",
+            ),
+            (
+                serde_json::json!({ "kind": "semi", "condition": on, "prefix": "c_" }),
+                "`prefix` of `join-tables` has no effect on a `semi` join",
+            ),
+            (
+                serde_json::json!({ "kind": "outer", "using": ["id"] }),
+                "the argument `kind` of `join-tables` is one of `left`",
+            ),
+            (
+                serde_json::json!({ "using": [] }),
+                "the list `using` of `join-tables` is shorter than its `minItems` of 1",
+            ),
+            (
+                serde_json::json!({ "using": ["id", " "] }),
+                "the column `using` of `join-tables` holds a name that is empty or blank",
+            ),
+            (
+                serde_json::json!({ "using": ["id", 7] }),
+                "each item of the argument `using` of `join-tables` is a string, not 7",
+            ),
+            (
+                serde_json::json!({ "condition": "a = b; DROP TABLE x" }),
+                "the condition `condition` holds a `;`",
+            ),
+            (
+                serde_json::json!({ "condition": "a = b;" }),
+                "the condition `condition` holds a `;`",
+            ),
+        ] {
+            let err = op
+                .admit(&arguments(given.clone()))
+                .err()
+                .unwrap_or_else(|| panic!("{given} was admitted"))
+                .to_string();
+            assert!(
+                err.contains(named),
+                "{given} was refused with another message: {err}"
+            );
+        }
+        for given in [
+            serde_json::json!({ "using": ["id"] }),
+            serde_json::json!({ "kind": "anti", "condition": on }),
+            serde_json::json!({ "kind": "cross", "prefix": "c_" }),
+        ] {
+            let admitted = op.admit(&arguments(given.clone()));
+            assert!(admitted.is_ok(), "{given} was refused: {admitted:?}");
+        }
+    }
+
+    #[test]
+    fn a_join_of_a_table_to_itself_in_any_case_is_refused_naming_both_roles() {
+        let op = operation(JOIN_TABLES).unwrap();
+        let checks = op.reads_checks.expect("the join checks its reads");
+        let reads = op
+            .admit_reads(
+                Some("orders"),
+                &arguments(serde_json::json!({ "other": "Orders" })),
+            )
+            .unwrap();
+        let err = checks(&reads).unwrap_err().to_string();
+        assert!(
+            err.contains("`table`") && err.contains("`other`") && err.contains("itself"),
+            "{err}"
+        );
+        let reads = op
+            .admit_reads(
+                Some("orders"),
+                &arguments(serde_json::json!({ "other": "customers" })),
+            )
+            .unwrap();
+        assert!(checks(&reads).is_ok());
+    }
+
+    #[test]
+    fn typed_arguments_split_a_list_of_strings_on_commas_and_trim_each() {
+        let given = arguments(serde_json::json!({
+            "using": "customer_id, region",
+            "kind": "full",
+            "condition": "a, b",
+        }));
+        assert_eq!(
+            serde_json::Value::Object(typed_arguments(JOIN_TABLES, given)),
+            serde_json::json!({
+                "using": ["customer_id", "region"],
+                "kind": "full",
+                "condition": "a, b",
+            })
+        );
+        let empty = typed_arguments(
+            JOIN_TABLES,
+            arguments(serde_json::json!({ "using": "a,,b" })),
+        );
+        assert_eq!(empty["using"], serde_json::json!(["a", "", "b"]));
+        assert!(
+            operation(JOIN_TABLES).unwrap().admit(&empty).is_err(),
+            "an empty item is admitted"
+        );
+    }
+
+    #[test]
     fn a_fragment_holding_the_sentinel_in_any_case_is_refused() {
         for expression in ["__arc_probe", "amount AS __ARC_PROBE", "'__Arc_Probe'"] {
             let err = probed(DERIVE_COLUMN, "expression", EXPRESSION, expression)
@@ -5375,6 +6003,7 @@ mod tests {
             sql: |recording| recording.text("where").to_string(),
             recognised: None,
             checks: None,
+            reads_checks: None,
             notes: None,
         }
     }

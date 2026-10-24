@@ -434,6 +434,46 @@ fn on_beside_a_read_of_the_table_role_or_a_read_with_no_role_is_refused_with_the
     }
 }
 
+#[test]
+fn a_read_of_the_table_role_given_twice_is_refused_as_a_list_with_the_directory_untouched() {
+    let protocol = Protocol::new();
+    let before = protocol.files();
+    refused(
+        &protocol.arc(&[
+            "operation",
+            "record",
+            "filter-rows",
+            "--read",
+            "table=a",
+            "--read",
+            "table=b",
+            "--name",
+            "big_orders",
+            "--arg",
+            "where=amount > 100",
+        ]),
+        &["`table`", "not a list"],
+    );
+    assert_eq!(protocol.files(), before, "the directory changed");
+}
+
+#[test]
+fn no_table_on_either_surface_is_refused_naming_both() {
+    let protocol = Protocol::new();
+    refused(
+        &protocol.arc(&[
+            "operation",
+            "record",
+            "filter-rows",
+            "--name",
+            "big_orders",
+            "--arg",
+            "where=amount > 100",
+        ]),
+        &["`--on`", "`--read table=`"],
+    );
+}
+
 // ------------------------------------------------------------- description
 
 #[test]

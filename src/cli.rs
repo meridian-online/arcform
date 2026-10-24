@@ -493,7 +493,9 @@ pub enum OperationCmd {
         name: String,
 
         /// An argument of the operation (repeatable), as `arc operation describe`
-        /// lists them. Format: KEY=VALUE.
+        /// lists them. Format: KEY=VALUE. A list argument takes its items
+        /// comma-separated (`using=a,b`), so an item holding a comma can be given
+        /// through `arc mcp` alone.
         #[arg(long = "arg", value_name = "KEY=VALUE")]
         args: Vec<String>,
 
