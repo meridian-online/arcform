@@ -773,6 +773,88 @@ fn a_rename_of_a_column_the_table_lacks_or_onto_one_it_has_records_and_fails_the
     }
 }
 
+/// `arc operation record derive-column` on `orders` as `doubled_orders`, with
+/// `column` and `expression` as given.
+fn record_derive(protocol: &Protocol, column: &str, expression: &str) -> Output {
+    protocol.arc(&[
+        "operation",
+        "record",
+        "derive-column",
+        "--on",
+        "orders",
+        "--name",
+        "doubled_orders",
+        "--arg",
+        &format!("column={column}"),
+        "--arg",
+        &format!("expression={expression}"),
+    ])
+}
+
+#[test]
+fn record_derive_writes_the_model_and_arc_run_adds_the_computed_column() {
+    let protocol = Protocol::new();
+    ok(
+        &record_derive(&protocol, "doubled", "amount * 2"),
+        "arc operation record derive-column",
+    );
+    assert_eq!(
+        protocol.read("models/02_doubled_orders.sql"),
+        "-- generated: derive-column on orders\nCREATE OR REPLACE TABLE \"doubled_orders\" AS\nSELECT *, amount * 2 AS __arc_derived\nFROM orders;\nALTER TABLE \"doubled_orders\" RENAME COLUMN __arc_derived TO doubled;\n"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    assert_eq!(
+        columns(&protocol, "doubled_orders"),
+        ["id", "amount", "note", "doubled"],
+        "doubled_orders holds every column of orders and the new one last"
+    );
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    let doubled: Vec<i64> = db
+        .prepare("SELECT doubled FROM doubled_orders ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        doubled,
+        [100, 300, 600, 200],
+        "each row holds its amount doubled"
+    );
+}
+
+#[test]
+fn a_derive_onto_a_column_the_table_has_records_and_fails_the_run() {
+    let protocol = Protocol::new();
+    ok(
+        &record_derive(&protocol, "amount", "amount * 2"),
+        "arc operation record derive-column",
+    );
+    let out = protocol.arc(&["run"]);
+    assert!(
+        !out.status.success(),
+        "arc run of a clashing derive exited 0"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("amount"),
+        "the failed run does not name amount:\n{stderr}"
+    );
+}
+
+#[test]
+fn an_expression_that_is_not_one_is_refused_with_the_directory_untouched() {
+    let protocol = Protocol::new();
+    let before = protocol.files();
+    for expression in ["1 FROM orders", "amount, note", "amount * 2 -- double"] {
+        refused(
+            &record_derive(&protocol, "doubled", expression),
+            &["the expression `expression` of `derive-column` is not one SQL expression"],
+        );
+        assert_eq!(protocol.files(), before, "a refusal changed the directory");
+    }
+}
+
 // ------------------------------------------------- the directory `--dir` names
 
 #[test]
