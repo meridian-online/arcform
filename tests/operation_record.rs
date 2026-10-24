@@ -1144,6 +1144,23 @@ fn a_window_summarised_over_the_whole_table_gives_one_row() {
 }
 
 #[test]
+fn a_constant_in_the_group_by_is_refused_with_the_directory_untouched() {
+    // Grouped by its place, a number or a string is the same value for every
+    // row, so the summary would be one group for the whole table.
+    for group_by in ["2", "'note'"] {
+        let protocol = Protocol::new();
+        let before = protocol.files();
+        let out = record_summary(&protocol, "count(*) AS n", Some(group_by));
+        refused(&out, &["`group_by`", "holds a constant", group_by]);
+        assert_eq!(
+            protocol.files(),
+            before,
+            "{group_by:?}: the directory changed"
+        );
+    }
+}
+
+#[test]
 fn a_select_list_that_is_not_one_is_refused_with_the_directory_untouched() {
     let protocol = Protocol::new();
     let before = protocol.files();

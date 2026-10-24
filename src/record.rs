@@ -979,7 +979,7 @@ const CATALOGUE: &[Operation] = &[
         parameters: summarise_rows_parameters,
         sql: summarise_rows_sql,
         recognised: None,
-        checks: None,
+        checks: Some(summarise_rows_checks),
     },
     Operation {
         long_name: DEDUPE_ROWS,
@@ -1480,7 +1480,8 @@ fn summarise_rows_parameters() -> serde_json::Value {
                 "description": "What the rows are grouped by: a SQL select list, recorded as written, \
                     each item of which may carry an alias (`date_trunc('month', at) AS month`). \
                     The step groups by each item by its place (`GROUP BY 1, 2`) and gives one row for each group, \
-                    the items first, so an aggregate here fails the run; \
+                    the items first, so an aggregate here fails the run, \
+                    and a constant (`2`, `'note'`) is refused, since it is the same value for every row and would make the whole table one group; \
                     without it, the step gives one row for the whole table (`GROUP BY ()`).",
                 "x-kind": "select-list",
             }
@@ -1503,9 +1504,10 @@ fn summarise_rows_parameters() -> serde_json::Value {
 /// asked again here through [`probe_items`], so it counts what the gate admitted
 /// and not commas; a `group_by` whose probe gives no items, which the gate would
 /// not have admitted, is grouped by `()`, so the function writes SQL for any
-/// recording and DuckDB judges it when the step runs. `GROUP BY ()` holds a window alone, `count(*) OVER ()`, to one
-/// row, and fails the run on a bare column, as a grouping would. arc does not
-/// open the database when it records, so neither failure can be refused then.
+/// recording and DuckDB judges it when the step runs. `GROUP BY ()` holds a
+/// window alone, `count(*) OVER ()`, to one row, and fails the run on a bare
+/// column, as a grouping would. arc does not open the database when it records,
+/// so neither failure can be refused then.
 fn summarise_rows_sql(recording: &Recording) -> String {
     let grouped = recording.arguments.get("group_by").and_then(|v| v.as_str());
     let (select, group_by) = match grouped {
@@ -1531,6 +1533,44 @@ fn summarise_rows_sql(recording: &Recording) -> String {
         recording.text("aggregates"),
         from_ident(recording.on),
     )
+}
+
+/// Whether each item of `group_by`, already admitted as a select list, is
+/// something that differs from row to row: an item DuckDB reads as a literal
+/// constant ([`is_constant`]), read in the [`SELECT_LIST`] probe the gate
+/// admitted, is refused naming `group_by`. The step groups by each item's place,
+/// so `group_by=2` writes `SELECT 2, … GROUP BY 1` and groups by the number `2`,
+/// not by the second column, and `group_by='note'` by the string: each is the
+/// same value for every row, so the summary would be one row for the whole
+/// table. Only a literal is refused, the likely mistake for a column's place or
+/// name; an item constant by other means, `1+0`, is the analyst's to avoid.
+/// Without `group_by` there is no grouping, and nothing to check.
+fn summarise_rows_checks(arguments: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+    let Some(group_by) = arguments
+        .get("group_by")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(());
+    };
+    let items = probe_items(&(SELECT_LIST.probe)(group_by)).unwrap_or_default();
+    // The probe's first and last items are its own, not `group_by`'s.
+    let listed = items.get(1..items.len().saturating_sub(1)).unwrap_or(&[]);
+    if listed.iter().any(is_constant) {
+        return Err(refused(format!(
+            "the select list `group_by` of `{SUMMARISE_ROWS}` holds a constant, a number or a \
+             string that is the same value for every row, not a column, so the summary would be \
+             one group: {group_by}"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `node`, an item of DuckDB's tree, is a literal constant — a number,
+/// a string or `NULL` — which is the same value for every row it is written
+/// into. [`summarise_rows_checks`] and [`dedupe_rows_checks`] refuse one where it
+/// would make every row one group or tie them all.
+fn is_constant(node: &serde_json::Value) -> bool {
+    node["class"] == "CONSTANT"
 }
 
 /// The `parameters` schema of [`DEDUPE_ROWS`]: two optional strings, `key` and
@@ -1623,9 +1663,9 @@ fn dedupe_rows_window(key: &str, order_by: &str) -> String {
 /// refused for the `;` first ([`ends_no_statement`]), in the words a clause's
 /// gives it. Without either argument there is no window, and nothing to check.
 ///
-/// A literal constant in either is refused too, naming the argument. Inside
-/// `OVER` a constant is the same value for every row, not a column's place as a
-/// number is in `sort-rows`' order or `summarise-rows`' grouping: `key=1` would
+/// A literal constant in either is refused too, naming the argument
+/// ([`is_constant`]). Inside `OVER` a constant is the same value for every row,
+/// not a column's place as a number is in `sort-rows`' order: `key=1` would
 /// make the whole table one key, and `order_by=2 desc` or `order_by='x'` would tie
 /// every row, so the row kept would be arbitrary. Only a literal is refused, the
 /// likely mistake for a column's place; an order that is constant by other means,
@@ -1657,16 +1697,15 @@ fn dedupe_rows_checks(arguments: &serde_json::Map<String, serde_json::Value>) ->
             )));
         }
     };
-    let constant = |node: &serde_json::Value| node["class"] == "CONSTANT";
     let mut partitions = window["partitions"].as_array().into_iter().flatten();
     let mut orders = window["orders"].as_array().into_iter().flatten();
     for (noun, name, value, holds) in [
-        ("partition key", "key", key, partitions.any(constant)),
+        ("partition key", "key", key, partitions.any(is_constant)),
         (
             "order",
             "order_by",
             order_by,
-            orders.any(|order| constant(&order["expression"])),
+            orders.any(|order| is_constant(&order["expression"])),
         ),
     ] {
         if holds {
@@ -2284,9 +2323,8 @@ pub(crate) struct OperationRequest<'a> {
 /// all (see [`one_statement`]); a SQL fragment its probe refuses (see
 /// [`probed`]); what the operation's own `checks` refuse, such as a dedupe's key
 /// and order that do not read as one window; a table no step of the protocol
-/// makes; and a
-/// description that is empty or spans lines (see [`record_step`]). Each
-/// refusal's message names what was wrong.
+/// makes; and a description that is empty or spans lines (see [`record_step`]).
+/// Each refusal's message names what was wrong.
 pub(crate) fn record_operation(
     dir: &Path,
     request: &OperationRequest,
@@ -2605,9 +2643,10 @@ impl Operation {
     /// annotated with a clause `x-kind` — a `condition` or an `order` — is also
     /// checked as that clause, through [`one_statement`]; one annotated with a
     /// probed `x-kind` — an `expression`, a `type`, a `select-list` or a
-    /// `partition` — is checked in its probe, through [`probed`]; one annotated as a `column`, a name and not SQL, is checked
-    /// only to be a name at all, not empty or blank, since [`column_ident`]
-    /// carries any other name as written. An argument the schema's
+    /// `partition` — is checked in its probe, through [`probed`]; one annotated
+    /// as a `column`, a name and not SQL, is checked only to be a name at all,
+    /// not empty or blank, since [`column_ident`] carries any other name as
+    /// written. An argument the schema's
     /// `dependentRequired` ties to others is refused without them, a number below
     /// its property's `minimum` or above its `maximum` is refused naming the
     /// argument and the bound, before its type is checked, so a whole number too
@@ -4418,6 +4457,34 @@ mod tests {
                 err.contains("`group_by`"),
                 "{group_by:?}: the refusal does not name the argument: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn a_constant_in_the_group_by_is_refused_naming_group_by() {
+        let op = operation(SUMMARISE_ROWS).unwrap();
+        for group_by in ["2", "'note'", "note, 2"] {
+            let err = op
+                .admit(&arguments(serde_json::json!({
+                    "aggregates": "count(*) AS n",
+                    "group_by": group_by,
+                })))
+                .expect_err(group_by)
+                .to_string();
+            assert!(
+                err.contains(
+                    "the select list `group_by` of `summarise-rows` holds a constant, \
+                     a number or a string that is the same value for every row"
+                ),
+                "{group_by:?} was refused with another message: {err}"
+            );
+        }
+        for group_by in ["note", "amount > 100 AS big", "amount + 0"] {
+            let admitted = op.admit(&arguments(serde_json::json!({
+                "aggregates": "count(*) AS n",
+                "group_by": group_by,
+            })));
+            assert!(admitted.is_ok(), "{group_by:?} was refused: {admitted:?}");
         }
     }
 
