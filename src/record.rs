@@ -1481,7 +1481,7 @@ fn summarise_rows_parameters() -> serde_json::Value {
                     each item of which may carry an alias (`date_trunc('month', at) AS month`). \
                     The step groups by each item by its place (`GROUP BY 1, 2`) and gives one row for each group, \
                     the items first, so an aggregate here fails the run, \
-                    and a constant (`2`, `'note'`) is refused, since it is the same value for every row and would make the whole table one group; \
+                    and a constant (`2`, `'note'`) is refused, since it is the same value for every row and so groups nothing (alone, it would make the whole table one group); \
                     without it, the step gives one row for the whole table (`GROUP BY ()`).",
                 "x-kind": "select-list",
             }
@@ -1541,8 +1541,8 @@ fn summarise_rows_sql(recording: &Recording) -> String {
 /// admitted, is refused naming `group_by`. The step groups by each item's place,
 /// so `group_by=2` writes `SELECT 2, … GROUP BY 1` and groups by the number `2`,
 /// not by the second column, and `group_by='note'` by the string: each is the
-/// same value for every row, so the summary would be one row for the whole
-/// table. Only a literal is refused, the likely mistake for a column's place or
+/// same value for every row, so it groups nothing, and alone it would make the
+/// summary one row for the whole table. Only a literal is refused, the likely mistake for a column's place or
 /// name; an item constant by other means, `1+0`, is the analyst's to avoid.
 /// Without `group_by` there is no grouping, and nothing to check.
 fn summarise_rows_checks(arguments: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
@@ -1558,8 +1558,8 @@ fn summarise_rows_checks(arguments: &serde_json::Map<String, serde_json::Value>)
     if listed.iter().any(is_constant) {
         return Err(refused(format!(
             "the select list `group_by` of `{SUMMARISE_ROWS}` holds a constant, a number or a \
-             string that is the same value for every row, not a column, so the summary would be \
-             one group: {group_by}"
+             string that is the same value for every row, not a column, so it groups nothing \
+             (alone, it would make the whole table one group): {group_by}"
         )));
     }
     Ok(())
@@ -1568,7 +1568,7 @@ fn summarise_rows_checks(arguments: &serde_json::Map<String, serde_json::Value>)
 /// Whether `node`, an item of DuckDB's tree, is a literal constant — a number,
 /// a string or `NULL` — which is the same value for every row it is written
 /// into. [`summarise_rows_checks`] and [`dedupe_rows_checks`] refuse one where it
-/// would make every row one group or tie them all.
+/// would group nothing or tie every row.
 fn is_constant(node: &serde_json::Value) -> bool {
     node["class"] == "CONSTANT"
 }
@@ -4474,7 +4474,8 @@ mod tests {
             assert!(
                 err.contains(
                     "the select list `group_by` of `summarise-rows` holds a constant, \
-                     a number or a string that is the same value for every row"
+                     a number or a string that is the same value for every row, not a column, \
+                     so it groups nothing (alone, it would make the whole table one group)"
                 ),
                 "{group_by:?} was refused with another message: {err}"
             );

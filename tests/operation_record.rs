@@ -1146,7 +1146,7 @@ fn a_window_summarised_over_the_whole_table_gives_one_row() {
 #[test]
 fn a_constant_in_the_group_by_is_refused_with_the_directory_untouched() {
     // Grouped by its place, a number or a string is the same value for every
-    // row, so the summary would be one group for the whole table.
+    // row, so it groups nothing; alone, it would make the whole table one group.
     for group_by in ["2", "'note'"] {
         let protocol = Protocol::new();
         let before = protocol.files();
