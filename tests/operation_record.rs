@@ -975,6 +975,96 @@ fn a_type_that_is_not_one_is_refused_with_the_directory_untouched() {
     }
 }
 
+/// `arc operation record summarise-rows` on `orders` as `order_counts`, with
+/// `aggregates` and, when given, `group_by`.
+fn record_summary(protocol: &Protocol, aggregates: &str, group_by: Option<&str>) -> Output {
+    let aggregates = format!("aggregates={aggregates}");
+    let group_by = group_by.map(|g| format!("group_by={g}"));
+    let mut args = vec![
+        "operation",
+        "record",
+        "summarise-rows",
+        "--on",
+        "orders",
+        "--name",
+        "order_counts",
+    ];
+    if let Some(group_by) = &group_by {
+        args.extend(["--arg", group_by]);
+    }
+    args.extend(["--arg", &aggregates]);
+    protocol.arc(&args)
+}
+
+#[test]
+fn record_summary_writes_the_grouped_model_and_arc_run_gives_one_row_for_each_group() {
+    let protocol = Protocol::new();
+    ok(
+        &record_summary(&protocol, "count(*) AS n", Some("amount > 100 AS big")),
+        "arc operation record summarise-rows",
+    );
+    assert_eq!(
+        protocol.read("models/02_order_counts.sql"),
+        "-- generated: summarise-rows on orders\nCREATE OR REPLACE TABLE \"order_counts\" AS\nSELECT amount > 100 AS big, count(*) AS n\nFROM orders\nGROUP BY ALL;\n"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    let groups: Vec<(bool, i64)> = db
+        .prepare("SELECT big, n FROM order_counts ORDER BY big")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(groups, [(false, 2), (true, 2)]);
+}
+
+#[test]
+fn record_summary_without_a_group_by_gives_one_row_for_the_whole_table() {
+    let protocol = Protocol::new();
+    ok(
+        &record_summary(&protocol, "count(*) AS n", None),
+        "arc operation record summarise-rows",
+    );
+    assert_eq!(
+        protocol.read("models/02_order_counts.sql"),
+        "-- generated: summarise-rows on orders\nCREATE OR REPLACE TABLE \"order_counts\" AS\nSELECT count(*) AS n\nFROM orders;\n"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    let rows: Vec<i64> = db
+        .prepare("SELECT n FROM order_counts ORDER BY n")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows, [4]);
+}
+
+#[test]
+fn a_select_list_that_is_not_one_is_refused_with_the_directory_untouched() {
+    let protocol = Protocol::new();
+    let before = protocol.files();
+    for aggregates in [
+        "count(*) FROM other",
+        "a UNION SELECT b",
+        "count(*); DROP TABLE orders",
+        "count(*) AS n -- all",
+    ] {
+        refused(
+            &record_summary(&protocol, aggregates, None),
+            &["the select list `aggregates`"],
+        );
+        assert_eq!(protocol.files(), before, "a refusal changed the directory");
+    }
+    refused(
+        &record_summary(&protocol, "count(*) AS n", Some("big -- by size")),
+        &["the select list `group_by` of `summarise-rows`"],
+    );
+    assert_eq!(protocol.files(), before, "a refusal changed the directory");
+}
+
 // ------------------------------------------------- the directory `--dir` names
 
 #[test]

@@ -36,6 +36,7 @@ const HIDE_COLUMN: &str = "hide-column";
 const RENAME_COLUMN: &str = "rename-column";
 const DERIVE_COLUMN: &str = "derive-column";
 const CAST_COLUMN: &str = "cast-column";
+const SUMMARISE_ROWS: &str = "summarise-rows";
 
 /// The operators the default build holds: the ten every build holds and the two
 /// `http-fetch` adds, which `cli` turns on.
@@ -228,6 +229,7 @@ fn list_prints_each_operation_with_a_sentence() {
         RENAME_COLUMN,
         DERIVE_COLUMN,
         CAST_COLUMN,
+        SUMMARISE_ROWS,
     ] {
         let line = line_opening_with(&text, op);
         assert!(
@@ -245,6 +247,7 @@ fn list_prints_each_operation_with_a_sentence() {
         RENAME_COLUMN,
         DERIVE_COLUMN,
         CAST_COLUMN,
+        SUMMARISE_ROWS,
     ] {
         let entry = entries
             .iter()
@@ -440,6 +443,7 @@ fn describe_prints_each_operator_in_the_five_keys_an_operation_is_described_in()
         RENAME_COLUMN,
         DERIVE_COLUMN,
         CAST_COLUMN,
+        SUMMARISE_ROWS,
     ]) {
         let out = arc(&["operation", "describe", op]);
         assert_eq!(
@@ -736,7 +740,8 @@ fn list_prints_the_operations_and_no_operator() {
             HIDE_COLUMN,
             RENAME_COLUMN,
             DERIVE_COLUMN,
-            CAST_COLUMN
+            CAST_COLUMN,
+            SUMMARISE_ROWS
         ],
         "`arc operation list` prints the operations and nothing else:\n{text}"
     );

@@ -255,6 +255,7 @@ fn called_with_each_operator_and_operation_it_returns_what_arc_operation_describ
                 "rename-column",
                 "derive-column",
                 "cast-column",
+                "summarise-rows",
             ]
             .map(String::from),
         )
@@ -295,7 +296,8 @@ fn called_with_no_argument_it_lists_no_operator() {
             "hide-column",
             "rename-column",
             "derive-column",
-            "cast-column"
+            "cast-column",
+            "summarise-rows"
         ],
         "the listing holds the operations alone, not the operators {operators:?}"
     );

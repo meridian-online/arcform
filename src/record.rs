@@ -599,6 +599,10 @@ const DERIVE_COLUMN: &str = "derive-column";
 /// written once as [`FILTER_ROWS`] is.
 const CAST_COLUMN: &str = "cast-column";
 
+/// The long name of the operation that summarises the rows of a table, in groups
+/// or as a whole, written once as [`FILTER_ROWS`] is.
+const SUMMARISE_ROWS: &str = "summarise-rows";
+
 /// One SQL operation arc holds: what it is called, what it does, what it reads
 /// and writes, and what it takes — described so that it can be recorded as a
 /// step by name. The catalogue holds the description and nothing that runs.
@@ -917,6 +921,34 @@ const CATALOGUE: &[Operation] = &[
         writes: &[STEP_TABLE],
         parameters: cast_column_parameters,
         sql: cast_column_sql,
+        recognised: None,
+    },
+    Operation {
+        long_name: SUMMARISE_ROWS,
+        summary: "Summarises the rows of a table with SQL aggregates, one row for each group or one for the whole table.",
+        reads: &[
+            Role {
+                name: "table",
+                kind: "table",
+                list: false,
+                required: true,
+                of: None,
+                min_items: None,
+                description: "The table whose rows are summarised.",
+            },
+            Role {
+                name: "column",
+                kind: "column",
+                list: false,
+                required: false,
+                of: Some("table"),
+                min_items: None,
+                description: "A column the rows are grouped by or summarised over; the arguments may name others.",
+            },
+        ],
+        writes: &[STEP_TABLE],
+        parameters: summarise_rows_parameters,
+        sql: summarise_rows_sql,
         recognised: None,
     },
 ];
@@ -1292,6 +1324,71 @@ fn cast_column_sql(recording: &Recording) -> String {
         quote_ident(recording.name),
         recording.text("type"),
         from_ident(recording.on),
+    )
+}
+
+/// The `parameters` schema of [`SUMMARISE_ROWS`]: a required string,
+/// `aggregates`, and an optional one, `group_by`. Closed to any other key, as
+/// [`hide_column_parameters`] is.
+///
+/// Both are SQL select lists, recorded as written, so `x-kind` marks each a
+/// `select-list` and [`Operation::admit`] holds it to one: DuckDB must read it, in
+/// the probe [`SELECT_LIST`] writes, as the items of a select that reads no
+/// table. Whether an item of `aggregates` is an aggregate is left to DuckDB when
+/// the step runs: arc does not sort functions into aggregates and others.
+fn summarise_rows_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "aggregates": {
+                "type": "string",
+                "description": "What each row of the summary holds: a SQL select list of aggregates, \
+                    recorded as written, each item of which may carry an alias \
+                    (`count(*) AS n, sum(amount) AS total`).",
+                "x-kind": "select-list",
+            },
+            "group_by": {
+                "type": "string",
+                "description": "What the rows are grouped by: a SQL select list, recorded as written, \
+                    each item of which may carry an alias (`date_trunc('month', at) AS month`). \
+                    The step groups by every item (`GROUP BY ALL`) and gives one row for each group, \
+                    the items first; without it, the step gives one row for the whole table.",
+                "x-kind": "select-list",
+            }
+        },
+        "required": ["aggregates"],
+    })
+}
+
+/// The SQL step of [`SUMMARISE_ROWS`]: a table named for the step, holding the
+/// `group_by` items and then the `aggregates`, grouped by every `group_by` item
+/// through `GROUP BY ALL`; or, without `group_by`, the `aggregates` alone over the
+/// whole table, one row. The table read is written as [`from_ident`] writes it,
+/// and both lists as given.
+///
+/// `GROUP BY ALL` groups by every item of the select list that holds no
+/// aggregate, so a grouping item may carry an alias, and the grouping is not
+/// written twice. Its one statement is enough: DuckDB fails the run when an item
+/// of `aggregates` is neither an aggregate nor grouped, and arc does not open the
+/// database when it records.
+fn summarise_rows_sql(recording: &Recording) -> String {
+    let query = match recording.arguments.get("group_by").and_then(|v| v.as_str()) {
+        Some(group_by) => format!(
+            "SELECT {group_by}, {}\nFROM {}\nGROUP BY ALL",
+            recording.text("aggregates"),
+            from_ident(recording.on),
+        ),
+        None => format!(
+            "SELECT {}\nFROM {}",
+            recording.text("aggregates"),
+            from_ident(recording.on),
+        ),
+    };
+    format!(
+        "CREATE OR REPLACE TABLE {} AS\n{query};\n",
+        quote_ident(recording.name)
     )
 }
 
@@ -2200,7 +2297,36 @@ const EXPRESSION: Probe = Probe {
     noun: "expression",
     probe: |value| format!("SELECT {value} AS {SENTINEL}"),
     admits: |items| match items {
-        [item] if item["alias"] == SENTINEL => one_value_per_row(item),
+        [item] if item["alias"] == SENTINEL => {
+            one_value_per_row(item).map_err(|spread| match spread {
+                Spread::Columns => "expands to several columns, where the step adds one",
+                Spread::Rows => "changes the number of rows, where the step keeps every row",
+            })
+        }
+        _ => Err(NOT_ONE),
+    },
+};
+
+/// The probe of a `select-list`: `SELECT <value>, 1 AS __arc_probe`, which must
+/// read as at least two items, the last called [`SENTINEL`], each item before it
+/// one value for each row ([`one_value_per_row`]). The value may list several
+/// items, each with an alias. `count(*) FROM other` and `a UNION SELECT b` are not
+/// a bare select, and `count(*) AS n -- all` swallows the sentinel item. A star
+/// would widen the list to every column of the table, and an `unnest` would change
+/// the number of rows the step groups or summarises, so each is refused.
+const SELECT_LIST: Probe = Probe {
+    noun: "select list",
+    probe: |value| format!("SELECT {value}, 1 AS {SENTINEL}"),
+    admits: |items| match items {
+        [listed @ .., last] if !listed.is_empty() && last["alias"] == SENTINEL => listed
+            .iter()
+            .try_for_each(one_value_per_row)
+            .map_err(|spread| match spread {
+                Spread::Columns => {
+                    "has an item that expands to several columns, where each item gives one"
+                }
+                Spread::Rows => "changes the number of rows the step reads",
+            }),
         _ => Err(NOT_ONE),
     },
 };
@@ -2233,27 +2359,39 @@ const TYPE: Probe = Probe {
 /// step; an `unnest` or an `unlist` gives several rows for one. A subquery is not
 /// looked inside: its star reads its own `FROM`, and it gives one value, so
 /// `EXISTS (SELECT * FROM orders)` is admitted. `count(*)` holds no star node.
-fn one_value_per_row(node: &serde_json::Value) -> std::result::Result<(), &'static str> {
+/// Each probe that walks an item says in its own words what the [`Spread`] would
+/// do to its step.
+fn one_value_per_row(node: &serde_json::Value) -> std::result::Result<(), Spread> {
     match node {
         serde_json::Value::Object(fields) => {
             if node["class"] == "SUBQUERY" {
                 return Ok(());
             }
             if node["class"] == "STAR" || node["type"] == "OPERATOR_UNPACK" {
-                return Err("expands to several columns, where the step adds one");
+                return Err(Spread::Columns);
             }
             if node["class"] == "FUNCTION"
                 && node["function_name"].as_str().is_some_and(|name| {
                     name.eq_ignore_ascii_case("unnest") || name.eq_ignore_ascii_case("unlist")
                 })
             {
-                return Err("changes the number of rows, where the step keeps every row");
+                return Err(Spread::Rows);
             }
             fields.values().try_for_each(one_value_per_row)
         }
         serde_json::Value::Array(items) => items.iter().try_for_each(one_value_per_row),
         _ => Ok(()),
     }
+}
+
+/// How an item that is not one value for each row spreads, as
+/// [`one_value_per_row`] finds it.
+enum Spread {
+    /// A star or an unpacked `COLUMNS(..)`: one item in the probe, several
+    /// columns in the step.
+    Columns,
+    /// An `unnest` or an `unlist`: several rows for one.
+    Rows,
 }
 
 impl Probe {
@@ -2263,6 +2401,7 @@ impl Probe {
         match x_kind.as_str() {
             Some("expression") => Some(EXPRESSION),
             Some("type") => Some(TYPE),
+            Some("select-list") => Some(SELECT_LIST),
             _ => None,
         }
     }
@@ -3515,6 +3654,158 @@ mod tests {
             assert!(
                 err.contains("`type`"),
                 "{type_name:?}: the refusal does not name the argument: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_summary_takes_a_required_aggregates_an_optional_group_by_and_no_other_key() {
+        let schema = summarise_rows_parameters();
+
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["aggregates"]),
+            "`aggregates` is not the one required parameter"
+        );
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::json!(false),
+            "the schema is open to a key it does not name"
+        );
+        assert_eq!(
+            schema["properties"].as_object().map(|p| p.len()),
+            Some(2),
+            "the schema takes a parameter besides `aggregates` and `group_by`"
+        );
+        for key in ["aggregates", "group_by"] {
+            let property = &schema["properties"][key];
+            assert_eq!(property["type"], "string", "`{key}` is not a string");
+            assert_eq!(
+                property["x-kind"], "select-list",
+                "`{key}` is not marked a select list"
+            );
+            assert!(
+                property["description"]
+                    .as_str()
+                    .is_some_and(|d| d.contains("select list") && d.contains("alias")),
+                "`{key}` does not say it is a select list that may carry aliases: {property}"
+            );
+        }
+        assert!(
+            schema["properties"]["group_by"]["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("GROUP BY ALL")),
+            "`group_by` does not say the step groups by every item"
+        );
+    }
+
+    #[test]
+    fn the_summary_groups_by_all_when_given_a_group_by_and_reads_the_whole_table_without() {
+        let grouped = arguments(serde_json::json!({
+            "group_by": "amount > 100 AS big",
+            "aggregates": "count(*) AS n",
+        }));
+        let recording = Recording {
+            name: "order_counts",
+            on: "orders",
+            arguments: &grouped,
+        };
+        assert_eq!(
+            summarise_rows_sql(&recording),
+            "CREATE OR REPLACE TABLE \"order_counts\" AS\nSELECT amount > 100 AS big, count(*) AS n\nFROM orders\nGROUP BY ALL;\n"
+        );
+        let whole = arguments(serde_json::json!({ "aggregates": "count(*) AS n" }));
+        let recording = Recording {
+            name: "order_counts",
+            on: "orders",
+            arguments: &whole,
+        };
+        assert_eq!(
+            summarise_rows_sql(&recording),
+            "CREATE OR REPLACE TABLE \"order_counts\" AS\nSELECT count(*) AS n\nFROM orders;\n"
+        );
+    }
+
+    #[test]
+    fn a_select_list_duckdb_reads_as_the_items_of_a_bare_select_is_admitted() {
+        let op = operation(SUMMARISE_ROWS).unwrap();
+        for (aggregates, group_by) in [
+            ("count(*) AS n, sum(amount) AS total", None),
+            ("count(*)", Some("note")),
+            ("count(*) AS n", Some("amount > 100 AS big, note")),
+            (
+                "count(*) AS n",
+                Some("date_trunc('month', DATE '2026-01-02') AS month"),
+            ),
+            ("max(amount) FILTER (WHERE id > 1) AS top", None),
+            ("count(*) AS n", Some("(SELECT max(id) FROM orders) AS m")),
+        ] {
+            let mut given = serde_json::json!({ "aggregates": aggregates });
+            if let Some(group_by) = group_by {
+                given["group_by"] = group_by.into();
+            }
+            let admitted = op.admit(&arguments(given));
+            assert!(
+                admitted.is_ok(),
+                "{aggregates:?} by {group_by:?} was refused: {admitted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn what_is_not_one_select_list_is_refused_naming_the_argument() {
+        let op = operation(SUMMARISE_ROWS).unwrap();
+        for aggregates in [
+            "count(*) FROM other",             // a select that reads a table
+            "a UNION SELECT b",                // a set operation, not a select
+            "count(*); DROP TABLE orders",     // a second statement
+            "count(*) AS n -- all",            // a comment that swallows the sentinel item
+            "",                                // nothing at all
+            "count(*) AS n, 1 AS __arc_probe", // the sentinel supplied by the caller
+            "*",                               // a star that widens the list to every column
+            "count(*), orders.*",
+            "COLUMNS('amount|id')",
+            "unnest([1, 2]) AS u", // more rows for the summary
+        ] {
+            let err = op
+                .admit(&arguments(serde_json::json!({ "aggregates": aggregates })))
+                .expect_err(aggregates)
+                .to_string();
+            assert!(
+                err.contains("`aggregates`"),
+                "{aggregates:?}: the refusal does not name the argument: {err}"
+            );
+        }
+        for group_by in ["big -- by size", "*", "unnest([1, 2])", "note FROM other"] {
+            let err = op
+                .admit(&arguments(serde_json::json!({
+                    "aggregates": "count(*) AS n",
+                    "group_by": group_by,
+                })))
+                .expect_err(group_by)
+                .to_string();
+            assert!(
+                err.contains("`group_by`"),
+                "{group_by:?}: the refusal does not name the argument: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_select_list_that_is_not_one_is_refused_in_the_select_list_wording() {
+        for (list, reason) in [
+            ("count(*) AS n -- all", "is not one SQL select list"),
+            ("note, *", "has an item that expands to several columns"),
+            ("unnest([1, 2])", "changes the number of rows"),
+        ] {
+            let err = probed(SUMMARISE_ROWS, "group_by", SELECT_LIST, list)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!(
+                    "the select list `group_by` of `summarise-rows` {reason}"
+                )),
+                "{list:?} was refused with another message: {err}"
             );
         }
     }
