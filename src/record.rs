@@ -1051,23 +1051,12 @@ fn quote_ident(name: &str) -> String {
 /// reserved word such as `order`, which a step made under quotes and which
 /// `FROM order` would not parse.
 ///
-/// DuckDB is asked, on an in-memory database opened once for the thread, rather
-/// than given a list of the words: a list copied into the source would stay as it
-/// was when DuckDB's own grows. A database that cannot be opened gives the quoted
-/// name, which DuckDB reads as the table whatever the name.
-///
-/// The connection is never dropped: a thread's storage is torn down after DuckDB 2.0's own
-/// per-thread state, and closing a database then crashes the process. It is one small
-/// in-memory database for each thread that asks, kept until the process ends.
+/// DuckDB is asked, on the thread's [`with_reader`] database, rather than given a
+/// list of the words: a list copied into the source would stay as it was when
+/// DuckDB's own grows. A database that cannot be opened gives the quoted name,
+/// which DuckDB reads as the table whatever the name.
 fn from_ident(name: &str) -> String {
-    thread_local! {
-        static READER: Option<std::mem::ManuallyDrop<duckdb::Connection>> =
-            duckdb::Connection::open_in_memory().ok().map(std::mem::ManuallyDrop::new);
-    }
-    READER.with(|con| match con {
-        Some(con) => from_ident_on(con, name),
-        None => quote_ident(name),
-    })
+    with_reader(name, from_ident_on)
 }
 
 /// [`from_ident`] on a database already open, for a caller that writes more than
@@ -1099,28 +1088,35 @@ fn reads_bare_as_table(con: &duckdb::Connection, name: &str) -> bool {
 /// so it cannot break out of the clause it is written into, and a reserved word
 /// such as `order`, which DuckDB does not read bare as a column.
 ///
-/// DuckDB is asked, on an in-memory database opened once for the thread and never
-/// dropped, for the reasons [`from_ident`] gives. A database that cannot be opened
-/// gives the quoted name, which DuckDB reads as the column whatever the name.
+/// DuckDB is asked, on the thread's [`with_reader`] database, as [`from_ident`]
+/// asks it. A database that cannot be opened gives the quoted name, which DuckDB
+/// reads as the column whatever the name.
 fn column_ident(name: &str) -> String {
+    with_reader(name, |con, name| {
+        if is_plain(name) && reads_bare_as_column(con, name) {
+            name.to_string()
+        } else {
+            quote_ident(name)
+        }
+    })
+}
+
+/// `write` of `name`, asked on an in-memory DuckDB database opened once for the
+/// thread, which [`from_ident`] and [`column_ident`] both ask whether a name reads
+/// bare; or `name` through [`quote_ident`] when the database cannot be opened.
+///
+/// The connection is never dropped: a thread's storage is torn down after DuckDB 2.0's own
+/// per-thread state, and closing a database then crashes the process. It is one small
+/// in-memory database for each thread that asks, kept until the process ends.
+fn with_reader(name: &str, write: impl FnOnce(&duckdb::Connection, &str) -> String) -> String {
     thread_local! {
         static READER: Option<std::mem::ManuallyDrop<duckdb::Connection>> =
             duckdb::Connection::open_in_memory().ok().map(std::mem::ManuallyDrop::new);
     }
     READER.with(|con| match con {
-        Some(con) => column_ident_on(con, name),
+        Some(con) => write(con, name),
         None => quote_ident(name),
     })
-}
-
-/// [`column_ident`] on a database already open, for a caller that writes more
-/// than one column in a row.
-fn column_ident_on(con: &duckdb::Connection, name: &str) -> String {
-    if is_plain(name) && reads_bare_as_column(con, name) {
-        name.to_string()
-    } else {
-        quote_ident(name)
-    }
 }
 
 /// Whether `name` is of only ASCII letters, digits and underscores, and does not
@@ -1734,7 +1730,7 @@ impl Operation {
     /// annotated with a clause `x-kind` — a `condition` or an `order` — is also
     /// checked as that clause, through [`one_statement`]; one annotated as a
     /// `column`, a name and not a clause, is checked only to be a name at all, not
-    /// empty, since [`column_ident`] carries any other name as written.
+    /// empty or blank, since [`column_ident`] carries any other name as written.
     fn admit(&self, arguments: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
         let schema = (self.parameters)();
         let empty = serde_json::Map::new();
@@ -1784,9 +1780,11 @@ impl Operation {
             {
                 one_statement(key, clause, text)?;
             }
-            if property["x-kind"] == "column" && value.as_str() == Some("") {
+            if property["x-kind"] == "column"
+                && value.as_str().is_some_and(|name| name.trim().is_empty())
+            {
                 return Err(refused(format!(
-                    "the column `{key}` of `{}` is empty",
+                    "the column `{key}` of `{}` is empty or blank",
                     self.long_name
                 )));
             }
@@ -2706,19 +2704,19 @@ mod tests {
         assert_eq!(
             schema["required"],
             serde_json::json!(["column"]),
-            "`column` is the one required parameter"
+            "`column` is not the one required parameter"
         );
         assert_eq!(
             schema["additionalProperties"],
             serde_json::json!(false),
-            "the schema is closed to any other key"
+            "the schema is open to a key it does not name"
         );
         assert_eq!(
             schema["properties"].as_object().map(|p| p.len()),
             Some(1),
-            "`column` is the one parameter"
+            "the schema takes a parameter besides `column`"
         );
-        assert_eq!(column["type"], "string", "`column` is a string");
+        assert_eq!(column["type"], "string", "`column` is not a string");
         assert_eq!(
             column["x-kind"], "column",
             "`column` does not say its value is a column name"
@@ -2762,19 +2760,22 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_column_is_refused_naming_the_argument_and_the_operation() {
+    fn an_empty_or_blank_column_is_refused_naming_the_argument_and_the_operation() {
         let op = operation(HIDE_COLUMN).unwrap();
-        let err = op
-            .admit(&arguments(serde_json::json!({ "column": "" })))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("the column `column` of `hide-column` is empty"),
-            "{err}"
-        );
+        for blank in ["", " "] {
+            let err = op
+                .admit(&arguments(serde_json::json!({ "column": blank })))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("the column `column` of `hide-column` is empty or blank"),
+                "{blank:?} was refused with another message: {err}"
+            );
+        }
         assert!(
             op.admit(&arguments(serde_json::json!({ "column": "note" })))
-                .is_ok()
+                .is_ok(),
+            "a column with a name was refused"
         );
     }
 

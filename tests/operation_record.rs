@@ -688,14 +688,16 @@ fn a_column_named_with_a_reserved_word_is_hidden_written_in_quotes_and_runs() {
 }
 
 #[test]
-fn an_empty_column_to_hide_is_refused_with_the_directory_untouched() {
+fn an_empty_or_blank_column_to_hide_is_refused_with_the_directory_untouched() {
     let protocol = Protocol::new();
     let before = protocol.files();
-    refused(
-        &protocol.record_on("hide-column", "orders", "no_note", "column="),
-        &["the column `column` of `hide-column` is empty"],
-    );
-    assert_eq!(protocol.files(), before, "a refusal changes nothing");
+    for arg in ["column=", "column= "] {
+        refused(
+            &protocol.record_on("hide-column", "orders", "no_note", arg),
+            &["the column `column` of `hide-column` is empty or blank"],
+        );
+        assert_eq!(protocol.files(), before, "a refusal changed the directory");
+    }
 }
 
 // ------------------------------------------------- the directory `--dir` names

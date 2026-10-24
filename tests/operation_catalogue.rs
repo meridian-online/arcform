@@ -216,7 +216,7 @@ fn the_text_listing_and_the_json_listing_say_the_same_thing() {
 }
 
 #[test]
-fn list_prints_sort_rows_beside_filter_rows_each_with_a_sentence() {
+fn list_prints_each_operation_with_a_sentence() {
     let text = arc_ok(&["operation", "list"]);
     for op in [FILTER_ROWS, SORT_ROWS, HIDE_COLUMN] {
         let line = line_opening_with(&text, op);
