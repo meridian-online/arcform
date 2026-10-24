@@ -1147,6 +1147,117 @@ fn a_select_list_that_is_not_one_is_refused_with_the_directory_untouched() {
     assert_eq!(protocol.files(), before, "a refusal changed the directory");
 }
 
+/// `arc operation record dedupe-rows` on `orders` as `unique_orders`, with each
+/// of `args` as an `--arg`.
+fn record_dedupe(protocol: &Protocol, args: &[&str]) -> Output {
+    let mut command = vec![
+        "operation",
+        "record",
+        "dedupe-rows",
+        "--on",
+        "orders",
+        "--name",
+        "unique_orders",
+    ];
+    for arg in args {
+        command.extend(["--arg", arg]);
+    }
+    protocol.arc(&command)
+}
+
+/// A Protocol whose `orders` holds `rows`, a SQL `VALUES` list of
+/// `(id, amount, note)`, in place of the fixture's own.
+fn holding(rows: &str) -> Protocol {
+    let protocol = Protocol::new();
+    std::fs::write(
+        protocol.dir.join("models/01_orders.sql"),
+        format!(
+            "CREATE OR REPLACE TABLE orders AS\nSELECT * FROM (VALUES {rows})\n    AS t(id, amount, note);\n"
+        ),
+    )
+    .unwrap();
+    protocol
+}
+
+/// The rows of `unique_orders` after `arc run`, in the order of `id` and `amount`.
+fn unique_orders(protocol: &Protocol) -> Vec<(i32, i32, String)> {
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    db.prepare("SELECT id, amount, note FROM unique_orders ORDER BY id, amount")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+#[test]
+fn record_dedupe_without_arguments_keeps_one_of_each_set_of_identical_rows() {
+    let protocol = holding("(1, 50, 'a'), (1, 50, 'a'), (2, 150, 'b')");
+    ok(
+        &record_dedupe(&protocol, &[]),
+        "arc operation record dedupe-rows",
+    );
+    assert_eq!(
+        protocol.read("models/02_unique_orders.sql"),
+        "-- generated: dedupe-rows on orders\nCREATE OR REPLACE TABLE \"unique_orders\" AS\nSELECT DISTINCT *\nFROM orders;\n"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    assert_eq!(
+        unique_orders(&protocol),
+        [(1, 50, "a".to_string()), (2, 150, "b".to_string())]
+    );
+}
+
+#[test]
+fn record_dedupe_with_a_key_and_an_order_keeps_the_first_row_of_each_key() {
+    let protocol = holding("(1, 50, 'a'), (2, 150, 'a'), (3, 300, 'b'), (4, 100, 'b')");
+    ok(
+        &record_dedupe(&protocol, &["key=note", "order_by=amount desc"]),
+        "arc operation record dedupe-rows",
+    );
+    assert_eq!(
+        protocol.read("models/02_unique_orders.sql"),
+        "-- generated: dedupe-rows on orders\nCREATE OR REPLACE TABLE \"unique_orders\" AS\nSELECT *\nFROM orders\nQUALIFY row_number() OVER (PARTITION BY note ORDER BY amount desc\n) = 1;\n"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    assert_eq!(
+        unique_orders(&protocol),
+        [(2, 150, "a".to_string()), (3, 300, "b".to_string())],
+        "the highest amount of each note was not the row kept"
+    );
+}
+
+#[test]
+fn a_dedupe_key_or_order_that_is_not_one_window_is_refused_with_the_directory_untouched() {
+    let protocol = Protocol::new();
+    let before = protocol.files();
+    for (args, named) in [
+        (
+            &["key=note"][..],
+            &["`key` of `dedupe-rows` needs `order_by` as well"][..],
+        ),
+        (
+            &["order_by=amount"][..],
+            &["`order_by` of `dedupe-rows` needs `key` as well"][..],
+        ),
+        (
+            &["key=note AS n", "order_by=amount"][..],
+            &["`key`", "`order_by`"][..],
+        ),
+        (
+            &["key=*", "order_by=amount"][..],
+            &["the partition key `key`"][..],
+        ),
+        (
+            &["key=note", "order_by=amount LIMIT 1"][..],
+            &["`key`", "`order_by`"][..],
+        ),
+    ] {
+        refused(&record_dedupe(&protocol, args), named);
+        assert_eq!(protocol.files(), before, "a refusal changed the directory");
+    }
+}
+
 // ------------------------------------------------- the directory `--dir` names
 
 #[test]

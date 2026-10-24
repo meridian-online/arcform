@@ -603,6 +603,10 @@ const CAST_COLUMN: &str = "cast-column";
 /// or as a whole, written once as [`FILTER_ROWS`] is.
 const SUMMARISE_ROWS: &str = "summarise-rows";
 
+/// The long name of the operation that keeps one row of each set of duplicates,
+/// written once as [`FILTER_ROWS`] is.
+const DEDUPE_ROWS: &str = "dedupe-rows";
+
 /// One SQL operation arc holds: what it is called, what it does, what it reads
 /// and writes, and what it takes — described so that it can be recorded as a
 /// step by name. The catalogue holds the description and nothing that runs.
@@ -625,7 +629,16 @@ pub(crate) struct Operation {
     /// statement is not it. `None` in place of the reader for an operation no
     /// statement is read as yet.
     recognised: Option<fn(&Statement) -> Option<Reading>>,
+    /// A check of the arguments taken together, run by [`Operation::admit`] once
+    /// each value has passed its own, or `None` when each value checked alone is
+    /// enough. It is for a gate no one value can be held to: [`DEDUPE_ROWS`]'
+    /// `key` and `order_by` are written into one window, and are probed there
+    /// together.
+    checks: Option<Checks>,
 }
+
+/// A check of an operation's arguments taken together: `Ok`, or the refusal.
+type Checks = fn(&serde_json::Map<String, serde_json::Value>) -> Result<()>;
 
 /// What a statement read as an operation is read to: the table the operation
 /// is applied to, and its arguments.
@@ -782,6 +795,7 @@ const CATALOGUE: &[Operation] = &[
         parameters: filter_rows_parameters,
         sql: filter_rows_sql,
         recognised: Some(filter_rows_recognised),
+        checks: None,
     },
     Operation {
         long_name: SORT_ROWS,
@@ -810,6 +824,7 @@ const CATALOGUE: &[Operation] = &[
         parameters: sort_rows_parameters,
         sql: sort_rows_sql,
         recognised: None,
+        checks: None,
     },
     Operation {
         long_name: HIDE_COLUMN,
@@ -838,6 +853,7 @@ const CATALOGUE: &[Operation] = &[
         parameters: hide_column_parameters,
         sql: hide_column_sql,
         recognised: None,
+        checks: None,
     },
     Operation {
         long_name: RENAME_COLUMN,
@@ -866,6 +882,7 @@ const CATALOGUE: &[Operation] = &[
         parameters: rename_column_parameters,
         sql: rename_column_sql,
         recognised: None,
+        checks: None,
     },
     Operation {
         long_name: DERIVE_COLUMN,
@@ -894,6 +911,7 @@ const CATALOGUE: &[Operation] = &[
         parameters: derive_column_parameters,
         sql: derive_column_sql,
         recognised: None,
+        checks: None,
     },
     Operation {
         long_name: CAST_COLUMN,
@@ -922,6 +940,7 @@ const CATALOGUE: &[Operation] = &[
         parameters: cast_column_parameters,
         sql: cast_column_sql,
         recognised: None,
+        checks: None,
     },
     Operation {
         long_name: SUMMARISE_ROWS,
@@ -950,6 +969,36 @@ const CATALOGUE: &[Operation] = &[
         parameters: summarise_rows_parameters,
         sql: summarise_rows_sql,
         recognised: None,
+        checks: None,
+    },
+    Operation {
+        long_name: DEDUPE_ROWS,
+        summary: "Keeps one row of each set of duplicates in a table: one of each set of identical rows, or the first in an order of each key's rows.",
+        reads: &[
+            Role {
+                name: "table",
+                kind: "table",
+                list: false,
+                required: true,
+                of: None,
+                min_items: None,
+                description: "The table whose duplicate rows are dropped.",
+            },
+            Role {
+                name: "column",
+                kind: "column",
+                list: false,
+                required: false,
+                of: Some("table"),
+                min_items: None,
+                description: "A column the rows are told apart by, which `key` may name with others.",
+            },
+        ],
+        writes: &[STEP_TABLE],
+        parameters: dedupe_rows_parameters,
+        sql: dedupe_rows_sql,
+        recognised: None,
+        checks: Some(dedupe_rows_checks),
     },
 ];
 
@@ -1089,10 +1138,6 @@ fn conditions(text: &str) -> impl Iterator<Item = &str> {
 /// schema holds no `enum` and no `pattern` that would hold it to a column or to
 /// the directions listed.
 fn sort_rows_parameters() -> serde_json::Value {
-    let directions: Vec<serde_json::Value> = DIRECTIONS
-        .iter()
-        .map(|d| serde_json::json!({ "word": d.word, "sign": d.sign }))
-        .collect();
     serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -1104,11 +1149,21 @@ fn sort_rows_parameters() -> serde_json::Value {
                     recorded as written; the order may name several columns, each with a direction. \
                     The directions listed are the ones offered by word, not a limit.",
                 "x-kind": "order",
-                "x-directions": directions,
+                "x-directions": directions(),
             }
         },
         "required": ["order_by"],
     })
+}
+
+/// The [`DIRECTIONS`] an order offers, as an `x-directions` annotation lists them:
+/// each a word and its sign. [`sort_rows_parameters`] and
+/// [`dedupe_rows_parameters`] annotate their `order_by` with it.
+fn directions() -> Vec<serde_json::Value> {
+    DIRECTIONS
+        .iter()
+        .map(|d| serde_json::json!({ "word": d.word, "sign": d.sign }))
+        .collect()
 }
 
 /// The SQL step of [`SORT_ROWS`]: a table named for the step, holding the rows of
@@ -1400,6 +1455,122 @@ fn summarise_rows_sql(recording: &Recording) -> String {
         recording.text("aggregates"),
         from_ident(recording.on),
     )
+}
+
+/// The `parameters` schema of [`DEDUPE_ROWS`]: two optional strings, `key` and
+/// `order_by`, given together or not at all. Closed to any other key, as
+/// [`hide_column_parameters`] is.
+///
+/// `dependentRequired` says each needs the other, and [`Operation::admit`] holds
+/// the arguments to it. A key alone would keep an arbitrary row of each key, so
+/// the step's table could differ from one run to the next; an order alone would
+/// be a sort. `key` is SQL, recorded as written, so `x-kind` marks it a
+/// `partition` and [`Operation::admit`] holds it to one: DuckDB must read it, in
+/// the probe [`PARTITION`] writes, as the items of a select that reads no table.
+/// `order_by` keeps [`sort_rows_parameters`]' annotation, an `order` with its
+/// `x-directions`, and is checked as that clause; [`dedupe_rows_checks`] then
+/// probes the two in the window the step writes.
+fn dedupe_rows_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "key": {
+                "type": "string",
+                "description": "What tells one row's duplicates from another's: a SQL list of expressions, \
+                    recorded as written, with no alias (`note`, `lower(note), id`). \
+                    The step keeps one row for each key, the first in `order_by`, \
+                    and `key` is given with `order_by` or not at all; \
+                    without both, the step keeps one of each set of rows identical in every column (`SELECT DISTINCT *`).",
+                "x-kind": "partition",
+            },
+            "order_by": {
+                "type": "string",
+                "description": "Which row of each key is kept: the first in the order this SQL `ORDER BY` clause gives, \
+                    recorded as written, given with `key` or not at all. \
+                    Where two rows of a key tie on the order, either may be kept. \
+                    The directions listed are the ones offered by word, not a limit.",
+                "x-kind": "order",
+                "x-directions": directions(),
+            }
+        },
+        "dependentRequired": {
+            "key": ["order_by"],
+            "order_by": ["key"],
+        },
+    })
+}
+
+/// The SQL step of [`DEDUPE_ROWS`]: a table named for the step. With `key` and
+/// `order_by`, it holds every column of the rows the [`dedupe_rows_window`] numbers
+/// first, one for each key; without them, one row of each set of rows identical in
+/// every column, `SELECT DISTINCT *`. The table read is written as [`from_ident`]
+/// writes it, and both arguments as given.
+///
+/// No tie-break over the whole row is added to the order: the order is the
+/// analyst's statement of which row is kept, and where two rows of a key tie on
+/// it, either may be.
+fn dedupe_rows_sql(recording: &Recording) -> String {
+    let from = from_ident(recording.on);
+    let query = match recording.arguments.get("key").and_then(|v| v.as_str()) {
+        Some(key) => format!(
+            "SELECT *\nFROM {from}\nQUALIFY {} = 1",
+            dedupe_rows_window(key, recording.text("order_by"))
+        ),
+        None => format!("SELECT DISTINCT *\nFROM {from}"),
+    };
+    format!(
+        "CREATE OR REPLACE TABLE {} AS\n{query};\n",
+        quote_ident(recording.name)
+    )
+}
+
+/// The window a keyed [`DEDUPE_ROWS`] step numbers each key's rows in:
+/// `row_number() OVER (PARTITION BY <key> ORDER BY <order_by>\n)`, both as given.
+/// The newline before the `)` ends a `--` comment the order closes with, so the
+/// comment cannot swallow the window's close. [`dedupe_rows_sql`] writes it into
+/// the step, and [`dedupe_rows_checks`] into the probe of the two arguments.
+fn dedupe_rows_window(key: &str, order_by: &str) -> String {
+    format!("row_number() OVER (PARTITION BY {key} ORDER BY {order_by}\n)")
+}
+
+/// Whether `key` and `order_by`, each already admitted on its own, read together
+/// as the one window the step writes: DuckDB must read
+/// `SELECT <window> AS __arc_probe`, the [`dedupe_rows_window`] of the two, as a
+/// bare select ([`bare_select`]) of one `WINDOW` item, the function `row_number`,
+/// called [`SENTINEL`], over the window's default frame. An alias in the key,
+/// which `PARTITION BY` does not take, does not parse; an order that closes the
+/// window, `amount) = 1 OR (1`, leaves an item that is not the window; and one
+/// that runs on into a frame or a `LIMIT` gives a frame that is not the default,
+/// or does not parse. Without either argument there is no window, and nothing to
+/// check.
+fn dedupe_rows_checks(arguments: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+    let text = |key| arguments.get(key).and_then(serde_json::Value::as_str);
+    let (Some(key), Some(order_by)) = (text("key"), text("order_by")) else {
+        return Ok(());
+    };
+    let probe = format!("SELECT {} AS {SENTINEL}", dedupe_rows_window(key, order_by));
+    let one_window = !order_by.to_ascii_lowercase().contains(SENTINEL)
+        && probe_items(&probe).is_some_and(|items| match items.as_slice() {
+            [item] => {
+                item["alias"] == SENTINEL
+                    && item["class"] == "WINDOW"
+                    && item["function_name"] == "row_number"
+                    && item["start"] == "UNBOUNDED_PRECEDING"
+                    && item["end"] == "CURRENT_ROW_RANGE"
+                    && item["exclude_clause"] == "NO_OTHER"
+            }
+            _ => false,
+        });
+    if one_window {
+        Ok(())
+    } else {
+        Err(refused(format!(
+            "the partition key `key` and the order `order_by` of `{DEDUPE_ROWS}` do not read as one \
+             `row_number()` window, `PARTITION BY` the key `ORDER BY` the order: {key} / {order_by}"
+        )))
+    }
 }
 
 /// `name` as a double-quoted SQL identifier, a `"` inside it doubled. The step's
@@ -2106,7 +2277,10 @@ impl Operation {
     /// probed `x-kind` — an `expression` — is checked in its probe, through
     /// [`probed`]; one annotated as a `column`, a name and not SQL, is checked
     /// only to be a name at all, not empty or blank, since [`column_ident`]
-    /// carries any other name as written.
+    /// carries any other name as written. An argument the schema's
+    /// `dependentRequired` ties to others is refused without them, and the
+    /// operation's own `checks`, when it has them, run last, on the arguments
+    /// together.
     fn admit(&self, arguments: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
         let schema = (self.parameters)();
         let empty = serde_json::Map::new();
@@ -2137,6 +2311,21 @@ impl Operation {
                     "`{}` needs the argument `{required}`, and none was given",
                     self.long_name
                 )));
+            }
+        }
+        let dependent = schema["dependentRequired"]
+            .as_object()
+            .into_iter()
+            .flatten();
+        for (given, needs) in dependent.filter(|(given, _)| arguments.contains_key(*given)) {
+            let needs = needs.as_array().into_iter().flatten();
+            for needed in needs.filter_map(serde_json::Value::as_str) {
+                if !arguments.contains_key(needed) {
+                    return Err(refused(format!(
+                        "the argument `{given}` of `{}` needs `{needed}` as well, and none was given",
+                        self.long_name
+                    )));
+                }
             }
         }
         for (key, value) in arguments {
@@ -2170,7 +2359,7 @@ impl Operation {
                 )));
             }
         }
-        Ok(())
+        self.checks.map_or(Ok(()), |checks| checks(arguments))
     }
 }
 
@@ -2343,6 +2532,17 @@ const SELECT_LIST: Probe = Probe {
     },
 };
 
+/// The probe of a `partition` key: the [`SELECT_LIST`] probe and its check, in
+/// the words of a partition key. A `)` that would close the window the key is
+/// written into does not parse in it, a clause such as `ORDER BY` is not a bare
+/// select, and a star or an `unnest` is refused as in a select list. An alias,
+/// which a select list takes and `PARTITION BY` does not, passes here and is
+/// refused by [`dedupe_rows_checks`], which probes the key in its window.
+const PARTITION: Probe = Probe {
+    noun: "partition key",
+    ..SELECT_LIST
+};
+
 /// The probe of a `type`: `SELECT CAST(NULL AS <value>) AS __arc_probe`, which
 /// must read as exactly one item, a `CAST`, called [`SENTINEL`], whose child is
 /// the probe's own `NULL`. `INTEGER) AS x, (1` closes the cast and adds an item,
@@ -2417,6 +2617,7 @@ impl Probe {
             Some("expression") => Some(EXPRESSION),
             Some("type") => Some(TYPE),
             Some("select-list") => Some(SELECT_LIST),
+            Some("partition") => Some(PARTITION),
             _ => None,
         }
     }
@@ -3847,6 +4048,168 @@ mod tests {
     }
 
     #[test]
+    fn the_dedupe_takes_a_key_and_an_order_each_needing_the_other_and_no_other_key() {
+        let schema = dedupe_rows_parameters();
+
+        assert_eq!(
+            schema.get("required"),
+            None,
+            "the dedupe requires an argument, where both are optional"
+        );
+        assert_eq!(
+            schema["dependentRequired"],
+            serde_json::json!({ "key": ["order_by"], "order_by": ["key"] }),
+            "`key` and `order_by` do not each need the other"
+        );
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::json!(false),
+            "the schema is open to a key it does not name"
+        );
+        assert_eq!(schema["properties"]["key"]["x-kind"], "partition");
+        assert_eq!(schema["properties"]["order_by"]["x-kind"], "order");
+        assert_eq!(
+            schema["properties"]["order_by"]["x-directions"],
+            sort_rows_parameters()["properties"]["order_by"]["x-directions"],
+            "the dedupe's order does not offer the directions a sort's does"
+        );
+    }
+
+    #[test]
+    fn the_dedupe_keeps_distinct_rows_or_the_first_of_each_key() {
+        let whole = arguments(serde_json::json!({}));
+        let recording = Recording {
+            name: "unique_orders",
+            on: "orders",
+            arguments: &whole,
+        };
+        assert_eq!(
+            dedupe_rows_sql(&recording),
+            "CREATE OR REPLACE TABLE \"unique_orders\" AS\nSELECT DISTINCT *\nFROM orders;\n"
+        );
+        let keyed = arguments(serde_json::json!({ "key": "note", "order_by": "amount desc" }));
+        let recording = Recording {
+            name: "unique_orders",
+            on: "orders",
+            arguments: &keyed,
+        };
+        assert_eq!(
+            dedupe_rows_sql(&recording),
+            "CREATE OR REPLACE TABLE \"unique_orders\" AS\nSELECT *\nFROM orders\nQUALIFY row_number() OVER (PARTITION BY note ORDER BY amount desc\n) = 1;\n"
+        );
+    }
+
+    #[test]
+    fn a_key_and_an_order_that_read_as_one_window_are_admitted() {
+        let op = operation(DEDUPE_ROWS).unwrap();
+        for (key, order_by) in [
+            ("note", "amount desc"),
+            ("lower(note), id", "amount, id desc NULLS LAST"),
+            ("note", "amount desc -- the largest first"),
+            ("note", "(SELECT max(id) FROM orders)"),
+        ] {
+            let admitted = op.admit(&arguments(
+                serde_json::json!({ "key": key, "order_by": order_by }),
+            ));
+            assert!(
+                admitted.is_ok(),
+                "{key:?} by {order_by:?} was refused: {admitted:?}"
+            );
+        }
+        assert!(op.admit(&arguments(serde_json::json!({}))).is_ok());
+    }
+
+    #[test]
+    fn a_key_or_an_order_given_alone_is_refused_naming_both() {
+        let op = operation(DEDUPE_ROWS).unwrap();
+        for (given, needed) in [("key", "order_by"), ("order_by", "key")] {
+            let err = op
+                .admit(&arguments(serde_json::json!({ (given): "note" })))
+                .expect_err(given)
+                .to_string();
+            assert!(
+                err.contains(&format!(
+                    "`{given}` of `dedupe-rows` needs `{needed}` as well"
+                )),
+                "{given} alone was refused with another message: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_or_an_order_that_does_not_stay_in_the_window_is_refused() {
+        let op = operation(DEDUPE_ROWS).unwrap();
+        for (key, order_by, named) in [
+            ("note AS n", "amount", "`order_by`"), // an alias, which PARTITION BY does not take
+            ("note ORDER BY amount", "amount", "`key`"), // a clause of the key's own
+            (
+                "note) = 1 OR TRUE OR row_number() OVER (PARTITION BY note",
+                "amount",
+                "`key`",
+            ), // a key that closes the window
+            ("*", "amount", "`key`"),              // every column at once
+            ("note -- by note", "amount", "`key`"), // a comment that swallows the order
+            ("note", "amount LIMIT 1", "`order_by`"), // a clause after the order
+            ("note", "amount) = 1 OR (1", "`order_by`"), // an order that closes the window
+            ("note", "amount ROWS UNBOUNDED PRECEDING", "`order_by`"), // a frame
+            ("note", "amount; DROP TABLE orders", "`order_by`"),
+        ] {
+            let err = op
+                .admit(&arguments(
+                    serde_json::json!({ "key": key, "order_by": order_by }),
+                ))
+                .expect_err(key)
+                .to_string();
+            assert!(
+                err.contains(named),
+                "{key:?} by {order_by:?}: the refusal does not name {named}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pair_that_is_not_one_window_is_refused_naming_both_arguments() {
+        for (key, order_by) in [
+            ("note AS n", "amount"),
+            ("note", "amount LIMIT 1"),
+            ("note", "amount) = 1 OR (1"),
+            ("note", "amount ROWS UNBOUNDED PRECEDING"),
+            ("note", "amount\n) AS __arc_probe --"),
+        ] {
+            let err = dedupe_rows_checks(&arguments(
+                serde_json::json!({ "key": key, "order_by": order_by }),
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains(
+                    "the partition key `key` and the order `order_by` of `dedupe-rows` do not read as one `row_number()` window"
+                ),
+                "{key:?} by {order_by:?} was refused with another message: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_partition_key_that_is_not_one_is_refused_in_the_partition_key_wording() {
+        for (key, reason) in [
+            ("note -- by note", "is not one SQL partition key"),
+            ("note, *", "has an item that expands to several columns"),
+            ("unnest([1, 2])", "changes the number of rows"),
+        ] {
+            let err = probed(DEDUPE_ROWS, "key", PARTITION, key)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!(
+                    "the partition key `key` of `dedupe-rows` {reason}"
+                )),
+                "{key:?} was refused with another message: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn a_fragment_holding_the_sentinel_in_any_case_is_refused() {
         for expression in ["__arc_probe", "amount AS __ARC_PROBE", "'__Arc_Probe'"] {
             let err = probed(DERIVE_COLUMN, "expression", EXPRESSION, expression)
@@ -3903,7 +4266,35 @@ mod tests {
             parameters,
             sql: |recording| recording.text("where").to_string(),
             recognised: None,
+            checks: None,
         }
+    }
+
+    #[test]
+    fn an_argument_given_without_one_it_depends_on_is_refused_naming_both() {
+        let op = operation_taking(|| {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "from": { "type": "string" }, "to": { "type": "string" } },
+                "dependentRequired": { "from": ["to"] },
+            })
+        });
+        assert!(
+            op.admit(&arguments(serde_json::json!({ "to": "b" })))
+                .is_ok()
+        );
+        assert!(
+            op.admit(&arguments(serde_json::json!({ "from": "a", "to": "b" })))
+                .is_ok()
+        );
+        let err = op
+            .admit(&arguments(serde_json::json!({ "from": "a" })))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("the argument `from` of `test-op` needs `to` as well"),
+            "the refusal does not name both arguments: {err}"
+        );
     }
 
     fn arguments(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
