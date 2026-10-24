@@ -964,7 +964,7 @@ fn a_type_that_is_not_one_is_refused_with_the_directory_untouched() {
     for type_name in ["INTEGER) AS x, (1", "INTEGER; DROP TABLE orders", ""] {
         refused(
             &record_cast(&protocol, "amount", type_name),
-            &["`type`", "`cast-column`"],
+            &["the type `type`"],
         );
         assert_eq!(protocol.files(), before, "a refusal changed the directory");
     }
