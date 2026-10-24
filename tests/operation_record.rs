@@ -700,6 +700,46 @@ fn an_empty_or_blank_column_to_hide_is_refused_with_the_directory_untouched() {
     }
 }
 
+#[test]
+fn record_rename_writes_the_model_and_arc_run_renames_the_column_in_place() {
+    let protocol = Protocol::new();
+    ok(
+        &protocol.arc(&[
+            "operation",
+            "record",
+            "rename-column",
+            "--on",
+            "orders",
+            "--name",
+            "relabelled",
+            "--arg",
+            "column=note",
+            "--arg",
+            "to=label",
+        ]),
+        "arc operation record rename-column",
+    );
+    assert_eq!(
+        protocol.read("models/02_relabelled.sql"),
+        "-- generated: rename-column on orders\nCREATE OR REPLACE TABLE \"relabelled\" AS\nSELECT * RENAME (note AS label)\nFROM orders;\n"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    assert_eq!(
+        columns(&protocol, "relabelled"),
+        ["id", "amount", "label"],
+        "relabelled holds the columns of orders, note as label"
+    );
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    let labels: Vec<String> = db
+        .prepare("SELECT label FROM relabelled ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(labels, ["a;b", "abc", "xyz", "a"], "the values were kept");
+}
+
 // ------------------------------------------------- the directory `--dir` names
 
 #[test]

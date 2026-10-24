@@ -587,6 +587,10 @@ const SORT_ROWS: &str = "sort-rows";
 /// [`FILTER_ROWS`] is.
 const HIDE_COLUMN: &str = "hide-column";
 
+/// The long name of the operation that renames a column, written once as
+/// [`FILTER_ROWS`] is.
+const RENAME_COLUMN: &str = "rename-column";
+
 /// One SQL operation arc holds: what it is called, what it does, what it reads
 /// and writes, and what it takes — described so that it can be recorded as a
 /// step by name. The catalogue holds the description and nothing that runs.
@@ -823,6 +827,34 @@ const CATALOGUE: &[Operation] = &[
         sql: hide_column_sql,
         recognised: None,
     },
+    Operation {
+        long_name: RENAME_COLUMN,
+        summary: "Renames one column of a table, keeping every column in its place and every row.",
+        reads: &[
+            Role {
+                name: "table",
+                kind: "table",
+                list: false,
+                required: true,
+                of: None,
+                min_items: None,
+                description: "The table a column is renamed in.",
+            },
+            Role {
+                name: "column",
+                kind: "column",
+                list: false,
+                required: false,
+                of: Some("table"),
+                min_items: None,
+                description: "The column renamed, which the `column` argument names.",
+            },
+        ],
+        writes: &[STEP_TABLE],
+        parameters: rename_column_parameters,
+        sql: rename_column_sql,
+        recognised: None,
+    },
 ];
 
 /// The `parameters` schema of [`FILTER_ROWS`]: one required string, `where`.
@@ -1028,6 +1060,50 @@ fn hide_column_sql(recording: &Recording) -> String {
         "CREATE OR REPLACE TABLE {} AS\nSELECT * EXCLUDE ({})\nFROM {};\n",
         quote_ident(recording.name),
         recording.column("column"),
+        from_ident(recording.on),
+    )
+}
+
+/// The `parameters` schema of [`RENAME_COLUMN`]: two required strings, `column`
+/// and `to`. Closed to any other key, as [`hide_column_parameters`] is.
+///
+/// Both are names, not SQL: `x-kind` says so, and the step writes each through
+/// [`column_ident`], so a name holding a space, a `"` or a reserved word is
+/// carried as that name and cannot break out of the `RENAME`. An empty name in
+/// either is refused when the step is recorded ([`Operation::admit`]).
+fn rename_column_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "column": {
+                "type": "string",
+                "description": "The name of the column renamed, as the table names it; \
+                    a name, not SQL, so a name that needs quotes is given without them.",
+                "x-kind": "column",
+            },
+            "to": {
+                "type": "string",
+                "description": "The name the column takes; a name, not SQL, \
+                    so a name that needs quotes is given without them.",
+                "x-kind": "column",
+            }
+        },
+        "required": ["column", "to"],
+    })
+}
+
+/// The SQL step of [`RENAME_COLUMN`]: a table named for the step, holding every
+/// row and every column of the table it is applied to, the one named by `column`
+/// under the name `to` and in the place it held. The table read is written as
+/// [`from_ident`] writes it, and each column as [`column_ident`] does.
+fn rename_column_sql(recording: &Recording) -> String {
+    format!(
+        "CREATE OR REPLACE TABLE {} AS\nSELECT * RENAME ({} AS {})\nFROM {};\n",
+        quote_ident(recording.name),
+        recording.column("column"),
+        recording.column("to"),
         from_ident(recording.on),
     )
 }
@@ -2776,6 +2852,79 @@ mod tests {
             op.admit(&arguments(serde_json::json!({ "column": "note" })))
                 .is_ok(),
             "a column with a name was refused"
+        );
+    }
+
+    #[test]
+    fn the_rename_takes_a_required_column_and_to_and_no_other_key() {
+        let schema = rename_column_parameters();
+
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["column", "to"]),
+            "`column` and `to` are not the required parameters"
+        );
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::json!(false),
+            "the schema is open to a key it does not name"
+        );
+        assert_eq!(
+            schema["properties"].as_object().map(|p| p.len()),
+            Some(2),
+            "the schema takes a parameter besides `column` and `to`"
+        );
+        for key in ["column", "to"] {
+            let property = &schema["properties"][key];
+            assert_eq!(property["type"], "string", "`{key}` is not a string");
+            assert_eq!(
+                property["x-kind"], "column",
+                "`{key}` does not say its value is a column name"
+            );
+            assert!(
+                property["description"]
+                    .as_str()
+                    .is_some_and(|d| !d.trim().is_empty()),
+                "`{key}` has no description: {property}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_rename_writes_both_names_into_a_rename_of_every_column() {
+        let arguments = arguments(serde_json::json!({ "column": "note", "to": "order" }));
+        let recording = Recording {
+            name: "relabelled",
+            on: "orders",
+            arguments: &arguments,
+        };
+        assert_eq!(
+            rename_column_sql(&recording),
+            "CREATE OR REPLACE TABLE \"relabelled\" AS\nSELECT * RENAME (note AS \"order\")\nFROM orders;\n"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_blank_new_name_is_refused_naming_the_argument_and_the_operation() {
+        let op = operation(RENAME_COLUMN).unwrap();
+        for blank in ["", " "] {
+            let err = op
+                .admit(&arguments(
+                    serde_json::json!({ "column": "note", "to": blank }),
+                ))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("the column `to` of `rename-column` is empty or blank"),
+                "{blank:?} was refused with another message: {err}"
+            );
+        }
+        assert!(
+            op.admit(&arguments(
+                serde_json::json!({ "column": "note", "to": "label" })
+            ))
+            .is_ok(),
+            "a rename to a name was refused"
         );
     }
 
