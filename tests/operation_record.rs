@@ -961,7 +961,12 @@ fn a_cast_of_a_column_the_table_lacks_records_and_fails_the_run() {
 fn a_type_that_is_not_one_is_refused_with_the_directory_untouched() {
     let protocol = Protocol::new();
     let before = protocol.files();
-    for type_name in ["INTEGER) AS x, (1", "INTEGER; DROP TABLE orders", ""] {
+    for type_name in [
+        "INTEGER) AS x, (1",
+        "INTEGER; DROP TABLE orders",
+        "INTEGER)::DECIMAL(10,2",
+        "",
+    ] {
         refused(
             &record_cast(&protocol, "amount", type_name),
             &["the type `type`"],

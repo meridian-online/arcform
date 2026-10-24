@@ -883,7 +883,7 @@ const CATALOGUE: &[Operation] = &[
                 required: false,
                 of: Some("table"),
                 min_items: None,
-                description: "The column added, which the `column` argument names.",
+                description: "A column the expression reads; the expression may name others.",
             },
         ],
         writes: &[STEP_TABLE],
@@ -2206,14 +2206,22 @@ const EXPRESSION: Probe = Probe {
 };
 
 /// The probe of a `type`: `SELECT CAST(NULL AS <value>) AS __arc_probe`, which
-/// must read as exactly one item, a `CAST`, called [`SENTINEL`]. `INTEGER) AS x, (1`
-/// closes the cast and adds an item, so the select lists two; `INTEGER) --` leaves
-/// the item without the alias; neither is a type.
+/// must read as exactly one item, a `CAST`, called [`SENTINEL`], whose child is
+/// the probe's own `NULL`. `INTEGER) AS x, (1` closes the cast and adds an item,
+/// so the select lists two; `INTEGER) --` leaves the item without the alias; and
+/// `INTEGER)::DECIMAL(10,2` is one `CAST` item too, but of a cast, so the step
+/// would convert through `INTEGER` first. None is a type.
 const TYPE: Probe = Probe {
     noun: "type",
     probe: |value| format!("SELECT CAST(NULL AS {value}) AS {SENTINEL}"),
     admits: |items| match items {
-        [item] if item["alias"] == SENTINEL && item["class"] == "CAST" => Ok(()),
+        [item]
+            if item["alias"] == SENTINEL
+                && item["class"] == "CAST"
+                && item["child"]["class"] == "CONSTANT" =>
+        {
+            Ok(())
+        }
         _ => Err(NOT_ONE),
     },
 };
@@ -3493,6 +3501,10 @@ mod tests {
             "INTEGER; DROP TABLE orders",
             "",
             "INTEGER) AS __arc_probe -- c",
+            "INTEGER) -- c",
+            "INTEGER)::DECIMAL(10,2",
+            "INTEGER)::VARCHAR::DECIMAL(10,2",
+            "INTEGER)::VARCHAR(1",
         ] {
             let err = op
                 .admit(&arguments(
