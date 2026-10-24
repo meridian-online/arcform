@@ -18,6 +18,7 @@ src/
   precondition.rs # Typed step preconditions (modified_after, fresh, command, tool)
   state.rs        # Run state tracking (step config hash, artifact hash, staleness)
   inspect.rs      # Read-only look inside a Protocol's database: `arc table describe`, `arc sql query`
+  record.rs       # Recording a step: the operation catalogue, its argument gates, `arc operation record`, `arc sql record`
   protocol_files.rs # Writes a Protocol's schemas/, panels/ and README.md, each recorded in its own history: `arc protocol write-file`
   panel_check.rs  # Finds panels that name a table or column the Protocol does not make: `arc panel check`
   report.rs       # Writes report.md from an agent's prose and a run's contract: `arc report write`
@@ -68,6 +69,23 @@ When no DuckDB 2 answers, `arc run` refuses before any step runs, and a DuckDB 2
 The run contract records each statement's `byte_range`, computed from DuckDB's statement split and mapped from the command-line batches back to file bytes (a range that cannot be placed is `null`), and its `read_by`: `duckdb`, `sqlparser`, or `nothing`.
 
 `tests/reader_parity.rs` is the parity gate. It reads every `.sql` file under `tests/fixtures` and `examples` with both readers and compares what each statement produces and reads; each known difference is pinned exactly with its reason, and the test also pins which statements take the sqlparser-rs fallback, so a change in DuckDB's reading or in the fallback shows up as a failure. Known sqlparser-rs gaps, which only the forced and fallback paths see: tables inside `EXISTS` and scalar subqueries.
+
+### The operation catalogue
+
+`CATALOGUE` in `src/record.rs` holds the SQL operations arc can record as a step by name: `filter-rows`, `sort-rows`, `hide-column`, `rename-column`, `derive-column`, `cast-column`, `summarise-rows`, `dedupe-rows`, `limit-rows` and `fill-nulls`. Each entry is a description and a SQL writer, and nothing that runs: a long name, one sentence, what the step reads and writes by role, a closed JSON Schema of its arguments, and the function that writes the step's model from a recording the schema has admitted. `arc operation list|describe|record` and `arc mcp`'s `operation_list`, `operation_describe` and `operation_record` read the same entries, so an operation added there reaches both with no other edit. Only `filter-rows` has a recogniser, which reads typed SQL back as the operation.
+
+A recorded model opens with `-- generated: <operation> on <table>` and makes the table the step's name names. Most are one `CREATE OR REPLACE TABLE … AS` statement. `rename-column` and `derive-column` are a copy and an `ALTER TABLE … RENAME COLUMN` in one transaction: DuckDB 2.0's `SELECT * RENAME` renames nothing when the column is misspelt, and a select whose new column clashes with an existing one suffixes it `_1`, both without an error, while `ALTER` fails the run and the transaction leaves no table. `derive-column` adds its column as `__arc_derived` before renaming it, so a table already holding that name is not one it can add to. `summarise-rows` groups by position (`GROUP BY 1, …, k`, or `GROUP BY ()` with no grouping) so that DuckDB fails the run on a plain column among the aggregates, which `GROUP BY ALL` would silently group by.
+
+Arguments come in two kinds, set by each property's `x-kind`. A column (`x-kind: column`) is a name, not SQL: `column_ident` writes it bare where DuckDB reads it bare as that column and quoted otherwise, so it cannot leave the clause it is written into, and only an empty or blank name is refused. Everything else is a SQL fragment written verbatim, so `Operation::admit` checks it with DuckDB's parser before anything is written, in a probe that reproduces what follows the fragment in the step and ends in the alias `__arc_probe`:
+
+| `x-kind` | Probe | Holds it to |
+|---|---|---|
+| `condition`, `order` | `SELECT 1 WHERE <v>` / `SELECT 1 ORDER BY <v>` | one statement |
+| `expression` | `SELECT <v> AS __arc_probe` | one item of a bare select |
+| `select-list`, `partition` | `SELECT <v>, 1 AS __arc_probe` | a bare select ending in the sentinel |
+| `type` | `SELECT CAST(NULL AS <v>) AS __arc_probe` | one `CAST` of the probe's own `NULL` |
+
+A bare select has no `FROM`, `WHERE`, grouping, `HAVING`, `QUALIFY`, sample, modifier or CTE. A trailing `--` comment swallows the sentinel, a comma list displaces it and a clause that runs on makes the select not bare, so each is refused. A star or `COLUMNS(…)` outside a subquery reads as one item and expands to several columns, and `unnest`, `unlist` and `generate_subscripts` change the number of rows, so the expression and select-list probes refuse them too; a value holding `__arc_probe` itself is refused. Where a fragment's position depends on another argument, an operation-level `checks` hook probes the step's own clause: `dedupe-rows` asks that its key and order read as one `row_number() OVER (PARTITION BY … ORDER BY …)` with the default frame and no constant in either, and `limit-rows` that its order leaves the step's `LIMIT` the only limit and offset. `admit` also reads `dependentRequired`, `minimum` and `maximum`. The command line passes every `--arg` as a string, so `typed_arguments` turns one into a number where the schema types it `integer`; `arc mcp` passes JSON as given.
 
 ### Release and distribution
 
