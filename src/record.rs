@@ -595,6 +595,10 @@ const RENAME_COLUMN: &str = "rename-column";
 /// expression, written once as [`FILTER_ROWS`] is.
 const DERIVE_COLUMN: &str = "derive-column";
 
+/// The long name of the operation that converts a column to another type,
+/// written once as [`FILTER_ROWS`] is.
+const CAST_COLUMN: &str = "cast-column";
+
 /// One SQL operation arc holds: what it is called, what it does, what it reads
 /// and writes, and what it takes — described so that it can be recorded as a
 /// step by name. The catalogue holds the description and nothing that runs.
@@ -885,6 +889,34 @@ const CATALOGUE: &[Operation] = &[
         writes: &[STEP_TABLE],
         parameters: derive_column_parameters,
         sql: derive_column_sql,
+        recognised: None,
+    },
+    Operation {
+        long_name: CAST_COLUMN,
+        summary: "Converts one column of a table to another type, keeping every other column and every row.",
+        reads: &[
+            Role {
+                name: "table",
+                kind: "table",
+                list: false,
+                required: true,
+                of: None,
+                min_items: None,
+                description: "The table a column is converted in.",
+            },
+            Role {
+                name: "column",
+                kind: "column",
+                list: false,
+                required: false,
+                of: Some("table"),
+                min_items: None,
+                description: "The column converted, which the `column` argument names.",
+            },
+        ],
+        writes: &[STEP_TABLE],
+        parameters: cast_column_parameters,
+        sql: cast_column_sql,
         recognised: None,
     },
 ];
@@ -1210,6 +1242,56 @@ fn derive_column_sql(recording: &Recording) -> String {
         recording.text("expression"),
         from_ident(recording.on),
         recording.column("column"),
+    )
+}
+
+/// The `parameters` schema of [`CAST_COLUMN`]: two required strings, `column`
+/// and `type`. Closed to any other key, as [`hide_column_parameters`] is.
+///
+/// `column` is a name, not SQL, written through [`column_ident`]. `type` is SQL,
+/// recorded as written, so `x-kind` marks it a type and [`Operation::admit`]
+/// holds it to one: DuckDB must read it, in the probe [`TYPE`] writes, as the one
+/// type of a `CAST`.
+fn cast_column_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "column": {
+                "type": "string",
+                "description": "The name of the column converted, as the table names it; \
+                    a name, not SQL, so a name that needs quotes is given without them. \
+                    A name the table does not have fails the run.",
+                "x-kind": "column",
+            },
+            "type": {
+                "type": "string",
+                "description": "The type the column is converted to: any DuckDB type, \
+                    written as SQL (`VARCHAR`, `DECIMAL(10, 2)`, `INTEGER[]`). \
+                    The conversion is a `CAST`, not a `TRY_CAST`, so a value that does not convert fails the run.",
+                "x-kind": "type",
+            }
+        },
+        "required": ["column", "type"],
+    })
+}
+
+/// The SQL step of [`CAST_COLUMN`]: a table named for the step, holding every
+/// row and every column of the table it is applied to, the one named converted
+/// in place by `REPLACE`. The table read is written as [`from_ident`] writes it,
+/// the type as given, and the column as [`column_ident`] does, twice.
+///
+/// One statement is enough: DuckDB fails the run when the column is not in the
+/// table (`Column "nope" in REPLACE list not found`), and arc does not open the
+/// database when it records, so it could not refuse the name then.
+fn cast_column_sql(recording: &Recording) -> String {
+    let column = recording.column("column");
+    format!(
+        "CREATE OR REPLACE TABLE {} AS\nSELECT * REPLACE (CAST({column} AS {}) AS {column})\nFROM {};\n",
+        quote_ident(recording.name),
+        recording.text("type"),
+        from_ident(recording.on),
     )
 }
 
@@ -2123,6 +2205,19 @@ const EXPRESSION: Probe = Probe {
     },
 };
 
+/// The probe of a `type`: `SELECT CAST(NULL AS <value>) AS __arc_probe`, which
+/// must read as exactly one item, a `CAST`, called [`SENTINEL`]. `INTEGER) AS x, (1`
+/// closes the cast and adds an item, so the select lists two; `INTEGER) --` leaves
+/// the item without the alias; neither is a type.
+const TYPE: Probe = Probe {
+    noun: "type",
+    probe: |value| format!("SELECT CAST(NULL AS {value}) AS {SENTINEL}"),
+    admits: |items| match items {
+        [item] if item["alias"] == SENTINEL && item["class"] == "CAST" => Ok(()),
+        _ => Err(NOT_ONE),
+    },
+};
+
 /// Whether `node`, an item of DuckDB's tree, gives one value for each row it is
 /// written into: `Ok`, or why not. A star — `*`, `orders.*`, `* EXCLUDE (..)`,
 /// `COLUMNS(..)`, alone or inside a function — and a `*COLUMNS(..)` unpacked into
@@ -2159,6 +2254,7 @@ impl Probe {
     fn of(x_kind: &serde_json::Value) -> Option<Probe> {
         match x_kind.as_str() {
             Some("expression") => Some(EXPRESSION),
+            Some("type") => Some(TYPE),
             _ => None,
         }
     }
@@ -3374,6 +3470,39 @@ mod tests {
                     "the expression `expression` of `derive-column` {reason}"
                 )),
                 "{expression:?} was refused with another message: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_type_duckdb_reads_as_the_one_type_of_a_cast_is_admitted() {
+        let op = operation(CAST_COLUMN).unwrap();
+        for type_name in ["VARCHAR", "DECIMAL(10, 2)", "INTEGER[]"] {
+            let admitted = op.admit(&arguments(
+                serde_json::json!({ "column": "amount", "type": type_name }),
+            ));
+            assert!(admitted.is_ok(), "{type_name:?} was refused: {admitted:?}");
+        }
+    }
+
+    #[test]
+    fn what_is_not_one_type_is_refused_naming_the_argument() {
+        let op = operation(CAST_COLUMN).unwrap();
+        for type_name in [
+            "INTEGER) AS x, (1",
+            "INTEGER; DROP TABLE orders",
+            "",
+            "INTEGER) AS __arc_probe -- c",
+        ] {
+            let err = op
+                .admit(&arguments(
+                    serde_json::json!({ "column": "amount", "type": type_name }),
+                ))
+                .expect_err(type_name)
+                .to_string();
+            assert!(
+                err.contains("`type`"),
+                "{type_name:?}: the refusal does not name the argument: {err}"
             );
         }
     }

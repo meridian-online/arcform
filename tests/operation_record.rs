@@ -889,6 +889,87 @@ fn an_expression_that_is_not_one_is_refused_with_the_directory_untouched() {
     }
 }
 
+/// `arc operation record cast-column` on `orders` as `typed_orders`, with
+/// `column` and `type` as given.
+fn record_cast(protocol: &Protocol, column: &str, type_name: &str) -> Output {
+    protocol.arc(&[
+        "operation",
+        "record",
+        "cast-column",
+        "--on",
+        "orders",
+        "--name",
+        "typed_orders",
+        "--arg",
+        &format!("column={column}"),
+        "--arg",
+        &format!("type={type_name}"),
+    ])
+}
+
+#[test]
+fn record_cast_writes_the_model_and_arc_run_converts_the_column() {
+    let protocol = Protocol::new();
+    ok(
+        &record_cast(&protocol, "amount", "VARCHAR"),
+        "arc operation record cast-column",
+    );
+    assert_eq!(
+        protocol.read("models/02_typed_orders.sql"),
+        "-- generated: cast-column on orders\nCREATE OR REPLACE TABLE \"typed_orders\" AS\nSELECT * REPLACE (CAST(amount AS VARCHAR) AS amount)\nFROM orders;\n"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    assert_eq!(
+        columns(&protocol, "typed_orders"),
+        ["id", "amount", "note"],
+        "typed_orders holds every column of orders in its place"
+    );
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    let kind: String = db
+        .query_row("SELECT typeof(amount) FROM typed_orders LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(kind, "VARCHAR");
+    let amounts: Vec<String> = db
+        .prepare("SELECT amount FROM typed_orders ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(amounts, ["50", "150", "300", "100"]);
+}
+
+#[test]
+fn a_cast_of_a_column_the_table_lacks_records_and_fails_the_run() {
+    let protocol = Protocol::new();
+    ok(
+        &record_cast(&protocol, "nope", "VARCHAR"),
+        "arc operation record cast-column",
+    );
+    let out = protocol.arc(&["run"]);
+    assert!(!out.status.success(), "arc run of a misspelt cast exited 0");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Column \"nope\" in REPLACE list not found"),
+        "the failed run does not say nope is not in the table:\n{stderr}"
+    );
+}
+
+#[test]
+fn a_type_that_is_not_one_is_refused_with_the_directory_untouched() {
+    let protocol = Protocol::new();
+    let before = protocol.files();
+    for type_name in ["INTEGER) AS x, (1", "INTEGER; DROP TABLE orders", ""] {
+        refused(
+            &record_cast(&protocol, "amount", type_name),
+            &["`type`", "`cast-column`"],
+        );
+        assert_eq!(protocol.files(), before, "a refusal changed the directory");
+    }
+}
+
 // ------------------------------------------------- the directory `--dir` names
 
 #[test]
