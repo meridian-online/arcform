@@ -79,10 +79,10 @@ Expected: every test named passes; fmt and clippy are clean. CI on Linux is the 
 - `fn bare_select(con_tree: &serde_json::Value) -> Option<usize>` — `Some(n)` when the tree's one statement is a `SELECT_NODE` with `from_table.type == "EMPTY"`, `where_clause`, `having`, `qualify`, `sample` null, `group_expressions`, `group_sets`, `modifiers` empty, `cte_map.map` empty; `n` = `select_list` length.
 - `fn probe_items(probe: &str) -> Option<Vec<serde_json::Value>>` — the select list of `probe` when DuckDB reads it as one statement whose tree `bare_select` accepts; built on `bare_select`.
 - Gate for `x-kind: "expression"` (spec, "Gates on arguments"): `SELECT <v> AS __arc_probe` gives exactly one item whose `alias` is `__arc_probe`; else refused ``the expression `<key>` of `<op>` is not one SQL expression``. A `;` with a second statement keeps the existing multi-statement wording.
-- Schema `column` (x-kind column), `expression` (x-kind expression), both required. SQL `SELECT *, <expression> AS <column>\nFROM <t>`.
+- Schema `column` (x-kind column), `expression` (x-kind expression), both required. SQL: `CREATE OR REPLACE TABLE "<name>" AS\nSELECT *, <expression> AS __arc_derived\nFROM <t>;\nALTER TABLE "<name>" RENAME COLUMN __arc_derived TO <column>;\n` (spec, calls made: a clash must fail the run, not suffix). Same two-statement shape rename-column uses.
 
 - [ ] Unit: `amount * 2`, `upper(note)`, `CASE WHEN amount > 100 THEN 'big' ELSE 'small' END`, `regexp_replace(note, 'a', 'b')` admitted; `1 FROM orders`, `amount; DROP TABLE orders`, `1) FROM orders WHERE (1`, `` refused, naming `expression`; also `amount, note`, `amount * 2 -- double` and `amount AS __arc_probe -- c` (the sentinel typed by the caller).
-- [ ] Integration: model bytes for `column=doubled`, `expression=amount * 2`; after run, `doubled` is `[100, 300, 600, 200]` by id.
+- [ ] Integration: model bytes for `column=doubled`, `expression=amount * 2`; after run, `doubled` is `[100, 300, 600, 200]` by id; `column=amount` records and `arc run` fails naming `amount`.
 - [ ] Verify; commit.
 
 ### Task 4: `cast-column`

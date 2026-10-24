@@ -33,8 +33,8 @@ The table read is written as `from_ident` writes it; a column name as `column_id
 | Operation | Arguments | Query |
 |---|---|---|
 | `hide-column` | `column` (name, required) | `SELECT * EXCLUDE (<column>) FROM <t>` |
-| `rename-column` | `column`, `to` (names, required) | `SELECT * RENAME (<column> AS <to>) FROM <t>` |
-| `derive-column` | `column` (name of the new column), `expression` (SQL expression), both required | `SELECT *, <expression> AS <column> FROM <t>` |
+| `rename-column` | `column`, `to` (names, required) | `SELECT * FROM <t>`, then `ALTER TABLE "<name>" RENAME COLUMN <column> TO <to>` |
+| `derive-column` | `column` (name of the new column), `expression` (SQL expression), both required | `SELECT *, <expression> AS __arc_derived FROM <t>`, then `ALTER TABLE "<name>" RENAME COLUMN __arc_derived TO <column>` |
 | `cast-column` | `column` (name), `type` (SQL type), both required | `SELECT * REPLACE (CAST(<column> AS <type>) AS <column>) FROM <t>` |
 | `summarise-rows` | `aggregates` (select list, required), `group_by` (select list, optional) | `SELECT [<group_by>, ]<aggregates> FROM <t>[ GROUP BY ALL]` |
 | `dedupe-rows` | `key` (partition key) and `order_by` (order), given together or not at all | neither: `SELECT DISTINCT * FROM <t>`; both: `SELECT * FROM <t> QUALIFY row_number() OVER (PARTITION BY <key> ORDER BY <order_by>\n) = 1` |
@@ -70,7 +70,7 @@ Each clause starts its own line in the model, as the filter's and the sort's do.
 - The row dedupe-rows keeps is fixed when the order is unique within each key; where two rows tie on the order, either may be kept. No tie-break over the whole row is added: the order is the analyst's statement of which row wins.
 - A fragment with a trailing `--` comment is refused rather than rewritten: the gate cannot tell a comment from text the step would lose.
 - `cast-column` uses `CAST`, so a value that does not convert fails the run, not the recording; `TRY_CAST` would hide it as a null.
-- `derive-column` onto a name the table already holds is not refused at record time: arc does not open the database, so the run reports the duplicate.
+- `rename-column` and `derive-column` are each written as two statements, the step's table made and then `ALTER TABLE "<name>" RENAME COLUMN … TO <column>`: DuckDB 2.0's `SELECT * RENAME` renames nothing when the column is misspelt, and a select whose new column clashes with an existing one gives it a `_1` suffix, both silently. `ALTER` fails the run in each case. `derive-column` adds its column as `__arc_derived` and renames it. arc does not open the database at record time, so a clash cannot be refused then.
 
 ## Left to the builder
 
