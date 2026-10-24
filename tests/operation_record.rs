@@ -626,6 +626,847 @@ fn arc_run_puts_the_rows_in_the_order_the_sort_stored() {
     );
 }
 
+/// The name of each column of `table` in the database `arc run` made, in the
+/// order the table holds them.
+fn columns(protocol: &Protocol, table: &str) -> Vec<String> {
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    db.prepare(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_name = ? ORDER BY ordinal_position",
+    )
+    .unwrap()
+    .query_map([table], |row| row.get(0))
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+#[test]
+fn record_hide_writes_the_model_and_arc_run_drops_the_column() {
+    let protocol = Protocol::new();
+    ok(
+        &protocol.record_on("hide-column", "orders", "no_note", "column=note"),
+        "arc operation record hide-column",
+    );
+    assert_eq!(
+        protocol.read("models/02_no_note.sql"),
+        "-- generated: hide-column on orders\nCREATE OR REPLACE TABLE \"no_note\" AS\nSELECT * EXCLUDE (note)\nFROM orders;\n"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    assert_eq!(
+        columns(&protocol, "no_note"),
+        ["id", "amount"],
+        "no_note holds every column of orders but note"
+    );
+    assert_eq!(
+        protocol.ids("no_note"),
+        [1, 2, 3, 4],
+        "no_note holds every row of orders"
+    );
+}
+
+#[test]
+fn a_column_named_with_a_reserved_word_is_hidden_written_in_quotes_and_runs() {
+    let protocol = Protocol::new();
+    std::fs::write(
+        protocol.dir.join("models/01_orders.sql"),
+        ORDERS_SQL.replacen("note)", "\"order\")", 1),
+    )
+    .unwrap();
+    ok(
+        &protocol.record_on("hide-column", "orders", "no_order", "column=order"),
+        "arc operation record hide-column",
+    );
+    assert_eq!(
+        protocol.read("models/02_no_order.sql"),
+        "-- generated: hide-column on orders\nCREATE OR REPLACE TABLE \"no_order\" AS\nSELECT * EXCLUDE (\"order\")\nFROM orders;\n",
+        "the column is written in quotes, as DuckDB reads it"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    assert_eq!(columns(&protocol, "orders"), ["id", "amount", "order"]);
+    assert_eq!(columns(&protocol, "no_order"), ["id", "amount"]);
+}
+
+#[test]
+fn an_empty_or_blank_column_to_hide_is_refused_with_the_directory_untouched() {
+    let protocol = Protocol::new();
+    let before = protocol.files();
+    for arg in ["column=", "column= "] {
+        refused(
+            &protocol.record_on("hide-column", "orders", "no_note", arg),
+            &["the column `column` of `hide-column` is empty or blank"],
+        );
+        assert_eq!(protocol.files(), before, "a refusal changed the directory");
+    }
+}
+
+#[test]
+fn record_rename_writes_the_model_and_arc_run_renames_the_column_in_place() {
+    let protocol = Protocol::new();
+    ok(
+        &protocol.arc(&[
+            "operation",
+            "record",
+            "rename-column",
+            "--on",
+            "orders",
+            "--name",
+            "relabelled",
+            "--arg",
+            "column=note",
+            "--arg",
+            "to=label",
+        ]),
+        "arc operation record rename-column",
+    );
+    assert_eq!(
+        protocol.read("models/02_relabelled.sql"),
+        "-- generated: rename-column on orders\nBEGIN TRANSACTION;\nCREATE OR REPLACE TABLE \"relabelled\" AS\nSELECT *\nFROM orders;\nALTER TABLE \"relabelled\" RENAME COLUMN note TO label;\nCOMMIT;\n"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    assert_eq!(
+        columns(&protocol, "relabelled"),
+        ["id", "amount", "label"],
+        "relabelled holds the columns of orders, note as label"
+    );
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    let labels: Vec<String> = db
+        .prepare("SELECT label FROM relabelled ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(labels, ["a;b", "abc", "xyz", "a"], "the values were kept");
+}
+
+#[test]
+fn a_rename_of_a_column_the_table_lacks_or_onto_one_it_has_records_and_fails_the_run() {
+    for (args, message) in [
+        (
+            ["column=nte", "to=label"],
+            "does not have a column with name \"nte\"",
+        ),
+        (
+            ["column=note", "to=id"],
+            "Column with name \"id\" already exists",
+        ),
+    ] {
+        let protocol = Protocol::new();
+        ok(
+            &protocol.arc(&[
+                "operation",
+                "record",
+                "rename-column",
+                "--on",
+                "orders",
+                "--name",
+                "relabelled",
+                "--arg",
+                args[0],
+                "--arg",
+                args[1],
+            ]),
+            "arc operation record rename-column",
+        );
+        let out = protocol.arc(&["run"]);
+        assert!(!out.status.success(), "arc run of {args:?} exited 0");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(message),
+            "the failed run does not say {message}:\n{stderr}"
+        );
+        assert!(
+            !table_exists(&protocol, "relabelled"),
+            "the failed run of {args:?} left relabelled made"
+        );
+    }
+}
+
+/// Whether the Protocol's database holds a table called `table`.
+fn table_exists(protocol: &Protocol, table: &str) -> bool {
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    db.query_row(
+        "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
+        [table],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap()
+        > 0
+}
+
+/// `arc operation record derive-column` on `orders` as `doubled_orders`, with
+/// `column` and `expression` as given.
+fn record_derive(protocol: &Protocol, column: &str, expression: &str) -> Output {
+    protocol.arc(&[
+        "operation",
+        "record",
+        "derive-column",
+        "--on",
+        "orders",
+        "--name",
+        "doubled_orders",
+        "--arg",
+        &format!("column={column}"),
+        "--arg",
+        &format!("expression={expression}"),
+    ])
+}
+
+#[test]
+fn record_derive_writes_the_model_and_arc_run_adds_the_computed_column() {
+    let protocol = Protocol::new();
+    ok(
+        &record_derive(&protocol, "doubled", "amount * 2"),
+        "arc operation record derive-column",
+    );
+    assert_eq!(
+        protocol.read("models/02_doubled_orders.sql"),
+        "-- generated: derive-column on orders\nBEGIN TRANSACTION;\nCREATE OR REPLACE TABLE \"doubled_orders\" AS\nSELECT *, amount * 2 AS __arc_derived\nFROM orders;\nALTER TABLE \"doubled_orders\" RENAME COLUMN __arc_derived TO doubled;\nCOMMIT;\n"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    assert_eq!(
+        columns(&protocol, "doubled_orders"),
+        ["id", "amount", "note", "doubled"],
+        "doubled_orders holds every column of orders and the new one last"
+    );
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    let doubled: Vec<i64> = db
+        .prepare("SELECT doubled FROM doubled_orders ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        doubled,
+        [100, 300, 600, 200],
+        "each row holds its amount doubled"
+    );
+}
+
+#[test]
+fn a_derive_onto_a_column_the_table_has_records_and_fails_the_run() {
+    let protocol = Protocol::new();
+    ok(
+        &record_derive(&protocol, "amount", "amount * 2"),
+        "arc operation record derive-column",
+    );
+    let out = protocol.arc(&["run"]);
+    assert!(
+        !out.status.success(),
+        "arc run of a clashing derive exited 0"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Column with name \"amount\" already exists"),
+        "the failed run does not say amount already exists:\n{stderr}"
+    );
+    assert!(
+        !table_exists(&protocol, "doubled_orders"),
+        "the failed run left doubled_orders made"
+    );
+}
+
+#[test]
+fn an_expression_that_is_not_one_is_refused_with_the_directory_untouched() {
+    let protocol = Protocol::new();
+    let before = protocol.files();
+    for (expression, reason) in [
+        ("1 FROM orders", "is not one SQL expression"),
+        ("amount, note", "is not one SQL expression"),
+        ("amount * 2 -- double", "is not one SQL expression"),
+        ("* EXCLUDE (amount)", "expands to several columns"),
+        ("unnest([1, 2])", "changes the number of rows"),
+    ] {
+        refused(
+            &record_derive(&protocol, "doubled", expression),
+            &[&format!(
+                "the expression `expression` of `derive-column` {reason}"
+            )],
+        );
+        assert_eq!(protocol.files(), before, "a refusal changed the directory");
+    }
+}
+
+/// `arc operation record cast-column` on `orders` as `typed_orders`, with
+/// `column` and `type` as given.
+fn record_cast(protocol: &Protocol, column: &str, type_name: &str) -> Output {
+    protocol.arc(&[
+        "operation",
+        "record",
+        "cast-column",
+        "--on",
+        "orders",
+        "--name",
+        "typed_orders",
+        "--arg",
+        &format!("column={column}"),
+        "--arg",
+        &format!("type={type_name}"),
+    ])
+}
+
+#[test]
+fn record_cast_writes_the_model_and_arc_run_converts_the_column() {
+    let protocol = Protocol::new();
+    ok(
+        &record_cast(&protocol, "amount", "VARCHAR"),
+        "arc operation record cast-column",
+    );
+    assert_eq!(
+        protocol.read("models/02_typed_orders.sql"),
+        "-- generated: cast-column on orders\nCREATE OR REPLACE TABLE \"typed_orders\" AS\nSELECT * REPLACE (CAST(amount AS VARCHAR) AS amount)\nFROM orders;\n"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    assert_eq!(
+        columns(&protocol, "typed_orders"),
+        ["id", "amount", "note"],
+        "typed_orders holds every column of orders in its place"
+    );
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    let kind: String = db
+        .query_row("SELECT typeof(amount) FROM typed_orders LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(kind, "VARCHAR");
+    let amounts: Vec<String> = db
+        .prepare("SELECT amount FROM typed_orders ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(amounts, ["50", "150", "300", "100"]);
+}
+
+#[test]
+fn a_cast_of_a_column_the_table_lacks_records_and_fails_the_run() {
+    let protocol = Protocol::new();
+    ok(
+        &record_cast(&protocol, "nope", "VARCHAR"),
+        "arc operation record cast-column",
+    );
+    let out = protocol.arc(&["run"]);
+    assert!(!out.status.success(), "arc run of a misspelt cast exited 0");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Column \"nope\" in REPLACE list not found"),
+        "the failed run does not say nope is not in the table:\n{stderr}"
+    );
+}
+
+#[test]
+fn a_value_the_cast_cannot_convert_fails_the_run() {
+    // The step casts with `CAST`, not `TRY_CAST`, so a note such as 'abc' that
+    // is no integer fails the run rather than becoming a `NULL`.
+    let protocol = Protocol::new();
+    ok(
+        &record_cast(&protocol, "note", "INTEGER"),
+        "arc operation record cast-column",
+    );
+    let out = protocol.arc(&["run"]);
+    assert!(
+        !out.status.success(),
+        "arc run of a cast that cannot convert exited 0"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Could not convert string"),
+        "the failed run does not give DuckDB's conversion error:\n{stderr}"
+    );
+}
+
+#[test]
+fn a_type_that_is_not_one_is_refused_with_the_directory_untouched() {
+    let protocol = Protocol::new();
+    let before = protocol.files();
+    for type_name in [
+        "INTEGER) AS x, (1",
+        "INTEGER; DROP TABLE orders",
+        "INTEGER)::DECIMAL(10,2",
+        "",
+    ] {
+        refused(
+            &record_cast(&protocol, "amount", type_name),
+            &["the type `type`"],
+        );
+        assert_eq!(protocol.files(), before, "a refusal changed the directory");
+    }
+}
+
+/// `arc operation record summarise-rows` on `orders` as `order_counts`, with
+/// `aggregates` and, when given, `group_by`.
+fn record_summary(protocol: &Protocol, aggregates: &str, group_by: Option<&str>) -> Output {
+    let aggregates = format!("aggregates={aggregates}");
+    let group_by = group_by.map(|g| format!("group_by={g}"));
+    let mut args = vec![
+        "operation",
+        "record",
+        "summarise-rows",
+        "--on",
+        "orders",
+        "--name",
+        "order_counts",
+    ];
+    if let Some(group_by) = &group_by {
+        args.extend(["--arg", group_by]);
+    }
+    args.extend(["--arg", &aggregates]);
+    protocol.arc(&args)
+}
+
+#[test]
+fn record_summary_writes_the_grouped_model_and_arc_run_gives_one_row_for_each_group() {
+    let protocol = Protocol::new();
+    ok(
+        &record_summary(&protocol, "count(*) AS n", Some("amount > 100 AS big")),
+        "arc operation record summarise-rows",
+    );
+    assert_eq!(
+        protocol.read("models/02_order_counts.sql"),
+        "-- generated: summarise-rows on orders\nCREATE OR REPLACE TABLE \"order_counts\" AS\nSELECT amount > 100 AS big, count(*) AS n\nFROM orders\nGROUP BY 1;\n"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    let groups: Vec<(bool, i64)> = db
+        .prepare("SELECT big, n FROM order_counts ORDER BY big")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(groups, [(false, 2), (true, 2)]);
+}
+
+#[test]
+fn record_summary_without_a_group_by_gives_one_row_for_the_whole_table() {
+    let protocol = Protocol::new();
+    ok(
+        &record_summary(&protocol, "count(*) AS n", None),
+        "arc operation record summarise-rows",
+    );
+    assert_eq!(
+        protocol.read("models/02_order_counts.sql"),
+        "-- generated: summarise-rows on orders\nCREATE OR REPLACE TABLE \"order_counts\" AS\nSELECT count(*) AS n\nFROM orders\nGROUP BY ();\n"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    let rows: Vec<i64> = db
+        .prepare("SELECT n FROM order_counts ORDER BY n")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows, [4]);
+}
+
+#[test]
+fn a_group_by_of_two_items_is_grouped_by_both_places() {
+    let protocol = Protocol::new();
+    ok(
+        &record_summary(
+            &protocol,
+            "count(*) AS n",
+            Some("amount > 100 AS big, note"),
+        ),
+        "arc operation record summarise-rows",
+    );
+    assert!(
+        protocol
+            .read("models/02_order_counts.sql")
+            .contains("\nGROUP BY 1, 2;\n"),
+        "the model does not group by both places"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    let rows: i64 = db
+        .query_row("SELECT count(*) FROM order_counts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 4, "each (big, note) pair of orders is its own group");
+}
+
+#[test]
+fn a_column_in_the_aggregates_that_is_not_grouped_records_and_fails_the_run() {
+    let protocol = Protocol::new();
+    ok(
+        &record_summary(
+            &protocol,
+            "count(*) AS n, note",
+            Some("amount > 100 AS big"),
+        ),
+        "arc operation record summarise-rows",
+    );
+    let out = protocol.arc(&["run"]);
+    assert!(
+        !out.status.success(),
+        "arc run of an ungrouped column exited 0"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("GROUP BY"),
+        "the failed run does not say note is not in the GROUP BY:\n{stderr}"
+    );
+}
+
+#[test]
+fn an_aggregate_in_the_group_by_records_and_fails_the_run() {
+    let protocol = Protocol::new();
+    ok(
+        &record_summary(&protocol, "count(*) AS n", Some("count(*) AS c")),
+        "arc operation record summarise-rows",
+    );
+    let out = protocol.arc(&["run"]);
+    assert!(
+        !out.status.success(),
+        "arc run of an aggregate in the grouping exited 0"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("GROUP BY clause cannot contain aggregates"),
+        "the failed run does not say the GROUP BY cannot hold an aggregate:\n{stderr}"
+    );
+}
+
+#[test]
+fn a_bare_column_summarised_over_the_whole_table_fails_the_run() {
+    let protocol = Protocol::new();
+    ok(
+        &record_summary(&protocol, "note", None),
+        "arc operation record summarise-rows",
+    );
+    let out = protocol.arc(&["run"]);
+    assert!(!out.status.success(), "arc run of a bare column exited 0");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("GROUP BY"),
+        "the failed run does not say note is not grouped:\n{stderr}"
+    );
+}
+
+#[test]
+fn a_window_summarised_over_the_whole_table_gives_one_row() {
+    let protocol = Protocol::new();
+    ok(
+        &record_summary(&protocol, "count(*) OVER () AS n", None),
+        "arc operation record summarise-rows",
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    let rows: i64 = db
+        .query_row("SELECT count(*) FROM order_counts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        rows, 1,
+        "a window over the whole table gave a row for each row"
+    );
+}
+
+#[test]
+fn a_constant_in_the_group_by_is_refused_with_the_directory_untouched() {
+    // Grouped by its place, a number or a string is the same value for every
+    // row, so it groups nothing; alone, it would make the whole table one group.
+    for group_by in ["2", "'note'"] {
+        let protocol = Protocol::new();
+        let before = protocol.files();
+        let out = record_summary(&protocol, "count(*) AS n", Some(group_by));
+        refused(&out, &["`group_by`", "holds a constant", group_by]);
+        assert_eq!(
+            protocol.files(),
+            before,
+            "{group_by:?}: the directory changed"
+        );
+    }
+}
+
+#[test]
+fn a_select_list_that_is_not_one_is_refused_with_the_directory_untouched() {
+    let protocol = Protocol::new();
+    let before = protocol.files();
+    for aggregates in [
+        "count(*) FROM other",
+        "a UNION SELECT b",
+        "count(*); DROP TABLE orders",
+        "count(*) AS n -- all",
+    ] {
+        refused(
+            &record_summary(&protocol, aggregates, None),
+            &["the select list `aggregates`"],
+        );
+        assert_eq!(protocol.files(), before, "a refusal changed the directory");
+    }
+    refused(
+        &record_summary(&protocol, "count(*) AS n", Some("big -- by size")),
+        &["the select list `group_by` of `summarise-rows`"],
+    );
+    assert_eq!(protocol.files(), before, "a refusal changed the directory");
+}
+
+/// `arc operation record dedupe-rows` on `orders` as `unique_orders`, with each
+/// of `args` as an `--arg`.
+fn record_dedupe(protocol: &Protocol, args: &[&str]) -> Output {
+    let mut command = vec![
+        "operation",
+        "record",
+        "dedupe-rows",
+        "--on",
+        "orders",
+        "--name",
+        "unique_orders",
+    ];
+    for arg in args {
+        command.extend(["--arg", arg]);
+    }
+    protocol.arc(&command)
+}
+
+/// A Protocol whose `orders` holds `rows`, a SQL `VALUES` list of
+/// `(id, amount, note)`, in place of the fixture's own.
+fn holding(rows: &str) -> Protocol {
+    let protocol = Protocol::new();
+    std::fs::write(
+        protocol.dir.join("models/01_orders.sql"),
+        format!(
+            "CREATE OR REPLACE TABLE orders AS\nSELECT * FROM (VALUES {rows})\n    AS t(id, amount, note);\n"
+        ),
+    )
+    .unwrap();
+    protocol
+}
+
+/// The rows of `unique_orders` after `arc run`, in the order of `id` and `amount`.
+fn unique_orders(protocol: &Protocol) -> Vec<(i32, i32, String)> {
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    db.prepare("SELECT id, amount, note FROM unique_orders ORDER BY id, amount")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+#[test]
+fn record_dedupe_without_arguments_keeps_one_of_each_set_of_identical_rows() {
+    let protocol = holding("(1, 50, 'a'), (1, 50, 'a'), (2, 150, 'b')");
+    ok(
+        &record_dedupe(&protocol, &[]),
+        "arc operation record dedupe-rows",
+    );
+    assert_eq!(
+        protocol.read("models/02_unique_orders.sql"),
+        "-- generated: dedupe-rows on orders\nCREATE OR REPLACE TABLE \"unique_orders\" AS\nSELECT DISTINCT *\nFROM orders;\n"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    assert_eq!(
+        unique_orders(&protocol),
+        [(1, 50, "a".to_string()), (2, 150, "b".to_string())]
+    );
+}
+
+#[test]
+fn record_dedupe_with_a_key_and_an_order_keeps_the_first_row_of_each_key() {
+    let protocol = holding("(1, 50, 'a'), (2, 150, 'a'), (3, 300, 'b'), (4, 100, 'b')");
+    ok(
+        &record_dedupe(&protocol, &["key=note", "order_by=amount desc"]),
+        "arc operation record dedupe-rows",
+    );
+    assert_eq!(
+        protocol.read("models/02_unique_orders.sql"),
+        "-- generated: dedupe-rows on orders\nCREATE OR REPLACE TABLE \"unique_orders\" AS\nSELECT *\nFROM orders\nQUALIFY row_number() OVER (PARTITION BY note ORDER BY amount desc\n) = 1;\n"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    assert_eq!(
+        unique_orders(&protocol),
+        [(2, 150, "a".to_string()), (3, 300, "b".to_string())],
+        "the highest amount of each note was not the row kept"
+    );
+}
+
+#[test]
+fn a_dedupe_key_or_order_that_is_not_one_window_is_refused_with_the_directory_untouched() {
+    let protocol = Protocol::new();
+    let before = protocol.files();
+    for (args, named) in [
+        (
+            &["key=note"][..],
+            &["`key` of `dedupe-rows` needs `order_by` as well"][..],
+        ),
+        (
+            &["order_by=amount"][..],
+            &["`order_by` of `dedupe-rows` needs `key` as well"][..],
+        ),
+        (
+            &["key=note AS n", "order_by=amount"][..],
+            &["`key`", "`order_by`"][..],
+        ),
+        (
+            &["key=*", "order_by=amount"][..],
+            &["the partition key `key`"][..],
+        ),
+        (
+            &["key=note", "order_by=amount LIMIT 1"][..],
+            &["`key`", "`order_by`"][..],
+        ),
+        (
+            &["key=note", "order_by=2 desc"][..],
+            &["the order `order_by`", "holds a constant"][..],
+        ),
+    ] {
+        refused(&record_dedupe(&protocol, args), named);
+        assert_eq!(protocol.files(), before, "a refusal changed the directory");
+    }
+}
+
+/// `arc operation record limit-rows` on `orders` as `top_orders`, with each of
+/// `args` as an `--arg`.
+fn record_limit(protocol: &Protocol, args: &[&str]) -> Output {
+    let mut command = vec![
+        "operation",
+        "record",
+        "limit-rows",
+        "--on",
+        "orders",
+        "--name",
+        "top_orders",
+    ];
+    for arg in args {
+        command.extend(["--arg", arg]);
+    }
+    protocol.arc(&command)
+}
+
+/// The model `limit-rows` writes for `count=2` and `order_by=amount desc`.
+const TOP_ORDERS_MODEL: &str = "-- generated: limit-rows on orders\nCREATE OR REPLACE TABLE \"top_orders\" AS\nSELECT *\nFROM orders\nORDER BY amount desc\nLIMIT 2;\n";
+
+#[test]
+fn record_limit_keeps_the_first_rows_in_the_order_given() {
+    let protocol = Protocol::new();
+    ok(
+        &record_limit(&protocol, &["count=2", "order_by=amount desc"]),
+        "arc operation record limit-rows",
+    );
+    assert_eq!(protocol.read("models/02_top_orders.sql"), TOP_ORDERS_MODEL);
+    ok(&protocol.arc(&["run"]), "arc run");
+    assert_eq!(protocol.ids("top_orders"), [3, 2]);
+}
+
+#[test]
+fn a_limit_count_that_is_not_a_whole_number_from_zero_or_an_order_the_limit_cannot_follow_is_refused_with_the_directory_untouched()
+ {
+    let protocol = Protocol::new();
+    let before = protocol.files();
+    for (args, named) in [
+        (
+            &["count=ten"][..],
+            &["the argument `count` of `limit-rows` is an integer"][..],
+        ),
+        (
+            &["count=-1"][..],
+            &["the argument `count` of `limit-rows` has a minimum of 0"][..],
+        ),
+        (
+            &["count=9223372036854775808"][..],
+            &["the argument `count` of `limit-rows` has a maximum of 9223372036854775807"][..],
+        ),
+        (
+            &["count=100000000000000000000"][..],
+            &["the argument `count` of `limit-rows` has a maximum of 9223372036854775807"][..],
+        ),
+        (
+            &["order_by=amount"][..],
+            &["`limit-rows` needs the argument `count`"][..],
+        ),
+        (
+            &["count=2", "order_by=amount LIMIT 1"][..],
+            &["the order `order_by` of `limit-rows`"][..],
+        ),
+        (
+            &["count=2", "order_by=amount OFFSET 2"][..],
+            &["the order `order_by` of `limit-rows`"][..],
+        ),
+    ] {
+        refused(&record_limit(&protocol, args), named);
+        assert_eq!(protocol.files(), before, "a refusal changed the directory");
+    }
+}
+
+/// `arc operation record fill-nulls` on `orders` as `filled_orders`, with
+/// `column` and `value` as given.
+fn record_fill(protocol: &Protocol, column: &str, value: &str) -> Output {
+    protocol.arc(&[
+        "operation",
+        "record",
+        "fill-nulls",
+        "--on",
+        "orders",
+        "--name",
+        "filled_orders",
+        "--arg",
+        &format!("column={column}"),
+        "--arg",
+        &format!("value={value}"),
+    ])
+}
+
+#[test]
+fn record_fill_writes_the_model_and_arc_run_fills_the_missing_values_alone() {
+    let protocol = holding("(1, 50, 'a'), (2, NULL, 'b'), (3, 300, 'c')");
+    ok(
+        &record_fill(&protocol, "amount", "0"),
+        "arc operation record fill-nulls",
+    );
+    assert_eq!(
+        protocol.read("models/02_filled_orders.sql"),
+        "-- generated: fill-nulls on orders\nCREATE OR REPLACE TABLE \"filled_orders\" AS\nSELECT * REPLACE (coalesce(amount, 0) AS amount)\nFROM orders;\n"
+    );
+    ok(&protocol.arc(&["run"]), "arc run");
+    assert_eq!(
+        columns(&protocol, "filled_orders"),
+        ["id", "amount", "note"],
+        "filled_orders holds every column of orders in its place"
+    );
+    let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
+    let amounts: Vec<i32> = db
+        .prepare("SELECT amount FROM filled_orders ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(amounts, [50, 0, 300]);
+}
+
+#[test]
+fn a_fill_of_a_column_the_table_lacks_records_and_fails_the_run() {
+    let protocol = Protocol::new();
+    ok(
+        &record_fill(&protocol, "nope", "0"),
+        "arc operation record fill-nulls",
+    );
+    let out = protocol.arc(&["run"]);
+    assert!(!out.status.success(), "arc run of a misspelt fill exited 0");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("in REPLACE list not found"),
+        "the failed run does not say nope is not in the table:\n{stderr}"
+    );
+}
+
+#[test]
+fn a_fill_value_that_is_not_one_expression_is_refused_with_the_directory_untouched() {
+    let protocol = Protocol::new();
+    let before = protocol.files();
+    for value in ["0 --", "0) , (1", "0; DROP TABLE orders", "*"] {
+        refused(
+            &record_fill(&protocol, "amount", value),
+            &["the expression `value`"],
+        );
+        assert_eq!(protocol.files(), before, "a refusal changed the directory");
+    }
+}
+
 // ------------------------------------------------- the directory `--dir` names
 
 #[test]
@@ -1461,6 +2302,45 @@ mod mcp {
             "the Protocol the agent recorded into differs from the one the terminal did"
         );
         assert_eq!(agent.read("models/02_by_amount.sql"), BY_AMOUNT_MODEL);
+    }
+
+    #[test]
+    fn the_tool_records_a_limit_as_the_terminal_does() {
+        let terminal = Protocol::new();
+        let agent = Protocol::new();
+        ok(
+            &record_limit(&terminal, &["count=2", "order_by=amount desc"]),
+            "arc operation record limit-rows",
+        );
+
+        let result = call_operation_record(
+            &agent.dir,
+            &agent.history,
+            json!({
+                "operation": "limit-rows",
+                "on": "orders",
+                "name": "top_orders",
+                "arguments": { "count": 2, "order_by": "amount desc" },
+            }),
+        );
+        assert_ne!(
+            result["isError"],
+            true,
+            "the call failed: {}",
+            text(&result)
+        );
+        assert_eq!(result["structuredContent"]["step"], "top_orders");
+        assert_eq!(
+            result["structuredContent"]["model"],
+            "models/02_top_orders.sql"
+        );
+
+        assert_eq!(
+            agent.files(),
+            terminal.files(),
+            "the Protocol the agent recorded into differs from the one the terminal did"
+        );
+        assert_eq!(agent.read("models/02_top_orders.sql"), TOP_ORDERS_MODEL);
     }
 
     #[test]

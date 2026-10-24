@@ -1492,7 +1492,9 @@ fn dispatch_operation(cmd: OperationCmd, out: &mut impl Write) -> Result<()> {
             description,
             dir,
         } => {
-            let arguments = operation_arguments(&args)?;
+            // `--arg` gives strings; an argument the operation types `integer`
+            // is turned into one here, as `arc mcp`'s JSON gives it.
+            let arguments = crate::record::typed_arguments(&long_name, operation_arguments(&args)?);
             let history = open_history()?;
             let request = crate::record::OperationRequest {
                 long_name: &long_name,
@@ -1675,9 +1677,9 @@ fn operation_record(
     Ok(())
 }
 
-/// The `--arg KEY=VALUE` values as the operation's arguments, each a string.
-/// An entry without `=` is refused, and so is a key given twice, rather than
-/// one value silently winning.
+/// The `--arg KEY=VALUE` values as the operation's arguments, each a string,
+/// which [`crate::record::typed_arguments`] then types. An entry without `=` is
+/// refused, and so is a key given twice, rather than one value silently winning.
 fn operation_arguments(args: &[String]) -> Result<serde_json::Map<String, serde_json::Value>> {
     let mut arguments = serde_json::Map::new();
     for entry in args {

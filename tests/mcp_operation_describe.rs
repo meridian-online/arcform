@@ -247,7 +247,21 @@ fn operator_names() -> Vec<String> {
 fn called_with_each_operator_and_operation_it_returns_what_arc_operation_describe_prints() {
     let names: Vec<String> = operator_names()
         .into_iter()
-        .chain(["filter-rows".to_string(), "sort-rows".to_string()])
+        .chain(
+            [
+                "filter-rows",
+                "sort-rows",
+                "hide-column",
+                "rename-column",
+                "derive-column",
+                "cast-column",
+                "summarise-rows",
+                "dedupe-rows",
+                "limit-rows",
+                "fill-nulls",
+            ]
+            .map(String::from),
+        )
         .collect();
     let requests: Vec<Value> = names
         .iter()
@@ -279,7 +293,18 @@ fn called_with_no_argument_it_lists_no_operator() {
         .collect();
     assert_eq!(
         names,
-        ["filter-rows", "sort-rows"],
+        [
+            "filter-rows",
+            "sort-rows",
+            "hide-column",
+            "rename-column",
+            "derive-column",
+            "cast-column",
+            "summarise-rows",
+            "dedupe-rows",
+            "limit-rows",
+            "fill-nulls"
+        ],
         "the listing holds the operations alone, not the operators {operators:?}"
     );
 }
