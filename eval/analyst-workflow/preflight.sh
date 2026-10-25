@@ -15,6 +15,7 @@
 # Usage: eval/analyst-workflow/preflight.sh            (uses `arc` on PATH and tasks.yaml here)
 #        ARC=target/debug/arc eval/analyst-workflow/preflight.sh
 #        TASKS=other-tasks.yaml eval/analyst-workflow/preflight.sh
+#        PREFLIGHT_TIMEOUT=120 eval/analyst-workflow/preflight.sh   (seconds per URL, default 90)
 #
 # Needs curl and python3 with PyYAML, or python3 and mikefarah's yq. Prints one line per
 # failure and exits 1 if there is any.
@@ -29,6 +30,7 @@ default_tasks=0
 tasks_real="$(cd "$(dirname "$tasks")" 2>/dev/null && pwd -P)/$(basename "$tasks")"
 [ "$tasks_real" = "$(cd "$here" && pwd -P)/tasks.yaml" ] && default_tasks=1
 arc="${ARC:-arc}"
+timeout="${PREFLIGHT_TIMEOUT:-90}"
 failures=0
 
 fail() {
@@ -105,11 +107,11 @@ fi
 # 2. Every URL answers.
 while IFS=' ' read -r kind tid url; do
   [ "$kind" = "URL" ] || continue
-  code="$(curl -sS -o /dev/null -I -L --max-time 30 -w '%{http_code}' "$url" 2>/dev/null)"
+  code="$(curl -sS -o /dev/null -I -L --max-time "$timeout" -w '%{http_code}' "$url" 2>/dev/null)"
   case "$code" in
     2??) ok "$tid: HEAD $code $url"; continue ;;
   esac
-  get="$(curl -sS -o /dev/null -L -r 0-0 --max-time 30 -w '%{http_code}' "$url" 2>/dev/null)"
+  get="$(curl -sS -o /dev/null -L -r 0-0 --max-time "$timeout" -w '%{http_code}' "$url" 2>/dev/null)"
   case "$get" in
     2??) ok "$tid: GET $get (HEAD $code) $url" ;;
     *) fail "$tid: dataset unreachable, HEAD $code and ranged GET $get: $url" ;;
