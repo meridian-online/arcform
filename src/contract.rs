@@ -637,6 +637,7 @@ fn build_assets(
             let kind = match asset_kind {
                 AssetKind::File => "file",
                 AssetKind::Directory => "directory",
+                AssetKind::Remote => "remote",
                 // A pattern is never one relation either, but nothing in this
                 // report distinguishes it from a table with no producer today —
                 // both are unmeasurable through the engine and land as "source".
@@ -651,6 +652,8 @@ fn build_assets(
             // Measure the asset net-new. Files and directories are measured on disk;
             // relational assets (table/source) are measured through the engine.
             let (path, bytes, row_count, content_hash) = match kind {
+                // A URL is not read from disk or the engine: no path, bytes or hash.
+                "remote" => (None, None, None, None),
                 "file" => {
                     let full = dir.join(name);
                     let (bytes, content_hash) = measure_file(&full);

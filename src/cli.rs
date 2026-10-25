@@ -477,16 +477,25 @@ pub enum OperationCmd {
         /// The operation's long name, as listed by `arc operation list`.
         long_name: String,
 
-        /// The table the operation is applied to, one a step of the protocol makes.
+        /// The table the operation is applied to, one a step of the protocol makes:
+        /// shorthand for `--read table=TABLE`.
         #[arg(long)]
-        on: String,
+        on: Option<String>,
+
+        /// A table the operation reads, by the role it plays (repeatable), as `arc
+        /// operation describe` lists them. Repeated for a list role, each table is
+        /// added in order. Format: ROLE=TABLE.
+        #[arg(long = "read", value_name = "ROLE=TABLE")]
+        reads: Vec<String>,
 
         /// The new step's name, which is also the name of the table it makes.
         #[arg(long)]
         name: String,
 
         /// An argument of the operation (repeatable), as `arc operation describe`
-        /// lists them. Format: KEY=VALUE.
+        /// lists them. Format: KEY=VALUE. A list argument takes its items
+        /// comma-separated (`using=a,b`), so an item holding a comma can be given
+        /// through `arc mcp` alone.
         #[arg(long = "arg", value_name = "KEY=VALUE")]
         args: Vec<String>,
 
@@ -1487,18 +1496,23 @@ fn dispatch_operation(cmd: OperationCmd, out: &mut impl Write) -> Result<()> {
         OperationCmd::Record {
             long_name,
             on,
+            reads,
             name,
             args,
             description,
             dir,
         } => {
             // `--arg` gives strings; an argument the operation types `integer`
-            // is turned into one here, as `arc mcp`'s JSON gives it.
+            // is turned into one here, as `arc mcp`'s JSON gives it. `--read`
+            // gives a role's tables one at a time; a list role's are gathered
+            // into a list here, as `arc mcp`'s JSON gives them.
             let arguments = crate::record::typed_arguments(&long_name, operation_arguments(&args)?);
+            let reads = crate::record::typed_reads(&long_name, &operation_reads(&reads)?);
             let history = open_history()?;
             let request = crate::record::OperationRequest {
                 long_name: &long_name,
-                on: &on,
+                on: on.as_deref(),
+                reads: &reads,
                 name: &name,
                 arguments: &arguments,
                 description: description.as_deref(),
@@ -1659,22 +1673,45 @@ fn operation_describe(name: &str, out: &mut impl Write) -> Result<()> {
 /// Execute `arc operation record`: hand the request to the record path, which
 /// writes the step's SQL from the operation's catalogue entry. Nothing here
 /// names an operation or an argument. A refusal is the error, with nothing
-/// written to the protocol or to `out`.
+/// written to the protocol or to `out`. What the operation says of the
+/// recording goes to stderr after the line on `out`, one `note:` line each.
 fn operation_record(
     dir: &Path,
     request: &crate::record::OperationRequest,
     history: &LocalHistory,
     out: &mut impl Write,
 ) -> Result<()> {
-    let model = crate::record::record_operation(dir, request, history)?;
+    let recorded = crate::record::record_operation(dir, request, history)?;
     writeln!(
         out,
         "recorded step {} as {} in {} — `arc run` runs it",
         request.name,
-        model.display(),
+        recorded.model.display(),
         dir.join(crate::spec::MANIFEST_FILENAME).display()
     )?;
+    for note in &recorded.notes {
+        eprintln!("note: {note}");
+    }
     Ok(())
+}
+
+/// The `--read ROLE=TABLE` values as pairs, in the order given, which
+/// [`crate::record::typed_reads`] then gathers by role. An entry without `=` is
+/// refused, as `--arg`'s is.
+fn operation_reads(reads: &[String]) -> Result<Vec<(String, String)>> {
+    reads
+        .iter()
+        .map(|entry| {
+            entry
+                .split_once('=')
+                .map(|(role, table)| (role.to_string(), table.to_string()))
+                .ok_or_else(|| {
+                    Error::Io(std::io::Error::other(format!(
+                        "`--read {entry}` must be ROLE=TABLE"
+                    )))
+                })
+        })
+        .collect()
 }
 
 /// The `--arg KEY=VALUE` values as the operation's arguments, each a string,
@@ -2601,7 +2638,8 @@ mod tests {
         let history = LocalHistory::at_root(root.path().join("history"));
         let request = crate::record::OperationRequest {
             long_name: "filter-rows",
-            on: "orders",
+            on: Some("orders"),
+            reads: &serde_json::Map::new(),
             name: "big",
             arguments: &arguments,
             description: None,
