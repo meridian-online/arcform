@@ -57,7 +57,7 @@ Install the skills and connect the server the way a user would, following `skill
 - **Codex:** `arc skills install --agent codex` (it writes `~/.agents/skills`), and the server in `~/.codex/config.toml` with `tool_timeout_sec = 600`.
 - **Desktop chat client:** `arc skills install --target <folder>` to write this arc's skills into a folder outside the task's, then zip each skill folder there, leaving out its `.arc-skill` marker, and upload it, and connect `arc mcp` by absolute path, as `desktop-chat-tools.md` shows. Turn off any file-system connector, so arc is the only route to files.
 
-Nothing else may tell the agent about arc. Each task runs in a new, empty folder (not this repository), with no `CLAUDE.md`, `AGENTS.md` or other instructions that name arc. The agent's usual user settings stay as they are: an analyst's agent has other skills competing for the same question, and the eval should see that.
+Nothing else may tell the agent about arc. Each task runs in a new, empty folder (not this repository), with no `CLAUDE.md`, `AGENTS.md` or other instructions that name arc, and on a path that does not name it either: the agent sees its working directory, so keep the run folders out of a folder called `arc-eval` even when the binary and the backups live there. The agent's usual user settings stay as they are: an analyst's agent has other skills competing for the same question, and the eval should see that.
 
 ## 3. Run a task
 
