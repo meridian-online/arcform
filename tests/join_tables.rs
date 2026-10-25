@@ -353,3 +353,50 @@ fn the_tool_writes_the_bytes_the_terminal_writes() {
         assert_eq!(agent.read(file), terminal.read(file), "{file}");
     }
 }
+
+#[test]
+fn a_right_join_on_using_keeps_the_customer_with_no_order_with_its_key_set() {
+    let protocol = Protocol::new();
+    protocol.record_and_run(&["kind=right", "using=customer_id"]);
+    assert_eq!(
+        protocol.columns(),
+        ["customer_id", "id", "name", "amount", "customers_name"]
+    );
+    assert_eq!(
+        protocol.rows("SELECT customer_id, customers_name FROM joined WHERE id IS NULL"),
+        [(Some(30), Some("Cy".to_string()))],
+        "customer 30 is kept with its key set"
+    );
+    assert_eq!(
+        protocol.rows("SELECT customer_id, name FROM joined WHERE id IS NULL"),
+        [(Some(30), None)],
+        "the order columns are null for it"
+    );
+    assert_eq!(
+        protocol.rows("SELECT count(*)::INTEGER, NULL::VARCHAR FROM joined"),
+        [(Some(3), None)],
+        "orders 1 and 2 match, and customer 30 has none; order 3 is dropped"
+    );
+}
+
+#[test]
+fn a_cross_join_pairs_every_order_with_every_customer() {
+    let protocol = Protocol::new();
+    protocol.record_and_run(&["kind=cross"]);
+    assert_eq!(
+        protocol.columns(),
+        [
+            "id",
+            "customer_id",
+            "name",
+            "amount",
+            "customers_customer_id",
+            "customers_name"
+        ]
+    );
+    assert_eq!(
+        protocol.rows("SELECT count(*)::INTEGER, NULL::VARCHAR FROM joined"),
+        [(Some(9), None)],
+        "three orders by three customers"
+    );
+}
