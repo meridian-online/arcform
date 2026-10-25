@@ -4,18 +4,19 @@ A release is a pushed version tag. `.github/workflows/release.yml` does the rest
 
 The agent-facing walkthrough is the release skill, `.claude/skills/release/SKILL.md`. This page says what the machinery does and what it requires.
 
-## Before the first release: two repository secrets
+## Before the first release: three repository secrets
 
 Hugh adds these under the arcform repository's Settings → Secrets and variables → Actions. An agent cannot.
 
 - **`INSTALL_SITE_TOKEN`**: a GitHub token that can send a repository dispatch to `meridian-online/install` (a fine-grained token with Contents read and write on that repository, the same kind finetype uses). The `update-install-site` job sends `scripts/install.sh` with it. The install repository must also list arcform in its `update.yml` matrix and serve `/arc`, or the dispatch is accepted and ignored.
 - **`CARGO_REGISTRY_TOKEN`**: a crates.io API token with the `publish-new` and `publish-update` scopes. The `publish-crates` job publishes `arcform-sqlparser` and `arcform` with it. Without it the job fails with a message naming the secret, after the GitHub release is already out; add it and re-run that job.
+- **`SKILLS_REPO_TOKEN`**: a fine-grained GitHub token with Contents read and write on `meridian-online/data-analysis-skills`. The `publish-skills` job copies the tag's `skills/` into that repository with it. Without it the job fails with a message naming the secret, after the GitHub release is already out; add it and re-run that job.
 
 ## What a release tag must be
 
 A pushed tag starts a release only when it is `v` followed by three dot-separated numbers, such as `v0.2.0`. `release.yml` filters its tag trigger on `v[0-9]+.[0-9]+.[0-9]+`, so a tag such as `v0.3.0-rc1` or `v19-train-state` starts nothing.
 
-A version tag then has to pass `release.yml`'s first job, `tag-guard`, before anything else runs. Every other job waits on it, directly or through another job, none carries an `if:` that would run it after a failure, and `publish-crates` and `update-install-site` also wait on the `release` job, so a refusal stops the run before a binary is built, a release is created or a crate is published. `scripts/check_release_tag.py` refuses when:
+A version tag then has to pass `release.yml`'s first job, `tag-guard`, before anything else runs. Every other job waits on it, directly or through another job, none carries an `if:` that would run it after a failure, and `publish-crates`, `update-install-site` and `publish-skills` also wait on the `release` job, so a refusal stops the run before a binary is built, a release is created or a crate is published. `scripts/check_release_tag.py` refuses when:
 
 - the tag is not a version (exit 3), which is the second line of defence behind the trigger filter;
 - the tag's number differs from `version` under `[package]` in `Cargo.toml` (exit 4);
@@ -37,6 +38,7 @@ The script reads `release.yml` without a YAML library, so it understands only th
 | `release` | `tag-guard`, `build` | Requires all eight files and checks each checksum, then creates the GitHub release with `body: ${{ needs.tag-guard.outputs.notes }}` and `fail_on_unmatched_files: true`. |
 | `publish-crates` | `release` | Publishes `arcform-sqlparser` (from `vendor/sqlparser-0.55.0`) when crates.io's API answers 404 for its version; when that version is already there, `scripts/check_fork_published.py` requires the published crate to be this tree's fork file for file, and fails with a request to bump the fork's patch version if it is not. Then it publishes `arcform` (`cargo publish --locked --no-verify`, since the `build` legs have already built and tested this source and verifying would need a system libduckdb the runner lacks) when its version is not there either. Any answer other than 200 or 404 stops the job. |
 | `update-install-site` | `release` | Sends `scripts/install.sh` to `meridian-online/install` as an `update-install-script` dispatch carrying the tag and repository. |
+| `publish-skills` | `tag-guard`, `release` | Replaces `skills/` in `meridian-online/data-analysis-skills` with the tag's `skills/` and commits "Skills from arc <tag>". It commits nothing when the skills are unchanged, and does nothing when the newest such commit there names a higher version than the tag, so re-running an older tag cannot roll the skills back. Runs one at a time. |
 
 The Linux binaries are built on Ubuntu 22.04, so they need glibc 2.35 or later. Older systems build from source with `CXXFLAGS='-DDUCKDB_VERSION="v2.0.0"' cargo install arcform --locked --features mcp,bundled-duckdb`. The `CXXFLAGS` setting is needed until duckdb-rs fixes [#917](https://github.com/duckdb/duckdb-rs/issues/917); without it the bundled DuckDB reports a development version.
 
@@ -52,7 +54,7 @@ The Linux binaries are built on Ubuntu 22.04, so they need glibc 2.35 or later. 
 
 - **`tag-guard` refused:** nothing was published. Fix the tree on a branch and merge it, then Hugh moves the tag to the fixed `main` (below).
 - **A `build` leg failed:** nothing was published, because `release` needs every leg. Re-run the failed jobs if the failure was the runner's; otherwise fix and merge, then Hugh moves the tag.
-- **`publish-crates` or `update-install-site` failed:** the GitHub release is out. Fix the cause (usually a missing secret) and re-run the failed job. `publish-crates` skips a crate whose version is already on crates.io, so a re-run publishes only what is missing. A crate version, once published, cannot be replaced; a fix to it is a new patch release.
+- **`publish-crates`, `update-install-site` or `publish-skills` failed:** the GitHub release is out. Fix the cause (usually a missing secret) and re-run the failed job. `publish-crates` skips a crate whose version is already on crates.io, so a re-run publishes only what is missing. A crate version, once published, cannot be replaced; a fix to it is a new patch release.
 
 Moving the tag is Hugh's step, as pushing it was. Delete it on GitHub and locally, then tag the fixed `main` and push again:
 

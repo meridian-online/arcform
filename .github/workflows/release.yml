@@ -285,7 +285,22 @@ jobs:
     needs: [tag-guard, release]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # One publish at a time, and a queued one is never cancelled: two tags
+    # pushed together would otherwise race to the same branch.
+    concurrency:
+      group: publish-skills
+      cancel-in-progress: false
     steps:
+      - name: The skills repository token is set
+        shell: bash
+        env:
+          SKILLS_REPO_TOKEN: ${{ secrets.SKILLS_REPO_TOKEN }}
+        run: |
+          if [ -z "${SKILLS_REPO_TOKEN}" ]; then
+            echo "::error::SKILLS_REPO_TOKEN is not set on this repository, so the skills were not published. Add the secret and re-run this job."
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           path: arcform
@@ -301,6 +316,14 @@ jobs:
         run: |
           set -euo pipefail
           cd skills-repo
+          # Re-running an older tag must not roll the skills back: skip when the
+          # newest "Skills from arc vX.Y.Z" commit names a higher version.
+          last="$(git log --format=%s --grep='^Skills from arc v[0-9]' -n 1 | sed -n 's/^Skills from arc //p')"
+          if [ -n "${last}" ] && [ "${last}" != "${GITHUB_REF_NAME}" ] \
+            && [ "$(printf '%s\n%s\n' "${last}" "${GITHUB_REF_NAME}" | sort -V | tail -n 1)" = "${last}" ]; then
+            echo "The published skills are from ${last}, newer than ${GITHUB_REF_NAME}; leaving them alone."
+            exit 0
+          fi
           rm -rf skills
           cp -R ../arcform/skills skills
           git add -A skills

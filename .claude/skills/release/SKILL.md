@@ -121,7 +121,7 @@ gh run list --workflow release.yml --limit 3
 gh run watch <run-id> --exit-status
 ```
 
-The five jobs are `tag-guard`, `build` (four legs), `release`, `publish-crates` and `update-install-site`. When the run is green, check what it published:
+The six jobs are `tag-guard`, `build` (four legs), `release`, `publish-crates`, `update-install-site` and `publish-skills`. When the run is green, check what it published:
 
 ```bash
 gh release view vX.Y.Z --json assets,body,publishedAt   # eight assets; the body is the changelog section
