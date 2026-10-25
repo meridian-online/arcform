@@ -25,11 +25,15 @@ You decide which views drive and which respond. Usually the focal view drives; w
 
 ## The data's quality, beside the views
 
-The quality view says how far to trust what the brush shows. It is a count bar over the same table and the same selection, splitting the rows that are complete from those missing the column the claim rests on, so that as the user brushes it shows how many of the brushed rows the claim can speak for.
+The quality view says how far to trust what the other views select. It is a count bar over the same table and the same selection, splitting the rows that are complete from those missing the column the claim rests on: with nothing selected it shows the whole table, and when the user clicks a category or brushes another column it shows how many of the selected rows are missing that value.
+
+**A brush on the claim's own column cannot select its missing rows.** A range brush on `minutes` keeps the rows whose `minutes` falls inside the range, and a null falls inside no range, so while the focal view is brushed the quality view shows none missing. That is true of the brushed rows, not a finding about the data: say it in the quality view's title, and do not read it as the data being complete. The view answers for the selections the other views make (click "van": how many van jobs have no time).
+
+Mosaic's way round this is a second selection that the focal brush does not feed, with the quality view reading that one. Brightfield implements the `crossfilter`, `intersect`, `union` and `single` selections, but feeding one click into two selections takes two interactors on one plot, and none of Brightfield's own examples does that. Do not rely on it: keep one selection, and word the quality view as the missing values among the rows the other views select.
 
 - Record the split as a column of the table the dashboard reads (`CASE WHEN minutes IS NULL THEN 'missing' ELSE 'complete' END AS minutes_status`), since a bare-string channel must be a column.
 - Draw it as `mark: barX` with `x: { count: }`, `y:` the status column, and `filterBy: $sel`, over a grey ghost of the same bar without the filter, so both categories stay on the axis when the brushed rows have none missing.
-- Title it with what it counts: "Jobs with a recorded time".
+- Title it with what it counts and whose selection it follows: "Recorded time, among the jobs the other views select".
 - **Never use a `text` mark for it.** Brightfield's text mark does not aggregate, so a "20,433 of 20,640 complete" line cannot be drawn as one; the count bar is how the figure follows the selection.
 
 When the profile found other problems (rows that fail the schema, a column typed as something other than its name says), name them in the claim you hand over. When the claim rests on a weak column, say so in the panel's title or the claim, in your own words.
@@ -65,7 +69,7 @@ Before you hand over:
 
 ## One composition, worked
 
-This is the composition for one dataset's story, not a layout to copy. The fixture holds 180 delivery jobs; exploring found that delivery time has two peaks, bikes and vans, that zone barely moves it within either, and that `minutes` is missing in some jobs. So the focal view is the distribution of `minutes`, brushed; the responders are the jobs' distances against their times, the courier types and the zones; and the quality view counts the brushed jobs with and without a time.
+This is the composition for one dataset's story, not a layout to copy. The fixture holds 180 delivery jobs; exploring found that delivery time has two peaks, bikes and vans, and that `minutes` is missing in 9 jobs. The bikes' and vans' median times were 14 and 47 minutes, while within each type the zone medians ran from 12.5 to 15.5 minutes for bikes and from 42.5 to 52 for vans, so courier type matters far more than zone. So the focal view is the distribution of `minutes`, brushed; the responders are the jobs' distances against their times, the courier types and the zones; and the quality view counts the jobs the other views select with and without a time.
 
 A step makes the one table the dashboard reads, with the quality split as a column; the run makes it; the panel is written and checked:
 
@@ -73,7 +77,7 @@ A step makes the one table the dashboard reads, with the quality split as a colu
 arc sql record "SELECT *, CASE WHEN minutes IS NULL THEN 'missing' ELSE 'complete' END AS minutes_status FROM jobs" --name jobs_dashboard --description "The jobs the dashboard reads, with whether each has a recorded time"
 arc run
 arc protocol write-file panels/overview.yaml <<'YAML'
-title: Delivery time is two populations, bikes and vans; within each, zone barely moves it
+title: Delivery time is two populations, bikes and vans; courier type matters far more than zone
 params:
   sel: { select: crossfilter }
 hconcat:
@@ -154,7 +158,7 @@ hconcat:
         data: { from: jobs_dashboard, filterBy: $sel }
         x: { count: }
         y: minutes_status
-      title: Jobs with a recorded time
+      title: Recorded time, among the jobs the other views select
       yLabel: minutes_status
       width: 320
       height: 100

@@ -77,14 +77,19 @@ arc sql query "SELECT courier_type, count(minutes) AS jobs, min(minutes) AS fast
 ```
 
 ```text expect
-"row_count": 2
+          24
+        ],
+        [
+          "van",
+          75,
+          25,
 ```
 
 Bikes took 6 to 24 minutes and vans 25 to 71: two populations that do not overlap. The next queries test whether zone moves either of them.
 
 ## 5. State the story as a claim, and check it
 
-Write the story as one claim the views can test: "Delivery time is two populations, bikes and vans; within each, zone barely moves it." Then run every view you plan as a query before you compose it. A view that comes out flat, empty or uninformative is dropped, not shown. If two claims are equally credible, this is the moment for your one question.
+Write the story as one claim the views can test: "Delivery time is two populations, bikes and vans; courier type matters far more than zone." Then run every view you plan as a query before you compose it. A view that comes out flat, empty or uninformative is dropped, not shown. If two claims are equally credible, this is the moment for your one question.
 
 ## 6. Compose one linked panel
 
@@ -93,7 +98,7 @@ Load `references/composing.md`. One panel holds every view, over one table and o
 Two things are always within reach, though not necessarily on the first screen:
 
 - **The grid** of the table the dashboard reads, so the user can answer their row-level questions. Brightfield draws that grid itself, and a brush in the panel filters it; do not try to draw it in the panel.
-- **The data's quality**, as a view over the same table and the same selection: how many of the brushed rows are complete and how many are missing the column the claim rests on.
+- **The data's quality**, as a view over the same table and the same selection: how many of the rows the other views select are complete, and how many are missing the column the claim rests on. A brush on that column itself can never select its missing rows, so under such a brush the quality view shows none missing; it speaks for the selections made in the other views, and for the whole table when nothing is selected.
 
 A claim that rests on a weak column says so in its own words, in the panel's title or the claim you state.
 

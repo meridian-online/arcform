@@ -49,7 +49,7 @@ Read the missing values as you go. If the column a claim would rest on is missin
 
 ## Stating the claim
 
-The claim is one sentence that names what drives the data and what does not: "Delivery time is two populations, bikes and vans; within each, zone barely moves it." It must be something the views can test by brushing: select the vans in one view and the long times light up in another.
+The claim is one sentence that names what drives the data and what does not: "Delivery time is two populations, bikes and vans; courier type matters far more than zone." It must be something the views can test by brushing: select the vans in one view and the long times light up in another.
 
 Say what the claim is about as association, not cause, unless the data is from an experiment. "Vans take longer" is what the data shows; "vans make deliveries slow" is not.
 
@@ -63,16 +63,23 @@ Some data has nothing to compose. Make no dashboard when the data has:
 
 Then write no panel. Hand the profile over and say why, in a sentence the user can act on: "This file is one column of 20 part codes, with nothing measured about them, so there is no dashboard to compose. Here is the profile; a file with a measure per code, such as stock or price, would give one."
 
-Here the fixture's `codes.csv`, one column of codes, is loaded, described and profiled, and no panel is written:
+Here the fixture's `codes.csv` is loaded, described and profiled. The example shows the profile behind the decision, not the decision itself: one column, 20 rows, every value typed as an identifier. That is what you hand over, with the sentence saying why there is no dashboard.
 
 ```sh arc-example needs=finetype fixture=dashboard-from-data
 arc sql record "SELECT * FROM read_csv('codes.csv')" --name raw_codes --description "Load the part codes as they arrive"
 arc run
 arc table describe raw_codes
 arc table profile raw_codes
-test ! -e panels
 ```
 
 ```text expect
-"type": "representation.identifier.alphanumeric_id"
+  "columns": [
+    {
+      "name": "code",
+      "null_count": 0,
+      "type": "VARCHAR"
+    }
+  ],
 ```
+
+The description lists one column, `code`, over 20 rows, and the profile types it as `representation.identifier.alphanumeric_id`: a single identifier column, with nothing measured.
