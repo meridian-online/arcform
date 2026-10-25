@@ -98,16 +98,18 @@ Load `references/composing.md`. One panel holds every view, over one table and o
 Two things are always within reach, though not necessarily on the first screen:
 
 - **The grid** of the table the dashboard reads, so the user can answer their row-level questions. Brightfield draws that grid itself, and a brush in the panel filters it; do not try to draw it in the panel.
-- **The data's quality**, as a view over the same table and the same selection: how many of the rows the other views select are complete, and how many are missing the column the claim rests on. A brush on that column itself can never select its missing rows, so under such a brush the quality view shows none missing; it speaks for the selections made in the other views, and for the whole table when nothing is selected.
+- **The data's quality**, as a view over the same table and the same selection: how many of the rows the other views select are complete, and how many are missing the column the claim rests on. When that column is complete, the flat split is dropped and the view shows the weakness that bears most on the claim instead (mixed scales in the measure, say). A brush on that column itself can never select its missing rows, so under such a brush the quality view shows none missing; it speaks for the selections made in the other views, and for the whole table when nothing is selected.
 
-A claim that rests on a weak column says so in its own words, in the panel's title or the claim you state.
+A claim that rests on a weak column says so in its own words, in the focal plot's title or the claim you state.
+
+Brightfield draws no top-level `title`. Keep the claim there for Mosaic and the report's caption, and put it as the focal plot's `title` too; for CC BY data, append the credit line to that plot title, since only a drawn title reaches an exported picture.
 
 ## 7. Check what was made
 
 - `panel_check` (`arc panel check`) comes back clean. Act on every warning as `presenting-findings` says, and write the panel again.
 - **The story test**: the takeaway fits in one sentence, and that sentence is the claim.
 - **The intuition test**: the dashboard reads without hover. Titles and axis labels say what each view shows.
-- **The honesty test**: nothing is claimed as causal that is only associated, every number in a title came from a query you ran, and the quality view is there for the column the claim rests on.
+- **The honesty test**: nothing is claimed as causal that is only associated, every number in a title came from a query you ran, and the quality view is there for the column the claim rests on, or for the data's main weakness when that column is complete.
 
 ## 8. Hand over
 
@@ -127,10 +129,13 @@ Follow `presenting-findings`' route: the user opens the Protocol folder in Brigh
 | --- | --- |
 | You are about to ask the user what they want to see | Look first. Size from the data, say what you assumed in one line, and act |
 | The dashboard is a histogram per column, or a KPI row and a trend | That is a template. Find the claim first (step 4), and compose the views that test it |
-| Every view has the same size and weight, and no title states a claim | A chart gallery, not a story. Choose the focal view, make it the largest, and put the claim in the panel's title |
+| Every view has the same size and weight, and no title states a claim | A chart gallery, not a story. Choose the focal view, make it the largest, and put the claim in the top-level `title` and in the focal plot's `title`, which is the one that is drawn |
 | A number in a title or in the chat came from what you know about the dataset | Run the query that gives it, and quote that |
 | A planned view comes out flat or empty when you query it | Drop it. Do not show a view that says nothing |
 | The claim rests on a column with missing values and nothing on the panel says so | Add the quality view for that column (`references/composing.md`) |
+| The quality view would be a complete/missing bar with nothing missing | It is flat, so drop it. Show the weakness that bears most on the claim instead (`references/composing.md`) |
+| The claim or the CC BY credit sits only in the top-level `title`, and the exported picture lacks it | Brightfield does not draw that title. Put the claim in the focal plot's `title`, and append the credit to it |
+| A hexbin on a map projection, `r` or `opacity` on dots, or a log colour scale is not drawn | Brightfield cannot draw them. Use a hexbin over longitude and latitude, and clamp a skewed count with `colorDomain` (`references/composing.md`) |
 | `warning:` lines from `arc protocol write-file`, or `arc panel check` exits 1 | The panel names a table or column the Protocol does not make. Fix it from `table_describe` and write it again |
 | Brushing one view changes nothing in the others | Each responder must read `data: { from: <table>, filterBy: $sel }`, and `params` must declare `sel`. See `references/composing.md` |
 | Ranked bars reorder, or their totals vanish, under a brush | They carry `filterBy`. Ranked bars and counts over time use `toggleY` and `highlight` instead |

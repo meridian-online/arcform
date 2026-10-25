@@ -21,6 +21,8 @@ How a responder reads the selection depends on its kind:
 - **A binned histogram, a scatter or a map** draws two layers: the whole table in grey (`fill: "#b7b3ae"`) as a ghost, and on top the same mark reading `data: { from: <table>, filterBy: $sel }`. The ghost keeps the total on the page, so the brushed rows read as a share of it. Add `xDomain: Fixed` so the axis does not move under the brush.
 - **Ranked bars and counts over time** use one layer with no `filterBy`: `select: toggleY` (or `toggleX` for vertical bars) publishes a click into `$sel`, and `select: highlight` with `by: $sel` shows the selected rows inside each bar. Brightfield's ranked bars take their total off the page and reorder the axis under the pointer when they carry `filterBy`, so do not give them one. These views drive as well as respond: a click on a bar filters the others.
 
+**Colour.** For a magnitude, the sequential default is one hue running light to dark, or `viridis`; never a rainbow such as `turbo`. A ramp whose dark end matches a dark background loses its top values: look at the dark-mode thumbnail before you hand over, and change the scheme if the largest values vanish. Colour a dimension of eight values or fewer by identity (see the limits below).
+
 You decide which views drive and which respond. Usually the focal view drives; when the claim is about a category ("vans are the slow ones"), the bars of that category may lead and the distribution respond.
 
 ## The data's quality, beside the views
@@ -36,15 +38,23 @@ Mosaic's way round this is a second selection that the focal brush does not feed
 - Title it with what it counts and whose selection it follows: "Recorded time, among the courier types and zones clicked".
 - **Never use a `text` mark for it.** Brightfield's text mark does not aggregate, so a "20,433 of 20,640 complete" line cannot be drawn as one; the count bar is how the figure follows the selection.
 
-When the profile found other problems (rows that fail the schema, a column typed as something other than its name says), name them in the claim you hand over. When the claim rests on a weak column, say so in the panel's title or the claim, in your own words.
+**When the claim's columns are complete, there is nothing to split.** A complete/missing bar with one bar in it is a flat view, so drop it like any other. Put in its place the view of the weakness that bears most on the claim, over the same table and the same selection. Look for it in the profile and the exploring queries: a measure on mixed scales or units, rows that fail the schema, a threshold that is read inconsistently. Its title says what it shows, and the selection it follows. Record the grouping as a column of the table, as for the missing-value split.
+
+For example, a count of earthquakes above a magnitude-4.5 floor had no missing magnitudes, but 81% of the magnitudes were body-wave (`mb`) and the rest on other scales, so the floor is read on mixed scales. Its quality view was a bar of the count by magnitude scale, titled "Magnitude scale of the quakes selected: the 4.5 floor is read on mixed scales". That is the weakness in that data, not a view to add to yours.
+
+When the profile found other problems (rows that fail the schema, a column typed as something other than its name says), name them in the claim you hand over. When the claim rests on a weak column, say so in the focal plot's title or the claim, in your own words.
 
 ## The grid
 
 Every dashboard rests on the grid of its table, so the user can answer their row-level questions. Brightfield draws that grid itself, for the table the panel reads, and a brush in the panel filters it. Do not draw one in the panel: Brightfield draws no Mosaic `table` input.
 
-## The credit line
+## The claim and the credit, in a drawn title
 
-When the data's licence asks for credit (CC BY, for one), put the credit in the panel's top-level `title` text ("Notable AI models over time. Data: Epoch AI, CC BY 4.0"). Brightfield draws no `subtitle`, and a `meta.credit` key is not drawn either.
+Brightfield does not draw a panel's top-level `title`: not in the chart document, not in the tiles, not in `export-png`. Only the PDF report uses it, as a caption. A title that is drawn is a plot's own `title`, so:
+
+- Keep the claim in the top-level `title`, for Mosaic and for the report's caption.
+- Put the claim as the focal plot's `title` as well, so the person looking at the dashboard, or at its exported picture, reads it.
+- When the data's licence asks for credit (CC BY, for one), append the credit line to the focal plot's `title` ("Notable AI models over time. Data: Epoch AI, CC BY 4.0"). Only a drawn title reaches an exported picture, so a credit anywhere else is lost there. Brightfield draws no `subtitle`, and a `meta.credit` key is not drawn either.
 
 ## Brightfield's limits
 
@@ -55,17 +65,25 @@ A composition that reaches past these draws wrongly or not at all.
 - **No facets.** `fx` and `fy` are not drawn: every row lands on one plot. Use separate plots in the `hconcat`/`vconcat` instead.
 - **No `table` input.** The grid is Brightfield's, outside the panel.
 - **No `text` mark for a count.** It does not aggregate.
+- **No hexbin through a map projection.** For a dense point map, draw a hexbin over plain longitude and latitude, which is an equirectangular map, and label the axes `longitude` and `latitude`.
+- **`opacity` and `r` on dots are not drawn.** Overplotting cannot be thinned by opacity or sized by radius: bin it (a hexbin) or colour it.
+- **No log, sqrt or symlog colour scale.** The colour of a skewed count is linear. See "Colour for a skewed count" below.
+- **`colorScale: quantize` on a hexbin fill does not match its legend, and `colorLabel` is not drawn.** Do not use either; say in the plot's title what the colour counts.
+
+### Colour for a skewed count
+
+When most bins hold a few rows and a handful hold very many, a linear ramp spends its whole range on the handful. Use a sequential scheme (`colorScheme: viridis`, below) and clamp the ramp with a numeric `colorDomain` whose upper end is a percentile you queried (`quantile_cont(n, 0.99)` over the bin counts, say), so the top colour means "this many or more". The legend cannot carry the cap, so state it in the plot's title: "(colour capped at 110 a hexagon)".
 
 ## The checks
 
 Before you hand over:
 
 1. `panel_check` (`arc panel check`) is clean, and `protocol_write_file` gave no `warnings`. It checks tables and bare-string columns; it does not look inside `{ bin: … }` or `{ count: }`, so check those column names with `table_describe`.
-2. The takeaway fits in one sentence, and the panel's title says it.
+2. The takeaway fits in one sentence, and the top-level `title` and the focal plot's `title` say it. For CC BY data, the focal plot's `title` also carries the credit.
 3. The dashboard reads without hover: every plot has a title or axis labels that say what it shows.
 4. Nothing is claimed as causal that is only associated.
 5. Every number in a title came from a query you ran.
-6. The quality view is there for the column the claim rests on.
+6. The quality view is there for the column the claim rests on, or, when those columns are complete, for the weakness that bears most on the claim.
 
 ## One composition, worked
 
@@ -94,7 +112,7 @@ hconcat:
         y: { count: }
       - select: intervalX
         as: $sel
-      title: Minutes per delivery
+      title: Delivery time is two populations, bikes and vans; courier type matters far more than zone
       xDomain: Fixed
       xLabel: minutes
       width: 560
