@@ -1352,6 +1352,12 @@ mod tests {
                 "`arguments` must be an object",
             ),
             ("dir", json!(7), "`dir` must be a string, not 7"),
+            ("on", json!(7), "`on` must be a string, not 7"),
+            (
+                "reads",
+                json!(["orders"]),
+                "`reads` must be an object of each role the operation reads, not [\"orders\"]",
+            ),
         ];
         for (key, value, message) in refusals {
             let mut args = request.clone();
