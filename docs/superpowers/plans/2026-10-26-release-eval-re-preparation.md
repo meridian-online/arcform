@@ -21,7 +21,7 @@
 
 ## Review Focus
 
-1. A run folder that holds anything naming arc beyond `.claude/skills/` (Claude Code only): check with `find $EVAL/runs -mindepth 3 -not -path '*/.claude/skills*'` printing nothing.
+1. A run folder that holds anything naming arc beyond `.claude/skills/` (Claude Code only): check with `find $EVAL/runs -mindepth 3 -not -path '*/claude-code/*/.claude' -not -path '*/.claude/skills*'` printing nothing.
 2. A skill installed or zipped from a binary other than the pinned one: every `.arc-skill` marker and zip comes from `$EVAL/bin/arc`; check six skills in each Claude Code folder and six zips.
 3. A zip that carries the `.arc-skill` marker, or nests its folder wrongly: `unzip -l` shows `<skill>/SKILL.md` at the top and no `.arc-skill`.
 4. The pinned binary refusing Homebrew's `duckdb` on a real run: Task 3's smoke run exercises it.
@@ -64,7 +64,7 @@
 - [ ] **Step 1:** Create `$EVAL/runs/<agent>/<task id>/` for all 3 × 13, and `$EVAL/transcripts/`, `$EVAL/task-ids.txt` (13 ids, analyst tasks first in file order, then dashboard).
 - [ ] **Step 2:** For each Claude Code folder: `$EVAL/bin/arc skills install --target <folder>/.claude/skills`. Expected: six skills each.
 - [ ] **Step 3:** `$EVAL/bin/arc skills install --target $EVAL/desktop-skills/staging`; then for each skill, from `staging/`, `zip -r ../<skill>.zip <skill> -x '<skill>/.arc-skill'`. Expected: six zips, `unzip -l` shows `<skill>/SKILL.md` and no `.arc-skill`.
-- [ ] **Step 4:** Preflight, with Task 1's script from its branch if not yet merged (`git show raise-the-eval-preflight-url-timeout:eval/analyst-workflow/preflight.sh > $EVAL/preflight.sh`, run with `TASKS=` pointing at main's task files): `ARC=$EVAL/bin/arc` for `tasks.yaml` and for `dashboard-tasks.yaml`. Save both outputs to `$EVAL/preflight-tasks.txt` and `$EVAL/preflight-dashboard.txt`. Expected: `preflight: all checks passed` for both. A dataset gone is a needs-human flag, not a substitution.
+- [ ] **Step 4:** Preflight, with Task 1's script from its branch if not yet merged (run it from the branch's worktree checkout, so the default `tasks.yaml` is recognised and its ten-task and 4/4/2 checks run; a copy outside the repo silently skips them): `ARC=$EVAL/bin/arc` for `tasks.yaml` and for `dashboard-tasks.yaml`. Save both outputs to `$EVAL/preflight-tasks.txt` and `$EVAL/preflight-dashboard.txt`. Expected: `preflight: all checks passed` for both. A dataset gone is a needs-human flag, not a substitution.
 - [ ] **Step 5:** Verify Review Focus 1–3 with the commands named there.
 
 ### Task 5: Handout

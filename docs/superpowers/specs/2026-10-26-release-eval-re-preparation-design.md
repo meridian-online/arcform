@@ -9,11 +9,11 @@ The skills release (0.3.0) is tested by the analyst-workflow eval in `eval/analy
 - The eval runs the ten tasks of `tasks.yaml` and the three of `dashboard-tasks.yaml`, each in Claude Code, Codex and a desktop chat client: 39 sessions.
 - The nine dashboard runs are practice. Their results go in the release pull request and do not hold the release; the dashboard rubric stays *proposed for review*.
 - The analyst pass bar in `score.md` was approved as proposed on 21 Oct.
-- The preparation goes in a new eval folder, dated for the first session (2026-11-02), beside the 20 Oct one, built from main. The 20 Oct folder is left untouched: it holds the only backups of the agents' configs from before any eval change, which are what the maintainer restores from afterwards.
+- The preparation goes in a new eval folder, dated for the first session (2026-11-02), beside the 20 Oct one, built from main. The 20 Oct folder is left untouched, as a fallback for the restore; the restore itself uses copies taken on 2 Nov (Goal 5).
 
 ## Goals
 
-1. One arc binary, built from main with the MCP feature, linked against Homebrew's DuckDB 2.0 library, pinned in the new folder. `arc --version` prints the version every skill's `arc_version` names.
+1. One arc binary, built from main with the MCP feature, linked against Homebrew's DuckDB 2.0 library, pinned in the new folder. `arc --version` prints the version every skill's `arc_version` names, and a build record names the commit and the linked DuckDB library, since 0.2.0 alone does not tell this build from the released 0.2.0. The eval runs before the version bump, against main at 0.2.0 (the maintainer's ruling of 23 Oct); the release pull request says so.
 2. The preflight passes for both task files against that binary, on this machine's `duckdb`, `finetype` and `uv`. A Protocol run through the pinned binary succeeds on Homebrew's `duckdb` (the 23 Oct failure was an engine refusal; this proves it is gone).
 3. 39 empty run folders, one per task and agent. Each Claude Code folder holds the six skills, installed by the pinned binary with `--target`. Codex and desktop folders are empty.
 4. The six skills, written by the pinned binary to a staging folder, zipped one per skill without the `.arc-skill` marker, for upload to the desktop client.
@@ -46,7 +46,7 @@ The skills release (0.3.0) is tested by the analyst-workflow eval in `eval/analy
 ## Approaches
 
 1. **Refresh the 20 Oct folder in place**: swap the binary, reinstall six skills over five, rebuild zips and handout. Least work; risks a leftover file from the old preparation and a folder whose name no longer says what it holds.
-2. **A new dated folder built from main** (chosen): fresh binary, fresh run folders, skills and zips from that binary, a new handout that points at the 20 Oct backups for the restore. Slightly more setup; every file traces to the pinned build.
+2. **A new dated folder built from main** (chosen): fresh binary, fresh run folders, skills and zips from that binary, a new handout whose restore uses copies taken on 2 Nov, with the 20 Oct backups as a fallback. Slightly more setup; every file traces to the pinned build.
 3. **Option 2 plus a committed preparation script**: makes the rebuild-and-reinstall after each skill fix one command. More public code to review before the runs, and parts of it are specific to this machine. Declined: reruns are few enough to follow the runbook by hand.
 
 ## Left to the builder
