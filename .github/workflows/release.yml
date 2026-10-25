@@ -286,7 +286,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # One publish at a time: a running publish is never cancelled, and when
-    # several queue, only the newest waits. Two tags pushed together would
+    # several queue, only the most recently queued waits. Two tags pushed together would
     # otherwise race to the same branch.
     concurrency:
       group: publish-skills

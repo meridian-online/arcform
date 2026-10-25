@@ -55,7 +55,7 @@ The Linux binaries are built on Ubuntu 22.04, so they need glibc 2.35 or later. 
 - **`tag-guard` refused:** nothing was published. Fix the tree on a branch and merge it, then Hugh moves the tag to the fixed `main` (below).
 - **A `build` leg failed:** nothing was published, because `release` needs every leg. Re-run the failed jobs if the failure was the runner's; otherwise fix and merge, then Hugh moves the tag.
 - **`publish-crates`, `update-install-site` or `publish-skills` failed:** the GitHub release is out. Fix the cause (usually a missing secret) and re-run the failed job. `publish-crates` skips a crate whose version is already on crates.io, so a re-run publishes only what is missing. A crate version, once published, cannot be replaced; a fix to it is a new patch release.
-- **`publish-skills` was cancelled:** a newer tag replaced it in the queue. The newer run publishes the newer skills, so there is nothing to re-run.
+- **`publish-skills` was cancelled:** a later-queued run replaced it. If that later run was for an older tag, re-run this one; the rollback guard makes a re-run safe either way.
 
 Moving the tag is Hugh's step, as pushing it was. Delete it on GitHub and locally, then tag the fixed `main` and push again:
 
