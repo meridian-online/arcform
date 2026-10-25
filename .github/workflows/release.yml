@@ -285,8 +285,9 @@ jobs:
     needs: [tag-guard, release]
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # One publish at a time, and a queued one is never cancelled: two tags
-    # pushed together would otherwise race to the same branch.
+    # One publish at a time: a running publish is never cancelled, and when
+    # several queue, only the newest waits. Two tags pushed together would
+    # otherwise race to the same branch.
     concurrency:
       group: publish-skills
       cancel-in-progress: false
@@ -310,6 +311,9 @@ jobs:
           repository: meridian-online/data-analysis-skills
           token: ${{ secrets.SKILLS_REPO_TOKEN }}
           path: skills-repo
+          # The whole history, so the rollback guard sees the last "Skills from
+          # arc" commit even when later commits sit on top of it.
+          fetch-depth: 0
 
       - name: Replace skills/ with this tag's skills and publish them
         shell: bash
