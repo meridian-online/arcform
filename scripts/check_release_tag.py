@@ -78,7 +78,7 @@ GUARD_STEP_ID = "guard"
 PUBLISH_ACTION = "softprops/action-gh-release"
 # Jobs that publish beyond GitHub. They wait for the GitHub release, so a tag
 # whose build failed never reaches crates.io or the install site.
-AFTER_RELEASE_JOBS = ("publish-crates", "update-install-site")
+AFTER_RELEASE_JOBS = ("publish-crates", "update-install-site", "publish-skills")
 TAG_FILTER = "v[0-9]+.[0-9]+.[0-9]+"
 # The notes travel as step output -> job output -> the publish step's `body:`.
 GUARD_ARGS = '--tag "${GITHUB_REF_NAME}" --github-output "${GITHUB_OUTPUT}"'

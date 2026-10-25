@@ -277,6 +277,42 @@ jobs:
             cargo publish --locked --no-verify -p arcform
           fi
 
+  # Mirrors this tag's `skills/` into meridian-online/data-analysis-skills, the
+  # public repository `npx skills add` installs from. A tag whose skills match
+  # what is there commits nothing and passes.
+  publish-skills:
+    name: Publish the skills
+    needs: [tag-guard, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: arcform
+
+      - uses: actions/checkout@v4
+        with:
+          repository: meridian-online/data-analysis-skills
+          token: ${{ secrets.SKILLS_REPO_TOKEN }}
+          path: skills-repo
+
+      - name: Replace skills/ with this tag's skills and publish them
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd skills-repo
+          rm -rf skills
+          cp -R ../arcform/skills skills
+          git add -A skills
+          if git diff --cached --quiet; then
+            echo "The skills at ${GITHUB_REF_NAME} match what is already published; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Skills from arc ${GITHUB_REF_NAME}"
+          git push
+
   update-install-site:
     name: Update the install site
     needs: release
