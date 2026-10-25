@@ -24,8 +24,10 @@ set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 tasks="${TASKS:-$here/tasks.yaml}"
 # The ten-task count and the 4/4/2 sizes belong to the default file only.
+# Compare resolved paths, so a relative TASKS naming the same file still counts as the default.
 default_tasks=0
-[ "$tasks" = "$here/tasks.yaml" ] && default_tasks=1
+tasks_real="$(cd "$(dirname "$tasks")" 2>/dev/null && pwd -P)/$(basename "$tasks")"
+[ "$tasks_real" = "$(cd "$here" && pwd -P)/tasks.yaml" ] && default_tasks=1
 arc="${ARC:-arc}"
 failures=0
 

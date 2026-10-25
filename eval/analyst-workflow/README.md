@@ -147,7 +147,7 @@ The `dashboard-from-data` skill answers "show me what's in this", which none of 
 
 The rubric is *proposed for review* and waits on the maintainer's approval. Until he approves it, run the tasks for practice but do not score a release against it.
 
-Run the preflight against the dashboard tasks with `TASKS=eval/analyst-workflow/dashboard-tasks.yaml eval/analyst-workflow/preflight.sh`. The ten-task count and the 4/4/2 sizes apply only to the default `tasks.yaml`; any other task file may use `size: dashboard`. Set up the agents and run a task as in sections 2 and 3, with these differences: the task has no plan playback, so there is no refinement to give; the time cap is 15 minutes; and the analyst opens the data file or the Protocol folder in Brightfield when the agent says to, which is the "first picture" the rubric times.
+Run the preflight against the dashboard tasks with `TASKS=eval/analyst-workflow/dashboard-tasks.yaml eval/analyst-workflow/preflight.sh`. The ten-task count and the 4/4/2 sizes apply only to the default `tasks.yaml`; any other task file may use `size: dashboard`. Set up the agents and run a task as in sections 2 and 3, with these differences: the task has no plan playback, so there is no refinement to give; the time cap is 15 minutes, counted from the prompt and including the download of the data, and a session that reaches it without a clean panel fails outcome 6 of the dashboard rubric (`score-dashboard.md` says how the cap and the first-picture time treat downloads); and the analyst opens the data file or the Protocol folder in Brightfield when the agent says to, which is the "first picture" the rubric times.
 
 ## The datasets
 

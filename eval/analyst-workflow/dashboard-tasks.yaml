@@ -23,10 +23,10 @@ tasks:
       https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv
     notes: >-
       CSV, one row per year from 1880, with a month column for each of January to December,
-      the annual mean (J-D) and four seasonal means. The first line is a title, not the
+      two annual means (J-D, January to December, and D-N, December to November) and four seasonal means. The first line is a title, not the
       header, so a default CSV read gets the wrong columns. Missing values are written as
-      "***" (the current year's later months, and the seasons that need a month not yet
-      measured), so columns read as text or means that skip the stars are the trap. Values
+      "***" (the current year's later months, the seasons and annual means that need a month
+      not yet measured, and D-N and DJF for 1880, which need the December before it), so columns read as text or means that skip the stars are the trap. Values
       are anomalies in degrees Celsius against 1951-1980, not temperatures. A good session
       finds the trend and where it steepens, and a dashboard could pair it with the months
       or seasons that move most; it should say the latest year is partial.
@@ -39,10 +39,10 @@ tasks:
       Make me a dashboard of US retail sales from this Census Bureau spreadsheet:
       https://www.census.gov/retail/mrts/www/mrtssales92-present.xlsx
     notes: >-
-      Excel workbook of about 440 KB with one sheet per year from 1992. Each sheet stacks
-      blocks of rows by kind of business, with a not-adjusted and an adjusted block side by
-      side, header text above the data and footnotes below it, and month columns with a
-      total. Some cells hold "(S)" (suppressed) or "(NA)" instead of a number, and the
+      Excel workbook of about 440 KB with one sheet per year from 1992. Each sheet has
+      months across the columns and a TOTAL, and kinds of business down the rows in two
+      blocks stacked one above the other, NOT ADJUSTED and then ADJUSTED, with header text
+      above and footnotes below. Some cells hold "(S)" (suppressed) or "(NA)" instead of a number, and the
       latest year is partial. The business categories overlap (a total, subtotals and their
       parts), so summing them double counts. A good session finds how the kinds of business
       differ in growth or seasonality; the dashboard should let the analyst brush one kind
@@ -56,12 +56,14 @@ tasks:
       I've got a month of US flight on-time data and want to see what's in it:
       https://transtats.bts.gov/PREZIP/On_Time_Reporting_Carrier_On_Time_Performance_1987_present_2024_6.zip
     notes: >-
-      The file is June 2024, a zip of one CSV with about 600,000 flights and over a hundred
+      The file is June 2024, a zip of one CSV with about 611,000 flights and 110
       columns. June 2024 was chosen because it is a full summer month with real delay
       variety (thunderstorms, congestion) and it falls before the July 2024 airline-systems
       outage, so no single event dominates it. The zip is about 31 MB, so the session has to
-      fetch and unpack it first. Delays are blank for cancelled and diverted flights, which
-      carry their own flags, so an average delay over all rows is the trap. Delay columns
+      fetch and unpack it first. Cancelled and diverted flights carry their own flags. Arrival delay is blank for
+      both, and departure delay is blank for nearly all cancelled flights but present for
+      diverted ones, which did depart, so the columns are empty in different places and an
+      average over all rows is the trap. Delay columns
       are in minutes and can be negative (early). The five delay-cause columns are filled
       only for flights delayed 15 minutes or more. A good session finds what drives the
       delays (the hour of the day, the carrier, the airport) and shows the cancelled flights
