@@ -22,7 +22,7 @@ A session that reaches the 15-minute cap without a panel that `panel_check` pass
 
 ## Results
 
-One row per task and agent. Write `y` or `n` in each column, and put the evidence in the run's section below. The Pass column is `y` when outcomes 1, 2, 3, 4 and 6 are all `y`. It leaves out the Arc column, which the pass bar judges across agents (at least two of three), and outcome 5. Outcome 5 is judged once per agent, on its last task, so the Pass on the agent's earlier rows is provisional until then, and a `n` on outcome 5 turns all three of that agent's rows to `n`.
+One row per task and agent. Write `y` or `n` in each column, and put the evidence in the run's section below. The Pass column is `y` when outcomes 1, 2, 3, 4 and 6 are all `y` and outcome 5, scored on the agent's last task, is not `n`. It does not include the Arc column, which the pass bar judges across agents (at least two of three). Outcome 5 is judged once per agent, on its last task, so the Pass on the agent's earlier rows is provisional until then, and a `n` on outcome 5 turns all three of that agent's rows to `n`.
 
 | Task | Agent | Arc | 1 | 2 | 3 | 4 | 5 | 6 | Pass |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
