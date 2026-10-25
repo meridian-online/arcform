@@ -3,8 +3,10 @@
 # whose dataset has gone, or skills written for another arc, wastes a paid agent run.
 #
 # Checks:
-#   1. tasks.yaml is well formed: ten tasks with the six fields, sizes 4 quick, 4 analysis,
-#      2 project, unique ids, and no prompt that names arc.
+#   1. The task file is well formed: every task has the six fields, a unique id, a known size,
+#      and no prompt that names arc. The default tasks.yaml must hold ten tasks, sizes 4 quick,
+#      4 analysis, 2 project; any other file (TASKS=...) may use `size: dashboard` and holds
+#      any number of tasks.
 #   2. Every dataset_url, and every other URL a prompt carries, answers 2xx to a HEAD request.
 #      A server that rejects HEAD gets a one-byte ranged GET before the URL counts as gone.
 #   3. `arc --version` equals each skill's arc_version (from `arc skills list`), and arc was
@@ -21,6 +23,9 @@ set -u
 
 here="$(cd "$(dirname "$0")" && pwd)"
 tasks="${TASKS:-$here/tasks.yaml}"
+# The ten-task count and the 4/4/2 sizes belong to the default file only.
+default_tasks=0
+[ "$tasks" = "$here/tasks.yaml" ] && default_tasks=1
 arc="${ARC:-arc}"
 failures=0
 
@@ -46,11 +51,15 @@ fi
 # 1. Shape. Prints "FAIL ..." lines for problems, then "URL <id> <url>" lines to check.
 checked="$(printf '%s' "$tasks_json" | python3 -c '
 import json, re, sys
+default = sys.argv[1] == "1"
 doc = json.load(sys.stdin)
 tasks = doc.get("tasks") or []
 fields = ["id", "size", "dataset_url", "licence", "prompt", "notes"]
 want = {"quick": 4, "analysis": 4, "project": 2}
-if len(tasks) != 10:
+sizes = list(want) if default else list(want) + ["dashboard"]
+if not tasks:
+    print("FAIL the task file holds no tasks")
+if default and len(tasks) != 10:
     print(f"FAIL tasks.yaml holds {len(tasks)} tasks, not 10")
 seen = set()
 for t in tasks:
@@ -61,18 +70,19 @@ for t in tasks:
     if tid in seen:
         print(f"FAIL {tid}: id is used twice")
     seen.add(tid)
-    if t.get("size") not in want:
-        print("FAIL %s: size %r is not quick, analysis or project" % (tid, t.get("size")))
+    if t.get("size") not in sizes:
+        print("FAIL %s: size %r is not one of %s" % (tid, t.get("size"), ", ".join(sizes)))
     if re.search(r"\barc(form)?\b", str(t.get("prompt", "")), re.I):
         print(f"FAIL {tid}: the prompt names arc; the eval needs the agent to choose it unprompted")
     urls = [t.get("dataset_url")] + [u.rstrip(".,;:)\"") for u in re.findall(r"https?://\S+", str(t.get("prompt", "")))]
     for u in dict.fromkeys(u for u in urls if u):
         print(f"URL {tid} {u}")
-for size, n in want.items():
-    got = sum(1 for t in tasks if t.get("size") == size)
-    if got != n:
-        print(f"FAIL tasks.yaml has {got} {size} tasks, not {n}")
-')" || { printf 'FAIL  could not check tasks.yaml (see the error above)\n'; exit 1; }
+if default:
+    for size, n in want.items():
+        got = sum(1 for t in tasks if t.get("size") == size)
+        if got != n:
+            print(f"FAIL tasks.yaml has {got} {size} tasks, not {n}")
+' "$default_tasks")" || { printf 'FAIL  could not check the task file (see the error above)\n'; exit 1; }
 
 shape_ok=1
 while IFS= read -r line; do
@@ -82,7 +92,13 @@ while IFS= read -r line; do
 done <<EOF
 $checked
 EOF
-[ "$shape_ok" = 1 ] && ok "tasks.yaml: ten tasks, sizes 4/4/2, no prompt names arc"
+if [ "$shape_ok" = 1 ]; then
+  if [ "$default_tasks" = 1 ]; then
+    ok "tasks.yaml: ten tasks, sizes 4/4/2, no prompt names arc"
+  else
+    ok "$(basename "$tasks"): every task has the six fields and a known size, no prompt names arc"
+  fi
+fi
 
 # 2. Every URL answers.
 while IFS=' ' read -r kind tid url; do

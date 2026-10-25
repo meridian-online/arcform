@@ -1,0 +1,68 @@
+# The analyst workflow's dashboard eval: three "show me what's in this" tasks on public
+# datasets that are not in the gallery.
+#
+# Run it with TASKS=eval/analyst-workflow/dashboard-tasks.yaml eval/analyst-workflow/preflight.sh,
+# and score it with score-dashboard.md. Each prompt is what an analyst would type, pasted
+# into the agent verbatim. It never names arc, arcform or a skill: the eval measures whether
+# the agent reaches for arc on its own. Every URL a prompt carries, and every dataset_url, is
+# checked by preflight.sh before a run.
+#
+# Fields: id, size, dataset_url, licence, prompt, notes. The size is `dashboard` for all
+# three. `notes` is for the evaluator, not the agent: what the data holds, the quality issue
+# a good session should surface, and what a good dashboard could show. The prompts ask to
+# see the data; none poses a specific question, so the answer is a composed dashboard and
+# the claim it carries, and the views should differ across the three tasks.
+
+tasks:
+  - id: dashboard-gistemp
+    size: dashboard
+    dataset_url: https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv
+    licence: Public domain (NASA Goddard Institute for Space Studies, a US Government work)
+    prompt: >-
+      Show me what's in this: NASA's table of global temperature changes, one row per year.
+      https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv
+    notes: >-
+      CSV, one row per year from 1880, with a month column for each of January to December,
+      the annual mean (J-D) and four seasonal means. The first line is a title, not the
+      header, so a default CSV read gets the wrong columns. Missing values are written as
+      "***" (the current year's later months, and the seasons that need a month not yet
+      measured), so columns read as text or means that skip the stars are the trap. Values
+      are anomalies in degrees Celsius against 1951-1980, not temperatures. A good session
+      finds the trend and where it steepens, and a dashboard could pair it with the months
+      or seasons that move most; it should say the latest year is partial.
+
+  - id: dashboard-retail-sales
+    size: dashboard
+    dataset_url: https://www.census.gov/retail/mrts/www/mrtssales92-present.xlsx
+    licence: CC0 1.0 (US Census Bureau, Monthly Retail Trade Survey)
+    prompt: >-
+      Make me a dashboard of US retail sales from this Census Bureau spreadsheet:
+      https://www.census.gov/retail/mrts/www/mrtssales92-present.xlsx
+    notes: >-
+      Excel workbook of about 440 KB with one sheet per year from 1992. Each sheet stacks
+      blocks of rows by kind of business, with a not-adjusted and an adjusted block side by
+      side, header text above the data and footnotes below it, and month columns with a
+      total. Some cells hold "(S)" (suppressed) or "(NA)" instead of a number, and the
+      latest year is partial. The business categories overlap (a total, subtotals and their
+      parts), so summing them double counts. A good session finds how the kinds of business
+      differ in growth or seasonality; the dashboard should let the analyst brush one kind
+      against the rest, and should not sum categories that contain each other.
+
+  - id: dashboard-flight-delays
+    size: dashboard
+    dataset_url: https://transtats.bts.gov/PREZIP/On_Time_Reporting_Carrier_On_Time_Performance_1987_present_2024_6.zip
+    licence: Public domain (US Bureau of Transportation Statistics, a US Government work)
+    prompt: >-
+      I've got a month of US flight on-time data and want to see what's in it:
+      https://transtats.bts.gov/PREZIP/On_Time_Reporting_Carrier_On_Time_Performance_1987_present_2024_6.zip
+    notes: >-
+      The file is June 2024, a zip of one CSV with about 600,000 flights and over a hundred
+      columns. June 2024 was chosen because it is a full summer month with real delay
+      variety (thunderstorms, congestion) and it falls before the July 2024 airline-systems
+      outage, so no single event dominates it. The zip is about 31 MB, so the session has to
+      fetch and unpack it first. Delays are blank for cancelled and diverted flights, which
+      carry their own flags, so an average delay over all rows is the trap. Delay columns
+      are in minutes and can be negative (early). The five delay-cause columns are filled
+      only for flights delayed 15 minutes or more. A good session finds what drives the
+      delays (the hour of the day, the carrier, the airport) and shows the cancelled flights
+      as quality, not as zero delay.
