@@ -31,6 +31,9 @@ tasks_real="$(cd "$(dirname "$tasks")" 2>/dev/null && pwd -P)/$(basename "$tasks
 [ "$tasks_real" = "$(cd "$here" && pwd -P)/tasks.yaml" ] && default_tasks=1
 arc="${ARC:-arc}"
 timeout="${PREFLIGHT_TIMEOUT:-90}"
+case "$timeout" in
+  ''|*[!0-9]*) printf 'FAIL  PREFLIGHT_TIMEOUT must be a whole number of seconds, not "%s"\n' "$timeout"; exit 1 ;;
+esac
 failures=0
 
 fail() {
