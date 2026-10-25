@@ -183,7 +183,11 @@ fn a_path_that_matches_nothing_records_and_the_run_fails_naming_it() {
         String::from_utf8_lossy(&run.stderr)
     );
     assert!(!run.status.success(), "the run succeeded:\n{output}");
-    assert!(output.contains("data/missing.csv"), "{output}");
+    assert!(
+        output.contains("step 'missing' failed")
+            && output.contains("No files found that match the pattern \"data/missing.csv\""),
+        "the run did not fail in the `missing` step on DuckDB's own error:\n{output}"
+    );
 }
 
 #[test]
