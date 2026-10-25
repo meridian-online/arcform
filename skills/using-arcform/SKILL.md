@@ -59,7 +59,7 @@ A quick look still starts with `scoping-an-analysis` and ends with `presenting-f
 | Check | `building-and-checking-a-protocol` | Anything that changes the answer's meaning |
 | Present | `presenting-findings` | The answer, how it was derived, and what else was found |
 
-Start every task at Scope, even a quick look: choosing the size is what keeps a quick look quick.
+Start every task at Scope, even a quick look: choosing the size is what keeps a quick look quick. The exception is "show me what's in this" or a request for a dashboard, with no question to answer: load `dashboard-from-data`, which sizes the work in one line itself and composes a linked dashboard from the data.
 
 ## Check the binary
 
@@ -73,7 +73,7 @@ arc 0.
 
 ## When to switch
 
-- The environment check passed: load `scoping-an-analysis`.
+- The environment check passed: load `scoping-an-analysis`, or `dashboard-from-data` when the user asks to see what is in a dataset or for a dashboard. A specific question still goes to `scoping-an-analysis`.
 - The plan is agreed and the data is not yet typed: `profiling-and-typing-data`.
 - The quality findings are shown: `building-and-checking-a-protocol`.
 - The run record is clean and every table has the rows you expect: `presenting-findings`.

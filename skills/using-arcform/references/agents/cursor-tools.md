@@ -6,7 +6,7 @@ The skills name each tool by its bare name, such as `sql_query`, and each comman
 
 Use one of two routes, not both: with both, Cursor holds two copies of every skill.
 
-- **The plugin.** This repository is a Cursor plugin (`.cursor-plugin/plugin.json`): it brings the five skills and the arc MCP server. This route is untested. Install it from this repository at the tag `vX.Y.Z` matching `arc --version`, as [Cursor's plugin docs](https://cursor.com/docs/reference/plugins) describe, so the skills match your arc; it works from the first release that carries the plugin manifest.
+- **The plugin.** This repository is a Cursor plugin (`.cursor-plugin/plugin.json`): it brings the six skills and the arc MCP server. This route is untested. Install it from this repository at the tag `vX.Y.Z` matching `arc --version`, as [Cursor's plugin docs](https://cursor.com/docs/reference/plugins) describe, so the skills match your arc; it works from the first release that carries the plugin manifest.
 - **The skills folder.** `arc skills install --agent cursor` writes the skills into `~/.agents/skills/`, the shared folder Cursor reads beside `~/.cursor/skills/`, so Codex and Gemini CLI on the same machine share the one copy. Connect the server yourself (below).
 
 ## Connecting `arc mcp`

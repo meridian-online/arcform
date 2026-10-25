@@ -23,8 +23,8 @@ WHAT ONLY A PUSHED TAG RUNS, AND WHAT STANDS IN FOR IT
     GitHub's tag matching cannot be run anywhere but GitHub. `--wiring` reads
     release.yml instead: the tag filter is exactly `v[0-9]+.[0-9]+.[0-9]+`,
     the guard step is unconditional and refuses rather than warns, every other
-    job needs it, none runs after a failure, publish-crates and
-    update-install-site wait on the release, and the release body is the
+    job needs it, none runs after a failure, publish-crates,
+    update-install-site and publish-skills wait on the release, and the release body is the
     guard's notes. That is a reading of the workflow text, and it is the
     honest limit of what a pull request can check about a trigger.
 
@@ -78,7 +78,7 @@ GUARD_STEP_ID = "guard"
 PUBLISH_ACTION = "softprops/action-gh-release"
 # Jobs that publish beyond GitHub. They wait for the GitHub release, so a tag
 # whose build failed never reaches crates.io or the install site.
-AFTER_RELEASE_JOBS = ("publish-crates", "update-install-site")
+AFTER_RELEASE_JOBS = ("publish-crates", "update-install-site", "publish-skills")
 TAG_FILTER = "v[0-9]+.[0-9]+.[0-9]+"
 # The notes travel as step output -> job output -> the publish step's `body:`.
 GUARD_ARGS = '--tag "${GITHUB_REF_NAME}" --github-output "${GITHUB_OUTPUT}"'
@@ -832,6 +832,7 @@ def self_test() -> int:
             ("the guard step's id changed", (RELEASE_WORKFLOW, f"        id: {GUARD_STEP_ID}\n", "        id: check\n")),
             ("update-install-site stops waiting on the release", (RELEASE_WORKFLOW, "    name: Update the install site\n    needs: release\n", f"    name: Update the install site\n    needs: {GUARD_JOB}\n")),
             ("publish-crates stops waiting on the release", (RELEASE_WORKFLOW, "    needs: release\n", f"    needs: [{GUARD_JOB}, build]\n")),
+            ("publish-skills stops waiting on the release", (RELEASE_WORKFLOW, "    needs: [tag-guard, release]\n", f"    needs: {GUARD_JOB}\n")),
             ("the guard's job output renamed", (RELEASE_WORKFLOW, f"      {NOTES_OUTPUT}: {NOTES_JOB_OUTPUT}", f"      body: {NOTES_JOB_OUTPUT}")),
         )
         for label, edit in wiring_cases:

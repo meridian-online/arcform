@@ -105,7 +105,7 @@ PATH="$PWD/../bin:$PATH" perl -e 'alarm 900; exec @ARGV' \
   > ../transcript.jsonl
 ```
 
-The first line of the transcript (`"subtype":"init"`) lists the skills and MCP servers the session loaded: check the five skills and a connected `arc` are there before scoring. To read the session as text:
+The first line of the transcript (`"subtype":"init"`) lists the skills and MCP servers the session loaded: check the six skills and a connected `arc` are there before scoring. To read the session as text:
 
 ```sh
 jq -r 'select(.type == "assistant") | .message.content[]
@@ -135,6 +135,19 @@ Attach the filled `score.md` to the release pull request: the summary table, the
 ## The pass bar
 
 *Proposed for review:* every task chooses arc in at least two of the three agents, and every project task ends with all seven outcomes in every agent. A release that misses it ships only with the maintainer's explicit decision, recorded in the release pull request.
+
+## Dashboard tasks
+
+The `dashboard-from-data` skill answers "show me what's in this", which none of the ten tasks above asks, so it has its own tasks and its own rubric:
+
+| File | What it holds |
+| --- | --- |
+| `dashboard-tasks.yaml` | Three dashboard tasks (`size: dashboard`) on datasets outside Brightfield's start gallery: NASA's global temperature table, the Census Bureau's monthly retail sales and one month of US flight on-time data. Same six fields as `tasks.yaml`; the prompts ask to see the data and never name arc |
+| `score-dashboard.md` | The rubric: chose arc, a first picture within the first few minutes, a claim checked against a query, a quality view in the panel, at most one question, no template across the three tasks, and a clean `panel_check` |
+
+The rubric is *proposed for review* and waits on the maintainer's approval. Until he approves it, run the tasks for practice but do not score a release against it.
+
+Run the preflight against the dashboard tasks with `TASKS=eval/analyst-workflow/dashboard-tasks.yaml eval/analyst-workflow/preflight.sh`. The ten-task count and the 4/4/2 sizes apply only to the default `tasks.yaml`; any other task file may use `size: dashboard`. Set up the agents and run a task as in sections 2 and 3, with these differences: the task has no plan playback, so there is no refinement to give; the time cap is 15 minutes, counted from the prompt and including the download of the data, and a session that reaches it without a clean panel fails outcome 6 of the dashboard rubric (`score-dashboard.md` says how the cap and the first-picture time treat downloads); and the analyst opens the data file or the Protocol folder in Brightfield when the agent says to, which is the "first picture" the rubric times.
 
 ## The datasets
 
