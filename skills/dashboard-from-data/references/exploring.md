@@ -69,7 +69,6 @@ Here the fixture's `codes.csv` is loaded, described and profiled. The example sh
 arc sql record "SELECT * FROM read_csv('codes.csv')" --name raw_codes --description "Load the part codes as they arrive"
 arc run
 arc table describe raw_codes
-arc table profile raw_codes
 ```
 
 ```text expect
@@ -82,4 +81,14 @@ arc table profile raw_codes
   ],
 ```
 
-The description lists one column, `code`, over 20 rows, and the profile types it as `representation.identifier.alphanumeric_id`: a single identifier column, with nothing measured.
+The description lists one column, `code`, over 20 rows. The profile types it as `representation.identifier.alphanumeric_id`: a single identifier column, with nothing measured.
+
+```sh arc-example needs=finetype fixture=dashboard-from-data
+arc sql record "SELECT * FROM read_csv('codes.csv')" --name raw_codes --description "Load the part codes as they arrive"
+arc run
+arc table profile raw_codes
+```
+
+```text expect
+representation.identifier.alphanumeric_id
+```

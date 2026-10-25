@@ -23,7 +23,7 @@
   "interface": {
     "displayName": "Arcform",
     "shortDescription": "Analyse tabular data in Protocols you can re-run",
-    "longDescription": "Five skills take an agent from agreeing the question to handing over the answer: scoping, profiling and typing the data, building and checking a Protocol, and presenting the findings. Each step is recorded through arc, so the analysis is a folder anyone can run again rather than a throwaway script. Needs the arc binary, with its MCP server, on PATH.",
+    "longDescription": "Six skills take an agent from agreeing the question to handing over the answer, or from a dataset to a dashboard of it: scoping, profiling and typing the data, building and checking a Protocol, and presenting the findings. Each step is recorded through arc, so the analysis is a folder anyone can run again rather than a throwaway script. Needs the arc binary, with its MCP server, on PATH.",
     "developerName": "Meridian",
     "category": "Developer Tools",
     "capabilities": [

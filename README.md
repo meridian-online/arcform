@@ -77,7 +77,7 @@ An analyst working through an agent needs three things: arc with its MCP server,
 
 ### Plugins
 
-This repository is a plugin for each of these agents. Each one installs the five [agent skills](#agent-skills) and starts `arc mcp` from `PATH`; arc itself is not part of the plugin, so install it first. A plugin route installs the skills of a released arc from a release tag: the one you name for Gemini CLI and Cursor (`v` and the version `arc --version` prints), and the newest release's for Claude Code and Codex. These routes work from the first release that carries the plugin manifests; until then, use `arc skills install`.
+This repository is a plugin for each of these agents. Each one installs the six [agent skills](#agent-skills) and starts `arc mcp` from `PATH`; arc itself is not part of the plugin, so install it first. A plugin route installs the skills of a released arc from a release tag: the one you name for Gemini CLI and Cursor (`v` and the version `arc --version` prints), and the newest release's for Claude Code and Codex. These routes work from the first release that carries the plugin manifests; until then, use `arc skills install`.
 
 | Agent | Install |
 | --- | --- |
@@ -153,7 +153,7 @@ Through these tools an agent can start a Protocol, look at its tables, query the
 
 ### Agent skills
 
-[`skills/`](skills/) holds five agent skills that teach an agent the analyst workflow through these tools: `using-arcform`, the entry point, then `scoping-an-analysis`, `profiling-and-typing-data`, `building-and-checking-a-protocol` and `presenting-findings`, one for each stage from agreeing the question to handing over the answer. Each shows every step both as an `arc` command and as the matching tool, and `cargo test --features mcp --test skills` checks what they name and runs their examples against this binary. FineType's five tools (`infer`, `profile`, `taxonomy`, `validate`, `generate`) are taught in [`skills/profiling-and-typing-data/`](skills/profiling-and-typing-data/), whose [`references/what-finetype-teaches.md`](skills/profiling-and-typing-data/references/what-finetype-teaches.md) routes everything FineType's own agent skills teach through arc, so an agent working through arc does not need FineType's skills.
+[`skills/`](skills/) holds six agent skills that teach an agent the analyst workflow through these tools: `using-arcform`, the entry point, then `scoping-an-analysis`, `profiling-and-typing-data`, `building-and-checking-a-protocol` and `presenting-findings`, one for each stage from agreeing the question to handing over the answer, and `dashboard-from-data`, which turns a dataset into a linked dashboard when the user asks to see what is in it. Each shows every step both as an `arc` command and as the matching tool, and `cargo test --features mcp --test skills` checks what they name and runs their examples against this binary. FineType's five tools (`infer`, `profile`, `taxonomy`, `validate`, `generate`) are taught in [`skills/profiling-and-typing-data/`](skills/profiling-and-typing-data/), whose [`references/what-finetype-teaches.md`](skills/profiling-and-typing-data/references/what-finetype-teaches.md) routes everything FineType's own agent skills teach through arc, so an agent working through arc does not need FineType's skills.
 
 The skills ship inside `arc`, at its version. Without a [plugin](#plugins), install them into each agent found on this machine:
 

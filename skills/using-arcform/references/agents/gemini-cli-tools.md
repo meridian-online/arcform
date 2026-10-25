@@ -6,7 +6,7 @@ The skills name each tool by its bare name, such as `sql_query`, and each comman
 
 Use one of two routes, not both: with both, Gemini CLI holds two copies of every skill.
 
-- **The extension.** This repository is a Gemini CLI extension (`gemini-extension.json`): it brings the five skills, which Gemini CLI finds in the extension's `skills/` folder, and the arc MCP server.
+- **The extension.** This repository is a Gemini CLI extension (`gemini-extension.json`): it brings the six skills, which Gemini CLI finds in the extension's `skills/` folder, and the arc MCP server.
 
   ```sh
   gemini extensions install https://github.com/meridian-online/arcform --ref vX.Y.Z

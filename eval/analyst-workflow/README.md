@@ -105,7 +105,7 @@ PATH="$PWD/../bin:$PATH" perl -e 'alarm 900; exec @ARGV' \
   > ../transcript.jsonl
 ```
 
-The first line of the transcript (`"subtype":"init"`) lists the skills and MCP servers the session loaded: check the five skills and a connected `arc` are there before scoring. To read the session as text:
+The first line of the transcript (`"subtype":"init"`) lists the skills and MCP servers the session loaded: check the six skills and a connected `arc` are there before scoring. To read the session as text:
 
 ```sh
 jq -r 'select(.type == "assistant") | .message.content[]
