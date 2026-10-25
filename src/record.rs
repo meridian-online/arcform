@@ -2141,6 +2141,7 @@ fn join_prefix(given: Option<&serde_json::Value>, other: &str) -> String {
 
 /// Whether the arguments of [`JOIN_TABLES`] make one join: exactly one of
 /// `using` and `condition` for every kind but `cross`, which takes neither; no
+/// key twice in `using`, compared in any case as DuckDB folds a name; no
 /// `prefix` on `semi` or `anti`, which keep `table`'s columns alone; a `prefix`
 /// that is not empty and holds no `\` or control character, which the rename
 /// pattern it is written into cannot carry as written; and a `condition` that,
@@ -2169,6 +2170,20 @@ fn join_tables_checks(arguments: &serde_json::Map<String, serde_json::Value>) ->
             };
             return Err(refused(format!(
                 "a `{kind}` join of `{JOIN_TABLES}` is on one key, and {given}: {rule}"
+            )));
+        }
+    }
+    let keys = arguments.get("using").and_then(serde_json::Value::as_array);
+    let mut seen = std::collections::HashSet::new();
+    for key in keys
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+    {
+        if !seen.insert(key.to_lowercase()) {
+            return Err(refused(format!(
+                "the key `{key}` is in `using` of `{JOIN_TABLES}` twice, in any case, as DuckDB \
+                 folds a name; a join is on each key once"
             )));
         }
     }
@@ -5848,6 +5863,14 @@ mod tests {
             (
                 serde_json::json!({ "kind": "cross", "using": ["id"] }),
                 "`cross`, which takes neither",
+            ),
+            (
+                serde_json::json!({ "kind": "cross", "condition": on }),
+                "`cross`, which takes neither",
+            ),
+            (
+                serde_json::json!({ "using": ["id", "region", "ID"] }),
+                "the key `ID` is in `using` of `join-tables` twice",
             ),
             (
                 serde_json::json!({ "kind": "semi", "condition": on, "prefix": "c_" }),

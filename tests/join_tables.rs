@@ -262,6 +262,42 @@ fn a_semi_join_keeps_the_orders_with_a_customer_and_an_anti_join_the_other() {
     }
 }
 
+#[test]
+fn a_join_of_a_table_to_itself_in_another_case_is_refused_with_the_directory_untouched() {
+    let protocol = Protocol::new();
+    let snapshot = || {
+        let mut models: Vec<String> = std::fs::read_dir(protocol.dir.join("models"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        models.sort();
+        (protocol.read("arcform.yaml"), models)
+    };
+    let before = snapshot();
+    let out = protocol.arc(&[
+        "operation",
+        "record",
+        "join-tables",
+        "--on",
+        "orders",
+        "--read",
+        "other=Orders",
+        "--name",
+        "joined",
+        "--arg",
+        "using=customer_id",
+    ]);
+    assert!(!out.status.success(), "a join of orders to itself recorded");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for named in ["`table`", "`other`", "itself"] {
+        assert!(
+            stderr.contains(named),
+            "the refusal does not name {named}:\n{stderr}"
+        );
+    }
+    assert_eq!(snapshot(), before, "the refusal changed the directory");
+}
+
 #[cfg(feature = "mcp")]
 #[test]
 fn the_tool_writes_the_bytes_the_terminal_writes() {
