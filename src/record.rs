@@ -2369,10 +2369,12 @@ fn read_file_sql(recording: &Recording) -> String {
 /// case, or leaves the folder through `..` once its components are
 /// normalised. Nothing for a path inside the folder. Neither is a refusal.
 ///
-/// The live note names the fetch operators this build holds for the scheme:
-/// `http_fetch` for `http` and `https`, and `opendal_fetch` for any scheme in a
-/// build with the `opendal` feature; a scheme only `opendal_fetch` reaches, in a
-/// build without it, is told that a copy needs one with it.
+/// The live note names the fetch operators this build holds that reach the
+/// scheme: `http_fetch` for `http` and `https` in any case, and, in a build
+/// with the `opendal` feature, `opendal_fetch` for `http`, `https` and `s3`,
+/// lower case, as it compares them. An `s3` URL in a build without the feature
+/// is told that a copy needs one with it; any other scheme, that no fetch arc
+/// holds reaches it.
 fn read_file_notes(arguments: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
     let path = arguments
         .get("path")
@@ -2383,23 +2385,32 @@ fn read_file_notes(arguments: &serde_json::Map<String, serde_json::Value>) -> Ve
         .filter(|_| crate::asset_kind::is_remote(path))
         .map(|(scheme, _)| scheme);
     if let Some(scheme) = scheme.filter(|scheme| !scheme.eq_ignore_ascii_case("file")) {
-        let http = ["http", "https"]
+        let opendal = cfg!(feature = "opendal");
+        let mut fetches = Vec::new();
+        if ["http", "https"]
             .iter()
-            .any(|http| scheme.eq_ignore_ascii_case(http));
-        let snapshot = match (http, cfg!(feature = "opendal")) {
-            (true, true) => {
-                "fetch it with `http_fetch` or `opendal_fetch` and read the file the \
-                             fetch writes"
-            }
-            (true, false) => "fetch it with `http_fetch` and read the file the fetch writes",
-            (false, true) => "fetch it with `opendal_fetch` and read the file the fetch writes",
-            (false, false) => {
-                "a copy needs a build of arc with the `opendal` feature, whose \
-                               `opendal_fetch` fetches it"
-            }
+            .any(|http| scheme.eq_ignore_ascii_case(http))
+        {
+            fetches.push("`http_fetch`");
+        }
+        if opendal && ["http", "https", "s3"].contains(&scheme) {
+            fetches.push("`opendal_fetch`");
+        }
+        let snapshot = if !fetches.is_empty() {
+            format!(
+                "for a snapshot, fetch it with {} and read the file the fetch writes",
+                fetches.join(" or ")
+            )
+        } else if scheme == "s3" {
+            "for a snapshot, a copy needs a build of arc with the `opendal` feature, whose \
+             `opendal_fetch` fetches it"
+                .to_string()
+        } else {
+            "no fetch arc holds reaches its scheme, so there is no snapshot to read instead"
+                .to_string()
         };
         return vec![format!(
-            "`{path}` is read live at each run and no copy is kept; for a snapshot, {snapshot}."
+            "`{path}` is read live at each run and no copy is kept; {snapshot}."
         )];
     }
     if scheme.is_some() || path.starts_with('~') || leaves_the_folder(path) {
@@ -6320,37 +6331,46 @@ mod tests {
             );
         }
         let opendal = cfg!(feature = "opendal");
-        for (remote, http) in [
-            ("s3://b/k.csv", false),
-            ("HTTPS://x.org/a.csv", true),
-            ("http://x.org/a.csv", true),
-            ("hf://datasets/x", false),
+        for (remote, http, by_opendal) in [
+            ("s3://b/k.csv", false, true),
+            ("S3://b/k.csv", false, false),
+            ("HTTPS://x.org/a.csv", true, false),
+            ("http://x.org/a.csv", true, true),
+            ("hf://datasets/x", false, false),
+            ("gs://b/k.csv", false, false),
         ] {
             let notes = notes(remote);
             assert_eq!(notes.len(), 1, "{remote}: {notes:?}");
+            let note = &notes[0];
             assert!(
-                notes[0].contains(&format!("`{remote}`")) && notes[0].contains("live"),
-                "{remote}: {notes:?}"
+                note.contains(&format!("`{remote}`")) && note.contains("live"),
+                "{remote}: {note}"
             );
             assert_eq!(
-                notes[0].contains("`http_fetch`"),
+                note.contains("`http_fetch`"),
                 http,
-                "{remote}: `http_fetch` is named for an HTTP URL alone: {notes:?}"
+                "{remote}: `http_fetch` is named for an HTTP URL alone: {note}"
             );
             assert_eq!(
-                notes[0].contains("fetch it with `opendal_fetch`")
-                    || notes[0].contains("or `opendal_fetch`"),
-                opendal,
-                "{remote}: `opendal_fetch` is offered only in a build that holds it: {notes:?}"
+                note.contains("fetch it with `opendal_fetch`")
+                    || note.contains("or `opendal_fetch`"),
+                opendal && by_opendal,
+                "{remote}: `opendal_fetch` is offered only in a build that holds it, for a \
+                 scheme it takes: {note}"
             );
             assert_eq!(
-                notes[0].contains("needs a build of arc with the `opendal` feature"),
-                !http && !opendal,
-                "{remote}: {notes:?}"
+                note.contains("needs a build of arc with the `opendal` feature"),
+                !opendal && remote.starts_with("s3://"),
+                "{remote}: {note}"
+            );
+            assert_eq!(
+                note.contains("no fetch arc holds reaches its scheme"),
+                !(http || by_opendal || remote.starts_with("s3://")),
+                "{remote}: {note}"
             );
             assert!(
-                notes[0].ends_with('.') && !notes[0].contains('\n'),
-                "{remote}: {notes:?}"
+                note.ends_with('.') && !note.contains('\n'),
+                "{remote}: {note}"
             );
         }
     }
