@@ -62,8 +62,8 @@ const INSTRUCTIONS: &str = "Use arc when you analyse data over DuckDB and the wo
     (building-and-checking-a-protocol). Check: run it and test the tables it makes \
     (building-and-checking-a-protocol). Present: give the answer, how it was derived and what \
     else turned up (presenting-findings). When the user asks to see what is in a dataset, or for \
-    a dashboard, rather than a specific question, load dashboard-from-data instead. Start with the using-arcform skill where skills \
-    are available.\n\n\
+    a dashboard, rather than a specific question, load (dashboard-from-data) instead. Start \
+    with the using-arcform skill where skills are available.\n\n\
     The tools below are listed in the order you use them: Discover serves Scope and Profile, \
     Record serves Build, Run and Check serve Check, and Present serves Present.\n\n\
     Work in this order. Discover: table_describe shows what a table in a Protocol's database \

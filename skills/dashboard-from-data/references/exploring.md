@@ -65,7 +65,7 @@ Then write no panel. Hand the profile over and say why, in a sentence the user c
 
 Here the fixture's `codes.csv` is loaded, described and profiled. The example shows the profile behind the decision, not the decision itself: one column, 20 rows, every value typed as an identifier. That is what you hand over, with the sentence saying why there is no dashboard.
 
-```sh arc-example needs=finetype fixture=dashboard-from-data
+```sh arc-example fixture=dashboard-from-data
 arc sql record "SELECT * FROM read_csv('codes.csv')" --name raw_codes --description "Load the part codes as they arrive"
 arc run
 arc table describe raw_codes
