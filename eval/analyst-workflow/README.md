@@ -134,7 +134,7 @@ Attach the filled `score.md` to the release pull request: the summary table, the
 
 ## The pass bar
 
-*Proposed for review:* every task chooses arc in at least two of the three agents, and every project task ends with all seven outcomes in every agent. A release that misses it ships only with the maintainer's explicit decision, recorded in the release pull request.
+*Approved by the maintainer on 21 October 2026:* every task chooses arc in at least two of the three agents, and every project task ends with all seven outcomes in every agent. A release that misses it ships only with the maintainer's explicit decision, recorded in the release pull request.
 
 ## Dashboard tasks
 

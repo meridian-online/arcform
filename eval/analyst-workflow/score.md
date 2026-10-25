@@ -81,7 +81,7 @@ Group the failures by cause across tasks and agents. For each: the cause, the ru
 
 ## Pass bar
 
-*Proposed for review:* every task chooses arc in at least two of the three agents, and every project task ends with all seven outcomes in every agent.
+*Approved by the maintainer on 21 October 2026:* every task chooses arc in at least two of the three agents, and every project task ends with all seven outcomes in every agent.
 
 - Tasks choosing arc in at least two agents: _ of 10
 - Project tasks with all seven outcomes, in every agent: _ of 2
