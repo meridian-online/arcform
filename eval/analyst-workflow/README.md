@@ -142,7 +142,7 @@ The `dashboard-from-data` skill answers "show me what's in this", which none of 
 
 | File | What it holds |
 | --- | --- |
-| `dashboard-tasks.yaml` | Three dashboard tasks (`size: dashboard`) on datasets outside the gallery: NASA's global temperature table, the Census Bureau's monthly retail sales and one month of US flight on-time data. Same six fields as `tasks.yaml`; the prompts ask to see the data and never name arc |
+| `dashboard-tasks.yaml` | Three dashboard tasks (`size: dashboard`) on datasets outside Brightfield's start gallery: NASA's global temperature table, the Census Bureau's monthly retail sales and one month of US flight on-time data. Same six fields as `tasks.yaml`; the prompts ask to see the data and never name arc |
 | `score-dashboard.md` | The rubric: chose arc, a first picture within the first few minutes, a claim checked against a query, a quality view in the panel, at most one question, no template across the three tasks, and a clean `panel_check` |
 
 The rubric is *proposed for review* and waits on the maintainer's approval. Until he approves it, run the tasks for practice but do not score a release against it.

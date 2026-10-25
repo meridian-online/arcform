@@ -97,12 +97,12 @@ Load `references/composing.md`. One panel holds every view, over one table and o
 
 Two things are always within reach, though not necessarily on the first screen:
 
-- **The grid** of the table the dashboard reads, so the user can answer their row-level questions. Brightfield draws that grid itself, and a brush in the panel filters it; do not try to draw it in the panel.
+- **The grid** of the table the dashboard reads, so the user can answer their row-level questions. Brightfield draws that grid itself. A brush in the panel filters the grid, and a filter typed in the grid narrows the views, given the panel declares `sel`; tell the user both at hand-over. Do not try to draw it in the panel.
 - **The data's quality**, as a view over the same table and the same selection: how many of the rows the other views select are complete, and how many are missing the column the claim rests on. When that column is complete, the flat split is dropped and the view shows the weakness that bears most on the claim instead (mixed scales in the measure, say). A brush on that column itself can never select its missing rows, so under such a brush the quality view shows none missing; it speaks for the selections made in the other views, and for the whole table when nothing is selected.
 
 A claim that rests on a weak column says so in its own words, in the focal plot's title or the claim you state.
 
-Brightfield draws no top-level `title`. Keep the claim there for Mosaic and the report's caption, and put it as the focal plot's `title` too; for CC BY data, append the credit line to that plot title, since only a drawn title reaches an exported picture.
+A concat panel's top-level `title` is not drawn. Keep the claim there for Mosaic and the report (arc's `report_write` and Brightfield's PDF), and put it as the focal plot's `title` too; for CC BY data, append the credit line to that plot title, since only a drawn title reaches an exported picture.
 
 ## 7. Check what was made
 

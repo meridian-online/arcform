@@ -155,6 +155,8 @@ Through these tools an agent can start a Protocol, look at its tables, query the
 
 [`skills/`](skills/) holds six agent skills that teach an agent the analyst workflow through these tools: `using-arcform`, the entry point, then `scoping-an-analysis`, `profiling-and-typing-data`, `building-and-checking-a-protocol` and `presenting-findings`, one for each stage from agreeing the question to handing over the answer, and `dashboard-from-data`, which turns a dataset into a linked dashboard when the user asks to see what is in it. Each shows every step both as an `arc` command and as the matching tool, and `cargo test --features mcp --test skills` checks what they name and runs their examples against this binary. FineType's five tools (`infer`, `profile`, `taxonomy`, `validate`, `generate`) are taught in [`skills/profiling-and-typing-data/`](skills/profiling-and-typing-data/), whose [`references/what-finetype-teaches.md`](skills/profiling-and-typing-data/references/what-finetype-teaches.md) routes everything FineType's own agent skills teach through arc, so an agent working through arc does not need FineType's skills.
 
+Each release tag also publishes the skills to the public `meridian-online/data-analysis-skills` repository, so `npx skills add meridian-online/data-analysis-skills` installs the newest release's skills without arc; they match your arc only when it is the newest release.
+
 The skills ship inside `arc`, at its version. Without a [plugin](#plugins), install them into each agent found on this machine:
 
 ```sh

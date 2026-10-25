@@ -1,5 +1,5 @@
 # The analyst workflow's dashboard eval: three "show me what's in this" tasks on public
-# datasets that are not in the gallery.
+# datasets that are not in Brightfield's start gallery.
 #
 # Run it with TASKS=eval/analyst-workflow/dashboard-tasks.yaml eval/analyst-workflow/preflight.sh,
 # and score it with score-dashboard.md. Each prompt is what an analyst would type, pasted

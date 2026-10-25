@@ -23,7 +23,7 @@ How a responder reads the selection depends on its kind:
 
 You decide which views drive and which respond. Usually the focal view drives; when the claim is about a category ("vans are the slow ones"), the bars of that category may lead and the distribution respond.
 
-**Colour.** For a magnitude, the sequential default is one hue running light to dark, or `viridis`; never a rainbow such as `turbo`. A ramp whose dark end matches a dark background loses its top values: look at the dark-mode thumbnail before you hand over, and change the scheme if the largest values vanish. Colour a dimension of eight values or fewer by identity (see the limits below).
+**Colour.** For a magnitude, Brightfield's default is `viridis`; a single-hue ramp is also fine; never a rainbow such as `turbo`. Prefer `viridis`: a single-hue ramp whose dark end is near a dark background loses its top values. You cannot render the panel, so when you use a single-hue ramp, ask the user to check the largest values in Brightfield's dark mode. Colour a dimension of eight values or fewer by identity (see the limits below).
 
 ## The data's quality, beside the views
 
@@ -50,7 +50,7 @@ Every dashboard rests on the grid of its table, so the user can answer their row
 
 ## The claim and the credit, in a drawn title
 
-Brightfield does not draw a panel's top-level `title`: not in the chart document, not in the tiles, not in `export-png`. Only the PDF report uses it, as a caption. A title that is drawn is a plot's own `title`, so:
+A concat panel's (`hconcat` or `vconcat`) top-level `title` is not drawn: not in the chart document, not in the tiles, not in `export-png`. The report uses it as a caption, both arc's `report_write` and Brightfield's PDF. In a single-`plot` panel the top-level title is the plot's own title. A title that is drawn is a plot's own `title`, so:
 
 - Keep the claim in the top-level `title`, for Mosaic and for the report's caption.
 - Put the claim as the focal plot's `title` as well, so the person looking at the dashboard, or at its exported picture, reads it.
@@ -72,7 +72,7 @@ A composition that reaches past these draws wrongly or not at all.
 
 ### Colour for a skewed count
 
-When most bins hold a few rows and a handful hold very many, a linear ramp spends its whole range on the handful. Use a sequential scheme (`colorScheme: viridis`, the default; see Colour above) and clamp the ramp with a numeric `colorDomain` whose upper end is a percentile you queried (`quantile_cont(n, 0.99)` over the bin counts, say), so the top colour means "this many or more". The legend cannot carry the cap, so state it in the plot's title: "(colour capped at 110 a hexagon)".
+When most bins hold a few rows and a handful hold very many, a linear ramp spends its whole range on the handful. Use a sequential scheme (`colorScheme: viridis`, Brightfield's default; a single-hue ramp is also fine; never a rainbow such as `turbo`; see Colour above) and clamp the ramp with a numeric `colorDomain` whose upper end is a percentile you queried (`quantile_cont(n, 0.99)` over the bin counts, say), so the top colour means "this many or more". The legend cannot carry the cap, so state it in the plot's title: "(colour capped at <cap> a hexagon)".
 
 ## The checks
 
