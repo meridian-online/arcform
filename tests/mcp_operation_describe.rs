@@ -260,6 +260,7 @@ fn called_with_each_operator_and_operation_it_returns_what_arc_operation_describ
                 "limit-rows",
                 "fill-nulls",
                 "join-tables",
+                "append-rows",
             ]
             .map(String::from),
         )
@@ -305,7 +306,8 @@ fn called_with_no_argument_it_lists_no_operator() {
             "dedupe-rows",
             "limit-rows",
             "fill-nulls",
-            "join-tables"
+            "join-tables",
+            "append-rows"
         ],
         "the listing holds the operations alone, not the operators {operators:?}"
     );

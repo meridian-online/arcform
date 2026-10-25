@@ -620,6 +620,10 @@ const FILL_NULLS: &str = "fill-nulls";
 /// as [`FILTER_ROWS`] is.
 const JOIN_TABLES: &str = "join-tables";
 
+/// The long name of the operation that stacks other tables' rows under a
+/// table's, written once as [`FILTER_ROWS`] is.
+const APPEND_ROWS: &str = "append-rows";
+
 /// One SQL operation arc holds: what it is called, what it does, what it reads
 /// and writes, and what it takes — described so that it can be recorded as a
 /// step by name. The catalogue holds the description and nothing that runs.
@@ -1192,6 +1196,46 @@ const CATALOGUE: &[Operation] = &[
         recognised: None,
         checks: Some(join_tables_checks),
         reads_checks: Some(join_tables_reads_checks),
+        notes: None,
+    },
+    Operation {
+        long_name: APPEND_ROWS,
+        summary: "Appends the rows of one or more tables to a table's, matching columns by name and keeping every row, duplicates included.",
+        reads: &[
+            Role {
+                name: "table",
+                kind: "table",
+                list: false,
+                required: true,
+                of: None,
+                min_items: None,
+                description: "The table whose rows come first, and whose columns the result starts with.",
+            },
+            Role {
+                name: "column",
+                kind: "column",
+                list: false,
+                required: false,
+                of: Some("table"),
+                min_items: None,
+                description: "A column of the table, for a caller that names one.",
+            },
+            Role {
+                name: "other",
+                kind: "table",
+                list: true,
+                required: true,
+                of: None,
+                min_items: Some(1),
+                description: "The tables whose rows follow `table`'s, in the order given; a column one lacks is null in its rows.",
+            },
+        ],
+        writes: &[STEP_TABLE],
+        parameters: append_rows_parameters,
+        sql: append_rows_sql,
+        recognised: None,
+        checks: None,
+        reads_checks: None,
         notes: None,
     },
 ];
@@ -2234,6 +2278,35 @@ fn join_tables_reads_checks(reads: &Reads) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// The `parameters` schema of [`APPEND_ROWS`]: none. Closed to any key, as an
+/// operator's `with:` schema is, so the tables it stacks are all it takes.
+fn append_rows_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+    })
+}
+
+/// The SQL step of [`APPEND_ROWS`]: a table named for the step, made by the rows
+/// of the table it is applied to followed by those of each table in `other`, in
+/// the order given, as `UNION ALL BY NAME` stacks them: columns matched by name,
+/// a column a table lacks null in its rows, and every row kept. Each table is
+/// written as [`from_ident`] writes it, and one repeated, or `table` itself in
+/// `other`, is stacked again.
+fn append_rows_sql(recording: &Recording) -> String {
+    let selects: Vec<String> = std::iter::once(recording.on)
+        .chain(recording.reads.list("other").iter().map(String::as_str))
+        .map(|table| format!("SELECT * FROM {}", from_ident(table)))
+        .collect();
+    format!(
+        "CREATE OR REPLACE TABLE {} AS\n{};\n",
+        quote_ident(recording.name),
+        selects.join("\nUNION ALL BY NAME\n"),
+    )
 }
 
 /// `name` as a double-quoted SQL identifier, a `"` inside it doubled. The step's
@@ -5943,6 +6016,100 @@ mod tests {
             )
             .unwrap();
         assert!(checks(&reads).is_ok());
+    }
+
+    #[test]
+    fn the_union_reads_a_table_a_column_of_it_and_a_list_of_others_and_takes_no_key() {
+        let op = operation(APPEND_ROWS).expect("the union is held");
+        let description = op.description();
+        let reads = description["reads"].as_array().unwrap();
+        let shape: Vec<(&str, &str, bool, bool)> = reads
+            .iter()
+            .map(|role| {
+                (
+                    role["name"].as_str().unwrap(),
+                    role["kind"].as_str().unwrap(),
+                    role["required"].as_bool().unwrap(),
+                    role["list"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("table", "table", true, false),
+                ("column", "column", false, false),
+                ("other", "table", true, true)
+            ]
+        );
+        assert_eq!(reads[2]["min_items"], 1);
+        let schema = append_rows_parameters();
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+        assert_eq!(schema["properties"], serde_json::json!({}));
+        assert!(op.reads_checks.is_none() && op.notes.is_none());
+    }
+
+    /// The SQL [`append_rows_sql`] writes for `on` with the tables `others`,
+    /// as the step `unioned`.
+    fn union_sql(on: &str, others: &[&str]) -> String {
+        let arguments = arguments(serde_json::json!({}));
+        let reads = Reads(vec![
+            ("table", vec![on.to_string()]),
+            ("other", others.iter().map(ToString::to_string).collect()),
+        ]);
+        append_rows_sql(&Recording {
+            name: "unioned",
+            on,
+            reads: &reads,
+            arguments: &arguments,
+        })
+    }
+
+    #[test]
+    fn the_union_writes_each_other_table_after_the_first_in_the_order_given() {
+        assert_eq!(
+            union_sql("orders_2024", &["orders_2025"]),
+            "CREATE OR REPLACE TABLE \"unioned\" AS\nSELECT * FROM orders_2024\nUNION ALL BY NAME\nSELECT * FROM orders_2025;\n"
+        );
+        assert_eq!(
+            union_sql("a", &["c", "b", "c"]),
+            "CREATE OR REPLACE TABLE \"unioned\" AS\nSELECT * FROM a\nUNION ALL BY NAME\nSELECT * FROM c\nUNION ALL BY NAME\nSELECT * FROM b\nUNION ALL BY NAME\nSELECT * FROM c;\n"
+        );
+        assert_eq!(
+            union_sql("my orders", &["order"]),
+            "CREATE OR REPLACE TABLE \"unioned\" AS\nSELECT * FROM \"my orders\"\nUNION ALL BY NAME\nSELECT * FROM \"order\";\n"
+        );
+    }
+
+    #[test]
+    fn a_union_with_no_other_table_or_one_for_a_list_is_refused_and_a_repeat_is_admitted() {
+        let op = operation(APPEND_ROWS).unwrap();
+        for (given, named) in [
+            (
+                serde_json::json!({ "other": [] }),
+                ["`other`", "at least 1"],
+            ),
+            (serde_json::json!({ "other": "x" }), ["`other`", "a list"]),
+        ] {
+            let err = op
+                .admit_reads(Some("orders"), &arguments(given.clone()))
+                .expect_err(&given.to_string())
+                .to_string();
+            assert!(named.iter().all(|n| err.contains(n)), "{given}: {err}");
+        }
+        for other in [
+            serde_json::json!(["b", "b"]),
+            serde_json::json!(["orders"]),
+            serde_json::json!(["b"]),
+        ] {
+            let reads = op
+                .admit_reads(
+                    Some("orders"),
+                    &arguments(serde_json::json!({ "other": other })),
+                )
+                .unwrap_or_else(|e| panic!("{other} was refused: {e}"));
+            assert!(!reads.list("other").is_empty());
+        }
     }
 
     #[test]

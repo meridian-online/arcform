@@ -41,6 +41,7 @@ const DEDUPE_ROWS: &str = "dedupe-rows";
 const LIMIT_ROWS: &str = "limit-rows";
 const FILL_NULLS: &str = "fill-nulls";
 const JOIN_TABLES: &str = "join-tables";
+const APPEND_ROWS: &str = "append-rows";
 
 /// The operators the default build holds: the ten every build holds and the two
 /// `http-fetch` adds, which `cli` turns on.
@@ -238,6 +239,7 @@ fn list_prints_each_operation_with_a_sentence() {
         LIMIT_ROWS,
         FILL_NULLS,
         JOIN_TABLES,
+        APPEND_ROWS,
     ] {
         let line = line_opening_with(&text, op);
         assert!(
@@ -260,6 +262,7 @@ fn list_prints_each_operation_with_a_sentence() {
         LIMIT_ROWS,
         FILL_NULLS,
         JOIN_TABLES,
+        APPEND_ROWS,
     ] {
         let entry = entries
             .iter()
@@ -460,6 +463,7 @@ fn describe_prints_each_operator_in_the_five_keys_an_operation_is_described_in()
         LIMIT_ROWS,
         FILL_NULLS,
         JOIN_TABLES,
+        APPEND_ROWS,
     ]) {
         let out = arc(&["operation", "describe", op]);
         assert_eq!(
@@ -761,7 +765,8 @@ fn list_prints_the_operations_and_no_operator() {
             DEDUPE_ROWS,
             LIMIT_ROWS,
             FILL_NULLS,
-            JOIN_TABLES
+            JOIN_TABLES,
+            APPEND_ROWS
         ],
         "`arc operation list` prints the operations and nothing else:\n{text}"
     );
