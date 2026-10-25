@@ -624,6 +624,10 @@ const JOIN_TABLES: &str = "join-tables";
 /// table's, written once as [`FILTER_ROWS`] is.
 const APPEND_ROWS: &str = "append-rows";
 
+/// The long name of the operation that makes a table from a file, a glob of
+/// files or a URL, written once as [`FILTER_ROWS`] is.
+const READ_FILE: &str = "read-file";
+
 /// One SQL operation arc holds: what it is called, what it does, what it reads
 /// and writes, and what it takes — described so that it can be recorded as a
 /// step by name. The catalogue holds the description and nothing that runs.
@@ -844,9 +848,10 @@ const STEP_TABLE: Role = Role {
 
 /// Every operation arc holds, in the order `arc operation list` prints them.
 ///
-/// Each of these reads a table, then the column it is asked from, and a join
-/// the table it is joined to after them. The column is not required: `arc
-/// operation record` records a step from the tables and the arguments alone.
+/// Each of these but [`READ_FILE`] reads a table, then the column it is asked
+/// from, and a join the table it is joined to after them; the file read reads
+/// no table. The column is not required: `arc operation record` records a step
+/// from the tables and the arguments alone.
 const CATALOGUE: &[Operation] = &[
     Operation {
         long_name: FILTER_ROWS,
@@ -1237,6 +1242,18 @@ const CATALOGUE: &[Operation] = &[
         checks: None,
         reads_checks: None,
         notes: None,
+    },
+    Operation {
+        long_name: READ_FILE,
+        summary: "Makes a table from a file, a glob of files or a URL, as DuckDB reads it.",
+        reads: &[],
+        writes: &[STEP_TABLE],
+        parameters: read_file_parameters,
+        sql: read_file_sql,
+        recognised: None,
+        checks: None,
+        reads_checks: None,
+        notes: Some(read_file_notes),
     },
 ];
 
@@ -2309,6 +2326,92 @@ fn append_rows_sql(recording: &Recording) -> String {
     )
 }
 
+/// The `parameters` schema of [`READ_FILE`]: one required string, `path`,
+/// annotated as a `path`. Closed to any other key, as [`hide_column_parameters`]
+/// is.
+///
+/// The path is written as a single-quoted literal, so [`Operation::admit`]
+/// holds it only to be a path at all: not empty or blank, and no control
+/// character. It is not required to exist, since a fetch step may write it
+/// later and DuckDB fails the run on a path that matches nothing.
+fn read_file_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path"],
+        "properties": {
+            "path": {
+                "type": "string",
+                "x-kind": "path",
+                "description": "What the table is read from: a relative or absolute path, a glob or a URL, \
+                    as DuckDB's `FROM '…'` reads it, its format taken from its ending.",
+            }
+        },
+    })
+}
+
+/// The SQL step of [`READ_FILE`]: a table named for the step, made by every
+/// row DuckDB reads from `path`, written as a single-quoted literal, a `'`
+/// inside it doubled.
+fn read_file_sql(recording: &Recording) -> String {
+    format!(
+        "CREATE OR REPLACE TABLE {} AS\nSELECT *\nFROM '{}';\n",
+        quote_ident(recording.name),
+        recording.text("path").replace('\'', "''"),
+    )
+}
+
+/// What is said of a [`READ_FILE`] step once it is recorded: that its `path`
+/// is read live, when it is a URL of any scheme but `file` (see
+/// [`is_remote`](crate::asset_kind::is_remote)); or that it is outside the
+/// Protocol's folder, when it is absolute, opens with `~` or `file://` in any
+/// case, or leaves the folder through `..` once its components are
+/// normalised. Nothing for a path inside the folder. Neither is a refusal.
+fn read_file_notes(arguments: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    let path = arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let scheme = path
+        .split_once("://")
+        .filter(|_| crate::asset_kind::is_remote(path))
+        .map(|(scheme, _)| scheme);
+    if scheme.is_some_and(|scheme| !scheme.eq_ignore_ascii_case("file")) {
+        return vec![format!(
+            "`{path}` is read live at each run and no copy is kept; for a snapshot, fetch it with \
+             `http_fetch` or `opendal_fetch` and read the file the fetch writes."
+        )];
+    }
+    if scheme.is_some() || path.starts_with('~') || leaves_the_folder(path) {
+        return vec![format!(
+            "`{path}` is outside the Protocol's folder, so the step works on this machine only."
+        )];
+    }
+    Vec::new()
+}
+
+/// Whether the relative or absolute `path` reaches outside the folder it is
+/// read from: it has a root, or a `..` climbs above where its components
+/// started once each `.` is dropped and each `..` takes back the name before
+/// it.
+fn leaves_the_folder(path: &str) -> bool {
+    use std::path::Component;
+    let mut depth = 0usize;
+    for component in Path::new(path).components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => return true,
+            Component::CurDir => {}
+            Component::ParentDir => match depth.checked_sub(1) {
+                Some(up) => depth = up,
+                None => return true,
+            },
+            Component::Normal(_) => depth += 1,
+        }
+    }
+    false
+}
+
 /// `name` as a double-quoted SQL identifier, a `"` inside it doubled. The step's
 /// own name is always quoted, so a name arc admits that would otherwise read as
 /// SQL — [`valid_step_name`] admits a `"` — cannot break out of the statement.
@@ -3209,7 +3312,9 @@ impl Operation {
     /// `partition` — is checked in its probe, through [`probed`]; one annotated
     /// as a `column`, a name and not SQL, is checked only to be a name at all,
     /// not empty or blank, since [`column_ident`] carries any other name as
-    /// written. An argument the schema's
+    /// written; and one annotated as a `path`, written as a literal, is checked
+    /// to be not empty or blank and to hold no control character. An argument
+    /// the schema's
     /// `dependentRequired` ties to others is refused without them, a value outside
     /// its property's `enum` is refused naming those it takes, a list is held to
     /// its property's `minItems` and `items` ([`Operation::admit_items`]), a number below
@@ -3325,6 +3430,23 @@ impl Operation {
                     "the column `{key}` of `{}` is empty or blank",
                     self.long_name
                 )));
+            }
+            if property["x-kind"] == "path"
+                && let Some(path) = value.as_str()
+            {
+                let wrong = if path.trim().is_empty() {
+                    Some("is empty or blank")
+                } else if path.chars().any(char::is_control) {
+                    Some("holds a control character")
+                } else {
+                    None
+                };
+                if let Some(wrong) = wrong {
+                    return Err(refused(format!(
+                        "the path `{key}` of `{}` {wrong}",
+                        self.long_name
+                    )));
+                }
             }
         }
         self.checks.map_or(Ok(()), |checks| checks(arguments))
@@ -6110,6 +6232,130 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{other} was refused: {e}"));
             assert!(!reads.list("other").is_empty());
         }
+    }
+
+    #[test]
+    fn the_file_read_reads_no_table_and_takes_one_required_path() {
+        let op = operation(READ_FILE).expect("the file read is held");
+        let description = op.description();
+        assert_eq!(description["reads"], serde_json::json!([]));
+        assert_eq!(description["writes"][0]["name"], "out");
+        let schema = read_file_parameters();
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+        assert_eq!(schema["required"], serde_json::json!(["path"]));
+        let path = &schema["properties"]["path"];
+        assert_eq!(path["type"], "string");
+        assert_eq!(path["x-kind"], "path");
+        assert!(path["description"].as_str().is_some_and(is_one_sentence));
+        assert!(op.notes.is_some() && op.reads_checks.is_none());
+    }
+
+    /// The SQL [`read_file_sql`] writes for `path`, as the step `orders`.
+    fn file_read_sql(path: &str) -> String {
+        let arguments = arguments(serde_json::json!({ "path": path }));
+        read_file_sql(&Recording {
+            name: "orders",
+            on: "",
+            reads: &Reads::default(),
+            arguments: &arguments,
+        })
+    }
+
+    #[test]
+    fn the_file_read_writes_the_path_as_a_literal_with_its_quotes_doubled() {
+        for (path, literal) in [
+            ("data/orders.csv", "'data/orders.csv'"),
+            ("data/*.csv", "'data/*.csv'"),
+            ("https://x.org/a.parquet", "'https://x.org/a.parquet'"),
+            ("data/o'brien.csv", "'data/o''brien.csv'"),
+        ] {
+            assert_eq!(
+                file_read_sql(path),
+                format!("CREATE OR REPLACE TABLE \"orders\" AS\nSELECT *\nFROM {literal};\n"),
+                "{path}"
+            );
+        }
+        assert_eq!(provenance(READ_FILE, &Reads::default()), "read-file");
+    }
+
+    #[test]
+    fn the_file_read_notes_a_path_outside_the_folder_or_read_live() {
+        let notes = |path: &str| read_file_notes(&arguments(serde_json::json!({ "path": path })));
+        for inside in ["data/a.csv", "./data/a.csv", "data/../a.csv", "data/*.csv"] {
+            assert_eq!(notes(inside), Vec::<String>::new(), "{inside}");
+        }
+        for outside in [
+            "/tmp/a.csv",
+            "~/a.csv",
+            "file:///tmp/a.csv",
+            "FILE:///tmp/a.csv",
+            "../a.csv",
+            "data/../../a.csv",
+        ] {
+            let notes = notes(outside);
+            assert_eq!(notes.len(), 1, "{outside}: {notes:?}");
+            assert!(
+                notes[0].contains(&format!("`{outside}`"))
+                    && notes[0].contains("outside the Protocol's folder")
+                    && !notes[0].contains("live"),
+                "{outside}: {notes:?}"
+            );
+        }
+        for remote in ["s3://b/k.csv", "HTTPS://x.org/a.csv", "hf://datasets/x"] {
+            let notes = notes(remote);
+            assert_eq!(notes.len(), 1, "{remote}: {notes:?}");
+            assert!(
+                notes[0].contains(&format!("`{remote}`"))
+                    && notes[0].contains("live")
+                    && notes[0].contains("`http_fetch`")
+                    && notes[0].contains("`opendal_fetch`"),
+                "{remote}: {notes:?}"
+            );
+            assert!(
+                notes[0].ends_with('.') && !notes[0].contains('\n'),
+                "{remote}: {notes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_read_of_an_empty_blank_or_control_path_or_of_a_table_is_refused() {
+        let op = operation(READ_FILE).unwrap();
+        for path in ["", "  ", "data/a.csv\n", "data/\ta.csv"] {
+            let err = op
+                .admit(&arguments(serde_json::json!({ "path": path })))
+                .expect_err(path)
+                .to_string();
+            assert!(err.contains("`path`"), "{path:?}: {err}");
+        }
+        let err = op.admit(&arguments(serde_json::json!({}))).unwrap_err();
+        assert!(err.to_string().contains("`path`"), "{err}");
+        for path in [
+            "data/a.csv",
+            "s3://b/k.csv",
+            "/tmp/a.csv",
+            "data/o'brien.csv",
+        ] {
+            let admitted = op.admit(&arguments(serde_json::json!({ "path": path })));
+            assert!(admitted.is_ok(), "{path} was refused: {admitted:?}");
+        }
+        for (on, reads) in [
+            (Some("orders"), serde_json::json!({})),
+            (None, serde_json::json!({ "table": "x" })),
+        ] {
+            let err = op
+                .admit_reads(on, &arguments(reads.clone()))
+                .expect_err(&reads.to_string())
+                .to_string();
+            assert!(err.contains("reads no table"), "{on:?} {reads}: {err}");
+        }
+        assert!(
+            op.admit_reads(None, &arguments(serde_json::json!({})))
+                .unwrap()
+                .tables()
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
