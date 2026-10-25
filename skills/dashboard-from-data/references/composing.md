@@ -21,9 +21,9 @@ How a responder reads the selection depends on its kind:
 - **A binned histogram, a scatter or a map** draws two layers: the whole table in grey (`fill: "#b7b3ae"`) as a ghost, and on top the same mark reading `data: { from: <table>, filterBy: $sel }`. The ghost keeps the total on the page, so the brushed rows read as a share of it. Add `xDomain: Fixed` so the axis does not move under the brush.
 - **Ranked bars and counts over time** use one layer with no `filterBy`: `select: toggleY` (or `toggleX` for vertical bars) publishes a click into `$sel`, and `select: highlight` with `by: $sel` shows the selected rows inside each bar. Brightfield's ranked bars take their total off the page and reorder the axis under the pointer when they carry `filterBy`, so do not give them one. These views drive as well as respond: a click on a bar filters the others.
 
-**Colour.** For a magnitude, the sequential default is one hue running light to dark, or `viridis`; never a rainbow such as `turbo`. A ramp whose dark end matches a dark background loses its top values: look at the dark-mode thumbnail before you hand over, and change the scheme if the largest values vanish. Colour a dimension of eight values or fewer by identity (see the limits below).
-
 You decide which views drive and which respond. Usually the focal view drives; when the claim is about a category ("vans are the slow ones"), the bars of that category may lead and the distribution respond.
+
+**Colour.** For a magnitude, the sequential default is one hue running light to dark, or `viridis`; never a rainbow such as `turbo`. A ramp whose dark end matches a dark background loses its top values: look at the dark-mode thumbnail before you hand over, and change the scheme if the largest values vanish. Colour a dimension of eight values or fewer by identity (see the limits below).
 
 ## The data's quality, beside the views
 
@@ -68,11 +68,11 @@ A composition that reaches past these draws wrongly or not at all.
 - **No hexbin through a map projection.** For a dense point map, draw a hexbin over plain longitude and latitude, which is an equirectangular map, and label the axes `longitude` and `latitude`.
 - **`opacity` and `r` on dots are not drawn.** Overplotting cannot be thinned by opacity or sized by radius: bin it (a hexbin) or colour it.
 - **No log, sqrt or symlog colour scale.** The colour of a skewed count is linear. See "Colour for a skewed count" below.
-- **`colorScale: quantize` on a hexbin fill does not match its legend, and `colorLabel` is not drawn.** Do not use either; say in the plot's title what the colour counts.
+- **`colorScale: quantize` on a hexbin fill does not match its legend, and `colorLabel` is not drawn.** Do not use either; say in the plot's title what the colour counts. `panels.md`'s quantize rule holds for ordinary fills; only a hexbin fill mismatches its legend.
 
 ### Colour for a skewed count
 
-When most bins hold a few rows and a handful hold very many, a linear ramp spends its whole range on the handful. Use a sequential scheme (`colorScheme: viridis`, below) and clamp the ramp with a numeric `colorDomain` whose upper end is a percentile you queried (`quantile_cont(n, 0.99)` over the bin counts, say), so the top colour means "this many or more". The legend cannot carry the cap, so state it in the plot's title: "(colour capped at 110 a hexagon)".
+When most bins hold a few rows and a handful hold very many, a linear ramp spends its whole range on the handful. Use a sequential scheme (`colorScheme: viridis`, the default; see Colour above) and clamp the ramp with a numeric `colorDomain` whose upper end is a percentile you queried (`quantile_cont(n, 0.99)` over the bin counts, say), so the top colour means "this many or more". The legend cannot carry the cap, so state it in the plot's title: "(colour capped at 110 a hexagon)".
 
 ## The checks
 
