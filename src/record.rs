@@ -2121,6 +2121,8 @@ fn join_tables_parameters() -> serde_json::Value {
                 "description": "What each column of `other` is renamed with, put before its name; `<other>_` by default. \
                     The step cannot know which names clash, so the rule is fixed: `table`'s columns keep their names, \
                     every column of `other` comes through prefixed, and the `using` keys appear once, bare, first. \
+                    A prefixed column that clashes with one `table` already has, as when `table` was joined to `other` before, \
+                    is renamed with a `_1` suffix without an error; give another `prefix` to avoid it. \
                     A prefix that is empty or holds a `\\` or a control character is refused, and `semi` and `anti`, \
                     which keep `table`'s columns alone, take none.",
             }
