@@ -115,7 +115,8 @@ mod tests {
         let mut headers = BTreeMap::new();
         headers.insert("User-Agent".to_string(), "meridian".to_string());
         let meta = FetchMeta {
-            url: "https://openlake.meridian.online/edgar.parquet".to_string(),
+            url: "https://openlake.meridian.online/sec/company_tickers_exchange.parquet"
+                .to_string(),
             request_headers: headers,
             etag: Some("\"abc123\"".to_string()),
             last_modified: Some("Sat, 04 Jul 2026 06:31:19 GMT".to_string()),
@@ -143,7 +144,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("edgar.parquet");
         let meta = FetchMeta {
-            url: "https://openlake.meridian.online/edgar.parquet".to_string(),
+            url: "https://openlake.meridian.online/sec/company_tickers_exchange.parquet"
+                .to_string(),
             etag: Some("\"abc123\"".to_string()),
             sha256: "deadbeef".to_string(),
             ..Default::default()

@@ -1,10 +1,12 @@
-# The `source.gleif` Protocol — the reproducible *definition* of how the GLEIF Legal
+# The `gleif.lei` Protocol — the reproducible *definition* of how the GLEIF Legal
 # Entity Identifier Dataset is ingested from the official GLEIF golden copy. `arc run`
 # executes this manifest; one Run → one Dataset version (the freshness lever). See
 # ./README.md (the Protocol primitive).
 #
 # MOSTLY-CONFIG. The terminal COPY is now parquet_export; datapackage_describe emits the
-# descriptor from the built Parquet. The finetype_validate drift gate is DEFERRED until
+# descriptor from the built Parquet. Three steps are `command:` rather than typed
+# operators and are named here rather than left to be discovered: `fetch_gleif` (see its
+# note below), `stamp_version` and `stamp_descriptor`. The finetype_validate drift gate is DEFERRED until
 # the first full-scale Run exists to derive its contract from — see the validate note at
 # the tail of this manifest. The FETCH is still an opaque `command:` step by design — see its
 # note: the golden copy is republished DAILY and its URL is resolved at run time from a
@@ -18,7 +20,7 @@
 #     the out-of-repo publish pipeline and READS this Protocol's terminal output,
 #     build/gleif.parquet + the emitted datapackage.json. It is not an arcform step.
 #
-# Produces: build/gleif.parquet  →  published as source.gleif
+# Produces: build/gleif.parquet  →  published as gleif.lei
 name: gleif
 engine: duckdb
 engine_version: ">=1.2"
@@ -65,13 +67,18 @@ steps:
       order_by: "country, legal_name, lei"
 
   # ── Describe: EMIT datapackage.json from the built Parquet ───────────────────────
-  # finetype types every column; descriptor.overrides.json overlays the curated half
+  # finetype types every column nominations.finetype.json does not declare;
+  # descriptor.overrides.json overlays the curated half
   # (identity, licenses, sources, per-field prose, primaryKey). Hard-fails on drift.
   - name: describe
     op: datapackage_describe@1
     with:
       parquet: build/gleif.parquet
       overrides: descriptor.overrides.json
+      # The columns whose type is declared rather than inferred. finetype takes each one
+      # as given, carries its label's bounds, marks it x-finetype-nominated and states no
+      # confidence for it; the file says why each was declared.
+      nominations: nominations.finetype.json
       out: datapackage.json
 
   # ── Stamp: record WHICH finetype produced the descriptor ─────────────────────────
@@ -83,6 +90,34 @@ steps:
   # when they typed it — which is the claim that cannot be trusted here.
   - name: stamp_version
     command: "python3 ../../scripts/stamp_finetype_version.py --descriptor datapackage.json"
+  # ── Self-describe: put the descriptor INSIDE the Parquet it describes ───────────
+  # Someone holding https://openlake.meridian.online/gleif/lei.parquet
+  # cannot find the datapackage.json that describes it: it is a second file, in a
+  # source repository they have no reason to know exists, and behind an authenticating
+  # edge there is no repository to find. This step writes the finished descriptor into
+  # the file's own Parquet footer, so the object answers for itself from its URL alone:
+  #   SELECT decode(value) FROM parquet_kv_metadata('<url>')
+  #    WHERE decode(key) = 'datapackage.json';
+  #
+  # It runs LAST because it embeds the FINISHED descriptor, and it re-measures the
+  # resource `bytes` and `hash` because stamping lengthens the file past the figures
+  # describe took off the unstamped build.
+  #
+  # It is NOT a field on parquet_export above. That operator's `metadata:` values are
+  # literal strings in this manifest, and the descriptor does not exist until describe
+  # has read the very Parquet that would have to carry it.
+  #
+  # The embedded copy omits the resource `bytes` and `hash`, and the package's
+  # `created`: a file cannot state its own size, because writing the value changes it,
+  # and a write time moves on a publish that changed nothing else. Those stay in
+  # datapackage.json, measured against the finished object; check_descriptors.py holds
+  # the two copies to each other.
+  #
+  # Everything before the footer is compared byte for byte, so the order_by above still
+  # decides the data bytes and a stamp that moved one is refused with the original left
+  # in place. Re-running the step is a no-op to the byte.
+  - name: stamp_descriptor
+    command: "python3 ../../scripts/stamp_descriptor.py stamp --descriptor datapackage.json --parquet build/gleif.parquet"
 
   # ── Validate: GATE the built Parquet against the self-derived finetype contract ──
   # DEFERRED — NO validate step yet, on purpose. The finetype_validate@1 gate needs a

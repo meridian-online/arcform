@@ -1509,7 +1509,7 @@ mod tests {
             (
                 "gleif/arcform.yaml",
                 include_str!("../tests/fixtures/open_analytics/gleif/arcform.yaml"),
-                "b9560912b49511e0f5d113406acf8e298811200ee6f55536149cfd90dfbbdbeb",
+                "0ead97a5cd547ea4c59f8137f0decd9ae2b1df4ebb0352b01fe6fd1b08c168fd",
             ),
             (
                 "gleif/models/load.sql",
@@ -1524,7 +1524,7 @@ mod tests {
             (
                 "naics/arcform.yaml",
                 include_str!("../tests/fixtures/open_analytics/naics/arcform.yaml"),
-                "3a9a3c870ce7e485ecb0d6d94c80e16bb33bc71bfcbeabe78677b34f55caceba",
+                "8e1290e3bb2dbf1c556885de2a700dbe100735f4d4f2bcf6c32083e61193c8c1",
             ),
             (
                 "naics/models/load.sql",
@@ -1539,12 +1539,12 @@ mod tests {
             (
                 "edgar/arcform.yaml",
                 include_str!("../tests/fixtures/open_analytics/edgar/arcform.yaml"),
-                "3dc51d55313c71df8562808eede1bbc65556b1c88be4a9159f050d02a6411439",
+                "767ec8d0d0596098ba7820de349022fbb51dd6c1dc1319223c2486c67e5000a2",
             ),
             (
                 "edgar/models/load.sql",
                 include_str!("../tests/fixtures/open_analytics/edgar/models/load.sql"),
-                "f472f769efb93e815020eb4062f283bb3aaf2f1680d4493c29ff1885f8999fe7",
+                "5f46bb84a3ff3a7873cf4a02b09198c7c0b0621050606b1c90c8bef83ee48bd9",
             ),
             (
                 "edgar/models/package.sql",
@@ -1554,7 +1554,7 @@ mod tests {
             (
                 "edgar_gleif/arcform.yaml",
                 include_str!("../tests/fixtures/open_analytics/edgar_gleif/arcform.yaml"),
-                "934e691a91868aad6ced19a66dd66b868fec7cd9759fc51c437f7adde5614c00",
+                "7ccaf4d96e567da0e8b3386ffec476874c90b3e8d6927516ffce946b61c3b071",
             ),
             (
                 "edgar_gleif/models/sec_entities.sql",
@@ -1571,12 +1571,12 @@ mod tests {
             (
                 "edgar_gleif/models/tier.sql",
                 include_str!("../tests/fixtures/open_analytics/edgar_gleif/models/tier.sql"),
-                "155534dbe397777c58caef91992dc6aeb0d244d56a37bab9bdea907010db7dda",
+                "c10d1da31bd836412fd2414bf36b9a15ce1712453a98faa02f79af84529c5ee0",
             ),
             (
                 "edgar_gleif/models/package.sql",
                 include_str!("../tests/fixtures/open_analytics/edgar_gleif/models/package.sql"),
-                "1806cbe9d1a0af36376b98d599cc73b2fa5008e467a90ee0ea6df18d75143097",
+                "1bf34dc4da5eb055b2f5eee3da86e154e1e20c5bca85c280e2baefe1bde1ab38",
             ),
         ];
 

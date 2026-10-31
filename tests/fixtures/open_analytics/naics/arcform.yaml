@@ -1,10 +1,12 @@
-# The `source.naics` Protocol — the reproducible *definition* of how the NAICS 2022
+# The `census.naics_2022` Protocol — the reproducible *definition* of how the NAICS 2022
 # industry-classification Dataset is ingested from the official U.S. Census file.
 # `arc run` executes this manifest; one Run → one Dataset version. See ./README.md.
 #
-# ALL-CONFIG. Every step is a first-class `sql:` model or a typed `op:` operator (the
-# arcform catalog) — there are NO opaque `command:`/`sh -c` steps. The curl fetch is
-# now http_fetch; the terminal COPY is parquet_export; datapackage_describe emits the
+# MOSTLY-CONFIG. Every step but one is a first-class `sql:` model or a typed `op:`
+# operator (the arcform catalog). The exception is named here rather than left for a
+# reader to discover: `stamp_descriptor` is a `command:` step. This comment used to say
+# there were none, which stopped being true the moment that step landed. The curl fetch
+# is http_fetch; the terminal COPY is parquet_export; datapackage_describe emits the
 # descriptor from the built Parquet; finetype_validate gates it. (The Census workbook is
 # an .xlsx — load.sql reads it directly via DuckDB's `excel` extension, so no external
 # xlsx→csv tool is needed.) Operator code lives in the arcform repo, not here.
@@ -14,7 +16,7 @@
 #     the out-of-repo publish pipeline and READS this Protocol's terminal output,
 #     build/naics.parquet + the emitted datapackage.json. It is not an arcform step.
 #
-# Produces: build/naics.parquet  →  published as source.naics
+# Produces: build/naics.parquet  →  published as census.naics_2022
 name: naics
 engine: duckdb
 engine_version: ">=1.2"
@@ -62,13 +64,18 @@ steps:
       order_by: "code"
 
   # ── Describe: EMIT datapackage.json from the built Parquet ───────────────────────
-  # finetype types every column; descriptor.overrides.json overlays the curated half
+  # finetype types every column nominations.finetype.json does not declare;
+  # descriptor.overrides.json overlays the curated half
   # (identity, licenses, sources, per-field prose, primaryKey). Hard-fails on drift.
   - name: describe
     op: datapackage_describe@1
     with:
       parquet: build/naics.parquet
       overrides: descriptor.overrides.json
+      # The columns whose type is declared rather than inferred. finetype takes each one
+      # as given, carries its label's bounds, marks it x-finetype-nominated and states no
+      # confidence for it; the file says why each was declared.
+      nominations: nominations.finetype.json
       out: datapackage.json
 
   # ── Validate: GATE the built Parquet against the self-derived finetype contract ──
@@ -80,6 +87,34 @@ steps:
     with:
       parquet: build/naics.parquet
       schema: schema.finetype.json
+  # ── Self-describe: put the descriptor INSIDE the Parquet it describes ───────────
+  # Someone holding https://openlake.meridian.online/census/naics_2022.parquet
+  # cannot find the datapackage.json that describes it: it is a second file, in a
+  # source repository they have no reason to know exists, and behind an authenticating
+  # edge there is no repository to find. This step writes the finished descriptor into
+  # the file's own Parquet footer, so the object answers for itself from its URL alone:
+  #   SELECT decode(value) FROM parquet_kv_metadata('<url>')
+  #    WHERE decode(key) = 'datapackage.json';
+  #
+  # It runs LAST because it embeds the FINISHED descriptor, and it re-measures the
+  # resource `bytes` and `hash` because stamping lengthens the file past the figures
+  # describe took off the unstamped build.
+  #
+  # It is NOT a field on parquet_export above. That operator's `metadata:` values are
+  # literal strings in this manifest, and the descriptor does not exist until describe
+  # has read the very Parquet that would have to carry it.
+  #
+  # The embedded copy omits the resource `bytes` and `hash`, and the package's
+  # `created`: a file cannot state its own size, because writing the value changes it,
+  # and a write time moves on a publish that changed nothing else. Those stay in
+  # datapackage.json, measured against the finished object; check_descriptors.py holds
+  # the two copies to each other.
+  #
+  # Everything before the footer is compared byte for byte, so the order_by above still
+  # decides the data bytes and a stamp that moved one is refused with the original left
+  # in place. Re-running the step is a no-op to the byte.
+  - name: stamp_descriptor
+    command: "python3 ../../scripts/stamp_descriptor.py stamp --descriptor datapackage.json --parquet build/naics.parquet"
 
   # publish: the out-of-repo publish pipeline reads build/naics.parquet + the emitted
   # datapackage.json (boundary — not an arc step). See README.
