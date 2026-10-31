@@ -6,8 +6,8 @@ plus the `models/*.sql` files each one's `sql:` steps reference, vendored here s
 `src/asset.rs`) is self-contained on CI, which checks out only this repo. Both
 repos are public.
 
-**Last synced from `open-analytics` commit `95239cab28c2a07e1681069b196a523eb972b331`**
-(2026-08-14T06:49:22+10:00, the most recent commit to touch any of the vendored
+**Last synced from `open-analytics` commit `ca20f29fc5b0eba6130eb190ce9949c8dd87798d`**
+(2026-10-31T11:12:35+10:00, the most recent commit to touch any of the vendored
 paths as of the sync).
 
 `all_open_analytics_manifests_have_not_drifted_from_their_vendored_checksums` (in

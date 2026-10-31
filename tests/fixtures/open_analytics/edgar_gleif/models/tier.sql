@@ -1,5 +1,5 @@
--- Build the tiered, multi-grain edge set: one row per asserted identity, keyed by a
--- typed SEC identifier (cik | series | class). Tiers, in precedence order:
+-- Build the tiered, multi-grain edge set: one row per link between an EDGAR identifier
+-- and an LEI, keyed by a typed SEC identifier (cik | series | class). Tiers, in precedence order:
 --   authoritative  — deterministic, no guessing (SEC registration; N-CEN next)
 --   confirmed      — exact normalised-name Splink match (~95% precision)
 --   candidate      — fuzzy name match, surfaced not asserted

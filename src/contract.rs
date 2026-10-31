@@ -1277,7 +1277,8 @@ steps:
         // A fetch left a sidecar recording the remote content identity — reuse it
         // verbatim rather than re-hashing the file under a second scheme.
         let meta = FetchMeta {
-            url: "https://openlake.meridian.online/edgar.parquet".to_string(),
+            url: "https://openlake.meridian.online/sec/company_tickers_exchange.parquet"
+                .to_string(),
             sha256: "feedface00000000000000000000000000000000000000000000000000000000".to_string(),
             ..Default::default()
         };

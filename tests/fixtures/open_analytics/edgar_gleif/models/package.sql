@@ -1,7 +1,8 @@
 -- Enrich every edge from the sources (by LEI → GLEIF; by CIK → EDGAR), stamp the
 -- as_of, build a search corpus, and MATERIALISE the terminal table the `parquet_export`
--- operator writes to build/edgar_gleif.parquet (the Parquet the out-of-repo publish
--- seam consumes). Funds (key_type=series) don't join to EDGAR, so their display name
+-- operator writes to build/stage/edgar_gleif.parquet (stamp_descriptor writes the
+-- stamped copy, build/edgar_gleif.parquet, which the out-of-repo publish seam
+-- consumes). Funds (key_type=series) don't join to EDGAR, so their display name
 -- comes from GLEIF's legal_name via coalesce.
 --
 -- GRAIN: one row per (key_type, key, lei) edge. A CIK can carry several tickers, so

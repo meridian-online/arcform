@@ -3,7 +3,8 @@
 arcform's first typed Python operator (`uv`-run). Resolves **SEC EDGAR** company tickers
 (`cik`/`ticker`/`name`) to **GLEIF** legal entities (`lei`) by probabilistic name matching
 (Fellegi-Sunter, [Splink](https://moj-analytical-services.github.io/splink/) 4, DuckDB
-backend), and publishes the EDGAR↔GLEIF crosswalk as an open dataset.
+backend), and publishes the EDGAR↔GLEIF crosswalk as an open dataset, at
+`https://openlake.meridian.online/library/edgar_lei.parquet`.
 
 Both sources are open: SEC EDGAR (public domain), GLEIF golden copy (CC0).
 
@@ -25,7 +26,14 @@ Both sources are open: SEC EDGAR (public domain), GLEIF golden copy (CC0).
 
 ## Run
 
+Fetch the two inputs first, from Meridian's open datasets:
+
+- `edgar.parquet` from `https://openlake.meridian.online/sec/company_tickers_exchange.parquet`
+- `gleif.parquet` from `https://openlake.meridian.online/gleif/lei.parquet`
+
 ```bash
+curl -fsSLo edgar.parquet https://openlake.meridian.online/sec/company_tickers_exchange.parquet
+curl -fsSLo gleif.parquet https://openlake.meridian.online/gleif/lei.parquet
 uv run operators/splink_resolve/resolve.py \
     --edgar edgar.parquet --gleif gleif.parquet --out edgar_gleif_crosswalk.parquet
 # --sample N   cap GLEIF ISSUED rows for a fast smoke test
