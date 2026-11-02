@@ -4572,7 +4572,7 @@ mod tests {
     ];
 
     // Every description, of an operation or of an operator, is read the same way
-    // by a caller: the same five keys, and each role in `reads` and `writes` named
+    // by a caller: the same five keys (and an operator's `wraps` and `example`), and each role in `reads` and `writes` named
     // once, of a kind arc knows, with a sentence to print, an `of` that points back
     // at an earlier read that holds columns, and `min_items` on a list alone. An
     // operation reads nothing, or reads first one required table called `table`,
@@ -4589,9 +4589,22 @@ mod tests {
                 .map(String::as_str)
                 .collect();
             keys.sort_unstable();
+            // An operator's description adds `wraps` and `example` to the five.
+            let expected: &[&str] = if operation(name).is_some() {
+                &["long_name", "parameters", "reads", "summary", "writes"]
+            } else {
+                &[
+                    "example",
+                    "long_name",
+                    "parameters",
+                    "reads",
+                    "summary",
+                    "wraps",
+                    "writes",
+                ]
+            };
             assert_eq!(
-                keys,
-                ["long_name", "parameters", "reads", "summary", "writes"],
+                keys, expected,
                 "`{name}`: the description holds a key the shape does not name:\n{description}"
             );
             assert_eq!(description["long_name"], name, "`{name}`: {description}");
