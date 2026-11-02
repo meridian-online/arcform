@@ -28,6 +28,9 @@ use crate::engine::StepOutput;
 use crate::error::{Error, Result};
 
 mod ducklake_publish;
+// Only its test reads it: the generated README sections are checked, not built.
+#[cfg(test)]
+mod reference;
 
 /// Assets an operator step reads and produces — merged into the [`crate::asset::AssetGraph`]
 /// exactly as SQL introspection and command `produces`/`depends_on` are.
@@ -1071,6 +1074,12 @@ fn described(op_name: &str) -> Option<&'static Described> {
 /// the form a `with:` block is written from.
 pub(crate) fn description(op_name: &str) -> Option<serde_json::Value> {
     catalog().into_iter().find(|op| op.name() == op_name)?;
+    description_in_any_build(op_name)
+}
+
+/// [`description`] for any operator [`DESCRIBED`] holds, whether or not this
+/// build's catalog does, so a README is generated alike in every build.
+fn description_in_any_build(op_name: &str) -> Option<serde_json::Value> {
     // Both tables answer for every catalog operator, as the tests below hold them to.
     let (described, schema) = described(op_name).zip(with_schema(op_name))?;
     let roles = |keys: &[RoleKey]| -> Vec<crate::record::Role> {
