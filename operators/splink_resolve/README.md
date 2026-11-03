@@ -8,6 +8,51 @@ backend), and publishes the EDGAR↔GLEIF crosswalk as an open dataset, at
 
 Both sources are open: SEC EDGAR (public domain), GLEIF golden copy (CC0).
 
+<!-- arc:reference:start -->
+
+## Reference
+
+<!-- Generated from arc's operator catalogue (src/operator.rs). Edit it there, then run `ARC_UPDATE_READMES=1 cargo test --lib operator::reference`. -->
+
+Matches EDGAR entities to GLEIF entities with Splink and writes the resolved crosswalk.
+
+### What it wraps
+
+- [Splink](https://moj-analytical-services.github.io/splink/): Splink 4's Fellegi-Sunter model scores each EDGAR and GLEIF name pair, with fixed priors so a run is reproducible.
+- [DuckDB](https://duckdb.org): The backend Splink runs its comparisons on.
+
+### Reads
+
+| Key | Names | Required | Description |
+|---|---|---|---|
+| `edgar` | file | yes | The EDGAR entity Parquet file, the crosswalk's left side. |
+| `gleif` | file | yes | The GLEIF golden-copy Parquet file, the crosswalk's right side. |
+
+### Writes
+
+| Key | Names | Required | Description |
+|---|---|---|---|
+| `out` | file | yes | The Parquet file the resolved crosswalk is written to. |
+
+### Parameters
+
+| Key | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `sample` | integer | no | `0` | Optional GLEIF-row cap for a fast smoke test; 0 resolves the full corpus. |
+
+### Example step
+
+```yaml
+- name: resolve
+  op: splink_resolve@1
+  with:
+    edgar: raw/edgar.parquet
+    gleif: raw/gleif.parquet
+    out: build/edgar_gleif_crosswalk.parquet
+```
+
+<!-- arc:reference:end -->
+
 ## Status — spike
 
 - **Model (v1)** = a fully-specified Fellegi-Sunter name comparison with expert m/u priors:

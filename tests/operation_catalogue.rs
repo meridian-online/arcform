@@ -74,6 +74,18 @@ fn operators() -> Vec<&'static str> {
 /// The keys every description holds, sorted.
 const DESCRIPTION_KEYS: [&str; 5] = ["long_name", "parameters", "reads", "summary", "writes"];
 
+/// The keys an operator's description holds, sorted: an operation's five, and
+/// `wraps` and `example`.
+const OPERATOR_DESCRIPTION_KEYS: [&str; 7] = [
+    "example",
+    "long_name",
+    "parameters",
+    "reads",
+    "summary",
+    "wraps",
+    "writes",
+];
+
 /// The role called `name` in `description[direction]`, or a failure that shows the
 /// description.
 fn role<'d>(description: &'d Value, direction: &str, name: &str) -> &'d Value {
@@ -453,8 +465,9 @@ fn describe_reads_the_filters_table_then_a_column_of_it_and_writes_a_table() {
 }
 
 #[test]
-fn describe_prints_each_operator_in_the_five_keys_an_operation_is_described_in() {
-    for op in operators().into_iter().chain([
+fn describe_prints_each_operator_in_the_five_keys_an_operation_is_described_in_and_two_more() {
+    let operators = operators();
+    for op in operators.iter().copied().chain([
         FILTER_ROWS,
         SORT_ROWS,
         HIDE_COLUMN,
@@ -486,9 +499,14 @@ fn describe_prints_each_operator_in_the_five_keys_an_operation_is_described_in()
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
+        let expected: &[&str] = if operators.contains(&op) {
+            &OPERATOR_DESCRIPTION_KEYS
+        } else {
+            &DESCRIPTION_KEYS
+        };
         assert_eq!(
-            keys, DESCRIPTION_KEYS,
-            "`{op}` is not described in the five keys, and `applied_to` is not one:\n{description}"
+            keys, expected,
+            "`{op}` is not described in its keys, and `applied_to` is not one:\n{description}"
         );
         assert_eq!(description["long_name"], op, "`{op}`:\n{description}");
         assert!(
@@ -500,6 +518,43 @@ fn describe_prints_each_operator_in_the_five_keys_an_operation_is_described_in()
             "`{op}`: `parameters` is not a JSON Schema object:\n{description}"
         );
     }
+}
+
+#[test]
+fn an_operator_description_names_what_it_wraps_and_an_example_step() {
+    for op in operators() {
+        let description = arc_json(&["operation", "describe", op]);
+        let wraps = description["wraps"]
+            .as_array()
+            .unwrap_or_else(|| panic!("`{op}`: `wraps` is not a list:\n{description}"));
+        for w in wraps {
+            for key in ["id", "name", "url", "use"] {
+                assert!(
+                    w[key].as_str().is_some_and(|v| !v.is_empty()),
+                    "`{op}`: a `wraps` entry has no `{key}`:\n{description}"
+                );
+            }
+            assert!(
+                w["url"].as_str().unwrap().starts_with("https://"),
+                "`{op}`:\n{description}"
+            );
+        }
+        let example = description["example"]
+            .as_str()
+            .unwrap_or_else(|| panic!("`{op}`: `example` is not text:\n{description}"));
+        assert!(
+            example.contains(&format!("op: {op}@")),
+            "`{op}`'s example does not run it:\n{example}"
+        );
+    }
+    let splink = arc_json(&["operation", "describe", "splink_resolve"]);
+    let ids: Vec<&str> = splink["wraps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w["id"].as_str())
+        .collect();
+    assert_eq!(ids, ["splink", "duckdb"], "{splink}");
 }
 
 #[test]

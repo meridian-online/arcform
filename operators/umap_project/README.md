@@ -30,6 +30,57 @@ There is **no text column and no model**. A map of longitudes and latitudes need
 neither, and demanding them is what made the merged step this replaced unusable for
 that case.
 
+<!-- arc:reference:start -->
+
+## Reference
+
+<!-- Generated from arc's operator catalogue (src/operator.rs). Edit it there, then run `ARC_UPDATE_READMES=1 cargo test --lib operator::reference`. -->
+
+Places each row of a Parquet file on a two-dimensional map with UMAP, from the numeric columns it names.
+
+### What it wraps
+
+- [umap-learn](https://umap-learn.readthedocs.io): Fits the UMAP projection and places each row on the map, keeping the fit so appended rows land in the same layout.
+- [DuckDB](https://duckdb.org): Reads the input Parquet and writes the output.
+
+### Reads
+
+| Key | Names | Required | Description |
+|---|---|---|---|
+| `input` | file | yes | The Parquet file holding the columns to project. |
+| `columns` | list of column of `input` | yes | The numeric columns of `input` to reduce, in order. |
+| `fit` | file | no | The fit an earlier run kept, read back so the rows it holds keep their places. |
+
+### Writes
+
+| Key | Names | Required | Description |
+|---|---|---|---|
+| `out` | file | yes | The Parquet file written, every input column plus each row's place on the map. |
+| `fit` | file | no | The fit this run keeps, so a later run places appended rows into the same layout. |
+
+### Parameters
+
+| Key | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `metric` | one of `euclidean`, `cosine` | no | `euclidean` | How the distance between two rows is measured. The default is the reading an arbitrary feature matrix wants; cosine is the reading an L2-normalised vector column wants. Nothing here scales your columns — under euclidean a wider-spread column dominates the layout, which is a decision for the SQL step that selects them. |
+| `min_dist` | number | no | `0.1` | UMAP min_dist: how tightly points may pack. |
+| `neighbors` | integer | no | `15` | UMAP n_neighbors: low reads local structure, high reads global. At most one below the input's row count: arc run counts the rows of the Parquet `input` names when the step runs, and refuses a value above that bound before the script starts, naming the value and the row count. An unset value takes 15 or that bound, whichever is smaller. x-at-most states the bound for a program: rows_of names the with: key whose Parquet is counted, minus what is taken off its row count, and bounds_default that the bound applies to the default as well. The bound is arcform's, not umap-learn's, so umap-learn's documentation for n_neighbors does not describe it. |
+
+### Example step
+
+```yaml
+- name: project
+  op: umap_project@1
+  with:
+    input: build/corpus_embedded.parquet
+    columns: [embedding]
+    out: build/corpus_mapped.parquet
+    fit: build/corpus.umap
+    metric: cosine
+```
+
+<!-- arc:reference:end -->
+
 ## What each knob is proven to do, and what it is not
 
 `umap_project_invocation_materialises_the_frozen_script_and_names_it`
