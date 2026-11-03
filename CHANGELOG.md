@@ -9,6 +9,10 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ## [Unreleased]
 
+### Added
+
+- **`arc operation describe` gives an operator's `wraps`, the projects it stands on, and an `example` step, and every operator has a README at `operators/<name>/README.md` whose Reference section is generated from that description.** A reader sent to an operator from meridian.online found three READMEs among thirteen operators, and none said in one place what the operator wraps, its defaults or how a step is written. Each `wraps` entry carries a stable id, a name, a link and one sentence of use; each example is checked to load, and a test fails when a README's Reference section has drifted from the catalogue.
+
 ## [0.2.2] - 2026-10-24
 
 arc 0.2.2 moves arc onto DuckDB 2.0. arc is a single binary that runs a data pipeline, a Protocol, from a YAML manifest of SQL and shell steps, and reads each SQL step to work out which tables it reads and makes. From this release it links DuckDB 2.0, runs SQL steps on DuckDB 2.0's own `duckdb` command line, and works out each step's inputs and outputs from DuckDB's own parse of the SQL rather than a copy of DuckDB's grammar. The install script now installs DuckDB 2.0.0's release build for you when no suitable `duckdb` is found, and `arc run` warns when a Protocol last ran on a different DuckDB, since DuckDB 2.0 changes some results without an error.

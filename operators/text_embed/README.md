@@ -27,6 +27,55 @@ carrying every input column plus a vector column of `FLOAT`.
     model_release: minishlab/potion-base-8M@bf8b056651a2c21b8d2565580b8569da283cab23
 ```
 
+<!-- arc:reference:start -->
+
+## Reference
+
+<!-- Generated from arc's operator catalogue (src/operator.rs). Edit it there, then run `ARC_UPDATE_READMES=1 cargo test --lib operator::reference`. -->
+
+Writes a vector for the text in one column of a Parquet file, with a DuckDB embedding extension.
+
+### What it wraps
+
+- [subtoken](https://github.com/meridian-online/subtoken): The DuckDB embedding extension whose `subtoken_embed()` returns each vector; it carries the model's weights.
+- [DuckDB](https://duckdb.org): Loads the extension and runs the one statement that embeds the column.
+
+### Reads
+
+| Key | Names | Required | Description |
+|---|---|---|---|
+| `input` | file | yes | The Parquet file holding the corpus. |
+| `text_column` | column of `input` | yes | The column of `input` whose text is embedded. |
+| `extension` | file | yes | The loadable embedding extension, which holds the model's weights. |
+| `model` | directory | no | A model directory the extension is checked against, never read for weights. |
+
+### Writes
+
+| Key | Names | Required | Description |
+|---|---|---|---|
+| `out` | file | yes | The Parquet file written, every input column plus the vector column. |
+
+### Parameters
+
+| Key | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `model_release` | string | no | none | Optional. `<model-id>@<revision>` naming the release the `model` directory was taken from. Both go into the content address the extension publishes, so the check cannot be made from the directory alone. Set with model. |
+| `vector_column` | string | no | `embedding` | Column the vectors are written into. Name another to embed a second column of the same corpus in a later step. |
+
+### Example step
+
+```yaml
+- name: embed
+  op: text_embed@1
+  with:
+    input: build/corpus.parquet
+    text_column: description
+    extension: vendor/subtoken.duckdb_extension
+    out: build/corpus_embedded.parquet
+```
+
+<!-- arc:reference:end -->
+
 ## It writes vectors and nothing else
 
 That is the point of it being its own step. An analyst who wants vectors for
