@@ -106,7 +106,7 @@ finish() {
   exit "$code"
 }
 
-# shellcheck disable=SC2329 # invoked by the trap below
+# shellcheck disable=SC2317,SC2329 # invoked by the trap below
 on_signal() {
   interrupted=1
   if [[ -n $arc_pid ]]; then
@@ -124,7 +124,7 @@ trap on_signal TERM INT
 
 # A command that fails under `set -e` outside the checks above still ends in
 # finish, so the log is uploaded and the exit code names the step.
-# shellcheck disable=SC2329 # invoked by the trap below
+# shellcheck disable=SC2317,SC2329 # invoked by the trap below
 on_exit() {
   local rc=$?
   if [[ $finishing == 0 && $log_open == 1 ]]; then
