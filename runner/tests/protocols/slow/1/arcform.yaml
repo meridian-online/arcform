@@ -1,0 +1,5 @@
+name: slow
+db: slow.duckdb
+steps:
+  - name: wait
+    command: sleep 7 && echo "slow - done"

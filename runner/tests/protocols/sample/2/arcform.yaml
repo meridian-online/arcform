@@ -1,0 +1,7 @@
+name: sample
+db: sample.duckdb
+steps:
+  - name: make_numbers
+    sql: models/numbers.sql
+  - name: report
+    command: echo "sample - the branch head ran"

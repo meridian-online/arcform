@@ -4,7 +4,8 @@
 arc loads extensions into the linked libduckdb in-process, and an extension
 loads only into the version it was built for. So CI's DuckDB, the version
 install.sh recommends and the version arc's messages pin
-(DUCKDB_RECOMMENDED in src/engine.rs) must be the DuckDB that `libduckdb-sys` in Cargo.lock
+(DUCKDB_RECOMMENDED in src/engine.rs) and the DuckDB the runner image
+installs (DUCKDB_VERSION in runner/Dockerfile) must be the DuckDB that `libduckdb-sys` in Cargo.lock
 links, and each entry in vetted_extensions.json must list that version (it may
 list others too, as an extension can be vetted on two patches at once).
 
@@ -15,7 +16,7 @@ duckdb-rs's own patch, not DuckDB's.
 
     python3 -I scripts/check_duckdb_version.py [--lock Cargo.lock]
         [--workflow PATH ...] [--install scripts/install.sh]
-        [--engine src/engine.rs]
+        [--engine src/engine.rs] [--dockerfile runner/Dockerfile]
         [--vetted src/vetted_extensions.json]
 
     exit 0  every pin agrees
@@ -63,6 +64,7 @@ def main(argv):
     ap.add_argument("--install", default=str(ROOT / "scripts/install.sh"))
     ap.add_argument("--engine", default=str(ROOT / "src/engine.rs"))
     ap.add_argument("--vetted", default=str(ROOT / "src/vetted_extensions.json"))
+    ap.add_argument("--dockerfile", default=str(ROOT / "runner/Dockerfile"))
     args = ap.parse_args(argv)
     workflows = args.workflow or [str(ROOT / w) for w in WORKFLOWS]
 
@@ -75,6 +77,7 @@ def main(argv):
         held.append(
             (args.engine, pin(Path(args.engine), r'^pub const DUCKDB_RECOMMENDED: &str = "(v[\d.]+)";'))
         )
+        held.append((args.dockerfile, pin(Path(args.dockerfile), r"^ARG DUCKDB_VERSION=(v[\d.]+)\s*$")))
         vetted = json.loads(Path(args.vetted).read_text())
         lacking = [
             f"{args.vetted}: extension {e['name']} lists {e['duckdb_versions']}"
