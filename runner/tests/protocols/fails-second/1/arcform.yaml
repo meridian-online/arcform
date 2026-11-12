@@ -1,0 +1,9 @@
+name: fails_second
+db: fails_second.duckdb
+steps:
+  - name: first
+    command: echo "first - ok"
+  - name: second
+    command: echo "second - failing on purpose" >&2; exit 3
+  - name: third
+    command: echo "third - should never run"

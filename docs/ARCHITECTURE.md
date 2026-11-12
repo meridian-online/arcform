@@ -29,6 +29,11 @@ src/
     mod.rs        #   JSON-RPC transport, protocol-version negotiation, the tool registry, each tool's read-only, open-world and destructive annotations
     finetype.rs   #   The five FineType tools, each running the `finetype` command
     hero.rs       #   arc's own tools: protocol_run, protocol_create, the record, edit, history, describe, query, check and report tools
+
+runner/           # The hosted runner image: one run of one pinned Protocol (see "The runner image")
+  Dockerfile      #   linux/arm64: arc built from this tree, DuckDB's release library and command line, curl, jq, git
+  entrypoint.sh   #   exchange the token, fetch the pinned commit, `arc run`, renew, upload the run log
+  tests/run.sh    #   the image's acceptance tests, against the stub in tests/stub/
 ```
 
 ### `arc mcp` and `protocol_run`
@@ -106,6 +111,69 @@ Every operator in `DESCRIBED`, the Rust ones included, has `operators/<name>/REA
 ### Release and distribution
 
 The package and library are `arcform` and the binary is `arc`. The vendored sqlparser fork is published as its own crate, `arcform-sqlparser`, pinned exactly, because Cargo drops `[patch.crates-io]` on publish. A release binary is built with `mcp,bundled-duckdb`, so it carries DuckDB and starts on a machine with no DuckDB library; SQL steps still run through the `duckdb` command. A pushed `vX.Y.Z` tag builds four targets, publishes the GitHub release with the tag's `CHANGELOG.md` section as its notes, publishes both crates and updates the install script, behind a guard that refuses a tag not matching `Cargo.toml` and the changelog. `docs/RELEASE.md` describes the machinery.
+
+### The runner image
+
+`runner/Dockerfile` builds a `linux/arm64` image for hosted runs: a container that runs one Protocol at one commit, writes the run's log to object storage and exits. Build it from the repository root with `docker build --platform linux/arm64 -f runner/Dockerfile -t arc-runner .`. It holds arc built from this tree, linked against DuckDB's v2.0.0 release library rather than built with `bundled-duckdb` (which takes tens of minutes from cold, where this build takes minutes), the DuckDB command line SQL steps run through, and curl, jq and git. Both DuckDB downloads are checked against the SHA-256 digests GitHub publishes for the release assets, and `scripts/check_duckdb_version.py` holds the Dockerfile's `DUCKDB_VERSION` to the version `Cargo.lock` links, with CI's and install.sh's. The image has no Python, so a Protocol whose operators need Python does not run in it yet.
+
+**Inputs**, all in the environment:
+
+- `RUN_ID`: the run's id, letters, digits, `_` and `-`.
+- `RUN_TOKEN`: a one-time token for the credential exchange.
+- `PROTOCOL_REF`: `<namespace>/<name>@<commit>`, the commit in full (40 or 64 hex digits). A branch, a tag or a short commit is refused.
+- `CREDENTIAL_EXCHANGE_URL`: the base URL of the service that exchanges the token.
+- `PROTOCOL_FORGE_URL`: the base URL of the git server; the Protocol's repository is `<PROTOCOL_FORGE_URL>/<namespace>/<name>.git`, with `arcform.yaml` at its root.
+
+Both URLs must be `https`. `ARC_RUNNER_INSECURE_HTTP=1` allows `http`, for the tests' stub; nothing else should set it.
+
+**What the entrypoint does**, in order, each a named step:
+
+1. **inputs**: checks each value against the shapes above, and removes `RUN_TOKEN` from its own environment before anything else starts.
+2. **exchange**: `POST <exchange>/v1/runs/<RUN_ID>/credentials` with `Authorization: Bearer <RUN_TOKEN>`. The reply is
+   ```json
+   {
+     "credential": {"access_key_id": "…", "secret_access_key": "…", "session_token": "…",
+                    "expires_at": "2026-11-13T00:15:00Z"},
+     "renewal_token": "…",
+     "storage": {"endpoint": "https://<account>.r2.cloudflarestorage.com", "bucket": "…", "region": "auto"},
+     "run_log": {"prefix": "<subscriber>/runs/<RUN_ID>/"}
+   }
+   ```
+   `storage.region` defaults to `auto`. The log's prefix must be a folder ending `runs/<RUN_ID>/`, either `runs/<RUN_ID>/` itself or under another folder; any other prefix is refused, so a reply meant for another run cannot direct this run's log there.
+3. **fetch**: fetches the pinned commit alone (`git fetch --depth 1 <repo> <commit>`) into an empty repository, checks it out, and checks that `HEAD` is that commit and that `arcform.yaml` is at the root. A commit the server does not hold fails here.
+4. **run**: `arc run` in the checkout. Its output goes to the run log and is streamed to standard output, which the operator's logs keep.
+5. **upload**: puts the log at `<prefix>run.log` in the bucket with an S3 `PUT`, signed with AWS Signature Version 4 by curl's `--aws-sigv4` using the current credential and its session token, and with the body's SHA-256 as `x-amz-content-sha256`. Terminal colour codes are taken out of the uploaded copy.
+
+Once the exchange has succeeded, every later failure still uploads the log. The exit code names the first step that failed, and so does the last line of output (`arc-runner: failed at <step>: …`); for a failed Protocol step, that line also names the step arc reported, as `step '<name>' failed`:
+
+| Exit | Step |
+|---|---|
+| 0 | the run and the upload succeeded |
+| 10 | inputs |
+| 11 | exchange |
+| 12 | fetch |
+| 13 | run: a Protocol step failed |
+| 14 | upload, after a run that succeeded |
+| 15 | interrupted: a `SIGTERM` or `SIGINT` reached the entrypoint; arc is stopped, given ten seconds, and the log uploaded |
+
+**Renewal.** While the run goes on, a background loop renews the credential once two thirds of its life has passed: `POST <exchange>/v1/runs/<RUN_ID>/credentials/renew` with `Authorization: Bearer <renewal_token>`, whose reply carries a new `credential` and may carry a new `renewal_token`. A network error or a 5xx is retried with a doubling wait of up to 30 seconds. A 4xx means the control plane holds the run as over, and the loop stops, so the credential lapses.
+
+**What a Protocol step can reach.** The whole run is treated as hostile; these rules keep the token and the credential out of the run's environment and its log:
+
+- The entrypoint starts as root. The credential, the renewal token and the log live in `/run/arc-runner`, which only root can read.
+- Every git command and `arc run` itself run as the user `protocol`, through `setpriv` with no capabilities and `no_new_privs`, under `env -i`: a step's environment holds `HOME`, `PATH`, `LANG`, `NO_COLOR`, `RUN_ID` and `PROTOCOL_REF`, and what arc adds. Running as another user also keeps a step from reading the entrypoint's environment through `/proc/1/environ`.
+- Tokens and credentials reach curl on standard input, as a `--config` file, never as arguments, which any process can read from `/proc/<pid>/cmdline`. A value that could break out of that file's quoting is refused when it is read.
+
+**Tests.** `runner/tests/run.sh [IMAGE]` runs the image's acceptance tests. Each test starts a fresh stub on a private Docker network and runs the image once with `docker run --platform linux/arm64`. The stub (`runner/tests/stub/stub.py`) stands in for the credential exchange, minting throwaway credentials and refusing a spent token; for the S3 endpoint, verifying each upload's Signature Version 4 against the credential it names and refusing an expired one; and for the forge, serving the repositories `stub/make-forge.sh` commits from `runner/tests/protocols/` through `git http-backend`. The tests:
+
+- `runs_pinned_protocol`: a Protocol with a SQL step and a command step, pinned to its first commit while its branch has moved on, exits 0 and writes `sub_test/runs/<run_id>/run.log`, which shows the pinned commit's output and not the branch head's.
+- `fails_named_step`: a Protocol whose second step fails exits 13; the log shows the first step's output, names step `second`, and shows nothing of the third.
+- `token_and_credential_kept_out_of_step_env`: a step that prints its environment, `/proc/1/environ` and the runner's state directory leaves none of the one-time token, any issued credential part or any renewal token in the log.
+- `renews_credential_while_running`: with credentials lasting four seconds and a Protocol running for seven, the credential is renewed and the log is signed with a renewed credential.
+- `uploads_the_log_when_stopped`: `docker stop` during a step, as a Spot interruption would, exits 15 within ten seconds and still writes the log, which names the interruption.
+- `refuses_a_reference_without_a_full_commit`, `fails_fetch_of_an_unknown_commit` and `refuses_a_spent_token`: exits 10, 12 and 11, and a refused reference does not spend the token.
+
+CI's `runner-image` job builds the image on an arm64 runner, shellchecks the scripts and runs these tests.
 
 ### Agent skills
 

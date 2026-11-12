@@ -1,0 +1,1 @@
+CREATE OR REPLACE TABLE numbers AS SELECT range AS n FROM range(10);

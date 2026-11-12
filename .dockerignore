@@ -1,0 +1,15 @@
+# The runner image's build context is the repository root. Send only what
+# runner/Dockerfile copies: the sources `cargo build` reads, and the entrypoint.
+*
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!src/
+!skills/
+!operators/
+!vendor/
+!tests/fixtures/
+!runner/entrypoint.sh
+**/target/
+**/__pycache__/
+**/.DS_Store

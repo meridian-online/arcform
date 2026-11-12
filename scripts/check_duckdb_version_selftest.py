@@ -18,6 +18,7 @@ LOCK = '[[package]]\nname = "libduckdb-sys"\nversion = "{}"\nsource = "registry+
 WORKFLOW = "env:\n  # a comment\n  DUCKDB_VERSION: {}\n"
 INSTALL = '#!/bin/sh\nDUCKDB_RECOMMENDED="{}"\n'
 ENGINE = 'pub const OLDEST_ENGINE: &str = "2.0.0";\npub const DUCKDB_RECOMMENDED: &str = "{}";\n'
+DOCKERFILE = "FROM x\nARG DUCKDB_VERSION={}\nARG DUCKDB_LIBS_SHA256=00\n"
 VETTED = '{{"extensions": [{{"name": "h3", "duckdb_versions": ["{}"]}}]}}\n'
 
 failures = []
@@ -32,7 +33,7 @@ def check(name, ok, detail=""):
 
 
 def run(lock="1.20000.0", ci="v2.0.0", parity="v2.0.0", install="v2.0.0", vetted="v2.0.0",
-        engine="v2.0.0"):
+        engine="v2.0.0", dockerfile="v2.0.0"):
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
         (d / "Cargo.lock").write_text(LOCK.format(lock))
@@ -41,6 +42,7 @@ def run(lock="1.20000.0", ci="v2.0.0", parity="v2.0.0", install="v2.0.0", vetted
         (d / "install.sh").write_text(INSTALL.format(install))
         (d / "vetted.json").write_text(VETTED.format(vetted))
         (d / "engine.rs").write_text(ENGINE.format(engine))
+        (d / "Dockerfile").write_text(DOCKERFILE.format(dockerfile))
         p = subprocess.run(
             [
                 sys.executable, "-I", str(CHECK),
@@ -50,6 +52,7 @@ def run(lock="1.20000.0", ci="v2.0.0", parity="v2.0.0", install="v2.0.0", vetted
                 "--install", str(d / "install.sh"),
                 "--vetted", str(d / "vetted.json"),
                 "--engine", str(d / "engine.rs"),
+                "--dockerfile", str(d / "Dockerfile"),
             ],
             capture_output=True, text=True,
         )
@@ -69,7 +72,8 @@ def main():
     # The decoding follows duckdb-rs build_linked.rs: major = n / 10000,
     # minor = n / 100 % 100, patch = n % 100.
     for crate, want in [("1.20000.0", "v2.0.0"), ("1.10506.0", "v1.5.6"), ("1.20103.2", "v2.1.3")]:
-        code, out = run(lock=crate, ci=want, parity=want, install=want, vetted=want, engine=want)
+        code, out = run(lock=crate, ci=want, parity=want, install=want, vetted=want, engine=want,
+                        dockerfile=want)
         check(f"crate {crate} decodes to {want}", code == 0, out)
 
     code, out = run()
@@ -81,6 +85,8 @@ def main():
     expect_fail("install.sh disagreeing fails", "install.sh", "v1.5.6", install="v1.5.6")
     expect_fail("engine.rs disagreeing fails", "engine.rs", "v1.5.6", engine="v1.5.6")
     expect_fail("vetted_extensions.json disagreeing fails", "vetted.json", "v1.5.6", vetted="v1.5.6")
+    expect_fail("the runner image's Dockerfile disagreeing fails", "Dockerfile", "v1.5.6",
+                dockerfile="v1.5.6")
 
     print(f"\n{len(failures)} failed" if failures else "\nall passed")
     return 1 if failures else 0

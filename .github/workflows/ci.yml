@@ -135,6 +135,28 @@ jobs:
 
   # Clippy and the test suite both compile the crate against system DuckDB, so
   # they share a job that provisions the library once.
+  # The hosted runner image (runner/): build it for linux/arm64, on an arm64 runner,
+  # and run its acceptance tests against the stub in runner/tests, which stands in
+  # for the credential exchange, the storage endpoint and the forge. Nothing leaves
+  # the runner. docs/ARCHITECTURE.md ("The runner image") describes it.
+  runner-image:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck and jq
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck jq
+      - name: shellcheck
+        run: |
+          shellcheck runner/entrypoint.sh runner/tests/run.sh
+          shellcheck -s sh runner/tests/stub/make-forge.sh
+      - name: Build the image
+        run: docker build --platform linux/arm64 -f runner/Dockerfile -t arc-runner .
+      - name: The image's size
+        run: docker image inspect arc-runner --format '{{.Size}} bytes uncompressed'
+      - name: Acceptance tests
+        run: runner/tests/run.sh arc-runner
+
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
