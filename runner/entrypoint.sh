@@ -45,6 +45,7 @@ renew_pid=""
 child_pid=""    # the git command or arc run under way, run in the background so a signal is handled at once
 tail_pid=""
 interrupted=0
+protocol_ran=0  # 1 once arc run has ended
 
 say() {
   if [[ $log_open == 1 ]]; then
@@ -119,7 +120,7 @@ on_signal() {
       sleep 10
       kill -KILL "$child_pid" 2>/dev/null || true
     ) &
-  elif [[ $step == run ]]; then
+  elif [[ $protocol_ran == 1 ]]; then
     finish 15 interrupted "stopped after the Protocol ran"
   else
     finish 15 interrupted "stopped during $step"
@@ -384,6 +385,7 @@ tail -c "+$offset" -f --pid="$child_pid" "$LOG" &
 tail_pid=$!
 arc_status=0
 wait_child || arc_status=$?
+protocol_ran=1
 wait "$tail_pid" 2>/dev/null || true
 tail_pid=""
 

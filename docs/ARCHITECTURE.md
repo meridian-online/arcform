@@ -174,6 +174,7 @@ Each git command and `arc run` run in the background while the entrypoint waits 
 - `renews_credential_while_running`: with credentials lasting four seconds and a Protocol running for seven, the credential is renewed and the log is signed with a renewed credential.
 - `uploads_the_log_when_stopped`: `docker stop` during a step, as a Spot interruption would, exits 15 within ten seconds and still writes the log, which names the interruption.
 - `uploads_the_log_when_stopped_during_fetch`: the same against a git server that never answers, so the stop lands during the fetch.
+- `fails_a_stalled_fetch`: left alone, a run against that silent server fails at fetch after a minute, exits 12, and uploads the log with git's reason. The test takes that minute.
 - `refuses_a_reference_without_a_full_commit` (a branch name, and a 64-digit commit), `fails_fetch_of_an_unknown_commit` and `refuses_a_spent_token`: exits 10, 12 and 11, and a refused reference does not spend the token.
 - `does_not_repeat_an_exchange_that_was_answered`: an exchange that spends the token and answers 503 gets one request, and the run exits 11.
 

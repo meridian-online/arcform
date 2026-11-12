@@ -58,12 +58,12 @@ start_stub() { # start_stub RUN_ID TOKEN LIFETIME [EXCHANGE_FAILS]
 
 state() { docker exec "$stub" python3 -I /stub/stub.py --state; }
 
-run_image() { # run_image RUN_ID TOKEN PROTOCOL_REF: the exit code; output in $out/<test>.out
+run_image() { # run_image RUN_ID TOKEN PROTOCOL_REF [FORGE_URL]: the exit code; output in $out/<test>.out
   local code=0
   docker run --rm --platform linux/arm64 --network "$net" \
     -e RUN_ID="$1" -e RUN_TOKEN="$2" -e PROTOCOL_REF="$3" \
     -e CREDENTIAL_EXCHANGE_URL=http://stub:8080 \
-    -e PROTOCOL_FORGE_URL=http://stub:8080/git \
+    -e PROTOCOL_FORGE_URL="${4:-http://stub:8080/git}" \
     -e ARC_RUNNER_INSECURE_HTTP=1 \
     "$image" >"$out/$current.out" 2>&1 || code=$?
   echo "$code"
@@ -218,6 +218,20 @@ log=$(uploaded_log "$run")
 expect "exit code 15 (interrupted), not $code" equals "$code" 15
 expect "the log is written and names the fetch" contains "$log" "failed at interrupted: stopped during fetch"
 expect "it stopped within ten seconds, not $stopped_in" at_least 10 "$stopped_in"
+end
+
+# ---------------------------------------------------------------------------
+begin fails_a_stalled_fetch
+run="run-stall-2"
+token=$(openssl rand -hex 24)
+start_stub "$run" "$token" 900
+# The same silent git server, left alone: the fetch gives up after a minute
+# under 1 KB/s. This test takes that minute.
+code=$(run_image "$run" "$token" "test/sample@$pinned" http://stub:8080/stall)
+log=$(uploaded_log "$run")
+expect "exit code 12 (fetch), not $code" equals "$code" 12
+expect "the log names the fetch" contains "$log" "failed at fetch: could not fetch test/sample"
+expect "the log gives git's reason" contains "$log" "Operation too slow"
 end
 
 # ---------------------------------------------------------------------------
