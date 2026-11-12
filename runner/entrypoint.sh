@@ -42,7 +42,7 @@ finishing=0     # 1 once finish has begun
 step=inputs     # the step under way, and its exit code
 step_code=10
 renew_pid=""
-arc_pid=""
+child_pid=""    # the git command or arc run under way, run in the background so a signal is handled at once
 tail_pid=""
 interrupted=0
 
@@ -109,15 +109,20 @@ finish() {
 # shellcheck disable=SC2317,SC2329 # invoked by the trap below
 on_signal() {
   interrupted=1
-  if [[ -n $arc_pid ]]; then
-    kill -TERM "$arc_pid" 2>/dev/null || true
-    # arc has ten seconds to stop before it is killed.
+  # An upload under way finishes, and keeps the exit code it was given.
+  [[ $finishing == 1 ]] && return 0
+  if [[ -n $child_pid ]]; then
+    # wait_child sees `interrupted` and finishes once the child has stopped.
+    kill -TERM "$child_pid" 2>/dev/null || true
+    # The child has ten seconds to stop before it is killed.
     (
       sleep 10
-      kill -KILL "$arc_pid" 2>/dev/null || true
+      kill -KILL "$child_pid" 2>/dev/null || true
     ) &
+  elif [[ $step == run ]]; then
+    finish 15 interrupted "stopped after the Protocol ran"
   else
-    finish 15 interrupted "stopped before the Protocol ran"
+    finish 15 interrupted "stopped during $step"
   fi
 }
 trap on_signal TERM INT
@@ -311,6 +316,43 @@ say "run $RUN_ID: $PROTOCOL_REF"
 renew_loop &
 renew_pid=$!
 
+# start_child CMD...: start CMD as `protocol` in the background, its output
+# appended to the log. A simple command, not as_protocol, so that $! is the
+# process that becomes CMD (setpriv and env each exec the next) and a signal
+# sent to it reaches CMD. Bash runs a trap only between commands, so a
+# foreground child would hold off a stop until it ended.
+start_child() {
+  "${protocol_cmd[@]}" "$@" >>"$LOG" 2>&1 &
+  child_pid=$!
+}
+
+# wait_child: wait for the child; return its status, or finish as
+# interrupted when a signal arrived meanwhile.
+wait_child() {
+  local rc
+  while :; do
+    rc=0
+    wait "$child_pid" || rc=$?
+    # A trapped signal ends the wait early, while the child is still running
+    # or not yet reaped, and its /proc entry is still there; waiting again
+    # reaps it.
+    [[ -e /proc/$child_pid ]] && continue
+    break
+  done
+  child_pid=""
+  if [[ $interrupted == 1 ]]; then
+    [[ -n $tail_pid ]] && wait "$tail_pid" 2>/dev/null
+    finish 15 interrupted "stopped during $step"
+  fi
+  return "$rc"
+}
+
+# run_child CMD...: start_child, then wait_child.
+run_child() {
+  start_child "$@"
+  wait_child
+}
+
 # ---- fetch --------------------------------------------------------------------
 
 step=fetch
@@ -318,9 +360,12 @@ step_code=12
 repo_url="$FORGE/$namespace/$name.git"
 install -d -o "$PROTOCOL_USER" -g "$PROTOCOL_USER" -m 0755 "$WORK"
 cd "$WORK"
-if ! as_protocol git init --quiet "$WORK" >>"$LOG" 2>&1 ||
-  ! as_protocol git -C "$WORK" fetch --quiet --depth 1 --no-tags "$repo_url" "$commit" >>"$LOG" 2>&1 ||
-  ! as_protocol git -C "$WORK" -c advice.detachedHead=false checkout --quiet --detach FETCH_HEAD >>"$LOG" 2>&1; then
+# A transfer slower than 1 KB/s for a minute fails, so a stalled server ends
+# the step rather than holding the run.
+if ! run_child git init --quiet "$WORK" ||
+  ! run_child git -C "$WORK" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 \
+    fetch --quiet --depth 1 --no-tags "$repo_url" "$commit" ||
+  ! run_child git -C "$WORK" -c advice.detachedHead=false checkout --quiet --detach FETCH_HEAD; then
   finish 12 fetch "could not fetch $namespace/$name at $commit"
 fi
 head=$(as_protocol git -C "$WORK" rev-parse 'HEAD^{commit}') || finish 12 fetch "could not read the checkout's HEAD"
@@ -333,30 +378,15 @@ say "fetched $namespace/$name at $commit"
 step=run
 step_code=13
 offset=$(($(stat -c %s "$LOG") + 1))
-# A simple command, not the function, so that $! is the process that becomes
-# arc (setpriv and env each exec the next) and a signal sent to it reaches arc.
-"${protocol_cmd[@]}" arc run >>"$LOG" 2>&1 &
-arc_pid=$!
+start_child arc run
 # Stream the run's output to standard output, which the operator's logs keep.
-tail -c "+$offset" -f --pid="$arc_pid" "$LOG" &
+tail -c "+$offset" -f --pid="$child_pid" "$LOG" &
 tail_pid=$!
-
 arc_status=0
-while :; do
-  rc=0
-  wait "$arc_pid" || rc=$?
-  # A trapped signal ends the wait early, while arc is still running or not yet
-  # reaped, and its /proc entry is still there; waiting again reaps it.
-  [[ -e /proc/$arc_pid ]] && continue
-  arc_status=$rc
-  break
-done
-arc_pid=""
+wait_child || arc_status=$?
 wait "$tail_pid" 2>/dev/null || true
+tail_pid=""
 
-if [[ $interrupted == 1 ]]; then
-  finish 15 interrupted "the run was stopped"
-fi
 if [[ $arc_status != 0 ]]; then
   failed_step=$(grep -o "step '[^']*' failed" "$LOG" | tail -n 1 || true)
   finish 13 run "${failed_step:+$failed_step; }arc exited $arc_status"

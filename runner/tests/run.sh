@@ -69,6 +69,29 @@ run_image() { # run_image RUN_ID TOKEN PROTOCOL_REF: the exit code; output in $o
   echo "$code"
 }
 
+start_detached() { # start_detached RUN_ID TOKEN PROTOCOL_REF [FORGE_URL]: the container's id
+  docker run --detach --platform linux/arm64 --network "$net" \
+    -e RUN_ID="$1" -e RUN_TOKEN="$2" -e PROTOCOL_REF="$3" \
+    -e CREDENTIAL_EXCHANGE_URL=http://stub:8080 \
+    -e PROTOCOL_FORGE_URL="${4:-http://stub:8080/git}" \
+    -e ARC_RUNNER_INSECURE_HTTP=1 \
+    "$image"
+}
+
+stop_when() { # stop_when CID TEXT: once the container's output shows TEXT, stop it as ECS would; sets code and stopped_in
+  local cid=$1 text=$2 started
+  for _ in $(seq 1 100); do
+    docker logs "$cid" 2>&1 | grep -qF -- "$text" && break
+    sleep 0.1
+  done
+  started=$(date +%s)
+  docker stop --time 30 "$cid" >/dev/null
+  stopped_in=$(($(date +%s) - started))
+  code=$(docker wait "$cid")
+  docker logs "$cid" >"$out/$current.out" 2>&1
+  docker rm "$cid" >/dev/null
+}
+
 uploaded_log() { # uploaded_log RUN_ID: the run log the image wrote, or nothing
   state | jq -r --arg k "sub_test/runs/$1/run.log" '.objects[$k] // empty'
 }
@@ -175,25 +198,25 @@ begin uploads_the_log_when_stopped
 run="run-stop-1"
 token=$(openssl rand -hex 24)
 start_stub "$run" "$token" 900
-cid=$(docker run --detach --platform linux/arm64 --network "$net" \
-  -e RUN_ID="$run" -e RUN_TOKEN="$token" -e PROTOCOL_REF="test/slow@$slow" \
-  -e CREDENTIAL_EXCHANGE_URL=http://stub:8080 -e PROTOCOL_FORGE_URL=http://stub:8080/git \
-  -e ARC_RUNNER_INSECURE_HTTP=1 "$image")
 # Stop it once its seven-second step has started, as a Spot interruption would.
-for _ in $(seq 1 100); do
-  docker logs "$cid" 2>&1 | grep -q 'wait' && break
-  sleep 0.1
-done
-started=$(date +%s)
-docker stop --time 30 "$cid" >/dev/null
-stopped_in=$(($(date +%s) - started))
-code=$(docker wait "$cid")
-docker logs "$cid" >"$out/$current.out" 2>&1
-docker rm "$cid" >/dev/null
+stop_when "$(start_detached "$run" "$token" "test/slow@$slow")" "[1/1]"
 log=$(uploaded_log "$run")
 expect "exit code 15 (interrupted), not $code" equals "$code" 15
-expect "the log is written and names the interruption" contains "$log" "failed at interrupted: the run was stopped"
+expect "the log is written and names the interruption" contains "$log" "failed at interrupted: stopped during run"
 expect "the step did not finish" lacks "$log" "slow - done"
+expect "it stopped within ten seconds, not $stopped_in" at_least 10 "$stopped_in"
+end
+
+# ---------------------------------------------------------------------------
+begin uploads_the_log_when_stopped_during_fetch
+run="run-stall-1"
+token=$(openssl rand -hex 24)
+start_stub "$run" "$token" 900
+# This forge never answers, so the fetch is under way when the stop comes.
+stop_when "$(start_detached "$run" "$token" "test/sample@$pinned" http://stub:8080/stall)" "run $run:"
+log=$(uploaded_log "$run")
+expect "exit code 15 (interrupted), not $code" equals "$code" 15
+expect "the log is written and names the fetch" contains "$log" "failed at interrupted: stopped during fetch"
 expect "it stopped within ten seconds, not $stopped_in" at_least 10 "$stopped_in"
 end
 

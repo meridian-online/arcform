@@ -5,7 +5,8 @@
   and .../credentials/renew), which mints throwaway credentials;
 - an S3-compatible store (PUT /<bucket>/<key>), which checks each upload's
   AWS Signature Version 4 against the credential it names and keeps the body;
-- a git forge (/git/<namespace>/<name>.git), served by `git http-backend`.
+- a git forge (/git/<namespace>/<name>.git), served by `git http-backend`,
+  and one that never answers (/stall/...), for a stop during the fetch.
 
 GET /_stub/state returns everything the stub saw and issued, so a test can
 assert on it. `stub.py --state` prints that from inside the container.
@@ -25,6 +26,7 @@ import secrets
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import urlopen
@@ -182,6 +184,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, state)
         if self.path.startswith("/git/"):
             return self.git()
+        if self.path.startswith("/stall/"):
+            time.sleep(3600)
         self.reply(404, {"error": "not found"})
 
     def do_POST(self):

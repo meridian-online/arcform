@@ -140,7 +140,7 @@ Both URLs must be `https`. `ARC_RUNNER_INSECURE_HTTP=1` allows `http`, for the t
    }
    ```
    `storage.region` defaults to `auto`. The renewal token lasts the run. The token is good for one exchange, so the request is sent again only when curl could not reach the host at all; after a timeout or an error answer the step fails, since the token may already be spent. The log's prefix must be a folder ending `runs/<RUN_ID>/`, either `runs/<RUN_ID>/` itself or under another folder; any other prefix is refused, so a reply meant for another run cannot direct this run's log there.
-3. **fetch**: fetches the pinned commit alone (`git fetch --depth 1 <repo> <commit>`) into an empty repository, checks it out, and checks that `HEAD` is that commit and that `arcform.yaml` is at the root. A commit the server does not hold fails here.
+3. **fetch**: fetches the pinned commit alone (`git fetch --depth 1 <repo> <commit>`) into an empty repository, failing if the transfer stays under 1 KB/s for a minute, checks it out, and checks that `HEAD` is that commit and that `arcform.yaml` is at the root. A commit the server does not hold fails here.
 4. **run**: `arc run` in the checkout. Its output goes to the run log and is streamed to standard output, which the operator's logs keep.
 5. **upload**: puts the log at `<prefix>run.log` in the bucket with an S3 `PUT`, signed with AWS Signature Version 4 by curl's `--aws-sigv4` using the current credential and its session token, and with the body's SHA-256 as `x-amz-content-sha256`. Terminal colour codes are taken out of the uploaded copy.
 
@@ -154,7 +154,9 @@ Once the exchange has succeeded, every later failure still uploads the log, an u
 | 12 | fetch |
 | 13 | run: a Protocol step failed |
 | 14 | upload, after a run that succeeded |
-| 15 | interrupted: a `SIGTERM` or `SIGINT` reached the entrypoint; arc is stopped, given ten seconds, and the log uploaded |
+| 15 | interrupted: a `SIGTERM` or `SIGINT` reached the entrypoint; the git command or `arc run` under way is stopped, given ten seconds, and the log uploaded |
+
+Each git command and `arc run` run in the background while the entrypoint waits on them, because bash runs a signal's handler only between commands: a stop during a foreground fetch would wait for the fetch to end. A signal that arrives while the log is being uploaded lets the upload finish and keeps its exit code.
 
 **Renewal.** While the run goes on, a background loop renews the credential once two thirds of its life has passed: `POST <exchange>/v1/runs/<RUN_ID>/credentials/renew` with `Authorization: Bearer <renewal_token>`, whose reply is `{"credential": {…}}`, in the exchange's shape. A network error, a 408, a 429 or a 5xx is tried again after a wait that doubles up to 30 seconds. Any other 4xx means the control plane holds the run as over, and the loop stops, so the credential lapses. The upload signs with a copy of the credential taken once, so a renewal that lands meanwhile cannot mix two credentials.
 
@@ -171,6 +173,7 @@ Once the exchange has succeeded, every later failure still uploads the log, an u
 - `token_and_credential_kept_out_of_step_env`: a step that prints its environment, `/proc/1/environ` and the runner's state directory leaves none of the one-time token, any issued credential part or any renewal token in the log.
 - `renews_credential_while_running`: with credentials lasting four seconds and a Protocol running for seven, the credential is renewed and the log is signed with a renewed credential.
 - `uploads_the_log_when_stopped`: `docker stop` during a step, as a Spot interruption would, exits 15 within ten seconds and still writes the log, which names the interruption.
+- `uploads_the_log_when_stopped_during_fetch`: the same against a git server that never answers, so the stop lands during the fetch.
 - `refuses_a_reference_without_a_full_commit` (a branch name, and a 64-digit commit), `fails_fetch_of_an_unknown_commit` and `refuses_a_spent_token`: exits 10, 12 and 11, and a refused reference does not spend the token.
 - `does_not_repeat_an_exchange_that_was_answered`: an exchange that spends the token and answers 503 gets one request, and the run exits 11.
 
