@@ -32,12 +32,15 @@ readonly SAFE_PATH=/usr/local/bin:/usr/bin:/bin
 readonly TOKEN_RE='^[A-Za-z0-9._~+/=-]{1,4096}$'
 readonly RUN_ID_RE='^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$'
 readonly NAME_RE='[A-Za-z0-9][A-Za-z0-9._-]{0,99}'
-readonly REF_RE="^($NAME_RE)/($NAME_RE)@([0-9a-f]{40}|[0-9a-f]{64})\$"
+readonly REF_RE="^($NAME_RE)/($NAME_RE)@([0-9a-f]{40})\$"
 readonly BUCKET_RE='^[a-z0-9][a-z0-9.-]{1,62}$'
 readonly REGION_RE='^[a-z0-9-]{1,32}$'
 readonly PREFIX_RE='^([A-Za-z0-9_.-]+/)+$'
 
 log_open=0      # 1 once run.log exists; 0 again once its upload has begun
+finishing=0     # 1 once finish has begun
+step=inputs     # the step under way, and its exit code
+step_code=10
 renew_pid=""
 arc_pid=""
 tail_pid=""
@@ -83,6 +86,7 @@ stop_renewal() {
 finish() {
   local code=$1 step=$2 detail=${3:-}
   local upload_ok=1
+  finishing=1
   if [[ $code != 0 ]]; then
     say "failed at $step${detail:+: $detail}"
   else
@@ -118,18 +122,42 @@ on_signal() {
 }
 trap on_signal TERM INT
 
+# A command that fails under `set -e` outside the checks above still ends in
+# finish, so the log is uploaded and the exit code names the step.
+# shellcheck disable=SC2329 # invoked by the trap below
+on_exit() {
+  local rc=$?
+  if [[ $finishing == 0 && $log_open == 1 ]]; then
+    finish "$step_code" "$step" "an unexpected error (status $rc)"
+  fi
+}
+trap on_exit EXIT
+
 # post_json URL TOKEN OUT: POST with a bearer token, the reply body to OUT.
-# Prints the HTTP status; fails when no reply came.
+# Prints the HTTP status; fails when no reply came. The token may be good for
+# one use only, so the POST is repeated only when curl could not resolve or
+# connect to the host, and so sent nothing; never after a timeout or an error
+# answer, when the server may already have spent the token.
 post_json() {
-  local url=$1 token=$2 out=$3
-  printf 'header = "Authorization: Bearer %s"\n' "$token" |
-    curl --config - --silent --show-error --output "$out" --write-out '%{http_code}' \
-      --max-time 30 --retry 3 --retry-connrefused \
-      -X POST -H 'Accept: application/json' "$url"
+  local url=$1 token=$2 out=$3 attempt rc status
+  for attempt in 1 2 3 4; do
+    rc=0
+    status=$(printf 'header = "Authorization: Bearer %s"\n' "$token" |
+      curl --config - --silent --show-error --output "$out" --write-out '%{http_code}' \
+        --connect-timeout 10 --max-time 30 \
+        -X POST -H 'Accept: application/json' "$url") || rc=$?
+    case $rc in
+      0) printf '%s' "$status"; return 0 ;;
+      6 | 7) ((attempt < 4)) && sleep $((attempt * 2)) ;;
+      *) return 1 ;;
+    esac
+  done
+  return 1
 }
 
 # store_credential REPLY: check the credential in an exchange or renewal
-# reply and make it the current one.
+# reply and make it the current one. The renewal token is the exchange's and
+# lasts the run: a renewal reply carries a credential and nothing else.
 store_credential() {
   local reply=$1 field value expires
   for field in access_key_id secret_access_key session_token; do
@@ -143,21 +171,16 @@ store_credential() {
   fi
   jq '.credential' "$reply" >"$STATE/credential.json.new"
   mv -f "$STATE/credential.json.new" "$STATE/credential.json"
-  value=$(jq -r '.renewal_token // empty' "$reply")
-  if [[ -n $value ]]; then
-    [[ $value =~ $TOKEN_RE ]] || { say "the reply's renewal_token is malformed"; return 1; }
-    printf '%s' "$value" >"$STATE/renewal_token.new"
-    mv -f "$STATE/renewal_token.new" "$STATE/renewal_token"
-  fi
 }
 
 # renew_once: 0 renewed, 2 try again later, 3 refused (the run is over as far
-# as the control plane is concerned).
+# as the control plane is concerned). 408 and 429 are worth trying again.
 renew_once() {
   local status
   status=$(post_json "$EXCHANGE/v1/runs/$RUN_ID/credentials/renew" "$(<"$STATE/renewal_token")" "$STATE/renew.json") || return 2
   case $status in
     2??) store_credential "$STATE/renew.json" || return 2 ;;
+    408 | 429) return 2 ;;
     4??) return 3 ;;
     *) return 2 ;;
   esac
@@ -166,7 +189,7 @@ renew_once() {
 # renew_loop: renew once two thirds of the current credential's life has
 # passed; back off on errors; stop when the control plane refuses.
 renew_loop() {
-  trap - TERM INT
+  trap - TERM INT EXIT
   local expires left wait backoff=2 rc
   while :; do
     expires=$(date -u -d "$(jq -r '.expires_at' "$STATE/credential.json")" +%s)
@@ -188,14 +211,18 @@ renew_loop() {
 }
 
 upload_log() {
-  local cred="$STATE/credential.json" sealed="$STATE/run.log.sealed" akid secret session hash url
+  local cred="$STATE/credential.upload.json" sealed="$STATE/run.log.sealed" akid secret session hash url
   # Upload a copy, which the renewal loop cannot append to meanwhile, without
   # the terminal colour codes arc writes.
-  sed 's/\x1b\[[0-9;?]*[ -\/]*[@-~]//g' "$LOG" >"$sealed"
-  akid=$(jq -r '.access_key_id' "$cred")
-  secret=$(jq -r '.secret_access_key' "$cred")
-  session=$(jq -r '.session_token' "$cred")
-  hash=$(sha256sum "$sealed" | cut -d' ' -f1)
+  sed 's/\x1b\[[0-9;?]*[ -\/]*[@-~]//g' "$LOG" >"$sealed" || return 1
+  # Sign with one credential throughout: the renewal loop may replace
+  # credential.json between reads, and it renames a whole file into place, so
+  # a copy holds one credential.
+  cp "$STATE/credential.json" "$cred" || return 1
+  akid=$(jq -r '.access_key_id' "$cred") || return 1
+  secret=$(jq -r '.secret_access_key' "$cred") || return 1
+  session=$(jq -r '.session_token' "$cred") || return 1
+  hash=$(sha256sum "$sealed" | cut -d' ' -f1) || return 1
   url="$STORAGE_ENDPOINT/$STORAGE_BUCKET/${LOG_PREFIX}run.log"
   {
     printf 'user = "%s:%s"\n' "$akid" "$secret"
@@ -249,13 +276,18 @@ protocol_cmd=(
 
 # ---- exchange -----------------------------------------------------------------
 
+step=exchange
+step_code=11
 reply="$STATE/exchange.json"
 status=$(post_json "$EXCHANGE/v1/runs/$RUN_ID/credentials" "$run_token" "$reply") ||
   { say "failed at exchange: no reply from the credential exchange"; exit 11; }
 run_token=""
 [[ $status == 2?? ]] || { say "failed at exchange: the credential exchange answered $status"; exit 11; }
 store_credential "$reply" || { say "failed at exchange: the reply did not hold a usable credential"; exit 11; }
-[[ -s $STATE/renewal_token ]] || { say "failed at exchange: the reply held no renewal token"; exit 11; }
+renewal_token=$(jq -r '.renewal_token // empty' "$reply")
+[[ $renewal_token =~ $TOKEN_RE ]] || { say "failed at exchange: the reply's renewal_token is missing or malformed"; exit 11; }
+printf '%s' "$renewal_token" >"$STATE/renewal_token"
+renewal_token=""
 
 STORAGE_ENDPOINT=$(jq -r '.storage.endpoint // empty' "$reply")
 STORAGE_BUCKET=$(jq -r '.storage.bucket // empty' "$reply")
@@ -281,6 +313,8 @@ renew_pid=$!
 
 # ---- fetch --------------------------------------------------------------------
 
+step=fetch
+step_code=12
 repo_url="$FORGE/$namespace/$name.git"
 install -d -o "$PROTOCOL_USER" -g "$PROTOCOL_USER" -m 0755 "$WORK"
 cd "$WORK"
@@ -289,13 +323,15 @@ if ! as_protocol git init --quiet "$WORK" >>"$LOG" 2>&1 ||
   ! as_protocol git -C "$WORK" -c advice.detachedHead=false checkout --quiet --detach FETCH_HEAD >>"$LOG" 2>&1; then
   finish 12 fetch "could not fetch $namespace/$name at $commit"
 fi
-head=$(as_protocol git -C "$WORK" rev-parse 'HEAD^{commit}')
+head=$(as_protocol git -C "$WORK" rev-parse 'HEAD^{commit}') || finish 12 fetch "could not read the checkout's HEAD"
 [[ $head == "$commit" ]] || finish 12 fetch "fetched $head, not the pinned $commit"
 [[ -f $WORK/arcform.yaml ]] || finish 12 fetch "no arcform.yaml at the repository's root"
 say "fetched $namespace/$name at $commit"
 
 # ---- run ----------------------------------------------------------------------
 
+step=run
+step_code=13
 offset=$(($(stat -c %s "$LOG") + 1))
 # A simple command, not the function, so that $! is the process that becomes
 # arc (setpriv and env each exec the next) and a signal sent to it reaches arc.

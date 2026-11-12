@@ -41,10 +41,11 @@ expect() { # expect DESCRIPTION COMMAND...: record a failed expectation
   fi
 }
 
-start_stub() { # start_stub RUN_ID TOKEN LIFETIME
+start_stub() { # start_stub RUN_ID TOKEN LIFETIME [EXCHANGE_FAILS]
   docker rm -f "$stub" >/dev/null 2>&1 || true
   docker run --detach --name "$stub" --network "$net" --network-alias stub \
     -e STUB_RUN_ID="$1" -e STUB_RUN_TOKEN="$2" -e STUB_LIFETIME="$3" \
+    -e STUB_EXCHANGE_FAILS="${4:-0}" \
     "$stub_image" >/dev/null
   for _ in $(seq 1 50); do
     if docker exec "$stub" python3 -I /stub/stub.py --state >/dev/null 2>&1; then return 0; fi
@@ -205,6 +206,20 @@ code=$(run_image "$run" "$token" "test/sample@main")
 expect "exit code 10 (inputs), not $code" equals "$code" 10
 expect "the token is not spent" equals "$(state | jq '.exchanges')" 0
 expect "the output names the reference" contains "$(cat "$out/$current.out")" "PROTOCOL_REF must be"
+code=$(run_image "$run" "$token" "test/sample@$(openssl rand -hex 32)")
+expect "a 64-digit commit exits 10 (inputs), not $code" equals "$code" 10
+expect "the token is still not spent" equals "$(state | jq '.exchange_posts')" 0
+end
+
+# ---------------------------------------------------------------------------
+begin does_not_repeat_an_exchange_that_was_answered
+run="run-once-1"
+token=$(openssl rand -hex 24)
+# The exchange spends the token, then answers 503.
+start_stub "$run" "$token" 900 503
+code=$(run_image "$run" "$token" "test/sample@$pinned")
+expect "exit code 11 (exchange), not $code" equals "$code" 11
+expect "one exchange request, not $(state | jq '.exchange_posts')" equals "$(state | jq '.exchange_posts')" 1
 end
 
 # ---------------------------------------------------------------------------

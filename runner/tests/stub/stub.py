@@ -11,7 +11,8 @@ GET /_stub/state returns everything the stub saw and issued, so a test can
 assert on it. `stub.py --state` prints that from inside the container.
 
 Configuration: STUB_RUN_ID, STUB_RUN_TOKEN, STUB_LIFETIME (seconds a
-credential lasts, default 900) and STUB_ENDPOINT (the storage endpoint the
+credential lasts, default 900), STUB_EXCHANGE_FAILS (an HTTP status the
+exchange answers with after spending the token) and STUB_ENDPOINT (the storage endpoint the
 exchange names, default http://stub:8080).
 """
 
@@ -41,6 +42,9 @@ if sys.argv[1:] == ["--state"]:
 RUN_ID = os.environ["STUB_RUN_ID"]
 RUN_TOKEN = os.environ["STUB_RUN_TOKEN"]
 LIFETIME = int(os.environ.get("STUB_LIFETIME", "900"))
+# When set, the exchange spends the token and then answers with this status,
+# as a service that failed after spending it would.
+EXCHANGE_FAILS = int(os.environ.get("STUB_EXCHANGE_FAILS", "0"))
 ENDPOINT = os.environ.get("STUB_ENDPOINT", f"http://stub:{PORT}")
 PREFIX = f"sub_test/runs/{RUN_ID}/"
 
@@ -51,6 +55,7 @@ lock = threading.Lock()
 state = {
     "run_token": RUN_TOKEN,
     "commits": COMMITS,
+    "exchange_posts": 0,
     "exchanges": 0,
     "exchange_refusals": 0,
     "renewals": 0,
@@ -186,10 +191,13 @@ class Handler(BaseHTTPRequestHandler):
         del body
         with lock:
             if self.path == f"/v1/runs/{RUN_ID}/credentials":
+                state["exchange_posts"] += 1
                 if self.bearer() != RUN_TOKEN or current["token_spent"]:
                     state["exchange_refusals"] += 1
                     return self.reply(401, {"error": "token refused"})
                 current["token_spent"] = True
+                if EXCHANGE_FAILS:
+                    return self.reply(EXCHANGE_FAILS, {"error": "failed after spending the token"})
                 state["exchanges"] += 1
                 return self.reply(
                     200,
@@ -205,7 +213,7 @@ class Handler(BaseHTTPRequestHandler):
                     state["renewal_refusals"] += 1
                     return self.reply(401, {"error": "renewal refused"})
                 state["renewals"] += 1
-                return self.reply(200, {"credential": mint(), "renewal_token": new_renewal_token()})
+                return self.reply(200, {"credential": mint()})
         self.reply(404, {"error": "not found"})
 
     def do_PUT(self):

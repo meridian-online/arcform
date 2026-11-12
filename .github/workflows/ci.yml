@@ -133,8 +133,6 @@ jobs:
       - name: install.sh self-test, with an empty environment
         run: env -i PATH=/usr/bin:/bin sh scripts/install.sh --self-test
 
-  # Clippy and the test suite both compile the crate against system DuckDB, so
-  # they share a job that provisions the library once.
   # The hosted runner image (runner/): build it for linux/arm64, on an arm64 runner,
   # and run its acceptance tests against the stub in runner/tests, which stands in
   # for the credential exchange, the storage endpoint and the forge. Nothing leaves
@@ -157,6 +155,8 @@ jobs:
       - name: Acceptance tests
         run: runner/tests/run.sh arc-runner
 
+  # Clippy and the test suite both compile the crate against system DuckDB, so
+  # they share a job that provisions the library once.
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30

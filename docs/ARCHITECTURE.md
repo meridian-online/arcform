@@ -120,7 +120,7 @@ The package and library are `arcform` and the binary is `arc`. The vendored sqlp
 
 - `RUN_ID`: the run's id, letters, digits, `_` and `-`.
 - `RUN_TOKEN`: a one-time token for the credential exchange.
-- `PROTOCOL_REF`: `<namespace>/<name>@<commit>`, the commit in full (40 or 64 hex digits). A branch, a tag or a short commit is refused.
+- `PROTOCOL_REF`: `<namespace>/<name>@<commit>`, the commit in full (40 hex digits). A branch, a tag or a short commit is refused, and so is a 64-digit commit from a SHA-256 repository, which the image does not fetch.
 - `CREDENTIAL_EXCHANGE_URL`: the base URL of the service that exchanges the token.
 - `PROTOCOL_FORGE_URL`: the base URL of the git server; the Protocol's repository is `<PROTOCOL_FORGE_URL>/<namespace>/<name>.git`, with `arcform.yaml` at its root.
 
@@ -139,12 +139,12 @@ Both URLs must be `https`. `ARC_RUNNER_INSECURE_HTTP=1` allows `http`, for the t
      "run_log": {"prefix": "<subscriber>/runs/<RUN_ID>/"}
    }
    ```
-   `storage.region` defaults to `auto`. The log's prefix must be a folder ending `runs/<RUN_ID>/`, either `runs/<RUN_ID>/` itself or under another folder; any other prefix is refused, so a reply meant for another run cannot direct this run's log there.
+   `storage.region` defaults to `auto`. The renewal token lasts the run. The token is good for one exchange, so the request is sent again only when curl could not reach the host at all; after a timeout or an error answer the step fails, since the token may already be spent. The log's prefix must be a folder ending `runs/<RUN_ID>/`, either `runs/<RUN_ID>/` itself or under another folder; any other prefix is refused, so a reply meant for another run cannot direct this run's log there.
 3. **fetch**: fetches the pinned commit alone (`git fetch --depth 1 <repo> <commit>`) into an empty repository, checks it out, and checks that `HEAD` is that commit and that `arcform.yaml` is at the root. A commit the server does not hold fails here.
 4. **run**: `arc run` in the checkout. Its output goes to the run log and is streamed to standard output, which the operator's logs keep.
 5. **upload**: puts the log at `<prefix>run.log` in the bucket with an S3 `PUT`, signed with AWS Signature Version 4 by curl's `--aws-sigv4` using the current credential and its session token, and with the body's SHA-256 as `x-amz-content-sha256`. Terminal colour codes are taken out of the uploaded copy.
 
-Once the exchange has succeeded, every later failure still uploads the log. The exit code names the first step that failed, and so does the last line of output (`arc-runner: failed at <step>: …`); for a failed Protocol step, that line also names the step arc reported, as `step '<name>' failed`:
+Once the exchange has succeeded, every later failure still uploads the log, an unexpected one included (an `EXIT` trap ends in the same path, naming the step under way). The exit code names the first step that failed, and so does the last line of output (`arc-runner: failed at <step>: …`); for a failed Protocol step, that line also names the step arc reported, as `step '<name>' failed`:
 
 | Exit | Step |
 |---|---|
@@ -156,7 +156,7 @@ Once the exchange has succeeded, every later failure still uploads the log. The 
 | 14 | upload, after a run that succeeded |
 | 15 | interrupted: a `SIGTERM` or `SIGINT` reached the entrypoint; arc is stopped, given ten seconds, and the log uploaded |
 
-**Renewal.** While the run goes on, a background loop renews the credential once two thirds of its life has passed: `POST <exchange>/v1/runs/<RUN_ID>/credentials/renew` with `Authorization: Bearer <renewal_token>`, whose reply carries a new `credential` and may carry a new `renewal_token`. A network error or a 5xx is retried with a doubling wait of up to 30 seconds. A 4xx means the control plane holds the run as over, and the loop stops, so the credential lapses.
+**Renewal.** While the run goes on, a background loop renews the credential once two thirds of its life has passed: `POST <exchange>/v1/runs/<RUN_ID>/credentials/renew` with `Authorization: Bearer <renewal_token>`, whose reply is `{"credential": {…}}`, in the exchange's shape. A network error, a 408, a 429 or a 5xx is tried again after a wait that doubles up to 30 seconds. Any other 4xx means the control plane holds the run as over, and the loop stops, so the credential lapses. The upload signs with a copy of the credential taken once, so a renewal that lands meanwhile cannot mix two credentials.
 
 **What a Protocol step can reach.** The whole run is treated as hostile; these rules keep the token and the credential out of the run's environment and its log:
 
@@ -171,7 +171,8 @@ Once the exchange has succeeded, every later failure still uploads the log. The 
 - `token_and_credential_kept_out_of_step_env`: a step that prints its environment, `/proc/1/environ` and the runner's state directory leaves none of the one-time token, any issued credential part or any renewal token in the log.
 - `renews_credential_while_running`: with credentials lasting four seconds and a Protocol running for seven, the credential is renewed and the log is signed with a renewed credential.
 - `uploads_the_log_when_stopped`: `docker stop` during a step, as a Spot interruption would, exits 15 within ten seconds and still writes the log, which names the interruption.
-- `refuses_a_reference_without_a_full_commit`, `fails_fetch_of_an_unknown_commit` and `refuses_a_spent_token`: exits 10, 12 and 11, and a refused reference does not spend the token.
+- `refuses_a_reference_without_a_full_commit` (a branch name, and a 64-digit commit), `fails_fetch_of_an_unknown_commit` and `refuses_a_spent_token`: exits 10, 12 and 11, and a refused reference does not spend the token.
+- `does_not_repeat_an_exchange_that_was_answered`: an exchange that spends the token and answers 503 gets one request, and the run exits 11.
 
 CI's `runner-image` job builds the image on an arm64 runner, shellchecks the scripts and runs these tests.
 
