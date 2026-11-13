@@ -266,7 +266,7 @@
 No code. Needs Hugh's go-ahead and a write token for a test prefix; nothing touches `catalog/open.ducklake` or any live dataset key.
 
 - [ ] **Step 1: Ask Hugh** for the go-ahead and a test prefix (for example `lake-test/`) on the open bucket, and for the credential in a `.env` file outside the repo.
-- [ ] **Step 2: Run** a fixture Protocol with `public_base: https://openlake.meridian.online/`, `catalog: lake-test/catalog/test.ducklake`, `data_path: lake-test/lake/` and the open bucket's name, `arc run --publish`. Expected: report `target: live`, `committed: true`.
+- [ ] **Step 2: Run** a fixture Protocol with `public_base: https://openlake.meridian.online/`, `catalog: lake-test/catalog/test.ducklake`, `data_path: lake-test/lake/` and the open bucket's name, `arc run --publish`. Expected: report `target: live`, `committed: true`. Then publish a change to the same table (more than 10 rows changed, so DuckLake writes a data file): this proves the commit reads the existing files and writes new ones through `s3://` with the override, and an https attach reads the result.
 - [ ] **Step 3: Prove the conditional write**: run the same publish from two shells at once with different changes. Expected: both succeed, one with `attempts >= 2`, and an attach over https reads both changes.
 - [ ] **Step 4: Read it from outside**: from a fresh DuckDB 2.0, `ATTACH 'ducklake:https://openlake.meridian.online/lake-test/catalog/test.ducklake' AS t (READ_ONLY)` and query a table, `meta.fields`, and a time-travel version.
 - [ ] **Step 5: Clean up** the test prefix with Hugh's agreement, and record the outcome on the pull request.
