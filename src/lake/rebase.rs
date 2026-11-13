@@ -337,10 +337,17 @@ fn old_tables(
         )?
         .into_iter()
         .map(|f| match f[0].strip_prefix(old_data_path) {
-            Some(rest) if !old_data_path.is_empty() => format!("{new_data_path}{rest}"),
-            _ => f[0].clone(),
+            Some(rest) if !old_data_path.is_empty() => Ok(format!("{new_data_path}{rest}")),
+            // Outside the old data path, only an absolute path or URL is carried: a
+            // relative one would register a local path silently.
+            _ if f[0].starts_with('/') || f[0].contains("://") => Ok(f[0].clone()),
+            _ => Err(failed(format!(
+                "table {label} has the data file `{}`, which is neither under the old data \
+                 path `{old_data_path}` nor an absolute path or URL",
+                f[0]
+            ))),
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
         out.push(OldTable {
             schema,
             name,
@@ -779,6 +786,51 @@ mod tests {
             query_i64(&out, &local, "SELECT count(*) FROM ducklake_snapshots('n')"),
             2
         );
+    }
+
+    /// Files DuckLake wrote itself under the old data path move to the new one.
+    #[test]
+    fn rebase_rewrites_files_under_the_old_data_path() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        let old = p.join("old.ducklake");
+        let served = p.join("served");
+        std::fs::create_dir_all(&served).unwrap();
+        // More rows than DuckLake inlines into the catalogue, so it writes a file.
+        exec(&format!(
+            "ATTACH 'ducklake:{c}' AS o (DATA_PATH '{d}/'); \
+             CREATE TABLE o.t AS SELECT range AS id FROM range(0, 500);",
+            c = old.display(),
+            d = served.display()
+        ));
+        let server = crate::lake::test_server::TestServer::serve(&served);
+        let new_path = server.url("");
+        let out = p.join("new.ducklake");
+        rebase(old.to_str().unwrap(), &out, &new_path).unwrap();
+
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "INSTALL httpfs; LOAD httpfs; LOAD ducklake; \
+             ATTACH 'ducklake:{c}' AS n (DATA_PATH '{new_path}', READ_ONLY);",
+            c = out.display()
+        ))
+        .unwrap();
+        let mut stmt = conn
+            .prepare("SELECT data_file FROM ducklake_list_files('n', 't')")
+            .unwrap();
+        let files: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(!files.is_empty());
+        for f in &files {
+            assert!(f.starts_with(&new_path), "{f}");
+        }
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM n.t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 500);
     }
 
     #[test]

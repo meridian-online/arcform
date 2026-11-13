@@ -22,7 +22,8 @@ mod test_server;
 /// A run record a live publish asked to have uploaded once the run ends.
 pub(crate) struct RunRecordUpload {
     pub store: Arc<dyn ObjectStore>,
-    /// The record's key, `runs/<run_id>.json`.
+    /// The record's key, `<runs><run_id>.json`: `runs` is the configured prefix
+    /// (default `runs/`), and a manifest entry's `run.record` is `public_base` plus this.
     pub key: String,
     /// The snapshot the publish committed or found, named if the upload fails.
     pub snapshot_id: i64,

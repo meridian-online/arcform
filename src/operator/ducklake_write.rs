@@ -291,7 +291,57 @@ impl DucklakeWriteConfig {
         for f in &self.files {
             check_key("files.to", &f.to)?;
         }
+        self.check_keys_apart()?;
         self.credential.validate()
+    }
+
+    /// A readable copy or a `files.to` key must not land on the lake's own objects:
+    /// the catalogue, the manifest, the data path, the pinned catalogue prefix or the
+    /// run records. Equal, under a prefix, or a prefix of one all collide.
+    fn check_keys_apart(&self) -> Result<()> {
+        // (field, value, is a prefix)
+        let mut owned: Vec<(&str, String, bool)> = vec![
+            ("catalog", self.catalog.clone(), false),
+            ("data_path", self.data_prefix(), true),
+            ("catalog", pinned_prefix(&self.catalog), true),
+            ("runs", self.runs.clone(), true),
+        ];
+        if let Some(m) = &self.manifest {
+            owned.push(("manifest", m.clone(), false));
+        }
+        let mut keys: Vec<(&str, &str)> = Vec::new();
+        for t in &self.tables {
+            if let Some(c) = &t.readable_copy {
+                keys.push(("readable_copy", c));
+            }
+        }
+        for f in &self.files {
+            keys.push(("files.to", &f.to));
+        }
+        for (field, key) in keys {
+            // A `files.to` without a trailing `/` may be a file or a folder's prefix.
+            let mut variants = vec![key.to_string()];
+            if !key.ends_with('/') {
+                variants.push(format!("{key}/"));
+            }
+            for (other, value, is_prefix) in &owned {
+                let hit = variants.iter().any(|v| {
+                    let under = if *is_prefix {
+                        v.starts_with(value.as_str())
+                    } else {
+                        v == value
+                    };
+                    under || (v.ends_with('/') && value.starts_with(v.as_str()))
+                });
+                if hit {
+                    return Err(invalid(format!(
+                        "`{field}: {key}` collides with the lake's own `{other}: {value}`; \
+                         keep copies and files apart from it"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The key the run record is uploaded to.
@@ -1056,6 +1106,21 @@ credential:
             ("data_path: lake/", "data_path: /lake/", "data_path"),
             ("demo/codes.parquet", "../codes.parquet", "readable_copy"),
             ("to: demo/search/", "to: s3://elsewhere/", "files.to"),
+            (
+                "demo/codes.parquet",
+                "catalog/test.ducklake",
+                "readable_copy",
+            ),
+            ("demo/codes.parquet", "lake/x.parquet", "data_path"),
+            (
+                "demo/codes.parquet",
+                "catalog/test-x.ducklake",
+                "readable_copy",
+            ),
+            ("demo/codes.parquet", "runs/x.json", "runs"),
+            ("to: demo/search/", "to: lake/", "files.to"),
+            ("to: demo/search/", "to: catalog/", "files.to"),
+            ("to: demo/search/", "to: runs", "files.to"),
         ] {
             let yaml = BASE.replace(from, to);
             let e = refusal(&yaml);

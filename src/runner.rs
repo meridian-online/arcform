@@ -1080,7 +1080,8 @@ pub fn run_with_publish(
             extensions.loaded(),
         )
     });
-    let run_contract = contract::build_contract(contract::ContractInputs {
+    #[cfg_attr(not(feature = "http-fetch"), allow(unused_mut))]
+    let mut run_contract = contract::build_contract(contract::ContractInputs {
         manifest: &manifest,
         dir,
         db_path: &db_path,
@@ -1121,6 +1122,16 @@ pub fn run_with_publish(
         (Ok(()), Err(e)) => {
             // The run recorded `success` before the upload; the exit code is an error.
             let _ = state.finish_run(&run_id, executed, "error", total_retries);
+            // The record on disk says the same, so history, the record and the exit
+            // code agree.
+            run_contract.run.outcome = "error".to_string();
+            if let Err(w) = contract::write_contract(&runs_dir, &run_id, &run_contract) {
+                eprintln!(
+                    "{} could not rewrite run contract: {}",
+                    "warning:".yellow(),
+                    w
+                );
+            }
             Err(e)
         }
         (Err(e), Err(upload)) => {
