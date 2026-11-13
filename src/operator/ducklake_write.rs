@@ -732,11 +732,14 @@ impl Job<'_> {
         let record_url = format!("{}{record_key}", self.cfg.public_base);
         let work = Work::new()?;
         let mut on_landed = |outcome: &CommitOutcome| {
-            crate::lake::queue_run_record_upload(
-                Arc::clone(&store),
-                record_key.clone(),
-                outcome.snapshot_id,
-            );
+            // An unchanged publish committed nothing, so no snapshot names a record.
+            if outcome.committed {
+                crate::lake::queue_run_record_upload(
+                    Arc::clone(&store),
+                    record_key.clone(),
+                    outcome.snapshot_id,
+                );
+            }
         };
         let published = publish_with_landing(
             store.as_ref(),
@@ -1101,7 +1104,6 @@ credential:
             write_path: format!("{}/lake/", root.display()),
             pinned_prefix: Some(pinned_prefix(&cfg.catalog)),
         };
-        drop(crate::lake::take_run_record_uploads());
         let report = job.publish_live(Arc::clone(&store), &lake, None).unwrap();
         assert_eq!(
             report.run_record.as_deref(),
@@ -1400,7 +1402,6 @@ credential:
             write_path: format!("{}/lake/", root.display()),
             pinned_prefix: Some(pinned_prefix(&cfg.catalog)),
         };
-        drop(crate::lake::take_run_record_uploads());
         let e = job
             .publish_live(Arc::clone(&store), &lake, None)
             .err()
@@ -1618,10 +1619,45 @@ credential:
             let report = job
                 .publish_live(Arc::clone(&store) as Arc<dyn ObjectStore>, &lake, None)
                 .unwrap();
-            drop(crate::lake::take_run_record_uploads());
             assert_eq!(report.manifest_written, Some(run == "run-1"), "{run}");
             // The attempt's own fetch, and none after the catalogue lands.
             assert_eq!(store.gets(&cfg.catalog), 1, "{run}");
+        }
+    }
+
+    /// Only a publish that committed a snapshot owes a run record: an unchanged
+    /// re-run queues nothing, since no snapshot or manifest entry would name it.
+    #[test]
+    fn an_unchanged_live_publish_queues_no_run_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        write_codes(p);
+        let yaml = BASE.replace(
+            "files:\n  - from: build/search/\n    to: demo/search/\n",
+            "",
+        );
+        let cfg = DucklakeWriteConfig::parse(&with(&yaml)).unwrap();
+        let root = p.join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        let lake = Lake {
+            catalog_key: cfg.catalog.clone(),
+            data_path: format!("{}/lake/", root.display()),
+            data_prefix: "lake/".into(),
+            write_path: format!("{}/lake/", root.display()),
+            pinned_prefix: Some(pinned_prefix(&cfg.catalog)),
+        };
+        let store: Arc<dyn ObjectStore> = Arc::new(DirStore::new(&root));
+        for (run, committed) in [("run-1", true), ("run-2", false)] {
+            let job = Job {
+                cfg: &cfg,
+                dir: p,
+                prepared: cfg.tables.iter().map(|t| prepare(p, t).unwrap()).collect(),
+                run_id: Some(run.into()),
+            };
+            let report = job.publish_live(Arc::clone(&store), &lake, None).unwrap();
+            assert_eq!(report.committed, committed, "{run}");
+            let queued = crate::lake::take_run_record_uploads();
+            assert_eq!(queued.len(), usize::from(committed), "{run}");
         }
     }
 
@@ -1667,9 +1703,7 @@ credential:
                 prepared: vec![prepare(p, &cfg.tables[0]).unwrap()],
                 run_id: Some(run.into()),
             };
-            let report = job.publish_live(Arc::clone(&store), &lake, None).unwrap();
-            drop(crate::lake::take_run_record_uploads());
-            report
+            job.publish_live(Arc::clone(&store), &lake, None).unwrap()
         };
         assert!(publish(&a_cfg, "run-1").committed);
         assert!(publish(&b_cfg, "run-2").committed);

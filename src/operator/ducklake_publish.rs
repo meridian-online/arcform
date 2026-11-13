@@ -47,6 +47,7 @@
 //! production: this operator publishes whenever it runs.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -150,6 +151,20 @@ fn has_scheme(s: &str) -> bool {
 
 /// A location from the manifest: a relative path resolves against the manifest
 /// directory; an absolute path, a URL or a connection string passes through.
+/// A variable's value from the dotenv files, where an empty entry defers to the
+/// process environment as `ducklake_write` does.
+fn lookup_var(
+    dotenv: &HashMap<String, String>,
+    var: &str,
+    process_env: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    dotenv
+        .get(var)
+        .cloned()
+        .filter(|v| !v.is_empty())
+        .or_else(|| process_env(var))
+}
+
 fn resolve_location(dir: &Path, location: &str) -> String {
     if has_scheme(location) || Path::new(location).is_absolute() {
         location.to_string()
@@ -530,12 +545,7 @@ impl Operator for DucklakePublish {
                 let values = credential
                     // The manifest's dotenv files, then the process environment;
                     // never the run's own `ARC_*` variables in `ctx.env`.
-                    .resolve(|var| {
-                        ctx.dotenv
-                            .get(var)
-                            .cloned()
-                            .or_else(|| std::env::var(var).ok())
-                    })
+                    .resolve(|var| lookup_var(ctx.dotenv, var, |v| std::env::var(v).ok()))
                     .map_err(|missing| {
                         failed(format!(
                             "no credential available — `credential.env` names {} but {} unset \
@@ -952,6 +962,15 @@ mod tests {
 
         let report = publish_in(dir.path(), &yaml, &HashMap::new(), &vars).unwrap();
         assert_eq!(report["action"], "registered");
+    }
+
+    #[test]
+    fn an_empty_dotenv_entry_defers_to_the_process_environment() {
+        let dotenv: HashMap<String, String> = [("K".to_string(), String::new())].into();
+        let env = |v: &str| (v == "K").then(|| "from-env".to_string());
+        assert_eq!(lookup_var(&dotenv, "K", env).as_deref(), Some("from-env"));
+        let set: HashMap<String, String> = [("K".to_string(), "dot".to_string())].into();
+        assert_eq!(lookup_var(&set, "K", env).as_deref(), Some("dot"));
     }
 
     #[test]
