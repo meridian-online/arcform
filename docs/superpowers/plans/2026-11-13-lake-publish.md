@@ -50,7 +50,7 @@
   - `pub trait ObjectStore: Send + Sync { fn get(&self, key: &str) -> Result<Option<(Vec<u8>, ETag)>, StoreError>; fn put(&self, key: &str, bytes: &[u8], cond: PutCondition, cache_control: Option<&str>) -> Result<ETag, StoreError>; fn put_file(&self, key: &str, path: &Path, cond: PutCondition, cache_control: Option<&str>) -> Result<ETag, StoreError>; }`
   - `pub struct DirStore { root: PathBuf }` (`DirStore::new(root)`): keys are paths under `root`; the ETag is the SHA-256 of the bytes; `IfMatch` and `IfAbsent` are checked and the write is made atomic with a lock file plus rename, so two threads racing on one key give exactly one winner.
   - `pub struct S3Store` (`S3Store::r2(account_id, bucket, key_id, secret)`, `S3Store::new(endpoint_url, bucket, region, key_id, secret)`): signs requests with `rusty-s3`, sends them with `ureq`. `IfMatch` sends `If-Match`, `IfAbsent` sends `If-None-Match: *`, both as signed headers. 412 maps to `PreconditionFailed`, 429 to `Throttled`, 404 on get to `Ok(None)`.
-  - `pub struct PublicHttpStore { base_url }`: read-only `get` over plain https (no credentials), `put` returns `StoreError::Other("read-only")`. Used to copy the live catalogue for a local run.
+  - `pub struct PublicHttpStore { base_url }`: read-only `get` over plain https (no credentials), `put` returns `StoreError::Other("read-only")`. Used by `arc lake rebase` (Task 7) to read a catalogue given by URL.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -152,8 +152,8 @@
 - Produces:
   - `pub struct Lake { pub catalog_key: String /* e.g. catalog/open.ducklake */, pub data_path: String /* persisted https data path, e.g. https://openlake.meridian.online/lake/ */, pub data_prefix: String /* store key prefix matching data_path, e.g. lake/ */, pub pinned_prefix: String /* e.g. catalog/open- */ }`
   - `pub struct ExtraFile { pub from: PathBuf, pub to: String /* key, or key prefix ending in / for a directory */ }`
-  - `pub struct Published { pub outcome: CommitOutcome, pub uploaded: Vec<UploadedObject /* key, bytes, sha256 */>, pub pinned_catalog: Option<String>, pub attempts: u32 }`
-  - `pub fn publish(store: &dyn ObjectStore, lake: &Lake, work: &Path, tables: &[TableInput], readable: &[(PathBuf, String)] /* file, key */, extra: &[ExtraFile], commit_info: &serde_json::Value, max_attempts: u32) -> Result<Published>`: each attempt: `get(catalog_key)` (absent → new catalogue), write it to `work/catalog.ducklake`, empty `work/staging`, `commit`, then if `committed`: `put_file` each of `new_files` under `data_prefix` with `IfAbsent`, `put` the catalogue at `pinned_prefix + <first 16 hex of its SHA-256> + ".ducklake"` with `IfAbsent` and `Cache-Control: public, max-age=31536000, immutable`, then at `catalog_key` with `IfMatch(fetched etag)` or `IfAbsent` when it was new, `Cache-Control: public, max-age=60`; on `PreconditionFailed` or `Throttled` from that final write, sleep `250ms * attempt` and start again, and after `max_attempts` fail naming the catalogue key and the attempt count. If not `committed`: `get` the catalogue again and start again if its ETag moved; otherwise `put` the fetched catalogue's pinned copy with `IfAbsent` (a no-op when present). Only after that, `put_file` each readable copy and extra file with `Any`. `Published.pinned_catalog` is always set.
+  - `pub struct Published { pub outcome: CommitOutcome, pub uploaded: Vec<UploadedObject /* key, bytes, sha256 */>, pub superseded: Vec<String>, pub pinned_catalog: Option<String>, pub catalog_etag: ETag, pub attempts: u32 }`
+  - `pub fn publish(store: &dyn ObjectStore, lake: &Lake, work: &Path, tables: &[TableInput], readable: &[(PathBuf, String)] /* file, key */, extra: &[ExtraFile], commit_info: &serde_json::Value, max_attempts: u32) -> Result<Published>`: each attempt: `get(catalog_key)` (absent → new catalogue), write it to `work/catalog.ducklake`, empty `work/staging`, `commit`, then if `committed`: `put_file` each of `new_files` under `data_prefix` with `IfAbsent`, `put` the catalogue at `pinned_prefix + <first 16 hex of its SHA-256> + ".ducklake"` with `IfAbsent` and `Cache-Control: public, max-age=31536000, immutable`, then at `catalog_key` with `IfMatch(fetched etag)` or `IfAbsent` when it was new, `Cache-Control: public, max-age=60`; on `PreconditionFailed` or `Throttled` from that final write, sleep `250ms * attempt` and start again, and after `max_attempts` fail naming the catalogue key and the attempt count. If not `committed`: `get` the catalogue again and start again if its ETag moved; otherwise `put` the fetched catalogue's pinned copy with `IfAbsent` (a no-op when present). Only after that, for each readable copy and extra file: `get` the catalogue and, if its ETag is still the one this attempt wrote or verified, `put_file` it with `Any`; if it moved, skip it and record the key in `Published.superseded` (a newer publish owns it). This narrows the window in which two successful publishes can leave the stable copy behind the newest snapshot to the time between that check and the write; the next publish repairs it either way. `Published.pinned_catalog` is always set.
 
 - [ ] **Step 1: Write the failing tests**
   - `a_publish_is_readable_over_http`: publish two tables into a `DirStore`; attach `ducklake:http://127.0.0.1:<port>/catalog/open.ducklake` READ_ONLY with `data_path` set to `http://127.0.0.1:<port>/lake/`; both tables read their rows; `meta.descriptors` has two rows.
@@ -161,6 +161,7 @@
   - `an_unchanged_publish_writes_no_catalogue`: catalogue ETag unchanged, no pinned copy added.
   - `a_lost_race_retries_and_both_publishes_land`: two threads publish different tables into one store; both succeed, one with `attempts >= 2`; the final catalogue holds both tables.
   - `a_refused_upload_leaves_the_live_lake_as_it_was`: a store wrapper that fails `put_file` for data files → `publish` errs; the catalogue object, its ETag and the readable copy's bytes are unchanged (Review Focus 1).
+  - `a_superseded_publish_does_not_overwrite_the_readable_copy`: a store wrapper that, just before this publish's readable upload, lets a second publish of the same table land → this publish reports the key in `superseded`, and the stable copy holds the second publish's bytes.
   - `a_publish_that_loses_every_race_leaves_the_readable_copy_alone`: a store wrapper that always answers `PreconditionFailed` on the catalogue write → `publish` errs after `max_attempts`; the readable copy's bytes are unchanged.
   - `the_pinned_copy_is_byte_identical_to_the_catalogue`.
   - `extra_files_upload_under_their_prefix`: a directory `from` uploads each file under `to`.
@@ -169,7 +170,7 @@
 
 - [ ] **Step 3: Implement `publish`.**
 
-- [ ] **Step 4: Run them and see them pass**: `cargo test --lib lake::publish` → 8 passed.
+- [ ] **Step 4: Run them and see them pass**: `cargo test --lib lake::publish` → 9 passed.
 
 - [ ] **Step 5: Commit** `Publish a lake's catalogue last, with a conditional write and retry`
 
@@ -183,7 +184,7 @@
 - Consumes: `ObjectStore`, `PutCondition` (Task 1); `Published` (Task 4).
 - Produces:
   - `pub struct ManifestEntry { pub address: String /* namespace/name */, pub url: String, pub rows: u64, pub bytes: u64, pub sha256: String, pub published: String /* RFC 3339 commit time */, pub run: serde_json::Value /* {"id","record"} */, pub extra: serde_json::Map<String, serde_json::Value> }`
-  - `pub fn update_manifest(store: &dyn ObjectStore, key: &str, entries: &[ManifestEntry], pinned_catalog: Option<&str>, max_attempts: u32) -> Result<bool /* written */>`: get the manifest (absent → `{"datasets":{}}`; present but not JSON, or without a `datasets` object → error, never start from empty); set each entry under `datasets[address]`, keeping keys it doesn't set; set top-level `catalog.url` when `pinned_catalog` is given; write only if the result differs, with `IfMatch`, retrying on `PreconditionFailed`/`Throttled` like Task 4.
+  - `pub fn update_manifest(store: &dyn ObjectStore, key: &str, entries: &[ManifestEntry], pinned_catalog: Option<&str>, max_attempts: u32) -> Result<bool /* written */>`: get the manifest (absent → `{"datasets":{}}`; present but not JSON, or without a `datasets` object → error, never start from empty); set each entry under `datasets[address]`, keeping keys it doesn't set; set top-level `catalog.url` when `pinned_catalog` is given; write only if the result differs, with `IfMatch`, retrying on `PreconditionFailed`/`Throttled` like Task 4. Called with `Published.catalog_etag`: before writing, `get` the catalogue and skip the manifest update (returning `false`) if its ETag moved, since a newer publish owns the entries.
 
 - [ ] **Step 1: Write the failing tests**
   - `an_entry_is_written_and_other_entries_are_kept`.
@@ -195,7 +196,7 @@
 
 - [ ] **Step 3: Implement `update_manifest`.**
 
-- [ ] **Step 4: Run them and see them pass**: `cargo test --lib lake::manifest && cargo test --lib lake::publish` → 3 and 9 passed.
+- [ ] **Step 4: Run them and see them pass**: `cargo test --lib lake::manifest && cargo test --lib lake::publish` → 3 and 10 passed.
 
 - [ ] **Step 5: Commit** `Keep a compatible manifest.json while its readers move to the catalogue`
 
@@ -211,14 +212,14 @@
 - Produces:
   - Config, `deny_unknown_fields`: `public_base: String` (the bucket's public https base, e.g. `https://openlake.meridian.online/`), `catalog: String` (the catalogue's key, e.g. `catalog/open.ducklake`), `data_path: String` (the data prefix key, e.g. `lake/`; the persisted data path is `public_base + data_path`), `local_catalog: String` (relative to the Protocol), `tables: Vec<{ table, from, key: Option<Vec<String>>, descriptor, readable_copy: Option<String>, on_schema_change: Option<"fail"|"replace">, manifest_extra: Option<Map> }>`, `files: Vec<{ from, to }>`, `manifest: Option<String>` (store key, e.g. `manifest.json`), `credential: { type: "r2"|"s3", env: { key_id, secret, account_id } (r2) or { key_id, secret, endpoint, region } (s3), bucket: String }`. `Lake.pinned_prefix` is `catalog` with `.ducklake` replaced by `-`. Refuse a `public_base` that does not end in `/` or is not https (plain http is allowed only for `127.0.0.1` and `localhost`, for tests), and a `catalog` or `data_path` that is absolute or contains `..`.
   - `assets`: reads every `from`, `descriptor` and `files[].from`.
-  - `run`: resolve each credential variable from `ctx.env` then the process environment. All set → live: `S3Store`, `publish`, then `update_manifest` if `manifest` is set, then register the run record upload. Any unset → if `ctx.env["ARC_PUBLISH"] == "required"`, fail naming the unset variables (names only); else local: `publish` into a `DirStore` rooted at `<local_catalog>`'s folder, with a local `Lake` whose `catalog_key` is `<local_catalog>`'s file name, `data_prefix` `<that name>.files/`, and persisted `data_path` the absolute path of that folder plus `/`, so the local lake reads back from disk; print `ducklake_write: published locally to <local_catalog>; the live lake needs <VARS> set`. The live catalogue is not fetched. The step succeeds in both cases.
+  - `run`: resolve each credential variable from `ctx.env` then the process environment. All set → live: `S3Store`, `publish`, then `update_manifest` if `manifest` is set, then register the run record upload. Any unset → if `ctx.env["ARC_PUBLISH"] == "required"`, fail naming the unset variables (names only); else local: `publish` into a `DirStore` rooted at `<local_catalog>`'s folder, with a local `Lake` whose `catalog_key` is `<local_catalog>`'s file name, `data_prefix` `<that name>.files/`, persisted `data_path` the absolute path of `<local_catalog>`'s folder joined with `data_prefix` (so `…/build/lake/open.ducklake.files/`), and `pinned_prefix` `<name stem>-` (local runs write pinned copies too, harmlessly), so the local lake reads back from disk; print `ducklake_write: published locally to <local_catalog>; the live lake needs <VARS> set`. The live catalogue is not fetched. The step succeeds in both cases.
   - Report: `{ "target": "live"|"local", "snapshot_id", "committed", "attempts", "tables": [TableChange…], "uploaded": [{key, bytes, sha256}], "pinned_catalog", "run_record": "runs/<run_id>.json" (live only), "missing_credential": [names] (local only) }`.
   - Commit info stamped on the snapshot: `{ "op": "ducklake_write", "run_id", "run_record": "<public base>/runs/<run_id>.json", "tables": [{table, rows}] }`.
   - `pub(crate) fn queue_run_record_upload(store: Arc<dyn ObjectStore>, key: String)` and `pub(crate) fn take_run_record_uploads() -> Vec<(Arc<dyn ObjectStore>, String)>` in `src/lake/mod.rs`, a process-wide `Mutex<Vec<…>>`. The runner, after `write_contract`, uploads `<runs_dir>/<run_id>.json` to each queued key with `PutCondition::IfAbsent`; a failure prints the error naming the key and the committed snapshot and makes `arc run` exit non-zero.
 
 - [ ] **Step 1: Write the failing tests**
   - Unit: `config_refuses_an_unsafe_key_or_base`; `config_refuses_the_meta_schema`; `assets_read_every_input`.
-  - Integration (`tests/ducklake_write.rs`), with a local static server standing in for the public catalogue URL and no credential set:
+  - Integration (`tests/ducklake_write.rs`), with no credential set unless a test says otherwise:
     - `without_a_credential_the_run_publishes_locally_and_is_green`: exit 0; report `target == "local"`, `missing_credential` lists the variable names; the local catalogue holds the tables.
     - `with_publish_a_missing_credential_fails_the_step`: `arc run --publish` exits non-zero; stderr names the variables and contains no value.
     - `a_local_lake_reads_back`: a fixture table of 50 rows (above DuckLake's inlining limit, so it is written to a data file), published locally twice with a change between; attaching `<local_catalog>` read-only returns the second run's rows, and time travel to the first snapshot the first run's.

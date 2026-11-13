@@ -76,7 +76,7 @@ The catalogue's persisted data path is the https address readers use. DuckLake r
    If nothing changed (no rows, no descriptor, no comment), the transaction makes no write, DuckDB commits no snapshot, and the step reports `unchanged` with the current snapshot. Nothing run-specific is written into a table, so a rebuild of the same data by a new run is still unchanged.
 5. **Upload the new data and delete files** this snapshot added, from staging to the lake prefix. Uploading before the catalogue is safe because nothing references a file until the catalogue does.
 6. **Upload the catalogue conditionally**, only if its ETag is still the one fetched in step 2. If another publish won, discard the local commit, go back to step 2, and redo the transaction. Data files already uploaded are not lost: any the retry does not reference are orphans that DuckLake's cleanup can remove. Retry a bounded number of times, then fail, naming the conflict. When nothing was committed, instead re-read the catalogue's ETag and go back to step 2 if it moved.
-7. **Upload the readable copy** of each table (the Protocol's stamped Parquet, byte for byte) and any extra files, only now that the catalogue holds this snapshot. Readers fetch these at fixed addresses, so they are never written before the commit lands: a failed or lost publish leaves them as they were.
+7. **Upload the readable copy** of each table (the Protocol's stamped Parquet, byte for byte) and any extra files, only now that the catalogue holds this snapshot. Readers fetch these at fixed addresses, so they are never written before the commit lands: a failed or lost publish leaves them as they were. Each is written only if the catalogue still holds this publish's snapshot when it is checked, so a newer publish's copy is never overwritten by an older one; the remaining window between that check and the write is closed by the next publish.
 8. **Report** each table's action (`registered`, `unchanged`), snapshot id, row counts by change type, and the uploaded objects with their sizes and SHA-256, in the step's report in the run record.
 
 ### Upsert, not MERGE
@@ -102,7 +102,9 @@ The manifest declares, under the step's `credential:`, the secret type (`r2` or 
 - name: publish
   op: ducklake_write@1
   with:
-    catalog: https://openlake.meridian.online/catalog/open.ducklake
+    public_base: https://openlake.meridian.online/
+    catalog: catalog/open.ducklake                 # a key under public_base
+    data_path: lake/                               # persisted data path is public_base + data_path
     local_catalog: build/lake/open.ducklake      # the fallback catalogue; its data goes in build/lake/open.ducklake.files/
     tables:
       - table: bls.soc_2018
@@ -115,6 +117,7 @@ The manifest declares, under the step's `credential:`, the secret type (`r2` or 
         to: gleif/lei/
     credential:
       type: r2
+      bucket: meridian-open
       env: { key_id: R2_ACCESS_KEY_ID, secret: R2_SECRET_ACCESS_KEY, account_id: R2_ACCOUNT_ID }
 ```
 
