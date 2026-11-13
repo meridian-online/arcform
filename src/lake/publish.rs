@@ -489,6 +489,39 @@ pub fn publish(
     commit_info: &serde_json::Value,
     max_attempts: u32,
 ) -> Result<Published> {
+    publish_with_landing(
+        store,
+        lake,
+        secret_sql,
+        work,
+        tables,
+        readable,
+        extra,
+        commit_info,
+        max_attempts,
+        &mut |_| {},
+    )
+}
+
+/// [`publish`], calling `on_landed` with the commit's outcome as soon as the
+/// catalogue holds it, before the uploads after it: whatever fails later, the
+/// snapshot is in the lake, and the caller may owe something it names.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the publish signature the step calls"
+)]
+pub fn publish_with_landing(
+    store: &dyn ObjectStore,
+    lake: &Lake,
+    secret_sql: Option<&str>,
+    work: &Path,
+    tables: &[TableInput],
+    readable: &[(PathBuf, String)],
+    extra: &[ExtraFile],
+    commit_info: &serde_json::Value,
+    max_attempts: u32,
+    on_landed: &mut dyn FnMut(&CommitOutcome),
+) -> Result<Published> {
     fs::create_dir_all(work).map_err(io_failed(work))?;
     let max_attempts = max_attempts.max(1);
     let mut attempts = 0;
@@ -513,6 +546,7 @@ pub fn publish(
         }
         std::thread::sleep(Duration::from_millis(250 * u64::from(attempts)));
     };
+    on_landed(&landed.outcome);
 
     let every_table: Vec<&str> = tables.iter().map(|t| t.table.as_str()).collect();
     let mut files: Vec<(PathBuf, String, Vec<&str>)> = Vec::new();

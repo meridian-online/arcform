@@ -649,6 +649,7 @@ mod tests {
             dir,
             db_path: dir,
             env,
+            dotenv: crate::operator::no_dotenv(),
             timeout: None,
             cache: None,
         };

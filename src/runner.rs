@@ -711,15 +711,14 @@ pub fn run_with_publish(
                 } else if let Some(ref op_ref) = step.op {
                     match operator::resolve(op_ref) {
                         Ok(op) => {
-                            // An operator reads its credentials from the step's
-                            // environment, which includes the manifest's dotenv files:
-                            // their variables sit under the run's own, which win.
-                            let mut op_env = dotenv_vars.clone();
-                            op_env.extend(env_map.iter().map(|(k, v)| (k.clone(), v.clone())));
+                            // The dotenv variables ride separately, for an operator
+                            // that asks for a credential by name; `env` is the run's
+                            // own, and is all a spawned process inherits.
                             let ctx = operator::OpContext {
                                 dir,
                                 db_path: db_path.as_path(),
-                                env: &op_env,
+                                env: &env_map,
+                                dotenv: &dotenv_vars,
                                 timeout: step_timeout,
                                 cache: fetch_cache.as_ref(),
                             };
@@ -1111,7 +1110,12 @@ pub fn run_with_publish(
     #[cfg(feature = "http-fetch")]
     let step_loop_result = match (
         step_loop_result,
-        upload_run_records(&runs_dir, &run_id, crate::lake::take_run_record_uploads()),
+        upload_run_records(
+            dir,
+            &runs_dir,
+            &run_id,
+            crate::lake::take_run_record_uploads(),
+        ),
     ) {
         (result, Ok(())) => result,
         (Ok(()), Err(e)) => Err(e),
@@ -1141,28 +1145,42 @@ pub fn run_with_publish(
     }
 }
 
-/// Upload `<runs_dir>/<run_id>.json` to each key in `uploads`, only where no object
-/// is there yet. Every upload is tried; the first failure is returned, and any other
-/// printed.
+/// Upload `<runs_dir>/<run_id>.json`, as [`public_record`] gives it, to each key in
+/// `uploads`, only where no object is there yet, or where the object already holds
+/// these bytes (two publish steps in one run queue the same key). Every upload is
+/// tried; the first failure is returned, and any other printed.
 #[cfg(feature = "http-fetch")]
 fn upload_run_records(
+    dir: &Path,
     runs_dir: &Path,
     run_id: &str,
     uploads: Vec<crate::lake::RunRecordUpload>,
 ) -> Result<()> {
-    let record = runs_dir.join(format!("{run_id}.json"));
+    use crate::lake::store::{PutCondition, StoreError};
+
+    if uploads.is_empty() {
+        return Ok(());
+    }
+    let path = runs_dir.join(format!("{run_id}.json"));
+    let record = std::fs::read(&path)
+        .map_err(|e| format!("read {}: {e}", path.display()))
+        .and_then(|bytes| public_record(&bytes, dir));
     let mut first = None;
     for upload in uploads {
-        let result = upload
-            .store
-            .put_file(
-                &upload.key,
-                &record,
-                crate::lake::store::PutCondition::IfAbsent,
-                None,
-            )
-            .map(|_| ())
-            .map_err(|e| e.to_string());
+        let result = record.clone().and_then(|bytes| {
+            match upload
+                .store
+                .put(&upload.key, &bytes, PutCondition::IfAbsent, None)
+            {
+                Ok(_) => Ok(()),
+                Err(StoreError::PreconditionFailed) => match upload.store.get(&upload.key) {
+                    Ok(Some((there, _))) if there == bytes => Ok(()),
+                    Ok(_) => Err("a different record is already there".to_string()),
+                    Err(e) => Err(e.to_string()),
+                },
+                Err(e) => Err(e.to_string()),
+            }
+        });
         if let Err(reason) = result {
             let e = Error::RunRecordUpload {
                 key: upload.key,
@@ -1177,6 +1195,78 @@ fn upload_run_records(
         }
     }
     first.map_or(Ok(()), Err)
+}
+
+/// The run record as it is published beside a snapshot, in a public bucket: the
+/// Protocol directory, which the record names absolutely, rewritten to `.` in every
+/// key and string, and refused outright if any string still starts with the home
+/// directory. The record on disk keeps its paths.
+#[cfg(feature = "http-fetch")]
+fn public_record(bytes: &[u8], dir: &Path) -> std::result::Result<Vec<u8>, String> {
+    fn rewrite(s: &str, prefixes: &[String]) -> String {
+        let mut out = s.to_string();
+        for prefix in prefixes {
+            if out == *prefix {
+                return ".".to_string();
+            }
+            out = out.replace(&format!("{prefix}/"), "./");
+        }
+        out
+    }
+    fn walk(
+        value: &mut serde_json::Value,
+        prefixes: &[String],
+        home: Option<&str>,
+        leaked: &mut bool,
+    ) {
+        use serde_json::Value;
+        let under_home = |s: &str| home.is_some_and(|h| s == h || s.starts_with(&format!("{h}/")));
+        match value {
+            Value::String(s) => {
+                *s = rewrite(s, prefixes);
+                *leaked |= under_home(s);
+            }
+            Value::Array(items) => {
+                for item in items {
+                    walk(item, prefixes, home, leaked);
+                }
+            }
+            Value::Object(map) => {
+                let entries = std::mem::take(map);
+                for (key, mut item) in entries {
+                    let key = rewrite(&key, prefixes);
+                    *leaked |= under_home(&key);
+                    walk(&mut item, prefixes, home, leaked);
+                    map.insert(key, item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut record: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| format!("the record is not JSON: {e}"))?;
+    let mut prefixes = vec![dir.display().to_string()];
+    if let Ok(canonical) = dir.canonicalize() {
+        prefixes.push(canonical.display().to_string());
+    }
+    prefixes.retain(|p| p.len() > 1);
+    prefixes.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    prefixes.dedup();
+    let home = std::env::var("HOME")
+        .ok()
+        .map(|h| h.trim_end_matches('/').to_string())
+        .filter(|h| !h.is_empty());
+    let mut leaked = false;
+    walk(&mut record, &prefixes, home.as_deref(), &mut leaked);
+    if leaked {
+        return Err(
+            "the record names a path under the home directory, and the bucket is public; \
+             not uploading it"
+                .to_string(),
+        );
+    }
+    serde_json::to_vec_pretty(&record).map_err(|e| e.to_string())
 }
 
 /// The staleness verdict for a run: which steps must execute, and — for each step that
@@ -1262,6 +1352,17 @@ fn compute_staleness(
         // function is arranged around — a step kind exempt from the hash is a step
         // that can certify work it did not do.
         if step.command.is_some() && step.preconditions.is_empty() {
+            stale.insert(step.name.clone());
+            continue;
+        }
+        // An operator whose effect is outside the Protocol, such as a publish into a
+        // lake, runs on every run: whether it may skip depends on where it went last
+        // time and on the run's own flags, which no hash of its inputs records.
+        if step
+            .op
+            .as_deref()
+            .is_some_and(|op| operator::resolve(op).is_ok_and(|o| o.always_runs()))
+        {
             stale.insert(step.name.clone());
             continue;
         }
@@ -2018,21 +2119,31 @@ mod run_record_upload_tests {
         std::fs::write(runs.join("r1.json"), b"{\"run\":1}").unwrap();
         let store = Arc::new(DirStore::new(dir.path().join("store")));
 
-        upload_run_records(&runs, "r1", vec![upload(&store, "runs/r1.json")]).unwrap();
-        assert_eq!(
-            store.get("runs/r1.json").unwrap().unwrap().0,
-            b"{\"run\":1}"
-        );
+        upload_run_records(
+            dir.path(),
+            &runs,
+            "r1",
+            vec![upload(&store, "runs/r1.json")],
+        )
+        .unwrap();
+        let uploaded: serde_json::Value =
+            serde_json::from_slice(&store.get("runs/r1.json").unwrap().unwrap().0).unwrap();
+        assert_eq!(uploaded, serde_json::json!({"run": 1}));
 
-        // A record is never overwritten: a second upload to the same key is refused,
-        // and the run is told which key and which committed snapshot.
+        // A different record is never overwritten: the run is told which key and
+        // which committed snapshot.
         store
             .put("runs/r2.json", b"other", PutCondition::Any, None)
             .unwrap();
         std::fs::write(runs.join("r2.json"), b"{}").unwrap();
-        let e = upload_run_records(&runs, "r2", vec![upload(&store, "runs/r2.json")])
-            .unwrap_err()
-            .to_string();
+        let e = upload_run_records(
+            dir.path(),
+            &runs,
+            "r2",
+            vec![upload(&store, "runs/r2.json")],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             e.contains("`runs/r2.json`") && e.contains("snapshot 7"),
             "{e}"
@@ -2040,7 +2151,81 @@ mod run_record_upload_tests {
         assert_eq!(store.get("runs/r2.json").unwrap().unwrap().0, b"other");
 
         // Nothing queued: nothing to do.
-        upload_run_records(&runs, "r3", Vec::new()).unwrap();
+        upload_run_records(dir.path(), &runs, "r3", Vec::new()).unwrap();
+    }
+
+    /// Two publish steps in one run queue the same record: the second finds this
+    /// run's bytes already there, and the run succeeds.
+    #[test]
+    fn two_publishes_in_one_run_upload_its_record_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(runs.join("r1.json"), b"{\"run\":1}").unwrap();
+        let store = Arc::new(DirStore::new(dir.path().join("store")));
+        upload_run_records(
+            dir.path(),
+            &runs,
+            "r1",
+            vec![
+                upload(&store, "runs/r1.json"),
+                upload(&store, "runs/r1.json"),
+            ],
+        )
+        .unwrap();
+        // A later run of the same id (a retry) also finds it in place.
+        upload_run_records(
+            dir.path(),
+            &runs,
+            "r1",
+            vec![upload(&store, "runs/r1.json")],
+        )
+        .unwrap();
+    }
+
+    /// The bucket is public: the uploaded record names neither the Protocol's
+    /// directory nor the home directory, and the record on disk is left as it was.
+    #[test]
+    fn the_uploaded_record_names_no_local_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let protocol = dir.path().join("protocol");
+        let runs = protocol.join("build/.arcform/runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        let shown = protocol.display().to_string();
+        let record = serde_json::json!({
+            "protocol": { "dir": shown },
+            "steps": [{ "report": { "local": format!("{shown}/build/lake/x.ducklake") } }],
+            "assets": { format!("{shown}/data/x.parquet"): 1 },
+        });
+        let bytes = serde_json::to_vec(&record).unwrap();
+        std::fs::write(runs.join("r1.json"), &bytes).unwrap();
+        let store = Arc::new(DirStore::new(dir.path().join("store")));
+        upload_run_records(&protocol, &runs, "r1", vec![upload(&store, "runs/r1.json")]).unwrap();
+
+        let uploaded = String::from_utf8(store.get("runs/r1.json").unwrap().unwrap().0).unwrap();
+        let canonical = protocol.canonicalize().unwrap().display().to_string();
+        assert!(!uploaded.contains(&shown), "{uploaded}");
+        assert!(!uploaded.contains(&canonical), "{uploaded}");
+        let home = std::env::var("HOME").unwrap();
+        assert!(!uploaded.contains(&home), "{uploaded}");
+        let uploaded: serde_json::Value = serde_json::from_str(&uploaded).unwrap();
+        assert_eq!(uploaded["protocol"]["dir"], ".");
+        assert_eq!(
+            uploaded["steps"][0]["report"]["local"],
+            "./build/lake/x.ducklake"
+        );
+        assert!(uploaded["assets"].get("./data/x.parquet").is_some());
+        assert_eq!(std::fs::read(runs.join("r1.json")).unwrap(), bytes);
+
+        // A path under the home directory that is not the Protocol's refuses the
+        // upload rather than publishing it.
+        let leak = serde_json::json!({ "db": format!("{home}/elsewhere/pipeline.db") });
+        std::fs::write(runs.join("r2.json"), serde_json::to_vec(&leak).unwrap()).unwrap();
+        let e = upload_run_records(&protocol, &runs, "r2", vec![upload(&store, "runs/r2.json")])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("home directory"), "{e}");
+        assert!(store.get("runs/r2.json").unwrap().is_none());
     }
 }
 

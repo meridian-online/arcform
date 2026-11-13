@@ -35,10 +35,12 @@ use super::{OpAssets, OpContext, Operator, sql_string_literal};
 use crate::asset_kind::AssetKind;
 use crate::engine::StepOutput;
 use crate::error::{Error, Result};
-use crate::lake::commit::{TableChange, TableInput};
+use crate::lake::commit::{CommitOutcome, TableChange, TableInput};
 use crate::lake::manifest::{ManifestEntry, update_manifest};
 use crate::lake::meta::{META_SCHEMA, table_descriptor};
-use crate::lake::publish::{ExtraFile, Lake, Published, UploadedObject, newer_change, publish};
+use crate::lake::publish::{
+    ExtraFile, Lake, Published, UploadedObject, newer_change, publish, publish_with_landing,
+};
 use crate::lake::store::{DirStore, ObjectStore, S3Store};
 use crate::runner::{PUBLISH_ENV, RUN_ID_ENV};
 
@@ -670,37 +672,55 @@ impl Job<'_> {
 
     /// The live lake, with the resolved credential.
     fn live(&self, credential: &Resolved) -> Result<Report> {
+        let store: Arc<dyn ObjectStore> = Arc::new(credential.store()?);
+        let lake = self.cfg.live_lake(&credential.bucket);
+        self.publish_live(store, &lake, Some(&credential.secret_sql()))
+    }
+
+    /// Publish into `lake` in `store`, then keep the manifest. The run record is
+    /// queued as soon as the catalogue holds the snapshot, since the snapshot names
+    /// it: a failure after that still leaves the record owed.
+    fn publish_live(
+        &self,
+        store: Arc<dyn ObjectStore>,
+        lake: &Lake,
+        secret_sql: Option<&str>,
+    ) -> Result<Report> {
         let run_id = self.run_id.clone().ok_or_else(|| {
             failed(format!(
                 "{RUN_ID_ENV} is not set; a live publish runs inside `arc run`, which names \
                  the run its record is uploaded for"
             ))
         })?;
-        let store: Arc<dyn ObjectStore> = Arc::new(credential.store()?);
-        let lake = self.cfg.live_lake(&credential.bucket);
         let record_key = format!("runs/{run_id}.json");
         let record_url = format!("{}{record_key}", self.cfg.public_base);
         let work = Work::new()?;
-        let secret = credential.secret_sql();
-        let published = self.publish(
+        let mut on_landed = |outcome: &CommitOutcome| {
+            crate::lake::queue_run_record_upload(
+                Arc::clone(&store),
+                record_key.clone(),
+                outcome.snapshot_id,
+            );
+        };
+        let published = publish_with_landing(
             store.as_ref(),
-            &lake,
-            Some(&secret),
+            lake,
+            secret_sql,
             &work.0,
-            Some(record_url),
+            &self.inputs(),
+            &self.readable(),
+            &self.extra(),
+            &self.commit_info(Some(record_url)),
+            MAX_ATTEMPTS,
+            &mut on_landed,
         )?;
         let manifest_written = match &self.cfg.manifest {
             Some(key) => {
-                Some(self.write_manifest(store.as_ref(), &lake, &work.0, &published, key)?)
+                Some(self.write_manifest(store.as_ref(), lake, &work.0, &published, key)?)
             }
             None => None,
         };
-        crate::lake::queue_run_record_upload(
-            Arc::clone(&store),
-            record_key.clone(),
-            published.outcome.snapshot_id,
-        );
-        let mut report = Report::new("live", &lake, published);
+        let mut report = Report::new("live", lake, published);
         report.run_record = Some(record_key);
         report.manifest_written = manifest_written;
         Ok(report)
@@ -806,6 +826,13 @@ impl Operator for DucklakeWrite {
         semver::Version::new(1, 0, 0)
     }
 
+    /// A publish runs every time: a run that published locally is not one that
+    /// published live, `--publish` changes what the step must do, and an unchanged
+    /// publish commits nothing while still repairing a manifest left behind.
+    fn always_runs(&self) -> bool {
+        true
+    }
+
     fn assets(&self, with: &Value) -> Result<OpAssets> {
         let cfg = DucklakeWriteConfig::parse(with)?;
         let mut assets = OpAssets::default();
@@ -826,8 +853,10 @@ impl Operator for DucklakeWrite {
 
     fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
         let cfg = DucklakeWriteConfig::parse(with)?;
+        // The manifest's dotenv files, then the process environment. Never `ctx.env`:
+        // that is the run's own `ARC_*` variables.
         let lookup = |var: &str| {
-            ctx.env
+            ctx.dotenv
                 .get(var)
                 .cloned()
                 .filter(|v| !v.is_empty())
@@ -1021,13 +1050,8 @@ credential:
         );
     }
 
-    /// The live path's own work past `publish`, the manifest and the commit metadata,
-    /// run against a store on disk: `publish` and the store are the lake module's,
-    /// tested there.
-    #[test]
-    fn a_publish_writes_the_manifest_and_its_snapshot_names_the_run() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path();
+    /// Three codes at `data/codes.parquet`, with their descriptor beside them.
+    fn write_codes(p: &Path) {
         std::fs::create_dir_all(p.join("data")).unwrap();
         let conn = duckdb::Connection::open_in_memory().unwrap();
         conn.execute_batch(&format!(
@@ -1040,6 +1064,112 @@ credential:
             r#"{"name":"codes","resources":[{"name":"codes","schema":{"fields":[{"name":"code","type":"string"},{"name":"label","type":"string"}],"primaryKey":["code"]}}]}"#,
         )
         .unwrap();
+    }
+
+    /// A store that refuses every upload of one key, as a dropped connection would.
+    struct RefusingKey {
+        inner: DirStore,
+        key: &'static str,
+    }
+
+    impl ObjectStore for RefusingKey {
+        fn get(
+            &self,
+            key: &str,
+        ) -> std::result::Result<
+            Option<(Vec<u8>, crate::lake::store::ETag)>,
+            crate::lake::store::StoreError,
+        > {
+            self.inner.get(key)
+        }
+        fn etag(
+            &self,
+            key: &str,
+        ) -> std::result::Result<Option<crate::lake::store::ETag>, crate::lake::store::StoreError>
+        {
+            self.inner.etag(key)
+        }
+        fn put(
+            &self,
+            key: &str,
+            bytes: &[u8],
+            cond: crate::lake::store::PutCondition,
+            cache: Option<&str>,
+        ) -> std::result::Result<crate::lake::store::ETag, crate::lake::store::StoreError> {
+            self.inner.put(key, bytes, cond, cache)
+        }
+        fn put_file(
+            &self,
+            key: &str,
+            path: &Path,
+            cond: crate::lake::store::PutCondition,
+            cache: Option<&str>,
+        ) -> std::result::Result<crate::lake::store::ETag, crate::lake::store::StoreError> {
+            if key == self.key {
+                return Err(crate::lake::store::StoreError::Other(
+                    "the connection dropped".into(),
+                ));
+            }
+            self.inner.put_file(key, path, cond, cache)
+        }
+    }
+
+    /// The snapshot names the run's record from the moment the catalogue lands, so a
+    /// failure after that (here, the readable copy's upload) still leaves the record
+    /// queued: the run fails, and its record is uploaded beside the snapshot.
+    #[test]
+    fn a_failure_after_the_catalogue_lands_still_queues_the_run_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        write_codes(p);
+        let yaml = BASE.replace(
+            "files:\n  - from: build/search/\n    to: demo/search/\n",
+            "",
+        );
+        let cfg = DucklakeWriteConfig::parse(&with(&yaml)).unwrap();
+        let job = Job {
+            cfg: &cfg,
+            dir: p,
+            prepared: vec![prepare(p, &cfg.tables[0]).unwrap()],
+            run_id: Some("run-9".into()),
+        };
+        let root = p.join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(RefusingKey {
+            inner: DirStore::new(&root),
+            key: "demo/codes.parquet",
+        });
+        let lake = Lake {
+            catalog_key: cfg.catalog.clone(),
+            data_path: format!("{}/lake/", root.display()),
+            data_prefix: "lake/".into(),
+            write_path: format!("{}/lake/", root.display()),
+            pinned_prefix: pinned_prefix(&cfg.catalog),
+        };
+        drop(crate::lake::take_run_record_uploads());
+        let e = job
+            .publish_live(Arc::clone(&store), &lake, None)
+            .err()
+            .expect("the readable copy's upload fails");
+        assert!(e.to_string().contains("demo/codes.parquet"), "{e}");
+        assert!(
+            store.get(&cfg.catalog).unwrap().is_some(),
+            "the catalogue landed"
+        );
+        let queued = crate::lake::take_run_record_uploads();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].key, "runs/run-9.json");
+        assert_eq!(queued[0].snapshot_id, 1);
+    }
+
+    /// The live path's own work past `publish`, the manifest and the commit metadata,
+    /// run against a store on disk: `publish` and the store are the lake module's,
+    /// tested there.
+    #[test]
+    fn a_publish_writes_the_manifest_and_its_snapshot_names_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        write_codes(p);
         let yaml = BASE
             .replace(
                 "files:\n  - from: build/search/\n    to: demo/search/\n",
@@ -1154,11 +1284,15 @@ credential:
         let dir = tempfile::tempdir().unwrap();
         let mut env = HashMap::new();
         env.insert(PUBLISH_ENV.to_string(), "required".to_string());
-        env.insert("A".to_string(), "account-value".to_string());
+        let mut dotenv = HashMap::new();
+        dotenv.insert("A".to_string(), "account-value".to_string());
+        // A dotenv file cannot make the publish required, nor stand in for arc's flag.
+        dotenv.insert(PUBLISH_ENV.to_string(), "optional".to_string());
         let ctx = OpContext {
             dir: dir.path(),
             db_path: dir.path(),
             env: &env,
+            dotenv: &dotenv,
             timeout: None,
             cache: None,
         };

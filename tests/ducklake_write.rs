@@ -335,3 +335,25 @@ fn the_report_and_logs_never_contain_a_credential_value() {
         "a live run never writes the local lake"
     );
 }
+
+#[test]
+fn publish_after_a_local_run_still_requires_the_credential() {
+    let dir = project(5, "first");
+    let p = dir.path();
+    let (code, stdout, stderr) = arc(p, &[], &[]);
+    assert_eq!(code, Some(0), "arc run failed:\n{stdout}\n{stderr}");
+
+    // Nothing changed since, but the local publish is not the live one: the step runs
+    // again, and without the credential a required publish fails.
+    let (code, stdout, stderr) = arc(p, &["--publish"], &[]);
+    assert_ne!(
+        code,
+        Some(0),
+        "a required publish after a local one must not pass as fresh:\n{stdout}\n{stderr}"
+    );
+    assert_eq!(step_outcome(&stdout, "publish"), "ran");
+    assert!(
+        stderr.contains("ARC_TEST_LAKE_KEY_ID") && stderr.contains("ARC_TEST_LAKE_SECRET"),
+        "{stderr}"
+    );
+}

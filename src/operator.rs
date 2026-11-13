@@ -80,8 +80,13 @@ pub struct OpContext<'a> {
     pub dir: &'a Path,
     /// The pipeline's DuckDB file — operators that touch tables open this.
     pub db_path: &'a Path,
-    /// `ARC_PARAM_*` environment for the step, passed through to subprocess operators.
+    /// The run's own variables for the step (`ARC_PARAM_*`, `ARC_DB_PATH`,
+    /// `ARC_RUN_ID`, `ARC_PUBLISH`), passed through to subprocess operators.
     pub env: &'a HashMap<String, String>,
+    /// The variables of the manifest's `dotenv:` files. Not passed to any subprocess:
+    /// an operator that reads a credential looks here, then in the process
+    /// environment.
+    pub dotenv: &'a HashMap<String, String>,
     /// Step timeout, if any — enforced by `run_process` (Inherit mode).
     pub timeout: Option<Duration>,
     /// The shared fetch cache, when the environment gives the run one. Ingress
@@ -89,6 +94,13 @@ pub struct OpContext<'a> {
     /// Protocols want it; `None` is a run with no cache, which every other operator
     /// is anyway.
     pub cache: Option<&'a crate::fetch_cache::FetchCache>,
+}
+
+/// An empty `dotenv:` map, for a context built outside a run.
+#[cfg(test)]
+pub(crate) fn no_dotenv() -> &'static HashMap<String, String> {
+    static EMPTY: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(HashMap::new)
 }
 
 /// A first-class typed operator. Registered in the [`catalog`], addressed by
@@ -108,6 +120,13 @@ pub trait Operator: Sync {
 
     /// Execute the operator.
     fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput>;
+
+    /// Whether the step runs on every run, never skipped as fresh. For an operator
+    /// whose effect lives outside the Protocol, where a hash of its inputs cannot
+    /// tell whether the last run's effect is the one this run wants.
+    fn always_runs(&self) -> bool {
+        false
+    }
 }
 
 static PARQUET_EXPORT: ParquetExport = ParquetExport;
@@ -7323,6 +7342,7 @@ mod tests {
             dir,
             db_path: dir,
             env,
+            dotenv: no_dotenv(),
             timeout: None,
             cache: None,
         }
@@ -7802,6 +7822,7 @@ mod tests {
             dir,
             db_path: db,
             env: &env,
+            dotenv: no_dotenv(),
             timeout: None,
             cache: None,
         };
@@ -10855,6 +10876,7 @@ mod tests {
                 dir,
                 db_path: dir,
                 env: &env,
+                dotenv: no_dotenv(),
                 timeout: None,
                 cache,
             },
