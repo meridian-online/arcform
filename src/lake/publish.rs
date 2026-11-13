@@ -550,36 +550,35 @@ pub fn publish(
             superseded.push(key);
             continue;
         }
-        // The copy's own version first, then the catalogue: a newer publish uploads
-        // only after its catalogue lands, so either the check sees it, or the
-        // conditional upload below is refused.
-        let mut cond = copy_condition(store, &key)?;
-        if guard.newer(&owners)? {
-            superseded.push(key);
-            continue;
-        }
+        // Every try reads the copy's own version first, then the catalogue: a newer
+        // publish uploads only after its catalogue lands, so either the check sees
+        // it, or the conditional upload is refused. A refusal may also be an older
+        // publish's late upload, which no newer snapshot accounts for: try again.
         let mut refusals = 0;
         loop {
+            let cond = copy_condition(store, &key)?;
+            if guard.newer(&owners)? {
+                superseded.push(key);
+                break;
+            }
             match store.put_file(&key, &file, cond, None) {
                 Ok(_) => {
                     uploaded.push(describe(&key, &file)?);
                     break;
                 }
-                // Written since the check: by a newer publish, or by an older one's
-                // late upload. Only a newer snapshot of the table owns the key.
                 Err(StoreError::PreconditionFailed) => {
+                    refusals += 1;
+                    if refusals < COPY_ATTEMPTS {
+                        continue;
+                    }
                     if guard.newer(&owners)? {
                         superseded.push(key);
                         break;
                     }
-                    refusals += 1;
-                    if refusals >= COPY_ATTEMPTS {
-                        return Err(failed(format!(
-                            "`{key}` kept changing under this publish; gave up after \
-                             {refusals} refused uploads"
-                        )));
-                    }
-                    cond = copy_condition(store, &key)?;
+                    return Err(failed(format!(
+                        "`{key}` kept changing under this publish; gave up after \
+                         {refusals} refused uploads"
+                    )));
                 }
                 Err(e) => return Err(store_failed("upload", &key)(e)),
             }
@@ -782,6 +781,8 @@ mod tests {
         format!("SELECT range AS id, '{tag}' || range AS v FROM range({n})")
     }
 
+    type Hook<'a> = Box<dyn FnOnce() + Send + 'a>;
+
     /// A store that passes through to `inner`, with faults and a hook.
     struct Wrapped<'a> {
         inner: &'a dyn ObjectStore,
@@ -790,6 +791,11 @@ mod tests {
         throttle_next_pin: Mutex<bool>,
         refuse_catalog_writes: bool,
         throttle_catalog_writes: bool,
+        /// Answer `PreconditionFailed` to every readable or extra upload.
+        refuse_copy_uploads: bool,
+        /// Run once, just before the etag lookup numbered `.0` (from 1).
+        before_etag: Mutex<(u32, Option<Hook<'a>>)>,
+        etag_calls: AtomicU32,
         /// Run once, just before the first readable or extra upload.
         before_copy_upload: Mutex<Option<Box<dyn FnOnce() + Send + 'a>>>,
         /// Waited on before the first catalogue write.
@@ -807,7 +813,10 @@ mod tests {
                 throttle_next_pin: Mutex::new(false),
                 refuse_catalog_writes: false,
                 throttle_catalog_writes: false,
+                refuse_copy_uploads: false,
                 before_copy_upload: Mutex::new(None),
+                before_etag: Mutex::new((0, None)),
+                etag_calls: AtomicU32::new(0),
                 barrier: None,
                 waited: Mutex::new(false),
                 after_catalog_write: Mutex::new(None),
@@ -826,6 +835,14 @@ mod tests {
         }
 
         fn etag(&self, key: &str) -> std::result::Result<Option<ETag>, StoreError> {
+            let n = self.etag_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let hook = {
+                let mut slot = self.before_etag.lock().unwrap();
+                if slot.0 == n { slot.1.take() } else { None }
+            };
+            if let Some(hook) = hook {
+                hook();
+            }
             self.inner.etag(key)
         }
 
@@ -880,6 +897,9 @@ mod tests {
             let hook = self.before_copy_upload.lock().unwrap().take();
             if let Some(hook) = hook {
                 hook();
+            }
+            if self.refuse_copy_uploads {
+                return Err(StoreError::PreconditionFailed);
             }
             self.inner.put_file(key, path, cond, cache_control)
         }
@@ -1298,5 +1318,63 @@ mod tests {
             fx.object("ns/a.parquet").unwrap().0,
             std::fs::read(&a).unwrap()
         );
+    }
+
+    #[test]
+    fn a_newer_publish_during_the_retry_is_not_overwritten() {
+        let fx = Fixture::new();
+        let v1 = fx.parquet("v1.parquet", &rows(20, "old"));
+        let v2 = fx.parquet("v2.parquet", &rows(25, "new"));
+        let store = Wrapped::new(&fx.store);
+        // The first upload is refused: an older publish's late copy lands.
+        *store.before_copy_upload.lock().unwrap() = Some(Box::new(|| {
+            fx.store
+                .put("ns/a.parquet", b"older bytes", PutCondition::Any, None)
+                .unwrap();
+        }));
+        // Then, as the retry reads the copy's version, a newer publish lands.
+        *store.before_etag.lock().unwrap() = (
+            2,
+            Some(Box::new(|| {
+                let newer = fx
+                    .publish(
+                        &[input("s.a", &v2)],
+                        &[(v2.clone(), "ns/a.parquet".to_string())],
+                    )
+                    .unwrap();
+                assert!(newer.superseded.is_empty());
+            })),
+        );
+        let out = fx
+            .publish_via(
+                &store,
+                &[input("s.a", &v1)],
+                &[(v1.clone(), "ns/a.parquet".to_string())],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(out.superseded, ["ns/a.parquet"]);
+        assert_eq!(
+            fx.object("ns/a.parquet").unwrap().0,
+            std::fs::read(&v2).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_copy_refused_every_time_fails_naming_the_key() {
+        let fx = Fixture::new();
+        let a = fx.parquet("a.parquet", &rows(3, "a"));
+        let mut store = Wrapped::new(&fx.store);
+        store.refuse_copy_uploads = true;
+        let err = fx
+            .publish_via(
+                &store,
+                &[input("s.a", &a)],
+                &[(a.clone(), "ns/a.parquet".to_string())],
+                &[],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ns/a.parquet") && err.contains('3'), "{err}");
     }
 }
