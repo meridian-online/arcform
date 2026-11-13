@@ -100,9 +100,14 @@ impl Drop for Scratch {
 /// and the next rebase to the same path does not replay the WAL into its catalogue.
 fn discard(out: &Path) {
     let _ = std::fs::remove_file(out);
+    let _ = std::fs::remove_file(wal_of(out));
+}
+
+/// The WAL DuckDB keeps beside the database file `out`.
+fn wal_of(out: &Path) -> std::path::PathBuf {
     let mut wal = out.as_os_str().to_owned();
     wal.push(".wal");
-    let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
+    std::path::PathBuf::from(wal)
 }
 
 struct OldTable {
@@ -133,6 +138,14 @@ pub fn rebase(from: &str, out: &Path, data_path: &str) -> Result<RebaseReport> {
         return Err(failed(format!(
             "{} already exists; rebase writes a new catalogue and never overwrites one",
             out.display()
+        )));
+    }
+    let wal = wal_of(out);
+    if wal.exists() {
+        return Err(failed(format!(
+            "{} already exists, and DuckDB would replay it into the new catalogue; \
+             delete it and run the rebase again",
+            wal.display()
         )));
     }
     let mut new_data_path = data_path.to_string();
@@ -800,6 +813,23 @@ mod tests {
             !dir.path().join("new.ducklake.wal").exists(),
             "no WAL is left behind"
         );
+    }
+
+    /// A WAL left beside the output would be replayed into the new catalogue, so
+    /// its presence refuses the rebase, naming it, before anything is written.
+    #[test]
+    fn rebase_refuses_a_wal_beside_the_output() {
+        let dir = TempDir::new().unwrap();
+        let old = old_lake(&dir);
+        let out = dir.path().join("new.ducklake");
+        let wal = dir.path().join("new.ducklake.wal");
+        std::fs::write(&wal, b"left behind").unwrap();
+        let err = rebase(old.to_str().unwrap(), &out, NEW_DATA_PATH)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("new.ducklake.wal"), "{err}");
+        assert!(!out.exists());
+        assert_eq!(std::fs::read(&wal).unwrap(), b"left behind");
     }
 
     /// DuckDB checkpoints as the connection closes, so a WAL survives only an
