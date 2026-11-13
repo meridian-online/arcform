@@ -435,35 +435,129 @@ fn strip_alias(sql: &str) -> String {
     out
 }
 
-/// Views in an order each can be created in: a view after every view whose name
-/// its SQL mentions. A cycle (or a false match) leaves the rest in name order, and
-/// creating them then fails naming the view.
-fn views_in_dependency_order(views: Vec<Vec<String>>) -> Vec<Vec<String>> {
-    let mentions = |sql: &str, name: &str| {
-        let mut from = 0;
-        while let Some(at) = sql[from..].find(name) {
-            let (start, end) = (from + at, from + at + name.len());
-            let before = sql[..start].chars().next_back();
-            let after = sql[end..].chars().next();
-            let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
-            if !word(before) && !word(after) {
-                return true;
+/// The dotted identifier chains in `sql` outside string literals, lowercased, with
+/// quoted identifiers unquoted.
+fn identifier_chains(sql: &str) -> Vec<Vec<String>> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut chains: Vec<Vec<String>> = Vec::new();
+    let mut open = false; // the last token was a dot, so the next identifier extends
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' {
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\'' {
+                    if chars.get(i + 1) == Some(&'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
             }
-            from = end;
+            i += 1;
+            open = false;
+        } else if c == '"' || c.is_alphabetic() || c == '_' {
+            let mut word = String::new();
+            if c == '"' {
+                i += 1;
+                while i < chars.len() {
+                    if chars[i] == '"' {
+                        if chars.get(i + 1) == Some(&'"') {
+                            word.push('"');
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    word.push(chars[i]);
+                    i += 1;
+                }
+                i += 1;
+            } else {
+                while i < chars.len()
+                    && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '$')
+                {
+                    word.push(chars[i]);
+                    i += 1;
+                }
+            }
+            let word = word.to_lowercase();
+            match chains.last_mut() {
+                Some(chain) if open => chain.push(word),
+                _ => chains.push(vec![word]),
+            }
+            open = false;
+        } else if c == '.' && !open && !chains.is_empty() {
+            open = true;
+            i += 1;
+        } else {
+            i += 1;
+            if !c.is_whitespace() {
+                open = false;
+            }
         }
-        false
-    };
-    let mut left = views;
-    let mut ordered: Vec<Vec<String>> = Vec::with_capacity(left.len());
-    while !left.is_empty() {
-        let ready = left.iter().position(|v| {
-            !left
-                .iter()
-                .any(|w| !std::ptr::eq(v, w) && mentions(&v[2], &w[1]))
-        });
-        ordered.push(left.remove(ready.unwrap_or(0)));
     }
-    ordered
+    chains
+}
+
+/// The views a view's SQL refers to, among `views`: by `schema.name` (any catalogue
+/// before it ignored), or by bare name for a view in the same schema or in `main`.
+/// The view's own `CREATE VIEW <name> AS` header is not a reference.
+fn view_references(view: &[String], views: &[Vec<String>]) -> Vec<usize> {
+    let chains = identifier_chains(&view[2]);
+    let body = chains
+        .iter()
+        .position(|c| c == &["view".to_string()])
+        .and_then(|v| {
+            chains[v..]
+                .iter()
+                .position(|c| c == &["as".to_string()])
+                .map(|a| v + a + 1)
+        })
+        .unwrap_or(0);
+    let own_schema = view[0].to_lowercase();
+    views
+        .iter()
+        .enumerate()
+        .filter(|(_, other)| {
+            let (schema, name) = (other[0].to_lowercase(), other[1].to_lowercase());
+            chains[body..].iter().any(|c| match c.as_slice() {
+                [n] => *n == name && (schema == own_schema || schema == "main"),
+                [.., sch, n] => *sch == schema && *n == name,
+                [] => false,
+            })
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Views in an order each can be created in: a view after every view it refers to.
+/// A cycle leaves the rest in name order, and creating them then fails naming the
+/// view. Views over tables only keep their name order.
+fn views_in_dependency_order(views: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    let deps: Vec<Vec<usize>> = views
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            view_references(v, &views)
+                .into_iter()
+                .filter(|j| *j != i)
+                .collect()
+        })
+        .collect();
+    let mut done = vec![false; views.len()];
+    let mut order: Vec<usize> = Vec::with_capacity(views.len());
+    while order.len() < views.len() {
+        let next = (0..views.len())
+            .find(|&i| !done[i] && deps[i].iter().all(|&j| done[j]))
+            .or_else(|| (0..views.len()).find(|&i| !done[i]))
+            .expect("a view is left");
+        done[next] = true;
+        order.push(next);
+    }
+    order.into_iter().map(|i| views[i].clone()).collect()
 }
 
 /// The key a catalogue URL names in its bucket: the URL's path without the leading
@@ -814,5 +908,32 @@ mod tests {
         assert_eq!(report.views.len(), 3);
         let local = format!("{}/x/", dir.path().display());
         assert_eq!(query_i64(&out, &local, "SELECT n FROM n.s.a_summary"), 5);
+    }
+
+    #[test]
+    fn same_named_views_in_two_schemas_and_case_differences_are_ordered() {
+        let dir = TempDir::new().unwrap();
+        let old = old_lake(&dir);
+        exec(&format!(
+            "ATTACH 'ducklake:{c}' AS o (DATA_PATH '{p}/olddata/'); \
+             CREATE SCHEMA o.mart; CREATE SCHEMA o.staging; \
+             CREATE VIEW o.staging.orders AS SELECT id FROM o.s.a; \
+             CREATE VIEW o.mart.orders AS SELECT id FROM o.staging.orders; \
+             CREATE VIEW o.s.b_base AS SELECT id FROM o.s.a; \
+             CREATE VIEW o.s.a_upper AS SELECT id FROM \"B_BASE\";",
+            c = old.display(),
+            p = dir.path().display()
+        ));
+        let out = dir.path().join("new.ducklake");
+        rebase(old.to_str().unwrap(), &out, NEW_DATA_PATH).unwrap();
+        let local = format!("{}/x/", dir.path().display());
+        assert_eq!(
+            query_i64(&out, &local, "SELECT count(*) FROM n.mart.orders"),
+            5
+        );
+        assert_eq!(
+            query_i64(&out, &local, "SELECT count(*) FROM n.s.a_upper"),
+            5
+        );
     }
 }
