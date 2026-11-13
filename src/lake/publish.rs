@@ -1377,4 +1377,117 @@ mod tests {
             .to_string();
         assert!(err.contains("ns/a.parquet") && err.contains('3'), "{err}");
     }
+
+    /// The entry a caller (the operator) would build for a table's readable copy.
+    fn manifest_entry(
+        address: &str,
+        url: &str,
+        bytes: &[u8],
+    ) -> crate::lake::manifest::ManifestEntry {
+        crate::lake::manifest::ManifestEntry {
+            address: address.to_string(),
+            url: url.to_string(),
+            rows: 20,
+            bytes: bytes.len() as u64,
+            sha256: sha256_hex(bytes),
+            published: "2026-11-13T00:00:00Z".to_string(),
+            run: json!({"id": "r", "record": "runs/r.json"}),
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn a_newer_publish_of_one_table_leaves_only_its_entry_alone() {
+        use crate::lake::manifest::update_manifest;
+        let fx = Fixture::new();
+        let a = fx.parquet("a.parquet", &rows(20, "a"));
+        let b1 = fx.parquet("b1.parquet", &rows(20, "b"));
+        let b2 = fx.parquet("b2.parquet", &rows(25, "newer"));
+        let first = fx
+            .publish(&[input("s.a", &a), input("s.b", &b1)], &[])
+            .unwrap();
+        let snapshot = first.outcome.snapshot_id;
+        // A newer publish changes table B only.
+        fx.publish(&[input("s.b", &b2)], &[]).unwrap();
+        let mut kept = Vec::new();
+        for (table, address, file) in [("s.a", "ns/a", &a), ("s.b", "ns/b", &b1)] {
+            let changed = newer_change(&fx.store, &fx.lake, &fx.work(), snapshot, table).unwrap();
+            if !changed {
+                kept.push(manifest_entry(address, "u", &std::fs::read(file).unwrap()));
+            }
+        }
+        assert_eq!(
+            kept.iter().map(|e| e.address.as_str()).collect::<Vec<_>>(),
+            ["ns/a"]
+        );
+        assert!(update_manifest(&fx.store, "manifest.json", &kept, None, 3).unwrap());
+        let doc: serde_json::Value =
+            serde_json::from_slice(&fx.object("manifest.json").unwrap().0).unwrap();
+        assert!(doc["datasets"]["ns/a"].is_object());
+        assert!(doc["datasets"].get("ns/b").is_none());
+    }
+
+    #[test]
+    fn an_unchanged_publish_repairs_a_stale_manifest_entry() {
+        use crate::lake::manifest::update_manifest;
+        let fx = Fixture::new();
+        let a = fx.parquet("a.parquet", &rows(20, "a"));
+        let bytes = std::fs::read(&a).unwrap();
+        let entry = manifest_entry("ns/a", "u", &bytes);
+        let first = fx.publish(&[input("s.a", &a)], &[]).unwrap();
+        let pinned = first.pinned_catalog.clone().unwrap();
+        update_manifest(
+            &fx.store,
+            "manifest.json",
+            std::slice::from_ref(&entry),
+            Some(&pinned),
+            3,
+        )
+        .unwrap();
+
+        // An interrupted publish left the manifest behind.
+        let mut stale = entry.clone();
+        stale.sha256 = "0".repeat(64);
+        update_manifest(
+            &fx.store,
+            "manifest.json",
+            &[stale],
+            Some("catalog/open-old.ducklake"),
+            3,
+        )
+        .unwrap();
+
+        // The next publish changes nothing, yet the caller's filtered write repairs both.
+        let again = fx.publish(&[input("s.a", &a)], &[]).unwrap();
+        assert!(!again.outcome.committed);
+        assert_eq!(
+            fx.store.etag(CATALOG).unwrap(),
+            Some(again.catalog_etag.clone())
+        );
+        assert!(
+            !newer_change(
+                &fx.store,
+                &fx.lake,
+                &fx.work(),
+                again.outcome.snapshot_id,
+                "s.a"
+            )
+            .unwrap()
+        );
+        let pinned = again.pinned_catalog.clone().unwrap();
+        assert!(
+            update_manifest(
+                &fx.store,
+                "manifest.json",
+                std::slice::from_ref(&entry),
+                Some(&pinned),
+                3
+            )
+            .unwrap()
+        );
+        let doc: serde_json::Value =
+            serde_json::from_slice(&fx.object("manifest.json").unwrap().0).unwrap();
+        assert_eq!(doc["datasets"]["ns/a"]["sha256"], entry.sha256);
+        assert_eq!(doc["catalog"]["url"], pinned);
+    }
 }

@@ -16,6 +16,12 @@ pub(crate) mod commit;
     not(test),
     expect(dead_code, reason = "used by the lake publish step in later tasks")
 )]
+pub(crate) mod manifest;
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the lake publish step in later tasks")
+)]
 pub(crate) mod publish;
 
 #[cfg(test)]

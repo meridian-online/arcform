@@ -113,7 +113,7 @@ const EXPORTED: [(&str, &str); 46] = [
 
 /// Every module file in the crate. Frozen so a new one cannot be added without
 /// passing under the checks below.
-const MODULE_FILES: [&str; 48] = [
+const MODULE_FILES: [&str; 49] = [
     "asset.rs",
     "asset_kind.rs",
     "bridge.rs",
@@ -138,6 +138,7 @@ const MODULE_FILES: [&str; 48] = [
     "inspect.rs",
     "introspect.rs",
     "lake/commit.rs",
+    "lake/manifest.rs",
     "lake/meta.rs",
     "lake/mod.rs",
     "lake/publish.rs",
