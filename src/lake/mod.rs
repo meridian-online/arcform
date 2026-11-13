@@ -3,3 +3,6 @@
 
 #[expect(dead_code, reason = "used by the lake publish step in later tasks")]
 pub(crate) mod store;
+
+#[expect(dead_code, reason = "used by the lake publish step in later tasks")]
+pub(crate) mod meta;
