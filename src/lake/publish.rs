@@ -919,7 +919,8 @@ mod tests {
         /// Answer `PreconditionFailed` to every readable or extra upload.
         refuse_copy_uploads: bool,
         /// Run once, just before the version lookup of a readable or extra file
-        /// numbered `.0` (from 1). The catalogue's own lookups are not counted.
+        /// numbered `.0` (from 1). The lookups of the catalogue and its pinned
+        /// copies are not counted.
         before_etag: Mutex<(u32, Option<Hook<'a>>)>,
         etag_calls: AtomicU32,
         /// Run once, just before the first readable or extra upload.
@@ -961,7 +962,7 @@ mod tests {
         }
 
         fn head(&self, key: &str) -> std::result::Result<Option<ObjectHead>, StoreError> {
-            if key != CATALOG {
+            if key != CATALOG && !key.starts_with("catalog/open-") {
                 let n = self.etag_calls.fetch_add(1, Ordering::SeqCst) + 1;
                 let hook = {
                     let mut slot = self.before_etag.lock().unwrap();
@@ -1453,17 +1454,25 @@ mod tests {
         let fx = Fixture::new();
         let v1 = fx.parquet("v1.parquet", &rows(20, "old"));
         let v2 = fx.parquet("v2.parquet", &rows(25, "new"));
+        let refused = std::sync::atomic::AtomicBool::new(false);
+        let retried = std::sync::atomic::AtomicBool::new(false);
         let store = Wrapped::new(&fx.store);
         // The first upload is refused: an older publish's late copy lands.
         *store.before_copy_upload.lock().unwrap() = Some(Box::new(|| {
             fx.store
                 .put("ns/a.parquet", b"older bytes", PutCondition::Any, None)
                 .unwrap();
+            refused.store(true, Ordering::SeqCst);
         }));
         // Then, as the retry reads the copy's version, a newer publish lands.
         *store.before_etag.lock().unwrap() = (
             2,
             Some(Box::new(|| {
+                assert!(
+                    refused.load(Ordering::SeqCst),
+                    "the first upload was refused"
+                );
+                retried.store(true, Ordering::SeqCst);
                 let newer = fx
                     .publish(
                         &[input("s.a", &v2)],
@@ -1481,6 +1490,10 @@ mod tests {
                 &[],
             )
             .unwrap();
+        assert!(
+            retried.load(Ordering::SeqCst),
+            "the retry read the copy's version"
+        );
         assert_eq!(out.superseded, ["ns/a.parquet"]);
         assert_eq!(
             fx.object("ns/a.parquet").unwrap().0,
