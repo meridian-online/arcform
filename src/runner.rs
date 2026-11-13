@@ -1199,8 +1199,8 @@ fn upload_run_records(
 
 /// The run record as it is published beside a snapshot, in a public bucket: the
 /// Protocol directory, which the record names absolutely, rewritten to `.` in every
-/// key and string, and refused outright if any key or string still holds a path
-/// under the home directory, anywhere in it. The record on disk keeps its paths.
+/// key and string, and refused outright if any key or string still names the home
+/// directory or a path under it, anywhere in it. The record on disk keeps its paths.
 #[cfg(feature = "http-fetch")]
 fn public_record(bytes: &[u8], dir: &Path) -> std::result::Result<Vec<u8>, String> {
     fn rewrite(s: &str, prefixes: &[String]) -> String {
@@ -1220,9 +1220,18 @@ fn public_record(bytes: &[u8], dir: &Path) -> std::result::Result<Vec<u8>, Strin
         leaked: &mut bool,
     ) {
         use serde_json::Value;
-        // Anywhere in the string: a home path inside SQL text, an argument or an
-        // error message is published as surely as one standing alone.
-        let under_home = |s: &str| home.is_some_and(|h| s == h || s.contains(&format!("{h}/")));
+        // Anywhere in the string, a home path inside SQL text, an argument or an
+        // error message is published as surely as one standing alone. A match must
+        // end the path component: `/Users/hughes` is not under `/Users/hugh`.
+        let under_home = |s: &str| {
+            home.is_some_and(|h| {
+                s.match_indices(h).any(|(at, _)| {
+                    s[at + h.len()..].chars().next().is_none_or(|c| {
+                        c == '/' || !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+                    })
+                })
+            })
+        };
         match value {
             Value::String(s) => {
                 *s = rewrite(s, prefixes);
@@ -2243,6 +2252,21 @@ mod run_record_upload_tests {
         upload_run_records(&slashed, &runs, "r4", vec![upload(&store, "runs/r4.json")]).unwrap();
         let uploaded = String::from_utf8(store.get("runs/r4.json").unwrap().unwrap().0).unwrap();
         assert!(!uploaded.contains(&shown), "{uploaded}");
+
+        // The bare home directory partway through a string refuses it too; a longer
+        // name that merely starts with it does not.
+        let bare = serde_json::json!({
+            "sql": { "text": format!("SET home_directory='{home}'") }
+        });
+        std::fs::write(runs.join("r5.json"), serde_json::to_vec(&bare).unwrap()).unwrap();
+        let e = upload_run_records(&protocol, &runs, "r5", vec![upload(&store, "runs/r5.json")])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("home directory"), "{e}");
+        assert!(store.get("runs/r5.json").unwrap().is_none());
+        let longer = serde_json::json!({ "note": format!("{home}es/x") });
+        std::fs::write(runs.join("r6.json"), serde_json::to_vec(&longer).unwrap()).unwrap();
+        upload_run_records(&protocol, &runs, "r6", vec![upload(&store, "runs/r6.json")]).unwrap();
 
         // A path under the home directory that is not the Protocol's refuses the
         // upload rather than publishing it.
