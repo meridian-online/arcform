@@ -87,14 +87,10 @@ pub struct DirStore {
     root: PathBuf,
 }
 
-/// Holds a key's lock file; removing it on drop releases the key.
-struct LockGuard(PathBuf);
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
+/// Holds an advisory lock on a key's sidecar lock file. The kernel drops the lock
+/// when the file closes, including when the process is killed, so no lock outlives
+/// its holder. The sidecar file itself stays behind, unlocked.
+struct LockGuard(fs::File);
 
 impl DirStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -109,21 +105,26 @@ impl DirStore {
         let mut name = path.as_os_str().to_owned();
         name.push(".lock");
         let lock_path = PathBuf::from(name);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(other)?;
         let start = Instant::now();
         loop {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-            {
-                Ok(_) => return Ok(LockGuard(lock_path)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            match file.try_lock() {
+                Ok(()) => return Ok(LockGuard(file)),
+                Err(fs::TryLockError::WouldBlock) => {
                     if start.elapsed() > Duration::from_secs(30) {
-                        return Err(other("timed out waiting for the object's lock"));
+                        return Err(other(format!(
+                            "timed out waiting for the lock file {}",
+                            lock_path.display()
+                        )));
                     }
                     std::thread::sleep(Duration::from_millis(2));
                 }
-                Err(e) => return Err(other(e)),
+                Err(fs::TryLockError::Error(e)) => return Err(other(e)),
             }
         }
     }
@@ -196,17 +197,30 @@ impl ObjectStore for DirStore {
 // ---------------------------------------------------------------- S3Store
 
 /// A request ready to send: the presigned URL and the headers that must accompany it.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct PreparedRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
 }
 
+// The URL is presigned: its query holds the key id and the signature, so Debug
+// prints the path only.
+impl std::fmt::Debug for PreparedRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let shown = self.url.split('?').next().unwrap_or_default();
+        f.debug_struct("PreparedRequest")
+            .field("url", &format_args!("{shown}?<redacted>"))
+            .field("headers", &self.headers)
+            .finish()
+    }
+}
+
 /// Map an HTTP status to the store error it stands for, if it is one.
 fn map_status(status: u16) -> Option<StoreError> {
     match status {
-        412 => Some(StoreError::PreconditionFailed),
-        429 => Some(StoreError::Throttled),
+        // 409 is S3's ConditionalRequestConflict: a racing conditional write.
+        409 | 412 => Some(StoreError::PreconditionFailed),
+        429 | 503 => Some(StoreError::Throttled),
         _ => None,
     }
 }
@@ -215,9 +229,27 @@ fn map_status(status: u16) -> Option<StoreError> {
 pub struct S3Store {
     bucket: Bucket,
     credentials: Credentials,
+    agent: ureq::Agent,
 }
 
 const SIGN_FOR: Duration = Duration::from_secs(3600);
+
+/// One agent per store, with timeouts so a stalled endpoint fails instead of hanging.
+fn agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(120))
+        .timeout_write(Duration::from_secs(120))
+        .build()
+}
+
+/// The response's ETag, or an error: a store that omits it cannot be written to
+/// conditionally afterwards.
+fn etag_of(resp: &ureq::Response, key: &str) -> Result<ETag, StoreError> {
+    resp.header("etag")
+        .map(|e| ETag(e.to_string()))
+        .ok_or_else(|| StoreError::Other(format!("missing ETag for {key}")))
+}
 
 impl S3Store {
     /// Cloudflare R2: `https://<account_id>.r2.cloudflarestorage.com`, region `auto`.
@@ -255,6 +287,7 @@ impl S3Store {
         Ok(S3Store {
             bucket,
             credentials: Credentials::new(key_id, secret),
+            agent: agent(),
         })
     }
 
@@ -303,7 +336,10 @@ impl S3Store {
         cache_control: Option<&str>,
     ) -> Result<ETag, StoreError> {
         let prepared = self.request(Method::Put, key, &cond);
-        let mut req = ureq::put(&prepared.url).set("Content-Length", &len.to_string());
+        let mut req = self
+            .agent
+            .put(&prepared.url)
+            .set("Content-Length", &len.to_string());
         for (k, v) in &prepared.headers {
             req = req.set(k, v);
         }
@@ -311,7 +347,7 @@ impl S3Store {
             req = req.set("Cache-Control", cc);
         }
         match req.send(body) {
-            Ok(resp) => Ok(ETag(resp.header("etag").unwrap_or_default().to_string())),
+            Ok(resp) => etag_of(&resp, key),
             Err(e) => Err(map_ureq_error(e, key)),
         }
     }
@@ -342,7 +378,7 @@ fn read_get_response(
 ) -> Result<Option<(Vec<u8>, ETag)>, StoreError> {
     match result {
         Ok(resp) => {
-            let etag = ETag(resp.header("etag").unwrap_or_default().to_string());
+            let etag = etag_of(&resp, key)?;
             let mut bytes = Vec::new();
             resp.into_reader()
                 .read_to_end(&mut bytes)
@@ -359,7 +395,7 @@ use std::io::Read as _;
 impl ObjectStore for S3Store {
     fn get(&self, key: &str) -> Result<Option<(Vec<u8>, ETag)>, StoreError> {
         let prepared = self.request(Method::Get, key, &PutCondition::Any);
-        read_get_response(ureq::get(&prepared.url).call(), key)
+        read_get_response(self.agent.get(&prepared.url).call(), key)
     }
 
     fn put(
@@ -390,12 +426,14 @@ impl ObjectStore for S3Store {
 /// Read-only access to a publicly readable bucket over plain https, no credentials.
 pub struct PublicHttpStore {
     base_url: String,
+    agent: ureq::Agent,
 }
 
 impl PublicHttpStore {
     pub fn new(base_url: impl Into<String>) -> Self {
         PublicHttpStore {
             base_url: base_url.into(),
+            agent: agent(),
         }
     }
 }
@@ -403,7 +441,7 @@ impl PublicHttpStore {
 impl ObjectStore for PublicHttpStore {
     fn get(&self, key: &str) -> Result<Option<(Vec<u8>, ETag)>, StoreError> {
         let url = format!("{}/{}", self.base_url.trim_end_matches('/'), key);
-        read_get_response(ureq::get(&url).call(), key)
+        read_get_response(self.agent.get(&url).call(), key)
     }
 
     fn put(
@@ -538,6 +576,8 @@ mod tests {
     fn s3_status_codes_map_to_store_errors() {
         assert_eq!(map_status(412), Some(StoreError::PreconditionFailed));
         assert_eq!(map_status(429), Some(StoreError::Throttled));
+        assert_eq!(map_status(409), Some(StoreError::PreconditionFailed));
+        assert_eq!(map_status(503), Some(StoreError::Throttled));
         assert_eq!(map_status(200), None);
     }
 
@@ -567,6 +607,22 @@ mod tests {
         ] {
             assert!(!shown.contains(bad), "{shown}");
         }
+    }
+
+    #[test]
+    fn a_leftover_lock_file_does_not_block_a_write() {
+        let (d, s) = store();
+        std::fs::write(d.path().join("k.lock"), b"").unwrap();
+        s.put("k", b"A", PutCondition::Any, None).unwrap();
+        assert_eq!(s.get("k").unwrap().unwrap().0, b"A");
+    }
+
+    #[test]
+    fn a_prepared_request_debug_hides_the_signature() {
+        let s = S3Store::r2("acct", "bucket", "KEYID-123", "s3cr3t-value").unwrap();
+        let req = s.request(Method::Get, "k", &PutCondition::Any);
+        let shown = format!("{req:?}");
+        assert!(!shown.contains("KEYID-123") && !shown.contains("X-Amz-Signature"));
     }
 
     #[test]

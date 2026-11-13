@@ -1,7 +1,5 @@
 //! Publishing a Protocol's tables into a DuckLake catalogue held on S3-compatible
 //! object storage (Cloudflare R2). Compiled under `http-fetch`, like `http_fetch`.
 
-// Later tasks consume this module; until they land nothing calls it.
-#![allow(dead_code)]
-
+#[expect(dead_code, reason = "used by the lake publish step in later tasks")]
 pub(crate) mod store;
