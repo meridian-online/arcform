@@ -75,9 +75,9 @@ The catalogue's persisted data path is the https address readers use. DuckLake r
    - if anything above changed, stamp the commit's metadata with the run's identity and each table's row counts.
    If nothing changed (no rows, no descriptor, no comment), the transaction makes no write, DuckDB commits no snapshot, and the step reports `unchanged` with the current snapshot. Nothing run-specific is written into a table, so a rebuild of the same data by a new run is still unchanged.
 5. **The new data and delete files are already in the bucket**, written by DuckLake in step 4. That is safe before the catalogue upload because nothing references a file until the catalogue does; files from a commit that is then lost or fails are orphans that DuckLake's cleanup can remove.
-6. **Upload the catalogue conditionally**, only if its ETag is still the one fetched in step 2. If another publish won, discard the local commit, go back to step 2, and redo the transaction. Data files already uploaded are not lost: any the retry does not reference are orphans that DuckLake's cleanup can remove. Retry a bounded number of times, then fail, naming the conflict. When nothing was committed, instead re-read the catalogue's ETag and go back to step 2 if it moved.
+6. **Upload the catalogue conditionally**, only if its ETag is still the one fetched in step 2. If another publish won, discard the local commit, go back to step 2, and redo the transaction. Data files the lost commit wrote are not lost: any the retry does not reference are orphans that DuckLake's cleanup can remove. Retry a bounded number of times, then fail, naming the conflict. When nothing was committed, instead re-read the catalogue's ETag and go back to step 2 if it moved.
 7. **Upload the readable copy** of each table (the Protocol's stamped Parquet, byte for byte) and any extra files, only now that the catalogue holds this snapshot. Readers fetch these at fixed addresses, so they are never written before the commit lands: a failed or lost publish leaves them as they were. A copy is skipped only when a snapshot newer than this publish's changed that same table, so a newer publish's copy is never overwritten by an older one, while another Protocol's commit to a different table never stops this publish's uploads. The manifest entries follow the same rule. The remaining window between that check and the write is closed by the table's next publish.
-8. **Report** each table's action (`registered`, `unchanged`), snapshot id, row counts by change type, and the uploaded objects with their sizes and SHA-256, in the step's report in the run record.
+8. **Report** each table's action (`registered`, `unchanged`), snapshot id, row counts by change type, the readable copies and extra files uploaded with their sizes and SHA-256, and the data files DuckLake wrote (by path), in the step's report in the run record.
 
 ### Upsert, not MERGE
 
@@ -143,7 +143,7 @@ When a table already exists and the input's columns differ, a column added at th
 
 ### The local catalogue (agent's call)
 
-Without the credential, the step publishes into a lake of its own at `local_catalog`, whose data path is the local folder beside it (`<local_catalog>.files/`), so the contributor can attach it and query exactly what the run built, offline. Its history is the history of local runs, separate from the live lake's. An earlier draft started each local run from a copy of the live catalogue to report the live diff, but a catalogue whose data path is the live https address cannot read files a local run adds, so the local lake would not read back. Staging is a separate folder, emptied at the start of each publish.
+Without the credential, the step publishes into a lake of its own at `local_catalog`, whose data path is the local folder beside it (`<local_catalog>.files/`), so the contributor can attach it and query exactly what the run built, offline. Its history is the history of local runs, separate from the live lake's. An earlier draft started each local run from a copy of the live catalogue to report the live diff, but a catalogue whose data path is the live https address cannot read files a local run adds, so the local lake would not read back.
 
 ### The run record beside the snapshot (agent's call)
 
@@ -170,7 +170,8 @@ Catalogue backends considered: a file on R2 (chosen: no server, no running cost,
 
 ## Proven by the spike (DuckDB 2.0, local folder served over http)
 
-- Writing with `OVERRIDE_DATA_PATH` to a staging folder records relative paths, and a reader attaching the catalogue over http resolves them against the persisted data path.
+- Writing with `OVERRIDE_DATA_PATH` to another folder records relative paths, and a reader attaching the catalogue over http resolves them against the persisted data path. An override to a separate folder also hides the lake's existing files, which is why the writer overrides to the same objects through another address.
+- Not yet exercised: DuckLake reading and writing through `s3://` on R2 with the override, and a relative path resolving to the same object under both addresses. Task 8's live check proves it; the fallback is downloading the step's tables into a local folder before the commit.
 - `UPDATE`, `DELETE`, `INSERT` in one transaction: one snapshot, a correct change feed, and no snapshot when nothing changed.
 - Small changes and the `meta` tables are inlined into the catalogue, with no data files.
 - `COMMENT ON` and time travel are visible to http readers.
@@ -182,7 +183,7 @@ Catalogue backends considered: a file on R2 (chosen: no server, no running cost,
 ## Left to the builder
 
 - Which S3 client performs uploads and the conditional write, and how it handles R2's endpoint.
-- The local catalogue's exact folder layout, and how staging is cleaned.
+- The local catalogue's exact folder layout.
 - Retry count and backoff on a lost conditional write.
 - Whether `ducklake_publish@1` is kept beside the new operator or retired. Nothing published uses it today.
 - Test strategy for R2: a local S3-compatible server in CI, or a fake object store behind a trait. The live bucket is exercised once, by hand, with Hugh.
