@@ -37,25 +37,28 @@ impl ManifestEntry {
         m.insert("sha256".into(), json!(self.sha256));
         m.insert("published".into(), json!(self.published));
         m.insert("run".into(), self.run.clone());
+        // `extra` never overwrites a core key: those are the step's own facts.
         for (k, v) in &self.extra {
-            m.insert(k.clone(), v.clone());
+            m.entry(k.clone()).or_insert_with(|| v.clone());
         }
         m
     }
 }
 
-/// Apply `entries` and the pinned catalogue address to the manifest at `key`, and
-/// write it back with `IfMatch` only when it changed. Returns whether it was written.
+/// Apply the entries and pinned catalogue address `current` returns to the manifest
+/// at `key`, and write it back with `IfMatch` only when it changed. Returns whether
+/// it was written.
 ///
-/// The caller passes only entries whose table no newer snapshot changed, and the
-/// pinned address only while the live catalogue is still the one this publish wrote
-/// or verified. A manifest that is not a JSON object with a `datasets` object is an
-/// error: it is never rebuilt from empty.
+/// `current` is called on every attempt, after the manifest is read and before it is
+/// written: it returns only the entries whose table no newer snapshot has changed,
+/// and the pinned address only while the live catalogue is still the one this
+/// publish wrote or verified. Re-asking each time keeps a refused retry from
+/// re-applying stale entries over a newer publish's. A manifest that is not a JSON
+/// object with a `datasets` object is an error: it is never rebuilt from empty.
 pub fn update_manifest(
     store: &dyn ObjectStore,
     key: &str,
-    entries: &[ManifestEntry],
-    pinned_catalog: Option<&str>,
+    current: &dyn Fn() -> Result<(Vec<ManifestEntry>, Option<String>)>,
     max_attempts: u32,
 ) -> Result<bool> {
     let max_attempts = max_attempts.max(1);
@@ -63,16 +66,17 @@ pub fn update_manifest(
     let mut throttled = false;
     loop {
         attempts += 1;
-        let current = store
+        let found = store
             .get(key)
             .map_err(|e| failed(format!("read the manifest `{key}`: {e}")))?;
-        let (mut doc, cond) = match &current {
+        let (mut doc, cond) = match &found {
             Some((bytes, etag)) => (parse(key, bytes)?, PutCondition::IfMatch(etag.clone())),
             None => (json!({"datasets": {}}), PutCondition::IfAbsent),
         };
+        let (entries, pinned_catalog) = current()?;
         let before = doc.clone();
-        apply(&mut doc, entries, pinned_catalog);
-        if current.is_some() && doc == before {
+        apply(&mut doc, &entries, pinned_catalog.as_deref());
+        if found.is_some() && doc == before {
             return Ok(false);
         }
         let mut bytes = serde_json::to_vec_pretty(&doc)
@@ -131,6 +135,59 @@ fn apply(doc: &mut Value, entries: &[ManifestEntry], pinned_catalog: Option<&str
     }
 }
 
+/// A store that runs a hook once, just before the first manifest write, and then
+/// refuses that write as a lost race would.
+#[cfg(test)]
+pub(crate) struct BeforeFirstPut<'a> {
+    inner: &'a dyn ObjectStore,
+    hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send + 'a>>>,
+}
+
+#[cfg(test)]
+impl<'a> BeforeFirstPut<'a> {
+    pub(crate) fn new(inner: &'a dyn ObjectStore, hook: impl FnOnce() + Send + 'a) -> Self {
+        Self {
+            inner,
+            hook: std::sync::Mutex::new(Some(Box::new(hook))),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ObjectStore for BeforeFirstPut<'_> {
+    fn get(
+        &self,
+        key: &str,
+    ) -> std::result::Result<Option<(Vec<u8>, super::store::ETag)>, StoreError> {
+        self.inner.get(key)
+    }
+    fn etag(&self, key: &str) -> std::result::Result<Option<super::store::ETag>, StoreError> {
+        self.inner.etag(key)
+    }
+    fn put(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        cond: PutCondition,
+        cache_control: Option<&str>,
+    ) -> std::result::Result<super::store::ETag, StoreError> {
+        // The hook's own writes go to `inner`, never back through here.
+        if let Some(hook) = self.hook.lock().unwrap().take() {
+            hook();
+        }
+        self.inner.put(key, bytes, cond, cache_control)
+    }
+    fn put_file(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+        cond: PutCondition,
+        cache_control: Option<&str>,
+    ) -> std::result::Result<super::store::ETag, StoreError> {
+        self.inner.put_file(key, path, cond, cache_control)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,8 +230,12 @@ mod tests {
         let written = update_manifest(
             &store,
             KEY,
-            &[entry("c/d", "abc")],
-            Some("catalog/open-1.ducklake"),
+            &|| {
+                Ok((
+                    vec![entry("c/d", "abc")],
+                    Some("catalog/open-1.ducklake".to_string()),
+                ))
+            },
             3,
         )
         .unwrap();
@@ -192,7 +253,9 @@ mod tests {
     fn an_absent_manifest_is_created() {
         let dir = TempDir::new().unwrap();
         let store = DirStore::new(dir.path());
-        assert!(update_manifest(&store, KEY, &[entry("c/d", "abc")], None, 3).unwrap());
+        assert!(
+            update_manifest(&store, KEY, &|| Ok((vec![entry("c/d", "abc")], None)), 3).unwrap()
+        );
         assert_eq!(read(&store)["datasets"]["c/d"]["rows"], 3);
     }
 
@@ -203,14 +266,14 @@ mod tests {
         store
             .put(KEY, b"not json", PutCondition::Any, None)
             .unwrap();
-        let err = update_manifest(&store, KEY, &[entry("c/d", "abc")], None, 3)
+        let err = update_manifest(&store, KEY, &|| Ok((vec![entry("c/d", "abc")], None)), 3)
             .unwrap_err()
             .to_string();
         assert!(err.contains("not JSON"), "{err}");
         assert_eq!(store.get(KEY).unwrap().unwrap().0, b"not json");
 
         store.put(KEY, b"{}", PutCondition::Any, None).unwrap();
-        let err = update_manifest(&store, KEY, &[entry("c/d", "abc")], None, 3)
+        let err = update_manifest(&store, KEY, &|| Ok((vec![entry("c/d", "abc")], None)), 3)
             .unwrap_err()
             .to_string();
         assert!(err.contains("datasets"), "{err}");
@@ -220,10 +283,73 @@ mod tests {
     fn an_identical_manifest_is_not_rewritten() {
         let dir = TempDir::new().unwrap();
         let store = DirStore::new(dir.path());
-        let e = [entry("c/d", "abc")];
-        assert!(update_manifest(&store, KEY, &e, Some("p"), 3).unwrap());
+        let cur = || Ok((vec![entry("c/d", "abc")], Some("p".to_string())));
+        assert!(update_manifest(&store, KEY, &cur, 3).unwrap());
         let etag = store.etag(KEY).unwrap();
-        assert!(!update_manifest(&store, KEY, &e, Some("p"), 3).unwrap());
+        assert!(!update_manifest(&store, KEY, &cur, 3).unwrap());
         assert_eq!(store.etag(KEY).unwrap(), etag);
+    }
+
+    #[test]
+    fn a_key_the_step_does_not_set_survives_inside_the_entry() {
+        let dir = TempDir::new().unwrap();
+        let store = DirStore::new(dir.path());
+        store
+            .put(
+                KEY,
+                br#"{"datasets":{"c/d":{"url":"old","keep":"me"}}}"#,
+                PutCondition::Any,
+                None,
+            )
+            .unwrap();
+        update_manifest(&store, KEY, &|| Ok((vec![entry("c/d", "abc")], None)), 3).unwrap();
+        let doc = read(&store);
+        assert_eq!(doc["datasets"]["c/d"]["keep"], "me");
+        assert_eq!(doc["datasets"]["c/d"]["sha256"], "abc");
+    }
+
+    #[test]
+    fn extra_cannot_overwrite_the_core_keys() {
+        let dir = TempDir::new().unwrap();
+        let store = DirStore::new(dir.path());
+        let mut e = entry("c/d", "abc");
+        e.extra.insert("sha256".into(), json!("evil"));
+        e.extra.insert("url".into(), json!("evil"));
+        update_manifest(&store, KEY, &|| Ok((vec![e.clone()], None)), 3).unwrap();
+        let doc = read(&store);
+        assert_eq!(doc["datasets"]["c/d"]["sha256"], "abc");
+        assert_eq!(
+            doc["datasets"]["c/d"]["url"],
+            "https://example.test/c/d.parquet"
+        );
+        assert_eq!(doc["datasets"]["c/d"]["searchRows"], 7);
+    }
+
+    #[test]
+    fn a_refused_first_write_retries_and_keeps_what_the_winner_wrote() {
+        let dir = TempDir::new().unwrap();
+        let inner = DirStore::new(dir.path());
+        // Absent at the read; another writer creates it before ours lands, so the
+        // first write (IfAbsent) is refused and the retry writes IfMatch.
+        let store = BeforeFirstPut::new(&inner, || {
+            inner
+                .put(
+                    KEY,
+                    br#"{"datasets":{"a/b":{"url":"theirs"}}}"#,
+                    PutCondition::Any,
+                    None,
+                )
+                .unwrap();
+        });
+        let calls = std::cell::Cell::new(0);
+        let cur = || {
+            calls.set(calls.get() + 1);
+            Ok((vec![entry("c/d", "abc")], None))
+        };
+        assert!(update_manifest(&store, KEY, &cur, 3).unwrap());
+        assert_eq!(calls.get(), 2, "entries are recomputed on every attempt");
+        let doc = read(&inner);
+        assert_eq!(doc["datasets"]["a/b"]["url"], "theirs");
+        assert_eq!(doc["datasets"]["c/d"]["sha256"], "abc");
     }
 }

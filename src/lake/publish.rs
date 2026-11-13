@@ -1420,7 +1420,9 @@ mod tests {
             kept.iter().map(|e| e.address.as_str()).collect::<Vec<_>>(),
             ["ns/a"]
         );
-        assert!(update_manifest(&fx.store, "manifest.json", &kept, None, 3).unwrap());
+        assert!(
+            update_manifest(&fx.store, "manifest.json", &|| Ok((kept.clone(), None)), 3).unwrap()
+        );
         let doc: serde_json::Value =
             serde_json::from_slice(&fx.object("manifest.json").unwrap().0).unwrap();
         assert!(doc["datasets"]["ns/a"].is_object());
@@ -1439,8 +1441,7 @@ mod tests {
         update_manifest(
             &fx.store,
             "manifest.json",
-            std::slice::from_ref(&entry),
-            Some(&pinned),
+            &|| Ok((vec![entry.clone()], Some(pinned.clone()))),
             3,
         )
         .unwrap();
@@ -1448,14 +1449,21 @@ mod tests {
         // An interrupted publish left the manifest behind.
         let mut stale = entry.clone();
         stale.sha256 = "0".repeat(64);
-        update_manifest(
-            &fx.store,
-            "manifest.json",
-            &[stale],
-            Some("catalog/open-old.ducklake"),
-            3,
-        )
-        .unwrap();
+        assert!(
+            update_manifest(
+                &fx.store,
+                "manifest.json",
+                &|| Ok((
+                    vec![stale.clone()],
+                    Some("catalog/open-old.ducklake".to_string())
+                )),
+                3,
+            )
+            .unwrap()
+        );
+        let doc = manifest_doc(&fx);
+        assert_eq!(doc["datasets"]["ns/a"]["sha256"], "0".repeat(64));
+        assert_eq!(doc["catalog"]["url"], "catalog/open-old.ducklake");
 
         // The next publish changes nothing, yet the caller's filtered write repairs both.
         let again = fx.publish(&[input("s.a", &a)], &[]).unwrap();
@@ -1479,15 +1487,97 @@ mod tests {
             update_manifest(
                 &fx.store,
                 "manifest.json",
-                std::slice::from_ref(&entry),
-                Some(&pinned),
+                &|| Ok((vec![entry.clone()], Some(pinned.clone()))),
                 3
             )
             .unwrap()
         );
-        let doc: serde_json::Value =
-            serde_json::from_slice(&fx.object("manifest.json").unwrap().0).unwrap();
+        let doc = manifest_doc(&fx);
         assert_eq!(doc["datasets"]["ns/a"]["sha256"], entry.sha256);
         assert_eq!(doc["catalog"]["url"], pinned);
+    }
+
+    fn manifest_doc(fx: &Fixture) -> serde_json::Value {
+        serde_json::from_slice(&fx.object("manifest.json").unwrap().0).unwrap()
+    }
+
+    /// What the operator computes for one table: its entry only if no newer snapshot
+    /// changed the table, and the pinned address only while the live catalogue is
+    /// still the one this publish wrote.
+    fn filtered(
+        fx: &Fixture,
+        published: &Published,
+        table: &str,
+        address: &str,
+        file: &Path,
+    ) -> crate::error::Result<(Vec<crate::lake::manifest::ManifestEntry>, Option<String>)> {
+        let mut entries = Vec::new();
+        if !newer_change(
+            &fx.store,
+            &fx.lake,
+            &fx.work(),
+            published.outcome.snapshot_id,
+            table,
+        )? {
+            entries.push(manifest_entry(address, "u", &std::fs::read(file).unwrap()));
+        }
+        let pinned = if fx.store.etag(CATALOG).unwrap() == Some(published.catalog_etag.clone()) {
+            published.pinned_catalog.clone()
+        } else {
+            None
+        };
+        Ok((entries, pinned))
+    }
+
+    #[test]
+    fn a_refused_manifest_write_does_not_reapply_a_stale_entry_over_a_newer_publish() {
+        use crate::lake::manifest::{BeforeFirstPut, update_manifest};
+        let fx = Fixture::new();
+        let a1 = fx.parquet("a1.parquet", &rows(20, "one"));
+        let a2 = fx.parquet("a2.parquet", &rows(22, "two"));
+        let a3 = fx.parquet("a3.parquet", &rows(25, "three"));
+        let first = fx.publish(&[input("s.a", &a1)], &[]).unwrap();
+        let (e, p) = filtered(&fx, &first, "s.a", "ns/a", &a1).unwrap();
+        update_manifest(
+            &fx.store,
+            "manifest.json",
+            &|| Ok((e.clone(), p.clone())),
+            3,
+        )
+        .unwrap();
+
+        // An older publish (2) reads the manifest; before its write, a newer publish
+        // (3) of the same table lands and writes its own entry.
+        let second = fx.publish(&[input("s.a", &a2)], &[]).unwrap();
+        let store = BeforeFirstPut::new(&fx.store, || {
+            let third = fx.publish(&[input("s.a", &a3)], &[]).unwrap();
+            let (e, p) = filtered(&fx, &third, "s.a", "ns/a", &a3).unwrap();
+            update_manifest(
+                &fx.store,
+                "manifest.json",
+                &|| Ok((e.clone(), p.clone())),
+                3,
+            )
+            .unwrap();
+        });
+        update_manifest(
+            &store,
+            "manifest.json",
+            &|| filtered(&fx, &second, "s.a", "ns/a", &a2),
+            3,
+        )
+        .unwrap();
+
+        let doc = manifest_doc(&fx);
+        assert_eq!(
+            doc["datasets"]["ns/a"]["sha256"],
+            sha256_hex(&std::fs::read(&a3).unwrap())
+        );
+        let live_pin = fx.store.etag(CATALOG).unwrap();
+        assert!(live_pin.is_some());
+        assert_ne!(
+            doc["catalog"]["url"].as_str().unwrap(),
+            second.pinned_catalog.as_deref().unwrap()
+        );
     }
 }
