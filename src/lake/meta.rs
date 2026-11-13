@@ -75,9 +75,20 @@ pub fn table_descriptor(
         Some(Value::String(k)) => vec![k.clone()],
         Some(Value::Array(ks)) => ks
             .iter()
-            .filter_map(|k| k.as_str().map(String::from))
-            .collect(),
-        _ => Vec::new(),
+            .map(|k| {
+                k.as_str().map(String::from).ok_or_else(|| {
+                    failed(format!(
+                        "the primaryKey of table '{table_name}' has an entry that is not a string: {k}"
+                    ))
+                })
+            })
+            .collect::<Result<_>>()?,
+        None | Some(Value::Null) => Vec::new(),
+        Some(other) => {
+            return Err(failed(format!(
+                "the primaryKey of table '{table_name}' must be a string or an array of strings, found {other}"
+            )));
+        }
     };
 
     let mut fields = Vec::with_capacity(raw_fields.len());
@@ -109,6 +120,21 @@ pub fn table_descriptor(
                 .unwrap_or_else(|| Value::Object(Default::default())),
             is_key: key.iter().any(|k| k == name),
         });
+    }
+
+    let mut seen = BTreeSet::new();
+    for f in &fields {
+        if !seen.insert(f.column_name.as_str()) {
+            return Err(failed(format!(
+                "the descriptor for table '{table_name}' lists field '{}' more than once",
+                f.column_name
+            )));
+        }
+    }
+    if let Some(missing) = key.iter().find(|k| !seen.contains(k.as_str())) {
+        return Err(failed(format!(
+            "the primaryKey of table '{table_name}' names '{missing}', which is not in schema.fields"
+        )));
     }
 
     let described: BTreeSet<&str> = fields.iter().map(|f| f.column_name.as_str()).collect();
@@ -218,5 +244,52 @@ mod tests {
         let r = p["resources"][0].clone();
         p["resources"].as_array_mut().unwrap().push(r);
         assert!(table_descriptor("soc", &p, &cols(&["code", "level", "definition"])).is_err());
+    }
+
+    #[test]
+    fn a_primary_key_naming_a_missing_field_is_refused() {
+        let mut p = sample();
+        p["resources"][0]["schema"]["primaryKey"] = json!(["nope"]);
+        let err = table_descriptor("soc", &p, &cols(&["code", "level", "definition"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn a_non_string_primary_key_entry_is_refused() {
+        let mut p = sample();
+        p["resources"][0]["schema"]["primaryKey"] = json!([1]);
+        let err = table_descriptor("soc", &p, &cols(&["code", "level", "definition"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a string"), "{err}");
+    }
+
+    #[test]
+    fn a_repeated_field_name_is_refused() {
+        let mut p = sample();
+        let f = p["resources"][0]["schema"]["fields"][0].clone();
+        p["resources"][0]["schema"]["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(f);
+        let err = table_descriptor("soc", &p, &cols(&["code", "level", "definition"]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'code'") && err.contains("more than once"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_resource_without_fields_is_refused() {
+        let mut p = sample();
+        p["resources"][0]["schema"]
+            .as_object_mut()
+            .unwrap()
+            .remove("fields");
+        assert!(table_descriptor("soc", &p, &cols(&["code"])).is_err());
     }
 }
