@@ -1384,4 +1384,21 @@ mod tests {
         let unchanged = lake.commit(&[input("s.t", second, id_v("s.t"))]).unwrap();
         assert!(unchanged.new_files.is_empty());
     }
+
+    #[test]
+    fn a_failing_secret_is_never_quoted() {
+        let lake = Lake::new();
+        let err = commit(
+            &lake.catalog(),
+            DATA_PATH,
+            "s3://bucket/lake/",
+            Some("CREATE TEMPORARY SECRET x (TYPE s3, KEY_ID 'sentinel-xyz', BOGUS 1)"),
+            &[],
+            &json!({}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("secret"), "{err}");
+        assert!(!err.contains("sentinel-xyz"), "{err}");
+    }
 }

@@ -9,6 +9,7 @@
 //! once the catalogue holds this publish's snapshot, and are skipped when a newer
 //! snapshot changed their table, so an older publish never overwrites a newer one's.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -165,8 +166,16 @@ struct Landed {
     etag: ETag,
 }
 
-/// One fetch, commit and conditional catalogue write. `None`: another publish moved
-/// the catalogue first, so start again.
+/// How an attempt ended.
+enum Try {
+    Landed(Landed),
+    /// Another publish moved the catalogue first: start again.
+    Lost,
+    /// The store throttled a write: start again.
+    Throttled,
+}
+
+/// One fetch, commit and conditional catalogue write.
 fn attempt(
     store: &dyn ObjectStore,
     lake: &Lake,
@@ -174,7 +183,7 @@ fn attempt(
     work: &Path,
     tables: &[TableInput],
     commit_info: &serde_json::Value,
-) -> Result<Option<Landed>> {
+) -> Result<Try> {
     let key = lake.catalog_key.as_str();
     let fetched = store
         .get(key)
@@ -199,12 +208,12 @@ fn attempt(
                 .map_err(store_failed("fetch the catalogue", key))?
                 .map(|(_, etag)| etag);
             if now.as_ref() != Some(&fetched_etag) {
-                return Ok(None);
+                return Ok(Try::Lost);
             }
             let Some(pinned) = pin(store, lake, &fetched_bytes)? else {
-                return Ok(None);
+                return Ok(Try::Throttled);
             };
-            Ok(Some(Landed {
+            Ok(Try::Landed(Landed {
                 outcome,
                 pinned,
                 etag: fetched_etag,
@@ -216,19 +225,20 @@ fn attempt(
             // and last.
             let bytes = read_catalogue(&catalog_file)?;
             let Some(pinned) = pin(store, lake, &bytes)? else {
-                return Ok(None);
+                return Ok(Try::Throttled);
             };
             let cond = match fetched {
                 Some((_, etag)) => PutCondition::IfMatch(etag),
                 None => PutCondition::IfAbsent,
             };
             match store.put(key, &bytes, cond, Some(STABLE_CACHE)) {
-                Ok(etag) => Ok(Some(Landed {
+                Ok(etag) => Ok(Try::Landed(Landed {
                     outcome,
                     pinned,
                     etag,
                 })),
-                Err(StoreError::PreconditionFailed | StoreError::Throttled) => Ok(None),
+                Err(StoreError::PreconditionFailed) => Ok(Try::Lost),
+                Err(StoreError::Throttled) => Ok(Try::Throttled),
                 Err(e) => Err(store_failed("write the catalogue", key)(e)),
             }
         }
@@ -251,15 +261,26 @@ pub fn newer_change(
     table: &str,
 ) -> Result<bool> {
     let key = lake.catalog_key.as_str();
-    let Some((bytes, _)) = store
+    match store
         .get(key)
         .map_err(store_failed("fetch the catalogue", key))?
-    else {
-        return Ok(false);
-    };
+    {
+        Some((bytes, _)) => newer_change_in(lake, work, &bytes, since_snapshot, table),
+        None => Ok(false),
+    }
+}
+
+/// `newer_change` against catalogue bytes already fetched.
+fn newer_change_in(
+    lake: &Lake,
+    work: &Path,
+    bytes: &[u8],
+    since_snapshot: i64,
+    table: &str,
+) -> Result<bool> {
     fs::create_dir_all(work).map_err(io_failed(work))?;
     let file = work.join("newer.ducklake");
-    place_catalogue(&file, Some(&bytes))?;
+    place_catalogue(&file, Some(bytes))?;
 
     let context = |what: &'static str| move |e: duckdb::Error| failed(format!("{what}: {e}"));
     let conn = duckdb::Connection::open_in_memory().map_err(context("open duckdb"))?;
@@ -288,7 +309,8 @@ pub fn newer_change(
     let exists = |schema: &str, name: &str| -> Result<bool> {
         conn.query_row(
             "SELECT count(*) FROM duckdb_tables() \
-             WHERE database_name = 'arc_newer' AND schema_name = ? AND table_name = ?",
+             WHERE database_name = 'arc_newer' AND lower(schema_name) = lower(?) \
+             AND lower(table_name) = lower(?)",
             [schema, name],
             |r| r.get::<_, i64>(0),
         )
@@ -320,7 +342,7 @@ pub fn newer_change(
         .query_row(
             &format!(
                 "SELECT count(*) FROM ducklake_table_changes('arc_newer', {}, 'descriptors', {from}, {latest}) \
-                 WHERE table_name = ?",
+                 WHERE lower(table_name) = lower(?)",
                 sql_string_literal(META_SCHEMA)
             ),
             [format!("{schema}.{name}")],
@@ -399,15 +421,22 @@ pub fn publish(
     fs::create_dir_all(work).map_err(io_failed(work))?;
     let max_attempts = max_attempts.max(1);
     let mut attempts = 0;
+    let mut throttled = false;
     let landed = loop {
         attempts += 1;
-        if let Some(landed) = attempt(store, lake, secret_sql, work, tables, commit_info)? {
-            break landed;
+        match attempt(store, lake, secret_sql, work, tables, commit_info)? {
+            Try::Landed(landed) => break landed,
+            Try::Lost => {}
+            Try::Throttled => throttled = true,
         }
         if attempts >= max_attempts {
+            let why = if throttled {
+                "another publish won, or the store throttled"
+            } else {
+                "another publish won each time"
+            };
             return Err(failed(format!(
-                "another publish changed the catalogue `{}` first on each of {attempts} \
-                 attempts; giving up",
+                "could not write the catalogue `{}` after {attempts} attempts ({why})",
                 lake.catalog_key
             )));
         }
@@ -437,17 +466,45 @@ pub fn publish(
 
     let mut uploaded = Vec::new();
     let mut superseded = Vec::new();
+    // Per catalogue ETag and table, whether a newer snapshot changed the table. A
+    // newer change stays newer, whatever the catalogue does next.
+    let mut checked: HashMap<(String, String), bool> = HashMap::new();
+    let mut newer_tables: HashSet<String> = HashSet::new();
     for (file, key, owners) in files {
-        let current = store
-            .get(&lake.catalog_key)
-            .map_err(store_failed("fetch the catalogue", &lake.catalog_key))?
-            .map(|(_, etag)| etag);
-        let mut newer = false;
-        if current.as_ref() != Some(&landed.etag) {
-            for table in owners {
-                if newer_change(store, lake, work, landed.outcome.snapshot_id, table)? {
-                    newer = true;
-                    break;
+        // The copy's own ETag first, then the catalogue: a newer publish uploads
+        // only after its catalogue lands, so either the check sees it, or the
+        // conditional upload below does.
+        let copy_cond = match store.get(&key).map_err(store_failed("fetch", &key))? {
+            Some((_, etag)) => PutCondition::IfMatch(etag),
+            None => PutCondition::IfAbsent,
+        };
+        let mut newer = owners.iter().any(|t| newer_tables.contains(*t));
+        if !newer {
+            let current = store
+                .get(&lake.catalog_key)
+                .map_err(store_failed("fetch the catalogue", &lake.catalog_key))?;
+            if let Some((bytes, etag)) = current.filter(|(_, e)| *e != landed.etag) {
+                for table in &owners {
+                    let cache_key = (etag.0.clone(), (*table).to_string());
+                    let changed = match checked.get(&cache_key) {
+                        Some(&changed) => changed,
+                        None => {
+                            let changed = newer_change_in(
+                                lake,
+                                work,
+                                &bytes,
+                                landed.outcome.snapshot_id,
+                                table,
+                            )?;
+                            checked.insert(cache_key, changed);
+                            changed
+                        }
+                    };
+                    if changed {
+                        newer_tables.insert((*table).to_string());
+                        newer = true;
+                        break;
+                    }
                 }
             }
         }
@@ -455,10 +512,12 @@ pub fn publish(
             superseded.push(key);
             continue;
         }
-        store
-            .put_file(&key, &file, PutCondition::Any, None)
-            .map_err(store_failed("upload", &key))?;
-        uploaded.push(describe(&key, &file)?);
+        match store.put_file(&key, &file, copy_cond, None) {
+            Ok(_) => uploaded.push(describe(&key, &file)?),
+            // Written since the check: a newer publish owns it.
+            Err(StoreError::PreconditionFailed) => superseded.push(key),
+            Err(e) => return Err(store_failed("upload", &key)(e)),
+        }
     }
 
     Ok(Published {
@@ -661,7 +720,12 @@ mod tests {
     struct Wrapped<'a> {
         inner: &'a dyn ObjectStore,
         fail_pinned_uploads: bool,
+        /// Answer `Throttled` to the next pinned-copy write.
+        throttle_next_pin: Mutex<bool>,
         refuse_catalog_writes: bool,
+        throttle_catalog_writes: bool,
+        /// Run once, just before the first readable or extra upload.
+        before_copy_upload: Mutex<Option<Box<dyn FnOnce() + Send + 'a>>>,
         /// Waited on before the first catalogue write.
         barrier: Option<&'a Barrier>,
         waited: Mutex<bool>,
@@ -674,7 +738,10 @@ mod tests {
             Wrapped {
                 inner,
                 fail_pinned_uploads: false,
+                throttle_next_pin: Mutex::new(false),
                 refuse_catalog_writes: false,
+                throttle_catalog_writes: false,
+                before_copy_upload: Mutex::new(None),
                 barrier: None,
                 waited: Mutex::new(false),
                 after_catalog_write: Mutex::new(None),
@@ -699,10 +766,20 @@ mod tests {
             cond: PutCondition,
             cache_control: Option<&str>,
         ) -> std::result::Result<ETag, StoreError> {
-            if self.fail_pinned_uploads && key.starts_with("catalog/open-") {
-                return Err(StoreError::Other("upload refused".into()));
+            if key.starts_with("catalog/open-") {
+                if self.fail_pinned_uploads {
+                    return Err(StoreError::Other("upload refused".into()));
+                }
+                let mut throttle = self.throttle_next_pin.lock().unwrap();
+                if *throttle {
+                    *throttle = false;
+                    return Err(StoreError::Throttled);
+                }
             }
             if key == CATALOG {
+                if self.throttle_catalog_writes {
+                    return Err(StoreError::Throttled);
+                }
                 if self.refuse_catalog_writes {
                     return Err(StoreError::PreconditionFailed);
                 }
@@ -730,6 +807,10 @@ mod tests {
             cond: PutCondition,
             cache_control: Option<&str>,
         ) -> std::result::Result<ETag, StoreError> {
+            let hook = self.before_copy_upload.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
             self.inner.put_file(key, path, cond, cache_control)
         }
     }
@@ -1005,6 +1086,8 @@ mod tests {
             .to_string();
         assert!(err.contains(CATALOG), "{err}");
         assert!(err.contains('3'), "names the attempt count: {err}");
+        assert!(err.contains("another publish won"), "{err}");
+        assert!(!err.contains("throttl"), "{err}");
         assert_eq!(fx.object(CATALOG).unwrap(), catalogue);
         assert_eq!(fx.object("ns/a.parquet").unwrap().0, copy);
     }
@@ -1063,5 +1146,61 @@ mod tests {
         ] {
             assert!(keys.contains(&k), "{keys:?}");
         }
+    }
+
+    #[test]
+    fn a_copy_written_between_the_check_and_the_upload_is_not_overwritten() {
+        let fx = Fixture::new();
+        let v1 = fx.parquet("v1.parquet", &rows(20, "old"));
+        let v2 = fx.parquet("v2.parquet", &rows(25, "new"));
+        let store = Wrapped::new(&fx.store);
+        *store.before_copy_upload.lock().unwrap() = Some(Box::new(|| {
+            let newer = fx
+                .publish(
+                    &[input("s.a", &v2)],
+                    &[(v2.clone(), "ns/a.parquet".to_string())],
+                )
+                .unwrap();
+            assert!(newer.superseded.is_empty());
+        }));
+        let out = fx
+            .publish_via(
+                &store,
+                &[input("s.a", &v1)],
+                &[(v1.clone(), "ns/a.parquet".to_string())],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(out.superseded, ["ns/a.parquet"]);
+        assert_eq!(
+            fx.object("ns/a.parquet").unwrap().0,
+            std::fs::read(&v2).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_throttled_pinned_copy_write_retries() {
+        let fx = Fixture::new();
+        let a = fx.parquet("a.parquet", &rows(20, "a"));
+        let store = Wrapped::new(&fx.store);
+        *store.throttle_next_pin.lock().unwrap() = true;
+        let out = fx
+            .publish_via(&store, &[input("s.a", &a)], &[], &[])
+            .unwrap();
+        assert_eq!(out.attempts, 2);
+        assert_eq!(fx.http_count("SELECT count(*) FROM lake.s.a"), 20);
+    }
+
+    #[test]
+    fn running_out_of_attempts_while_throttled_names_throttling() {
+        let fx = Fixture::new();
+        let a = fx.parquet("a.parquet", &rows(3, "a"));
+        let mut store = Wrapped::new(&fx.store);
+        store.throttle_catalog_writes = true;
+        let err = fx
+            .publish_via(&store, &[input("s.a", &a)], &[], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(CATALOG) && err.contains("throttled"), "{err}");
     }
 }
