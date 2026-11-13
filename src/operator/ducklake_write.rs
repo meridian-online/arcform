@@ -333,19 +333,20 @@ impl DucklakeWriteConfig {
         if let Some(m) = &self.manifest {
             owned.push(("manifest", m.clone(), false));
         }
-        let mut keys: Vec<(&str, &str)> = Vec::new();
+        // (field, key, whether the key may also be a folder's prefix)
+        let mut keys: Vec<(&str, &str, bool)> = Vec::new();
         for t in &self.tables {
             if let Some(c) = &t.readable_copy {
-                keys.push(("readable_copy", c));
+                keys.push(("readable_copy", c, false));
             }
         }
         for f in &self.files {
-            keys.push(("files.to", &f.to));
+            keys.push(("files.to", &f.to, true));
         }
-        for (field, key) in keys {
+        for (field, key, may_be_folder) in keys {
             // A `files.to` without a trailing `/` may be a file or a folder's prefix.
             let mut variants = vec![key.to_string()];
-            if !key.ends_with('/') {
+            if may_be_folder && !key.ends_with('/') {
                 variants.push(format!("{key}/"));
             }
             for (other, value, is_prefix) in &owned {
@@ -1145,6 +1146,7 @@ credential:
             ("to: demo/search/", "to: lake/", "files.to"),
             ("to: demo/search/", "to: catalog/", "files.to"),
             ("to: demo/search/", "to: runs", "files.to"),
+            ("to: demo/search/", "to: lake", "files.to"),
             ("data_path: lake/", "data_path: catalog/", "data_path"),
             ("data_path: lake/", "data_path: runs/", "data_path"),
         ] {
@@ -1152,6 +1154,9 @@ credential:
             let e = refusal(&yaml);
             assert!(e.contains(names), "{to}: {e}");
         }
+        // A readable copy is an exact key: `lake` is not under `lake/`.
+        let yaml = BASE.replace("demo/codes.parquet", "lake");
+        assert!(DucklakeWriteConfig::parse(&with(&yaml)).is_ok());
         // Plain http is for tests on this machine only.
         for local in ["http://127.0.0.1:8080/", "http://localhost/"] {
             let yaml = BASE.replace("https://lake.example/", local);

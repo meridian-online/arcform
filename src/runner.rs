@@ -1162,12 +1162,17 @@ pub fn run_with_publish(
     }
 }
 
-/// The values a public run record must not carry: every dotenv variable, and each
-/// variable a step's `credential.env` names, from the dotenv files or else the
-/// process environment.
+/// The values a public run record must not carry: each credential's `key_id` and
+/// `secret` (from the dotenv files or else the process environment), and every
+/// dotenv value whose name looks secret. An endpoint, region or account id is not
+/// one, and nor is an ordinary dotenv param, which the public copy redacts anyway.
 #[cfg(feature = "http-fetch")]
 fn record_secrets(manifest: &Manifest, dotenv: &HashMap<String, String>) -> Vec<String> {
-    let mut out: Vec<String> = dotenv.values().cloned().collect();
+    let mut out: Vec<String> = dotenv
+        .iter()
+        .filter(|(name, _)| contract::is_secret_key(name))
+        .map(|(_, v)| v.clone())
+        .collect();
     for step in &manifest.steps {
         let Some(env) = step
             .with
@@ -1178,7 +1183,11 @@ fn record_secrets(manifest: &Manifest, dotenv: &HashMap<String, String>) -> Vec<
         else {
             continue;
         };
-        for var in env.values().filter_map(serde_yaml::Value::as_str) {
+        for (param, var) in env {
+            if !matches!(param.as_str(), Some("key_id" | "secret")) {
+                continue;
+            }
+            let Some(var) = var.as_str() else { continue };
             let value = dotenv
                 .get(var)
                 .cloned()
@@ -2369,6 +2378,62 @@ mod run_record_upload_tests {
         )
         .unwrap();
         assert!(store.get("runs/ok.json").unwrap().is_some());
+    }
+
+    /// Only a credential's key id and secret count against the record: its endpoint
+    /// appears in the record's public base and must not refuse it.
+    #[test]
+    fn only_a_real_secret_refuses_the_record() {
+        let manifest: Manifest = serde_yaml::from_str(
+            "name: t\ndotenv: []\nsteps:\n  - name: w\n    op: ducklake_write\n    with:\n      credential:\n        type: s3\n        bucket: b\n        env: { key_id: KID, secret: SEC, endpoint: EP, region: REG }\n",
+        )
+        .unwrap();
+        let dotenv: HashMap<String, String> = [
+            ("KID", "AKIAEXAMPLEKEY1"),
+            ("SEC", "wJalrXUtnFEMI-secret"),
+            ("EP", "https://ep.example.com"),
+            ("REG", "region-east-1"),
+            ("ORDINARY", "ordinary-value"),
+            ("API_TOKEN", "token-value-123"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let secrets = record_secrets(&manifest, &dotenv);
+        assert!(secrets.contains(&"AKIAEXAMPLEKEY1".to_string()));
+        assert!(secrets.contains(&"wJalrXUtnFEMI-secret".to_string()));
+        assert!(secrets.contains(&"token-value-123".to_string()));
+        for not in ["https://ep.example.com", "region-east-1", "ordinary-value"] {
+            assert!(!secrets.contains(&not.to_string()), "{not}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        let store = Arc::new(DirStore::new(dir.path().join("store")));
+        let run = |id: &str, record: serde_json::Value| {
+            std::fs::write(runs.join(format!("{id}.json")), record.to_string()).unwrap();
+            upload_run_records(
+                dir.path(),
+                &runs,
+                id,
+                vec![upload(&store, &format!("runs/{id}.json"))],
+                &secrets,
+            )
+        };
+        run(
+            "ok",
+            serde_json::json!({"steps": [{"report": {"url": "https://ep.example.com/lake/"}}]}),
+        )
+        .unwrap();
+        assert!(
+            run(
+                "bad",
+                serde_json::json!({"steps": [{"report": {"k": "wJalrXUtnFEMI-secret"}}]}),
+            )
+            .is_err()
+        );
+        assert!(store.get("runs/bad.json").unwrap().is_none());
     }
 
     /// The bucket is public: the uploaded record names neither the Protocol's
