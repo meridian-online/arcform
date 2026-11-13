@@ -40,7 +40,7 @@ pub struct Lake {
     /// The store key prefix matching `data_path`, e.g. `lake/`.
     pub data_prefix: String,
     /// The same objects as `data_path`, addressed so DuckDB can read and write them:
-    /// `s3://<bucket>/<data_prefix>` live, a local folder otherwise. Ends in `/`.
+    /// `r2://<bucket>/<data_prefix>` (or `s3://`) live, a local folder otherwise. Ends in `/`.
     pub write_path: String,
     /// The pinned copies' key prefix, e.g. `catalog/open-`.
     pub pinned_prefix: String,

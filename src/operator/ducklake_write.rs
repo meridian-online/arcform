@@ -121,6 +121,17 @@ enum CredentialKind {
     S3,
 }
 
+impl CredentialKind {
+    /// The URL scheme DuckDB reads and writes this kind of store through, and the
+    /// scope of its secret.
+    fn scheme(self) -> &'static str {
+        match self {
+            CredentialKind::R2 => "r2",
+            CredentialKind::S3 => "s3",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug))]
 #[serde(deny_unknown_fields)]
@@ -151,6 +162,7 @@ struct CredentialEnv {
 }
 
 /// The credential's values, resolved from the environment.
+#[cfg_attr(test, derive(Clone))]
 struct Resolved {
     kind: CredentialKind,
     bucket: String,
@@ -277,13 +289,19 @@ impl DucklakeWriteConfig {
         prefix
     }
 
-    /// The live lake, for `bucket`.
-    fn live_lake(&self, bucket: &str) -> Lake {
+    /// The live lake, in the credential's bucket. The write path's scheme is the
+    /// credential's type, since DuckDB applies a secret only within its scope: an
+    /// `r2` secret covers `r2://` and an `s3` secret `s3://`.
+    fn live_lake(&self, credential: &Resolved) -> Lake {
         let data_prefix = self.data_prefix();
         Lake {
             catalog_key: self.catalog.clone(),
             data_path: format!("{}{data_prefix}", self.public_base),
-            write_path: format!("s3://{bucket}/{data_prefix}"),
+            write_path: format!(
+                "{}://{}/{data_prefix}",
+                credential.kind.scheme(),
+                credential.bucket
+            ),
             data_prefix,
             pinned_prefix: pinned_prefix(&self.catalog),
         }
@@ -311,7 +329,7 @@ impl CredentialConfig {
             if var.as_deref().is_none_or(str::is_empty) {
                 return Err(invalid(format!(
                     "`credential.env.{param}` must name a variable for a credential of type `{}`",
-                    self.kind_name()
+                    self.kind.scheme()
                 )));
             }
         }
@@ -319,13 +337,6 @@ impl CredentialConfig {
             return Err(invalid("`credential.env` names an empty variable"));
         }
         Ok(())
-    }
-
-    fn kind_name(&self) -> &'static str {
-        match self.kind {
-            CredentialKind::R2 => "r2",
-            CredentialKind::S3 => "s3",
-        }
     }
 
     /// The variables this credential reads, in manifest order.
@@ -394,7 +405,7 @@ impl Resolved {
     }
 
     /// The DuckDB secret letting DuckLake read and write the lake's data through
-    /// `s3://`. Temporary: it dies with the commit's in-memory DuckDB.
+    /// the write path (`r2://` or `s3://`). Temporary: it dies with the commit's in-memory DuckDB.
     fn secret_sql(&self) -> String {
         let common = format!(
             "KEY_ID {}, SECRET {}",
@@ -673,7 +684,7 @@ impl Job<'_> {
     /// The live lake, with the resolved credential.
     fn live(&self, credential: &Resolved) -> Result<Report> {
         let store: Arc<dyn ObjectStore> = Arc::new(credential.store()?);
-        let lake = self.cfg.live_lake(&credential.bucket);
+        let lake = self.cfg.live_lake(credential);
         self.publish_live(store, &lake, Some(&credential.secret_sql()))
     }
 
@@ -1048,6 +1059,44 @@ credential:
             s3.secret_sql(),
             "CREATE TEMPORARY SECRET arc_ducklake_write (TYPE s3, KEY_ID 'kid', SECRET 'it''s', ENDPOINT '127.0.0.1:9000', REGION 'us-east-1', URL_STYLE 'path', USE_SSL false);"
         );
+    }
+
+    /// DuckDB applies a secret only to paths within its scope, and an `r2` secret's
+    /// scope is `r2://`: the live lake's write path must fall inside it, or DuckLake
+    /// would reach the data unauthenticated.
+    #[test]
+    fn the_secret_applies_to_the_write_path() {
+        let cfg = DucklakeWriteConfig::parse(&with(BASE)).unwrap();
+        let r2 = Resolved {
+            kind: CredentialKind::R2,
+            bucket: "test-bucket".into(),
+            key_id: "kid".into(),
+            secret: "sec".into(),
+            location: "acct".into(),
+            region: "auto".into(),
+        };
+        let s3 = Resolved {
+            kind: CredentialKind::S3,
+            location: "http://127.0.0.1:9000/".into(),
+            region: "us-east-1".into(),
+            ..r2.clone()
+        };
+        for (credential, kind) in [(&r2, "r2"), (&s3, "s3")] {
+            let lake = cfg.live_lake(credential);
+            let conn = duckdb::Connection::open_in_memory().unwrap();
+            conn.execute_batch("INSTALL httpfs; LOAD httpfs;").unwrap();
+            conn.execute_batch(&credential.secret_sql()).unwrap();
+            let file = format!("{}ab/cd.parquet", lake.write_path);
+            let names: Vec<String> = conn
+                .prepare("SELECT name FROM which_secret(?, ?)")
+                .unwrap()
+                .query_map([file.as_str(), kind], |r| r.get(0))
+                .unwrap()
+                .collect::<duckdb::Result<_>>()
+                .unwrap();
+            assert_eq!(names, ["arc_ducklake_write"], "{kind}: {file}");
+            assert!(lake.write_path.ends_with("test-bucket/lake/"), "{kind}");
+        }
     }
 
     /// Three codes at `data/codes.parquet`, with their descriptor beside them.

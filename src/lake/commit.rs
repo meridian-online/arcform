@@ -3,7 +3,7 @@
 //!
 //! The catalogue is attached with its data path overridden to the lake's write
 //! path: the same objects the persisted data path names, addressed so DuckDB can
-//! read and write them (`s3://<bucket>/<prefix>/` live, a local folder otherwise).
+//! read and write them (`r2://<bucket>/<prefix>/`, or `s3://`, live; a local folder otherwise).
 //! DuckLake reads the files already in the lake there and writes new ones in place,
 //! recorded relative to the persisted data path. Uploading the catalogue is the
 //! caller's job.
@@ -732,7 +732,7 @@ fn new_files(conn: &duckdb::Connection, snapshot: i64) -> Result<Vec<String>> {
 /// Write `tables` into the DuckLake catalogue at `catalog_file` as one snapshot,
 /// creating the catalogue with `data_path` as its persisted data path if the file is
 /// absent. Data files are read and written under `write_path`, a local folder or an
-/// `s3://bucket/prefix/` URL naming the same objects as `data_path`. `secret_sql`,
+/// `r2://` or `s3://` URL naming the same objects as `data_path`. `secret_sql`,
 /// when given, runs before the attach (the caller's `CREATE TEMPORARY SECRET`); it
 /// never appears in an error. An unchanged commit makes no write and commits no
 /// snapshot.
