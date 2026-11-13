@@ -3293,7 +3293,7 @@ impl ParquetExportConfig {
 /// That is the whole escape — a plain `'…'` literal in DuckDB processes no backslash
 /// escapes (unlike `E'…'`), so a backslash, a newline and a `"` all pass through as
 /// themselves. Verified against DuckDB 1.5.4 for `\`, LF and `"`.
-fn sql_string_literal(s: &str) -> String {
+pub(crate) fn sql_string_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 

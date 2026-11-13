@@ -35,7 +35,7 @@ pub struct FieldRow {
     pub is_key: bool,
 }
 
-fn failed(msg: impl std::fmt::Display) -> Error {
+pub(super) fn failed(msg: impl std::fmt::Display) -> Error {
     Error::StepFailed {
         step: String::new(),
         code: 1,
