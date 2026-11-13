@@ -14,7 +14,7 @@
 
 - DuckDB is pinned `duckdb = "=1.20000.0"` (DuckDB v2.0.0). Do not change it.
 - New catalogues use DuckLake's current format (1.1 on DuckDB 2.0); do not pass `DUCKLAKE_VERSION`. Readers need DuckDB 2.0 or later.
-- Every lake write goes into the local catalogue file attached with `OVERRIDE_DATA_PATH true` to a staging folder. Never write through https.
+- Every lake write goes into the local copy of the catalogue file, attached with `OVERRIDE_DATA_PATH true` to the lake's write path: the same objects the persisted https data path names, addressed so DuckDB can read and write them (`s3://<bucket>/<data_prefix>` live, a local folder in tests and for the local lake). Never write through https, and never override to a staging folder (DuckLake would look for existing files there).
 - One snapshot per publish for all of a step's tables. An unchanged publish commits no snapshot.
 - Upsert is `UPDATE` + `DELETE` + `INSERT` in one transaction, never `MERGE INTO` (DuckLake supports only one UPDATE/DELETE action in a MERGE).
 - `meta` is a reserved schema name: a table may not be published into it.
