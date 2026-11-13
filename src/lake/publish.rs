@@ -623,6 +623,30 @@ pub fn publish_with_landing(
     on_landed: &mut dyn FnMut(&CommitOutcome),
 ) -> Result<Published> {
     fs::create_dir_all(work).map_err(io_failed(work))?;
+    // Every file to upload is expanded and read before the catalogue is touched, so
+    // a missing source refuses the publish with nothing written.
+    let every_table: Vec<&str> = tables.iter().map(|t| t.table.as_str()).collect();
+    let mut files: Vec<(PathBuf, String, Vec<&str>, UploadedObject)> = Vec::new();
+    for (file, key) in readable {
+        let owners: Vec<&str> = tables
+            .iter()
+            .filter(|t| t.parquet == *file)
+            .map(|t| t.table.as_str())
+            .collect();
+        let owners = if owners.is_empty() {
+            every_table.clone()
+        } else {
+            owners
+        };
+        let local = describe(key, file)?;
+        files.push((file.clone(), key.clone(), owners, local));
+    }
+    for e in extra {
+        for (file, key) in expand(e)? {
+            let local = describe(&key, &file)?;
+            files.push((file, key, every_table.clone(), local));
+        }
+    }
     let max_attempts = max_attempts.max(1);
     let mut attempts = 0;
     let mut throttled = false;
@@ -648,27 +672,6 @@ pub fn publish_with_landing(
     };
     on_landed(&landed.outcome);
 
-    let every_table: Vec<&str> = tables.iter().map(|t| t.table.as_str()).collect();
-    let mut files: Vec<(PathBuf, String, Vec<&str>)> = Vec::new();
-    for (file, key) in readable {
-        let owners: Vec<&str> = tables
-            .iter()
-            .filter(|t| t.parquet == *file)
-            .map(|t| t.table.as_str())
-            .collect();
-        let owners = if owners.is_empty() {
-            every_table.clone()
-        } else {
-            owners
-        };
-        files.push((file.clone(), key.clone(), owners));
-    }
-    for e in extra {
-        for (file, key) in expand(e)? {
-            files.push((file, key, every_table.clone()));
-        }
-    }
-
     let mut uploaded = Vec::new();
     let mut unchanged = Vec::new();
     let mut superseded = Vec::new();
@@ -680,12 +683,11 @@ pub fn publish_with_landing(
         landed.etag.clone(),
         Seen::default(),
     );
-    for (file, key, owners) in files {
+    for (file, key, owners, local) in files {
         if guard.known_newer(&owners) {
             superseded.push(key);
             continue;
         }
-        let local = describe(&key, &file)?;
         // Every try reads the copy's own version first, then the catalogue: a newer
         // publish uploads only after its catalogue lands, so either the check sees
         // it, or the conditional upload is refused. A refusal may also be an older
@@ -1390,6 +1392,29 @@ mod tests {
         ] {
             assert!(keys.contains(&k), "{keys:?}");
         }
+    }
+
+    /// A missing extra file refuses the publish before the catalogue is written.
+    #[test]
+    fn a_missing_extra_file_refuses_the_publish_before_anything_is_written() {
+        let fx = Fixture::new();
+        let a = fx.parquet("a.parquet", &rows(3, "a"));
+        let e = fx
+            .publish_via(
+                &fx.store,
+                &[input("s.a", &a)],
+                &[],
+                &[ExtraFile {
+                    from: fx.dir.path().join("missing"),
+                    to: "ns/search/".to_string(),
+                }],
+            )
+            .expect_err("refused");
+        assert!(e.to_string().contains("missing"), "{e}");
+        assert!(
+            fx.store.get(&fx.lake.catalog_key).unwrap().is_none(),
+            "no catalogue was written"
+        );
     }
 
     #[test]

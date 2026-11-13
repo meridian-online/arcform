@@ -921,6 +921,12 @@ impl Operator for DucklakeWrite {
         // The asset graph reads a directory's kind from its trailing `/`, as it does
         // every asset name's, without asking the filesystem.
         for f in &cfg.files {
+            if !ctx.dir.join(&f.from).exists() {
+                return Err(failed(format!(
+                    "`files.from: {}` does not exist; nothing was published",
+                    f.from
+                )));
+            }
             if !f.from.ends_with('/') && ctx.dir.join(&f.from).is_dir() {
                 return Err(failed(format!(
                     "`files.from: {0}` is a directory; write it `{0}/` so the run records \
@@ -1841,9 +1847,33 @@ credential:
         assert!(!p.join("build/lake").exists(), "nothing was published");
     }
 
+    /// A `files.from` that does not exist is refused up front, naming the path.
+    #[test]
+    fn a_missing_files_source_is_refused_before_anything_is_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        write_codes(p);
+        let env = HashMap::new();
+        let ctx = OpContext {
+            dir: p,
+            db_path: p,
+            env: &env,
+            dotenv: crate::operator::no_dotenv(),
+            timeout: None,
+            cache: None,
+        };
+        let e = DucklakeWrite
+            .run(&with(BASE), &ctx)
+            .expect_err("refused")
+            .to_string();
+        assert!(e.contains("build/search/"), "{e}");
+        assert!(!p.join("build/lake").exists(), "nothing was published");
+    }
+
     #[test]
     fn a_required_publish_without_the_credential_fails_naming_only_variables() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("build/search")).unwrap();
         let mut env = HashMap::new();
         env.insert(PUBLISH_ENV.to_string(), "required".to_string());
         let mut dotenv = HashMap::new();

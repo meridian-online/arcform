@@ -1118,7 +1118,11 @@ pub fn run_with_publish(
         ),
     ) {
         (result, Ok(())) => result,
-        (Ok(()), Err(e)) => Err(e),
+        (Ok(()), Err(e)) => {
+            // The run recorded `success` before the upload; the exit code is an error.
+            let _ = state.finish_run(&run_id, executed, "error", total_retries);
+            Err(e)
+        }
         (Err(e), Err(upload)) => {
             eprintln!("{} {}", "error:".red(), upload);
             Err(e)
