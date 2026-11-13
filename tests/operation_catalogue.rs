@@ -44,9 +44,9 @@ const JOIN_TABLES: &str = "join-tables";
 const APPEND_ROWS: &str = "append-rows";
 const READ_FILE: &str = "read-file";
 
-/// The operators the default build holds: the ten every build holds and the two
+/// The operators the default build holds: the ten every build holds and the three
 /// `http-fetch` adds, which `cli` turns on.
-const OPERATORS: [&str; 12] = [
+const OPERATORS: [&str; 13] = [
     "parquet_export",
     "archive_extract",
     "datapackage_describe",
@@ -59,6 +59,7 @@ const OPERATORS: [&str; 12] = [
     "ducklake_publish",
     "http_fetch",
     "html_link_discover",
+    "ducklake_write",
 ];
 
 /// Every operator this build holds: [`OPERATORS`], and `opendal_fetch` in a build
@@ -662,7 +663,7 @@ fn a_fetcher_reads_nothing_and_a_check_or_a_publish_writes_nothing() {
             "`{op}` writes what it fetches:\n{description}"
         );
     }
-    for op in ["finetype_validate", "ducklake_publish"] {
+    for op in ["finetype_validate", "ducklake_publish", "ducklake_write"] {
         let description = arc_json(&["operation", "describe", op]);
         assert_eq!(
             description["writes"],

@@ -28,6 +28,8 @@ use crate::engine::StepOutput;
 use crate::error::{Error, Result};
 
 mod ducklake_publish;
+#[cfg(feature = "http-fetch")]
+mod ducklake_write;
 // Only its test reads it: the generated README sections are checked, not built.
 #[cfg(test)]
 mod reference;
@@ -122,11 +124,14 @@ static UMAP_PROJECT: UmapProject = UmapProject;
 static TEXT_EMBED: TextEmbed = TextEmbed;
 static UV: Uv = Uv;
 static DUCKLAKE_PUBLISH: ducklake_publish::DucklakePublish = ducklake_publish::DucklakePublish;
+#[cfg(feature = "http-fetch")]
+static DUCKLAKE_WRITE: ducklake_write::DucklakeWrite = ducklake_write::DucklakeWrite;
 #[cfg(feature = "opendal")]
 static OPENDAL_FETCH: OpendalFetch = OpendalFetch;
 
-/// The built-in operator catalog. Two entries are feature-gated: the ureq-backed
-/// ingress ops (`http_fetch`, `html_link_discover`) appear only under `http-fetch`
+/// The built-in operator catalog. Some entries are feature-gated: the ureq-backed
+/// ops (`http_fetch`, `html_link_discover`, and `ducklake_write`, whose object store
+/// sends its requests with ureq) appear only under `http-fetch`
 /// (enabled via `cli`; a `default-features = false` library consumer builds without
 /// them and without ureq — see Cargo.toml), and `opendal_fetch` only under `opendal`
 /// (off by default to keep the single binary lean).
@@ -148,6 +153,7 @@ fn catalog() -> Vec<&'static dyn Operator> {
     ops.extend([
         &HTTP_FETCH as &'static dyn Operator,
         &HTML_LINK_DISCOVER as &'static dyn Operator,
+        &DUCKLAKE_WRITE as &'static dyn Operator,
     ]);
     #[cfg(feature = "opendal")]
     ops.push(&OPENDAL_FETCH);
@@ -386,6 +392,78 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
             }),
             &["file", "catalog", "table"],
         ),
+        "ducklake_write" => object(
+            json!({
+                "public_base": { "type": "string", "pattern": "^https?://[^/?#]+/([^?#]*/)?$", "description": "The bucket's public base address, ending in `/`, e.g. `https://openlake.meridian.online/`. Readers resolve the catalogue and its data under it. Must be https; plain http is admitted only for 127.0.0.1 and localhost, for tests." },
+                "catalog": { "type": "string", "description": "The catalogue's key under `public_base`, e.g. `catalog/open.ducklake`. Its immutable pinned copies go beside it, as `catalog/open-<sha16>.ducklake`. Relative, without `..`." },
+                "data_path": { "type": "string", "description": "The key prefix DuckLake writes the lake's data files under, e.g. `lake/`; the catalogue's persisted data path is `public_base` followed by it. Relative, without `..`." },
+                "local_catalog": { "type": "string", "description": "The catalogue a run without the write credential publishes into instead, relative to the protocol directory, e.g. `build/lake/open.ducklake`. Its data goes in the folder beside it, `<local_catalog>.files/`, so the local lake attaches and reads back offline." },
+                "tables": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "The tables to publish, committed together as one snapshot. Each is upserted on its key, so the snapshot records only the rows that changed, and an unchanged publish commits nothing.",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "table": { "type": "string", "description": "`table` (schema main) or `schema.table`. The schema `meta` is reserved for the lake's descriptors." },
+                            "from": { "type": "string", "description": "The Parquet file whose rows the table takes, relative to the protocol directory. Declared as a read, so the step runs after whatever produces it." },
+                            "key": { "type": "array", "items": { "type": "string" }, "description": "The columns rows are matched on. Omitted, the descriptor's primaryKey; empty, the table is replaced whole when it differs." },
+                            "descriptor": { "type": "string", "description": "The table's Frictionless descriptor, one resource, relative to the protocol directory. Written into the lake's meta.descriptors and meta.fields in the same snapshot; its fields must name exactly the file's columns." },
+                            "readable_copy": { "type": "string", "description": "The key the file itself is uploaded to, byte for byte, for readers who download rather than attach, e.g. `bls/soc_2018.parquet`. Uploaded only once the catalogue holds the snapshot." },
+                            "on_schema_change": { "type": "string", "enum": ["fail", "replace"], "default": "fail", "description": "What a change to the table's columns, other than a column added at the end, does: fail the step naming the difference, or drop and recreate the table in the same snapshot." },
+                            "manifest_extra": { "type": "object", "additionalProperties": { "description": "Any JSON value." }, "description": "Further keys for the table's entry in the compatible manifest. They never replace a key the step writes itself." }
+                        },
+                        "required": ["table", "from", "descriptor"]
+                    }
+                },
+                "files": {
+                    "type": "array",
+                    "description": "Extra files uploaded as they are, once the catalogue holds the snapshot.",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "from": { "type": "string", "description": "A file, or a directory ending in `/`, relative to the protocol directory." },
+                            "to": { "type": "string", "description": "The key, or for a directory a key prefix ending in `/`." }
+                        },
+                        "required": ["from", "to"]
+                    }
+                },
+                "manifest": { "type": "string", "description": "Optional. The key of a compatible `manifest.json` kept current for readers of today's manifest: each table with a `readable_copy` gets an entry, and the top-level `catalog.url` names the pinned catalogue. Written after the catalogue, and only by a live publish." },
+                "credential": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "description": "The write credential, its values read from the environment: the manifest's dotenv files, then the process environment. With any variable unset the step publishes into `local_catalog` and succeeds, unless the run is `arc run --publish`.",
+                    "properties": {
+                        "type": { "type": "string", "enum": ["r2", "s3"], "description": "`r2` for Cloudflare R2, `s3` for another S3-compatible store." },
+                        "bucket": { "type": "string", "description": "The bucket the lake lives in." },
+                        "env": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "description": "Each secret parameter's environment variable. The manifest names variables and never holds a value.",
+                            "properties": {
+                                "key_id": { "type": "string", "description": "The variable holding the access key id." },
+                                "secret": { "type": "string", "description": "The variable holding the secret access key." },
+                                "account_id": { "type": "string", "x-required-for": "r2", "description": "`r2` only, and required for it: the variable holding the Cloudflare account id." },
+                                "endpoint": { "type": "string", "x-required-for": "s3", "description": "`s3` only, and required for it: the variable holding the endpoint's URL." },
+                                "region": { "type": "string", "x-required-for": "s3", "description": "`s3` only, and required for it: the variable holding the region." }
+                            },
+                            "required": ["key_id", "secret"]
+                        }
+                    },
+                    "required": ["type", "bucket", "env"]
+                }
+            }),
+            &[
+                "public_base",
+                "catalog",
+                "data_path",
+                "local_catalog",
+                "tables",
+                "credential",
+            ],
+        ),
         _ => return None,
     };
     // Name the schema after the operator so an authoring form can title it.
@@ -444,6 +522,7 @@ const IGNORED_KEYWORDS: &[&str] = &[
     "default",
     "x-at-most",
     "x-kind",
+    "x-required-for",
 ];
 
 fn check_against(schema: &Json, value: &Json, at: &str, faults: &mut Vec<String>) {
@@ -1054,6 +1133,68 @@ const DESCRIBED: &[Described] = &[
         )],
         writes: &[],
     },
+    Described {
+        name: "ducklake_write",
+        summary: "Publishes tables into a DuckLake catalogue on object storage, as one snapshot, upserting each on its key, or into a local lake when the write credential is not set.",
+        wraps: &[
+            Wraps {
+                id: "ducklake",
+                name: "DuckLake",
+                url: "https://ducklake.select",
+                use_: "Writes the tables' data files and records each publish as a snapshot readers can time-travel through, with a row-level change feed between snapshots.",
+            },
+            Wraps {
+                id: "duckdb",
+                name: "DuckDB",
+                url: "https://duckdb.org",
+                use_: "Runs the upsert, an `UPDATE`, `DELETE` and `INSERT` in one transaction, against the catalogue attached through its `ducklake` extension.",
+            },
+            Wraps {
+                id: "cloudflare-r2",
+                name: "Cloudflare R2",
+                url: "https://developers.cloudflare.com/r2/",
+                use_: "Holds the catalogue and its data; the catalogue is written conditionally on the version fetched, so two publishes never overwrite each other.",
+            },
+        ],
+        example: r#"- name: publish
+  op: ducklake_write@1
+  with:
+    public_base: https://openlake.meridian.online/
+    catalog: catalog/open.ducklake
+    data_path: lake/
+    local_catalog: build/lake/open.ducklake
+    tables:
+      - table: bls.soc_2018
+        from: build/soc_2018.parquet
+        descriptor: soc_2018.datapackage.json
+        readable_copy: bls/soc_2018.parquet
+    credential:
+      type: r2
+      bucket: meridian-open
+      env:
+        key_id: R2_ACCESS_KEY_ID
+        secret: R2_SECRET_ACCESS_KEY
+        account_id: R2_ACCOUNT_ID
+"#,
+        reads: &[
+            role(
+                "tables.from",
+                "file",
+                "Each table's Parquet file, whose rows the table takes.",
+            ),
+            role(
+                "tables.descriptor",
+                "file",
+                "Each table's Frictionless descriptor, written into the lake's `meta` schema.",
+            ),
+            role(
+                "files.from",
+                "any",
+                "Each extra file or directory, uploaded as it is.",
+            ),
+        ],
+        writes: &[],
+    },
 ];
 
 /// The summary and the roles of the operator called `op_name`, or `None` for a name
@@ -1116,18 +1257,37 @@ fn description_in_any_build(op_name: &str) -> Option<serde_json::Value> {
 
 /// `key` as a role, its `list`, `required` and `min_items` read from its entry in
 /// the operator's `with:` schema.
+///
+/// A key with dots, such as `tables.from`, names a key inside each item of a list
+/// (or inside an object): the role is a list when any step of the path is, takes its
+/// `min_items` from the first list on the path, and is required when every step is.
 fn resolved_role(key: &RoleKey, schema: &serde_json::Value) -> crate::record::Role {
-    let entry = &schema["properties"][key.key];
-    let list = entry["type"] == "array";
+    let mut object = schema;
+    let mut list = false;
+    let mut required = true;
+    let mut min_items = None;
+    for part in key.key.split('.') {
+        required &= object["required"]
+            .as_array()
+            .is_some_and(|keys| keys.iter().any(|k| k == part));
+        let entry = &object["properties"][part];
+        if entry["type"] == "array" {
+            if !list {
+                min_items = Some(entry["minItems"].as_u64().unwrap_or(0));
+            }
+            list = true;
+            object = &entry["items"];
+        } else {
+            object = entry;
+        }
+    }
     crate::record::Role {
         name: key.key,
         kind: key.kind,
         list,
-        required: schema["required"]
-            .as_array()
-            .is_some_and(|required| required.iter().any(|k| k == key.key)),
+        required,
         of: key.of,
-        min_items: list.then(|| entry["minItems"].as_u64().unwrap_or(0)),
+        min_items,
         description: key.description,
     }
 }
@@ -1268,7 +1428,10 @@ mod with_schema_tests {
         for d in DESCRIBED {
             for w in d.wraps {
                 assert!(
-                    !w.id.is_empty() && w.id.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
+                    !w.id.is_empty()
+                        && w.id
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
                     "`{}`: `{}` is not a kebab-case id",
                     d.name,
                     w.id
@@ -1369,9 +1532,11 @@ mod with_schema_tests {
     /// `deserialize_struct` the names it accepts, renames applied, which are the keys
     /// `deny_unknown_fields` admits. The recorder answers every field with a
     /// placeholder of the type asked for, so the derive carries on into a nested struct
-    /// and names its fields too. A struct inside a sequence or a map is not reached,
-    /// because no element is produced; no configuration has one, and [`schema_objects`]
-    /// refuses a schema that would need it.
+    /// and names its fields too. A sequence is answered with one element, recorded at
+    /// the path `<key>.0`, so a struct inside a list is named as [`schema_objects`]
+    /// names the object a list's `items` describe; an enum takes its first variant. A
+    /// struct inside a map is not reached, because no entry is produced; no
+    /// configuration has one, and [`schema_objects`] refuses a schema that would need it.
     fn configuration_fields<T: serde::de::DeserializeOwned>() -> BTreeMap<String, BTreeSet<String>>
     {
         let found = RefCell::new(BTreeMap::new());
@@ -1408,6 +1573,8 @@ mod with_schema_tests {
             "text_embed" => configuration_fields::<TextEmbedConfig>(),
             "uv" => configuration_fields::<UvConfig>(),
             "ducklake_publish" => configuration_fields::<ducklake_publish::DucklakePublishConfig>(),
+            #[cfg(feature = "http-fetch")]
+            "ducklake_write" => configuration_fields::<ducklake_write::DucklakeWriteConfig>(),
             other => panic!(
                 "operator `{other}` is in the catalogue, but configuration_fields_of does \
                  not name its configuration struct — add it there"
@@ -1456,7 +1623,6 @@ mod with_schema_tests {
             deserialize_str => visit_str(""),
             deserialize_string => visit_str(""),
             deserialize_unit => visit_unit(),
-            deserialize_seq => visit_seq(serde::de::value::SeqDeserializer::new(std::iter::empty::<u8>())),
             deserialize_map => visit_map(serde::de::value::MapDeserializer::new(std::iter::empty::<(u8, u8)>())),
         }
 
@@ -1493,8 +1659,42 @@ mod with_schema_tests {
             })
         }
 
+        fn deserialize_seq<V: Visitor<'de>>(
+            self,
+            visitor: V,
+        ) -> std::result::Result<V::Value, Self::Error> {
+            visitor.visit_seq(OneElement(Some(FieldRecorder {
+                path: joined(&self.path, "0"),
+                found: self.found,
+            })))
+        }
+
+        fn deserialize_enum<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            variants: &'static [&'static str],
+            visitor: V,
+        ) -> std::result::Result<V::Value, Self::Error> {
+            let first = variants.first().copied().unwrap_or_default();
+            visitor.visit_enum(serde::de::value::StrDeserializer::<Self::Error>::new(first))
+        }
+
         serde::forward_to_deserialize_any! {
-            i128 u128 char bytes byte_buf unit_struct tuple tuple_struct enum identifier ignored_any
+            i128 u128 char bytes byte_buf unit_struct tuple tuple_struct identifier ignored_any
+        }
+    }
+
+    /// A sequence of one element, recorded by the recorder it holds.
+    struct OneElement<'a>(Option<FieldRecorder<'a>>);
+
+    impl<'de> serde::de::SeqAccess<'de> for OneElement<'_> {
+        type Error = serde::de::value::Error;
+
+        fn next_element_seed<T: DeserializeSeed<'de>>(
+            &mut self,
+            seed: T,
+        ) -> std::result::Result<Option<T::Value>, Self::Error> {
+            self.0.take().map(|r| seed.deserialize(r)).transpose()
         }
     }
 
@@ -1540,20 +1740,22 @@ mod with_schema_tests {
     }
 
     /// Each object a `with:` schema describes, by the path its keys are read at: `""`
-    /// for the block, and the path of every property that is an object with
-    /// `properties` of its own.
+    /// for the block, the path of every property that is an object with `properties`
+    /// of its own, and `<key>.0` for the object a list's `items` describe (its first
+    /// item, as the probe and the field recorder build it).
     fn schema_objects(schema: &Json) -> BTreeMap<String, &Json> {
         fn walk<'s>(path: String, object: &'s Json, out: &mut BTreeMap<String, &'s Json>) {
             for (key, prop) in properties(object) {
-                for nested in ["items", "additionalProperties"] {
-                    assert!(
-                        prop[nested].get("properties").is_none(),
-                        "`{}` describes an object inside its `{nested}`, which the \
-                         field recorder does not reach — extend it before relying on \
-                         this check there",
-                        joined(&path, key)
-                    );
+                if prop["type"] == "array" && prop["items"].get("properties").is_some() {
+                    walk(joined(&joined(&path, key), "0"), &prop["items"], out);
                 }
+                assert!(
+                    prop["additionalProperties"].get("properties").is_none(),
+                    "`{}` describes an object inside its `additionalProperties`, which the \
+                     field recorder does not reach — extend it before relying on this check \
+                     there",
+                    joined(&path, key)
+                );
                 if prop.get("properties").is_some() {
                     walk(joined(&path, key), prop, out);
                 }
@@ -1602,6 +1804,7 @@ mod with_schema_tests {
                     format!("probe_{key}"),
                     "a".repeat(64),
                     format!("probe_{key}==1.0"),
+                    "https://probe.example/".to_string(),
                 ];
                 let Some(pattern) = prop["pattern"].as_str() else {
                     return json!(candidates[0]);
@@ -1636,6 +1839,10 @@ mod with_schema_tests {
                     format!("probe_{key}"): probe(&format!("{key}_value"), &prop["additionalProperties"])
                 }),
             },
+            // A schema with no type and nothing else that constrains a value admits any.
+            None if prop.get("type").is_none() && prop.get("enum").is_none() => {
+                json!(format!("probe_{key}"))
+            }
             other => panic!("`{key}` has schema type {other:?}, which probe() cannot build"),
         }
     }
@@ -1783,7 +1990,14 @@ mod with_schema_tests {
                 }
                 for (i, (key, _)) in keys.iter().enumerate() {
                     let omitted_by = admitted.iter().find(|&&mask| mask & (1 << i) == 0);
+                    // `x-required-for` states a key is required when another key holds a
+                    // given value, which the probe fixes at one of them: the subsets
+                    // cannot read it, and `required` cannot say it.
+                    let conditional = object["properties"][key.as_str()]
+                        .get("x-required-for")
+                        .is_some();
                     match (omitted_by, declared.contains(*key)) {
+                        (None, false) if conditional => {}
                         (None, false) => faults.push(format!(
                             "{op}: every manifest the configuration admits holds `{}`, but the \
                              schema does not list it in `required`",
@@ -1879,22 +2093,38 @@ mod with_schema_tests {
                 .map(|(name, _)| name)
                 .collect();
 
-            let declared = required(&schema);
             for direction in ["reads", "writes"] {
                 for role in described[direction].as_array().expect("a list") {
                     let name = role["name"].as_str().expect("a name");
-                    let Some(entry) = schema["properties"].get(name) else {
+                    // A dotted name is a key inside each item of a list: walk to it.
+                    let mut object = &schema;
+                    let mut found = true;
+                    let mut list = false;
+                    let mut required_all = true;
+                    let mut min_items = None;
+                    for part in name.split('.') {
+                        let Some(entry) = object["properties"].get(part) else {
+                            found = false;
+                            break;
+                        };
+                        required_all &= required(object).contains(part);
+                        if entry["type"] == "array" {
+                            if !list {
+                                min_items = Some(entry["minItems"].as_u64().unwrap_or(0));
+                            }
+                            list = true;
+                            object = &entry["items"];
+                        } else {
+                            object = entry;
+                        }
+                    }
+                    if !found {
                         faults.push(format!(
                             "{op}: {direction} `{name}`, which its `with:` schema does not describe"
                         ));
                         continue;
-                    };
-                    let list = entry["type"] == "array";
-                    let expected = (
-                        list,
-                        declared.contains(name),
-                        list.then(|| entry["minItems"].as_u64().unwrap_or(0)),
-                    );
+                    }
+                    let expected = (list, required_all, min_items);
                     let stated = (
                         role["list"].as_bool().unwrap_or(!list),
                         role["required"].as_bool().unwrap_or(!expected.1),
@@ -2004,7 +2234,7 @@ mod with_schema_tests {
                 let Ok(assets) = resolve(op).expect("in the catalogue").assets(&yaml) else {
                     continue;
                 };
-                every_role_set |= role_keys.iter().all(|k| with.get(*k).is_some());
+                every_role_set |= role_keys.iter().all(|k| !values_at(&with, k).is_empty());
                 for (direction, recorded) in
                     [("reads", &assets.reads), ("writes", &assets.produces)]
                 {
@@ -2012,7 +2242,7 @@ mod with_schema_tests {
                     let from = |name: &str, role: &str, role_kind: &str| -> bool {
                         let kind = kind_word(assets.kinds[name]);
                         let kind_holds = role_kind == "any" || role_kind == kind;
-                        match &with[role] {
+                        values_at(&with, role).into_iter().any(|at| match at {
                             Json::String(value) => {
                                 (name == value && kind_holds)
                                     || (role_kind == "directory"
@@ -2024,7 +2254,7 @@ mod with_schema_tests {
                             }
                             Json::Array(values) => kind_holds && values.iter().any(|v| v == name),
                             _ => false,
-                        }
+                        })
                     };
                     for name in recorded {
                         if !roles.iter().any(|(role, kind)| from(name, role, kind)) {
@@ -2037,7 +2267,7 @@ mod with_schema_tests {
                         }
                     }
                     for (role, kind) in &roles {
-                        if *kind == "column" || with.get(*role).is_none() {
+                        if *kind == "column" || values_at(&with, role).is_empty() {
                             continue;
                         }
                         if !recorded.iter().any(|name| from(name, role, kind)) {
@@ -2060,6 +2290,23 @@ mod with_schema_tests {
             &faults,
             "an operator's roles disagree with what its `assets()` records",
         );
+    }
+
+    /// The values a role's key names in `with`: the key's own value, or for a dotted
+    /// key such as `tables.from`, the value at `from` in each item of `tables`.
+    fn values_at<'w>(with: &'w Json, key: &str) -> Vec<&'w Json> {
+        let mut at = vec![with];
+        for part in key.split('.') {
+            at = at
+                .into_iter()
+                .flat_map(|v| match v {
+                    Json::Array(items) => items.iter().collect(),
+                    other => vec![other],
+                })
+                .filter_map(|v| v.get(part))
+                .collect();
+        }
+        at
     }
 
     const JSON_TYPES: [&str; 6] = ["string", "integer", "number", "boolean", "array", "object"];
@@ -2847,6 +3094,8 @@ ap.add_argument("--nowhere", default=NOWHERE)
             "text_embed" => read_as::<TextEmbedConfig>(with),
             "uv" => read_as::<UvConfig>(with),
             "ducklake_publish" => read_as::<ducklake_publish::DucklakePublishConfig>(with),
+            #[cfg(feature = "http-fetch")]
+            "ducklake_write" => read_as::<ducklake_write::DucklakeWriteConfig>(with),
             other => panic!(
                 "operator `{other}` is in the catalogue, but configured does not name its \
                  configuration struct — add it there"

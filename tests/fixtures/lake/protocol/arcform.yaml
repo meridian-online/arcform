@@ -1,0 +1,23 @@
+name: lake_write
+engine: duckdb
+db: build/pipeline.db
+steps:
+  - name: publish
+    op: ducklake_write@1
+    with:
+      public_base: https://lake.example/
+      catalog: catalog/test.ducklake
+      data_path: lake/
+      local_catalog: build/lake/test.ducklake
+      tables:
+        - table: demo.codes
+          from: data/codes.parquet
+          descriptor: codes.datapackage.json
+          readable_copy: demo/codes.parquet
+      credential:
+        type: r2
+        bucket: test-bucket
+        env:
+          key_id: ARC_TEST_LAKE_KEY_ID
+          secret: ARC_TEST_LAKE_SECRET
+          account_id: ARC_TEST_LAKE_ACCOUNT_ID

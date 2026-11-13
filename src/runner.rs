@@ -297,6 +297,25 @@ pub fn run_with_params(
     force: bool,
     cli_params: &[(String, String)],
 ) -> Result<()> {
+    run_with_publish(dir, engine, state, force, cli_params, false)
+}
+
+/// The variable each step's environment holds the run's id in.
+pub(crate) const RUN_ID_ENV: &str = "ARC_RUN_ID";
+/// The variable `arc run --publish` sets to `required` in each step's environment: a
+/// publish step that cannot reach its live target then fails instead of publishing
+/// locally.
+pub(crate) const PUBLISH_ENV: &str = "ARC_PUBLISH";
+
+/// Run a pipeline with CLI parameter overrides; `publish` is `arc run --publish`.
+pub fn run_with_publish(
+    dir: &Path,
+    engine: &dyn Engine,
+    state: &dyn StateBackend,
+    force: bool,
+    cli_params: &[(String, String)],
+    publish: bool,
+) -> Result<()> {
     let manifest = Manifest::load(dir)?;
 
     // Before anything else is checked, so a run refused below still names the file.
@@ -436,6 +455,13 @@ pub fn run_with_params(
 
     // Start a new run record.
     let run_id = state.start_run()?;
+    env_map.insert(RUN_ID_ENV.to_string(), run_id.clone());
+    if publish {
+        env_map.insert(PUBLISH_ENV.to_string(), "required".to_string());
+    }
+    // Uploads an earlier run in this process queued and never took are not this run's.
+    #[cfg(feature = "http-fetch")]
+    drop(crate::lake::take_run_record_uploads());
 
     // Who produces what — computed once, consulted both by staleness detection and by
     // the artifact hash each successful step records for the *next* run to compare.
@@ -685,10 +711,15 @@ pub fn run_with_params(
                 } else if let Some(ref op_ref) = step.op {
                     match operator::resolve(op_ref) {
                         Ok(op) => {
+                            // An operator reads its credentials from the step's
+                            // environment, which includes the manifest's dotenv files:
+                            // their variables sit under the run's own, which win.
+                            let mut op_env = dotenv_vars.clone();
+                            op_env.extend(env_map.iter().map(|(k, v)| (k.clone(), v.clone())));
                             let ctx = operator::OpContext {
                                 dir,
                                 db_path: db_path.as_path(),
-                                env: &env_map,
+                                env: &op_env,
                                 timeout: step_timeout,
                                 cache: fetch_cache.as_ref(),
                             };
@@ -1074,6 +1105,22 @@ pub fn run_with_params(
     stream.complete(outcome);
     print!("{}", contract::render_dag(&run_contract));
 
+    // A live publish's run record, uploaded beside its snapshot now the record is
+    // complete. The snapshot is already committed, so a failed upload fails the run
+    // and names both.
+    #[cfg(feature = "http-fetch")]
+    let step_loop_result = match (
+        step_loop_result,
+        upload_run_records(&runs_dir, &run_id, crate::lake::take_run_record_uploads()),
+    ) {
+        (result, Ok(())) => result,
+        (Ok(()), Err(e)) => Err(e),
+        (Err(e), Err(upload)) => {
+            eprintln!("{} {}", "error:".red(), upload);
+            Err(e)
+        }
+    };
+
     // Print summary and return the pipeline result (not hook result).
     match step_loop_result {
         Ok(()) => {
@@ -1092,6 +1139,44 @@ pub fn run_with_params(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Upload `<runs_dir>/<run_id>.json` to each key in `uploads`, only where no object
+/// is there yet. Every upload is tried; the first failure is returned, and any other
+/// printed.
+#[cfg(feature = "http-fetch")]
+fn upload_run_records(
+    runs_dir: &Path,
+    run_id: &str,
+    uploads: Vec<crate::lake::RunRecordUpload>,
+) -> Result<()> {
+    let record = runs_dir.join(format!("{run_id}.json"));
+    let mut first = None;
+    for upload in uploads {
+        let result = upload
+            .store
+            .put_file(
+                &upload.key,
+                &record,
+                crate::lake::store::PutCondition::IfAbsent,
+                None,
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        if let Err(reason) = result {
+            let e = Error::RunRecordUpload {
+                key: upload.key,
+                snapshot_id: upload.snapshot_id,
+                reason,
+            };
+            if first.is_some() {
+                eprintln!("{} {}", "error:".red(), e);
+            } else {
+                first = Some(e);
+            }
+        }
+    }
+    first.map_or(Ok(()), Err)
 }
 
 /// The staleness verdict for a run: which steps must execute, and — for each step that
@@ -1908,6 +1993,55 @@ fn produced_artifact_hash(
         buf.push('\n');
     }
     Some(state::content_hash(buf.as_bytes()))
+}
+
+#[cfg(all(test, feature = "http-fetch"))]
+mod run_record_upload_tests {
+    use super::*;
+    use crate::lake::RunRecordUpload;
+    use crate::lake::store::{DirStore, ObjectStore, PutCondition};
+    use std::sync::Arc;
+
+    fn upload(store: &Arc<DirStore>, key: &str) -> RunRecordUpload {
+        RunRecordUpload {
+            store: Arc::clone(store) as Arc<dyn ObjectStore>,
+            key: key.to_string(),
+            snapshot_id: 7,
+        }
+    }
+
+    #[test]
+    fn the_run_record_is_uploaded_once_and_a_refusal_names_the_key_and_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(runs.join("r1.json"), b"{\"run\":1}").unwrap();
+        let store = Arc::new(DirStore::new(dir.path().join("store")));
+
+        upload_run_records(&runs, "r1", vec![upload(&store, "runs/r1.json")]).unwrap();
+        assert_eq!(
+            store.get("runs/r1.json").unwrap().unwrap().0,
+            b"{\"run\":1}"
+        );
+
+        // A record is never overwritten: a second upload to the same key is refused,
+        // and the run is told which key and which committed snapshot.
+        store
+            .put("runs/r2.json", b"other", PutCondition::Any, None)
+            .unwrap();
+        std::fs::write(runs.join("r2.json"), b"{}").unwrap();
+        let e = upload_run_records(&runs, "r2", vec![upload(&store, "runs/r2.json")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("`runs/r2.json`") && e.contains("snapshot 7"),
+            "{e}"
+        );
+        assert_eq!(store.get("runs/r2.json").unwrap().unwrap().0, b"other");
+
+        // Nothing queued: nothing to do.
+        upload_run_records(&runs, "r3", Vec::new()).unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -4293,6 +4427,30 @@ steps:
         assert!(state.runs.borrow().is_empty(), "no run was recorded");
     }
 
+    #[test]
+    fn publish_requires_the_live_publish_in_every_steps_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: test\nsteps:\n  - name: s1\n    sql: models/s1.sql\n";
+        setup_project(dir.path(), yaml, &[("models/s1.sql", "SELECT 1;")]);
+        let env_of = |publish: bool| {
+            let engine = MockEngine::new();
+            let state = MockStateBackend::new();
+            run_with_publish(dir.path(), &engine, &state, true, &[], publish).unwrap();
+            let calls = engine.calls.borrow();
+            match calls.iter().find(|c| matches!(c, MockCall::Sql { .. })) {
+                Some(MockCall::Sql { env, .. }) => env.clone(),
+                _ => panic!("expected SQL call"),
+            }
+        };
+        let published = env_of(true);
+        assert_eq!(published[PUBLISH_ENV], "required");
+        // The id the state backend gave the run, which names its record.
+        assert_eq!(published[RUN_ID_ENV], "run-1");
+        let plain = env_of(false);
+        assert!(!plain.contains_key(PUBLISH_ENV));
+        assert_eq!(plain[RUN_ID_ENV], "run-1");
+    }
+
     // Backwards compatibility — existing manifests work identically.
     #[test]
     fn test_param_backwards_compat_no_params() {
@@ -4309,12 +4467,13 @@ steps:
         let sql_call = calls.iter().find(|c| matches!(c, MockCall::Sql { .. }));
         match sql_call {
             Some(MockCall::Sql { env, .. }) => {
-                // No parameter reaches the step; the one variable arc sets on every
-                // run is where the database is.
-                let keys: Vec<&String> = env.keys().collect();
+                // No parameter reaches the step; the variables arc sets on every
+                // run are where the database is and the run's id.
+                let mut keys: Vec<&String> = env.keys().collect();
+                keys.sort();
                 assert_eq!(
                     keys,
-                    vec!["ARC_DB_PATH"],
+                    vec!["ARC_DB_PATH", "ARC_RUN_ID"],
                     "backwards-compat: no ARC_PARAM_ variable without params"
                 );
             }

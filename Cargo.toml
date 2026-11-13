@@ -139,7 +139,8 @@ default = ["cli"]
 # binary is always whole.
 cli = ["dep:clap", "http-fetch"]
 # The ureq-backed HTTP ingress path — the `http_fetch` + `html_link_discover`
-# operators and the `fresh` precondition's HEAD probe. Enabled via `cli` (never
+# operators and the `fresh` precondition's HEAD probe — and the lake publish step,
+# `ducklake_write`, whose object store sends its requests with ureq. Enabled via `cli` (never
 # reachable without a running pipeline, which is a CLI-only operation), so a
 # `default-features = false` library consumer builds without ureq and its
 # rustls/ring TLS stack. Kept a *named* feature distinct from `cli` so a future

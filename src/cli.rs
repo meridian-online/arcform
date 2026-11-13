@@ -122,6 +122,10 @@ pub enum Commands {
         /// Overrides dotenv and manifest defaults.
         #[arg(long = "param", value_name = "KEY=VALUE")]
         params: Vec<String>,
+
+        /// Require the publish steps to publish live; fail if a write credential is missing
+        #[arg(long)]
+        publish: bool,
     },
 
     /// Pin the build of a community extension on the vetted list that the community
@@ -1121,13 +1125,13 @@ pub fn init_at(name: &str, base: &std::path::Path) -> Result<()> {
 }
 
 /// Execute the `arc run` command.
-pub fn run_pipeline(force: bool, raw_params: &[String]) -> Result<()> {
+pub fn run_pipeline(force: bool, publish: bool, raw_params: &[String]) -> Result<()> {
     let cli_params = crate::runner::parse_params(raw_params)?;
     let cwd = std::env::current_dir()?;
     let manifest = Manifest::load(&cwd)?;
     let engine = DuckDbEngine;
     let state = DuckDbStateBackend::for_protocol(&manifest, &cwd)?;
-    crate::runner::run_with_params(&cwd, &engine, &state, force, &cli_params)
+    crate::runner::run_with_publish(&cwd, &engine, &state, force, &cli_params, publish)
 }
 
 /// Execute `arc upgrade <name>`: refuse a name off the vetted list before DuckDB is asked
@@ -1258,7 +1262,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         } => create_protocol(&dir, name, engine, db, &open_history()?),
         Commands::EditProtocol { dir, op } => edit_protocol(&dir, op, &open_history()?),
         Commands::History { cmd } => dispatch_history(cmd),
-        Commands::Run { force, params } => run_pipeline(force, &params),
+        Commands::Run {
+            force,
+            params,
+            publish,
+        } => run_pipeline(force, publish, &params),
         Commands::Upgrade { name, dir } => {
             upgrade_extension(&dir, &name, &DuckDbEngine, &open_history()?)
         }

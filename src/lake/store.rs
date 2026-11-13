@@ -93,7 +93,9 @@ pub struct DirStore {
 /// Holds an advisory lock on a key's sidecar lock file. The kernel drops the lock
 /// when the file closes, including when the process is killed, so no lock outlives
 /// its holder. The sidecar file itself stays behind, unlocked.
-struct LockGuard(fs::File);
+struct LockGuard(
+    #[expect(dead_code, reason = "held for its drop, which releases the lock")] fs::File,
+);
 
 impl DirStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -460,6 +462,10 @@ pub struct PublicHttpStore {
     agent: ureq::Agent,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "read by `arc lake rebase` in a later task")
+)]
 impl PublicHttpStore {
     pub fn new(base_url: impl Into<String>) -> Self {
         PublicHttpStore {
