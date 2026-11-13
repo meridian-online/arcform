@@ -70,13 +70,13 @@ The catalogue's persisted data path is the https address readers use. DuckLake r
 4. **In one transaction, for each table:**
    - create the schema and table if missing, from the input's columns;
    - `UPDATE` rows whose key matches and whose values differ, `DELETE` rows whose key is gone, `INSERT` rows whose key is new;
-   - replace that table's row in `meta.descriptors` and its rows in `meta.fields`;
-   - set `COMMENT ON` for the table and each column from the descriptor;
-   - stamp the commit's metadata with the run's identity and each table's row counts.
-   If nothing changed (no rows, no descriptor), DuckDB commits no snapshot, and the step reports `unchanged` with the current snapshot.
+   - replace that table's row in `meta.descriptors` and its rows in `meta.fields`, only when they differ from what is stored;
+   - set `COMMENT ON` for the table and each column from the descriptor, only where the text differs;
+   - if anything above changed, stamp the commit's metadata with the run's identity and each table's row counts.
+   If nothing changed (no rows, no descriptor, no comment), the transaction makes no write, DuckDB commits no snapshot, and the step reports `unchanged` with the current snapshot. Nothing run-specific is written into a table, so a rebuild of the same data by a new run is still unchanged.
 5. **Upload the new data and delete files** this snapshot added, from staging to the lake prefix. Uploading before the catalogue is safe because nothing references a file until the catalogue does.
-6. **Write the readable copy** of each table, stamped with its descriptor, and upload it with any extra files.
-7. **Upload the catalogue conditionally**, only if its ETag is still the one fetched in step 2. If another publish won, discard the local commit, go back to step 2, and redo the transaction. Data files already uploaded are not lost: any the retry does not reference are orphans that DuckLake's cleanup can remove. Retry a bounded number of times, then fail, naming the conflict.
+6. **Upload the catalogue conditionally**, only if its ETag is still the one fetched in step 2. If another publish won, discard the local commit, go back to step 2, and redo the transaction. Data files already uploaded are not lost: any the retry does not reference are orphans that DuckLake's cleanup can remove. Retry a bounded number of times, then fail, naming the conflict. When nothing was committed, instead re-read the catalogue's ETag and go back to step 2 if it moved.
+7. **Upload the readable copy** of each table (the Protocol's stamped Parquet, byte for byte) and any extra files, only now that the catalogue holds this snapshot. Readers fetch these at fixed addresses, so they are never written before the commit lands: a failed or lost publish leaves them as they were.
 8. **Report** each table's action (`registered`, `unchanged`), snapshot id, row counts by change type, and the uploaded objects with their sizes and SHA-256, in the step's report in the run record.
 
 ### Upsert, not MERGE
@@ -87,7 +87,7 @@ DuckLake's `MERGE INTO` supports only a single `UPDATE` or `DELETE` action today
 
 Every catalogue arc publishes into holds:
 
-- `meta.descriptors(table_name VARCHAR PRIMARY KEY, descriptor JSON, run_id VARCHAR)` — the table's whole Frictionless descriptor. `table_name` is `schema.table`.
+- `meta.descriptors(table_name VARCHAR, descriptor JSON)` — the table's whole Frictionless descriptor. `table_name` is `schema.table`. DuckLake enforces no primary keys, so the step keeps `table_name` unique itself; the run that wrote a row is in the snapshot's commit metadata, not in the row.
 - `meta.fields(table_name, column_name, ordinal, type, finetype_label, description, constraints JSON, is_key BOOLEAN)` — derived from the descriptor's `schema.fields` and `primaryKey`.
 
 `meta` is reserved: no namespace may take that name. A few rows each, so DuckLake inlines them into the catalogue rather than writing files. The descriptor written here omits the resource's `bytes` and `hash`, which describe a single file and have no meaning for a lake table. It also omits the package's `created`, as the footer copy already does.
@@ -103,7 +103,7 @@ The manifest declares, under the step's `credential:`, the secret type (`r2` or 
   op: ducklake_write@1
   with:
     catalog: https://openlake.meridian.online/catalog/open.ducklake
-    local_catalog: build/lake/open.ducklake      # the fallback, and the staging area
+    local_catalog: build/lake/open.ducklake      # the fallback catalogue; its data goes in build/lake/open.ducklake.files/
     tables:
       - table: bls.soc_2018
         from: build/soc_2018.parquet               # or a DuckDB relation the Protocol produced
@@ -124,7 +124,7 @@ The step reads each `from:` and `descriptor:`, so it runs after the steps that p
 
 With `manifest: manifest.json` set, the step also reads the live manifest, updates each published table's entry, and writes it back with the same conditional write. It is written after the catalogue, so a reader never sees a manifest entry for a snapshot the catalogue doesn't hold. The option exists so the follow-up work can ship before web and the monitor read the catalogue, and it is removed after.
 
-Each entry keeps the keys today's readers use (agent's call): `url` is the readable copy's address; `rows`, `bytes` and `sha256` describe that copy; `published` is the commit time; `run` names the run and its record at `runs/<run_id>.json`. The top-level `catalog` names the pinned catalogue address. A table entry can carry extra keys from the step's `files:` (for gleif: `searchUrls`, `searchRows`), declared in the step. The old per-dataset fixed snapshots (`<namespace>/<name>/<sha16>.parquet`) are no longer written.
+When a publish commits nothing, the step still pins the current catalogue (its pinned address is written only if absent) and passes it to the manifest, so a manifest left behind by an interrupted publish is repaired by the next one. Each entry keeps the keys today's readers use (agent's call): `url` is the readable copy's address; `rows`, `bytes` and `sha256` describe that copy; `published` is the commit time; `run` names the run and its record at `runs/<run_id>.json`. The top-level `catalog` names the pinned catalogue address. A table entry can carry extra keys from the step's `files:` (for gleif: `searchUrls`, `searchRows`), declared in the step. The old per-dataset fixed snapshots (`<namespace>/<name>/<sha16>.parquet`) are no longer written.
 
 ### The cutover (agent's call)
 
@@ -140,7 +140,7 @@ When a table already exists and the input's columns differ, a column added at th
 
 ### The local catalogue (agent's call)
 
-Without the credential, the local catalogue starts from a fresh copy of the live catalogue, which anyone can read, so a local run reports exactly the diff a live publish would commit. When the live catalogue cannot be fetched (offline, or a lake not yet created), it starts empty and says so. Each local run starts again from the live copy, so local history never diverges from the live lake's. Staging is a separate folder, emptied at the start of each publish.
+Without the credential, the step publishes into a lake of its own at `local_catalog`, whose data path is the local folder beside it (`<local_catalog>.files/`), so the contributor can attach it and query exactly what the run built, offline. Its history is the history of local runs, separate from the live lake's. An earlier draft started each local run from a copy of the live catalogue to report the live diff, but a catalogue whose data path is the live https address cannot read files a local run adds, so the local lake would not read back. Staging is a separate folder, emptied at the start of each publish.
 
 ### The run record beside the snapshot (agent's call)
 

@@ -60,6 +60,7 @@
   - `racing_conditional_writes_have_one_winner`: 8 threads each `get` then `put IfMatch` on one key; exactly one `Ok`.
   - `s3_store_signs_conditional_headers`: build the PUT request an `S3Store::r2("acct", "bucket", "k", "s")` would send for `IfMatch(ETag("\"abc\""))` (expose `fn request(&self, method, key, cond) -> PreparedRequest { url, headers }` as `pub(crate)` for this) and assert the URL host is `acct.r2.cloudflarestorage.com`, `if-match` is among the signed headers, and the secret appears nowhere in the URL or headers.
   - `s3_status_codes_map_to_store_errors`: `fn map_status(u16) -> Option<StoreError>` gives 412 → `PreconditionFailed`, 429 → `Throttled`.
+  - `a_transport_error_names_no_secret`: a request to a closed port on `127.0.0.1` (via `S3Store::new("http://127.0.0.1:<closed>", …)`) fails with `StoreError::Other` whose `Display` names the object key and contains neither the key id, the secret, `X-Amz-Signature` nor `X-Amz-Credential`. `S3Store` errors carry the HTTP status and the object key only, never a request URL.
 
 - [ ] **Step 2: Run them and see them fail**
 
@@ -71,7 +72,7 @@
 - [ ] **Step 4: Run the tests and see them pass**
 
   Run: `cargo test --lib lake::store`
-  Expected: 6 passed.
+  Expected: 7 passed.
 
 - [ ] **Step 5: Commit** `Add an object-store seam for publishing a lake to S3-compatible storage`
 
@@ -115,13 +116,14 @@
   - `pub struct TableInput { pub table: String /* schema.table */, pub parquet: PathBuf, pub descriptor: TableDescriptor, pub key: Vec<String> /* defaults to descriptor.key */, pub replace_on_schema_change: bool }`
   - `pub struct TableChange { pub table: String, pub action: TableAction /* Registered | Unchanged | Replaced */, pub inserted: u64, pub updated: u64, pub deleted: u64, pub rows: u64 }`
   - `pub struct CommitOutcome { pub snapshot_id: i64, pub committed: bool, pub tables: Vec<TableChange>, pub new_files: Vec<String> /* paths relative to the data path, data and delete files this snapshot added */ }`
-  - `pub fn commit(catalog_file: &Path, data_path: &str /* persisted, used only when creating */, staging: &Path, tables: &[TableInput], commit_info: &serde_json::Value) -> Result<CommitOutcome>`: opens an in-memory DuckDB, `LOAD ducklake`, creates the catalogue with `DATA_PATH data_path` if the file is absent, re-attaches with `DATA_PATH staging, OVERRIDE_DATA_PATH true`, then in ONE transaction per call: for each table, create schema/table if missing (`CREATE TABLE … AS FROM read_parquet(…)`); otherwise compare columns (an added trailing column → `ALTER TABLE ADD COLUMN`; any other difference → error naming it, unless `replace_on_schema_change`, which drops and recreates); refuse duplicate or NULL keys (error names the key and one example value); upsert with `UPDATE … FROM` where `IS DISTINCT FROM` on any non-key column, `DELETE … WHERE NOT EXISTS`, `INSERT … WHERE NOT EXISTS`; a table with an empty key is deleted and reinserted whole; then replace its rows in `meta.descriptors(table_name VARCHAR, descriptor JSON, run_id VARCHAR)` and `meta.fields(table_name, column_name, ordinal, type, finetype_label, description, constraints JSON, is_key)` and set `COMMENT ON` for the table and its columns; finally `CALL set_commit_message('arcform', …, extra_info => commit_info)`. Every identifier is double-quoted. `committed` is false when the newest snapshot id did not change. `new_files` is read from `ducklake_data_file` and `ducklake_delete_file` rows whose `begin_snapshot` is the new snapshot.
+  - `pub fn commit(catalog_file: &Path, data_path: &str /* persisted, used only when creating */, staging: &Path, tables: &[TableInput], commit_info: &serde_json::Value) -> Result<CommitOutcome>`: opens an in-memory DuckDB, `LOAD ducklake`, creates the catalogue with `DATA_PATH data_path` if the file is absent, re-attaches with `DATA_PATH staging, OVERRIDE_DATA_PATH true`, then in ONE transaction per call: for each table, create schema/table if missing (`CREATE TABLE … AS FROM read_parquet(…)`); otherwise compare columns (an added trailing column → `ALTER TABLE ADD COLUMN`; any other difference → error naming it, unless `replace_on_schema_change`, which drops and recreates); refuse duplicate or NULL keys (error names the key and one example value); upsert with `UPDATE … FROM` where `IS DISTINCT FROM` on any non-key column, `DELETE … WHERE NOT EXISTS`, `INSERT … WHERE NOT EXISTS`; a table with an empty key is deleted and reinserted whole; then replace its rows in `meta.descriptors(table_name VARCHAR, descriptor JSON)` and `meta.fields(table_name, column_name, ordinal, type, finetype_label, description, constraints JSON, is_key)` only when they differ from the stored rows (compare with `IS DISTINCT FROM`), and set `COMMENT ON` for the table and its columns only where the text differs; finally, only if any statement above changed something (count the rows each one affected), `CALL set_commit_message('arcform', …, extra_info => commit_info)`. No run-specific value is written into any table. Every identifier is double-quoted. `committed` is false when the newest snapshot id did not change. `new_files` is read from `ducklake_data_file` and `ducklake_delete_file` rows whose `begin_snapshot` is the new snapshot.
   - Refuses `META_SCHEMA` as a table's schema.
 
 - [ ] **Step 1: Write the failing tests** (each builds its input Parquet with `COPY … TO` in a temp dir, as `src/operator/ducklake_publish.rs`'s tests do):
   - `a_first_commit_creates_the_tables_and_meta`: two tables in one call → one snapshot; both tables hold their rows; `meta.fields` has a row per column; `duckdb_tables().comment` holds the descriptor's description.
   - `a_rebuild_with_three_rows_changed_records_only_those`: second commit with ids 5,6,7 changed, one row gone, one new → `TableChange { updated: 3, deleted: 1, inserted: 1 }` and `ducklake_table_changes` shows `update_preimage`/`update_postimage` for 3 rows.
   - `an_unchanged_rebuild_commits_nothing`: `committed == false`, snapshot count unchanged, `new_files` empty.
+  - `a_new_run_with_the_same_data_and_descriptor_commits_nothing`: two commits with identical rows and descriptor but different `commit_info` run ids → the second has `committed == false`.
   - `null_values_compare_as_values`: a non-key column going from NULL to NULL is unchanged; NULL to 'x' is an update.
   - `quoted_column_names_publish_and_upsert`: columns `order`, `Code Display`, `MixedCase` (Review Focus 2).
   - `duplicate_keys_are_refused` and `null_keys_are_refused`: error names the key column and an offending value; nothing committed (Review Focus 3).
@@ -135,7 +137,7 @@
 
 - [ ] **Step 3: Implement `commit`.**
 
-- [ ] **Step 4: Run them and see them pass**: `cargo test --lib lake::commit` → 12 passed.
+- [ ] **Step 4: Run them and see them pass**: `cargo test --lib lake::commit` → 13 passed.
 
 - [ ] **Step 5: Commit** `Commit a Protocol's tables into a DuckLake as one upserted snapshot`
 
@@ -143,7 +145,7 @@
 
 **Files:**
 - Create: `src/lake/publish.rs`
-- Test: `tests/lake_publish.rs` (integration; starts a static file server over a `DirStore` root on `127.0.0.1` in a thread, with `std::net::TcpListener`, serving GET and HEAD)
+- Test: unit tests in `src/lake/publish.rs`, with a static file server over a `DirStore` root on `127.0.0.1` in a thread (`std::net::TcpListener`, GET and HEAD) in `src/lake/test_server.rs` under `#[cfg(test)]` (the `lake` module is crate-private, so an integration test cannot reach it)
 
 **Interfaces:**
 - Consumes: `ObjectStore`, `DirStore`, `PutCondition`, `StoreError` (Task 1); `commit`, `TableInput`, `CommitOutcome` (Task 3).
@@ -151,22 +153,23 @@
   - `pub struct Lake { pub catalog_key: String /* e.g. catalog/open.ducklake */, pub data_path: String /* persisted https data path, e.g. https://openlake.meridian.online/lake/ */, pub data_prefix: String /* store key prefix matching data_path, e.g. lake/ */, pub pinned_prefix: String /* e.g. catalog/open- */ }`
   - `pub struct ExtraFile { pub from: PathBuf, pub to: String /* key, or key prefix ending in / for a directory */ }`
   - `pub struct Published { pub outcome: CommitOutcome, pub uploaded: Vec<UploadedObject /* key, bytes, sha256 */>, pub pinned_catalog: Option<String>, pub attempts: u32 }`
-  - `pub fn publish(store: &dyn ObjectStore, lake: &Lake, work: &Path, tables: &[TableInput], readable: &[(PathBuf, String)] /* file, key */, extra: &[ExtraFile], commit_info: &serde_json::Value, max_attempts: u32) -> Result<Published>`: each attempt: `get(catalog_key)` (absent → new catalogue), write it to `work/catalog.ducklake`, empty `work/staging`, `commit`, then if `committed`: `put_file` each of `new_files` under `data_prefix` with `IfAbsent`; then (committed or not) `put_file` each readable copy and extra file with `Any`; then if `committed`: `put` the catalogue at `pinned_prefix + <first 16 hex of its SHA-256> + ".ducklake"` with `IfAbsent` and `Cache-Control: public, max-age=31536000, immutable`, then at `catalog_key` with `IfMatch(fetched etag)` or `IfAbsent` when it was new, `Cache-Control: public, max-age=60`. On `PreconditionFailed` or `Throttled` from the final write, sleep `250ms * attempt` and start again; after `max_attempts`, fail naming the catalogue key and the attempt count.
+  - `pub fn publish(store: &dyn ObjectStore, lake: &Lake, work: &Path, tables: &[TableInput], readable: &[(PathBuf, String)] /* file, key */, extra: &[ExtraFile], commit_info: &serde_json::Value, max_attempts: u32) -> Result<Published>`: each attempt: `get(catalog_key)` (absent → new catalogue), write it to `work/catalog.ducklake`, empty `work/staging`, `commit`, then if `committed`: `put_file` each of `new_files` under `data_prefix` with `IfAbsent`, `put` the catalogue at `pinned_prefix + <first 16 hex of its SHA-256> + ".ducklake"` with `IfAbsent` and `Cache-Control: public, max-age=31536000, immutable`, then at `catalog_key` with `IfMatch(fetched etag)` or `IfAbsent` when it was new, `Cache-Control: public, max-age=60`; on `PreconditionFailed` or `Throttled` from that final write, sleep `250ms * attempt` and start again, and after `max_attempts` fail naming the catalogue key and the attempt count. If not `committed`: `get` the catalogue again and start again if its ETag moved; otherwise `put` the fetched catalogue's pinned copy with `IfAbsent` (a no-op when present). Only after that, `put_file` each readable copy and extra file with `Any`. `Published.pinned_catalog` is always set.
 
 - [ ] **Step 1: Write the failing tests**
   - `a_publish_is_readable_over_http`: publish two tables into a `DirStore`; attach `ducklake:http://127.0.0.1:<port>/catalog/open.ducklake` READ_ONLY with `data_path` set to `http://127.0.0.1:<port>/lake/`; both tables read their rows; `meta.descriptors` has two rows.
   - `a_second_publish_time_travels`: after a change, `AT (VERSION => first)` over http reads the old rows.
   - `an_unchanged_publish_writes_no_catalogue`: catalogue ETag unchanged, no pinned copy added.
   - `a_lost_race_retries_and_both_publishes_land`: two threads publish different tables into one store; both succeed, one with `attempts >= 2`; the final catalogue holds both tables.
-  - `a_refused_upload_leaves_the_live_lake_as_it_was`: a store wrapper that fails `put_file` for data files → `publish` errs; the catalogue object and its ETag are unchanged (Review Focus 1).
+  - `a_refused_upload_leaves_the_live_lake_as_it_was`: a store wrapper that fails `put_file` for data files → `publish` errs; the catalogue object, its ETag and the readable copy's bytes are unchanged (Review Focus 1).
+  - `a_publish_that_loses_every_race_leaves_the_readable_copy_alone`: a store wrapper that always answers `PreconditionFailed` on the catalogue write → `publish` errs after `max_attempts`; the readable copy's bytes are unchanged.
   - `the_pinned_copy_is_byte_identical_to_the_catalogue`.
   - `extra_files_upload_under_their_prefix`: a directory `from` uploads each file under `to`.
 
-- [ ] **Step 2: Run them and see them fail**: `cargo test --test lake_publish` → compile error.
+- [ ] **Step 2: Run them and see them fail**: `cargo test --lib lake::publish` → compile error.
 
 - [ ] **Step 3: Implement `publish`.**
 
-- [ ] **Step 4: Run them and see them pass**: `cargo test --test lake_publish` → 7 passed.
+- [ ] **Step 4: Run them and see them pass**: `cargo test --lib lake::publish` → 8 passed.
 
 - [ ] **Step 5: Commit** `Publish a lake's catalogue last, with a conditional write and retry`
 
@@ -174,7 +177,7 @@
 
 **Files:**
 - Create: `src/lake/manifest.rs`
-- Test: unit tests in `src/lake/manifest.rs`; one case added to `tests/lake_publish.rs`
+- Test: unit tests in `src/lake/manifest.rs`; one case added to `src/lake/publish.rs`'s tests
 
 **Interfaces:**
 - Consumes: `ObjectStore`, `PutCondition` (Task 1); `Published` (Task 4).
@@ -186,13 +189,13 @@
   - `an_entry_is_written_and_other_entries_are_kept`.
   - `a_manifest_that_is_not_json_is_refused`.
   - `an_identical_manifest_is_not_rewritten`: returns `false`, ETag unchanged.
-  - In `tests/lake_publish.rs`: `an_unchanged_publish_repairs_a_stale_manifest_entry` (Review Focus 5): publish, overwrite the manifest entry with an old `sha256`, publish again unchanged → entry restored.
+  - In `src/lake/publish.rs`'s tests: `an_unchanged_publish_repairs_a_stale_manifest_entry` (Review Focus 5): publish, overwrite the manifest entry with an old `sha256` and `catalog.url` with an older pinned address, publish again unchanged → both restored.
 
 - [ ] **Step 2: Run them and see them fail**: `cargo test --lib lake::manifest` → compile error.
 
 - [ ] **Step 3: Implement `update_manifest`.**
 
-- [ ] **Step 4: Run them and see them pass**: `cargo test --lib lake::manifest && cargo test --test lake_publish` → 3 and 8 passed.
+- [ ] **Step 4: Run them and see them pass**: `cargo test --lib lake::manifest && cargo test --lib lake::publish` → 3 and 9 passed.
 
 - [ ] **Step 5: Commit** `Keep a compatible manifest.json while its readers move to the catalogue`
 
@@ -208,7 +211,7 @@
 - Produces:
   - Config, `deny_unknown_fields`: `public_base: String` (the bucket's public https base, e.g. `https://openlake.meridian.online/`), `catalog: String` (the catalogue's key, e.g. `catalog/open.ducklake`), `data_path: String` (the data prefix key, e.g. `lake/`; the persisted data path is `public_base + data_path`), `local_catalog: String` (relative to the Protocol), `tables: Vec<{ table, from, key: Option<Vec<String>>, descriptor, readable_copy: Option<String>, on_schema_change: Option<"fail"|"replace">, manifest_extra: Option<Map> }>`, `files: Vec<{ from, to }>`, `manifest: Option<String>` (store key, e.g. `manifest.json`), `credential: { type: "r2"|"s3", env: { key_id, secret, account_id } (r2) or { key_id, secret, endpoint, region } (s3), bucket: String }`. `Lake.pinned_prefix` is `catalog` with `.ducklake` replaced by `-`. Refuse a `public_base` that does not end in `/` or is not https (plain http is allowed only for `127.0.0.1` and `localhost`, for tests), and a `catalog` or `data_path` that is absolute or contains `..`.
   - `assets`: reads every `from`, `descriptor` and `files[].from`.
-  - `run`: resolve each credential variable from `ctx.env` then the process environment. All set → live: `S3Store`, `publish`, then `update_manifest` if `manifest` is set, then register the run record upload. Any unset → if `ctx.env["ARC_PUBLISH"] == "required"`, fail naming the unset variables (names only); else local: copy the live catalogue through `PublicHttpStore` into a `DirStore` rooted at `<local_catalog>`'s folder (if the fetch fails, start empty and say so), `publish` into it, and print `ducklake_write: published locally to <local_catalog>; the live lake needs <VARS> set`. The step succeeds in both cases.
+  - `run`: resolve each credential variable from `ctx.env` then the process environment. All set → live: `S3Store`, `publish`, then `update_manifest` if `manifest` is set, then register the run record upload. Any unset → if `ctx.env["ARC_PUBLISH"] == "required"`, fail naming the unset variables (names only); else local: `publish` into a `DirStore` rooted at `<local_catalog>`'s folder, with a local `Lake` whose `catalog_key` is `<local_catalog>`'s file name, `data_prefix` `<that name>.files/`, and persisted `data_path` the absolute path of that folder plus `/`, so the local lake reads back from disk; print `ducklake_write: published locally to <local_catalog>; the live lake needs <VARS> set`. The live catalogue is not fetched. The step succeeds in both cases.
   - Report: `{ "target": "live"|"local", "snapshot_id", "committed", "attempts", "tables": [TableChange…], "uploaded": [{key, bytes, sha256}], "pinned_catalog", "run_record": "runs/<run_id>.json" (live only), "missing_credential": [names] (local only) }`.
   - Commit info stamped on the snapshot: `{ "op": "ducklake_write", "run_id", "run_record": "<public base>/runs/<run_id>.json", "tables": [{table, rows}] }`.
   - `pub(crate) fn queue_run_record_upload(store: Arc<dyn ObjectStore>, key: String)` and `pub(crate) fn take_run_record_uploads() -> Vec<(Arc<dyn ObjectStore>, String)>` in `src/lake/mod.rs`, a process-wide `Mutex<Vec<…>>`. The runner, after `write_contract`, uploads `<runs_dir>/<run_id>.json` to each queued key with `PutCondition::IfAbsent`; a failure prints the error naming the key and the committed snapshot and makes `arc run` exit non-zero.
@@ -218,8 +221,8 @@
   - Integration (`tests/ducklake_write.rs`), with a local static server standing in for the public catalogue URL and no credential set:
     - `without_a_credential_the_run_publishes_locally_and_is_green`: exit 0; report `target == "local"`, `missing_credential` lists the variable names; the local catalogue holds the tables.
     - `with_publish_a_missing_credential_fails_the_step`: `arc run --publish` exits non-zero; stderr names the variables and contains no value.
-    - `a_local_run_starts_from_the_live_catalogue`: the served catalogue already holds table A at version 1; a local run that changes A reports `updated` counts relative to it.
-    - `the_report_and_logs_never_contain_a_credential_value`: with credential variables set to sentinel values and a `DirStore`-backed endpoint unreachable, the step fails and neither the run record nor stderr contains the sentinels.
+    - `a_local_lake_reads_back`: a fixture table of 50 rows (above DuckLake's inlining limit, so it is written to a data file), published locally twice with a change between; attaching `<local_catalog>` read-only returns the second run's rows, and time travel to the first snapshot the first run's.
+    - `the_report_and_logs_never_contain_a_credential_value`: with `type: s3`, `endpoint` a closed port on `127.0.0.1`, and `key_id` and `secret` set to sentinel values, the step fails and neither the run record nor stderr contains either sentinel. `key_id` and `secret` are the secret parameters; `account_id`, `endpoint`, `region` and `bucket` are not.
   - `operation_catalogue` and `public_surface` tests already enumerate operators; update their expectations for the new operator.
 
 - [ ] **Step 2: Run them and see them fail**: `cargo test --test ducklake_write` → compile error.
@@ -259,7 +262,7 @@
 No code. Needs Hugh's go-ahead and a write token for a test prefix; nothing touches `catalog/open.ducklake` or any live dataset key.
 
 - [ ] **Step 1: Ask Hugh** for the go-ahead and a test prefix (for example `lake-test/`) on the open bucket, and for the credential in a `.env` file outside the repo.
-- [ ] **Step 2: Run** a fixture Protocol with `catalog: https://openlake.meridian.online/lake-test/catalog/test.ducklake`, `data_path: https://openlake.meridian.online/lake-test/lake/`, `arc run --publish`. Expected: report `target: live`, `committed: true`.
+- [ ] **Step 2: Run** a fixture Protocol with `public_base: https://openlake.meridian.online/`, `catalog: lake-test/catalog/test.ducklake`, `data_path: lake-test/lake/` and the open bucket's name, `arc run --publish`. Expected: report `target: live`, `committed: true`.
 - [ ] **Step 3: Prove the conditional write**: run the same publish from two shells at once with different changes. Expected: both succeed, one with `attempts >= 2`, and an attach over https reads both changes.
 - [ ] **Step 4: Read it from outside**: from a fresh DuckDB 2.0, `ATTACH 'ducklake:https://openlake.meridian.online/lake-test/catalog/test.ducklake' AS t (READ_ONLY)` and query a table, `meta.fields`, and a time-travel version.
 - [ ] **Step 5: Clean up** the test prefix with Hugh's agreement, and record the outcome on the pull request.
