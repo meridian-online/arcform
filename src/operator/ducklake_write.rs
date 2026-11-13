@@ -744,9 +744,9 @@ impl Job<'_> {
     }
 
     /// Bring each published table's entry in the compatible manifest up to date,
-    /// leaving any a newer snapshot owns. Every value comes from the snapshot the
-    /// catalogue holds, the run included, so a publish that changed nothing leaves
-    /// the manifest as it was.
+    /// leaving any a newer snapshot owns. An entry whose copy is unchanged keeps the
+    /// time and run it was published with (see [`update_manifest`]), so a publish
+    /// that changed nothing leaves the manifest as it was.
     fn write_manifest(
         &self,
         store: &dyn ObjectStore,
@@ -756,20 +756,15 @@ impl Job<'_> {
         key: &str,
     ) -> Result<bool> {
         let snapshot = published.outcome.snapshot_id;
-        let facts = snapshot_facts(&work.join("catalog.ducklake"), snapshot)?;
-        let time = facts.time;
-        // The run that committed the snapshot; this one, if the snapshot names none.
-        let run = match facts.run_id {
-            Some(id) => json!({ "id": id, "record": facts.run_record }),
-            None => json!({
-                "id": self.run_id,
-                "record": format!(
-                    "{}runs/{}.json",
-                    self.cfg.public_base,
-                    self.run_id.as_deref().unwrap_or_default()
-                ),
-            }),
-        };
+        let time = snapshot_time(&work.join("catalog.ducklake"), snapshot)?;
+        let run = json!({
+            "id": self.run_id,
+            "record": format!(
+                "{}runs/{}.json",
+                self.cfg.public_base,
+                self.run_id.as_deref().unwrap_or_default()
+            ),
+        });
         let mut entries: Vec<(String, ManifestEntry)> = Vec::new();
         for (t, p) in self.cfg.tables.iter().zip(&self.prepared) {
             let Some(copy) = &t.readable_copy else {
@@ -794,7 +789,14 @@ impl Job<'_> {
             .pinned_catalog
             .as_ref()
             .map(|k| format!("{}{k}", self.cfg.public_base));
-        let watch = Watch::new(store, lake, work, snapshot, published.catalog_etag.clone());
+        let watch = Watch::new(
+            store,
+            lake,
+            work,
+            snapshot,
+            published.catalog_etag.clone(),
+            published.seen.clone(),
+        );
         let current = || -> Result<(Vec<ManifestEntry>, Option<String>)> {
             let live = watch.live_etag()?;
             let mut current = Vec::with_capacity(entries.len());
@@ -822,19 +824,9 @@ fn file_digest(path: &Path) -> Result<(u64, String)> {
     Ok((bytes, format!("{:x}", hasher.finalize())))
 }
 
-/// What a snapshot records about itself.
-struct SnapshotFacts {
-    /// The commit time, RFC 3339.
-    time: String,
-    /// The run that committed it and that run's record, from its commit metadata.
-    run_id: Option<String>,
-    run_record: Option<String>,
-}
-
-/// `snapshot`'s commit time and run, read from the catalogue file as a plain DuckDB
-/// database (DuckLake keeps its snapshots in `ducklake_snapshot`, and their commit
-/// metadata in `ducklake_snapshot_changes`).
-fn snapshot_facts(catalog_file: &Path, snapshot: i64) -> Result<SnapshotFacts> {
+/// The commit time of `snapshot`, RFC 3339, read from the catalogue file as a plain
+/// DuckDB database (DuckLake keeps its snapshots in `ducklake_snapshot`).
+fn snapshot_time(catalog_file: &Path, snapshot: i64) -> Result<String> {
     let context = |e: duckdb::Error| failed(format!("read the snapshot's commit time: {e}"));
     let conn = duckdb::Connection::open_in_memory().map_err(context)?;
     conn.execute_batch(&format!(
@@ -842,27 +834,16 @@ fn snapshot_facts(catalog_file: &Path, snapshot: i64) -> Result<SnapshotFacts> {
         sql_string_literal(&catalog_file.display().to_string())
     ))
     .map_err(context)?;
-    let (micros, info): (i64, Option<String>) = conn
+    let micros: i64 = conn
         .query_row(
-            "SELECT epoch_us(s.snapshot_time), c.commit_extra_info \
-             FROM arc_catalog.ducklake_snapshot AS s \
-             LEFT JOIN arc_catalog.ducklake_snapshot_changes AS c USING (snapshot_id) \
-             WHERE s.snapshot_id = ?",
+            "SELECT epoch_us(snapshot_time) FROM arc_catalog.ducklake_snapshot WHERE snapshot_id = ?",
             [snapshot],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )
         .map_err(context)?;
     let at = std::time::UNIX_EPOCH
         + std::time::Duration::from_micros(u64::try_from(micros).unwrap_or_default());
-    let info: serde_json::Value = info
-        .and_then(|i| serde_json::from_str(&i).ok())
-        .unwrap_or_default();
-    let text = |field: &str| info.get(field).and_then(|v| v.as_str()).map(str::to_string);
-    Ok(SnapshotFacts {
-        time: humantime::format_rfc3339_seconds(at).to_string(),
-        run_id: text("run_id"),
-        run_record: text("run_record"),
-    })
+    Ok(humantime::format_rfc3339_seconds(at).to_string())
 }
 
 impl Operator for DucklakeWrite {
@@ -1540,6 +1521,64 @@ credential:
             // The attempt's own fetch, and none after the catalogue lands.
             assert_eq!(store.gets(&cfg.catalog), 1, "{run}");
         }
+    }
+
+    /// A manifest entry names the run that published its copy: an unchanged rerun
+    /// of one step, after another step committed to the same catalogue, leaves the
+    /// manifest byte for byte as it was.
+    #[test]
+    fn an_unchanged_rerun_keeps_its_entry_after_another_step_publishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        write_codes(p);
+        std::fs::copy(p.join("data/codes.parquet"), p.join("data/more.parquet")).unwrap();
+        std::fs::copy(
+            p.join("codes.datapackage.json"),
+            p.join("more.datapackage.json"),
+        )
+        .unwrap();
+        let a_yaml = BASE.replace(
+            "files:\n  - from: build/search/\n    to: demo/search/\n",
+            "manifest: manifest.json\n",
+        );
+        let b_yaml = a_yaml
+            .replace("demo.codes", "demo.more")
+            .replace("data/codes.parquet", "data/more.parquet")
+            .replace("codes.datapackage.json", "more.datapackage.json")
+            .replace("demo/codes.parquet", "demo/more.parquet");
+        let a_cfg = DucklakeWriteConfig::parse(&with(&a_yaml)).unwrap();
+        let b_cfg = DucklakeWriteConfig::parse(&with(&b_yaml)).unwrap();
+        let root = p.join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        let lake = Lake {
+            catalog_key: a_cfg.catalog.clone(),
+            data_path: format!("{}/lake/", root.display()),
+            data_prefix: "lake/".into(),
+            write_path: format!("{}/lake/", root.display()),
+            pinned_prefix: Some(pinned_prefix(&a_cfg.catalog)),
+        };
+        let store: Arc<dyn ObjectStore> = Arc::new(DirStore::new(&root));
+        let publish = |cfg: &DucklakeWriteConfig, run: &str| {
+            let job = Job {
+                cfg,
+                dir: p,
+                prepared: vec![prepare(p, &cfg.tables[0]).unwrap()],
+                run_id: Some(run.into()),
+            };
+            let report = job.publish_live(Arc::clone(&store), &lake, None).unwrap();
+            drop(crate::lake::take_run_record_uploads());
+            report
+        };
+        assert!(publish(&a_cfg, "run-1").committed);
+        assert!(publish(&b_cfg, "run-2").committed);
+        let before = std::fs::read(root.join("manifest.json")).unwrap();
+        let rerun = publish(&a_cfg, "run-3");
+        assert!(!rerun.committed);
+        assert_eq!(rerun.manifest_written, Some(false));
+        assert_eq!(std::fs::read(root.join("manifest.json")).unwrap(), before);
+        let manifest: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        assert_eq!(manifest["datasets"]["demo/codes"]["run"]["id"], "run-1");
+        assert_eq!(manifest["datasets"]["demo/more"]["run"]["id"], "run-2");
     }
 
     /// No reader fetches the local lake's catalogue by a pinned address, so a local

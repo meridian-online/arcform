@@ -47,7 +47,8 @@ impl ManifestEntry {
 
 /// Apply the entries and pinned catalogue address `current` returns to the manifest
 /// at `key`, and write it back with `IfMatch` only when it changed. Returns whether
-/// it was written.
+/// it was written. An entry whose `url`, `rows`, `bytes` and `sha256` match the
+/// manifest's keeps its `published` and `run`: the copy is the one published then.
 ///
 /// `current` is called on every attempt, after the manifest is read and before it is
 /// written: it returns only the entries whose table no newer snapshot has changed,
@@ -123,8 +124,18 @@ fn apply(doc: &mut Value, entries: &[ManifestEntry], pinned_catalog: Option<&str
             *slot = json!({});
         }
         let target = slot.as_object_mut().expect("just made an object");
-        for (k, v) in entry.fields() {
-            target.insert(k, v);
+        let fields = entry.fields();
+        // The same copy as the entry already names: it keeps the time and run it
+        // was published with, whichever run publishes it again.
+        let same_copy = ["url", "rows", "bytes", "sha256"]
+            .iter()
+            .all(|k| target.get(*k).is_some_and(|v| Some(v) == fields.get(*k)));
+        for (k, v) in fields {
+            let kept =
+                same_copy && matches!(k.as_str(), "published" | "run") && target.contains_key(&k);
+            if !kept {
+                target.insert(k, v);
+            }
         }
     }
     if let Some(url) = pinned_catalog {

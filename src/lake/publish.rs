@@ -77,6 +77,8 @@ pub struct Published {
     /// Readable copies and extra files skipped because a newer snapshot changed
     /// their table: a newer publish owns them.
     pub superseded: Vec<String>,
+    /// What the uploads learned about newer snapshots, for the manifest's check.
+    pub seen: Seen,
     /// The pinned catalogue's key; `None` when the lake pins no copies.
     pub pinned_catalog: Option<String>,
     /// The stable catalogue's ETag as this publish wrote or verified it.
@@ -444,22 +446,36 @@ pub struct Watch<'a> {
     seen: RefCell<Seen>,
 }
 
-#[derive(Default)]
-struct Seen {
+/// What a [`Watch`] has learned, carried in [`Published`] so the manifest's watch
+/// starts where the uploads' left off.
+#[derive(Default, Clone)]
+pub struct Seen {
     /// The newest catalogue fetched, and its ETag.
-    fetched: Option<(ETag, Vec<u8>)>,
+    fetched: Option<(ETag, std::sync::Arc<Vec<u8>>)>,
     checked: HashMap<(String, String), bool>,
     newer_tables: HashSet<String>,
 }
 
+impl std::fmt::Debug for Seen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Seen")
+            .field("fetched", &self.fetched.as_ref().map(|(etag, _)| etag))
+            .field("checked", &self.checked)
+            .field("newer_tables", &self.newer_tables)
+            .finish()
+    }
+}
+
 impl<'a> Watch<'a> {
-    /// A watch for the publish that landed `snapshot` with the catalogue at `landed`.
+    /// A watch for the publish that landed `snapshot` with the catalogue at `landed`,
+    /// knowing what `seen` holds (for a fresh watch, `Seen::default()`).
     pub fn new(
         store: &'a dyn ObjectStore,
         lake: &'a Lake,
         work: &'a Path,
         snapshot: i64,
         landed: ETag,
+        seen: Seen,
     ) -> Self {
         Watch {
             store,
@@ -467,8 +483,13 @@ impl<'a> Watch<'a> {
             work,
             snapshot,
             landed,
-            seen: RefCell::new(Seen::default()),
+            seen: RefCell::new(seen),
         }
+    }
+
+    /// What the watch has learned, for a later watch of the same publish.
+    pub fn into_seen(self) -> Seen {
+        self.seen.into_inner()
     }
 
     /// The live catalogue's ETag, by HEAD.
@@ -512,7 +533,9 @@ impl<'a> Watch<'a> {
                 .map_err(store_failed("fetch the catalogue", key))?;
             match fetched {
                 // Moved again since the HEAD: the newer version answers just as well.
-                Some((bytes, etag)) if etag != self.landed => seen.fetched = Some((etag, bytes)),
+                Some((bytes, etag)) if etag != self.landed => {
+                    seen.fetched = Some((etag, std::sync::Arc::new(bytes)));
+                }
                 _ => return Ok(false),
             }
         }
@@ -655,6 +678,7 @@ pub fn publish_with_landing(
         work,
         landed.outcome.snapshot_id,
         landed.etag.clone(),
+        Seen::default(),
     );
     for (file, key, owners) in files {
         if guard.known_newer(&owners) {
@@ -714,6 +738,7 @@ pub fn publish_with_landing(
         uploaded,
         unchanged,
         superseded,
+        seen: guard.into_seen(),
         pinned_catalog: landed.pinned,
         catalog_etag: landed.etag,
         attempts,
