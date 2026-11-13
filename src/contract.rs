@@ -984,7 +984,7 @@ pub fn render_dag(contract: &Contract) -> String {
 const REDACTED: &str = "***REDACTED***";
 
 /// Whether a config/param key name looks like it holds a secret.
-fn is_secret_key(key: &str) -> bool {
+pub(crate) fn is_secret_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     [
         "secret",

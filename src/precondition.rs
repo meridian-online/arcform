@@ -1222,6 +1222,7 @@ mod tests {
                     dir,
                     db_path: &db,
                     env: &env,
+                    dotenv: crate::operator::no_dotenv(),
                     timeout: None,
                     cache,
                 },

@@ -473,3 +473,59 @@ steps:
         .expect("the step wrote its declared output");
     assert_eq!(emitted.trim(), "ok = true");
 }
+
+/// The manifest's `dotenv:` variables are for arc and for the steps that ask for a
+/// credential by name; a script an operator spawns never inherits them, so a `.env`
+/// holding a publish credential does not hand it to every Python step in the
+/// Protocol.
+#[test]
+fn a_spawned_script_does_not_inherit_the_dotenv_variables() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let script = "import json, os, sys\n\
+                  json.dump({k: v for k, v in os.environ.items() if k.startswith('ARC_')}, \
+                  open(sys.argv[1], 'w'))\n";
+    std::fs::create_dir_all(dir.join("scripts")).unwrap();
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    std::fs::write(dir.join("scripts/env.py"), script).unwrap();
+    std::fs::write(dir.join("data/input.txt"), "one\n").unwrap();
+    std::fs::write(
+        dir.join(".env"),
+        "ARC_TEST_DOTENV_SENTINEL=sentinel-dotenv-value\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("arcform.yaml"),
+        format!(
+            r#"name: uv_dotenv_fixture
+engine: duckdb
+db: build/fixture.duckdb
+dotenv: [.env]
+
+steps:
+  - name: env
+    op: uv@1
+    with:
+      script: scripts/env.py
+      sha256: "{}"
+      args: ["build/env.json"]
+      reads: ["data/input.txt"]
+      produces: ["build/env.json"]
+"#,
+            sha256_of(script.as_bytes())
+        ),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = arc_run_stubbed(dir);
+    assert_eq!(code, Some(0), "stdout:\n{stdout}\n{stderr}");
+    let seen = std::fs::read_to_string(dir.join("build/env.json")).unwrap();
+    assert!(
+        seen.contains("ARC_RUN_ID"),
+        "the script sees the run's own variables: {seen}"
+    );
+    assert!(
+        !seen.contains("sentinel-dotenv-value"),
+        "the script sees a dotenv variable: {seen}"
+    );
+}

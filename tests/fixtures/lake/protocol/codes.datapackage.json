@@ -1,0 +1,18 @@
+{
+  "name": "codes",
+  "description": "A small code list for testing the lake publish step.",
+  "resources": [
+    {
+      "name": "codes",
+      "path": "data/codes.parquet",
+      "format": "parquet",
+      "schema": {
+        "fields": [
+          { "name": "code", "type": "string", "description": "The code." },
+          { "name": "label", "type": "string", "description": "What the code means." }
+        ],
+        "primaryKey": ["code"]
+      }
+    }
+  ]
+}

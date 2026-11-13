@@ -309,6 +309,16 @@ pub enum Error {
     #[error("missing required parameter '{name}' (no default, not in dotenv or CLI)")]
     MissingParam { name: String },
 
+    #[error(
+        "could not upload the run record to `{key}`: {reason}; the lake's snapshot \
+         {snapshot_id} or the manifest names that record"
+    )]
+    RunRecordUpload {
+        key: String,
+        snapshot_id: i64,
+        reason: String,
+    },
+
     #[error("step '{step}' timed out")]
     StepTimeout { step: String },
 

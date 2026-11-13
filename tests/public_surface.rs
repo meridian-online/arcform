@@ -113,7 +113,7 @@ const EXPORTED: [(&str, &str); 46] = [
 
 /// Every module file in the crate. Frozen so a new one cannot be added without
 /// passing under the checks below.
-const MODULE_FILES: [&str; 42] = [
+const MODULE_FILES: [&str; 51] = [
     "asset.rs",
     "asset_kind.rs",
     "bridge.rs",
@@ -137,6 +137,14 @@ const MODULE_FILES: [&str; 42] = [
     "ingress_meta.rs",
     "inspect.rs",
     "introspect.rs",
+    "lake/commit.rs",
+    "lake/manifest.rs",
+    "lake/meta.rs",
+    "lake/mod.rs",
+    "lake/publish.rs",
+    "lake/rebase.rs",
+    "lake/store.rs",
+    "lake/test_server.rs",
     "lib.rs",
     "main.rs",
     "manifest.rs",
@@ -150,6 +158,9 @@ const MODULE_FILES: [&str; 42] = [
     // `ducklake_publish`, split out of `operator.rs` because it is a module's worth of
     // code on its own. Private to the crate like every operator: it exports nothing.
     "operator/ducklake_publish.rs",
+    // `ducklake_write`, the lake publish step over `lake/`, in a file of its own for the
+    // same reason. Private to the crate: it exports nothing.
+    "operator/ducklake_write.rs",
     // The generated Reference section of each operator's README, and the test that
     // holds the READMEs to it. Compiled only for tests; it exports nothing.
     "operator/reference.rs",
@@ -904,11 +915,12 @@ fn cargo_toml_gates_the_binary_entry_point() {
     // ureq and, as its sole runtime consumer, the whole rustls/ring TLS stack. See
     // src/operator.rs (http_fetch) for the reachability rationale.
     assert!(
-        manifest.contains("\nhttp-fetch = [\"dep:ureq\", \"dep:url\"]"),
+        manifest.contains("\nhttp-fetch = [\"dep:ureq\", \"dep:url\", \"dep:rusty-s3\"]"),
         "`http-fetch` must be declared and own `ureq`, so turning it off (which \
          `default-features = false` does) drops the HTTP client and its TLS stack. \
          It also owns `url`, which `http_fetch` uses to resolve a relative redirect \
-         `Location` while following redirects itself"
+         `Location` while following redirects itself, and `rusty-s3`, the request signer \
+         the lake publish object store uses"
     );
     assert!(
         manifest.contains(

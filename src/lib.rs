@@ -50,6 +50,8 @@ mod history;
 mod ingress_meta;
 mod inspect;
 mod introspect;
+#[cfg(feature = "http-fetch")]
+mod lake;
 mod manifest;
 #[cfg(feature = "mcp")]
 mod mcp;

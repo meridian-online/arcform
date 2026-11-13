@@ -52,7 +52,7 @@ Use an operator for work that is not a query over tables already in the database
 | Entity resolution | `splink_resolve` |
 | Embedding and projection | `text_embed`, `umap_project` |
 | Export and description | `parquet_export`, `datapackage_describe`, `finetype_validate` |
-| Publishing | `ducklake_publish` |
+| Publishing | `ducklake_write` (tables into a DuckLake on object storage, upserted on their keys as one snapshot; without the write credential it publishes into a local lake and the run stays green, and `arc run --publish` makes the live publish required), `ducklake_publish` (one Parquet file into a DuckLake catalog whose data path is local) |
 | A pinned Python script | `uv` (a script pinned by its digest, run with uv) |
 
 Read the operator's `with:` before recording it, and pass it as JSON. `operator_record` checks it against the operator's schema and refuses a block that does not fit, naming the field, with the Protocol untouched.

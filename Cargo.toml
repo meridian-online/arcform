@@ -96,6 +96,9 @@ ureq = { version = "2", default-features = false, features = ["tls"], optional =
 # ureq depends on this crate unconditionally, so the gated dep adds nothing to the
 # graph that `http-fetch` does not already pull in.
 url = { version = "2", optional = true }
+# lake publish: SigV4 presigning for the S3-compatible object store (R2) behind
+# `src/lake/store.rs`. Sans-IO: requests are sent with ureq. Gated with it.
+rusty-s3 = { version = "0.11", default-features = false, features = ["rustcrypto"], optional = true }
 tar = "0.4"
 flate2 = "1"
 dirs = "5"
@@ -136,13 +139,14 @@ default = ["cli"]
 # binary is always whole.
 cli = ["dep:clap", "http-fetch"]
 # The ureq-backed HTTP ingress path — the `http_fetch` + `html_link_discover`
-# operators and the `fresh` precondition's HEAD probe. Enabled via `cli` (never
+# operators and the `fresh` precondition's HEAD probe — and the lake publish step,
+# `ducklake_write`, whose object store sends its requests with ureq. Enabled via `cli` (never
 # reachable without a running pipeline, which is a CLI-only operation), so a
 # `default-features = false` library consumer builds without ureq and its
 # rustls/ring TLS stack. Kept a *named* feature distinct from `cli` so a future
 # engine-as-library consumer could opt the fetch path back in without the clap
 # argv parser.
-http-fetch = ["dep:ureq", "dep:url"]
+http-fetch = ["dep:ureq", "dep:url", "dep:rusty-s3"]
 # The OpenDAL-backed opendal_fetch operator (multi-backend ingress; securelake s3://).
 opendal = ["dep:opendal", "dep:opendal-http-transport-reqwest", "dep:reqwest", "dep:tokio"]
 # The `arc mcp` entry point: a Model Context Protocol server over stdio that

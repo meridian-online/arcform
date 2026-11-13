@@ -1,0 +1,105 @@
+{
+  "$schema": "https://datapackage.org/profiles/2.0/datapackage.json",
+  "created": "2026-11-03T02:36:56Z",
+  "description": "The 2018 Standard Occupational Classification.",
+  "homepage": "https://meridian.online/datasets/bls/soc_2018",
+  "licenses": [
+    {
+      "name": "other-pd",
+      "path": "https://www.bls.gov/opub/copyright-information.htm",
+      "title": "Public domain (U.S. Bureau of Labor Statistics)"
+    }
+  ],
+  "name": "soc_2018",
+  "sources": [
+    {
+      "path": "https://www.bls.gov/soc/2018/home.htm",
+      "title": "2018 Standard Occupational Classification System \u2014 U.S. Bureau of Labor Statistics"
+    },
+    {
+      "path": "https://www.bls.gov/soc/2018/soc_2018_definitions.xlsx",
+      "title": "2018 SOC definitions (soc_2018_definitions.xlsx) \u2014 U.S. Bureau of Labor Statistics"
+    }
+  ],
+  "title": "SOC 2018 \u2014 Standard Occupational Classification (U.S.)",
+  "x-finetype-version": "0.6.67",
+  "x-meridian-code-list": {
+    "levels": [
+      "major",
+      "minor",
+      "broad",
+      "detailed"
+    ]
+  },
+  "resources": [
+    {
+      "bytes": 150277,
+      "format": "parquet",
+      "hash": "sha256:b3ee7b5f3e30fd7341dcaf33c71ab1f35111830c83846586f1eeb882ea8a1ff7",
+      "mediatype": "application/vnd.apache.parquet",
+      "name": "soc_2018",
+      "path": "https://openlake.meridian.online/bls/soc_2018.parquet",
+      "schema": {
+        "fields": [
+          {
+            "constraints": {
+              "maxLength": 7,
+              "minLength": 7,
+              "pattern": "^[0-9]{2}-[0-9]{4}$"
+            },
+            "description": "The SOC 2018 code, two digits, a hyphen and four digits.",
+            "name": "code",
+            "type": "string",
+            "x-finetype-label": "representation.identifier.numeric_code",
+            "x-finetype-nominated": true,
+            "x-finetype-pattern-fit": {
+              "canonical": "^[0-9]+$",
+              "outcome": "widened"
+            }
+          },
+          {
+            "constraints": {
+              "enum": [
+                "major",
+                "minor",
+                "broad",
+                "detailed"
+              ]
+            },
+            "description": "Hierarchy level: major, minor, broad or detailed.",
+            "name": "level",
+            "type": "string",
+            "x-finetype-confidence": 0.8783,
+            "x-finetype-enum-domain": {
+              "cohesion": 1.0,
+              "distinct": 4,
+              "domain": [
+                "broad",
+                "detailed",
+                "major",
+                "minor"
+              ],
+              "open": true,
+              "rows": 1447
+            },
+            "x-finetype-label": "representation.text.word"
+          },
+          {
+            "constraints": {
+              "maxLength": 65536,
+              "minLength": 1
+            },
+            "description": "BLS's definition of a detailed occupation.",
+            "name": "definition",
+            "type": "string",
+            "x-finetype-label": "representation.text.plain_text",
+            "x-finetype-nominated": true
+          }
+        ],
+        "primaryKey": [
+          "code"
+        ]
+      }
+    }
+  ]
+}
