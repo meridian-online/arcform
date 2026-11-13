@@ -14,6 +14,8 @@ pub(crate) mod manifest;
 
 pub(crate) mod publish;
 
+pub(crate) mod rebase;
+
 #[cfg(test)]
 mod test_server;
 

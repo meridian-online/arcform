@@ -462,10 +462,6 @@ pub struct PublicHttpStore {
     agent: ureq::Agent,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by `arc lake rebase` in a later task")
-)]
 impl PublicHttpStore {
     pub fn new(base_url: impl Into<String>) -> Self {
         PublicHttpStore {

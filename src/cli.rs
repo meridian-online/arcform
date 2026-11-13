@@ -150,6 +150,12 @@ pub enum Commands {
         cmd: RegistryCmd,
     },
 
+    /// Maintain a DuckLake lake.
+    Lake {
+        #[command(subcommand)]
+        cmd: LakeCmd,
+    },
+
     /// List the SQL operations arc holds, describe what one takes, and record
     /// one as a step of a protocol.
     Operation {
@@ -545,6 +551,49 @@ pub enum OperatorCmd {
         /// Protocol directory (where arcform.yaml lives).
         #[arg(long, default_value = ".")]
         dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum LakeCmd {
+    /// Move a lake onto a new catalogue with a different data path.
+    ///
+    /// DuckLake cannot change a catalogue's persisted data path, so this builds
+    /// a new catalogue with `--data-path`, creates each table of the old one in
+    /// it, registers each table's current data files by address (the files stay
+    /// where they are) and recreates its views, in one snapshot. A table with
+    /// deleted rows is refused. The `meta` schema is not carried.
+    ///
+    /// With `--upload` the new catalogue is also written to the object store,
+    /// only if nothing is there yet. `--credential-env` names the environment
+    /// variables that hold the store's credentials, as
+    /// `<type>:<param>=<VAR>,...`: `r2:account_id=VAR,key_id=VAR,secret=VAR`, or
+    /// `s3:endpoint=VAR,key_id=VAR,secret=VAR[,region=VAR]`. The values are read
+    /// from the environment and never printed.
+    Rebase {
+        /// The old catalogue: a file, or an https URL to download.
+        #[arg(long)]
+        from: String,
+
+        /// Where to write the new catalogue file. Must not exist.
+        #[arg(long)]
+        out: PathBuf,
+
+        /// The new catalogue's persisted data path, an https URL.
+        #[arg(long = "data-path")]
+        data_path: String,
+
+        /// Also upload the result to this catalogue URL's key, if absent.
+        #[arg(long, requires_all = ["bucket", "credential_env"])]
+        upload: Option<String>,
+
+        /// The bucket to upload into.
+        #[arg(long)]
+        bucket: Option<String>,
+
+        /// Credentials by environment variable name: `<type>:<param>=<VAR>,...`.
+        #[arg(long = "credential-env", value_name = "SPEC")]
+        credential_env: Option<String>,
     },
 }
 
@@ -1271,6 +1320,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             upgrade_extension(&dir, &name, &DuckDbEngine, &open_history()?)
         }
         Commands::Registry { cmd } => dispatch_registry(cmd, verbose),
+        Commands::Lake { cmd } => dispatch_lake(cmd, &mut std::io::stdout()),
         Commands::Operation { cmd } => dispatch_operation(cmd, &mut std::io::stdout()),
         Commands::Operator { cmd } => dispatch_operator(cmd, &mut std::io::stdout()),
         Commands::Sql { cmd } => dispatch_sql(cmd, &mut std::io::stdout()),
@@ -1285,6 +1335,50 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Commands::Table { cmd } => dispatch_table(cmd, &mut std::io::stdout()),
         Commands::Skills { cmd } => dispatch_skills(cmd, &mut std::io::stdout()),
+    }
+}
+
+/// Execute an `arc lake` verb.
+fn dispatch_lake(cmd: LakeCmd, out: &mut impl Write) -> Result<()> {
+    use crate::lake::rebase;
+    match cmd {
+        LakeCmd::Rebase {
+            from,
+            out: catalogue,
+            data_path,
+            upload,
+            bucket,
+            credential_env,
+        } => {
+            // Everything the upload needs is checked before the long rebase.
+            let store = match (&upload, &bucket, &credential_env) {
+                (Some(_), Some(bucket), Some(spec)) => {
+                    Some(rebase::store_from_env(bucket, spec, &|name| {
+                        std::env::var(name).ok()
+                    })?)
+                }
+                _ => None,
+            };
+            let report = rebase::rebase(&from, &catalogue, &data_path)?;
+            for (table, files) in &report.tables {
+                writeln!(out, "table {table}: {files} files")?;
+            }
+            for view in &report.views {
+                writeln!(out, "view {view}")?;
+            }
+            writeln!(
+                out,
+                "{} tables, {} views -> {}",
+                report.tables.len(),
+                report.views.len(),
+                catalogue.display()
+            )?;
+            if let (Some(url), Some(store)) = (upload, store) {
+                let key = rebase::upload_catalogue(&catalogue, &url, &store)?;
+                writeln!(out, "uploaded {key}")?;
+            }
+            Ok(())
+        }
     }
 }
 
