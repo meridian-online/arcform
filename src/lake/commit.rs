@@ -410,8 +410,14 @@ fn schema_difference(
             found.push("the columns were reordered".to_string());
         }
     }
+    // Which columns form the key, not the order the descriptor lists them in.
+    let sorted = |k: &[String]| {
+        let mut k = k.to_vec();
+        k.sort();
+        k
+    };
     if let Some(stored) = stored_key
-        && stored != key
+        && sorted(stored) != sorted(key)
     {
         found.push(format!(
             "the key was ({}), is now ({})",
@@ -1256,6 +1262,30 @@ mod tests {
             lake.strings("SELECT column_name FROM lake.meta.fields WHERE is_key"),
             ["v"]
         );
+    }
+
+    #[test]
+    fn a_composite_key_out_of_field_order_republishes_unchanged() {
+        let lake = Lake::new();
+        let d = || {
+            descriptor(
+                "s.c",
+                &[("id", "integer"), ("region", "string"), ("v", "string")],
+                &["region", "id"],
+            )
+        };
+        let p = lake.parquet(
+            "c.parquet",
+            "SELECT range AS id, 'r' || (range % 2) AS region, 'v' AS v FROM range(6)",
+        );
+        assert!(
+            lake.commit(&[input("s.c", p.clone(), d())])
+                .unwrap()
+                .committed
+        );
+        let again = lake.commit(&[input("s.c", p, d())]).unwrap();
+        assert!(!again.committed, "{again:?}");
+        assert_eq!(change(&again, "s.c").action, TableAction::Unchanged);
     }
 
     #[test]
