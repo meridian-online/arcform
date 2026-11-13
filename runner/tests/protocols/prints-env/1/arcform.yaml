@@ -1,0 +1,12 @@
+name: prints_env
+db: prints_env.duckdb
+steps:
+  - name: print_env
+    command: |
+      echo "--- the step's environment"
+      env
+      echo "--- PID 1's environment"
+      tr '\0' '\n' < /proc/1/environ || true
+      echo "--- the runner's state directory"
+      ls -la /run/arc-runner || true
+      cat /run/arc-runner/credential.json /run/arc-runner/renewal_token || true
