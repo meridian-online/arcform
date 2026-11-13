@@ -96,6 +96,15 @@ impl Drop for Scratch {
     }
 }
 
+/// Remove a half-built catalogue and its WAL, so neither is mistaken for a result
+/// and the next rebase to the same path does not replay the WAL into its catalogue.
+fn discard(out: &Path) {
+    let _ = std::fs::remove_file(out);
+    let mut wal = out.as_os_str().to_owned();
+    wal.push(".wal");
+    let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
+}
+
 struct OldTable {
     schema: String,
     name: String,
@@ -225,8 +234,7 @@ pub fn rebase(from: &str, out: &Path, data_path: &str) -> Result<RebaseReport> {
     if let Err(e) = result {
         let _ = conn.execute_batch("ROLLBACK");
         drop(conn);
-        // A half-built catalogue is not left behind to be mistaken for a result.
-        let _ = std::fs::remove_file(out);
+        discard(out);
         return Err(e);
     }
 
@@ -775,6 +783,38 @@ mod tests {
         assert!(err.to_string().contains("s.a"), "{err}");
         assert!(err.to_string().contains("delete"), "{err}");
         assert!(!out.exists(), "no catalogue is left behind");
+    }
+
+    /// A failure after the new catalogue is created removes it, and its WAL.
+    #[test]
+    fn a_failed_rebase_leaves_no_catalogue_or_wal() {
+        let dir = TempDir::new().unwrap();
+        let old = old_lake(&dir);
+        // A registered file gone missing fails the rebase partway through.
+        std::fs::remove_file(dir.path().join("files/b1.parquet")).unwrap();
+        let out = dir.path().join("new.ducklake");
+        let err = rebase(old.to_str().unwrap(), &out, NEW_DATA_PATH).unwrap_err();
+        assert!(err.to_string().contains("b1.parquet"), "{err}");
+        assert!(!out.exists(), "no catalogue is left behind");
+        assert!(
+            !dir.path().join("new.ducklake.wal").exists(),
+            "no WAL is left behind"
+        );
+    }
+
+    /// DuckDB checkpoints as the connection closes, so a WAL survives only an
+    /// interrupted checkpoint; `discard` removes one all the same, since the next
+    /// rebase to that path would replay it into its new catalogue.
+    #[test]
+    fn discard_removes_the_catalogue_and_its_wal() {
+        let dir = TempDir::new().unwrap();
+        let out = dir.path().join("new.ducklake");
+        std::fs::write(&out, b"catalogue").unwrap();
+        std::fs::write(dir.path().join("new.ducklake.wal"), b"wal").unwrap();
+        discard(&out);
+        assert!(!out.exists());
+        assert!(!dir.path().join("new.ducklake.wal").exists());
+        discard(&out);
     }
 
     #[test]
