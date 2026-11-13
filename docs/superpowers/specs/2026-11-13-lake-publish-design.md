@@ -43,6 +43,7 @@ This replaces publishing that happens outside the run today: a script uploads fi
 - **The credential comes from the environment**, which includes a `.env` file the manifest lists. Hugh's own publishes use a `.env` on his machine. Managed runs later inject the same variables from a cloud secret store.
 - **The readable `<namespace>/<name>.parquet` stays.** Downloading the whole file with `curl`, without DuckDB and without auth, is a use Meridian publishes for. It is a separate object that the catalogue never registers, because DuckLake's maintenance may delete files it owns.
 - **Descriptors are for users and agents solving a Protocol.** Lakes are reference data. An agent holding a column it cannot place, such as postal codes, should be able to find which table holds those values as a key. That is why `meta.fields` is one row per column with its finetype label, constraints and key flag.
+- **Readers move to DuckDB 2.0.** DuckDB 2.0 writes the catalogue file in its 2.0 storage format on every write, which DuckDB 1.x cannot open. Hugh chose to move readers to 2.0 over writing the lake with a pinned DuckDB 1.5. The published `ATTACH` snippets and dataset pages state DuckDB 2.0 or later from the first publish. Since readers need 2.0 regardless, the catalogue uses DuckLake's current format, 1.1, rather than pinning 1.0 (agent's call).
 - **Every open dataset moves onto this step**, as follow-up work in open-analytics. This build has to support what all of them need, including gleif's search parts.
 
 ## How a publish works
@@ -64,7 +65,7 @@ The catalogue's persisted data path is the https address readers use. DuckLake r
 ### The step, in order
 
 1. **Resolve the target.** Look up the write credential (below). With it, the target is the live lake. Without it, the target is a local catalogue in the Protocol's build folder, and the step reports `published locally` naming the missing variables. Under `--publish`, a missing credential fails the step instead.
-2. **Fetch the catalogue.** Download the live catalogue object and remember its ETag. If none exists yet, create one with the https data path, pinned to DuckLake format 1.0 (`DUCKLAKE_VERSION '1.0'`), because a 1.1 catalogue cannot be opened by readers still on DuckDB 1.x.
+2. **Fetch the catalogue.** Download the live catalogue object and remember its ETag. If none exists yet, create one with the https data path, at DuckLake's current format (1.1 on DuckDB 2.0).
 3. **Attach it read-write with the data path overridden to a local staging folder** (`OVERRIDE_DATA_PATH true`). New data files land in staging under the same relative layout.
 4. **In one transaction, for each table:**
    - create the schema and table if missing, from the input's columns;
@@ -127,7 +128,7 @@ Each entry keeps the keys today's readers use (agent's call): `url` is the reada
 
 ### The cutover (agent's call)
 
-The live catalogue and manifest have writers in infra that rebuild and overwrite them without checking what they read, and a version collector that deletes files the manifest no longer names, which the new catalogue still registers. So the migration below, stopping infra's catalogue rebuild and manifest flip, and stopping the collector all happen together, before the first live publish, as open-analytics' and infra's follow-up work. After the cutover, a dataset whose Protocol has not yet moved keeps serving its current files and is refreshed only once it moves. This build supplies the migration and documents the cutover; it does not change infra.
+The live catalogue and manifest have writers in infra that rebuild and overwrite them without checking what they read, and a version collector that deletes files the manifest no longer names, which the new catalogue still registers. So the migration below, the notice to readers that they need DuckDB 2.0, stopping infra's catalogue rebuild and manifest flip, and stopping the collector all happen together, before the first live publish, as open-analytics' and infra's follow-up work. After the cutover, a dataset whose Protocol has not yet moved keeps serving its current files and is refreshed only once it moves. This build supplies the migration and documents the cutover; it does not change infra.
 
 ### Moving the live open lake
 
@@ -159,7 +160,7 @@ Catalogue backends considered: a file on R2 (chosen: no server, no running cost,
 
 ## Constraints
 
-- DuckDB 2.0 and its DuckLake extension, as arcform links today. The catalogue stays at format 1.0 until Hugh moves readers on.
+- DuckDB 2.0 and its DuckLake extension, as arcform links today, write the lake. Readers need DuckDB 2.0 or later.
 - One writer per catalogue, enforced by the conditional upload. Throughput is bounded by the seconds a catalogue fetch, commit and upload take, far above what a published lake needs.
 - The repo is public. The open lake's addresses are public; credentials never appear in a manifest, a report or a log.
 - No live write to the production bucket during the build without Hugh's go-ahead.
@@ -170,10 +171,10 @@ Catalogue backends considered: a file on R2 (chosen: no server, no running cost,
 - `UPDATE`, `DELETE`, `INSERT` in one transaction: one snapshot, a correct change feed, and no snapshot when nothing changed.
 - Small changes and the `meta` tables are inlined into the catalogue, with no data files.
 - `COMMENT ON` and time travel are visible to http readers.
-- `DUCKLAKE_VERSION '1.0'` on `ATTACH` pins a new catalogue to format 1.0.
+- `DUCKLAKE_VERSION '1.0'` on `ATTACH` pins a new catalogue's DuckLake format to 1.0, but not its DuckDB storage format (below).
 
 - R2's S3 API documents `If-Match` and `If-None-Match` on `PutObject`, checked atomically against committed state, so the conditional catalogue write is supported. R2 also limits writes to one per second per key and answers `429` above it, which the retry must treat as a conflict. Not yet exercised against a live bucket.
-- **DuckDB 1.x cannot open any catalogue DuckDB 2.0 has written.** Pinning the DuckLake format to 1.0 is not enough: the catalogue is itself a DuckDB database file, and DuckDB 2.0's DuckLake extension writes it in DuckDB's 2.0 storage format on any write, even to a catalogue created by 1.5. Neither `storage_compatibility_version` nor creating the file at an older storage version first prevents it. DuckDB 1.5.2 refuses the result (`Trying to read a database file with version number 999`). The live catalogue is in 1.5 storage today, so its readers need DuckDB 1.5 or later.
+- **DuckDB 1.x cannot open any catalogue DuckDB 2.0 has written.** Pinning the DuckLake format to 1.0 is not enough: the catalogue is itself a DuckDB database file, and DuckDB 2.0's DuckLake extension writes it in DuckDB's 2.0 storage format on any write, even to a catalogue created by 1.5. Neither `storage_compatibility_version` nor creating the file at an older storage version first prevents it. DuckDB 1.5.2 refuses the result (`Trying to read a database file with version number 999`). The live catalogue is in 1.5 storage today, so its readers need DuckDB 1.5 or later; after the first publish they need 2.0.
 
 ## Left to the builder
 
