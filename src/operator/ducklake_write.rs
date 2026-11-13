@@ -107,7 +107,7 @@ enum OnSchemaChange {
 #[cfg_attr(test, derive(Debug))]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
-    /// A file or directory, relative to the Protocol.
+    /// A file, or a directory ending in `/`, relative to the Protocol.
     from: String,
     /// The key, or for a directory a key prefix ending in `/`.
     to: String,
@@ -864,6 +864,17 @@ impl Operator for DucklakeWrite {
 
     fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
         let cfg = DucklakeWriteConfig::parse(with)?;
+        // The asset graph reads a directory's kind from its trailing `/`, as it does
+        // every asset name's, without asking the filesystem.
+        for f in &cfg.files {
+            if !f.from.ends_with('/') && ctx.dir.join(&f.from).is_dir() {
+                return Err(failed(format!(
+                    "`files.from: {0}` is a directory; write it `{0}/` so the run records \
+                     it as one",
+                    f.from
+                )));
+            }
+        }
         // The manifest's dotenv files, then the process environment. Never `ctx.env`:
         // that is the run's own `ARC_*` variables.
         let lookup = |var: &str| {
@@ -1326,6 +1337,34 @@ credential:
             !job.write_manifest(&store, &lake, &work.0, &again, "manifest.json")
                 .unwrap()
         );
+    }
+
+    /// A directory's kind is read from its trailing `/`, as every asset name's is, so
+    /// a `files.from` naming a directory without one is refused before anything is
+    /// published, rather than recorded as a file.
+    #[test]
+    fn a_files_directory_without_a_trailing_slash_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        write_codes(p);
+        std::fs::create_dir_all(p.join("build/search")).unwrap();
+        std::fs::write(p.join("build/search/part.json"), b"{}").unwrap();
+        let yaml = BASE.replace("from: build/search/", "from: build/search");
+        let env = HashMap::new();
+        let ctx = OpContext {
+            dir: p,
+            db_path: p,
+            env: &env,
+            dotenv: crate::operator::no_dotenv(),
+            timeout: None,
+            cache: None,
+        };
+        let e = DucklakeWrite
+            .run(&with(&yaml), &ctx)
+            .expect_err("refused")
+            .to_string();
+        assert!(e.contains("`build/search/`"), "{e}");
+        assert!(!p.join("build/lake").exists(), "nothing was published");
     }
 
     #[test]
