@@ -528,8 +528,10 @@ impl Operator for DucklakePublish {
             None => None,
             Some(credential) => {
                 let values = credential
+                    // The manifest's dotenv files, then the process environment;
+                    // never the run's own `ARC_*` variables in `ctx.env`.
                     .resolve(|var| {
-                        ctx.env
+                        ctx.dotenv
                             .get(var)
                             .cloned()
                             .or_else(|| std::env::var(var).ok())
@@ -640,16 +642,27 @@ mod tests {
         serde_yaml::from_str(yaml).unwrap()
     }
 
+    /// Publish with `dotenv` as the manifest's dotenv variables, where a credential
+    /// is looked up first.
     fn publish_with(
         dir: &Path,
         yaml: &str,
+        dotenv: &HashMap<String, String>,
+    ) -> Result<serde_json::Value> {
+        publish_in(dir, yaml, &HashMap::new(), dotenv)
+    }
+
+    fn publish_in(
+        dir: &Path,
+        yaml: &str,
         env: &HashMap<String, String>,
+        dotenv: &HashMap<String, String>,
     ) -> Result<serde_json::Value> {
         let ctx = OpContext {
             dir,
             db_path: dir,
             env,
-            dotenv: crate::operator::no_dotenv(),
+            dotenv,
             timeout: None,
             cache: None,
         };
@@ -912,6 +925,32 @@ mod tests {
             "secret".to_string(),
         );
         let report = publish_with(dir.path(), &yaml, &env).unwrap();
+        assert_eq!(report["action"], "registered");
+    }
+
+    /// The credential comes from the manifest's dotenv files (then the process
+    /// environment), never from the run's own `ARC_*` variables.
+    #[test]
+    fn a_dotenv_credential_satisfies_the_check() {
+        let dir = tempfile::tempdir().unwrap();
+        build(dir.path(), "SELECT range AS id FROM range(3)");
+        let yaml = format!(
+            "{PUBLISH}credential:\n  type: s3\n  env:\n    key_id: ARC_TEST_DUCKLAKE_DOTENV_KEY\n    secret: ARC_TEST_DUCKLAKE_DOTENV_SECRET\n"
+        );
+        let vars: HashMap<String, String> = [
+            ("ARC_TEST_DUCKLAKE_DOTENV_KEY", "id"),
+            ("ARC_TEST_DUCKLAKE_DOTENV_SECRET", "secret"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        let err = publish_in(dir.path(), &yaml, &vars, &HashMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no credential available"), "{err}");
+
+        let report = publish_in(dir.path(), &yaml, &HashMap::new(), &vars).unwrap();
         assert_eq!(report["action"], "registered");
     }
 

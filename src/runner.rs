@@ -1199,8 +1199,8 @@ fn upload_run_records(
 
 /// The run record as it is published beside a snapshot, in a public bucket: the
 /// Protocol directory, which the record names absolutely, rewritten to `.` in every
-/// key and string, and refused outright if any string still starts with the home
-/// directory. The record on disk keeps its paths.
+/// key and string, and refused outright if any key or string still holds a path
+/// under the home directory, anywhere in it. The record on disk keeps its paths.
 #[cfg(feature = "http-fetch")]
 fn public_record(bytes: &[u8], dir: &Path) -> std::result::Result<Vec<u8>, String> {
     fn rewrite(s: &str, prefixes: &[String]) -> String {
@@ -1220,7 +1220,9 @@ fn public_record(bytes: &[u8], dir: &Path) -> std::result::Result<Vec<u8>, Strin
         leaked: &mut bool,
     ) {
         use serde_json::Value;
-        let under_home = |s: &str| home.is_some_and(|h| s == h || s.starts_with(&format!("{h}/")));
+        // Anywhere in the string: a home path inside SQL text, an argument or an
+        // error message is published as surely as one standing alone.
+        let under_home = |s: &str| home.is_some_and(|h| s == h || s.contains(&format!("{h}/")));
         match value {
             Value::String(s) => {
                 *s = rewrite(s, prefixes);
@@ -1249,6 +1251,12 @@ fn public_record(bytes: &[u8], dir: &Path) -> std::result::Result<Vec<u8>, Strin
     let mut prefixes = vec![dir.display().to_string()];
     if let Ok(canonical) = dir.canonicalize() {
         prefixes.push(canonical.display().to_string());
+    }
+    // Without a trailing `/`, so `<dir>/…` is found however the directory was given.
+    for p in &mut prefixes {
+        while p.len() > 1 && p.ends_with('/') {
+            p.pop();
+        }
     }
     prefixes.retain(|p| p.len() > 1);
     prefixes.sort_by_key(|p| std::cmp::Reverse(p.len()));
@@ -2216,6 +2224,25 @@ mod run_record_upload_tests {
         );
         assert!(uploaded["assets"].get("./data/x.parquet").is_some());
         assert_eq!(std::fs::read(runs.join("r1.json")).unwrap(), bytes);
+
+        // A path under the home directory anywhere in a string, such as inside a
+        // step's SQL, refuses the upload too.
+        let leak = serde_json::json!({
+            "sql": { "text": format!("SELECT * FROM read_csv('{home}/elsewhere/x.csv')") }
+        });
+        std::fs::write(runs.join("r3.json"), serde_json::to_vec(&leak).unwrap()).unwrap();
+        let e = upload_run_records(&protocol, &runs, "r3", vec![upload(&store, "runs/r3.json")])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("home directory"), "{e}");
+        assert!(store.get("runs/r3.json").unwrap().is_none());
+
+        // The directory given with a trailing `/` is rewritten all the same.
+        let slashed = std::path::PathBuf::from(format!("{shown}/"));
+        std::fs::write(runs.join("r4.json"), &bytes).unwrap();
+        upload_run_records(&slashed, &runs, "r4", vec![upload(&store, "runs/r4.json")]).unwrap();
+        let uploaded = String::from_utf8(store.get("runs/r4.json").unwrap().unwrap().0).unwrap();
+        assert!(!uploaded.contains(&shown), "{uploaded}");
 
         // A path under the home directory that is not the Protocol's refuses the
         // upload rather than publishing it.
