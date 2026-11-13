@@ -394,6 +394,77 @@ fn expand(extra: &ExtraFile) -> Result<Vec<(PathBuf, String)>> {
     Ok(out)
 }
 
+/// How many times a readable copy's conditional upload may be refused, by writes
+/// that no newer snapshot accounts for, before the publish fails.
+const COPY_ATTEMPTS: u32 = 3;
+
+/// The condition that makes an upload to `key` land only on the version just read.
+fn copy_condition(store: &dyn ObjectStore, key: &str) -> Result<PutCondition> {
+    Ok(
+        match store
+            .etag(key)
+            .map_err(store_failed("read the version of", key))?
+        {
+            Some(etag) => PutCondition::IfMatch(etag),
+            None => PutCondition::IfAbsent,
+        },
+    )
+}
+
+/// Whether a snapshot newer than the landed one changed a file's tables, with each
+/// table's answer cached per catalogue ETag. A newer change stays newer.
+struct Supersede<'a> {
+    store: &'a dyn ObjectStore,
+    lake: &'a Lake,
+    work: &'a Path,
+    landed: &'a Landed,
+    checked: HashMap<(String, String), bool>,
+    newer_tables: HashSet<String>,
+}
+
+impl Supersede<'_> {
+    fn known_newer(&self, owners: &[&str]) -> bool {
+        owners.iter().any(|t| self.newer_tables.contains(*t))
+    }
+
+    /// One catalogue fetch, then the cached or computed check for each table.
+    fn newer(&mut self, owners: &[&str]) -> Result<bool> {
+        if self.known_newer(owners) {
+            return Ok(true);
+        }
+        let key = &self.lake.catalog_key;
+        let current = self
+            .store
+            .get(key)
+            .map_err(store_failed("fetch the catalogue", key))?;
+        let Some((bytes, etag)) = current.filter(|(_, e)| *e != self.landed.etag) else {
+            return Ok(false);
+        };
+        for table in owners {
+            let cache_key = (etag.0.clone(), (*table).to_string());
+            let changed = match self.checked.get(&cache_key) {
+                Some(&changed) => changed,
+                None => {
+                    let changed = newer_change_in(
+                        self.lake,
+                        self.work,
+                        &bytes,
+                        self.landed.outcome.snapshot_id,
+                        table,
+                    )?;
+                    self.checked.insert(cache_key, changed);
+                    changed
+                }
+            };
+            if changed {
+                self.newer_tables.insert((*table).to_string());
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
 /// Publish `tables` into the lake in `store` as one snapshot (`secret_sql` lets
 /// DuckDB reach `lake.write_path`, and never appears in an error), then upload each
 /// readable copy (`file`, `key`) and extra file, retrying the whole sequence when
@@ -466,57 +537,52 @@ pub fn publish(
 
     let mut uploaded = Vec::new();
     let mut superseded = Vec::new();
-    // Per catalogue ETag and table, whether a newer snapshot changed the table. A
-    // newer change stays newer, whatever the catalogue does next.
-    let mut checked: HashMap<(String, String), bool> = HashMap::new();
-    let mut newer_tables: HashSet<String> = HashSet::new();
+    let mut guard = Supersede {
+        store,
+        lake,
+        work,
+        landed: &landed,
+        checked: HashMap::new(),
+        newer_tables: HashSet::new(),
+    };
     for (file, key, owners) in files {
-        // The copy's own ETag first, then the catalogue: a newer publish uploads
-        // only after its catalogue lands, so either the check sees it, or the
-        // conditional upload below does.
-        let copy_cond = match store.get(&key).map_err(store_failed("fetch", &key))? {
-            Some((_, etag)) => PutCondition::IfMatch(etag),
-            None => PutCondition::IfAbsent,
-        };
-        let mut newer = owners.iter().any(|t| newer_tables.contains(*t));
-        if !newer {
-            let current = store
-                .get(&lake.catalog_key)
-                .map_err(store_failed("fetch the catalogue", &lake.catalog_key))?;
-            if let Some((bytes, etag)) = current.filter(|(_, e)| *e != landed.etag) {
-                for table in &owners {
-                    let cache_key = (etag.0.clone(), (*table).to_string());
-                    let changed = match checked.get(&cache_key) {
-                        Some(&changed) => changed,
-                        None => {
-                            let changed = newer_change_in(
-                                lake,
-                                work,
-                                &bytes,
-                                landed.outcome.snapshot_id,
-                                table,
-                            )?;
-                            checked.insert(cache_key, changed);
-                            changed
-                        }
-                    };
-                    if changed {
-                        newer_tables.insert((*table).to_string());
-                        newer = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if newer {
+        if guard.known_newer(&owners) {
             superseded.push(key);
             continue;
         }
-        match store.put_file(&key, &file, copy_cond, None) {
-            Ok(_) => uploaded.push(describe(&key, &file)?),
-            // Written since the check: a newer publish owns it.
-            Err(StoreError::PreconditionFailed) => superseded.push(key),
-            Err(e) => return Err(store_failed("upload", &key)(e)),
+        // The copy's own version first, then the catalogue: a newer publish uploads
+        // only after its catalogue lands, so either the check sees it, or the
+        // conditional upload below is refused.
+        let mut cond = copy_condition(store, &key)?;
+        if guard.newer(&owners)? {
+            superseded.push(key);
+            continue;
+        }
+        let mut refusals = 0;
+        loop {
+            match store.put_file(&key, &file, cond, None) {
+                Ok(_) => {
+                    uploaded.push(describe(&key, &file)?);
+                    break;
+                }
+                // Written since the check: by a newer publish, or by an older one's
+                // late upload. Only a newer snapshot of the table owns the key.
+                Err(StoreError::PreconditionFailed) => {
+                    if guard.newer(&owners)? {
+                        superseded.push(key);
+                        break;
+                    }
+                    refusals += 1;
+                    if refusals >= COPY_ATTEMPTS {
+                        return Err(failed(format!(
+                            "`{key}` kept changing under this publish; gave up after \
+                             {refusals} refused uploads"
+                        )));
+                    }
+                    cond = copy_condition(store, &key)?;
+                }
+                Err(e) => return Err(store_failed("upload", &key)(e)),
+            }
         }
     }
 
@@ -757,6 +823,10 @@ mod tests {
     impl ObjectStore for Wrapped<'_> {
         fn get(&self, key: &str) -> std::result::Result<Option<(Vec<u8>, ETag)>, StoreError> {
             self.inner.get(key)
+        }
+
+        fn etag(&self, key: &str) -> std::result::Result<Option<ETag>, StoreError> {
+            self.inner.etag(key)
         }
 
         fn put(
@@ -1202,5 +1272,31 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains(CATALOG) && err.contains("throttled"), "{err}");
+    }
+
+    #[test]
+    fn an_older_publishs_late_copy_is_replaced_by_the_newer_one() {
+        let fx = Fixture::new();
+        let a = fx.parquet("a.parquet", &rows(20, "a"));
+        let store = Wrapped::new(&fx.store);
+        *store.before_copy_upload.lock().unwrap() = Some(Box::new(|| {
+            // An older publish's slow upload lands; no newer catalogue does.
+            fx.store
+                .put("ns/a.parquet", b"older bytes", PutCondition::Any, None)
+                .unwrap();
+        }));
+        let out = fx
+            .publish_via(
+                &store,
+                &[input("s.a", &a)],
+                &[(a.clone(), "ns/a.parquet".to_string())],
+                &[],
+            )
+            .unwrap();
+        assert!(out.superseded.is_empty(), "{:?}", out.superseded);
+        assert_eq!(
+            fx.object("ns/a.parquet").unwrap().0,
+            std::fs::read(&a).unwrap()
+        );
     }
 }

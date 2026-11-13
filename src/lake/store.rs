@@ -10,7 +10,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use rusty_s3::actions::{GetObject, PutObject, S3Action};
+use rusty_s3::actions::{GetObject, HeadObject, PutObject, S3Action};
 use rusty_s3::{Bucket, Credentials, Method, UrlStyle};
 use sha2::{Digest, Sha256};
 
@@ -51,6 +51,9 @@ impl std::error::Error for StoreError {}
 pub trait ObjectStore: Send + Sync {
     /// The object's bytes and ETag, or `None` when the key does not exist.
     fn get(&self, key: &str) -> Result<Option<(Vec<u8>, ETag)>, StoreError>;
+
+    /// The object's ETag without its bytes, or `None` when the key does not exist.
+    fn etag(&self, key: &str) -> Result<Option<ETag>, StoreError>;
 
     fn put(
         &self,
@@ -139,6 +142,10 @@ impl DirStore {
 }
 
 impl ObjectStore for DirStore {
+    fn etag(&self, key: &str) -> Result<Option<ETag>, StoreError> {
+        Self::etag_of_existing(&self.path_of(key))
+    }
+
     fn get(&self, key: &str) -> Result<Option<(Vec<u8>, ETag)>, StoreError> {
         match fs::read(self.path_of(key)) {
             Ok(b) => {
@@ -313,6 +320,13 @@ impl S3Store {
                 }
                 a.sign(SIGN_FOR)
             }
+            Method::Head => {
+                let mut a = HeadObject::new(&self.bucket, Some(&self.credentials), key);
+                for (k, v) in &headers {
+                    a.headers_mut().insert(k.clone(), v.clone());
+                }
+                a.sign(SIGN_FOR)
+            }
             _ => {
                 let mut a = GetObject::new(&self.bucket, Some(&self.credentials), key);
                 for (k, v) in &headers {
@@ -392,7 +406,24 @@ fn read_get_response(
 
 use std::io::Read as _;
 
+/// A HEAD response's ETag, `None` on 404.
+fn read_head_response(
+    result: Result<ureq::Response, ureq::Error>,
+    key: &str,
+) -> Result<Option<ETag>, StoreError> {
+    match result {
+        Ok(resp) => etag_of(&resp, key).map(Some),
+        Err(ureq::Error::Status(404, _)) => Ok(None),
+        Err(e) => Err(map_ureq_error(e, key)),
+    }
+}
+
 impl ObjectStore for S3Store {
+    fn etag(&self, key: &str) -> Result<Option<ETag>, StoreError> {
+        let prepared = self.request(Method::Head, key, &PutCondition::Any);
+        read_head_response(self.agent.head(&prepared.url).call(), key)
+    }
+
     fn get(&self, key: &str) -> Result<Option<(Vec<u8>, ETag)>, StoreError> {
         let prepared = self.request(Method::Get, key, &PutCondition::Any);
         read_get_response(self.agent.get(&prepared.url).call(), key)
@@ -439,6 +470,11 @@ impl PublicHttpStore {
 }
 
 impl ObjectStore for PublicHttpStore {
+    fn etag(&self, key: &str) -> Result<Option<ETag>, StoreError> {
+        let url = format!("{}/{}", self.base_url.trim_end_matches('/'), key);
+        read_head_response(self.agent.head(&url).call(), key)
+    }
+
     fn get(&self, key: &str) -> Result<Option<(Vec<u8>, ETag)>, StoreError> {
         let url = format!("{}/{}", self.base_url.trim_end_matches('/'), key);
         read_get_response(self.agent.get(&url).call(), key)
@@ -632,5 +668,24 @@ mod tests {
             s.put("k", b"x", PutCondition::Any, None),
             Err(StoreError::Other("read-only".into()))
         );
+    }
+
+    #[test]
+    fn dir_store_etag_matches_get() {
+        let (_d, s) = store();
+        assert_eq!(s.etag("missing").unwrap(), None);
+        let put = s.put("a/b.bin", b"hello", PutCondition::Any, None).unwrap();
+        assert_eq!(s.etag("a/b.bin").unwrap(), Some(put.clone()));
+        assert_eq!(s.get("a/b.bin").unwrap().unwrap().1, put);
+    }
+
+    #[test]
+    fn s3_store_signs_a_head_request() {
+        let s = S3Store::r2("acct", "bucket", "KEYID-123", "s3cr3t-value").unwrap();
+        let req = s.request(Method::Head, "ns/a.parquet", &PutCondition::Any);
+        let url = url::Url::parse(&req.url).unwrap();
+        assert_eq!(url.path(), "/bucket/ns/a.parquet");
+        assert!(url.query_pairs().any(|(k, _)| k == "X-Amz-Signature"));
+        assert!(!req.url.contains("s3cr3t-value"));
     }
 }
