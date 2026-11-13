@@ -1209,7 +1209,7 @@ const DESCRIBED: &[Described] = &[
             role(
                 "files.from",
                 "any",
-                "Each extra file or directory, uploaded as it is.",
+                "Each extra file, or a directory ending in `/`, uploaded as it is.",
             ),
         ],
         writes: &[],

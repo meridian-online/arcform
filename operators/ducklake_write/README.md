@@ -22,7 +22,7 @@ Publishes tables into a DuckLake catalogue on object storage, as one snapshot, u
 |---|---|---|---|
 | `tables.from` | list of file | yes | Each table's Parquet file, whose rows the table takes. |
 | `tables.descriptor` | list of file | yes | Each table's Frictionless descriptor, written into the lake's `meta` schema. |
-| `files.from` | list of any | no | Each extra file or directory, uploaded as it is. |
+| `files.from` | list of any | no | Each extra file, or a directory ending in `/`, uploaded as it is. |
 
 ### Parameters
 
