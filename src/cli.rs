@@ -562,7 +562,8 @@ pub enum LakeCmd {
     /// a new catalogue with `--data-path`, creates each table of the old one in
     /// it, registers each table's current data files by address (the files stay
     /// where they are) and recreates its views, in one snapshot. A table with
-    /// deleted rows is refused. The `meta` schema is not carried.
+    /// deleted rows is refused. The `meta` schema is not carried, and of each table
+    /// only its column names and types are: no NOT NULL, defaults or partitioning.
     ///
     /// With `--upload` the new catalogue is also written to the object store,
     /// only if nothing is there yet. `--credential-env` names the environment
@@ -588,11 +589,11 @@ pub enum LakeCmd {
         upload: Option<String>,
 
         /// The bucket to upload into.
-        #[arg(long)]
+        #[arg(long, requires = "upload")]
         bucket: Option<String>,
 
         /// Credentials by environment variable name: `<type>:<param>=<VAR>,...`.
-        #[arg(long = "credential-env", value_name = "SPEC")]
+        #[arg(long = "credential-env", value_name = "SPEC", requires = "upload")]
         credential_env: Option<String>,
     },
 }
@@ -1351,6 +1352,9 @@ fn dispatch_lake(cmd: LakeCmd, out: &mut impl Write) -> Result<()> {
             credential_env,
         } => {
             // Everything the upload needs is checked before the long rebase.
+            if let Some(url) = &upload {
+                rebase::upload_key(url)?;
+            }
             let store = match (&upload, &bucket, &credential_env) {
                 (Some(_), Some(bucket), Some(spec)) => {
                     Some(rebase::store_from_env(bucket, spec, &|name| {

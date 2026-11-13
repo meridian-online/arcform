@@ -76,8 +76,12 @@ impl Scratch {
         let mut name = out.as_os_str().to_owned();
         name.push(".work");
         let dir = std::path::PathBuf::from(name);
-        std::fs::create_dir(&dir)
-            .map_err(|e| failed(format!("create the working folder {}: {e}", dir.display())))?;
+        std::fs::create_dir(&dir).map_err(|e| {
+            failed(format!(
+                "create the working folder {}: {e}; if an earlier rebase left it behind, delete it",
+                dir.display()
+            ))
+        })?;
         Ok(Scratch(dir))
     }
 
@@ -155,6 +159,7 @@ pub fn rebase(from: &str, out: &Path, data_path: &str) -> Result<RebaseReport> {
         ),
         3,
     )?;
+    let ordered_views = views_in_dependency_order(views.clone());
     let schemas = strings(
         &conn,
         &format!(
@@ -207,7 +212,7 @@ pub fn rebase(from: &str, out: &Path, data_path: &str) -> Result<RebaseReport> {
         }
         conn.execute_batch(&format!("USE {NEW};"))
             .map_err(db("select the new catalogue"))?;
-        for v in &views {
+        for v in &ordered_views {
             conn.execute_batch(&strip_alias(&v[2]))
                 .map_err(db(&format!("recreate the view {}.{}", v[0], v[1])))?;
         }
@@ -365,13 +370,16 @@ fn inlined(conn: &duckdb::Connection, schema: &str, name: &str) -> Result<(i64, 
             };
             rows += live("_ducklake_end_snapshot").or_else(|_| live("end_snapshot"))?;
         }
-        // Absent until the table has had a row deleted from one of its files.
         let table = ident(&format!("ducklake_inlined_delete_{}", id[0]));
         deletes += count(
             conn,
             &format!("SELECT count(*) FROM {OLD_METADATA}.{table}"),
         )
-        .unwrap_or(0);
+        .or_else(|e| match e {
+            // Absent until a row has been deleted from one of the table's files.
+            Error::StepFailed { stderr, .. } if stderr.contains("does not exist") => Ok(0),
+            other => Err(other),
+        })?;
     }
     Ok((rows, deletes))
 }
@@ -381,16 +389,86 @@ fn count(conn: &duckdb::Connection, sql: &str) -> Result<i64> {
         .map_err(db("count rows of the old catalogue"))
 }
 
-/// A view's SQL with the old catalogue's alias removed, so it resolves against the
-/// new catalogue, which is the default while the views are created.
+/// A view's SQL with the old catalogue's alias removed where it qualifies a name, so
+/// it resolves against the new catalogue, which is the default while the views are
+/// created. Only the alias as a whole identifier is removed, never inside a string
+/// literal or a longer identifier.
 fn strip_alias(sql: &str) -> String {
-    sql.replace(&format!("\"{OLD}\"."), "")
-        .replace(&format!("{OLD}."), "")
+    let chars: Vec<char> = sql.chars().collect();
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    let alias: Vec<char> = OLD.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' || c == '"' {
+            // Copy the quoted run whole; a doubled quote is an escaped one.
+            let start = i;
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == c {
+                    if chars.get(i + 1) == Some(&c) {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            i = (i + 1).min(chars.len());
+            let run: String = chars[start..i].iter().collect();
+            if c == '"' && run == format!("\"{OLD}\"") && chars.get(i) == Some(&'.') {
+                i += 1; // the quoted alias and its dot
+            } else {
+                out.push_str(&run);
+            }
+            continue;
+        }
+        let boundary = i == 0 || !is_ident(chars[i - 1]);
+        if boundary && chars[i..].starts_with(&alias) && chars.get(i + alias.len()) == Some(&'.') {
+            i += alias.len() + 1;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Views in an order each can be created in: a view after every view whose name
+/// its SQL mentions. A cycle (or a false match) leaves the rest in name order, and
+/// creating them then fails naming the view.
+fn views_in_dependency_order(views: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    let mentions = |sql: &str, name: &str| {
+        let mut from = 0;
+        while let Some(at) = sql[from..].find(name) {
+            let (start, end) = (from + at, from + at + name.len());
+            let before = sql[..start].chars().next_back();
+            let after = sql[end..].chars().next();
+            let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+            if !word(before) && !word(after) {
+                return true;
+            }
+            from = end;
+        }
+        false
+    };
+    let mut left = views;
+    let mut ordered: Vec<Vec<String>> = Vec::with_capacity(left.len());
+    while !left.is_empty() {
+        let ready = left.iter().position(|v| {
+            !left
+                .iter()
+                .any(|w| !std::ptr::eq(v, w) && mentions(&v[2], &w[1]))
+        });
+        ordered.push(left.remove(ready.unwrap_or(0)));
+    }
+    ordered
 }
 
 /// The key a catalogue URL names in its bucket: the URL's path without the leading
 /// slash.
-fn upload_key(url: &str) -> Result<String> {
+pub fn upload_key(url: &str) -> Result<String> {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
@@ -706,5 +784,35 @@ mod tests {
         );
         let err = upload_catalogue(&file, url, &store).unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
+    }
+
+    #[test]
+    fn strip_alias_rewrites_only_the_whole_identifier_outside_literals() {
+        assert_eq!(
+            strip_alias(
+                "SELECT x, 'arc_old.y' AS lit, \"my arc_old.col\", my_arc_old.z, arc_old.s.t.c \
+                 FROM arc_old.s.t JOIN \"arc_old\".s.u ON (arc_old.s.u.k = 1)"
+            ),
+            "SELECT x, 'arc_old.y' AS lit, \"my arc_old.col\", my_arc_old.z, s.t.c \
+             FROM s.t JOIN s.u ON (s.u.k = 1)"
+        );
+    }
+
+    #[test]
+    fn views_over_later_named_views_are_recreated() {
+        let dir = TempDir::new().unwrap();
+        let old = old_lake(&dir);
+        exec(&format!(
+            "ATTACH 'ducklake:{c}' AS o (DATA_PATH '{p}/olddata/'); \
+             CREATE VIEW o.s.b_base AS SELECT id, 'arc_old.x' AS lit FROM o.s.a; \
+             CREATE VIEW o.s.a_summary AS SELECT count(*) AS n FROM o.s.b_base;",
+            c = old.display(),
+            p = dir.path().display()
+        ));
+        let out = dir.path().join("new.ducklake");
+        let report = rebase(old.to_str().unwrap(), &out, NEW_DATA_PATH).unwrap();
+        assert_eq!(report.views.len(), 3);
+        let local = format!("{}/x/", dir.path().display());
+        assert_eq!(query_i64(&out, &local, "SELECT n FROM n.s.a_summary"), 5);
     }
 }
