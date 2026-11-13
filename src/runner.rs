@@ -1222,13 +1222,18 @@ fn public_record(bytes: &[u8], dir: &Path) -> std::result::Result<Vec<u8>, Strin
         use serde_json::Value;
         // Anywhere in the string, a home path inside SQL text, an argument or an
         // error message is published as surely as one standing alone. A match must
-        // end the path component: `/Users/hughes` is not under `/Users/hugh`.
+        // end the path component: `/home/alices` is not under `/home/alice`, and
+        // nor is `/home/alice.config`, but `/home/alice.` ending a sentence is.
+        let path_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
         let under_home = |s: &str| {
             home.is_some_and(|h| {
                 s.match_indices(h).any(|(at, _)| {
-                    s[at + h.len()..].chars().next().is_none_or(|c| {
-                        c == '/' || !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-                    })
+                    let mut rest = s[at + h.len()..].chars();
+                    match rest.next() {
+                        None | Some('/') => true,
+                        Some('.') => rest.next().is_none_or(|c| !path_char(c)),
+                        Some(c) => !path_char(c),
+                    }
                 })
             })
         };
@@ -2264,6 +2269,32 @@ mod run_record_upload_tests {
             .to_string();
         assert!(e.contains("home directory"), "{e}");
         assert!(store.get("runs/r5.json").unwrap().is_none());
+        // The home directory ending a sentence is still the home directory; a
+        // longer name with a dot in it is not.
+        for (n, text) in [
+            format!("Ran in {home}."),
+            format!("Ran in {home}. Then stopped"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("r7{n}");
+            let sentence = serde_json::json!({ "note": text });
+            std::fs::write(
+                runs.join(format!("{id}.json")),
+                serde_json::to_vec(&sentence).unwrap(),
+            )
+            .unwrap();
+            let key = format!("runs/{id}.json");
+            let e = upload_run_records(&protocol, &runs, &id, vec![upload(&store, &key)])
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("home directory"), "{text}: {e}");
+            assert!(store.get(&key).unwrap().is_none());
+        }
+        let dotted = serde_json::json!({ "note": format!("{home}.config/x") });
+        std::fs::write(runs.join("r8.json"), serde_json::to_vec(&dotted).unwrap()).unwrap();
+        upload_run_records(&protocol, &runs, "r8", vec![upload(&store, "runs/r8.json")]).unwrap();
         let longer = serde_json::json!({ "note": format!("{home}es/x") });
         std::fs::write(runs.join("r6.json"), serde_json::to_vec(&longer).unwrap()).unwrap();
         upload_run_records(&protocol, &runs, "r6", vec![upload(&store, "runs/r6.json")]).unwrap();

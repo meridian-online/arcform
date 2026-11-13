@@ -927,7 +927,7 @@ mod tests {
     }
 
     /// A descriptor for `table` with `columns` (name, Frictionless type), keyed on
-    /// `key`, through Task 2's reader.
+    /// `key`, through the descriptor reader.
     fn descriptor(table: &str, columns: &[(&str, &str)], key: &[&str]) -> TableDescriptor {
         let fields: Vec<Value> = columns
             .iter()
