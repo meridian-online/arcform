@@ -8,7 +8,7 @@ Publishes a Protocol's tables into a DuckLake catalogue on object storage, such 
 
 <!-- Generated from arc's operator catalogue (src/operator.rs). Edit it there, then run `ARC_UPDATE_READMES=1 cargo test --lib operator::reference`. -->
 
-Publishes tables into a DuckLake catalogue on object storage, as one snapshot, upserting each on its key, or into a local lake when the write credential is not set.
+Publishes tables into a DuckLake catalogue on object storage, as one snapshot, upserting each on its key, and uploads the run record under `runs`, or publishes into a local lake when the write credential is not set.
 
 ### What it wraps
 
@@ -35,6 +35,7 @@ Publishes tables into a DuckLake catalogue on object storage, as one snapshot, u
 | `local_catalog` | string | yes | none | The catalogue a run without the write credential publishes into instead, relative to the protocol directory, e.g. `build/lake/open.ducklake`. Its data goes in the folder beside it, `<local_catalog>.files/`, so the local lake attaches and reads back offline. |
 | `manifest` | string | no | none | Optional. The key of a compatible `manifest.json` kept current for readers of today's manifest: each table with a `readable_copy` gets an entry, and the top-level `catalog.url` names the pinned catalogue. Written after the catalogue, and only by a live publish. |
 | `public_base` | string | yes | none | The bucket's public base address, ending in `/`, e.g. `https://openlake.meridian.online/`. Readers resolve the catalogue and its data under it. Must be https; plain http is admitted only for 127.0.0.1 and localhost, for tests. |
+| `runs` | string | no | `runs/` | The key prefix, ending in `/`, the run record is uploaded under as `<runs><run_id>.json`; the snapshot's commit metadata names it under `public_base`. Relative, without `..`. A lake under a prefix keeps its records there, e.g. `lake-test/runs/`. |
 | `tables` | list of mapping | yes | none | The tables to publish, committed together as one snapshot. Each is upserted on its key, so the snapshot records only the rows that changed, and an unchanged publish commits nothing. |
 
 ### Example step

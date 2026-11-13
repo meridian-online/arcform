@@ -15,8 +15,8 @@
 //! variables the live lake needs. `arc run --publish` (which sets
 //! `ARC_PUBLISH=required`) makes a missing credential fail the step instead.
 //!
-//! A live publish also queues the run's record for upload to `runs/<run_id>.json`
-//! once the run ends (see [`crate::lake::queue_run_record_upload`]); the snapshot's
+//! A live publish also queues the run's record for upload to `<runs><run_id>.json`
+//! (`runs` defaults to `runs/`) once the run ends (see [`crate::lake::queue_run_record_upload`]); the snapshot's
 //! commit metadata names that address.
 //!
 //! No credential value ever reaches a report, a log line or an error: values are
@@ -68,7 +68,14 @@ pub(super) struct DucklakeWriteConfig {
     files: Vec<FileConfig>,
     #[serde(default)]
     manifest: Option<String>,
+    /// The key prefix, ending in `/`, the run record is uploaded under.
+    #[serde(default = "default_runs")]
+    runs: String,
     credential: CredentialConfig,
+}
+
+fn default_runs() -> String {
+    "runs/".into()
 }
 
 #[derive(Deserialize)]
@@ -244,6 +251,13 @@ impl DucklakeWriteConfig {
         check_public_base(&self.public_base)?;
         check_key("catalog", &self.catalog)?;
         check_key("data_path", &self.data_path)?;
+        check_key("runs", &self.runs)?;
+        if !self.runs.ends_with('/') {
+            return Err(invalid(format!(
+                "`runs: {}` must be a key prefix ending in `/`",
+                self.runs
+            )));
+        }
         if let Some(manifest) = &self.manifest {
             check_key("manifest", manifest)?;
         }
@@ -278,6 +292,11 @@ impl DucklakeWriteConfig {
             check_key("files.to", &f.to)?;
         }
         self.credential.validate()
+    }
+
+    /// The key the run record is uploaded to.
+    fn record_key(&self, run_id: &str) -> String {
+        format!("{}{run_id}.json", self.runs)
     }
 
     /// The data prefix, ending in `/`.
@@ -709,7 +728,7 @@ impl Job<'_> {
                  the run its record is uploaded for"
             ))
         })?;
-        let record_key = format!("runs/{run_id}.json");
+        let record_key = self.cfg.record_key(&run_id);
         let record_url = format!("{}{record_key}", self.cfg.public_base);
         let work = Work::new()?;
         let mut on_landed = |outcome: &CommitOutcome| {
@@ -760,9 +779,9 @@ impl Job<'_> {
         let run = json!({
             "id": self.run_id,
             "record": format!(
-                "{}runs/{}.json",
+                "{}{}",
                 self.cfg.public_base,
-                self.run_id.as_deref().unwrap_or_default()
+                self.cfg.record_key(self.run_id.as_deref().unwrap_or_default())
             ),
         });
         let mut entries: Vec<(String, ManifestEntry)> = Vec::new();
@@ -1029,6 +1048,89 @@ credential:
         assert!(refusal(&s3).contains("credential.env.endpoint"));
         let s3 = s3.replace("account_id: A", "endpoint: E, region: R");
         assert!(DucklakeWriteConfig::parse(&with(&s3)).is_ok());
+    }
+
+    #[test]
+    fn runs_defaults_to_the_runs_prefix_and_refuses_an_unsafe_one() {
+        let cfg = DucklakeWriteConfig::parse(&with(BASE)).unwrap();
+        assert_eq!(cfg.runs, "runs/");
+        assert_eq!(cfg.record_key("run-1"), "runs/run-1.json");
+        let with_runs = |runs: &str| format!("{BASE}runs: {runs}\n");
+        let ok = DucklakeWriteConfig::parse(&with(&with_runs("lake-test/runs/"))).unwrap();
+        assert_eq!(ok.record_key("run-1"), "lake-test/runs/run-1.json");
+        for bad in [
+            "/runs/",
+            "../runs/",
+            "a/../runs/",
+            "s3://elsewhere/",
+            "runs",
+        ] {
+            let e = refusal(&with_runs(bad));
+            assert!(e.contains("runs"), "{bad}: {e}");
+        }
+    }
+
+    /// A lake under a prefix keeps its run records there: the record is queued
+    /// under the configured prefix and the snapshot names that address.
+    #[test]
+    fn a_configured_runs_prefix_holds_the_record_and_the_snapshot_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        write_codes(p);
+        let yaml = format!(
+            "{}runs: lake-test/runs/\n",
+            BASE.replace(
+                "files:\n  - from: build/search/\n    to: demo/search/\n",
+                ""
+            )
+        );
+        let cfg = DucklakeWriteConfig::parse(&with(&yaml)).unwrap();
+        let job = Job {
+            cfg: &cfg,
+            dir: p,
+            prepared: vec![prepare(p, &cfg.tables[0]).unwrap()],
+            run_id: Some("run-3".into()),
+        };
+        let root = p.join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(DirStore::new(&root));
+        let lake = Lake {
+            catalog_key: cfg.catalog.clone(),
+            data_path: format!("{}/lake/", root.display()),
+            data_prefix: "lake/".into(),
+            write_path: format!("{}/lake/", root.display()),
+            pinned_prefix: Some(pinned_prefix(&cfg.catalog)),
+        };
+        drop(crate::lake::take_run_record_uploads());
+        let report = job.publish_live(Arc::clone(&store), &lake, None).unwrap();
+        assert_eq!(
+            report.run_record.as_deref(),
+            Some("lake-test/runs/run-3.json")
+        );
+        let queued = crate::lake::take_run_record_uploads();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].key, "lake-test/runs/run-3.json");
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "LOAD ducklake; ATTACH {} AS l (READ_ONLY);",
+            sql_string_literal(&format!(
+                "ducklake:{}",
+                root.join("catalog/test.ducklake").display()
+            ))
+        ))
+        .unwrap();
+        let info: String = conn
+            .query_row(
+                "SELECT commit_extra_info FROM ducklake_snapshots('l') ORDER BY snapshot_id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+        assert_eq!(
+            info["run_record"],
+            "https://lake.example/lake-test/runs/run-3.json"
+        );
     }
 
     #[test]
