@@ -449,7 +449,7 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
                         "required": ["from", "to"]
                     }
                 },
-                "runs": { "type": "string", "default": "runs/", "pattern": "/$", "description": "The key prefix, ending in `/`, the run record is uploaded under as `<runs><run_id>.json`; the snapshot's commit metadata names it under `public_base`. Relative, without `..`. A lake under a prefix keeps its records there, e.g. `lake-test/runs/`." },
+                "runs": { "type": "string", "default": "runs/", "pattern": "^[^/:][^:]*/$", "description": "The key prefix, ending in `/`, the run record is uploaded under as `<runs><run_id>.json`; the snapshot's commit metadata names it under `public_base`. Relative, without `..`. A lake under a prefix keeps its records there, e.g. `lake-test/runs/`." },
                 "manifest": { "type": "string", "description": "Optional. The key of a compatible `manifest.json` kept current for readers of today's manifest: each table with a `readable_copy` gets an entry, and the top-level `catalog.url` names the pinned catalogue. Written after the catalogue, and only by a live publish." },
                 "credential": {
                     "type": "object",
@@ -1822,6 +1822,7 @@ mod with_schema_tests {
             Some("string") => {
                 let candidates = [
                     format!("probe_{key}"),
+                    format!("probe_{key}/"),
                     "a".repeat(64),
                     format!("probe_{key}==1.0"),
                     "https://probe.example/".to_string(),
