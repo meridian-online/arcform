@@ -7,8 +7,11 @@
 //! last write leaves the live lake as it was (at worst, orphan data files nothing
 //! references). Readable copies and extra files are uploaded only
 //! once the catalogue holds this publish's snapshot, and are skipped when a newer
-//! snapshot changed their table, so an older publish never overwrites a newer one's.
+//! snapshot changed their table, so an older publish never overwrites a newer one's,
+//! or when the object already holds their bytes, so an unchanged publish writes
+//! nothing. The live catalogue is fetched again only when its ETag has moved.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
@@ -20,7 +23,7 @@ use sha2::{Digest, Sha256};
 
 use super::commit::{CommitOutcome, TableInput, commit};
 use super::meta::{META_SCHEMA, failed};
-use super::store::{ETag, ObjectStore, PutCondition, StoreError};
+use super::store::{ETag, ObjectHead, ObjectStore, PutCondition, StoreError};
 use crate::error::{Error, Result};
 use crate::operator::sql_string_literal;
 
@@ -42,8 +45,9 @@ pub struct Lake {
     /// The same objects as `data_path`, addressed so DuckDB can read and write them:
     /// `r2://<bucket>/<data_prefix>` (or `s3://`) live, a local folder otherwise. Ends in `/`.
     pub write_path: String,
-    /// The pinned copies' key prefix, e.g. `catalog/open-`.
-    pub pinned_prefix: String,
+    /// The pinned copies' key prefix, e.g. `catalog/open-`; `None` for a lake no
+    /// reader fetches by a pinned address (the local lake), which pins none.
+    pub pinned_prefix: Option<String>,
 }
 
 /// A file or directory to upload beside the step's tables.
@@ -67,10 +71,13 @@ pub struct Published {
     /// The readable copies and extra files this publish uploaded. The data files
     /// DuckLake wrote are in `outcome.new_files`.
     pub uploaded: Vec<UploadedObject>,
+    /// Readable copies and extra files not uploaded because the object already
+    /// held their bytes.
+    pub unchanged: Vec<String>,
     /// Readable copies and extra files skipped because a newer snapshot changed
     /// their table: a newer publish owns them.
     pub superseded: Vec<String>,
-    /// The pinned catalogue's key. Always set.
+    /// The pinned catalogue's key; `None` when the lake pins no copies.
     pub pinned_catalog: Option<String>,
     /// The stable catalogue's ETag as this publish wrote or verified it.
     pub catalog_etag: ETag,
@@ -143,18 +150,32 @@ fn read_catalogue(path: &Path) -> Result<Vec<u8>> {
     fs::read(path).map_err(io_failed(path))
 }
 
-/// Upload `bytes`' immutable copy, if absent, and return its key; `None` when the
-/// store is throttling, so the attempt starts again.
-fn pin(store: &dyn ObjectStore, lake: &Lake, bytes: &[u8]) -> Result<Option<String>> {
-    let key = format!(
-        "{}{}.ducklake",
-        lake.pinned_prefix,
-        &sha256_hex(bytes)[..16]
-    );
+/// How pinning a catalogue went.
+enum Pin {
+    /// The pinned copy's key, or `None` for a lake that pins none.
+    Done(Option<String>),
+    /// The store throttled the write: start the attempt again.
+    Throttled,
+}
+
+/// Upload `bytes`' immutable copy, if absent, and return its key.
+fn pin(store: &dyn ObjectStore, lake: &Lake, bytes: &[u8]) -> Result<Pin> {
+    let Some(prefix) = &lake.pinned_prefix else {
+        return Ok(Pin::Done(None));
+    };
+    let key = format!("{prefix}{}.ducklake", &sha256_hex(bytes)[..16]);
+    // Its key is its content's hash: present already, it holds these bytes, and an
+    // unchanged publish sends none of them again.
+    let present = store
+        .etag(&key)
+        .map_err(store_failed("read the version of", &key))?;
+    if present.is_some() {
+        return Ok(Pin::Done(Some(key)));
+    }
     match store.put(&key, bytes, PutCondition::IfAbsent, Some(PINNED_CACHE)) {
         // Present already: its key is its content's hash, so it holds these bytes.
-        Ok(_) | Err(StoreError::PreconditionFailed) => Ok(Some(key)),
-        Err(StoreError::Throttled) => Ok(None),
+        Ok(_) | Err(StoreError::PreconditionFailed) => Ok(Pin::Done(Some(key))),
+        Err(StoreError::Throttled) => Ok(Pin::Throttled),
         Err(e) => Err(store_failed("upload the pinned catalogue", &key)(e)),
     }
 }
@@ -162,7 +183,7 @@ fn pin(store: &dyn ObjectStore, lake: &Lake, bytes: &[u8]) -> Result<Option<Stri
 /// What an attempt that landed leaves for the uploads after it.
 struct Landed {
     outcome: CommitOutcome,
-    pinned: String,
+    pinned: Option<String>,
     etag: ETag,
 }
 
@@ -204,13 +225,12 @@ fn attempt(
             // Nothing changed. The catalogue stands as fetched, unless another
             // publish moved it meanwhile; pin it so a manifest can name it.
             let now = store
-                .get(key)
-                .map_err(store_failed("fetch the catalogue", key))?
-                .map(|(_, etag)| etag);
+                .etag(key)
+                .map_err(store_failed("read the version of", key))?;
             if now.as_ref() != Some(&fetched_etag) {
                 return Ok(Try::Lost);
             }
-            let Some(pinned) = pin(store, lake, &fetched_bytes)? else {
+            let Pin::Done(pinned) = pin(store, lake, &fetched_bytes)? else {
                 return Ok(Try::Throttled);
             };
             Ok(Try::Landed(Landed {
@@ -224,7 +244,7 @@ fn attempt(
             // the pinned copy goes next, then the stable catalogue, conditionally
             // and last.
             let bytes = read_catalogue(&catalog_file)?;
-            let Some(pinned) = pin(store, lake, &bytes)? else {
+            let Pin::Done(pinned) = pin(store, lake, &bytes)? else {
                 return Ok(Try::Throttled);
             };
             let cond = match fetched {
@@ -251,9 +271,10 @@ fn split_table(table: &str) -> (&str, &str) {
 }
 
 /// Whether a snapshot newer than `since_snapshot` in the store's current catalogue
-/// changed `table`'s rows or its descriptor in `meta.descriptors`. Both checks go
-/// by name, so DuckLake resolves table ids itself.
-pub fn newer_change(
+/// changed `table`'s rows or its descriptor in `meta.descriptors`, fetching the
+/// catalogue every time: the tests' reference for what [`Watch`] answers.
+#[cfg(test)]
+pub(crate) fn newer_change(
     store: &dyn ObjectStore,
     lake: &Lake,
     work: &Path,
@@ -270,7 +291,9 @@ pub fn newer_change(
     }
 }
 
-/// `newer_change` against catalogue bytes already fetched.
+/// Whether a snapshot newer than `since_snapshot` in the catalogue `bytes` changed
+/// `table`'s rows or its descriptor in `meta.descriptors`. Both checks go by name,
+/// so DuckLake resolves table ids itself.
 fn newer_change_in(
     lake: &Lake,
     work: &Path,
@@ -398,66 +421,120 @@ fn expand(extra: &ExtraFile) -> Result<Vec<(PathBuf, String)>> {
 /// that no newer snapshot accounts for, before the publish fails.
 const COPY_ATTEMPTS: u32 = 3;
 
-/// The condition that makes an upload to `key` land only on the version just read.
-fn copy_condition(store: &dyn ObjectStore, key: &str) -> Result<PutCondition> {
-    Ok(
-        match store
-            .etag(key)
-            .map_err(store_failed("read the version of", key))?
-        {
-            Some(etag) => PutCondition::IfMatch(etag),
-            None => PutCondition::IfAbsent,
-        },
-    )
+/// The condition that makes an upload land only on the version `head` describes.
+fn copy_condition(head: Option<&ObjectHead>) -> PutCondition {
+    match head {
+        Some(h) => PutCondition::IfMatch(h.etag.clone()),
+        None => PutCondition::IfAbsent,
+    }
 }
 
-/// Whether a snapshot newer than the landed one changed a file's tables, with each
-/// table's answer cached per catalogue ETag. A newer change stays newer.
-struct Supersede<'a> {
+/// Watches the live catalogue after a publish lands, answering whether a snapshot
+/// newer than the landed one changed a table. Each question costs one HEAD; the
+/// catalogue is fetched only when its ETag has moved from the landed one, once per
+/// ETag, and each table's answer is cached per ETag. A table found changed stays
+/// changed. Shared by the uploads and the manifest, so a publish where nothing
+/// moves fetches no catalogue after landing.
+pub struct Watch<'a> {
     store: &'a dyn ObjectStore,
     lake: &'a Lake,
     work: &'a Path,
-    landed: &'a Landed,
+    snapshot: i64,
+    landed: ETag,
+    seen: RefCell<Seen>,
+}
+
+#[derive(Default)]
+struct Seen {
+    /// The newest catalogue fetched, and its ETag.
+    fetched: Option<(ETag, Vec<u8>)>,
     checked: HashMap<(String, String), bool>,
     newer_tables: HashSet<String>,
 }
 
-impl Supersede<'_> {
-    fn known_newer(&self, owners: &[&str]) -> bool {
-        owners.iter().any(|t| self.newer_tables.contains(*t))
+impl<'a> Watch<'a> {
+    /// A watch for the publish that landed `snapshot` with the catalogue at `landed`.
+    pub fn new(
+        store: &'a dyn ObjectStore,
+        lake: &'a Lake,
+        work: &'a Path,
+        snapshot: i64,
+        landed: ETag,
+    ) -> Self {
+        Watch {
+            store,
+            lake,
+            work,
+            snapshot,
+            landed,
+            seen: RefCell::new(Seen::default()),
+        }
     }
 
-    /// One catalogue fetch, then the cached or computed check for each table.
-    fn newer(&mut self, owners: &[&str]) -> Result<bool> {
-        if self.known_newer(owners) {
+    /// The live catalogue's ETag, by HEAD.
+    pub fn live_etag(&self) -> Result<Option<ETag>> {
+        let key = self.lake.catalog_key.as_str();
+        self.store
+            .etag(key)
+            .map_err(store_failed("read the version of", key))
+    }
+
+    /// Whether any of `tables` is already known to have a newer change.
+    fn known_newer(&self, tables: &[&str]) -> bool {
+        let seen = self.seen.borrow();
+        tables.iter().any(|t| seen.newer_tables.contains(*t))
+    }
+
+    /// Whether a snapshot newer than the landed one changed any of `tables`, asking
+    /// the store for the catalogue's version now.
+    pub fn newer(&self, tables: &[&str]) -> Result<bool> {
+        if self.known_newer(tables) {
             return Ok(true);
         }
-        let key = &self.lake.catalog_key;
-        let current = self
-            .store
-            .get(key)
-            .map_err(store_failed("fetch the catalogue", key))?;
-        let Some((bytes, etag)) = current.filter(|(_, e)| *e != self.landed.etag) else {
+        let live = self.live_etag()?;
+        self.newer_at(live.as_ref(), tables)
+    }
+
+    /// [`Self::newer`], for a catalogue version `live` the caller has just read.
+    pub fn newer_at(&self, live: Option<&ETag>, tables: &[&str]) -> Result<bool> {
+        if self.known_newer(tables) {
+            return Ok(true);
+        }
+        let Some(live) = live.filter(|e| **e != self.landed) else {
             return Ok(false);
         };
-        for table in owners {
+        let mut seen = self.seen.borrow_mut();
+        if seen.fetched.as_ref().is_none_or(|(e, _)| e != live) {
+            let key = self.lake.catalog_key.as_str();
+            let fetched = self
+                .store
+                .get(key)
+                .map_err(store_failed("fetch the catalogue", key))?;
+            match fetched {
+                // Moved again since the HEAD: the newer version answers just as well.
+                Some((bytes, etag)) if etag != self.landed => seen.fetched = Some((etag, bytes)),
+                _ => return Ok(false),
+            }
+        }
+        let Seen {
+            fetched,
+            checked,
+            newer_tables,
+        } = &mut *seen;
+        let (etag, bytes) = fetched.as_ref().expect("fetched above");
+        for table in tables {
             let cache_key = (etag.0.clone(), (*table).to_string());
-            let changed = match self.checked.get(&cache_key) {
+            let changed = match checked.get(&cache_key) {
                 Some(&changed) => changed,
                 None => {
-                    let changed = newer_change_in(
-                        self.lake,
-                        self.work,
-                        &bytes,
-                        self.landed.outcome.snapshot_id,
-                        table,
-                    )?;
-                    self.checked.insert(cache_key, changed);
+                    let changed =
+                        newer_change_in(self.lake, self.work, bytes, self.snapshot, table)?;
+                    checked.insert(cache_key, changed);
                     changed
                 }
             };
             if changed {
-                self.newer_tables.insert((*table).to_string());
+                newer_tables.insert((*table).to_string());
                 return Ok(true);
             }
         }
@@ -570,34 +647,47 @@ pub fn publish_with_landing(
     }
 
     let mut uploaded = Vec::new();
+    let mut unchanged = Vec::new();
     let mut superseded = Vec::new();
-    let mut guard = Supersede {
+    let guard = Watch::new(
         store,
         lake,
         work,
-        landed: &landed,
-        checked: HashMap::new(),
-        newer_tables: HashSet::new(),
-    };
+        landed.outcome.snapshot_id,
+        landed.etag.clone(),
+    );
     for (file, key, owners) in files {
         if guard.known_newer(&owners) {
             superseded.push(key);
             continue;
         }
+        let local = describe(&key, &file)?;
         // Every try reads the copy's own version first, then the catalogue: a newer
         // publish uploads only after its catalogue lands, so either the check sees
         // it, or the conditional upload is refused. A refusal may also be an older
         // publish's late upload, which no newer snapshot accounts for: try again.
+        // An object already holding these bytes needs no upload at all.
         let mut refusals = 0;
         loop {
-            let cond = copy_condition(store, &key)?;
+            let head = store
+                .head(&key)
+                .map_err(store_failed("read the version of", &key))?;
+            if head
+                .as_ref()
+                .and_then(|h| h.sha256.as_deref())
+                .is_some_and(|sha| sha == local.sha256)
+            {
+                unchanged.push(key);
+                break;
+            }
+            let cond = copy_condition(head.as_ref());
             if guard.newer(&owners)? {
                 superseded.push(key);
                 break;
             }
             match store.put_file(&key, &file, cond, None) {
                 Ok(_) => {
-                    uploaded.push(describe(&key, &file)?);
+                    uploaded.push(local);
                     break;
                 }
                 Err(StoreError::PreconditionFailed) => {
@@ -622,8 +712,9 @@ pub fn publish_with_landing(
     Ok(Published {
         outcome: landed.outcome,
         uploaded,
+        unchanged,
         superseded,
-        pinned_catalog: Some(landed.pinned),
+        pinned_catalog: landed.pinned,
         catalog_etag: landed.etag,
         attempts,
     })
@@ -634,7 +725,7 @@ mod tests {
     use super::*;
     use crate::lake::commit::TableInput;
     use crate::lake::meta::{TableDescriptor, table_descriptor};
-    use crate::lake::store::{DirStore, ETag, ObjectStore, PutCondition, StoreError};
+    use crate::lake::store::{DirStore, ETag, ObjectHead, ObjectStore, PutCondition, StoreError};
     use crate::lake::test_server::TestServer;
     use crate::operator::sql_string_literal;
     use serde_json::json;
@@ -665,7 +756,7 @@ mod tests {
                 data_path: server.url("lake/"),
                 data_prefix: "lake/".to_string(),
                 write_path: format!("{}/", root.join("lake").display()),
-                pinned_prefix: "catalog/open-".to_string(),
+                pinned_prefix: Some("catalog/open-".to_string()),
             };
             Fixture {
                 store: DirStore::new(&root),
@@ -827,7 +918,8 @@ mod tests {
         throttle_catalog_writes: bool,
         /// Answer `PreconditionFailed` to every readable or extra upload.
         refuse_copy_uploads: bool,
-        /// Run once, just before the etag lookup numbered `.0` (from 1).
+        /// Run once, just before the version lookup of a readable or extra file
+        /// numbered `.0` (from 1). The catalogue's own lookups are not counted.
         before_etag: Mutex<(u32, Option<Hook<'a>>)>,
         etag_calls: AtomicU32,
         /// Run once, just before the first readable or extra upload.
@@ -868,16 +960,18 @@ mod tests {
             self.inner.get(key)
         }
 
-        fn etag(&self, key: &str) -> std::result::Result<Option<ETag>, StoreError> {
-            let n = self.etag_calls.fetch_add(1, Ordering::SeqCst) + 1;
-            let hook = {
-                let mut slot = self.before_etag.lock().unwrap();
-                if slot.0 == n { slot.1.take() } else { None }
-            };
-            if let Some(hook) = hook {
-                hook();
+        fn head(&self, key: &str) -> std::result::Result<Option<ObjectHead>, StoreError> {
+            if key != CATALOG {
+                let n = self.etag_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                let hook = {
+                    let mut slot = self.before_etag.lock().unwrap();
+                    if slot.0 == n { slot.1.take() } else { None }
+                };
+                if let Some(hook) = hook {
+                    hook();
+                }
             }
-            self.inner.etag(key)
+            self.inner.head(key)
         }
 
         fn put(

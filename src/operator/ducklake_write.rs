@@ -39,7 +39,7 @@ use crate::lake::commit::{CommitOutcome, TableChange, TableInput};
 use crate::lake::manifest::{ManifestEntry, update_manifest};
 use crate::lake::meta::{META_SCHEMA, table_descriptor};
 use crate::lake::publish::{
-    ExtraFile, Lake, Published, UploadedObject, newer_change, publish, publish_with_landing,
+    ExtraFile, Lake, Published, UploadedObject, Watch, publish, publish_with_landing,
 };
 use crate::lake::store::{DirStore, ObjectStore, S3Store};
 use crate::runner::{PUBLISH_ENV, RUN_ID_ENV};
@@ -303,7 +303,7 @@ impl DucklakeWriteConfig {
                 credential.bucket
             ),
             data_prefix,
-            pinned_prefix: pinned_prefix(&self.catalog),
+            pinned_prefix: Some(pinned_prefix(&self.catalog)),
         }
     }
 }
@@ -533,6 +533,10 @@ struct Report {
     attempts: u32,
     tables: Vec<TableChange>,
     uploaded: Vec<UploadedObject>,
+    /// Readable copies and extra files not uploaded because the object already held
+    /// their bytes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unchanged: Vec<String>,
     /// Readable copies and extra files skipped because a newer snapshot changed their
     /// table.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -560,6 +564,7 @@ impl Report {
             attempts: published.attempts,
             tables: published.outcome.tables,
             uploaded: published.uploaded,
+            unchanged: published.unchanged,
             superseded: published.superseded,
             data_files: published
                 .outcome
@@ -661,12 +666,13 @@ impl Job<'_> {
             .map_err(|e| failed(format!("resolve {}: {e}", folder.display())))?;
         let data_prefix = format!("{name}.files/");
         let data_path = format!("{}/{data_prefix}", folder.display());
+        // No reader fetches the local catalogue by a pinned address, so it pins none.
         let lake = Lake {
             catalog_key: name.clone(),
             write_path: data_path.clone(),
             data_path,
             data_prefix,
-            pinned_prefix: pinned_prefix(&name),
+            pinned_prefix: None,
         };
         let store = DirStore::new(&folder);
         let work = Work::new()?;
@@ -738,7 +744,9 @@ impl Job<'_> {
     }
 
     /// Bring each published table's entry in the compatible manifest up to date,
-    /// leaving any a newer snapshot owns.
+    /// leaving any a newer snapshot owns. Every value comes from the snapshot the
+    /// catalogue holds, the run included, so a publish that changed nothing leaves
+    /// the manifest as it was.
     fn write_manifest(
         &self,
         store: &dyn ObjectStore,
@@ -748,11 +756,20 @@ impl Job<'_> {
         key: &str,
     ) -> Result<bool> {
         let snapshot = published.outcome.snapshot_id;
-        let time = snapshot_time(&work.join("catalog.ducklake"), snapshot)?;
-        let run = json!({
-            "id": self.run_id,
-            "record": format!("{}runs/{}.json", self.cfg.public_base, self.run_id.as_deref().unwrap_or_default()),
-        });
+        let facts = snapshot_facts(&work.join("catalog.ducklake"), snapshot)?;
+        let time = facts.time;
+        // The run that committed the snapshot; this one, if the snapshot names none.
+        let run = match facts.run_id {
+            Some(id) => json!({ "id": id, "record": facts.run_record }),
+            None => json!({
+                "id": self.run_id,
+                "record": format!(
+                    "{}runs/{}.json",
+                    self.cfg.public_base,
+                    self.run_id.as_deref().unwrap_or_default()
+                ),
+            }),
+        };
         let mut entries: Vec<(String, ManifestEntry)> = Vec::new();
         for (t, p) in self.cfg.tables.iter().zip(&self.prepared) {
             let Some(copy) = &t.readable_copy else {
@@ -777,16 +794,15 @@ impl Job<'_> {
             .pinned_catalog
             .as_ref()
             .map(|k| format!("{}{k}", self.cfg.public_base));
+        let watch = Watch::new(store, lake, work, snapshot, published.catalog_etag.clone());
         let current = || -> Result<(Vec<ManifestEntry>, Option<String>)> {
+            let live = watch.live_etag()?;
             let mut current = Vec::with_capacity(entries.len());
             for (table, entry) in &entries {
-                if !newer_change(store, lake, work, snapshot, table)? {
+                if !watch.newer_at(live.as_ref(), &[table.as_str()])? {
                     current.push(entry.clone());
                 }
             }
-            let live = store
-                .etag(&lake.catalog_key)
-                .map_err(|e| failed(format!("read the version of `{}`: {e}", lake.catalog_key)))?;
             let pinned = pinned
                 .clone()
                 .filter(|_| live.as_ref() == Some(&published.catalog_etag));
@@ -806,9 +822,19 @@ fn file_digest(path: &Path) -> Result<(u64, String)> {
     Ok((bytes, format!("{:x}", hasher.finalize())))
 }
 
-/// The commit time of `snapshot`, RFC 3339, read from the catalogue file as a plain
-/// DuckDB database (DuckLake keeps its snapshots in `ducklake_snapshot`).
-fn snapshot_time(catalog_file: &Path, snapshot: i64) -> Result<String> {
+/// What a snapshot records about itself.
+struct SnapshotFacts {
+    /// The commit time, RFC 3339.
+    time: String,
+    /// The run that committed it and that run's record, from its commit metadata.
+    run_id: Option<String>,
+    run_record: Option<String>,
+}
+
+/// `snapshot`'s commit time and run, read from the catalogue file as a plain DuckDB
+/// database (DuckLake keeps its snapshots in `ducklake_snapshot`, and their commit
+/// metadata in `ducklake_snapshot_changes`).
+fn snapshot_facts(catalog_file: &Path, snapshot: i64) -> Result<SnapshotFacts> {
     let context = |e: duckdb::Error| failed(format!("read the snapshot's commit time: {e}"));
     let conn = duckdb::Connection::open_in_memory().map_err(context)?;
     conn.execute_batch(&format!(
@@ -816,16 +842,27 @@ fn snapshot_time(catalog_file: &Path, snapshot: i64) -> Result<String> {
         sql_string_literal(&catalog_file.display().to_string())
     ))
     .map_err(context)?;
-    let micros: i64 = conn
+    let (micros, info): (i64, Option<String>) = conn
         .query_row(
-            "SELECT epoch_us(snapshot_time) FROM arc_catalog.ducklake_snapshot WHERE snapshot_id = ?",
+            "SELECT epoch_us(s.snapshot_time), c.commit_extra_info \
+             FROM arc_catalog.ducklake_snapshot AS s \
+             LEFT JOIN arc_catalog.ducklake_snapshot_changes AS c USING (snapshot_id) \
+             WHERE s.snapshot_id = ?",
             [snapshot],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(context)?;
     let at = std::time::UNIX_EPOCH
         + std::time::Duration::from_micros(u64::try_from(micros).unwrap_or_default());
-    Ok(humantime::format_rfc3339_seconds(at).to_string())
+    let info: serde_json::Value = info
+        .and_then(|i| serde_json::from_str(&i).ok())
+        .unwrap_or_default();
+    let text = |field: &str| info.get(field).and_then(|v| v.as_str()).map(str::to_string);
+    Ok(SnapshotFacts {
+        time: humantime::format_rfc3339_seconds(at).to_string(),
+        run_id: text("run_id"),
+        run_record: text("run_record"),
+    })
 }
 
 impl Operator for DucklakeWrite {
@@ -1126,6 +1163,78 @@ credential:
         .unwrap();
     }
 
+    /// A store on disk that counts catalogue fetches and records every write.
+    struct Counting {
+        inner: DirStore,
+        gets: std::sync::Mutex<HashMap<String, u32>>,
+        puts: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Counting {
+        fn new(root: &Path) -> Self {
+            Counting {
+                inner: DirStore::new(root),
+                gets: Default::default(),
+                puts: Default::default(),
+            }
+        }
+
+        fn gets(&self, key: &str) -> u32 {
+            self.gets.lock().unwrap().get(key).copied().unwrap_or(0)
+        }
+
+        fn puts(&self) -> Vec<String> {
+            self.puts.lock().unwrap().clone()
+        }
+    }
+
+    impl ObjectStore for Counting {
+        fn get(
+            &self,
+            key: &str,
+        ) -> std::result::Result<
+            Option<(Vec<u8>, crate::lake::store::ETag)>,
+            crate::lake::store::StoreError,
+        > {
+            *self
+                .gets
+                .lock()
+                .unwrap()
+                .entry(key.to_string())
+                .or_default() += 1;
+            self.inner.get(key)
+        }
+        fn head(
+            &self,
+            key: &str,
+        ) -> std::result::Result<
+            Option<crate::lake::store::ObjectHead>,
+            crate::lake::store::StoreError,
+        > {
+            self.inner.head(key)
+        }
+        fn put(
+            &self,
+            key: &str,
+            bytes: &[u8],
+            cond: crate::lake::store::PutCondition,
+            cache: Option<&str>,
+        ) -> std::result::Result<crate::lake::store::ETag, crate::lake::store::StoreError> {
+            self.puts.lock().unwrap().push(key.to_string());
+            self.inner.put(key, bytes, cond, cache)
+        }
+        fn put_file(
+            &self,
+            key: &str,
+            path: &Path,
+            cond: crate::lake::store::PutCondition,
+            cache: Option<&str>,
+        ) -> std::result::Result<crate::lake::store::ETag, crate::lake::store::StoreError> {
+            self.puts.lock().unwrap().push(key.to_string());
+            self.inner.put_file(key, path, cond, cache)
+        }
+    }
+
     /// A store that refuses every upload of one key, as a dropped connection would.
     struct RefusingKey {
         inner: DirStore,
@@ -1142,12 +1251,14 @@ credential:
         > {
             self.inner.get(key)
         }
-        fn etag(
+        fn head(
             &self,
             key: &str,
-        ) -> std::result::Result<Option<crate::lake::store::ETag>, crate::lake::store::StoreError>
-        {
-            self.inner.etag(key)
+        ) -> std::result::Result<
+            Option<crate::lake::store::ObjectHead>,
+            crate::lake::store::StoreError,
+        > {
+            self.inner.head(key)
         }
         fn put(
             &self,
@@ -1204,7 +1315,7 @@ credential:
             data_path: format!("{}/lake/", root.display()),
             data_prefix: "lake/".into(),
             write_path: format!("{}/lake/", root.display()),
-            pinned_prefix: pinned_prefix(&cfg.catalog),
+            pinned_prefix: Some(pinned_prefix(&cfg.catalog)),
         };
         drop(crate::lake::take_run_record_uploads());
         let e = job
@@ -1255,7 +1366,7 @@ credential:
             data_path: format!("{}/lake/", root.display()),
             data_prefix: "lake/".into(),
             write_path: format!("{}/lake/", root.display()),
-            pinned_prefix: pinned_prefix(&cfg.catalog),
+            pinned_prefix: Some(pinned_prefix(&cfg.catalog)),
         };
         let work = Work::new().unwrap();
         let published = job
@@ -1329,14 +1440,139 @@ credential:
             })
         );
 
-        // Published again unchanged: the manifest already says all of it.
+        // Published again unchanged, by another run: nothing in the store is
+        // rewritten, the manifest still naming the run that committed the snapshot.
+        let manifest_before = std::fs::read(root.join("manifest.json")).unwrap();
+        let rerun = Job {
+            cfg: &cfg,
+            dir: p,
+            prepared: vec![prepare(p, &cfg.tables[0]).unwrap()],
+            run_id: Some("run-2".into()),
+        };
+        let counting = Counting::new(&root);
         let work = Work::new().unwrap();
-        let again = job.publish(&store, &lake, None, &work.0, None).unwrap();
+        let again = rerun
+            .publish(
+                &counting,
+                &lake,
+                None,
+                &work.0,
+                Some("https://lake.example/runs/run-2.json".into()),
+            )
+            .unwrap();
         assert!(!again.outcome.committed);
+        assert!(again.uploaded.is_empty(), "{:?}", again.uploaded);
+        assert_eq!(again.unchanged, ["demo/codes.parquet"]);
         assert!(
-            !job.write_manifest(&store, &lake, &work.0, &again, "manifest.json")
+            !rerun
+                .write_manifest(&counting, &lake, &work.0, &again, "manifest.json")
                 .unwrap()
         );
+        assert_eq!(counting.puts(), Vec::<String>::new());
+        assert_eq!(
+            std::fs::read(root.join("manifest.json")).unwrap(),
+            manifest_before
+        );
+
+        // A copy left stale is still repaired.
+        std::fs::write(root.join("demo/codes.parquet"), b"stale").unwrap();
+        let work = Work::new().unwrap();
+        let repaired = rerun.publish(&store, &lake, None, &work.0, None).unwrap();
+        assert_eq!(
+            repaired
+                .uploaded
+                .iter()
+                .map(|u| u.key.as_str())
+                .collect::<Vec<_>>(),
+            ["demo/codes.parquet"]
+        );
+        assert_eq!(
+            std::fs::read(root.join("demo/codes.parquet")).unwrap(),
+            std::fs::read(p.join("data/codes.parquet")).unwrap()
+        );
+    }
+
+    /// Where nothing moves after the catalogue lands, the uploads and the manifest
+    /// read the catalogue's version, and fetch none of its bytes.
+    #[test]
+    fn a_publish_fetches_the_catalogue_once_when_nothing_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        write_codes(p);
+        std::fs::copy(p.join("data/codes.parquet"), p.join("data/more.parquet")).unwrap();
+        std::fs::copy(
+            p.join("codes.datapackage.json"),
+            p.join("more.datapackage.json"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(p.join("build/search")).unwrap();
+        for part in ["a", "b", "c"] {
+            std::fs::write(p.join(format!("build/search/{part}.json")), part).unwrap();
+        }
+        let yaml = BASE
+            .replace(
+                "files:\n",
+                "  - table: demo.more\n    from: data/more.parquet\n    descriptor: more.datapackage.json\n    readable_copy: demo/more.parquet\nmanifest: manifest.json\nfiles:\n",
+            );
+        let cfg = DucklakeWriteConfig::parse(&with(&yaml)).unwrap();
+        let root = p.join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        let lake = Lake {
+            catalog_key: cfg.catalog.clone(),
+            data_path: format!("{}/lake/", root.display()),
+            data_prefix: "lake/".into(),
+            write_path: format!("{}/lake/", root.display()),
+            pinned_prefix: Some(pinned_prefix(&cfg.catalog)),
+        };
+        for run in ["run-1", "run-2"] {
+            let job = Job {
+                cfg: &cfg,
+                dir: p,
+                prepared: cfg.tables.iter().map(|t| prepare(p, t).unwrap()).collect(),
+                run_id: Some(run.into()),
+            };
+            let store = Arc::new(Counting::new(&root));
+            let report = job
+                .publish_live(Arc::clone(&store) as Arc<dyn ObjectStore>, &lake, None)
+                .unwrap();
+            drop(crate::lake::take_run_record_uploads());
+            assert_eq!(report.manifest_written, Some(run == "run-1"), "{run}");
+            // The attempt's own fetch, and none after the catalogue lands.
+            assert_eq!(store.gets(&cfg.catalog), 1, "{run}");
+        }
+    }
+
+    /// No reader fetches the local lake's catalogue by a pinned address, so a local
+    /// publish pins none.
+    #[test]
+    fn a_local_publish_pins_no_catalogue_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        write_codes(p);
+        let yaml = BASE.replace(
+            "files:\n  - from: build/search/\n    to: demo/search/\n",
+            "",
+        );
+        let env = HashMap::new();
+        let ctx = OpContext {
+            dir: p,
+            db_path: p,
+            env: &env,
+            dotenv: crate::operator::no_dotenv(),
+            timeout: None,
+            cache: None,
+        };
+        let out = DucklakeWrite.run(&with(&yaml), &ctx).unwrap();
+        let report = out.report.unwrap();
+        assert_eq!(report["target"], "local");
+        assert_eq!(report["committed"], true);
+        assert!(report["pinned_catalog"].is_null(), "{report}");
+        let names: Vec<String> = std::fs::read_dir(p.join("build/lake"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".ducklake"))
+            .collect();
+        assert_eq!(names, ["test.ducklake"]);
     }
 
     /// A directory's kind is read from its trailing `/`, as every asset name's is, so

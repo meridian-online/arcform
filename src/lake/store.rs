@@ -18,6 +18,20 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ETag(pub String);
 
+/// What a HEAD request tells about an object, without its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectHead {
+    pub etag: ETag,
+    /// The SHA-256 of the object's content, hex, when the store knows it: a
+    /// directory store hashes the file, and an S3 store returns the
+    /// `x-amz-meta-sha256` this client sets on every upload. `None` for an object
+    /// uploaded without it.
+    pub sha256: Option<String>,
+}
+
+/// The user metadata an S3 upload carries its content's SHA-256 in, returned on HEAD.
+const SHA256_META: &str = "x-amz-meta-sha256";
+
 /// The condition a write must meet to take effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PutCondition {
@@ -52,8 +66,14 @@ pub trait ObjectStore: Send + Sync {
     /// The object's bytes and ETag, or `None` when the key does not exist.
     fn get(&self, key: &str) -> Result<Option<(Vec<u8>, ETag)>, StoreError>;
 
+    /// The object's ETag and content hash without its bytes, or `None` when the key
+    /// does not exist.
+    fn head(&self, key: &str) -> Result<Option<ObjectHead>, StoreError>;
+
     /// The object's ETag without its bytes, or `None` when the key does not exist.
-    fn etag(&self, key: &str) -> Result<Option<ETag>, StoreError>;
+    fn etag(&self, key: &str) -> Result<Option<ETag>, StoreError> {
+        Ok(self.head(key)?.map(|h| h.etag))
+    }
 
     fn put(
         &self,
@@ -144,8 +164,14 @@ impl DirStore {
 }
 
 impl ObjectStore for DirStore {
-    fn etag(&self, key: &str) -> Result<Option<ETag>, StoreError> {
-        Self::etag_of_existing(&self.path_of(key))
+    /// The ETag is the content's SHA-256, so it is the content hash too.
+    fn head(&self, key: &str) -> Result<Option<ObjectHead>, StoreError> {
+        Ok(
+            Self::etag_of_existing(&self.path_of(key))?.map(|etag| ObjectHead {
+                sha256: Some(etag.0.clone()),
+                etag,
+            }),
+        )
     }
 
     fn get(&self, key: &str) -> Result<Option<(Vec<u8>, ETag)>, StoreError> {
@@ -308,7 +334,22 @@ impl S3Store {
         key: &str,
         cond: &PutCondition,
     ) -> PreparedRequest {
+        self.request_with(method, key, cond, None)
+    }
+
+    /// [`Self::request`], for a PUT carrying its content's SHA-256 as user metadata,
+    /// signed like the condition.
+    fn request_with(
+        &self,
+        method: Method,
+        key: &str,
+        cond: &PutCondition,
+        sha256: Option<&str>,
+    ) -> PreparedRequest {
         let mut headers: Vec<(String, String)> = Vec::new();
+        if let Some(sha) = sha256 {
+            headers.push((SHA256_META.into(), sha.to_string()));
+        }
         match cond {
             PutCondition::Any => {}
             PutCondition::IfMatch(ETag(e)) => headers.push(("if-match".into(), e.clone())),
@@ -347,11 +388,12 @@ impl S3Store {
         &self,
         key: &str,
         len: u64,
+        sha256: &str,
         body: impl std::io::Read,
         cond: PutCondition,
         cache_control: Option<&str>,
     ) -> Result<ETag, StoreError> {
-        let prepared = self.request(Method::Put, key, &cond);
+        let prepared = self.request_with(Method::Put, key, &cond, Some(sha256));
         let mut req = self
             .agent
             .put(&prepared.url)
@@ -408,20 +450,23 @@ fn read_get_response(
 
 use std::io::Read as _;
 
-/// A HEAD response's ETag, `None` on 404.
+/// A HEAD response's ETag and content hash, `None` on 404.
 fn read_head_response(
     result: Result<ureq::Response, ureq::Error>,
     key: &str,
-) -> Result<Option<ETag>, StoreError> {
+) -> Result<Option<ObjectHead>, StoreError> {
     match result {
-        Ok(resp) => etag_of(&resp, key).map(Some),
+        Ok(resp) => Ok(Some(ObjectHead {
+            etag: etag_of(&resp, key)?,
+            sha256: resp.header(SHA256_META).map(str::to_string),
+        })),
         Err(ureq::Error::Status(404, _)) => Ok(None),
         Err(e) => Err(map_ureq_error(e, key)),
     }
 }
 
 impl ObjectStore for S3Store {
-    fn etag(&self, key: &str) -> Result<Option<ETag>, StoreError> {
+    fn head(&self, key: &str) -> Result<Option<ObjectHead>, StoreError> {
         let prepared = self.request(Method::Head, key, &PutCondition::Any);
         read_head_response(self.agent.head(&prepared.url).call(), key)
     }
@@ -438,7 +483,8 @@ impl ObjectStore for S3Store {
         cond: PutCondition,
         cache_control: Option<&str>,
     ) -> Result<ETag, StoreError> {
-        self.send_put(key, bytes.len() as u64, bytes, cond, cache_control)
+        let sha = sha256_hex(bytes);
+        self.send_put(key, bytes.len() as u64, &sha, bytes, cond, cache_control)
     }
 
     fn put_file(
@@ -448,9 +494,17 @@ impl ObjectStore for S3Store {
         cond: PutCondition,
         cache_control: Option<&str>,
     ) -> Result<ETag, StoreError> {
+        // Hashed first, then sent: the hash travels in a signed header.
+        let mut hasher = Sha256::new();
+        let len =
+            std::io::copy(&mut fs::File::open(path).map_err(other)?, &mut hasher).map_err(other)?;
+        let sha: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let file = fs::File::open(path).map_err(other)?;
-        let len = file.metadata().map_err(other)?.len();
-        self.send_put(key, len, file, cond, cache_control)
+        self.send_put(key, len, &sha, file, cond, cache_control)
     }
 }
 
@@ -472,7 +526,7 @@ impl PublicHttpStore {
 }
 
 impl ObjectStore for PublicHttpStore {
-    fn etag(&self, key: &str) -> Result<Option<ETag>, StoreError> {
+    fn head(&self, key: &str) -> Result<Option<ObjectHead>, StoreError> {
         let url = format!("{}/{}", self.base_url.trim_end_matches('/'), key);
         read_head_response(self.agent.head(&url).call(), key)
     }
@@ -679,6 +733,43 @@ mod tests {
         let put = s.put("a/b.bin", b"hello", PutCondition::Any, None).unwrap();
         assert_eq!(s.etag("a/b.bin").unwrap(), Some(put.clone()));
         assert_eq!(s.get("a/b.bin").unwrap().unwrap().1, put);
+    }
+
+    /// An upload carries its content's SHA-256 in signed user metadata, which HEAD
+    /// returns, so a later publish can tell the object already holds its bytes.
+    #[test]
+    fn s3_store_signs_the_content_hash_into_an_upload() {
+        let s = S3Store::r2("acct", "bucket", "KEYID-123", "s3cr3t-value").unwrap();
+        let req = s.request_with(
+            Method::Put,
+            "ns/a.parquet",
+            &PutCondition::Any,
+            Some("abc123"),
+        );
+        assert!(
+            req.headers
+                .contains(&("x-amz-meta-sha256".into(), "abc123".into()))
+        );
+        let url = url::Url::parse(&req.url).unwrap();
+        let signed = url
+            .query_pairs()
+            .find(|(k, _)| k == "X-Amz-SignedHeaders")
+            .unwrap()
+            .1
+            .into_owned();
+        assert!(
+            signed.split(';').any(|h| h == "x-amz-meta-sha256"),
+            "{signed}"
+        );
+    }
+
+    #[test]
+    fn dir_store_head_reports_the_content_hash() {
+        let (_d, s) = store();
+        assert_eq!(s.head("missing").unwrap(), None);
+        s.put("k", b"hello", PutCondition::Any, None).unwrap();
+        let head = s.head("k").unwrap().unwrap();
+        assert_eq!(head.sha256.as_deref(), Some(sha256_hex(b"hello").as_str()));
     }
 
     #[test]

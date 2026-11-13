@@ -161,8 +161,8 @@ impl ObjectStore for BeforeFirstPut<'_> {
     ) -> std::result::Result<Option<(Vec<u8>, super::store::ETag)>, StoreError> {
         self.inner.get(key)
     }
-    fn etag(&self, key: &str) -> std::result::Result<Option<super::store::ETag>, StoreError> {
-        self.inner.etag(key)
+    fn head(&self, key: &str) -> std::result::Result<Option<super::store::ObjectHead>, StoreError> {
+        self.inner.head(key)
     }
     fn put(
         &self,
