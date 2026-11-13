@@ -1,10 +1,11 @@
 //! Publishing a local DuckLake commit to an object store.
 //!
-//! Each attempt fetches the live catalogue, commits into a local copy of it, uploads
-//! the data files the commit added, pins an immutable copy of the new catalogue, and
-//! only then writes the stable catalogue, conditionally on the ETag it fetched. A
-//! failure before that last write leaves the live lake as it was (at worst, orphan
-//! data files nothing references). Readable copies and extra files are uploaded only
+//! Each attempt fetches the live catalogue and commits into a local copy of it, with
+//! DuckLake reading and writing data files in place through the lake's write path.
+//! It then pins an immutable copy of the new catalogue, and only then writes the
+//! stable catalogue, conditionally on the ETag it fetched. A failure before that
+//! last write leaves the live lake as it was (at worst, orphan data files nothing
+//! references). Readable copies and extra files are uploaded only
 //! once the catalogue holds this publish's snapshot, and are skipped when a newer
 //! snapshot changed their table, so an older publish never overwrites a newer one's.
 
@@ -37,6 +38,9 @@ pub struct Lake {
     pub data_path: String,
     /// The store key prefix matching `data_path`, e.g. `lake/`.
     pub data_prefix: String,
+    /// The same objects as `data_path`, addressed so DuckDB can read and write them:
+    /// `s3://<bucket>/<data_prefix>` live, a local folder otherwise. Ends in `/`.
+    pub write_path: String,
     /// The pinned copies' key prefix, e.g. `catalog/open-`.
     pub pinned_prefix: String,
 }
@@ -59,7 +63,8 @@ pub struct UploadedObject {
 #[derive(Debug, Clone)]
 pub struct Published {
     pub outcome: CommitOutcome,
-    /// The data files, readable copies and extra files this publish uploaded.
+    /// The readable copies and extra files this publish uploaded. The data files
+    /// DuckLake wrote are in `outcome.new_files`.
     pub uploaded: Vec<UploadedObject>,
     /// Readable copies and extra files skipped because a newer snapshot changed
     /// their table: a newer publish owns them.
@@ -137,8 +142,9 @@ fn read_catalogue(path: &Path) -> Result<Vec<u8>> {
     fs::read(path).map_err(io_failed(path))
 }
 
-/// Upload `bytes`' immutable copy, if absent, and return its key.
-fn pin(store: &dyn ObjectStore, lake: &Lake, bytes: &[u8]) -> Result<String> {
+/// Upload `bytes`' immutable copy, if absent, and return its key; `None` when the
+/// store is throttling, so the attempt starts again.
+fn pin(store: &dyn ObjectStore, lake: &Lake, bytes: &[u8]) -> Result<Option<String>> {
     let key = format!(
         "{}{}.ducklake",
         lake.pinned_prefix,
@@ -146,89 +152,15 @@ fn pin(store: &dyn ObjectStore, lake: &Lake, bytes: &[u8]) -> Result<String> {
     );
     match store.put(&key, bytes, PutCondition::IfAbsent, Some(PINNED_CACHE)) {
         // Present already: its key is its content's hash, so it holds these bytes.
-        Ok(_) | Err(StoreError::PreconditionFailed) => Ok(key),
+        Ok(_) | Err(StoreError::PreconditionFailed) => Ok(Some(key)),
+        Err(StoreError::Throttled) => Ok(None),
         Err(e) => Err(store_failed("upload the pinned catalogue", &key)(e)),
     }
-}
-
-/// The live data and delete files of `tables` and of `meta`, relative to the data
-/// path, as the catalogue at `catalog_file` records them.
-fn current_files(catalog_file: &Path, tables: &[TableInput]) -> Result<Vec<String>> {
-    let context = |what: &'static str| move |e: duckdb::Error| failed(format!("{what}: {e}"));
-    let conn = duckdb::Connection::open_in_memory().map_err(context("open duckdb"))?;
-    conn.execute_batch(&format!(
-        "ATTACH {} AS arc_fetched (READ_ONLY);",
-        sql_string_literal(&catalog_file.display().to_string())
-    ))
-    .map_err(context("open the fetched catalogue"))?;
-    let mut wanted: Vec<(String, String)> = tables
-        .iter()
-        .map(|t| {
-            let (schema, name) = split_table(&t.table);
-            (schema.to_string(), name.to_string())
-        })
-        .collect();
-    wanted.push((META_SCHEMA.to_string(), "descriptors".to_string()));
-    wanted.push((META_SCHEMA.to_string(), "fields".to_string()));
-    let files = |kind: &str| {
-        format!(
-            "SELECT s.path || t.path || f.path \
-             FROM arc_fetched.{kind} AS f \
-             JOIN arc_fetched.ducklake_table AS t ON t.table_id = f.table_id AND t.end_snapshot IS NULL \
-             JOIN arc_fetched.ducklake_schema AS s ON s.schema_id = t.schema_id AND s.end_snapshot IS NULL \
-             WHERE f.end_snapshot IS NULL \
-             AND s.path_is_relative AND t.path_is_relative AND f.path_is_relative \
-             AND s.schema_name = $1 AND t.table_name = $2"
-        )
-    };
-    let sql = format!(
-        "{} UNION ALL {} ORDER BY 1",
-        files("ducklake_data_file"),
-        files("ducklake_delete_file")
-    );
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(context("read the catalogue's files"))?;
-    let mut out = Vec::new();
-    for (schema, name) in &wanted {
-        let rows = stmt
-            .query_map([schema, name], |r| r.get::<_, String>(0))
-            .and_then(|rows| rows.collect::<std::result::Result<Vec<_>, _>>())
-            .map_err(context("read the catalogue's files"))?;
-        out.extend(rows);
-    }
-    Ok(out)
-}
-
-/// Download the files a commit into `catalog_file` reads into `staging`. With its
-/// data path overridden to staging, DuckLake resolves the files already in the lake
-/// there too, so the upsert can compare against them.
-fn fetch_current_files(
-    store: &dyn ObjectStore,
-    lake: &Lake,
-    catalog_file: &Path,
-    staging: &Path,
-    tables: &[TableInput],
-) -> Result<()> {
-    for rel in current_files(catalog_file, tables)? {
-        let key = format!("{}{rel}", lake.data_prefix);
-        let (bytes, _) = store
-            .get(&key)
-            .map_err(store_failed("fetch", &key))?
-            .ok_or_else(|| failed(format!("the catalogue names `{key}`, which is missing")))?;
-        let path = staging.join(&rel);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(io_failed(parent))?;
-        }
-        fs::write(&path, bytes).map_err(io_failed(&path))?;
-    }
-    Ok(())
 }
 
 /// What an attempt that landed leaves for the uploads after it.
 struct Landed {
     outcome: CommitOutcome,
-    uploaded: Vec<UploadedObject>,
     pinned: String,
     etag: ETag,
 }
@@ -238,6 +170,7 @@ struct Landed {
 fn attempt(
     store: &dyn ObjectStore,
     lake: &Lake,
+    secret_sql: Option<&str>,
     work: &Path,
     tables: &[TableInput],
     commit_info: &serde_json::Value,
@@ -248,20 +181,11 @@ fn attempt(
         .map_err(store_failed("fetch the catalogue", key))?;
     let catalog_file = work.join("catalog.ducklake");
     place_catalogue(&catalog_file, fetched.as_ref().map(|(b, _)| b.as_slice()))?;
-    // A failed commit leaves files in staging: each attempt starts from an empty one.
-    let staging = work.join("staging");
-    if staging.exists() {
-        fs::remove_dir_all(&staging).map_err(io_failed(&staging))?;
-    }
-    fs::create_dir_all(&staging).map_err(io_failed(&staging))?;
-    if fetched.is_some() {
-        fetch_current_files(store, lake, &catalog_file, &staging, tables)?;
-    }
-
     let outcome = commit(
         &catalog_file,
         &lake.data_path,
-        &staging,
+        &lake.write_path,
+        secret_sql,
         tables,
         commit_info,
     )?;
@@ -277,28 +201,23 @@ fn attempt(
             if now.as_ref() != Some(&fetched_etag) {
                 return Ok(None);
             }
-            let pinned = pin(store, lake, &fetched_bytes)?;
+            let Some(pinned) = pin(store, lake, &fetched_bytes)? else {
+                return Ok(None);
+            };
             Ok(Some(Landed {
                 outcome,
-                uploaded: Vec::new(),
                 pinned,
                 etag: fetched_etag,
             }))
         }
         fetched => {
-            // Committed, or the catalogue is new: the data first, then the pinned
-            // copy, then the stable catalogue, conditionally and last.
-            let mut uploaded = Vec::with_capacity(outcome.new_files.len());
-            for rel in &outcome.new_files {
-                let data_key = format!("{}{rel}", lake.data_prefix);
-                let path = staging.join(rel);
-                store
-                    .put_file(&data_key, &path, PutCondition::IfAbsent, None)
-                    .map_err(store_failed("upload", &data_key))?;
-                uploaded.push(describe(&data_key, &path)?);
-            }
+            // Committed, or the catalogue is new. DuckLake wrote the data in place;
+            // the pinned copy goes next, then the stable catalogue, conditionally
+            // and last.
             let bytes = read_catalogue(&catalog_file)?;
-            let pinned = pin(store, lake, &bytes)?;
+            let Some(pinned) = pin(store, lake, &bytes)? else {
+                return Ok(None);
+            };
             let cond = match fetched {
                 Some((_, etag)) => PutCondition::IfMatch(etag),
                 None => PutCondition::IfAbsent,
@@ -306,7 +225,6 @@ fn attempt(
             match store.put(key, &bytes, cond, Some(STABLE_CACHE)) {
                 Ok(etag) => Ok(Some(Landed {
                     outcome,
-                    uploaded,
                     pinned,
                     etag,
                 })),
@@ -454,7 +372,8 @@ fn expand(extra: &ExtraFile) -> Result<Vec<(PathBuf, String)>> {
     Ok(out)
 }
 
-/// Publish `tables` into the lake in `store` as one snapshot, then upload each
+/// Publish `tables` into the lake in `store` as one snapshot (`secret_sql` lets
+/// DuckDB reach `lake.write_path`, and never appears in an error), then upload each
 /// readable copy (`file`, `key`) and extra file, retrying the whole sequence when
 /// another publish wins the catalogue write, up to `max_attempts` times.
 ///
@@ -469,6 +388,7 @@ fn expand(extra: &ExtraFile) -> Result<Vec<(PathBuf, String)>> {
 pub fn publish(
     store: &dyn ObjectStore,
     lake: &Lake,
+    secret_sql: Option<&str>,
     work: &Path,
     tables: &[TableInput],
     readable: &[(PathBuf, String)],
@@ -481,7 +401,7 @@ pub fn publish(
     let mut attempts = 0;
     let landed = loop {
         attempts += 1;
-        if let Some(landed) = attempt(store, lake, work, tables, commit_info)? {
+        if let Some(landed) = attempt(store, lake, secret_sql, work, tables, commit_info)? {
             break landed;
         }
         if attempts >= max_attempts {
@@ -515,7 +435,7 @@ pub fn publish(
         }
     }
 
-    let mut uploaded = landed.uploaded;
+    let mut uploaded = Vec::new();
     let mut superseded = Vec::new();
     for (file, key, owners) in files {
         let current = store
@@ -586,6 +506,7 @@ mod tests {
                 catalog_key: CATALOG.to_string(),
                 data_path: server.url("lake/"),
                 data_prefix: "lake/".to_string(),
+                write_path: format!("{}/", root.join("lake").display()),
                 pinned_prefix: "catalog/open-".to_string(),
             };
             Fixture {
@@ -625,6 +546,7 @@ mod tests {
             publish(
                 store,
                 &self.lake,
+                None,
                 &self.work(),
                 tables,
                 readable,
@@ -738,8 +660,7 @@ mod tests {
     /// A store that passes through to `inner`, with faults and a hook.
     struct Wrapped<'a> {
         inner: &'a dyn ObjectStore,
-        data_prefix: &'static str,
-        fail_data_uploads: bool,
+        fail_pinned_uploads: bool,
         refuse_catalog_writes: bool,
         /// Waited on before the first catalogue write.
         barrier: Option<&'a Barrier>,
@@ -752,8 +673,7 @@ mod tests {
         fn new(inner: &'a dyn ObjectStore) -> Self {
             Wrapped {
                 inner,
-                data_prefix: "lake/",
-                fail_data_uploads: false,
+                fail_pinned_uploads: false,
                 refuse_catalog_writes: false,
                 barrier: None,
                 waited: Mutex::new(false),
@@ -779,6 +699,9 @@ mod tests {
             cond: PutCondition,
             cache_control: Option<&str>,
         ) -> std::result::Result<ETag, StoreError> {
+            if self.fail_pinned_uploads && key.starts_with("catalog/open-") {
+                return Err(StoreError::Other("upload refused".into()));
+            }
             if key == CATALOG {
                 if self.refuse_catalog_writes {
                     return Err(StoreError::PreconditionFailed);
@@ -807,9 +730,6 @@ mod tests {
             cond: PutCondition,
             cache_control: Option<&str>,
         ) -> std::result::Result<ETag, StoreError> {
-            if self.fail_data_uploads && key.starts_with(self.data_prefix) {
-                return Err(StoreError::Other("upload refused".into()));
-            }
             self.inner.put_file(key, path, cond, cache_control)
         }
     }
@@ -829,7 +749,10 @@ mod tests {
         assert_eq!(out.attempts, 1);
         assert!(!out.outcome.new_files.is_empty(), "twenty rows make a file");
         for f in &out.outcome.new_files {
-            assert!(fx.object(&format!("lake/{f}")).is_some(), "{f} uploaded");
+            assert!(
+                fx.object(&format!("{}{f}", fx.lake.data_prefix)).is_some(),
+                "{f} in the store"
+            );
         }
         let readable = out
             .uploaded
@@ -938,7 +861,7 @@ mod tests {
 
         let v2 = fx.parquet("v2.parquet", &rows(40, "new"));
         let mut store = Wrapped::new(&fx.store);
-        store.fail_data_uploads = true;
+        store.fail_pinned_uploads = true;
         let err = fx
             .publish_via(
                 &store,

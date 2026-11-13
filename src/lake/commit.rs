@@ -1,9 +1,11 @@
 //! Writing a Protocol's tables into a local DuckLake catalogue file as one upserted
 //! snapshot, with each table's descriptor in the reserved `meta` schema.
 //!
-//! The catalogue is attached with its data path overridden to a staging folder, so
-//! every data file this commit writes lands there, recorded relative to the
-//! catalogue's persisted data path. Uploading those files and the catalogue is the
+//! The catalogue is attached with its data path overridden to the lake's write
+//! path: the same objects the persisted data path names, addressed so DuckDB can
+//! read and write them (`s3://<bucket>/<prefix>/` live, a local folder otherwise).
+//! DuckLake reads the files already in the lake there and writes new ones in place,
+//! recorded relative to the persisted data path. Uploading the catalogue is the
 //! caller's job.
 //!
 //! An unchanged commit makes no write at all, so DuckDB commits no snapshot: every
@@ -729,12 +731,16 @@ fn new_files(conn: &duckdb::Connection, snapshot: i64) -> Result<Vec<String>> {
 
 /// Write `tables` into the DuckLake catalogue at `catalog_file` as one snapshot,
 /// creating the catalogue with `data_path` as its persisted data path if the file is
-/// absent. New data files are written under `staging`. An unchanged commit makes no
-/// write and commits no snapshot.
+/// absent. Data files are read and written under `write_path`, a local folder or an
+/// `s3://bucket/prefix/` URL naming the same objects as `data_path`. `secret_sql`,
+/// when given, runs before the attach (the caller's `CREATE TEMPORARY SECRET`); it
+/// never appears in an error. An unchanged commit makes no write and commits no
+/// snapshot.
 pub fn commit(
     catalog_file: &Path,
     data_path: &str,
-    staging: &Path,
+    write_path: &str,
+    secret_sql: Option<&str>,
     tables: &[TableInput],
     commit_info: &serde_json::Value,
 ) -> Result<CommitOutcome> {
@@ -742,6 +748,16 @@ pub fn commit(
     let mut conn = duckdb::Connection::open_in_memory().map_err(db("open duckdb"))?;
     conn.execute_batch("INSTALL ducklake; LOAD ducklake;")
         .map_err(db("load ducklake"))?;
+    let remote = write_path.contains("://");
+    if remote {
+        conn.execute_batch("INSTALL httpfs; LOAD httpfs;")
+            .map_err(db("load httpfs"))?;
+    }
+    if let Some(secret) = secret_sql {
+        // The statement holds the credential: its error is not passed on.
+        conn.execute_batch(secret)
+            .map_err(|_| failed("creating the object-store secret failed"))?;
+    }
     let catalog = sql_string_literal(&format!("ducklake:{}", catalog_file.display()));
     if !catalog_file.exists() {
         conn.execute_batch(&format!(
@@ -753,15 +769,17 @@ pub fn commit(
             catalog_file.display()
         )))?;
     }
-    std::fs::create_dir_all(staging)
-        .map_err(|e| failed(format!("create {}: {e}", staging.display())))?;
-    let mut staging_path = staging.display().to_string();
-    if !staging_path.ends_with('/') {
-        staging_path.push('/');
+    if !remote {
+        std::fs::create_dir_all(write_path)
+            .map_err(|e| failed(format!("create {write_path}: {e}")))?;
+    }
+    let mut write_path = write_path.to_string();
+    if !write_path.ends_with('/') {
+        write_path.push('/');
     }
     conn.execute_batch(&format!(
         "ATTACH {catalog} AS {LAKE} (DATA_PATH {}, OVERRIDE_DATA_PATH true);",
-        sql_string_literal(&staging_path)
+        sql_string_literal(&write_path)
     ))
     .map_err(db(&format!(
         "attach the catalogue {}",
@@ -844,8 +862,8 @@ mod tests {
             self.dir.path().join("lake.ducklake")
         }
 
-        fn staging(&self) -> PathBuf {
-            self.dir.path().join("staging")
+        fn files(&self) -> PathBuf {
+            self.dir.path().join("files")
         }
 
         /// Write `select` to a Parquet file named `name` in the test's folder.
@@ -866,17 +884,24 @@ mod tests {
         }
 
         fn commit_with(&self, tables: &[TableInput], info: &Value) -> Result<CommitOutcome> {
-            commit(&self.catalog(), DATA_PATH, &self.staging(), tables, info)
+            commit(
+                &self.catalog(),
+                DATA_PATH,
+                &format!("{}/", self.files().display()),
+                None,
+                tables,
+                info,
+            )
         }
 
         /// Read the catalogue through a connection of the test's own, reading data
-        /// files from staging, closed before the next commit opens it.
+        /// files from the write path, closed before the next commit opens it.
         fn read<T>(&self, f: impl FnOnce(&duckdb::Connection) -> T) -> T {
             let conn = duckdb::Connection::open_in_memory().unwrap();
             conn.execute_batch(&format!(
                 "LOAD ducklake; ATTACH {} AS lake (DATA_PATH {}, OVERRIDE_DATA_PATH true);",
                 sql_string_literal(&format!("ducklake:{}", self.catalog().display())),
-                sql_string_literal(&format!("{}/", self.staging().display())),
+                sql_string_literal(&format!("{}/", self.files().display())),
             ))
             .unwrap();
             f(&conn)
@@ -1338,7 +1363,7 @@ mod tests {
         );
         for f in &out.new_files {
             assert!(f.starts_with("s/t/"), "{f}");
-            assert!(lake.staging().join(f).is_file(), "{f}");
+            assert!(lake.files().join(f).is_file(), "{f}");
         }
         // Deleting 15 rows of the file writes a delete file.
         let second = lake.parquet(
@@ -1354,7 +1379,7 @@ mod tests {
                 !out.new_files.contains(f),
                 "{f} was already the first snapshot's"
             );
-            assert!(lake.staging().join(f).is_file(), "{f}");
+            assert!(lake.files().join(f).is_file(), "{f}");
         }
         let unchanged = lake.commit(&[input("s.t", second, id_v("s.t"))]).unwrap();
         assert!(unchanged.new_files.is_empty());
