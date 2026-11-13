@@ -1,6 +1,6 @@
 # The runner image uploads a run's outputs beside its log
 
-Status: design, written while the author was away. Every call below is the agent's, for the author to approve or overturn before the build.
+Status: approved 2026-11-13. Written while the author was away; the calls below are the agent's, and the author approved them as written.
 
 ## Why
 
@@ -21,7 +21,7 @@ The runner image (`runner/`) uploads only `<prefix>run.log`. A Protocol's output
 
 ## Approaches
 
-1. **Upload every file the run record says the run produced.** No new manifest field, but it uploads raw downloads (GLEIF's is a ~470 MB zip) alongside the dataset, which is exactly the traffic the cost model says must not leave.
+1. **Upload every file the run record says the run produced.** No new manifest field, but the record lists raw downloads too (GLEIF's is a ~470 MB zip), so they would be uploaded beside the dataset. That is the traffic the cost model says must not leave, so this was rejected.
 2. **Upload what `datapackage.json` lists.** It fits Meridian's description standard, but the open datasets' descriptors give each resource's published URL as its `path`, not the file in the build, and a Protocol without a descriptor would upload nothing.
 3. **The Protocol declares its outputs in `arcform.yaml`, arc checks and records them, and the runner uploads what the run record lists.** (Chosen.) One explicit list, checked by arc at load and after the run, with each file's size and SHA-256 in the record, so the runner reads paths from arc's own JSON rather than parsing YAML in bash.
 
