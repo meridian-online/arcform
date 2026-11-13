@@ -149,8 +149,6 @@ fn has_scheme(s: &str) -> bool {
         .is_some_and(|(scheme, _)| scheme.len() > 1 && is_identifier(scheme))
 }
 
-/// A location from the manifest: a relative path resolves against the manifest
-/// directory; an absolute path, a URL or a connection string passes through.
 /// A variable's value from the dotenv files, where an empty entry defers to the
 /// process environment as `ducklake_write` does.
 fn lookup_var(
@@ -165,6 +163,8 @@ fn lookup_var(
         .or_else(|| process_env(var))
 }
 
+/// A location from the manifest: a relative path resolves against the manifest
+/// directory; an absolute path, a URL or a connection string passes through.
 fn resolve_location(dir: &Path, location: &str) -> String {
     if has_scheme(location) || Path::new(location).is_absolute() {
         location.to_string()

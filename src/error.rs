@@ -311,7 +311,7 @@ pub enum Error {
 
     #[error(
         "could not upload the run record to `{key}`: {reason}; the lake's snapshot \
-         {snapshot_id} is already committed and names that record"
+         {snapshot_id} or the manifest names that record"
     )]
     RunRecordUpload {
         key: String,

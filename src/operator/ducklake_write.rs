@@ -731,14 +731,17 @@ impl Job<'_> {
         let record_key = self.cfg.record_key(&run_id);
         let record_url = format!("{}{record_key}", self.cfg.public_base);
         let work = Work::new()?;
+        let mut queued = false;
         let mut on_landed = |outcome: &CommitOutcome| {
-            // An unchanged publish committed nothing, so no snapshot names a record.
+            // An unchanged publish committed nothing, so no snapshot names a record;
+            // a manifest entry written below can still name it.
             if outcome.committed {
                 crate::lake::queue_run_record_upload(
                     Arc::clone(&store),
                     record_key.clone(),
                     outcome.snapshot_id,
                 );
+                queued = true;
             }
         };
         let published = publish_with_landing(
@@ -759,8 +762,19 @@ impl Job<'_> {
             }
             None => None,
         };
+        // A manifest write that changed the manifest may have entered this run's
+        // record as an entry's `run.record`, so the record is owed even though no
+        // snapshot names it.
+        if !queued && manifest_written == Some(true) {
+            crate::lake::queue_run_record_upload(
+                Arc::clone(&store),
+                record_key.clone(),
+                published.outcome.snapshot_id,
+            );
+            queued = true;
+        }
         let mut report = Report::new("live", lake, published);
-        report.run_record = Some(record_key);
+        report.run_record = queued.then_some(record_key);
         report.manifest_written = manifest_written;
         Ok(report)
     }
@@ -1658,6 +1672,55 @@ credential:
             assert_eq!(report.committed, committed, "{run}");
             let queued = crate::lake::take_run_record_uploads();
             assert_eq!(queued.len(), usize::from(committed), "{run}");
+            assert_eq!(report.run_record.is_some(), committed, "{run}");
+        }
+    }
+
+    /// A manifest entry names this run's record, so an unchanged publish whose
+    /// manifest write adds the entry still owes that record.
+    #[test]
+    fn a_manifest_entry_naming_the_run_queues_its_record_without_a_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        write_codes(p);
+        let plain = BASE.replace(
+            "files:\n  - from: build/search/\n    to: demo/search/\n",
+            "",
+        );
+        let with_manifest = BASE.replace(
+            "files:\n  - from: build/search/\n    to: demo/search/\n",
+            "manifest: manifest.json\n",
+        );
+        let plain_cfg = DucklakeWriteConfig::parse(&with(&plain)).unwrap();
+        let cfg = DucklakeWriteConfig::parse(&with(&with_manifest)).unwrap();
+        let root = p.join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        let lake = Lake {
+            catalog_key: cfg.catalog.clone(),
+            data_path: format!("{}/lake/", root.display()),
+            data_prefix: "lake/".into(),
+            write_path: format!("{}/lake/", root.display()),
+            pinned_prefix: Some(pinned_prefix(&cfg.catalog)),
+        };
+        let store: Arc<dyn ObjectStore> = Arc::new(DirStore::new(&root));
+        for (run, c) in [("run-1", &plain_cfg), ("run-2", &cfg)] {
+            let job = Job {
+                cfg: c,
+                dir: p,
+                prepared: c.tables.iter().map(|t| prepare(p, t).unwrap()).collect(),
+                run_id: Some(run.into()),
+            };
+            let report = job.publish_live(Arc::clone(&store), &lake, None).unwrap();
+            let queued = crate::lake::take_run_record_uploads();
+            if run == "run-2" {
+                assert!(!report.committed);
+                assert_eq!(report.manifest_written, Some(true));
+                assert_eq!(queued.len(), 1);
+                assert_eq!(queued[0].key, "runs/run-2.json");
+                assert!(report.run_record.is_some());
+                let manifest = std::fs::read_to_string(root.join("manifest.json")).unwrap();
+                assert!(manifest.contains("runs/run-2.json"), "{manifest}");
+            }
         }
     }
 
