@@ -1116,6 +1116,7 @@ pub fn run_with_publish(
             &runs_dir,
             &run_id,
             crate::lake::take_run_record_uploads(),
+            &record_secrets(&manifest, &dotenv_vars),
         ),
     ) {
         (result, Ok(())) => result,
@@ -1125,6 +1126,7 @@ pub fn run_with_publish(
             // The record on disk says the same, so history, the record and the exit
             // code agree.
             run_contract.run.outcome = "error".to_string();
+            stream.complete("error");
             if let Err(w) = contract::write_contract(&runs_dir, &run_id, &run_contract) {
                 eprintln!(
                     "{} could not rewrite run contract: {}",
@@ -1160,6 +1162,36 @@ pub fn run_with_publish(
     }
 }
 
+/// The values a public run record must not carry: every dotenv variable, and each
+/// variable a step's `credential.env` names, from the dotenv files or else the
+/// process environment.
+#[cfg(feature = "http-fetch")]
+fn record_secrets(manifest: &Manifest, dotenv: &HashMap<String, String>) -> Vec<String> {
+    let mut out: Vec<String> = dotenv.values().cloned().collect();
+    for step in &manifest.steps {
+        let Some(env) = step
+            .with
+            .as_ref()
+            .and_then(|w| w.get("credential"))
+            .and_then(|c| c.get("env"))
+            .and_then(serde_yaml::Value::as_mapping)
+        else {
+            continue;
+        };
+        for var in env.values().filter_map(serde_yaml::Value::as_str) {
+            let value = dotenv
+                .get(var)
+                .cloned()
+                .filter(|v| !v.is_empty())
+                .or_else(|| std::env::var(var).ok());
+            out.extend(value);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Upload `<runs_dir>/<run_id>.json`, as [`public_record`] gives it, to each key in
 /// `uploads`, only where no object is there yet, or where the object already holds
 /// these bytes (two publish steps in one run queue the same key). Every upload is
@@ -1170,6 +1202,7 @@ fn upload_run_records(
     runs_dir: &Path,
     run_id: &str,
     uploads: Vec<crate::lake::RunRecordUpload>,
+    secrets: &[String],
 ) -> Result<()> {
     use crate::lake::store::{PutCondition, StoreError};
 
@@ -1179,7 +1212,7 @@ fn upload_run_records(
     let path = runs_dir.join(format!("{run_id}.json"));
     let record = std::fs::read(&path)
         .map_err(|e| format!("read {}: {e}", path.display()))
-        .and_then(|bytes| public_record(&bytes, dir));
+        .and_then(|bytes| public_record(&bytes, dir, secrets));
     let mut first = None;
     for upload in uploads {
         let result = record.clone().and_then(|bytes| {
@@ -1217,7 +1250,52 @@ fn upload_run_records(
 /// key and string, and refused outright if any key or string still names the home
 /// directory or a path under it, anywhere in it. The record on disk keeps its paths.
 #[cfg(feature = "http-fetch")]
-fn public_record(bytes: &[u8], dir: &Path) -> std::result::Result<Vec<u8>, String> {
+fn public_record(
+    bytes: &[u8],
+    dir: &Path,
+    secrets: &[String],
+) -> std::result::Result<Vec<u8>, String> {
+    /// A value shorter than this is too likely to match by chance (`true`, `1`).
+    const MIN_SECRET_LEN: usize = 8;
+
+    /// SQL text and command lines give way to their SHA-256, and a parameter that
+    /// came from a dotenv file gives up its value: none of them belongs in a public
+    /// bucket, and a secret written inline would go with them.
+    fn scrub(value: &mut serde_json::Value) {
+        use serde_json::Value;
+        use sha2::Digest;
+        match value {
+            Value::Array(items) => items.iter_mut().for_each(scrub),
+            Value::Object(map) => {
+                for key in ["sql_text", "command"] {
+                    if let Some(Value::String(text)) = map.get(key) {
+                        let digest = sha2::Sha256::digest(text.as_bytes());
+                        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+                        map.insert(key.to_string(), serde_json::json!({ "sha256": hex }));
+                    }
+                }
+                if map.get("source").and_then(Value::as_str) == Some("env")
+                    && map.get("value").is_some_and(Value::is_string)
+                {
+                    map.insert("value".to_string(), Value::String("[redacted]".into()));
+                }
+                map.values_mut().for_each(scrub);
+            }
+            _ => {}
+        }
+    }
+    fn holds(value: &serde_json::Value, secrets: &[&str]) -> bool {
+        use serde_json::Value;
+        match value {
+            Value::String(s) => secrets.iter().any(|v| s.contains(v)),
+            Value::Array(items) => items.iter().any(|i| holds(i, secrets)),
+            Value::Object(map) => map
+                .iter()
+                .any(|(k, v)| secrets.iter().any(|s| k.contains(s)) || holds(v, secrets)),
+            _ => false,
+        }
+    }
+
     fn rewrite(s: &str, prefixes: &[String]) -> String {
         let mut out = s.to_string();
         for prefix in prefixes {
@@ -1296,6 +1374,19 @@ fn public_record(bytes: &[u8], dir: &Path) -> std::result::Result<Vec<u8>, Strin
         .ok()
         .map(|h| h.trim_end_matches('/').to_string())
         .filter(|h| !h.is_empty());
+    scrub(&mut record);
+    let secrets: Vec<&str> = secrets
+        .iter()
+        .map(String::as_str)
+        .filter(|v| v.len() >= MIN_SECRET_LEN)
+        .collect();
+    if holds(&record, &secrets) {
+        return Err(
+            "a credential value appears in the record, and the bucket is public; \
+             not uploading it"
+                .to_string(),
+        );
+    }
     let mut leaked = false;
     walk(&mut record, &prefixes, home.as_deref(), &mut leaked);
     if leaked {
@@ -2163,6 +2254,7 @@ mod run_record_upload_tests {
             &runs,
             "r1",
             vec![upload(&store, "runs/r1.json")],
+            &[],
         )
         .unwrap();
         let uploaded: serde_json::Value =
@@ -2180,6 +2272,7 @@ mod run_record_upload_tests {
             &runs,
             "r2",
             vec![upload(&store, "runs/r2.json")],
+            &[],
         )
         .unwrap_err()
         .to_string();
@@ -2190,7 +2283,7 @@ mod run_record_upload_tests {
         assert_eq!(store.get("runs/r2.json").unwrap().unwrap().0, b"other");
 
         // Nothing queued: nothing to do.
-        upload_run_records(dir.path(), &runs, "r3", Vec::new()).unwrap();
+        upload_run_records(dir.path(), &runs, "r3", Vec::new(), &[]).unwrap();
     }
 
     /// Two publish steps in one run queue the same record: the second finds this
@@ -2210,6 +2303,7 @@ mod run_record_upload_tests {
                 upload(&store, "runs/r1.json"),
                 upload(&store, "runs/r1.json"),
             ],
+            &[],
         )
         .unwrap();
         // A later run of the same id (a retry) also finds it in place.
@@ -2218,8 +2312,63 @@ mod run_record_upload_tests {
             &runs,
             "r1",
             vec![upload(&store, "runs/r1.json")],
+            &[],
         )
         .unwrap();
+    }
+
+    /// SQL text goes as its hash, a value a dotenv variable holds refuses the upload
+    /// wherever else it appears, and an ordinary record still uploads.
+    #[test]
+    fn the_public_record_drops_source_text_and_refuses_a_known_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        let store = Arc::new(DirStore::new(dir.path().join("store")));
+        let secrets = vec!["s3cr3t-value-123".to_string(), "short".to_string()];
+        let run = |id: &str, record: serde_json::Value| {
+            std::fs::write(runs.join(format!("{id}.json")), record.to_string()).unwrap();
+            upload_run_records(
+                dir.path(),
+                &runs,
+                id,
+                vec![upload(&store, &format!("runs/{id}.json"))],
+                &secrets,
+            )
+        };
+
+        // The secret sits in SQL text only: the text is replaced by its hash.
+        run(
+            "sql",
+            serde_json::json!({"steps": [{"sql": {"sql_text":
+                "CREATE SECRET (KEY_ID 's3cr3t-value-123')", "sql_hash": "h"}}]}),
+        )
+        .unwrap();
+        let sql = String::from_utf8(store.get("runs/sql.json").unwrap().unwrap().0).unwrap();
+        assert!(
+            !sql.contains("CREATE SECRET") && !sql.contains("s3cr3t"),
+            "{sql}"
+        );
+        assert!(sql.contains("sha256"), "{sql}");
+
+        // The secret sits in an op's `with:`: refused, nothing uploaded, no quote.
+        let e = run(
+            "with",
+            serde_json::json!({"steps": [{"resolved_with": {"url": "https://x/?k=s3cr3t-value-123"}}]}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("credential value"), "{e}");
+        assert!(!e.contains("s3cr3t"), "{e}");
+        assert!(store.get("runs/with.json").unwrap().is_none());
+
+        // A short value never counts, and an ordinary record uploads.
+        run(
+            "ok",
+            serde_json::json!({"steps": [{"resolved_with": {"note": "a short one"}}]}),
+        )
+        .unwrap();
+        assert!(store.get("runs/ok.json").unwrap().is_some());
     }
 
     /// The bucket is public: the uploaded record names neither the Protocol's
@@ -2239,7 +2388,14 @@ mod run_record_upload_tests {
         let bytes = serde_json::to_vec(&record).unwrap();
         std::fs::write(runs.join("r1.json"), &bytes).unwrap();
         let store = Arc::new(DirStore::new(dir.path().join("store")));
-        upload_run_records(&protocol, &runs, "r1", vec![upload(&store, "runs/r1.json")]).unwrap();
+        upload_run_records(
+            &protocol,
+            &runs,
+            "r1",
+            vec![upload(&store, "runs/r1.json")],
+            &[],
+        )
+        .unwrap();
 
         let uploaded = String::from_utf8(store.get("runs/r1.json").unwrap().unwrap().0).unwrap();
         let canonical = protocol.canonicalize().unwrap().display().to_string();
@@ -2262,16 +2418,29 @@ mod run_record_upload_tests {
             "sql": { "text": format!("SELECT * FROM read_csv('{home}/elsewhere/x.csv')") }
         });
         std::fs::write(runs.join("r3.json"), serde_json::to_vec(&leak).unwrap()).unwrap();
-        let e = upload_run_records(&protocol, &runs, "r3", vec![upload(&store, "runs/r3.json")])
-            .unwrap_err()
-            .to_string();
+        let e = upload_run_records(
+            &protocol,
+            &runs,
+            "r3",
+            vec![upload(&store, "runs/r3.json")],
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("home directory"), "{e}");
         assert!(store.get("runs/r3.json").unwrap().is_none());
 
         // The directory given with a trailing `/` is rewritten all the same.
         let slashed = std::path::PathBuf::from(format!("{shown}/"));
         std::fs::write(runs.join("r4.json"), &bytes).unwrap();
-        upload_run_records(&slashed, &runs, "r4", vec![upload(&store, "runs/r4.json")]).unwrap();
+        upload_run_records(
+            &slashed,
+            &runs,
+            "r4",
+            vec![upload(&store, "runs/r4.json")],
+            &[],
+        )
+        .unwrap();
         let uploaded = String::from_utf8(store.get("runs/r4.json").unwrap().unwrap().0).unwrap();
         assert!(!uploaded.contains(&shown), "{uploaded}");
 
@@ -2281,9 +2450,15 @@ mod run_record_upload_tests {
             "sql": { "text": format!("SET home_directory='{home}'") }
         });
         std::fs::write(runs.join("r5.json"), serde_json::to_vec(&bare).unwrap()).unwrap();
-        let e = upload_run_records(&protocol, &runs, "r5", vec![upload(&store, "runs/r5.json")])
-            .unwrap_err()
-            .to_string();
+        let e = upload_run_records(
+            &protocol,
+            &runs,
+            "r5",
+            vec![upload(&store, "runs/r5.json")],
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("home directory"), "{e}");
         assert!(store.get("runs/r5.json").unwrap().is_none());
         // The home directory ending a sentence is still the home directory; a
@@ -2304,7 +2479,7 @@ mod run_record_upload_tests {
             )
             .unwrap();
             let key = format!("runs/{id}.json");
-            let e = upload_run_records(&protocol, &runs, &id, vec![upload(&store, &key)])
+            let e = upload_run_records(&protocol, &runs, &id, vec![upload(&store, &key)], &[])
                 .unwrap_err()
                 .to_string();
             assert!(e.contains("home directory"), "{text}: {e}");
@@ -2322,19 +2497,32 @@ mod run_record_upload_tests {
                 serde_json::to_vec(&dotted).unwrap(),
             )
             .unwrap();
-            upload_run_records(&protocol, &runs, &id, vec![upload(&store, &key)]).unwrap();
+            upload_run_records(&protocol, &runs, &id, vec![upload(&store, &key)], &[]).unwrap();
         }
         let longer = serde_json::json!({ "note": format!("{home}es/x") });
         std::fs::write(runs.join("r6.json"), serde_json::to_vec(&longer).unwrap()).unwrap();
-        upload_run_records(&protocol, &runs, "r6", vec![upload(&store, "runs/r6.json")]).unwrap();
+        upload_run_records(
+            &protocol,
+            &runs,
+            "r6",
+            vec![upload(&store, "runs/r6.json")],
+            &[],
+        )
+        .unwrap();
 
         // A path under the home directory that is not the Protocol's refuses the
         // upload rather than publishing it.
         let leak = serde_json::json!({ "db": format!("{home}/elsewhere/pipeline.db") });
         std::fs::write(runs.join("r2.json"), serde_json::to_vec(&leak).unwrap()).unwrap();
-        let e = upload_run_records(&protocol, &runs, "r2", vec![upload(&store, "runs/r2.json")])
-            .unwrap_err()
-            .to_string();
+        let e = upload_run_records(
+            &protocol,
+            &runs,
+            "r2",
+            vec![upload(&store, "runs/r2.json")],
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("home directory"), "{e}");
         assert!(store.get("runs/r2.json").unwrap().is_none());
     }

@@ -292,7 +292,31 @@ impl DucklakeWriteConfig {
             check_key("files.to", &f.to)?;
         }
         self.check_keys_apart()?;
+        self.check_out_of_the_data_path()?;
         self.credential.validate()
+    }
+
+    /// DuckLake's orphan cleanup deletes what it does not know under the data path,
+    /// so the catalogue, manifest, run records and pinned copies stay out of it.
+    fn check_out_of_the_data_path(&self) -> Result<()> {
+        let data = self.data_prefix();
+        let mut owned: Vec<(&str, String)> = vec![
+            ("catalog", self.catalog.clone()),
+            ("catalog", pinned_prefix(&self.catalog)),
+            ("runs", self.runs.clone()),
+        ];
+        if let Some(m) = &self.manifest {
+            owned.push(("manifest", m.clone()));
+        }
+        for (field, key) in owned {
+            if key.starts_with(&data) {
+                return Err(invalid(format!(
+                    "`{field}: {key}` falls under `data_path: {data}`, where DuckLake's \
+                     cleanup could delete it"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// A readable copy or a `files.to` key must not land on the lake's own objects:
@@ -1121,6 +1145,8 @@ credential:
             ("to: demo/search/", "to: lake/", "files.to"),
             ("to: demo/search/", "to: catalog/", "files.to"),
             ("to: demo/search/", "to: runs", "files.to"),
+            ("data_path: lake/", "data_path: catalog/", "data_path"),
+            ("data_path: lake/", "data_path: runs/", "data_path"),
         ] {
             let yaml = BASE.replace(from, to);
             let e = refusal(&yaml);
