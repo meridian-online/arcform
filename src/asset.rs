@@ -688,6 +688,7 @@ mod tests {
             hooks: crate::manifest::Hooks::default(),
             steps,
             assets,
+            outputs: Vec::new(),
         };
 
         AssetGraph::build(&manifest, dir)

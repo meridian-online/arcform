@@ -1,0 +1,7 @@
+name: two_records
+db: two_records.duckdb
+steps:
+  - name: write
+    command: mkdir -p build && printf ok > build/out.txt
+outputs:
+  - build/out.txt

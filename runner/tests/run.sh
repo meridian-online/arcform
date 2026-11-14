@@ -41,11 +41,11 @@ expect() { # expect DESCRIPTION COMMAND...: record a failed expectation
   fi
 }
 
-start_stub() { # start_stub RUN_ID TOKEN LIFETIME [EXCHANGE_FAILS]
+start_stub() { # start_stub RUN_ID TOKEN LIFETIME [EXCHANGE_FAILS] [PUT_DELAY]
   docker rm -f "$stub" >/dev/null 2>&1 || true
   docker run --detach --name "$stub" --network "$net" --network-alias stub \
     -e STUB_RUN_ID="$1" -e STUB_RUN_TOKEN="$2" -e STUB_LIFETIME="$3" \
-    -e STUB_EXCHANGE_FAILS="${4:-0}" \
+    -e STUB_EXCHANGE_FAILS="${4:-0}" -e STUB_PUT_DELAY="${5:-0}" \
     "$stub_image" >/dev/null
   for _ in $(seq 1 50); do
     if docker exec "$stub" python3 -I /stub/stub.py --state >/dev/null 2>&1; then return 0; fi
@@ -78,12 +78,13 @@ start_detached() { # start_detached RUN_ID TOKEN PROTOCOL_REF [FORGE_URL]: the c
     "$image"
 }
 
-stop_when() { # stop_when CID TEXT: once the container's output shows TEXT, stop it as ECS would; sets code and stopped_in
-  local cid=$1 text=$2 started
+stop_when() { # stop_when CID TEXT [DELAY]: DELAY seconds after the container's output shows TEXT, stop it as ECS would; sets code and stopped_in
+  local cid=$1 text=$2 delay=${3:-0} started
   for _ in $(seq 1 100); do
     docker logs "$cid" 2>&1 | grep -qF -- "$text" && break
     sleep 0.1
   done
+  sleep "$delay"
   started=$(date +%s)
   docker stop --time 30 "$cid" >/dev/null
   stopped_in=$(($(date +%s) - started))
@@ -93,7 +94,21 @@ stop_when() { # stop_when CID TEXT: once the container's output shows TEXT, stop
 }
 
 uploaded_log() { # uploaded_log RUN_ID: the run log the image wrote, or nothing
-  state | jq -r --arg k "sub_test/runs/$1/run.log" '.objects[$k] // empty'
+  state | jq -r --arg k "sub_test/runs/$1/run.log" '.objects[$k].text // empty'
+}
+
+keys_under() { # keys_under RUN_ID: every key the image wrote under its run's prefix, one per line, sorted
+  state | jq -r --arg p "sub_test/runs/$1/" '.objects | keys[] | select(startswith($p)) | ltrimstr($p)' | sort
+}
+
+no_credential_in_objects() { # no object holds an issued credential part or renewal token
+  local secret texts
+  texts=$(state | jq -r '.objects[].text // empty')
+  while read -r secret; do
+    [[ -z $secret ]] && continue
+    grep -qF -- "$secret" <<<"$texts" && return 1
+  done < <(state | jq -r '.issued[] | .access_key_id, .secret_access_key, .session_token' && state | jq -r '.renewal_tokens[]')
+  return 0
 }
 
 begin() {
@@ -126,6 +141,12 @@ head_commit=$(state | jq -r '.commits.sample[1]')
 fails_second=$(state | jq -r '.commits["fails-second"][0]')
 prints_env=$(state | jq -r '.commits["prints-env"][0]')
 slow=$(state | jq -r '.commits.slow[0]')
+with_outputs=$(state | jq -r '.commits["with-outputs"][0]')
+output_symlink=$(state | jq -r '.commits["output-symlink"][0]')
+output_rewritten=$(state | jq -r '.commits["output-rewritten"][0]')
+output_space=$(state | jq -r '.commits["output-space"][0]')
+two_records=$(state | jq -r '.commits["two-records"][0]')
+slow_upload=$(state | jq -r '.commits["slow-upload"][0]')
 
 # ---------------------------------------------------------------------------
 begin runs_pinned_protocol
@@ -281,6 +302,107 @@ code=$(run_image "$run" "$token" "test/sample@$pinned")
 expect "the first run exits 0, not $first" equals "$first" 0
 expect "the second exits 11 (exchange), not $code" equals "$code" 11
 expect "the stub refused one exchange" equals "$(state | jq '.exchange_refusals')" 1
+end
+
+# ---------------------------------------------------------------------------
+begin runs_pinned_protocol_with_outputs
+run="run-outputs-1"
+token=$(openssl rand -hex 24)
+start_stub "$run" "$token" 900
+code=$(run_image "$run" "$token" "test/with-outputs@$with_outputs")
+log=$(uploaded_log "$run")
+record=$(state | jq -r --arg k "sub_test/runs/$run/run.json" '.objects[$k].text // empty')
+expect "exit code 0, not $code" equals "$code" 0
+expect "no upload refused" equals "$(state | jq '.rejected_puts | length')" 0
+expect "run.json is written" contains "$(keys_under "$run")" "run.json"
+expect "run.log is written" contains "$(keys_under "$run")" "run.log"
+expect "the record lists four files" equals "$(jq '[.outputs[].files[]] | length' <<<"$record")" 4
+expect "the record lists the nested file" contains "$(jq -r '.outputs[].files[].path' <<<"$record")" "build/parts/sub/b.txt"
+while IFS=$'\t' read -r path sha; do
+  expect "outputs/$path is uploaded with the record's sha256" equals \
+    "$(state | jq -r --arg k "sub_test/runs/$run/outputs/$path" '.objects[$k].sha256 // empty')" "$sha"
+done < <(jq -r '.outputs[].files[] | "\(.path)\t\(.sha256)"' <<<"$record")
+expect "the uploads run in the record's order, run.json after the outputs, the log last" equals \
+  "$(state | jq -r --arg p "sub_test/runs/$run/" '[.puts[].key | ltrimstr($p)] | join(" ")')" \
+  "outputs/build/out.parquet outputs/build/parts/ edge .txt outputs/build/parts/a.txt outputs/build/parts/sub/b.txt run.json run.log"
+expect "the log counts the outputs" contains "$log" "wrote 2 outputs: 4 files"
+end
+
+# ---------------------------------------------------------------------------
+begin uploads_no_outputs_when_a_step_fails
+run="run-fails-2"
+token=$(openssl rand -hex 24)
+start_stub "$run" "$token" 900
+code=$(run_image "$run" "$token" "test/fails-second@$fails_second")
+expect "exit code 13 (the run step), not $code" equals "$code" 13
+expect "only run.log is written" equals "$(keys_under "$run")" "run.log"
+end
+
+# ---------------------------------------------------------------------------
+begin refuses_an_output_outside_the_checkout
+run="run-symlink-1"
+token=$(openssl rand -hex 24)
+start_stub "$run" "$token" 900
+code=$(run_image "$run" "$token" "test/output-symlink@$output_symlink")
+log=$(uploaded_log "$run")
+expect "exit code 14 (outputs), not $code" equals "$code" 14
+expect "the log names the refused output" contains "$log" "output build/out.txt is refused: it is a symlink"
+expect "only run.log is written" equals "$(keys_under "$run")" "run.log"
+expect "no uploaded object holds a credential part" no_credential_in_objects
+end
+
+# ---------------------------------------------------------------------------
+begin refuses_an_output_changed_after_the_run
+run="run-rewritten-1"
+token=$(openssl rand -hex 24)
+start_stub "$run" "$token" 900
+code=$(run_image "$run" "$token" "test/output-rewritten@$output_rewritten")
+log=$(uploaded_log "$run")
+expect "exit code 14 (outputs), not $code" equals "$code" 14
+expect "the log names the changed output" contains "$log" "output build/out.txt changed after arc recorded it"
+expect "neither the output nor run.json is written" equals "$(keys_under "$run")" "run.log"
+end
+
+# ---------------------------------------------------------------------------
+begin uploads_an_output_with_a_space_in_its_name
+run="run-space-1"
+token=$(openssl rand -hex 24)
+start_stub "$run" "$token" 900
+code=$(run_image "$run" "$token" "test/output-space@$output_space")
+expect "exit code 0, not $code" equals "$code" 0
+expect "no upload refused" equals "$(state | jq '.rejected_puts | length')" 0
+expect "the output keeps its name" equals "$(keys_under "$run")" $'outputs/build/my out.csv\nrun.json\nrun.log'
+expect "its bytes arrived" equals \
+  "$(state | jq -r --arg k "sub_test/runs/$run/outputs/build/my out.csv" '.objects[$k].text // empty')" $'a,b\n1,2'
+end
+
+# ---------------------------------------------------------------------------
+begin refuses_more_than_one_run_record
+run="run-records-1"
+token=$(openssl rand -hex 24)
+start_stub "$run" "$token" 900
+code=$(run_image "$run" "$token" "test/two-records@$two_records")
+log=$(uploaded_log "$run")
+expect "exit code 14 (outputs), not $code" equals "$code" 14
+expect "the log says how many records" contains "$log" "expected one run record under build/.arcform/runs/, found 2"
+expect "the log names the leftover record" contains "$log" "20260101-000000-leftover.json"
+expect "only run.log is written" equals "$(keys_under "$run")" "run.log"
+end
+
+# ---------------------------------------------------------------------------
+begin stopped_during_output_upload
+run="run-stop-outputs-1"
+token=$(openssl rand -hex 24)
+# Each output's PUT waits five seconds, so the stop comes mid-upload.
+start_stub "$run" "$token" 900 0 5
+stop_when "$(start_detached "$run" "$token" "test/slow-upload@$slow_upload")" "uploading the run's outputs" 2
+log=$(uploaded_log "$run")
+expect "exit code 15 (interrupted), not $code" equals "$code" 15
+expect "the log names the interruption" contains "$log" "failed at interrupted: stopped during the output upload"
+expect "run.log is written" contains "$(keys_under "$run")" "run.log"
+expect "run.json is not written" lacks "$(keys_under "$run")" "run.json"
+expect "the second output is not written" lacks "$(keys_under "$run")" "outputs/build/b.bin"
+expect "it stopped within ten seconds, not $stopped_in" at_least 10 "$stopped_in"
 end
 
 echo

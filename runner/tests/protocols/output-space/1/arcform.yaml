@@ -1,0 +1,7 @@
+name: output_space
+db: output_space.duckdb
+steps:
+  - name: write
+    command: mkdir -p build && printf 'a,b\n1,2\n' > 'build/my out.csv'
+outputs:
+  - build/my out.csv

@@ -4,7 +4,9 @@
 - the control plane's credential exchange (POST /v1/runs/{run_id}/credentials
   and .../credentials/renew), which mints throwaway credentials;
 - an S3-compatible store (PUT /<bucket>/<key>), which checks each upload's
-  AWS Signature Version 4 against the credential it names and keeps the body;
+  AWS Signature Version 4 against the credential it names and keeps, under
+  the percent-decoded key, the body's size, its SHA-256 and its text when it
+  decodes as UTF-8 (`{"bytes", "sha256", "text"}`, `text` null otherwise);
 - a git forge (/git/<namespace>/<name>.git), served by `git http-backend`,
   and one that never answers (/stall/...), for a stop during the fetch.
 
@@ -13,8 +15,9 @@ assert on it. `stub.py --state` prints that from inside the container.
 
 Configuration: STUB_RUN_ID, STUB_RUN_TOKEN, STUB_LIFETIME (seconds a
 credential lasts, default 900), STUB_EXCHANGE_FAILS (an HTTP status the
-exchange answers with after spending the token) and STUB_ENDPOINT (the storage endpoint the
-exchange names, default http://stub:8080).
+exchange answers with after spending the token), STUB_ENDPOINT (the storage endpoint the
+exchange names, default http://stub:8080) and STUB_PUT_DELAY (seconds each PUT of a key
+under outputs/ waits before it is answered, default 0).
 """
 
 import hashlib
@@ -29,6 +32,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote
 from urllib.request import urlopen
 
 PORT = 8080
@@ -48,6 +52,7 @@ LIFETIME = int(os.environ.get("STUB_LIFETIME", "900"))
 # as a service that failed after spending it would.
 EXCHANGE_FAILS = int(os.environ.get("STUB_EXCHANGE_FAILS", "0"))
 ENDPOINT = os.environ.get("STUB_ENDPOINT", f"http://stub:{PORT}")
+PUT_DELAY = float(os.environ.get("STUB_PUT_DELAY", "0"))
 PREFIX = f"sub_test/runs/{RUN_ID}/"
 
 with open(os.path.join(FORGE, "commits.json")) as f:
@@ -222,18 +227,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         body = self.body()
+        if PUT_DELAY and "/outputs/" in self.path:
+            time.sleep(PUT_DELAY)
         with lock:
             prefix = f"/{BUCKET}/"
             if not self.path.startswith(prefix):
                 return self.reply(404, b"no such bucket", "text/plain")
             why = check_sigv4("PUT", self.path, self.headers, body)
-            key = self.path[len(prefix):]
+            key = unquote(self.path[len(prefix):])
             if why:
                 state["rejected_puts"].append({"key": key, "why": why})
                 return self.reply(403, why.encode(), "text/plain")
             match = AUTH_RE.match(self.headers["Authorization"])
             state["puts"].append({"key": key, "access_key_id": match.group(1)})
-            state["objects"][key] = body.decode("utf-8", "replace")
+            try:
+                text = body.decode("utf-8")
+            except UnicodeDecodeError:
+                text = None
+            state["objects"][key] = {"bytes": len(body), "sha256": sha256_hex(body), "text": text}
         self.send_response(200)
         self.send_header("ETag", '"' + hashlib.md5(body).hexdigest() + '"')
         self.send_header("Content-Length", "0")

@@ -49,6 +49,34 @@ pub struct Contract {
     pub assets: Vec<AssetEntry>,
     /// One entry per declared step.
     pub steps: Vec<StepEntry>,
+    /// One entry per path the manifest's `outputs:` declares, in manifest order, with each
+    /// file's size and SHA-256 as the run left it. Empty when the manifest declares none or
+    /// the run failed. Added under `b4/1`, and a record written before it reads with the
+    /// list empty. The runner image uploads exactly the files listed here.
+    #[serde(default)]
+    pub outputs: Vec<OutputEntry>,
+}
+
+/// A declared output: a file, or a directory with every file under it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputEntry {
+    /// The path as `outputs:` declares it, without a trailing `/`.
+    pub path: String,
+    /// `"file"` or `"directory"`.
+    pub kind: String,
+    /// The output's files: for a file, itself; for a directory, every file under it,
+    /// sorted by the bytes of their paths.
+    pub files: Vec<OutputFile>,
+}
+
+/// One file of a declared output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputFile {
+    /// Relative to the Protocol's folder, with `/` separators.
+    pub path: String,
+    pub bytes: u64,
+    /// SHA-256 of the file's bytes, as lower-case hex.
+    pub sha256: String,
 }
 
 /// Run-level metadata.
@@ -472,6 +500,9 @@ pub struct ContractInputs<'a> {
     pub steps_engine: Option<StepsEngine>,
     /// The files beside the Protocol's file the run named as possible copies and did not read.
     pub possible_copies: Vec<PossibleCopy>,
+    /// The declared outputs as the run left them, from [`record_outputs`]; empty for a run
+    /// that failed.
+    pub outputs: Vec<OutputEntry>,
 }
 
 /// Assemble the full contract from the run's manifest, asset graph, and outcomes.
@@ -525,7 +556,130 @@ pub fn build_contract(inp: ContractInputs) -> Contract {
         },
         assets,
         steps,
+        outputs: inp.outputs,
     }
+}
+
+/// Each declared output's files, without reading their bytes: for each path in `outputs`,
+/// its kind and its files' paths relative to `dir`, sorted by the bytes of their paths.
+/// Fails naming the first output that is missing, and anything that is neither a regular
+/// file nor a directory (a symlink, at the top, inside a directory or as a folder on the
+/// declared path, among them), since nothing but a regular file inside the Protocol is
+/// uploaded.
+pub fn list_outputs(
+    dir: &Path,
+    outputs: &[String],
+) -> crate::error::Result<Vec<(String, String, Vec<String>)>> {
+    let mut listed = Vec::new();
+    for declared in outputs {
+        let path = declared.trim_end_matches('/').to_string();
+        // A folder on the way that is a symlink could lead out of the Protocol.
+        let mut parent = dir.to_path_buf();
+        let parts: Vec<&str> = path.split('/').collect();
+        for part in &parts[..parts.len() - 1] {
+            parent.push(part);
+            if std::fs::symlink_metadata(&parent).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(crate::error::Error::OutputMissing {
+                    path: path.clone(),
+                    why: format!(
+                        "the folder {} on its path is a symlink, which is not followed",
+                        parent.strip_prefix(dir).unwrap_or(&parent).display()
+                    ),
+                });
+            }
+        }
+        let full = dir.join(&path);
+        let meta =
+            std::fs::symlink_metadata(&full).map_err(|e| crate::error::Error::OutputMissing {
+                path: path.clone(),
+                why: if e.kind() == std::io::ErrorKind::NotFound {
+                    "the run did not leave it".to_string()
+                } else {
+                    format!("it could not be read: {e}")
+                },
+            })?;
+        if meta.is_file() {
+            listed.push((path.clone(), "file".to_string(), vec![path]));
+        } else if meta.is_dir() {
+            let mut files = Vec::new();
+            walk_output_dir(&full, &path, &mut files)?;
+            files.sort_by(|a: &String, b: &String| a.as_bytes().cmp(b.as_bytes()));
+            listed.push((path, "directory".to_string(), files));
+        } else {
+            return Err(not_a_file(&path));
+        }
+    }
+    Ok(listed)
+}
+
+fn not_a_file(path: &str) -> crate::error::Error {
+    crate::error::Error::OutputMissing {
+        path: path.to_string(),
+        why: "it is not a regular file or a directory (a symlink is not followed)".to_string(),
+    }
+}
+
+fn walk_output_dir(full: &Path, rel: &str, files: &mut Vec<String>) -> crate::error::Result<()> {
+    let entries = std::fs::read_dir(full).map_err(|e| crate::error::Error::OutputMissing {
+        path: rel.to_string(),
+        why: format!("its folder could not be listed: {e}"),
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|e| crate::error::Error::OutputMissing {
+            path: rel.to_string(),
+            why: format!("its folder could not be listed: {e}"),
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(crate::error::Error::OutputMissing {
+                path: format!("{rel}/{}", name.to_string_lossy()),
+                why: "its name is not UTF-8".to_string(),
+            });
+        };
+        let child_rel = format!("{rel}/{name}");
+        let kind = entry
+            .file_type()
+            .map_err(|e| crate::error::Error::OutputMissing {
+                path: child_rel.clone(),
+                why: e.to_string(),
+            })?;
+        if kind.is_file() {
+            files.push(child_rel);
+        } else if kind.is_dir() {
+            walk_output_dir(&entry.path(), &child_rel, files)?;
+        } else {
+            return Err(not_a_file(&child_rel));
+        }
+    }
+    Ok(())
+}
+
+/// Each declared output with its files' sizes and SHA-256, read as the run left them.
+/// Fails as [`list_outputs`] does, and when a listed file cannot be read.
+pub fn record_outputs(dir: &Path, outputs: &[String]) -> crate::error::Result<Vec<OutputEntry>> {
+    list_outputs(dir, outputs)?
+        .into_iter()
+        .map(|(path, kind, rels)| {
+            let files = rels
+                .into_iter()
+                .map(|rel| {
+                    let full = dir.join(&rel);
+                    let unreadable = |e: std::io::Error| crate::error::Error::OutputMissing {
+                        path: rel.clone(),
+                        why: format!("it could not be read: {e}"),
+                    };
+                    let bytes = std::fs::symlink_metadata(&full).map_err(unreadable)?.len();
+                    let sha256 = crate::fetch_cache::hash_file(&full).map_err(unreadable)?;
+                    Ok(OutputFile {
+                        path: rel.clone(),
+                        bytes,
+                        sha256,
+                    })
+                })
+                .collect::<crate::error::Result<Vec<_>>>()?;
+            Ok(OutputEntry { path, kind, files })
+        })
+        .collect()
 }
 
 /// The `.json` files in `runs_dir`, newest first by modified time (empty if the directory is
@@ -1449,6 +1603,18 @@ steps:
         assert_eq!(engine.platform, None);
         assert_eq!(engine.extensions, None);
         assert_eq!(contract.run.protocol.possible_copies, Vec::new());
+    }
+
+    #[test]
+    fn old_record_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = runs_dir(dir.path());
+        std::fs::create_dir_all(&runs).unwrap();
+        let id = "20261001-225417-11c7d1ec";
+        assert!(!RECORD_BEFORE_STEPS_ENGINE.contains("\"outputs\""));
+        std::fs::write(runs.join(format!("{id}.json")), RECORD_BEFORE_STEPS_ENGINE).unwrap();
+        let contract = load_contract(dir.path(), Some(id)).expect("a record without outputs loads");
+        assert_eq!(contract.outputs, Vec::new());
     }
 
     #[test]

@@ -110,6 +110,15 @@ pub struct Manifest {
     /// which step produces the asset and its dependencies.
     #[serde(default)]
     pub assets: std::collections::HashMap<String, AssetOverride>,
+
+    /// The finished files and folders a run leaves for publishing, as paths relative to
+    /// the manifest directory. Load refuses an absolute path, a `..` or `.` component, a
+    /// duplicate and a path inside `build/.arcform/`. After the last step of a run that
+    /// would otherwise succeed, `arc run` fails the run when one is missing, and records
+    /// each one's files with their sizes and SHA-256 in the run record, which is what the
+    /// runner image uploads. Left out of a manifest serialised from this struct when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<String>,
 }
 
 fn default_engine() -> String {
@@ -239,6 +248,63 @@ impl Step {
     pub(crate) fn is_sql(&self) -> bool {
         self.sql.is_some()
     }
+}
+
+/// Refuse an `outputs:` entry that could name something outside the Protocol, that names
+/// arc's own run state, or that repeats another entry once a trailing `/` is dropped.
+fn validate_outputs(outputs: &[String]) -> Result<()> {
+    use std::path::Component;
+    let mut seen = std::collections::HashSet::new();
+    for raw in outputs {
+        let refuse = |why: &str| Err(Error::ManifestValidation(format!("outputs: '{raw}' {why}")));
+        let trimmed = raw.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return refuse("is empty: an output is a path relative to the Protocol's folder");
+        }
+        let path = Path::new(trimmed);
+        let mut parts = Vec::new();
+        for component in path.components() {
+            match component {
+                Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+                Component::ParentDir => {
+                    return refuse(
+                        "has a '..' component: an output stays inside the Protocol's folder",
+                    );
+                }
+                Component::CurDir => {
+                    return refuse("has a '.' or empty component: write the path plainly");
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    return refuse(
+                        "is absolute: an output is a path relative to the Protocol's folder",
+                    );
+                }
+            }
+        }
+        // `Path::components` drops `.` components and repeated separators, so check the
+        // raw segments for those as written.
+        if trimmed.split('/').any(|seg| seg == "." || seg.is_empty()) {
+            return refuse("has a '.' or empty component: write the path plainly");
+        }
+        if parts.len() >= 2 && parts[0] == "build" && parts[1] == ".arcform" || parts == ["build"] {
+            return refuse(
+                "is or holds arc's run state under build/.arcform/, which is not an output",
+            );
+        }
+        let joined = parts.join("/");
+        // An output inside another would have its files recorded, and uploaded, twice.
+        if let Some(other) = seen.iter().find(|other: &&String| {
+            joined.starts_with(&format!("{other}/")) || other.starts_with(&format!("{joined}/"))
+        }) {
+            return refuse(&format!(
+                "is inside, or holds, the declared output '{other}': declare one of them"
+            ));
+        }
+        if !seen.insert(joined) {
+            return refuse("is declared twice");
+        }
+    }
+    Ok(())
 }
 
 /// Validate a retry policy's fields.
@@ -421,6 +487,8 @@ impl Manifest {
             }
         }
 
+        validate_outputs(&self.outputs)?;
+
         // Validate lifecycle hooks.
         let hook_entries: [(&str, &Option<Step>); 4] = [
             ("hooks.on_init", &self.hooks.on_init),
@@ -534,6 +602,7 @@ impl Manifest {
             hooks: Hooks::default(),
             steps: Vec::new(),
             assets: std::collections::HashMap::new(),
+            outputs: Vec::new(),
         }
     }
 
@@ -607,6 +676,7 @@ mod tests {
             hooks: Hooks::default(),
             steps,
             assets: std::collections::HashMap::new(),
+            outputs: Vec::new(),
         }
     }
 
@@ -965,5 +1035,96 @@ assets:
             named.db_path(Path::new("/tmp/project")).unwrap(),
             PathBuf::from("/tmp/project/state/p.db")
         );
+    }
+
+    fn outputs_error(outputs: &str) -> String {
+        Manifest::from_yaml_str(&format!("name: p\noutputs:\n{outputs}"))
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn outputs_parse() {
+        let manifest = Manifest::from_yaml_str(
+            "name: p\noutputs:\n  - build/out.parquet\n  - datapackage.json\n",
+        )
+        .unwrap();
+        assert_eq!(manifest.outputs, ["build/out.parquet", "datapackage.json"]);
+        let none = Manifest::from_yaml_str("name: p\n").unwrap();
+        assert!(none.outputs.is_empty());
+        assert!(
+            !serde_yaml::to_string(&none).unwrap().contains("outputs"),
+            "an empty list is left out of a written manifest"
+        );
+    }
+
+    #[test]
+    fn outputs_refuse_absolute() {
+        let err = outputs_error("  - /etc/passwd\n");
+        assert!(
+            err.contains("'/etc/passwd'") && err.contains("absolute"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn outputs_refuse_parent_and_dot() {
+        for (bad, why) in [
+            ("../secret", "'..'"),
+            ("build/../../x", "'..'"),
+            ("./build/out.csv", "'.'"),
+            ("build/./out.csv", "'.'"),
+            ("build//out.csv", "empty"),
+            ("/", "empty"),
+        ] {
+            let err = outputs_error(&format!("  - '{bad}'\n"));
+            assert!(
+                err.contains(&format!("'{bad}'")) && err.contains(why),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn outputs_refuse_duplicates() {
+        let err = outputs_error("  - build/parts\n  - build/parts/\n");
+        assert!(
+            err.contains("'build/parts/'") && err.contains("twice"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn outputs_refuse_nesting() {
+        for (first, second) in [
+            ("build/parts", "build/parts/a.txt"),
+            ("build/parts/a.txt", "build/parts/"),
+        ] {
+            let err = outputs_error(&format!("  - {first}\n  - {second}\n"));
+            assert!(
+                err.contains(&format!("'{second}'"))
+                    && err.contains(&format!("'{}'", first.trim_end_matches('/')))
+                    && err.contains("inside"),
+                "{err}"
+            );
+        }
+        let ok = Manifest::from_yaml_str("name: p\noutputs:\n  - build/parts\n  - build/parts2\n");
+        assert!(ok.is_ok(), "siblings load: {ok:?}");
+    }
+
+    #[test]
+    fn outputs_refuse_run_state() {
+        for bad in [
+            "build/.arcform",
+            "build/.arcform/runs/x.json",
+            "build",
+            "build/",
+        ] {
+            let err = outputs_error(&format!("  - '{bad}'\n"));
+            assert!(
+                err.contains(&format!("'{bad}'")) && err.contains("run state"),
+                "{bad}: {err}"
+            );
+        }
     }
 }
