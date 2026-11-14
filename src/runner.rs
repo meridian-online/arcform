@@ -900,6 +900,17 @@ pub fn run_with_publish(
     // The step loop recorded `success` in the state backend already.
     let mut refused_after_success = false;
 
+    // --- Declared outputs, checked before the hooks ---
+    // A run whose steps succeeded but left a declared output missing fails here, so
+    // `on_failure` runs rather than `on_success`. The files are hashed after the hooks.
+    if step_loop_result.is_ok()
+        && !manifest.outputs.is_empty()
+        && let Err(e) = contract::list_outputs(dir, &manifest.outputs)
+    {
+        step_loop_result = Err(e);
+        refused_after_success = true;
+    }
+
     match &step_loop_result {
         Ok(()) => {
             // --- on_success hook ---
@@ -1051,6 +1062,24 @@ pub fn run_with_publish(
         }
     };
 
+    // --- Declared outputs, recorded after the last hook ---
+    // Hashed here, after the hooks and the pin recheck, so the record holds each file as the
+    // run left it. One that a hook removed fails the run.
+    let mut step_loop_result = step_loop_result;
+    let mut outputs_failed = false;
+    let outputs = if step_loop_result.is_ok() && !manifest.outputs.is_empty() {
+        match contract::record_outputs(dir, &manifest.outputs) {
+            Ok(outputs) => outputs,
+            Err(e) => {
+                step_loop_result = Err(e);
+                outputs_failed = true;
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     // --- Finalize the live Protocol+Run contract ---
     // Assemble the full contract (assets, per-table row counts, steps), write it to
     // `<run_id>.json`, mark the status stream complete, and render the asset DAG to
@@ -1065,7 +1094,7 @@ pub fn run_with_publish(
     // The step loop recorded `success` in the state backend before the recheck and the hooks,
     // so a run the recheck or a refused hook failed records the outcome its contract gives in
     // its place.
-    if changed_after_success || refused_after_success {
+    if changed_after_success || refused_after_success || outputs_failed {
         let _ = state.finish_run(&run_id, executed, outcome, total_retries);
     }
     // What the DuckDB the steps ran on reports, after the last step and hook, so the record
@@ -1094,6 +1123,7 @@ pub fn run_with_publish(
         step_outcomes: &step_outcomes,
         steps_engine,
         possible_copies,
+        outputs,
     });
     if let Err(e) = contract::write_contract(&runs_dir, &run_id, &run_contract) {
         eprintln!(

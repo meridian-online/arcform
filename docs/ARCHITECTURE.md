@@ -115,6 +115,25 @@ Every operator in `DESCRIBED`, the Rust ones included, has `operators/<name>/REA
 
 `AssetKind` in `src/asset_kind.rs` classifies every name the graph holds: `file` (hashed by its bytes), `directory` (hashed as a manifest of its contents), `pattern` (a glob, never hashed itself), `table` (never hashed; staleness comes from the producing step) and `remote`. A `remote` asset is any `scheme://` URL a step reads or writes, named in the graph by the URL as written, from SQL (`FROM 'https://…'`, `read_csv('s3://…')`, `COPY … TO 's3://…'`) or from a manifest's `depends_on:`, `produces:` or `assets:`; a glob URL is remote, not a pattern. arc cannot read one from disk, so it is never hashed and never checked as missing, and a step that reads or produces one is forced stale on every run, by an explicit check that holds for every kind of step rather than by leaving the asset out of the hash. `file://` counts as remote, because arc does not strip the scheme and so cannot hash the file; forcing the step stale never reports a false "unchanged". The run contract names the kind `remote`, with no path, size or hash, and its version tag is unchanged. `http_fetch`'s `url` is a configuration value, not an asset, since `fetch_cache` already handles its freshness. A follow-up would replace the forced rerun with a conditional check, an ETag or Last-Modified comparison for `https://` and the object's ETag for `s3://`.
 
+### Declared outputs
+
+A Protocol names the finished files it leaves for publishing in an optional top-level `outputs:` list in `arcform.yaml`, each a path relative to the Protocol's folder, a file or a directory:
+
+```yaml
+outputs:
+  - build/gleif.parquet
+  - datapackage.json
+```
+
+Load refuses an absolute path, a `..`, `.` or empty component, a duplicate (a trailing `/` is dropped first), `build` itself and anything under `build/.arcform/`, which holds arc's run state (`validate_outputs` in `src/manifest.rs`). After the last step of a run that would otherwise succeed, and before the hooks, arc checks each output is there and is a regular file or a directory holding only regular files and directories; anything else, a symlink at any depth among them, fails the run with a failed step's exit code, naming the path, so `on_failure` runs and `on_success` does not (`contract::list_outputs`). After the last hook arc hashes them, so the record holds each file as the run left it, and an output a hook removed fails the run there.
+
+The run record (`build/.arcform/runs/<run_id>.json`) carries `outputs`: one entry per declared path, in manifest order, with `path` (without a trailing `/`), `kind` (`file` or `directory`) and `files`, each `{path, bytes, sha256}` relative to the Protocol. A file output lists itself; a directory lists every file under it, sorted by the bytes of their paths. A failed run records an empty list. The field was added under `b4/1` with `#[serde(default)]`, so a record written before it reads with the list empty. Beyond the check and the record, `outputs:` changes nothing about a local run.
+
+The runner image uploads exactly the files this list names (see "The runner image"), which is why the declaration lives in arc rather than in the runner. The rulings behind it, from the design approved on 2026-11-13:
+
+- **The Protocol declares its outputs; arc checks and records them, and the runner reads the record, never `arcform.yaml`.** Two alternatives were rejected. Uploading every file the record says a run produced would ship raw downloads (GLEIF's is about 470 MB) beside the dataset, and only finished outputs should leave a hosted run, since every byte out of AWS is charged and counts against a subscriber's allowance. Uploading what `datapackage.json` lists does not work because the open datasets' descriptors give each resource's published URL as its `path`, not the file in the build, and a Protocol without a descriptor would upload nothing. A fixed `outputs/` folder by convention was dropped because nothing would check it, and the open datasets' publish already reads `build/<name>.parquet` and `datapackage.json` where they are.
+- **A missing declared output fails the run in arc itself, locally too**, so a Protocol that stops writing an output is caught before a hosted run uploads an incomplete set.
+
 ### Publishing into a lake
 
 `ducklake_write@1` (`src/operator/ducklake_write.rs`, on the building blocks in `src/lake/`, compiled under `http-fetch`) ends a Protocol by writing one or more tables into a DuckLake catalogue held in S3-compatible object storage, Cloudflare R2 for Meridian's open lake, as one snapshot. Publishing used to happen outside the run, in scripts that uploaded files and rebuilt the catalogue from scratch; now the run record showing the step succeeded is the provenance. Readers attach the catalogue over https with no credentials and no server, and R2 charges no egress.
@@ -261,7 +280,7 @@ The structural test proves a skill names only what arc has, not that an agent pi
 
 ## Key types
 
-- **`Manifest`** — top-level project config loaded from `arcform.yaml`. Contains `name`, `engine`, `engine_version`, `db`, `steps`, `assets`.
+- **`Manifest`** — top-level project config loaded from `arcform.yaml`. Contains `name`, `engine`, `engine_version`, `db`, `steps`, `assets`, `outputs`.
 - **`Step`** — a pipeline step. Either `sql` (path to .sql file) or `command` (shell string). Has `produces`, `depends_on`, `preconditions`.
 - **`Precondition`** — typed freshness check. Variants: `modified_after` (file age), `fresh` (a fetched artifact's recorded identity vs. the remote), `command` (shell exit code), `tool` (the identity of an external binary or artifact the step did not produce — a reported version or a content hash). AND semantics — all must pass to skip.
 - **`AssetOverride`** — manual asset dependency declaration (for command steps; SQL steps auto-discover).
@@ -276,6 +295,7 @@ The structural test proves a skill names only what arc has, not that an agent pi
    - SQL steps: delegate to engine CLI (`duckdb <db> -f <file.sql>`)
    - Command steps: shell execution with real-time stdout streaming
 4. Update run state after each step
+5. Check the declared `outputs:` are there (before the hooks), run the hooks, then hash the outputs into the run record
 
 ## Runtime dependencies
 

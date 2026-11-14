@@ -262,6 +262,11 @@ pub enum Error {
     #[error("{0}")]
     SqlReader(String),
 
+    // A path the manifest's `outputs:` declares is not there after the last step, or is
+    // something arc does not record as an output. Fails the run with a failed step's code.
+    #[error("declared output '{path}' cannot be recorded: {why}")]
+    OutputMissing { path: String, why: String },
+
     #[error("step '{step}' failed (exit code {code}):\n{stderr}")]
     StepFailed {
         step: String,
@@ -390,6 +395,7 @@ impl Error {
     pub(crate) fn exit_code(&self) -> i32 {
         match self {
             Error::StepFailed { .. }
+            | Error::OutputMissing { .. }
             | Error::StepExecution { .. }
             | Error::Precondition { .. }
             | Error::ToolPrecondition { .. }
