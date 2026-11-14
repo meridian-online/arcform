@@ -176,6 +176,22 @@ fn an_output_a_hook_removes_fails_the_run() {
 }
 
 #[test]
+fn an_output_that_cannot_be_read_names_why() {
+    // A file where the path needs a folder: reading it fails with ENOTDIR, not NotFound.
+    let dir = project(
+        "name: outs\nsteps:\n  - name: write\n    command: printf x > build/x.txt\noutputs:\n  - build/x.txt/y\n",
+        None,
+    );
+    let (code, _, stderr) = common::arc_run_raw(dir.path());
+    assert_ne!(code, Some(0));
+    assert!(
+        stderr.contains("build/x.txt/y") && stderr.contains("could not be read"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("did not leave it"), "{stderr}");
+}
+
+#[test]
 fn no_outputs_records_empty_list() {
     let dir = project(
         "name: outs\nsteps:\n  - name: ok\n    command: 'true'\n",
