@@ -135,8 +135,8 @@ def build_inputs(con: duckdb.DuckDBPyConnection, edgar_path: str, gleif_path: st
     gleif_in_sql = blocking_select("gleif_src", "country")
     con.execute(f"CREATE OR REPLACE TABLE edgar_in AS {edgar_in_sql};")
     con.execute(f"CREATE OR REPLACE TABLE gleif_in AS {gleif_in_sql};")
-    e = con.sql("SELECT count(*) FROM edgar_in").fetchone()[0]
-    g = con.sql("SELECT count(*) FROM gleif_in").fetchone()[0]
+    e = con.sql("SELECT count(*) FROM edgar_in").fetchall()[0][0]
+    g = con.sql("SELECT count(*) FROM gleif_in").fetchall()[0][0]
     print(f"[inputs] edgar(ticker-grain)={e:,}  gleif(all statuses{'/sampled' if sample else ''})={g:,}")
 
 
@@ -220,7 +220,7 @@ def run(edgar_path: str, gleif_path: str, out_path: str, sample: int) -> None:
         FROM ranked WHERE rn=1;
     """)
 
-    edgar_rows = con.sql("SELECT count(*) FROM edgar_src").fetchone()[0]
+    edgar_rows = con.sql("SELECT count(*) FROM edgar_src").fetchall()[0][0]
     print(f"\n[coverage] of {edgar_rows:,} EDGAR ticker-rows:")
     print(con.sql(f"""
         SELECT status, count(*) AS n,
@@ -231,7 +231,7 @@ def run(edgar_path: str, gleif_path: str, out_path: str, sample: int) -> None:
         FROM edges GROUP BY status
         ORDER BY array_position(['confirmed','ambiguous','candidate','weak'], status);
     """).df().to_string(index=False))
-    conf = con.sql("SELECT count(*) FROM edges WHERE status IN ('confirmed','ambiguous')").fetchone()[0]
+    conf = con.sql("SELECT count(*) FROM edges WHERE status IN ('confirmed','ambiguous')").fetchall()[0][0]
     print(f"\n[confident universe] confirmed+ambiguous = {conf:,} "
           f"({round(100.0*conf/edgar_rows,1)}% of ticker-rows)")
 
