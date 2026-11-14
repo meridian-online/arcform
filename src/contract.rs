@@ -563,8 +563,9 @@ pub fn build_contract(inp: ContractInputs) -> Contract {
 /// Each declared output's files, without reading their bytes: for each path in `outputs`,
 /// its kind and its files' paths relative to `dir`, sorted by the bytes of their paths.
 /// Fails naming the first output that is missing, and anything that is neither a regular
-/// file nor a directory (a symlink, at the top or inside a directory, among them), since
-/// nothing but a regular file inside the Protocol is uploaded.
+/// file nor a directory (a symlink, at the top, inside a directory or as a folder on the
+/// declared path, among them), since nothing but a regular file inside the Protocol is
+/// uploaded.
 pub fn list_outputs(
     dir: &Path,
     outputs: &[String],
@@ -572,11 +573,30 @@ pub fn list_outputs(
     let mut listed = Vec::with_capacity(outputs.len());
     for declared in outputs {
         let path = declared.trim_end_matches('/').to_string();
+        // A folder on the way that is a symlink could lead out of the Protocol.
+        let mut parent = dir.to_path_buf();
+        let parts: Vec<&str> = path.split('/').collect();
+        for part in &parts[..parts.len() - 1] {
+            parent.push(part);
+            if std::fs::symlink_metadata(&parent).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(crate::error::Error::OutputMissing {
+                    path: path.clone(),
+                    why: format!(
+                        "the folder {} on its path is a symlink, which is not followed",
+                        parent.strip_prefix(dir).unwrap_or(&parent).display()
+                    ),
+                });
+            }
+        }
         let full = dir.join(&path);
         let meta =
-            std::fs::symlink_metadata(&full).map_err(|_| crate::error::Error::OutputMissing {
+            std::fs::symlink_metadata(&full).map_err(|e| crate::error::Error::OutputMissing {
                 path: path.clone(),
-                why: "the run did not leave it".to_string(),
+                why: if e.kind() == std::io::ErrorKind::NotFound {
+                    "the run did not leave it".to_string()
+                } else {
+                    format!("it could not be read: {e}")
+                },
             })?;
         if meta.is_file() {
             listed.push((path.clone(), "file".to_string(), vec![path]));

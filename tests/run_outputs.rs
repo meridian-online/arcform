@@ -138,6 +138,44 @@ fn a_symlink_output_fails_the_run() {
 }
 
 #[test]
+fn a_symlinked_folder_on_an_outputs_path_fails_the_run() {
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::write(elsewhere.path().join("x.txt"), "outside").unwrap();
+    let dir = project(
+        &format!(
+            "name: outs\nsteps:\n  - name: link\n    command: ln -s {} link\noutputs:\n  - link/x.txt\n",
+            elsewhere.path().display()
+        ),
+        None,
+    );
+    let (code, _, stderr) = common::arc_run_raw(dir.path());
+    assert_ne!(code, Some(0));
+    assert!(
+        stderr.contains("link/x.txt") && stderr.contains("symlink"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn an_output_a_hook_removes_fails_the_run() {
+    let dir = project(
+        "name: outs\nsteps:\n  - name: write\n    command: printf x > build/x.txt\noutputs:\n  - build/x.txt\nhooks:\n  on_success:\n    name: remove\n    command: rm build/x.txt\n",
+        None,
+    );
+    let (code, _, stderr) = common::arc_run_raw(dir.path());
+    let failed_step = project(
+        "name: fails\nsteps:\n  - name: bad\n    command: 'false'\n",
+        None,
+    );
+    let (failed_code, _, _) = common::arc_run_raw(failed_step.path());
+    assert_eq!(code, failed_code, "{stderr}");
+    assert!(stderr.contains("build/x.txt"), "{stderr}");
+    let record = record(dir.path());
+    assert_ne!(record["run"]["outcome"], "success");
+    assert_eq!(record["outputs"], serde_json::json!([]));
+}
+
+#[test]
 fn no_outputs_records_empty_list() {
     let dir = project(
         "name: outs\nsteps:\n  - name: ok\n    command: 'true'\n",
