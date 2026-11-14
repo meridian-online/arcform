@@ -6,12 +6,16 @@
 #   fetch     fetch the Protocol's repository at its pinned commit
 #   run       `arc run` as the unprivileged user `protocol`, renewing the
 #             credential in the background while it runs
+#   outputs   after a run that succeeded, upload each file arc's run record
+#             lists under the Protocol's declared outputs, then the record
+#             itself as run.json, the sign that every output arrived
 #   upload    write the run log where the exchange's reply said
 #
 # It exits 0 when the run and the upload succeed. Otherwise it exits with the
 # code of the first step that failed, and its last line names that step:
 #
-#   10 inputs   11 exchange   12 fetch   13 run   14 upload   15 interrupted
+#   10 inputs   11 exchange   12 fetch   13 run   14 outputs or upload
+#   15 interrupted
 #
 # The credential, the renewal token and the run log stay in a directory only
 # root can read. No Protocol step sees them: steps run as `protocol`, with an
@@ -36,6 +40,8 @@ readonly REF_RE="^($NAME_RE)/($NAME_RE)@([0-9a-f]{40})\$"
 readonly BUCKET_RE='^[a-z0-9][a-z0-9.-]{1,62}$'
 readonly REGION_RE='^[a-z0-9-]{1,32}$'
 readonly PREFIX_RE='^([A-Za-z0-9_.-]+/)+$'
+# One PUT carries up to 5 GiB; a larger output is refused, not split.
+readonly MAX_OUTPUT_BYTES=5368709120
 
 log_open=0      # 1 once run.log exists; 0 again once its upload has begun
 finishing=0     # 1 once finish has begun
@@ -46,6 +52,8 @@ child_pid=""    # the git command or arc run under way, run in the background so
 tail_pid=""
 interrupted=0
 protocol_ran=0  # 1 once arc run has ended
+uploading_outputs=0  # 1 while the outputs step runs
+upload_pid=""   # the curl of an upload under way, run in the background as child_pid is
 
 say() {
   if [[ $log_open == 1 ]]; then
@@ -88,6 +96,8 @@ finish() {
   local code=$1 step=$2 detail=${3:-}
   local upload_ok=1
   finishing=1
+  # The log's upload is never stopped as an output's would be.
+  uploading_outputs=0
   if [[ $code != 0 ]]; then
     say "failed at $step${detail:+: $detail}"
   else
@@ -112,6 +122,13 @@ on_signal() {
   interrupted=1
   # An upload under way finishes, and keeps the exit code it was given.
   [[ $finishing == 1 ]] && return 0
+  if [[ $uploading_outputs == 1 ]]; then
+    # The outputs step sees `interrupted`, abandons the rest and goes to the
+    # log: a Spot interruption gives two minutes, and the log matters more
+    # than a partial set of outputs.
+    if [[ -n $upload_pid ]]; then kill -TERM "$upload_pid" 2>/dev/null || true; fi
+    return 0
+  fi
   if [[ -n $child_pid ]]; then
     # wait_child sees `interrupted` and finishes once the child has stopped.
     kill -TERM "$child_pid" 2>/dev/null || true
@@ -216,29 +233,75 @@ renew_loop() {
   done
 }
 
-upload_log() {
-  local cred="$STATE/credential.upload.json" sealed="$STATE/run.log.sealed" akid secret session hash url
-  # Upload a copy, which the renewal loop cannot append to meanwhile, without
-  # the terminal colour codes arc writes.
-  sed 's/\x1b\[[0-9;?]*[ -\/]*[@-~]//g' "$LOG" >"$sealed" || return 1
-  # Sign with one credential throughout: the renewal loop may replace
-  # credential.json between reads, and it renames a whole file into place, so
-  # a copy holds one credential.
+# url_key KEY: KEY with each /-separated segment percent-encoded once, every
+# byte but A-Z a-z 0-9 - _ . ~, as S3 expects in a signed path.
+url_key() {
+  jq -rn --arg k "$1" '$k | split("/") | map(@uri) | join("/")'
+}
+
+# upload_file KEY PATH CONTENT_TYPE HASH: PUT PATH at <prefix>KEY in the
+# bucket, HASH being its SHA-256. Signs with one credential throughout: the
+# renewal loop may replace credential.json between reads, and it renames a
+# whole file into place, so a copy holds one credential. curl runs in the
+# background so a stop is handled at once; on_signal stops it during the
+# outputs step.
+upload_file() {
+  local key=$1 path=$2 type=$3 hash=$4 cred="$STATE/credential.upload.json" akid secret session url rc
   cp "$STATE/credential.json" "$cred" || return 1
   akid=$(jq -r '.access_key_id' "$cred") || return 1
   secret=$(jq -r '.secret_access_key' "$cred") || return 1
   session=$(jq -r '.session_token' "$cred") || return 1
-  hash=$(sha256sum "$sealed" | cut -d' ' -f1) || return 1
-  url="$STORAGE_ENDPOINT/$STORAGE_BUCKET/${LOG_PREFIX}run.log"
+  url="$STORAGE_ENDPOINT/$STORAGE_BUCKET/$(url_key "$LOG_PREFIX$key")" || return 1
+  # A transfer slower than 1 KB/s for a minute fails rather than holding the run.
   {
     printf 'user = "%s:%s"\n' "$akid" "$secret"
     printf 'header = "x-amz-security-token: %s"\n' "$session"
-  } | curl --config - --fail --silent --show-error --max-time 120 --retry 3 \
+  } | curl --config - --fail --silent --show-error --retry 3 --globoff \
+        --connect-timeout 10 --speed-limit 1000 --speed-time 60 \
         --aws-sigv4 "aws:amz:$STORAGE_REGION:s3" \
         -H "x-amz-content-sha256: $hash" \
-        -H 'Content-Type: text/plain; charset=utf-8' \
-        --upload-file "$sealed" --output /dev/null "$url" >&2 || return 1
+        -H "Content-Type: $type" \
+        --upload-file "$path" --output /dev/null "$url" >&2 &
+  upload_pid=$!
+  # A stop that came before curl started has no curl to stop yet.
+  if [[ $interrupted == 1 && $uploading_outputs == 1 ]]; then
+    kill -TERM "$upload_pid" 2>/dev/null || true
+  fi
+  while :; do
+    rc=0
+    wait "$upload_pid" || rc=$?
+    [[ -e /proc/$upload_pid ]] && continue
+    break
+  done
+  upload_pid=""
+  return "$rc"
+}
+
+upload_log() {
+  local sealed="$STATE/run.log.sealed" hash
+  # Upload a copy, which the renewal loop cannot append to meanwhile, without
+  # the terminal colour codes arc writes.
+  sed 's/\x1b\[[0-9;?]*[ -\/]*[@-~]//g' "$LOG" >"$sealed" || return 1
+  hash=$(sha256sum "$sealed" | cut -d' ' -f1) || return 1
+  upload_file run.log "$sealed" 'text/plain; charset=utf-8' "$hash" || return 1
   printf 'arc-runner: wrote the run log to %s/%s\n' "$STORAGE_BUCKET" "${LOG_PREFIX}run.log" >&2
+}
+
+# inside_checkout PATH: PATH is no symlink and resolves to a regular file
+# inside the checkout. Prints why not, and fails, otherwise.
+inside_checkout() {
+  local path=$1 real
+  if [[ -L $path ]]; then echo "it is a symlink"; return 1; fi
+  real=$(realpath -e -- "$path" 2>/dev/null) || { echo "it is not there"; return 1; }
+  if [[ $real != "$WORK"/* ]]; then echo "it resolves outside the checkout"; return 1; fi
+  if [[ ! -f $real || -L $real ]]; then echo "it is not a regular file"; return 1; fi
+}
+
+# stop_if_interrupted: end the outputs step as interrupted when a stop came.
+stop_if_interrupted() {
+  if [[ $interrupted == 1 ]]; then
+    finish 15 interrupted "stopped during the output upload"
+  fi
 }
 
 # ---- inputs -------------------------------------------------------------------
@@ -393,4 +456,93 @@ if [[ $arc_status != 0 ]]; then
   failed_step=$(grep -o "step '[^']*' failed" "$LOG" | tail -n 1 || true)
   finish 13 run "${failed_step:+$failed_step; }arc exited $arc_status"
 fi
-finish 0 run
+
+# ---- outputs ------------------------------------------------------------------
+
+step=outputs
+step_code=14
+uploading_outputs=1
+say "uploading the run's outputs"
+
+# Nothing the Protocol left running may rewrite a file between the check of its
+# hash and its upload.
+# Kill on every pass, so a process forked during one kill dies on the next.
+for _ in $(seq 1 50); do
+  pkill -KILL -u "$PROTOCOL_USER" 2>/dev/null || true
+  pgrep -u "$PROTOCOL_USER" >/dev/null || break
+  sleep 0.1
+done
+if pgrep -u "$PROTOCOL_USER" >/dev/null; then
+  finish 14 outputs "processes the Protocol left running could not be stopped"
+fi
+stop_if_interrupted
+
+# The run record arc wrote. More than one would leave the wrong run's list to
+# upload, so that fails the step; so does a record a Protocol step replaced
+# with a link out of the checkout.
+shopt -s nullglob
+records=("$WORK"/build/.arcform/runs/*.json)
+shopt -u nullglob
+if ((${#records[@]} != 1)); then
+  names=$(printf '%s ' "${records[@]##*/}")
+  finish 14 outputs "expected one run record under build/.arcform/runs/, found ${#records[@]}${names:+: ${names% }}"
+fi
+why=$(inside_checkout "${records[0]}") || finish 14 outputs "the run record ${records[0]##*/} is refused: $why"
+record="$STATE/run.json"
+cp -- "${records[0]}" "$record" || finish 14 outputs "could not copy the run record"
+
+# Each file as "<sha256>\t<bytes>\t<path>", one per line, tab-separated so a
+# path keeps any leading or trailing space. Paths with a control
+# character, an absolute path or a '.', '..' or empty segment are refused here,
+# so a key never leaves the run's prefix.
+listing="$STATE/outputs.txt"
+if ! jq -r '
+    (.outputs // []) as $o
+    | if ($o | type) != "array" then error("outputs is not a list") else . end
+    | $o[] | (.files // error("an output has no files"))[]
+    | if (.path | type) != "string" or (.path | explode | any(. < 32 or . == 127))
+         or (.path | startswith("/")) or ("/" + .path + "/" | test("/(\\.\\.?)?/"))
+      then error("a file path is not a plain relative path")
+      elif (.sha256 | type) != "string" or (.sha256 | test("^[0-9a-f]{64}$") | not)
+      then error("a sha256 is malformed")
+      elif (.bytes | type) != "number" then error("a size is not a number")
+      else "\(.sha256)\t\(.bytes)\t\(.path)" end
+  ' "$record" >"$listing" 2>"$STATE/outputs.err"; then
+  finish 14 outputs "the run record's outputs are malformed: $(head -c 200 "$STATE/outputs.err")"
+fi
+declared=$(jq '(.outputs // []) | length' "$record")
+
+files=0
+total=0
+while IFS=$'\t' read -r sha bytes rel; do
+  stop_if_interrupted
+  path="$WORK/$rel"
+  why=$(inside_checkout "$path") || finish 14 outputs "output $rel is refused: $why"
+  size=$(stat -c %s -- "$path") || finish 14 outputs "could not read output $rel"
+  if ((size > MAX_OUTPUT_BYTES)); then
+    finish 14 outputs "output $rel is $size bytes, over the 5 GiB one upload carries"
+  fi
+  actual=$(sha256sum -- "$path" | cut -d' ' -f1) || finish 14 outputs "could not read output $rel"
+  if [[ $actual != "$sha" || $size != "$bytes" ]]; then
+    finish 14 outputs "output $rel changed after arc recorded it"
+  fi
+  stop_if_interrupted
+  if ! upload_file "outputs/$rel" "$path" application/octet-stream "$sha"; then
+    stop_if_interrupted
+    finish 14 outputs "could not upload output $rel"
+  fi
+  files=$((files + 1))
+  total=$((total + size))
+done <"$listing"
+stop_if_interrupted
+
+# Last, and only once every output has arrived: a folder holding run.json holds
+# a complete set.
+record_hash=$(sha256sum "$record" | cut -d' ' -f1)
+if ! upload_file run.json "$record" application/json "$record_hash"; then
+  stop_if_interrupted
+  finish 14 outputs "could not upload the run record"
+fi
+uploading_outputs=0
+say "wrote $declared outputs: $files files, $total bytes"
+finish 0 outputs

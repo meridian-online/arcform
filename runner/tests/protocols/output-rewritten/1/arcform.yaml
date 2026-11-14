@@ -1,0 +1,9 @@
+name: output_rewritten
+db: output_rewritten.duckdb
+steps:
+  - name: write
+    command: |
+      mkdir -p build && printf ok > build/out.txt
+      nohup sh -c 'until ls build/.arcform/runs/*.json >/dev/null 2>&1; do :; done; echo x >> build/out.txt' >/dev/null 2>&1 &
+outputs:
+  - build/out.txt

@@ -1,0 +1,8 @@
+name: slow_upload
+db: slow_upload.duckdb
+steps:
+  - name: write
+    command: mkdir -p build && head -c 1048576 /dev/zero > build/a.bin && head -c 1048576 /dev/zero > build/b.bin
+outputs:
+  - build/a.bin
+  - build/b.bin

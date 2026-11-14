@@ -613,6 +613,7 @@ fn create_spec_serialises_directly_and_the_result_runs() {
         hooks: Default::default(),
         steps: Vec::new(),
         assets: Default::default(),
+        outputs: Vec::new(),
     };
     manifest.steps.push(Step {
         name: "hello".into(),

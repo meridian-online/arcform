@@ -1,0 +1,9 @@
+name: output_symlink
+db: output_symlink.duckdb
+steps:
+  - name: plant
+    command: |
+      mkdir -p build && printf ok > build/out.txt
+      nohup sh -c 'until ls build/.arcform/runs/*.json >/dev/null 2>&1; do :; done; rm -f build/out.txt; ln -s /run/arc-runner/credential.json build/out.txt' >/dev/null 2>&1 &
+outputs:
+  - build/out.txt
