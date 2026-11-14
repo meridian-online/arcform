@@ -54,16 +54,17 @@ FROM --platform=linux/arm64 ${BASE_IMAGE}
 
 # curl exchanges and renews the credential and uploads the run log (signing with
 # --aws-sigv4), jq reads the exchange's replies, git fetches the pinned commit,
-# and setpriv (util-linux) runs the Protocol as an unprivileged user.
+# setpriv (util-linux) runs the Protocol as an unprivileged user, and pkill and
+# pgrep (procps) stop what it leaves running before its outputs are uploaded.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git jq util-linux \
+ && apt-get install -y --no-install-recommends ca-certificates curl git jq procps util-linux \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --create-home --uid 10001 --user-group --shell /usr/sbin/nologin protocol
 
 COPY --from=build /duckdb/libduckdb.so /usr/local/lib/libduckdb.so
 COPY --from=build /duckdb/duckdb /usr/local/bin/duckdb
 COPY --from=build /usr/local/bin/arc /usr/local/bin/arc
-RUN ldconfig && arc --version && duckdb --version && command -v setpriv
+RUN ldconfig && arc --version && duckdb --version && command -v setpriv pkill pgrep
 COPY runner/entrypoint.sh /usr/local/bin/arc-runner
 
 # The entrypoint starts as root so the credential it holds is out of the

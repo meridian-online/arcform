@@ -125,7 +125,7 @@ outputs:
   - datapackage.json
 ```
 
-Load refuses an absolute path, a `..`, `.` or empty component, a duplicate (a trailing `/` is dropped first), `build` itself and anything under `build/.arcform/`, which holds arc's run state (`validate_outputs` in `src/manifest.rs`). After the last step of a run that would otherwise succeed, and before the hooks, arc checks each output is there and is a regular file or a directory holding only regular files and directories; anything else, a symlink at any depth among them, fails the run with a failed step's exit code, naming the path, so `on_failure` runs and `on_success` does not (`contract::list_outputs`). After the last hook arc hashes them, so the record holds each file as the run left it, and an output a hook removed fails the run there.
+Load refuses an absolute path, a `..`, `.` or empty component, a duplicate (a trailing `/` is dropped first), `build` itself and anything under `build/.arcform/`, which holds arc's run state (`validate_outputs` in `src/manifest.rs`). After the last step of a run that would otherwise succeed, and before the hooks, arc checks each output is there and is a regular file or a directory holding only regular files and directories; anything else, a symlink at any depth among them (a folder on the declared path included), fails the run with a failed step's exit code, naming the path, so `on_failure` runs and `on_success` does not (`contract::list_outputs`). After the last hook arc hashes them, so the record holds each file as the run left it, and an output a hook removed fails the run there.
 
 The run record (`build/.arcform/runs/<run_id>.json`) carries `outputs`: one entry per declared path, in manifest order, with `path` (without a trailing `/`), `kind` (`file` or `directory`) and `files`, each `{path, bytes, sha256}` relative to the Protocol. A file output lists itself; a directory lists every file under it, sorted by the bytes of their paths. A failed run records an empty list. The field was added under `b4/1` with `#[serde(default)]`, so a record written before it reads with the list empty. Beyond the check and the record, `outputs:` changes nothing about a local run.
 
@@ -214,7 +214,14 @@ Both URLs must be `https`. `ARC_RUNNER_INSECURE_HTTP=1` allows `http`, for the t
    `storage.region` defaults to `auto`. The renewal token lasts the run. The token is good for one exchange, so the request is sent again only when curl could not reach the host at all; after a timeout or an error answer the step fails, since the token may already be spent. The log's prefix must be a folder ending `runs/<RUN_ID>/`, either `runs/<RUN_ID>/` itself or under another folder; any other prefix is refused, so a reply meant for another run cannot direct this run's log there.
 3. **fetch**: fetches the pinned commit alone (`git fetch --depth 1 <repo> <commit>`) into an empty repository, failing if the transfer stays under 1 KB/s for a minute, checks it out, and checks that `HEAD` is that commit and that `arcform.yaml` is at the root. A commit the server does not hold fails here.
 4. **run**: `arc run` in the checkout. Its output goes to the run log and is streamed to standard output, which the operator's logs keep.
-5. **upload**: puts the log at `<prefix>run.log` in the bucket with an S3 `PUT`, signed with AWS Signature Version 4 by curl's `--aws-sigv4` using the current credential and its session token, and with the body's SHA-256 as `x-amz-content-sha256`. Terminal colour codes are taken out of the uploaded copy.
+5. **outputs**, after a run that succeeded: uploads the Protocol's declared outputs (see "Declared outputs") and the run record, reading arc's record and never `arcform.yaml`:
+   1. Kills every process left running as `protocol` (`pkill -KILL -u protocol`, then waits up to five seconds for none to remain), so nothing rewrites a file between the check of its hash and its upload.
+   2. Reads the one run record under `build/.arcform/runs/`; none, or more than one (a Protocol that committed its own), fails the step, naming them. The record must itself pass the file check below, and a copy is taken into the runner's state directory.
+   3. For each file the record lists, in its order: refuses a path that is absolute, has a `.`, `..` or empty segment or a control character, so a key never leaves the run's prefix; refuses the file unless it is no symlink and resolves (`realpath -e`) to a regular file inside the checkout, so a link to the runner's own state is never read; refuses it over 5 GiB, the most one `PUT` carries; and refuses it when its size or SHA-256 differs from the record's.
+   4. Uploads each file to `<prefix>outputs/<path>`, keeping its path, each segment percent-encoded once, signed as the log is with a fresh copy of the current credential.
+   5. Uploads the record to `<prefix>run.json`, last. **`run.json` is the completion marker: it is uploaded only once every output has been, so a run folder without it holds no finished set.**
+   6. Says how many declared outputs, files and bytes it wrote (`wrote 2 outputs: 3 files, 1234 bytes`), in the log and the container's output, so a hosted run's bytes out can be measured.
+6. **upload**: puts the log at `<prefix>run.log` in the bucket with an S3 `PUT`, signed with AWS Signature Version 4 by curl's `--aws-sigv4` using the current credential and its session token, and with the body's SHA-256 as `x-amz-content-sha256`. Terminal colour codes are taken out of the uploaded copy.
 
 Once the exchange has succeeded, every later failure still uploads the log, an unexpected one included (an `EXIT` trap ends in the same path, naming the step under way). The exit code names the first step that failed, and so does the last line of output (`arc-runner: failed at <step>: …`); for a failed Protocol step, that line also names the step arc reported, as `step '<name>' failed`:
 
@@ -225,8 +232,20 @@ Once the exchange has succeeded, every later failure still uploads the log, an u
 | 11 | exchange |
 | 12 | fetch |
 | 13 | run: a Protocol step failed |
-| 14 | upload, after a run that succeeded |
-| 15 | interrupted: a `SIGTERM` or `SIGINT` reached the entrypoint; the git command or `arc run` under way is stopped, given ten seconds, and the log uploaded |
+| 14 | outputs or upload, after a run that succeeded: an output or the record was refused or did not upload, or the log did not upload |
+| 15 | interrupted: a `SIGTERM` or `SIGINT` reached the entrypoint; the git command or `arc run` under way is stopped, given ten seconds, and the log uploaded. A stop during the outputs step stops the upload under way, abandons the rest and `run.json`, and goes straight to the log |
+
+What each outcome leaves under the prefix:
+
+| Case | Uploaded | Exit |
+|---|---|---|
+| the run succeeds and its outputs upload | the outputs, `run.json`, `run.log` | 0 |
+| the run succeeds and declares no outputs | `run.json`, `run.log` | 0 |
+| a step fails, or a declared output is missing | `run.log` | 13 |
+| an output is refused or its upload fails | the outputs before it, `run.log`; no `run.json` | 14 |
+| stopped during the output upload | the outputs before the stop, `run.log`; no `run.json` | 15 |
+
+The rulings behind the outputs step, from the design approved on 2026-11-13: outputs keep their paths under `<prefix>outputs/` and the record sits beside the log as `run.json`; a failed or interrupted run never uploads `run.json`, so a reader can tell a complete set from a partial one without trusting timing; a stop abandons the outputs for the log, because a Spot interruption gives two minutes and the log matters more than a partial dataset; and a file over 5 GiB is refused rather than split, since multipart upload is not needed for any open dataset today. The exchange's reply did not change: outputs go under the log's prefix.
 
 Each git command and `arc run` run in the background while the entrypoint waits on them, because bash runs a signal's handler only between commands: a stop during a foreground fetch would wait for the fetch to end. A signal that arrives while the log is being uploaded lets the upload finish and keeps its exit code.
 
@@ -249,6 +268,13 @@ Each git command and `arc run` run in the background while the entrypoint waits 
 - `fails_a_stalled_fetch`: left alone, a run against that silent server fails at fetch after a minute, exits 12, and uploads the log with git's reason. The test takes that minute.
 - `refuses_a_reference_without_a_full_commit` (a branch name, and a 64-digit commit), `fails_fetch_of_an_unknown_commit` and `refuses_a_spent_token`: exits 10, 12 and 11, and a refused reference does not spend the token.
 - `does_not_repeat_an_exchange_that_was_answered`: an exchange that spends the token and answers 503 gets one request, and the run exits 11.
+- `runs_pinned_protocol_with_outputs`: a file output and a directory output with a nested folder exit 0; each of the record's files lands under `outputs/` with the record's SHA-256, in the record's order, then `run.json`, then `run.log`, and the log counts them.
+- `uploads_no_outputs_when_a_step_fails`: a Protocol that declares outputs and fails a step exits 13 and writes `run.log` alone.
+- `refuses_an_output_outside_the_checkout`: a leftover process swaps a hashed output for a link to the runner's credential once arc has written its record; the step exits 14, writes `run.log` alone, and no object holds any credential part.
+- `refuses_an_output_changed_after_the_run`: a leftover process appends to an output once arc has written its record; the hash check refuses it, and only `run.log` is written.
+- `uploads_an_output_with_a_space_in_its_name`: `build/my out.csv` lands at `outputs/build/my out.csv`, its signature checked.
+- `refuses_more_than_one_run_record`: a Protocol that committed a run record of its own exits 14, naming both.
+- `stopped_during_output_upload`: with each output's `PUT` held five seconds, `docker stop` two seconds into the upload exits 15 and writes `run.log` without `run.json` or the second output.
 
 CI's `runner-image` job builds the image on an arm64 runner, shellchecks the scripts and runs these tests.
 

@@ -1,0 +1,10 @@
+name: with_outputs
+db: with_outputs.duckdb
+steps:
+  - name: parts
+    command: mkdir -p build/parts/sub && printf a > build/parts/a.txt && printf b > build/parts/sub/b.txt
+  - name: out
+    sql: models/out.sql
+outputs:
+  - build/out.parquet
+  - build/parts
