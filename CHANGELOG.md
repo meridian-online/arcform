@@ -59,6 +59,10 @@ Rationale for each change is recorded in the project's design notes and commit h
 - **The tests that need the finetype CLI, `tests/table_profile.rs`'s CLI tests and the skills' `needs=finetype` examples, now run in CI, and fail when it is missing.** CI installs finetype 0.6.62 and sets `ARCFORM_REQUIRE_FINETYPE_CLI`; they used to skip there.
 - **The eval preflight allows each URL 90 seconds instead of 30, and `PREFLIGHT_TIMEOUT` sets it.** A USGS dataset query answers in about 29 seconds, so the 30-second limit left it almost no margin.
 
+### Fixed
+
+- **The `splink_resolve` operator runs under DuckDB 2.0's Python package.** It declares `duckdb>=2,<3` but counted rows with `fetchone()` on a relation, which DuckDB 2.0 removed, so it stopped after loading its inputs with `AttributeError: Relations no longer have fetchone()`. It now uses `fetchall()`, which reads the whole result; `con.execute(...).fetchone()` was not used because DuckDB 2.0 then holds the unfinished result and refuses the connection's next query.
+
 ## [0.2.2] - 2026-10-24
 
 arc 0.2.2 moves arc onto DuckDB 2.0. arc is a single binary that runs a data pipeline, a Protocol, from a YAML manifest of SQL and shell steps, and reads each SQL step to work out which tables it reads and makes. From this release it links DuckDB 2.0, runs SQL steps on DuckDB 2.0's own `duckdb` command line, and works out each step's inputs and outputs from DuckDB's own parse of the SQL rather than a copy of DuckDB's grammar. The install script now installs DuckDB 2.0.0's release build for you when no suitable `duckdb` is found, and `arc run` warns when a Protocol last ran on a different DuckDB, since DuckDB 2.0 changes some results without an error.
