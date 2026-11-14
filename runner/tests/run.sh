@@ -316,16 +316,16 @@ expect "exit code 0, not $code" equals "$code" 0
 expect "no upload refused" equals "$(state | jq '.rejected_puts | length')" 0
 expect "run.json is written" contains "$(keys_under "$run")" "run.json"
 expect "run.log is written" contains "$(keys_under "$run")" "run.log"
-expect "the record lists three files" equals "$(jq '[.outputs[].files[]] | length' <<<"$record")" 3
+expect "the record lists four files" equals "$(jq '[.outputs[].files[]] | length' <<<"$record")" 4
 expect "the record lists the nested file" contains "$(jq -r '.outputs[].files[].path' <<<"$record")" "build/parts/sub/b.txt"
-while read -r path sha; do
+while IFS=$'\t' read -r path sha; do
   expect "outputs/$path is uploaded with the record's sha256" equals \
     "$(state | jq -r --arg k "sub_test/runs/$run/outputs/$path" '.objects[$k].sha256 // empty')" "$sha"
-done < <(jq -r '.outputs[].files[] | "\(.path) \(.sha256)"' <<<"$record")
+done < <(jq -r '.outputs[].files[] | "\(.path)\t\(.sha256)"' <<<"$record")
 expect "the uploads run in the record's order, run.json after the outputs, the log last" equals \
   "$(state | jq -r --arg p "sub_test/runs/$run/" '[.puts[].key | ltrimstr($p)] | join(" ")')" \
-  "outputs/build/out.parquet outputs/build/parts/a.txt outputs/build/parts/sub/b.txt run.json run.log"
-expect "the log counts the outputs" contains "$log" "wrote 2 outputs: 3 files"
+  "outputs/build/out.parquet outputs/build/parts/ edge .txt outputs/build/parts/a.txt outputs/build/parts/sub/b.txt run.json run.log"
+expect "the log counts the outputs" contains "$log" "wrote 2 outputs: 4 files"
 end
 
 # ---------------------------------------------------------------------------

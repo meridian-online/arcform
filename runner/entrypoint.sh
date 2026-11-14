@@ -96,6 +96,8 @@ finish() {
   local code=$1 step=$2 detail=${3:-}
   local upload_ok=1
   finishing=1
+  # The log's upload is never stopped as an output's would be.
+  uploading_outputs=0
   if [[ $code != 0 ]]; then
     say "failed at $step${detail:+: $detail}"
   else
@@ -261,6 +263,10 @@ upload_file() {
         -H "Content-Type: $type" \
         --upload-file "$path" --output /dev/null "$url" >&2 &
   upload_pid=$!
+  # A stop that came before curl started has no curl to stop yet.
+  if [[ $interrupted == 1 && $uploading_outputs == 1 ]]; then
+    kill -TERM "$upload_pid" 2>/dev/null || true
+  fi
   while :; do
     rc=0
     wait "$upload_pid" || rc=$?
@@ -484,7 +490,8 @@ why=$(inside_checkout "${records[0]}") || finish 14 outputs "the run record ${re
 record="$STATE/run.json"
 cp -- "${records[0]}" "$record" || finish 14 outputs "could not copy the run record"
 
-# Each file as "<sha256> <bytes> <path>", one per line. Paths with a control
+# Each file as "<sha256>\t<bytes>\t<path>", one per line, tab-separated so a
+# path keeps any leading or trailing space. Paths with a control
 # character, an absolute path or a '.', '..' or empty segment are refused here,
 # so a key never leaves the run's prefix.
 listing="$STATE/outputs.txt"
@@ -498,7 +505,7 @@ if ! jq -r '
       elif (.sha256 | type) != "string" or (.sha256 | test("^[0-9a-f]{64}$") | not)
       then error("a sha256 is malformed")
       elif (.bytes | type) != "number" then error("a size is not a number")
-      else "\(.sha256) \(.bytes) \(.path)" end
+      else "\(.sha256)\t\(.bytes)\t\(.path)" end
   ' "$record" >"$listing" 2>"$STATE/outputs.err"; then
   finish 14 outputs "the run record's outputs are malformed: $(head -c 200 "$STATE/outputs.err")"
 fi
@@ -506,7 +513,7 @@ declared=$(jq '(.outputs // []) | length' "$record")
 
 files=0
 total=0
-while read -r sha bytes rel; do
+while IFS=$'\t' read -r sha bytes rel; do
   stop_if_interrupted
   path="$WORK/$rel"
   why=$(inside_checkout "$path") || finish 14 outputs "output $rel is refused: $why"
