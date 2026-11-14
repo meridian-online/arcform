@@ -291,7 +291,16 @@ fn validate_outputs(outputs: &[String]) -> Result<()> {
                 "is or holds arc's run state under build/.arcform/, which is not an output",
             );
         }
-        if !seen.insert(parts.join("/")) {
+        let joined = parts.join("/");
+        // An output inside another would have its files recorded, and uploaded, twice.
+        if let Some(other) = seen.iter().find(|other: &&String| {
+            joined.starts_with(&format!("{other}/")) || other.starts_with(&format!("{joined}/"))
+        }) {
+            return refuse(&format!(
+                "is inside, or holds, the declared output '{other}': declare one of them"
+            ));
+        }
+        if !seen.insert(joined) {
             return refuse("is declared twice");
         }
     }
@@ -1083,6 +1092,24 @@ assets:
             err.contains("'build/parts/'") && err.contains("twice"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn outputs_refuse_nesting() {
+        for (first, second) in [
+            ("build/parts", "build/parts/a.txt"),
+            ("build/parts/a.txt", "build/parts/"),
+        ] {
+            let err = outputs_error(&format!("  - {first}\n  - {second}\n"));
+            assert!(
+                err.contains(&format!("'{second}'"))
+                    && err.contains(&format!("'{}'", first.trim_end_matches('/')))
+                    && err.contains("inside"),
+                "{err}"
+            );
+        }
+        let ok = Manifest::from_yaml_str("name: p\noutputs:\n  - build/parts\n  - build/parts2\n");
+        assert!(ok.is_ok(), "siblings load: {ok:?}");
     }
 
     #[test]
