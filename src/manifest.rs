@@ -250,7 +250,6 @@ impl Step {
     }
 }
 
-/// Validate a retry policy's fields.
 /// Refuse an `outputs:` entry that could name something outside the Protocol, that names
 /// arc's own run state, or that repeats another entry once a trailing `/` is dropped.
 fn validate_outputs(outputs: &[String]) -> Result<()> {
@@ -299,6 +298,7 @@ fn validate_outputs(outputs: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Validate a retry policy's fields.
 fn validate_retry_policy(policy: &RetryPolicy, context: &str) -> Result<()> {
     if policy.max_attempts < 1 {
         return Err(Error::ManifestValidation(format!(
