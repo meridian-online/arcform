@@ -632,6 +632,7 @@ fn a_spec_grown_by_recording_runs_under_the_bare_binary() {
         hooks: Default::default(),
         steps: Vec::new(),
         assets: Default::default(),
+        outputs: Vec::new(),
     };
     manifest.steps.push(Step {
         name: "fetch".into(),
