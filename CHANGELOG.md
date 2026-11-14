@@ -61,7 +61,7 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Fixed
 
-- **The `splink_resolve` operator runs under DuckDB 2.0's Python package.** It declares `duckdb>=2,<3` but counted rows with `fetchone()` on a relation, which DuckDB 2.0 removed, so it stopped after loading its inputs with `AttributeError: Relations no longer have fetchone()`. It now uses `fetchall()`, which reads the whole result; `con.execute(...).fetchone()` was not used because DuckDB 2.0 then holds the unfinished result and refuses the connection's next query.
+- **The `splink_resolve` operator runs under DuckDB 2.0's Python package.** It declares `duckdb>=2,<3` but counted rows with `fetchone()` on a relation, which DuckDB 2.0 removed, so it stopped after loading its inputs with `AttributeError: Relations no longer have fetchone()`. It now uses `fetchall()`, which reads the whole result; `con.execute(...).fetchone()` was not used because DuckDB 2.0 then holds the unfinished result and refuses the operator's later `con.sql(...)` queries on that connection.
 
 ## [0.2.2] - 2026-10-24
 
