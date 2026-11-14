@@ -570,7 +570,7 @@ pub fn list_outputs(
     dir: &Path,
     outputs: &[String],
 ) -> crate::error::Result<Vec<(String, String, Vec<String>)>> {
-    let mut listed = Vec::with_capacity(outputs.len());
+    let mut listed = Vec::new();
     for declared in outputs {
         let path = declared.trim_end_matches('/').to_string();
         // A folder on the way that is a symlink could lead out of the Protocol.
