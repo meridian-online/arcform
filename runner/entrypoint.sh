@@ -466,8 +466,9 @@ say "uploading the run's outputs"
 
 # Nothing the Protocol left running may rewrite a file between the check of its
 # hash and its upload.
-pkill -KILL -u "$PROTOCOL_USER" 2>/dev/null || true
+# Kill on every pass, so a process forked during one kill dies on the next.
 for _ in $(seq 1 50); do
+  pkill -KILL -u "$PROTOCOL_USER" 2>/dev/null || true
   pgrep -u "$PROTOCOL_USER" >/dev/null || break
   sleep 0.1
 done
