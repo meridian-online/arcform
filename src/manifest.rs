@@ -396,7 +396,6 @@ impl Step {
     }
 
     /// The step's severity, `error` when it names none.
-    #[allow(dead_code)] // read by the runner once checks run
     pub(crate) fn severity_or_default(&self) -> Severity {
         self.severity.unwrap_or(Severity::Error)
     }

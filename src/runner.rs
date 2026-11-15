@@ -421,6 +421,7 @@ pub fn run_with_publish(
         return Err(Error::SqlReader(refusals.join("\n")));
     }
     crate::check::refuse_check_shapes(&manifest, dir, &asset_graph)?;
+    crate::check::refuse_publish_before_error_check(&manifest, &asset_graph)?;
 
     // Resolve parameters: dotenv files → manifest defaults → CLI overrides.
     let dotenv_vars = load_dotenv_files(dir, &manifest.dotenv);

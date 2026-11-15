@@ -188,3 +188,26 @@ fn a_check_runs_again_on_an_unchanged_second_run() {
     assert_eq!(step(second, "t")["status"]["state"], "skipped", "{second}");
     assert_ne!(step(second, "c")["status"]["state"], "skipped", "{second}");
 }
+
+#[test]
+fn the_ordering_rule_refuses_before_any_step_runs() {
+    let manifest = "name: c\ndb: build/c.duckdb\nsteps:\n  - name: load\n    sql: models/t.sql\n  - name: export\n    sql: models/export.sql\n  - name: publish\n    op: ducklake_write@1\n    with:\n      public_base: https://lake.example/\n      catalog: catalog/test.ducklake\n      data_path: lake/\n      local_catalog: build/lake/test.ducklake\n      tables:\n        - table: demo.t\n          from: build/t.parquet\n          descriptor: t.datapackage.json\n      credential:\n        type: r2\n        bucket: test-bucket\n        env:\n          key_id: ARC_TEST_LAKE_KEY_ID\n          secret: ARC_TEST_LAKE_SECRET\n          account_id: ARC_TEST_LAKE_ACCOUNT_ID\n  - name: c\n    check: checks/c.sql\n    risk: the analyst reads a wrong table\n";
+    let dir = project(
+        manifest,
+        &[
+            MAKES_T,
+            (
+                "models/export.sql",
+                "COPY t TO 'build/t.parquet' (FORMAT parquet);\n",
+            ),
+            ("checks/c.sql", "SELECT * FROM t WHERE n < 0;\n"),
+        ],
+    );
+    let (code, _, stderr) = common::arc_run_raw(dir.path());
+    assert_ne!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("step 'publish' publishes before the error check 'c'"),
+        "{stderr}"
+    );
+    assert!(records(dir.path()).is_empty(), "a run left a record");
+}

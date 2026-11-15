@@ -575,6 +575,25 @@ impl AssetGraph {
         affected.into_iter().collect()
     }
 
+    /// The given assets plus every asset any producer of one of them reads, to a fixed
+    /// point: everything the given assets are built from. Names are lowercased, as the
+    /// graph's are.
+    pub fn upstream_assets(&self, assets: &BTreeSet<String>) -> BTreeSet<String> {
+        let mut found = assets.clone();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for step_assets in self.steps.values() {
+                if step_assets.produces.iter().any(|a| found.contains(a)) {
+                    for read in &step_assets.reads {
+                        changed |= found.insert(read.clone());
+                    }
+                }
+            }
+        }
+        found
+    }
+
     /// Check if this graph has any asset information worth validating.
     /// Returns false if no steps have any known assets (pure v0.1 manifest).
     pub fn has_assets(&self) -> bool {
