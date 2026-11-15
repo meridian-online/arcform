@@ -245,6 +245,14 @@ fn random_suffix(attempt: u32) -> String {
     format!("{:x}{:x}{attempt}", std::process::id(), nanos & 0xffff_ffff)
 }
 
+/// Whether the relative `path` stays inside the folder it is read from: not absolute,
+/// and not reaching above it with `..`.
+fn inside_folder(path: &Path) -> bool {
+    clean(path)
+        .components()
+        .all(|c| matches!(c, Component::Normal(_)))
+}
+
 /// `path` without its `.` components, so `./data.duckdb` and `data.duckdb` compare equal.
 fn clean(path: &Path) -> PathBuf {
     path.components()
@@ -282,7 +290,9 @@ fn copy_tree(from: &Path, to: &Path, relative: &Path, skip: &[PathBuf]) -> std::
 
 /// Rewrite the copy's `arcform.yaml` as a YAML value, so every key it does not touch is
 /// kept: take out the steps `plan` removes, append the test's inline checks as `error`
-/// check steps carrying its risk, and give it a database of its own when it names none.
+/// check steps carrying its risk, and give it a database of its own unless it names one
+/// inside its folder: a `db:` that is absent, null, absolute or reaching above the folder
+/// would be a database outside the copy, the user's own or one in arc's data folder.
 fn rewrite_manifest(
     copy: &Path,
     test: &ProtocolTest,
@@ -295,7 +305,11 @@ fn rewrite_manifest(
     let Some(map) = doc.as_mapping_mut() else {
         return Err(cannot("it is not a mapping".into()));
     };
-    if !map.contains_key("db") {
+    let own_db = map
+        .get("db")
+        .and_then(Value::as_str)
+        .is_some_and(|db| !db.trim().is_empty() && inside_folder(Path::new(db)));
+    if !own_db {
         map.insert("db".into(), TEST_DB.into());
     }
     let Some(steps) = map.get_mut("steps").and_then(Value::as_sequence_mut) else {
@@ -386,15 +400,33 @@ fn run_child(
     })))
 }
 
-/// The text arc printed after `error: `: from the first line that starts with it to the
-/// end of standard error, trimmed. arc prints its error last, so this holds it whole even
-/// when it runs to several lines.
+/// The text arc printed after `error: `: from the last line that starts with it to the
+/// end of standard error, trimmed, with DuckDB's context lines taken out. arc prints its
+/// own error last, so a step's earlier `error: ` line is not mistaken for it. DuckDB echoes
+/// the failing SQL in a `LINE <n>: …` line with a caret line under it; that echo holds the
+/// SQL's own text, an `error('…')` message included, so it is dropped before matching.
 fn error_message(stderr: &str) -> Option<String> {
     let at = stderr
         .match_indices("error: ")
         .map(|(i, _)| i)
-        .find(|&i| i == 0 || stderr[..i].ends_with('\n'))?;
-    Some(stderr[at + "error: ".len()..].trim().to_string())
+        .filter(|&i| i == 0 || stderr[..i].ends_with('\n'))
+        .last()?;
+    let kept: Vec<&str> = stderr[at + "error: ".len()..]
+        .lines()
+        .filter(|line| !is_duckdb_context(line))
+        .collect();
+    Some(kept.join("\n").trim().to_string())
+}
+
+/// Whether `line` is DuckDB's echo of the SQL (`LINE 3: SELECT …`) or the caret line
+/// pointing into it (only spaces and `^`).
+fn is_duckdb_context(line: &str) -> bool {
+    let echo = line
+        .strip_prefix("LINE ")
+        .and_then(|rest| rest.split_once(": "))
+        .is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    let caret = line.contains('^') && line.chars().all(|c| c == ' ' || c == '^');
+    echo || caret
 }
 
 /// The first of the test's own checks the copy's run record shows returning rows, with
@@ -414,11 +446,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_error_message_runs_from_the_first_error_line_to_the_end() {
-        let stderr = "warning: a thing\nnot an error: here\nerror: step 'load' failed (exit code 1):\nInvalid Input Error: codes header has moved\n";
+    fn the_error_message_is_arcs_last_error_without_duckdbs_context() {
+        let stderr = "error: retrying\nwarning: a thing\nnot an error: here\n\
+Binder Error: Referenced column \"code\" not found\n\
+LINE 1: SELECT CASE WHEN code IS NULL THEN error('codes header has moved') END FROM codes;\n\
+                         ^\n\
+error: step 'load' failed (exit code 1):\n\
+Binder Error: Referenced column \"code\" not found\n\
+LINE 1: SELECT CASE WHEN code IS NULL THEN error('codes header has moved') END FROM codes;\n\
+                         ^\n";
         assert_eq!(
             error_message(stderr).as_deref(),
-            Some("step 'load' failed (exit code 1):\nInvalid Input Error: codes header has moved")
+            Some(
+                "step 'load' failed (exit code 1):\nBinder Error: Referenced column \"code\" not found"
+            )
         );
         assert_eq!(error_message("nothing went wrong\n"), None);
     }
@@ -454,6 +495,43 @@ mod tests {
         assert!(!path.join("data.duckdb.wal").exists());
         drop(copy);
         assert!(!path.exists(), "the copy outlived its guard");
+    }
+
+    #[test]
+    fn only_a_database_inside_the_folder_is_kept() {
+        let plan = TestPlan {
+            removed_steps: Vec::new(),
+            placements: Vec::new(),
+        };
+        let test = ProtocolTest {
+            name: "n".into(),
+            risk: "r".into(),
+            fixtures: Default::default(),
+            breaks: Default::default(),
+            expect: None,
+            checks: Vec::new(),
+            params: Default::default(),
+            measure_history: None,
+        };
+        for (db, kept) in [
+            ("data.duckdb", "data.duckdb"),
+            ("./build/x.duckdb", "./build/x.duckdb"),
+            ("null", TEST_DB),
+            ("\"\"", TEST_DB),
+            ("/var/x.duckdb", TEST_DB),
+            ("../shared.duckdb", TEST_DB),
+            ("data/../../x.duckdb", TEST_DB),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join(MANIFEST_FILENAME),
+                format!("name: t\ndb: {db}\nsteps:\n  - name: s\n    command: \"true\"\n"),
+            )
+            .unwrap();
+            rewrite_manifest(dir.path(), &test, &plan).unwrap();
+            let manifest = Manifest::load(dir.path()).unwrap();
+            assert_eq!(manifest.db.as_deref(), Some(kept), "db: {db}");
+        }
     }
 
     #[test]

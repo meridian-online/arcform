@@ -351,3 +351,65 @@ fn a_path_outside_the_protocol_resolves_in_the_copy() {
         "{stdout}"
     );
 }
+
+#[test]
+fn a_message_in_duckdbs_echo_of_the_sql_does_not_pass_the_test() {
+    // The renamed column fails the guard's own binding, and DuckDB's error echoes the
+    // guard's SQL, message and all; only the error itself counts.
+    let load = "CREATE OR REPLACE TABLE codes AS FROM read_csv('build/raw/codes.csv', all_varchar = true);\n\
+SELECT CASE WHEN code IS NULL THEN error('codes header has moved') END FROM codes;\n";
+    let p = Protocol::with(
+        &test_yaml(
+            "a moved header is refused",
+            "  break:\n    fetch_codes: ALTER TABLE fixture RENAME COLUMN code TO kode\n  expect:\n    fails_with: header has moved\n",
+        ),
+        "http://127.0.0.1:9/never",
+        load,
+        "",
+    );
+    let (code, stdout, stderr) = p.arc_test();
+    assert_eq!(code, Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("FAIL a moved header is refused\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("expected the run to fail with \"header has moved\"; it failed with: "),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Binder Error"), "{stdout}");
+    assert!(!stdout.contains("LINE 1:"), "{stdout}");
+}
+
+/// `p`'s manifest with `db: <db>` added under its name.
+fn with_db(p: &Protocol, db: &str) {
+    let manifest = std::fs::read_to_string(p.dir().join("arcform.yaml")).unwrap();
+    p.write(
+        "arcform.yaml",
+        &manifest.replacen("name: codes\n", &format!("name: codes\ndb: {db}\n"), 1),
+    );
+}
+
+#[test]
+fn a_database_outside_the_protocol_is_not_touched() {
+    let p = Protocol::new(&test_yaml("the codes load", ""));
+    with_db(&p, "../shared.duckdb");
+    let (code, stdout, stderr) = p.arc_test();
+    assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.lines().any(|l| l == "ok the codes load"), "{stdout}");
+    let shared = p.root.path().join("shared.duckdb");
+    assert!(!shared.exists(), "the test wrote {}", shared.display());
+}
+
+#[test]
+fn a_null_database_leaves_nothing_in_arcs_data_folder() {
+    let p = Protocol::new(&test_yaml("the codes load", ""));
+    with_db(&p, "null");
+    let (code, stdout, stderr) = p.arc_test();
+    assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let data = p.root.path().join("arc-db");
+    let left: Vec<_> = std::fs::read_dir(&data)
+        .map(|d| d.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "arc's data folder holds {left:?}");
+}

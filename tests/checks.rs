@@ -895,3 +895,27 @@ fn checks_and_measures_end_to_end() {
         .unwrap();
     assert_eq!(rows, 10);
 }
+
+#[test]
+fn an_unreadable_measure_history_csv_fails_the_run_before_it_starts() {
+    let dir = project(
+        WITH_CHECK,
+        &[MAKES_T, ("checks/c.sql", "SELECT n FROM t WHERE n < 0;")],
+    );
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_arc"))
+        .current_dir(dir.path())
+        .env("ARCFORM_DB_DIR", std::env::temp_dir().join("arc-tests-db"))
+        .env("ARC_TEST_MEASURE_HISTORY", dir.path().join("missing.csv"))
+        .arg("run")
+        .output()
+        .expect("spawn arc run");
+    let stderr = common::strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert_ne!(out.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("ARC_TEST_MEASURE_HISTORY"), "{stderr}");
+    assert!(stderr.contains("missing.csv"), "{stderr}");
+    let runs = dir.path().join("build/.arcform/runs");
+    let left: Vec<_> = std::fs::read_dir(&runs)
+        .map(|d| d.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "the run left {left:?}");
+}

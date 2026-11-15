@@ -589,6 +589,19 @@ pub fn run_with_publish(
     let mut skipped = 0;
     let mut total_retries: usize = 0;
 
+    // Earlier successful runs' measures are what a check reads as `measure_history`, and
+    // are wanted only when a check or measure step could read them. Under `arc test` a CSV
+    // stands in for them; it is read here, before the run's stream exists, so a CSV that
+    // cannot be read fails the run without leaving a partial stream behind.
+    let reads_history = manifest
+        .steps
+        .iter()
+        .any(|s| s.is_check() || s.is_measure());
+    let history_csv = match std::env::var_os(check::MEASURE_HISTORY_ENV) {
+        Some(csv) if reads_history => Some(check::history_from_csv(Path::new(&csv))?),
+        _ => None,
+    };
+
     // --- Live Protocol+Run contract ---
     // Persist the asset graph + a per-step status stream instead of discarding the
     // graph when the run returns. `runs_dir` and its parents are created up front;
@@ -603,16 +616,11 @@ pub fn run_with_publish(
     let contract_params = contract::param_entries(&manifest.params, &dotenv_vars, cli_params);
     // Every measure this run has taken so far, in run order: what a check reads as `measures`.
     let mut run_measures: IndexMap<String, Option<f64>> = IndexMap::new();
-    // Earlier successful runs' measures for the same parameters: what a check reads as
-    // `measure_history`, loaded once before the first step, and only when a check or
-    // measure step could read it. Under `arc test` a CSV may stand in for them.
-    let reads_history = manifest
-        .steps
-        .iter()
-        .any(|s| s.is_check() || s.is_measure());
-    let run_history = match std::env::var_os(check::MEASURE_HISTORY_ENV) {
-        _ if !reads_history => Vec::new(),
-        Some(csv) => check::history_from_csv(Path::new(&csv))?,
+    // Otherwise they come from the run records with the same parameters, loaded once
+    // before the first step.
+    let run_history = match history_csv {
+        Some(rows) => rows,
+        None if !reads_history => Vec::new(),
         None => check::load_history(
             &runs_dir,
             &run_id,
