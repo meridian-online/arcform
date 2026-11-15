@@ -89,6 +89,12 @@ pub(crate) fn load_tests(dir: &Path) -> Result<Vec<ProtocolTest>> {
     let mut tests = Vec::with_capacity(raw.len());
     for r in raw {
         let name = r.name;
+        if name.trim().is_empty() {
+            return Err(refuse(
+                dir,
+                format!("{TESTS_FILENAME}: a test has an empty name:"),
+            ));
+        }
         let bad = |what: String| refuse(dir, format!("{TESTS_FILENAME}: test '{name}': {what}"));
         if !seen.insert(name.clone()) {
             return Err(refuse(
@@ -119,21 +125,29 @@ pub(crate) fn load_tests(dir: &Path) -> Result<Vec<ProtocolTest>> {
             if !r.fixtures.contains_key(&key) {
                 return Err(bad(format!("break: '{key}' has no fixture of that name")));
             }
-            let sql = match b {
-                RawBreak::One(s) => s.trim().to_string(),
-                RawBreak::Many(v) => v
-                    .iter()
-                    .map(|s| {
-                        let s = s.trim();
-                        if s.ends_with(';') {
-                            s.to_string()
-                        } else {
-                            format!("{s};")
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
+            let statements: Vec<String> = match b {
+                RawBreak::One(s) => vec![s],
+                RawBreak::Many(v) => v,
             };
+            // A trailing `-- comment` would swallow a `;` on the same line, so the
+            // terminator goes on a line of its own.
+            let normalise = |s: &str| {
+                let s = s.trim();
+                if s.ends_with(';') {
+                    s.to_string()
+                } else {
+                    format!("{s}\n;")
+                }
+            };
+            if statements.iter().all(|s| s.trim().is_empty()) {
+                return Err(bad(format!("break: '{key}' is empty")));
+            }
+            let sql = statements
+                .iter()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| normalise(s))
+                .collect::<Vec<_>>()
+                .join("\n");
             breaks.insert(key, sql);
         }
         if !r.checks.is_empty() && r.expect.is_some() {
@@ -257,9 +271,42 @@ mod tests {
         .unwrap();
         assert_eq!(
             t[0].breaks["f"],
-            "UPDATE fixture SET a = 1;\nDELETE FROM fixture;"
+            "UPDATE fixture SET a = 1\n;\nDELETE FROM fixture;"
         );
-        assert_eq!(t[0].breaks["g"], "DELETE FROM fixture");
+        assert_eq!(t[0].breaks["g"], "DELETE FROM fixture\n;");
+    }
+
+    #[test]
+    fn a_single_string_and_a_one_item_list_store_the_same_text() {
+        let head =
+            "- name: x\n  risk: r\n  fixtures:\n    f: testdata/soc_definitions.xlsx\n  break:\n";
+        let one = load(&format!("{head}    f: DELETE FROM fixture\n")).unwrap();
+        let list = load(&format!("{head}    f: [DELETE FROM fixture]\n")).unwrap();
+        assert_eq!(one[0].breaks["f"], list[0].breaks["f"]);
+    }
+
+    #[test]
+    fn a_statement_ending_in_a_comment_keeps_its_terminator_on_its_own_line() {
+        let t = load(
+            "- name: x\n  risk: r\n  fixtures:\n    f: testdata/soc_definitions.xlsx\n  break:\n    f: DELETE FROM fixture -- all rows\n",
+        )
+        .unwrap();
+        assert_eq!(t[0].breaks["f"], "DELETE FROM fixture -- all rows\n;");
+    }
+
+    #[test]
+    fn a_blank_name_or_an_empty_break_is_refused() {
+        let m = msg("- name: ' '\n  risk: r\n");
+        assert!(m.contains("name:"), "{m}");
+        let head =
+            "- name: x\n  risk: r\n  fixtures:\n    f: testdata/soc_definitions.xlsx\n  break:\n";
+        for b in ["    f: ''\n", "    f: []\n"] {
+            let m = msg(&format!("{head}{b}"));
+            assert!(
+                m.contains("break:") && m.contains("'f'") && m.contains("empty"),
+                "{m}"
+            );
+        }
     }
 
     #[test]
@@ -296,7 +343,7 @@ mod tests {
         assert_eq!(t[0].name, "a moved definitions header is refused");
         assert_eq!(
             t[0].breaks["fetch_definitions"],
-            "UPDATE fixture SET B = 'Code' WHERE row = 8"
+            "UPDATE fixture SET B = 'Code' WHERE row = 8\n;"
         );
         assert_eq!(
             t[0].expect.as_ref().unwrap().fails_with,
