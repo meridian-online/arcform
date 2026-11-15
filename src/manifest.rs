@@ -202,7 +202,17 @@ impl Serialize for MeasureHistory {
         match self {
             MeasureHistory::Runs(n) => map.serialize_entry("runs", n)?,
             MeasureHistory::Since(d) => {
-                map.serialize_entry("since", &humantime::format_duration(*d).to_string())?
+                // Whole days or hours as a manifest author writes them (`90d`, `12h`);
+                // anything finer in humantime's own words, which read back the same.
+                let secs = d.as_secs();
+                let text = if d.subsec_nanos() == 0 && secs > 0 && secs % 86_400 == 0 {
+                    format!("{}d", secs / 86_400)
+                } else if d.subsec_nanos() == 0 && secs > 0 && secs % 3_600 == 0 {
+                    format!("{}h", secs / 3_600)
+                } else {
+                    humantime::format_duration(*d).to_string()
+                };
+                map.serialize_entry("since", &text)?
             }
         }
         map.end()
@@ -1484,6 +1494,23 @@ assets:
             "measure_history: { runs: 5, since: 90d }\n",
         ] {
             assert!(load(bad).is_err(), "{bad} should be refused");
+        }
+    }
+
+    /// A manifest written back keeps the window as its author wrote it.
+    #[test]
+    fn measure_history_round_trips_as_written() {
+        for (written, expected) in [
+            ("measure_history: { since: 90d }\n", "since: 90d"),
+            ("measure_history: { since: 12h }\n", "since: 12h"),
+            ("measure_history: { since: 90m }\n", "since: 1h 30m"),
+            ("measure_history: { runs: 5 }\n", "runs: 5"),
+        ] {
+            let m = Manifest::from_yaml_str(&format!("name: p\n{written}")).unwrap();
+            let yaml = serde_yaml::to_string(&m).unwrap();
+            assert!(yaml.contains(expected), "{written} wrote {yaml}");
+            let again = Manifest::from_yaml_str(&yaml).unwrap();
+            assert_eq!(again.measure_history, m.measure_history, "{yaml}");
         }
     }
 

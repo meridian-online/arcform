@@ -61,12 +61,23 @@ fn iso_to_epoch_secs(text: &str) -> Option<i64> {
     Some(days * 86_400 + hh * 3_600 + mm * 60 + ss)
 }
 
-/// Whether two runs resolved the same parameters: each key and value, whatever supplied it.
+/// Whether two runs resolved the same parameters: the same keys, each with the same value,
+/// in any order and whatever supplied them. A value redacted on either side (a secret-looking
+/// key, or a dotenv value in a record restored from the published copy) matches any value,
+/// since the record no longer says what it was.
 fn same_params(a: &[ParamEntry], b: &[ParamEntry]) -> bool {
+    let redacted = contract::is_redaction_marker;
+    let sorted = |p: &[ParamEntry]| {
+        let mut v: Vec<(String, String)> =
+            p.iter().map(|e| (e.key.clone(), e.value.clone())).collect();
+        v.sort();
+        v
+    };
+    let (a, b) = (sorted(a), sorted(b));
     a.len() == b.len()
         && a.iter()
-            .zip(b)
-            .all(|(x, y)| x.key == y.key && x.value == y.value)
+            .zip(&b)
+            .all(|((ka, va), (kb, vb))| ka == kb && (va == vb || redacted(va) || redacted(vb)))
 }
 
 /// Earlier runs' measures, for `measure_history`: every record in `runs_dir` that reads as
@@ -437,12 +448,14 @@ pub(crate) fn measure_tables(db_path: &Path, tables: &[String]) -> IndexMap<Stri
         }
         // The blocks the table's columns are stored in, counted once each, times the
         // database's block size: DuckDB's own account of the table's bytes. A constant
-        // segment has no block (`-1`). `pragma_storage_info` refuses a view.
+        // segment has no block (`-1`). `pragma_storage_info` refuses a view. The name is
+        // quoted, so a table called `order` or `group` is read as a table, not a keyword.
+        let ident = format!("\"{}\"", table.replace('"', "\"\""));
         let sql = format!(
-            "SELECT (SELECT count(*) FROM {table}),\n  \
+            "SELECT (SELECT count(*) FROM {ident}),\n  \
              (SELECT count(DISTINCT b) FROM (\n    \
-             SELECT block_id AS b FROM pragma_storage_info('{table}')\n    \
-             UNION ALL SELECT unnest(additional_block_ids) FROM pragma_storage_info('{table}')\n  \
+             SELECT block_id AS b FROM pragma_storage_info('{ident}')\n    \
+             UNION ALL SELECT unnest(additional_block_ids) FROM pragma_storage_info('{ident}')\n  \
              ) WHERE b >= 0)\n  \
              * (SELECT block_size FROM pragma_database_size() WHERE database_name = current_database())"
         );
@@ -819,6 +832,48 @@ mod tests {
         assert_eq!(ids(&rows), ["a"]);
     }
 
+    fn params(pairs: &[(&str, &str)]) -> Vec<ParamEntry> {
+        pairs
+            .iter()
+            .map(|(k, v)| ParamEntry {
+                key: k.to_string(),
+                value: v.to_string(),
+                source: "cli".into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn same_params_ignores_the_order_params_are_declared_in() {
+        let a = params(&[("release", "2018"), ("region", "eu")]);
+        let b = params(&[("region", "eu"), ("release", "2018")]);
+        assert!(same_params(&a, &b));
+    }
+
+    /// A record restored from the published copy holds `[redacted]` for a dotenv value, and
+    /// a secret-looking key is redacted in the local record too: either matches any value.
+    #[test]
+    fn same_params_matches_a_redacted_value_to_any_value() {
+        let current = params(&[("release", "2018")]);
+        assert!(same_params(&params(&[("release", "[redacted]")]), &current));
+        assert!(same_params(&current, &params(&[("release", "[redacted]")])));
+        assert!(same_params(
+            &params(&[("release", "***REDACTED***")]),
+            &current
+        ));
+    }
+
+    #[test]
+    fn same_params_still_tells_plain_values_and_keys_apart() {
+        let current = params(&[("release", "2018")]);
+        assert!(!same_params(&params(&[("release", "2010")]), &current));
+        assert!(!same_params(&params(&[("year", "2018")]), &current));
+        assert!(!same_params(
+            &params(&[("release", "2018"), ("region", "eu")]),
+            &current
+        ));
+    }
+
     #[test]
     fn history_runs_window_counts_only_runs_that_measured() {
         let dir = write_runs(&[
@@ -1150,6 +1205,27 @@ mod tests {
             "{values:?}"
         );
         assert!(measure_tables(&dir.path().join("none.duckdb"), &tables).is_empty());
+    }
+
+    #[test]
+    fn a_table_named_as_a_keyword_is_measured() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("m.duckdb");
+        {
+            let conn = duckdb::Connection::open(&db).unwrap();
+            conn.execute_batch("CREATE TABLE \"order\" AS SELECT * FROM range(2) r(n);")
+                .unwrap();
+        }
+        let values = measure_tables(&db, &["order".to_string()]);
+        assert_eq!(
+            values.get("table:order.row_count"),
+            Some(&Some(2.0)),
+            "{values:?}"
+        );
+        assert!(
+            values["table:order.bytes"].is_some_and(|b| b > 0.0),
+            "{values:?}"
+        );
     }
 
     #[test]

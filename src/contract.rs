@@ -1223,6 +1223,15 @@ pub fn render_dag(contract: &Contract) -> String {
 
 const REDACTED: &str = "***REDACTED***";
 
+/// What the published copy of a run record writes in place of a dotenv parameter's value.
+pub(crate) const PUBLISHED_REDACTED: &str = "[redacted]";
+
+/// Whether `value` is one of the markers a record writes in place of a parameter's value:
+/// a secret-looking key's in the local record, or a dotenv value's in the published copy.
+pub(crate) fn is_redaction_marker(value: &str) -> bool {
+    value == REDACTED || value == PUBLISHED_REDACTED
+}
+
 /// Whether a config/param key name looks like it holds a secret.
 pub(crate) fn is_secret_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();

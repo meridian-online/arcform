@@ -582,14 +582,23 @@ pub fn run_with_publish(
     // Every measure this run has taken so far, in run order: what a check reads as `measures`.
     let mut run_measures: IndexMap<String, Option<f64>> = IndexMap::new();
     // Earlier successful runs' measures for the same parameters: what a check reads as
-    // `measure_history`, loaded once before the first step.
-    let run_history = check::load_history(
-        &runs_dir,
-        &run_id,
-        &contract_params,
-        &manifest.measure_history,
-        std::time::SystemTime::now(),
-    );
+    // `measure_history`, loaded once before the first step, and only when a check or
+    // measure step could read it.
+    let run_history = if manifest
+        .steps
+        .iter()
+        .any(|s| s.is_check() || s.is_measure())
+    {
+        check::load_history(
+            &runs_dir,
+            &run_id,
+            &contract_params,
+            &manifest.measure_history,
+            std::time::SystemTime::now(),
+        )
+    } else {
+        Vec::new()
+    };
 
     // Pipeline-level timeout tracking.
     let pipeline_start = Instant::now();
@@ -1479,6 +1488,9 @@ fn public_record(
 ) -> std::result::Result<Vec<u8>, String> {
     /// A value shorter than this is too likely to match by chance (`true`, `1`).
     const MIN_SECRET_LEN: usize = 8;
+    /// What the published copy says in place of a check's error.
+    const PUBLISHED_CHECK_ERROR: &str =
+        "the check's query did not run; the local run record holds DuckDB's message";
 
     /// SQL text and command lines give way to their SHA-256, and a parameter that
     /// came from a dotenv file gives up its value: none of them belongs in a public
@@ -1499,7 +1511,10 @@ fn public_record(
                 if map.get("source").and_then(Value::as_str) == Some("env")
                     && map.get("value").is_some_and(Value::is_string)
                 {
-                    map.insert("value".to_string(), Value::String("[redacted]".into()));
+                    map.insert(
+                        "value".to_string(),
+                        Value::String(contract::PUBLISHED_REDACTED.into()),
+                    );
                 }
                 map.values_mut().for_each(scrub);
             }
@@ -1598,11 +1613,21 @@ fn public_record(
         .filter(|h| !h.is_empty());
     scrub(&mut record);
     // With `check_samples: false` no sample row leaves the machine; the column
-    // names stay, so a reader still sees what the check selected.
-    if !check_samples && let Some(steps) = record.get_mut("steps").and_then(|s| s.as_array_mut()) {
+    // names stay, so a reader still sees what the check selected. A check's error is
+    // DuckDB's own message, which can quote the data it failed on (`Could not convert
+    // string '…'`), so it never leaves the machine either: the local record keeps it.
+    if let Some(steps) = record.get_mut("steps").and_then(|s| s.as_array_mut()) {
         for step in steps {
             if let Some(check) = step.get_mut("check").and_then(|c| c.as_object_mut()) {
-                check.insert("sample".to_string(), serde_json::json!([]));
+                if !check_samples {
+                    check.insert("sample".to_string(), serde_json::json!([]));
+                }
+                if check.get("error").is_some_and(|e| !e.is_null()) {
+                    check.insert(
+                        "error".to_string(),
+                        serde_json::Value::String(PUBLISHED_CHECK_ERROR.to_string()),
+                    );
+                }
             }
         }
     }
@@ -1717,7 +1742,8 @@ fn compute_staleness(
             continue;
         }
         // A check or measure reads the data as it is now and produces nothing a hash could
-        // certify, so it runs on every run, and so does a step that follows it.
+        // certify, so it runs on every run. A step after it is made stale only if it names
+        // the check in `depends_on:`; following it in the step list does not.
         if step.is_check() || step.is_measure() {
             stale.insert(step.name.clone());
             continue;
@@ -2580,6 +2606,44 @@ mod run_record_upload_tests {
             serde_json::json!(["id", "v"])
         );
         assert_eq!(v["steps"][0]["check"]["rows_returned"], 2);
+    }
+
+    #[test]
+    fn a_checks_error_is_replaced_in_the_published_copy_whatever_check_samples_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = serde_json::json!({"steps": [
+            {"check": {"error": "Conversion Error: Could not convert string \
+                'jane.doe@example.com' to INT32", "sample": [], "sample_columns": []}},
+            {"check": {"error": null, "sample": [], "sample_columns": []}}
+        ]})
+        .to_string();
+        for check_samples in [true, false] {
+            let out = public_record(record.as_bytes(), dir.path(), &[], check_samples).unwrap();
+            let text = String::from_utf8(out).unwrap();
+            assert!(!text.contains("jane.doe"), "{text}");
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                v["steps"][0]["check"]["error"],
+                "the check's query did not run; the local run record holds DuckDB's message"
+            );
+            assert_eq!(v["steps"][1]["check"]["error"], serde_json::Value::Null);
+        }
+    }
+
+    /// With samples off, a sample cell holding a dotenv secret is emptied before the secret
+    /// check looks, so the upload goes ahead.
+    #[test]
+    fn check_samples_false_empties_a_sample_holding_a_secret_and_uploads() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = serde_json::json!({"steps": [{"check": {"sample":
+            [["token s3cr3t-value-123"]], "sample_columns": ["t"]}}]})
+        .to_string();
+        let secrets = vec!["s3cr3t-value-123".to_string()];
+        let out = public_record(record.as_bytes(), dir.path(), &secrets, false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("s3cr3t"), "{text}");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["steps"][0]["check"]["sample"], serde_json::json!([]));
     }
 
     #[test]

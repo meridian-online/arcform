@@ -574,6 +574,27 @@ fn each_produced_table_is_measured_at_its_step() {
 }
 
 #[test]
+fn a_table_named_order_is_measured_at_its_step() {
+    let dir = project(
+        WITH_MEASURE,
+        &[
+            (
+                "models/t.sql",
+                "CREATE OR REPLACE TABLE \"order\" AS SELECT * FROM range(2) r(n);\n",
+            ),
+            ("measures/m.sql", "SELECT 1 AS one;\n"),
+        ],
+    );
+    common::arc_run(dir.path());
+    let record = &records(dir.path())[0];
+    let entry = step(record, "t");
+    assert_eq!(
+        entry["measure"]["values"]["table:order.row_count"], 2.0,
+        "{entry}"
+    );
+}
+
+#[test]
 fn a_check_reads_this_runs_measures() {
     for (other, passes) in [(3, true), (4, false)] {
         let manifest = format!(
@@ -680,7 +701,7 @@ fn measures_holds_one_row_per_name_the_latest_winning() {
 #[test]
 fn a_comparison_check_sees_the_previous_run() {
     let manifest = "name: c\ndb: build/c.duckdb\nsteps:\n  - name: t\n    sql: models/t.sql\n  - name: drop\n    check: checks/drop.sql\n    risk: a table shrank by half\n    severity: warn\n";
-    let compare = "SELECT name FROM measures m JOIN (SELECT name, last(value ORDER BY run_at) AS prev FROM measure_history GROUP BY name) p USING (name) WHERE m.value < p.prev * 0.5\n";
+    let compare = "SELECT name FROM measures m JOIN (SELECT name, last(value ORDER BY run_at, run_id) AS prev FROM measure_history GROUP BY name) p USING (name) WHERE m.value < p.prev * 0.5\n";
     let dir = project(
         manifest,
         &[
@@ -753,7 +774,7 @@ fn checks_and_measures_end_to_end() {
             ),
             (
                 "checks/shrank.sql",
-                "SELECT name, m.value, p.prev FROM measures m JOIN (\n  SELECT name, last(value ORDER BY run_at) AS prev FROM measure_history GROUP BY name\n) p USING (name)\nWHERE m.value < p.prev * 0.5\nORDER BY name;\n",
+                "SELECT name, m.value, p.prev FROM measures m JOIN (\n  SELECT name, last(value ORDER BY run_at, run_id) AS prev FROM measure_history GROUP BY name\n) p USING (name)\nWHERE m.value < p.prev * 0.5\nORDER BY name;\n",
             ),
             (
                 "checks/unique.sql",
