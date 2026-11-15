@@ -221,7 +221,6 @@ pub enum Severity {
 
 impl Severity {
     /// The word the manifest, the record and the output use for it.
-    #[allow(dead_code)] // read by the runner once checks run
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Severity::Error => "error",

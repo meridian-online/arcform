@@ -282,14 +282,15 @@ fn read_loaded(answer: &str) -> Vec<(String, ReportedExtension)> {
 }
 
 /// A directory of arc's own, outside the Protocol's, that a SQL step's process writes its
-/// answer into, removed with everything in it when this is dropped.
-struct AnswerDir(PathBuf);
+/// answer into, removed with everything in it when this is dropped. A check writes its
+/// wrapper and reads its answer in one too.
+pub(crate) struct AnswerDir(PathBuf);
 
 impl AnswerDir {
     /// A new, empty directory under the system's temporary directory, or `None` when arc cannot
     /// make one. `create_dir` refuses a path that is there already, so the directory is one no
     /// other process made, and two steps running at once in one arc each have their own.
-    fn new() -> Option<Self> {
+    pub(crate) fn new() -> Option<Self> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("arc-loaded-{}-{n}", std::process::id()));
@@ -299,6 +300,11 @@ impl AnswerDir {
     /// The file the step's process writes its answer to.
     fn file(&self) -> PathBuf {
         self.0.join("loaded")
+    }
+
+    /// The directory itself.
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
     }
 }
 

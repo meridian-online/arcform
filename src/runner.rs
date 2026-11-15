@@ -7,11 +7,12 @@ use owo_colors::OwoColorize;
 
 use crate::asset::{AssetGraph, StepAssets};
 use crate::asset_kind::AssetKind;
+use crate::check;
 use crate::contract;
 use crate::engine::{
     ALLOW_UNTESTED_ENGINE_ENV, Engine, ExtensionRecheck, OLDEST_ENGINE, ProtocolSql,
-    SUPPORTED_ENGINE_RANGE, check_extension_installs, check_extension_pins, protocol_sql,
-    recheck_extension_pins,
+    SUPPORTED_ENGINE_RANGE, StepOutput, check_extension_installs, check_extension_pins,
+    protocol_sql, recheck_extension_pins,
 };
 use crate::error::{Error, Result};
 use crate::manifest::{MANIFEST_FILENAME, Manifest, Param, RetryPolicy};
@@ -608,6 +609,7 @@ pub fn run_with_publish(
                         skip_reason,
                         duration_sec: None,
                         report: None,
+                        check: None,
                     },
                 );
                 continue;
@@ -661,6 +663,8 @@ pub fn run_with_publish(
             let max_attempts = effective_retry.map_or(1, |r| r.max_attempts);
 
             let mut last_error = None;
+            // What a check step found on its last attempt, for the record.
+            let mut check_section: Option<contract::CheckSection> = None;
 
             // Wall-clock timer for this step — spans every attempt and its backoff sleep,
             // captured into the contract as `duration_sec` (per-step timing, replacing the
@@ -698,7 +702,51 @@ pub fn run_with_publish(
                     }
                 };
 
-                let result = if let Some(source) = ProtocolSql::step(step, dir) {
+                let result = if step.is_check()
+                    && let Some(source) = ProtocolSql::step(step, dir)
+                {
+                    // The check's file is checked again as a SQL step's is, then its one
+                    // query runs inside arc's wrapper, which counts and samples its rows.
+                    check_again(&mut extensions, engine, &source)
+                        .and_then(|()| check::check_query(dir, step))
+                        .and_then(|query| {
+                            let mut ctx = check::QueryContext {
+                                engine,
+                                db_path: &db_path,
+                                env: &env_map,
+                                timeout: step_timeout,
+                                loaded: extensions.loaded_mut(),
+                                measures: &[],
+                                history: &[],
+                            };
+                            check::run_check(step, &query, &mut ctx)
+                        })
+                        .and_then(|section| {
+                            let passed = section.success;
+                            let severity = step.severity_or_default();
+                            if !passed && severity == crate::manifest::Severity::Error {
+                                return Err(Error::CheckFailed {
+                                    step: step.name.clone(),
+                                    check: Box::new(section),
+                                });
+                            }
+                            if !passed {
+                                eprintln!(
+                                    "{} check '{}' found {} rows: {}",
+                                    "warning:".yellow(),
+                                    step.name,
+                                    section.rows_returned,
+                                    section.risk
+                                );
+                            }
+                            check_section = Some(section);
+                            Ok(StepOutput {
+                                stderr: String::new(),
+                                stdout: None,
+                                report: None,
+                            })
+                        })
+                } else if let Some(source) = ProtocolSql::step(step, dir) {
                     // Before each attempt: a step earlier in the run, or an earlier attempt of
                     // this one, can have written over the file since a check read it.
                     check_again(&mut extensions, engine, &source).and_then(|()| {
@@ -827,6 +875,7 @@ pub fn run_with_publish(
                                 skip_reason: None,
                                 duration_sec: Some(step_start.elapsed().as_secs_f64()),
                                 report: output.report,
+                                check: check_section.take(),
                             },
                         );
                         break;
@@ -850,7 +899,12 @@ pub fn run_with_publish(
                     }
                     Err(e) => {
                         // Non-retryable errors (StepExecution, a refusal by the check just
-                        // before the step runs, etc.) — halt immediately.
+                        // before the step runs, a failed error check, etc.) — halt immediately.
+                        let check = match &e {
+                            Error::CheckFailed { check, .. } => Some((**check).clone()),
+                            _ if step.is_check() => Some(check::not_run(step, &e)),
+                            _ => None,
+                        };
                         let _ = state.record_step(&step.name, &sql_hash, "", StepStatus::Failed);
                         let _ = state.finish_run(&run_id, executed, "error", total_retries);
                         stream.step(&step.name, "failed");
@@ -862,6 +916,7 @@ pub fn run_with_publish(
                                 skip_reason: None,
                                 duration_sec: Some(step_start.elapsed().as_secs_f64()),
                                 report: None,
+                                check,
                             },
                         );
                         return Err(e);
@@ -883,6 +938,9 @@ pub fn run_with_publish(
                         skip_reason: None,
                         duration_sec: Some(step_start.elapsed().as_secs_f64()),
                         report: None,
+                        // A check whose query did not run counts as failed, whatever its
+                        // severity.
+                        check: step.is_check().then(|| check::not_run(step, &err)),
                     },
                 );
                 return Err(err);
@@ -947,6 +1005,10 @@ pub fn run_with_publish(
                         failure_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
                         failure_env.insert("ARC_EXIT_CODE".to_string(), code.to_string());
                     }
+                    Error::CheckFailed { step, .. } => {
+                        failure_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
+                        failure_env.insert("ARC_EXIT_CODE".to_string(), "check".to_string());
+                    }
                     Error::StepTimeout { step } => {
                         failure_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
                         failure_env.insert("ARC_EXIT_CODE".to_string(), "timeout".to_string());
@@ -1003,6 +1065,10 @@ pub fn run_with_publish(
                     Error::StepFailed { step, code, .. } => {
                         exit_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
                         exit_env.insert("ARC_EXIT_CODE".to_string(), code.to_string());
+                    }
+                    Error::CheckFailed { step, .. } => {
+                        exit_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
+                        exit_env.insert("ARC_EXIT_CODE".to_string(), "check".to_string());
                     }
                     Error::StepTimeout { step } => {
                         exit_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
@@ -6420,7 +6486,7 @@ steps:
         let raw = std::fs::read_to_string(&json_path).unwrap();
         let contract: Contract = serde_json::from_str(&raw).expect("contract JSON deserializes");
 
-        assert_eq!(contract.contract_version, "b4/1");
+        assert_eq!(contract.contract_version, "b5/1");
         assert_eq!(contract.run.outcome, "success");
         assert_eq!(contract.run.run_id, "run-1");
         assert_eq!(contract.run.attempt_id, "run-1");

@@ -2,8 +2,9 @@
 //! FineType proxy.
 //!
 //! - `protocol_run` runs a Protocol and returns its live **Protocol+Run contract**
-//!   (`contract_version` `b4/1`): the run's protocol, engine, params, assets and
-//!   per-step outcome, the same JSON `arc run` writes under `build/.arcform/runs/`.
+//!   (`contract_version` `b5/1`): the run's protocol, engine, params, assets and
+//!   per-step outcome (a check's findings among them), the same JSON `arc run` writes under
+//!   `build/.arcform/runs/`.
 //!   A file beside `arcform.yaml` that may be a copy a synced drive set aside is named
 //!   in its `run.protocol.possible_copies`, with the warning `arc run` prints for it.
 //!   The run is a child `arc run` whose output this process reads, so the server's

@@ -14,7 +14,7 @@
 //!     `run_complete` line. Append-only; a tailing reader takes the last complete
 //!     line per step.
 //!
-//! The `contract_version` tag (`"b4/1"`) versions the JSON shape. Fields that a
+//! The `contract_version` tag (`"b5/1"`) versions the JSON shape. Fields that a
 //! later phase will populate (bytes, content hashes, file-path lineage, per-step
 //! duration, typed skip reasons, …) are present in the schema but emitted as `null`
 //! now, so the shape is stable across phases.
@@ -32,7 +32,9 @@ use crate::ingress_meta::FetchMeta;
 use crate::manifest::{Manifest, Param, Step};
 
 /// The JSON contract shape version. An opaque tag — bump it when the shape changes.
-pub const CONTRACT_VERSION: &str = "b4/1";
+/// `b5/1` added each check step's `check` section and the run's `checks` counts; a `b4/1`
+/// record reads with neither.
+pub const CONTRACT_VERSION: &str = "b5/1";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Contract shape
@@ -92,6 +94,57 @@ pub struct RunInfo {
     pub finished_at: Option<String>,
     /// `"success"`, `"error"`, or `"partial"`.
     pub outcome: String,
+    /// How the run's checks fared. Added under `b5/1`; a record written before it reads
+    /// with every count zero.
+    #[serde(default)]
+    pub checks: ChecksSummary,
+}
+
+/// How many of a run's checks passed, warned and failed. A check that failed to run counts
+/// as failed whatever its severity.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChecksSummary {
+    pub passed: u32,
+    pub warned: u32,
+    pub failed: u32,
+}
+
+impl ChecksSummary {
+    /// Count `checks`, one section per check step that ran or failed to.
+    fn count<'a>(checks: impl Iterator<Item = &'a CheckSection>) -> Self {
+        let mut summary = ChecksSummary::default();
+        for check in checks {
+            if check.success {
+                summary.passed += 1;
+            } else if check.error.is_none() && check.severity == "warn" {
+                summary.warned += 1;
+            } else {
+                summary.failed += 1;
+            }
+        }
+        summary
+    }
+}
+
+/// What a check step found, in the names OpenLineage's data-quality assertions use
+/// (`name`, `success`, `severity`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckSection {
+    pub name: String,
+    pub risk: String,
+    /// `"error"` or `"warn"`.
+    pub severity: String,
+    /// True when the check's query returned no rows.
+    pub success: bool,
+    pub rows_returned: u64,
+    /// The first rows the query returned, at most 20, each cell as text (`null` for SQL
+    /// `NULL`) cut to 200 characters.
+    pub sample: Vec<Vec<Option<String>>>,
+    /// The query's column names, in order.
+    pub sample_columns: Vec<String>,
+    /// Why the check's query did not run; absent when it ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Which protocol ran, and the exact manifest bytes it ran from.
@@ -242,6 +295,9 @@ pub struct StepEntry {
     /// reader of the contract ignores fields it does not know.
     pub report: Option<serde_json::Value>,
     pub narrative: Narrative,
+    /// For a `check:` step that ran: what it found. Added under `b5/1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<CheckSection>,
 }
 
 /// A resolved `op:` reference.
@@ -434,6 +490,9 @@ pub struct StepOutcome {
     /// The operator's own report of a successful execution (see
     /// [`crate::engine::StepOutput::report`]); `None` otherwise.
     pub report: Option<serde_json::Value>,
+    /// What a check step found, or why its query did not run; `None` for any other step
+    /// and for a check that was not reached.
+    pub check: Option<CheckSection>,
 }
 
 /// What a run records of the DuckDB its SQL steps ran on: [`EngineInfo`]'s `duckdb_cli`,
@@ -555,6 +614,9 @@ pub fn build_contract(inp: ContractInputs) -> Contract {
             started_at: Some(inp.started_at.to_string()),
             finished_at: Some(inp.finished_at.to_string()),
             outcome: inp.outcome.to_string(),
+            checks: ChecksSummary::count(
+                inp.step_outcomes.values().filter_map(|o| o.check.as_ref()),
+            ),
         },
         assets,
         steps,
@@ -1019,6 +1081,7 @@ fn build_step(
         skip_reason: None,
         duration_sec: None,
         report: None,
+        check: None,
     });
 
     // Effective retry policy: a step override wins, else the manifest default.
@@ -1056,6 +1119,7 @@ fn build_step(
         ingress_meta,
         report: outcome.report,
         narrative: Narrative::default(),
+        check: outcome.check,
     }
 }
 
@@ -1599,16 +1663,53 @@ steps:
 
     #[test]
     fn a_record_written_before_the_steps_engine_fields_reads_with_each_absent() {
-        assert_eq!(CONTRACT_VERSION, "b4/1");
         let contract: Contract = serde_json::from_str(RECORD_BEFORE_STEPS_ENGINE)
             .expect("a record in the shape arc wrote before reads into Contract");
-        assert_eq!(contract.contract_version, CONTRACT_VERSION);
+        assert_eq!(contract.contract_version, "b4/1");
         let engine = &contract.run.engine;
         assert_eq!(engine.duckdb.as_deref(), Some("v1.5.4"));
         assert_eq!(engine.duckdb_cli, None);
         assert_eq!(engine.platform, None);
         assert_eq!(engine.extensions, None);
         assert_eq!(contract.run.protocol.possible_copies, Vec::new());
+    }
+
+    #[test]
+    fn a_check_that_failed_to_run_counts_as_failed_whatever_its_severity() {
+        let section = |severity: &str, success: bool, error: Option<&str>| CheckSection {
+            name: "c".into(),
+            risk: "r".into(),
+            severity: severity.into(),
+            success,
+            rows_returned: 0,
+            sample: Vec::new(),
+            sample_columns: Vec::new(),
+            error: error.map(String::from),
+        };
+        let checks = [
+            section("error", true, None),
+            section("warn", true, None),
+            section("warn", false, None),
+            section("error", false, None),
+            section("warn", false, Some("no such table")),
+        ];
+        assert_eq!(
+            ChecksSummary::count(checks.iter()),
+            ChecksSummary {
+                passed: 2,
+                warned: 1,
+                failed: 2
+            }
+        );
+    }
+
+    #[test]
+    fn a_b4_record_reads_with_no_checks() {
+        let contract: Contract = serde_json::from_str(RECORD_BEFORE_STEPS_ENGINE)
+            .expect("a b4/1 record reads into Contract");
+        assert_eq!(contract.contract_version, "b4/1");
+        assert_eq!(contract.run.checks, ChecksSummary::default());
+        assert!(contract.steps.iter().all(|s| s.check.is_none()));
     }
 
     #[test]

@@ -2,12 +2,175 @@
 //! names one file, read here as Protocol SQL: through the same reader as any other step, and
 //! refused before a run starts unless it holds exactly one query.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 
 use crate::asset::AssetGraph;
+use crate::contract::CheckSection;
+use crate::engine::{AnswerDir, Engine, LoadedExtensions};
 use crate::error::{Error, Result};
 use crate::manifest::{Manifest, Step};
+
+/// How many of a failing check's rows the record keeps.
+const SAMPLE_ROWS: usize = 20;
+
+/// How many characters of a sample cell the record keeps; a longer cell is cut and ends `…`.
+const SAMPLE_CELL_CHARS: usize = 200;
+
+/// One earlier run's measure, as a check reads it from `measure_history`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[allow(dead_code)] // built once arc reads earlier runs' measures
+pub(crate) struct HistoryRow {
+    pub(crate) run_id: String,
+    pub(crate) run_at: String,
+    pub(crate) name: String,
+    pub(crate) value: Option<f64>,
+}
+
+/// What a check's query runs with: the step's DuckDB, database, parameters and timeout, and
+/// the measures it may compare.
+pub(crate) struct QueryContext<'a> {
+    pub(crate) engine: &'a dyn Engine,
+    pub(crate) db_path: &'a Path,
+    pub(crate) env: &'a HashMap<String, String>,
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) loaded: &'a mut LoadedExtensions,
+    /// This run's measures so far, as `measures` holds them.
+    pub(crate) measures: &'a [(String, Option<f64>)],
+    /// Earlier runs' measures, as `measure_history` holds them.
+    pub(crate) history: &'a [HistoryRow],
+}
+
+/// What the wrapper writes to `answer.json`.
+#[derive(Deserialize)]
+struct Answer {
+    rows_returned: u64,
+    columns: Vec<String>,
+    sample: Vec<Vec<Option<String>>>,
+}
+
+/// `path` as a SQL string literal.
+fn sql_path(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "''"))
+}
+
+/// The SQL that runs `query` for a check: `measures` and `measure_history` stood up as
+/// temporary tables, the query's rows kept in a third, and the count, the column names and
+/// the first rows, each cell as text, written to `answer.json` in `dir`.
+fn wrapper(dir: &Path, query: &str) -> String {
+    let measures = sql_path(&dir.join("measures.json"));
+    let history = sql_path(&dir.join("history.json"));
+    let answer = sql_path(&dir.join("answer.json"));
+    // `[*COLUMNS(*)]` packs a row into a list only once every column is one type, so the
+    // inner query casts them first; DuckDB 2.0 expands `[COLUMNS(*)::VARCHAR]` into one
+    // single-element list per column instead.
+    format!(
+        "CREATE TEMP TABLE measures AS\n  \
+         SELECT * FROM read_json({measures}, columns = {{name: 'VARCHAR', value: 'DOUBLE'}});\n\
+         CREATE TEMP TABLE measure_history AS\n  \
+         SELECT * FROM read_json({history},\n    \
+         columns = {{run_id: 'VARCHAR', run_at: 'TIMESTAMP', name: 'VARCHAR', value: 'DOUBLE'}});\n\
+         CREATE TEMP TABLE __arc_rows AS\n\
+         {query}\n\
+         ;\n\
+         COPY (SELECT\n  \
+         (SELECT count(*) FROM __arc_rows) AS rows_returned,\n  \
+         (SELECT list(column_name) FROM (DESCRIBE __arc_rows)) AS columns,\n  \
+         (SELECT coalesce(list(r), []) FROM (SELECT [*COLUMNS(*)] AS r FROM \
+         (SELECT COLUMNS(*)::VARCHAR FROM __arc_rows LIMIT {SAMPLE_ROWS}))) AS sample\n\
+         ) TO {answer} (FORMAT json);\n"
+    )
+}
+
+/// `cell` cut to [`SAMPLE_CELL_CHARS`] characters, ending `…` when it was longer.
+fn truncate_cell(cell: String) -> String {
+    match cell.char_indices().nth(SAMPLE_CELL_CHARS) {
+        Some((at, _)) => format!("{}…", &cell[..at]),
+        None => cell,
+    }
+}
+
+/// Run the check `step`, whose one query is `query`, and say what it found. An error is a
+/// query that did not run; a query that returned rows is a section with `success` false.
+pub(crate) fn run_check(step: &Step, query: &str, ctx: &mut QueryContext) -> Result<CheckSection> {
+    let failed = |source: std::io::Error| Error::StepExecution {
+        step: step.name.clone(),
+        source,
+    };
+    let answer_dir = AnswerDir::new().ok_or_else(|| {
+        failed(std::io::Error::other(
+            "arc could not make a temporary directory for the check's answer",
+        ))
+    })?;
+    let dir = answer_dir.path();
+    let measures: Vec<serde_json::Value> = ctx
+        .measures
+        .iter()
+        .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+        .collect();
+    let write = |file: &str, text: String| std::fs::write(dir.join(file), text).map_err(failed);
+    write(
+        "measures.json",
+        serde_json::Value::from(measures).to_string(),
+    )?;
+    write(
+        "history.json",
+        serde_json::to_string(ctx.history).unwrap_or_else(|_| "[]".to_string()),
+    )?;
+    write("wrapper.sql", wrapper(dir, query))?;
+    ctx.engine
+        .execute_sql(
+            ctx.db_path,
+            &dir.join("wrapper.sql"),
+            ctx.env,
+            ctx.timeout,
+            ctx.loaded,
+        )
+        .map_err(|e| match e {
+            // The engine names the file it ran, which is arc's wrapper, not the check.
+            Error::StepTimeout { .. } => Error::StepTimeout {
+                step: step.name.clone(),
+            },
+            other => other,
+        })?;
+    let text = std::fs::read_to_string(dir.join("answer.json")).map_err(failed)?;
+    let answer: Answer = serde_json::from_str(text.trim()).map_err(|e| {
+        failed(std::io::Error::other(format!(
+            "arc could not read the check's answer: {e}"
+        )))
+    })?;
+    Ok(CheckSection {
+        name: step.name.clone(),
+        risk: step.risk.clone().unwrap_or_default(),
+        severity: step.severity_or_default().as_str().to_string(),
+        success: answer.rows_returned == 0,
+        rows_returned: answer.rows_returned,
+        sample: answer
+            .sample
+            .into_iter()
+            .map(|row| row.into_iter().map(|c| c.map(truncate_cell)).collect())
+            .collect(),
+        sample_columns: answer.columns,
+        error: None,
+    })
+}
+
+/// The section of a check step whose query did not run: failed, with no rows and `why`.
+pub(crate) fn not_run(step: &Step, why: &Error) -> CheckSection {
+    CheckSection {
+        name: step.name.clone(),
+        risk: step.risk.clone().unwrap_or_default(),
+        severity: step.severity_or_default().as_str().to_string(),
+        success: false,
+        rows_returned: 0,
+        sample: Vec::new(),
+        sample_columns: Vec::new(),
+        error: Some(why.to_string()),
+    }
+}
 
 /// The tables arc keeps for a run's checks and measures. A step may read them and none may
 /// make them, so a check on them has nothing in the asset graph to depend on.
@@ -168,6 +331,23 @@ mod tests {
         let manifest = Manifest::from_yaml_str(&yaml).unwrap();
         let graph = AssetGraph::build(&manifest, dir.path());
         refuse_publish_before_error_check(&manifest, &graph)
+    }
+
+    #[test]
+    fn a_cell_is_cut_at_200_characters_not_bytes() {
+        let short = "é".repeat(200);
+        assert_eq!(truncate_cell(short.clone()), short);
+        let cut = truncate_cell("é".repeat(300));
+        assert_eq!(cut.chars().count(), 201);
+        assert_eq!(cut, format!("{}…", "é".repeat(200)));
+    }
+
+    #[test]
+    fn a_path_with_a_quote_is_one_sql_literal() {
+        assert_eq!(
+            sql_path(Path::new("/tmp/o'brien/answer.json")),
+            "'/tmp/o''brien/answer.json'"
+        );
     }
 
     #[test]

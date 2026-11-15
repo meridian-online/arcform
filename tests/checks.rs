@@ -109,11 +109,14 @@ fn a_protocol_without_checks_may_make_a_measures_table() {
 
 #[test]
 fn a_pivot_check_file_is_one_query() {
+    // The pivot returns a row, so the check is a warning, which leaves the run green.
     let dir = project(
-        WITH_CHECK,
+        &format!("{WITH_CHECK}    severity: warn\n"),
         &[MAKES_T, ("checks/c.sql", "PIVOT t ON n USING sum(n);\n")],
     );
     common::arc_run(dir.path());
+    let record = &records(dir.path())[0];
+    assert_eq!(step(record, "c")["check"]["rows_returned"], 1);
 }
 
 #[test]
@@ -146,10 +149,16 @@ fn a_check_reads_its_tables_in_the_asset_graph() {
 
 #[test]
 fn a_check_reading_measures_lists_no_measures_asset() {
-    // Nothing makes `measures` yet, so a command step stands one up for the check to read.
+    // arc stands `measures` and `measure_history` up for the check itself.
     let dir = project(
-        "name: c\ndb: build/c.duckdb\nsteps:\n  - name: m\n    command: duckdb \"$ARC_DB_PATH\" \"CREATE OR REPLACE TABLE measures AS SELECT 1 AS n\"\n  - name: c\n    check: checks/c.sql\n    risk: the analyst reads a wrong table\n",
-        &[("checks/c.sql", "SELECT * FROM measures WHERE n < 0;\n")],
+        WITH_CHECK,
+        &[
+            MAKES_T,
+            (
+                "checks/c.sql",
+                "SELECT m.name FROM measures m JOIN measure_history h USING (name) WHERE m.value < h.value;\n",
+            ),
+        ],
     );
     common::arc_run(dir.path());
     let records = records(dir.path());
@@ -210,4 +219,208 @@ fn the_ordering_rule_refuses_before_any_step_runs() {
         "{stderr}"
     );
     assert!(records(dir.path()).is_empty(), "a run left a record");
+}
+
+/// Three rows of `(code, parent)`, every one an orphan.
+const MAKES_ORPHANS: (&str, &str) = (
+    "models/t.sql",
+    "CREATE OR REPLACE TABLE t AS SELECT * FROM (VALUES ('11-1', '11-0'), ('11-2', '11-0'), ('11-3', NULL)) v(code, parent);\n",
+);
+const ORPHANS: (&str, &str) = ("checks/c.sql", "SELECT code, parent FROM t;\n");
+const RISK: &str = "the analyst reads a wrong table";
+
+/// `WITH_CHECK` with `extra` added to the check step.
+fn with_check(extra: &str) -> String {
+    format!("{WITH_CHECK}{extra}")
+}
+
+#[test]
+fn a_passing_check_records_success_and_no_rows() {
+    let dir = project(
+        WITH_CHECK,
+        &[MAKES_T, ("checks/c.sql", "SELECT * FROM t WHERE n < 0;\n")],
+    );
+    common::arc_run(dir.path());
+    let record = &records(dir.path())[0];
+    assert_eq!(record["contract_version"], "b5/1");
+    let check = &step(record, "c")["check"];
+    assert_eq!(check["name"], "c", "{check}");
+    assert_eq!(check["success"], true, "{check}");
+    assert_eq!(check["rows_returned"], 0, "{check}");
+    assert_eq!(check["sample"], serde_json::json!([]), "{check}");
+    assert_eq!(check["sample_columns"], serde_json::json!(["n"]), "{check}");
+    assert_eq!(check["severity"], "error", "{check}");
+    assert_eq!(check["risk"], RISK, "{check}");
+    assert!(check.get("error").is_none(), "{check}");
+    assert_eq!(
+        record["run"]["checks"],
+        serde_json::json!({"passed": 1, "warned": 0, "failed": 0})
+    );
+    assert!(
+        step(record, "t").get("check").is_none(),
+        "a sql step has no check section"
+    );
+}
+
+#[test]
+fn a_failed_warn_check_leaves_the_run_green() {
+    let dir = project(
+        &with_check("    severity: warn\n"),
+        &[MAKES_ORPHANS, ORPHANS],
+    );
+    let (code, _, stderr) = common::arc_run_raw(dir.path());
+    assert_eq!(code, Some(0), "{stderr}");
+    let record = &records(dir.path())[0];
+    let entry = step(record, "c");
+    assert_eq!(entry["status"]["state"], "success", "{entry}");
+    let check = &entry["check"];
+    assert_eq!(check["success"], false, "{check}");
+    assert_eq!(check["severity"], "warn", "{check}");
+    assert_eq!(check["rows_returned"], 3, "{check}");
+    assert_eq!(
+        check["sample_columns"],
+        serde_json::json!(["code", "parent"])
+    );
+    assert_eq!(
+        check["sample"],
+        serde_json::json!([["11-1", "11-0"], ["11-2", "11-0"], ["11-3", null]])
+    );
+    assert_eq!(record["run"]["outcome"], "success");
+    assert_eq!(
+        record["run"]["checks"],
+        serde_json::json!({"passed": 0, "warned": 1, "failed": 0})
+    );
+    let plain = common::strip_ansi(&stderr);
+    let line = plain
+        .lines()
+        .find(|l| l.starts_with("warning:") && l.contains("check 'c'"))
+        .unwrap_or_else(|| panic!("no warning naming the check in:\n{plain}"));
+    assert!(line.contains(RISK), "{line}");
+    assert!(line.contains("3 rows"), "{line}");
+}
+
+#[test]
+fn a_failed_error_check_stops_the_run_before_the_next_step() {
+    let manifest = with_check("  - name: after\n    command: touch build/after.marker\n");
+    let dir = project(&manifest, &[MAKES_ORPHANS, ORPHANS]);
+    let (code, _, stderr) = common::arc_run_raw(dir.path());
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("check 'c' failed:"), "{stderr}");
+    assert!(stderr.contains(RISK), "{stderr}");
+    assert!(
+        !dir.path().join("build/after.marker").exists(),
+        "the step after a failed error check ran"
+    );
+    let record = &records(dir.path())[0];
+    let entry = step(record, "c");
+    assert_eq!(entry["status"]["state"], "failed", "{entry}");
+    assert_eq!(entry["check"]["success"], false, "{entry}");
+    assert_eq!(entry["check"]["rows_returned"], 3, "{entry}");
+    assert_eq!(entry["check"]["sample"].as_array().unwrap().len(), 3);
+    assert!(entry["check"].get("error").is_none(), "{entry}");
+    assert_eq!(record["run"]["checks"]["failed"], 1);
+    assert_eq!(record["run"]["outcome"], "partial");
+}
+
+#[test]
+fn a_check_whose_sql_fails_fails_the_step_even_as_warn() {
+    let dir = project(
+        &with_check("    severity: warn\n"),
+        &[
+            MAKES_T,
+            ("checks/c.sql", "SELECT 'x'::INTEGER AS n FROM t;\n"),
+        ],
+    );
+    let (code, _, stderr) = common::arc_run_raw(dir.path());
+    assert_ne!(code, Some(0), "{stderr}");
+    let record = &records(dir.path())[0];
+    let entry = step(record, "c");
+    assert_eq!(entry["status"]["state"], "failed", "{entry}");
+    let check = &entry["check"];
+    assert_eq!(check["success"], false, "{check}");
+    assert_eq!(check["rows_returned"], 0, "{check}");
+    assert_eq!(check["sample"], serde_json::json!([]), "{check}");
+    assert!(
+        check["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "{check}"
+    );
+    assert_eq!(
+        record["run"]["checks"],
+        serde_json::json!({"passed": 0, "warned": 0, "failed": 1})
+    );
+}
+
+#[test]
+fn a_check_with_comments_and_no_semicolon_runs() {
+    let dir = project(
+        WITH_CHECK,
+        &[
+            MAKES_T,
+            (
+                "checks/c.sql",
+                "-- leading\nSELECT 1 WHERE false -- trailing",
+            ),
+        ],
+    );
+    common::arc_run(dir.path());
+    let record = &records(dir.path())[0];
+    assert_eq!(step(record, "c")["check"]["success"], true);
+}
+
+#[test]
+fn a_sample_is_capped_and_cells_truncated() {
+    let dir = project(
+        &with_check("    severity: warn\n"),
+        &[
+            MAKES_T,
+            (
+                "checks/c.sql",
+                "SELECT repeat('x', 10000) AS s FROM range(50);\n",
+            ),
+        ],
+    );
+    common::arc_run(dir.path());
+    let record = &records(dir.path())[0];
+    let check = &step(record, "c")["check"];
+    assert_eq!(check["rows_returned"], 50);
+    let sample = check["sample"].as_array().unwrap();
+    assert_eq!(sample.len(), 20);
+    for row in sample {
+        let cell = row[0].as_str().unwrap();
+        assert_eq!(cell.chars().count(), 201, "{cell}");
+        assert!(cell.ends_with('…'), "{cell}");
+    }
+}
+
+#[test]
+fn a_check_can_read_its_parameters() {
+    let manifest = format!(
+        "{}    severity: warn\nparams:\n  limit:\n    default: \"5\"\n",
+        WITH_CHECK
+    );
+    let dir = project(
+        &manifest,
+        &[
+            MAKES_T,
+            ("checks/c.sql", "SELECT getenv('ARC_PARAM_LIMIT') AS v;\n"),
+        ],
+    );
+    common::arc_run(dir.path());
+    let record = &records(dir.path())[0];
+    assert_eq!(
+        step(record, "c")["check"]["sample"],
+        serde_json::json!([["5"]])
+    );
+}
+
+#[test]
+fn a_failed_error_check_names_itself_to_the_failure_hook() {
+    let manifest = with_check(
+        "hooks:\n  on_failure:\n    name: tell\n    command: echo \"$ARC_FAILED_STEP $ARC_EXIT_CODE\" > build/failed\n",
+    );
+    let dir = project(&manifest, &[MAKES_ORPHANS, ORPHANS]);
+    let (code, _, stderr) = common::arc_run_raw(dir.path());
+    assert_eq!(code, Some(2), "{stderr}");
+    let told = std::fs::read_to_string(dir.path().join("build/failed")).unwrap();
+    assert_eq!(told.trim(), "c check");
 }
