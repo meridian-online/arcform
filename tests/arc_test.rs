@@ -413,3 +413,39 @@ fn a_null_database_leaves_nothing_in_arcs_data_folder() {
         .unwrap_or_default();
     assert!(left.is_empty(), "arc's data folder holds {left:?}");
 }
+
+#[test]
+fn an_error_line_inside_a_steps_failure_does_not_cut_the_message_short() {
+    // DuckDB's failure, which arc's error for the step holds whole, has a line of its own
+    // that starts `error: `; the message is still all of arc's error.
+    let load = "CREATE OR REPLACE TABLE codes AS FROM read_csv('build/raw/codes.csv', all_varchar = true);\n\
+SELECT error('codes header has moved' || chr(10) || 'error: aborting') AS guard;\n";
+    let p = Protocol::with(
+        &test_yaml(
+            "a moved header is refused",
+            "  expect:\n    fails_with: header has moved\n",
+        ),
+        "http://127.0.0.1:9/never",
+        load,
+        "",
+    );
+    let (code, stdout, stderr) = p.arc_test();
+    assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.lines().any(|l| l == "ok a moved header is refused"),
+        "{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_database_reached_through_a_linked_folder_is_not_touched() {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let p = Protocol::new(&test_yaml("the codes load", ""));
+    std::os::unix::fs::symlink(elsewhere.path(), p.dir().join("data")).unwrap();
+    with_db(&p, "data/x.duckdb");
+    let (code, stdout, stderr) = p.arc_test();
+    assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let target = elsewhere.path().join("x.duckdb");
+    assert!(!target.exists(), "the test wrote {}", target.display());
+}

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use serde_yaml::Value;
 
 use crate::asset::AssetGraph;
-use crate::check::MEASURE_HISTORY_ENV;
+use crate::check::{ERROR_FILE_ENV, MEASURE_HISTORY_ENV};
 use crate::contract::{CheckSection, Contract};
 use crate::engine::Engine;
 use crate::manifest::{MANIFEST_FILENAME, Manifest};
@@ -40,6 +40,9 @@ pub(crate) struct TestResult {
 
 /// The name a test's inline check `n` (1-based) has as a step in the copy's manifest.
 const CHECK_STEP_PREFIX: &str = "arc-test-check-";
+
+/// Where in the copy the child `arc run` writes its error, through [`ERROR_FILE_ENV`].
+const ERROR_FILE: &str = ".arc-test/error.txt";
 
 /// The folder in the copy that holds the test's inline checks as files.
 const CHECKS_DIR: &str = ".arc-test/checks";
@@ -245,12 +248,23 @@ fn random_suffix(attempt: u32) -> String {
     format!("{:x}{:x}{attempt}", std::process::id(), nanos & 0xffff_ffff)
 }
 
-/// Whether the relative `path` stays inside the folder it is read from: not absolute,
-/// and not reaching above it with `..`.
-fn inside_folder(path: &Path) -> bool {
-    clean(path)
-        .components()
-        .all(|c| matches!(c, Component::Normal(_)))
+/// Whether the relative `path` stays inside `copy`: not absolute, not reaching above it
+/// with `..`, and not through a linked folder that leads out of it. The deepest part of
+/// the path that exists (a dangling link counts, and refuses) is resolved, links and all,
+/// and must lie under the copy.
+fn inside_copy(copy: &Path, path: &Path) -> bool {
+    let path = clean(path);
+    if !path.components().all(|c| matches!(c, Component::Normal(_))) {
+        return false;
+    }
+    let Ok(root) = std::fs::canonicalize(copy) else {
+        return false;
+    };
+    let full = root.join(&path);
+    let Some(existing) = full.ancestors().find(|a| a.symlink_metadata().is_ok()) else {
+        return false;
+    };
+    std::fs::canonicalize(existing).is_ok_and(|resolved| resolved.starts_with(&root))
 }
 
 /// `path` without its `.` components, so `./data.duckdb` and `data.duckdb` compare equal.
@@ -308,7 +322,7 @@ fn rewrite_manifest(
     let own_db = map
         .get("db")
         .and_then(Value::as_str)
-        .is_some_and(|db| !db.trim().is_empty() && inside_folder(Path::new(db)));
+        .is_some_and(|db| !db.trim().is_empty() && inside_copy(copy, Path::new(db)));
     if !own_db {
         map.insert("db".into(), TEST_DB.into());
     }
@@ -355,9 +369,15 @@ fn run_child(
     for (key, value) in &test.params {
         command.arg(format!("--param={key}={value}"));
     }
+    let error_file = copy.join(ERROR_FILE);
+    if let Some(parent) = error_file.parent() {
+        std::fs::create_dir_all(parent).map_err(cannot)?;
+    }
+    let _ = std::fs::remove_file(&error_file);
     command
         .current_dir(copy)
         .env("NO_COLOR", "1")
+        .env(ERROR_FILE_ENV, &error_file)
         .env_remove(PUBLISH_ENV)
         .env_remove(MEASURE_HISTORY_ENV)
         .stdin(Stdio::null())
@@ -393,6 +413,11 @@ fn run_child(
     if status.success() {
         return Ok(None);
     }
+    // arc wrote its own error to the file; only a child that crashed or was killed did not,
+    // and then the error is looked for on its standard error.
+    if let Ok(text) = std::fs::read_to_string(&error_file) {
+        return Ok(Some(without_duckdb_context(&text)));
+    }
     let bytes = stderr.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let text = strip_ansi(&String::from_utf8_lossy(&bytes));
     Ok(Some(error_message(&text).unwrap_or_else(|| {
@@ -400,22 +425,27 @@ fn run_child(
     })))
 }
 
-/// The text arc printed after `error: `: from the last line that starts with it to the
-/// end of standard error, trimmed, with DuckDB's context lines taken out. arc prints its
-/// own error last, so a step's earlier `error: ` line is not mistaken for it. DuckDB echoes
-/// the failing SQL in a `LINE <n>: …` line with a caret line under it; that echo holds the
-/// SQL's own text, an `error('…')` message included, so it is dropped before matching.
+/// `text` without DuckDB's echo of the failing SQL: each `LINE <n>: …` line and the caret
+/// line under it. The echo holds the SQL's own text, an `error('…')` message included, so
+/// it is not part of the message a test matches.
+fn without_duckdb_context(text: &str) -> String {
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| !is_duckdb_context(line))
+        .collect();
+    kept.join("\n").trim().to_string()
+}
+
+/// The error a child that wrote no error file printed: from the last line of standard
+/// error that starts with `error: ` to the end, trimmed, with DuckDB's context lines taken
+/// out. Only a fallback: a step's own output may hold such a line too.
 fn error_message(stderr: &str) -> Option<String> {
     let at = stderr
         .match_indices("error: ")
         .map(|(i, _)| i)
         .filter(|&i| i == 0 || stderr[..i].ends_with('\n'))
         .last()?;
-    let kept: Vec<&str> = stderr[at + "error: ".len()..]
-        .lines()
-        .filter(|line| !is_duckdb_context(line))
-        .collect();
-    Some(kept.join("\n").trim().to_string())
+    Some(without_duckdb_context(&stderr[at + "error: ".len()..]))
 }
 
 /// Whether `line` is DuckDB's echo of the SQL (`LINE 3: SELECT …`) or the caret line

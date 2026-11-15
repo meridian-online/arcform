@@ -93,6 +93,10 @@ pub fn cli_main() {
     let cli = cli::Cli::parse();
 
     if let Err(e) = cli::dispatch(cli) {
+        // `arc test` reads a child run's error from this file, not from its standard error.
+        if let Some(path) = std::env::var_os(check::ERROR_FILE_ENV) {
+            let _ = std::fs::write(path, e.to_string());
+        }
         eprintln!("error: {}", e);
         std::process::exit(e.exit_code());
     }

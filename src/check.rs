@@ -149,6 +149,12 @@ pub(crate) fn load_history(
 /// own, so a test can show a comparison check failing without earlier runs.
 pub(crate) const MEASURE_HISTORY_ENV: &str = "ARC_TEST_MEASURE_HISTORY";
 
+/// The variable `arc test` sets to a file in its copy of the Protocol. When it is set, a
+/// failing `arc` writes its error's text there as well as after `error: ` on standard
+/// error, so `arc test` reads arc's own error whole, not a line of a step's output that
+/// happens to start the same way. It is `arc test`'s own, as [`MEASURE_HISTORY_ENV`] is.
+pub(crate) const ERROR_FILE_ENV: &str = "ARC_TEST_ERROR_FILE";
+
 /// Earlier runs' measures from a CSV with the header `run_id,run_at,name,value`, read with
 /// the linked library, every row taken as given and in file order: no window and no
 /// parameter filter. An empty `value` is SQL `NULL`.
