@@ -127,6 +127,12 @@ pub trait Operator: Sync {
     fn always_runs(&self) -> bool {
         false
     }
+
+    /// Whether the step publishes what it reads to somewhere other people read it, so a
+    /// check on that data has to come before it. See `check::refuse_publish_before_error_check`.
+    fn publishes(&self) -> bool {
+        false
+    }
 }
 
 static PARQUET_EXPORT: ParquetExport = ParquetExport;

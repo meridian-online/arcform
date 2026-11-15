@@ -614,6 +614,8 @@ fn create_spec_serialises_directly_and_the_result_runs() {
         steps: Vec::new(),
         assets: Default::default(),
         outputs: Vec::new(),
+        measure_history: Default::default(),
+        check_samples: true,
     };
     manifest.steps.push(Step {
         name: "hello".into(),
@@ -628,6 +630,10 @@ fn create_spec_serialises_directly_and_the_result_runs() {
         output: None,
         retry: None,
         timeout_sec: None,
+        check: None,
+        measure: None,
+        risk: None,
+        severity: None,
     });
 
     let out = create_spec(&project, &manifest).expect("create succeeds");

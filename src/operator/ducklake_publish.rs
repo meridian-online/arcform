@@ -525,6 +525,10 @@ impl Operator for DucklakePublish {
         semver::Version::new(1, 0, 0)
     }
 
+    fn publishes(&self) -> bool {
+        true
+    }
+
     fn assets(&self, with: &Value) -> Result<OpAssets> {
         let cfg = DucklakePublishConfig::parse(with)?;
         let mut assets = OpAssets::default();

@@ -159,12 +159,12 @@ fn every_stdout_line_of_protocol_run_is_json_rpc() {
 }
 
 #[test]
-fn protocol_run_returns_the_b4_protocol_and_run_contract() {
+fn protocol_run_returns_the_b5_protocol_and_run_contract() {
     let dir = copy_fixture("mcp_stdout");
     let result = protocol_run(dir.path(), json!({}));
     let contract = &result["structuredContent"];
     assert_eq!(
-        contract["contract_version"], "b4/1",
+        contract["contract_version"], "b5/1",
         "protocol_run must return the live Protocol+Run contract"
     );
     assert_eq!(contract["run"]["protocol"]["name"], "mcp_stdout");

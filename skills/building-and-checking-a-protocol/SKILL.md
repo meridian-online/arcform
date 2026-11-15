@@ -88,6 +88,14 @@ arc table describe large_sales
 "row_count": 0
 ```
 
+**Write a rule the data must keep as a check, not as a SQL step that calls `error()`.** Put the query that returns the rows breaking the rule in its own file, and add it to `arcform.yaml` as a `check:` step with a `risk:` line saying what would go wrong in the published data without it. No rows means it passes. The run record then shows the check by name, with how many rows broke the rule and a sample of them; a `sql:` step calling `error()` is just another failed step. A check stops the run by default; `severity: warn` lets the run carry on and report it. Keep `error()` for a load model that must stop the moment a source file looks wrong.
+
+```yaml
+- name: unique_orders
+  check: checks/unique_orders.sql   # SELECT order_id FROM clean_orders GROUP BY order_id HAVING count(*) > 1
+  risk: a duplicated order is counted twice in revenue
+```
+
 The Check stage's checkpoint is anything that changes the meaning of the answer: a table that had to be rebuilt, rows dropped that the question counts, a join that lost a source. Tell the user before presenting.
 
 ## 7. Undo through history

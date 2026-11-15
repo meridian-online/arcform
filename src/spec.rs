@@ -234,7 +234,8 @@ pub use crate::history::{
     record_step_with_history,
 };
 pub use crate::manifest::{
-    AssetOverride, Defaults, Hooks, MANIFEST_FILENAME, Manifest, Param, RetryPolicy, Step,
+    AssetOverride, Defaults, Hooks, MANIFEST_FILENAME, Manifest, MeasureHistory, Param,
+    RetryPolicy, Severity, Step,
 };
 pub use crate::panel_check::{CheckedPanels, PanelFinding, check_panel, check_panels};
 pub use crate::precondition::{FreshConfig, ModifiedAfterConfig, Precondition, ToolConfig};

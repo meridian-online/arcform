@@ -7,11 +7,12 @@ use owo_colors::OwoColorize;
 
 use crate::asset::{AssetGraph, StepAssets};
 use crate::asset_kind::AssetKind;
+use crate::check;
 use crate::contract;
 use crate::engine::{
     ALLOW_UNTESTED_ENGINE_ENV, Engine, ExtensionRecheck, OLDEST_ENGINE, ProtocolSql,
-    SUPPORTED_ENGINE_RANGE, check_extension_installs, check_extension_pins, protocol_sql,
-    recheck_extension_pins,
+    SUPPORTED_ENGINE_RANGE, StepOutput, check_extension_installs, check_extension_pins,
+    protocol_sql, recheck_extension_pins,
 };
 use crate::error::{Error, Result};
 use crate::manifest::{MANIFEST_FILENAME, Manifest, Param, RetryPolicy};
@@ -108,6 +109,62 @@ fn execute_hook(
         engine.execute_command(command, env, false, None)?;
     }
     Ok(())
+}
+
+/// What `step` measured, for its record: `own`, a measure step's values, then each table it
+/// produces, measured now that it has exited. Each value goes into `run_measures`, which
+/// the checks after it read. `None` when the step measured nothing.
+fn measure_section(
+    mut own: IndexMap<String, Option<f64>>,
+    step: &crate::manifest::Step,
+    db_path: &Path,
+    graph: &AssetGraph,
+    run_measures: &mut IndexMap<String, Option<f64>>,
+) -> Option<contract::MeasureSection> {
+    own.extend(check::measure_tables(
+        db_path,
+        &check::produced_tables(graph, step),
+    ));
+    if own.is_empty() {
+        return None;
+    }
+    // One row per name, the latest measurement winning: a name moves to where it was last
+    // measured, so `measures` keeps run order by each value's latest measurement.
+    for (name, value) in &own {
+        run_measures.shift_remove(name);
+        run_measures.insert(name.clone(), *value);
+    }
+    Some(contract::MeasureSection { values: own })
+}
+
+/// Run a check or measure step's one query: its file checked again as a SQL step's is, then
+/// `run` given the query and what it runs with, inside arc's wrapper.
+#[allow(clippy::too_many_arguments)]
+fn run_step_query<T>(
+    step: &crate::manifest::Step,
+    source: &ProtocolSql,
+    dir: &Path,
+    engine: &dyn Engine,
+    extensions: &mut ExtensionRecheck,
+    db_path: &Path,
+    env: &HashMap<String, String>,
+    timeout: Option<Duration>,
+    measures: &IndexMap<String, Option<f64>>,
+    history: &[check::HistoryRow],
+    run: impl FnOnce(&check::StepQuery, &mut check::QueryContext) -> Result<T>,
+) -> Result<T> {
+    check_again(extensions, engine, source)?;
+    let query = check::check_query(dir, step)?;
+    let mut ctx = check::QueryContext {
+        engine,
+        db_path,
+        env,
+        timeout,
+        loaded: extensions.loaded_mut(),
+        measures,
+        history,
+    };
+    run(&query, &mut ctx)
 }
 
 /// Check a SQL step's or hook's file again just before it runs, and print each warning the
@@ -420,6 +477,8 @@ pub fn run_with_publish(
         let refusals: Vec<String> = asset_graph.unreadable.iter().map(|u| u.refusal()).collect();
         return Err(Error::SqlReader(refusals.join("\n")));
     }
+    crate::check::refuse_check_shapes(&manifest, dir, &asset_graph)?;
+    crate::check::refuse_publish_before_error_check(&manifest, &asset_graph)?;
 
     // Resolve parameters: dotenv files → manifest defaults → CLI overrides.
     let dotenv_vars = load_dotenv_files(dir, &manifest.dotenv);
@@ -520,6 +579,26 @@ pub fn run_with_publish(
     let mut stream = contract::RunStream::create(&runs_dir, &run_id);
     let mut step_outcomes: HashMap<String, contract::StepOutcome> = HashMap::new();
     let contract_params = contract::param_entries(&manifest.params, &dotenv_vars, cli_params);
+    // Every measure this run has taken so far, in run order: what a check reads as `measures`.
+    let mut run_measures: IndexMap<String, Option<f64>> = IndexMap::new();
+    // Earlier successful runs' measures for the same parameters: what a check reads as
+    // `measure_history`, loaded once before the first step, and only when a check or
+    // measure step could read it.
+    let run_history = if manifest
+        .steps
+        .iter()
+        .any(|s| s.is_check() || s.is_measure())
+    {
+        check::load_history(
+            &runs_dir,
+            &run_id,
+            &contract_params,
+            &manifest.measure_history,
+            std::time::SystemTime::now(),
+        )
+    } else {
+        Vec::new()
+    };
 
     // Pipeline-level timeout tracking.
     let pipeline_start = Instant::now();
@@ -598,6 +677,15 @@ pub fn run_with_publish(
                 );
                 skipped += 1;
                 stream.step(&step.name, "skipped");
+                // A fresh step's tables are measured as a step that ran has them, so the
+                // run's measures have no hole where nothing changed.
+                let measure = measure_section(
+                    IndexMap::new(),
+                    step,
+                    &db_path,
+                    &asset_graph,
+                    &mut run_measures,
+                );
                 step_outcomes.insert(
                     step.name.clone(),
                     contract::StepOutcome {
@@ -606,6 +694,8 @@ pub fn run_with_publish(
                         skip_reason,
                         duration_sec: None,
                         report: None,
+                        check: None,
+                        measure,
                     },
                 );
                 continue;
@@ -626,7 +716,7 @@ pub fn run_with_publish(
             println!("[{}/{}] {} ...", i + 1, total, step.name.bold());
 
             // Compute the SQL hash for this step (for state recording).
-            let sql_hash = if let Some(ref sql) = step.sql {
+            let sql_hash = if let Some(sql) = step.sql_file() {
                 let sql_path = dir.join(sql);
                 if !sql_path.exists() {
                     return Err(Error::SqlFileNotFound {
@@ -659,6 +749,10 @@ pub fn run_with_publish(
             let max_attempts = effective_retry.map_or(1, |r| r.max_attempts);
 
             let mut last_error = None;
+            // What a check step found on its last attempt, for the record.
+            let mut check_section: Option<contract::CheckSection> = None;
+            // What a measure step measured, for the record and for the checks after it.
+            let mut measured: IndexMap<String, Option<f64>> = IndexMap::new();
 
             // Wall-clock timer for this step — spans every attempt and its backoff sleep,
             // captured into the contract as `duration_sec` (per-step timing, replacing the
@@ -696,7 +790,74 @@ pub fn run_with_publish(
                     }
                 };
 
-                let result = if let Some(source) = ProtocolSql::step(step, dir) {
+                let result = if step.is_check()
+                    && let Some(source) = ProtocolSql::step(step, dir)
+                {
+                    // The wrapper counts and samples the check's rows.
+                    run_step_query(
+                        step,
+                        &source,
+                        dir,
+                        engine,
+                        &mut extensions,
+                        &db_path,
+                        &env_map,
+                        step_timeout,
+                        &run_measures,
+                        &run_history,
+                        |query, ctx| check::run_check(step, query, ctx),
+                    )
+                    .and_then(|section| {
+                        let passed = section.success;
+                        let severity = step.severity_or_default();
+                        if !passed && severity == crate::manifest::Severity::Error {
+                            return Err(Error::CheckFailed {
+                                step: step.name.clone(),
+                                check: Box::new(section),
+                            });
+                        }
+                        if !passed {
+                            eprintln!(
+                                "{} check '{}' found {} rows: {}",
+                                "warning:".yellow(),
+                                step.name,
+                                section.rows_returned,
+                                section.risk
+                            );
+                        }
+                        check_section = Some(section);
+                        Ok(StepOutput {
+                            stderr: String::new(),
+                            stdout: None,
+                            report: None,
+                        })
+                    })
+                } else if step.is_measure()
+                    && let Some(source) = ProtocolSql::step(step, dir)
+                {
+                    // The wrapper hands back the one row the measure must return.
+                    run_step_query(
+                        step,
+                        &source,
+                        dir,
+                        engine,
+                        &mut extensions,
+                        &db_path,
+                        &env_map,
+                        step_timeout,
+                        &run_measures,
+                        &run_history,
+                        |query, ctx| check::run_measure(step, query, ctx),
+                    )
+                    .map(|values| {
+                        measured = values;
+                        StepOutput {
+                            stderr: String::new(),
+                            stdout: None,
+                            report: None,
+                        }
+                    })
+                } else if let Some(source) = ProtocolSql::step(step, dir) {
                     // Before each attempt: a step earlier in the run, or an earlier attempt of
                     // this one, can have written over the file since a check read it.
                     check_again(&mut extensions, engine, &source).and_then(|()| {
@@ -817,6 +978,13 @@ pub fn run_with_publish(
 
                         last_error = None;
                         stream.step(&step.name, "success");
+                        let measure = measure_section(
+                            std::mem::take(&mut measured),
+                            step,
+                            &db_path,
+                            &asset_graph,
+                            &mut run_measures,
+                        );
                         step_outcomes.insert(
                             step.name.clone(),
                             contract::StepOutcome {
@@ -825,6 +993,8 @@ pub fn run_with_publish(
                                 skip_reason: None,
                                 duration_sec: Some(step_start.elapsed().as_secs_f64()),
                                 report: output.report,
+                                check: check_section.take(),
+                                measure,
                             },
                         );
                         break;
@@ -848,7 +1018,12 @@ pub fn run_with_publish(
                     }
                     Err(e) => {
                         // Non-retryable errors (StepExecution, a refusal by the check just
-                        // before the step runs, etc.) — halt immediately.
+                        // before the step runs, a failed error check, etc.) — halt immediately.
+                        let check = match &e {
+                            Error::CheckFailed { check, .. } => Some((**check).clone()),
+                            _ if step.is_check() => Some(check::not_run(step, &e)),
+                            _ => None,
+                        };
                         let _ = state.record_step(&step.name, &sql_hash, "", StepStatus::Failed);
                         let _ = state.finish_run(&run_id, executed, "error", total_retries);
                         stream.step(&step.name, "failed");
@@ -860,6 +1035,8 @@ pub fn run_with_publish(
                                 skip_reason: None,
                                 duration_sec: Some(step_start.elapsed().as_secs_f64()),
                                 report: None,
+                                check,
+                                measure: None,
                             },
                         );
                         return Err(e);
@@ -881,6 +1058,10 @@ pub fn run_with_publish(
                         skip_reason: None,
                         duration_sec: Some(step_start.elapsed().as_secs_f64()),
                         report: None,
+                        // A check whose query did not run counts as failed, whatever its
+                        // severity.
+                        check: step.is_check().then(|| check::not_run(step, &err)),
+                        measure: None,
                     },
                 );
                 return Err(err);
@@ -945,6 +1126,10 @@ pub fn run_with_publish(
                         failure_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
                         failure_env.insert("ARC_EXIT_CODE".to_string(), code.to_string());
                     }
+                    Error::CheckFailed { step, .. } => {
+                        failure_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
+                        failure_env.insert("ARC_EXIT_CODE".to_string(), "check".to_string());
+                    }
                     Error::StepTimeout { step } => {
                         failure_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
                         failure_env.insert("ARC_EXIT_CODE".to_string(), "timeout".to_string());
@@ -1001,6 +1186,10 @@ pub fn run_with_publish(
                     Error::StepFailed { step, code, .. } => {
                         exit_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
                         exit_env.insert("ARC_EXIT_CODE".to_string(), code.to_string());
+                    }
+                    Error::CheckFailed { step, .. } => {
+                        exit_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
+                        exit_env.insert("ARC_EXIT_CODE".to_string(), "check".to_string());
                     }
                     Error::StepTimeout { step } => {
                         exit_env.insert("ARC_FAILED_STEP".to_string(), step.clone());
@@ -1147,6 +1336,7 @@ pub fn run_with_publish(
             &run_id,
             crate::lake::take_run_record_uploads(),
             &record_secrets(&manifest, &dotenv_vars),
+            manifest.check_samples,
         ),
     ) {
         (result, Ok(())) => result,
@@ -1242,6 +1432,7 @@ fn upload_run_records(
     run_id: &str,
     uploads: Vec<crate::lake::RunRecordUpload>,
     secrets: &[String],
+    check_samples: bool,
 ) -> Result<()> {
     use crate::lake::store::{PutCondition, StoreError};
 
@@ -1251,7 +1442,7 @@ fn upload_run_records(
     let path = runs_dir.join(format!("{run_id}.json"));
     let record = std::fs::read(&path)
         .map_err(|e| format!("read {}: {e}", path.display()))
-        .and_then(|bytes| public_record(&bytes, dir, secrets));
+        .and_then(|bytes| public_record(&bytes, dir, secrets, check_samples));
     let mut first = None;
     for upload in uploads {
         let result = record.clone().and_then(|bytes| {
@@ -1293,9 +1484,13 @@ fn public_record(
     bytes: &[u8],
     dir: &Path,
     secrets: &[String],
+    check_samples: bool,
 ) -> std::result::Result<Vec<u8>, String> {
     /// A value shorter than this is too likely to match by chance (`true`, `1`).
     const MIN_SECRET_LEN: usize = 8;
+    /// What the published copy says in place of a check's error.
+    const PUBLISHED_CHECK_ERROR: &str =
+        "the check's query did not run; the local run record holds DuckDB's message";
 
     /// SQL text and command lines give way to their SHA-256, and a parameter that
     /// came from a dotenv file gives up its value: none of them belongs in a public
@@ -1316,7 +1511,10 @@ fn public_record(
                 if map.get("source").and_then(Value::as_str) == Some("env")
                     && map.get("value").is_some_and(Value::is_string)
                 {
-                    map.insert("value".to_string(), Value::String("[redacted]".into()));
+                    map.insert(
+                        "value".to_string(),
+                        Value::String(contract::PUBLISHED_REDACTED.into()),
+                    );
                 }
                 map.values_mut().for_each(scrub);
             }
@@ -1414,6 +1612,25 @@ fn public_record(
         .map(|h| h.trim_end_matches('/').to_string())
         .filter(|h| !h.is_empty());
     scrub(&mut record);
+    // With `check_samples: false` no sample row leaves the machine; the column
+    // names stay, so a reader still sees what the check selected. A check's error is
+    // DuckDB's own message, which can quote the data it failed on (`Could not convert
+    // string '…'`), so it never leaves the machine either: the local record keeps it.
+    if let Some(steps) = record.get_mut("steps").and_then(|s| s.as_array_mut()) {
+        for step in steps {
+            if let Some(check) = step.get_mut("check").and_then(|c| c.as_object_mut()) {
+                if !check_samples {
+                    check.insert("sample".to_string(), serde_json::json!([]));
+                }
+                if check.get("error").is_some_and(|e| !e.is_null()) {
+                    check.insert(
+                        "error".to_string(),
+                        serde_json::Value::String(PUBLISHED_CHECK_ERROR.to_string()),
+                    );
+                }
+            }
+        }
+    }
     let secrets: Vec<&str> = secrets
         .iter()
         .map(String::as_str)
@@ -1521,6 +1738,14 @@ fn compute_staleness(
         // function is arranged around — a step kind exempt from the hash is a step
         // that can certify work it did not do.
         if step.command.is_some() && step.preconditions.is_empty() {
+            stale.insert(step.name.clone());
+            continue;
+        }
+        // A check or measure reads the data as it is now and produces nothing a hash could
+        // certify, so it runs on every run. It produces nothing, so it never makes a later
+        // step stale: a later step is stale only for its own reasons or for an upstream
+        // asset that changed.
+        if step.is_check() || step.is_measure() {
             stale.insert(step.name.clone());
             continue;
         }
@@ -1692,7 +1917,7 @@ fn is_hash_stale(
                 // Command step — the command line itself. See `command_config_hash`
                 // for why the first run after this landed re-runs each one once.
                 command_config_hash(step) != prior_state.sql_hash
-            } else if let Some(ref sql) = step.sql {
+            } else if let Some(sql) = step.sql_file() {
                 let sql_path = dir.join(sql);
                 if sql_path.exists() {
                     let content = std::fs::read(&sql_path).map_err(|e| Error::FileRead {
@@ -2294,6 +2519,7 @@ mod run_record_upload_tests {
             "r1",
             vec![upload(&store, "runs/r1.json")],
             &[],
+            true,
         )
         .unwrap();
         let uploaded: serde_json::Value =
@@ -2312,6 +2538,7 @@ mod run_record_upload_tests {
             "r2",
             vec![upload(&store, "runs/r2.json")],
             &[],
+            true,
         )
         .unwrap_err()
         .to_string();
@@ -2322,7 +2549,7 @@ mod run_record_upload_tests {
         assert_eq!(store.get("runs/r2.json").unwrap().unwrap().0, b"other");
 
         // Nothing queued: nothing to do.
-        upload_run_records(dir.path(), &runs, "r3", Vec::new(), &[]).unwrap();
+        upload_run_records(dir.path(), &runs, "r3", Vec::new(), &[], true).unwrap();
     }
 
     /// Two publish steps in one run queue the same record: the second finds this
@@ -2343,6 +2570,7 @@ mod run_record_upload_tests {
                 upload(&store, "runs/r1.json"),
             ],
             &[],
+            true,
         )
         .unwrap();
         // A later run of the same id (a retry) also finds it in place.
@@ -2352,8 +2580,94 @@ mod run_record_upload_tests {
             "r1",
             vec![upload(&store, "runs/r1.json")],
             &[],
+            true,
         )
         .unwrap();
+    }
+
+    fn record_with_samples() -> Vec<u8> {
+        serde_json::json!({"steps": [
+            {"name": "a", "check": {"name": "c", "risk": "r", "severity": "warn",
+                "success": false, "rows_returned": 2,
+                "sample": [["1", "x"], ["2", null]], "sample_columns": ["id", "v"]}},
+            {"name": "b", "sql": {"sql_hash": "h"}}
+        ]})
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn check_samples_false_empties_every_sample_in_the_published_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = public_record(&record_with_samples(), dir.path(), &[], false).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["steps"][0]["check"]["sample"], serde_json::json!([]));
+        assert_eq!(
+            v["steps"][0]["check"]["sample_columns"],
+            serde_json::json!(["id", "v"])
+        );
+        assert_eq!(v["steps"][0]["check"]["rows_returned"], 2);
+    }
+
+    #[test]
+    fn a_checks_error_is_replaced_in_the_published_copy_whatever_check_samples_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = serde_json::json!({"steps": [
+            {"check": {"error": "Conversion Error: Could not convert string \
+                'jane.doe@example.com' to INT32", "sample": [], "sample_columns": []}},
+            {"check": {"error": null, "sample": [], "sample_columns": []}}
+        ]})
+        .to_string();
+        for check_samples in [true, false] {
+            let out = public_record(record.as_bytes(), dir.path(), &[], check_samples).unwrap();
+            let text = String::from_utf8(out).unwrap();
+            assert!(!text.contains("jane.doe"), "{text}");
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                v["steps"][0]["check"]["error"],
+                "the check's query did not run; the local run record holds DuckDB's message"
+            );
+            assert_eq!(v["steps"][1]["check"]["error"], serde_json::Value::Null);
+        }
+    }
+
+    /// With samples off, a sample cell holding a dotenv secret is emptied before the secret
+    /// check looks, so the upload goes ahead.
+    #[test]
+    fn check_samples_false_empties_a_sample_holding_a_secret_and_uploads() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = serde_json::json!({"steps": [{"check": {"sample":
+            [["token s3cr3t-value-123"]], "sample_columns": ["t"]}}]})
+        .to_string();
+        let secrets = vec!["s3cr3t-value-123".to_string()];
+        let out = public_record(record.as_bytes(), dir.path(), &secrets, false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("s3cr3t"), "{text}");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["steps"][0]["check"]["sample"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn check_samples_true_keeps_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = public_record(&record_with_samples(), dir.path(), &[], true).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            v["steps"][0]["check"]["sample"],
+            serde_json::json!([["1", "x"], ["2", null]])
+        );
+    }
+
+    #[test]
+    fn a_sample_holding_a_secret_is_refused_as_any_other_string_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = serde_json::json!({"steps": [{"check": {"sample":
+            [["token s3cr3t-value-123"]], "sample_columns": ["t"]}}]})
+        .to_string();
+        let secrets = vec!["s3cr3t-value-123".to_string()];
+        let e = public_record(record.as_bytes(), dir.path(), &secrets, true).unwrap_err();
+        assert!(e.contains("credential"), "{e}");
+        assert!(!e.contains("s3cr3t"), "{e}");
     }
 
     /// SQL text goes as its hash, a value a dotenv variable holds refuses the upload
@@ -2373,6 +2687,7 @@ mod run_record_upload_tests {
                 id,
                 vec![upload(&store, &format!("runs/{id}.json"))],
                 &secrets,
+                true,
             )
         };
 
@@ -2449,6 +2764,7 @@ mod run_record_upload_tests {
                 id,
                 vec![upload(&store, &format!("runs/{id}.json"))],
                 &secrets,
+                true,
             )
         };
         run(
@@ -2489,6 +2805,7 @@ mod run_record_upload_tests {
             "r1",
             vec![upload(&store, "runs/r1.json")],
             &[],
+            true,
         )
         .unwrap();
 
@@ -2519,6 +2836,7 @@ mod run_record_upload_tests {
             "r3",
             vec![upload(&store, "runs/r3.json")],
             &[],
+            true,
         )
         .unwrap_err()
         .to_string();
@@ -2534,6 +2852,7 @@ mod run_record_upload_tests {
             "r4",
             vec![upload(&store, "runs/r4.json")],
             &[],
+            true,
         )
         .unwrap();
         let uploaded = String::from_utf8(store.get("runs/r4.json").unwrap().unwrap().0).unwrap();
@@ -2551,6 +2870,7 @@ mod run_record_upload_tests {
             "r5",
             vec![upload(&store, "runs/r5.json")],
             &[],
+            true,
         )
         .unwrap_err()
         .to_string();
@@ -2574,9 +2894,10 @@ mod run_record_upload_tests {
             )
             .unwrap();
             let key = format!("runs/{id}.json");
-            let e = upload_run_records(&protocol, &runs, &id, vec![upload(&store, &key)], &[])
-                .unwrap_err()
-                .to_string();
+            let e =
+                upload_run_records(&protocol, &runs, &id, vec![upload(&store, &key)], &[], true)
+                    .unwrap_err()
+                    .to_string();
             assert!(e.contains("home directory"), "{text}: {e}");
             assert!(store.get(&key).unwrap().is_none());
         }
@@ -2592,7 +2913,8 @@ mod run_record_upload_tests {
                 serde_json::to_vec(&dotted).unwrap(),
             )
             .unwrap();
-            upload_run_records(&protocol, &runs, &id, vec![upload(&store, &key)], &[]).unwrap();
+            upload_run_records(&protocol, &runs, &id, vec![upload(&store, &key)], &[], true)
+                .unwrap();
         }
         let longer = serde_json::json!({ "note": format!("{home}es/x") });
         std::fs::write(runs.join("r6.json"), serde_json::to_vec(&longer).unwrap()).unwrap();
@@ -2602,6 +2924,7 @@ mod run_record_upload_tests {
             "r6",
             vec![upload(&store, "runs/r6.json")],
             &[],
+            true,
         )
         .unwrap();
 
@@ -2615,6 +2938,7 @@ mod run_record_upload_tests {
             "r2",
             vec![upload(&store, "runs/r2.json")],
             &[],
+            true,
         )
         .unwrap_err()
         .to_string();
@@ -6412,7 +6736,7 @@ steps:
         let raw = std::fs::read_to_string(&json_path).unwrap();
         let contract: Contract = serde_json::from_str(&raw).expect("contract JSON deserializes");
 
-        assert_eq!(contract.contract_version, "b4/1");
+        assert_eq!(contract.contract_version, "b5/1");
         assert_eq!(contract.run.outcome, "success");
         assert_eq!(contract.run.run_id, "run-1");
         assert_eq!(contract.run.attempt_id, "run-1");

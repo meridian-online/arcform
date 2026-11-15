@@ -119,6 +119,124 @@ pub struct Manifest {
     /// runner image uploads. Left out of a manifest serialised from this struct when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<String>,
+
+    /// How far back `measure_history` reads: the last `runs: N` runs (default 30) or the
+    /// runs `since: <duration>` ago (`90d`, `12h`). Exactly one of the two.
+    #[serde(default, skip_serializing_if = "MeasureHistory::is_default")]
+    pub measure_history: MeasureHistory,
+
+    /// Whether a failing check records a sample of the rows it returned (default true).
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub check_samples: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+/// The window `measure_history` reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeasureHistory {
+    /// The most recent N runs; N is at least 1.
+    Runs(u32),
+    /// The runs within this long of now.
+    Since(std::time::Duration),
+}
+
+impl MeasureHistory {
+    fn is_default(&self) -> bool {
+        *self == MeasureHistory::default()
+    }
+}
+
+impl Default for MeasureHistory {
+    fn default() -> Self {
+        MeasureHistory::Runs(30)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MeasureHistoryRaw {
+    runs: Option<u32>,
+    since: Option<String>,
+}
+
+fn invalid<E: serde::de::Error>(message: impl std::fmt::Display) -> E {
+    E::custom(message)
+}
+
+impl<'de> Deserialize<'de> for MeasureHistory {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let raw = MeasureHistoryRaw::deserialize(d)?;
+        match (raw.runs, raw.since) {
+            (Some(0), None) => Err(invalid::<D::Error>(
+                "measure_history.runs must be at least 1: say how many runs to read",
+            )),
+            (Some(n), None) => Ok(MeasureHistory::Runs(n)),
+            (None, Some(since)) => match humantime::parse_duration(&since) {
+                Ok(d) if d.is_zero() => Err(invalid::<D::Error>(
+                    "measure_history.since must be longer than zero: write one such as 90d or 12h",
+                )),
+                Ok(d) => Ok(MeasureHistory::Since(d)),
+                Err(e) => Err(invalid::<D::Error>(format!(
+                    "measure_history.since '{since}' is not a duration ({e}): write one such as 90d or 12h"
+                ))),
+            },
+            (Some(_), Some(_)) => Err(invalid::<D::Error>(
+                "measure_history takes runs: or since:, not both",
+            )),
+            (None, None) => Err(invalid::<D::Error>("measure_history needs runs: or since:")),
+        }
+    }
+}
+
+impl Serialize for MeasureHistory {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(Some(1))?;
+        match self {
+            MeasureHistory::Runs(n) => map.serialize_entry("runs", n)?,
+            MeasureHistory::Since(d) => {
+                // Whole days or hours as a manifest author writes them (`90d`, `12h`);
+                // anything finer in humantime's own words, which read back the same.
+                let secs = d.as_secs();
+                let text = if d.subsec_nanos() == 0 && secs > 0 && secs % 86_400 == 0 {
+                    format!("{}d", secs / 86_400)
+                } else if d.subsec_nanos() == 0 && secs > 0 && secs % 3_600 == 0 {
+                    format!("{}h", secs / 3_600)
+                } else {
+                    humantime::format_duration(*d).to_string()
+                };
+                map.serialize_entry("since", &text)?
+            }
+        }
+        map.end()
+    }
+}
+
+/// How seriously a failing check is taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    /// A failure fails the run and stops publishing.
+    Error,
+    /// A failure is recorded and reported; the run carries on.
+    Warn,
+}
+
+impl Severity {
+    /// The word the manifest, the record and the output use for it.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Severity::Error => "error",
+            Severity::Warn => "warn",
+        }
+    }
 }
 
 fn default_engine() -> String {
@@ -187,6 +305,26 @@ pub struct Step {
     /// Step-level timeout in seconds. Clamped to remaining pipeline time.
     #[serde(default)]
     pub timeout_sec: Option<f64>,
+
+    /// Relative path to a SQL file that selects the rows that break a rule. A check
+    /// passes when it returns none. Needs `risk:`. Mutually exclusive with the other
+    /// step arms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<String>,
+
+    /// Relative path to a SQL file that selects one row of numbers to record each run.
+    /// Mutually exclusive with the other step arms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measure: Option<String>,
+
+    /// What goes wrong for the analyst if a check fails, in one line. Required on a
+    /// check, refused elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<String>,
+
+    /// `error` (the default) or `warn`. Only a check takes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<Severity>,
 }
 
 /// Lifecycle hooks for pipeline setup, teardown, and notification.
@@ -241,12 +379,34 @@ impl Step {
             output: None,
             retry: None,
             timeout_sec: None,
+            check: None,
+            measure: None,
+            risk: None,
+            severity: None,
         }
     }
 
-    /// Returns true if this step uses the engine (sql field).
-    pub(crate) fn is_sql(&self) -> bool {
-        self.sql.is_some()
+    /// The SQL file this step runs: its `sql`, `check` or `measure` path, whichever is set.
+    pub(crate) fn sql_file(&self) -> Option<&str> {
+        self.sql
+            .as_deref()
+            .or(self.check.as_deref())
+            .or(self.measure.as_deref())
+    }
+
+    /// True for a `check:` step.
+    pub(crate) fn is_check(&self) -> bool {
+        self.check.is_some()
+    }
+
+    /// True for a `measure:` step.
+    pub(crate) fn is_measure(&self) -> bool {
+        self.measure.is_some()
+    }
+
+    /// The step's severity, `error` when it names none.
+    pub(crate) fn severity_or_default(&self) -> Severity {
+        self.severity.unwrap_or(Severity::Error)
     }
 }
 
@@ -352,8 +512,9 @@ impl Manifest {
     /// discard it and write the bytes it already has. Nothing here re-serialises, so
     /// the comments, key order and formatting in those bytes survive untouched.
     ///
-    /// Checks the manifest in isolation: names non-empty and unique, exactly one of
-    /// `sql`/`command`/`op` per step, `op:` steps resolvable against the operator
+    /// Checks the manifest in isolation: names non-empty, unique and free of `:`, exactly
+    /// one of `sql`/`command`/`op`/`check`/`measure` per step, a `risk:` on each check and
+    /// none on any other step, no `produces:`/`output:`/`preconditions:` on a check or measure, `op:` steps resolvable against the operator
     /// catalog with a `with:` block that deserialises, well-formed preconditions,
     /// retry policies and `engine_version` constraint, and the hook restrictions. It
     /// does not touch the filesystem — referenced SQL files, dotenv files and fetched
@@ -428,6 +589,13 @@ impl Manifest {
                 )));
             }
 
+            if step.name.contains(':') {
+                return Err(Error::ManifestValidation(format!(
+                    "step '{}': a step name cannot contain ':', which names a table or file in a check; rename the step",
+                    step.name
+                )));
+            }
+
             // Check for duplicate step names.
             if !seen_names.insert(&step.name) {
                 return Err(Error::ManifestValidation(format!(
@@ -443,25 +611,72 @@ impl Manifest {
                 })?;
             }
 
-            // Each step must have exactly one of sql, command, or op.
+            // Each step must have exactly one of sql, command, op, check or measure.
             let arms = [
                 step.sql.is_some(),
                 step.command.is_some(),
                 step.op.is_some(),
+                step.check.is_some(),
+                step.measure.is_some(),
             ];
             match arms.iter().filter(|present| **present).count() {
                 0 => {
                     return Err(Error::ManifestValidation(format!(
-                        "step '{}': must have one of 'sql', 'command', or 'op'",
+                        "step '{}': must have one of 'sql', 'command', 'op', 'check' or 'measure'",
                         step.name
                     )));
                 }
                 1 => {}
                 _ => {
                     return Err(Error::ManifestValidation(format!(
-                        "step '{}': must have exactly one of 'sql', 'command', or 'op', not several",
+                        "step '{}': must have exactly one of 'sql', 'command', 'op', 'check' or 'measure', not several",
                         step.name
                     )));
+                }
+            }
+
+            if step.is_check() || step.is_measure() {
+                let kind = if step.is_check() { "check" } else { "measure" };
+                for (set, field) in [
+                    (!step.produces.is_empty(), "produces"),
+                    (step.output.is_some(), "output"),
+                    (!step.preconditions.is_empty(), "preconditions"),
+                ] {
+                    if set {
+                        return Err(Error::ManifestValidation(format!(
+                            "step '{}': a {kind} step cannot declare {field}: it produces nothing and always runs; remove it",
+                            step.name
+                        )));
+                    }
+                }
+            }
+            if step.is_check() {
+                match step.risk.as_deref() {
+                    None => {
+                        return Err(Error::ManifestValidation(format!(
+                            "step '{}': a check needs risk: one line on what goes wrong for the analyst if it fails",
+                            step.name
+                        )));
+                    }
+                    Some(risk) if risk.trim().is_empty() || risk.contains(['\n', '\r']) => {
+                        return Err(Error::ManifestValidation(format!(
+                            "step '{}': risk: must be one non-empty line",
+                            step.name
+                        )));
+                    }
+                    Some(_) => {}
+                }
+            } else {
+                for (set, field) in [
+                    (step.risk.is_some(), "risk:"),
+                    (step.severity.is_some(), "severity:"),
+                ] {
+                    if set {
+                        return Err(Error::ManifestValidation(format!(
+                            "step '{}': only a check step takes {field}; remove it or make the step a check",
+                            step.name
+                        )));
+                    }
                 }
             }
 
@@ -556,6 +771,20 @@ impl Manifest {
                     )));
                 }
 
+                // Hooks cannot be checks or measures, and take neither risk nor severity.
+                if hook.check.is_some() || hook.measure.is_some() {
+                    return Err(Error::ManifestValidation(format!(
+                        "{}: hooks cannot be a check or measure",
+                        label
+                    )));
+                }
+                if hook.risk.is_some() || hook.severity.is_some() {
+                    return Err(Error::ManifestValidation(format!(
+                        "{}: hooks cannot have risk or severity: only a check step takes them",
+                        label
+                    )));
+                }
+
                 // Hooks must not have retry.
                 if hook.retry.is_some() {
                     return Err(Error::ManifestValidation(format!(
@@ -603,6 +832,8 @@ impl Manifest {
             steps: Vec::new(),
             assets: std::collections::HashMap::new(),
             outputs: Vec::new(),
+            measure_history: Default::default(),
+            check_samples: true,
         }
     }
 
@@ -615,8 +846,8 @@ impl Manifest {
             &self.hooks.on_exit,
         ]
         .iter()
-        .any(|h| h.as_ref().is_some_and(|s| s.is_sql()));
-        self.steps.iter().any(|s| s.is_sql()) || hook_has_sql
+        .any(|h| h.as_ref().is_some_and(|s| s.sql_file().is_some()));
+        self.steps.iter().any(|s| s.sql_file().is_some()) || hook_has_sql
     }
 }
 
@@ -640,6 +871,10 @@ mod tests {
             output: None,
             retry: None,
             timeout_sec: None,
+            check: None,
+            measure: None,
+            risk: None,
+            severity: None,
         }
     }
 
@@ -658,6 +893,10 @@ mod tests {
             output: None,
             retry: None,
             timeout_sec: None,
+            check: None,
+            measure: None,
+            risk: None,
+            severity: None,
         }
     }
 
@@ -677,6 +916,8 @@ mod tests {
             steps,
             assets: std::collections::HashMap::new(),
             outputs: Vec::new(),
+            measure_history: Default::default(),
+            check_samples: true,
         }
     }
 
@@ -754,6 +995,10 @@ mod tests {
                 output: None,
                 retry: None,
                 timeout_sec: None,
+                check: None,
+                measure: None,
+                risk: None,
+                severity: None,
             }],
         );
         let err = m.validate().unwrap_err();
@@ -778,6 +1023,10 @@ mod tests {
                 output: None,
                 retry: None,
                 timeout_sec: None,
+                check: None,
+                measure: None,
+                risk: None,
+                severity: None,
             }],
         );
         let err = m.validate().unwrap_err();
@@ -1126,5 +1375,162 @@ assets:
                 "{bad}: {err}"
             );
         }
+    }
+
+    fn load_err(yaml: &str) -> String {
+        Manifest::from_yaml_str(yaml).unwrap_err().to_string()
+    }
+
+    fn check_yaml(extra: &str) -> String {
+        format!("name: p\nsteps:\n  - name: a\n    check: checks/a.sql\n{extra}")
+    }
+
+    #[test]
+    fn a_check_step_loads_with_risk_and_default_severity() {
+        let m = Manifest::from_yaml_str(&check_yaml("    risk: x\n")).unwrap();
+        let step = &m.steps[0];
+        assert!(step.is_check() && !step.is_measure());
+        assert_eq!(step.severity_or_default(), Severity::Error);
+        assert_eq!(step.sql_file(), Some("checks/a.sql"));
+    }
+
+    #[test]
+    fn a_check_without_risk_is_refused() {
+        assert!(load_err(&check_yaml("")).contains("step 'a': a check needs risk:"));
+    }
+
+    #[test]
+    fn an_empty_or_multiline_risk_is_refused() {
+        assert!(
+            load_err(&check_yaml("    risk: \"\"\n")).contains("risk: must be one non-empty line")
+        );
+        assert!(
+            load_err(&check_yaml("    risk: \"a\\nb\"\n"))
+                .contains("risk: must be one non-empty line")
+        );
+    }
+
+    #[test]
+    fn severity_warn_loads_and_other_values_are_refused() {
+        let m = Manifest::from_yaml_str(&check_yaml("    risk: x\n    severity: warn\n")).unwrap();
+        assert_eq!(m.steps[0].severity_or_default(), Severity::Warn);
+        assert_eq!(Severity::Warn.as_str(), "warn");
+        assert!(matches!(
+            Manifest::from_yaml_str(&check_yaml("    risk: x\n    severity: info\n")),
+            Err(Error::ManifestParse(_))
+        ));
+    }
+
+    #[test]
+    fn risk_or_severity_on_a_non_check_is_refused() {
+        for arm in ["sql: a.sql", "measure: m.sql"] {
+            let risk = format!("name: p\nsteps:\n  - name: a\n    {arm}\n    risk: x\n");
+            assert!(load_err(&risk).contains("only a check step takes risk:"));
+            let sev = format!("name: p\nsteps:\n  - name: a\n    {arm}\n    severity: warn\n");
+            assert!(load_err(&sev).contains("only a check step takes severity:"));
+        }
+    }
+
+    #[test]
+    fn check_and_measure_count_as_step_arms() {
+        let both = "name: p\nsteps:\n  - name: a\n    sql: a.sql\n    check: c.sql\n    risk: x\n";
+        assert!(
+            load_err(both)
+                .contains("must have exactly one of 'sql', 'command', 'op', 'check' or 'measure'")
+        );
+        let none = "name: p\nsteps:\n  - name: a\n";
+        assert!(
+            load_err(none)
+                .contains("must have one of 'sql', 'command', 'op', 'check' or 'measure'")
+        );
+    }
+
+    #[test]
+    fn check_and_measure_refuse_produces_output_and_preconditions() {
+        let cases = [
+            ("check: c.sql\n    risk: x", "produces: [t]", "produces"),
+            ("check: c.sql\n    risk: x", "output: o", "output"),
+            ("measure: m.sql", "produces: [t]", "produces"),
+            ("measure: m.sql", "output: o", "output"),
+            (
+                "measure: m.sql",
+                "preconditions:\n      - command: 'true'",
+                "preconditions",
+            ),
+        ];
+        for (arm, extra, field) in cases {
+            let yaml = format!("name: p\nsteps:\n  - name: a\n    {arm}\n    {extra}\n");
+            let err = load_err(&yaml);
+            assert!(err.contains(&format!("cannot declare {field}")), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_step_name_with_a_colon_is_refused() {
+        let yaml = "name: p\nsteps:\n  - name: 'table:x'\n    sql: a.sql\n";
+        assert!(load_err(yaml).contains("cannot contain ':'"));
+    }
+
+    #[test]
+    fn measure_history_defaults_to_30_runs_and_reads_runs_or_since() {
+        let load = |extra: &str| Manifest::from_yaml_str(&format!("name: p\n{extra}"));
+        assert_eq!(load("").unwrap().measure_history, MeasureHistory::Runs(30));
+        assert_eq!(
+            load("measure_history: { runs: 5 }\n")
+                .unwrap()
+                .measure_history,
+            MeasureHistory::Runs(5)
+        );
+        assert_eq!(
+            load("measure_history: { since: 90d }\n")
+                .unwrap()
+                .measure_history,
+            MeasureHistory::Since(std::time::Duration::from_secs(90 * 86_400))
+        );
+        for bad in [
+            "measure_history: { runs: 0 }\n",
+            "measure_history: { since: soon }\n",
+            "measure_history: { since: 0s }\n",
+            "measure_history: { runs: 5, since: 90d }\n",
+        ] {
+            assert!(load(bad).is_err(), "{bad} should be refused");
+        }
+    }
+
+    /// A manifest written back keeps the window as its author wrote it.
+    #[test]
+    fn measure_history_round_trips_as_written() {
+        for (written, expected) in [
+            ("measure_history: { since: 90d }\n", "since: 90d"),
+            ("measure_history: { since: 12h }\n", "since: 12h"),
+            ("measure_history: { since: 90m }\n", "since: 1h 30m"),
+            ("measure_history: { runs: 5 }\n", "runs: 5"),
+        ] {
+            let m = Manifest::from_yaml_str(&format!("name: p\n{written}")).unwrap();
+            let yaml = serde_yaml::to_string(&m).unwrap();
+            assert!(yaml.contains(expected), "{written} wrote {yaml}");
+            let again = Manifest::from_yaml_str(&yaml).unwrap();
+            assert_eq!(again.measure_history, m.measure_history, "{yaml}");
+        }
+    }
+
+    #[test]
+    fn check_samples_defaults_to_true() {
+        assert!(Manifest::from_yaml_str("name: p\n").unwrap().check_samples);
+        let off = Manifest::from_yaml_str("name: p\ncheck_samples: false\n").unwrap();
+        assert!(!off.check_samples);
+    }
+
+    #[test]
+    fn a_hook_cannot_be_a_check() {
+        let yaml = "name: p\nhooks:\n  on_exit:\n    name: h\n    check: c.sql\n    risk: x\n";
+        assert!(load_err(yaml).contains("hooks.on_exit: must have either 'sql' or 'command'"));
+        let with_sql = "name: p\nhooks:\n  on_exit:\n    name: h\n    sql: a.sql\n    check: c.sql\n    risk: x\n";
+        assert!(load_err(with_sql).contains("hooks.on_exit: hooks cannot be a check or measure"));
+        let measure =
+            "name: p\nhooks:\n  on_exit:\n    name: h\n    sql: a.sql\n    measure: m.sql\n";
+        assert!(load_err(measure).contains("hooks cannot be a check or measure"));
+        let risk = "name: p\nhooks:\n  on_exit:\n    name: h\n    sql: a.sql\n    risk: x\n";
+        assert!(load_err(risk).contains("hooks.on_exit: hooks cannot have risk or severity"));
     }
 }

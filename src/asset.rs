@@ -152,7 +152,7 @@ impl AssetGraph {
             // captured verbatim by the parser, never lowercased here, so its graph
             // node IS its real on-disk spelling; `record` still runs so
             // `declared_case` holds a uniform entry regardless of provenance.
-            if let Some(ref sql_path) = step.sql {
+            if let Some(sql_path) = step.sql_file() {
                 let full_path = manifest_dir.join(sql_path);
                 match std::fs::read_to_string(&full_path) {
                     Ok(sql_content) => match introspect::read_sql(&sql_content) {
@@ -160,7 +160,7 @@ impl AssetGraph {
                             if let Some(reason) = &step_sql.unreadable {
                                 graph.unreadable.push(UnreadableStep {
                                     step: step.name.clone(),
-                                    file: sql_path.clone(),
+                                    file: sql_path.to_string(),
                                     reason: reason.clone(),
                                 });
                             }
@@ -186,6 +186,13 @@ impl AssetGraph {
                                 );
                             }
                             for asset in &sql_assets.inputs {
+                                // The tables a run's checks and measures read of arc's own
+                                // are not graph assets: a step cannot make them.
+                                if (step.is_check() || step.is_measure())
+                                    && crate::check::is_reserved_table(asset)
+                                {
+                                    continue;
+                                }
                                 let kind = sql_assets
                                     .kinds
                                     .get(asset)
@@ -568,6 +575,25 @@ impl AssetGraph {
         affected.into_iter().collect()
     }
 
+    /// The given assets plus every asset any producer of one of them reads, to a fixed
+    /// point: everything the given assets are built from. Names are lowercased, as the
+    /// graph's are.
+    pub fn upstream_assets(&self, assets: &BTreeSet<String>) -> BTreeSet<String> {
+        let mut found = assets.clone();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for step_assets in self.steps.values() {
+                if step_assets.produces.iter().any(|a| found.contains(a)) {
+                    for read in &step_assets.reads {
+                        changed |= found.insert(read.clone());
+                    }
+                }
+            }
+        }
+        found
+    }
+
     /// Check if this graph has any asset information worth validating.
     /// Returns false if no steps have any known assets (pure v0.1 manifest).
     pub fn has_assets(&self) -> bool {
@@ -598,6 +624,10 @@ mod tests {
             output: None,
             retry: None,
             timeout_sec: None,
+            check: None,
+            measure: None,
+            risk: None,
+            severity: None,
         }
     }
 
@@ -621,6 +651,10 @@ mod tests {
             output: None,
             retry: None,
             timeout_sec: None,
+            check: None,
+            measure: None,
+            risk: None,
+            severity: None,
         }
     }
 
@@ -639,6 +673,10 @@ mod tests {
             output: None,
             retry: None,
             timeout_sec: None,
+            check: None,
+            measure: None,
+            risk: None,
+            severity: None,
         }
     }
 
@@ -657,6 +695,10 @@ mod tests {
             output: None,
             retry: None,
             timeout_sec: None,
+            check: None,
+            measure: None,
+            risk: None,
+            severity: None,
         }
     }
 
@@ -689,9 +731,45 @@ mod tests {
             steps,
             assets,
             outputs: Vec::new(),
+            measure_history: Default::default(),
+            check_samples: true,
         };
 
         AssetGraph::build(&manifest, dir)
+    }
+
+    // The tables arc keeps its measures in are not graph assets for a check or a measure,
+    // but a plain SQL step that reads one still reads it.
+    #[test]
+    fn a_checks_and_measures_reads_leave_out_arcs_own_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut check = sql_step("c", "");
+        check.sql = None;
+        check.check = Some("checks/c.sql".to_string());
+        let mut measure = sql_step("m", "");
+        measure.sql = None;
+        measure.measure = Some("measures/m.sql".to_string());
+        let plain = sql_step("p", "models/p.sql");
+        let graph = build_graph(
+            dir.path(),
+            vec![check, measure, plain],
+            HashMap::new(),
+            &[
+                ("checks/c.sql", "SELECT * FROM measures JOIN t ON true;"),
+                (
+                    "measures/m.sql",
+                    "SELECT * FROM measure_history JOIN t ON true;",
+                ),
+                ("models/p.sql", "SELECT * FROM measures JOIN t ON true;"),
+            ],
+        );
+
+        let c = &graph.steps["c"].reads;
+        assert!(c.contains("t") && !c.contains("measures"), "{c:?}");
+        let m = &graph.steps["m"].reads;
+        assert!(m.contains("t") && !m.contains("measure_history"), "{m:?}");
+        let p = &graph.steps["p"].reads;
+        assert!(p.contains("t") && p.contains("measures"), "{p:?}");
     }
 
     // SQL steps auto-discover produced assets.
@@ -1255,6 +1333,34 @@ mod tests {
         );
 
         assert!(!graph.has_assets(), "bare command step has no assets");
+    }
+
+    // upstream_assets walks producers' reads to a fixed point, and stops on a cycle.
+    #[test]
+    fn test_upstream_assets_chain_and_cycle() {
+        let set =
+            |names: &[&str]| -> BTreeSet<String> { names.iter().map(|n| n.to_string()).collect() };
+        let empty = || AssetGraph {
+            steps: BTreeMap::new(),
+            warnings: vec![],
+            unreadable: vec![],
+        };
+        let step = |produces: &[&str], reads: &[&str]| StepAssets {
+            produces: set(produces),
+            reads: set(reads),
+            ..Default::default()
+        };
+        let mut graph = empty();
+        graph.steps.insert("a".into(), step(&["x"], &[]));
+        graph.steps.insert("b".into(), step(&["y"], &["x"]));
+        graph.steps.insert("c".into(), step(&["z"], &["y"]));
+        assert_eq!(graph.upstream_assets(&set(&["z"])), set(&["x", "y", "z"]));
+        assert_eq!(graph.upstream_assets(&set(&["x"])), set(&["x"]));
+
+        let mut cyclic = empty();
+        cyclic.steps.insert("a".into(), step(&["p"], &["q"]));
+        cyclic.steps.insert("b".into(), step(&["q"], &["p"]));
+        assert_eq!(cyclic.upstream_assets(&set(&["p"])), set(&["p", "q"]));
     }
 
     // downstream_steps computes transitive downstream.

@@ -973,6 +973,10 @@ impl Operator for DucklakeWrite {
         true
     }
 
+    fn publishes(&self) -> bool {
+        true
+    }
+
     fn assets(&self, with: &Value) -> Result<OpAssets> {
         let cfg = DucklakeWriteConfig::parse(with)?;
         let mut assets = OpAssets::default();

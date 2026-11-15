@@ -274,6 +274,17 @@ pub enum Error {
         stderr: String,
     },
 
+    // An `error` check's query returned rows. Not retried: the same data gives the same rows.
+    #[error(
+        "check '{step}' failed: {} ({} rows returned)",
+        check.risk,
+        check.rows_returned
+    )]
+    CheckFailed {
+        step: String,
+        check: Box<crate::contract::CheckSection>,
+    },
+
     #[error("step '{step}' failed: {source}")]
     StepExecution {
         step: String,
@@ -395,6 +406,7 @@ impl Error {
     pub(crate) fn exit_code(&self) -> i32 {
         match self {
             Error::StepFailed { .. }
+            | Error::CheckFailed { .. }
             | Error::OutputMissing { .. }
             | Error::StepExecution { .. }
             | Error::Precondition { .. }
@@ -649,6 +661,19 @@ mod exit_code_tests {
     #[test]
     fn execution_failures_found_a_problem() {
         for e in [
+            Error::CheckFailed {
+                step: "c".into(),
+                check: Box::new(crate::contract::CheckSection {
+                    name: "c".into(),
+                    risk: "a wrong table".into(),
+                    severity: "error".into(),
+                    success: false,
+                    rows_returned: 3,
+                    sample: Vec::new(),
+                    sample_columns: Vec::new(),
+                    error: None,
+                }),
+            },
             Error::StepFailed {
                 step: "s".into(),
                 code: 1,

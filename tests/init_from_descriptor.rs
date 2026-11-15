@@ -109,9 +109,9 @@ fn generates_and_runs_a_protocol_from_a_descriptor() {
         String::from_utf8_lossy(&run.stderr)
     );
 
-    // --- the emitted b4/1 contract ------------------------------------------
+    // --- the emitted b5/1 contract ------------------------------------------
     let contract = read_contract(&project);
-    assert_eq!(contract["contract_version"], "b4/1");
+    assert_eq!(contract["contract_version"], "b5/1");
     assert_eq!(contract["run"]["outcome"], "success");
 
     let assets = contract["assets"].as_array().expect("assets array");
