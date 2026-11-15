@@ -531,3 +531,94 @@ fn a_missing_tests_file_exits_1_naming_it() {
     assert_eq!(code, Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(stderr.contains("tests.yaml"), "{stderr}");
 }
+
+/// Write `text` to `path` under `root`, creating its folders.
+fn write_at(root: &Path, path: &str, text: &str) -> PathBuf {
+    let full = root.join(path);
+    std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+    std::fs::write(&full, text).unwrap();
+    full
+}
+
+#[test]
+fn a_fixture_landing_above_the_protocol_is_refused_and_writes_nothing() {
+    let p = Protocol::new(&test_yaml("the codes load", ""));
+    let manifest = std::fs::read_to_string(p.dir().join("arcform.yaml")).unwrap();
+    p.write(
+        "arcform.yaml",
+        &manifest.replace("out: build/raw/codes.csv", "out: ../raw/codes.csv"),
+    );
+    let real = write_at(p.root.path(), "raw/codes.csv", "the user's own\n");
+    let (code, stdout, stderr) = p.arc_test();
+    assert_eq!(code, Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains(
+            "fixture 'fetch_codes' lands at ../raw/codes.csv, outside the Protocol's folder; a test writes only inside its copy"
+        ),
+        "{stdout}"
+    );
+    assert_eq!(std::fs::read_to_string(real).unwrap(), "the user's own\n");
+}
+
+#[test]
+fn a_sql_step_writing_above_the_protocol_is_refused_and_writes_nothing() {
+    let p = Protocol::new(&test_yaml("the codes load", ""));
+    p.write(
+        "models/export.sql",
+        "COPY codes TO '../exports/codes.csv';\n",
+    );
+    let real = write_at(p.root.path(), "exports/codes.csv", "the user's own\n");
+    let (code, stdout, stderr) = p.arc_test();
+    assert_eq!(code, Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains(
+            "step 'export' writes ../exports/codes.csv, outside the Protocol's folder, which a test must not change"
+        ),
+        "{stdout}"
+    );
+    assert_eq!(std::fs::read_to_string(real).unwrap(), "the user's own\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fixture_landing_through_a_linked_folder_is_refused_and_writes_nothing() {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let real = write_at(elsewhere.path(), "codes.csv", "the user's own\n");
+    let p = Protocol::new(&test_yaml("the codes load", ""));
+    std::os::unix::fs::symlink(elsewhere.path(), p.dir().join("linked")).unwrap();
+    let manifest = std::fs::read_to_string(p.dir().join("arcform.yaml")).unwrap();
+    p.write(
+        "arcform.yaml",
+        &manifest.replace("out: build/raw/codes.csv", "out: linked/codes.csv"),
+    );
+    let (code, stdout, stderr) = p.arc_test();
+    assert_eq!(code, Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains(
+            "fixture 'fetch_codes' lands at linked/codes.csv, outside the Protocol's folder; a test writes only inside its copy"
+        ),
+        "{stdout}"
+    );
+    assert_eq!(std::fs::read_to_string(real).unwrap(), "the user's own\n");
+}
+
+#[test]
+fn a_failed_command_step_shows_the_end_of_its_standard_error() {
+    let p = Protocol::new(&test_yaml("the codes load", ""));
+    let manifest = std::fs::read_to_string(p.dir().join("arcform.yaml")).unwrap();
+    p.write(
+        "arcform.yaml",
+        &manifest.replace(
+            "  - name: size\n",
+            "  - name: shout\n    command: \"echo 'warming up' >&2; echo 'the real cause' >&2; exit 3\"\n  - name: size\n",
+        ),
+    );
+    let (code, stdout, stderr) = p.arc_test();
+    assert_eq!(code, Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains(
+            "it failed with: step 'shout' failed (exit code 3):\n  its standard error ended:\n    warming up\n    the real cause\n"
+        ),
+        "{stdout}"
+    );
+}

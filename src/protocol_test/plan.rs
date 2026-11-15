@@ -10,6 +10,7 @@ use crate::asset::{AssetGraph, StepAssets};
 use crate::asset_kind::{AssetKind, is_remote};
 use crate::manifest::{Manifest, Step};
 use crate::operator::Operator;
+use crate::record::leaves_the_folder;
 
 use super::ProtocolTest;
 
@@ -21,11 +22,39 @@ pub(crate) struct TestPlan {
     pub removed_steps: Vec<String>,
     /// Fixture files to copy into place, in `fixtures:` order.
     pub placements: Vec<Placement>,
+    /// Every path a kept step, a `sql:` hook or a break writes, relative to the Protocol's
+    /// folder, with who writes it (`step 'x'`, `hook 'on_init'`, `the break of x`). Each
+    /// is inside the folder as written; the run checks it again in the copy, where a
+    /// copied link could still lead out.
+    pub writes: Vec<Write>,
+}
+
+/// One path a test's run writes, and who writes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Write {
+    /// `step 'x'`, `hook 'on_init'` or `the break of x`.
+    pub who: String,
+    pub path: String,
+}
+
+/// The refusal for a fixture `key` whose file would land at `dest`, outside the folder.
+pub(crate) fn fixture_outside(key: &str, dest: &str) -> String {
+    format!(
+        "fixture '{key}' lands at {dest}, outside the Protocol's folder; a test writes only \
+         inside its copy"
+    )
+}
+
+/// The refusal for `who` writing `path`, outside the folder.
+pub(crate) fn write_outside(who: &str, path: &str) -> String {
+    format!("{who} writes {path}, outside the Protocol's folder, which a test must not change")
 }
 
 /// One fixture file and where it lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Placement {
+    /// The `fixtures:` key it was given under.
+    pub key: String,
     /// The checked-in file, relative to the Protocol's folder.
     pub fixture: String,
     /// The output it stands in for, relative to the Protocol's folder, spelt as the
@@ -46,11 +75,15 @@ pub(crate) struct Placement {
 /// it cannot have one either. What is left must not reach the network: a fetch step
 /// with no fixture, or a SQL step reading or writing a URL, refuses the test.
 ///
+/// Nothing a fixture or a step arc runs writes may land outside the folder: a fixture
+/// whose output path, or a path a kept `sql:`, `check:`, `measure:` or `op:` step, a
+/// `sql:` hook or a break writes, that is absolute or climbs above the folder refuses
+/// the test. A `command:` step's writes are not seen.
+///
 /// `dir` is the Protocol's folder; every path in the plan is relative to it. Hooks are
 /// not in the graph, so a `sql:` hook's file is read from it and refused the same way
-/// when it reads or writes a URL, and an `op:` hook that fetches refuses the test; any
-/// other hook runs as written. A test's `break:` statements are read and refused the
-/// same way.
+/// when it reads or writes a URL; any other hook runs as written. A test's `break:`
+/// statements are read and refused the same way.
 pub(crate) fn plan_test(
     manifest: &Manifest,
     graph: &AssetGraph,
@@ -145,6 +178,9 @@ pub(crate) fn plan_test(
             (step, lowered)
         };
         let dest = declared(step, &output);
+        if leaves_the_folder(&dest) {
+            return Err(fixture_outside(key, &dest));
+        }
         if !keyed.entry(&step.name).or_default().insert(output) {
             return Err(format!(
                 "fixture '{key}': {dest} of step '{}' already has a fixture",
@@ -152,6 +188,7 @@ pub(crate) fn plan_test(
             ));
         }
         placements.push(Placement {
+            key: key.clone(),
             fixture: fixture.clone(),
             dest,
             statements: test.breaks.get(key).cloned(),
@@ -179,6 +216,7 @@ pub(crate) fn plan_test(
     }
 
     let mut removed_steps = Vec::new();
+    let mut writes = Vec::new();
     for step in &manifest.steps {
         let op = operator(step);
         if keyed.contains_key(step.name.as_str()) || op.is_some_and(|op| op.publishes()) {
@@ -195,18 +233,30 @@ pub(crate) fn plan_test(
         }
         // A step DuckDB runs reads and writes what its SQL names; a URL there is the
         // network.
+        let who = format!("step '{}'", step.name);
         if step.sql.is_some() || step.is_check() || step.is_measure() {
             let a = assets(step);
             refuse_remote(
-                &format!("step '{}'", step.name),
+                &who,
                 a.reads.iter().map(|r| declared(step, r)),
                 a.produces.iter().map(|p| declared(step, p)),
             )?;
         }
+        // A path a step arc runs writes must stay in the copy. A `command:` step's writes
+        // are its own: arc cannot see them, so what it declares is not held to this.
+        if step.sql.is_some() || step.is_check() || step.is_measure() || step.op.is_some() {
+            let a = assets(step);
+            for path in a
+                .produces
+                .iter()
+                .filter(|p| is_path(a.declared_kind.get(*p)))
+            {
+                keep_inside(&mut writes, &who, declared(step, path))?;
+            }
+        }
     }
 
-    // Hooks are not in the graph, so a `sql:` hook's file is read here the same way. A
-    // hook that fetches has no output a fixture could stand in for, so it refuses the test.
+    // Hooks are not in the graph, so a `sql:` hook's file is read here the same way.
     let hooks = &manifest.hooks;
     for (slot, hook) in [
         ("on_init", &hooks.on_init),
@@ -214,6 +264,9 @@ pub(crate) fn plan_test(
         ("on_failure", &hooks.on_failure),
         ("on_exit", &hooks.on_exit),
     ] {
+        // Defensive: the manifest loader refuses an `op:` hook, so this never fires on a
+        // loaded manifest. A hook that fetches has no output a fixture could stand in for,
+        // so if the loader came to allow one, it would refuse the test here.
         if let Some(op) = hook.as_ref().and_then(operator).filter(|op| op.ingress()) {
             return Err(format!(
                 "hook '{slot}' fetches data ({}) and a test cannot give a hook a fixture",
@@ -231,11 +284,19 @@ pub(crate) fn plan_test(
             continue;
         };
         let assets = read.merged();
+        let who = format!("hook '{slot}'");
         refuse_remote(
-            &format!("hook '{slot}'"),
+            &who,
             assets.inputs.into_iter(),
-            assets.outputs.into_iter(),
+            assets.outputs.iter().cloned(),
         )?;
+        for path in assets
+            .outputs
+            .iter()
+            .filter(|p| is_path(assets.kinds.get(*p)))
+        {
+            keep_inside(&mut writes, &who, path.clone())?;
+        }
     }
 
     // A break is SQL DuckDB runs too, so it is read and refused the same way.
@@ -244,16 +305,25 @@ pub(crate) fn plan_test(
             continue;
         };
         let assets = read.merged();
+        let who = format!("the break of {key}");
         refuse_remote(
-            &format!("the break of {key}"),
+            &who,
             assets.inputs.into_iter(),
-            assets.outputs.into_iter(),
+            assets.outputs.iter().cloned(),
         )?;
+        for path in assets
+            .outputs
+            .iter()
+            .filter(|p| is_path(assets.kinds.get(*p)))
+        {
+            keep_inside(&mut writes, &who, path.clone())?;
+        }
     }
 
     Ok(TestPlan {
         removed_steps,
         placements,
+        writes,
     })
 }
 
@@ -273,6 +343,27 @@ fn refuse_remote(
     if let Some(url) = writes.find(|w| is_remote(w)) {
         return Err(format!("{who} writes {url}, which a test must not reach"));
     }
+    Ok(())
+}
+
+/// Whether an output of this kind is a path on disk: not a table and not a URL.
+fn is_path(kind: Option<&AssetKind>) -> bool {
+    !matches!(kind, Some(AssetKind::Table | AssetKind::Remote))
+}
+
+/// Refuse `path` when it is absolute or climbs above the folder, else add it to `writes`.
+fn keep_inside(
+    writes: &mut Vec<Write>,
+    who: &str,
+    path: String,
+) -> std::result::Result<(), String> {
+    if leaves_the_folder(&path) {
+        return Err(write_outside(who, &path));
+    }
+    writes.push(Write {
+        who: who.to_string(),
+        path,
+    });
     Ok(())
 }
 
@@ -330,8 +421,9 @@ mod tests {
         }
     }
 
-    fn placement(fixture: &str, dest: &str, statements: Option<&str>) -> Placement {
+    fn placement(key: &str, fixture: &str, dest: &str, statements: Option<&str>) -> Placement {
         Placement {
+            key: key.into(),
             fixture: fixture.into(),
             dest: dest.into(),
             statements: statements.map(str::to_string),
@@ -363,7 +455,12 @@ mod tests {
         assert_eq!(plan.removed_steps, ["fetch"]);
         assert_eq!(
             plan.placements,
-            [placement("testdata/a.csv", "build/raw/a.csv", None)]
+            [placement(
+                "fetch",
+                "testdata/a.csv",
+                "build/raw/a.csv",
+                None
+            )]
         );
     }
 
@@ -376,7 +473,12 @@ mod tests {
         assert_eq!(plan.removed_steps, ["fetch"]);
         assert_eq!(
             plan.placements,
-            [placement("testdata/a.csv", "build/raw/Data.csv", None)]
+            [placement(
+                "build/raw/data.csv",
+                "testdata/a.csv",
+                "build/raw/Data.csv",
+                None
+            )]
         );
     }
 
@@ -465,6 +567,45 @@ mod tests {
     }
 
     #[test]
+    fn a_fixture_or_a_kept_step_writing_outside_the_folder_is_refused() {
+        let steps = FETCH.replace("build/raw/a.csv", "./raw/../../raw/a.csv");
+        let err = plan(&steps, &[], &test_with(&[("fetch", "a.csv")], &[])).unwrap_err();
+        assert_eq!(
+            err,
+            "fixture 'fetch' lands at ./raw/../../raw/a.csv, outside the Protocol's folder; a \
+             test writes only inside its copy"
+        );
+
+        let export = "  - name: export\n    op: parquet_export@1\n    with:\n      input: t\n      dest: /tmp/t.parquet\n";
+        let err = plan(
+            &format!("{FETCH}{export}"),
+            &[],
+            &test_with(&[("fetch", "a.csv")], &[]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "step 'export' writes /tmp/t.parquet, outside the Protocol's folder, which a test \
+             must not change"
+        );
+
+        let inside = export.replace("/tmp/t.parquet", "build/../t.parquet");
+        let plan = plan(
+            &format!("{FETCH}{inside}"),
+            &[],
+            &test_with(&[("fetch", "a.csv")], &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.writes,
+            [Write {
+                who: "step 'export'".into(),
+                path: "build/../t.parquet".into()
+            }]
+        );
+    }
+
+    #[test]
     fn publishing_steps_are_removed() {
         let test = test_with(&[("fetch", "testdata/a.csv")], &[]);
         let plan = plan(&format!("{FETCH}{PUBLISH}"), &[], &test).unwrap();
@@ -493,8 +634,8 @@ mod tests {
         assert_eq!(
             plan.placements,
             [
-                placement("x.csv", "build/raw/a.csv", None),
-                placement("y.csv", "build/raw/b.csv", None)
+                placement("build/raw/a.csv", "x.csv", "build/raw/a.csv", None),
+                placement("build/raw/b.csv", "y.csv", "build/raw/b.csv", None)
             ]
         );
     }
@@ -556,6 +697,7 @@ mod tests {
         assert_eq!(
             plan.placements,
             [placement(
+                "fetch",
                 "testdata/a.csv",
                 "build/raw/a.csv",
                 Some("DELETE FROM fixture WHERE row = 1")

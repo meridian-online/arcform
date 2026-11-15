@@ -475,6 +475,7 @@ mod tests {
 
     fn placement(fixture: &str, dest: &str, statements: Option<&str>) -> Placement {
         Placement {
+            key: dest.to_string(),
             fixture: format!("testdata/{fixture}"),
             dest: dest.to_string(),
             statements: statements.map(str::to_string),
@@ -649,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs a DuckDB 2 CLI with the excel extension"]
+    #[ignore = "needs a DuckDB 2 CLI"]
     fn a_csv_round_trip_keeps_delimiter_and_header() {
         for newline in ["\n", "\r\n"] {
             let text = ["code;name", "007;Alpha", "010;\"Be;ta\"", ""].join(newline);
@@ -665,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs a DuckDB 2 CLI with the excel extension"]
+    #[ignore = "needs a DuckDB 2 CLI"]
     fn a_csv_header_duckdb_would_rename_is_refused() {
         for (header, why) in [
             ("code,,name", "a blank name"),
@@ -687,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs a DuckDB 2 CLI with the excel extension"]
+    #[ignore = "needs a DuckDB 2 CLI"]
     fn a_csv_with_lines_above_its_header_is_refused() {
         let text = "Report of codes\n\ncode,name\n007,Alpha\n010,Beta\n";
         let (_root, protocol, copy) = protocol_with("codes.csv", text.as_bytes());
@@ -700,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs a DuckDB 2 CLI with the excel extension"]
+    #[ignore = "needs a DuckDB 2 CLI"]
     fn a_csv_break_changes_a_value_and_keeps_the_rest() {
         let text = "code;name\n007;Alpha\n010;Beta\n";
         let (_root, protocol, copy) = protocol_with("codes.csv", text.as_bytes());
@@ -717,7 +718,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs a DuckDB 2 CLI with the excel extension"]
+    #[ignore = "needs a DuckDB 2 CLI"]
     fn a_json_array_stays_an_array() {
         let text = "  [{\"code\": \"007\", \"n\": 1, \"at\": \"2018-01-01T00:00:00Z\", \"on\": \"2018-01-01\"}, {\"code\": \"010\", \"n\": 2, \"at\": \"2018-01-02T00:00:00Z\", \"on\": \"2018-01-02\"}]\n";
         let (_root, protocol, copy) = protocol_with("codes.json", text.as_bytes());
@@ -736,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs a DuckDB 2 CLI with the excel extension"]
+    #[ignore = "needs a DuckDB 2 CLI"]
     fn ndjson_stays_ndjson() {
         let text = "{\"code\": \"007\", \"n\": 1}\n{\"code\": \"010\", \"n\": 2}\n";
         let (_root, protocol, copy) = protocol_with("codes.ndjson", text.as_bytes());
@@ -757,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs a DuckDB 2 CLI with the excel extension"]
+    #[ignore = "needs a DuckDB 2 CLI"]
     fn a_break_that_duckdb_rejects_names_the_fixture_and_leaves_no_temporary_file() {
         let (_root, protocol, copy) = protocol_with("codes.csv", b"code\n007\n");
         let placed = placement(
@@ -780,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs a DuckDB 2 CLI with the excel extension"]
+    #[ignore = "needs a DuckDB 2 CLI"]
     fn a_break_installing_an_unvetted_extension_is_refused() {
         let (_root, protocol, copy) = protocol_with("codes.csv", b"code\n007\n");
         let placed = placement(

@@ -2427,7 +2427,7 @@ fn read_file_notes(arguments: &serde_json::Map<String, serde_json::Value>) -> Ve
 /// read from: it has a root, or a `..` climbs above where its components
 /// started once each `.` is dropped and each `..` takes back the name before
 /// it.
-fn leaves_the_folder(path: &str) -> bool {
+pub(crate) fn leaves_the_folder(path: &str) -> bool {
     use std::path::Component;
     let mut depth = 0usize;
     for component in Path::new(path).components() {

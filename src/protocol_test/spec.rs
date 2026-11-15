@@ -102,7 +102,11 @@ pub(crate) fn load_tests(dir: &Path) -> Result<Vec<ProtocolTest>> {
                 format!("{TESTS_FILENAME}: two tests are named '{name}'"),
             ));
         }
-        let risk = match r.risk.map(|s| s.trim().to_string()) {
+        // A block-scalar risk spans lines; it prints as one.
+        let risk = match r
+            .risk
+            .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+        {
             Some(s) if !s.is_empty() => s,
             _ => {
                 return Err(bad(
@@ -322,6 +326,17 @@ mod tests {
                 "{m}"
             );
         }
+    }
+
+    #[test]
+    fn a_risk_over_several_lines_reads_as_one() {
+        let t = load(
+            "- name: x\n  risk: >-\n    the codes\n\n    load   wrong\n  checks: [SELECT 1]\n",
+        )
+        .unwrap();
+        assert_eq!(t[0].risk, "the codes load wrong");
+        let t = load("- name: x\n  risk: |\n    one\n    two\n").unwrap();
+        assert_eq!(t[0].risk, "one two");
     }
 
     #[test]

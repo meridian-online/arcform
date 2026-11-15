@@ -54,8 +54,8 @@ pub(crate) fn junit(protocol: &str, results: &[TestResult]) -> String {
 }
 
 /// `text` safe in XML element text: markup characters escaped, and each character XML 1.0
-/// cannot hold (control characters other than tab, newline and carriage return) replaced
-/// with U+FFFD.
+/// cannot hold (control characters other than tab, newline and carriage return, and the
+/// noncharacters U+FFFE and U+FFFF) replaced with U+FFFD.
 fn escape(text: &str) -> String {
     escape_with(text, false)
 }
@@ -79,7 +79,9 @@ fn escape_with(text: &str, attribute: bool) -> String {
             '\r' if attribute => out.push_str("&#13;"),
             '\t' if attribute => out.push_str("&#9;"),
             '\n' | '\r' | '\t' => out.push(c),
-            c if (c as u32) < 0x20 => out.push('\u{FFFD}'),
+            c if (c as u32) < 0x20 || matches!(c, '\u{FFFE}' | '\u{FFFF}') => {
+                out.push('\u{FFFD}');
+            }
             c => out.push(c),
         }
     }
@@ -194,6 +196,11 @@ mod tests {
         assert!(
             xml.contains(">m\u{FFFD}\u{FFFD}\u{FFFD}\ttab</failure>"),
             "{xml}"
+        );
+        let nonchars = junit("p", &[failed("a\u{FFFE}b\u{FFFF}c", "r", "m")]);
+        assert!(
+            nonchars.contains("name=\"a\u{FFFD}b\u{FFFD}c\""),
+            "{nonchars}"
         );
         assert!(
             !xml.chars().any(|c| c < ' ' && !"\n\t".contains(c)),

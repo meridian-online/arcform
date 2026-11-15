@@ -17,7 +17,7 @@ use crate::runner::{PUBLISH_ENV, strip_ansi};
 
 use super::ProtocolTest;
 use super::fixture::{RoundTrip, place};
-use super::plan::{TestPlan, plan_test};
+use super::plan::{TestPlan, fixture_outside, plan_test, write_outside};
 
 /// How one test came out.
 #[derive(Debug, Clone, PartialEq)]
@@ -53,6 +53,9 @@ const TEST_DB: &str = "build/arc-test.duckdb";
 
 /// How many of a failing test check's rows the failure shows.
 const SAMPLE_LINES: usize = 5;
+
+/// How many lines of a failed `command:` or `uv` step's standard error the failure shows.
+const STDERR_TAIL_LINES: usize = 10;
 
 /// How long to wait, once the child `arc run` has exited, for the rest of what it printed.
 const READER_GRACE: Duration = Duration::from_secs(2);
@@ -90,24 +93,34 @@ fn judge(
 ) -> std::result::Result<(), String> {
     let plan = plan_test(manifest, graph, dir, test)?;
     let run = run_in_copy(dir, test, &plan, engine, false)?;
+    // How the failure reads: arc's error, then the end of a failed step's own standard
+    // error when arc's error does not hold it. Only shown: `fails_with` matches arc's error.
+    let shown = |message: &str| match &run.stderr_tail {
+        Some(tail) if failed_step_runs_its_own(manifest, message) => {
+            format!("{message}\nits standard error ended:\n{tail}")
+        }
+        _ => message.to_string(),
+    };
     let Some(expect) = &test.expect else {
         if let Some((n, check)) = &run.failed_check {
             return Err(check_failure(test, *n, check));
         }
-        return match run.failure {
+        return match &run.failure {
             Some(message) => Err(format!(
-                "expected the run to succeed; it failed with: {message}"
+                "expected the run to succeed; it failed with: {}",
+                shown(message)
             )),
             None => Ok(()),
         };
     };
     let text = &expect.fails_with;
-    match run.failure {
+    match &run.failure {
         None => Err(format!(
             "expected the run to fail with \"{text}\"; it succeeded"
         )),
         Some(message) if !message.contains(text.as_str()) => Err(format!(
-            "expected the run to fail with \"{text}\"; it failed with: {message}"
+            "expected the run to fail with \"{text}\"; it failed with: {}",
+            shown(message)
         )),
         Some(_) => {
             // The break must be what makes the run fail: the same rewrite with no
@@ -146,11 +159,35 @@ fn check_failure(test: &ProtocolTest, n: usize, check: &CheckSection) -> String 
     what
 }
 
+/// Whether `message` is arc's error for a `command:` or `uv` step that exited non-zero.
+/// Such a step's standard error goes to the terminal, not into arc's error, so the
+/// failure shows its end.
+fn failed_step_runs_its_own(manifest: &Manifest, message: &str) -> bool {
+    let Some((name, _)) = message
+        .strip_prefix("step '")
+        .and_then(|rest| rest.split_once("' failed (exit code "))
+    else {
+        return false;
+    };
+    manifest.steps.iter().any(|step| {
+        step.name == name
+            && (step.command.is_some()
+                || step
+                    .op
+                    .as_deref()
+                    .and_then(|op| crate::operator::resolve(op).ok())
+                    .is_some_and(|op| op.name() == "uv"))
+    })
+}
+
 /// What one child run left.
 struct ChildOutcome {
     /// arc's error, when it failed: the text of the file `ARC_TEST_ERROR_FILE` names, or,
     /// from a child that wrote none, the text after `error: ` on its standard error.
     failure: Option<String>,
+    /// The last lines of what the child printed to standard error before arc's own
+    /// error, each indented by two spaces, when it failed and printed any.
+    stderr_tail: Option<String>,
     /// The first of the test's own checks that returned rows, with its number.
     failed_check: Option<(usize, CheckSection)>,
 }
@@ -168,6 +205,17 @@ fn run_in_copy(
     let dir = std::fs::canonicalize(dir)
         .map_err(|e| format!("the Protocol folder {} cannot be read: {e}", dir.display()))?;
     let copy = ProtocolCopy::make(&dir)?;
+    // The plan refused a path written above the folder; a copied link can still lead out.
+    for placement in &plan.placements {
+        if !inside_copy(copy.path(), Path::new(&placement.dest)) {
+            return Err(fixture_outside(&placement.key, &placement.dest));
+        }
+    }
+    for write in &plan.writes {
+        if !inside_copy(copy.path(), Path::new(&write.path)) {
+            return Err(write_outside(&write.who, &write.path));
+        }
+    }
     rewrite_manifest(copy.path(), test, plan)?;
     for placement in &plan.placements {
         let round_trip = match (&placement.statements, control) {
@@ -178,9 +226,10 @@ fn run_in_copy(
         place(copy.path(), placement, &dir, engine, round_trip)?;
     }
     let history = test.measure_history.as_ref().map(|h| dir.join(h));
-    let child = run_child(copy.path(), test, history.as_deref())?;
+    let (failure, stderr_tail) = run_child(copy.path(), test, history.as_deref())?;
     Ok(ChildOutcome {
-        failure: child,
+        failure,
+        stderr_tail,
         failed_check: failed_test_check(copy.path()),
     })
 }
@@ -352,17 +401,21 @@ fn rewrite_manifest(
     std::fs::write(&path, text).map_err(|e| cannot(e.to_string()))
 }
 
+/// A child run's failure, if any, and the end of its standard error.
+type ChildRun = (Option<String>, Option<String>);
+
 /// Run `arc run --force` on `copy` from this executable, one `--param` per test parameter,
 /// with standard input closed and standard output dropped. Its failure is the text of the
 /// file `ARC_TEST_ERROR_FILE` names, and its standard error is read only as the fallback
 /// for a child that wrote no such file. The child gets `history` as its measure history and
-/// never publishes. `Ok(None)` when it succeeded, `Ok(Some(message))` when it failed, `Err`
-/// when it could not start.
+/// never publishes. `Ok((None, None))` when it succeeded, `Ok((Some(message), tail))` when it
+/// failed, with the end of its standard error as [`stderr_tail`] gives it, `Err` when it
+/// could not start.
 fn run_child(
     copy: &Path,
     test: &ProtocolTest,
     history: Option<&Path>,
-) -> std::result::Result<Option<String>, String> {
+) -> std::result::Result<ChildRun, String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
 
@@ -414,18 +467,42 @@ fn run_child(
     let status = child.wait().map_err(cannot)?;
     let _ = done_rx.recv_timeout(READER_GRACE);
     if status.success() {
-        return Ok(None);
-    }
-    // arc wrote its own error to the file; only a child that crashed or was killed did not,
-    // and then the error is looked for on its standard error.
-    if let Ok(text) = std::fs::read_to_string(&error_file) {
-        return Ok(Some(error_from_file(&text)));
+        return Ok((None, None));
     }
     let bytes = stderr.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let text = strip_ansi(&String::from_utf8_lossy(&bytes));
-    Ok(Some(error_message(&text).unwrap_or_else(|| {
-        format!("arc run exited with {status} and printed no error")
-    })))
+    let tail = stderr_tail(&text);
+    // arc wrote its own error to the file; only a child that crashed or was killed did not,
+    // and then the error is looked for on its standard error.
+    if let Ok(file) = std::fs::read_to_string(&error_file) {
+        return Ok((Some(error_from_file(&file)), tail));
+    }
+    let message = error_message(&text)
+        .unwrap_or_else(|| format!("arc run exited with {status} and printed no error"));
+    Ok((Some(message), tail))
+}
+
+/// The last [`STDERR_TAIL_LINES`] lines with text on them that the child printed to
+/// standard error (already free of colour codes) before arc's own `error: ` line, with
+/// DuckDB's echo of the SQL taken out, each indented by two spaces. `None` when there are
+/// none.
+fn stderr_tail(stderr: &str) -> Option<String> {
+    let before = stderr
+        .match_indices("error: ")
+        .map(|(i, _)| i)
+        .filter(|&i| i == 0 || stderr[..i].ends_with('\n'))
+        .last()
+        .map_or(stderr, |at| &stderr[..at]);
+    let lines: Vec<&str> = before
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !is_duckdb_context(line))
+        .collect();
+    let start = lines.len().saturating_sub(STDERR_TAIL_LINES);
+    let kept: Vec<String> = lines[start..]
+        .iter()
+        .map(|line| format!("  {}", line.trim_end()))
+        .collect();
+    (!kept.is_empty()).then(|| kept.join("\n"))
 }
 
 /// The error text arc wrote to the error file, with any colour codes and DuckDB's context
@@ -504,6 +581,18 @@ LINE 1: SELECT CASE WHEN code IS NULL THEN error('codes header has moved') END F
     }
 
     #[test]
+    fn the_stderr_tail_is_the_last_ten_lines_before_arcs_error() {
+        let mut stderr = String::new();
+        for n in 1..=12 {
+            stderr.push_str(&format!("line {n}\n\n"));
+        }
+        stderr.push_str("LINE 1: SELECT 1\n       ^\nerror: step 's' failed (exit code 1):\n");
+        let expected: Vec<String> = (3..=12).map(|n| format!("  line {n}")).collect();
+        assert_eq!(stderr_tail(&stderr), Some(expected.join("\n")));
+        assert_eq!(stderr_tail("error: step 's' failed (exit code 1):\n"), None);
+    }
+
+    #[test]
     fn an_error_file_with_colour_codes_matches_as_plain_text() {
         let text = "\x1b[31merror\x1b[0m: step 'load' failed:\n\x1b[1mcodes header has moved\x1b[0m\n\
 LINE 1: SELECT error('x')\n         ^\n";
@@ -551,6 +640,7 @@ LINE 1: SELECT error('x')\n         ^\n";
         let plan = TestPlan {
             removed_steps: Vec::new(),
             placements: Vec::new(),
+            writes: Vec::new(),
         };
         let test = ProtocolTest {
             name: "n".into(),
@@ -604,6 +694,7 @@ LINE 1: SELECT error('x')\n         ^\n";
         let plan = TestPlan {
             removed_steps: vec!["fetch".into()],
             placements: Vec::new(),
+            writes: Vec::new(),
         };
         rewrite_manifest(dir.path(), &test, &plan).unwrap();
         let manifest = Manifest::load(dir.path()).unwrap();
