@@ -133,6 +133,14 @@ pub trait Operator: Sync {
     fn publishes(&self) -> bool {
         false
     }
+
+    /// Whether the step fetches data from the network, so `arc test` must give it a
+    /// fixture in its place. See `protocol_test::plan_test`.
+    // Read only by `arc test`'s planner, which no command calls yet.
+    #[allow(dead_code)]
+    fn ingress(&self) -> bool {
+        false
+    }
 }
 
 static PARQUET_EXPORT: ParquetExport = ParquetExport;
@@ -3964,6 +3972,10 @@ impl Operator for HttpFetch {
         "http_fetch"
     }
 
+    fn ingress(&self) -> bool {
+        true
+    }
+
     fn version(&self) -> semver::Version {
         semver::Version::new(1, 0, 0)
     }
@@ -4278,6 +4290,10 @@ impl OpendalFetchConfig {
 impl Operator for OpendalFetch {
     fn name(&self) -> &'static str {
         "opendal_fetch"
+    }
+
+    fn ingress(&self) -> bool {
+        true
     }
 
     fn version(&self) -> semver::Version {
@@ -5664,6 +5680,10 @@ impl Operator for HtmlLinkDiscover {
         "html_link_discover"
     }
 
+    fn ingress(&self) -> bool {
+        true
+    }
+
     fn version(&self) -> semver::Version {
         semver::Version::new(1, 0, 0)
     }
@@ -6146,6 +6166,10 @@ impl GleifRaFetchConfig {
 impl Operator for GleifRaFetch {
     fn name(&self) -> &'static str {
         "gleif_ra_fetch"
+    }
+
+    fn ingress(&self) -> bool {
+        true
     }
 
     fn version(&self) -> semver::Version {

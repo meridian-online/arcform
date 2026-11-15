@@ -3,6 +3,7 @@
 // Nothing consumes this yet; the commands that run tests arrive in later changes.
 #![allow(dead_code)]
 
+mod plan;
 mod spec;
 
 #[allow(unused_imports)]
