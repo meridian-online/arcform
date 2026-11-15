@@ -1,6 +1,8 @@
 # Protocol checks, measures and tests
 
-Design, 2026-11-15. Arcform builds it; nothing here is built yet.
+Design, 2026-11-15. Arcform builds it in parts.
+
+**Status.** The Checks, Measures, Comparing with earlier runs and The run record sections are built, and `docs/ARCHITECTURE.md`'s "Checks and measures" section is now the authority for them: the run record is `b5/1`, a failed error check exits 2 as a failed step does until the exit-code work below settles both, and the rulings made while building are recorded there. Telling the analyst and Protocol tests are not built yet; this file stays as their design until they are, then folds into the architecture docs. The `NOT IN` examples below pass silently when the subquery holds a `NULL`; write such a check with `NOT EXISTS` or an anti join.
 
 ## Intent
 
