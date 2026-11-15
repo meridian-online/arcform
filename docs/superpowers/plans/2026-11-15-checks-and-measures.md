@@ -32,7 +32,7 @@ Recorded here so Hugh reads them in one place; each is restated in the task that
 5. **A check or measure whose SQL fails to run** (a missing table, a type error) fails its step whatever its severity: a broken warn check is a broken Protocol, not a warning.
 6. **A measure column whose value is SQL `NULL`** is recorded as JSON `null` and appears in `measures` with a `NULL` value; it is not refused.
 7. **The ordering rule's "through the graph"** means: an `error` check that comes after a publishing step is refused when any table or file the check reads is one the publishing step reads or an upstream ancestor of one (a check on `soc` guards a publish of `build/soc.parquet` that a later `COPY soc TO …` wrote).
-8. **`measures` and `measure_history` are reserved table names**: arc refuses a manifest in which a step produces either.
+8. **`measures` and `measure_history` are reserved table names in a Protocol with checks or measures**: arc refuses a manifest that declares a check or measure step and has a step producing either. A Protocol without checks keeps any table name (the brewtrend example has a `measures` table).
 9. **Step names may not contain `:`**, which the spec relies on for the `table:` prefix and which `validate` does not enforce today.
 10. **A failed `error` check exits as a failed step does today** (exit code 2, via `Error::exit_code`). The spec's 0/1 exit codes belong to the Telling-the-analyst issue, which should settle both together.
 12. **History compares like with like.** `measure_history` keeps only earlier runs whose recorded `run.params` (key and value, as the record holds them) equal this run's, so a run for another `release` is not a baseline.
