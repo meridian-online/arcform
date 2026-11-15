@@ -393,12 +393,13 @@ fn rewrite_manifest(
         return Err(cannot("it is not a mapping".into()));
     };
     // The database kept is named as `normalise` reads it, the same file the copy left out.
+    // Both spellings must stay inside: a link before a `..` makes them differ.
     let own_db = map
         .get("db")
         .and_then(Value::as_str)
         .filter(|db| !db.trim().is_empty() && inside_copy(copy, Path::new(db)))
         .and_then(|db| normalise(Path::new(db)))
-        .filter(|db| !db.as_os_str().is_empty());
+        .filter(|db| !db.as_os_str().is_empty() && inside_copy(copy, db));
     let db = own_db.map_or_else(
         || TEST_DB.to_string(),
         |db| db.to_string_lossy().into_owned(),
@@ -722,6 +723,41 @@ LINE 1: SELECT error('x')\n         ^\n";
             let manifest = Manifest::load(dir.path()).unwrap();
             assert_eq!(manifest.db.as_deref(), Some(kept), "db: {db}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_database_whose_written_and_normalised_paths_differ_is_replaced() {
+        // `inner/..` is `a` to the system, so the path as written stays inside, but the
+        // normalised `out/x.duckdb` leads out through the `out` link.
+        let outside = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("a/b"), dir.path().join("inner")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("out")).unwrap();
+        std::fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            "name: t\ndb: inner/../out/x.duckdb\nsteps:\n  - name: s\n    command: \"true\"\n",
+        )
+        .unwrap();
+        let plan = TestPlan {
+            removed_steps: Vec::new(),
+            placements: Vec::new(),
+            writes: Vec::new(),
+        };
+        let test = ProtocolTest {
+            name: "n".into(),
+            risk: "r".into(),
+            fixtures: Default::default(),
+            breaks: Default::default(),
+            expect: None,
+            checks: Vec::new(),
+            params: Default::default(),
+            measure_history: None,
+        };
+        rewrite_manifest(dir.path(), &test, &plan).unwrap();
+        let manifest = Manifest::load(dir.path()).unwrap();
+        assert_eq!(manifest.db.as_deref(), Some(TEST_DB));
     }
 
     #[test]
