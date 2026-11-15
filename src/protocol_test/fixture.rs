@@ -111,7 +111,7 @@ fn rewrite(
             let (sheet, end) = xlsx_layout(&dest).map_err(cannot)?;
             xlsx_sql(&dest, &temp, &sheet, &end, statements)
         }
-        Format::Csv => csv_sql(&dest, &temp, statements),
+        Format::Csv => csv_sql(&dest, &temp, fixture, statements),
         Format::Json => {
             let bytes = std::fs::read(&dest).map_err(|e| cannot(e.to_string()))?;
             let array = bytes
@@ -159,13 +159,10 @@ fn rewrite(
     );
     if let Err(error) = ran {
         let _ = std::fs::remove_file(&temp);
-        let message = match error {
-            Error::StepFailed { stderr, .. } if !stderr.trim().is_empty() => {
-                stderr.trim().to_string()
-            }
-            other => other.to_string(),
-        };
-        return Err(format!("the break of {fixture} did not run: {message}"));
+        return Err(format!(
+            "the break of {fixture} did not run: {}",
+            duckdb_failure(error)
+        ));
     }
     std::fs::rename(&temp, &dest).map_err(|e| {
         let _ = std::fs::remove_file(&temp);
@@ -173,6 +170,22 @@ fn rewrite(
             "the rewritten file could not replace the fixture: {e}"
         ))
     })
+}
+
+/// What DuckDB said when the break's SQL failed: its standard error, or, when it printed
+/// nothing there, its exit code.
+fn duckdb_failure(error: Error) -> String {
+    match error {
+        Error::StepFailed { stderr, code, .. } => {
+            let stderr = stderr.trim();
+            if stderr.is_empty() {
+                format!("DuckDB exited with code {code} and printed nothing")
+            } else {
+                stderr.to_string()
+            }
+        }
+        other => other.to_string(),
+    }
 }
 
 /// `text` as a SQL string literal.
@@ -198,6 +211,8 @@ fn body(statements: &str) -> String {
 /// The SQL that reads the only sheet of the workbook `dest`, cells `A1` to `end`, every cell
 /// as text and every blank row kept, numbers its rows `row`, runs `statements`, and writes
 /// the rows back in `row` order to `temp`, with no header and under the same sheet name.
+/// Blank rows after the last row with a cell are dropped before the write: a used range
+/// that runs past the data would otherwise come back as rows of empty cells.
 fn xlsx_sql(dest: &Path, temp: &Path, sheet: &str, end: &str, statements: &str) -> String {
     let dest = path_literal(dest);
     let temp = path_literal(temp);
@@ -211,37 +226,65 @@ fn xlsx_sql(dest: &Path, temp: &Path, sheet: &str, end: &str, statements: &str) 
          header = false, all_varchar = true, stop_at_empty = false, sheet = {sheet}, \
          range = {range});\n\
          {}\
+         DELETE FROM fixture WHERE row > (SELECT coalesce(max(row), 0) FROM (SELECT row, \
+         coalesce(*COLUMNS(* EXCLUDE (row))) AS arc_test_cell FROM fixture) \
+         WHERE arc_test_cell IS NOT NULL);\n\
          COPY (SELECT * EXCLUDE (row) FROM fixture ORDER BY row) TO {temp} \
          (FORMAT xlsx, HEADER false, SHEET {sheet});\n",
         body(statements)
     )
 }
 
-/// The SQL that reads the CSV file `dest` with the delimiter, quote and header DuckDB's
-/// sniffer finds in it (`sniff_csv` gives `(empty)` for a quote or escape it found none of;
-/// the quote is then `"` and the escape the quote, DuckDB's defaults), every column as text, runs `statements`, and writes it back to
-/// `temp` with the same delimiter, quote and header.
-fn csv_sql(dest: &Path, temp: &Path, statements: &str) -> String {
+/// The SQL that reads the CSV file `dest` with the delimiter, quote, line ending and header
+/// DuckDB's sniffer finds in it, every column as text, runs `statements`, and writes it back
+/// to `temp` the same way. `sniff_csv` gives `(empty)` for a quote or escape it found none
+/// of; the quote is then `"` and the escape the quote, DuckDB's defaults.
+///
+/// Two files are refused, as DuckDB would not write them back as they were: one with lines
+/// above its header, which the reader skips, and one whose header DuckDB's reader renames
+/// (a blank name, a repeated one, spaces around one), found by comparing the names it gives
+/// with the file's first line read as data. Each check is a `SET VARIABLE`, which prints
+/// nothing when it passes.
+fn csv_sql(dest: &Path, temp: &Path, fixture: &str, statements: &str) -> String {
     let dest = path_literal(dest);
     let temp = path_literal(temp);
+    let skipped = literal(&format!(
+        "{fixture} has lines above its header, which DuckDB skips and would not write back; \
+         check in a second fixture with the change made instead"
+    ));
+    let renamed = literal(&format!(
+        "the header of {fixture} has names DuckDB reads differently (a blank, repeated or \
+         padded name), so it would not write it back as it is; check in a second fixture \
+         with the change made instead"
+    ));
+    let options = "delim = getvariable('arc_test_delim'), quote = getvariable('arc_test_quote'), \
+                   escape = getvariable('arc_test_escape'), skip = 0, all_varchar = true";
     format!(
         "SET VARIABLE arc_test_delim = (SELECT Delimiter FROM sniff_csv({dest}));\n\
          SET VARIABLE arc_test_quote = (SELECT coalesce(nullif(Quote, '(empty)'), '\"') FROM sniff_csv({dest}));\n\
          SET VARIABLE arc_test_escape = (SELECT coalesce(nullif(Escape, '(empty)'), nullif(Quote, '(empty)'), '\"') FROM sniff_csv({dest}));\n\
+         SET VARIABLE arc_test_newline = (SELECT NewLineDelimiter FROM sniff_csv({dest}));\n\
          SET VARIABLE arc_test_header = (SELECT HasHeader FROM sniff_csv({dest}));\n\
-         CREATE TABLE fixture AS FROM read_csv({dest}, delim = getvariable('arc_test_delim'), \
-         quote = getvariable('arc_test_quote'), escape = getvariable('arc_test_escape'), \
-         header = getvariable('arc_test_header'), all_varchar = true);\n\
+         SET VARIABLE arc_test_refused = (SELECT error({skipped}) FROM sniff_csv({dest}) WHERE SkipRows > 0);\n\
+         CREATE TABLE fixture AS FROM read_csv({dest}, {options}, \
+         header = getvariable('arc_test_header'));\n\
+         SET VARIABLE arc_test_refused = (SELECT error({renamed}) FROM (SELECT list_transform([*COLUMNS(*)], lambda cell: coalesce(cell, '')) \
+         AS cells FROM read_csv({dest}, {options}, header = false) LIMIT 1) \
+         WHERE getvariable('arc_test_header') AND cells IS DISTINCT FROM (SELECT \
+         list(column_name ORDER BY ordinal_position) FROM information_schema.columns \
+         WHERE table_name = 'fixture' AND table_schema = current_schema()));\n\
          {}\
          COPY fixture TO {temp} (FORMAT csv, DELIMITER getvariable('arc_test_delim'), \
          QUOTE getvariable('arc_test_quote'), ESCAPE getvariable('arc_test_escape'), \
-         HEADER getvariable('arc_test_header'));\n",
+         NEW_LINE getvariable('arc_test_newline'), HEADER getvariable('arc_test_header'));\n",
         body(statements)
     )
 }
 
 /// The SQL that reads the JSON file `dest`, an array when `array` is true and one object
-/// per line otherwise, runs `statements`, and writes it back to `temp` the same way.
+/// per line otherwise, runs `statements`, and writes it back to `temp` the same way. Date
+/// and timestamp detection is off (a format of `%%` matches no value), so a timestamp
+/// string comes back as written rather than in the machine's time zone.
 fn json_sql(dest: &Path, temp: &Path, array: bool, statements: &str) -> String {
     let dest = path_literal(dest);
     let temp = path_literal(temp);
@@ -251,7 +294,8 @@ fn json_sql(dest: &Path, temp: &Path, array: bool, statements: &str) -> String {
         ("newline_delimited", "false")
     };
     format!(
-        "CREATE TABLE fixture AS FROM read_json({dest}, format = '{format}');\n\
+        "CREATE TABLE fixture AS FROM read_json({dest}, format = '{format}', \
+         dateformat = '%%', timestampformat = '%%');\n\
          {}\
          COPY fixture TO {temp} (FORMAT json, ARRAY {array});\n",
         body(statements)
@@ -259,8 +303,8 @@ fn json_sql(dest: &Path, temp: &Path, array: bool, statements: &str) -> String {
 }
 
 /// The name of the only sheet in the workbook at `path`, and the last cell of its used
-/// range (`"D88"`): the worksheet's `<dimension ref>`, or the furthest column and row of
-/// any cell when it has none. A workbook with more than one sheet is refused, since DuckDB
+/// range (`"D88"`): the larger column and the larger row of the worksheet's
+/// `<dimension ref>` end and of any cell's `r`. A workbook with more than one sheet is refused, since DuckDB
 /// writes one sheet back and dropping the others would test a different file.
 fn xlsx_layout(path: &Path) -> std::result::Result<(String, String), String> {
     let shown = path.display();
@@ -317,21 +361,27 @@ fn xlsx_layout(path: &Path) -> std::result::Result<(String, String), String> {
     };
     let worksheet = member(&sheet_path)?;
 
+    // The furthest cell, widened to the dimension's end: Excel's dimension can run past the
+    // data, and a stale one written by another tool can stop short of it.
+    let mut furthest: Option<(u64, u64)> = None;
+    let mut widen = |column: u64, row: u64| {
+        let (max_column, max_row) = furthest.unwrap_or((0, 0));
+        furthest = Some((max_column.max(column), max_row.max(row)));
+    };
+    let cell_ref = Regex::new(r"^([A-Za-z]+)([0-9]+)$").expect("a valid pattern");
     let dimension =
         Regex::new(r#"<(?:\w+:)?dimension\s[^>]*\bref="([^"]+)""#).expect("a valid pattern");
     if let Some(found) = dimension.captures(&worksheet) {
         let range = &found[1];
         let end = range.rsplit(':').next().unwrap_or(range);
-        return Ok((name, end.to_ascii_uppercase()));
+        if let Some(parts) = cell_ref.captures(end) {
+            widen(column_number(&parts[1]), parts[2].parse().unwrap_or(0));
+        }
     }
     let cell =
         Regex::new(r#"<(?:\w+:)?c\s[^>]*\br="([A-Za-z]+)([0-9]+)""#).expect("a valid pattern");
-    let mut furthest: Option<(u64, u64)> = None;
     for found in cell.captures_iter(&worksheet) {
-        let column = column_number(&found[1]);
-        let row: u64 = found[2].parse().unwrap_or(0);
-        let (max_column, max_row) = furthest.unwrap_or((0, 0));
-        furthest = Some((max_column.max(column), max_row.max(row)));
+        widen(column_number(&found[1]), found[2].parse().unwrap_or(0));
     }
     let (column, row) = furthest.ok_or_else(|| format!("{shown}: sheet '{name}' has no cells"))?;
     Ok((name, format!("{}{row}", column_letters(column))))
@@ -373,7 +423,7 @@ fn column_letters(mut n: u64) -> String {
 mod tests {
     use super::*;
     use crate::engine::{DuckDbEngine, duckdb_program};
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::path::PathBuf;
 
     const TITLE_BLOCK: &str = "tests/fixtures/arc_test/title_block.xlsx";
@@ -601,14 +651,52 @@ mod tests {
     #[test]
     #[ignore = "needs a DuckDB 2 CLI with the excel extension"]
     fn a_csv_round_trip_keeps_delimiter_and_header() {
-        let text = "code;name\n007;Alpha\n010;\"Be;ta\"\n";
+        for newline in ["\n", "\r\n"] {
+            let text = ["code;name", "007;Alpha", "010;\"Be;ta\"", ""].join(newline);
+            let (_root, protocol, copy) = protocol_with("codes.csv", text.as_bytes());
+            let placed = placement("codes.csv", "build/raw/codes.csv", None);
+            place(&copy, &placed, &protocol, &DuckDbEngine, RoundTrip::Control).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(copy.join("build/raw/codes.csv")).unwrap(),
+                text,
+                "{newline:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a DuckDB 2 CLI with the excel extension"]
+    fn a_csv_header_duckdb_would_rename_is_refused() {
+        for (header, why) in [
+            ("code,,name", "a blank name"),
+            ("code,name,code", "a repeated name"),
+            (" code , name,x", "spaces around names"),
+        ] {
+            let text = format!("{header}\n1,2,3\n");
+            let (_root, protocol, copy) = protocol_with("codes.csv", text.as_bytes());
+            let placed = placement("codes.csv", "build/raw/codes.csv", None);
+            let refusal =
+                place(&copy, &placed, &protocol, &DuckDbEngine, RoundTrip::Control).unwrap_err();
+            assert!(refusal.contains("testdata/codes.csv"), "{why}: {refusal}");
+            assert!(refusal.contains("header"), "{why}: {refusal}");
+            assert!(
+                refusal.contains("check in a second fixture"),
+                "{why}: {refusal}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a DuckDB 2 CLI with the excel extension"]
+    fn a_csv_with_lines_above_its_header_is_refused() {
+        let text = "Report of codes\n\ncode,name\n007,Alpha\n010,Beta\n";
         let (_root, protocol, copy) = protocol_with("codes.csv", text.as_bytes());
         let placed = placement("codes.csv", "build/raw/codes.csv", None);
-        place(&copy, &placed, &protocol, &DuckDbEngine, RoundTrip::Control).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(copy.join("build/raw/codes.csv")).unwrap(),
-            text
-        );
+        let refusal =
+            place(&copy, &placed, &protocol, &DuckDbEngine, RoundTrip::Control).unwrap_err();
+        assert!(refusal.contains("testdata/codes.csv"), "{refusal}");
+        assert!(refusal.contains("above its header"), "{refusal}");
+        assert!(refusal.contains("check in a second fixture"), "{refusal}");
     }
 
     #[test]
@@ -631,7 +719,7 @@ mod tests {
     #[test]
     #[ignore = "needs a DuckDB 2 CLI with the excel extension"]
     fn a_json_array_stays_an_array() {
-        let text = "  [{\"code\": \"007\", \"n\": 1}, {\"code\": \"010\", \"n\": 2}]\n";
+        let text = "  [{\"code\": \"007\", \"n\": 1, \"at\": \"2018-01-01T00:00:00Z\", \"on\": \"2018-01-01\"}, {\"code\": \"010\", \"n\": 2, \"at\": \"2018-01-02T00:00:00Z\", \"on\": \"2018-01-02\"}]\n";
         let (_root, protocol, copy) = protocol_with("codes.json", text.as_bytes());
         let placed = placement(
             "codes.json",
@@ -641,7 +729,10 @@ mod tests {
         place(&copy, &placed, &protocol, &DuckDbEngine, RoundTrip::Break).unwrap();
         let written = std::fs::read_to_string(copy.join("build/raw/codes.json")).unwrap();
         let value: serde_json::Value = serde_json::from_str(&written).unwrap();
-        assert_eq!(value, serde_json::json!([{"code": "007", "n": 1}]));
+        assert_eq!(
+            value,
+            serde_json::json!([{"code": "007", "n": 1, "at": "2018-01-01T00:00:00Z", "on": "2018-01-01"}])
+        );
     }
 
     #[test]
@@ -708,5 +799,129 @@ mod tests {
             std::fs::read(copy.join("build/raw/codes.csv")).unwrap(),
             b"code\n007\n"
         );
+    }
+
+    #[test]
+    fn a_stale_dimension_is_widened_to_the_furthest_cell() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.xlsx");
+        let bytes = zip_of(&[
+            (
+                "xl/workbook.xml",
+                r#"<workbook><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            ("xl/_rels/workbook.xml.rels", RELS),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<worksheet><dimension ref="A1"/><sheetData><row r="5"><c r="C5"/></row></sheetData></worksheet>"#,
+            ),
+        ]);
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(xlsx_layout(&path).unwrap().1, "C5");
+    }
+
+    #[test]
+    fn a_duckdb_failure_with_nothing_on_stderr_says_so() {
+        let failed = Error::StepFailed {
+            step: String::new(),
+            code: 3,
+            stderr: " \n".to_string(),
+        };
+        assert_eq!(
+            duckdb_failure(failed),
+            "DuckDB exited with code 3 and printed nothing"
+        );
+        let failed = Error::StepFailed {
+            step: String::new(),
+            code: 1,
+            stderr: "Binder Error: no\n".to_string(),
+        };
+        assert_eq!(duckdb_failure(failed), "Binder Error: no");
+    }
+
+    /// `TITLE_BLOCK` with its dimension rewritten to `range`, in a Protocol folder.
+    fn title_block_with_dimension(range: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let mut archive =
+            zip::ZipArchive::new(std::fs::File::open(repo().join(TITLE_BLOCK)).unwrap()).unwrap();
+        let mut entries = Vec::new();
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).unwrap();
+            let mut text = String::new();
+            entry.read_to_string(&mut text).unwrap();
+            let text = text.replace(
+                r#"<dimension ref="A1:D10"/>"#,
+                &format!(r#"<dimension ref="{range}"/>"#),
+            );
+            entries.push((entry.name().to_string(), text));
+        }
+        let borrowed: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(name, text)| (name.as_str(), text.as_str()))
+            .collect();
+        protocol_with("title_block.xlsx", &zip_of(&borrowed))
+    }
+
+    /// Every cell DuckDB reads from `path` with no range given.
+    fn cells_without_range(path: &Path) -> Vec<String> {
+        query(&format!(
+            "LOAD excel; SELECT * FROM read_xlsx({}, header = false, all_varchar = true, \
+             stop_at_empty = false);",
+            path_literal(path)
+        ))
+        .lines()
+        .skip(1)
+        .map(str::to_string)
+        .collect()
+    }
+
+    #[test]
+    #[ignore = "needs a DuckDB 2 CLI with the excel extension"]
+    fn an_xlsx_whose_dimension_runs_past_its_data_round_trips() {
+        let (_root, protocol, copy) = title_block_with_dimension("A1:F12");
+        let fixture = protocol.join("testdata/title_block.xlsx");
+        assert_eq!(xlsx_layout(&fixture).unwrap().1, "F12");
+        let placed = placement("title_block.xlsx", "build/raw/t.xlsx", None);
+        place(&copy, &placed, &protocol, &DuckDbEngine, RoundTrip::Control).unwrap();
+        let written = copy.join("build/raw/t.xlsx");
+        assert_eq!(cells(&written, "D10"), cells(&fixture, "D10"));
+        assert_eq!(cells_without_range(&written), cells_without_range(&fixture));
+        assert_eq!(xlsx_layout(&written).unwrap().1, "D10");
+    }
+
+    #[test]
+    #[ignore = "needs a DuckDB 2 CLI with the excel extension"]
+    fn a_number_cell_comes_back_as_text() {
+        let root = tempfile::tempdir().unwrap();
+        let protocol = root.path().join("protocol");
+        let copy = root.path().join("copy");
+        std::fs::create_dir_all(protocol.join("testdata")).unwrap();
+        let fixture = protocol.join("testdata/n.xlsx");
+        // A workbook whose B1 is a number cell.
+        query(&format!(
+            "LOAD excel; COPY (SELECT 'count' AS a, 12 AS b) TO {} (FORMAT xlsx, HEADER false);",
+            path_literal(&fixture)
+        ));
+        let sheet = |path: &Path| {
+            let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+            let mut text = String::new();
+            archive
+                .by_name("xl/worksheets/sheet1.xml")
+                .unwrap()
+                .read_to_string(&mut text)
+                .unwrap();
+            let b1 = Regex::new(r#"<c r="B1"[^>]*>"#).unwrap();
+            b1.find(&text).unwrap().as_str().to_string()
+        };
+        assert!(
+            !sheet(&fixture).contains("inlineStr"),
+            "{}",
+            sheet(&fixture)
+        );
+        let placed = placement("n.xlsx", "build/raw/n.xlsx", None);
+        place(&copy, &placed, &protocol, &DuckDbEngine, RoundTrip::Control).unwrap();
+        let written = copy.join("build/raw/n.xlsx");
+        // Ruling 9: cell types are not kept. The number comes back as the text "12".
+        assert!(sheet(&written).contains("inlineStr"), "{}", sheet(&written));
+        assert_eq!(cells(&written, "B1"), cells(&fixture, "B1"));
     }
 }

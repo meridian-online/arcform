@@ -48,7 +48,8 @@ pub(crate) struct Placement {
 ///
 /// `dir` is the Protocol's folder; every path in the plan is relative to it. Hooks are
 /// not in the graph, so a `sql:` hook's file is read from it and refused the same way
-/// when it reads or writes a URL; any other hook runs as written.
+/// when it reads or writes a URL; any other hook runs as written. A test's `break:`
+/// statements are read and refused the same way.
 pub(crate) fn plan_test(
     manifest: &Manifest,
     graph: &AssetGraph,
@@ -229,13 +230,26 @@ pub(crate) fn plan_test(
         )?;
     }
 
+    // A break is SQL DuckDB runs too, so it is read and refused the same way.
+    for (key, statements) in &test.breaks {
+        let Ok(read) = crate::introspect::read_sql(statements) else {
+            continue;
+        };
+        let assets = read.merged();
+        refuse_remote(
+            &format!("the break of {key}"),
+            assets.inputs.into_iter(),
+            assets.outputs.into_iter(),
+        )?;
+    }
+
     Ok(TestPlan {
         removed_steps,
         placements,
     })
 }
 
-/// Refuse the first URL in what `who` (`step 'x'` or `hook 'on_init'`) reads, then in
+/// Refuse the first URL in what `who` (`step 'x'`, `hook 'on_init'` or `the break of x`) reads, then in
 /// what it writes.
 fn refuse_remote(
     who: &str,
@@ -484,6 +498,27 @@ mod tests {
         let err = plan(&format!("{FETCH}{PUBLISH}"), &[], &test).unwrap_err();
         assert!(err.contains("step 'publish'"), "{err}");
         assert!(err.contains("publishes"), "{err}");
+    }
+
+    #[test]
+    fn a_break_reading_or_writing_a_url_refuses_the_test() {
+        use crate::duckdb_lineage::recorded_steps::{URL_BARE, URL_COPY};
+        use crate::introspect::test_reading;
+        for (sql, said) in [
+            (
+                URL_BARE,
+                "the break of fetch reads https://x.org/a.csv, which a test cannot reach",
+            ),
+            (
+                URL_COPY,
+                "the break of fetch writes s3://b/out.parquet, which a test must not reach",
+            ),
+        ] {
+            let test = test_with(&[("fetch", "testdata/a.csv")], &[("fetch", sql)]);
+            let err =
+                test_reading::with(test_reading::recorded, || plan(FETCH, &[], &test)).unwrap_err();
+            assert!(err.starts_with(said), "{err}");
+        }
     }
 
     #[test]
