@@ -49,9 +49,11 @@ use std::path::{Path, PathBuf};
 
 /// Every type, constant and function `arcform::spec` re-exports, and the module that
 /// owns it. An `impl` on any of these names may only appear in its owning file.
-const EXPORTED: [(&str, &str); 46] = [
+const EXPORTED: [(&str, &str); 48] = [
     ("Manifest", "manifest.rs"),
     ("Step", "manifest.rs"),
+    ("Severity", "manifest.rs"),
+    ("MeasureHistory", "manifest.rs"),
     ("Param", "manifest.rs"),
     ("Defaults", "manifest.rs"),
     ("RetryPolicy", "manifest.rs"),
@@ -202,7 +204,7 @@ const MODULE_FILES: [&str; 51] = [
 /// `src/spec.rs`: editing an existing spec goes through the write path, which splices
 /// original bytes and never re-serialises. This freeze keeps any change to that
 /// arrangement a deliberate, version-visible act instead of a silent drift.
-const FROZEN_DERIVES: [(&str, &str, &[&str]); 23] = [
+const FROZEN_DERIVES: [(&str, &str, &[&str]); 25] = [
     (
         "manifest.rs",
         "Param",
@@ -222,6 +224,24 @@ const FROZEN_DERIVES: [(&str, &str, &[&str]); 23] = [
         "manifest.rs",
         "Manifest",
         &["Debug", "Clone", "Serialize", "Deserialize"],
+    ),
+    (
+        "manifest.rs",
+        "MeasureHistory",
+        &["Debug", "Clone", "Copy", "PartialEq", "Eq"],
+    ),
+    (
+        "manifest.rs",
+        "Severity",
+        &[
+            "Debug",
+            "Clone",
+            "Copy",
+            "PartialEq",
+            "Eq",
+            "Serialize",
+            "Deserialize",
+        ],
     ),
     (
         "manifest.rs",
@@ -1029,6 +1049,8 @@ fn exported_modules_declare_only_contracted_items() {
             // Re-exported types.
             "Manifest",
             "Step",
+            "Severity",
+            "MeasureHistory",
             "Param",
             "Defaults",
             "RetryPolicy",

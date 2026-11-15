@@ -598,6 +598,10 @@ mod tests {
             output: None,
             retry: None,
             timeout_sec: None,
+            check: None,
+            measure: None,
+            risk: None,
+            severity: None,
         }
     }
 
@@ -621,6 +625,10 @@ mod tests {
             output: None,
             retry: None,
             timeout_sec: None,
+            check: None,
+            measure: None,
+            risk: None,
+            severity: None,
         }
     }
 
@@ -639,6 +647,10 @@ mod tests {
             output: None,
             retry: None,
             timeout_sec: None,
+            check: None,
+            measure: None,
+            risk: None,
+            severity: None,
         }
     }
 
@@ -657,6 +669,10 @@ mod tests {
             output: None,
             retry: None,
             timeout_sec: None,
+            check: None,
+            measure: None,
+            risk: None,
+            severity: None,
         }
     }
 
@@ -689,6 +705,8 @@ mod tests {
             steps,
             assets,
             outputs: Vec::new(),
+            measure_history: Default::default(),
+            check_samples: true,
         };
 
         AssetGraph::build(&manifest, dir)

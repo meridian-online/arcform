@@ -633,6 +633,8 @@ fn a_spec_grown_by_recording_runs_under_the_bare_binary() {
         steps: Vec::new(),
         assets: Default::default(),
         outputs: Vec::new(),
+        measure_history: Default::default(),
+        check_samples: true,
     };
     manifest.steps.push(Step {
         name: "fetch".into(),
@@ -650,6 +652,10 @@ fn a_spec_grown_by_recording_runs_under_the_bare_binary() {
         output: None,
         retry: None,
         timeout_sec: None,
+        check: None,
+        measure: None,
+        risk: None,
+        severity: None,
     });
     create_spec(&proto, &manifest).expect("the seed spec is created");
 
