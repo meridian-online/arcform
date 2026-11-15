@@ -115,7 +115,7 @@ const EXPORTED: [(&str, &str); 48] = [
 
 /// Every module file in the crate. Frozen so a new one cannot be added without
 /// passing under the checks below.
-const MODULE_FILES: [&str; 52] = [
+const MODULE_FILES: [&str; 58] = [
     "asset.rs",
     "asset_kind.rs",
     "bridge.rs",
@@ -173,6 +173,14 @@ const MODULE_FILES: [&str; 52] = [
     "protocol_files.rs",
     // What an application reads from a Protocol it did not write.
     "protocol_read.rs",
+    // `arc test`: a Protocol run against checked-in fixtures in place of its fetches.
+    // Private to the crate.
+    "protocol_test/fixture.rs",
+    "protocol_test/mod.rs",
+    "protocol_test/plan.rs",
+    "protocol_test/report.rs",
+    "protocol_test/run.rs",
+    "protocol_test/spec.rs",
     "record.rs",
     "registry/cache.rs",
     "registry/index.rs",
