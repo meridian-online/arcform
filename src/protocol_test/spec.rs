@@ -92,7 +92,7 @@ pub(crate) fn load_tests(dir: &Path) -> Result<Vec<ProtocolTest>> {
         if name.trim().is_empty() {
             return Err(refuse(
                 dir,
-                format!("{TESTS_FILENAME}: a test has an empty name:"),
+                format!("{TESTS_FILENAME}: a test has an empty name"),
             ));
         }
         let bad = |what: String| refuse(dir, format!("{TESTS_FILENAME}: test '{name}': {what}"));
@@ -130,10 +130,13 @@ pub(crate) fn load_tests(dir: &Path) -> Result<Vec<ProtocolTest>> {
                 RawBreak::Many(v) => v,
             };
             // A trailing `-- comment` would swallow a `;` on the same line, so the
-            // terminator goes on a line of its own.
+            // terminator goes on a line of its own. A statement counts as terminated
+            // only when its last line, cut at its first `--`, ends with `;`.
             let normalise = |s: &str| {
                 let s = s.trim();
-                if s.ends_with(';') {
+                let last = s.lines().last().unwrap_or("");
+                let code = last.split_once("--").map_or(last, |(code, _)| code);
+                if code.trim_end().ends_with(';') {
                     s.to_string()
                 } else {
                     format!("{s}\n;")
@@ -295,9 +298,21 @@ mod tests {
     }
 
     #[test]
+    fn a_semicolon_inside_a_trailing_comment_does_not_terminate_a_statement() {
+        let t = load(
+            "- name: x\n  risk: r\n  fixtures:\n    f: testdata/soc_definitions.xlsx\n  break:\n    f:\n      - 'DELETE FROM fixture -- all rows;'\n      - UPDATE fixture SET a = 1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            t[0].breaks["f"],
+            "DELETE FROM fixture -- all rows;\n;\nUPDATE fixture SET a = 1\n;"
+        );
+    }
+
+    #[test]
     fn a_blank_name_or_an_empty_break_is_refused() {
         let m = msg("- name: ' '\n  risk: r\n");
-        assert!(m.contains("name:"), "{m}");
+        assert_eq!(m, "tests.yaml: a test has an empty name");
         let head =
             "- name: x\n  risk: r\n  fixtures:\n    f: testdata/soc_definitions.xlsx\n  break:\n";
         for b in ["    f: ''\n", "    f: []\n"] {

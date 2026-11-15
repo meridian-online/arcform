@@ -44,14 +44,15 @@ pub(crate) struct Placement {
 /// keyed, since a fixtured step does not run. A fixture stands in for a file, so a step
 /// that makes a table cannot have one, and a publishing step never runs in a test, so
 /// it cannot have one either. What is left must not reach the network: a fetch step
-/// with no fixture, or a SQL step reading a URL, refuses the test.
+/// with no fixture, or a SQL step reading or writing a URL, refuses the test.
 ///
-/// `_dir` is the Protocol's folder; every path in the plan is relative to it, and
-/// planning reads nothing from it.
+/// `dir` is the Protocol's folder; every path in the plan is relative to it. Hooks are
+/// not in the graph, so a `sql:` hook's file is read from it and refused the same way
+/// when it reads or writes a URL; any other hook runs as written.
 pub(crate) fn plan_test(
     manifest: &Manifest,
     graph: &AssetGraph,
-    _dir: &Path,
+    dir: &Path,
     test: &ProtocolTest,
 ) -> std::result::Result<TestPlan, String> {
     let no_assets = StepAssets::default();
@@ -190,26 +191,67 @@ pub(crate) fn plan_test(
                 op.name()
             ));
         }
-        // A step DuckDB runs reads what its SQL names; a URL there is a network read.
-        let runs_sql = step.sql.is_some() || step.is_check() || step.is_measure();
-        if let Some(url) = assets(step)
-            .reads
-            .iter()
-            .map(|r| declared(step, r))
-            .find(|r| runs_sql && is_remote(r))
-        {
-            return Err(format!(
-                "step '{}' reads {url}, which a test cannot reach; read it through a fetch \
-                 step and give that a fixture",
-                step.name
-            ));
+        // A step DuckDB runs reads and writes what its SQL names; a URL there is the
+        // network.
+        if step.sql.is_some() || step.is_check() || step.is_measure() {
+            let a = assets(step);
+            refuse_remote(
+                &format!("step '{}'", step.name),
+                a.reads.iter().map(|r| declared(step, r)),
+                a.produces.iter().map(|p| declared(step, p)),
+            )?;
         }
+    }
+
+    // Hooks are not in the graph, so a `sql:` hook's file is read here the same way.
+    let hooks = &manifest.hooks;
+    for (slot, hook) in [
+        ("on_init", &hooks.on_init),
+        ("on_success", &hooks.on_success),
+        ("on_failure", &hooks.on_failure),
+        ("on_exit", &hooks.on_exit),
+    ] {
+        let Some(path) = hook.as_ref().and_then(|h| h.sql.as_deref()) else {
+            continue;
+        };
+        // A file that cannot be read or parsed is the run's to report, not the plan's.
+        let Ok(sql) = std::fs::read_to_string(dir.join(path)) else {
+            continue;
+        };
+        let Ok(read) = crate::introspect::read_sql(&sql) else {
+            continue;
+        };
+        let assets = read.merged();
+        refuse_remote(
+            &format!("hook '{slot}'"),
+            assets.inputs.into_iter(),
+            assets.outputs.into_iter(),
+        )?;
     }
 
     Ok(TestPlan {
         removed_steps,
         placements,
     })
+}
+
+/// Refuse the first URL in what `who` (`step 'x'` or `hook 'on_init'`) reads, then in
+/// what it writes.
+fn refuse_remote(
+    who: &str,
+    mut reads: impl Iterator<Item = String>,
+    mut writes: impl Iterator<Item = String>,
+) -> std::result::Result<(), String> {
+    if let Some(url) = reads.find(|r| is_remote(r)) {
+        return Err(format!(
+            "{who} reads {url}, which a test cannot reach; read it through a fetch step and \
+             give that a fixture"
+        ));
+    }
+    if let Some(url) = writes.find(|w| is_remote(w)) {
+        return Err(format!("{who} writes {url}, which a test must not reach"));
+    }
+    Ok(())
 }
 
 /// The operator an `op:` step names, if it resolves.
@@ -280,13 +322,15 @@ mod tests {
             .into_iter()
             .filter(|name| crate::operator::resolve(name).unwrap().ingress())
             .collect();
-        #[allow(unused_mut)]
-        let mut expected = vec!["gleif_ra_fetch", "html_link_discover", "http_fetch"];
-        #[cfg(feature = "opendal")]
-        expected.push("opendal_fetch");
+        let expected = [
+            "gleif_ra_fetch",
+            "html_link_discover",
+            "http_fetch",
+            #[cfg(feature = "opendal")]
+            "opendal_fetch",
+        ];
         let mut ingress = ingress;
         ingress.sort_unstable();
-        expected.sort_unstable();
         assert_eq!(ingress, expected);
     }
 
@@ -338,6 +382,47 @@ mod tests {
         assert!(err.contains("step 'load'"), "{err}");
         assert!(err.contains("https://x.org/a.csv"), "{err}");
         assert!(err.contains("a test cannot reach"), "{err}");
+    }
+
+    #[test]
+    fn a_sql_step_writing_a_url_refuses_the_test() {
+        use crate::introspect::test_reading;
+        let sql = crate::duckdb_lineage::recorded_steps::URL_COPY;
+        let err = test_reading::with(test_reading::recorded, || {
+            plan(
+                "  - name: export\n    sql: export.sql\n",
+                &[("export.sql", sql)],
+                &test_with(&[], &[]),
+            )
+        })
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "step 'export' writes s3://b/out.parquet, which a test must not reach"
+        );
+    }
+
+    #[test]
+    fn a_sql_hook_reading_or_writing_a_url_refuses_the_test() {
+        use crate::duckdb_lineage::recorded_steps::{URL_BARE, URL_COPY};
+        use crate::introspect::test_reading;
+        for (hook, sql, said) in [
+            ("on_init", URL_BARE, "reads https://x.org/a.csv"),
+            ("on_exit", URL_COPY, "writes s3://b/out.parquet"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("hook.sql"), sql).unwrap();
+            let manifest = Manifest::from_yaml_str(&format!(
+                "name: t\nhooks:\n  {hook}:\n    name: setup\n    sql: hook.sql\nsteps:\n  - name: s\n    command: \"true\"\n"
+            ))
+            .unwrap();
+            let err = test_reading::with(test_reading::recorded, || {
+                let graph = AssetGraph::build(&manifest, dir.path());
+                plan_test(&manifest, &graph, dir.path(), &test_with(&[], &[]))
+            })
+            .unwrap_err();
+            assert!(err.starts_with(&format!("hook '{hook}' {said}")), "{err}");
+        }
     }
 
     #[test]
