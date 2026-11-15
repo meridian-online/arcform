@@ -196,6 +196,28 @@ fn report_hook_failure(slot: &str, hook: &crate::manifest::Step, e: &Error) {
     }
 }
 
+/// Drop terminal escape sequences, which arc writes whatever `NO_COLOR` says, so what a
+/// child `arc run` printed reads as plain text. A control sequence (`ESC [` up to its final
+/// byte) is dropped whole, and any other escape with the one character after it.
+pub(crate) fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        if chars.next() == Some('[') {
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Run a pipeline with no CLI parameter overrides.
 ///
 /// Convenience wrapper that delegates to `run_with_params` with empty params.
@@ -583,21 +605,21 @@ pub fn run_with_publish(
     let mut run_measures: IndexMap<String, Option<f64>> = IndexMap::new();
     // Earlier successful runs' measures for the same parameters: what a check reads as
     // `measure_history`, loaded once before the first step, and only when a check or
-    // measure step could read it.
-    let run_history = if manifest
+    // measure step could read it. Under `arc test` a CSV may stand in for them.
+    let reads_history = manifest
         .steps
         .iter()
-        .any(|s| s.is_check() || s.is_measure())
-    {
-        check::load_history(
+        .any(|s| s.is_check() || s.is_measure());
+    let run_history = match std::env::var_os(check::MEASURE_HISTORY_ENV) {
+        _ if !reads_history => Vec::new(),
+        Some(csv) => check::history_from_csv(Path::new(&csv))?,
+        None => check::load_history(
             &runs_dir,
             &run_id,
             &contract_params,
             &manifest.measure_history,
             std::time::SystemTime::now(),
-        )
-    } else {
-        Vec::new()
+        ),
     };
 
     // Pipeline-level timeout tracking.

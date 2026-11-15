@@ -136,8 +136,6 @@ pub trait Operator: Sync {
 
     /// Whether the step fetches data from the network, so `arc test` must give it a
     /// fixture in its place. See `protocol_test::plan_test`.
-    // Read only by `arc test`'s planner, which no command calls yet.
-    #[allow(dead_code)]
     fn ingress(&self) -> bool {
         false
     }

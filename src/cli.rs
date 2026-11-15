@@ -128,6 +128,16 @@ pub enum Commands {
         publish: bool,
     },
 
+    /// Run the Protocol's tests in `tests.yaml`: each in a copy of the Protocol beside it,
+    /// with checked-in fixture files in place of its fetches and its publishing steps left
+    /// out. Prints `ok <name>` for a passing test, and for a failing one its name, its risk
+    /// and what happened against what was expected. Exits 1 when any test fails.
+    Test {
+        /// Protocol directory (where arcform.yaml and tests.yaml live).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+
     /// Pin the build of a community extension on the vetted list that the community
     /// registry serves, for this machine's DuckDB version and platform. arc installs that
     /// build over any file DuckDB holds for the extension, loads it, and writes the
@@ -1184,6 +1194,31 @@ pub fn run_pipeline(force: bool, publish: bool, raw_params: &[String]) -> Result
     crate::runner::run_with_publish(&cwd, &engine, &state, force, &cli_params, publish)
 }
 
+/// Execute `arc test`: run every test, writing each result to `out` as it finishes, and
+/// fail when any test failed.
+fn test_protocol(dir: &Path, out: &mut impl Write) -> Result<()> {
+    let mut written = Ok(());
+    let results = crate::protocol_test::run_tests(dir, |result| {
+        if written.is_ok() {
+            written = out
+                .write_all(crate::protocol_test::render(result).as_bytes())
+                .and_then(|()| out.flush());
+        }
+    })?;
+    written?;
+    let failed = results
+        .iter()
+        .filter(|r| r.outcome != crate::protocol_test::Outcome::Passed)
+        .count();
+    if failed > 0 {
+        return Err(Error::Io(std::io::Error::other(format!(
+            "{failed} of {} tests failed",
+            results.len()
+        ))));
+    }
+    Ok(())
+}
+
 /// Execute `arc upgrade <name>`: refuse a name off the vetted list before DuckDB is asked
 /// anything, check the engine's version as `arc run` does, install and load the build of
 /// `name` the community registry serves, and write its SHA-256 as the pin for this DuckDB
@@ -1317,6 +1352,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             params,
             publish,
         } => run_pipeline(force, publish, &params),
+        Commands::Test { dir } => test_protocol(&dir, &mut std::io::stdout()),
         Commands::Upgrade { name, dir } => {
             upgrade_extension(&dir, &name, &DuckDbEngine, &open_history()?)
         }

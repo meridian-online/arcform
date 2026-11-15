@@ -382,6 +382,14 @@ pub enum Error {
     #[error("registry: '{feature}' is not implemented in v1")]
     RegistryUnimplemented { feature: String },
 
+    // The CSV `arc test` hands a run as its `measure_history` cannot be read.
+    #[error("the measure history {path} (from {var}) cannot be read: {reason}")]
+    MeasureHistoryFile {
+        var: &'static str,
+        path: PathBuf,
+        reason: String,
+    },
+
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }

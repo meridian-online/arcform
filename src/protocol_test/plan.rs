@@ -48,8 +48,9 @@ pub(crate) struct Placement {
 ///
 /// `dir` is the Protocol's folder; every path in the plan is relative to it. Hooks are
 /// not in the graph, so a `sql:` hook's file is read from it and refused the same way
-/// when it reads or writes a URL; any other hook runs as written. A test's `break:`
-/// statements are read and refused the same way.
+/// when it reads or writes a URL, and an `op:` hook that fetches refuses the test; any
+/// other hook runs as written. A test's `break:` statements are read and refused the
+/// same way.
 pub(crate) fn plan_test(
     manifest: &Manifest,
     graph: &AssetGraph,
@@ -204,7 +205,8 @@ pub(crate) fn plan_test(
         }
     }
 
-    // Hooks are not in the graph, so a `sql:` hook's file is read here the same way.
+    // Hooks are not in the graph, so a `sql:` hook's file is read here the same way. A
+    // hook that fetches has no output a fixture could stand in for, so it refuses the test.
     let hooks = &manifest.hooks;
     for (slot, hook) in [
         ("on_init", &hooks.on_init),
@@ -212,6 +214,12 @@ pub(crate) fn plan_test(
         ("on_failure", &hooks.on_failure),
         ("on_exit", &hooks.on_exit),
     ] {
+        if let Some(op) = hook.as_ref().and_then(operator).filter(|op| op.ingress()) {
+            return Err(format!(
+                "hook '{slot}' fetches data ({}) and a test cannot give a hook a fixture",
+                op.name()
+            ));
+        }
         let Some(path) = hook.as_ref().and_then(|h| h.sql.as_deref()) else {
             continue;
         };
@@ -437,6 +445,23 @@ mod tests {
             .unwrap_err();
             assert!(err.starts_with(&format!("hook '{hook}' {said}")), "{err}");
         }
+    }
+
+    #[test]
+    fn an_op_hook_that_fetches_refuses_the_test() {
+        let yaml = "name: t\nhooks:\n  on_init:\n    name: get\n    op: http_fetch@1\n    with:\n      url: https://example.com/a.csv\n      out: build/raw/a.csv\nsteps:\n  - name: s\n    command: \"true\"\n";
+        // The loader refuses an `op:` hook today; the plan refuses a fetching one as well,
+        // so a test never fetches if the loader comes to allow them.
+        let refused = Manifest::from_yaml_str(yaml).unwrap_err().to_string();
+        assert!(refused.contains("hooks.on_init"), "{refused}");
+        let manifest: Manifest = serde_yaml::from_str(yaml).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let graph = AssetGraph::build(&manifest, dir.path());
+        let err = plan_test(&manifest, &graph, dir.path(), &test_with(&[], &[])).unwrap_err();
+        assert_eq!(
+            err,
+            "hook 'on_init' fetches data (http_fetch) and a test cannot give a hook a fixture"
+        );
     }
 
     #[test]

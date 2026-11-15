@@ -48,6 +48,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use super::{Annotations, ToolDef, ToolOutput, ToolResult};
+use crate::runner::strip_ansi;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // protocol_run
@@ -201,28 +202,6 @@ fn run_child(dir: &Path, force: bool, params: &[(String, String)]) -> std::io::R
         status,
         tail: strip_ansi(&String::from_utf8_lossy(&bytes)),
     })
-}
-
-/// Drop terminal escape sequences, which arc writes whatever `NO_COLOR` says, so the
-/// tail an agent reads is plain text. A control sequence (`ESC [` up to its final
-/// byte) is dropped whole, and any other escape with the one character after it.
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        if chars.next() == Some('[') {
-            for c in chars.by_ref() {
-                if ('@'..='~').contains(&c) {
-                    break;
-                }
-            }
-        }
-    }
-    out
 }
 
 /// Runtime parameter overrides, accepted as an object `{key: value}` or an array of
