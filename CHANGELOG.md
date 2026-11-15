@@ -52,6 +52,7 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Changed
 
+- **In the `spec` library API, `Step` and `Manifest` gained fields for checks and measures, and two types, `Severity` and `MeasureHistory`, are new.** `Step` has `check`, `measure`, `risk` and `severity`, and `Manifest` has `measure_history` and `check_samples`, so code that builds either struct with every field named must add them.
 - **The run record's `contract_version` is now `b5/1`, from `b4/1`.** It adds the `check` and `measure` step sections and `run.checks`; a `b4/1` record still reads, with no sections and every count zero.
 - **The `splink_resolve` README says where to fetch its two inputs, at Meridian's open datasets' new addresses (`sec/company_tickers_exchange.parquet` and `gleif/lei.parquet` on `openlake.meridian.online`), and the four vendored open-analytics recipes are re-synced to use them.** The datasets moved on 2026-10-31 from addresses such as `openlake.meridian.online/edgar.parquet`; the README named only local file names.
 - **A URL a step reads or writes is now a `remote` asset, never read from disk.** That covers a URL in SQL (`FROM 'https://…'`, `read_csv('s3://…')`, `COPY … TO 's3://…'`) and one written in `depends_on:`, `produces:` or `assets:`, whatever its `scheme://`. A step reading or writing one reruns every run, as before, but no longer warns that a file is missing. A `file://` URL is treated as remote too. The run record gives the asset the kind `remote`, with no path, size or hash.
