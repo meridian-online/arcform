@@ -820,6 +820,72 @@ mod tests {
     }
 
     #[test]
+    fn history_runs_window_counts_only_runs_that_measured() {
+        let dir = write_runs(&[
+            (
+                "a.json",
+                record(
+                    "a",
+                    Some("2026-10-01T00:00:00Z"),
+                    "success",
+                    "2018",
+                    &[("m.a", 1.0)],
+                ),
+            ),
+            (
+                "b.json",
+                record("b", Some("2026-10-02T00:00:00Z"), "success", "2018", &[]),
+            ),
+        ]);
+        let rows = load_history(
+            dir.path(),
+            "now",
+            &release("2018"),
+            &MeasureHistory::Runs(1),
+            at(0),
+        );
+        assert_eq!(ids(&rows), ["a"]);
+    }
+
+    #[test]
+    fn history_compares_params_by_key_and_value_whatever_their_source() {
+        let with_source = |id: &str, started: &str, value: &str, source: &str| {
+            let mut v: serde_json::Value = serde_json::from_str(&record(
+                id,
+                Some(started),
+                "success",
+                value,
+                &[("m.a", 1.0)],
+            ))
+            .unwrap();
+            v["run"]["params"][0]["source"] = source.into();
+            v.to_string()
+        };
+        let dir = write_runs(&[
+            (
+                "a.json",
+                with_source("a", "2026-10-01T00:00:00Z", "2018", "default"),
+            ),
+            (
+                "b.json",
+                with_source("b", "2026-10-02T00:00:00Z", "2018", "env"),
+            ),
+            (
+                "c.json",
+                with_source("c", "2026-10-03T00:00:00Z", "2010", "cli"),
+            ),
+        ]);
+        let rows = load_history(
+            dir.path(),
+            "now",
+            &release("2018"),
+            &MeasureHistory::Runs(30),
+            at(0),
+        );
+        assert_eq!(ids(&rows), ["a", "b"]);
+    }
+
+    #[test]
     fn history_skips_unreadable_old_failed_and_current_records() {
         let mut old: serde_json::Value = serde_json::from_str(&record(
             "old",
