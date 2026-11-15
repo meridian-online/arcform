@@ -82,14 +82,38 @@ fn a_check_file_holding_a_create_is_refused() {
 #[test]
 fn a_step_producing_measures_is_refused() {
     let dir = project(
-        "name: c\ndb: build/c.duckdb\nsteps:\n  - name: m\n    sql: models/m.sql\n",
-        &[("models/m.sql", "CREATE TABLE measures AS SELECT 1;")],
+        "name: c\ndb: build/c.duckdb\nsteps:\n  - name: m\n    sql: models/m.sql\n  - name: c\n    check: checks/c.sql\n    risk: the analyst reads a wrong table\n",
+        &[
+            ("models/m.sql", "CREATE TABLE measures AS SELECT 1;"),
+            ("checks/c.sql", "SELECT * FROM measures WHERE false;"),
+        ],
     );
     let (code, _, stderr) = common::arc_run_raw(dir.path());
     assert_ne!(code, Some(0), "{stderr}");
     assert!(stderr.contains("measures"), "{stderr}");
     assert!(stderr.contains("reserves"), "{stderr}");
     assert!(records(dir.path()).is_empty());
+}
+
+#[test]
+fn a_protocol_without_checks_may_make_a_measures_table() {
+    let dir = project(
+        "name: c\ndb: build/c.duckdb\nsteps:\n  - name: m\n    sql: models/m.sql\n",
+        &[(
+            "models/m.sql",
+            "CREATE OR REPLACE TABLE measures AS SELECT 1;",
+        )],
+    );
+    common::arc_run(dir.path());
+}
+
+#[test]
+fn a_pivot_check_file_is_one_query() {
+    let dir = project(
+        WITH_CHECK,
+        &[MAKES_T, ("checks/c.sql", "PIVOT t ON n USING sum(n);\n")],
+    );
+    common::arc_run(dir.path());
 }
 
 #[test]

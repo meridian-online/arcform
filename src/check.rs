@@ -35,8 +35,14 @@ pub(crate) fn refuse_check_shapes(
     dir: &Path,
     graph: &AssetGraph,
 ) -> Result<()> {
+    // A Protocol with no check or measure may keep any table it likes, `measures` included.
+    let has_checks = manifest
+        .steps
+        .iter()
+        .any(|s| s.is_check() || s.is_measure());
     for step in &manifest.steps {
-        if let Some(assets) = graph.steps.get(&step.name)
+        if has_checks
+            && let Some(assets) = graph.steps.get(&step.name)
             && let Some(reserved) = assets.produces.iter().find(|t| is_reserved_table(t))
         {
             return Err(Error::ManifestValidation(format!(
@@ -74,8 +80,7 @@ pub(crate) fn check_query(dir: &Path, step: &Step) -> Result<String> {
     let read = crate::introspect::read_sql(&text).map_err(Error::SqlReader)?;
     let count = read.statements.len();
     if count != 1 {
-        let s = if count == 1 { "" } else { "s" };
-        return refuse(format!("holds {count} statement{s}"));
+        return refuse(format!("holds {count} statements"));
     }
     if !read.is_query[0] {
         return refuse("holds a statement that is not a query".to_string());

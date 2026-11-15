@@ -587,7 +587,11 @@ fn duckdb_step(reading: &duckdb_lineage::StepReading) -> StepSql {
     for (n, statement) in reading.statements.iter().enumerate() {
         let mut assets = duckdb_statement(statement);
         let mut read_by = ReadBy::DuckDb;
-        let mut is_query = matches!(statement.form, duckdb_lineage::Form::Query);
+        // A statement-level `PIVOT` returns rows, so it is a query here too.
+        let mut is_query = matches!(
+            statement.form,
+            duckdb_lineage::Form::Query | duckdb_lineage::Form::Pivot
+        );
         if matches!(
             statement.form,
             duckdb_lineage::Form::Unread(_) | duckdb_lineage::Form::NotParsed(_)
