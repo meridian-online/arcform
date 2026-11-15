@@ -1203,8 +1203,8 @@ pub fn run_pipeline(force: bool, publish: bool, raw_params: &[String]) -> Result
     crate::runner::run_with_publish(&cwd, &engine, &state, force, &cli_params, publish)
 }
 
-/// Execute `arc test`: run every test (or the one `name`), writing each result to `out` as it finishes, and
-/// fail when any test failed.
+/// Execute `arc test`: run every test (or the one `name`), writing each result to `out` as it
+/// finishes, and fail when any test failed.
 fn test_protocol(
     dir: &Path,
     name: Option<&str>,
@@ -1226,7 +1226,12 @@ fn test_protocol(
     let passed = results.len() - failed;
     writeln!(out, "{passed} passed, {failed} failed")?;
     if let Some(path) = junit {
-        std::fs::write(path, junit_xml(&protocol, &results))?;
+        std::fs::write(path, junit_xml(&protocol, &results)).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("cannot write the JUnit file {}: {e}", path.display()),
+            )
+        })?;
     }
     if failed > 0 {
         return Err(Error::TestsFailed {

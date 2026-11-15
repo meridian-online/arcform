@@ -355,8 +355,9 @@ fn rewrite_manifest(
 /// Run `arc run --force` on `copy` from this executable, one `--param` per test parameter,
 /// with standard input closed and standard output dropped. Its failure is the text of the
 /// file `ARC_TEST_ERROR_FILE` names, and its standard error is read only as the fallback
-/// for a child that wrote no such file. The child gets `history` as its measure history and never publishes. `Ok(None)` when it
-/// succeeded, `Ok(Some(message))` when it failed, `Err` when it could not start.
+/// for a child that wrote no such file. The child gets `history` as its measure history and
+/// never publishes. `Ok(None)` when it succeeded, `Ok(Some(message))` when it failed, `Err`
+/// when it could not start.
 fn run_child(
     copy: &Path,
     test: &ProtocolTest,

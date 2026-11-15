@@ -23,7 +23,7 @@ pub(crate) fn print_result(out: &mut impl Write, result: &TestResult) -> io::Res
 /// test, and for a failed one a `failure` whose message is its risk line and whose body is
 /// what happened.
 pub(crate) fn junit(protocol: &str, results: &[TestResult]) -> String {
-    let protocol = escape(protocol);
+    let protocol = escape_attr(protocol);
     let failures = results
         .iter()
         .filter(|r| r.outcome != Outcome::Passed)
@@ -37,14 +37,14 @@ pub(crate) fn junit(protocol: &str, results: &[TestResult]) -> String {
     for result in results {
         let head = format!(
             "    <testcase classname=\"{protocol}\" name=\"{}\" time=\"{:.3}\"",
-            escape(&result.name),
+            escape_attr(&result.name),
             result.seconds
         );
         match &result.outcome {
             Outcome::Passed => xml.push_str(&format!("{head}/>\n")),
             Outcome::Failed { what } => xml.push_str(&format!(
                 "{head}>\n      <failure message=\"risk: {}\">{}</failure>\n    </testcase>\n",
-                escape(&result.risk),
+                escape_attr(&result.risk),
                 escape(what)
             )),
         }
@@ -53,8 +53,20 @@ pub(crate) fn junit(protocol: &str, results: &[TestResult]) -> String {
     xml
 }
 
-/// `text` safe in XML element text and in a double-quoted attribute.
+/// `text` safe in XML element text: markup characters escaped, and each character XML 1.0
+/// cannot hold (control characters other than tab, newline and carriage return) replaced
+/// with U+FFFD.
 fn escape(text: &str) -> String {
+    escape_with(text, false)
+}
+
+/// `text` safe in a double-quoted attribute: as [`escape`], and tab, newline and carriage
+/// return written as character references so a parser does not normalise them to spaces.
+fn escape_attr(text: &str) -> String {
+    escape_with(text, true)
+}
+
+fn escape_with(text: &str, attribute: bool) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
@@ -63,6 +75,11 @@ fn escape(text: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
+            '\n' if attribute => out.push_str("&#10;"),
+            '\r' if attribute => out.push_str("&#13;"),
+            '\t' if attribute => out.push_str("&#9;"),
+            '\n' | '\r' | '\t' => out.push(c),
+            c if (c as u32) < 0x20 => out.push('\u{FFFD}'),
             c => out.push(c),
         }
     }
@@ -158,5 +175,40 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "ok one\nFAIL two\n  risk: the risk\n  line a\n  line b\n"
         );
+    }
+
+    #[test]
+    fn characters_xml_cannot_hold_become_replacement_characters() {
+        let xml = junit(
+            "p",
+            &[failed("a\0b\x07c\x1bd", "r\0\x07\x1b", "m\0\x07\x1b\ttab")],
+        );
+        assert!(
+            xml.contains("name=\"a\u{FFFD}b\u{FFFD}c\u{FFFD}d\""),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("message=\"risk: r\u{FFFD}\u{FFFD}\u{FFFD}\""),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(">m\u{FFFD}\u{FFFD}\u{FFFD}\ttab</failure>"),
+            "{xml}"
+        );
+        assert!(
+            !xml.chars().any(|c| c < ' ' && !"\n\t".contains(c)),
+            "{xml:?}"
+        );
+    }
+
+    #[test]
+    fn line_breaks_in_an_attribute_are_character_references() {
+        let xml = junit("p", &[failed("a\nb", "one\r\ntwo\tthree", "x\ny")]);
+        assert!(xml.contains("name=\"a&#10;b\""), "{xml}");
+        assert!(
+            xml.contains("message=\"risk: one&#13;&#10;two&#9;three\""),
+            "{xml}"
+        );
+        assert!(xml.contains(">x\ny</failure>"), "{xml}");
     }
 }
