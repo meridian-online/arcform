@@ -39,6 +39,8 @@ Recorded here so Hugh reads them in one place; each is restated in the task that
 13. **A check that fails to run counts as failed** in `run.checks`, whatever its severity: its step entry gets a `CheckSection` with `success: false`, `rows_returned: 0`, an empty sample and `error: Some(<message>)`.
 14. **A measure column name may not contain `.`**, so each `<step>.<column>` name maps to one step and one column.
 15. **`measures` and `measure_history` are not graph assets**: a check's or measure's reads of them are left out of the asset graph.
+16. **`measure_history: { runs: N }` counts earlier runs that recorded measures**, so records from before this change, which hold none, do not push useful baselines out of the window; parameters match on key and value, not on where a value came from.
+17. **When two steps produce one table, the latest measurement wins** in this run's `measures` (one row per name); each step's entry keeps its own values.
 11. `check:` and `measure:` steps refuse `produces:`, `output:` and `preconditions:` (they produce nothing and are never skipped); `depends_on:`, `retry:`, `timeout_sec:` and `description:` are allowed. `risk:` and `severity:` are refused on any step that is not a check.
 
 ## Review Focus
