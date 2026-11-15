@@ -134,7 +134,7 @@ pub(crate) fn refuse_publish_before_error_check(
 mod tests {
     use super::*;
 
-    const PUBLISH: &str = "  - name: publish\n    op: ducklake_write@1\n    with:\n      public_base: https://lake.example/\n      catalog: catalog/test.ducklake\n      data_path: lake/\n      local_catalog: build/lake/test.ducklake\n      tables:\n        - table: demo.soc\n          from: build/soc.parquet\n          descriptor: soc.datapackage.json\n      credential:\n        type: r2\n        bucket: test-bucket\n        env:\n          key_id: ARC_TEST_LAKE_KEY_ID\n          secret: ARC_TEST_LAKE_SECRET\n          account_id: ARC_TEST_LAKE_ACCOUNT_ID\n";
+    const PUBLISH: &str = "  - name: publish\n    op: ducklake_publish@1\n    with:\n      file: build/soc.parquet\n      catalog: build/lake/test.ducklake\n      table: demo.soc\n";
 
     /// `load`, `export`, then `publish` and `check` in the order given.
     fn refusal(check_extra: &str, check_reads: &str, check_first: bool) -> Result<()> {

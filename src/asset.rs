@@ -1301,6 +1301,34 @@ mod tests {
         assert!(!graph.has_assets(), "bare command step has no assets");
     }
 
+    // upstream_assets walks producers' reads to a fixed point, and stops on a cycle.
+    #[test]
+    fn test_upstream_assets_chain_and_cycle() {
+        let set =
+            |names: &[&str]| -> BTreeSet<String> { names.iter().map(|n| n.to_string()).collect() };
+        let empty = || AssetGraph {
+            steps: BTreeMap::new(),
+            warnings: vec![],
+            unreadable: vec![],
+        };
+        let step = |produces: &[&str], reads: &[&str]| StepAssets {
+            produces: set(produces),
+            reads: set(reads),
+            ..Default::default()
+        };
+        let mut graph = empty();
+        graph.steps.insert("a".into(), step(&["x"], &[]));
+        graph.steps.insert("b".into(), step(&["y"], &["x"]));
+        graph.steps.insert("c".into(), step(&["z"], &["y"]));
+        assert_eq!(graph.upstream_assets(&set(&["z"])), set(&["x", "y", "z"]));
+        assert_eq!(graph.upstream_assets(&set(&["x"])), set(&["x"]));
+
+        let mut cyclic = empty();
+        cyclic.steps.insert("a".into(), step(&["p"], &["q"]));
+        cyclic.steps.insert("b".into(), step(&["q"], &["p"]));
+        assert_eq!(cyclic.upstream_assets(&set(&["p"])), set(&["p", "q"]));
+    }
+
     // downstream_steps computes transitive downstream.
     #[test]
     fn test_v03_downstream_steps() {
