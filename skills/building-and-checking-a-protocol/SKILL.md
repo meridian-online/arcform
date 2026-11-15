@@ -96,6 +96,8 @@ arc table describe large_sales
   risk: a duplicated order is counted twice in revenue
 ```
 
+**Prove a load refuses bad data with a test, not by waiting for the source to send some.** Write `tests.yaml` beside `arcform.yaml`: a list of tests, each with a `name:` and a required `risk:` line saying what would go wrong in published data without it. Under `fixtures:`, map each fetch step to a checked-in file standing in for what it downloads; a test never reaches the network, so a fetch step without a fixture refuses the test, and publishing steps never run. To show a refusal fires, add a `break:` mapping that fixture to SQL over a table named `fixture` (for an xlsx sheet, a `row` column and one column per letter: `UPDATE fixture SET B = 'Code' WHERE row = 8`), and `expect: { fails_with: <text of arc's error> }`; arc writes the file back and also runs the test without the break, to prove the failure comes from it. A test with no `expect:` asserts the run succeeds, and its `checks:` list holds inline queries that must return no rows. Run them with `arc test`, or one with `arc test <name>`; `--junit <file>` writes JUnit XML for CI. Each test runs in a copy of the Protocol, so the Protocol's own tables and database are left alone.
+
 The Check stage's checkpoint is anything that changes the meaning of the answer: a table that had to be rebuilt, rows dropped that the question counts, a join that lost a source. Tell the user before presenting.
 
 ## 7. Undo through history

@@ -2,7 +2,7 @@
 
 Design, 2026-11-15. Arcform builds it in parts.
 
-**Status.** The Checks, Measures, Comparing with earlier runs and The run record sections are built, and `docs/ARCHITECTURE.md`'s "Checks and measures" section is now the authority for them: the run record is `b5/1`, a failed error check exits 2 as a failed step does until the exit-code work below settles both, and the rulings made while building are recorded there. Telling the analyst and Protocol tests are not built yet; this file stays as their design until they are, then folds into the architecture docs. The `NOT IN` examples below pass silently when the subquery holds a `NULL`; write such a check with `NOT EXISTS` or an anti join.
+**Status.** The Checks, Measures, Comparing with earlier runs and The run record sections are built, and `docs/ARCHITECTURE.md`'s "Checks and measures" section is now the authority for them: the run record is `b5/1`, a failed error check exits 2 as a failed step does until the exit-code work below settles both, and the rulings made while building are recorded there. Protocol tests are built too, and `docs/ARCHITECTURE.md`'s "Protocol tests" section is now their authority, with the rulings made while building them. Only Telling the analyst is not built yet; this file stays as its design until it is, then folds into the architecture docs. The `NOT IN` examples below pass silently when the subquery holds a `NULL`; write such a check with `NOT EXISTS` or an anti join.
 
 ## Intent
 
@@ -185,46 +185,7 @@ The webhook rules, from the comparison with Airflow, Dagu, dbt, Dagster, Prefect
 
 ### Protocol tests
 
-One file per Protocol, `tests.yaml` beside `arcform.yaml`:
-
-```yaml
-- name: a moved definitions header is refused
-  risk: BLS moves the header row and titles load into the wrong columns
-  fixtures:
-    fetch_definitions: testdata/soc_definitions.xlsx
-  break:
-    fetch_definitions: UPDATE fixture SET B = 'Code' WHERE row = 8
-  expect:
-    fails_with: header row has moved
-
-- name: every parent code exists
-  risk: an orphaned code publishes a broken hierarchy
-  fixtures:
-    fetch_definitions: testdata/soc_definitions.xlsx
-  checks:
-    - SELECT code FROM soc_2018 WHERE parent NOT IN (SELECT code FROM soc_2018)
-  params:
-    release: "2018"
-```
-
-- **`risk:` is required** on every test, as on every check step, and leads its failure output.
-- **`fixtures:`** maps a step's name to a checked-in file that stands in for what that step would write. The step does not run. A step that writes several outputs maps each output path to a file instead.
-- **A test never fetches data.** The operator catalogue gains an `ingress` flag on the operators that fetch data (`http_fetch`, `opendal_fetch`, `gleif_ra_fetch`, `html_link_discover`); an ingress step with no fixture refuses the test, naming the step. A `sql:` step that reads a remote address (`FROM 'https://…'`, which arc already classes as a remote asset) refuses the test the same way. Publishing steps never run in a test. Every other step runs as written, `uv` and `command:` steps included, since the open-analytics harnesses had to fake exactly those steps by hand; a tool such as `uv` may still download what it needs to run, but no issuer data comes from the network.
-- **`break:`** maps a fixture to one or more SQL statements. arc reads the fixture into a table named `fixture` (for xlsx: every cell as text, no header, a `row` column and one column per sheet letter; for CSV and JSON, DuckDB's reader), runs the statements, and writes the table back in the same format with DuckDB's writer. A format SQL cannot express (a zip archive, an encoding change, an old .xls) uses a second checked-in fixture instead.
-- **A control for every break.** A test with `break:` also runs once with the same round trip and no statements, and that run must not fail with the expected message. Agents will not remember to write one, so arc does it; it proves a refusal comes from the break and not from the rewrite.
-- **`expect: fails_with:`** asserts the run fails and the failure message contains the text. With no `expect:`, the test asserts the run succeeds, every `error` check passes, and every check listed under `checks:` returns no rows. Test checks are inline SQL of the same failing-rows shape.
-- **`params:`** overrides the Protocol's parameters for the test.
-- **`measure_history:`** in a test names a CSV (`run_id, run_at, name, value`) that stands in for earlier runs, so a comparison check can be shown to fail. Without it, a test's history is empty.
-- **How it runs.** `arc test` copies the Protocol into a temporary directory with its own database, places fixtures, applies breaks, runs the real steps in manifest order (in-run checks included), then the test's checks. Tests run one after another; `arc test <name>` runs one.
-- **Output.** One line per passing test. A failing test prints its name, its risk line, and what happened against what was expected:
-
-```
-FAIL a moved definitions header is refused
-  risk: BLS moves the header row and titles load into the wrong columns
-  expected the run to fail with "header row has moved"; it succeeded
-```
-
-- `arc test --junit <file>` writes JUnit XML for CI, each failure's message led by its risk line. Exit code 1 when any test fails.
+Built; see `docs/ARCHITECTURE.md`, "Protocol tests".
 
 ### What changes in open-analytics, for scale
 

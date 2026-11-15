@@ -36,6 +36,13 @@ src/
     mod.rs        #   JSON-RPC transport, protocol-version negotiation, the tool registry, each tool's read-only, open-world and destructive annotations
     finetype.rs   #   The five FineType tools, each running the `finetype` command
     hero.rs       #   arc's own tools: protocol_run, protocol_create, the record, edit, history, describe, query, check and report tools
+  protocol_test/  # `arc test`: a Protocol run against checked-in fixtures in place of its fetches (see "Protocol tests")
+    mod.rs        #   runs each test in tests.yaml order and hands back the results
+    spec.rs       #   reads and checks tests.yaml: `ProtocolTest`
+    plan.rs       #   which steps a test's fixtures replace, which never run, and the network refusals: `TestPlan`
+    fixture.rs    #   places fixtures and applies a break as SQL, writing the file back in its format
+    run.rs        #   one test: the copy beside the Protocol, its rewritten manifest, the child `arc run`, the outcome, the control
+    report.rs     #   the `ok`/`FAIL` lines and the JUnit XML
 
 runner/           # The hosted runner image: one run of one pinned Protocol (see "The runner image")
   Dockerfile      #   linux/arm64: arc built from this tree, DuckDB's release library and command line, curl, jq, git
@@ -194,6 +201,82 @@ WHERE m.value < p.prev * 0.5;
 - *`measures` and `measure_history` are not graph assets.* No step makes them, so a dependency on them could never be satisfied; a check's reads of them are left out of the graph.
 - *`measure_history: { runs: N }` counts earlier runs that recorded measures*, so records written before this change, which hold none, do not push useful baselines out of the window.
 - *When two steps produce one table, the latest measurement wins in `measures`*, one row per name, so a comparison sees the table as it now stands; each step's entry keeps what it measured.
+
+### Protocol tests
+
+`arc test` runs a Protocol against checked-in fixture files in place of what its fetches would download, and asserts either that the run succeeds with every check passing or that it fails with a given message. The tests live in one file per Protocol, `tests.yaml` beside `arcform.yaml`, so a loader's refusals (a moved header, a mark it does not know) can be shown to fire without the source ever sending a bad file (`src/protocol_test/`, and the `Commands::Test` arm of `src/cli.rs`):
+
+```yaml
+- name: a moved definitions header is refused
+  risk: the issuer moves the header row and titles load into the wrong columns
+  fixtures:
+    fetch_definitions: testdata/definitions.xlsx
+  break:
+    fetch_definitions: UPDATE fixture SET B = 'Code' WHERE row = 8
+  expect:
+    fails_with: definitions header row has moved
+
+- name: every parent code exists
+  risk: an orphaned code publishes a broken hierarchy
+  fixtures:
+    fetch_definitions: testdata/definitions.xlsx
+  checks:
+    - SELECT code FROM codes WHERE parent IS NOT NULL AND parent NOT IN (SELECT code FROM codes)
+  params:
+    release: "2018"
+  measure_history: testdata/history.csv   # optional: run_id,run_at,name,value
+```
+
+**What a test says.** `name:` and `risk:` are required; `risk:` is one line saying what would go wrong in published data without the test, and leads its failure. `fixtures:` maps a step to a checked-in file, relative to the Protocol's folder, that stands in for what the step writes; the step does not run. A key is a step's name when that step writes exactly one file, or else an output path, and a step whose outputs are keyed by path must have every file it writes keyed. `break:` maps a fixture key to one SQL statement or a list of them. `expect: { fails_with: <text> }` asserts the run fails with a message containing the text; with no `expect:`, the test asserts the run succeeds, which means every `error` check in the Protocol passes, and every query under `checks:` returns no rows. `checks:` are inline queries of the same failing-rows shape as a check step. `params:` overrides the Protocol's parameters, a number or boolean read as its text. `measure_history:` names a CSV that stands in for earlier runs' measures.
+
+**How one runs** (`protocol_test::run`). Each test gets a fresh copy of the Protocol, a hidden sibling folder `.<folder>.arc-test-<random>` in the Protocol's parent, holding everything in the folder except `build/` and the database `db:` names with its `.wal`; a symbolic link is copied as a link. The copy's `arcform.yaml` is rewritten as a YAML value, every other key kept: the fixtured steps and every publishing step (`Operator::publishes`) are taken out, each inline check is appended as a `check:` step named `arc-test-check-<n>` (from 1) with `severity: error` and the test's risk, and `db:` becomes `build/arc-test.duckdb` unless it names a path that stays inside the copy. The fixtures are copied into place, each break is applied, and arc spawns itself as `arc run --force` in the copy, with one `--param` per test parameter, standard input closed, standard output dropped, `NO_COLOR=1`, `ARC_PUBLISH` cleared, and two variables that are `arc test`'s own: `ARC_TEST_ERROR_FILE`, a file in the copy to which a failing `arc` writes its error, and `ARC_TEST_MEASURE_HISTORY`, the test's `measure_history:` CSV, which the runner then reads as `measure_history` in place of its run records, every row as given, with no window or parameter filter. The outcome comes from the child's exit status, that error file and the copy's run record, which says which inline check returned rows. The copy is removed on every return path. Tests run one after another in file order; `arc test <name>` runs one.
+
+**Breaks** (`protocol_test::fixture`). A break is Protocol SQL, run on the Protocol's DuckDB command line against a scratch database in the copy, after the same extension refusals a step's file goes through. arc reads the placed fixture into a table named `fixture`, runs the statements, and writes the table back in the format it came in, over the placed file. Each statement is trimmed and terminated with `;` on a line of its own when it has none, and the statements are joined in order. For `.xlsx`, `fixture` has a `row` column numbering the rows from 1 and one text column per sheet letter (`A`, `B`, …), read with `header = false`, `all_varchar = true` and `stop_at_empty = false` over `A1` to the used range's last cell under `SET threads = 1`, and written back `ORDER BY row` with no header under the same sheet name. `row` orders the rows and is not a cell address, so the shift-and-insert idiom `UPDATE fixture SET row = row + 1 WHERE row >= 5; INSERT INTO fixture (row, A) VALUES (5, 'x')` puts a new row fifth. For `.csv` and `.tsv`, every column is read as text with the delimiter, quote, escape, line ending and header DuckDB's `sniff_csv` finds, and written back with the same. For `.json`, an array stays an array and one object per line stays so, with date and timestamp detection off. A control runs too: a test that expects a failure and has a break is run a second time, in a fresh copy, with each broken fixture rewritten through the same round trip and no statements.
+
+**What a test reports.** A passing test prints `ok <name>`. A failing one prints `FAIL <name>`, then `  risk: <risk>`, then what happened, each line indented two spaces, one of:
+
+- `expected the run to fail with "<text>"; it succeeded`
+- `expected the run to fail with "<text>"; it failed with: <message>`
+- `expected the run to succeed; it failed with: <message>`
+- `check <n> returned <k> rows: <query>`, then up to five of its sample rows, cells joined with ` | `
+- `the control run, with the fixtures rewritten and no break, also failed with "<text>", so the failure does not come from the break`
+- a refusal, below.
+
+The last line is `<n> passed, <m> failed`. `arc test --junit <file>` also writes JUnit XML: one `testsuite` named for the Protocol, a `testcase` per test with its time, and for a failure a `failure` whose `message` is `risk: <risk>` and whose body is what happened; characters XML cannot hold are replaced with U+FFFD. `arc test` exits 1 when any test fails, displaying `<m> of <n> tests failed`.
+
+**Refused before any test runs**, exit 1, each message beginning `tests.yaml: `: a missing or unparseable file, an unknown key (a misspelt `brake:` is named), a test with an empty name, two tests with one name (`two tests are named '<name>'`), and per test (`test '<name>': …`) a missing `risk:`, a fixture or `measure_history` file that does not exist, a `break:` key with no fixture of that name or with only empty statements, `checks:` together with `expect:`, an empty `fails_with:`, and a parameter that is not a string, number or boolean. `arc test <name>` with a name no test has lists the tests.
+
+**Refused tests.** A test that cannot be run as written is a failing test, reported with its risk and the refusal, and the rest still run:
+
+- `step '<s>' fetches data (<operator>) and the test gives it no fixture; add one under fixtures:` for an ingress step (`Operator::ingress`: `http_fetch`, `html_link_discover`, `gleif_ra_fetch`, `opendal_fetch`) left without one.
+- `<who> reads <url>, which a test cannot reach; read it through a fetch step and give that a fixture`, and `<who> writes <url>, which a test must not reach`, where `<who>` is `step '<s>'` for a `sql:`, `check:` or `measure:` step, `hook '<slot>'` for a `sql:` hook, or `the break of <key>`.
+- `hook '<slot>' fetches data (<operator>) and a test cannot give a hook a fixture` for an `op:` hook that is ingress.
+- A fixture key that is neither a step nor a file a step writes; a step keyed by name that writes no file, or several (`key a fixture by each output path instead`); a step with some of its files fixtured and not others; a fixture for a step that makes a table, or for a publishing step; two fixtures for one file.
+- A break arc cannot round-trip, each saying to check in a second fixture with the change made instead: a file that is not `.xlsx`, `.csv`, `.tsv`, `.json`, `.jsonl` or `.ndjson` (in any case); a workbook with more than one sheet; a CSV with lines above its header, which DuckDB skips; a CSV whose header DuckDB would rename (a blank, repeated or padded name). A break that installs an extension arc has not vetted is refused as a step's file would be, and one whose SQL fails is `the break of <fixture> did not run: <DuckDB's message>`.
+
+**What `fails_with:` matches.** The text arc's own final error holds: what the child wrote to `ARC_TEST_ERROR_FILE`, colour codes stripped and DuckDB's echo of the failing SQL (each `LINE n: …` line and the caret line under it) removed. A child that wrote no file, one that crashed, is read from its standard error instead, from the last line beginning `error: `. A failed `command:` step's own standard error is not part of that error, since it streams past, so a refusal test of a `command:` or `uv` step matches only `step '<s>' failed (exit code <n>)`.
+
+**Acceptance.** A copy of a real 2018 occupational code-list Protocol, with three statistical-agency workbooks as fixtures for its three fetch steps, passed nine tests: one pass case carrying twenty inline checks (parents, levels and depths, ancestors, release, staging and illustrative-example counts, the shared title and crosswalk contracts), one break that still passes, and seven refusal breaks, among them a moved definitions header and an illustrative-example mark the loader does not know. The JUnit file listed each test.
+
+**Rulings and their reasons.** The design chose fixtures in place of fetches, breaks as SQL over the fixture and a control for every break over hand-faked steps and checked-in broken copies of every file, which is what the earlier Python harnesses had to do. The calls made while building it:
+
+- *A test never reaches the network for data.* An ingress step needs a fixture, and any SQL arc runs in the test (a step, a check, a measure, a `sql:` hook, a break) that reads or writes a URL refuses it, as does an ingress `op:` hook, which has no output a fixture could stand in for. Writing is refused as well as reading, so a test never sends a file anywhere. `command:` and `uv` steps run as written, since those are what tests most need to exercise; a tool such as `uv` may still download what it needs, a script that fetches by itself is not seen, and such a step runs with the environment `arc test` was given, credentials included.
+- *Publishing steps never run in a test.* A test must not change a published lake; `ARC_PUBLISH` is cleared in the child for the same reason.
+- *The copy sits beside the Protocol, not in the system's temporary directory.* A Protocol reaches shared files with `..` (a script or contract two folders up), and a sibling at the same depth resolves every such path to the same file without arc having to find them. Its name starts with `.` and holds `arc-test`, so an `arc test` killed before it could remove one leaves a folder that is plainly safe to delete.
+- *The copy leaves out `build/` and the database*, so each test starts with no state and no earlier run records, and `arc run --force` runs every step.
+- *The copy's database is its own.* `db:` is kept only when it resolves inside the copy; absent, null, absolute, reaching above the folder with `..`, or through a linked folder that leads out of it, it becomes `build/arc-test.duckdb`, so a test never touches the user's database or one in arc's data folder. A `command:` step that hard-codes a database path outside the folder still reaches it.
+- *The child is `arc run`, not the runner in-process.* Each test gets a fresh process, `arc test`'s own output stays one line per test, and the outcome is read from the same record and exit status a user sees.
+- *Fixtured steps are removed, not stubbed.* `depends_on:` names assets, not steps, so a removed step leaves the files it would have written as plain source files, which the fixtures are. A fixture stands in for a file, so a step that makes a table cannot have one.
+- *Inline checks become real check steps*, appended after the Protocol's own, so the runner refuses a query that is not exactly one, gives it `measures` and `measure_history`, and records it, as for any check. `checks:` with `expect:` is refused because a run expected to fail never reaches them.
+- *`fails_with:` matches arc's own final error, written to a file.* Reading standard error matched the wrong thing twice in review: DuckDB echoes the failing SQL, `error('…')` message included, so a message could match text that was never raised; and a step's own output can hold a line starting `error: `. `ARC_TEST_ERROR_FILE` gives the exact text; standard error is only the fallback for a child that crashed. The cost is that a `command:` step's stderr is not matched, so a refusal raised inside a script shows only as the step's exit; changing what `arc run` reports for a failed command step is separate work.
+- *A control runs for every break that expects a failure.* Agents and people will not remember to write one, and it proves the refusal comes from the break, not from the round trip or from a message the Protocol prints whatever the data. A break test that expects success has nothing for a control to rule out.
+- *A break writes the file back as it was, or is refused.* A refusal test against a different file proves nothing, so the round trip keeps what a loader can see: a CSV's delimiter, quote, escape, line ending and header; a JSON file's array or line form, with dates and timestamps kept as the text they were rather than shifted into the machine's time zone; a workbook's cells and blank rows. A CSV with lines above its header, or a header DuckDB would rename, would come back different, so it is refused. A workbook drops trailing empty rows, which a used range past the data would otherwise write back as rows of empty cells, and a stale `<dimension>` is widened to the furthest cell. Formatting and cell types are not kept: every cell comes back as text, which a loader reading `all_varchar = true` cannot tell apart. A workbook of several sheets is refused because DuckDB's writer writes one.
+- *Each break statement is terminated on its own line*, so a trailing `-- comment` cannot swallow the `;`.
+- *Break SQL is Protocol SQL*, run on the Protocol's DuckDB command line after the same extension refusals, so a break cannot do what a step could not.
+- *`measure_history:` replaces the run records wholesale*, rows taken as given, so a test can show a comparison check failing without fabricating earlier runs; with none, a test's history is empty, as a first run's is. Its variable is `arc test`'s own, like `ARC_TEST_ERROR_FILE`.
+- *Lifecycle hooks run as written*, like every step that is not a publish, apart from the network refusals above.
+- *A refused test is a failing test, and the rest still run*, so one bad fixture key does not hide every other result; a `tests.yaml` that does not load stops before any test, since no result could be trusted.
+- *JUnit's failure message is the risk line*, so a CI summary that shows only the message still says what is at stake.
 
 ### Publishing into a lake
 
@@ -375,6 +458,8 @@ The structural test proves a skill names only what arc has, not that an agent pi
 - **`CheckSection`** — a check step's entry in the run record: `name`, `risk`, `severity`, `success`, `rows_returned`, `sample`, `sample_columns`, and `error` when the query did not run.
 - **`MeasureSection`** — `values`, the measures a step recorded: a measure step's `<step>.<column>` names, and `table:<t>.row_count` and `table:<t>.bytes` for each table a step produced.
 - **`ChecksSummary`** — `run.checks` in the record: how many checks `passed`, `warned` and `failed`.
+- **`ProtocolTest`** — one test from `tests.yaml`: `name`, `risk`, `fixtures`, `breaks`, `expect` (`fails_with`), `checks`, `params`, `measure_history`.
+- **`TestPlan`** — what one test changes in its copy: `removed_steps` (fixtured and publishing steps, in manifest order) and `placements`, each a fixture, the output it lands at and its break statements.
 
 ## Execution model
 
@@ -391,6 +476,8 @@ The structural test proves a skill names only what arc has, not that an agent pi
    - After a step that produces tables succeeds or is skipped as fresh: measure each table's `row_count` and `bytes` into the step's entry and this run's `measures`
 4. Update run state after each step
 5. Check the declared `outputs:` are there (before the hooks), run the hooks, then hash the outputs into the run record
+
+`arc test` runs this whole model once per test, as a child `arc run --force` in a copy of the Protocol with fixtures in place of its fetches and its publishing steps taken out (see "Protocol tests").
 
 ## Runtime dependencies
 
