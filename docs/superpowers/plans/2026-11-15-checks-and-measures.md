@@ -35,6 +35,10 @@ Recorded here so Hugh reads them in one place; each is restated in the task that
 8. **`measures` and `measure_history` are reserved table names**: arc refuses a manifest in which a step produces either.
 9. **Step names may not contain `:`**, which the spec relies on for the `table:` prefix and which `validate` does not enforce today.
 10. **A failed `error` check exits as a failed step does today** (exit code 2, via `Error::exit_code`). The spec's 0/1 exit codes belong to the Telling-the-analyst issue, which should settle both together.
+12. **History compares like with like.** `measure_history` keeps only earlier runs whose recorded `run.params` (key and value, as the record holds them) equal this run's, so a run for another `release` is not a baseline.
+13. **A check that fails to run counts as failed** in `run.checks`, whatever its severity: its step entry gets a `CheckSection` with `success: false`, `rows_returned: 0`, an empty sample and `error: Some(<message>)`.
+14. **A measure column name may not contain `.`**, so each `<step>.<column>` name maps to one step and one column.
+15. **`measures` and `measure_history` are not graph assets**: a check's or measure's reads of them are left out of the asset graph.
 11. `check:` and `measure:` steps refuse `produces:`, `output:` and `preconditions:` (they produce nothing and are never skipped); `depends_on:`, `retry:`, `timeout_sec:` and `description:` are allowed. `risk:` and `severity:` are refused on any step that is not a check.
 
 ## Review Focus
@@ -102,6 +106,7 @@ git commit -m "Add check and measure step kinds to the manifest"
 **Files:**
 - Modify: `src/asset.rs:155` (`AssetGraph::build`), `src/engine.rs:1783-1810` (`ProtocolSql::new`, `protocol_sql`), `src/contract.rs` (`build_step`'s `sql` section and `kind`), `src/runner.rs` (`sql_hash` at ~line 628, `compute_staleness` ~line 1516)
 - Modify: `src/contract.rs` `StepKind` (add `Check`, `Measure`)
+- Modify: `src/manifest.rs` `requires_engine` (~line 834: use `sql_file()`, so a Protocol whose only SQL is in checks still gets the engine preflight); remove Task 1's `#[allow(dead_code)]` on the helpers this task now uses
 - Create: `src/check.rs` (starts here with the refusals; Tasks 3–6 add to it); add `mod check;` in `src/lib.rs` and `"check.rs"` to `MODULE_FILES` in `tests/public_surface.rs`
 - Test: `tests/checks.rs` (new integration test file, real `arc` binary, `mod common;` as `tests/run_outputs.rs` does)
 
@@ -117,6 +122,8 @@ git commit -m "Add check and measure step kinds to the manifest"
   - `a_check_file_holding_a_create_is_refused`: `CREATE TABLE x AS SELECT 1` refused the same way.
   - `a_step_producing_measures_is_refused`: a `sql:` step `CREATE TABLE measures AS SELECT 1` refused, message names `measures` as reserved.
   - `a_check_reads_its_tables_in_the_asset_graph`: a passing run with `sql: models/t.sql` then `check: checks/c.sql` reading `t`; the run record's step entry for the check has `kind: "check"`, a `sql` section with `model_path: "checks/c.sql"` and one statement reading `t`, and the `t` asset's `consumed_by` lists the check.
+  - `a_check_reading_measures_lists_no_measures_asset` (ruling 15): a check reading `measures` passes, and the record has no asset named `measures` or `measure_history`.
+  - `a_protocol_whose_only_sql_is_a_check_gets_the_engine_preflight`: a `command:` step plus a check on a table the command makes with `duckdb`; the run passes.
   - `a_check_runs_again_on_an_unchanged_second_run`: run twice; the second run's record shows the `sql:` step `skipped` and the check step not skipped.
 
 - [ ] **Step 2: Run them to verify they fail**
@@ -124,7 +131,7 @@ git commit -m "Add check and measure step kinds to the manifest"
 Run: `cargo test --test checks`
 Expected: FAIL (the manifest loads from Task 1, but the runner treats the step as having no SQL).
 
-- [ ] **Step 3: Implement.** Switch each "the step's SQL file" reader listed above from `step.sql` to `step.sql_file()`. In `compute_staleness`, a check or measure step is stale unconditionally, as a `command:` step without preconditions is (same early `continue`). Call `check::refuse_check_shapes` in `run_with_publish` right after the asset graph is built and before run state is set up, so a refused Protocol leaves no run behind (the same place the existing SQL-reader refusals are raised). For now the runner executes a check or measure step's file with `engine.execute_sql` as a plain SQL step; Task 4 replaces that.
+- [ ] **Step 3: Implement.** Switch each "the step's SQL file" reader listed above from `step.sql` to `step.sql_file()`. In `AssetGraph::build`, drop `measures` and `measure_history` from a check or measure step's reads (ruling 15). In `compute_staleness`, a check or measure step is stale unconditionally, as a `command:` step without preconditions is (same early `continue`). Call `check::refuse_check_shapes` in `run_with_publish` right after the asset graph is built and before run state is set up, so a refused Protocol leaves no run behind (the same place the existing SQL-reader refusals are raised). For now the runner executes a check or measure step's file with `engine.execute_sql` as a plain SQL step; Task 4 replaces that.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -192,8 +199,8 @@ git commit -m "Refuse a Protocol that publishes before an error check on what it
 **Interfaces:**
 - Consumes: Task 2's reading (the one statement's text, without its `;`).
 - Produces:
-  - In `src/contract.rs`: `pub struct CheckSection { name: String, risk: String, severity: String, success: bool, rows_returned: u64, sample: Vec<Vec<Option<String>>>, sample_columns: Vec<String> }` (all `pub`, `Serialize, Deserialize, Clone`); `StepEntry.check: Option<CheckSection>` and `StepOutcome.check: Option<CheckSection>`, both `#[serde(default, skip_serializing_if = "Option::is_none")]` on the entry; `pub struct ChecksSummary { passed: u32, warned: u32, failed: u32 }` and `RunInfo.checks: ChecksSummary` (`#[serde(default)]`), counted in `build_contract` from the step outcomes (`success` → passed; not success and warn → warned; not success and error → failed); `CONTRACT_VERSION = "b5/1"`.
-  - In `src/check.rs`: `pub(crate) fn run_check(step: &Step, query: &str, ctx: &QueryContext) -> Result<CheckSection>` where `pub(crate) struct QueryContext<'a> { engine: &'a dyn Engine, db_path: &'a Path, env: &'a HashMap<String, String>, timeout: Option<Duration>, loaded: &'a mut LoadedExtensions, measures: &'a [(String, Option<f64>)], history: &'a [HistoryRow] }`. (`HistoryRow` is defined in Task 6; until then pass `&[]` and define it here as `pub(crate) struct HistoryRow { run_id: String, run_at: String, name: String, value: Option<f64> }`.)
+  - In `src/contract.rs`: `pub struct CheckSection { name: String, risk: String, severity: String, success: bool, rows_returned: u64, sample: Vec<Vec<Option<String>>>, sample_columns: Vec<String>, error: Option<String> }` (`error` is `skip_serializing_if = "Option::is_none"`, set only when the check failed to run, ruling 13; all `pub`, `Serialize, Deserialize, Clone`); `StepEntry.check: Option<CheckSection>` and `StepOutcome.check: Option<CheckSection>`, both `#[serde(default, skip_serializing_if = "Option::is_none")]` on the entry; `pub struct ChecksSummary { passed: u32, warned: u32, failed: u32 }` and `RunInfo.checks: ChecksSummary` (`#[serde(default)]`), counted in `build_contract` from the step outcomes (`success` → passed; not success and warn → warned; not success and error → failed); `CONTRACT_VERSION = "b5/1"`.
+  - In `src/check.rs`: `pub(crate) fn run_check(step: &Step, query: &str, ctx: &mut QueryContext) -> Result<CheckSection>` where `pub(crate) struct QueryContext<'a> { engine: &'a dyn Engine, db_path: &'a Path, env: &'a HashMap<String, String>, timeout: Option<Duration>, loaded: &'a mut LoadedExtensions, measures: &'a [(String, Option<f64>)], history: &'a [HistoryRow] }`. (`HistoryRow` is defined in Task 6; until then pass `&[]` and define it here as `pub(crate) struct HistoryRow { run_id: String, run_at: String, name: String, value: Option<f64> }`.)
   - `Error::CheckFailed { step: String, check: Box<CheckSection> }`, displayed `check '<step>' failed: <risk> (<n> rows returned)`, in `exit_code`'s first arm with `StepFailed` (ruling 10), not retried.
 
 The wrapper is the one piece the signature does not determine. `run_check` writes `measures.json` and `history.json` (arrays of objects) and `wrapper.sql` into a fresh `AnswerDir`, runs `wrapper.sql` with `ctx.engine.execute_sql`, then reads `answer.json`:
@@ -210,7 +217,7 @@ CREATE TEMP TABLE __arc_rows AS
 COPY (SELECT
   (SELECT count(*) FROM __arc_rows) AS rows_returned,
   (SELECT list(column_name) FROM (DESCRIBE __arc_rows)) AS columns,
-  (SELECT list(r) FROM (SELECT [COLUMNS(*)::VARCHAR] AS r FROM __arc_rows LIMIT 20)) AS sample
+  (SELECT coalesce(list(r), []) FROM (SELECT [COLUMNS(*)::VARCHAR] AS r FROM __arc_rows LIMIT 20)) AS sample
 ) TO '<dir>/answer.json' (FORMAT json);
 ```
 
@@ -220,7 +227,7 @@ Paths are written as SQL string literals with `'` doubled. If `[COLUMNS(*)::VARC
   - `tests/checks.rs::a_passing_check_records_success_and_no_rows`: record's check entry has `check.success == true`, `rows_returned == 0`, `sample == []`, `severity == "error"`, `risk` as written; `run.checks == {passed: 1, warned: 0, failed: 0}`; `contract_version == "b5/1"`.
   - `a_failed_warn_check_leaves_the_run_green`: exit 0, step `status.state == "success"`, `check.success == false`, `rows_returned == 3`, `sample_columns == ["code", "parent"]`, three sample rows; `run.outcome == "success"`, `run.checks.warned == 1`; stderr has a `warning:` line naming the check, its risk and `3 rows`.
   - `a_failed_error_check_stops_the_run_before_the_next_step`: a `command:` step after the check never runs (its marker file is absent), exit 2, stderr contains `check 'c' failed:` and the risk, record step state `failed` with its `check` section filled, `run.checks.failed == 1`, `run.outcome` is `partial`.
-  - `a_check_whose_sql_fails_fails_the_step_even_as_warn` (ruling 5).
+  - `a_check_whose_sql_fails_fails_the_step_even_as_warn` (rulings 5 and 13): the step fails, its entry has `check.success == false` and an `error`, and `run.checks.failed == 1`.
   - `a_check_with_comments_and_no_semicolon_runs` (Review Focus 1): file `-- leading\nSELECT 1 WHERE false -- trailing` passes.
   - `a_sample_is_capped_and_cells_truncated` (Review Focus 4): a check returning 50 rows of `repeat('x', 10000)` gives `rows_returned == 50`, 20 sample rows, each cell 201 characters ending `…`.
   - `a_check_can_read_its_parameters`: `getenv('ARC_PARAM_LIMIT')` inside a check works as in a `sql:` step.
@@ -257,7 +264,7 @@ git commit -m "Run check steps, record each check's outcome and sample, and stop
 - Consumes: `QueryContext`, the wrapper and `AnswerDir` (Task 4).
 - Produces:
   - `pub struct MeasureSection { values: IndexMap<String, Option<f64>> }` in `src/contract.rs`; `StepEntry.measure` and `StepOutcome.measure`, `Option<MeasureSection>`, serialised as Task 4's `check` is. Key order: a measure step's columns in query order, then built-ins in produced-table order (sorted by name).
-  - `pub(crate) fn run_measure(step: &Step, query: &str, ctx: &QueryContext) -> Result<IndexMap<String, Option<f64>>>`: the same wrapper as `run_check` with a different final `COPY`, giving the row count, each column's name and type from `DESCRIBE`, and the first row's values cast to `DOUBLE`. Refused (step fails, `Error::StepExecution`-style message naming the step) unless exactly one row and every column type is numeric (`TINYINT` … `HUGEINT`, unsigned forms, `FLOAT`, `DOUBLE`, `DECIMAL(…)`). Names are `<step>.<column>`.
+  - `pub(crate) fn run_measure(step: &Step, query: &str, ctx: &mut QueryContext) -> Result<IndexMap<String, Option<f64>>>`: the same wrapper as `run_check` with a different final `COPY`, giving the row count, each column's name and type from `DESCRIBE`, and the first row's values cast to `DOUBLE`. Refused (step fails, `Error::StepExecution`-style message naming the step) unless exactly one row and every column type is numeric (`TINYINT` … `HUGEINT`, unsigned forms, `FLOAT`, `DOUBLE`, `DECIMAL(…)`). Names are `<step>.<column>`; a column name containing `.` fails the step (ruling 14).
   - `pub(crate) fn measure_tables(db_path: &Path, tables: &[String]) -> IndexMap<String, Option<f64>>`: opens the database with the linked `duckdb` crate read-only, and for each simple-identifier table gives `table:<t>.row_count` (`count(*)`) and `table:<t>.bytes` (ruling 4); a table it cannot measure is left out.
   - The runner keeps `run_measures: Vec<(String, Option<f64>)>` in run order and passes it as `QueryContext.measures`.
 
@@ -265,6 +272,7 @@ git commit -m "Run check steps, record each check's outcome and sample, and stop
   - `tests/checks.rs::a_measure_step_records_its_values`: `SELECT count(*) AS n, 0.5 AS share FROM t` → entry `measure.values == {"m.n": 3, "m.share": 0.5}`.
   - `a_measure_returning_two_rows_or_text_fails_its_step`: each fails, message names the step and the rule.
   - `a_null_measure_is_recorded_as_null` (Review Focus 2).
+  - `a_measure_column_with_a_dot_fails_its_step` (ruling 14).
   - `each_produced_table_is_measured_at_its_step`: the `sql:` step's entry has `measure.values["table:t.row_count"] == 3` and a positive `table:t.bytes`.
   - `a_check_reads_this_runs_measures`: a check `SELECT * FROM measures WHERE name = 'table:t.row_count' AND value <> 3` passes, and with `<> 4` fails (warn).
   - `a_check_before_a_measure_does_not_see_it`: `measures` holds only what ran earlier in the run.
@@ -299,11 +307,12 @@ git commit -m "Record measure steps and each produced table's row count and byte
 
 **Interfaces:**
 - Consumes: `HistoryRow` (Task 4), `MeasureHistory` (Task 1), `contract::contracts_by_age`.
-- Produces: `pub(crate) fn load_history(runs_dir: &Path, current_run_id: &str, window: &MeasureHistory, now: std::time::SystemTime) -> Vec<HistoryRow>`: every record in `runs_dir` that deserialises as a `Contract`, is not `current_run_id`, has `run.outcome == "success"` and has a `started_at`; each step's `measure` section becomes rows with `run_at = run.started_at`. `Runs(n)` keeps the `n` newest runs by `started_at`; `Since(d)` keeps runs started at or after `now - d`. Rows are returned oldest run first (newest last), steps in record order.
+- Produces: `pub(crate) fn load_history(runs_dir: &Path, current_run_id: &str, current_params: &[contract::ParamEntry], window: &MeasureHistory, now: std::time::SystemTime) -> Vec<HistoryRow>`: every record in `runs_dir` that deserialises as a `Contract`, is not `current_run_id`, has `run.outcome == "success"` and has a `started_at`, and whose `run.params` equal `current_params` (ruling 12); each step's `measure` section becomes rows with `run_at = run.started_at`. `Runs(n)` keeps the `n` newest runs by `started_at`; `Since(d)` keeps runs started at or after `now - d`. Rows are returned oldest run first (newest last), steps in record order.
 
 - [ ] **Step 1: Write the failing tests**
   - `history_keeps_the_newest_n_successful_runs_oldest_first`.
   - `history_since_keeps_runs_inside_the_window`.
+  - `history_keeps_only_runs_with_the_same_params` (ruling 12): records with `release=2018` and `release=2010`; asking with `2018` returns only the first's rows.
   - `history_skips_unreadable_old_failed_and_current_records` (Review Focus 3): a truncated `.json`, a `b4/1` record with no measure sections, a `partial` run and the current run id each contribute nothing, and nothing errors.
   - `tests/checks.rs::a_comparison_check_sees_the_previous_run`: run 1 loads 4 rows; run 2 loads 1 row (the `sql:` file changes between runs); a warn check `SELECT name FROM measures m JOIN (SELECT name, last(value ORDER BY run_at) AS prev FROM measure_history GROUP BY name) p USING (name) WHERE m.value < p.prev * 0.5` passes on run 1 (empty history) and warns on run 2 with `table:t.row_count` in its sample.
 
