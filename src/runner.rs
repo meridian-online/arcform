@@ -1327,6 +1327,7 @@ pub fn run_with_publish(
             &run_id,
             crate::lake::take_run_record_uploads(),
             &record_secrets(&manifest, &dotenv_vars),
+            manifest.check_samples,
         ),
     ) {
         (result, Ok(())) => result,
@@ -1422,6 +1423,7 @@ fn upload_run_records(
     run_id: &str,
     uploads: Vec<crate::lake::RunRecordUpload>,
     secrets: &[String],
+    check_samples: bool,
 ) -> Result<()> {
     use crate::lake::store::{PutCondition, StoreError};
 
@@ -1431,7 +1433,7 @@ fn upload_run_records(
     let path = runs_dir.join(format!("{run_id}.json"));
     let record = std::fs::read(&path)
         .map_err(|e| format!("read {}: {e}", path.display()))
-        .and_then(|bytes| public_record(&bytes, dir, secrets));
+        .and_then(|bytes| public_record(&bytes, dir, secrets, check_samples));
     let mut first = None;
     for upload in uploads {
         let result = record.clone().and_then(|bytes| {
@@ -1473,6 +1475,7 @@ fn public_record(
     bytes: &[u8],
     dir: &Path,
     secrets: &[String],
+    check_samples: bool,
 ) -> std::result::Result<Vec<u8>, String> {
     /// A value shorter than this is too likely to match by chance (`true`, `1`).
     const MIN_SECRET_LEN: usize = 8;
@@ -1594,6 +1597,15 @@ fn public_record(
         .map(|h| h.trim_end_matches('/').to_string())
         .filter(|h| !h.is_empty());
     scrub(&mut record);
+    // With `check_samples: false` no sample row leaves the machine; the column
+    // names stay, so a reader still sees what the check selected.
+    if !check_samples && let Some(steps) = record.get_mut("steps").and_then(|s| s.as_array_mut()) {
+        for step in steps {
+            if let Some(check) = step.get_mut("check").and_then(|c| c.as_object_mut()) {
+                check.insert("sample".to_string(), serde_json::json!([]));
+            }
+        }
+    }
     let secrets: Vec<&str> = secrets
         .iter()
         .map(String::as_str)
@@ -2480,6 +2492,7 @@ mod run_record_upload_tests {
             "r1",
             vec![upload(&store, "runs/r1.json")],
             &[],
+            true,
         )
         .unwrap();
         let uploaded: serde_json::Value =
@@ -2498,6 +2511,7 @@ mod run_record_upload_tests {
             "r2",
             vec![upload(&store, "runs/r2.json")],
             &[],
+            true,
         )
         .unwrap_err()
         .to_string();
@@ -2508,7 +2522,7 @@ mod run_record_upload_tests {
         assert_eq!(store.get("runs/r2.json").unwrap().unwrap().0, b"other");
 
         // Nothing queued: nothing to do.
-        upload_run_records(dir.path(), &runs, "r3", Vec::new(), &[]).unwrap();
+        upload_run_records(dir.path(), &runs, "r3", Vec::new(), &[], true).unwrap();
     }
 
     /// Two publish steps in one run queue the same record: the second finds this
@@ -2529,6 +2543,7 @@ mod run_record_upload_tests {
                 upload(&store, "runs/r1.json"),
             ],
             &[],
+            true,
         )
         .unwrap();
         // A later run of the same id (a retry) also finds it in place.
@@ -2538,8 +2553,56 @@ mod run_record_upload_tests {
             "r1",
             vec![upload(&store, "runs/r1.json")],
             &[],
+            true,
         )
         .unwrap();
+    }
+
+    fn record_with_samples() -> Vec<u8> {
+        serde_json::json!({"steps": [
+            {"name": "a", "check": {"name": "c", "risk": "r", "severity": "warn",
+                "success": false, "rows_returned": 2,
+                "sample": [["1", "x"], ["2", null]], "sample_columns": ["id", "v"]}},
+            {"name": "b", "sql": {"sql_hash": "h"}}
+        ]})
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn check_samples_false_empties_every_sample_in_the_published_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = public_record(&record_with_samples(), dir.path(), &[], false).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["steps"][0]["check"]["sample"], serde_json::json!([]));
+        assert_eq!(
+            v["steps"][0]["check"]["sample_columns"],
+            serde_json::json!(["id", "v"])
+        );
+        assert_eq!(v["steps"][0]["check"]["rows_returned"], 2);
+    }
+
+    #[test]
+    fn check_samples_true_keeps_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = public_record(&record_with_samples(), dir.path(), &[], true).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            v["steps"][0]["check"]["sample"],
+            serde_json::json!([["1", "x"], ["2", null]])
+        );
+    }
+
+    #[test]
+    fn a_sample_holding_a_secret_is_refused_as_any_other_string_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = serde_json::json!({"steps": [{"check": {"sample":
+            [["token s3cr3t-value-123"]], "sample_columns": ["t"]}}]})
+        .to_string();
+        let secrets = vec!["s3cr3t-value-123".to_string()];
+        let e = public_record(record.as_bytes(), dir.path(), &secrets, true).unwrap_err();
+        assert!(e.contains("credential"), "{e}");
+        assert!(!e.contains("s3cr3t"), "{e}");
     }
 
     /// SQL text goes as its hash, a value a dotenv variable holds refuses the upload
@@ -2559,6 +2622,7 @@ mod run_record_upload_tests {
                 id,
                 vec![upload(&store, &format!("runs/{id}.json"))],
                 &secrets,
+                true,
             )
         };
 
@@ -2635,6 +2699,7 @@ mod run_record_upload_tests {
                 id,
                 vec![upload(&store, &format!("runs/{id}.json"))],
                 &secrets,
+                true,
             )
         };
         run(
@@ -2675,6 +2740,7 @@ mod run_record_upload_tests {
             "r1",
             vec![upload(&store, "runs/r1.json")],
             &[],
+            true,
         )
         .unwrap();
 
@@ -2705,6 +2771,7 @@ mod run_record_upload_tests {
             "r3",
             vec![upload(&store, "runs/r3.json")],
             &[],
+            true,
         )
         .unwrap_err()
         .to_string();
@@ -2720,6 +2787,7 @@ mod run_record_upload_tests {
             "r4",
             vec![upload(&store, "runs/r4.json")],
             &[],
+            true,
         )
         .unwrap();
         let uploaded = String::from_utf8(store.get("runs/r4.json").unwrap().unwrap().0).unwrap();
@@ -2737,6 +2805,7 @@ mod run_record_upload_tests {
             "r5",
             vec![upload(&store, "runs/r5.json")],
             &[],
+            true,
         )
         .unwrap_err()
         .to_string();
@@ -2760,9 +2829,10 @@ mod run_record_upload_tests {
             )
             .unwrap();
             let key = format!("runs/{id}.json");
-            let e = upload_run_records(&protocol, &runs, &id, vec![upload(&store, &key)], &[])
-                .unwrap_err()
-                .to_string();
+            let e =
+                upload_run_records(&protocol, &runs, &id, vec![upload(&store, &key)], &[], true)
+                    .unwrap_err()
+                    .to_string();
             assert!(e.contains("home directory"), "{text}: {e}");
             assert!(store.get(&key).unwrap().is_none());
         }
@@ -2778,7 +2848,8 @@ mod run_record_upload_tests {
                 serde_json::to_vec(&dotted).unwrap(),
             )
             .unwrap();
-            upload_run_records(&protocol, &runs, &id, vec![upload(&store, &key)], &[]).unwrap();
+            upload_run_records(&protocol, &runs, &id, vec![upload(&store, &key)], &[], true)
+                .unwrap();
         }
         let longer = serde_json::json!({ "note": format!("{home}es/x") });
         std::fs::write(runs.join("r6.json"), serde_json::to_vec(&longer).unwrap()).unwrap();
@@ -2788,6 +2859,7 @@ mod run_record_upload_tests {
             "r6",
             vec![upload(&store, "runs/r6.json")],
             &[],
+            true,
         )
         .unwrap();
 
@@ -2801,6 +2873,7 @@ mod run_record_upload_tests {
             "r2",
             vec![upload(&store, "runs/r2.json")],
             &[],
+            true,
         )
         .unwrap_err()
         .to_string();
