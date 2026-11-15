@@ -148,7 +148,8 @@ fn check_failure(test: &ProtocolTest, n: usize, check: &CheckSection) -> String 
 
 /// What one child run left.
 struct ChildOutcome {
-    /// The text after `error: ` on its standard error, when it failed.
+    /// arc's error, when it failed: the text of the file `ARC_TEST_ERROR_FILE` names, or,
+    /// from a child that wrote none, the text after `error: ` on its standard error.
     failure: Option<String>,
     /// The first of the test's own checks that returned rows, with its number.
     failed_check: Option<(usize, CheckSection)>,
@@ -352,8 +353,9 @@ fn rewrite_manifest(
 }
 
 /// Run `arc run --force` on `copy` from this executable, one `--param` per test parameter,
-/// with standard input closed, standard output dropped and standard error read. The child
-/// gets `history` as its measure history and never publishes. `Ok(None)` when it
+/// with standard input closed and standard output dropped. Its failure is the text of the
+/// file `ARC_TEST_ERROR_FILE` names, and its standard error is read only as the fallback
+/// for a child that wrote no such file. The child gets `history` as its measure history and never publishes. `Ok(None)` when it
 /// succeeded, `Ok(Some(message))` when it failed, `Err` when it could not start.
 fn run_child(
     copy: &Path,
@@ -416,13 +418,19 @@ fn run_child(
     // arc wrote its own error to the file; only a child that crashed or was killed did not,
     // and then the error is looked for on its standard error.
     if let Ok(text) = std::fs::read_to_string(&error_file) {
-        return Ok(Some(without_duckdb_context(&text)));
+        return Ok(Some(error_from_file(&text)));
     }
     let bytes = stderr.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let text = strip_ansi(&String::from_utf8_lossy(&bytes));
     Ok(Some(error_message(&text).unwrap_or_else(|| {
         format!("arc run exited with {status} and printed no error")
     })))
+}
+
+/// The error text arc wrote to the error file, with any colour codes and DuckDB's context
+/// lines taken out.
+fn error_from_file(text: &str) -> String {
+    without_duckdb_context(&strip_ansi(text))
 }
 
 /// `text` without DuckDB's echo of the failing SQL: each `LINE <n>: …` line and the caret
@@ -492,6 +500,16 @@ LINE 1: SELECT CASE WHEN code IS NULL THEN error('codes header has moved') END F
             )
         );
         assert_eq!(error_message("nothing went wrong\n"), None);
+    }
+
+    #[test]
+    fn an_error_file_with_colour_codes_matches_as_plain_text() {
+        let text = "\x1b[31merror\x1b[0m: step 'load' failed:\n\x1b[1mcodes header has moved\x1b[0m\n\
+LINE 1: SELECT error('x')\n         ^\n";
+        assert_eq!(
+            error_from_file(text),
+            "error: step 'load' failed:\ncodes header has moved"
+        );
     }
 
     #[test]

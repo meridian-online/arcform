@@ -128,14 +128,23 @@ pub enum Commands {
         publish: bool,
     },
 
-    /// Run the Protocol's tests in `tests.yaml`: each in a copy of the Protocol beside it,
-    /// with checked-in fixture files in place of its fetches and its publishing steps left
-    /// out. Prints `ok <name>` for a passing test, and for a failing one its name, its risk
-    /// and what happened against what was expected. Exits 1 when any test fails.
+    /// Run the Protocol's tests in tests.yaml against their fixture files, in a temporary copy
+    ///
+    /// Each test runs in a copy of the Protocol beside it, with checked-in fixture files in
+    /// place of its fetches and its publishing steps left out. Prints `ok <name>` for a
+    /// passing test, and for a failing one its name, its risk and what happened against what
+    /// was expected, then `<n> passed, <m> failed`. Exits 1 when any test fails.
     Test {
+        /// Run only the test with this name; an unknown name lists the tests.
+        name: Option<String>,
+
         /// Protocol directory (where arcform.yaml and tests.yaml live).
         #[arg(long, default_value = ".")]
         dir: PathBuf,
+
+        /// Also write the results to this file as JUnit XML.
+        #[arg(long, value_name = "FILE")]
+        junit: Option<PathBuf>,
     },
 
     /// Pin the build of a community extension on the vetted list that the community
@@ -1194,27 +1203,36 @@ pub fn run_pipeline(force: bool, publish: bool, raw_params: &[String]) -> Result
     crate::runner::run_with_publish(&cwd, &engine, &state, force, &cli_params, publish)
 }
 
-/// Execute `arc test`: run every test, writing each result to `out` as it finishes, and
+/// Execute `arc test`: run every test (or the one `name`), writing each result to `out` as it finishes, and
 /// fail when any test failed.
-fn test_protocol(dir: &Path, out: &mut impl Write) -> Result<()> {
+fn test_protocol(
+    dir: &Path,
+    name: Option<&str>,
+    junit: Option<&Path>,
+    out: &mut impl Write,
+) -> Result<()> {
+    use crate::protocol_test::{Outcome, junit as junit_xml, print_result, run_tests};
     let mut written = Ok(());
-    let results = crate::protocol_test::run_tests(dir, |result| {
+    let (protocol, results) = run_tests(dir, name, |result| {
         if written.is_ok() {
-            written = out
-                .write_all(crate::protocol_test::render(result).as_bytes())
-                .and_then(|()| out.flush());
+            written = print_result(out, result).and_then(|()| out.flush());
         }
     })?;
     written?;
     let failed = results
         .iter()
-        .filter(|r| r.outcome != crate::protocol_test::Outcome::Passed)
+        .filter(|r| r.outcome != Outcome::Passed)
         .count();
+    let passed = results.len() - failed;
+    writeln!(out, "{passed} passed, {failed} failed")?;
+    if let Some(path) = junit {
+        std::fs::write(path, junit_xml(&protocol, &results))?;
+    }
     if failed > 0 {
-        return Err(Error::Io(std::io::Error::other(format!(
-            "{failed} of {} tests failed",
-            results.len()
-        ))));
+        return Err(Error::TestsFailed {
+            failed,
+            total: results.len(),
+        });
     }
     Ok(())
 }
@@ -1352,7 +1370,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             params,
             publish,
         } => run_pipeline(force, publish, &params),
-        Commands::Test { dir } => test_protocol(&dir, &mut std::io::stdout()),
+        Commands::Test { name, dir, junit } => test_protocol(
+            &dir,
+            name.as_deref(),
+            junit.as_deref(),
+            &mut std::io::stdout(),
+        ),
         Commands::Upgrade { name, dir } => {
             upgrade_extension(&dir, &name, &DuckDbEngine, &open_history()?)
         }

@@ -88,8 +88,15 @@ impl Protocol {
 
     /// `arc test --dir p`: (exit code, stdout with ANSI codes stripped, stderr).
     fn arc_test(&self) -> (Option<i32>, String, String) {
+        self.arc_test_with(&[])
+    }
+
+    /// `arc test <args> --dir p`.
+    fn arc_test_with(&self, args: &[&str]) -> (Option<i32>, String, String) {
         let out = Command::new(env!("CARGO_BIN_EXE_arc"))
-            .args(["test", "--dir"])
+            .arg("test")
+            .args(args)
+            .arg("--dir")
             .arg(self.dir())
             .env("ARCFORM_DB_DIR", self.root.path().join("arc-db"))
             .env_remove("ARC_PUBLISH")
@@ -448,4 +455,79 @@ fn a_database_reached_through_a_linked_folder_is_not_touched() {
     assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
     let target = elsewhere.path().join("x.duckdb");
     assert!(!target.exists(), "the test wrote {}", target.display());
+}
+
+/// A passing test and a failing one, in that order.
+fn one_passing_one_failing() -> String {
+    format!(
+        "{}{}",
+        test_yaml("the codes load", ""),
+        test_yaml(
+            "only management codes",
+            "  checks:\n    - SELECT code FROM codes WHERE code <> '11'\n"
+        )
+    )
+}
+
+#[test]
+fn arc_test_by_name_runs_one() {
+    let p = Protocol::new(&one_passing_one_failing());
+    let (code, stdout, stderr) = p.arc_test_with(&["the codes load"]);
+    assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.lines().any(|l| l == "ok the codes load"), "{stdout}");
+    assert!(!stdout.contains("only management codes"), "{stdout}");
+    assert_eq!(
+        stdout.lines().last(),
+        Some("1 passed, 0 failed"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn an_unknown_test_name_lists_the_names() {
+    let p = Protocol::new(&one_passing_one_failing());
+    let (code, stdout, stderr) = p.arc_test_with(&["nope"]);
+    assert_eq!(code, Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stderr.contains("no test is named 'nope'"), "{stderr}");
+    assert!(
+        stderr.contains("the codes load, only management codes"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("ok "), "no test should have run: {stdout}");
+}
+
+#[test]
+fn junit_file_is_written_and_exit_is_1_on_failure() {
+    let p = Protocol::new(&one_passing_one_failing());
+    let file = p.root.path().join("results.xml");
+    let (code, stdout, stderr) = p.arc_test_with(&["--junit", file.to_str().unwrap()]);
+    assert_eq!(code, Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        stdout.lines().last(),
+        Some("1 passed, 1 failed"),
+        "{stdout}"
+    );
+    assert!(stderr.contains("1 of 2 tests failed"), "{stderr}");
+    let xml = std::fs::read_to_string(&file).expect("the junit file is written");
+    assert!(
+        xml.contains("<testsuite name=\"codes\" tests=\"2\" failures=\"1\""),
+        "{xml}"
+    );
+    assert!(
+        xml.contains("<testcase classname=\"codes\" name=\"the codes load\""),
+        "{xml}"
+    );
+    assert!(
+        xml.contains("<failure message=\"risk: the codes load wrong\">"),
+        "{xml}"
+    );
+}
+
+#[test]
+fn a_missing_tests_file_exits_1_naming_it() {
+    let p = Protocol::new(&test_yaml("the codes load", ""));
+    std::fs::remove_file(p.dir().join("tests.yaml")).unwrap();
+    let (code, stdout, stderr) = p.arc_test();
+    assert_eq!(code, Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stderr.contains("tests.yaml"), "{stderr}");
 }

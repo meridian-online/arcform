@@ -390,6 +390,10 @@ pub enum Error {
         reason: String,
     },
 
+    /// `arc test` ran its tests and some failed. Each failure was printed as it came.
+    #[error("{failed} of {total} tests failed")]
+    TestsFailed { failed: usize, total: usize },
+
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }
@@ -729,6 +733,16 @@ mod exit_code_tests {
         ] {
             assert_eq!(e.exit_code(), 2, "expected 'found a problem' (2) for {e:?}");
         }
+    }
+
+    #[test]
+    fn failed_tests_exit_1_and_say_how_many() {
+        let e = Error::TestsFailed {
+            failed: 2,
+            total: 5,
+        };
+        assert_eq!(e.exit_code(), 1);
+        assert_eq!(e.to_string(), "2 of 5 tests failed");
     }
 
     #[test]
