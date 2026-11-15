@@ -178,19 +178,19 @@ impl<'de> Deserialize<'de> for MeasureHistory {
                 "measure_history.runs must be at least 1: say how many runs to read",
             )),
             (Some(n), None) => Ok(MeasureHistory::Runs(n)),
-            (None, Some(since)) => humantime::parse_duration(&since)
-                .map(MeasureHistory::Since)
-                .map_err(|e| {
-                    invalid::<D::Error>(format!(
-                        "measure_history.since '{since}' is not a duration ({e}): write one such as 90d or 12h"
-                    ))
-                }),
+            (None, Some(since)) => match humantime::parse_duration(&since) {
+                Ok(d) if d.is_zero() => Err(invalid::<D::Error>(
+                    "measure_history.since must be longer than zero: write one such as 90d or 12h",
+                )),
+                Ok(d) => Ok(MeasureHistory::Since(d)),
+                Err(e) => Err(invalid::<D::Error>(format!(
+                    "measure_history.since '{since}' is not a duration ({e}): write one such as 90d or 12h"
+                ))),
+            },
             (Some(_), Some(_)) => Err(invalid::<D::Error>(
                 "measure_history takes runs: or since:, not both",
             )),
-            (None, None) => Err(invalid::<D::Error>(
-                "measure_history needs runs: or since:",
-            )),
+            (None, None) => Err(invalid::<D::Error>("measure_history needs runs: or since:")),
         }
     }
 }
@@ -765,6 +765,20 @@ impl Manifest {
                 if !hook.depends_on.is_empty() {
                     return Err(Error::ManifestValidation(format!(
                         "{}: hooks cannot have depends_on",
+                        label
+                    )));
+                }
+
+                // Hooks cannot be checks or measures, and take neither risk nor severity.
+                if hook.check.is_some() || hook.measure.is_some() {
+                    return Err(Error::ManifestValidation(format!(
+                        "{}: hooks cannot be a check or measure",
+                        label
+                    )));
+                }
+                if hook.risk.is_some() || hook.severity.is_some() {
+                    return Err(Error::ManifestValidation(format!(
+                        "{}: hooks cannot have risk or severity: only a check step takes them",
                         label
                     )));
                 }
@@ -1474,6 +1488,7 @@ assets:
         for bad in [
             "measure_history: { runs: 0 }\n",
             "measure_history: { since: soon }\n",
+            "measure_history: { since: 0s }\n",
             "measure_history: { runs: 5, since: 90d }\n",
         ] {
             assert!(load(bad).is_err(), "{bad} should be refused");
@@ -1491,5 +1506,12 @@ assets:
     fn a_hook_cannot_be_a_check() {
         let yaml = "name: p\nhooks:\n  on_exit:\n    name: h\n    check: c.sql\n    risk: x\n";
         assert!(load_err(yaml).contains("hooks.on_exit: must have either 'sql' or 'command'"));
+        let with_sql = "name: p\nhooks:\n  on_exit:\n    name: h\n    sql: a.sql\n    check: c.sql\n    risk: x\n";
+        assert!(load_err(with_sql).contains("hooks.on_exit: hooks cannot be a check or measure"));
+        let measure =
+            "name: p\nhooks:\n  on_exit:\n    name: h\n    sql: a.sql\n    measure: m.sql\n";
+        assert!(load_err(measure).contains("hooks cannot be a check or measure"));
+        let risk = "name: p\nhooks:\n  on_exit:\n    name: h\n    sql: a.sql\n    risk: x\n";
+        assert!(load_err(risk).contains("hooks.on_exit: hooks cannot have risk or severity"));
     }
 }
