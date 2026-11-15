@@ -269,8 +269,8 @@ impl ProtocolCopy {
             }
         };
         let mut skip = vec![PathBuf::from("build")];
-        if let Some(db) = Manifest::load(dir).ok().and_then(|m| m.db) {
-            let db = clean(Path::new(&db));
+        let db = Manifest::load(dir).ok().and_then(|m| m.db);
+        if let Some(db) = db.as_deref().and_then(|db| normalise(Path::new(db))) {
             let mut wal = db.clone().into_os_string();
             wal.push(".wal");
             skip.push(PathBuf::from(wal));
@@ -306,18 +306,10 @@ fn random_suffix(attempt: u32) -> String {
 /// counts, and refuses) is resolved, links and `..` the way the system follows them, and
 /// must lie under the copy.
 fn inside_copy(copy: &Path, path: &Path) -> bool {
-    let path = clean(path);
-    let mut depth = 0usize;
-    for component in path.components() {
-        match component {
-            Component::Normal(_) => depth += 1,
-            Component::ParentDir => match depth.checked_sub(1) {
-                Some(up) => depth = up,
-                None => return false,
-            },
-            _ => return false,
-        }
+    if normalise(path).is_none() {
+        return false;
     }
+    let path = clean(path);
     let Ok(root) = std::fs::canonicalize(copy) else {
         return false;
     };
@@ -326,6 +318,26 @@ fn inside_copy(copy: &Path, path: &Path) -> bool {
         return false;
     };
     std::fs::canonicalize(existing).is_ok_and(|resolved| resolved.starts_with(&root))
+}
+
+/// The relative `path` read without the file system: each `.` dropped and each `..`
+/// taking back the name before it, so `./models/../data.duckdb` is `data.duckdb`. `None`
+/// when it is absolute or a `..` has nothing to take back, since it then leaves the folder.
+fn normalise(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(name) => out.push(name),
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(out)
 }
 
 /// `path` without its `.` components, so `./data.duckdb` and `data.duckdb` compare equal.
@@ -380,13 +392,18 @@ fn rewrite_manifest(
     let Some(map) = doc.as_mapping_mut() else {
         return Err(cannot("it is not a mapping".into()));
     };
+    // The database kept is named as `normalise` reads it, the same file the copy left out.
     let own_db = map
         .get("db")
         .and_then(Value::as_str)
-        .is_some_and(|db| !db.trim().is_empty() && inside_copy(copy, Path::new(db)));
-    if !own_db {
-        map.insert("db".into(), TEST_DB.into());
-    }
+        .filter(|db| !db.trim().is_empty() && inside_copy(copy, Path::new(db)))
+        .and_then(|db| normalise(Path::new(db)))
+        .filter(|db| !db.as_os_str().is_empty());
+    let db = own_db.map_or_else(
+        || TEST_DB.to_string(),
+        |db| db.to_string_lossy().into_owned(),
+    );
+    map.insert("db".into(), db.into());
     let Some(steps) = map.get_mut("steps").and_then(Value::as_sequence_mut) else {
         return Err(cannot("it has no list of steps".into()));
     };
@@ -644,6 +661,28 @@ LINE 1: SELECT error('x')\n         ^\n";
         assert!(!path.join("data.duckdb.wal").exists());
         drop(copy);
         assert!(!path.exists(), "the copy outlived its guard");
+
+        // A `db:` whose `..` stays inside names the same file, which is left out too.
+        let root = tempfile::tempdir().unwrap();
+        let p = root.path().join("p");
+        for (path, text) in [
+            (
+                "arcform.yaml",
+                "name: t\ndb: models/../data.duckdb\nsteps:\n  - name: s\n    command: \"true\"\n",
+            ),
+            ("data.duckdb", "db"),
+            ("data.duckdb.wal", "wal"),
+            ("models/m.sql", "SELECT 1;"),
+        ] {
+            let full = p.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, text).unwrap();
+        }
+        let p = std::fs::canonicalize(&p).unwrap();
+        let copy = ProtocolCopy::make(&p).unwrap();
+        assert!(copy.path().join("models/m.sql").is_file());
+        assert!(!copy.path().join("data.duckdb").exists());
+        assert!(!copy.path().join("data.duckdb.wal").exists());
     }
 
     #[test]
@@ -665,13 +704,13 @@ LINE 1: SELECT error('x')\n         ^\n";
         };
         for (db, kept) in [
             ("data.duckdb", "data.duckdb"),
-            ("./build/x.duckdb", "./build/x.duckdb"),
+            ("./build/x.duckdb", "build/x.duckdb"),
             ("null", TEST_DB),
             ("\"\"", TEST_DB),
             ("/var/x.duckdb", TEST_DB),
             ("../shared.duckdb", TEST_DB),
             ("data/../../x.duckdb", TEST_DB),
-            ("models/../data.duckdb", "models/../data.duckdb"),
+            ("models/../data.duckdb", "data.duckdb"),
         ] {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(
