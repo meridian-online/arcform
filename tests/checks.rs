@@ -424,3 +424,33 @@ fn a_failed_error_check_names_itself_to_the_failure_hook() {
     let told = std::fs::read_to_string(dir.path().join("build/failed")).unwrap();
     assert_eq!(told.trim(), "c check");
 }
+
+#[test]
+fn a_check_whose_sql_fails_on_every_retry_records_why() {
+    let dir = project(
+        &with_check("    retry:\n      max_attempts: 2\n      backoff_sec: 0\n"),
+        &[
+            MAKES_T,
+            (
+                "checks/c.sql",
+                "SELECT n\nFROM t\nWHERE no_such_column = 1;\n",
+            ),
+        ],
+    );
+    let (code, _, stderr) = common::arc_run_raw(dir.path());
+    assert_eq!(code, Some(2), "{stderr}");
+    let record = &records(dir.path())[0];
+    let entry = step(record, "c");
+    assert_eq!(entry["status"]["state"], "failed", "{entry}");
+    assert_eq!(entry["attempts"], 2, "{entry}");
+    let check = &entry["check"];
+    assert_eq!(check["success"], false, "{check}");
+    let error = check["error"].as_str().unwrap_or_default();
+    assert!(error.contains("no_such_column"), "{check}");
+    // DuckDB counts lines from the start of the query, as the check file does.
+    assert!(error.contains("LINE 3:"), "{check}");
+    assert_eq!(
+        record["run"]["checks"],
+        serde_json::json!({"passed": 0, "warned": 0, "failed": 1})
+    );
+}

@@ -64,23 +64,27 @@ fn wrapper(dir: &Path, query: &str) -> String {
     let measures = sql_path(&dir.join("measures.json"));
     let history = sql_path(&dir.join("history.json"));
     let answer = sql_path(&dir.join("answer.json"));
+    // One character past the cap, so arc can tell a cell it must mark as cut.
+    let cut = SAMPLE_CELL_CHARS + 1;
     // `[*COLUMNS(*)]` packs a row into a list only once every column is one type, so the
     // inner query casts them first; DuckDB 2.0 expands `[COLUMNS(*)::VARCHAR]` into one
-    // single-element list per column instead.
+    // single-element list per column instead. Cells are cut in SQL, so a huge value is never
+    // written out whole. The query starts on the `CREATE` line, so DuckDB's `LINE n`, which
+    // counts from the start of the statement, is the query's own line n; the `;` stays on a
+    // line of its own after any trailing `--` comment.
     format!(
         "CREATE TEMP TABLE measures AS\n  \
          SELECT * FROM read_json({measures}, columns = {{name: 'VARCHAR', value: 'DOUBLE'}});\n\
          CREATE TEMP TABLE measure_history AS\n  \
          SELECT * FROM read_json({history},\n    \
          columns = {{run_id: 'VARCHAR', run_at: 'TIMESTAMP', name: 'VARCHAR', value: 'DOUBLE'}});\n\
-         CREATE TEMP TABLE __arc_rows AS\n\
-         {query}\n\
+         CREATE TEMP TABLE __arc_rows AS {query}\n\
          ;\n\
          COPY (SELECT\n  \
          (SELECT count(*) FROM __arc_rows) AS rows_returned,\n  \
          (SELECT list(column_name) FROM (DESCRIBE __arc_rows)) AS columns,\n  \
          (SELECT coalesce(list(r), []) FROM (SELECT [*COLUMNS(*)] AS r FROM \
-         (SELECT COLUMNS(*)::VARCHAR FROM __arc_rows LIMIT {SAMPLE_ROWS}))) AS sample\n\
+         (SELECT left(COLUMNS(*)::VARCHAR, {cut}) FROM __arc_rows LIMIT {SAMPLE_ROWS}))) AS sample\n\
          ) TO {answer} (FORMAT json);\n"
     )
 }
@@ -118,7 +122,7 @@ pub(crate) fn run_check(step: &Step, query: &str, ctx: &mut QueryContext) -> Res
     )?;
     write(
         "history.json",
-        serde_json::to_string(ctx.history).unwrap_or_else(|_| "[]".to_string()),
+        serde_json::to_string(ctx.history).map_err(|e| failed(std::io::Error::other(e)))?,
     )?;
     write("wrapper.sql", wrapper(dir, query))?;
     ctx.engine
@@ -134,6 +138,7 @@ pub(crate) fn run_check(step: &Step, query: &str, ctx: &mut QueryContext) -> Res
             Error::StepTimeout { .. } => Error::StepTimeout {
                 step: step.name.clone(),
             },
+            Error::StepExecution { source, .. } => failed(source),
             other => other,
         })?;
     let text = std::fs::read_to_string(dir.join("answer.json")).map_err(failed)?;
