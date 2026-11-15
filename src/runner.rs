@@ -1742,8 +1742,9 @@ fn compute_staleness(
             continue;
         }
         // A check or measure reads the data as it is now and produces nothing a hash could
-        // certify, so it runs on every run. A step after it is made stale only if it names
-        // the check in `depends_on:`; following it in the step list does not.
+        // certify, so it runs on every run. It produces nothing, so it never makes a later
+        // step stale: a later step is stale only for its own reasons or for an upstream
+        // asset that changed.
         if step.is_check() || step.is_measure() {
             stale.insert(step.name.clone());
             continue;
