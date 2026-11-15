@@ -1795,10 +1795,10 @@ impl ProtocolSql {
     }
 
     fn new(place: String, name: Option<String>, step: &Step, dir: &Path) -> Option<Self> {
-        step.sql.as_ref().map(|file| ProtocolSql {
+        step.sql_file().map(|file| ProtocolSql {
             place,
             step: name,
-            file: file.clone(),
+            file: file.to_string(),
             path: dir.join(file),
         })
     }

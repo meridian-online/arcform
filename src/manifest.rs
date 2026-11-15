@@ -378,7 +378,6 @@ impl Step {
     }
 
     /// The SQL file this step runs: its `sql`, `check` or `measure` path, whichever is set.
-    #[allow(dead_code)] // read by the runner once checks and measures run
     pub(crate) fn sql_file(&self) -> Option<&str> {
         self.sql
             .as_deref()
@@ -400,11 +399,6 @@ impl Step {
     #[allow(dead_code)] // read by the runner once checks run
     pub(crate) fn severity_or_default(&self) -> Severity {
         self.severity.unwrap_or(Severity::Error)
-    }
-
-    /// Returns true if this step uses the engine (sql field).
-    pub(crate) fn is_sql(&self) -> bool {
-        self.sql.is_some()
     }
 }
 
@@ -844,8 +838,8 @@ impl Manifest {
             &self.hooks.on_exit,
         ]
         .iter()
-        .any(|h| h.as_ref().is_some_and(|s| s.is_sql()));
-        self.steps.iter().any(|s| s.is_sql()) || hook_has_sql
+        .any(|h| h.as_ref().is_some_and(|s| s.sql_file().is_some()));
+        self.steps.iter().any(|s| s.sql_file().is_some()) || hook_has_sql
     }
 }
 

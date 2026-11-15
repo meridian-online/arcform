@@ -152,7 +152,7 @@ impl AssetGraph {
             // captured verbatim by the parser, never lowercased here, so its graph
             // node IS its real on-disk spelling; `record` still runs so
             // `declared_case` holds a uniform entry regardless of provenance.
-            if let Some(ref sql_path) = step.sql {
+            if let Some(sql_path) = step.sql_file() {
                 let full_path = manifest_dir.join(sql_path);
                 match std::fs::read_to_string(&full_path) {
                     Ok(sql_content) => match introspect::read_sql(&sql_content) {
@@ -160,7 +160,7 @@ impl AssetGraph {
                             if let Some(reason) = &step_sql.unreadable {
                                 graph.unreadable.push(UnreadableStep {
                                     step: step.name.clone(),
-                                    file: sql_path.clone(),
+                                    file: sql_path.to_string(),
                                     reason: reason.clone(),
                                 });
                             }
@@ -186,6 +186,13 @@ impl AssetGraph {
                                 );
                             }
                             for asset in &sql_assets.inputs {
+                                // The tables a run's checks and measures read of arc's own
+                                // are not graph assets: a step cannot make them.
+                                if (step.is_check() || step.is_measure())
+                                    && crate::check::is_reserved_table(asset)
+                                {
+                                    continue;
+                                }
                                 let kind = sql_assets
                                     .kinds
                                     .get(asset)

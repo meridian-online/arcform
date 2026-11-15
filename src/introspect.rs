@@ -280,6 +280,9 @@ pub struct StepSql {
     pub statements: Vec<SqlAssets>,
     /// Which reader read each statement, in the order of `statements`.
     pub read_by: Vec<ReadBy>,
+    /// Whether each statement is a query, in the order of `statements`: DuckDB's form of
+    /// it when DuckDB read it, else whether sqlparser-rs parsed a `Statement::Query`.
+    pub(crate) is_query: Vec<bool>,
     /// Each statement's `[start, end)` bytes in the step's SQL, in the order of
     /// `statements`: where DuckDB's tokens place it when DuckDB read the step, else where
     /// [`statement_byte_ranges`] cuts it. `None` for a statement that cannot be placed.
@@ -584,13 +587,16 @@ fn duckdb_step(reading: &duckdb_lineage::StepReading) -> StepSql {
     for (n, statement) in reading.statements.iter().enumerate() {
         let mut assets = duckdb_statement(statement);
         let mut read_by = ReadBy::DuckDb;
+        let mut is_query = matches!(statement.form, duckdb_lineage::Form::Query);
         if matches!(
             statement.form,
             duckdb_lineage::Form::Unread(_) | duckdb_lineage::Form::NotParsed(_)
         ) {
-            match sqlparser_per_statement(&statement.text) {
+            match sqlparser_read(&statement.text) {
                 Ok(read) => {
-                    read.into_iter().for_each(|other| merge(&mut assets, other));
+                    is_query = !read.is_empty() && read.iter().all(|(_, query)| *query);
+                    read.into_iter()
+                        .for_each(|(other, _)| merge(&mut assets, other));
                     read_by = ReadBy::Sqlparser;
                 }
                 Err(_) => {
@@ -604,6 +610,7 @@ fn duckdb_step(reading: &duckdb_lineage::StepReading) -> StepSql {
         }
         step.statements.push(assets);
         step.read_by.push(read_by);
+        step.is_query.push(is_query);
         step.byte_ranges.push(statement.byte_range);
     }
     step
@@ -644,10 +651,12 @@ fn lexical_ranges(sql: &str, count: usize) -> Vec<Option<(usize, usize)>> {
 /// [`statement_byte_ranges`] cuts it and each statement is read alone, so a statement it
 /// cannot parse reads nothing and the others are still read.
 fn sqlparser_step(sql: &str) -> StepSql {
-    if let Ok(statements) = sqlparser_per_statement(sql) {
+    if let Ok(read) = sqlparser_read(sql) {
+        let (statements, is_query): (Vec<_>, Vec<_>) = read.into_iter().unzip();
         return StepSql {
             read_by: vec![ReadBy::Sqlparser; statements.len()],
             byte_ranges: lexical_ranges(sql, statements.len()),
+            is_query,
             statements,
             ..StepSql::default()
         };
@@ -664,17 +673,21 @@ fn sqlparser_step(sql: &str) -> StepSql {
         match sql
             .get(start..end)
             .ok_or_else(Vec::new)
-            .and_then(sqlparser_per_statement)
+            .and_then(sqlparser_read)
         {
             Ok(read) => {
                 let mut assets = SqlAssets::default();
-                read.into_iter().for_each(|other| merge(&mut assets, other));
+                let query = !read.is_empty() && read.iter().all(|(_, query)| *query);
+                read.into_iter()
+                    .for_each(|(other, _)| merge(&mut assets, other));
                 step.statements.push(assets);
                 step.read_by.push(ReadBy::Sqlparser);
+                step.is_query.push(query);
             }
             Err(_) => {
                 step.statements.push(SqlAssets::default());
                 step.read_by.push(ReadBy::Nothing);
+                step.is_query.push(false);
                 step.unread.push(UnreadStatement {
                     statement: n + 1,
                     line: sql[..start].matches('\n').count() + 1,
@@ -687,7 +700,13 @@ fn sqlparser_step(sql: &str) -> StepSql {
 
 /// sqlparser-rs's reading of each statement of `sql`, or its error when it cannot parse
 /// the whole of it. CTE names are filtered out of each statement's `inputs`.
+#[cfg(test)]
 fn sqlparser_per_statement(sql: &str) -> Result<Vec<SqlAssets>, Vec<String>> {
+    sqlparser_read(sql).map(|read| read.into_iter().map(|(assets, _)| assets).collect())
+}
+
+/// [`sqlparser_per_statement`], each statement with whether sqlparser-rs parsed it as a query.
+fn sqlparser_read(sql: &str) -> Result<Vec<(SqlAssets, bool)>, Vec<String>> {
     let dialect = DuckDbDialect {};
     let statements = Parser::parse_sql(&dialect, sql).map_err(|e| vec![e.to_string()])?;
 
@@ -700,7 +719,7 @@ fn sqlparser_per_statement(sql: &str) -> Result<Vec<SqlAssets>, Vec<String>> {
         for cte_name in internal {
             assets.inputs.remove(&cte_name);
         }
-        per_statement.push(assets);
+        per_statement.push((assets, matches!(stmt, sqlparser::ast::Statement::Query(_))));
     }
     Ok(per_statement)
 }

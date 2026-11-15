@@ -207,6 +207,8 @@ pub enum StepKind {
     Sql,
     Op,
     Command,
+    Check,
+    Measure,
 }
 
 /// A declared step and how it fared.
@@ -933,6 +935,10 @@ fn build_step(
 ) -> StepEntry {
     let kind = if step.sql.is_some() {
         StepKind::Sql
+    } else if step.is_check() {
+        StepKind::Check
+    } else if step.is_measure() {
+        StepKind::Measure
     } else if step.op.is_some() {
         StepKind::Op
     } else {
@@ -969,7 +975,7 @@ fn build_step(
     };
 
     // sql: keep the model text + hash + per-statement lineage.
-    let sql = step.sql.as_ref().map(|model_path| {
+    let sql = step.sql_file().map(|model_path| {
         let full = dir.join(model_path);
         let (sql_text, sql_hash, statements) = match std::fs::read(&full) {
             Ok(bytes) => {
@@ -1000,7 +1006,7 @@ fn build_step(
             Err(_) => (String::new(), String::new(), Vec::new()),
         };
         SqlInfo {
-            model_path: model_path.clone(),
+            model_path: model_path.to_string(),
             sql_text,
             sql_hash,
             statements,

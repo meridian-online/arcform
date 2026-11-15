@@ -420,6 +420,7 @@ pub fn run_with_publish(
         let refusals: Vec<String> = asset_graph.unreadable.iter().map(|u| u.refusal()).collect();
         return Err(Error::SqlReader(refusals.join("\n")));
     }
+    crate::check::refuse_check_shapes(&manifest, dir, &asset_graph)?;
 
     // Resolve parameters: dotenv files → manifest defaults → CLI overrides.
     let dotenv_vars = load_dotenv_files(dir, &manifest.dotenv);
@@ -626,7 +627,7 @@ pub fn run_with_publish(
             println!("[{}/{}] {} ...", i + 1, total, step.name.bold());
 
             // Compute the SQL hash for this step (for state recording).
-            let sql_hash = if let Some(ref sql) = step.sql {
+            let sql_hash = if let Some(sql) = step.sql_file() {
                 let sql_path = dir.join(sql);
                 if !sql_path.exists() {
                     return Err(Error::SqlFileNotFound {
@@ -1524,6 +1525,12 @@ fn compute_staleness(
             stale.insert(step.name.clone());
             continue;
         }
+        // A check or measure reads the data as it is now and produces nothing a hash could
+        // certify, so it runs on every run, and so does a step that follows it.
+        if step.is_check() || step.is_measure() {
+            stale.insert(step.name.clone());
+            continue;
+        }
         // An operator whose effect is outside the Protocol, such as a publish into a
         // lake, runs on every run: whether it may skip depends on where it went last
         // time and on the run's own flags, which no hash of its inputs records.
@@ -1692,7 +1699,7 @@ fn is_hash_stale(
                 // Command step — the command line itself. See `command_config_hash`
                 // for why the first run after this landed re-runs each one once.
                 command_config_hash(step) != prior_state.sql_hash
-            } else if let Some(ref sql) = step.sql {
+            } else if let Some(sql) = step.sql_file() {
                 let sql_path = dir.join(sql);
                 if sql_path.exists() {
                     let content = std::fs::read(&sql_path).map_err(|e| Error::FileRead {

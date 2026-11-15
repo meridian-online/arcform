@@ -36,6 +36,7 @@
 mod asset;
 mod asset_kind;
 mod bridge;
+mod check;
 #[cfg(feature = "cli")]
 mod cli;
 mod contract;
