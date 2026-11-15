@@ -61,6 +61,14 @@ fn iso_to_epoch_secs(text: &str) -> Option<i64> {
     Some(days * 86_400 + hh * 3_600 + mm * 60 + ss)
 }
 
+/// Whether two runs resolved the same parameters: each key and value, whatever supplied it.
+fn same_params(a: &[ParamEntry], b: &[ParamEntry]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x.key == y.key && x.value == y.value)
+}
+
 /// Earlier runs' measures, for `measure_history`: every record in `runs_dir` that reads as
 /// a contract, is not `current_run_id`, succeeded, has a `started_at` and ran with
 /// `current_params`. Each step's `measure` section becomes rows stamped with the run's
@@ -86,7 +94,9 @@ pub(crate) fn load_history(
         let Some(started_at) = run.started_at.clone() else {
             continue;
         };
-        if run.run_id == current_run_id || run.outcome != "success" || run.params != current_params
+        if run.run_id == current_run_id
+            || run.outcome != "success"
+            || !same_params(&run.params, current_params)
         {
             continue;
         }
