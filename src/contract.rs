@@ -224,7 +224,7 @@ pub struct ExtensionEntry {
 }
 
 /// A resolved parameter and where its value came from.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParamEntry {
     pub key: String,
     pub value: String,

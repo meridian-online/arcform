@@ -150,6 +150,7 @@ fn run_step_query<T>(
     env: &HashMap<String, String>,
     timeout: Option<Duration>,
     measures: &IndexMap<String, Option<f64>>,
+    history: &[check::HistoryRow],
     run: impl FnOnce(&check::StepQuery, &mut check::QueryContext) -> Result<T>,
 ) -> Result<T> {
     check_again(extensions, engine, source)?;
@@ -161,7 +162,7 @@ fn run_step_query<T>(
         timeout,
         loaded: extensions.loaded_mut(),
         measures,
-        history: &[],
+        history,
     };
     run(&query, &mut ctx)
 }
@@ -580,6 +581,15 @@ pub fn run_with_publish(
     let contract_params = contract::param_entries(&manifest.params, &dotenv_vars, cli_params);
     // Every measure this run has taken so far, in run order: what a check reads as `measures`.
     let mut run_measures: IndexMap<String, Option<f64>> = IndexMap::new();
+    // Earlier successful runs' measures for the same parameters: what a check reads as
+    // `measure_history`, loaded once before the first step.
+    let run_history = check::load_history(
+        &runs_dir,
+        &run_id,
+        &contract_params,
+        &manifest.measure_history,
+        std::time::SystemTime::now(),
+    );
 
     // Pipeline-level timeout tracking.
     let pipeline_start = Instant::now();
@@ -785,6 +795,7 @@ pub fn run_with_publish(
                         &env_map,
                         step_timeout,
                         &run_measures,
+                        &run_history,
                         |query, ctx| check::run_check(step, query, ctx),
                     )
                     .and_then(|section| {
@@ -826,6 +837,7 @@ pub fn run_with_publish(
                         &env_map,
                         step_timeout,
                         &run_measures,
+                        &run_history,
                         |query, ctx| check::run_measure(step, query, ctx),
                     )
                     .map(|values| {

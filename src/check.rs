@@ -11,10 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::asset::AssetGraph;
 use crate::asset_kind::AssetKind;
-use crate::contract::CheckSection;
+use crate::contract::{self, CheckSection, Contract, ParamEntry};
 use crate::engine::{AnswerDir, Engine, LoadedExtensions};
 use crate::error::{Error, Result};
-use crate::manifest::{Manifest, Step};
+use crate::manifest::{Manifest, MeasureHistory, Step};
 
 /// How many of a failing check's rows the record keeps.
 const SAMPLE_ROWS: usize = 20;
@@ -24,12 +24,103 @@ const SAMPLE_CELL_CHARS: usize = 200;
 
 /// One earlier run's measure, as a check reads it from `measure_history`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[allow(dead_code)] // built once arc reads earlier runs' measures
 pub(crate) struct HistoryRow {
     pub(crate) run_id: String,
     pub(crate) run_at: String,
     pub(crate) name: String,
     pub(crate) value: Option<f64>,
+}
+
+/// Seconds since the Unix epoch for an ISO timestamp as a run record holds it
+/// (`2026-10-01T22:54:17Z`); `None` for any other shape.
+fn iso_to_epoch_secs(text: &str) -> Option<i64> {
+    let b = text.as_bytes();
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
+        return None;
+    }
+    let num = |from: usize, to: usize| text.get(from..to)?.parse::<i64>().ok();
+    let (y, m, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (hh, mm, ss) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    // Howard Hinnant's days-from-civil, the inverse of the one the run record's clock uses.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hh * 3_600 + mm * 60 + ss)
+}
+
+/// Earlier runs' measures, for `measure_history`: every record in `runs_dir` that reads as
+/// a contract, is not `current_run_id`, succeeded, has a `started_at` and ran with
+/// `current_params`. Each step's `measure` section becomes rows stamped with the run's
+/// `started_at`. `Runs(n)` keeps the `n` newest runs that measured anything, `Since(d)` those
+/// started at or after `now - d`. Oldest run first, steps in record order. A record that is
+/// unreadable or written before measures existed contributes nothing and is not an error.
+pub(crate) fn load_history(
+    runs_dir: &Path,
+    current_run_id: &str,
+    current_params: &[ParamEntry],
+    window: &MeasureHistory,
+    now: std::time::SystemTime,
+) -> Vec<HistoryRow> {
+    let mut runs: Vec<(String, String, Vec<HistoryRow>)> = Vec::new();
+    for path in contract::contracts_by_age(runs_dir) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<Contract>(&text) else {
+            continue;
+        };
+        let run = &record.run;
+        let Some(started_at) = run.started_at.clone() else {
+            continue;
+        };
+        if run.run_id == current_run_id || run.outcome != "success" || run.params != current_params
+        {
+            continue;
+        }
+        let rows: Vec<HistoryRow> = record
+            .steps
+            .iter()
+            .filter_map(|step| step.measure.as_ref())
+            .flat_map(|section| section.values.iter())
+            .map(|(name, value)| HistoryRow {
+                run_id: run.run_id.clone(),
+                run_at: started_at.clone(),
+                name: name.clone(),
+                value: *value,
+            })
+            .collect();
+        if !rows.is_empty() {
+            runs.push((started_at, run.run_id.clone(), rows));
+        }
+    }
+    runs.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    match window {
+        MeasureHistory::Runs(n) => {
+            let drop = runs.len().saturating_sub(*n as usize);
+            runs.drain(..drop);
+        }
+        MeasureHistory::Since(span) => {
+            let now = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
+            let cutoff = now - span.as_secs() as i64;
+            runs.retain(|(started, _, _)| iso_to_epoch_secs(started).is_some_and(|t| t >= cutoff));
+        }
+    }
+    runs.into_iter().flat_map(|(_, _, rows)| rows).collect()
 }
 
 /// What a check's query runs with: the step's DuckDB, database, parameters and timeout, and
@@ -534,6 +625,258 @@ pub(crate) fn refuse_publish_before_error_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run record for the history tests: `measures` are `(name, value)` in one step.
+    fn record(
+        run_id: &str,
+        started_at: Option<&str>,
+        outcome: &str,
+        release: &str,
+        measures: &[(&str, f64)],
+    ) -> String {
+        let values: serde_json::Map<String, serde_json::Value> = measures
+            .iter()
+            .map(|(n, v)| (n.to_string(), serde_json::json!(v)))
+            .collect();
+        serde_json::json!({
+            "contract_version": "b5/1",
+            "run": {"run_id": run_id, "attempt_id": run_id,
+                "protocol": {"name": "t", "manifest_sha256": null, "dir": "."},
+                "engine": {"arc": "0", "duckdb": null, "duckdb_cli": null,
+                           "platform": null, "extensions": null},
+                "params": [{"key": "release", "value": release, "source": "cli"}],
+                "started_at": started_at, "finished_at": null, "outcome": outcome},
+            "assets": [],
+            "steps": [{"name": "m", "kind": "measure", "op_ref": null, "resolved_with": null,
+                "sql": null, "status": {"state": "success", "skip_reason": null},
+                "attempts": 1, "duration_sec": null, "retry": null, "timeout_sec": null,
+                "io": {"stdout_path": null, "stderr_path": null}, "ingress_meta": null,
+                "report": null, "narrative": {"label": null, "stage": null, "doc": null},
+                "measure": {"values": values}}]
+        })
+        .to_string()
+    }
+
+    fn release(value: &str) -> Vec<ParamEntry> {
+        vec![ParamEntry {
+            key: "release".into(),
+            value: value.into(),
+            source: "cli".into(),
+        }]
+    }
+
+    fn at(secs: u64) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn write_runs(files: &[(&str, String)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, text) in files {
+            std::fs::write(dir.path().join(name), text).unwrap();
+        }
+        dir
+    }
+
+    fn ids(rows: &[HistoryRow]) -> Vec<&str> {
+        rows.iter().map(|r| r.run_id.as_str()).collect()
+    }
+
+    #[test]
+    fn history_keeps_the_newest_n_successful_runs_oldest_first() {
+        // File order is deliberately not start order.
+        let dir = write_runs(&[
+            (
+                "c.json",
+                record(
+                    "c",
+                    Some("2026-10-03T00:00:00Z"),
+                    "success",
+                    "2018",
+                    &[("m.a", 3.0), ("m.b", 30.0)],
+                ),
+            ),
+            (
+                "a.json",
+                record(
+                    "a",
+                    Some("2026-10-01T00:00:00Z"),
+                    "success",
+                    "2018",
+                    &[("m.a", 1.0)],
+                ),
+            ),
+            (
+                "b.json",
+                record(
+                    "b",
+                    Some("2026-10-02T00:00:00Z"),
+                    "success",
+                    "2018",
+                    &[("m.a", 2.0)],
+                ),
+            ),
+        ]);
+        let rows = load_history(
+            dir.path(),
+            "now",
+            &release("2018"),
+            &MeasureHistory::Runs(2),
+            at(0),
+        );
+        assert_eq!(ids(&rows), ["b", "c", "c"]);
+        assert_eq!(rows[1].name, "m.a");
+        assert_eq!(rows[2].name, "m.b");
+        assert_eq!(rows[2].value, Some(30.0));
+        assert_eq!(rows[0].run_at, "2026-10-02T00:00:00Z");
+    }
+
+    #[test]
+    fn history_since_keeps_runs_inside_the_window() {
+        let dir = write_runs(&[
+            (
+                "a.json",
+                record(
+                    "a",
+                    Some("2026-10-01T00:00:00Z"),
+                    "success",
+                    "2018",
+                    &[("m.a", 1.0)],
+                ),
+            ),
+            (
+                "b.json",
+                record(
+                    "b",
+                    Some("2026-10-09T00:00:00Z"),
+                    "success",
+                    "2018",
+                    &[("m.a", 2.0)],
+                ),
+            ),
+            (
+                "c.json",
+                record(
+                    "c",
+                    Some("2026-10-10T00:00:00Z"),
+                    "success",
+                    "2018",
+                    &[("m.a", 3.0)],
+                ),
+            ),
+        ]);
+        // 2026-10-10T12:00:00Z, with a window of two days: the cut is 2026-10-08T12:00:00Z.
+        let now = iso_to_epoch_secs("2026-10-10T12:00:00Z").unwrap() as u64;
+        let window = MeasureHistory::Since(Duration::from_secs(2 * 86_400));
+        let rows = load_history(dir.path(), "now", &release("2018"), &window, at(now));
+        assert_eq!(ids(&rows), ["b", "c"]);
+        // A start exactly at the cut stays in.
+        let exact = MeasureHistory::Since(Duration::from_secs(86_400 + 12 * 3_600));
+        let rows = load_history(dir.path(), "now", &release("2018"), &exact, at(now));
+        assert_eq!(ids(&rows), ["b", "c"]);
+    }
+
+    #[test]
+    fn history_keeps_only_runs_with_the_same_params() {
+        let dir = write_runs(&[
+            (
+                "a.json",
+                record(
+                    "a",
+                    Some("2026-10-01T00:00:00Z"),
+                    "success",
+                    "2018",
+                    &[("m.a", 1.0)],
+                ),
+            ),
+            (
+                "b.json",
+                record(
+                    "b",
+                    Some("2026-10-02T00:00:00Z"),
+                    "success",
+                    "2010",
+                    &[("m.a", 2.0)],
+                ),
+            ),
+        ]);
+        let rows = load_history(
+            dir.path(),
+            "now",
+            &release("2018"),
+            &MeasureHistory::Runs(30),
+            at(0),
+        );
+        assert_eq!(ids(&rows), ["a"]);
+    }
+
+    #[test]
+    fn history_skips_unreadable_old_failed_and_current_records() {
+        let mut old: serde_json::Value = serde_json::from_str(&record(
+            "old",
+            Some("2026-10-01T00:00:00Z"),
+            "success",
+            "2018",
+            &[],
+        ))
+        .unwrap();
+        old["contract_version"] = "b4/1".into();
+        old["steps"][0].as_object_mut().unwrap().remove("measure");
+        let dir = write_runs(&[
+            ("truncated.json", "{\"run\": {".to_string()),
+            ("old.json", old.to_string()),
+            (
+                "partial.json",
+                record(
+                    "partial",
+                    Some("2026-10-02T00:00:00Z"),
+                    "partial",
+                    "2018",
+                    &[("m.a", 1.0)],
+                ),
+            ),
+            (
+                "current.json",
+                record(
+                    "now",
+                    Some("2026-10-03T00:00:00Z"),
+                    "success",
+                    "2018",
+                    &[("m.a", 2.0)],
+                ),
+            ),
+            (
+                "unstarted.json",
+                record("unstarted", None, "success", "2018", &[("m.a", 3.0)]),
+            ),
+            (
+                "good.json",
+                record(
+                    "good",
+                    Some("2026-10-04T00:00:00Z"),
+                    "success",
+                    "2018",
+                    &[("m.a", 4.0)],
+                ),
+            ),
+        ]);
+        let rows = load_history(
+            dir.path(),
+            "now",
+            &release("2018"),
+            &MeasureHistory::Runs(30),
+            at(0),
+        );
+        assert_eq!(ids(&rows), ["good"]);
+        // A folder that is not there is an empty history.
+        let none = load_history(
+            &dir.path().join("nope"),
+            "now",
+            &[],
+            &MeasureHistory::Runs(30),
+            at(0),
+        );
+        assert!(none.is_empty());
+    }
 
     const PUBLISH: &str = "  - name: publish\n    op: ducklake_publish@1\n    with:\n      file: build/soc.parquet\n      catalog: build/lake/test.ducklake\n      table: demo.soc\n";
 

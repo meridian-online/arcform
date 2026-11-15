@@ -676,3 +676,42 @@ fn measures_holds_one_row_per_name_the_latest_winning() {
         5.0
     );
 }
+
+#[test]
+fn a_comparison_check_sees_the_previous_run() {
+    let manifest = "name: c\ndb: build/c.duckdb\nsteps:\n  - name: t\n    sql: models/t.sql\n  - name: drop\n    check: checks/drop.sql\n    risk: a table shrank by half\n    severity: warn\n";
+    let compare = "SELECT name FROM measures m JOIN (SELECT name, last(value ORDER BY run_at) AS prev FROM measure_history GROUP BY name) p USING (name) WHERE m.value < p.prev * 0.5\n";
+    let dir = project(
+        manifest,
+        &[
+            (
+                "models/t.sql",
+                "CREATE OR REPLACE TABLE t AS SELECT * FROM range(4) r(n);\n",
+            ),
+            ("checks/drop.sql", compare),
+        ],
+    );
+    common::arc_run(dir.path());
+    // The sql file changes, so the step runs again and loads one row.
+    std::fs::write(
+        dir.path().join("models/t.sql"),
+        "CREATE OR REPLACE TABLE t AS SELECT * FROM range(1) r(n);\n",
+    )
+    .unwrap();
+    common::arc_run(dir.path());
+    let records = records(dir.path());
+    assert_eq!(records.len(), 2);
+    let first = &step(&records[0], "drop")["check"];
+    assert_eq!(
+        first["success"], true,
+        "an empty history warns nothing: {first}"
+    );
+    let second = &step(&records[1], "drop")["check"];
+    assert_eq!(second["success"], false, "{second}");
+    assert_eq!(second["severity"], "warn", "{second}");
+    let sample = second["sample"].as_array().unwrap();
+    assert!(
+        sample.contains(&serde_json::json!(["table:t.row_count"])),
+        "{second}"
+    );
+}
