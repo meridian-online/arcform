@@ -25,6 +25,11 @@ pub enum Error {
     #[error("invalid manifest: {0}")]
     ManifestValidation(String),
 
+    /// A Protocol's `tests.yaml` is missing, unreadable or refused. `reason` is the
+    /// whole message and starts with `tests.yaml`.
+    #[error("{reason}")]
+    TestFile { path: PathBuf, reason: String },
+
     // The spec write path's refusal for an edit that cannot be applied: the
     // route did not resolve, the fragment was missing or ambiguous, or the op
     // does not fit the shape it found. Distinct from `ManifestValidation`,
