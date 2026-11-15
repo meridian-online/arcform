@@ -738,6 +738,40 @@ mod tests {
         AssetGraph::build(&manifest, dir)
     }
 
+    // The tables arc keeps its measures in are not graph assets for a check or a measure,
+    // but a plain SQL step that reads one still reads it.
+    #[test]
+    fn a_checks_and_measures_reads_leave_out_arcs_own_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut check = sql_step("c", "");
+        check.sql = None;
+        check.check = Some("checks/c.sql".to_string());
+        let mut measure = sql_step("m", "");
+        measure.sql = None;
+        measure.measure = Some("measures/m.sql".to_string());
+        let plain = sql_step("p", "models/p.sql");
+        let graph = build_graph(
+            dir.path(),
+            vec![check, measure, plain],
+            HashMap::new(),
+            &[
+                ("checks/c.sql", "SELECT * FROM measures JOIN t ON true;"),
+                (
+                    "measures/m.sql",
+                    "SELECT * FROM measure_history JOIN t ON true;",
+                ),
+                ("models/p.sql", "SELECT * FROM measures JOIN t ON true;"),
+            ],
+        );
+
+        let c = &graph.steps["c"].reads;
+        assert!(c.contains("t") && !c.contains("measures"), "{c:?}");
+        let m = &graph.steps["m"].reads;
+        assert!(m.contains("t") && !m.contains("measure_history"), "{m:?}");
+        let p = &graph.steps["p"].reads;
+        assert!(p.contains("t") && p.contains("measures"), "{p:?}");
+    }
+
     // SQL steps auto-discover produced assets.
     #[test]
     fn test_sql_discovers_outputs() {
