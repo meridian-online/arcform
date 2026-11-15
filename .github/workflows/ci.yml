@@ -250,6 +250,15 @@ jobs:
           test -f "$dir/ducklake.duckdb_extension"
           test -f "$dir/httpfs.duckdb_extension"
 
+      # `arc test`'s round trips of an `.xlsx` fixture (src/protocol_test/fixture.rs) read
+      # and write the workbook with DuckDB's `excel` extension. Staged for the same reason
+      # as the two above: a registry that serves nothing is a red step here.
+      - name: Stage the excel DuckDB extension
+        run: |
+          set -euo pipefail
+          "$HOME/duckdb/duckdb" -c "INSTALL excel;"
+          test -f "$HOME/.duckdb/extensions/${DUCKDB_VERSION}/linux_amd64/excel.duckdb_extension"
+
       # `--all-targets` so the test modules are linted too, not just the binary.
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -274,7 +283,8 @@ jobs:
       # a step, and the refusals in src/engine.rs read each SQL file's tokens from one
       # (src/duckdb_tokens.rs). Their tests that start a named DuckDB, the parity gate in
       # tests/reader_parity.rs, which reads every SQL file in the repo with both readers,
-      # and the token-cache test in tests/vetted_extensions.rs are #[ignore]d so the step
+      # the token-cache test in tests/vetted_extensions.rs, and `arc test`'s fixture round
+      # trips in src/protocol_test/fixture.rs are #[ignore]d so the step
       # above reports them as ignored; run them here on the v2.0.0 release command line
       # the install step put in $HOME/duckdb. Every job runs 2.0.0, so this is
       # unconditional. The tests that read from captured answers ran above; with
@@ -292,6 +302,7 @@ jobs:
           cargo test --workspace --test duckdb_reader_switch -- --include-ignored
           cargo test --workspace --test reader_parity -- --include-ignored
           cargo test --workspace --test vetted_extensions -- --include-ignored a_file_read_again_unchanged_is_not_asked_again
+          cargo test --workspace --lib protocol_test -- --include-ignored
 
       # `uv` — and unlike the subtoken extension, it is cheap enough to belong on
       # the routine gate. `tests/uv_operator.rs` proves three of its four properties

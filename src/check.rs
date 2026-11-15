@@ -144,6 +144,48 @@ pub(crate) fn load_history(
     runs.into_iter().flat_map(|(_, _, rows)| rows).collect()
 }
 
+/// The variable `arc test` sets to a CSV of earlier runs' measures. When it is set, a run
+/// reads `measure_history` from that file in place of its run records. It is `arc test`'s
+/// own, so a test can show a comparison check failing without earlier runs.
+pub(crate) const MEASURE_HISTORY_ENV: &str = "ARC_TEST_MEASURE_HISTORY";
+
+/// The variable `arc test` sets to a file in its copy of the Protocol. When it is set, a
+/// failing `arc` writes its error's text there as well as after `error: ` on standard
+/// error, so `arc test` reads arc's own error whole, not a line of a step's output that
+/// happens to start the same way. It is `arc test`'s own, as [`MEASURE_HISTORY_ENV`] is.
+pub(crate) const ERROR_FILE_ENV: &str = "ARC_TEST_ERROR_FILE";
+
+/// Earlier runs' measures from a CSV with the header `run_id,run_at,name,value`, read with
+/// the linked library, every row taken as given and in file order: no window and no
+/// parameter filter. An empty `value` is SQL `NULL`.
+pub(crate) fn history_from_csv(path: &Path) -> Result<Vec<HistoryRow>> {
+    let refuse = |reason: String| Error::MeasureHistoryFile {
+        var: MEASURE_HISTORY_ENV,
+        path: path.to_path_buf(),
+        reason,
+    };
+    let conn = duckdb::Connection::open_in_memory().map_err(|e| refuse(e.to_string()))?;
+    let literal = path.to_string_lossy().replace('\'', "''");
+    let sql = format!(
+        "SELECT run_id, run_at, name, value FROM read_csv('{literal}', columns = \
+         {{run_id: 'VARCHAR', run_at: 'VARCHAR', name: 'VARCHAR', value: 'DOUBLE'}}, \
+         header = true)"
+    );
+    let mut statement = conn.prepare(&sql).map_err(|e| refuse(e.to_string()))?;
+    let rows = statement
+        .query_map([], |r| {
+            Ok(HistoryRow {
+                run_id: r.get(0)?,
+                run_at: r.get(1)?,
+                name: r.get(2)?,
+                value: r.get(3)?,
+            })
+        })
+        .map_err(|e| refuse(e.to_string()))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| refuse(e.to_string()))
+}
+
 /// What a check's query runs with: the step's DuckDB, database, parameters and timeout, and
 /// the measures it may compare.
 pub(crate) struct QueryContext<'a> {
@@ -648,6 +690,44 @@ pub(crate) fn refuse_publish_before_error_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_from_a_csv_is_every_row_as_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("it's history.csv");
+        std::fs::write(
+            &path,
+            "run_id,run_at,name,value\nr2,2026-02-01T00:00:00Z,size.codes,12.5\nr1,later,size.codes,\n",
+        )
+        .unwrap();
+        let rows = history_from_csv(&path).unwrap();
+        assert_eq!(
+            rows,
+            [
+                HistoryRow {
+                    run_id: "r2".into(),
+                    run_at: "2026-02-01T00:00:00Z".into(),
+                    name: "size.codes".into(),
+                    value: Some(12.5),
+                },
+                HistoryRow {
+                    run_id: "r1".into(),
+                    run_at: "later".into(),
+                    name: "size.codes".into(),
+                    value: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_history_csv_that_cannot_be_read_names_the_variable() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = history_from_csv(&dir.path().join("missing.csv")).unwrap_err();
+        let said = err.to_string();
+        assert!(said.contains("missing.csv"), "{said}");
+        assert!(said.contains(MEASURE_HISTORY_ENV), "{said}");
+    }
 
     /// A run record for the history tests: `measures` are `(name, value)` in one step.
     fn record(
