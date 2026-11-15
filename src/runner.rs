@@ -111,6 +111,27 @@ fn execute_hook(
     Ok(())
 }
 
+/// What `step` measured, for its record: `own`, a measure step's values, then each table it
+/// produces, measured now that it has exited. Each value is added to `run_measures`, which
+/// the checks after it read. `None` when the step measured nothing.
+fn measure_section(
+    mut own: IndexMap<String, Option<f64>>,
+    step: &crate::manifest::Step,
+    db_path: &Path,
+    graph: &AssetGraph,
+    run_measures: &mut Vec<(String, Option<f64>)>,
+) -> Option<contract::MeasureSection> {
+    own.extend(check::measure_tables(
+        db_path,
+        &check::produced_tables(graph, step),
+    ));
+    if own.is_empty() {
+        return None;
+    }
+    run_measures.extend(own.iter().map(|(name, value)| (name.clone(), *value)));
+    Some(contract::MeasureSection { values: own })
+}
+
 /// Check a SQL step's or hook's file again just before it runs, and print each warning the
 /// check gives that the run has not printed.
 fn check_again(
@@ -523,6 +544,8 @@ pub fn run_with_publish(
     let mut stream = contract::RunStream::create(&runs_dir, &run_id);
     let mut step_outcomes: HashMap<String, contract::StepOutcome> = HashMap::new();
     let contract_params = contract::param_entries(&manifest.params, &dotenv_vars, cli_params);
+    // Every measure this run has taken so far, in run order: what a check reads as `measures`.
+    let mut run_measures: Vec<(String, Option<f64>)> = Vec::new();
 
     // Pipeline-level timeout tracking.
     let pipeline_start = Instant::now();
@@ -601,6 +624,15 @@ pub fn run_with_publish(
                 );
                 skipped += 1;
                 stream.step(&step.name, "skipped");
+                // A fresh step's tables are measured as a step that ran has them, so the
+                // run's measures have no hole where nothing changed.
+                let measure = measure_section(
+                    IndexMap::new(),
+                    step,
+                    &db_path,
+                    &asset_graph,
+                    &mut run_measures,
+                );
                 step_outcomes.insert(
                     step.name.clone(),
                     contract::StepOutcome {
@@ -610,6 +642,7 @@ pub fn run_with_publish(
                         duration_sec: None,
                         report: None,
                         check: None,
+                        measure,
                     },
                 );
                 continue;
@@ -665,6 +698,8 @@ pub fn run_with_publish(
             let mut last_error = None;
             // What a check step found on its last attempt, for the record.
             let mut check_section: Option<contract::CheckSection> = None;
+            // What a measure step measured, for the record and for the checks after it.
+            let mut measured: IndexMap<String, Option<f64>> = IndexMap::new();
 
             // Wall-clock timer for this step — spans every attempt and its backoff sleep,
             // captured into the contract as `duration_sec` (per-step timing, replacing the
@@ -716,7 +751,7 @@ pub fn run_with_publish(
                                 env: &env_map,
                                 timeout: step_timeout,
                                 loaded: extensions.loaded_mut(),
-                                measures: &[],
+                                measures: &run_measures,
                                 history: &[],
                             };
                             check::run_check(step, &query, &mut ctx)
@@ -745,6 +780,33 @@ pub fn run_with_publish(
                                 stdout: None,
                                 report: None,
                             })
+                        })
+                } else if step.is_measure()
+                    && let Some(source) = ProtocolSql::step(step, dir)
+                {
+                    // As a check's: checked again, then its one query runs in the wrapper,
+                    // which hands back the one row it must return.
+                    check_again(&mut extensions, engine, &source)
+                        .and_then(|()| check::check_query(dir, step))
+                        .and_then(|query| {
+                            let mut ctx = check::QueryContext {
+                                engine,
+                                db_path: &db_path,
+                                env: &env_map,
+                                timeout: step_timeout,
+                                loaded: extensions.loaded_mut(),
+                                measures: &run_measures,
+                                history: &[],
+                            };
+                            check::run_measure(step, &query, &mut ctx)
+                        })
+                        .map(|values| {
+                            measured = values;
+                            StepOutput {
+                                stderr: String::new(),
+                                stdout: None,
+                                report: None,
+                            }
                         })
                 } else if let Some(source) = ProtocolSql::step(step, dir) {
                     // Before each attempt: a step earlier in the run, or an earlier attempt of
@@ -867,6 +929,13 @@ pub fn run_with_publish(
 
                         last_error = None;
                         stream.step(&step.name, "success");
+                        let measure = measure_section(
+                            std::mem::take(&mut measured),
+                            step,
+                            &db_path,
+                            &asset_graph,
+                            &mut run_measures,
+                        );
                         step_outcomes.insert(
                             step.name.clone(),
                             contract::StepOutcome {
@@ -876,6 +945,7 @@ pub fn run_with_publish(
                                 duration_sec: Some(step_start.elapsed().as_secs_f64()),
                                 report: output.report,
                                 check: check_section.take(),
+                                measure,
                             },
                         );
                         break;
@@ -917,6 +987,7 @@ pub fn run_with_publish(
                                 duration_sec: Some(step_start.elapsed().as_secs_f64()),
                                 report: None,
                                 check,
+                                measure: None,
                             },
                         );
                         return Err(e);
@@ -941,6 +1012,7 @@ pub fn run_with_publish(
                         // A check whose query did not run counts as failed, whatever its
                         // severity.
                         check: step.is_check().then(|| check::not_run(step, &err)),
+                        measure: None,
                     },
                 );
                 return Err(err);

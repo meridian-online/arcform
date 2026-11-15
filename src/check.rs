@@ -6,9 +6,11 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::time::Duration;
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::asset::AssetGraph;
+use crate::asset_kind::AssetKind;
 use crate::contract::CheckSection;
 use crate::engine::{AnswerDir, Engine, LoadedExtensions};
 use crate::error::{Error, Result};
@@ -44,7 +46,15 @@ pub(crate) struct QueryContext<'a> {
     pub(crate) history: &'a [HistoryRow],
 }
 
-/// What the wrapper writes to `answer.json`.
+/// A check or measure step's one query, as written, and how many lines of its file come
+/// before the line it starts on.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StepQuery {
+    pub(crate) sql: String,
+    pub(crate) lines_before: usize,
+}
+
+/// What the wrapper writes to `answer.json` for a check.
 #[derive(Deserialize)]
 struct Answer {
     rows_returned: u64,
@@ -57,36 +67,90 @@ fn sql_path(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "''"))
 }
 
-/// The SQL that runs `query` for a check: `measures` and `measure_history` stood up as
-/// temporary tables, the query's rows kept in a third, and the count, the column names and
-/// the first rows, each cell as text, written to `answer.json` in `dir`.
-fn wrapper(dir: &Path, query: &str) -> String {
+/// The SQL that runs `query`: `measures` and `measure_history` stood up as temporary
+/// tables, the query's rows kept in a third, `__arc_rows`, and `answer`, a `SELECT` over
+/// that third, written to `answer.json` in `dir`.
+fn wrapper(dir: &Path, query: &StepQuery, answer: &str) -> String {
     let measures = sql_path(&dir.join("measures.json"));
     let history = sql_path(&dir.join("history.json"));
-    let answer = sql_path(&dir.join("answer.json"));
-    // One character past the cap, so arc can tell a cell it must mark as cut.
-    let cut = SAMPLE_CELL_CHARS + 1;
-    // `[*COLUMNS(*)]` packs a row into a list only once every column is one type, so the
-    // inner query casts them first; DuckDB 2.0 expands `[COLUMNS(*)::VARCHAR]` into one
-    // single-element list per column instead. Cells are cut in SQL, so a huge value is never
-    // written out whole. The query starts on the `CREATE` line, so DuckDB's `LINE n`, which
-    // counts from the start of the statement, is the query's own line n; the `;` stays on a
-    // line of its own after any trailing `--` comment.
+    let answer_file = sql_path(&dir.join("answer.json"));
+    // DuckDB's `LINE n` counts from the start of the statement, so the query sits as many
+    // lines below the `CREATE` as it sits below the top of its file, and `LINE n` is the
+    // file's own line n. The `;` stays on a line of its own after any trailing `--` comment.
+    let lines_before = "\n".repeat(query.lines_before);
+    let sql = &query.sql;
     format!(
         "CREATE TEMP TABLE measures AS\n  \
          SELECT * FROM read_json({measures}, columns = {{name: 'VARCHAR', value: 'DOUBLE'}});\n\
          CREATE TEMP TABLE measure_history AS\n  \
          SELECT * FROM read_json({history},\n    \
          columns = {{run_id: 'VARCHAR', run_at: 'TIMESTAMP', name: 'VARCHAR', value: 'DOUBLE'}});\n\
-         CREATE TEMP TABLE __arc_rows AS {query}\n\
+         CREATE TEMP TABLE __arc_rows AS {lines_before}{sql}\n\
          ;\n\
-         COPY (SELECT\n  \
+         COPY ({answer}) TO {answer_file} (FORMAT json);\n"
+    )
+}
+
+/// A check's answer: the count, the column names and the first rows, each cell as text.
+fn check_answer() -> String {
+    // One character past the cap, so arc can tell a cell it must mark as cut.
+    let cut = SAMPLE_CELL_CHARS + 1;
+    // `[*COLUMNS(*)]` packs a row into a list only once every column is one type, so the
+    // inner query casts them first; DuckDB 2.0 expands `[COLUMNS(*)::VARCHAR]` into one
+    // single-element list per column instead. Cells are cut in SQL, so a huge value is never
+    // written out whole.
+    format!(
+        "SELECT\n  \
          (SELECT count(*) FROM __arc_rows) AS rows_returned,\n  \
          (SELECT list(column_name) FROM (DESCRIBE __arc_rows)) AS columns,\n  \
          (SELECT coalesce(list(r), []) FROM (SELECT [*COLUMNS(*)] AS r FROM \
-         (SELECT left(COLUMNS(*)::VARCHAR, {cut}) FROM __arc_rows LIMIT {SAMPLE_ROWS}))) AS sample\n\
-         ) TO {answer} (FORMAT json);\n"
+         (SELECT left(COLUMNS(*)::VARCHAR, {cut}) FROM __arc_rows LIMIT {SAMPLE_ROWS}))) AS sample\n"
     )
+}
+
+/// A measure's answer: the count, each column's name and type, and the first row's values
+/// cast to `DOUBLE` and written as text, so an infinity or a NaN reaches arc to be refused
+/// rather than breaking the JSON. A column that is not a number casts to `NULL`; arc refuses
+/// it by its type.
+const MEASURE_ANSWER: &str = "SELECT\n  \
+     (SELECT count(*) FROM __arc_rows) AS rows_returned,\n  \
+     (SELECT list({'name': column_name, 'type': column_type}) FROM (DESCRIBE __arc_rows)) AS columns,\n  \
+     (SELECT coalesce(list(r), []) FROM (SELECT [*COLUMNS(*)] AS r FROM \
+     (SELECT TRY_CAST(COLUMNS(*) AS DOUBLE)::VARCHAR FROM __arc_rows LIMIT 1))) AS first\n";
+
+/// What the wrapper writes to `answer.json` for a measure.
+#[derive(Deserialize)]
+struct MeasureAnswer {
+    rows_returned: u64,
+    columns: Vec<MeasureColumn>,
+    first: Vec<Vec<Option<String>>>,
+}
+
+#[derive(Deserialize)]
+struct MeasureColumn {
+    name: String,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+/// True for a DuckDB column type a measure may return: an integer of any width, signed or
+/// not, a `FLOAT`, a `DOUBLE` or a `DECIMAL`.
+fn is_numeric_type(kind: &str) -> bool {
+    const NUMERIC: [&str; 12] = [
+        "TINYINT",
+        "SMALLINT",
+        "INTEGER",
+        "BIGINT",
+        "HUGEINT",
+        "UTINYINT",
+        "USMALLINT",
+        "UINTEGER",
+        "UBIGINT",
+        "UHUGEINT",
+        "FLOAT",
+        "DOUBLE",
+    ];
+    NUMERIC.contains(&kind) || (kind.starts_with("DECIMAL(") && kind.ends_with(')'))
 }
 
 /// `cell` cut to [`SAMPLE_CELL_CHARS`] characters, ending `…` when it was longer.
@@ -97,17 +161,34 @@ fn truncate_cell(cell: String) -> String {
     }
 }
 
-/// Run the check `step`, whose one query is `query`, and say what it found. An error is a
-/// query that did not run; a query that returned rows is a section with `success` false.
-pub(crate) fn run_check(step: &Step, query: &str, ctx: &mut QueryContext) -> Result<CheckSection> {
+/// The error that fails `step` for `why`, named as the step, not arc's wrapper.
+fn step_failed(step: &Step, why: impl Into<String>) -> Error {
+    Error::StepExecution {
+        step: step.name.clone(),
+        source: std::io::Error::other(why.into()),
+    }
+}
+
+/// Run `query` for `step` inside the wrapper, with `answer` as its final `SELECT`, and give
+/// back the text of `answer.json`.
+fn run_wrapped(
+    step: &Step,
+    query: &StepQuery,
+    ctx: &mut QueryContext,
+    answer: &str,
+) -> Result<String> {
     let failed = |source: std::io::Error| Error::StepExecution {
         step: step.name.clone(),
         source,
     };
     let answer_dir = AnswerDir::new().ok_or_else(|| {
-        failed(std::io::Error::other(
-            "arc could not make a temporary directory for the check's answer",
-        ))
+        step_failed(
+            step,
+            format!(
+                "arc could not make a temporary directory for {}'s answer",
+                what_step(step)
+            ),
+        )
     })?;
     let dir = answer_dir.path();
     let measures: Vec<serde_json::Value> = ctx
@@ -124,7 +205,7 @@ pub(crate) fn run_check(step: &Step, query: &str, ctx: &mut QueryContext) -> Res
         "history.json",
         serde_json::to_string(ctx.history).map_err(|e| failed(std::io::Error::other(e)))?,
     )?;
-    write("wrapper.sql", wrapper(dir, query))?;
+    write("wrapper.sql", wrapper(dir, query, answer))?;
     ctx.engine
         .execute_sql(
             ctx.db_path,
@@ -141,12 +222,19 @@ pub(crate) fn run_check(step: &Step, query: &str, ctx: &mut QueryContext) -> Res
             Error::StepExecution { source, .. } => failed(source),
             other => other,
         })?;
-    let text = std::fs::read_to_string(dir.join("answer.json")).map_err(failed)?;
-    let answer: Answer = serde_json::from_str(text.trim()).map_err(|e| {
-        failed(std::io::Error::other(format!(
-            "arc could not read the check's answer: {e}"
-        )))
-    })?;
+    std::fs::read_to_string(dir.join("answer.json")).map_err(failed)
+}
+
+/// Run the check `step`, whose one query is `query`, and say what it found. An error is a
+/// query that did not run; a query that returned rows is a section with `success` false.
+pub(crate) fn run_check(
+    step: &Step,
+    query: &StepQuery,
+    ctx: &mut QueryContext,
+) -> Result<CheckSection> {
+    let text = run_wrapped(step, query, ctx, &check_answer())?;
+    let answer: Answer = serde_json::from_str(text.trim())
+        .map_err(|e| step_failed(step, format!("arc could not read the check's answer: {e}")))?;
     Ok(CheckSection {
         name: step.name.clone(),
         risk: step.risk.clone().unwrap_or_default(),
@@ -161,6 +249,127 @@ pub(crate) fn run_check(step: &Step, query: &str, ctx: &mut QueryContext) -> Res
         sample_columns: answer.columns,
         error: None,
     })
+}
+
+/// Run the measure `step`, whose one query is `query`, and give its values, each named
+/// `<step>.<column>`, in the query's column order. Refused, failing the step, unless the
+/// query returns exactly one row whose every column is a number with a name free of `.`.
+pub(crate) fn run_measure(
+    step: &Step,
+    query: &StepQuery,
+    ctx: &mut QueryContext,
+) -> Result<IndexMap<String, Option<f64>>> {
+    let text = run_wrapped(step, query, ctx, MEASURE_ANSWER)?;
+    let answer: MeasureAnswer = serde_json::from_str(text.trim()).map_err(|e| {
+        step_failed(
+            step,
+            format!("arc could not read the measure's answer: {e}"),
+        )
+    })?;
+    measure_values(step, answer)
+}
+
+/// The values of a measure's answer, or the refusal that fails `step`.
+fn measure_values(step: &Step, answer: MeasureAnswer) -> Result<IndexMap<String, Option<f64>>> {
+    let refuse = |why: String| Err(step_failed(step, why));
+    if answer.rows_returned != 1 {
+        return refuse(format!(
+            "the measure returned {} rows; a measure query returns exactly one row",
+            answer.rows_returned
+        ));
+    }
+    let row = answer.first.into_iter().next().unwrap_or_default();
+    let mut values = IndexMap::new();
+    for (at, column) in answer.columns.iter().enumerate() {
+        let name = &column.name;
+        if name.contains('.') {
+            return refuse(format!(
+                "measure column '{name}' has a '.' in its name; rename it, as each measure is \
+                 named <step>.<column>"
+            ));
+        }
+        if !is_numeric_type(&column.kind) {
+            return refuse(format!(
+                "measure column '{name}' is {}; every column of a measure query is numeric \
+                 (an integer, FLOAT, DOUBLE or DECIMAL), so cast it or leave it out",
+                column.kind
+            ));
+        }
+        let value = match row.get(at).cloned().flatten() {
+            None => None,
+            Some(cell) => match cell.parse::<f64>() {
+                Ok(v) if v.is_finite() => Some(v),
+                _ => {
+                    return refuse(format!(
+                        "measure column '{name}' is {cell}, which is not a finite number; \
+                         a measure is a finite number or NULL"
+                    ));
+                }
+            },
+        };
+        values.insert(format!("{}.{name}", step.name), value);
+    }
+    Ok(values)
+}
+
+/// `table:<t>.row_count` and `table:<t>.bytes` for each of `tables`, read from the database
+/// at `db_path` with the linked library, read-only, once the step that made them has exited.
+/// A table arc cannot measure (not a simple identifier, a view, gone) is left out, as is
+/// every table when the database cannot be opened.
+pub(crate) fn measure_tables(db_path: &Path, tables: &[String]) -> IndexMap<String, Option<f64>> {
+    let mut values = IndexMap::new();
+    if tables.is_empty() || !db_path.is_file() {
+        return values;
+    }
+    let Ok(config) = duckdb::Config::default()
+        .access_mode(duckdb::AccessMode::ReadOnly)
+        .and_then(|c| c.with("autoinstall_known_extensions", "false"))
+    else {
+        return values;
+    };
+    let Ok(conn) = duckdb::Connection::open_with_flags(db_path, config) else {
+        return values;
+    };
+    for table in tables {
+        if !crate::contract::is_simple_ident(table) {
+            continue;
+        }
+        // The blocks the table's columns are stored in, counted once each, times the
+        // database's block size: DuckDB's own account of the table's bytes. A constant
+        // segment has no block (`-1`). `pragma_storage_info` refuses a view.
+        let sql = format!(
+            "SELECT (SELECT count(*) FROM {table}),\n  \
+             (SELECT count(DISTINCT b) FROM (\n    \
+             SELECT block_id AS b FROM pragma_storage_info('{table}')\n    \
+             UNION ALL SELECT unnest(additional_block_ids) FROM pragma_storage_info('{table}')\n  \
+             ) WHERE b >= 0)\n  \
+             * (SELECT block_size FROM pragma_database_size() WHERE database_name = current_database())"
+        );
+        let Ok((rows, bytes)) = conn.query_row(&sql, [], |r| {
+            Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?))
+        }) else {
+            continue;
+        };
+        values.insert(format!("table:{table}.row_count"), rows.map(|n| n as f64));
+        values.insert(format!("table:{table}.bytes"), bytes.map(|n| n as f64));
+    }
+    values
+}
+
+/// The tables `step` produces, as the asset graph has them, in name order.
+pub(crate) fn produced_tables(graph: &AssetGraph, step: &Step) -> Vec<String> {
+    graph
+        .steps
+        .get(&step.name)
+        .map(|assets| {
+            assets
+                .produces
+                .iter()
+                .filter(|t| assets.declared_kind.get(*t) == Some(&AssetKind::Table))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The section of a check step whose query did not run: failed, with no rows and `why`.
@@ -194,6 +403,15 @@ fn what(step: &Step) -> &'static str {
         "a measure file"
     } else {
         "a check file"
+    }
+}
+
+/// What a step is called in a message about its query.
+fn what_step(step: &Step) -> &'static str {
+    if step.is_measure() {
+        "the measure"
+    } else {
+        "the check"
     }
 }
 
@@ -231,8 +449,9 @@ pub(crate) fn refuse_check_shapes(
     Ok(())
 }
 
-/// The one query of a check or measure step's file, as written, without its trailing `;`.
-pub(crate) fn check_query(dir: &Path, step: &Step) -> Result<String> {
+/// The one query of a check or measure step's file, as written, without its trailing `;`,
+/// and how many lines of the file come before it.
+pub(crate) fn check_query(dir: &Path, step: &Step) -> Result<StepQuery> {
     let file = step.sql_file().unwrap_or_default();
     let path = dir.join(file);
     let text = std::fs::read_to_string(&path).map_err(|source| Error::FileRead {
@@ -257,8 +476,22 @@ pub(crate) fn check_query(dir: &Path, step: &Step) -> Result<String> {
     let Some((start, end)) = read.byte_ranges[0] else {
         return refuse("holds a statement arc cannot place in the file".to_string());
     };
-    let query = text.get(start..end).unwrap_or_default().trim();
-    Ok(query.trim_end_matches(';').trim_end().to_string())
+    Ok(query_at(&text, start, end))
+}
+
+/// The query in `text` between `start` and `end`, trimmed, and the lines before it.
+fn query_at(text: &str, start: usize, end: usize) -> StepQuery {
+    let range = text.get(start..end).unwrap_or_default();
+    let query = range.trim_start();
+    let begins = start + (range.len() - query.len());
+    StepQuery {
+        sql: query
+            .trim_end()
+            .trim_end_matches(';')
+            .trim_end()
+            .to_string(),
+        lines_before: text[..begins].matches('\n').count(),
+    }
 }
 
 /// Refuse a Protocol in which an `error` check comes after a step that publishes data the
@@ -345,6 +578,159 @@ mod tests {
         let cut = truncate_cell("é".repeat(300));
         assert_eq!(cut.chars().count(), 201);
         assert_eq!(cut, format!("{}…", "é".repeat(200)));
+    }
+
+    #[test]
+    fn a_query_knows_the_lines_above_it() {
+        let text = "-- a header\n-- of two lines\n\n  SELECT 1\nFROM t;\n";
+        let start = text.find("--").unwrap();
+        let query = query_at(text, start, text.len());
+        // The reader's range can start at a comment; the lines are counted to the query.
+        assert_eq!(query.lines_before, 0);
+        let start = text.find("SELECT").unwrap() - 2;
+        let query = query_at(text, start, text.len());
+        assert_eq!(query.sql, "SELECT 1\nFROM t");
+        assert_eq!(query.lines_before, 3);
+        let query = query_at("SELECT 1;", 0, 9);
+        assert_eq!((query.sql.as_str(), query.lines_before), ("SELECT 1", 0));
+    }
+
+    #[test]
+    fn a_wrapper_puts_the_query_on_its_files_line() {
+        let query = StepQuery {
+            sql: "SELECT 1".into(),
+            lines_before: 2,
+        };
+        let sql = wrapper(Path::new("/tmp/a"), &query, "SELECT 1");
+        assert!(
+            sql.contains("CREATE TEMP TABLE __arc_rows AS \n\nSELECT 1\n;\n"),
+            "{sql}"
+        );
+        let first = StepQuery {
+            lines_before: 0,
+            ..query
+        };
+        let sql = wrapper(Path::new("/tmp/a"), &first, "SELECT 1");
+        assert!(
+            sql.contains("CREATE TEMP TABLE __arc_rows AS SELECT 1\n;\n"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn numeric_types_are_the_integers_floats_and_decimals() {
+        for kind in [
+            "TINYINT",
+            "UHUGEINT",
+            "HUGEINT",
+            "UBIGINT",
+            "FLOAT",
+            "DOUBLE",
+            "DECIMAL(18,3)",
+        ] {
+            assert!(is_numeric_type(kind), "{kind}");
+        }
+        for kind in [
+            "VARCHAR",
+            "BOOLEAN",
+            "DATE",
+            "INTEGER[]",
+            "DECIMAL",
+            "BIGNUM",
+        ] {
+            assert!(!is_numeric_type(kind), "{kind}");
+        }
+    }
+
+    fn measure_step() -> Step {
+        let yaml = "name: t\nsteps:\n  - name: m\n    measure: m.sql\n";
+        Manifest::from_yaml_str(yaml).unwrap().steps.remove(0)
+    }
+
+    fn answer(rows: u64, columns: &[(&str, &str)], first: &[Option<&str>]) -> MeasureAnswer {
+        MeasureAnswer {
+            rows_returned: rows,
+            columns: columns
+                .iter()
+                .map(|(name, kind)| MeasureColumn {
+                    name: name.to_string(),
+                    kind: kind.to_string(),
+                })
+                .collect(),
+            first: vec![first.iter().map(|c| c.map(String::from)).collect()],
+        }
+    }
+
+    #[test]
+    fn a_measure_keeps_its_column_order_and_nulls() {
+        let values = measure_values(
+            &measure_step(),
+            answer(
+                1,
+                &[("z", "INTEGER"), ("a", "DECIMAL(2,1)"), ("n", "BIGINT")],
+                &[None, Some("0.5"), Some("3.0")],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            values.into_iter().collect::<Vec<_>>(),
+            [
+                ("m.z".to_string(), None),
+                ("m.a".to_string(), Some(0.5)),
+                ("m.n".to_string(), Some(3.0))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_measure_is_refused_unless_one_finite_numeric_row() {
+        let step = measure_step();
+        let refused = |a: MeasureAnswer| measure_values(&step, a).unwrap_err().to_string();
+        let two = refused(answer(2, &[("n", "BIGINT")], &[Some("1.0")]));
+        assert!(
+            two.contains("step 'm'") && two.contains("exactly one row"),
+            "{two}"
+        );
+        let none = refused(MeasureAnswer {
+            rows_returned: 0,
+            columns: Vec::new(),
+            first: Vec::new(),
+        });
+        assert!(none.contains("returned 0 rows"), "{none}");
+        let text = refused(answer(1, &[("s", "VARCHAR")], &[None]));
+        assert!(
+            text.contains("'s' is VARCHAR") && text.contains("numeric"),
+            "{text}"
+        );
+        let dot = refused(answer(1, &[("a.b", "INTEGER")], &[Some("1.0")]));
+        assert!(dot.contains("'a.b'"), "{dot}");
+        let inf = refused(answer(1, &[("x", "DOUBLE")], &[Some("inf")]));
+        assert!(inf.contains("not a finite number"), "{inf}");
+    }
+
+    #[test]
+    fn a_table_is_measured_and_a_view_or_odd_name_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("m.duckdb");
+        {
+            let conn = duckdb::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t AS SELECT * FROM range(3) r(n); CREATE VIEW v AS SELECT 1 AS n;",
+            )
+            .unwrap();
+        }
+        let tables = ["t", "v", "gone", "build/x.parquet"].map(String::from);
+        let values = measure_tables(&db, &tables);
+        assert_eq!(
+            values.keys().collect::<Vec<_>>(),
+            ["table:t.row_count", "table:t.bytes"]
+        );
+        assert_eq!(values["table:t.row_count"], Some(3.0));
+        assert!(
+            values["table:t.bytes"].is_some_and(|b| b > 0.0),
+            "{values:?}"
+        );
+        assert!(measure_tables(&dir.path().join("none.duckdb"), &tables).is_empty());
     }
 
     #[test]

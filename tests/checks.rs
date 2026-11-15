@@ -433,7 +433,7 @@ fn a_check_whose_sql_fails_on_every_retry_records_why() {
             MAKES_T,
             (
                 "checks/c.sql",
-                "SELECT n\nFROM t\nWHERE no_such_column = 1;\n",
+                "-- a header\n-- of two lines\nSELECT n\nFROM t\nWHERE no_such_column = 1;\n",
             ),
         ],
     );
@@ -447,10 +447,197 @@ fn a_check_whose_sql_fails_on_every_retry_records_why() {
     assert_eq!(check["success"], false, "{check}");
     let error = check["error"].as_str().unwrap_or_default();
     assert!(error.contains("no_such_column"), "{check}");
-    // DuckDB counts lines from the start of the query, as the check file does.
-    assert!(error.contains("LINE 3:"), "{check}");
+    // DuckDB's line numbers are the check file's own, header comments counted.
+    assert!(error.contains("LINE 5:"), "{check}");
     assert_eq!(
         record["run"]["checks"],
         serde_json::json!({"passed": 0, "warned": 0, "failed": 1})
+    );
+}
+
+/// `t` of three rows, then a measure step `m` reading `measures/m.sql`.
+const WITH_MEASURE: &str = "name: c\ndb: build/c.duckdb\nsteps:\n  - name: t\n    sql: models/t.sql\n  - name: m\n    measure: measures/m.sql\n";
+const MAKES_THREE: (&str, &str) = (
+    "models/t.sql",
+    "CREATE OR REPLACE TABLE t AS SELECT * FROM range(3) r(n);\n",
+);
+
+/// A check step `name` of severity `warn` reading `checks/<name>.sql`.
+fn warn_check(name: &str) -> String {
+    format!(
+        "  - name: {name}\n    check: checks/{name}.sql\n    risk: the analyst reads a wrong table\n    severity: warn\n"
+    )
+}
+
+#[test]
+fn a_measure_step_records_its_values() {
+    let dir = project(
+        WITH_MEASURE,
+        &[
+            MAKES_THREE,
+            (
+                "measures/m.sql",
+                "SELECT count(*) AS n, 0.5 AS share FROM t;\n",
+            ),
+        ],
+    );
+    common::arc_run(dir.path());
+    let record = &records(dir.path())[0];
+    let entry = step(record, "m");
+    assert_eq!(entry["kind"], "measure", "{entry}");
+    assert_eq!(entry["status"]["state"], "success", "{entry}");
+    let values = entry["measure"]["values"].as_object().unwrap();
+    assert_eq!(values.len(), 2, "{entry}");
+    assert_eq!(values["m.n"], 3.0, "{entry}");
+    assert_eq!(values["m.share"], 0.5, "{entry}");
+}
+
+#[test]
+fn a_measure_returning_two_rows_or_text_fails_its_step() {
+    for (sql, rule) in [
+        ("SELECT n FROM t WHERE n < 2;\n", "exactly one row"),
+        ("SELECT 'x' AS s;\n", "numeric"),
+    ] {
+        let dir = project(WITH_MEASURE, &[MAKES_THREE, ("measures/m.sql", sql)]);
+        let (code, _, stderr) = common::arc_run_raw(dir.path());
+        assert_ne!(code, Some(0), "{sql}: {stderr}");
+        assert!(stderr.contains("step 'm'"), "{sql}: {stderr}");
+        assert!(stderr.contains(rule), "{sql}: {stderr}");
+        let record = &records(dir.path())[0];
+        let entry = step(record, "m");
+        assert_eq!(entry["status"]["state"], "failed", "{entry}");
+        assert!(entry.get("measure").is_none(), "{entry}");
+    }
+}
+
+#[test]
+fn a_null_measure_is_recorded_as_null() {
+    let manifest = format!("{WITH_MEASURE}{}", warn_check("c"));
+    let dir = project(
+        &manifest,
+        &[
+            MAKES_THREE,
+            ("measures/m.sql", "SELECT NULL::INTEGER AS z;\n"),
+            (
+                "checks/c.sql",
+                "SELECT name FROM measures WHERE name = 'm.z' AND value IS NULL;\n",
+            ),
+        ],
+    );
+    common::arc_run(dir.path());
+    let record = &records(dir.path())[0];
+    let entry = step(record, "m");
+    let values = entry["measure"]["values"].as_object().unwrap();
+    assert!(values.contains_key("m.z"), "{entry}");
+    assert!(values["m.z"].is_null(), "{entry}");
+    // `measures` holds the null measure, with a NULL value.
+    assert_eq!(step(record, "c")["check"]["rows_returned"], 1, "{record}");
+}
+
+#[test]
+fn a_measure_column_with_a_dot_fails_its_step() {
+    let dir = project(
+        WITH_MEASURE,
+        &[MAKES_THREE, ("measures/m.sql", "SELECT 1 AS \"a.b\";\n")],
+    );
+    let (code, _, stderr) = common::arc_run_raw(dir.path());
+    assert_ne!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("step 'm'"), "{stderr}");
+    assert!(stderr.contains("'a.b'"), "{stderr}");
+    let record = &records(dir.path())[0];
+    assert_eq!(step(record, "m")["status"]["state"], "failed");
+}
+
+#[test]
+fn each_produced_table_is_measured_at_its_step() {
+    let dir = project(
+        WITH_MEASURE,
+        &[MAKES_THREE, ("measures/m.sql", "SELECT 1 AS one;\n")],
+    );
+    common::arc_run(dir.path());
+    let record = &records(dir.path())[0];
+    let entry = step(record, "t");
+    let values = &entry["measure"]["values"];
+    assert_eq!(values["table:t.row_count"], 3.0, "{entry}");
+    assert!(
+        values["table:t.bytes"].as_f64().is_some_and(|b| b > 0.0),
+        "{entry}"
+    );
+    assert!(
+        step(record, "m")["measure"]["values"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|k| !k.starts_with("table:")),
+        "a measure step produces no table"
+    );
+}
+
+#[test]
+fn a_check_reads_this_runs_measures() {
+    for (other, passes) in [(3, true), (4, false)] {
+        let manifest = format!(
+            "name: c\ndb: build/c.duckdb\nsteps:\n  - name: t\n    sql: models/t.sql\n{}",
+            warn_check("c")
+        );
+        let check = format!(
+            "SELECT * FROM measures WHERE name = 'table:t.row_count' AND value <> {other};\n"
+        );
+        let dir = project(&manifest, &[MAKES_THREE, ("checks/c.sql", &check)]);
+        common::arc_run(dir.path());
+        let record = &records(dir.path())[0];
+        let found = &step(record, "c")["check"];
+        assert_eq!(found["success"], passes, "<> {other}: {found}");
+        assert_eq!(found["rows_returned"], u64::from(!passes), "{found}");
+    }
+}
+
+#[test]
+fn a_check_before_a_measure_does_not_see_it() {
+    let manifest = format!(
+        "name: c\ndb: build/c.duckdb\nsteps:\n  - name: t\n    sql: models/t.sql\n{}  - name: m\n    measure: measures/m.sql\n{}",
+        warn_check("before"),
+        warn_check("after")
+    );
+    let names = "SELECT name FROM measures ORDER BY name;\n";
+    let dir = project(
+        &manifest,
+        &[
+            MAKES_THREE,
+            ("measures/m.sql", "SELECT 7 AS seven;\n"),
+            ("checks/before.sql", names),
+            ("checks/after.sql", names),
+        ],
+    );
+    common::arc_run(dir.path());
+    let record = &records(dir.path())[0];
+    assert_eq!(
+        step(record, "before")["check"]["sample"],
+        serde_json::json!([["table:t.bytes"], ["table:t.row_count"]])
+    );
+    assert_eq!(
+        step(record, "after")["check"]["sample"],
+        serde_json::json!([["m.seven"], ["table:t.bytes"], ["table:t.row_count"]])
+    );
+}
+
+#[test]
+fn a_fresh_step_still_has_its_tables_measured() {
+    let dir = project(
+        WITH_MEASURE,
+        &[
+            MAKES_THREE,
+            ("measures/m.sql", "SELECT count(*) AS n FROM t;\n"),
+        ],
+    );
+    common::arc_run(dir.path());
+    common::arc_run(dir.path());
+    let records = records(dir.path());
+    assert_eq!(records.len(), 2);
+    let entry = step(&records[1], "t");
+    assert_eq!(entry["status"]["state"], "skipped", "{entry}");
+    assert_eq!(
+        entry["measure"]["values"]["table:t.row_count"], 3.0,
+        "{entry}"
     );
 }

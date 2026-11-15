@@ -147,6 +147,14 @@ pub struct CheckSection {
     pub error: Option<String>,
 }
 
+/// What a step measured: a `measure:` step's columns, named `<step>.<column>` in query
+/// order, then `table:<t>.row_count` and `table:<t>.bytes` for each table the step
+/// produced, in name order. A SQL `NULL` is JSON `null`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeasureSection {
+    pub values: IndexMap<String, Option<f64>>,
+}
+
 /// Which protocol ran, and the exact manifest bytes it ran from.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProtocolInfo {
@@ -298,6 +306,10 @@ pub struct StepEntry {
     /// For a `check:` step that ran: what it found. Added under `b5/1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<CheckSection>,
+    /// What the step measured, when it measured anything: a `measure:` step's values, and
+    /// each table a step produced. Added under `b5/1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measure: Option<MeasureSection>,
 }
 
 /// A resolved `op:` reference.
@@ -493,6 +505,8 @@ pub struct StepOutcome {
     /// What a check step found, or why its query did not run; `None` for any other step
     /// and for a check that was not reached.
     pub check: Option<CheckSection>,
+    /// What the step measured; `None` when it measured nothing.
+    pub measure: Option<MeasureSection>,
 }
 
 /// What a run records of the DuckDB its SQL steps ran on: [`EngineInfo`]'s `duckdb_cli`,
@@ -1082,6 +1096,7 @@ fn build_step(
         duration_sec: None,
         report: None,
         check: None,
+        measure: None,
     });
 
     // Effective retry policy: a step override wins, else the manifest default.
@@ -1120,6 +1135,7 @@ fn build_step(
         report: outcome.report,
         narrative: Narrative::default(),
         check: outcome.check,
+        measure: outcome.measure,
     }
 }
 
@@ -1243,7 +1259,7 @@ fn redact_json(value: &mut serde_json::Value) {
 }
 
 /// Whether `name` is a bare SQL identifier safe to interpolate into a count query.
-fn is_simple_ident(name: &str) -> bool {
+pub(crate) fn is_simple_ident(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
@@ -1704,12 +1720,31 @@ steps:
     }
 
     #[test]
+    fn a_measure_section_keeps_its_order_and_writes_null() {
+        let mut values = IndexMap::new();
+        values.insert("m.z".to_string(), None);
+        values.insert("m.a".to_string(), Some(0.5));
+        values.insert("table:t.row_count".to_string(), Some(3.0));
+        let text = serde_json::to_string(&MeasureSection { values }).unwrap();
+        assert_eq!(
+            text,
+            r#"{"values":{"m.z":null,"m.a":0.5,"table:t.row_count":3.0}}"#
+        );
+        let back: MeasureSection = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            back.values.keys().collect::<Vec<_>>(),
+            ["m.z", "m.a", "table:t.row_count"]
+        );
+    }
+
+    #[test]
     fn a_b4_record_reads_with_no_checks() {
         let contract: Contract = serde_json::from_str(RECORD_BEFORE_STEPS_ENGINE)
             .expect("a b4/1 record reads into Contract");
         assert_eq!(contract.contract_version, "b4/1");
         assert_eq!(contract.run.checks, ChecksSummary::default());
         assert!(contract.steps.iter().all(|s| s.check.is_none()));
+        assert!(contract.steps.iter().all(|s| s.measure.is_none()));
     }
 
     #[test]
