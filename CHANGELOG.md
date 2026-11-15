@@ -67,6 +67,7 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Fixed
 
+- **`ducklake_write` uploads readable copies and extra files with `Cache-Control: public, max-age=60`, so a CDN in front of the lake stops serving the old copy within a minute of a republish.** They are overwritten in place at fixed keys, and were uploaded with no Cache-Control, so a CDN that respects the origin's headers fell back to its default edge TTL and served the replaced file for half an hour or more while the catalogue and manifest already named the new one.
 - **The `splink_resolve` operator runs under DuckDB 2.0's Python package.** It declares `duckdb>=2,<3` but counted rows with `fetchone()` on a relation, which DuckDB 2.0 removed, so it stopped after loading its inputs with `AttributeError: Relations no longer have fetchone()`. It now uses `fetchall()`, which reads the whole result; `con.execute(...).fetchone()` was not used because DuckDB 2.0 then holds the unfinished result and refuses the operator's later `con.sql(...)` queries on that connection.
 
 ## [0.2.2] - 2026-10-24

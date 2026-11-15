@@ -29,7 +29,8 @@ use crate::operator::sql_string_literal;
 
 /// The pinned catalogue never changes: its key is its content's hash.
 const PINNED_CACHE: &str = "public, max-age=31536000, immutable";
-/// The stable catalogue moves with every publish.
+/// The stable catalogue, readable copies and extra files are overwritten in place
+/// at fixed keys, so a CDN in front of the lake must revalidate them soon.
 const STABLE_CACHE: &str = "public, max-age=60";
 
 /// Where a lake lives in its store.
@@ -711,7 +712,7 @@ pub fn publish_with_landing(
                 superseded.push(key);
                 break;
             }
-            match store.put_file(&key, &file, cond, None) {
+            match store.put_file(&key, &file, cond, Some(STABLE_CACHE)) {
                 Ok(_) => {
                     uploaded.push(local);
                     break;
@@ -957,6 +958,8 @@ mod tests {
         waited: Mutex<bool>,
         /// Run once, just after the first successful catalogue write.
         after_catalog_write: Mutex<Option<Box<dyn FnOnce() + Send + 'a>>>,
+        /// Each readable or extra upload's key and the Cache-Control it carried.
+        copy_caches: Mutex<Vec<(String, Option<String>)>>,
     }
 
     impl<'a> Wrapped<'a> {
@@ -974,6 +977,7 @@ mod tests {
                 barrier: None,
                 waited: Mutex::new(false),
                 after_catalog_write: Mutex::new(None),
+                copy_caches: Mutex::new(Vec::new()),
             }
         }
 
@@ -1054,6 +1058,10 @@ mod tests {
             if let Some(hook) = hook {
                 hook();
             }
+            self.copy_caches
+                .lock()
+                .unwrap()
+                .push((key.to_string(), cache_control.map(str::to_string)));
             if self.refuse_copy_uploads {
                 return Err(StoreError::PreconditionFailed);
             }
@@ -1392,6 +1400,37 @@ mod tests {
         ] {
             assert!(keys.contains(&k), "{keys:?}");
         }
+    }
+
+    /// Readable copies and extra files are overwritten in place at fixed keys, so
+    /// each carries a short Cache-Control: a CDN in front of the lake revalidates
+    /// within a minute instead of serving the old copy for its default edge TTL.
+    #[test]
+    fn readable_copies_and_extra_files_carry_a_short_cache_control() {
+        let fx = Fixture::new();
+        let a = fx.parquet("a.parquet", &rows(20, "a"));
+        let single = fx.dir.path().join("single.json");
+        std::fs::write(&single, b"{}").unwrap();
+        let store = Wrapped::new(&fx.store);
+        fx.publish_via(
+            &store,
+            &[input("s.a", &a)],
+            &[(a.clone(), "ns/a.parquet".to_string())],
+            &[ExtraFile {
+                from: single,
+                to: "ns/single.json".to_string(),
+            }],
+        )
+        .unwrap();
+        let mut seen = store.copy_caches.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(
+            seen,
+            [
+                ("ns/a.parquet".to_string(), Some(STABLE_CACHE.to_string())),
+                ("ns/single.json".to_string(), Some(STABLE_CACHE.to_string())),
+            ]
+        );
     }
 
     /// A missing extra file refuses the publish before the catalogue is written.
