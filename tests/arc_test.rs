@@ -617,8 +617,20 @@ fn a_failed_command_step_shows_the_end_of_its_standard_error() {
     assert_eq!(code, Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
         stdout.contains(
-            "it failed with: step 'shout' failed (exit code 3):\n  its standard error ended:\n    warming up\n    the real cause\n"
+            "it failed with: step 'shout' failed (exit code 3):\n  the run's standard error ended:\n    warming up\n    the real cause\n"
         ),
         "{stdout}"
     );
+}
+
+#[test]
+fn a_write_whose_dotdot_stays_inside_the_protocol_runs() {
+    let p = Protocol::new(&test_yaml("the codes load", ""));
+    p.write(
+        "models/export.sql",
+        "COPY (SELECT 1 AS n) TO 'models/../out.csv';\n",
+    );
+    let (code, stdout, stderr) = p.arc_test();
+    assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.lines().any(|l| l == "ok the codes load"), "{stdout}");
 }

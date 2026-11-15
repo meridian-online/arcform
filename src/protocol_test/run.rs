@@ -93,11 +93,12 @@ fn judge(
 ) -> std::result::Result<(), String> {
     let plan = plan_test(manifest, graph, dir, test)?;
     let run = run_in_copy(dir, test, &plan, engine, false)?;
-    // How the failure reads: arc's error, then the end of a failed step's own standard
-    // error when arc's error does not hold it. Only shown: `fails_with` matches arc's error.
+    // How the failure reads: arc's error, then, for a failed `command:` or `uv` step whose
+    // output arc's error does not hold, the end of the whole run's standard error. Only
+    // shown: `fails_with` matches arc's error.
     let shown = |message: &str| match &run.stderr_tail {
         Some(tail) if failed_step_runs_its_own(manifest, message) => {
-            format!("{message}\nits standard error ended:\n{tail}")
+            format!("{message}\nthe run's standard error ended:\n{tail}")
         }
         _ => message.to_string(),
     };
@@ -299,13 +300,23 @@ fn random_suffix(attempt: u32) -> String {
 }
 
 /// Whether the relative `path` stays inside `copy`: not absolute, not reaching above it
-/// with `..`, and not through a linked folder that leads out of it. The deepest part of
-/// the path that exists (a dangling link counts, and refuses) is resolved, links and all,
-/// and must lie under the copy.
+/// with `..` (each `..` taking back the name before it, as `leaves_the_folder` reads a
+/// path, so `models/../out.csv` stays inside), and not through a linked folder that
+/// leads out of it. The deepest part of the path as written that exists (a dangling link
+/// counts, and refuses) is resolved, links and `..` the way the system follows them, and
+/// must lie under the copy.
 fn inside_copy(copy: &Path, path: &Path) -> bool {
     let path = clean(path);
-    if !path.components().all(|c| matches!(c, Component::Normal(_))) {
-        return false;
+    let mut depth = 0usize;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            Component::ParentDir => match depth.checked_sub(1) {
+                Some(up) => depth = up,
+                None => return false,
+            },
+            _ => return false,
+        }
     }
     let Ok(root) = std::fs::canonicalize(copy) else {
         return false;
@@ -660,6 +671,7 @@ LINE 1: SELECT error('x')\n         ^\n";
             ("/var/x.duckdb", TEST_DB),
             ("../shared.duckdb", TEST_DB),
             ("data/../../x.duckdb", TEST_DB),
+            ("models/../data.duckdb", "models/../data.duckdb"),
         ] {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(
