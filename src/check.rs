@@ -40,8 +40,8 @@ pub(crate) struct QueryContext<'a> {
     pub(crate) env: &'a HashMap<String, String>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) loaded: &'a mut LoadedExtensions,
-    /// This run's measures so far, as `measures` holds them.
-    pub(crate) measures: &'a [(String, Option<f64>)],
+    /// This run's measures so far, one per name, as `measures` holds them.
+    pub(crate) measures: &'a IndexMap<String, Option<f64>>,
     /// Earlier runs' measures, as `measure_history` holds them.
     pub(crate) history: &'a [HistoryRow],
 }

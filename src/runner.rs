@@ -112,14 +112,14 @@ fn execute_hook(
 }
 
 /// What `step` measured, for its record: `own`, a measure step's values, then each table it
-/// produces, measured now that it has exited. Each value is added to `run_measures`, which
+/// produces, measured now that it has exited. Each value goes into `run_measures`, which
 /// the checks after it read. `None` when the step measured nothing.
 fn measure_section(
     mut own: IndexMap<String, Option<f64>>,
     step: &crate::manifest::Step,
     db_path: &Path,
     graph: &AssetGraph,
-    run_measures: &mut Vec<(String, Option<f64>)>,
+    run_measures: &mut IndexMap<String, Option<f64>>,
 ) -> Option<contract::MeasureSection> {
     own.extend(check::measure_tables(
         db_path,
@@ -128,8 +128,42 @@ fn measure_section(
     if own.is_empty() {
         return None;
     }
-    run_measures.extend(own.iter().map(|(name, value)| (name.clone(), *value)));
+    // One row per name, the latest measurement winning: a name moves to where it was last
+    // measured, so `measures` keeps run order by each value's latest measurement.
+    for (name, value) in &own {
+        run_measures.shift_remove(name);
+        run_measures.insert(name.clone(), *value);
+    }
     Some(contract::MeasureSection { values: own })
+}
+
+/// Run a check or measure step's one query: its file checked again as a SQL step's is, then
+/// `run` given the query and what it runs with, inside arc's wrapper.
+#[allow(clippy::too_many_arguments)]
+fn run_step_query<T>(
+    step: &crate::manifest::Step,
+    source: &ProtocolSql,
+    dir: &Path,
+    engine: &dyn Engine,
+    extensions: &mut ExtensionRecheck,
+    db_path: &Path,
+    env: &HashMap<String, String>,
+    timeout: Option<Duration>,
+    measures: &IndexMap<String, Option<f64>>,
+    run: impl FnOnce(&check::StepQuery, &mut check::QueryContext) -> Result<T>,
+) -> Result<T> {
+    check_again(extensions, engine, source)?;
+    let query = check::check_query(dir, step)?;
+    let mut ctx = check::QueryContext {
+        engine,
+        db_path,
+        env,
+        timeout,
+        loaded: extensions.loaded_mut(),
+        measures,
+        history: &[],
+    };
+    run(&query, &mut ctx)
 }
 
 /// Check a SQL step's or hook's file again just before it runs, and print each warning the
@@ -545,7 +579,7 @@ pub fn run_with_publish(
     let mut step_outcomes: HashMap<String, contract::StepOutcome> = HashMap::new();
     let contract_params = contract::param_entries(&manifest.params, &dotenv_vars, cli_params);
     // Every measure this run has taken so far, in run order: what a check reads as `measures`.
-    let mut run_measures: Vec<(String, Option<f64>)> = Vec::new();
+    let mut run_measures: IndexMap<String, Option<f64>> = IndexMap::new();
 
     // Pipeline-level timeout tracking.
     let pipeline_start = Instant::now();
@@ -740,74 +774,68 @@ pub fn run_with_publish(
                 let result = if step.is_check()
                     && let Some(source) = ProtocolSql::step(step, dir)
                 {
-                    // The check's file is checked again as a SQL step's is, then its one
-                    // query runs inside arc's wrapper, which counts and samples its rows.
-                    check_again(&mut extensions, engine, &source)
-                        .and_then(|()| check::check_query(dir, step))
-                        .and_then(|query| {
-                            let mut ctx = check::QueryContext {
-                                engine,
-                                db_path: &db_path,
-                                env: &env_map,
-                                timeout: step_timeout,
-                                loaded: extensions.loaded_mut(),
-                                measures: &run_measures,
-                                history: &[],
-                            };
-                            check::run_check(step, &query, &mut ctx)
+                    // The wrapper counts and samples the check's rows.
+                    run_step_query(
+                        step,
+                        &source,
+                        dir,
+                        engine,
+                        &mut extensions,
+                        &db_path,
+                        &env_map,
+                        step_timeout,
+                        &run_measures,
+                        |query, ctx| check::run_check(step, query, ctx),
+                    )
+                    .and_then(|section| {
+                        let passed = section.success;
+                        let severity = step.severity_or_default();
+                        if !passed && severity == crate::manifest::Severity::Error {
+                            return Err(Error::CheckFailed {
+                                step: step.name.clone(),
+                                check: Box::new(section),
+                            });
+                        }
+                        if !passed {
+                            eprintln!(
+                                "{} check '{}' found {} rows: {}",
+                                "warning:".yellow(),
+                                step.name,
+                                section.rows_returned,
+                                section.risk
+                            );
+                        }
+                        check_section = Some(section);
+                        Ok(StepOutput {
+                            stderr: String::new(),
+                            stdout: None,
+                            report: None,
                         })
-                        .and_then(|section| {
-                            let passed = section.success;
-                            let severity = step.severity_or_default();
-                            if !passed && severity == crate::manifest::Severity::Error {
-                                return Err(Error::CheckFailed {
-                                    step: step.name.clone(),
-                                    check: Box::new(section),
-                                });
-                            }
-                            if !passed {
-                                eprintln!(
-                                    "{} check '{}' found {} rows: {}",
-                                    "warning:".yellow(),
-                                    step.name,
-                                    section.rows_returned,
-                                    section.risk
-                                );
-                            }
-                            check_section = Some(section);
-                            Ok(StepOutput {
-                                stderr: String::new(),
-                                stdout: None,
-                                report: None,
-                            })
-                        })
+                    })
                 } else if step.is_measure()
                     && let Some(source) = ProtocolSql::step(step, dir)
                 {
-                    // As a check's: checked again, then its one query runs in the wrapper,
-                    // which hands back the one row it must return.
-                    check_again(&mut extensions, engine, &source)
-                        .and_then(|()| check::check_query(dir, step))
-                        .and_then(|query| {
-                            let mut ctx = check::QueryContext {
-                                engine,
-                                db_path: &db_path,
-                                env: &env_map,
-                                timeout: step_timeout,
-                                loaded: extensions.loaded_mut(),
-                                measures: &run_measures,
-                                history: &[],
-                            };
-                            check::run_measure(step, &query, &mut ctx)
-                        })
-                        .map(|values| {
-                            measured = values;
-                            StepOutput {
-                                stderr: String::new(),
-                                stdout: None,
-                                report: None,
-                            }
-                        })
+                    // The wrapper hands back the one row the measure must return.
+                    run_step_query(
+                        step,
+                        &source,
+                        dir,
+                        engine,
+                        &mut extensions,
+                        &db_path,
+                        &env_map,
+                        step_timeout,
+                        &run_measures,
+                        |query, ctx| check::run_measure(step, query, ctx),
+                    )
+                    .map(|values| {
+                        measured = values;
+                        StepOutput {
+                            stderr: String::new(),
+                            stdout: None,
+                            report: None,
+                        }
+                    })
                 } else if let Some(source) = ProtocolSql::step(step, dir) {
                     // Before each attempt: a step earlier in the run, or an earlier attempt of
                     // this one, can have written over the file since a check read it.

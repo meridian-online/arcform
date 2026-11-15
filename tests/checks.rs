@@ -641,3 +641,38 @@ fn a_fresh_step_still_has_its_tables_measured() {
         "{entry}"
     );
 }
+
+#[test]
+fn measures_holds_one_row_per_name_the_latest_winning() {
+    let manifest = format!(
+        "name: c\ndb: build/c.duckdb\nsteps:\n  - name: t\n    sql: models/t.sql\n  - name: more\n    sql: models/more.sql\n{}",
+        warn_check("c")
+    );
+    let dir = project(
+        &manifest,
+        &[
+            MAKES_THREE,
+            (
+                "models/more.sql",
+                "INSERT INTO t SELECT * FROM range(3, 5);\n",
+            ),
+            (
+                "checks/c.sql",
+                "SELECT name, count(*) FROM measures WHERE name = 'table:t.row_count' GROUP BY name HAVING count(*) > 1\nUNION ALL SELECT name, 1 FROM measures WHERE name = 'table:t.row_count' AND value <> 5;\n",
+            ),
+        ],
+    );
+    common::arc_run(dir.path());
+    let record = &records(dir.path())[0];
+    let check = &step(record, "c")["check"];
+    assert_eq!(check["success"], true, "{check}");
+    // Each step's own entry keeps what it measured.
+    assert_eq!(
+        step(record, "t")["measure"]["values"]["table:t.row_count"],
+        3.0
+    );
+    assert_eq!(
+        step(record, "more")["measure"]["values"]["table:t.row_count"],
+        5.0
+    );
+}
