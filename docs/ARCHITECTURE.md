@@ -134,6 +134,67 @@ The runner image uploads exactly the files this list names (see "The runner imag
 - **The Protocol declares its outputs; arc checks and records them, and the runner reads the record, never `arcform.yaml`.** Two alternatives were rejected. Uploading every file the record says a run produced would ship raw downloads (GLEIF's is about 470 MB) beside the dataset, and only finished outputs should leave a hosted run, since every byte out of AWS is charged and counts against a subscriber's allowance. Uploading what `datapackage.json` lists does not work because the open datasets' descriptors give each resource's published URL as its `path`, not the file in the build, and a Protocol without a descriptor would upload nothing. A fixed `outputs/` folder by convention was dropped because nothing would check it, and the open datasets' publish already reads `build/<name>.parquet` and `datapackage.json` where they are.
 - **A missing declared output fails the run in arc itself, locally too**, so a Protocol that stops writing an output is caught before a hosted run uploads an incomplete set.
 
+### Checks and measures
+
+A Protocol asks questions of its own data with two step kinds beside `sql:`, `op:` and `command:`. A check is one SQL query that returns the rows that are wrong, and passes when it returns none. A measure is one SQL query that returns one row of named numbers, recorded in every run so later checks, in this run and in later ones, can compare against it. Both are steps in `arcform.yaml`, so a reader of the manifest sees every check and where it runs (`src/check.rs`, and the check and measure arms of the step loop in `src/runner.rs`):
+
+```yaml
+steps:
+  - name: load
+    sql: models/load.sql
+  - name: size
+    measure: measures/size.sql          # SELECT count(*) AS codes FROM codes
+  - name: unique
+    check: checks/unique.sql            # SELECT code FROM codes GROUP BY code HAVING count(*) > 1
+    risk: a duplicated code publishes two meanings for one key
+    severity: warn                      # optional; error by default
+measure_history: { runs: 30 }           # the default; or { since: 90d }
+check_samples: false                    # optional; keep samples out of the published record
+```
+
+**What a check does.** `risk:` is required: one line saying what would go wrong in published data without the check, which every failure leads with. A check that returns no rows succeeds. One that returns rows with `severity: error` (the default) fails its step with `check '<name>' failed: <risk> (<n> rows returned)`, and the run stops as it does for any failed step: exit code 2, every later step left unreached, `on_failure` and `on_exit` given `ARC_FAILED_STEP=<check>` and `ARC_EXIT_CODE=check`. A failed error check is not retried, since the same data gives the same rows. One that returns rows with `severity: warn` leaves its step succeeded, prints `warning: check '<name>' found <n> rows: <risk>` on stderr, and the run carries on and can finish green. A check whose SQL fails to run (a missing table, a type error) fails its step whatever its severity, and is retried as `retry:` says.
+
+**What a measure does.** Its query returns exactly one row, and every column is a number: an integer of any width, signed or not, `FLOAT`, `DOUBLE` or `DECIMAL`. Each column becomes a measure named `<step>.<column>`, recorded as a double; SQL `NULL` is recorded as JSON `null`, and an infinity or NaN is refused. A column name may not contain `.`. Anything else fails the step, naming the column and the rule. DuckDB renames duplicate column names as it stores the rows (`SELECT 1 AS a, 2 AS a` gives `a` and `a_1`), so such a query records `<step>.a` and `<step>.a_1`; give each column its own name.
+
+**Refused before any step runs.** A check or measure file holds exactly one query, read by the same reader as every SQL step (see "Reading a step's SQL"): two statements, or one that is not a query (a `CREATE`, an `INSERT`), is refused naming the step. A statement-level `PIVOT` counts as one query. `check:` and `measure:` steps refuse `produces:`, `output:` and `preconditions:`, and take `depends_on:`, `retry:`, `timeout_sec:` and `description:`; `risk:` and `severity:` are refused on any other step. A step name may not contain `:`. In a Protocol that declares a check or measure step, no step may produce a table named `measures` or `measure_history` (in any case); a Protocol with neither keeps any table name. Checks and measures are never skipped as fresh, and what they read is in the asset graph like any step's reads, so a checked table lists its checks in `consumed_by`.
+
+**The ordering rule** (`check::refuse_publish_before_error_check`). A step whose operator publishes (`Operator::publishes`: `ducklake_write` and `ducklake_publish`) may not come before an `error` check that reads any table or file the publishing step reads, or any asset upstream of one in the graph. A check on `codes` therefore guards a publish of `build/codes.parquet` that an earlier `COPY codes TO …` wrote. The refusal names both steps and the asset, and says to move the check before the publish or make it `severity: warn`. A `warn` check may come anywhere, since it stops nothing.
+
+**The wrapper.** A check's or measure's SQL is Protocol SQL, so it runs on the DuckDB command line through `Engine::execute_sql`, as every SQL step does, and never through the linked library. arc cannot ask the command line for a query's rows directly, so it makes an answer directory of its own under the system's temporary directory (`AnswerDir` in `src/engine.rs`, a fresh directory per query, removed afterwards) and writes three files there: `measures.json`, `history.json` and a generated `wrapper.sql`. The wrapper creates `measures` and `measure_history` as temporary tables from the two JSON files, keeps the query's rows in a temporary table `__arc_rows`, and copies one answer row to `answer.json` with `COPY … (FORMAT json)`, which arc reads back. Temporary tables leave nothing in the Protocol's database. A check's answer is the row count, the column names and the first 20 rows, each cell cast to `VARCHAR` and cut to 201 characters in SQL (`left(COLUMNS(*)::VARCHAR, 201)`, packed into one list per row with `[*COLUMNS(*)]`), which arc then cuts to 200 characters followed by `…`. The cut happens in SQL so a huge value is never written out whole, and one character past the cap tells arc which cells to mark. The cast comes before the packing because `[*COLUMNS(*)]` builds a list only when every column has one type, while DuckDB 2.0 expands `[COLUMNS(*)::VARCHAR]` into one single-element list per column. A measure's answer is the row count, each column's name and type from `DESCRIBE`, and the first row's values cast with `TRY_CAST` to `DOUBLE` and then to text, so an infinity or NaN reaches arc to be refused rather than breaking the JSON. The query sits in the wrapper below as many blank lines as precede it in its file, so the `LINE n` in a DuckDB error is line n of the check's own file. A check's parameters reach it as `ARC_PARAM_*` variables, as a SQL step's do.
+
+**Built-in measures.** Each step that produces a table, as the asset graph has it, has that table measured as soon as the step has succeeded and its process has exited (a failed step records no measures): arc opens the database once more, read-only, with the linked library, and records `table:<t>.row_count` (`count(*)`) and `table:<t>.bytes` in the step's own entry. `bytes` is the number of distinct storage blocks the table's columns occupy (`block_id` and `additional_block_ids` from `pragma_storage_info`, each `>= 0`) times the database's `block_size` from `pragma_database_size()`. It is coarse, since two tables sharing a block both count it, but stable and DuckDB's own account. It is not the `bytes` on a table's asset entry at the end of the run, an older figure from `duckdb_tables().estimated_size`. A table that cannot be measured (a name that is not a simple identifier, a view, a table since dropped) records nothing and is not an error. A step skipped as fresh is measured too when the run reaches it, so history has no gap on a run where nothing changed. The `table:` prefix keeps these apart from a measure step's names, which is why a step name may not contain `:`. This adds one database open to every table-producing step.
+
+**`measures` and `measure_history`.** A check or measure can read two tables arc stands up for it. `measures (name, value)` holds this run's measures so far, measure steps' and built-in alike, one row per name; when two steps produce one table, the later measurement wins, while each step's entry keeps its own values. `measure_history (run_id, run_at, name, value)` holds earlier runs' measures, oldest first, read once before the first step from the run records in `build/.arcform/runs/`. It keeps a record only when its outcome is `success` (a run with warnings is a success), it ran with the same parameters as this run (each key and value, whatever supplied them), and it recorded at least one measure. `run_at` is the run's `started_at`. The window is `measure_history: { runs: N }`, the newest N such runs (30 by default), or `measure_history: { since: <duration> }` (`90d`, `12h`), the runs started within that span; exactly one of the two. A Protocol's first run gets an empty `measure_history`, so a comparison over it returns no rows and passes. Neither table is a graph asset, so a check reading them depends on nothing in the graph through them. A comparison is an ordinary check:
+
+```sql
+SELECT name FROM measures m JOIN (
+  SELECT name, last(value ORDER BY run_at) AS prev FROM measure_history GROUP BY name
+) p USING (name)
+WHERE m.value < p.prev * 0.5;
+```
+
+**The record under `b5/1`.** `contract_version` is `b5/1` (`CONTRACT_VERSION` in `src/contract.rs`). A check step's entry gains a `check` section (`CheckSection`): `name`, `risk`, `severity` (`error` or `warn`), `success`, `rows_returned`, `sample` (at most 20 rows, each cell text or `null`) and `sample_columns`, and `error` only when the query did not run, in which case `success` is false, `rows_returned` 0 and the sample empty. The field names `name`, `success` and `severity` follow OpenLineage's data-quality assertions facet. A measure step's entry, and every table-producing step's entry, gains a `measure` section (`MeasureSection`), `{"values": {"<name>": <number or null>}}`: a measure step's columns in query order, then each produced table's `row_count` and `bytes` in table-name order. `run.checks` (`ChecksSummary`) counts `passed`, `warned` and `failed`; a check that failed to run counts as failed whatever its severity. Every new field reads with a default, so a `b4/1` record still reads, with no sections and a zero summary. The published copy of a record goes through the same scrubbing and secret refusal as the rest of it (see "Publishing into a lake"), samples included, and `check_samples: false` empties every `sample` in that copy while keeping `sample_columns` and `rows_returned`; the record on disk keeps its samples.
+
+**Rulings and their reasons.** The design chose checks and measures as steps over checks hanging off the step they check (which must file a check across several tables under one of them) and over a convention folder that runs every file as soon as its tables exist (which a reader of `arcform.yaml` cannot see). The calls made while building it:
+
+- *The contract tag is `b5/1`*, and every new field defaults on read, so records written before checks existed still read, and so does history built from them.
+- *A sample keeps 20 rows, each cell cut to 200 characters with a trailing `…`*, with SQL `NULL` kept as JSON `null`. Twenty rows are enough for a person to see the pattern of a failure, and the cut keeps a stray blob from swelling a record that may be published.
+- *Built-in measures live in the producing step's own entry, as a `measure` section of the same shape a measure step has*, so `measure_history` reads one shape from every step. A step skipped as fresh is still measured, so history has no holes on runs where nothing changed.
+- *`table:<t>.bytes` is storage blocks times block size.* `duckdb_tables().estimated_size` is a row estimate, not bytes; the block count is coarse but stable and DuckDB's own. `row_count` is `count(*)`. A table arc cannot measure records nothing rather than failing the run, since a measure no one asked for should never break a Protocol.
+- *A check or measure whose SQL fails to run fails its step, whatever its severity.* A broken warn check is a broken Protocol, not a warning, and passing it over would let a check that no longer runs look like one that passes.
+- *A measure whose value is SQL `NULL` is recorded as `null`*, and appears in `measures` with a `NULL` value, rather than being refused: a ratio over no rows is a real answer, and a check can test for it.
+- *The ordering rule reaches through the graph.* An error check after a publish is refused when anything it reads is something the publish reads or an ancestor of one, because a publish usually reads a file an export wrote from the checked table, not the table itself.
+- *`measures` and `measure_history` are reserved only in a Protocol that declares a check or measure step*, where a table of either name would hide arc's own. A Protocol without checks keeps any table name, so an existing Protocol with a `measures` table, such as the `brewtrend` example, still loads.
+- *Step names may not contain `:`*, which the `table:` prefix relies on to keep built-in measure names from colliding with a step's.
+- *A failed error check exits 2, as a failed step does.* Distinct exit codes for failed checks and for warnings belong to the work on telling the analyst, which should settle them all together.
+- *Check and measure steps refuse `produces:`, `output:` and `preconditions:`*, since they produce nothing and are never skipped, and `risk:` and `severity:` are refused on any other step, so a misplaced line is caught rather than ignored.
+- *History compares like with like.* `measure_history` keeps only earlier runs whose recorded parameters, key and value, equal this run's, so a run for another release is not a baseline. Where a value came from (default, dotenv, command line) does not matter, only what it was.
+- *A check that fails to run counts as failed in `run.checks`*, with its section's `error` set, so the summary never reports a broken check as passing or as a warning.
+- *A measure column name may not contain `.`*, so each `<step>.<column>` name maps back to one step and one column.
+- *`measures` and `measure_history` are not graph assets.* No step makes them, so a dependency on them could never be satisfied; a check's reads of them are left out of the graph.
+- *`measure_history: { runs: N }` counts earlier runs that recorded measures*, so records written before this change, which hold none, do not push useful baselines out of the window.
+- *When two steps produce one table, the latest measurement wins in `measures`*, one row per name, so a comparison sees the table as it now stands; each step's entry keeps what it measured.
+
 ### Publishing into a lake
 
 `ducklake_write@1` (`src/operator/ducklake_write.rs`, on the building blocks in `src/lake/`, compiled under `http-fetch`) ends a Protocol by writing one or more tables into a DuckLake catalogue held in S3-compatible object storage, Cloudflare R2 for Meridian's open lake, as one snapshot. Publishing used to happen outside the run, in scripts that uploaded files and rebuilt the catalogue from scratch; now the run record showing the step succeeded is the provenance. Readers attach the catalogue over https with no credentials and no server, and R2 charges no egress.
@@ -306,20 +367,28 @@ The structural test proves a skill names only what arc has, not that an agent pi
 
 ## Key types
 
-- **`Manifest`** — top-level project config loaded from `arcform.yaml`. Contains `name`, `engine`, `engine_version`, `db`, `steps`, `assets`, `outputs`.
-- **`Step`** — a pipeline step. Either `sql` (path to .sql file) or `command` (shell string). Has `produces`, `depends_on`, `preconditions`.
+- **`Manifest`** — top-level project config loaded from `arcform.yaml`. Contains `name`, `engine`, `engine_version`, `db`, `steps`, `assets`, `outputs`, `measure_history`, `check_samples`.
+- **`Step`** — a pipeline step: one of `sql` (path to .sql file), `check` or `measure` (path to a one-query .sql file), `op` (an operator) or `command` (shell string). Has `produces`, `depends_on`, `preconditions`; a check also has `risk` and `severity`.
 - **`Precondition`** — typed freshness check. Variants: `modified_after` (file age), `fresh` (a fetched artifact's recorded identity vs. the remote), `command` (shell exit code), `tool` (the identity of an external binary or artifact the step did not produce — a reported version or a content hash). AND semantics — all must pass to skip.
 - **`AssetOverride`** — manual asset dependency declaration (for command steps; SQL steps auto-discover).
+- **`MeasureHistory`** — the window `measure_history` reads: `Runs(n)` (default 30) or `Since(duration)`.
+- **`CheckSection`** — a check step's entry in the run record: `name`, `risk`, `severity`, `success`, `rows_returned`, `sample`, `sample_columns`, and `error` when the query did not run.
+- **`MeasureSection`** — `values`, the measures a step recorded: a measure step's `<step>.<column>` names, and `table:<t>.row_count` and `table:<t>.bytes` for each table a step produced.
+- **`ChecksSummary`** — `run.checks` in the record: how many checks `passed`, `warned` and `failed`.
 
 ## Execution model
 
 1. Load `arcform.yaml` manifest
 2. Build asset dependency graph (SQL introspection + manual overrides); refuse the manifest if two produces:/depends_on: declarations collapse onto one asset by case alone
+   - Refuse a check or measure file that is not one query, a step producing a reserved table in a Protocol with checks, and a publishing step placed before an `error` check on what it publishes
+   - Read `measure_history` from earlier successful runs' records with the same parameters
 3. For each step in order:
    - Evaluate preconditions (if any) + SQL/op config hash staleness + produced/read artifact hash staleness
-   - Skip if fresh; execute if stale
+   - Skip if fresh; execute if stale (check and measure steps are never skipped)
    - SQL steps: delegate to engine CLI (`duckdb <db> -f <file.sql>`)
+   - Check and measure steps: the one query inside arc's wrapper on the same CLI, with `measures` and `measure_history` stood up; a failed `error` check stops the run, a failed `warn` check prints a warning
    - Command steps: shell execution with real-time stdout streaming
+   - After a step that produces tables succeeds or is skipped as fresh: measure each table's `row_count` and `bytes` into the step's entry and this run's `measures`
 4. Update run state after each step
 5. Check the declared `outputs:` are there (before the hooks), run the hooks, then hash the outputs into the run record
 

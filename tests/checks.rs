@@ -715,3 +715,162 @@ fn a_comparison_check_sees_the_previous_run() {
         "{second}"
     );
 }
+
+/// The issue's acceptance: a load, a measure, a warn check, a comparison over
+/// `measure_history`, an error check and a local `ducklake_write` behind it. Run 1 passes and
+/// publishes; run 2 loads data the error check refuses, so nothing after it publishes.
+#[test]
+fn checks_and_measures_end_to_end() {
+    let manifest = "name: e2e\ndb: build/e2e.duckdb\nsteps:\n  - name: load\n    sql: models/load.sql\n  - name: size\n    measure: measures/size.sql\n  - name: labels\n    check: checks/labels.sql\n    risk: a code publishes without a label\n    severity: warn\n  - name: shrank\n    check: checks/shrank.sql\n    risk: a table lost half its rows since the last good run\n    severity: warn\n  - name: unique\n    check: checks/unique.sql\n    risk: a duplicated code publishes two meanings for one key\n  - name: export\n    sql: models/export.sql\n  - name: publish\n    op: ducklake_write@1\n    with:\n      public_base: https://lake.example/\n      catalog: catalog/test.ducklake\n      data_path: lake/\n      local_catalog: build/lake/test.ducklake\n      tables:\n        - table: demo.codes\n          from: data/codes.parquet\n          descriptor: codes.datapackage.json\n      credential:\n        type: r2\n        bucket: test-bucket\n        env:\n          key_id: ARC_TEST_LAKE_KEY_ID\n          secret: ARC_TEST_LAKE_SECRET\n          account_id: ARC_TEST_LAKE_ACCOUNT_ID\n";
+    let descriptor = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/lake/protocol/codes.datapackage.json"
+    ))
+    .unwrap();
+    let run1_csv: String = std::iter::once("code,label\n".to_string())
+        .chain((0..10).map(|n| format!("c{n:03},label {n}\n")))
+        .collect();
+    let dir = project(
+        manifest,
+        &[
+            ("codes.datapackage.json", &descriptor),
+            ("data/codes.csv", &run1_csv),
+            (
+                "models/load.sql",
+                "CREATE OR REPLACE TABLE codes AS SELECT code, label FROM read_csv('data/codes.csv', all_varchar = true);\n",
+            ),
+            (
+                "models/export.sql",
+                "COPY (SELECT * FROM codes ORDER BY code) TO 'data/codes.parquet' (FORMAT parquet);\n",
+            ),
+            (
+                "measures/size.sql",
+                "SELECT count(*) AS codes FROM codes;\n",
+            ),
+            (
+                "checks/labels.sql",
+                "SELECT code, label FROM codes WHERE coalesce(label, '') = '' ORDER BY code;\n",
+            ),
+            (
+                "checks/shrank.sql",
+                "SELECT name, m.value, p.prev FROM measures m JOIN (\n  SELECT name, last(value ORDER BY run_at) AS prev FROM measure_history GROUP BY name\n) p USING (name)\nWHERE m.value < p.prev * 0.5\nORDER BY name;\n",
+            ),
+            (
+                "checks/unique.sql",
+                "SELECT code, count(*) AS copies FROM codes GROUP BY code HAVING count(*) > 1 ORDER BY code;\n",
+            ),
+        ],
+    );
+    let p = dir.path();
+
+    // Run 1: every check passes and the lake gets its first snapshot.
+    let (code, stdout, stderr) = common::arc_run_raw(p);
+    assert_eq!(code, Some(0), "run 1:\n{stdout}\n{stderr}");
+    let first = records(p).pop().unwrap();
+    assert_eq!(first["contract_version"], "b5/1");
+    assert_eq!(
+        first["run"]["checks"],
+        serde_json::json!({"passed": 3, "warned": 0, "failed": 0}),
+        "{first}"
+    );
+    let published = &step(&first, "publish")["report"];
+    assert_eq!(published["target"], "local", "{published}");
+    assert_eq!(published["committed"], true, "{published}");
+    let first_snapshot = published["snapshot_id"].as_i64().unwrap();
+    assert_eq!(
+        step(&first, "size")["measure"]["values"]["size.codes"],
+        10.0
+    );
+
+    // Run 2: four rows, one code twice and one label empty.
+    std::fs::write(
+        p.join("data/codes.csv"),
+        "code,label\nc000,label 0\nc001,\nc002,label 2\nc002,label 2 again\n",
+    )
+    .unwrap();
+    let (code, stdout, stderr) = common::arc_run_raw(p);
+    assert_eq!(code, Some(2), "run 2:\n{stdout}\n{stderr}");
+    let all = records(p);
+    assert_eq!(all.len(), 2);
+    let second = &all[1];
+    assert_eq!(second["run"]["outcome"], "partial", "{second}");
+    assert_eq!(
+        second["run"]["checks"],
+        serde_json::json!({"passed": 0, "warned": 2, "failed": 1}),
+        "{second}"
+    );
+
+    // The measures: the measure step's own and the load's built-in ones.
+    assert_eq!(step(second, "size")["measure"]["values"]["size.codes"], 4.0);
+    assert_eq!(
+        step(second, "load")["measure"]["values"]["table:codes.row_count"],
+        4.0
+    );
+
+    // The warn check: its outcome, its rows, and a warning line on stderr.
+    let labels = &step(second, "labels")["check"];
+    assert_eq!(labels["success"], false, "{labels}");
+    assert_eq!(labels["severity"], "warn", "{labels}");
+    assert_eq!(step(second, "labels")["status"]["state"], "success");
+    assert_eq!(
+        labels["sample_columns"],
+        serde_json::json!(["code", "label"])
+    );
+    assert_eq!(labels["sample"], serde_json::json!([["c001", null]]));
+    let plain = common::strip_ansi(&stderr);
+    assert!(
+        plain.lines().any(|l| l.starts_with("warning:")
+            && l.contains("check 'labels'")
+            && l.contains("a code publishes without a label")),
+        "{plain}"
+    );
+
+    // The comparison: both counts fell below half of run 1's.
+    let shrank = &step(second, "shrank")["check"];
+    assert_eq!(shrank["success"], false, "{shrank}");
+    assert_eq!(
+        shrank["sample"],
+        serde_json::json!([
+            ["size.codes", "4.0", "10.0"],
+            ["table:codes.row_count", "4.0", "10.0"]
+        ]),
+        "{shrank}"
+    );
+
+    // The error check stops the run.
+    let unique = step(second, "unique");
+    assert_eq!(unique["status"]["state"], "failed", "{unique}");
+    assert_eq!(unique["check"]["success"], false, "{unique}");
+    assert_eq!(unique["check"]["severity"], "error", "{unique}");
+    assert_eq!(unique["check"]["rows_returned"], 1, "{unique}");
+    assert_eq!(
+        unique["check"]["sample"],
+        serde_json::json!([["c002", "2"]])
+    );
+    assert!(plain.contains("check 'unique' failed:"), "{plain}");
+
+    // Nothing after it ran, and the lake holds only run 1's snapshot.
+    for name in ["export", "publish"] {
+        let entry = step(second, name);
+        assert_eq!(entry["status"]["state"], "skipped", "{entry}");
+        assert_eq!(entry["attempts"], 0, "{entry}");
+    }
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    conn.execute_batch(&format!(
+        "LOAD ducklake; ATTACH 'ducklake:{}' AS lake (READ_ONLY);",
+        p.join("build/lake/test.ducklake").display()
+    ))
+    .unwrap();
+    let latest: i64 = conn
+        .query_row(
+            "SELECT max(snapshot_id) FROM ducklake_snapshots('lake')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(latest, first_snapshot);
+    let rows: i64 = conn
+        .query_row("SELECT count(*) FROM lake.demo.codes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 10);
+}
