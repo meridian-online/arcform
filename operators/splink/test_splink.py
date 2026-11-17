@@ -71,9 +71,6 @@ class ModelProblemsTest(unittest.TestCase):
         self.assertIn("exact", out[0])
         self.assertIn("m_probability", out[0])
 
-    def test_the_null_level_needs_no_probabilities(self) -> None:
-        self.assertEqual(op.model_problems(MODEL, TWO), [])
-
     def test_missing_comparisons_is_refused(self) -> None:
         m = copy.deepcopy(MODEL)
         del m["comparisons"]
@@ -121,6 +118,40 @@ class ModelProblemsTest(unittest.TestCase):
         m = model(blocking_rules_to_generate_predictions=[{"blocking_rule": "l.town = r.town"}])
         out = op.model_problems(m, TWO)
         self.assertTrue(any("'town'" in p for p in out))
+
+    def test_a_model_whose_only_probability_less_level_is_the_null_level_runs(self) -> None:
+        levels = MODEL["comparisons"][0]["comparison_levels"]
+        self.assertNotIn("m_probability", levels[0])
+        self.assertEqual(op.model_problems(MODEL, TWO), [])
+
+    def test_malformed_comparison_shapes_are_refused_not_raised(self) -> None:
+        for bad in (
+            ["not a dict"],
+            [{"output_column_name": "x", "comparison_levels": "nope"}],
+            [{"output_column_name": "x", "comparison_levels": ["nope"]}],
+        ):
+            out = op.model_problems(model(comparisons=bad), TWO)
+            self.assertTrue(any("comparison #0" in p for p in out), out)
+
+    def test_inputs_with_different_column_sets_are_refused_per_role(self) -> None:
+        extra = {**COLS, "extra": "VARCHAR"}
+        out = op.model_problems(MODEL, {"a": extra, "b": COLS})
+        self.assertTrue(any("'b'" in p and "extra" in p for p in out), out)
+
+    def test_a_type_mismatch_on_a_column_the_model_does_not_name_is_refused(self) -> None:
+        a = {**COLS, "other": "VARCHAR"}
+        b = {**COLS, "other": "BIGINT"}
+        out = op.model_problems(MODEL, {"a": a, "b": b})
+        self.assertTrue(any("'other'" in p and "a is VARCHAR" in p for p in out), out)
+
+    def test_an_unquoted_level_column_is_caught(self) -> None:
+        m = copy.deepcopy(MODEL)
+        m["comparisons"][0]["comparison_levels"][1]["sql_condition"] = "town_l = town_r"
+        self.assertTrue(any("'town'" in p for p in op.model_problems(m, TWO)))
+
+    def test_a_quoted_blocking_column_is_caught(self) -> None:
+        m = model(blocking_rules_to_generate_predictions=['l."town" = r."town"'])
+        self.assertTrue(any("'town'" in p for p in op.model_problems(m, TWO)))
 
 
 if __name__ == "__main__":

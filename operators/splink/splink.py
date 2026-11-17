@@ -31,6 +31,7 @@ def _quoted(name: str) -> str:
 
 
 def _level_columns(sql: str) -> set[str]:
+    # Heuristic: a regex over the SQL text, not a parser; unusual SQL may go unseen.
     """Columns a comparison-level condition reads: `"col_l"`, `col_r`, ..."""
     found = set(re.findall(r'"([^"]+)_[lr]"', sql))
     found |= set(re.findall(r"(?<![\w\"])([A-Za-z_]\w*)_[lr](?!\w)", sql))
@@ -38,6 +39,7 @@ def _level_columns(sql: str) -> set[str]:
 
 
 def _rule_columns(rule: str) -> set[str]:
+    # Heuristic: a regex over the SQL text, not a parser; unusual SQL may go unseen.
     """Columns a blocking rule reads: `l.col`, `r."col"`."""
     return {a or b for a, b in re.findall(r'\b[lr]\.(?:"([^"]+)"|(\w+))', rule)}
 
@@ -52,6 +54,16 @@ def model_problems(settings: dict, columns: dict[str, dict[str, str]]) -> list[s
     if not isinstance(comparisons, list) or not comparisons:
         problems.append("model has no `comparisons`: it needs at least one comparison")
         comparisons = []
+    valid = []
+    for i, comp in enumerate(comparisons):
+        levels = comp.get("comparison_levels") if isinstance(comp, dict) else None
+        if not isinstance(levels, list):
+            problems.append(f"comparison #{i} is not an object with a `comparison_levels` list")
+        elif not all(isinstance(lv, dict) for lv in levels):
+            problems.append(f"comparison #{i} has a comparison level that is not an object")
+        else:
+            valid.append(comp)
+    comparisons = valid
 
     needed: dict[str, str] = {}  # column -> where the model names it
     uid = settings.get("unique_id_column_name", "unique_id")
@@ -87,12 +99,20 @@ def model_problems(settings: dict, columns: dict[str, dict[str, str]]) -> list[s
     elif link_type not in LINK_TYPES:
         problems.append(f"link_type {link_type!r} is not one of {', '.join(LINK_TYPES)}")
 
+    names = set().union(*(set(c) for c in columns.values())) if columns else set()
+    for role, cols in columns.items():
+        lacks = sorted(names - set(cols))
+        if lacks:
+            problems.append(
+                f"input {role!r} lacks columns the other inputs have: {', '.join(lacks)}; "
+                "inputs must share one set of columns"
+            )
     for role, cols in columns.items():
         for col, where in needed.items():
             if col not in cols:
                 problems.append(f"input {role!r} has no column {col!r}, named by {where}")
 
-    for col, where in needed.items():
+    for col in sorted(names):
         seen = {r: c[col] for r, c in columns.items() if col in c}
         if len(set(seen.values())) > 1:
             detail = ", ".join(f"{r} is {t}" for r, t in seen.items())
@@ -127,14 +147,16 @@ def main(argv=None) -> int:
         elif role in inputs:
             refusals.append(f"role {role!r} is given twice")
         else:
+            if not re.fullmatch(r"[a-z][a-z0-9_]*", role):
+                refusals.append(f"role {role!r} must match [a-z][a-z0-9_]*")
             inputs[role] = path
     if not inputs and not refusals:
         refusals.append("at least one --input is required")
     if args.threshold_match_probability is not None and args.threshold_match_weight is not None:
         refusals.append("set threshold_match_probability or threshold_match_weight, not both")
     p = args.threshold_match_probability
-    if p is not None and not 0 <= p <= 1:
-        refusals.append(f"threshold_match_probability {p} is outside 0 to 1")
+    if p is not None and not 0 <= p < 1:
+        refusals.append(f"threshold_match_probability {p} must be at least 0 and below 1")
 
     settings = None
     try:
@@ -168,11 +190,28 @@ def main(argv=None) -> int:
         columns[role] = dict(zip(rel.columns, (str(t) for t in rel.types)))
 
     problems = model_problems(settings, columns)
+    if not problems:
+        uid = settings.get("unique_id_column_name", "unique_id")
+        for role, rel in relations.items():
+            dup = rel.aggregate(
+                f"count(*) - count(DISTINCT {_quoted(uid)})"
+            ).fetchall()[0][0]
+            if dup:
+                problems.append(
+                    f"input {role!r} has {dup} duplicate values in {uid!r}: "
+                    "unique ids must be unique within an input"
+                )
     if problems:
-        return _refuse(problems)
+        return _refuse(
+            [f"model {args.model}: {x}" if x.startswith(("model has", "comparison #")) else x
+             for x in problems]
+        )
 
     db_api = DuckDBAPI(connection=con)
-    sdfs = [db_api.register(rel, dataset_display_name=role) for role, rel in relations.items()]
+    sdfs = [
+        db_api.register(rel, dataset_display_name=role, table_name=f"splink_input_{n}")
+        for n, (role, rel) in enumerate(relations.items())
+    ]
     linker = Linker(sdfs if len(sdfs) > 1 else sdfs[0], args.model)
     predictions = linker.inference.predict(
         threshold_match_probability=args.threshold_match_probability,
@@ -180,9 +219,10 @@ def main(argv=None) -> int:
     )
 
     uid = settings.get("unique_id_column_name", "unique_id")
-    keys = [f"{_quoted(uid + '_l')}", f"{_quoted(uid + '_r')}"]
+    keys = [_quoted(uid + "_l"), _quoted(uid + "_r")]
     if len(inputs) > 1:
-        keys = ['"source_dataset_l"', '"source_dataset_r"'] + keys
+        src = settings.get("source_dataset_column_name", "source_dataset")
+        keys = [_quoted(src + "_l"), _quoted(src + "_r")] + keys
     table = con.sql(
         f"SELECT * FROM {predictions.physical_name} ORDER BY {', '.join(keys)}"
     ).to_arrow_table()

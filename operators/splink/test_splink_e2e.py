@@ -42,7 +42,8 @@ MODEL = {
 def write_parquet(path: Path, rows: list[tuple]) -> None:
     con = duckdb.connect()
     con.execute("CREATE TABLE t (unique_id BIGINT, name VARCHAR, postcode VARCHAR)")
-    con.executemany("INSERT INTO t VALUES (?, ?, ?)", rows)
+    if rows:
+        con.executemany("INSERT INTO t VALUES (?, ?, ?)", rows)
     con.execute("COPY t TO ? (FORMAT parquet)", [str(path)])
 
 
@@ -59,10 +60,10 @@ class SplinkE2ETest(unittest.TestCase):
         self.model.write_text(json.dumps(MODEL))
         self.out = self.dir / "out.parquet"
 
-    def run_op(self, *extra, a=None, model=None, out=None):
+    def run_op(self, *extra, a=None, model=None, out=None, role="a"):
         cmd = [
             sys.executable, str(SCRIPT),
-            "--input", f"a={a or self.a}", "--input", f"b={self.b}",
+            "--input", f"{role}={a or self.a}", "--input", f"b={self.b}",
             "--model", str(model or self.model), "--out", str(out or self.out), *extra,
         ]
         return subprocess.run(cmd, capture_output=True, text=True)
@@ -137,6 +138,68 @@ class SplinkE2ETest(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn("'name'", r.stderr)
         self.assertIn("BIGINT", r.stderr)
+
+    def test_a_role_that_is_not_a_plain_name_is_refused(self) -> None:
+        r = self.run_op(role="sec-edgar")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("sec-edgar", r.stderr)
+
+    def test_a_reserved_word_role_works(self) -> None:
+        r = self.run_op(role="order")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.rows()), 5)
+
+    def test_a_non_default_source_dataset_column_name_is_sorted_on(self) -> None:
+        # Splink 5 only names its own source column `source_dataset`; any other name
+        # must already be a column of the inputs, so the inputs carry `src`.
+        for path, tag in ((self.a, "A"), (self.b, "B")):
+            rel = duckdb.read_parquet(str(path))
+            rel = duckdb.sql("SELECT *, ? AS src FROM rel", params=[tag])
+            rel.write_parquet(str(path))
+        self.model.write_text(json.dumps({**MODEL, "source_dataset_column_name": "src"}))
+        r = self.run_op()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([g[:2] for g in self.rows()], [(1, 10), (1, 20), (2, 10), (2, 20), (3, 30)])
+        got = duckdb.sql("SELECT DISTINCT src_l, src_r FROM read_parquet(?)", params=[str(self.out)]).fetchall()
+        self.assertEqual(got, [("A", "B")])
+
+    def test_duplicate_unique_ids_in_an_input_are_refused(self) -> None:
+        dup = self.dir / "dup.parquet"
+        write_parquet(dup, [(1, "bob", "x"), (1, "ann", "x")])
+        r = self.run_op(a=dup)
+        self.assertEqual(r.returncode, 2)
+        for part in ("'a'", "'unique_id'", "1 duplicate"):
+            self.assertIn(part, r.stderr)
+        self.assertFalse(self.out.exists())
+
+    def test_a_model_without_comparisons_names_the_model_path(self) -> None:
+        bad = {k: v for k, v in MODEL.items() if k != "comparisons"}
+        self.model.write_text(json.dumps(bad))
+        r = self.run_op()
+        self.assertEqual(r.returncode, 2)
+        self.assertIn(str(self.model), r.stderr)
+        self.assertIn("comparisons", r.stderr)
+
+    def test_a_probability_threshold_of_one_is_refused(self) -> None:
+        r = self.run_op("--threshold-match-probability", "1")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("threshold_match_probability", r.stderr)
+
+    def test_both_thresholds_are_refused(self) -> None:
+        r = self.run_op("--threshold-match-probability", "0.5", "--threshold-match-weight", "1")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("not both", r.stderr)
+
+    def test_an_input_with_zero_rows_writes_the_schema_and_no_rows(self) -> None:
+        empty = self.dir / "empty.parquet"
+        write_parquet(empty, [])
+        full = self.dir / "full.parquet"
+        self.assertEqual(self.run_op(out=full).returncode, 0)
+        r = self.run_op(a=empty)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.rows(), [])
+        cols = lambda p: duckdb.sql("DESCRIBE SELECT * FROM read_parquet(?)", params=[str(p)]).fetchall()
+        self.assertEqual(cols(self.out), cols(full))
 
 
 if __name__ == "__main__":
