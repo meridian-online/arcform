@@ -80,6 +80,11 @@ const STDERR_TAIL_BYTES: usize = 64 * 1024;
 /// process the step left behind (`sleep 30 &`) inherits the pipe and holds it open.
 const STDERR_GRACE: Duration = Duration::from_secs(2);
 
+/// How long a step that passed waits for the rest of its standard error to reach the
+/// terminal: long enough for what was still in the pipe, short enough that a process the
+/// step left holding it does not hold the run up.
+const STDERR_SETTLE: Duration = Duration::from_millis(200);
+
 /// A child's standard error, streamed to the terminal as it arrives by a reader thread
 /// that keeps its last [`STDERR_TAIL_BYTES`].
 pub(crate) struct StderrTail {
@@ -142,11 +147,20 @@ impl StderrTail {
     /// The last [`FAILED_STEP_STDERR_LINES`] lines with text on them, once the child has
     /// exited: waits up to [`STDERR_GRACE`] for the pipe to close, then takes what came.
     pub(crate) fn finish(self) -> String {
-        if let Some(done) = self.done {
+        if let Some(done) = &self.done {
             let _ = done.recv_timeout(STDERR_GRACE);
         }
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         last_lines(&kept.bytes, kept.cut, FAILED_STEP_STDERR_LINES)
+    }
+
+    /// For a child that passed: wait up to [`STDERR_SETTLE`] for the rest of its standard
+    /// error to reach the terminal, so it does not print after arc's next line or get lost
+    /// when arc exits.
+    pub(crate) fn settle(self) {
+        if let Some(done) = &self.done {
+            let _ = done.recv_timeout(STDERR_SETTLE);
+        }
     }
 }
 
@@ -814,8 +828,8 @@ impl Engine for DuckDbEngine {
 
         let status = wait_with_timeout(&mut child, timeout, command)?;
 
-        // Only a failure waits for the tail: a step that passed and left a process holding
-        // its standard error is not held up by it.
+        // A failure waits up to two seconds for the tail; a step that passed waits only a
+        // moment, so a process it left holding its standard error does not hold it up.
         if !status.success() {
             let code = status.code().unwrap_or(1);
             return Err(Error::StepFailed {
@@ -824,6 +838,7 @@ impl Engine for DuckDbEngine {
                 stderr: stderr.finish(),
             });
         }
+        stderr.settle();
 
         Ok(StepOutput {
             stderr: String::new(),

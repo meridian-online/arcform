@@ -3287,6 +3287,7 @@ fn run_process(
                     stderr: stderr.finish(),
                 });
             }
+            stderr.settle();
             Ok(StepOutput {
                 stderr: String::new(),
                 stdout: None,
