@@ -425,17 +425,18 @@ fn stored_descriptor(conn: &duckdb::Connection, table: &str) -> Result<Option<se
 /// the commit when a table set to fail on a change has a label that moved without a
 /// nomination. Read before anything is written, so a refusal leaves the catalogue
 /// untouched.
-fn compare_descriptors(
+fn compare_descriptors<'t, 'a>(
     conn: &duckdb::Connection,
-    targets: &[Target<'_>],
-) -> Result<Vec<Vec<DescriptorChange>>> {
+    targets: &'t [Target<'a>],
+) -> Result<Vec<(&'t Target<'a>, Vec<DescriptorChange>)>> {
     let mut all = Vec::with_capacity(targets.len());
     for t in targets {
         let new = &t.input.descriptor.descriptor;
         let Some(stored) = stored_descriptor(conn, &t.full)? else {
-            all.push(Vec::new());
+            all.push((t, Vec::new()));
             continue;
         };
+        let changes = descriptor_changes(&stored, new);
         if t.input.on_descriptor_change == OnDescriptorChange::Fail {
             let moves = unnominated_label_moves(&stored, new);
             if !moves.is_empty() {
@@ -455,15 +456,30 @@ fn compare_descriptors(
                     })
                     .collect::<Vec<_>>()
                     .join("; ");
+                // The refusal is the only report a refused publish makes, so it
+                // carries the table's other changes too.
+                let others: Vec<String> = changes
+                    .iter()
+                    .filter(|c| {
+                        !(c.pointer.ends_with("/x-finetype-label")
+                            && moves.iter().any(|m| c.field.as_deref() == Some(&m.field)))
+                    })
+                    .map(DescriptorChange::describe)
+                    .collect();
+                let others = if others.is_empty() {
+                    String::new()
+                } else {
+                    format!(". Its other descriptor changes: {}", others.join("; "))
+                };
                 return Err(failed(format!(
                     "table '{}' has a FineType label that changed without a nomination: \
                      {list}; nominate the label if it is right, or fix the input if \
-                     it is not. Nothing was published",
+                     it is not. Nothing was published{others}",
                     t.full
                 )));
             }
         }
-        all.push(descriptor_changes(&stored, new));
+        all.push((t, changes));
     }
     Ok(all)
 }
@@ -875,7 +891,7 @@ pub fn commit(
         catalog_file.display()
     )))?;
     let before = current_snapshot(&conn)?;
-    let mut descriptor_changes = compare_descriptors(&conn, &targets)?.into_iter();
+    let compared = compare_descriptors(&conn, &targets)?;
 
     stage_sources(&conn, &targets)?;
     stage_meta(&conn, &targets)?;
@@ -885,9 +901,9 @@ pub fn commit(
         .map_err(db("begin the commit's transaction"))?;
     let mut wrote = ensure_meta(&tx)?;
     let mut changes = Vec::with_capacity(targets.len());
-    for t in &targets {
+    for (t, descriptor_changes) in compared {
         let (rows_written, mut change) = write_rows(&tx, t)?;
-        change.descriptor_changes = descriptor_changes.next().unwrap_or_default();
+        change.descriptor_changes = descriptor_changes;
         let meta_written = write_meta(&tx, &t.full)?;
         let comments_written = write_comments(&tx, t)?;
         if (meta_written || comments_written) && change.action == TableAction::Unchanged {
@@ -1504,6 +1520,24 @@ mod tests {
         table_descriptor("s.t", &package, &["id".to_string(), "v".to_string()]).unwrap()
     }
 
+    /// `s.t` keyed on `id` with `fields`, each a field object, in order.
+    fn s_t_with(fields: Vec<Value>) -> TableDescriptor {
+        let names: Vec<String> = fields
+            .iter()
+            .map(|f| f["name"].as_str().unwrap().to_string())
+            .collect();
+        let package = json!({
+            "name": "s.t",
+            "description": "all about s.t",
+            "resources": [{
+                "name": "s.t",
+                "format": "parquet",
+                "schema": {"fields": fields, "primaryKey": ["id"]},
+            }],
+        });
+        table_descriptor("s.t", &package, &names).unwrap()
+    }
+
     fn failing(table: &str, parquet: PathBuf, descriptor: TableDescriptor) -> TableInput {
         let mut t = input(table, parquet, descriptor);
         t.on_descriptor_change = OnDescriptorChange::Fail;
@@ -1523,6 +1557,7 @@ mod tests {
             change(&out, "s.t").descriptor_changes,
             [DescriptorChange {
                 pointer: "/resources/0/schema/fields/1/constraints/maxLength".into(),
+                field: Some("v".into()),
                 old: Some(json!(5)),
                 new: Some(json!(6)),
             }]
@@ -1613,11 +1648,13 @@ mod tests {
             [
                 DescriptorChange {
                     pointer: "/resources/0/schema/fields/1/x-finetype-label".into(),
+                    field: Some("v".into()),
                     old: Some(json!("a.b.c")),
                     new: Some(json!("x.y.z")),
                 },
                 DescriptorChange {
                     pointer: "/resources/0/schema/fields/1/x-finetype-nominated".into(),
+                    field: Some("v".into()),
                     old: None,
                     new: Some(json!(true)),
                 },
@@ -1650,8 +1687,145 @@ mod tests {
             change(&out, "s.t").descriptor_changes,
             [DescriptorChange {
                 pointer: "/resources/0/schema/fields/1/description".into(),
+                field: Some("v".into()),
                 old: Some(json!("the v")),
                 new: Some(json!("the new v")),
+            }]
+        );
+    }
+
+    #[test]
+    fn report_names_one_added_field_when_a_column_is_inserted_mid_schema() {
+        let lake = Lake::new();
+        let id = json!({"name": "id", "type": "integer", LABEL: "i.d"});
+        let v = json!({"name": "v", "type": "string", LABEL: "a.b.c"});
+        let w = json!({"name": "w", "type": "string", LABEL: "w.w.w"});
+        let first = lake.parquet("1.parquet", TWENTY);
+        lake.commit(&[input("s.t", first, s_t_with(vec![id.clone(), v.clone()]))])
+            .unwrap();
+        let second = lake.parquet(
+            "2.parquet",
+            "SELECT range AS id, 'w' AS w, 'v' || range AS v FROM range(20)",
+        );
+        let mut replace = input("s.t", second, s_t_with(vec![id, w.clone(), v]));
+        replace.replace_on_schema_change = true;
+        let out = lake.commit(&[replace]).unwrap();
+        assert_eq!(
+            change(&out, "s.t").descriptor_changes,
+            [DescriptorChange {
+                pointer: "/resources/0/schema/fields/1".into(),
+                field: Some("w".into()),
+                old: None,
+                new: Some(w),
+            }],
+            "v moved to index 2 with its label unchanged, so it is not reported"
+        );
+    }
+
+    #[test]
+    fn report_names_one_removed_field() {
+        let lake = Lake::new();
+        let id = json!({"name": "id", "type": "integer"});
+        let v = json!({"name": "v", "type": "string", LABEL: "a.b.c"});
+        let w = json!({"name": "w", "type": "string"});
+        let first = lake.parquet(
+            "1.parquet",
+            "SELECT range AS id, 'w' AS w, 'v' || range AS v FROM range(20)",
+        );
+        lake.commit(&[input(
+            "s.t",
+            first,
+            s_t_with(vec![id.clone(), w.clone(), v.clone()]),
+        )])
+        .unwrap();
+        let second = lake.parquet("2.parquet", TWENTY);
+        let mut replace = input("s.t", second, s_t_with(vec![id, v]));
+        replace.replace_on_schema_change = true;
+        let out = lake.commit(&[replace]).unwrap();
+        assert_eq!(
+            change(&out, "s.t").descriptor_changes,
+            [DescriptorChange {
+                pointer: "/resources/0/schema/fields/1".into(),
+                field: Some("w".into()),
+                old: Some(w),
+                new: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn fail_refuses_a_label_that_appears_and_names_the_other_changes() {
+        let lake = Lake::new();
+        let p = lake.parquet("t.parquet", TWENTY);
+        lake.commit(&[input("s.t", p.clone(), id_v_with(json!({}), json!({})))])
+            .unwrap();
+        let snapshots = lake.snapshots();
+        let err = lake
+            .commit(&[failing(
+                "s.t",
+                p,
+                id_v_with(
+                    json!({LABEL: "x.y.z", "description": "the new v"}),
+                    json!({}),
+                ),
+            )])
+            .unwrap_err()
+            .to_string();
+        for part in ["'v'", "no label", "'x.y.z'", "nominate", "the new v"] {
+            assert!(err.contains(part), "{part} missing from: {err}");
+        }
+        assert!(
+            !err.contains("x-finetype-label (field"),
+            "the refused move is not listed again among the other changes: {err}"
+        );
+        assert_eq!(lake.snapshots(), snapshots);
+    }
+
+    #[test]
+    fn fail_refuses_a_label_that_disappears() {
+        let lake = Lake::new();
+        let p = lake.parquet("t.parquet", TWENTY);
+        lake.commit(&[input(
+            "s.t",
+            p.clone(),
+            id_v_with(json!({LABEL: "a.b.c"}), json!({})),
+        )])
+        .unwrap();
+        let snapshots = lake.snapshots();
+        let err = lake
+            .commit(&[failing("s.t", p, id_v_with(json!({}), json!({})))])
+            .unwrap_err()
+            .to_string();
+        for part in ["'v'", "'a.b.c'", "no label", "nominate"] {
+            assert!(err.contains(part), "{part} missing from: {err}");
+        }
+        assert_eq!(lake.snapshots(), snapshots);
+    }
+
+    #[test]
+    fn fail_reports_a_labelled_field_new_to_the_table_without_refusing() {
+        let lake = Lake::new();
+        let id = json!({"name": "id", "type": "integer"});
+        let v = json!({"name": "v", "type": "string"});
+        let w = json!({"name": "w", "type": "string", LABEL: "w.w.w"});
+        let first = lake.parquet("1.parquet", TWENTY);
+        lake.commit(&[input("s.t", first, s_t_with(vec![id.clone(), v.clone()]))])
+            .unwrap();
+        let second = lake.parquet(
+            "2.parquet",
+            "SELECT range AS id, 'v' || range AS v, 'w' AS w FROM range(20)",
+        );
+        let out = lake
+            .commit(&[failing("s.t", second, s_t_with(vec![id, v, w.clone()]))])
+            .unwrap();
+        assert!(out.committed);
+        assert_eq!(
+            change(&out, "s.t").descriptor_changes,
+            [DescriptorChange {
+                pointer: "/resources/0/schema/fields/2".into(),
+                field: Some("w".into()),
+                old: None,
+                new: Some(w),
             }]
         );
     }

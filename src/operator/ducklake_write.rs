@@ -1073,17 +1073,7 @@ impl Operator for DucklakeWrite {
         }
         for t in &report.tables {
             for c in &t.descriptor_changes {
-                let value = |v: &Option<serde_json::Value>| {
-                    v.as_ref()
-                        .map_or_else(|| "(absent)".to_string(), |v| v.to_string())
-                };
-                eprintln!(
-                    "{NAME}: {} descriptor {}: {} -> {}",
-                    t.table,
-                    c.pointer,
-                    value(&c.old),
-                    value(&c.new)
-                );
+                eprintln!("{NAME}: {} descriptor {}", t.table, c.describe());
             }
         }
         Ok(StepOutput {
