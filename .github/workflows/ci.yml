@@ -334,6 +334,14 @@ jobs:
       - name: umap_project persisted-fit end to end
         run: uv run operators/umap_project/test_umap_project_fit.py
 
+      # splink_resolve's name key and a real Splink run on a dozen published EDGAR and
+      # GLEIF names, among them THE BOEING COMPANY, THE COCA-COLA COMPANY and THE WALT
+      # DISNEY COMPANY, which the 1.0.0 key could not match. Needs Splink and DuckDB, so it
+      # runs here under `uv`; the corpus is tiny, so it costs the dependency resolve and
+      # about a second of Splink.
+      - name: splink_resolve name key and three-company match
+        run: uv run operators/splink_resolve/test_splink_resolve.py
+
       # tests/text_embed.rs and tests/text_embed_parity.rs carry #[ignore]d tests that
       # need a built subtoken extension, which this runner does not stage — and,
       # for the projection half, the several hundred megabytes `uv` resolves for

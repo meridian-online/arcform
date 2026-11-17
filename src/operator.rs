@@ -947,7 +947,7 @@ const DESCRIBED: &[Described] = &[
             },
         ],
         example: r#"- name: resolve
-  op: splink_resolve@1
+  op: splink_resolve@2
   with:
     edgar: raw/edgar.parquet
     gleif: raw/gleif.parquet
@@ -5985,7 +5985,7 @@ impl Operator for ArchiveExtract {
 // ─────────────────────────────────────────────────────────────────────────────
 // splink_resolve (transform) — the probabilistic EDGAR↔GLEIF name match, promoted
 // from the opaque `command: uv run --script …/resolve.py …` step to a first-class,
-// versioned operator. `op: splink_resolve@1` addresses the EXACT frozen script bytes
+// versioned operator. `op: splink_resolve@2` addresses the EXACT frozen script bytes
 // embedded below (SEED=42 Fellegi-Sunter model; see resolve.py) — the reproducibility
 // contract the "call the script by relative path" step lacked. Its `reads`/`produces`
 // put the resolve *in* the asset graph, so a stale input propagates instead of the
@@ -6005,14 +6005,14 @@ impl Operator for ArchiveExtract {
 // smoke-test cap on GLEIF rows and is OMITTED for a published run (see the arg builder).
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The resolve script, pinned into the binary. `@1` == these exact bytes.
+/// The resolve script, pinned into the binary. `@2` == these exact bytes.
 const RESOLVE_PY: &str = include_str!("../operators/splink_resolve/resolve.py");
 
 /// The script cache directory `materialize_frozen_script` builds for this operator.
 /// Test-only, for the same reason [`UMAP_PROJECT_CACHE_DIR`] is: production never
 /// spells the path, and a test traps it to drive the cache's two failure paths.
 #[cfg(test)]
-const SPLINK_RESOLVE_CACHE_DIR: &str = "arcform-op-splink_resolve-1.0.0";
+const SPLINK_RESOLVE_CACHE_DIR: &str = "arcform-op-splink_resolve-2.0.0";
 
 struct SplinkResolve;
 
@@ -6070,8 +6070,12 @@ impl Operator for SplinkResolve {
         "splink_resolve"
     }
 
+    // 2.0.0, a major bump: the name key changed (a leading THE, EDGAR's /DE/-style tags,
+    // stacked legal forms, & against AND, dotted initials, accents, and LP no longer
+    // stripped), so the same inputs resolve to a different crosswalk. A Protocol pinned to
+    // `@1` is refused rather than handed a new set of matches it did not ask for.
     fn version(&self) -> semver::Version {
-        semver::Version::new(1, 0, 0)
+        semver::Version::new(2, 0, 0)
     }
 
     fn assets(&self, with: &Value) -> Result<OpAssets> {
@@ -6101,7 +6105,7 @@ impl Operator for SplinkResolve {
 /// arguments. Split out of [`Operator::run`], as [`umap_project_invocation`] is, so a
 /// test reads the argv the script is really given without spawning `uv`.
 fn splink_resolve_invocation(cfg: &SplinkResolveConfig, dir: &Path) -> Result<Vec<String>> {
-    let script = materialize_frozen_script("splink_resolve", "1.0.0", RESOLVE_PY)?;
+    let script = materialize_frozen_script("splink_resolve", "2.0.0", RESOLVE_PY)?;
     let extra = splink_resolve_args(
         &dir.join(&cfg.edgar).display().to_string(),
         &dir.join(&cfg.gleif).display().to_string(),
@@ -8117,9 +8121,10 @@ mod tests {
     #[test]
     fn splink_resolve_resolves_by_semver() {
         assert!(resolve("splink_resolve").is_ok());
-        assert!(resolve("splink_resolve@1").is_ok());
-        assert!(resolve("splink_resolve@^1.0").is_ok());
-        assert!(resolve("splink_resolve@2").is_err()); // version not satisfied
+        assert!(resolve("splink_resolve@2").is_ok());
+        assert!(resolve("splink_resolve@^2.0").is_ok());
+        assert!(resolve("splink_resolve@1").is_err()); // the 1.0.0 name key is gone
+        assert!(resolve("splink_resolve@3").is_err()); // version not satisfied
     }
 
     #[test]
@@ -8149,7 +8154,7 @@ mod tests {
             &["--sample".to_string(), "20000".to_string()]
         );
         // Full invocation threads through uv_run_args in the documented order.
-        let script = "/tmp/arcform-op-splink_resolve-1.0.0/splink_resolve.py";
+        let script = "/tmp/arcform-op-splink_resolve-2.0.0/splink_resolve.py";
         let argv = uv_run_args(script, &sampled);
         assert_eq!(argv[0], "run");
         assert_eq!(argv[1], "--script");

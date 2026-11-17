@@ -27,20 +27,96 @@ Run (arcform-Rust does not invoke Python operators yet — run manually via uv):
 from __future__ import annotations
 
 import argparse
+import re
+import unicodedata
 
 import duckdb
 from pydantic import BaseModel, Field
 
 SEED = 42  # frozen: fixed model + deterministic tie-break so the snapshot is reproducible
 
-# Normalized-name key: uppercase -> strip punctuation -> strip trailing corporate
-# suffix (CORP/INC/LLC/LTD/...) -> collapse whitespace.
-NORM_SQL = r"""
-trim(regexp_replace(regexp_replace(regexp_replace(
-    upper(coalesce({col},'')), '[^A-Z0-9 ]', ' ', 'g'),
-    '\s+(CORPORATION|CORP|INCORPORATED|INC|COMPANY|CO|LIMITED|LTD|LLC|PLC|LP|HOLDINGS|GROUP)\s*$', '', 'g'),
-    '\s+', ' ', 'g'))
-"""
+# --- The name key (2.0.0) ---------------------------------------------------------------
+# The only signal the model compares, and the only thing an exact-name confirmation rests
+# on, so each rule below is one way EDGAR and GLEIF write the same entity differently.
+# Each rule was measured by resolving the full corpus (10,404 EDGAR ticker-rows, 3.27M GLEIF
+# rows) with and without it; README.md has the before-and-after. The rules, in order:
+#   - Fold accents (Awalé -> AWALE). A word wholly in another script is dropped, as GLEIF
+#     appends a translation (AMTD Digital Inc. 尚乘數字科技集團). A word that mixes scripts
+#     leaves the name with no key: the Latin letters left after dropping the rest are not
+#     the name, so 1.0.0 matched BP PLC to BPエナジージャパン株式会社, and NFKD's folding
+#     of full-width ＩＨＩ would collide 株式会社ＩＨＩインフラスクエア with IHI Corporation.
+#     株式会社, the Japanese legal form, is dropped first, so KDDI株式会社 is KDDI and
+#     株式会社ＩＨＩ is IHI.
+#   - Drop EDGAR's trailing state or listing tag (/DE/, /MD, /ADR, /NEW/).
+#   - & and + are AND; punctuation becomes a space.
+#   - A leading or trailing article is dropped: GLEIF writes THE BOEING COMPANY, EDGAR
+#     BOEING CO. Before 2.0.0 this alone cost Boeing, Coca-Cola, Disney, Goldman Sachs...
+#   - A run of single letters is joined (S A -> SA, N V -> NV, L L C -> LLC) unless it opens
+#     the name, so dotted and undotted legal forms agree without GAP INC meeting G.A.P.
+#   - Trailing corporate legal forms are dropped, all of them (CO LTD, CORP PLC), since they
+#     are spellings of one entity's form, except a CO that follows AND: MORGAN STANLEY & CO.
+#     LLC is not MORGAN STANLEY. LP and LLC are not dropped: a same-named LP or LLC is
+#     usually a different entity from the listed corporation (a REIT's operating
+#     partnership, a broker-dealer subsidiary). HOLDINGS and GROUP are dropped only as the
+#     last word of a name with no legal form, as in 1.0.0: stacking them would equate
+#     SIRIUS XM HOLDINGS INC with its subsidiary SIRIUS XM INC.
+#   - AND is dropped, so A & B and A AND B agree.
+#
+# form_key is the same name with its legal forms kept, each in one spelling (COMPANY -> CO).
+# It is not compared by the model: it breaks a tie between GLEIF entities that share a
+# name_key, so WD 40 CO takes WD-40 Company over WD-40 COMPANY LIMITED, and TORO CORP.
+# takes TORO CORP. over THE TORO COMPANY.
+_LEGAL_FORMS = {"CORPORATION", "CORP", "INCORPORATED", "INC", "COMPANY", "CO", "LIMITED", "LTD", "PLC"}
+_FORM_SPELLING = {"CORPORATION": "CORP", "COMPANY": "CO", "INCORPORATED": "INC", "LIMITED": "LTD"}
+
+
+def name_key(name: str | None) -> str:
+    """The normalised company name both sides are compared on; '' means no usable name."""
+    toks = _name_tokens(name)
+    n = len(toks)
+    while len(toks) > 1 and toks[-1] in _LEGAL_FORMS and not (toks[-1] == "CO" and toks[-2] == "AND"):
+        toks.pop()
+    if len(toks) == n and len(toks) > 1 and toks[-1] in ("HOLDINGS", "GROUP"):
+        toks.pop()
+    return " ".join(t for t in toks if t != "AND")
+
+
+def form_key(name: str | None) -> str:
+    """name_key with the trailing legal forms kept, in one spelling: the tie-break key."""
+    return " ".join(_FORM_SPELLING.get(t, t) for t in _name_tokens(name) if t != "AND")
+
+
+def _name_tokens(name: str | None) -> list[str]:
+    s = unicodedata.normalize("NFKD", name or "")
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = s.replace("株式会社", " ")  # kabushiki kaisha, the Japanese legal form: KDDI株式会社
+    words = []
+    for w in s.split():
+        foreign = any(ord(c) > 127 and unicodedata.category(c).startswith("L") for c in w)
+        if not foreign:
+            words.append(w)
+        elif any(c.isascii() and c.isalnum() for c in w):
+            return []  # a word mixing scripts (BPエナジー..., 株式会社IHI) cannot be keyed
+        # a word wholly in another script is a translation beside the Latin name: dropped
+    s = " ".join(words)
+    s = re.sub(r"\s*/[A-Za-z]{2,3}/?\s*$", "", s)
+    s = s.upper().replace("&", " AND ").replace("+", " AND ")
+    toks = re.sub(r"[^A-Z0-9 ]", " ", s).split()
+    if toks[:1] == ["THE"]:
+        toks = toks[1:]
+    if toks[-1:] == ["THE"]:
+        toks = toks[:-1]
+
+    joined: list[str] = []
+    for i, t in enumerate(toks):
+        in_run = len(t) == 1 and t.isalpha() and i > 0 and len(toks[i - 1]) == 1 and toks[i - 1].isalpha()
+        run_opens_name = all(len(x) == 1 and x.isalpha() for x in toks[: i + 1])
+        if in_run and not run_opens_name:
+            joined[-1] += t
+        else:
+            joined.append(t)
+    return ["CO" if t == "COMPANY" and joined[i - 1 : i] == ["AND"] else t for i, t in enumerate(joined)]
+
 
 # --- Blocking-key derivation (scaling only — does NOT touch the frozen F-S model) -----
 # Leading "stopword" tokens that would otherwise pool into one giant block. Measured on
@@ -109,12 +185,18 @@ class SplinkResolveConfig(BaseModel):
 
 
 def build_inputs(con: duckdb.DuckDBPyConnection, edgar_path: str, gleif_path: str, sample: int) -> None:
-    n_e = NORM_SQL.format(col="company_name")   # EDGAR published name column
-    n_g = NORM_SQL.format(col="legal_name")     # GLEIF published name column
+    # The key is computed in Python (a DuckDB scalar UDF): joining single-letter runs needs
+    # a lookahead DuckDB's RE2 does not have, and one function is what the tests pin.
+    for fn in (name_key, form_key):
+        con.create_function(fn.__name__, fn, ["VARCHAR"], "VARCHAR",
+                            null_handling="special", side_effects=False)
+    n_e = "name_key(company_name)"   # EDGAR published name column
+    n_g = "name_key(legal_name)"     # GLEIF published name column
     con.execute(f"""
         CREATE OR REPLACE TABLE edgar_src AS
         SELECT 'e' || CAST(row_number() OVER () AS VARCHAR) AS uid,
-               cik, ticker, company_name AS raw_name, {n_e} AS nname
+               cik, ticker, company_name AS raw_name, {n_e} AS nname,
+               form_key(company_name) AS fname
         FROM read_parquet('{edgar_path}')
         WHERE {n_e} <> '';
     """)
@@ -124,7 +206,8 @@ def build_inputs(con: duckdb.DuckDBPyConnection, edgar_path: str, gleif_path: st
     con.execute(f"""
         CREATE OR REPLACE TABLE gleif_src AS
         SELECT lei AS uid, legal_name AS raw_name, jurisdiction, country,
-               registration_status AS reg_status, {n_g} AS nname
+               registration_status AS reg_status, {n_g} AS nname,
+               form_key(legal_name) AS fname
         FROM read_parquet('{gleif_path}')
         WHERE {n_g} <> '' AND registration_status IN ('ISSUED', 'LAPSED', 'RETIRED')
         {limit};
@@ -181,7 +264,8 @@ def run(edgar_path: str, gleif_path: str, out_path: str, sample: int) -> None:
     pred = linker.inference.predict(threshold_match_probability=0.30)
     con.register("pred", pred.as_pandas_dataframe())
 
-    # Best edge per EDGAR row; reg_status + US preference tie-break; residual ties -> ambiguous.
+    # Best edge per EDGAR row; tie-break by the same legal form (form_key), then reg_status, then
+    # a US preference; residual ties -> ambiguous.
     con.execute(f"""
         CREATE OR REPLACE TABLE edges AS
         WITH oriented AS (
@@ -196,7 +280,8 @@ def run(edgar_path: str, gleif_path: str, out_path: str, sample: int) -> None:
                  o.match_weight, o.match_probability,
                  CASE g.reg_status WHEN 'ISSUED' THEN 0 WHEN 'LAPSED' THEN 1
                                    WHEN 'RETIRED' THEN 2 ELSE 3 END AS reg_rank,
-                 (g.jurisdiction LIKE 'US%') AS is_us
+                 (g.jurisdiction LIKE 'US%') AS is_us,
+                 (e.fname = g.fname) AS same_form
           FROM oriented o
           JOIN edgar_src e ON e.uid=o.e_uid
           JOIN gleif_src g ON g.uid=o.g_uid
@@ -204,8 +289,8 @@ def run(edgar_path: str, gleif_path: str, out_path: str, sample: int) -> None:
         ranked AS (
           SELECT *,
             row_number() OVER (PARTITION BY e_uid
-              ORDER BY match_probability DESC, reg_rank ASC, is_us DESC, lei) AS rn,
-            count(*) OVER (PARTITION BY e_uid, match_probability, reg_rank, is_us) AS n_equiv
+              ORDER BY match_probability DESC, same_form DESC, reg_rank ASC, is_us DESC, lei) AS rn,
+            count(*) OVER (PARTITION BY e_uid, match_probability, same_form, reg_rank, is_us) AS n_equiv
           FROM joined
         )
         SELECT cik, ticker, company_name, lei, legal_name, jurisdiction, reg_status,

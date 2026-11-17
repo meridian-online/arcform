@@ -44,7 +44,7 @@ Matches EDGAR entities to GLEIF entities with Splink and writes the resolved cro
 
 ```yaml
 - name: resolve
-  op: splink_resolve@1
+  op: splink_resolve@2
   with:
     edgar: raw/edgar.parquet
     gleif: raw/gleif.parquet

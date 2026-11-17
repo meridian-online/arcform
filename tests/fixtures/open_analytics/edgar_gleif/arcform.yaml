@@ -185,7 +185,7 @@ steps:
     # from their producers); produces build/resolved.parquet. ~4h full-corpus job, so
     # retry is pinned to 1 (a mid-run failure/timeout is retryable in the substrate — a
     # cap stops the engine re-attempting a 4h job).
-    op: splink_resolve@1
+    op: splink_resolve@2
     with:
       edgar: build/sec_entities.parquet
       gleif: build/gleif.parquet
