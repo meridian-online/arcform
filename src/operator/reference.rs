@@ -17,7 +17,12 @@ pub(crate) const END: &str = "<!-- arc:reference:end -->";
 /// The Markdown Reference section for the operator called `op_name`, or `None`
 /// for a name the operator catalogue does not describe.
 pub(crate) fn reference_markdown(op_name: &str) -> Option<String> {
-    let d = super::description_in_any_build(op_name)?;
+    super::description_in_any_build(op_name).map(|d| render(&d))
+}
+
+/// The Reference section for one operator description, in the shape
+/// `arc operation describe` prints it.
+fn render(d: &serde_json::Value) -> String {
     let mut md = String::new();
     md.push_str("## Reference\n\n");
     md.push_str(
@@ -93,7 +98,7 @@ pub(crate) fn reference_markdown(op_name: &str) -> Option<String> {
     md.push_str("\n### Example step\n\n```yaml\n");
     md.push_str(d["example"].as_str().unwrap_or_default());
     md.push_str("```\n");
-    Some(md)
+    md
 }
 
 /// `readme` with the text between its markers replaced by `section`, or what is
@@ -165,6 +170,38 @@ mod tests {
             "{md}"
         );
         assert!(reference_markdown("no_such_operator").is_none());
+    }
+
+    // Every operator in the catalogue wraps a project, reads or writes something and
+    // takes a parameter, so the READMEs alone never reach the sections a description
+    // leaves out. This one leaves them all out.
+    #[test]
+    fn a_description_with_nothing_to_list_says_so_and_prints_no_empty_tables() {
+        let d = serde_json::json!({
+            "summary": "Does one thing.",
+            "wraps": [],
+            "reads": [],
+            "writes": [],
+            "parameters": {"type": "object", "properties": {}},
+            "example": "- name: one\n  op: one@1\n",
+        });
+        let md = render(&d);
+        assert!(
+            md.contains(
+                "### What it wraps\n\nNothing beyond arc: arc does this work in its own code.\n"
+            ),
+            "{md}"
+        );
+        for heading in ["### Reads", "### Writes", "### Parameters"] {
+            assert!(
+                !md.contains(heading),
+                "{heading} with nothing under it:\n{md}"
+            );
+        }
+        assert!(
+            md.ends_with("```yaml\n- name: one\n  op: one@1\n```\n"),
+            "{md}"
+        );
     }
 
     #[test]
