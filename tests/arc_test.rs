@@ -602,22 +602,67 @@ fn a_fixture_landing_through_a_linked_folder_is_refused_and_writes_nothing() {
     assert_eq!(std::fs::read_to_string(real).unwrap(), "the user's own\n");
 }
 
-#[test]
-fn a_failed_command_step_shows_the_end_of_its_standard_error() {
-    let p = Protocol::new(&test_yaml("the codes load", ""));
+/// The Protocol with a `shout` command step running `script` before the measure.
+fn with_command_step(tests: &str, script: &str) -> Protocol {
+    let p = Protocol::new(tests);
     let manifest = std::fs::read_to_string(p.dir().join("arcform.yaml")).unwrap();
     p.write(
         "arcform.yaml",
         &manifest.replace(
             "  - name: size\n",
-            "  - name: shout\n    command: \"echo 'warming up' >&2; echo 'the real cause' >&2; exit 3\"\n  - name: size\n",
+            &format!("  - name: shout\n    command: \"{script}\"\n  - name: size\n"),
         ),
+    );
+    p
+}
+
+#[test]
+fn a_failed_command_steps_standard_error_is_in_arcs_error() {
+    let p = with_command_step(
+        &test_yaml("the codes load", ""),
+        "echo 'warming up' >&2; echo 'the real cause' >&2; exit 3",
     );
     let (code, stdout, stderr) = p.arc_test();
     assert_eq!(code, Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
         stdout.contains(
-            "it failed with: step 'shout' failed (exit code 3):\n  the run's standard error ended:\n    warming up\n    the real cause\n"
+            "it failed with: step 'shout' failed (exit code 3):\n  warming up\n  the real cause\n"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn fails_with_matches_a_command_steps_own_refusal() {
+    let p = with_command_step(
+        &test_yaml(
+            "a script refuses",
+            "  expect:\n    fails_with: code list has a duplicate\n",
+        ),
+        "echo 'code list has a duplicate: 11' >&2; exit 1",
+    );
+    let (code, stdout, stderr) = p.arc_test();
+    assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.lines().any(|l| l == "ok a script refuses"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn fails_with_does_not_match_a_command_step_that_crashed() {
+    let p = with_command_step(
+        &test_yaml(
+            "a script refuses",
+            "  expect:\n    fails_with: code list has a duplicate\n",
+        ),
+        "echo 'Traceback (most recent call last):' >&2; echo 'KeyError: code' >&2; exit 1",
+    );
+    let (code, stdout, stderr) = p.arc_test();
+    assert_eq!(code, Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains(
+            "expected the run to fail with \"code list has a duplicate\"; it failed with: step 'shout' failed (exit code 1):\n  Traceback (most recent call last):\n  KeyError: code"
         ),
         "{stdout}"
     );

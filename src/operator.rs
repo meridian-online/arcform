@@ -3240,8 +3240,9 @@ ap.add_argument("--nowhere", default=NOWHERE)
 
 /// How a subprocess operator handles its child's output.
 enum OutputMode {
-    /// Inherit the terminal — stream child stdout/stderr live (e.g. `splink_resolve`'s
-    /// coverage tables). Honours the step timeout via `wait_with_timeout`.
+    /// Stream child stdout/stderr live (e.g. `splink_resolve`'s coverage tables), keeping
+    /// the end of stderr for a failure's error. Honours the step timeout via
+    /// `wait_with_timeout`.
     Inherit,
     /// Capture stdout+stderr into `StepOutput` — for ops that parse stdout
     /// (`datapackage_describe`) or surface child stderr. `output()` drains the pipes
@@ -3270,19 +3271,23 @@ fn run_process(
 
     match mode {
         OutputMode::Inherit => {
-            cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+            // Stderr streams to the terminal through arc, which keeps its last lines for
+            // the error of a process that fails, as a `command:` step's are.
+            cmd.stdout(Stdio::inherit()).stderr(Stdio::piped());
             let mut child = cmd.spawn().map_err(|e| Error::StepExecution {
                 step: name.to_string(),
                 source: e,
             })?;
+            let stderr = crate::engine::StderrTail::start(&mut child);
             let status = crate::engine::wait_with_timeout(&mut child, ctx.timeout, name)?;
             if !status.success() {
                 return Err(Error::StepFailed {
                     step: String::new(), // runner rewrites with the step name
                     code: status.code().unwrap_or(1),
-                    stderr: String::new(),
+                    stderr: stderr.finish(),
                 });
             }
+            stderr.settle();
             Ok(StepOutput {
                 stderr: String::new(),
                 stdout: None,
@@ -7646,6 +7651,34 @@ mod tests {
         // Capture: stdout is returned.
         let out = run_process("echo", &["hi".to_string()], &ctx, OutputMode::Capture, "t").unwrap();
         assert!(out.stdout.unwrap().contains("hi"));
+    }
+
+    #[test]
+    fn a_failed_process_keeps_the_end_of_its_stderr_in_its_error() {
+        let dir = std::env::temp_dir();
+        let env = HashMap::new();
+        let ctx = test_ctx(&dir, &env);
+        let script = "for n in $(seq 1 30); do echo \"line $n\" >&2; done; echo 'refused: bad codes' >&2; exit 2";
+        match run_process(
+            "sh",
+            &["-c".to_string(), script.to_string()],
+            &ctx,
+            OutputMode::Inherit,
+            "t",
+        ) {
+            Err(Error::StepFailed { code, stderr, .. }) => {
+                assert_eq!(code, 2);
+                let lines: Vec<&str> = stderr.lines().collect();
+                assert_eq!(
+                    lines.len(),
+                    crate::engine::FAILED_STEP_STDERR_LINES,
+                    "{stderr}"
+                );
+                assert_eq!(lines.first(), Some(&"line 12"), "{stderr}");
+                assert_eq!(lines.last(), Some(&"refused: bad codes"), "{stderr}");
+            }
+            other => panic!("expected StepFailed, got {:?}", other.map(|_| ())),
+        }
     }
 
     #[test]

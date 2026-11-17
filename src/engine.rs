@@ -68,6 +68,118 @@ fn stream_stderr(child: &mut std::process::Child) -> String {
     String::from_utf8_lossy(&captured).to_string()
 }
 
+/// How many lines of a failed `command:` or `uv` step's standard error its
+/// [`Error::StepFailed`] keeps: enough for a script's own refusal and the traceback above it.
+pub(crate) const FAILED_STEP_STDERR_LINES: usize = 20;
+
+/// The most standard error a step's tail holds while the step runs. A long step that prints
+/// progress for hours keeps only this much.
+const STDERR_TAIL_BYTES: usize = 64 * 1024;
+
+/// How long arc waits, after a step's process exits, for its standard error to close. A
+/// process the step left behind (`sleep 30 &`) inherits the pipe and holds it open.
+const STDERR_GRACE: Duration = Duration::from_secs(2);
+
+/// How long a step that passed waits for the rest of its standard error to reach the
+/// terminal: long enough for what was still in the pipe, short enough that a process the
+/// step left holding it does not hold the run up.
+const STDERR_SETTLE: Duration = Duration::from_millis(200);
+
+/// A child's standard error, streamed to the terminal as it arrives by a reader thread
+/// that keeps its last [`STDERR_TAIL_BYTES`].
+pub(crate) struct StderrTail {
+    kept: std::sync::Arc<std::sync::Mutex<TailBuffer>>,
+    done: Option<std::sync::mpsc::Receiver<()>>,
+}
+
+#[derive(Default)]
+struct TailBuffer {
+    bytes: Vec<u8>,
+    /// Bytes were dropped from the front, so the first line may be cut.
+    cut: bool,
+}
+
+impl TailBuffer {
+    fn push(&mut self, chunk: &[u8]) {
+        self.bytes.extend_from_slice(chunk);
+        if self.bytes.len() > 2 * STDERR_TAIL_BYTES {
+            let drop = self.bytes.len() - STDERR_TAIL_BYTES;
+            self.bytes.drain(..drop);
+            self.cut = true;
+        }
+    }
+}
+
+impl StderrTail {
+    /// Take `child`'s piped standard error and start streaming it. A child with no piped
+    /// standard error gives an empty tail.
+    pub(crate) fn start(child: &mut std::process::Child) -> Self {
+        let kept = std::sync::Arc::new(std::sync::Mutex::new(TailBuffer::default()));
+        let Some(mut pipe) = child.stderr.take() else {
+            return StderrTail { kept, done: None };
+        };
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let shared = std::sync::Arc::clone(&kept);
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let _ = std::io::Write::write_all(&mut std::io::stderr(), &chunk[..n]);
+                        shared
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(&chunk[..n]);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            let _ = done_tx.send(());
+        });
+        StderrTail {
+            kept,
+            done: Some(done_rx),
+        }
+    }
+
+    /// The last [`FAILED_STEP_STDERR_LINES`] lines with text on them, once the child has
+    /// exited: waits up to [`STDERR_GRACE`] for the pipe to close, then takes what came.
+    pub(crate) fn finish(self) -> String {
+        if let Some(done) = &self.done {
+            let _ = done.recv_timeout(STDERR_GRACE);
+        }
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        last_lines(&kept.bytes, kept.cut, FAILED_STEP_STDERR_LINES)
+    }
+
+    /// For a child that passed: wait up to [`STDERR_SETTLE`] for the rest of its standard
+    /// error to reach the terminal, so it does not print after arc's next line or get lost
+    /// when arc exits.
+    pub(crate) fn settle(self) {
+        if let Some(done) = &self.done {
+            let _ = done.recv_timeout(STDERR_SETTLE);
+        }
+    }
+}
+
+/// The last `n` lines of `bytes` with text on them, joined by newlines, without trailing
+/// whitespace. `cut` drops the first line, which may have lost its start.
+fn last_lines(bytes: &[u8], cut: bool, n: usize) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if cut && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let lines: Vec<&str> = lines
+        .into_iter()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
 /// Trait for executing pipeline steps.
 pub trait Engine {
     /// Execute a SQL file against a database.
@@ -685,21 +797,21 @@ impl Engine for DuckDbEngine {
         } else {
             Stdio::inherit()
         };
-        // Stderr: inherited for command steps (streams to terminal).
-        // When capturing stdout, stderr remains inherited so errors are visible.
-        let stderr_cfg = Stdio::inherit();
-
+        // Stderr streams to the terminal as it arrives, and its last lines are kept for
+        // the error of a step that fails, so `arc test`'s `fails_with` can match a
+        // script's own refusal and not only its exit code.
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(command)
             .envs(env)
             .stdout(stdout_cfg)
-            .stderr(stderr_cfg)
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| Error::StepExecution {
                 step: command.to_string(),
                 source: e,
             })?;
+        let stderr = StderrTail::start(&mut child);
 
         // If capturing, read stdout before wait() to avoid deadlocks.
         // Timeout applies to the wait after stdout drain (constraint #10).
@@ -716,14 +828,17 @@ impl Engine for DuckDbEngine {
 
         let status = wait_with_timeout(&mut child, timeout, command)?;
 
+        // A failure waits up to two seconds for the tail; a step that passed waits only a
+        // moment, so a process it left holding its standard error does not hold it up.
         if !status.success() {
             let code = status.code().unwrap_or(1);
             return Err(Error::StepFailed {
                 step: String::new(),
                 code,
-                stderr: String::new(),
+                stderr: stderr.finish(),
             });
         }
+        stderr.settle();
 
         Ok(StepOutput {
             stderr: String::new(),
@@ -2646,6 +2761,62 @@ pub mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_command_keeps_its_stderr_and_a_passing_one_returns_promptly() {
+        let env = HashMap::new();
+        match DuckDbEngine.execute_command(
+            "echo 'first' >&2; echo 'the refusal' >&2; exit 4",
+            &env,
+            false,
+            None,
+        ) {
+            Err(Error::StepFailed { code, stderr, .. }) => {
+                assert_eq!(code, 4);
+                assert_eq!(stderr, "first\nthe refusal");
+            }
+            other => panic!("expected StepFailed, got {:?}", other.map(|_| ())),
+        }
+        // A process left behind holds the pipe open; a step that passed does not wait on it.
+        let started = Instant::now();
+        let out = DuckDbEngine
+            .execute_command("sleep 5 >/dev/null & echo done", &env, true, None)
+            .unwrap();
+        assert_eq!(out.stdout.as_deref(), Some("done"));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn settle_waits_a_moment_for_a_held_pipe_and_no_longer() {
+        // `sleep` holds the pipe open after `sh` exits, so the reader is not done.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 3 >/dev/null &")
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let tail = StderrTail::start(&mut child);
+        child.wait().unwrap();
+        let started = Instant::now();
+        tail.settle();
+        let waited = started.elapsed();
+        assert!(waited >= STDERR_SETTLE, "{waited:?}");
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+    }
+
+    #[test]
+    fn the_tail_is_the_last_lines_with_text_and_drops_a_cut_first_line() {
+        assert_eq!(last_lines(b"a\n\n b  \nc\n", false, 2), " b\nc");
+        assert_eq!(last_lines(b"rtial\nwhole\n", true, 5), "whole");
+        assert_eq!(last_lines(b"", false, 5), "");
+        let mut buf = TailBuffer::default();
+        buf.push(&vec![b'x'; 3 * STDERR_TAIL_BYTES]);
+        assert!(buf.cut && buf.bytes.len() == STDERR_TAIL_BYTES);
+    }
 
     // Every arc build must link a DuckDB that reports the release, not a development
     // version. libduckdb-sys vendors a development DuckDB for the bundled build
