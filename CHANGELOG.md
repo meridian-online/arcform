@@ -9,6 +9,10 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-17
+
+arc 0.2.3 names the projects each operator is built on. arc is a single binary that runs a data pipeline, a Protocol, from a YAML manifest of SQL and shell steps, and an operator is a ready-made step, such as `http_fetch` or `splink_resolve`, that a Protocol names instead of writing the code itself. `arc operation describe <operator>` now also prints `wraps`, the open-source projects the operator is built on, each with a stable id, a name, a link and one sentence on what the operator uses it for, and `example`, one step written as manifest YAML that you can copy into a Protocol. Every one of the thirteen operators now has a README at `operators/<name>/README.md`, whose Reference section is generated from that description, so the README, the CLI and meridian.online's operation pages say the same thing. Nothing else changes from 0.2.2: arc still needs DuckDB 2.0.
+
 ### Added
 
 - **`arc operation describe` gives an operator's `wraps`, the projects it stands on, and an `example` step, and every operator has a README at `operators/<name>/README.md` whose Reference section is generated from that description.** A reader sent to an operator from meridian.online found three READMEs among thirteen operators, and none said in one place what the operator wraps, its defaults or how a step is written. Each `wraps` entry carries a stable id, a name, a link and one sentence of use; each example is checked to load, and a test fails when a README's Reference section has drifted from the catalogue.
@@ -165,7 +169,8 @@ Then `arc mcp` serves arc to an AI agent over the Model Context Protocol. An age
 - Shell command steps with real-time stdout streaming.
 - Sequential step execution with per-step progress feedback.
 
-[Unreleased]: https://github.com/meridian-online/arcform/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/meridian-online/arcform/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/meridian-online/arcform/releases/tag/v0.2.3
 [0.2.2]: https://github.com/meridian-online/arcform/releases/tag/v0.2.2
 [0.2.1]: https://github.com/meridian-online/arcform/releases/tag/v0.2.1
 [0.2.0]: https://github.com/meridian-online/arcform/releases/tag/v0.2.0
