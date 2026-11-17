@@ -3,6 +3,7 @@
 
 use std::collections::BTreeSet;
 
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::error::{Error, Result};
@@ -41,6 +42,143 @@ pub(super) fn failed(msg: impl std::fmt::Display) -> Error {
         code: 1,
         stderr: format!("ducklake_write: {msg}"),
     }
+}
+
+/// The key finetype records its confidence in a field's label under. It moves on
+/// every re-inference without the label moving, so a descriptor diff ignores it.
+const CONFIDENCE_KEY: &str = "x-finetype-confidence";
+const LABEL_KEY: &str = "x-finetype-label";
+const NOMINATED_KEY: &str = "x-finetype-nominated";
+
+/// One value that differs between a table's stored descriptor and the one being
+/// published: at `pointer`, a JSON Pointer into the descriptor, `old` became `new`.
+/// `None` is a value absent on that side.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DescriptorChange {
+    pub pointer: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new: Option<Value>,
+}
+
+/// A field's FineType label that moved without the new field being nominated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelMove {
+    pub field: String,
+    pub old: Option<String>,
+    pub new: Option<String>,
+}
+
+/// The descriptor less what a republish of the same data changes anyway: the
+/// package's `created`, each resource's `bytes` and `hash`, and each field's
+/// FineType confidence.
+fn comparable(descriptor: &Value) -> Value {
+    let mut d = descriptor.clone();
+    if let Some(o) = d.as_object_mut() {
+        o.remove("created");
+    }
+    if let Some(resources) = d.get_mut("resources").and_then(Value::as_array_mut) {
+        for r in resources {
+            if let Some(o) = r.as_object_mut() {
+                o.remove("bytes");
+                o.remove("hash");
+            }
+            if let Some(fields) = r
+                .pointer_mut("/schema/fields")
+                .and_then(Value::as_array_mut)
+            {
+                for f in fields.iter_mut().filter_map(Value::as_object_mut) {
+                    f.remove(CONFIDENCE_KEY);
+                }
+            }
+        }
+    }
+    d
+}
+
+/// One JSON Pointer reference token.
+fn pointer_token(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+fn diff(pointer: &str, old: Option<&Value>, new: Option<&Value>, out: &mut Vec<DescriptorChange>) {
+    match (old, new) {
+        (Some(Value::Object(a)), Some(Value::Object(b))) => {
+            let keys: BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+            for k in keys {
+                diff(
+                    &format!("{pointer}/{}", pointer_token(k)),
+                    a.get(k),
+                    b.get(k),
+                    out,
+                );
+            }
+        }
+        (Some(Value::Array(a)), Some(Value::Array(b))) => {
+            for i in 0..a.len().max(b.len()) {
+                diff(&format!("{pointer}/{i}"), a.get(i), b.get(i), out);
+            }
+        }
+        (old, new) if old != new => out.push(DescriptorChange {
+            pointer: pointer.to_string(),
+            old: old.cloned(),
+            new: new.cloned(),
+        }),
+        _ => {}
+    }
+}
+
+/// Every value that differs between a table's `stored` descriptor and its `new`
+/// one, in pointer order within each object and index order within each array,
+/// ignoring the package's `created`, the resources' `bytes` and `hash` and each
+/// field's `x-finetype-confidence`.
+pub fn descriptor_changes(stored: &Value, new: &Value) -> Vec<DescriptorChange> {
+    let mut out = Vec::new();
+    diff(
+        "",
+        Some(&comparable(stored)),
+        Some(&comparable(new)),
+        &mut out,
+    );
+    out
+}
+
+fn fields_by_name(descriptor: &Value) -> Vec<(&str, &serde_json::Map<String, Value>)> {
+    descriptor
+        .pointer("/resources/0/schema/fields")
+        .and_then(Value::as_array)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(Value::as_object)
+                .filter_map(|f| Some((f.get("name")?.as_str()?, f)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The fields in both descriptors whose `x-finetype-label` differs while the new
+/// field is not marked `"x-finetype-nominated": true`: inference that drifted,
+/// rather than a label someone chose.
+pub fn unnominated_label_moves(stored: &Value, new: &Value) -> Vec<LabelMove> {
+    let label = |f: &serde_json::Map<String, Value>| {
+        f.get(LABEL_KEY).and_then(Value::as_str).map(String::from)
+    };
+    let before = fields_by_name(stored);
+    fields_by_name(new)
+        .into_iter()
+        .filter_map(|(name, f)| {
+            let (_, old) = before.iter().find(|(n, _)| *n == name)?;
+            let (old, new) = (label(old), label(f));
+            let nominated = f.get(NOMINATED_KEY) == Some(&Value::Bool(true));
+            (old != new && !nominated).then(|| LabelMove {
+                field: name.to_string(),
+                old,
+                new,
+            })
+        })
+        .collect()
 }
 
 /// Reads `datapackage`'s single resource into the rows `meta` holds for `table_name`,

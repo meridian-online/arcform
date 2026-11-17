@@ -925,6 +925,7 @@ mod tests {
             key: descriptor.key.clone(),
             descriptor,
             replace_on_schema_change: false,
+            on_descriptor_change: Default::default(),
         }
     }
 
