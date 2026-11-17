@@ -979,6 +979,128 @@ fn resolved_role(key: &RoleKey, schema: &serde_json::Value) -> crate::record::Ro
 mod with_schema_tests {
     use super::*;
 
+    /// Check `with` against the JSON Schema [`with_schema`] gives `op_name`, and say
+    /// each way it falls short, or `None` for a name not in the catalog. It reads the
+    /// keywords the operator schemas use (`type`, `enum`, `properties`, `required`,
+    /// `additionalProperties`, `items`, `minItems`, `minProperties`, `minimum`,
+    /// `exclusiveMaximum`, `pattern`) and no others, and holds each example step to
+    /// its schema.
+    fn check_with(op_name: &str, with: &Json) -> Option<Vec<String>> {
+        let schema = with_schema(op_name)?;
+        let mut faults = Vec::new();
+        check_against(&schema, with, "with", &mut faults);
+        Some(faults)
+    }
+
+    fn check_against(schema: &Json, value: &Json, at: &str, faults: &mut Vec<String>) {
+        let kind = |v: &Json| match v {
+            Json::Null => "null",
+            Json::Bool(_) => "a boolean",
+            Json::Number(n) if n.is_i64() || n.is_u64() => "an integer",
+            Json::Number(_) => "a number",
+            Json::String(_) => "a string",
+            Json::Array(_) => "an array",
+            Json::Object(_) => "an object",
+        };
+        if let Some(ty) = schema.get("type").and_then(Json::as_str) {
+            let fits = match ty {
+                "object" => value.is_object(),
+                "array" => value.is_array(),
+                "string" => value.is_string(),
+                "integer" => value.is_i64() || value.is_u64(),
+                "number" => value.is_number(),
+                "boolean" => value.is_boolean(),
+                _ => true,
+            };
+            if !fits {
+                let article = match ty {
+                    "object" | "array" | "integer" => "an",
+                    _ => "a",
+                };
+                faults.push(format!(
+                    "`{at}` must be {article} {ty}, not {}",
+                    kind(value)
+                ));
+                return;
+            }
+        }
+        if let Some(allowed) = schema.get("enum").and_then(Json::as_array)
+            && !allowed.contains(value)
+        {
+            let held: Vec<String> = allowed.iter().map(Json::to_string).collect();
+            faults.push(format!(
+                "`{at}` is {value}, which is not one of {}",
+                held.join(", ")
+            ));
+        }
+        if let Some(number) = value.as_f64() {
+            if let Some(least) = schema.get("minimum").and_then(Json::as_f64)
+                && number < least
+            {
+                faults.push(format!("`{at}` is {value}, below the least, {least}"));
+            }
+            if let Some(bound) = schema.get("exclusiveMaximum").and_then(Json::as_f64)
+                && number >= bound
+            {
+                faults.push(format!("`{at}` is {value}, which must be below {bound}"));
+            }
+        }
+        if let (Some(text), Some(pattern)) =
+            (value.as_str(), schema.get("pattern").and_then(Json::as_str))
+            && regex::Regex::new(pattern).is_ok_and(|re| !re.is_match(text))
+        {
+            faults.push(format!("`{at}` is {value}, which does not match {pattern}"));
+        }
+        if let Some(items) = value.as_array() {
+            if let Some(least) = schema.get("minItems").and_then(Json::as_u64)
+                && (items.len() as u64) < least
+            {
+                faults.push(format!(
+                    "`{at}` has {} item(s), and needs at least {least}",
+                    items.len()
+                ));
+            }
+            if let Some(item_schema) = schema.get("items") {
+                for (i, item) in items.iter().enumerate() {
+                    check_against(item_schema, item, &format!("{at}[{i}]"), faults);
+                }
+            }
+        }
+        if let Some(map) = value.as_object() {
+            if let Some(least) = schema.get("minProperties").and_then(Json::as_u64)
+                && (map.len() as u64) < least
+            {
+                faults.push(format!(
+                    "`{at}` has {} key(s), and needs at least {least}",
+                    map.len()
+                ));
+            }
+            if let Some(required) = schema.get("required").and_then(Json::as_array) {
+                for key in required.iter().filter_map(Json::as_str) {
+                    if !map.contains_key(key) {
+                        faults.push(format!("`{at}` is missing the required field `{key}`"));
+                    }
+                }
+            }
+            let properties = schema.get("properties").and_then(Json::as_object);
+            for (key, member) in map {
+                let here = format!("{at}.{key}");
+                match properties.and_then(|p| p.get(key)) {
+                    Some(property) => check_against(property, member, &here, faults),
+                    None => match schema.get("additionalProperties") {
+                        Some(Json::Bool(false)) => {
+                            faults.push(format!("`{here}` is not a field this takes"))
+                        }
+                        Some(extra @ Json::Object(_)) => {
+                            check_against(extra, member, &here, faults)
+                        }
+                        _ => {}
+                    },
+                }
+            }
+        }
+    }
+
     #[test]
     fn every_catalog_operator_has_a_with_schema() {
         for name in catalog_names() {
