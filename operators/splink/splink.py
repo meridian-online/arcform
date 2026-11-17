@@ -44,23 +44,34 @@ def _rule_columns(rule: str) -> set[str]:
     return {a or b for a, b in re.findall(r'\b[lr]\.(?:"([^"]+)"|(\w+))', rule)}
 
 
-def model_problems(settings: dict, columns: dict[str, dict[str, str]]) -> list[str]:
+def model_problems(
+    settings: dict, columns: dict[str, dict[str, str]], model_path: str = "model"
+) -> list[str]:
     """One message per reason the model cannot run over these inputs.
 
-    `columns` maps each input's role to {column_name: duckdb_type}.
+    `columns` maps each input's role to {column_name: duckdb_type}. A problem with the
+    model itself is prefixed with `model_path`; a problem with an input names its role.
     """
     problems: list[str] = []
+
+    def about_model(msg: str) -> str:
+        return f"model {model_path}: {msg}"
+
     comparisons = settings.get("comparisons")
     if not isinstance(comparisons, list) or not comparisons:
-        problems.append("model has no `comparisons`: it needs at least one comparison")
+        problems.append(about_model("it has no `comparisons`; it needs at least one"))
         comparisons = []
     valid = []
     for i, comp in enumerate(comparisons):
         levels = comp.get("comparison_levels") if isinstance(comp, dict) else None
         if not isinstance(levels, list):
-            problems.append(f"comparison #{i} is not an object with a `comparison_levels` list")
+            problems.append(
+                about_model(f"comparison #{i} is not an object with a `comparison_levels` list")
+            )
         elif not all(isinstance(lv, dict) for lv in levels):
-            problems.append(f"comparison #{i} has a comparison level that is not an object")
+            problems.append(
+                about_model(f"comparison #{i} has a comparison level that is not an object")
+            )
         else:
             valid.append(comp)
     comparisons = valid
@@ -77,8 +88,10 @@ def model_problems(settings: dict, columns: dict[str, dict[str, str]]) -> list[s
                 missing = [k for k in ("m_probability", "u_probability") if level.get(k) is None]
                 if missing:
                     problems.append(
-                        f"comparison {cname!r} level {label!r} has no "
-                        f"{' or '.join(missing)}: the model is not fully specified"
+                        about_model(
+                            f"comparison {cname!r} level {label!r} has no "
+                            f"{' or '.join(missing)}; the model is not fully specified"
+                        )
                     )
             for col in _level_columns(level.get("sql_condition", "")):
                 needed.setdefault(col, f"comparison {cname!r} level {label!r}")
@@ -93,11 +106,15 @@ def model_problems(settings: dict, columns: dict[str, dict[str, str]]) -> list[s
     link_type = settings.get("link_type", "dedupe_only")
     n = len(columns)
     if link_type == "dedupe_only" and n != 1:
-        problems.append(f"link_type dedupe_only needs exactly one input, found {n}")
+        problems.append(about_model(f"link_type dedupe_only needs exactly one input, found {n}"))
     elif link_type in ("link_only", "link_and_dedupe") and n < 2:
-        problems.append(f"link_type {link_type} needs at least two inputs, found {n}")
+        problems.append(about_model(f"link_type {link_type} needs at least two inputs, found {n}"))
     elif link_type not in LINK_TYPES:
-        problems.append(f"link_type {link_type!r} is not one of {', '.join(LINK_TYPES)}")
+        problems.append(about_model(f"link_type {link_type!r} is not one of {', '.join(LINK_TYPES)}"))
+    src = settings.get("source_dataset_column_name", "source_dataset")
+    if link_type != "dedupe_only" and src != "source_dataset":
+        # Splink only creates a column named `source_dataset`; any other name must exist.
+        needed.setdefault(src, "source_dataset_column_name")
 
     names = set().union(*(set(c) for c in columns.values())) if columns else set()
     for role, cols in columns.items():
@@ -189,23 +206,23 @@ def main(argv=None) -> int:
         relations[role] = rel
         columns[role] = dict(zip(rel.columns, (str(t) for t in rel.types)))
 
-    problems = model_problems(settings, columns)
+    problems = model_problems(settings, columns, args.model)
     if not problems:
         uid = settings.get("unique_id_column_name", "unique_id")
         for role, rel in relations.items():
-            dup = rel.aggregate(
-                f"count(*) - count(DISTINCT {_quoted(uid)})"
-            ).fetchall()[0][0]
+            q = _quoted(uid)
+            nulls, dup = rel.aggregate(
+                f"count(*) FILTER (WHERE {q} IS NULL), count({q}) - count(DISTINCT {q})"
+            ).fetchall()[0]
+            if nulls:
+                problems.append(f"input {role!r}: {nulls} rows have a NULL {uid!r}")
             if dup:
                 problems.append(
                     f"input {role!r} has {dup} duplicate values in {uid!r}: "
                     "unique ids must be unique within an input"
                 )
     if problems:
-        return _refuse(
-            [f"model {args.model}: {x}" if x.startswith(("model has", "comparison #")) else x
-             for x in problems]
-        )
+        return _refuse(problems)
 
     db_api = DuckDBAPI(connection=con)
     sdfs = [

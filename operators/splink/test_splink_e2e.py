@@ -201,6 +201,38 @@ class SplinkE2ETest(unittest.TestCase):
         cols = lambda p: duckdb.sql("DESCRIBE SELECT * FROM read_parquet(?)", params=[str(p)]).fetchall()
         self.assertEqual(cols(self.out), cols(full))
 
+    def test_null_unique_ids_are_refused_and_not_counted_as_duplicates(self) -> None:
+        nulls = self.dir / "nulls.parquet"
+        write_parquet(nulls, [(None, "bob", "x"), (None, "ann", "x"), (1, "cy", "y")])
+        r = self.run_op(a=nulls)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("2 rows have a NULL 'unique_id'", r.stderr)
+        self.assertNotIn("duplicate", r.stderr)
+
+    def test_duplicates_are_counted_among_non_null_ids_only(self) -> None:
+        mixed = self.dir / "mixed.parquet"
+        write_parquet(mixed, [(None, "bob", "x"), (1, "ann", "x"), (1, "cy", "y")])
+        r = self.run_op(a=mixed)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("1 rows have a NULL", r.stderr)
+        self.assertIn("1 duplicate", r.stderr)
+
+    def test_a_custom_source_column_missing_from_an_input_is_refused(self) -> None:
+        self.model.write_text(json.dumps({**MODEL, "source_dataset_column_name": "src"}))
+        r = self.run_op()
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("'src'", r.stderr)
+        self.assertIn("'a'", r.stderr)
+        self.assertIn("'b'", r.stderr)
+
+    def test_a_missing_probability_refusal_names_the_model_path(self) -> None:
+        bad = json.loads(json.dumps(MODEL))
+        del bad["comparisons"][0]["comparison_levels"][1]["m_probability"]
+        self.model.write_text(json.dumps(bad))
+        r = self.run_op()
+        self.assertEqual(r.returncode, 2)
+        self.assertIn(str(self.model), r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

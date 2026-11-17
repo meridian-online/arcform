@@ -119,10 +119,22 @@ class ModelProblemsTest(unittest.TestCase):
         out = op.model_problems(m, TWO)
         self.assertTrue(any("'town'" in p for p in out))
 
-    def test_a_model_whose_only_probability_less_level_is_the_null_level_runs(self) -> None:
-        levels = MODEL["comparisons"][0]["comparison_levels"]
-        self.assertNotIn("m_probability", levels[0])
-        self.assertEqual(op.model_problems(MODEL, TWO), [])
+    def test_a_custom_source_dataset_column_must_be_in_every_input(self) -> None:
+        cols = {**COLS, "src": "VARCHAR"}
+        m = model(source_dataset_column_name="src")
+        out = op.model_problems(m, {"a": cols, "b": COLS})
+        self.assertTrue(any("'b'" in p and "'src'" in p for p in out), out)
+        self.assertFalse(any("'a'" in p and "'src'" in p for p in out), out)
+
+    def test_model_problems_name_the_model_path_and_input_problems_do_not(self) -> None:
+        m = copy.deepcopy(MODEL)
+        del m["comparisons"][0]["comparison_levels"][1]["m_probability"]
+        out = op.model_problems(m, TWO, "path/to/model.json")
+        self.assertEqual(len(out), 1)
+        self.assertIn("model path/to/model.json", out[0])
+        cols = {k: v for k, v in COLS.items() if k != "name"}
+        out = op.model_problems(MODEL, {"a": COLS, "b": cols}, "path/to/model.json")
+        self.assertFalse(any("path/to/model.json" in p for p in out), out)
 
     def test_malformed_comparison_shapes_are_refused_not_raised(self) -> None:
         for bad in (
