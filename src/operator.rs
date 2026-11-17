@@ -28,6 +28,9 @@ use crate::engine::StepOutput;
 use crate::error::{Error, Result};
 
 mod ducklake_publish;
+// Only its test reads it: the generated README sections are checked, not built.
+#[cfg(test)]
+mod reference;
 
 /// Assets an operator step reads and produces — merged into the [`crate::asset::AssetGraph`]
 /// exactly as SQL introspection and command `produces`/`depends_on` are.
@@ -404,11 +407,24 @@ struct RoleKey {
     description: &'static str,
 }
 
+/// A project an operator stands on: a stable `id` a page can bind a mark to, the
+/// project's name and address, and one sentence on what the operator uses it for.
+pub(crate) struct Wraps {
+    pub(crate) id: &'static str,
+    pub(crate) name: &'static str,
+    pub(crate) url: &'static str,
+    pub(crate) use_: &'static str,
+}
+
 /// What an operator's description says beyond its `with:` schema: one sentence
-/// saying what it does, and the keys its step reads and writes through.
+/// saying what it does, the projects it stands on (none when arc does the work
+/// itself), an example step as manifest YAML, and the keys its step reads and
+/// writes through.
 struct Described {
     name: &'static str,
     summary: &'static str,
+    wraps: &'static [Wraps],
+    example: &'static str,
     reads: &'static [RoleKey],
     writes: &'static [RoleKey],
 }
@@ -446,6 +462,19 @@ const DESCRIBED: &[Described] = &[
     Described {
         name: "parquet_export",
         summary: "Writes a table of the pipeline's database to a Parquet file.",
+        wraps: &[Wraps {
+            id: "duckdb",
+            name: "DuckDB",
+            url: "https://duckdb.org",
+            use_: "Its `COPY … TO … (FORMAT parquet)` statement writes the file, with the codec, row-group size, order and footer metadata the step sets.",
+        }],
+        example: r#"- name: export
+  op: parquet_export@1
+  with:
+    input: brewery_trend
+    dest: build/brewery_trend.parquet
+    order_by: year, state
+"#,
         reads: &[role(
             "input",
             "table",
@@ -460,6 +489,18 @@ const DESCRIBED: &[Described] = &[
     Described {
         name: "http_fetch",
         summary: "Downloads the file at one HTTP or HTTPS address.",
+        wraps: &[Wraps {
+            id: "ureq",
+            name: "ureq",
+            url: "https://github.com/algesten/ureq",
+            use_: "The HTTP client that makes the request; arc writes the body atomically and, with `sha256` set, checks it against the pin.",
+        }],
+        example: r#"- name: fetch_tickers
+  op: http_fetch@1
+  with:
+    url: https://openlake.meridian.online/sec/company_tickers_exchange.parquet
+    out: raw/company_tickers_exchange.parquet
+"#,
         reads: &[],
         writes: &[role(
             "out",
@@ -470,6 +511,18 @@ const DESCRIBED: &[Described] = &[
     Described {
         name: "opendal_fetch",
         summary: "Copies one object from a storage backend, such as S3 or HTTPS, to a file.",
+        wraps: &[Wraps {
+            id: "opendal",
+            name: "Apache OpenDAL",
+            url: "https://opendal.apache.org",
+            use_: "Reads the object through the storage service its address names, such as S3 or HTTP.",
+        }],
+        example: r#"- name: fetch_breweries
+  op: opendal_fetch@1
+  with:
+    from: s3://example-bucket/raw/breweries.csv
+    to: raw/breweries.csv
+"#,
         reads: &[],
         writes: &[role(
             "to",
@@ -480,6 +533,27 @@ const DESCRIBED: &[Described] = &[
     Described {
         name: "html_link_discover",
         summary: "Fetches an index page and lists the links on it that match a pattern, one address per line.",
+        wraps: &[
+            Wraps {
+                id: "ureq",
+                name: "ureq",
+                url: "https://github.com/algesten/ureq",
+                use_: "The HTTP client that fetches the index page.",
+            },
+            Wraps {
+                id: "regex",
+                name: "regex",
+                url: "https://github.com/rust-lang/regex",
+                use_: "Tests each link on the page against `pattern`.",
+            },
+        ],
+        example: r#"- name: discover
+  op: html_link_discover@1
+  with:
+    url: https://example.org/downloads/
+    pattern: '\.zip$'
+    out: build/zip_urls.txt
+"#,
         reads: &[],
         writes: &[role(
             "out",
@@ -490,6 +564,19 @@ const DESCRIBED: &[Described] = &[
     Described {
         name: "archive_extract",
         summary: "Extracts members of a zip archive into a directory.",
+        wraps: &[Wraps {
+            id: "zip",
+            name: "zip",
+            url: "https://github.com/zip-rs/zip2",
+            use_: "Reads the zip archive and inflates the members the step names or matches.",
+        }],
+        example: r#"- name: unzip
+  op: archive_extract@1
+  with:
+    archive: raw/breweries.zip
+    pattern: '\.csv$'
+    dest: raw/breweries/
+"#,
         reads: &[role(
             "archive",
             "file",
@@ -504,6 +591,19 @@ const DESCRIBED: &[Described] = &[
     Described {
         name: "datapackage_describe",
         summary: "Writes a Data Package descriptor for a Parquet file, its columns typed by FineType and overlaid with curated overrides.",
+        wraps: &[Wraps {
+            id: "finetype",
+            name: "FineType",
+            url: "https://github.com/meridian-online/finetype",
+            use_: "Its `finetype profile` command types each column and writes the base descriptor that the overrides are laid onto.",
+        }],
+        example: r#"- name: describe
+  op: datapackage_describe@1
+  with:
+    parquet: build/breweries.parquet
+    overrides: datapackage.overrides.json
+    out: datapackage.json
+"#,
         reads: &[
             role(
                 "parquet",
@@ -530,6 +630,26 @@ const DESCRIBED: &[Described] = &[
     Described {
         name: "finetype_validate",
         summary: "Checks a Parquet file against a JSON Schema contract with FineType, failing the step on any rejected row.",
+        wraps: &[
+            Wraps {
+                id: "finetype",
+                name: "FineType",
+                url: "https://github.com/meridian-online/finetype",
+                use_: "Its DuckDB extension's `ft_validate` checks every column against the contract, inside arc's own DuckDB.",
+            },
+            Wraps {
+                id: "duckdb",
+                name: "DuckDB",
+                url: "https://duckdb.org",
+                use_: "Runs the extension in-process, so no `finetype` or `duckdb` command is needed.",
+            },
+        ],
+        example: r#"- name: validate
+  op: finetype_validate@1
+  with:
+    parquet: build/breweries.parquet
+    schema: schema.finetype.json
+"#,
         reads: &[
             role("parquet", "file", "The Parquet file to check."),
             role(
@@ -543,6 +663,27 @@ const DESCRIBED: &[Described] = &[
     Described {
         name: "splink_resolve",
         summary: "Matches EDGAR entities to GLEIF entities with Splink and writes the resolved crosswalk.",
+        wraps: &[
+            Wraps {
+                id: "splink",
+                name: "Splink",
+                url: "https://moj-analytical-services.github.io/splink/",
+                use_: "Splink 4's Fellegi-Sunter model scores each EDGAR and GLEIF name pair, with fixed priors so a run is reproducible.",
+            },
+            Wraps {
+                id: "duckdb",
+                name: "DuckDB",
+                url: "https://duckdb.org",
+                use_: "The backend Splink runs its comparisons on.",
+            },
+        ],
+        example: r#"- name: resolve
+  op: splink_resolve@1
+  with:
+    edgar: raw/edgar.parquet
+    gleif: raw/gleif.parquet
+    out: build/edgar_gleif_crosswalk.parquet
+"#,
         reads: &[
             role(
                 "edgar",
@@ -564,6 +705,26 @@ const DESCRIBED: &[Described] = &[
     Described {
         name: "gleif_ra_fetch",
         summary: "Pages through GLEIF's entities for one registration authority and writes them to a CSV file.",
+        wraps: &[
+            Wraps {
+                id: "gleif-api",
+                name: "GLEIF API",
+                url: "https://www.gleif.org/en/lei-data/gleif-api",
+                use_: "The public API whose `lei-records` the step pages through, filtered to one registration authority.",
+            },
+            Wraps {
+                id: "dlt",
+                name: "dlt",
+                url: "https://dlthub.com",
+                use_: "Pages the API and writes the records.",
+            },
+        ],
+        example: r#"- name: fetch_ra
+  op: gleif_ra_fetch@1
+  with:
+    ra: RA000665
+    out: raw/gleif_ra000665.csv
+"#,
         reads: &[],
         writes: &[role(
             "out",
@@ -574,6 +735,29 @@ const DESCRIBED: &[Described] = &[
     Described {
         name: "umap_project",
         summary: "Places each row of a Parquet file on a two-dimensional map with UMAP, from the numeric columns it names.",
+        wraps: &[
+            Wraps {
+                id: "umap-learn",
+                name: "umap-learn",
+                url: "https://umap-learn.readthedocs.io",
+                use_: "Fits the UMAP projection and places each row on the map, keeping the fit so appended rows land in the same layout.",
+            },
+            Wraps {
+                id: "duckdb",
+                name: "DuckDB",
+                url: "https://duckdb.org",
+                use_: "Reads the input Parquet and writes the output.",
+            },
+        ],
+        example: r#"- name: project
+  op: umap_project@1
+  with:
+    input: build/corpus_embedded.parquet
+    columns: [embedding]
+    out: build/corpus_mapped.parquet
+    fit: build/corpus.umap
+    metric: cosine
+"#,
         reads: &[
             role(
                 "input",
@@ -607,6 +791,28 @@ const DESCRIBED: &[Described] = &[
     Described {
         name: "text_embed",
         summary: "Writes a vector for the text in one column of a Parquet file, with a DuckDB embedding extension.",
+        wraps: &[
+            Wraps {
+                id: "subtoken",
+                name: "subtoken",
+                url: "https://github.com/meridian-online/subtoken",
+                use_: "The DuckDB embedding extension whose `subtoken_embed()` returns each vector; it carries the model's weights.",
+            },
+            Wraps {
+                id: "duckdb",
+                name: "DuckDB",
+                url: "https://duckdb.org",
+                use_: "Loads the extension and runs the one statement that embeds the column.",
+            },
+        ],
+        example: r#"- name: embed
+  op: text_embed@1
+  with:
+    input: build/corpus.parquet
+    text_column: description
+    extension: vendor/subtoken.duckdb_extension
+    out: build/corpus_embedded.parquet
+"#,
         reads: &[
             role("input", "file", "The Parquet file holding the corpus."),
             column_of(
@@ -634,6 +840,21 @@ const DESCRIBED: &[Described] = &[
     Described {
         name: "uv",
         summary: "Runs a Python script pinned by its digest with uv.",
+        wraps: &[Wraps {
+            id: "uv",
+            name: "uv",
+            url: "https://docs.astral.sh/uv/",
+            use_: "Runs the script with the pinned requirements it is given, in an environment uv builds and caches.",
+        }],
+        example: r#"- name: summarise
+  op: uv@1
+  with:
+    script: scripts/summarise.py
+    sha256: 9f2c4e8b1a7d3f6e0c5b8a2d4f1e7c9b3a6d0f8e2c5b7a1d4f9e3c6b0a8d2f5e
+    deps: ["polars==1.12.0"]
+    reads: [build/breweries.parquet]
+    produces: [build/summary.parquet]
+"#,
         reads: &[role(
             "reads",
             "any",
@@ -648,6 +869,27 @@ const DESCRIBED: &[Described] = &[
     Described {
         name: "ducklake_publish",
         summary: "Publishes a Parquet file as the rows of a table in a DuckLake catalog, as one snapshot.",
+        wraps: &[
+            Wraps {
+                id: "ducklake",
+                name: "DuckLake",
+                url: "https://ducklake.select",
+                use_: "Registers a copy of the file with `ducklake_add_data_files` and replaces the table's rows in one snapshot.",
+            },
+            Wraps {
+                id: "duckdb",
+                name: "DuckDB",
+                url: "https://duckdb.org",
+                use_: "Attaches the DuckLake catalog through its `ducklake` extension.",
+            },
+        ],
+        example: r#"- name: publish
+  op: ducklake_publish@1
+  with:
+    file: build/breweries.parquet
+    catalog: lake.ducklake
+    table: breweries
+"#,
         reads: &[role(
             "file",
             "file",
@@ -669,10 +911,18 @@ fn described(op_name: &str) -> Option<&'static Described> {
 ///
 /// Its roles are the `with:` keys [`described`] names; `parameters` is the operator's
 /// [`with_schema`] with those keys taken out of `properties` and `required` and
-/// nothing else changed. `arc mcp`'s `operator_describe` returns the schema whole,
+/// nothing else changed. An operator's description adds two keys an operation's
+/// lacks: `wraps`, the projects it stands on, and `example`, a step as manifest
+/// YAML. `arc mcp`'s `operator_describe` returns the schema whole,
 /// the form a `with:` block is written from.
 pub(crate) fn description(op_name: &str) -> Option<serde_json::Value> {
     catalog().into_iter().find(|op| op.name() == op_name)?;
+    description_in_any_build(op_name)
+}
+
+/// [`description`] for any operator [`DESCRIBED`] holds, whether or not this
+/// build's catalog does, so a README is generated alike in every build.
+fn description_in_any_build(op_name: &str) -> Option<serde_json::Value> {
     // Both tables answer for every catalog operator, as the tests below hold them to.
     let (described, schema) = described(op_name).zip(with_schema(op_name))?;
     let roles = |keys: &[RoleKey]| -> Vec<crate::record::Role> {
@@ -695,13 +945,16 @@ pub(crate) fn description(op_name: &str) -> Option<serde_json::Value> {
     if let Some(required) = parameters["required"].as_array_mut() {
         required.retain(|key| !key.as_str().is_some_and(is_role));
     }
-    Some(crate::record::description(
-        op_name,
-        described.summary,
-        &reads,
-        &writes,
-        parameters,
-    ))
+    let mut description =
+        crate::record::description(op_name, described.summary, &reads, &writes, parameters);
+    description["wraps"] = described
+        .wraps
+        .iter()
+        .map(|w| serde_json::json!({ "id": w.id, "name": w.name, "url": w.url, "use": w.use_ }))
+        .collect::<Vec<_>>()
+        .into();
+    description["example"] = described.example.into();
+    Some(description)
 }
 
 /// `key` as a role, its `list`, `required` and `min_items` read from its entry in
@@ -726,6 +979,128 @@ fn resolved_role(key: &RoleKey, schema: &serde_json::Value) -> crate::record::Ro
 mod with_schema_tests {
     use super::*;
 
+    /// Check `with` against the JSON Schema [`with_schema`] gives `op_name`, and say
+    /// each way it falls short, or `None` for a name not in the catalog. It reads the
+    /// keywords the operator schemas use (`type`, `enum`, `properties`, `required`,
+    /// `additionalProperties`, `items`, `minItems`, `minProperties`, `minimum`,
+    /// `exclusiveMaximum`, `pattern`) and no others, and holds each example step to
+    /// its schema.
+    fn check_with(op_name: &str, with: &Json) -> Option<Vec<String>> {
+        let schema = with_schema(op_name)?;
+        let mut faults = Vec::new();
+        check_against(&schema, with, "with", &mut faults);
+        Some(faults)
+    }
+
+    fn check_against(schema: &Json, value: &Json, at: &str, faults: &mut Vec<String>) {
+        let kind = |v: &Json| match v {
+            Json::Null => "null",
+            Json::Bool(_) => "a boolean",
+            Json::Number(n) if n.is_i64() || n.is_u64() => "an integer",
+            Json::Number(_) => "a number",
+            Json::String(_) => "a string",
+            Json::Array(_) => "an array",
+            Json::Object(_) => "an object",
+        };
+        if let Some(ty) = schema.get("type").and_then(Json::as_str) {
+            let fits = match ty {
+                "object" => value.is_object(),
+                "array" => value.is_array(),
+                "string" => value.is_string(),
+                "integer" => value.is_i64() || value.is_u64(),
+                "number" => value.is_number(),
+                "boolean" => value.is_boolean(),
+                _ => true,
+            };
+            if !fits {
+                let article = match ty {
+                    "object" | "array" | "integer" => "an",
+                    _ => "a",
+                };
+                faults.push(format!(
+                    "`{at}` must be {article} {ty}, not {}",
+                    kind(value)
+                ));
+                return;
+            }
+        }
+        if let Some(allowed) = schema.get("enum").and_then(Json::as_array)
+            && !allowed.contains(value)
+        {
+            let held: Vec<String> = allowed.iter().map(Json::to_string).collect();
+            faults.push(format!(
+                "`{at}` is {value}, which is not one of {}",
+                held.join(", ")
+            ));
+        }
+        if let Some(number) = value.as_f64() {
+            if let Some(least) = schema.get("minimum").and_then(Json::as_f64)
+                && number < least
+            {
+                faults.push(format!("`{at}` is {value}, below the least, {least}"));
+            }
+            if let Some(bound) = schema.get("exclusiveMaximum").and_then(Json::as_f64)
+                && number >= bound
+            {
+                faults.push(format!("`{at}` is {value}, which must be below {bound}"));
+            }
+        }
+        if let (Some(text), Some(pattern)) =
+            (value.as_str(), schema.get("pattern").and_then(Json::as_str))
+            && regex::Regex::new(pattern).is_ok_and(|re| !re.is_match(text))
+        {
+            faults.push(format!("`{at}` is {value}, which does not match {pattern}"));
+        }
+        if let Some(items) = value.as_array() {
+            if let Some(least) = schema.get("minItems").and_then(Json::as_u64)
+                && (items.len() as u64) < least
+            {
+                faults.push(format!(
+                    "`{at}` has {} item(s), and needs at least {least}",
+                    items.len()
+                ));
+            }
+            if let Some(item_schema) = schema.get("items") {
+                for (i, item) in items.iter().enumerate() {
+                    check_against(item_schema, item, &format!("{at}[{i}]"), faults);
+                }
+            }
+        }
+        if let Some(map) = value.as_object() {
+            if let Some(least) = schema.get("minProperties").and_then(Json::as_u64)
+                && (map.len() as u64) < least
+            {
+                faults.push(format!(
+                    "`{at}` has {} key(s), and needs at least {least}",
+                    map.len()
+                ));
+            }
+            if let Some(required) = schema.get("required").and_then(Json::as_array) {
+                for key in required.iter().filter_map(Json::as_str) {
+                    if !map.contains_key(key) {
+                        faults.push(format!("`{at}` is missing the required field `{key}`"));
+                    }
+                }
+            }
+            let properties = schema.get("properties").and_then(Json::as_object);
+            for (key, member) in map {
+                let here = format!("{at}.{key}");
+                match properties.and_then(|p| p.get(key)) {
+                    Some(property) => check_against(property, member, &here, faults),
+                    None => match schema.get("additionalProperties") {
+                        Some(Json::Bool(false)) => {
+                            faults.push(format!("`{here}` is not a field this takes"))
+                        }
+                        Some(extra @ Json::Object(_)) => {
+                            check_against(extra, member, &here, faults)
+                        }
+                        _ => {}
+                    },
+                }
+            }
+        }
+    }
+
     #[test]
     fn every_catalog_operator_has_a_with_schema() {
         for name in catalog_names() {
@@ -739,6 +1114,62 @@ mod with_schema_tests {
                 schema["properties"].is_object(),
                 "`{name}` schema must carry `properties`"
             );
+        }
+    }
+
+    #[test]
+    fn every_example_step_loads() {
+        for d in DESCRIBED {
+            let steps: Vec<serde_yaml::Value> = serde_yaml::from_str(d.example)
+                .unwrap_or_else(|e| panic!("`{}`'s example is not YAML: {e}", d.name));
+            assert_eq!(steps.len(), 1, "`{}`'s example holds one step", d.name);
+            let step = &steps[0];
+            let op = step["op"].as_str().expect("the example names its `op`");
+            assert_eq!(
+                op.split('@').next(),
+                Some(d.name),
+                "`{}`'s example runs another operator",
+                d.name
+            );
+            assert!(
+                step["name"].is_string(),
+                "`{}`'s example step has no name",
+                d.name
+            );
+            let with = &step["with"];
+            let as_json = serde_json::to_value(with).expect("YAML a JSON value can hold");
+            let faults = check_with(d.name, &as_json).expect("a schema");
+            assert!(faults.is_empty(), "`{}`'s example: {faults:?}", d.name);
+            if catalog_names().contains(&d.name) {
+                assets_for(op, Some(with))
+                    .unwrap_or_else(|e| panic!("`{}`'s example does not load: {e}", d.name));
+            }
+        }
+    }
+
+    #[test]
+    fn every_wrapped_project_is_named_and_linked() {
+        for d in DESCRIBED {
+            for w in d.wraps {
+                assert!(
+                    !w.id.is_empty() && w.id.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
+                    "`{}`: `{}` is not a kebab-case id",
+                    d.name,
+                    w.id
+                );
+                assert!(
+                    w.url.starts_with("https://"),
+                    "`{}`: {} has no https address",
+                    d.name,
+                    w.id
+                );
+                assert!(
+                    !w.name.is_empty() && w.use_.ends_with('.'),
+                    "`{}`: {} needs a name and one sentence",
+                    d.name,
+                    w.id
+                );
+            }
         }
     }
 

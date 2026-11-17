@@ -98,7 +98,7 @@ const EXPORTED: [(&str, &str); 35] = [
 
 /// Every module file in the crate. Frozen so a new one cannot be added without
 /// passing under the checks below.
-const MODULE_FILES: [&str; 35] = [
+const MODULE_FILES: [&str; 36] = [
     "asset.rs",
     "asset_kind.rs",
     "bridge.rs",
@@ -132,6 +132,9 @@ const MODULE_FILES: [&str; 35] = [
     // `ducklake_publish`, split out of `operator.rs` because it is a module's worth of
     // code on its own. Private to the crate like every operator: it exports nothing.
     "operator/ducklake_publish.rs",
+    // The generated Reference section of each operator's README, and the test that
+    // holds the READMEs to it. Compiled only for tests; it exports nothing.
+    "operator/reference.rs",
     "precondition.rs",
     "record.rs",
     "registry/cache.rs",
