@@ -930,6 +930,7 @@ mod tests {
                 key: Vec::new(),
                 descriptor,
                 replace_on_schema_change: false,
+                on_descriptor_change: Default::default(),
             }],
             &json!({"run": "r1"}),
         )

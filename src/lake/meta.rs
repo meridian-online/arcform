@@ -3,6 +3,7 @@
 
 use std::collections::BTreeSet;
 
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::error::{Error, Result};
@@ -41,6 +42,222 @@ pub(super) fn failed(msg: impl std::fmt::Display) -> Error {
         code: 1,
         stderr: format!("ducklake_write: {msg}"),
     }
+}
+
+/// The key finetype records its confidence in a field's label under. It moves on
+/// every re-inference without the label moving, so a descriptor diff ignores it.
+const CONFIDENCE_KEY: &str = "x-finetype-confidence";
+const LABEL_KEY: &str = "x-finetype-label";
+const NOMINATED_KEY: &str = "x-finetype-nominated";
+
+/// One value that differs between a table's stored descriptor and the one being
+/// published: at `pointer`, a JSON Pointer into the new descriptor (into the stored
+/// one for a field it no longer has), `old` became `new`. `None` is a value absent
+/// on that side. Within a field, `field` names it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DescriptorChange {
+    pub pointer: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new: Option<Value>,
+}
+
+impl DescriptorChange {
+    /// `<pointer> (field '<name>'): <old> -> <new>`, `(absent)` for a missing side.
+    pub fn describe(&self) -> String {
+        let value = |v: &Option<Value>| {
+            v.as_ref()
+                .map_or_else(|| "(absent)".to_string(), Value::to_string)
+        };
+        let field = self
+            .field
+            .as_deref()
+            .map_or_else(String::new, |f| format!(" (field '{f}')"));
+        format!(
+            "{}{field}: {} -> {}",
+            self.pointer,
+            value(&self.old),
+            value(&self.new)
+        )
+    }
+}
+
+/// A field's FineType label that moved without the new field being nominated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelMove {
+    pub field: String,
+    pub old: Option<String>,
+    pub new: Option<String>,
+}
+
+/// The descriptor less what a republish of the same data changes anyway: the
+/// package's `created`, each resource's `bytes` and `hash`, and each field's
+/// FineType confidence.
+fn comparable(descriptor: &Value) -> Value {
+    let mut d = descriptor.clone();
+    if let Some(o) = d.as_object_mut() {
+        o.remove("created");
+    }
+    if let Some(resources) = d.get_mut("resources").and_then(Value::as_array_mut) {
+        for r in resources {
+            if let Some(o) = r.as_object_mut() {
+                o.remove("bytes");
+                o.remove("hash");
+            }
+            if let Some(fields) = r
+                .pointer_mut("/schema/fields")
+                .and_then(Value::as_array_mut)
+            {
+                for f in fields.iter_mut().filter_map(Value::as_object_mut) {
+                    f.remove(CONFIDENCE_KEY);
+                }
+            }
+        }
+    }
+    d
+}
+
+/// One JSON Pointer reference token.
+fn pointer_token(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+/// Whether `pointer` names a resource's `schema.fields` array.
+fn is_fields(pointer: &str) -> bool {
+    pointer
+        .strip_prefix("/resources/")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(i, rest)| i.parse::<usize>().is_ok() && rest == "schema/fields")
+}
+
+/// Each element's `name`, when every element is an object with a string name.
+fn names(fields: &[Value]) -> Option<Vec<&str>> {
+    fields
+        .iter()
+        .map(|f| f.get("name").and_then(Value::as_str))
+        .collect()
+}
+
+fn diff(
+    pointer: &str,
+    field: Option<&str>,
+    old: Option<&Value>,
+    new: Option<&Value>,
+    out: &mut Vec<DescriptorChange>,
+) {
+    let push = |out: &mut Vec<DescriptorChange>, pointer: &str, field: Option<&str>, old, new| {
+        out.push(DescriptorChange {
+            pointer: pointer.to_string(),
+            field: field.map(String::from),
+            old,
+            new,
+        })
+    };
+    match (old, new) {
+        (Some(Value::Object(a)), Some(Value::Object(b))) => {
+            let keys: BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+            for k in keys {
+                diff(
+                    &format!("{pointer}/{}", pointer_token(k)),
+                    field,
+                    a.get(k),
+                    b.get(k),
+                    out,
+                );
+            }
+        }
+        (Some(Value::Array(a)), Some(Value::Array(b))) => {
+            // Fields are matched by name, so a column added or removed mid-schema is
+            // one change rather than a shift of every field after it.
+            if let (true, Some(old_names), Some(new_names)) =
+                (is_fields(pointer), names(a), names(b))
+            {
+                for (j, name) in new_names.iter().enumerate() {
+                    let at = format!("{pointer}/{j}");
+                    match old_names.iter().position(|n| n == name) {
+                        Some(i) => diff(&at, Some(name), Some(&a[i]), Some(&b[j]), out),
+                        None => push(out, &at, Some(name), None, Some(b[j].clone())),
+                    }
+                }
+                for (i, name) in old_names.iter().enumerate() {
+                    if !new_names.contains(name) {
+                        push(
+                            out,
+                            &format!("{pointer}/{i}"),
+                            Some(name),
+                            Some(a[i].clone()),
+                            None,
+                        );
+                    }
+                }
+                return;
+            }
+            for i in 0..a.len().max(b.len()) {
+                diff(&format!("{pointer}/{i}"), field, a.get(i), b.get(i), out);
+            }
+        }
+        (old, new) if old != new => push(out, pointer, field, old.cloned(), new.cloned()),
+        _ => {}
+    }
+}
+
+/// Every value that differs between a table's `stored` descriptor and its `new`
+/// one, in key order within each object and index order within each array, except
+/// that a resource's fields are matched by name: a field on one side only is one
+/// change, the whole field, and a field on both is compared key by key. It
+/// ignores the package's `created`, the resources' `bytes` and `hash` and each
+/// field's `x-finetype-confidence`.
+pub fn descriptor_changes(stored: &Value, new: &Value) -> Vec<DescriptorChange> {
+    let mut out = Vec::new();
+    diff(
+        "",
+        None,
+        Some(&comparable(stored)),
+        Some(&comparable(new)),
+        &mut out,
+    );
+    out
+}
+
+// `table_descriptor` admits exactly one resource, so its fields are the table's.
+fn fields_by_name(descriptor: &Value) -> Vec<(&str, &serde_json::Map<String, Value>)> {
+    descriptor
+        .pointer("/resources/0/schema/fields")
+        .and_then(Value::as_array)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(Value::as_object)
+                .filter_map(|f| Some((f.get("name")?.as_str()?, f)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The fields in both descriptors whose `x-finetype-label` differs while the new
+/// field is not marked `"x-finetype-nominated": true`: inference that drifted,
+/// rather than a label someone chose.
+pub fn unnominated_label_moves(stored: &Value, new: &Value) -> Vec<LabelMove> {
+    let label = |f: &serde_json::Map<String, Value>| {
+        f.get(LABEL_KEY).and_then(Value::as_str).map(String::from)
+    };
+    let before = fields_by_name(stored);
+    fields_by_name(new)
+        .into_iter()
+        .filter_map(|(name, f)| {
+            let (_, old) = before.iter().find(|(n, _)| *n == name)?;
+            let (old, new) = (label(old), label(f));
+            let nominated = f.get(NOMINATED_KEY) == Some(&Value::Bool(true));
+            (old != new && !nominated).then(|| LabelMove {
+                field: name.to_string(),
+                old,
+                new,
+            })
+        })
+        .collect()
 }
 
 /// Reads `datapackage`'s single resource into the rows `meta` holds for `table_name`,

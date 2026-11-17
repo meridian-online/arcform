@@ -35,7 +35,7 @@ use super::{OpAssets, OpContext, Operator, sql_string_literal};
 use crate::asset_kind::AssetKind;
 use crate::engine::StepOutput;
 use crate::error::{Error, Result};
-use crate::lake::commit::{CommitOutcome, TableChange, TableInput};
+use crate::lake::commit::{CommitOutcome, OnDescriptorChange, TableChange, TableInput};
 use crate::lake::manifest::{ManifestEntry, update_manifest};
 use crate::lake::meta::{META_SCHEMA, table_descriptor};
 use crate::lake::publish::{
@@ -96,6 +96,8 @@ struct TableConfig {
     readable_copy: Option<String>,
     #[serde(default)]
     on_schema_change: OnSchemaChange,
+    #[serde(default)]
+    on_descriptor_change: OnDescriptorChange,
     /// Further keys for the table's entry in the compatible manifest.
     #[serde(default)]
     manifest_extra: serde_json::Map<String, serde_json::Value>,
@@ -589,6 +591,7 @@ fn prepare(dir: &Path, t: &TableConfig) -> Result<Prepared> {
             descriptor,
             key,
             replace_on_schema_change: t.on_schema_change == OnSchemaChange::Replace,
+            on_descriptor_change: t.on_descriptor_change,
         },
         rows,
     })
@@ -1068,6 +1071,11 @@ impl Operator for DucklakeWrite {
                 report.target, report.snapshot_id
             );
         }
+        for t in &report.tables {
+            for c in &t.descriptor_changes {
+                eprintln!("{NAME}: {} descriptor {}", t.table, c.describe());
+            }
+        }
         Ok(StepOutput {
             stderr: String::new(),
             stdout: None,
@@ -1171,6 +1179,27 @@ credential:
         assert!(refusal(&s3).contains("credential.env.endpoint"));
         let s3 = s3.replace("account_id: A", "endpoint: E, region: R");
         assert!(DucklakeWriteConfig::parse(&with(&s3)).is_ok());
+    }
+
+    #[test]
+    fn on_descriptor_change_defaults_to_report_and_takes_fail() {
+        let cfg = DucklakeWriteConfig::parse(&with(BASE)).unwrap();
+        assert_eq!(
+            cfg.tables[0].on_descriptor_change,
+            OnDescriptorChange::Report
+        );
+        let set = |value: &str| {
+            BASE.replace(
+                "    readable_copy: demo/codes.parquet\n",
+                &format!(
+                    "    readable_copy: demo/codes.parquet\n    on_descriptor_change: {value}\n"
+                ),
+            )
+        };
+        let cfg = DucklakeWriteConfig::parse(&with(&set("fail"))).unwrap();
+        assert_eq!(cfg.tables[0].on_descriptor_change, OnDescriptorChange::Fail);
+        let e = refusal(&set("ignore"));
+        assert!(e.contains("ignore") && e.contains("report"), "{e}");
     }
 
     #[test]
