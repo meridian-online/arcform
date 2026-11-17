@@ -2791,6 +2791,24 @@ mod tests {
     }
 
     #[test]
+    fn settle_waits_a_moment_for_a_held_pipe_and_no_longer() {
+        // `sleep` holds the pipe open after `sh` exits, so the reader is not done.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 3 >/dev/null &")
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let tail = StderrTail::start(&mut child);
+        child.wait().unwrap();
+        let started = Instant::now();
+        tail.settle();
+        let waited = started.elapsed();
+        assert!(waited >= STDERR_SETTLE, "{waited:?}");
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+    }
+
+    #[test]
     fn the_tail_is_the_last_lines_with_text_and_drops_a_cut_first_line() {
         assert_eq!(last_lines(b"a\n\n b  \nc\n", false, 2), " b\nc");
         assert_eq!(last_lines(b"rtial\nwhole\n", true, 5), "whole");
