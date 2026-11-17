@@ -19,7 +19,7 @@
 - Refusals before Splink starts, each naming what it found: a level other than the null level without both `m_probability` and `u_probability`; `link_type` `dedupe_only` with other than one input, or `link_only`/`link_and_dedupe` with fewer than two; an input missing `unique_id_column_name` or a column a comparison level, blocking rule or `additional_columns_to_retain` names; a role given twice.
 - Public repos (arcform, open-analytics, methods): no Kata refs, private repo names or local paths in branch names, commits, PR text or tracked files.
 - REVIEW.md line, verbatim, under "Meridian-specific — check on each review": `- **An operator is not one source:** a change that adds or extends an operator whose inputs are named for one source, or whose script holds one dataset's columns, endpoints, paging or model, is a finding at Medium or above: an operator takes those from the Protocol's \`with:\`.`
-- One cargo build at a time; build with `DUCKDB_LIB_DIR=/Volumes/Dev/duckdb-2.0.0` and test with `DYLD_LIBRARY_PATH` set to the same.
+- One cargo build at a time; build and test against DuckDB's v2.0.0 release library, as CLAUDE.md's Known issues describe.
 
 ## Review Focus
 
@@ -90,13 +90,13 @@
 - Delete: `docs/superpowers/specs/2026-11-18-splink-operator-design.md` and this plan, once Tasks 1–5 are done.
 
 - [ ] **Step 1: Make the edits.**
-- [ ] **Step 2: Run `diff REVIEW.md ~/github/meridian-online/methods-<task5-worktree>/REVIEW.md`.** Expected: no output.
+- [ ] **Step 2: Diff `REVIEW.md` against methods' branch copy from Task 5.** Expected: no difference.
 - [ ] **Step 3: Commit.** `Refuse an operator written for one source in review, and document splink@1`
 
 ### Task 4: The crosswalk on splink@1 (open-analytics)
 
 **Files** (in a worktree of open-analytics on a new branch from `origin/main`):
-- Create: `datasets/edgar_gleif/models/splink_inputs.sql`. It builds tables `edgar_in` and `gleif_in` with `splink_resolve` 1.0.0's `NORM_SQL` and `blocking_select()` output columns (`uid`, `nname`, `country`, `blk_p6`, `blk_p8`, `blk_tok`, `blk_exact`), plus `edgar_src` and `gleif_src` with the columns its `edges` query joins back to. Each is copied to `build/edgar_in.parquet` and `build/gleif_in.parquet`. Translate the SQL from `operators/splink_resolve/resolve.py` at arcform `origin/main` exactly, the `uid` numbering included.
+- Create: `datasets/edgar_gleif/models/splink_inputs.sql`. It builds tables `edgar_in` and `gleif_in` with `splink_resolve` 1.0.0's `NORM_SQL` and `blocking_select()` output columns (`uid`, `nname`, `country`, `blk_p6`, `blk_p8`, `blk_tok`, `blk_exact`), plus `edgar_src` and `gleif_src` with the columns its `edges` query joins back to. Each is copied to `build/edgar_in.parquet` and `build/gleif_in.parquet`. Translate the SQL from `operators/splink_resolve/resolve.py` at arcform `origin/main` exactly, except that EDGAR's `uid` is numbered in a fixed order (`ORDER BY cik, ticker, company_name`), since `row_number() OVER ()` is not deterministic and `uid` never reaches the published file.
 - Create: `datasets/edgar_gleif/models/edgar_gleif_model.json`, today's model as Splink settings JSON:
   - `link_type: link_only`, `unique_id_column_name: uid`, `probability_two_random_records_match: 0.01`.
   - The four blocking rules as `block_on` SQL.
@@ -114,7 +114,7 @@
 
 ### Task 5: The review rule in every repo
 
-**Files:** `REVIEW.md` in methods (canonical, first), then a byte copy in each of bearing, brightfield, design, dovetail, finetype, homebrew-tap, infra, install, landscape, subtoken and web. arcform's and open-analytics' copies ride in Tasks 3 and 4.
+**Files:** `REVIEW.md` in methods (canonical, first), then a byte copy in every other meridian-online repo that carries one, as `tools/review-drift` in methods lists them. arcform's and open-analytics' copies ride in Tasks 3 and 4.
 
 - [ ] **Step 1: In a methods worktree, add the Global Constraints line, run `tools/review-drift`'s own tests (`python3 tools/test_review_drift.py`), commit, push, and open the PR.**
 - [ ] **Step 2: For each repo listed:** in a worktree from its `origin/main`, copy methods' new REVIEW.md over its own, check `shasum` matches methods', then commit, push and open a PR titled `Review: an operator is not one source`.

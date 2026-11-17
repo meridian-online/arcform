@@ -61,7 +61,7 @@ REVIEW.md states that every Meridian code repo carries it byte for byte, so this
 
 ## Review of splink_resolve against Splink's guidance
 
-Read against Splink's documentation at `~/github/moj-analytical-services/splink` (Splink 5.0.0, November 2026). Splink's topic guides say almost nothing about organisation names. The nearest guidance is its business-rates demo (`docs/demos/examples/duckdb_no_test/business_rates_match.nb.py`), which matches company names from Companies House.
+Read against Splink's documentation as of Splink 5.0.0 (November 2026). Splink's topic guides say almost nothing about organisation names. The nearest guidance is its business-rates demo (`docs/demos/examples/duckdb_no_test/business_rates_match.nb.py`), which matches company names from Companies House.
 
 Every number below comes from resolving the full published inputs: 10,404 EDGAR ticker-rows against 3,273,734 GLEIF rows. 1.0.0 confirms 4,914 rows, and a name key revised along these findings confirms 5,791. The revised key is kept on branch `wip/splink-name-key-evidence`, with a test for each case.
 
