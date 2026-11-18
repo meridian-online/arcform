@@ -49,6 +49,8 @@ class Api:
         self.fail_times = fail_times  # None: fail every time
         self.with_total = with_total
         self.requests: list[tuple[float, str]] = []
+        self.redirects = 0
+        self.redirect_body = b""
         self.lock = threading.Lock()
 
     def respond(self, query: str) -> tuple[int, dict | None]:
@@ -74,7 +76,20 @@ class Api:
 def serve(api: Api):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
-            status, body = api.respond(urlsplit(self.path).query)
+            parts = urlsplit(self.path)
+            if parts.path.startswith("/moved/"):
+                # A redirect to the real first page, its body set by the test: JSON that
+                # looks like a page with the wrong total, or not JSON at all.
+                api.redirects += 1
+                payload = api.redirect_body
+                self.send_response(302)
+                self.send_header("Location", f"/{parts.path[len('/moved/'):]}?{parts.query}")
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            status, body = api.respond(parts.query)
             payload = json.dumps(body).encode() if body is not None else b'{"error":"boom"}'
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -224,6 +239,26 @@ class RestFetchE2E(unittest.TestCase):
         self.assertEqual(len(gaps), 2)
         for gap in gaps:
             self.assertGreaterEqual(gap, 0.3)
+
+    def test_a_redirected_first_request_is_followed_and_judged_by_its_target(self) -> None:
+        # requests runs response hooks on a 3xx before following it; the hook must leave
+        # the redirect alone and read the total from the page the redirect leads to.
+        api = self.three_pages()
+        api.redirect_body = json.dumps({"data": [], "meta": {"pagination": {"total": 999}}}).encode()
+        r = self.run_op(self.source(api, path="moved/items"),
+                        "--expect-total-path", "meta.pagination.total")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(api.redirects, 1)
+        self.assertEqual(unquote(api.requests[0][1]), FIRST_QUERY)
+        expected = b"".join(line + b"\n" for line in sorted(canonical(rec) for rec in RECORDS))
+        self.assertEqual(self.out.read_bytes(), expected)
+
+    def test_a_redirect_whose_body_is_not_json_is_followed(self) -> None:
+        api = self.three_pages()
+        api.redirect_body = b"<html>Moved</html>"
+        r = self.run_op(self.source(api, path="moved/items"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.out.read_bytes().splitlines()), 5)
 
     def test_a_refused_source_sends_no_request(self) -> None:
         api = self.three_pages()

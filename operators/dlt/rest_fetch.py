@@ -182,8 +182,10 @@ def fetch(source: dict, expect_total_path: str | None, page_delay_seconds: float
 
     def on_response(response, *args, **kwargs):
         # A requests response hook: runs on every attempt, before dlt's fallback
-        # raise_for_status, so an error response is left for that to raise.
-        if not response.ok:
+        # raise_for_status, so an error response is left for that to raise. requests
+        # also runs it on a 3xx before following it (`ok` is true below 400), so a
+        # redirect is left alone too and the page it leads to is judged instead.
+        if not response.ok or response.is_redirect:
             return response
         body = response.json()
         if selector and not jsonpath.find_values(selector, body):
