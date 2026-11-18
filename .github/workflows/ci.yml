@@ -72,6 +72,11 @@ jobs:
       # starts, are tested here with the standard library alone.
       - name: splink tests
         run: python3 operators/splink/test_splink.py
+      # rest_fetch.py, the dlt operator's script, likewise imports dlt inside `fetch()`,
+      # so its refusals and its canonical, atomic write are tested here with the
+      # standard library alone.
+      - name: dlt tests
+        run: python3 operators/dlt/test_rest_fetch.py
       # The checkers' own regression test runs FIRST, for the same reason the mutation
       # gate's self-test does: a checker is green over working prose and green over
       # broken prose, and the two runs look identical. Both defects it drives were
@@ -344,6 +349,14 @@ jobs:
       # predictions come out sorted and byte-identical across two runs.
       - name: splink end to end
         run: uv run operators/splink/test_splink_e2e.py
+
+      # `dlt@1` end to end: the script pages a local three-page API through dlt under
+      # `uv`, which the `operators` job has none of. It pins what the stdlib suite cannot
+      # reach: that bracketed query keys reach the request unchanged, that following
+      # `links.next` does not re-add the first request's parameters, and that a short or
+      # failed fetch leaves an earlier file as it was.
+      - name: dlt end to end
+        run: uv run operators/dlt/test_rest_fetch_e2e.py
 
       # The same operator driven through `arc run`: the script is materialised into the
       # temp directory and run by `uv`, which is where a script named for its package

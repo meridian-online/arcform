@@ -151,6 +151,7 @@ static DATAPACKAGE_DESCRIBE: DatapackageDescribe = DatapackageDescribe;
 static FINETYPE_VALIDATE: FinetypeValidate = FinetypeValidate;
 static SPLINK: Splink = Splink;
 static GLEIF_RA_FETCH: GleifRaFetch = GleifRaFetch;
+static DLT: Dlt = Dlt;
 static UMAP_PROJECT: UmapProject = UmapProject;
 static TEXT_EMBED: TextEmbed = TextEmbed;
 static UV: Uv = Uv;
@@ -175,6 +176,7 @@ fn catalog() -> Vec<&'static dyn Operator> {
         &FINETYPE_VALIDATE,
         &SPLINK,
         &GLEIF_RA_FETCH,
+        &DLT,
         &UMAP_PROJECT,
         &TEXT_EMBED,
         &UV,
@@ -387,6 +389,24 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
                 "user_agent": { "type": "string", "default": "Meridian Protocol (open-analytics; research@meridian.online)", "description": "User-Agent request header." }
             }),
             &["ra", "out"],
+        ),
+        "dlt" => object(
+            json!({
+                "source": { "type": "object", "description": "dlt's own `rest_api` source configuration, as dlt's documentation describes it: the client's base URL, headers and paginator, and exactly one resource with its endpoint, query parameters and data selector. Passed to dlt as JSON, so a bracketed query key stays as written and an integer stays an integer. Refused, before any request: no `client.base_url`; other than one resource; a key named `incremental`, `auth` or `processing_steps` anywhere except inside a request's own `params`, `headers`, `json` or `data`, where such a name is the API's business; a parameter of `type: resolve` or `type: incremental`; a `write_disposition` other than `replace`." },
+                "expect_total": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "description": "Optional guard against a fetch that stops early. `path` is a dotted path into the first response's JSON body where the API reports its record count; the fetch is refused, and nothing written, when it returns fewer records than that count minus `tolerance` (an integer, 0 or more, default 0).",
+                    "properties": {
+                        "path": { "type": "string", "description": "Dotted path into the first response's JSON body to the record count." },
+                        "tolerance": { "type": "integer", "minimum": 0, "default": 0, "description": "How many records short of the count a fetch may come." }
+                    },
+                    "required": ["path"]
+                },
+                "page_delay_seconds": { "type": "number", "minimum": 0, "default": 0.0, "description": "Seconds to pause before each request after the first, for an API that throttles. dlt retries failed requests but has no pacing of its own." },
+                "out": { "type": "string", "description": "The JSON Lines file the records are written to, relative to the protocol directory." }
+            }),
+            &["source", "out"],
         ),
         "umap_project" => object(
             json!({
@@ -1027,6 +1047,44 @@ const DESCRIBED: &[Described] = &[
         )],
     },
     Described {
+        name: "dlt",
+        summary: "Pages one resource of a REST API with dlt and writes its records to a sorted JSON Lines file.",
+        wraps: &[Wraps {
+            id: "dlt",
+            name: "dlt",
+            url: "https://dlthub.com",
+            use_: "Pages a REST API from a `rest_api` source configuration and yields its records.",
+        }],
+        example: r#"- name: fetch_gleif_sec_registrations
+  op: dlt@1
+  with:
+    source:                                  # dlt's rest_api configuration
+      client:
+        base_url: https://api.gleif.org/api/v1/
+        headers:
+          User-Agent: "Meridian Protocol (open-analytics; research@meridian.online)"
+        paginator: { type: json_link, next_url_path: links.next }
+      resources:
+        - name: lei_records
+          endpoint:
+            path: lei-records
+            data_selector: data
+            params:
+              "filter[entity.registeredAt]": RA000665
+              "page[size]": 200
+              "page[cursor]": "*"
+    expect_total: { path: meta.pagination.total, tolerance: 200 }   # optional
+    page_delay_seconds: 0.3                                          # optional, default 0
+    out: build/gleif_ra_sec.jsonl
+"#,
+        reads: &[],
+        writes: &[role(
+            "out",
+            "file",
+            "The JSON Lines file the records are written to, relative to the protocol directory, replaced only by a fetch that succeeds in full.",
+        )],
+    },
+    Described {
         name: "umap_project",
         summary: "Places each row of a Parquet file on a two-dimensional map with UMAP, from the numeric columns it names.",
         wraps: &[
@@ -1627,6 +1685,7 @@ mod with_schema_tests {
             "finetype_validate" => configuration_fields::<FinetypeValidateConfig>(),
             "splink" => configuration_fields::<SplinkConfig>(),
             "gleif_ra_fetch" => configuration_fields::<GleifRaFetchConfig>(),
+            "dlt" => configuration_fields::<DltConfig>(),
             "umap_project" => configuration_fields::<UmapProjectConfig>(),
             "text_embed" => configuration_fields::<TextEmbedConfig>(),
             "uv" => configuration_fields::<UvConfig>(),
@@ -2479,7 +2538,13 @@ mod with_schema_tests {
     }
 
     /// The operators that run a frozen Python script.
-    const SCRIPT_OPERATORS: [&str; 4] = ["splink", "gleif_ra_fetch", "umap_project", "text_embed"];
+    const SCRIPT_OPERATORS: [&str; 5] = [
+        "splink",
+        "gleif_ra_fetch",
+        "dlt",
+        "umap_project",
+        "text_embed",
+    ];
 
     /// Options a frozen script declares that no `with:` key reaches, each with the
     /// reason arc never passes it. Every run through arc takes the script's default for
@@ -2501,6 +2566,7 @@ mod with_schema_tests {
                 splink_invocation(&cfg, dir)
             }
             "gleif_ra_fetch" => gleif_ra_fetch_invocation(&GleifRaFetchConfig::parse(with)?, dir),
+            "dlt" => dlt_invocation(&DltConfig::parse(with)?, dir),
             "umap_project" => {
                 let cfg = UmapProjectConfig::parse(with)?;
                 cfg.validate()?;
@@ -2775,10 +2841,57 @@ mod with_schema_tests {
         manifests
     }
 
+    /// A key a frozen script's options are read against.
+    struct ScriptKey<'s> {
+        /// The key, dotted when it is inside an object (`expect_total.path`).
+        name: String,
+        schema: &'s Json,
+        /// Whether the object holding it requires it.
+        required_here: bool,
+        /// Whether every step's `with:` holds it: required at every level.
+        required: bool,
+    }
+
+    /// The keys a frozen script's options are read against: each top-level key, and in
+    /// place of a key whose value is an object of named keys (`dlt`'s `expect_total`,
+    /// which reaches the script as one option per key), each of its keys, dotted.
+    fn script_keys(schema: &Json) -> Vec<ScriptKey<'_>> {
+        let top = required(schema);
+        let mut keys = Vec::new();
+        for (key, prop) in properties(schema) {
+            if prop.get("properties").is_some() {
+                let inner = required(prop);
+                for (k, p) in properties(prop) {
+                    keys.push(ScriptKey {
+                        name: joined(key, k),
+                        schema: p,
+                        required_here: inner.contains(k),
+                        required: top.contains(key) && inner.contains(k),
+                    });
+                }
+            } else {
+                keys.push(ScriptKey {
+                    name: key.clone(),
+                    schema: prop,
+                    required_here: top.contains(key),
+                    required: top.contains(key),
+                });
+            }
+        }
+        keys
+    }
+
+    /// The value at a dotted key of `with`, if `with` holds it.
+    fn value_at_key<'w>(with: &'w Json, key: &str) -> Option<&'w Json> {
+        with.pointer(&format!("/{}", key.replace('.', "/")))
+    }
+
     /// Which option each schema key reaches in `call`, the step built from `full`, by
-    /// option: the one whose values carry the key's probe value. A key is found by the
-    /// value it carries, so a flag that carries none would need this extended; no key
-    /// reaches one. The faults name each key that cannot be found.
+    /// option: the one whose values carry the key's probe value, or, for an object
+    /// passed whole, the one whose single value is that object as JSON (`dlt`'s
+    /// `source` as `--source-json`). A key is found by the value it carries, so a flag
+    /// that carries none would need this extended; no key reaches one. The faults name
+    /// each key that cannot be found.
     fn options_keys_reach(
         schema: &Json,
         full: &Json,
@@ -2787,32 +2900,34 @@ mod with_schema_tests {
         let mut key_of = BTreeMap::new();
         let mut faults = Vec::new();
         let mut seen = BTreeSet::new();
-        for (key, _) in properties(schema) {
+        for ScriptKey { name: key, .. } in script_keys(schema) {
             // A key the manifest leaves out (one of `x-at-most-one-of`'s others) reaches
             // nothing in this call; another call carries it.
-            if full.get(key.as_str()).is_none() {
+            let Some(value) = value_at_key(full, &key) else {
                 continue;
-            }
-            let values = rendered(&full[key]);
+            };
+            let values = rendered(value);
             if values.is_empty() || !values.iter().all(|v| seen.insert(v.clone())) {
                 faults.push(format!(
-                    "`{key}`'s probe value {} cannot be told apart in the argv",
-                    full[key]
+                    "`{key}`'s probe value {value} cannot be told apart in the argv"
                 ));
                 continue;
             }
-            let reached = call
-                .passed
-                .iter()
-                .find(|(_, given)| values.iter().all(|v| given.iter().any(|a| carries(a, v))));
+            let as_json = |given: &[String]| {
+                value.is_object()
+                    && matches!(given, [one] if serde_json::from_str::<Json>(one).ok().as_ref() == Some(value))
+            };
+            let reached = call.passed.iter().find(|(_, given)| {
+                values.iter().all(|v| given.iter().any(|a| carries(a, v))) || as_json(given)
+            });
             match reached {
                 Some((option, _)) => {
                     key_of.insert(option.clone(), key.clone());
                 }
                 None => faults.push(format!(
                     "the schema's `{key}` reaches the script as no option — a manifest setting it \
-                     to {} passes {:?}",
-                    full[key], call.passed
+                     to {value} passes {:?}",
+                    call.passed
                 )),
             }
         }
@@ -2952,7 +3067,7 @@ ap.add_argument(
         for op in SCRIPT_OPERATORS {
             assert!(catalogue.contains(&op), "`{op}` is not in the catalogue");
             let schema = with_schema(op).expect("every catalogue operator has a schema");
-            let schema_required = required(&schema);
+            let keys = script_keys(&schema);
             let manifests = manifests_covering_every_key(&schema);
             let mut passed: BTreeMap<String, Vec<String>> = BTreeMap::new();
             let mut key_of = BTreeMap::new();
@@ -3005,12 +3120,16 @@ ap.add_argument(
                 let Some(key) = key_of.get(flag.as_str()) else {
                     continue;
                 };
-                if option.required && !schema_required.contains(key) {
+                let key = keys
+                    .iter()
+                    .find(|k| k.name == *key)
+                    .expect("an option is reached from a script key");
+                let (prop, key) = (key.schema, &key.name);
+                if option.required && !keys.iter().any(|k| k.name == *key && k.required) {
                     faults.push(format!(
                         "{op}: the script marks {flag} required=True, but the schema does not require `{key}`"
                     ));
                 }
-                let prop = &schema["properties"][key];
                 let schema_type = (prop["type"].as_str(), prop["items"]["type"].as_str());
                 match argparse_schema_type(option) {
                     Ok((t, items)) if (Some(t), items) == schema_type => {}
@@ -3018,6 +3137,9 @@ ap.add_argument(
                     // (`inputs`' role and path as `--input ROLE=PATH`).
                     Ok(("array", Some("string")))
                         if schema_type == (Some("array"), Some("object")) => {}
+                    // An object of no named keys reaches the script whole, as one JSON
+                    // string (`dlt`'s `source` as `--source-json`).
+                    Ok(("string", None)) if schema_type == (Some("object"), None) => {}
                     Ok((t, items)) => faults.push(format!(
                         "{op}: the script reads {flag} as {t}{}, but the schema types `{key}` as {}{}",
                         items.map(|i| format!(" of {i}")).unwrap_or_default(),
@@ -3104,7 +3226,9 @@ ap.add_argument("--nowhere", default=NOWHERE)
     /// for that option, read from the script the argv names and through a module-level
     /// name when the `default=` gives one. Every optional key is left out at once, from
     /// a manifest of the required keys. A required key is always set, so a `default`
-    /// stated for one is a fault as well.
+    /// stated for one is a fault as well. A key inside an object of named keys
+    /// (`expect_total.tolerance`) has its default read with that object set to its own
+    /// required keys, since the default is the one a step setting the object takes.
     #[test]
     fn every_default_a_frozen_script_takes_is_the_default_its_schema_states() {
         let mut faults = Vec::new();
@@ -3116,8 +3240,24 @@ ap.add_argument("--nowhere", default=NOWHERE)
                 .as_object()
                 .expect("a probe of a schema object is an object")
                 .iter()
-                .filter(|(key, _)| schema_required.contains(*key))
-                .map(|(key, value)| (key.clone(), value.clone()))
+                .filter_map(|(key, value)| {
+                    let prop = &schema["properties"][key];
+                    if prop.get("properties").is_some() {
+                        let inner = required(prop);
+                        let held: serde_json::Map<_, _> = value
+                            .as_object()
+                            .expect("a probe of a schema object is an object")
+                            .iter()
+                            .filter(|(k, _)| inner.contains(*k))
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        Some((key.clone(), held.into()))
+                    } else {
+                        schema_required
+                            .contains(key)
+                            .then(|| (key.clone(), value.clone()))
+                    }
+                })
                 .collect::<serde_json::Map<_, _>>()
                 .into();
             let (every_key, left_out) =
@@ -3139,9 +3279,10 @@ ap.add_argument("--nowhere", default=NOWHERE)
                 }
             }
             let declared = script_options(&left_out.source);
-            for (key, prop) in properties(&schema) {
+            for script_key in script_keys(&schema) {
+                let (key, prop) = (&script_key.name, script_key.schema);
                 let stated = prop.get("default");
-                if schema_required.contains(key) {
+                if script_key.required_here {
                     if let Some(stated) = stated {
                         faults.push(format!(
                             "{op}: the schema requires `{key}` and states {stated} as its default"
@@ -3233,6 +3374,7 @@ ap.add_argument("--nowhere", default=NOWHERE)
             "finetype_validate" => read_as::<FinetypeValidateConfig>(with),
             "splink" => read_as::<SplinkConfig>(with),
             "gleif_ra_fetch" => read_as::<GleifRaFetchConfig>(with),
+            "dlt" => read_as::<DltConfig>(with),
             "umap_project" => read_as::<UmapProjectConfig>(with),
             "text_embed" => read_as::<TextEmbedConfig>(with),
             "uv" => read_as::<UvConfig>(with),
@@ -3444,10 +3586,23 @@ fn uv_run_args(script: &str, extra: &[String]) -> Vec<String> {
 /// is a version bump + rebuild, never a silent edit. This is the reproducibility
 /// contract the old "call the script by relative path" step lacked.
 fn materialize_frozen_script(name: &str, version: &str, bytes: &str) -> Result<PathBuf> {
+    materialize_frozen_script_as(name, version, &format!("{}.py", name), bytes)
+}
+
+/// [`materialize_frozen_script`], with the script written as `file` rather than
+/// `<name>.py`. For an operator named after the package its script imports (`dlt`):
+/// `uv run --script` puts the script's own directory first on `sys.path`, so a
+/// `dlt.py` there would be what `import dlt` finds.
+fn materialize_frozen_script_as(
+    name: &str,
+    version: &str,
+    file: &str,
+    bytes: &str,
+) -> Result<PathBuf> {
     let dir = std::env::temp_dir().join(format!("arcform-op-{}-{}", name, version));
     std::fs::create_dir_all(&dir)
         .map_err(|e| fetch_failed(format!("{}: cache dir {}: {}", name, dir.display(), e)))?;
-    let path = dir.join(format!("{}.py", name));
+    let path = dir.join(file);
     write_script_if_changed(&path, bytes)
         .map_err(|e| fetch_failed(format!("{}: write {}: {}", name, path.display(), e)))?;
     Ok(path)
@@ -6375,6 +6530,208 @@ fn gleif_ra_fetch_invocation(cfg: &GleifRaFetchConfig, dir: &Path) -> Result<Vec
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// dlt (ingress) — page one resource of a REST API through dlt's `rest_api` source
+// and write its records as sorted JSON Lines.
+//
+// It is meant to replace `gleif_ra_fetch`, which serves one API only. Everything
+// particular to one API (base URL, headers, paginator, endpoint, query parameters, data
+// selector) is the step's `source`, which is dlt's own `rest_api` configuration
+// passed through as JSON; arc names none of it. The frozen `rest_fetch.py` adds what
+// a reproducible file needs and dlt does not give: refusals of anything that carries
+// state, secrets or hidden reshaping; canonical, byte-sorted output; an atomic
+// write; the `expect_total` guard against a short fetch; and pacing.
+//
+// arc refuses at load what serde and one bound decide (an unknown key, a `source`
+// that is not a mapping, a negative or non-finite `page_delay_seconds`, a negative
+// `tolerance`); the script refuses the rest, before any request.
+//
+// Ingress, so `reads: []` and `produces: [out]`, as `gleif_ra_fetch`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The dlt fetch script, pinned into the binary. `@1` == these exact bytes.
+const DLT_PY: &str = include_str!("../operators/dlt/rest_fetch.py");
+
+/// The script's file name in its cache directory: never `dlt.py`, which would shadow
+/// the `dlt` package (see [`materialize_frozen_script_as`]).
+const DLT_SCRIPT_FILE: &str = "rest_fetch.py";
+
+/// The script cache directory `materialize_frozen_script_as` builds for this
+/// operator. Test-only, for the same reason [`UMAP_PROJECT_CACHE_DIR`] is.
+#[cfg(test)]
+const DLT_CACHE_DIR: &str = "arcform-op-dlt-1.0.0";
+
+struct Dlt;
+
+/// Where the first response reports the record count, and how many short of it a
+/// fetch may come before it is refused as a paging failure.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Debug))]
+#[serde(deny_unknown_fields)]
+struct ExpectTotal {
+    path: String,
+    #[serde(default)]
+    tolerance: u64,
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Debug))]
+#[serde(deny_unknown_fields)]
+struct DltConfig {
+    /// dlt's `rest_api` configuration, passed to the script as JSON.
+    source: serde_yaml::Mapping,
+    #[serde(default)]
+    expect_total: Option<ExpectTotal>,
+    /// Seconds to pause between requests. Omitted from the argv when unset.
+    #[serde(default)]
+    page_delay_seconds: Option<f64>,
+    /// The JSON Lines file (the `produces` asset).
+    out: String,
+}
+
+impl DltConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        // Two refusals said by key, which serde's own messages do not name.
+        if let Some(source) = with.get("source")
+            && !source.is_mapping()
+        {
+            let found = match source {
+                Value::Null => "nothing",
+                Value::Bool(_) => "a boolean",
+                Value::Number(_) => "a number",
+                Value::String(_) => "a string",
+                Value::Sequence(_) => "a list",
+                Value::Mapping(_) => "a mapping",
+                Value::Tagged(_) => "a tagged value",
+            };
+            return Err(Error::ManifestValidation(format!(
+                "dlt: `source` must be a mapping, dlt's `rest_api` configuration; found {}",
+                found
+            )));
+        }
+        if let Some(t) = with
+            .get("expect_total")
+            .and_then(|e| e.get("tolerance"))
+            .and_then(Value::as_i64)
+            && t < 0
+        {
+            return Err(Error::ManifestValidation(format!(
+                "dlt: `expect_total.tolerance: {}` must be 0 or more",
+                t
+            )));
+        }
+        let cfg: Self = serde_yaml::from_value(with.clone()).map_err(|e| {
+            Error::ManifestValidation(format!("dlt: invalid `with:` config: {}", e))
+        })?;
+        if let Some(d) = cfg.page_delay_seconds
+            && !(d.is_finite() && d >= 0.0)
+        {
+            return Err(Error::ManifestValidation(format!(
+                "dlt: `page_delay_seconds: {}` must be a finite number, 0 or more",
+                d
+            )));
+        }
+        Ok(cfg)
+    }
+
+    /// `source` as the JSON the script reads. A value JSON would alter on the way is
+    /// refused, naming its dotted path: a non-finite number (`.inf`, `.nan`), which
+    /// serde_json writes as null; a YAML tagged value (`!foo bar`), which it writes as
+    /// `{"!foo": "bar"}`; and a key that is not a string (`200:`, `true:`, `~:`), which
+    /// it writes as a string or refuses. A key meant as text is quoted (`"200":`).
+    fn source_json(&self) -> Result<String> {
+        fn walk(value: &Value, at: &str) -> Result<()> {
+            let refuse = |what: String| {
+                Err(Error::ManifestValidation(format!(
+                    "dlt: {at} {what}, which JSON cannot carry unchanged"
+                )))
+            };
+            match value {
+                Value::Number(n) if n.as_f64().is_some_and(|f| !f.is_finite()) => {
+                    refuse(format!("is {}", n))
+                }
+                Value::Tagged(t) => refuse(format!("is a tagged value ({})", t.tag)),
+                Value::Sequence(items) => items
+                    .iter()
+                    .enumerate()
+                    .try_for_each(|(i, v)| walk(v, &format!("{at}[{i}]"))),
+                Value::Mapping(map) => map.iter().try_for_each(|(k, v)| match k {
+                    Value::String(k) => walk(v, &format!("{at}.{k}")),
+                    other => refuse(format!(
+                        "has the key {}, which is not a string; quote it",
+                        serde_yaml::to_string(other).unwrap_or_default().trim_end()
+                    )),
+                }),
+                _ => Ok(()),
+            }
+        }
+        let source = Value::Mapping(self.source.clone());
+        walk(&source, "source")?;
+        serde_json::to_string(&source).map_err(|e| {
+            Error::ManifestValidation(format!("dlt: source cannot be written as JSON: {}", e))
+        })
+    }
+}
+
+impl Operator for Dlt {
+    fn name(&self) -> &'static str {
+        "dlt"
+    }
+
+    fn ingress(&self) -> bool {
+        true
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = DltConfig::parse(with)?;
+        cfg.source_json()?;
+        let mut assets = OpAssets::default();
+        assets.record_produces(cfg.out.clone(), crate::asset_kind::AssetKind::File);
+        Ok(assets)
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        let cfg = DltConfig::parse(with)?;
+        // Built before `out`'s parent, so a refused source creates nothing.
+        let args = dlt_invocation(&cfg, ctx.dir)?;
+        let out = ctx.dir.join(&cfg.out);
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        run_process("uv", &args, ctx, OutputMode::Capture, "dlt")
+    }
+}
+
+/// The full argv `run` hands `uv`: materialise the frozen script and build its
+/// arguments. The source as one JSON argument, then the output, then each option the
+/// step sets. `expect_total` passes its tolerance whenever it is set, the default 0
+/// included.
+fn dlt_invocation(cfg: &DltConfig, dir: &Path) -> Result<Vec<String>> {
+    let source = cfg.source_json()?;
+    let script = materialize_frozen_script_as("dlt", "1.0.0", DLT_SCRIPT_FILE, DLT_PY)?;
+    let mut extra = vec![
+        "--source-json".to_string(),
+        source,
+        "--out".to_string(),
+        dir.join(&cfg.out).display().to_string(),
+    ];
+    if let Some(expect) = &cfg.expect_total {
+        extra.push("--expect-total-path".to_string());
+        extra.push(expect.path.clone());
+        extra.push("--expect-total-tolerance".to_string());
+        extra.push(expect.tolerance.to_string());
+    }
+    if let Some(d) = cfg.page_delay_seconds {
+        extra.push("--page-delay-seconds".to_string());
+        extra.push(d.to_string());
+    }
+    Ok(uv_run_args(&script.to_string_lossy(), &extra))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // umap_project (transform) — reduce numeric columns that ALREADY EXIST to the two
 // coordinates a map is drawn from. Reads one Parquet, builds a feature matrix from
 // the named columns, reduces it to two dimensions with UMAP, and writes a Parquet
@@ -8381,6 +8738,236 @@ mod tests {
         assert!(assets_for("gleif_ra_fetch", Some(&bogus)).is_err());
     }
 
+    // ── dlt ──────────────────────────────────────────────────────────────────
+
+    /// A step paging a cursor API whose query keys carry brackets and whose page size
+    /// is an integer, with every optional key set.
+    const DLT_STEP: &str = r#"
+source:
+  client:
+    base_url: https://api.example.org/v1/
+    paginator: { type: json_link, next_url_path: links.next }
+  resources:
+    - name: records
+      endpoint:
+        path: records
+        data_selector: data
+        params:
+          "filter[entity.kind]": ABC
+          "page[size]": 200
+          "page[cursor]": "*"
+expect_total: { path: meta.total, tolerance: 5 }
+page_delay_seconds: 0.25
+out: build/records.jsonl
+"#;
+
+    /// The step with only its required keys.
+    const DLT_MINIMAL_STEP: &str = r#"
+source:
+  client: { base_url: https://api.example.org/v1/ }
+  resources: [records]
+out: build/records.jsonl
+"#;
+
+    fn dlt_argv(yaml: &str, dir: &Path) -> Vec<String> {
+        let with: Value = serde_yaml::from_str(yaml).unwrap();
+        dlt_invocation(&DltConfig::parse(&with).unwrap(), dir).unwrap()
+    }
+
+    /// The value the argv passes after `flag`, if it passes `flag`.
+    fn dlt_flag<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
+        argv.iter()
+            .position(|a| a == flag)
+            .map(|at| argv[at + 1].as_str())
+    }
+
+    /// The refusal manifest load gives `yaml`, which has to be a `dlt: ` validation
+    /// error; and `run` gives the same refusal before it spawns anything.
+    fn dlt_refusal(yaml: &str) -> String {
+        let with: Value = serde_yaml::from_str(yaml).unwrap();
+        let at_load = match assets_for("dlt@1", Some(&with)) {
+            Err(Error::ManifestValidation(m)) => m,
+            other => panic!("manifest load must refuse {yaml}: {other:?}"),
+        };
+        assert!(at_load.starts_with("dlt: "), "{at_load}");
+        let dir = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+        let ctx = OpContext {
+            dir: dir.path(),
+            db_path: &dir.path().join("p.duckdb"),
+            env: &env,
+            dotenv: no_dotenv(),
+            timeout: None,
+            cache: None,
+        };
+        match Dlt.run(&with, &ctx) {
+            Err(Error::ManifestValidation(m)) => assert_eq!(m, at_load),
+            other => panic!("run must refuse {yaml} before spawning uv: {other:?}"),
+        }
+        at_load
+    }
+
+    #[test]
+    fn dlt_is_ingress_and_produces_only_out() {
+        let op = resolve("dlt@1").unwrap();
+        assert!(
+            op.ingress(),
+            "dlt fetches from the network, so `arc test` needs a fixture"
+        );
+        let with: Value = serde_yaml::from_str(DLT_STEP).unwrap();
+        let a = op.assets(&with).unwrap();
+        assert_eq!(a.produces, vec!["build/records.jsonl".to_string()]);
+        assert_eq!(
+            a.kinds["build/records.jsonl"],
+            crate::asset_kind::AssetKind::File
+        );
+        assert!(
+            a.reads.is_empty(),
+            "the API is not a graph node: {:?}",
+            a.reads
+        );
+    }
+
+    #[test]
+    fn dlt_argv_carries_the_source_as_json_with_bracketed_keys_and_integers_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let argv = dlt_argv(DLT_STEP, dir.path());
+        assert_eq!(argv[..2], ["run", "--script"]);
+        let source: serde_json::Value =
+            serde_json::from_str(dlt_flag(&argv, "--source-json").expect("--source-json")).unwrap();
+        let params = &source["resources"][0]["endpoint"]["params"];
+        assert_eq!(params["filter[entity.kind]"], serde_json::json!("ABC"));
+        assert_eq!(params["page[cursor]"], serde_json::json!("*"));
+        assert!(
+            params["page[size]"].is_u64() && params["page[size]"] == serde_json::json!(200),
+            "an integer param stays an integer, not 200.0 or \"200\": {params}"
+        );
+        assert_eq!(
+            source["client"]["paginator"],
+            serde_json::json!({"type": "json_link", "next_url_path": "links.next"})
+        );
+        assert_eq!(
+            dlt_flag(&argv, "--out"),
+            Some(
+                dir.path()
+                    .join("build/records.jsonl")
+                    .display()
+                    .to_string()
+                    .as_str()
+            )
+        );
+        assert_eq!(dlt_flag(&argv, "--expect-total-path"), Some("meta.total"));
+        assert_eq!(dlt_flag(&argv, "--expect-total-tolerance"), Some("5"));
+        assert_eq!(dlt_flag(&argv, "--page-delay-seconds"), Some("0.25"));
+    }
+
+    #[test]
+    fn dlt_argv_omits_unset_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let argv = dlt_argv(DLT_MINIMAL_STEP, dir.path());
+        for flag in [
+            "--expect-total-path",
+            "--expect-total-tolerance",
+            "--page-delay-seconds",
+        ] {
+            assert!(!argv.iter().any(|a| a == flag), "{flag} in {argv:?}");
+        }
+        // `expect_total` with only a path passes the tolerance it defaults to.
+        let argv = dlt_argv(
+            &format!("{DLT_MINIMAL_STEP}expect_total: {{ path: meta.total }}\n"),
+            dir.path(),
+        );
+        assert_eq!(dlt_flag(&argv, "--expect-total-path"), Some("meta.total"));
+        assert_eq!(dlt_flag(&argv, "--expect-total-tolerance"), Some("0"));
+    }
+
+    #[test]
+    fn dlt_refuses_an_unknown_key() {
+        let top = dlt_refusal(&format!("{DLT_MINIMAL_STEP}max_pages: 2\n"));
+        assert!(top.contains("max_pages"), "{top}");
+        let inner = dlt_refusal(&format!(
+            "{DLT_MINIMAL_STEP}expect_total: {{ path: meta.total, slack: 1 }}\n"
+        ));
+        assert!(inner.contains("slack"), "{inner}");
+    }
+
+    #[test]
+    fn dlt_refuses_a_source_that_is_not_a_mapping() {
+        for source in ["https://api.example.org/v1/records", "[records]"] {
+            let msg = dlt_refusal(&format!("source: {source}\nout: o.jsonl\n"));
+            assert!(msg.contains("source"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn dlt_refuses_a_negative_page_delay() {
+        for delay in ["-0.5", ".nan", ".inf"] {
+            let msg = dlt_refusal(&format!("{DLT_MINIMAL_STEP}page_delay_seconds: {delay}\n"));
+            assert!(msg.contains("page_delay_seconds"), "{msg}");
+        }
+        let tolerance = dlt_refusal(&format!(
+            "{DLT_MINIMAL_STEP}expect_total: {{ path: meta.total, tolerance: -1 }}\n"
+        ));
+        assert!(tolerance.contains("tolerance"), "{tolerance}");
+    }
+
+    #[test]
+    fn dlt_refuses_source_values_json_would_alter() {
+        let step = |params: &str| {
+            format!(
+                "source:\n  client: {{ base_url: https://api.example.org/v1/ }}\n  resources:\n    - name: r\n      endpoint:\n        params: {params}\nout: o.jsonl\n"
+            )
+        };
+        for (params, names) in [
+            (
+                "{ limit: .inf }",
+                "source.resources[0].endpoint.params.limit is .inf",
+            ),
+            (
+                "{ limit: .nan }",
+                "source.resources[0].endpoint.params.limit is .nan",
+            ),
+            (
+                "{ kind: !foo bar }",
+                "source.resources[0].endpoint.params.kind is a tagged value (!foo)",
+            ),
+            (
+                "{ 200: x }",
+                "source.resources[0].endpoint.params has the key 200",
+            ),
+            (
+                "{ true: x }",
+                "source.resources[0].endpoint.params has the key true",
+            ),
+        ] {
+            let msg = dlt_refusal(&step(params));
+            assert!(msg.contains(names), "{params}: {msg}");
+        }
+        // A quoted key and a finite float pass through.
+        let with: Value = serde_yaml::from_str(&step("{ \"200\": x, ratio: 0.5 }")).unwrap();
+        assert!(assets_for("dlt@1", Some(&with)).is_ok());
+    }
+
+    #[test]
+    fn dlt_resolves_by_semver() {
+        assert!(resolve("dlt@1").is_ok());
+        assert!(resolve("dlt@^1.0").is_ok());
+        assert!(resolve("dlt@2").is_err());
+    }
+
+    /// The script is run from a file named for what it does, never `dlt.py`: the
+    /// script's own directory is first on `sys.path`, so a `dlt.py` there would be
+    /// what `import dlt` finds.
+    #[test]
+    fn dlt_materialises_its_script_under_a_name_that_does_not_shadow_dlt() {
+        let dir = tempfile::tempdir().unwrap();
+        let argv = dlt_argv(DLT_MINIMAL_STEP, dir.path());
+        let script = Path::new(&argv[2]);
+        assert_eq!(script.file_name().unwrap(), "rest_fetch.py");
+        assert_eq!(std::fs::read_to_string(script).unwrap(), DLT_PY);
+        assert!(!script.with_file_name("dlt.py").exists());
+    }
+
     // ── umap_project ─────────────────────────────────────────────────────────
     //
     // The catalog entry is UNCONDITIONAL, beside the other uv-run operators and
@@ -9164,6 +9751,17 @@ mod tests {
                         GLEIF_RA_FETCH_CACHE_DIR,
                     )
                 }
+                "dlt" => {
+                    let with: Value = serde_yaml::from_str(
+                        "source: {client: {base_url: 'https://api.example.org/'}, resources: [r]}\nout: out.jsonl",
+                    )
+                    .unwrap();
+                    (
+                        Dlt.run(&with, &ctx)
+                            .expect_err("a script cache that cannot be written must stop the step"),
+                        DLT_CACHE_DIR,
+                    )
+                }
                 other => panic!("no operator called `{other}` to drive"),
             };
             let msg = err.to_string();
@@ -9196,6 +9794,7 @@ mod tests {
                 GLEIF_RA_FETCH_CACHE_DIR,
                 "gleif_ra_fetch.py",
             ),
+            ("dlt", DLT_CACHE_DIR, DLT_SCRIPT_FILE),
         ] {
             let block_the_directory = tempfile::tempdir().unwrap();
             std::fs::write(block_the_directory.path().join(cache_dir), b"in the way").unwrap();

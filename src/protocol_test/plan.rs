@@ -431,12 +431,13 @@ mod tests {
     }
 
     #[test]
-    fn the_four_fetch_operators_are_ingress_and_no_other_is() {
+    fn the_fetch_operators_are_ingress_and_no_other_is() {
         let ingress: Vec<&str> = crate::operator::catalog_names()
             .into_iter()
             .filter(|name| crate::operator::resolve(name).unwrap().ingress())
             .collect();
         let expected = [
+            "dlt",
             "gleif_ra_fetch",
             "html_link_discover",
             "http_fetch",
