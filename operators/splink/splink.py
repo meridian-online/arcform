@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -174,6 +175,10 @@ def main(argv=None) -> int:
     p = args.threshold_match_probability
     if p is not None and not 0 <= p < 1:
         refusals.append(f"threshold_match_probability {p} must be at least 0 and below 1")
+
+    w = args.threshold_match_weight
+    if w is not None and not math.isfinite(w):
+        refusals.append(f"threshold_match_weight {w} must be a finite number")
 
     settings = None
     try:

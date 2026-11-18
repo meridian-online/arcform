@@ -233,6 +233,13 @@ class SplinkE2ETest(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn(str(self.model), r.stderr)
 
+    def test_a_non_finite_weight_threshold_is_refused(self) -> None:
+        for value in ("inf", "nan"):
+            r = self.run_op("--threshold-match-weight", value)
+            self.assertEqual(r.returncode, 2, value)
+            self.assertIn("threshold_match_weight", r.stderr)
+            self.assertIn(value, r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
