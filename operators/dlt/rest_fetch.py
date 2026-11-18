@@ -9,9 +9,10 @@ paginator, endpoint path, query parameters and data selector all come from there
 script names no source, endpoint, field or header value; it adds only what a
 reproducible file needs and dlt does not give:
 
-  REFUSALS, before any request (exit 2, one line each). One resource; no `incremental`,
-    `auth`, `processing_steps` or `resolve` parameter anywhere; no `write_disposition`
-    other than `replace`. Each of those either carries state between runs, carries a
+  REFUSALS, before any request (exit 2, one line each). One resource; no key named `incremental`,
+    `auth` or `processing_steps` anywhere except inside a request's own `params`,
+    `headers`, `json` or `data`; no parameter of `type: resolve` or `type: incremental`;
+    no `write_disposition` other than `replace`. Each of those either carries state between runs, carries a
     secret into a manifest, reshapes records out of sight, or fans one fetch out into
     many — none of which a stateless, frozen ingress step can stand behind.
 
