@@ -140,9 +140,9 @@ Starts once Task 4's PR is merged and `grep -rn gleif_ra_fetch` over open-analyt
 
 ### Task 6: acquire.saas names dlt (landscape)
 
-Starts once Hugh answers the spec's open question and `dlt@1` is on arcform's `main`.
+Starts once `dlt@1` is in arcform's latest release tag, since a class counts as built only from a released operator.
 
-- [ ] **Step 1:** In `operators/vocabulary.yaml`, the `acquire.saas` class's `operators` names `dlt` in place of `gleif_ra_fetch`, and its built status follows Hugh's answer, with the page's note on authenticated APIs if he says yes. Regenerate with `operators/build.py` as its docs say, and run its checks.
+- [ ] **Step 1:** In `operators/vocabulary.yaml`, the `acquire.saas` class's `operators` names `dlt` in place of `gleif_ra_fetch`, and the class is marked as running through an operator, with the page noting that an API needing a key waits for secrets management (Hugh's ruling, in the spec). Regenerate with `operators/build.py` as its docs say, and run its checks.
 - [ ] **Step 2: Commit, push, open the PR, follow the build loop to ready, and stop.**
 
 ## Verification and what it costs

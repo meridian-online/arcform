@@ -1,6 +1,6 @@
 # A general dlt operator, whose REST source comes from the Protocol
 
-Design, 2026-11-18. Awaiting Hugh's approval; nothing below is built. Written while Hugh was away, from the design recorded on the work's issue and in the ruling that a paginated API is fetched by one dlt operator with each source configured in its Protocol. The calls made on his behalf are listed at the end.
+Design, 2026-11-18. Approved by Hugh the same day, as written. Written while Hugh was away, from the design recorded on the work's issue and in the ruling that a paginated API is fetched by one dlt operator with each source configured in its Protocol. The calls made on his behalf are listed at the end.
 
 ## Intent
 
@@ -90,7 +90,7 @@ The work is two pull requests in arcform, one in open-analytics and one in lands
 1. arcform: `dlt@1`. Starts from `main` once the Splink operator's pull request has merged, since both change the operator catalogue, the frozen-script operator list in its tests, the CI operator job and the architecture document, and the Splink one adds the review rule this operator is checked against. If it has not merged when the build starts, the branch starts from the Splink branch and rebases onto `main` when it merges.
 2. open-analytics: the move, with the parity evidence in its description. It needs `dlt@1` on arcform's `main`, since the Protocol pins an arc commit there. It is independent of the Splink move, which changes the `resolve` step rather than the GLEIF fetch; whichever lands second rebases over the other's pinned arc revision and README step table.
 3. arcform: remove `gleif_ra_fetch`, once open-analytics' default branch no longer names it.
-4. landscape: `acquire.saas` names `dlt`, once the open question below is answered.
+4. landscape: `acquire.saas` names `dlt` and runs through an operator, once `dlt@1` is in arc's latest release.
 
 ## Calls made on Hugh's behalf
 
@@ -101,9 +101,9 @@ The work is two pull requests in arcform, one in open-analytics and one in lands
 - **Two keys beside dlt's format.** `expect_total` and `page_delay_seconds` carry the two things `gleif_ra_fetch` did that dlt's `rest_api` configuration does not express: refusing a short fetch, and pacing.
 - **No default User-Agent.** `gleif_ra_fetch`'s default named open-analytics, which the review rule forbids in an operator. dlt sends its own when the Protocol sets none.
 
-## Open question
+## The acquire.saas question, settled
 
-Does a general `dlt` operator make `acquire.saas` "Runs through an operator" on Meridian's public operation pages? The one-case rule leaves a class "not built" when its operator covers one case. `dlt@1` covers any paginated REST API without authentication, which is most public data APIs but not most SaaS products, whose APIs need a key. The recommendation is yes, with the page stating that authenticated APIs wait for secrets management. This is a public-facing ruling, so it waits for Hugh; only the landscape step depends on it.
+The spec asked whether a general `dlt` operator makes `acquire.saas` "Runs through an operator" on Meridian's public operation pages, given the one-case rule. Hugh, 2026-11-18: "yes to acquire.saas". `dlt@1` covers any paginated REST API without authentication, so it is not one case of the class. Once `dlt@1` is in arc's latest release, the class names `dlt`, its page shows it as running through an operator, and the page says that an API needing a key waits for secrets management.
 
 ## Left to the builder
 
