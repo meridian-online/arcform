@@ -319,18 +319,18 @@ fn called_with_no_argument_it_lists_no_operator() {
 fn operator_describe_still_returns_the_with_schema_whole_its_roles_included() {
     let responses = mcp_session(&[json!({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": { "name": "operator_describe", "arguments": { "operator": "splink_resolve" } },
+        "params": { "name": "operator_describe", "arguments": { "operator": "splink" } },
     })]);
     let schema = &response_to(&responses, 1)["result"]["structuredContent"];
     assert_eq!(
         schema["required"],
-        json!(["edgar", "gleif", "out"]),
+        json!(["inputs", "model", "out"]),
         "operator_describe is the form a `with:` block is written from, roles and all: {schema}"
     );
-    for key in ["edgar", "gleif", "out", "sample"] {
+    for key in ["inputs", "model", "out", "threshold_match_probability"] {
         assert!(
             schema["properties"].get(key).is_some(),
-            "operator_describe dropped `{key}` from splink_resolve's schema: {schema}"
+            "operator_describe dropped `{key}` from splink's schema: {schema}"
         );
     }
     assert!(

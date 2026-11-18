@@ -429,7 +429,7 @@ impl Drop for AnswerDir {
 /// Wait for a child process with an optional timeout.
 /// Polls try_wait() at ~100ms intervals. On timeout, kills the child.
 /// `pub(crate)` so the operator subprocess substrate shares the identical
-/// kill-on-deadline semantics (the uv-run operators: splink_resolve, gleif).
+/// kill-on-deadline semantics (the uv-run operators: splink, gleif).
 pub(crate) fn wait_with_timeout(
     child: &mut std::process::Child,
     timeout: Option<Duration>,

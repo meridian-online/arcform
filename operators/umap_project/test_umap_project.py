@@ -470,8 +470,8 @@ class DescribeMismatchTest(unittest.TestCase):
                 self.assertIn(up.OPERATOR_NAME, said)
 
     def test_a_fit_written_by_a_different_operator_is_refused_by_name(self) -> None:
-        said = up.describe_mismatch(dict(self.header(), operator="splink_resolve"), self.header())
-        self.assertIn("splink_resolve", said)
+        said = up.describe_mismatch(dict(self.header(), operator="splink"), self.header())
+        self.assertIn("splink", said)
 
 
 class _StandInReducer:
