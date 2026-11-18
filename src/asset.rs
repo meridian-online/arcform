@@ -1577,6 +1577,18 @@ mod tests {
                         ),
                     ),
                     (
+                        "models/splink_inputs.sql",
+                        include_str!(
+                            "../tests/fixtures/open_analytics/edgar_gleif/models/splink_inputs.sql"
+                        ),
+                    ),
+                    (
+                        "models/resolved.sql",
+                        include_str!(
+                            "../tests/fixtures/open_analytics/edgar_gleif/models/resolved.sql"
+                        ),
+                    ),
+                    (
                         "models/package.sql",
                         include_str!(
                             "../tests/fixtures/open_analytics/edgar_gleif/models/package.sql"
@@ -1661,7 +1673,7 @@ mod tests {
             (
                 "edgar_gleif/arcform.yaml",
                 include_str!("../tests/fixtures/open_analytics/edgar_gleif/arcform.yaml"),
-                "7ccaf4d96e567da0e8b3386ffec476874c90b3e8d6927516ffce946b61c3b071",
+                "984405ebaf3c2099d86336d9823f4d14ebae1343a8bea10087ff2c7aa7aee924",
             ),
             (
                 "edgar_gleif/models/sec_entities.sql",
@@ -1679,6 +1691,25 @@ mod tests {
                 "edgar_gleif/models/tier.sql",
                 include_str!("../tests/fixtures/open_analytics/edgar_gleif/models/tier.sql"),
                 "c10d1da31bd836412fd2414bf36b9a15ce1712453a98faa02f79af84529c5ee0",
+            ),
+            (
+                "edgar_gleif/models/splink_inputs.sql",
+                include_str!(
+                    "../tests/fixtures/open_analytics/edgar_gleif/models/splink_inputs.sql"
+                ),
+                "35243550e1ec90c0cdb8561a8cc7cc5545197897696fb061aadb0ff218a56ce0",
+            ),
+            (
+                "edgar_gleif/models/resolved.sql",
+                include_str!("../tests/fixtures/open_analytics/edgar_gleif/models/resolved.sql"),
+                "0bf81534918aef0a38b3d6cc8347e9928b18739ccf10b0ef8b0d5bb651e21313",
+            ),
+            (
+                "edgar_gleif/models/edgar_gleif_model.json",
+                include_str!(
+                    "../tests/fixtures/open_analytics/edgar_gleif/models/edgar_gleif_model.json"
+                ),
+                "f4711a91c00a7595ad8b9898d098451188a3da74bd8a2d756947bd7ab59a1276",
             ),
             (
                 "edgar_gleif/models/package.sql",

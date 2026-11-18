@@ -178,21 +178,34 @@ steps:
       - build/ncen/2025q3/fund_reported_info.tsv
 
   # ── Resolve: probabilistic name match for the operating-company tail ───────────
-  - name: resolve
-    # The frozen Fellegi-Sunter/Splink model (SEED=42, precision-first), promoted from
-    # an opaque `uv run --script …` call to a versioned operator that embeds the exact
-    # script bytes. reads build/sec_entities.parquet + build/gleif.parquet (auto-wired
-    # from their producers); produces build/resolved.parquet. ~4h full-corpus job, so
-    # retry is pinned to 1 (a mid-run failure/timeout is retryable in the substrate — a
-    # cap stops the engine re-attempting a 4h job).
-    op: splink_resolve@1
+  # Three steps. The model is this Protocol's, not the operator's: splink@1 is arc's
+  # general Splink step and holds no source's columns or model. splink_inputs normalises
+  # both names and derives the blocking keys; score_pairs scores the blocked pairs with
+  # the frozen, fully specified Fellegi-Sunter model in models/edgar_gleif_model.json
+  # (Splink's own settings JSON, never trained in a run); resolved picks one LEI per
+  # EDGAR row and sets its status, writing build/resolved.parquet for tier.
+  - name: splink_inputs
+    sql: models/splink_inputs.sql
+
+  - name: score_pairs
+    # Retry is pinned to 1, as the full-corpus scoring step's always was: a failure here
+    # is the model or the inputs, which a second attempt does not change.
+    op: splink@1
     with:
-      edgar: build/sec_entities.parquet
-      gleif: build/gleif.parquet
-      out: build/resolved.parquet
+      inputs:
+        - role: edgar
+          path: build/edgar_in.parquet
+        - role: gleif
+          path: build/gleif_in.parquet
+      model: models/edgar_gleif_model.json
+      threshold_match_probability: 0.30
+      out: build/scored_pairs.parquet
     retry:
       max_attempts: 1
     timeout_sec: 14400
+
+  - name: resolved
+    sql: models/resolved.sql
 
   # ── Tier: deterministic (authoritative) ∪ splink (confirmed/candidate) ─────────
   - name: tier

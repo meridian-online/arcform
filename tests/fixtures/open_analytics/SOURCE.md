@@ -10,6 +10,14 @@ repos are public.
 (2026-10-31T11:12:35+10:00, the most recent commit to touch any of the vendored
 paths as of the sync).
 
+**Exception: `edgar_gleif`'s resolve steps.** The `splink_inputs`, `score_pairs` and
+`resolved` steps of `edgar_gleif/arcform.yaml`, with `models/splink_inputs.sql`,
+`models/resolved.sql` and `models/edgar_gleif_model.json`, were re-synced from
+`open-analytics` commit `a8e0e10f90cc678d297d7cbf41cfab6e4ea4180f` when
+arc's `splink_resolve` operator was removed. The rest of that manifest, and its
+other models, still date from the sync above, so this one file is no longer a
+byte-identical copy of the live manifest.
+
 `all_open_analytics_manifests_have_not_drifted_from_their_vendored_checksums` (in
 `src/asset.rs`) pins each file's SHA-256 so an accidental edit to a *vendored copy*
 fails loudly. It cannot detect the other direction — `open-analytics` changing a

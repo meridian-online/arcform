@@ -44,14 +44,13 @@ const JOIN_TABLES: &str = "join-tables";
 const APPEND_ROWS: &str = "append-rows";
 const READ_FILE: &str = "read-file";
 
-/// The operators the default build holds: the eleven every build holds and the three
+/// The operators the default build holds: the ten every build holds and the three
 /// `http-fetch` adds, which `cli` turns on.
-const OPERATORS: [&str; 14] = [
+const OPERATORS: [&str; 13] = [
     "parquet_export",
     "archive_extract",
     "datapackage_describe",
     "finetype_validate",
-    "splink_resolve",
     "splink",
     "gleif_ra_fetch",
     "umap_project",
@@ -549,7 +548,7 @@ fn an_operator_description_names_what_it_wraps_and_an_example_step() {
             "`{op}`'s example does not run it:\n{example}"
         );
     }
-    let splink = arc_json(&["operation", "describe", "splink_resolve"]);
+    let splink = arc_json(&["operation", "describe", "splink"]);
     let ids: Vec<&str> = splink["wraps"]
         .as_array()
         .unwrap()
@@ -561,18 +560,21 @@ fn an_operator_description_names_what_it_wraps_and_an_example_step() {
 
 #[test]
 fn describe_names_what_each_operators_step_reads_and_writes_by_role() {
-    let splink = arc_json(&["operation", "describe", "splink_resolve"]);
+    let splink = arc_json(&["operation", "describe", "splink"]);
     assert_eq!(
         roles(&splink, "reads"),
-        [entry("edgar", "file", None), entry("gleif", "file", None)],
-        "splink_resolve reads `edgar`, then `gleif`, each a file:\n{splink}"
+        [
+            entry("inputs.path", "file", None),
+            entry("model", "file", None)
+        ],
+        "splink reads each `inputs.path`, then the `model`, each a file:\n{splink}"
     );
     assert_eq!(roles(&splink, "writes"), [entry("out", "file", None)]);
-    for name in ["edgar", "gleif"] {
+    for name in ["inputs.path", "model"] {
         assert_eq!(
             role(&splink, "reads", name)["required"],
             true,
-            "splink_resolve's `{name}` is required:\n{splink}"
+            "splink's `{name}` is required:\n{splink}"
         );
     }
 

@@ -149,7 +149,6 @@ static HTML_LINK_DISCOVER: HtmlLinkDiscover = HtmlLinkDiscover;
 static ARCHIVE_EXTRACT: ArchiveExtract = ArchiveExtract;
 static DATAPACKAGE_DESCRIBE: DatapackageDescribe = DatapackageDescribe;
 static FINETYPE_VALIDATE: FinetypeValidate = FinetypeValidate;
-static SPLINK_RESOLVE: SplinkResolve = SplinkResolve;
 static SPLINK: Splink = Splink;
 static GLEIF_RA_FETCH: GleifRaFetch = GleifRaFetch;
 static UMAP_PROJECT: UmapProject = UmapProject;
@@ -174,7 +173,6 @@ fn catalog() -> Vec<&'static dyn Operator> {
         &ARCHIVE_EXTRACT,
         &DATAPACKAGE_DESCRIBE,
         &FINETYPE_VALIDATE,
-        &SPLINK_RESOLVE,
         &SPLINK,
         &GLEIF_RA_FETCH,
         &UMAP_PROJECT,
@@ -352,15 +350,6 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
                 "extension": { "type": "string", "description": "Optional per-step override for the FineType DuckDB extension path (else FINETYPE_DUCKDB_EXT)." }
             }),
             &["parquet", "schema"],
-        ),
-        "splink_resolve" => object(
-            json!({
-                "edgar": { "type": "string", "description": "EDGAR/SEC-entity Parquet (the crosswalk's left side)." },
-                "gleif": { "type": "string", "description": "GLEIF golden-copy Parquet (the right side)." },
-                "out": { "type": "string", "description": "Resolved-crosswalk Parquet to write." },
-                "sample": { "type": "integer", "minimum": 0, "default": 0, "description": "Optional GLEIF-row cap for a fast smoke test; 0 resolves the full corpus." }
-            }),
-            &["edgar", "gleif", "out"],
         ),
         "splink" => {
             let mut schema = object(
@@ -959,48 +948,6 @@ const DESCRIBED: &[Described] = &[
             ),
         ],
         writes: &[],
-    },
-    Described {
-        name: "splink_resolve",
-        summary: "Matches EDGAR entities to GLEIF entities with Splink and writes the resolved crosswalk.",
-        wraps: &[
-            Wraps {
-                id: "splink",
-                name: "Splink",
-                url: "https://moj-analytical-services.github.io/splink/",
-                use_: "Splink 4's Fellegi-Sunter model scores each EDGAR and GLEIF name pair, with fixed priors so a run is reproducible.",
-            },
-            Wraps {
-                id: "duckdb",
-                name: "DuckDB",
-                url: "https://duckdb.org",
-                use_: "The backend Splink runs its comparisons on.",
-            },
-        ],
-        example: r#"- name: resolve
-  op: splink_resolve@1
-  with:
-    edgar: raw/edgar.parquet
-    gleif: raw/gleif.parquet
-    out: build/edgar_gleif_crosswalk.parquet
-"#,
-        reads: &[
-            role(
-                "edgar",
-                "file",
-                "The EDGAR entity Parquet file, the crosswalk's left side.",
-            ),
-            role(
-                "gleif",
-                "file",
-                "The GLEIF golden-copy Parquet file, the crosswalk's right side.",
-            ),
-        ],
-        writes: &[role(
-            "out",
-            "file",
-            "The Parquet file the resolved crosswalk is written to.",
-        )],
     },
     Described {
         name: "splink",
@@ -1678,7 +1625,6 @@ mod with_schema_tests {
             "archive_extract" => configuration_fields::<ArchiveExtractConfig>(),
             "datapackage_describe" => configuration_fields::<DatapackageDescribeConfig>(),
             "finetype_validate" => configuration_fields::<FinetypeValidateConfig>(),
-            "splink_resolve" => configuration_fields::<SplinkResolveConfig>(),
             "splink" => configuration_fields::<SplinkConfig>(),
             "gleif_ra_fetch" => configuration_fields::<GleifRaFetchConfig>(),
             "umap_project" => configuration_fields::<UmapProjectConfig>(),
@@ -2330,15 +2276,15 @@ mod with_schema_tests {
             "`x-at-most` counts the rows of `{rows_of}`, which is no file the step reads"
         );
 
-        let described = description("splink_resolve").expect("splink_resolve is described");
-        for role in ["edgar", "gleif", "out"] {
+        let described = description("splink").expect("splink is described");
+        for role in ["model", "out"] {
             assert!(
                 described["parameters"]["properties"].get(role).is_none()
                     && !described["parameters"]["required"]
                         .as_array()
                         .expect("`required` is a list")
                         .contains(&json!(role)),
-                "`{role}` is a role and stays in splink_resolve's `parameters`: {described}"
+                "`{role}` is a role and stays in splink's `parameters`: {described}"
             );
         }
     }
@@ -2533,13 +2479,7 @@ mod with_schema_tests {
     }
 
     /// The operators that run a frozen Python script.
-    const SCRIPT_OPERATORS: [&str; 5] = [
-        "splink_resolve",
-        "splink",
-        "gleif_ra_fetch",
-        "umap_project",
-        "text_embed",
-    ];
+    const SCRIPT_OPERATORS: [&str; 4] = ["splink", "gleif_ra_fetch", "umap_project", "text_embed"];
 
     /// Options a frozen script declares that no `with:` key reaches, each with the
     /// reason arc never passes it. Every run through arc takes the script's default for
@@ -2555,7 +2495,6 @@ mod with_schema_tests {
     /// function `run` calls, without spawning `uv`.
     fn script_invocation(op: &str, with: &Value, dir: &Path) -> Result<Vec<String>> {
         match op {
-            "splink_resolve" => splink_resolve_invocation(&SplinkResolveConfig::parse(with)?, dir),
             "splink" => {
                 let cfg = SplinkConfig::parse(with)?;
                 cfg.validate()?;
@@ -3292,7 +3231,6 @@ ap.add_argument("--nowhere", default=NOWHERE)
             "archive_extract" => read_as::<ArchiveExtractConfig>(with),
             "datapackage_describe" => read_as::<DatapackageDescribeConfig>(with),
             "finetype_validate" => read_as::<FinetypeValidateConfig>(with),
-            "splink_resolve" => read_as::<SplinkResolveConfig>(with),
             "splink" => read_as::<SplinkConfig>(with),
             "gleif_ra_fetch" => read_as::<GleifRaFetchConfig>(with),
             "umap_project" => read_as::<UmapProjectConfig>(with),
@@ -3404,7 +3342,7 @@ ap.add_argument("--nowhere", default=NOWHERE)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Subprocess substrate — the shared spawn/wait/error-map for operators that wrap
-// an external process: a `uv run` Python script (splink_resolve, gleif_ra_fetch)
+// an external process: a `uv run` Python script (splink, gleif_ra_fetch)
 // or a CLI (datapackage_describe → finetype). One place for the retry taxonomy so
 // each op doesn't hand-roll a Command block with divergent error handling.
 // (Wired by those operators in later increments — allow(dead_code) until then.)
@@ -3412,7 +3350,7 @@ ap.add_argument("--nowhere", default=NOWHERE)
 
 /// How a subprocess operator handles its child's output.
 enum OutputMode {
-    /// Stream child stdout/stderr live (e.g. `splink_resolve`'s coverage tables), keeping
+    /// Stream child stdout/stderr live (e.g. `splink`'s refusals), keeping
     /// the end of stderr for a failure's error. Honours the step timeout via
     /// `wait_with_timeout`.
     Inherit,
@@ -6154,141 +6092,11 @@ impl Operator for ArchiveExtract {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// splink_resolve (transform) — the probabilistic EDGAR↔GLEIF name match, promoted
-// from the opaque `command: uv run --script …/resolve.py …` step to a first-class,
-// versioned operator. `op: splink_resolve@1` addresses the EXACT frozen script bytes
-// embedded below (SEED=42 Fellegi-Sunter model; see resolve.py) — the reproducibility
-// contract the "call the script by relative path" step lacked. Its `reads`/`produces`
-// put the resolve *in* the asset graph, so a stale input propagates instead of the
-// graph-island silent-skip the path-based step risked.
-//
-// Wraps the arcform-EMBEDDED resolve.py via the uv-run substrate (materialize_frozen_
-// script → uv_run_args → run_process), NOT a Rust reimplementation of Splink — Python
-// at the edges, same posture as datapackage_describe. Runs in OutputMode::Inherit so
-// resolve.py's `[coverage]` / `[hero tickers]` tables stream live and the step timeout
-// (the manifest's `timeout_sec`) is enforced by wait_with_timeout.
-//
-// SCALE — this is the ~4 h full-corpus job (GLEIF ≈ 3.2M rows). The manifest step MUST
-// pin `retry.max_attempts: 1`: a non-zero exit or timeout is retryable in the substrate,
-// so without a cap the engine would re-attempt a 4 h job up to `defaults.retry`. (A
-// spawn failure — bad `uv`/binary — is already NON-retryable, so a typo never burns
-// attempts; but a mid-run failure is the case the manifest cap guards.) `--sample` is a
-// smoke-test cap on GLEIF rows and is OMITTED for a published run (see the arg builder).
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// The resolve script, pinned into the binary. `@1` == these exact bytes.
-const RESOLVE_PY: &str = include_str!("../operators/splink_resolve/resolve.py");
-
-/// The script cache directory `materialize_frozen_script` builds for this operator.
-/// Test-only, for the same reason [`UMAP_PROJECT_CACHE_DIR`] is: production never
-/// spells the path, and a test traps it to drive the cache's two failure paths.
-#[cfg(test)]
-const SPLINK_RESOLVE_CACHE_DIR: &str = "arcform-op-splink_resolve-1.0.0";
-
-struct SplinkResolve;
-
-#[derive(Deserialize)]
-#[cfg_attr(test, derive(Debug))]
-#[serde(deny_unknown_fields)]
-struct SplinkResolveConfig {
-    /// EDGAR / SEC-entity Parquet (cik, ticker, company_name) — the crosswalk's left
-    /// side. A `reads` asset, resolved against ctx.dir.
-    edgar: String,
-    /// GLEIF golden-copy Parquet (lei, legal_name, jurisdiction, country, reg_status) —
-    /// the right side. A `reads` asset, resolved against ctx.dir.
-    gleif: String,
-    /// Resolved-crosswalk Parquet to write (the `produces` asset). Resolved against ctx.dir.
-    out: String,
-    /// Optional GLEIF-row cap for a fast smoke test (reservoir sample, SEED=42). OMITTED
-    /// from the argv unless `Some(n)` with `n > 0`; a published run leaves it unset (or 0)
-    /// and resolves the full corpus.
-    #[serde(default)]
-    sample: Option<u64>,
-}
-
-impl SplinkResolveConfig {
-    fn parse(with: &Value) -> Result<Self> {
-        serde_yaml::from_value(with.clone()).map_err(|e| {
-            Error::ManifestValidation(format!("splink_resolve: invalid `with:` config: {}", e))
-        })
-    }
-}
-
-/// Build resolve.py's argv tail (everything after the script path). `--sample` is emitted
-/// ONLY for a positive cap: a published run passes `sample: None` (or `0`) and the full
-/// GLEIF corpus is resolved. Factored out so the omit-on-publish rule is unit-testable
-/// without spawning `uv`.
-fn splink_resolve_args(edgar: &str, gleif: &str, out: &str, sample: Option<u64>) -> Vec<String> {
-    let mut a = vec![
-        "--edgar".to_string(),
-        edgar.to_string(),
-        "--gleif".to_string(),
-        gleif.to_string(),
-        "--out".to_string(),
-        out.to_string(),
-    ];
-    if let Some(n) = sample
-        && n > 0
-    {
-        a.push("--sample".to_string());
-        a.push(n.to_string());
-    }
-    a
-}
-
-impl Operator for SplinkResolve {
-    fn name(&self) -> &'static str {
-        "splink_resolve"
-    }
-
-    fn version(&self) -> semver::Version {
-        semver::Version::new(1, 0, 0)
-    }
-
-    fn assets(&self, with: &Value) -> Result<OpAssets> {
-        let cfg = SplinkResolveConfig::parse(with)?;
-        let mut assets = OpAssets::default();
-        assets.record_reads(cfg.edgar.clone(), crate::asset_kind::AssetKind::File);
-        assets.record_reads(cfg.gleif.clone(), crate::asset_kind::AssetKind::File);
-        assets.record_produces(cfg.out.clone(), crate::asset_kind::AssetKind::File);
-        Ok(assets)
-    }
-
-    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
-        let cfg = SplinkResolveConfig::parse(with)?;
-        let out = ctx.dir.join(&cfg.out);
-        if let Some(parent) = out.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        let args = splink_resolve_invocation(&cfg, ctx.dir)?;
-        // Inherit: stream resolve.py's coverage/hero-ticker tables live and honour the
-        // step timeout (a 4 h job that overruns is killed, not left hanging).
-        run_process("uv", &args, ctx, OutputMode::Inherit, "splink_resolve")
-    }
-}
-
-/// The full argv `run` hands `uv`: materialise the frozen script and build its
-/// arguments. Split out of [`Operator::run`], as [`umap_project_invocation`] is, so a
-/// test reads the argv the script is really given without spawning `uv`.
-fn splink_resolve_invocation(cfg: &SplinkResolveConfig, dir: &Path) -> Result<Vec<String>> {
-    let script = materialize_frozen_script("splink_resolve", "1.0.0", RESOLVE_PY)?;
-    let extra = splink_resolve_args(
-        &dir.join(&cfg.edgar).display().to_string(),
-        &dir.join(&cfg.gleif).display().to_string(),
-        &dir.join(&cfg.out).display().to_string(),
-        cfg.sample,
-    );
-    Ok(uv_run_args(&script.to_string_lossy(), &extra))
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // splink (transform) — probabilistic record linkage with a model the Protocol
-// supplies. Where `splink_resolve` holds one dataset's columns and model, this
-// operator holds none: the inputs, the Splink settings JSON and the threshold all
-// come from `with:`, and the frozen script scores the pairs with the model as given
+// supplies. This operator holds no dataset's columns or model: the inputs, the
+// Splink settings JSON and the threshold all come from `with:`, and the frozen script scores the pairs with the model as given
 // (it never trains). `op: splink@1` addresses the exact script bytes embedded below.
-// Same uv-run substrate as `splink_resolve`; runs in OutputMode::Inherit so the
+// Same uv-run substrate as the other frozen-script operators; runs in OutputMode::Inherit so the
 // script's refusals stream as they happen.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -6466,7 +6274,7 @@ fn splink_invocation(cfg: &SplinkConfig, dir: &Path) -> Result<Vec<String>> {
 // full-refresh (no incremental cursor persisted) — then writes a DETERMINISTIC
 // SORTED CSV so the row-set parity gate against the retired script is a clean
 // `EXCEPT`. Same uv-run substrate + frozen-script contract as datapackage_describe
-// and splink_resolve: `op@1` addresses these exact script bytes.
+// and splink: `op@1` addresses these exact script bytes.
 //
 // Ingress, so `reads: []` (the network source is not a graph node) and
 // `produces: [out]` — the CSV sits in the AssetGraph downstream of nothing and
@@ -7251,7 +7059,7 @@ fn text_embed_invocation(cfg: &TextEmbedConfig, dir: &Path) -> Result<Vec<String
 // ─────────────────────────────────────────────────────────────────────────────
 // uv (activate) — a Protocol's OWN Python step, inside the asset graph.
 //
-// The generic counterpart to the frozen-script operators (`splink_resolve`,
+// The generic counterpart to the frozen-script operators (`splink`,
 // `gleif_ra_fetch`, `umap_project`, `text_embed`): the same `uv run --script`
 // substrate, but the script is the Protocol's rather than one compiled into this
 // binary. Without it, a Python step has to be `command:` — which addresses no exact
@@ -8431,40 +8239,6 @@ mod tests {
     }
 
     #[test]
-    fn splink_resolve_declares_lineage() {
-        // reads = [edgar, gleif] (order-preserving), produces = [out].
-        let with: Value = serde_yaml::from_str(
-            "edgar: build/sec_entities.parquet\ngleif: build/gleif.parquet\nout: build/resolved.parquet",
-        )
-        .unwrap();
-        let a = assets_for("splink_resolve", Some(&with)).unwrap();
-        assert_eq!(
-            a.reads,
-            vec![
-                "build/sec_entities.parquet".to_string(),
-                "build/gleif.parquet".to_string()
-            ]
-        );
-        assert_eq!(a.produces, vec!["build/resolved.parquet".to_string()]);
-        // `sample` is optional — a published run omits it and still validates.
-        assert!(assets_for("splink_resolve", Some(&with)).is_ok());
-        // unknown field rejected (deny_unknown_fields)
-        let bad: Value = serde_yaml::from_str("edgar: e\ngleif: g\nout: o\nbogus: 1").unwrap();
-        assert!(assets_for("splink_resolve", Some(&bad)).is_err());
-        // missing a required field rejected
-        let miss: Value = serde_yaml::from_str("edgar: e\ngleif: g").unwrap();
-        assert!(assets_for("splink_resolve", Some(&miss)).is_err());
-    }
-
-    #[test]
-    fn splink_resolve_resolves_by_semver() {
-        assert!(resolve("splink_resolve").is_ok());
-        assert!(resolve("splink_resolve@1").is_ok());
-        assert!(resolve("splink_resolve@^1.0").is_ok());
-        assert!(resolve("splink_resolve@2").is_err()); // version not satisfied
-    }
-
-    #[test]
     fn splink_declares_every_input_and_the_model_as_reads() {
         let with: Value = serde_yaml::from_str(
             "inputs:\n  - {role: left, path: a.parquet}\n  - {role: right, path: b.parquet}\nmodel: m.json\nout: o.parquet",
@@ -8560,41 +8334,6 @@ mod tests {
         let none = splink_with("inputs: [{role: a, path: x}]");
         let argv = splink_invocation(&SplinkConfig::parse(&none).unwrap(), dir).unwrap();
         assert!(!argv.iter().any(|a| a.starts_with("--threshold")));
-    }
-
-    #[test]
-    fn splink_resolve_sample_omitted_for_published_run() {
-        // Published run: no sample → the full corpus, no `--sample` flag at all
-        // (it MUST be omittable — a `--sample 0` would cap GLEIF to zero rows).
-        let full = splink_resolve_args("e.parquet", "g.parquet", "o.parquet", None);
-        assert_eq!(
-            full,
-            vec![
-                "--edgar",
-                "e.parquet",
-                "--gleif",
-                "g.parquet",
-                "--out",
-                "o.parquet"
-            ]
-        );
-        assert!(!full.iter().any(|a| a == "--sample"));
-        // `sample: 0` is treated as "full corpus" too → still omitted.
-        let zero = splink_resolve_args("e.parquet", "g.parquet", "o.parquet", Some(0));
-        assert!(!zero.iter().any(|a| a == "--sample"));
-        // A positive smoke-test cap IS emitted, as the trailing `--sample N` pair.
-        let sampled = splink_resolve_args("e.parquet", "g.parquet", "o.parquet", Some(20_000));
-        assert_eq!(
-            &sampled[sampled.len() - 2..],
-            &["--sample".to_string(), "20000".to_string()]
-        );
-        // Full invocation threads through uv_run_args in the documented order.
-        let script = "/tmp/arcform-op-splink_resolve-1.0.0/splink_resolve.py";
-        let argv = uv_run_args(script, &sampled);
-        assert_eq!(argv[0], "run");
-        assert_eq!(argv[1], "--script");
-        assert_eq!(argv[2], script);
-        assert_eq!(argv[3], "--edgar");
     }
 
     #[test]
@@ -9404,18 +9143,6 @@ mod tests {
                         TEXT_EMBED_CACHE_DIR,
                     )
                 }
-                "splink_resolve" => {
-                    let with: Value = serde_yaml::from_str(
-                        "edgar: edgar.parquet\ngleif: gleif.parquet\nout: out.parquet",
-                    )
-                    .unwrap();
-                    (
-                        SplinkResolve
-                            .run(&with, &ctx)
-                            .expect_err("a script cache that cannot be written must stop the step"),
-                        SPLINK_RESOLVE_CACHE_DIR,
-                    )
-                }
                 "splink" => {
                     let with: Value = serde_yaml::from_str(
                         "inputs: [{role: left, path: in.parquet}]\nmodel: model.json\nout: out.parquet",
@@ -9463,11 +9190,6 @@ mod tests {
         for (operator, cache_dir, script) in [
             ("umap_project", UMAP_PROJECT_CACHE_DIR, "umap_project.py"),
             ("text_embed", TEXT_EMBED_CACHE_DIR, "text_embed.py"),
-            (
-                "splink_resolve",
-                SPLINK_RESOLVE_CACHE_DIR,
-                "splink_resolve.py",
-            ),
             ("splink", SPLINK_CACHE_DIR, "splink.py"),
             (
                 "gleif_ra_fetch",

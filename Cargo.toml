@@ -25,7 +25,6 @@ include = [
     "/skills/**",
     "/operators/gleif_ra_fetch/fetch_gleif_ra.py",
     "/operators/splink/splink.py",
-    "/operators/splink_resolve/resolve.py",
     "/operators/text_embed/text_embed.py",
     "/operators/umap_project/umap_project.py",
     "/Cargo.toml",
