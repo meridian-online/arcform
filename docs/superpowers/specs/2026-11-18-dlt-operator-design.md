@@ -81,7 +81,7 @@ In open-analytics' edgar_gleif Protocol:
 
 ## Landscape
 
-landscape's `acquire.saas` class (reading from a SaaS or REST API) lists `gleif_ra_fetch` as a one-case operator, which leaves the class "not built" on its public page. Once `dlt@1` is released, the class's `operators` names `dlt` in its place. Whether that makes the class "Runs through an operator" is the open question below.
+landscape's `acquire.saas` class (reading from a SaaS or REST API) lists `gleif_ra_fetch` as a one-case operator, which leaves the class "not built" on its public page. Once `dlt@1` is released, the class's `operators` names `dlt` in its place. Hugh ruled that this makes the class "Runs through an operator" (below).
 
 ## Sequence
 
