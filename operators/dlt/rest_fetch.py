@@ -28,9 +28,10 @@ reproducible file needs and dlt does not give:
     reports its record count. Fewer records than that count minus the tolerance is a
     paging failure that stopped early, and nothing is written (exit 1).
 
-  EMPTY PAGES. A page after the first that holds no records ends the fetch, keeping
-    the records before it, even when it carries a next link: some APIs hand one out
-    forever. An empty first page still writes an empty file.
+  PAGING LOOPS. A GET that repeats a request already made in this run, same full URL
+    and query, is a next link that leads back to an earlier page; the fetch fails (exit
+    1) and writes nothing. An empty page alone does not end the fetch: some cursor APIs
+    return one partway through with a cursor to more records.
 
   PACING. `--page-delay-seconds` sleeps before each request after the first. dlt's REST
     client retries failed requests but has no pacing of its own.
@@ -159,18 +160,14 @@ def _as_count(value: object, path: str) -> int:
     raise ValueError(f"{path} is {value!r}, not a record count")
 
 
-def _no_records(found: list) -> bool:
-    """Whether dlt's extract_response would make no records of these selector matches."""
-    data = found[0] if len(found) == 1 else found
-    return data is None or data == []
+class PagingLoop(Exception):
+    """The API's next page is a request this run has already made."""
 
 
 def fetch(source: dict, expect_total_path: str | None, page_delay_seconds: float) -> tuple[list, int | None]:
     """Page the source's one resource; return its records and the first response's total."""
     from dlt.common import jsonpath
     from dlt.sources.helpers.requests.retry import Client
-    from dlt.sources.helpers.rest_client.detector import find_response_page_data
-    from dlt.sources.helpers.rest_client.exceptions import IgnoreResponseException
     from dlt.sources.rest_api import rest_api_resources
 
     source = copy.deepcopy(source)
@@ -200,23 +197,12 @@ def fetch(source: dict, expect_total_path: str | None, page_delay_seconds: float
         if not response.ok or response.is_redirect:
             return response
         body = response.json()
-        if selector:
-            found = jsonpath.find_values(selector, body)
-            if not found:
-                raise ValueError(f"data_selector {selector!r} matches nothing in the response from {response.url}")
-        else:
-            found = [find_response_page_data(body)[1]]
+        if selector and not jsonpath.find_values(selector, body):
+            raise ValueError(f"data_selector {selector!r} matches nothing in the response from {response.url}")
         if state["first"]:
             state["first"] = False
             if expect_total_path:
                 state["total"] = _as_count(dotted_get(body, expect_total_path), expect_total_path)
-        elif _no_records(found):
-            # A later page with no records ends the fetch, whatever its next link says:
-            # a paginator such as json_link follows a next link that never runs out.
-            # dlt's paginate loop ends, keeping the pages before, on this exception,
-            # the one its own `ignore` response action raises. expect_total still
-            # refuses a fetch this leaves short.
-            raise IgnoreResponseException
         return response
 
     # An endpoint's response_actions replace the defaults' rather than adding to them.
@@ -226,8 +212,19 @@ def fetch(source: dict, expect_total_path: str | None, page_delay_seconds: float
     session = Client(raise_for_status=False).session  # what RESTClient builds by default
     send = session.send  # already wrapped in dlt's retries; pacing sits outside them
     sent = [0]
+    seen_gets: set[str] = set()
 
     def paced_send(request, **kwargs):
+        # Each logical request passes here once: dlt's retries sit inside `send`, and a
+        # redirect hop arrives with its own target URL. A GET repeating an earlier one
+        # is a next link that leads back, which no paginator would stop on.
+        if request.method == "GET":
+            if request.url in seen_gets:
+                raise PagingLoop(
+                    f"the API's next page repeats an earlier request ({request.url}); "
+                    "refusing to page in a loop"
+                )
+            seen_gets.add(request.url)
         if sent[0] and page_delay_seconds:
             time.sleep(page_delay_seconds)
         sent[0] += 1
@@ -304,7 +301,11 @@ def main() -> None:
         records, total = fetch(source, args.expect_total_path, delay)
     except Exception as exc:  # one line, not dlt's nested traceback
         _remove(part)
-        print(f"error: fetch failed: {_one_line(exc)}", file=sys.stderr)
+        root = _innermost(exc)
+        if isinstance(root, PagingLoop):
+            print(f"error: {root}", file=sys.stderr)
+        else:
+            print(f"error: fetch failed: {_one_line(exc)}", file=sys.stderr)
         sys.exit(1)
 
     if args.expect_total_path is not None:

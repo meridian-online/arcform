@@ -43,9 +43,10 @@ class Api:
     """One test's API: pages of records, a reported total, and failures to inject."""
 
     def __init__(self, pages, total=None, fail_page=None, fail_times=None, with_total=True,
-                 endless=False):
+                 loop_to=None):
         self.pages = pages
-        self.endless = endless  # the last page links to itself, so a next link never runs out
+        # "self": the last page's next link repeats its own request; "first": the first.
+        self.loop_to = loop_to
         self.total = sum(len(p) for p in pages) if total is None else total
         self.fail_page = fail_page
         self.fail_times = fail_times  # None: fail every time
@@ -70,8 +71,10 @@ class Api:
         nxt = None
         if index + 1 < len(self.pages):
             nxt = f"{self.base}/items?{NEXT_QUERIES[index]}"
-        elif self.endless and index > 0:
+        elif self.loop_to == "self" and index > 0:
             nxt = f"{self.base}/items?{NEXT_QUERIES[index - 1]}"
+        elif self.loop_to == "first":
+            nxt = f"{self.base}/items?{self.requests[0][1]}"
         body = {"data": self.pages[index], "links": {"next": nxt}}
         body["meta"] = {"pagination": {"total": self.total}} if self.with_total else {}
         return 200, body
@@ -236,26 +239,26 @@ class RestFetchE2E(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.out.read_bytes(), b"")
 
-    def test_an_empty_page_with_a_next_link_ends_the_fetch(self) -> None:
-        # The empty page links to itself, so only the empty page can stop the paging.
-        api = self.start(Api([RECORDS[0:2], []], endless=True))
-        r = self.run_op(self.source(api))
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(len(api.requests), 2)
-        expected = b"".join(line + b"\n" for line in sorted(canonical(rec) for rec in RECORDS[0:2]))
-        self.assertEqual(self.out.read_bytes(), expected)
-
-    def test_an_empty_page_ends_the_fetch_before_any_later_page(self) -> None:
+    def test_an_empty_page_with_a_fresh_cursor_is_paged_past(self) -> None:
         api = self.start(Api([RECORDS[0:2], [], RECORDS[2:4]]))
         r = self.run_op(self.source(api))
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(len(api.requests), 2)
-        self.assertEqual(len(self.out.read_bytes().splitlines()), 2)
+        self.assertEqual(len(api.requests), 3)
+        expected = b"".join(line + b"\n" for line in sorted(canonical(rec) for rec in RECORDS[0:4]))
+        self.assertEqual(self.out.read_bytes(), expected)
 
-    def test_a_fetch_an_empty_page_leaves_short_is_refused(self) -> None:
-        api = self.start(Api([RECORDS[0:2], []], total=5, endless=True))
-        r = self.run_op(self.source(api), "--expect-total-path", "meta.pagination.total")
-        self.assertFailed(r, "fetched 2 of 5 records")
+    def test_an_empty_page_linking_to_itself_is_refused(self) -> None:
+        api = self.start(Api([RECORDS[0:2], []], loop_to="self"))
+        r = self.run_op(self.source(api))
+        self.assertFailed(r, "repeats an earlier request", "refusing to page in a loop")
+        self.assertEqual(len(api.requests), 2)
+        self.assertFalse(self.out.exists())
+
+    def test_an_empty_page_linking_back_to_the_first_page_is_refused(self) -> None:
+        api = self.start(Api([RECORDS[0:2], []], loop_to="first"))
+        r = self.run_op(self.source(api))
+        self.assertFailed(r, "repeats an earlier request", "refusing to page in a loop")
+        self.assertEqual(len(api.requests), 2)
         self.assertFalse(self.out.exists())
 
     def test_the_page_delay_paces_every_request_after_the_first(self) -> None:
