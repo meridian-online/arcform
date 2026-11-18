@@ -149,7 +149,7 @@ static HTML_LINK_DISCOVER: HtmlLinkDiscover = HtmlLinkDiscover;
 static ARCHIVE_EXTRACT: ArchiveExtract = ArchiveExtract;
 static DATAPACKAGE_DESCRIBE: DatapackageDescribe = DatapackageDescribe;
 static FINETYPE_VALIDATE: FinetypeValidate = FinetypeValidate;
-static SPLINK_RESOLVE: SplinkResolve = SplinkResolve;
+static SPLINK: Splink = Splink;
 static GLEIF_RA_FETCH: GleifRaFetch = GleifRaFetch;
 static UMAP_PROJECT: UmapProject = UmapProject;
 static TEXT_EMBED: TextEmbed = TextEmbed;
@@ -173,7 +173,7 @@ fn catalog() -> Vec<&'static dyn Operator> {
         &ARCHIVE_EXTRACT,
         &DATAPACKAGE_DESCRIBE,
         &FINETYPE_VALIDATE,
-        &SPLINK_RESOLVE,
+        &SPLINK,
         &GLEIF_RA_FETCH,
         &UMAP_PROJECT,
         &TEXT_EMBED,
@@ -351,15 +351,34 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
             }),
             &["parquet", "schema"],
         ),
-        "splink_resolve" => object(
-            json!({
-                "edgar": { "type": "string", "description": "EDGAR/SEC-entity Parquet (the crosswalk's left side)." },
-                "gleif": { "type": "string", "description": "GLEIF golden-copy Parquet (the right side)." },
-                "out": { "type": "string", "description": "Resolved-crosswalk Parquet to write." },
-                "sample": { "type": "integer", "minimum": 0, "default": 0, "description": "Optional GLEIF-row cap for a fast smoke test; 0 resolves the full corpus." }
-            }),
-            &["edgar", "gleif", "out"],
-        ),
+        "splink" => {
+            let mut schema = object(
+                json!({
+                    "inputs": {
+                        "type": "array",
+                        "minItems": 1,
+                        "description": "The Parquet files the model scores, each under a role. The role is the name the model's SQL uses for that file's rows (and what `source_dataset` carries in the output); one input is a dedupe, two or more are a link. A role given twice is refused.",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "role": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$", "description": "The input's name: a lowercase letter, then lowercase letters, digits or underscores." },
+                                "path": { "type": "string", "description": "The Parquet file, relative to the protocol directory." }
+                            },
+                            "required": ["role", "path"]
+                        }
+                    },
+                    "model": { "type": "string", "description": "A Splink settings file, as Splink's own JSON. Every non-null comparison level in it must carry both m_probability and u_probability: the step does not train." },
+                    "threshold_match_probability": { "type": "number", "minimum": 0, "exclusiveMaximum": 1, "description": "Keep pairs at or above this match probability. Set at most one of the two thresholds; with neither, every blocked pair is written." },
+                    "threshold_match_weight": { "type": "number", "description": "Keep pairs at or above this match weight. Set at most one of the two thresholds." },
+                    "out": { "type": "string", "description": "The Parquet file Splink's predictions are written to, sorted so two runs on the same inputs are byte-identical." }
+                }),
+                &["inputs", "model", "out"],
+            );
+            schema["x-at-most-one-of"] =
+                json!(["threshold_match_probability", "threshold_match_weight"]);
+            schema
+        }
         "gleif_ra_fetch" => object(
             json!({
                 "ra": { "type": "string", "description": "GLEIF registration-authority id to page (e.g. RA000665)." },
@@ -554,6 +573,7 @@ const IGNORED_KEYWORDS: &[&str] = &[
     "description",
     "default",
     "x-at-most",
+    "x-at-most-one-of",
     "x-kind",
     "x-required-for",
 ];
@@ -930,14 +950,14 @@ const DESCRIBED: &[Described] = &[
         writes: &[],
     },
     Described {
-        name: "splink_resolve",
-        summary: "Matches EDGAR entities to GLEIF entities with Splink and writes the resolved crosswalk.",
+        name: "splink",
+        summary: "Scores record pairs with a Splink model you supply and writes the predictions to a Parquet file.",
         wraps: &[
             Wraps {
                 id: "splink",
                 name: "Splink",
                 url: "https://moj-analytical-services.github.io/splink/",
-                use_: "Splink 4's Fellegi-Sunter model scores each EDGAR and GLEIF name pair, with fixed priors so a run is reproducible.",
+                use_: "Scores each blocked pair with the model's Fellegi-Sunter weights, which the step takes as given and never trains.",
             },
             Wraps {
                 id: "duckdb",
@@ -946,29 +966,34 @@ const DESCRIBED: &[Described] = &[
                 use_: "The backend Splink runs its comparisons on.",
             },
         ],
-        example: r#"- name: resolve
-  op: splink_resolve@1
+        example: r#"- name: match
+  op: splink@1
   with:
-    edgar: raw/edgar.parquet
-    gleif: raw/gleif.parquet
-    out: build/edgar_gleif_crosswalk.parquet
+    inputs:
+      - role: left
+        path: build/left.parquet
+      - role: right
+        path: build/right.parquet
+    model: models/match.json
+    threshold_match_probability: 0.9
+    out: build/matches.parquet
 "#,
         reads: &[
             role(
-                "edgar",
+                "inputs.path",
                 "file",
-                "The EDGAR entity Parquet file, the crosswalk's left side.",
+                "A Parquet file the model scores, one per entry of `inputs`.",
             ),
             role(
-                "gleif",
+                "model",
                 "file",
-                "The GLEIF golden-copy Parquet file, the crosswalk's right side.",
+                "The Splink settings file, as Splink's own JSON.",
             ),
         ],
         writes: &[role(
             "out",
             "file",
-            "The Parquet file the resolved crosswalk is written to.",
+            "The Parquet file Splink's predictions are written to.",
         )],
     },
     Described {
@@ -1600,7 +1625,7 @@ mod with_schema_tests {
             "archive_extract" => configuration_fields::<ArchiveExtractConfig>(),
             "datapackage_describe" => configuration_fields::<DatapackageDescribeConfig>(),
             "finetype_validate" => configuration_fields::<FinetypeValidateConfig>(),
-            "splink_resolve" => configuration_fields::<SplinkResolveConfig>(),
+            "splink" => configuration_fields::<SplinkConfig>(),
             "gleif_ra_fetch" => configuration_fields::<GleifRaFetchConfig>(),
             "umap_project" => configuration_fields::<UmapProjectConfig>(),
             "text_embed" => configuration_fields::<TextEmbedConfig>(),
@@ -1859,16 +1884,47 @@ mod with_schema_tests {
                 json!((low + high) / 2.0)
             }
             Some("boolean") => json!(true),
-            Some("array") => json!([
-                probe(&format!("{key}_0"), &prop["items"]),
-                probe(&format!("{key}_1"), &prop["items"]),
-            ]),
+            Some("array") => {
+                let first = probe(&format!("{key}_0"), &prop["items"]);
+                let mut second = probe(&format!("{key}_1"), &prop["items"]);
+                // Two items built from one object schema would carry equal strings,
+                // which a configuration that keys a list by a field (`inputs`' roles)
+                // refuses as a repeat. The second takes a `_1` suffix wherever its
+                // property's pattern still admits it.
+                if let (Some(props), Some(item)) = (
+                    prop["items"]["properties"].as_object(),
+                    second.as_object_mut(),
+                ) {
+                    for (k, v) in item.iter_mut() {
+                        let Some(s) = v.as_str() else { continue };
+                        let suffixed = format!("{s}_1");
+                        let admitted = props[k].get("enum").is_none()
+                            && props[k]["pattern"].as_str().is_none_or(|p| {
+                                regex::Regex::new(p).is_ok_and(|re| re.is_match(&suffixed))
+                            });
+                        if admitted {
+                            *v = json!(suffixed);
+                        }
+                    }
+                }
+                json!([first, second])
+            }
             Some("object") => match prop.get("properties") {
-                Some(_) => properties(prop)
-                    .into_iter()
-                    .map(|(k, p)| (k.clone(), probe(k, p)))
-                    .collect::<serde_json::Map<_, _>>()
-                    .into(),
+                Some(_) => {
+                    // `x-at-most-one-of` names keys a manifest may not set together;
+                    // the probe sets the first and leaves the rest out, since a
+                    // manifest of every key would be refused.
+                    let excluded: Vec<&str> = prop["x-at-most-one-of"]
+                        .as_array()
+                        .map(|keys| keys.iter().skip(1).filter_map(Json::as_str).collect())
+                        .unwrap_or_default();
+                    properties(prop)
+                        .into_iter()
+                        .filter(|(k, _)| !excluded.contains(&k.as_str()))
+                        .map(|(k, p)| (k.clone(), probe(k, p)))
+                        .collect::<serde_json::Map<_, _>>()
+                        .into()
+                }
                 None => json!({
                     format!("probe_{key}"): probe(&format!("{key}_value"), &prop["additionalProperties"])
                 }),
@@ -2220,15 +2276,15 @@ mod with_schema_tests {
             "`x-at-most` counts the rows of `{rows_of}`, which is no file the step reads"
         );
 
-        let described = description("splink_resolve").expect("splink_resolve is described");
-        for role in ["edgar", "gleif", "out"] {
+        let described = description("splink").expect("splink is described");
+        for role in ["model", "out"] {
             assert!(
                 described["parameters"]["properties"].get(role).is_none()
                     && !described["parameters"]["required"]
                         .as_array()
                         .expect("`required` is a list")
                         .contains(&json!(role)),
-                "`{role}` is a role and stays in splink_resolve's `parameters`: {described}"
+                "`{role}` is a role and stays in splink's `parameters`: {described}"
             );
         }
     }
@@ -2423,12 +2479,7 @@ mod with_schema_tests {
     }
 
     /// The operators that run a frozen Python script.
-    const SCRIPT_OPERATORS: [&str; 4] = [
-        "splink_resolve",
-        "gleif_ra_fetch",
-        "umap_project",
-        "text_embed",
-    ];
+    const SCRIPT_OPERATORS: [&str; 4] = ["splink", "gleif_ra_fetch", "umap_project", "text_embed"];
 
     /// Options a frozen script declares that no `with:` key reaches, each with the
     /// reason arc never passes it. Every run through arc takes the script's default for
@@ -2444,7 +2495,11 @@ mod with_schema_tests {
     /// function `run` calls, without spawning `uv`.
     fn script_invocation(op: &str, with: &Value, dir: &Path) -> Result<Vec<String>> {
         match op {
-            "splink_resolve" => splink_resolve_invocation(&SplinkResolveConfig::parse(with)?, dir),
+            "splink" => {
+                let cfg = SplinkConfig::parse(with)?;
+                cfg.validate()?;
+                splink_invocation(&cfg, dir)
+            }
             "gleif_ra_fetch" => gleif_ra_fetch_invocation(&GleifRaFetchConfig::parse(with)?, dir),
             "umap_project" => {
                 let cfg = UmapProjectConfig::parse(with)?;
@@ -2645,6 +2700,7 @@ mod with_schema_tests {
             Json::Number(n) => vec![n.to_string()],
             Json::Bool(b) => vec![b.to_string()],
             Json::Array(items) => items.iter().flat_map(rendered).collect(),
+            Json::Object(fields) => fields.values().flat_map(rendered).collect(),
             _ => Vec::new(),
         }
     }
@@ -2652,7 +2708,12 @@ mod with_schema_tests {
     /// Whether an argv value carries a probe: as given, or as a path under the
     /// protocol directory.
     fn carries(argument: &str, probe: &str) -> bool {
-        argument == probe || Path::new(argument).ends_with(probe)
+        // `ROLE=PATH` carries the role and the path it joins.
+        let part_carries = |a: &str| a == probe || Path::new(a).ends_with(probe);
+        part_carries(argument)
+            || argument
+                .split_once('=')
+                .is_some_and(|(left, right)| part_carries(left) || part_carries(right))
     }
 
     /// A frozen-script operator's step, built as far as the argv its `run` hands `uv`:
@@ -2691,6 +2752,29 @@ mod with_schema_tests {
         Ok(ScriptCall { source, passed })
     }
 
+    /// The manifests that together carry every key of `schema`. One manifest of every
+    /// key, unless the schema names keys a manifest may not set together
+    /// (`x-at-most-one-of`): then each such key gets a manifest of its own, the others
+    /// left out.
+    fn manifests_covering_every_key(schema: &Json) -> Vec<Json> {
+        let first = probe("", schema);
+        let mut manifests = vec![first.clone()];
+        let exclusive: Vec<&str> = schema["x-at-most-one-of"]
+            .as_array()
+            .map(|keys| keys.iter().filter_map(Json::as_str).collect())
+            .unwrap_or_default();
+        for other in exclusive.iter().skip(1) {
+            let mut manifest = first.clone();
+            manifest
+                .as_object_mut()
+                .unwrap()
+                .remove(*exclusive.first().unwrap());
+            manifest[*other] = probe(other, &schema["properties"][*other]);
+            manifests.push(manifest);
+        }
+        manifests
+    }
+
     /// Which option each schema key reaches in `call`, the step built from `full`, by
     /// option: the one whose values carry the key's probe value. A key is found by the
     /// value it carries, so a flag that carries none would need this extended; no key
@@ -2704,6 +2788,11 @@ mod with_schema_tests {
         let mut faults = Vec::new();
         let mut seen = BTreeSet::new();
         for (key, _) in properties(schema) {
+            // A key the manifest leaves out (one of `x-at-most-one-of`'s others) reaches
+            // nothing in this call; another call carries it.
+            if full.get(key.as_str()).is_none() {
+                continue;
+            }
             let values = rendered(&full[key]);
             if values.is_empty() || !values.iter().all(|v| seen.insert(v.clone())) {
                 faults.push(format!(
@@ -2864,17 +2953,28 @@ ap.add_argument(
             assert!(catalogue.contains(&op), "`{op}` is not in the catalogue");
             let schema = with_schema(op).expect("every catalogue operator has a schema");
             let schema_required = required(&schema);
-            let full = probe("", &schema);
-            let call = match script_call(op, &full) {
-                Ok(call) => call,
-                Err(e) => {
-                    faults.push(format!("{op}, from a manifest of every schema key: {e}"));
-                    continue;
-                }
-            };
-            let ScriptCall { source, passed } = &call;
-            let (key_of, unreached) = options_keys_reach(&schema, &full, &call);
-            faults.extend(unreached.into_iter().map(|f| format!("{op}: {f}")));
+            let manifests = manifests_covering_every_key(&schema);
+            let mut passed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            let mut key_of = BTreeMap::new();
+            let mut source = String::new();
+            for full in &manifests {
+                let call = match script_call(op, full) {
+                    Ok(call) => call,
+                    Err(e) => {
+                        faults.push(format!("{op}, from a manifest of every schema key: {e}"));
+                        continue;
+                    }
+                };
+                let (reached, unreached) = options_keys_reach(&schema, full, &call);
+                faults.extend(unreached.into_iter().map(|f| format!("{op}: {f}")));
+                key_of.extend(reached);
+                passed.extend(call.passed);
+                source = call.source;
+            }
+            if source.is_empty() {
+                continue;
+            }
+            let (source, passed) = (&source, &passed);
 
             let never: BTreeSet<&str> = OPTIONS_ARC_NEVER_PASSES
                 .iter()
@@ -2914,6 +3014,10 @@ ap.add_argument(
                 let schema_type = (prop["type"].as_str(), prop["items"]["type"].as_str());
                 match argparse_schema_type(option) {
                     Ok((t, items)) if (Some(t), items) == schema_type => {}
+                    // An object per item reaches the script folded into one string
+                    // (`inputs`' role and path as `--input ROLE=PATH`).
+                    Ok(("array", Some("string")))
+                        if schema_type == (Some("array"), Some("object")) => {}
                     Ok((t, items)) => faults.push(format!(
                         "{op}: the script reads {flag} as {t}{}, but the schema types `{key}` as {}{}",
                         items.map(|i| format!(" of {i}")).unwrap_or_default(),
@@ -3028,7 +3132,12 @@ ap.add_argument("--nowhere", default=NOWHERE)
                         continue;
                     }
                 };
-            let (key_of, _) = options_keys_reach(&schema, &full, &every_key);
+            let mut key_of = options_keys_reach(&schema, &full, &every_key).0;
+            for other in manifests_covering_every_key(&schema).iter().skip(1) {
+                if let Ok(call) = script_call(op, other) {
+                    key_of.extend(options_keys_reach(&schema, other, &call).0);
+                }
+            }
             let declared = script_options(&left_out.source);
             for (key, prop) in properties(&schema) {
                 let stated = prop.get("default");
@@ -3122,7 +3231,7 @@ ap.add_argument("--nowhere", default=NOWHERE)
             "archive_extract" => read_as::<ArchiveExtractConfig>(with),
             "datapackage_describe" => read_as::<DatapackageDescribeConfig>(with),
             "finetype_validate" => read_as::<FinetypeValidateConfig>(with),
-            "splink_resolve" => read_as::<SplinkResolveConfig>(with),
+            "splink" => read_as::<SplinkConfig>(with),
             "gleif_ra_fetch" => read_as::<GleifRaFetchConfig>(with),
             "umap_project" => read_as::<UmapProjectConfig>(with),
             "text_embed" => read_as::<TextEmbedConfig>(with),
@@ -3233,7 +3342,7 @@ ap.add_argument("--nowhere", default=NOWHERE)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Subprocess substrate — the shared spawn/wait/error-map for operators that wrap
-// an external process: a `uv run` Python script (splink_resolve, gleif_ra_fetch)
+// an external process: a `uv run` Python script (splink, gleif_ra_fetch)
 // or a CLI (datapackage_describe → finetype). One place for the retry taxonomy so
 // each op doesn't hand-roll a Command block with divergent error handling.
 // (Wired by those operators in later increments — allow(dead_code) until then.)
@@ -3241,7 +3350,7 @@ ap.add_argument("--nowhere", default=NOWHERE)
 
 /// How a subprocess operator handles its child's output.
 enum OutputMode {
-    /// Stream child stdout/stderr live (e.g. `splink_resolve`'s coverage tables), keeping
+    /// Stream child stdout/stderr live (e.g. `splink`'s refusals), keeping
     /// the end of stderr for a failure's error. Honours the step timeout via
     /// `wait_with_timeout`.
     Inherit,
@@ -5983,91 +6092,119 @@ impl Operator for ArchiveExtract {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// splink_resolve (transform) — the probabilistic EDGAR↔GLEIF name match, promoted
-// from the opaque `command: uv run --script …/resolve.py …` step to a first-class,
-// versioned operator. `op: splink_resolve@1` addresses the EXACT frozen script bytes
-// embedded below (SEED=42 Fellegi-Sunter model; see resolve.py) — the reproducibility
-// contract the "call the script by relative path" step lacked. Its `reads`/`produces`
-// put the resolve *in* the asset graph, so a stale input propagates instead of the
-// graph-island silent-skip the path-based step risked.
-//
-// Wraps the arcform-EMBEDDED resolve.py via the uv-run substrate (materialize_frozen_
-// script → uv_run_args → run_process), NOT a Rust reimplementation of Splink — Python
-// at the edges, same posture as datapackage_describe. Runs in OutputMode::Inherit so
-// resolve.py's `[coverage]` / `[hero tickers]` tables stream live and the step timeout
-// (the manifest's `timeout_sec`) is enforced by wait_with_timeout.
-//
-// SCALE — this is the ~4 h full-corpus job (GLEIF ≈ 3.2M rows). The manifest step MUST
-// pin `retry.max_attempts: 1`: a non-zero exit or timeout is retryable in the substrate,
-// so without a cap the engine would re-attempt a 4 h job up to `defaults.retry`. (A
-// spawn failure — bad `uv`/binary — is already NON-retryable, so a typo never burns
-// attempts; but a mid-run failure is the case the manifest cap guards.) `--sample` is a
-// smoke-test cap on GLEIF rows and is OMITTED for a published run (see the arg builder).
+// splink (transform) — probabilistic record linkage with a model the Protocol
+// supplies. This operator holds no dataset's columns or model: the inputs, the
+// Splink settings JSON and the threshold all come from `with:`, and the frozen script scores the pairs with the model as given
+// (it never trains). `op: splink@1` addresses the exact script bytes embedded below.
+// Same uv-run substrate as the other frozen-script operators; runs in OutputMode::Inherit so the
+// script's refusals stream as they happen.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The resolve script, pinned into the binary. `@1` == these exact bytes.
-const RESOLVE_PY: &str = include_str!("../operators/splink_resolve/resolve.py");
+/// The splink script, pinned into the binary. `@1` == these exact bytes.
+const SPLINK_PY: &str = include_str!("../operators/splink/splink.py");
 
 /// The script cache directory `materialize_frozen_script` builds for this operator.
-/// Test-only, for the same reason [`UMAP_PROJECT_CACHE_DIR`] is: production never
-/// spells the path, and a test traps it to drive the cache's two failure paths.
+/// Test-only, for the same reason [`UMAP_PROJECT_CACHE_DIR`] is.
 #[cfg(test)]
-const SPLINK_RESOLVE_CACHE_DIR: &str = "arcform-op-splink_resolve-1.0.0";
+const SPLINK_CACHE_DIR: &str = "arcform-op-splink-1.0.0";
 
-struct SplinkResolve;
+struct Splink;
+
+/// One input: a Parquet file under the role the model's SQL and the output name it by.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Debug))]
+#[serde(deny_unknown_fields)]
+struct SplinkInput {
+    role: String,
+    path: String,
+}
 
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Debug))]
 #[serde(deny_unknown_fields)]
-struct SplinkResolveConfig {
-    /// EDGAR / SEC-entity Parquet (cik, ticker, company_name) — the crosswalk's left
-    /// side. A `reads` asset, resolved against ctx.dir.
-    edgar: String,
-    /// GLEIF golden-copy Parquet (lei, legal_name, jurisdiction, country, reg_status) —
-    /// the right side. A `reads` asset, resolved against ctx.dir.
-    gleif: String,
-    /// Resolved-crosswalk Parquet to write (the `produces` asset). Resolved against ctx.dir.
+struct SplinkConfig {
+    /// The inputs, each a `reads` asset resolved against ctx.dir.
+    inputs: Vec<SplinkInput>,
+    /// The Splink settings JSON (a `reads` asset).
+    model: String,
+    /// The predictions Parquet (the `produces` asset).
     out: String,
-    /// Optional GLEIF-row cap for a fast smoke test (reservoir sample, SEED=42). OMITTED
-    /// from the argv unless `Some(n)` with `n > 0`; a published run leaves it unset (or 0)
-    /// and resolves the full corpus.
+    /// Keep pairs at or above this probability, in `[0, 1)`. Omitted from the argv
+    /// when unset.
     #[serde(default)]
-    sample: Option<u64>,
+    threshold_match_probability: Option<f64>,
+    /// Keep pairs at or above this weight. Omitted from the argv when unset.
+    #[serde(default)]
+    threshold_match_weight: Option<f64>,
 }
 
-impl SplinkResolveConfig {
+impl SplinkConfig {
     fn parse(with: &Value) -> Result<Self> {
         serde_yaml::from_value(with.clone()).map_err(|e| {
-            Error::ManifestValidation(format!("splink_resolve: invalid `with:` config: {}", e))
+            Error::ManifestValidation(format!("splink: invalid `with:` config: {}", e))
         })
     }
-}
 
-/// Build resolve.py's argv tail (everything after the script path). `--sample` is emitted
-/// ONLY for a positive cap: a published run passes `sample: None` (or `0`) and the full
-/// GLEIF corpus is resolved. Factored out so the omit-on-publish rule is unit-testable
-/// without spawning `uv`.
-fn splink_resolve_args(edgar: &str, gleif: &str, out: &str, sample: Option<u64>) -> Vec<String> {
-    let mut a = vec![
-        "--edgar".to_string(),
-        edgar.to_string(),
-        "--gleif".to_string(),
-        gleif.to_string(),
-        "--out".to_string(),
-        out.to_string(),
-    ];
-    if let Some(n) = sample
-        && n > 0
-    {
-        a.push("--sample".to_string());
-        a.push(n.to_string());
+    /// Refuse, at manifest load, what is decidable without reading a file. The role
+    /// and probability rules are the script's own, stated here so a manifest is
+    /// refused before `uv` starts.
+    fn validate(&self) -> Result<()> {
+        if self.inputs.is_empty() {
+            return Err(Error::ManifestValidation(
+                "splink: `inputs:` is empty — name at least one Parquet file to score, each \
+                 with a `role` and a `path`"
+                    .to_string(),
+            ));
+        }
+        for (at, input) in self.inputs.iter().enumerate() {
+            let mut chars = input.role.chars();
+            let shaped = chars.next().is_some_and(|c| c.is_ascii_lowercase())
+                && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+            if !shaped {
+                return Err(Error::ManifestValidation(format!(
+                    "splink: `inputs:` role {:?} is not a lowercase letter followed by \
+                     lowercase letters, digits or underscores",
+                    input.role
+                )));
+            }
+            if self.inputs[..at].iter().any(|i| i.role == input.role) {
+                return Err(Error::ManifestValidation(format!(
+                    "splink: `inputs:` gives the role {:?} more than once — each input \
+                     needs a role of its own",
+                    input.role
+                )));
+            }
+        }
+        if self.threshold_match_probability.is_some() && self.threshold_match_weight.is_some() {
+            return Err(Error::ManifestValidation(
+                "splink: `threshold_match_probability` and `threshold_match_weight` are \
+                 both set — set one, or neither to write every blocked pair"
+                    .to_string(),
+            ));
+        }
+        if let Some(p) = self.threshold_match_probability
+            && !(0.0..1.0).contains(&p)
+        {
+            return Err(Error::ManifestValidation(format!(
+                "splink: `threshold_match_probability: {}` is outside [0, 1)",
+                p
+            )));
+        }
+        if let Some(w) = self.threshold_match_weight
+            && !w.is_finite()
+        {
+            return Err(Error::ManifestValidation(format!(
+                "splink: `threshold_match_weight: {}` is not a finite number",
+                w
+            )));
+        }
+        Ok(())
     }
-    a
 }
 
-impl Operator for SplinkResolve {
+impl Operator for Splink {
     fn name(&self) -> &'static str {
-        "splink_resolve"
+        "splink"
     }
 
     fn version(&self) -> semver::Version {
@@ -6075,39 +6212,52 @@ impl Operator for SplinkResolve {
     }
 
     fn assets(&self, with: &Value) -> Result<OpAssets> {
-        let cfg = SplinkResolveConfig::parse(with)?;
+        let cfg = SplinkConfig::parse(with)?;
+        cfg.validate()?;
         let mut assets = OpAssets::default();
-        assets.record_reads(cfg.edgar.clone(), crate::asset_kind::AssetKind::File);
-        assets.record_reads(cfg.gleif.clone(), crate::asset_kind::AssetKind::File);
+        for input in &cfg.inputs {
+            assets.record_reads(input.path.clone(), crate::asset_kind::AssetKind::File);
+        }
+        assets.record_reads(cfg.model.clone(), crate::asset_kind::AssetKind::File);
         assets.record_produces(cfg.out.clone(), crate::asset_kind::AssetKind::File);
         Ok(assets)
     }
 
     fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
-        let cfg = SplinkResolveConfig::parse(with)?;
+        let cfg = SplinkConfig::parse(with)?;
+        cfg.validate()?;
         let out = ctx.dir.join(&cfg.out);
         if let Some(parent) = out.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-
-        let args = splink_resolve_invocation(&cfg, ctx.dir)?;
-        // Inherit: stream resolve.py's coverage/hero-ticker tables live and honour the
-        // step timeout (a 4 h job that overruns is killed, not left hanging).
-        run_process("uv", &args, ctx, OutputMode::Inherit, "splink_resolve")
+        let args = splink_invocation(&cfg, ctx.dir)?;
+        run_process("uv", &args, ctx, OutputMode::Inherit, "splink")
     }
 }
 
 /// The full argv `run` hands `uv`: materialise the frozen script and build its
-/// arguments. Split out of [`Operator::run`], as [`umap_project_invocation`] is, so a
-/// test reads the argv the script is really given without spawning `uv`.
-fn splink_resolve_invocation(cfg: &SplinkResolveConfig, dir: &Path) -> Result<Vec<String>> {
-    let script = materialize_frozen_script("splink_resolve", "1.0.0", RESOLVE_PY)?;
-    let extra = splink_resolve_args(
-        &dir.join(&cfg.edgar).display().to_string(),
-        &dir.join(&cfg.gleif).display().to_string(),
-        &dir.join(&cfg.out).display().to_string(),
-        cfg.sample,
-    );
+/// arguments. One `--input ROLE=PATH` per input in manifest order, then the model and
+/// the output, then the one threshold the manifest set, if any.
+fn splink_invocation(cfg: &SplinkConfig, dir: &Path) -> Result<Vec<String>> {
+    let script = materialize_frozen_script("splink", "1.0.0", SPLINK_PY)?;
+    let at = |p: &str| dir.join(p).display().to_string();
+    let mut extra = Vec::new();
+    for input in &cfg.inputs {
+        extra.push("--input".to_string());
+        extra.push(format!("{}={}", input.role, at(&input.path)));
+    }
+    extra.push("--model".to_string());
+    extra.push(at(&cfg.model));
+    extra.push("--out".to_string());
+    extra.push(at(&cfg.out));
+    if let Some(p) = cfg.threshold_match_probability {
+        extra.push("--threshold-match-probability".to_string());
+        extra.push(p.to_string());
+    }
+    if let Some(w) = cfg.threshold_match_weight {
+        extra.push("--threshold-match-weight".to_string());
+        extra.push(w.to_string());
+    }
     Ok(uv_run_args(&script.to_string_lossy(), &extra))
 }
 
@@ -6124,7 +6274,7 @@ fn splink_resolve_invocation(cfg: &SplinkResolveConfig, dir: &Path) -> Result<Ve
 // full-refresh (no incremental cursor persisted) — then writes a DETERMINISTIC
 // SORTED CSV so the row-set parity gate against the retired script is a clean
 // `EXCEPT`. Same uv-run substrate + frozen-script contract as datapackage_describe
-// and splink_resolve: `op@1` addresses these exact script bytes.
+// and splink: `op@1` addresses these exact script bytes.
 //
 // Ingress, so `reads: []` (the network source is not a graph node) and
 // `produces: [out]` — the CSV sits in the AssetGraph downstream of nothing and
@@ -6909,7 +7059,7 @@ fn text_embed_invocation(cfg: &TextEmbedConfig, dir: &Path) -> Result<Vec<String
 // ─────────────────────────────────────────────────────────────────────────────
 // uv (activate) — a Protocol's OWN Python step, inside the asset graph.
 //
-// The generic counterpart to the frozen-script operators (`splink_resolve`,
+// The generic counterpart to the frozen-script operators (`splink`,
 // `gleif_ra_fetch`, `umap_project`, `text_embed`): the same `uv run --script`
 // substrate, but the script is the Protocol's rather than one compiled into this
 // binary. Without it, a Python step has to be `command:` — which addresses no exact
@@ -8089,72 +8239,101 @@ mod tests {
     }
 
     #[test]
-    fn splink_resolve_declares_lineage() {
-        // reads = [edgar, gleif] (order-preserving), produces = [out].
+    fn splink_declares_every_input_and_the_model_as_reads() {
         let with: Value = serde_yaml::from_str(
-            "edgar: build/sec_entities.parquet\ngleif: build/gleif.parquet\nout: build/resolved.parquet",
+            "inputs:\n  - {role: left, path: a.parquet}\n  - {role: right, path: b.parquet}\nmodel: m.json\nout: o.parquet",
         )
         .unwrap();
-        let a = assets_for("splink_resolve", Some(&with)).unwrap();
-        assert_eq!(
-            a.reads,
-            vec![
-                "build/sec_entities.parquet".to_string(),
-                "build/gleif.parquet".to_string()
-            ]
+        let a = assets_for("splink", Some(&with)).unwrap();
+        assert_eq!(a.reads, vec!["a.parquet", "b.parquet", "m.json"]);
+        assert_eq!(a.produces, vec!["o.parquet".to_string()]);
+    }
+
+    fn splink_with(extra: &str) -> Value {
+        serde_yaml::from_str(&format!("model: m.json\nout: o.parquet\n{extra}")).unwrap()
+    }
+
+    #[test]
+    fn splink_refuses_a_role_given_twice() {
+        let with = splink_with("inputs: [{role: a, path: x}, {role: a, path: y}]");
+        let err = assets_for("splink", Some(&with)).unwrap_err().to_string();
+        assert!(err.contains("inputs") && err.contains("\"a\""), "{err}");
+    }
+
+    #[test]
+    fn splink_refuses_both_thresholds() {
+        let with = splink_with(
+            "inputs: [{role: a, path: x}]\nthreshold_match_probability: 0.5\nthreshold_match_weight: 2",
         );
-        assert_eq!(a.produces, vec!["build/resolved.parquet".to_string()]);
-        // `sample` is optional — a published run omits it and still validates.
-        assert!(assets_for("splink_resolve", Some(&with)).is_ok());
-        // unknown field rejected (deny_unknown_fields)
-        let bad: Value = serde_yaml::from_str("edgar: e\ngleif: g\nout: o\nbogus: 1").unwrap();
-        assert!(assets_for("splink_resolve", Some(&bad)).is_err());
-        // missing a required field rejected
-        let miss: Value = serde_yaml::from_str("edgar: e\ngleif: g").unwrap();
-        assert!(assets_for("splink_resolve", Some(&miss)).is_err());
+        let err = assets_for("splink", Some(&with)).unwrap_err().to_string();
+        assert!(err.contains("threshold_match_probability"), "{err}");
+        assert!(err.contains("threshold_match_weight"), "{err}");
     }
 
     #[test]
-    fn splink_resolve_resolves_by_semver() {
-        assert!(resolve("splink_resolve").is_ok());
-        assert!(resolve("splink_resolve@1").is_ok());
-        assert!(resolve("splink_resolve@^1.0").is_ok());
-        assert!(resolve("splink_resolve@2").is_err()); // version not satisfied
+    fn splink_refuses_no_inputs() {
+        let with = splink_with("inputs: []");
+        let err = assets_for("splink", Some(&with)).unwrap_err().to_string();
+        assert!(err.contains("inputs"), "{err}");
     }
 
     #[test]
-    fn splink_resolve_sample_omitted_for_published_run() {
-        // Published run: no sample → the full corpus, no `--sample` flag at all
-        // (it MUST be omittable — a `--sample 0` would cap GLEIF to zero rows).
-        let full = splink_resolve_args("e.parquet", "g.parquet", "o.parquet", None);
+    fn splink_refuses_a_role_or_probability_the_script_would() {
+        let inf = splink_with("inputs: [{role: a, path: x}]\nthreshold_match_weight: .inf");
+        assert!(assets_for("splink", Some(&inf)).is_err());
+        let bad_role = splink_with("inputs: [{role: Left, path: x}]");
+        assert!(assets_for("splink", Some(&bad_role)).is_err());
+        for p in ["1", "-0.1", "1.5"] {
+            let with = splink_with(&format!(
+                "inputs: [{{role: a, path: x}}]\nthreshold_match_probability: {p}"
+            ));
+            assert!(assets_for("splink", Some(&with)).is_err(), "{p}");
+        }
+        let zero = splink_with("inputs: [{role: a, path: x}]\nthreshold_match_probability: 0");
+        assert!(assets_for("splink", Some(&zero)).is_ok());
+    }
+
+    #[test]
+    fn splink_resolves_by_semver() {
+        assert!(resolve("splink").is_ok());
+        assert!(resolve("splink@1").is_ok());
+        assert!(resolve("splink@2").is_err());
+    }
+
+    #[test]
+    fn splink_argv_carries_each_input_and_one_threshold() {
+        let dir = Path::new("proto");
+        let with = splink_with(
+            "inputs: [{role: left, path: a.parquet}, {role: right, path: b.parquet}]\nthreshold_match_probability: 0.9",
+        );
+        let cfg = SplinkConfig::parse(&with).unwrap();
+        let argv = splink_invocation(&cfg, dir).unwrap();
+        assert_eq!(&argv[..2], ["run", "--script"]);
         assert_eq!(
-            full,
-            vec![
-                "--edgar",
-                "e.parquet",
-                "--gleif",
-                "g.parquet",
+            &argv[3..],
+            [
+                "--input",
+                "left=proto/a.parquet",
+                "--input",
+                "right=proto/b.parquet",
+                "--model",
+                "proto/m.json",
                 "--out",
-                "o.parquet"
+                "proto/o.parquet",
+                "--threshold-match-probability",
+                "0.9",
             ]
         );
-        assert!(!full.iter().any(|a| a == "--sample"));
-        // `sample: 0` is treated as "full corpus" too → still omitted.
-        let zero = splink_resolve_args("e.parquet", "g.parquet", "o.parquet", Some(0));
-        assert!(!zero.iter().any(|a| a == "--sample"));
-        // A positive smoke-test cap IS emitted, as the trailing `--sample N` pair.
-        let sampled = splink_resolve_args("e.parquet", "g.parquet", "o.parquet", Some(20_000));
+        let with = splink_with("inputs: [{role: a, path: x}]\nthreshold_match_weight: -2.5");
+        let argv = splink_invocation(&SplinkConfig::parse(&with).unwrap(), dir).unwrap();
         assert_eq!(
-            &sampled[sampled.len() - 2..],
-            &["--sample".to_string(), "20000".to_string()]
+            &argv[argv.len() - 2..],
+            ["--threshold-match-weight", "-2.5"]
         );
-        // Full invocation threads through uv_run_args in the documented order.
-        let script = "/tmp/arcform-op-splink_resolve-1.0.0/splink_resolve.py";
-        let argv = uv_run_args(script, &sampled);
-        assert_eq!(argv[0], "run");
-        assert_eq!(argv[1], "--script");
-        assert_eq!(argv[2], script);
-        assert_eq!(argv[3], "--edgar");
+        assert!(!argv.iter().any(|a| a == "--threshold-match-probability"));
+        let none = splink_with("inputs: [{role: a, path: x}]");
+        let argv = splink_invocation(&SplinkConfig::parse(&none).unwrap(), dir).unwrap();
+        assert!(!argv.iter().any(|a| a.starts_with("--threshold")));
     }
 
     #[test]
@@ -8964,16 +9143,16 @@ mod tests {
                         TEXT_EMBED_CACHE_DIR,
                     )
                 }
-                "splink_resolve" => {
+                "splink" => {
                     let with: Value = serde_yaml::from_str(
-                        "edgar: edgar.parquet\ngleif: gleif.parquet\nout: out.parquet",
+                        "inputs: [{role: left, path: in.parquet}]\nmodel: model.json\nout: out.parquet",
                     )
                     .unwrap();
                     (
-                        SplinkResolve
+                        Splink
                             .run(&with, &ctx)
                             .expect_err("a script cache that cannot be written must stop the step"),
-                        SPLINK_RESOLVE_CACHE_DIR,
+                        SPLINK_CACHE_DIR,
                     )
                 }
                 "gleif_ra_fetch" => {
@@ -9011,11 +9190,7 @@ mod tests {
         for (operator, cache_dir, script) in [
             ("umap_project", UMAP_PROJECT_CACHE_DIR, "umap_project.py"),
             ("text_embed", TEXT_EMBED_CACHE_DIR, "text_embed.py"),
-            (
-                "splink_resolve",
-                SPLINK_RESOLVE_CACHE_DIR,
-                "splink_resolve.py",
-            ),
+            ("splink", SPLINK_CACHE_DIR, "splink.py"),
             (
                 "gleif_ra_fetch",
                 GLEIF_RA_FETCH_CACHE_DIR,

@@ -1,0 +1,54 @@
+{
+  "link_type": "link_only",
+  "unique_id_column_name": "uid",
+  "probability_two_random_records_match": 0.01,
+  "blocking_rules_to_generate_predictions": [
+    {"blocking_rule": "(l.\"country\" = r.\"country\") AND (l.\"blk_p6\" = r.\"blk_p6\")"},
+    {"blocking_rule": "l.\"blk_p8\" = r.\"blk_p8\""},
+    {"blocking_rule": "(l.\"country\" = r.\"country\") AND (l.\"blk_tok\" = r.\"blk_tok\")"},
+    {"blocking_rule": "l.\"blk_exact\" = r.\"blk_exact\""}
+  ],
+  "comparisons": [
+    {
+      "output_column_name": "nname",
+      "comparison_description": "normalized company name",
+      "comparison_levels": [
+        {
+          "sql_condition": "\"nname_l\" IS NULL OR \"nname_r\" IS NULL",
+          "label_for_charts": "Null",
+          "is_null_level": true
+        },
+        {
+          "sql_condition": "\"nname_l\" = \"nname_r\"",
+          "label_for_charts": "Exact",
+          "m_probability": 0.8,
+          "u_probability": 1e-06
+        },
+        {
+          "sql_condition": "jaro_winkler_similarity(\"nname_l\", \"nname_r\") >= 0.95",
+          "label_for_charts": "JW>=0.95",
+          "m_probability": 0.12,
+          "u_probability": 1e-05
+        },
+        {
+          "sql_condition": "jaro_winkler_similarity(\"nname_l\", \"nname_r\") >= 0.92",
+          "label_for_charts": "JW>=0.92",
+          "m_probability": 0.04,
+          "u_probability": 0.0001
+        },
+        {
+          "sql_condition": "jaro_winkler_similarity(\"nname_l\", \"nname_r\") >= 0.88",
+          "label_for_charts": "JW>=0.88",
+          "m_probability": 0.02,
+          "u_probability": 0.001
+        },
+        {
+          "sql_condition": "ELSE",
+          "label_for_charts": "All other",
+          "m_probability": 0.02,
+          "u_probability": 0.998889
+        }
+      ]
+    }
+  ]
+}

@@ -363,7 +363,7 @@ fn operation_describe_schema() -> Value {
         "properties": {
             "operation": {
                 "type": "string",
-                "description": "An operation's long name (e.g. filter-rows) or an operator's name (e.g. splink_resolve). Omit to list every operation arc holds."
+                "description": "An operation's long name (e.g. filter-rows) or an operator's name (e.g. splink). Omit to list every operation arc holds."
             }
         }
     })

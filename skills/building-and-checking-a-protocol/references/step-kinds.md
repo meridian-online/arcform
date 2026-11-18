@@ -49,7 +49,7 @@ Use an operator for work that is not a query over tables already in the database
 | Purpose | Operators |
 | --- | --- |
 | Fetching | `http_fetch` (one file at an address), `html_link_discover` (the links on an index page), `archive_extract` (members of a zip), `gleif_ra_fetch` (GLEIF entities for one registration authority) |
-| Entity resolution | `splink_resolve` |
+| Entity resolution | `splink` (scores record pairs with a Splink model the Protocol supplies, for any dataset) |
 | Embedding and projection | `text_embed`, `umap_project` |
 | Export and description | `parquet_export`, `datapackage_describe`, `finetype_validate` |
 | Publishing | `ducklake_write` (tables into a DuckLake on object storage, upserted on their keys as one snapshot; without the write credential it publishes into a local lake and the run stays green, and `arc run --publish` makes the live publish required), `ducklake_publish` (one Parquet file into a DuckLake catalog whose data path is local) |

@@ -454,8 +454,8 @@ class RefusesAFitThatDoesNotDescribeTheInputTest(unittest.TestCase):
 
     def test_a_file_that_is_not_this_operators_fit(self) -> None:
         stranger = self.dir / "stranger.pkl"
-        stranger.write_bytes(pickle.dumps({"header": {"operator": "splink_resolve"}}))
-        self.assertIn("splink_resolve", self._refused(fit=stranger))
+        stranger.write_bytes(pickle.dumps({"header": {"operator": "splink"}}))
+        self.assertIn("splink", self._refused(fit=stranger))
 
 
 if __name__ == "__main__":
