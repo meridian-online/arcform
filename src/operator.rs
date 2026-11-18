@@ -392,7 +392,7 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
         ),
         "dlt" => object(
             json!({
-                "source": { "type": "object", "description": "dlt's own `rest_api` source configuration, as dlt's documentation describes it: the client's base URL, headers and paginator, and exactly one resource with its endpoint, query parameters and data selector. Passed to dlt as JSON, so a bracketed query key stays as written and an integer stays an integer. Refused, before any request: no `client.base_url`; other than one resource; `incremental`, `auth`, `processing_steps` or a `resolve` parameter anywhere; a `write_disposition` other than `replace`." },
+                "source": { "type": "object", "description": "dlt's own `rest_api` source configuration, as dlt's documentation describes it: the client's base URL, headers and paginator, and exactly one resource with its endpoint, query parameters and data selector. Passed to dlt as JSON, so a bracketed query key stays as written and an integer stays an integer. Refused, before any request: no `client.base_url`; other than one resource; a key named `incremental`, `auth` or `processing_steps` anywhere except inside a request's own `params`, `headers`, `json` or `data`, where such a name is the API's business; a parameter of `type: resolve` or `type: incremental`; a `write_disposition` other than `replace`." },
                 "expect_total": {
                     "type": "object",
                     "additionalProperties": false,
