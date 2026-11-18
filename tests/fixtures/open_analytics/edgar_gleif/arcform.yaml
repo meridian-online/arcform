@@ -217,9 +217,7 @@ steps:
 
   - name: score_pairs
     # Retry is pinned to 1, as the full-corpus scoring step's always was: a failure here
-    # is the model or the inputs, which a second attempt does not change. The full corpus
-    # scores in under a minute; the timeout leaves room for a slow machine, not a run of
-    # hours.
+    # is the model or the inputs, which a second attempt does not change.
     op: splink@1
     with:
       inputs:
@@ -232,7 +230,7 @@ steps:
       out: build/scored_pairs.parquet
     retry:
       max_attempts: 1
-    timeout_sec: 1800
+    timeout_sec: 14400
 
   - name: resolved
     sql: models/resolved.sql

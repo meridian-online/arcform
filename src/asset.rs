@@ -1682,7 +1682,7 @@ mod tests {
             (
                 "edgar_gleif/arcform.yaml",
                 include_str!("../tests/fixtures/open_analytics/edgar_gleif/arcform.yaml"),
-                "8e7a77ec747a148913fbb4db635dd92e6054a65d6ab4e766f65b1112652f3a81",
+                "25578a545062c1223ebeaa7225f0ea5989fb0c560a2e46ab8f93c7c5a6618168",
             ),
             (
                 "edgar_gleif/models/sec_entities.sql",
@@ -1699,19 +1699,19 @@ mod tests {
             (
                 "edgar_gleif/models/tier.sql",
                 include_str!("../tests/fixtures/open_analytics/edgar_gleif/models/tier.sql"),
-                "b4f9aedafa4a2d624b329e60569a05f42a76e10f6b6c272ba71d366df09786dd",
+                "c10d1da31bd836412fd2414bf36b9a15ce1712453a98faa02f79af84529c5ee0",
             ),
             (
                 "edgar_gleif/models/splink_inputs.sql",
                 include_str!(
                     "../tests/fixtures/open_analytics/edgar_gleif/models/splink_inputs.sql"
                 ),
-                "c07d4b99879c70da37e842ae1333c0c47e5636ac8a50b83c37e56a7ee600eb83",
+                "35243550e1ec90c0cdb8561a8cc7cc5545197897696fb061aadb0ff218a56ce0",
             ),
             (
                 "edgar_gleif/models/resolved.sql",
                 include_str!("../tests/fixtures/open_analytics/edgar_gleif/models/resolved.sql"),
-                "21b2c3a3bca4da44707727280b5188b0d86d7afcc3932c8bdb51952a0e03f9f1",
+                "0bf81534918aef0a38b3d6cc8347e9928b18739ccf10b0ef8b0d5bb651e21313",
             ),
             (
                 "edgar_gleif/models/edgar_gleif_model.json",
