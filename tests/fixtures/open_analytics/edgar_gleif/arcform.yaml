@@ -13,7 +13,7 @@
 # `reads:`/`produces:` on derive_join_coverage are what put the coverage measurement
 # into the asset graph it was silently outside of. The retired
 # scripts/*.sh + scripts/describe.py did fetch/unzip/paginate/describe as bash; those
-# are now the http_fetch / archive_extract / gleif_ra_fetch / datapackage_describe /
+# are now the http_fetch / archive_extract / dlt / datapackage_describe /
 # parquet_export operators. This manifest REFERENCES them by name@version; their code
 # lives in the arcform repo (the engine + operator catalog), not here.
 #
@@ -95,14 +95,35 @@ steps:
   # Official sources ONLY (SEC + GLEIF). Authority provides the link for funds;
   # operating companies have no official CIK↔LEI, so they are name-resolved below.
   - name: fetch_gleif_sec_registrations
-    # GLEIF entities registered at SEC EDGAR (RA000665): LEI + registeredAs (numeric CIK
-    # for operating cos, S…/C… series/class for funds) + entity.category. Cursor-paged
-    # (GLEIF caps offset paging at 10k; RA000665 has ~27k) — the operator delegates
-    # paging to dlt. See arcform gleif_ra_fetch.
-    op: gleif_ra_fetch@1
+    # GLEIF entities registered at SEC EDGAR (RA000665), as GLEIF's raw lei-records, one
+    # JSON object per line; load.sql takes the LEI, registeredAs (numeric CIK for
+    # operating cos, S…/C… series/class for funds) and entity.category from each.
+    # Cursor-paged (GLEIF caps offset paging at 10k; RA000665 has ~27k): page[cursor]=*
+    # starts the cursor and dlt follows links.next until GLEIF gives none. `source` is
+    # dlt's own rest_api configuration. The fetch is refused, and nothing written, when it
+    # comes back more than one page (200) short of the meta.pagination.total GLEIF reports
+    # on the first page; it pauses 0.3 s between pages, out of politeness to GLEIF. See
+    # arcform dlt.
+    op: dlt@1
     with:
-      ra: RA000665
-      out: build/gleif_ra_sec.csv
+      source:
+        client:
+          base_url: https://api.gleif.org/api/v1/
+          headers:
+            User-Agent: "Meridian Protocol (open-analytics; research@meridian.online)"
+          paginator: { type: json_link, next_url_path: links.next }
+        resources:
+          - name: lei_records
+            endpoint:
+              path: lei-records
+              data_selector: data
+              params:
+                "filter[entity.registeredAt]": RA000665
+                "page[size]": 200
+                "page[cursor]": "*"
+      expect_total: { path: meta.pagination.total, tolerance: 200 }
+      page_delay_seconds: 0.3
+      out: build/gleif_ra_sec.jsonl
 
   # ── SEC Form N-CEN (the annual fund filing — most direct fund-LEI authority) ────
   # PINNED quarters (reproducibility): the retired fetch_ncen.sh discovered the "latest
@@ -174,7 +195,7 @@ steps:
     depends_on:
       - build/sec_entities.parquet
       - build/gleif.parquet
-      - build/gleif_ra_sec.csv
+      - build/gleif_ra_sec.jsonl
       - build/ncen/2026q2/registrant.tsv
       - build/ncen/2026q2/fund_reported_info.tsv
       - build/ncen/2026q1/registrant.tsv

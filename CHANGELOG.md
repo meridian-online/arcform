@@ -79,6 +79,7 @@ Rationale for each change is recorded in the project's design notes and commit h
 ### Removed
 
 - **The `splink_resolve@1` operator is removed.** One source is not an operator: it held the EDGAR to GLEIF match's columns and model in its script, so a fix to that one crosswalk needed an arc release. The crosswalk now runs on `splink@1`, with the model, the cleaning and the choice of a best match in its own Protocol, and its export is byte-identical. A manifest that pins `splink_resolve@1` is now refused as an unknown operator.
+- **The `gleif_ra_fetch@1` operator is removed.** One source is not an operator: it held GLEIF's address, endpoint, filter, paging and three fields in its script, so a change to what one Protocol takes from GLEIF needed an arc release. The EDGAR to GLEIF crosswalk now fetches on `dlt@1`, with GLEIF's address, filter and paging in its own Protocol. A manifest that pins `gleif_ra_fetch@1` is now refused as an unknown operator.
 
 ### Fixed
 

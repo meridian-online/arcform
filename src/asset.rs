@@ -1682,7 +1682,7 @@ mod tests {
             (
                 "edgar_gleif/arcform.yaml",
                 include_str!("../tests/fixtures/open_analytics/edgar_gleif/arcform.yaml"),
-                "125817bf385db9d9b7186d238cd4f51ec9bca9c180bbb3213507a6ab0d8a0cbf",
+                "25578a545062c1223ebeaa7225f0ea5989fb0c560a2e46ab8f93c7c5a6618168",
             ),
             (
                 "edgar_gleif/models/sec_entities.sql",
@@ -1694,7 +1694,7 @@ mod tests {
             (
                 "edgar_gleif/models/load.sql",
                 include_str!("../tests/fixtures/open_analytics/edgar_gleif/models/load.sql"),
-                "f7a7281129a753919c64d443dafd95140e98fa34fe2f297b5c090b451ccf1240",
+                "ca253d0a59e3b5db42ce569d7821aa95b178943e618075576a236bb8aa73b5f9",
             ),
             (
                 "edgar_gleif/models/tier.sql",

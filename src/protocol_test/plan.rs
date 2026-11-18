@@ -438,7 +438,6 @@ mod tests {
             .collect();
         let expected = [
             "dlt",
-            "gleif_ra_fetch",
             "html_link_discover",
             "http_fetch",
             #[cfg(feature = "opendal")]
