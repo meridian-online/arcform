@@ -9,6 +9,10 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ## [Unreleased]
 
+### Added
+
+- **`dlt@1`, an ingress operator that pages one resource of a REST API with dlt and writes its records to a JSON Lines file.** The step's `source` is dlt's own `rest_api` configuration, so the operator names no API: base URL, headers, paginator, endpoint, query parameters and data selector all come from the Protocol. Each record is written with sorted keys and UTF-8 kept as UTF-8, the lines sorted by their bytes, so two runs over the same data write the same file; the write is atomic, and a failed fetch leaves an earlier file as it was. `expect_total` refuses a fetch that returns fewer records than the API's own count, less a tolerance, and `page_delay_seconds` paces an API that throttles. `auth`, incremental loading, `processing_steps`, `resolve` parameters, a `write_disposition` other than `replace` and more than one resource are refused before any request. Its script, `operators/dlt/rest_fetch.py`, is frozen into the binary and run with uv, pinning `dlt==1.32.0`.
+
 ### Fixed
 
 - **`splink@1` writes its columns in a fixed order: `match_weight`, `match_probability`, the sort columns, then every other column by name.** Splink builds the columns a model retains from a set, so their order changed with each process's hash seed and two runs on the same inputs wrote the same rows in files that differed in bytes, against the operator's promise. A test now runs the script under two hash seeds and compares the files. The crosswalk's published output is unaffected: its SQL selects columns by name.
