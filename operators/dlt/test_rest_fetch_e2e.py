@@ -42,8 +42,10 @@ NEXT_QUERIES = ["page%5Bcursor%5D=c2&page%5Bsize%5D=2", "page%5Bcursor%5D=c3&pag
 class Api:
     """One test's API: pages of records, a reported total, and failures to inject."""
 
-    def __init__(self, pages, total=None, fail_page=None, fail_times=None, with_total=True):
+    def __init__(self, pages, total=None, fail_page=None, fail_times=None, with_total=True,
+                 endless=False):
         self.pages = pages
+        self.endless = endless  # the last page links to itself, so a next link never runs out
         self.total = sum(len(p) for p in pages) if total is None else total
         self.fail_page = fail_page
         self.fail_times = fail_times  # None: fail every time
@@ -68,6 +70,8 @@ class Api:
         nxt = None
         if index + 1 < len(self.pages):
             nxt = f"{self.base}/items?{NEXT_QUERIES[index]}"
+        elif self.endless and index > 0:
+            nxt = f"{self.base}/items?{NEXT_QUERIES[index - 1]}"
         body = {"data": self.pages[index], "links": {"next": nxt}}
         body["meta"] = {"pagination": {"total": self.total}} if self.with_total else {}
         return 200, body
@@ -142,7 +146,9 @@ class RestFetchE2E(unittest.TestCase):
         cmd = [sys.executable, str(SCRIPT), "--source-json", json.dumps(src), "--out", str(self.out), *extra]
         environ = {**os.environ, "RUNTIME__REQUEST_MAX_ATTEMPTS": "1", **(env or {})}
         # Run outside the repository so no `.dlt/` folder there is read as configuration.
-        return subprocess.run(cmd, capture_output=True, text=True, env=environ, cwd=self.dir)
+        # The timeout turns a fetch that never stops paging into a failure, not a hang.
+        return subprocess.run(cmd, capture_output=True, text=True, env=environ, cwd=self.dir,
+                              timeout=60)
 
     def three_pages(self, **kwargs) -> Api:
         return self.start(Api([RECORDS[0:2], RECORDS[2:4], RECORDS[4:5]], **kwargs))
@@ -229,6 +235,28 @@ class RestFetchE2E(unittest.TestCase):
         r = self.run_op(self.source(api), "--expect-total-path", "meta.pagination.total")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.out.read_bytes(), b"")
+
+    def test_an_empty_page_with_a_next_link_ends_the_fetch(self) -> None:
+        # The empty page links to itself, so only the empty page can stop the paging.
+        api = self.start(Api([RECORDS[0:2], []], endless=True))
+        r = self.run_op(self.source(api))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(api.requests), 2)
+        expected = b"".join(line + b"\n" for line in sorted(canonical(rec) for rec in RECORDS[0:2]))
+        self.assertEqual(self.out.read_bytes(), expected)
+
+    def test_an_empty_page_ends_the_fetch_before_any_later_page(self) -> None:
+        api = self.start(Api([RECORDS[0:2], [], RECORDS[2:4]]))
+        r = self.run_op(self.source(api))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(api.requests), 2)
+        self.assertEqual(len(self.out.read_bytes().splitlines()), 2)
+
+    def test_a_fetch_an_empty_page_leaves_short_is_refused(self) -> None:
+        api = self.start(Api([RECORDS[0:2], []], total=5, endless=True))
+        r = self.run_op(self.source(api), "--expect-total-path", "meta.pagination.total")
+        self.assertFailed(r, "fetched 2 of 5 records")
+        self.assertFalse(self.out.exists())
 
     def test_the_page_delay_paces_every_request_after_the_first(self) -> None:
         api = self.three_pages()

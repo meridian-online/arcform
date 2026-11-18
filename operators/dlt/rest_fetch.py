@@ -28,6 +28,10 @@ reproducible file needs and dlt does not give:
     reports its record count. Fewer records than that count minus the tolerance is a
     paging failure that stopped early, and nothing is written (exit 1).
 
+  EMPTY PAGES. A page after the first that holds no records ends the fetch, keeping
+    the records before it, even when it carries a next link: some APIs hand one out
+    forever. An empty first page still writes an empty file.
+
   PACING. `--page-delay-seconds` sleeps before each request after the first. dlt's REST
     client retries failed requests but has no pacing of its own.
 
@@ -155,10 +159,18 @@ def _as_count(value: object, path: str) -> int:
     raise ValueError(f"{path} is {value!r}, not a record count")
 
 
+def _no_records(found: list) -> bool:
+    """Whether dlt's extract_response would make no records of these selector matches."""
+    data = found[0] if len(found) == 1 else found
+    return data is None or data == []
+
+
 def fetch(source: dict, expect_total_path: str | None, page_delay_seconds: float) -> tuple[list, int | None]:
     """Page the source's one resource; return its records and the first response's total."""
     from dlt.common import jsonpath
     from dlt.sources.helpers.requests.retry import Client
+    from dlt.sources.helpers.rest_client.detector import find_response_page_data
+    from dlt.sources.helpers.rest_client.exceptions import IgnoreResponseException
     from dlt.sources.rest_api import rest_api_resources
 
     source = copy.deepcopy(source)
@@ -188,12 +200,23 @@ def fetch(source: dict, expect_total_path: str | None, page_delay_seconds: float
         if not response.ok or response.is_redirect:
             return response
         body = response.json()
-        if selector and not jsonpath.find_values(selector, body):
-            raise ValueError(f"data_selector {selector!r} matches nothing in the response from {response.url}")
+        if selector:
+            found = jsonpath.find_values(selector, body)
+            if not found:
+                raise ValueError(f"data_selector {selector!r} matches nothing in the response from {response.url}")
+        else:
+            found = [find_response_page_data(body)[1]]
         if state["first"]:
             state["first"] = False
             if expect_total_path:
                 state["total"] = _as_count(dotted_get(body, expect_total_path), expect_total_path)
+        elif _no_records(found):
+            # A later page with no records ends the fetch, whatever its next link says:
+            # a paginator such as json_link follows a next link that never runs out.
+            # dlt's paginate loop ends, keeping the pages before, on this exception,
+            # the one its own `ignore` response action raises. expect_total still
+            # refuses a fetch this leaves short.
+            raise IgnoreResponseException
         return response
 
     # An endpoint's response_actions replace the defaults' rather than adding to them.
