@@ -6533,8 +6533,8 @@ fn gleif_ra_fetch_invocation(cfg: &GleifRaFetchConfig, dir: &Path) -> Result<Vec
 // dlt (ingress) — page one resource of a REST API through dlt's `rest_api` source
 // and write its records as sorted JSON Lines.
 //
-// The general operator `gleif_ra_fetch` is to be replaced by. Everything particular
-// to one API (base URL, headers, paginator, endpoint, query parameters, data
+// It is meant to replace `gleif_ra_fetch`, which serves one API only. Everything
+// particular to one API (base URL, headers, paginator, endpoint, query parameters, data
 // selector) is the step's `source`, which is dlt's own `rest_api` configuration
 // passed through as JSON; arc names none of it. The frozen `rest_fetch.py` adds what
 // a reproducible file needs and dlt does not give: refusals of anything that carries
@@ -6633,11 +6633,41 @@ impl DltConfig {
         Ok(cfg)
     }
 
-    /// `source` as the JSON the script reads. A mapping JSON cannot hold, such as one
-    /// keyed by null, is refused here rather than handed on altered.
+    /// `source` as the JSON the script reads. A value JSON would alter on the way is
+    /// refused, naming its dotted path: a non-finite number (`.inf`, `.nan`), which
+    /// serde_json writes as null; a YAML tagged value (`!foo bar`), which it writes as
+    /// `{"!foo": "bar"}`; and a key that is not a string (`200:`, `true:`, `~:`), which
+    /// it writes as a string or refuses. A key meant as text is quoted (`"200":`).
     fn source_json(&self) -> Result<String> {
-        serde_json::to_string(&self.source).map_err(|e| {
-            Error::ManifestValidation(format!("dlt: `source` cannot be written as JSON: {}", e))
+        fn walk(value: &Value, at: &str) -> Result<()> {
+            let refuse = |what: String| {
+                Err(Error::ManifestValidation(format!(
+                    "dlt: {at} {what}, which JSON cannot carry unchanged"
+                )))
+            };
+            match value {
+                Value::Number(n) if n.as_f64().is_some_and(|f| !f.is_finite()) => {
+                    refuse(format!("is {}", n))
+                }
+                Value::Tagged(t) => refuse(format!("is a tagged value ({})", t.tag)),
+                Value::Sequence(items) => items
+                    .iter()
+                    .enumerate()
+                    .try_for_each(|(i, v)| walk(v, &format!("{at}[{i}]"))),
+                Value::Mapping(map) => map.iter().try_for_each(|(k, v)| match k {
+                    Value::String(k) => walk(v, &format!("{at}.{k}")),
+                    other => refuse(format!(
+                        "has the key {}, which is not a string; quote it",
+                        serde_yaml::to_string(other).unwrap_or_default().trim_end()
+                    )),
+                }),
+                _ => Ok(()),
+            }
+        }
+        let source = Value::Mapping(self.source.clone());
+        walk(&source, "source")?;
+        serde_json::to_string(&source).map_err(|e| {
+            Error::ManifestValidation(format!("dlt: source cannot be written as JSON: {}", e))
         })
     }
 }
@@ -8879,6 +8909,43 @@ out: build/records.jsonl
             "{DLT_MINIMAL_STEP}expect_total: {{ path: meta.total, tolerance: -1 }}\n"
         ));
         assert!(tolerance.contains("tolerance"), "{tolerance}");
+    }
+
+    #[test]
+    fn dlt_refuses_source_values_json_would_alter() {
+        let step = |params: &str| {
+            format!(
+                "source:\n  client: {{ base_url: https://api.example.org/v1/ }}\n  resources:\n    - name: r\n      endpoint:\n        params: {params}\nout: o.jsonl\n"
+            )
+        };
+        for (params, names) in [
+            (
+                "{ limit: .inf }",
+                "source.resources[0].endpoint.params.limit is .inf",
+            ),
+            (
+                "{ limit: .nan }",
+                "source.resources[0].endpoint.params.limit is .nan",
+            ),
+            (
+                "{ kind: !foo bar }",
+                "source.resources[0].endpoint.params.kind is a tagged value (!foo)",
+            ),
+            (
+                "{ 200: x }",
+                "source.resources[0].endpoint.params has the key 200",
+            ),
+            (
+                "{ true: x }",
+                "source.resources[0].endpoint.params has the key true",
+            ),
+        ] {
+            let msg = dlt_refusal(&step(params));
+            assert!(msg.contains(names), "{params}: {msg}");
+        }
+        // A quoted key and a finite float pass through.
+        let with: Value = serde_yaml::from_str(&step("{ \"200\": x, ratio: 0.5 }")).unwrap();
+        assert!(assets_for("dlt@1", Some(&with)).is_ok());
     }
 
     #[test]
