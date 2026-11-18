@@ -28,8 +28,8 @@ reproducible file needs and dlt does not give:
     reports its record count. Fewer records than that count minus the tolerance is a
     paging failure that stopped early, and nothing is written (exit 1).
 
-  PAGING LOOPS. A GET that repeats a request already made in this run, same full URL
-    and query, is a next link that leads back to an earlier page; the fetch fails (exit
+  PAGING LOOPS. A GET page whose final URL, query included, was already read in this
+    run is a next link that leads back to an earlier page; the fetch fails (exit
     1) and writes nothing. An empty page alone does not end the fetch: some cursor APIs
     return one partway through with a cursor to more records.
 
@@ -188,6 +188,7 @@ def fetch(source: dict, expect_total_path: str | None, page_delay_seconds: float
     selector = endpoint.get("data_selector", defaults.get("data_selector"))
 
     state: dict = {"first": True, "total": None}
+    pages_read: set[str] = set()
 
     def on_response(response, *args, **kwargs):
         # A requests response hook: runs on every attempt, before dlt's fallback
@@ -196,6 +197,16 @@ def fetch(source: dict, expect_total_path: str | None, page_delay_seconds: float
         # redirect is left alone too and the page it leads to is judged instead.
         if not response.ok or response.is_redirect:
             return response
+        # Only a final 2xx page reaches here, and dlt never retries one, so each page
+        # is seen once; a GET page whose final URL was already read in this run is a
+        # next link that leads back, which no paginator would stop on.
+        if response.request.method == "GET":
+            if response.url in pages_read:
+                raise PagingLoop(
+                    f"the API's next page repeats an earlier request ({response.url}); "
+                    "refusing to page in a loop"
+                )
+            pages_read.add(response.url)
         body = response.json()
         if selector and not jsonpath.find_values(selector, body):
             raise ValueError(f"data_selector {selector!r} matches nothing in the response from {response.url}")
@@ -212,27 +223,12 @@ def fetch(source: dict, expect_total_path: str | None, page_delay_seconds: float
     session = Client(raise_for_status=False).session  # what RESTClient builds by default
     send = session.send  # already wrapped in dlt's retries; pacing sits outside them
     sent = [0]
-    seen_gets: set[str] = set()
 
     def paced_send(request, **kwargs):
-        # A GET repeating one that already succeeded is a next link that leads back,
-        # which no paginator would stop on. dlt's retries sit inside `send`, but a
-        # redirect hop is sent through here from inside the outer request's retries,
-        # so it can pass more than once; only a URL whose response arrived (ok, or a
-        # redirect) is recorded, and a hop retried after failing is not a repeat.
-        is_get = request.method == "GET"
-        if is_get and request.url in seen_gets:
-            raise PagingLoop(
-                f"the API's next page repeats an earlier request ({request.url}); "
-                "refusing to page in a loop"
-            )
         if sent[0] and page_delay_seconds:
             time.sleep(page_delay_seconds)
         sent[0] += 1
-        response = send(request, **kwargs)
-        if is_get and (response.ok or response.is_redirect):
-            seen_gets.add(request.url)
-        return response
+        return send(request, **kwargs)
 
     session.send = paced_send
     source["client"]["session"] = session

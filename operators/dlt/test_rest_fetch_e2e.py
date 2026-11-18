@@ -84,6 +84,14 @@ def serve(api: Api):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
             parts = urlsplit(self.path)
+            if parts.path.startswith("/moved2/"):
+                # The first hop of a two-hop chain: on to the /moved/ redirect.
+                api.redirects += 1
+                self.send_response(302)
+                self.send_header("Location", f"/moved/{parts.path[len('/moved2/'):]}?{parts.query}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if parts.path.startswith("/moved/"):
                 # A redirect to the real first page, its body set by the test: JSON that
                 # looks like a page with the wrong total, or not JSON at all.
@@ -234,6 +242,17 @@ class RestFetchE2E(unittest.TestCase):
         self.assertEqual(api.redirects, 2)
         self.assertEqual(len(self.out.read_bytes().splitlines()), 5)
 
+    def test_a_two_hop_redirect_whose_target_is_retried_is_not_a_repeat(self) -> None:
+        api = self.three_pages(fail_page=0, fail_times=2)
+        api.redirect_body = b"<html>Moved</html>"
+        r = self.run_op(self.source(api, path="moved2/items"),
+                        env={"RUNTIME__REQUEST_MAX_ATTEMPTS": "2",
+                             "RUNTIME__REQUEST_BACKOFF_FACTOR": "0"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("repeats an earlier request", r.stderr)
+        self.assertEqual(api.redirects, 4)
+        self.assertEqual(len(self.out.read_bytes().splitlines()), 5)
+
     def test_a_missing_total_path_is_refused(self) -> None:
         api = self.three_pages(with_total=False)
         r = self.run_op(self.source(api), "--expect-total-path", "meta.pagination.total")
@@ -265,14 +284,14 @@ class RestFetchE2E(unittest.TestCase):
         api = self.start(Api([RECORDS[0:2], []], loop_to="self"))
         r = self.run_op(self.source(api))
         self.assertFailed(r, "repeats an earlier request", "refusing to page in a loop")
-        self.assertEqual(len(api.requests), 2)
+        self.assertEqual(len(api.requests), 3)  # the repeat is sent, then refused when it arrives
         self.assertFalse(self.out.exists())
 
     def test_an_empty_page_linking_back_to_the_first_page_is_refused(self) -> None:
         api = self.start(Api([RECORDS[0:2], []], loop_to="first"))
         r = self.run_op(self.source(api))
         self.assertFailed(r, "repeats an earlier request", "refusing to page in a loop")
-        self.assertEqual(len(api.requests), 2)
+        self.assertEqual(len(api.requests), 3)  # the repeat is sent, then refused when it arrives
         self.assertFalse(self.out.exists())
 
     def test_the_page_delay_paces_every_request_after_the_first(self) -> None:
