@@ -44,15 +44,16 @@ const JOIN_TABLES: &str = "join-tables";
 const APPEND_ROWS: &str = "append-rows";
 const READ_FILE: &str = "read-file";
 
-/// The operators the default build holds: the ten every build holds and the three
+/// The operators the default build holds: the eleven every build holds and the three
 /// `http-fetch` adds, which `cli` turns on.
-const OPERATORS: [&str; 13] = [
+const OPERATORS: [&str; 14] = [
     "parquet_export",
     "archive_extract",
     "datapackage_describe",
     "finetype_validate",
     "splink",
     "gleif_ra_fetch",
+    "dlt",
     "umap_project",
     "text_embed",
     "uv",
@@ -649,7 +650,7 @@ fn describe_names_what_each_operators_step_reads_and_writes_by_role() {
 
 #[test]
 fn a_fetcher_reads_nothing_and_a_check_or_a_publish_writes_nothing() {
-    let mut fetchers = vec!["http_fetch", "html_link_discover", "gleif_ra_fetch"];
+    let mut fetchers = vec!["http_fetch", "html_link_discover", "gleif_ra_fetch", "dlt"];
     if cfg!(feature = "opendal") {
         fetchers.push("opendal_fetch");
     }
