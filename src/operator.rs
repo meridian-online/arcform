@@ -150,6 +150,7 @@ static ARCHIVE_EXTRACT: ArchiveExtract = ArchiveExtract;
 static DATAPACKAGE_DESCRIBE: DatapackageDescribe = DatapackageDescribe;
 static FINETYPE_VALIDATE: FinetypeValidate = FinetypeValidate;
 static SPLINK_RESOLVE: SplinkResolve = SplinkResolve;
+static SPLINK: Splink = Splink;
 static GLEIF_RA_FETCH: GleifRaFetch = GleifRaFetch;
 static UMAP_PROJECT: UmapProject = UmapProject;
 static TEXT_EMBED: TextEmbed = TextEmbed;
@@ -174,6 +175,7 @@ fn catalog() -> Vec<&'static dyn Operator> {
         &DATAPACKAGE_DESCRIBE,
         &FINETYPE_VALIDATE,
         &SPLINK_RESOLVE,
+        &SPLINK,
         &GLEIF_RA_FETCH,
         &UMAP_PROJECT,
         &TEXT_EMBED,
@@ -360,6 +362,34 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
             }),
             &["edgar", "gleif", "out"],
         ),
+        "splink" => {
+            let mut schema = object(
+                json!({
+                    "inputs": {
+                        "type": "array",
+                        "minItems": 1,
+                        "description": "The Parquet files the model scores, each under a role. The role is the name the model's SQL uses for that file's rows (and what `source_dataset` carries in the output); one input is a dedupe, two or more are a link. A role given twice is refused.",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "role": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$", "description": "The input's name: a lowercase letter, then lowercase letters, digits or underscores." },
+                                "path": { "type": "string", "description": "The Parquet file, relative to the protocol directory." }
+                            },
+                            "required": ["role", "path"]
+                        }
+                    },
+                    "model": { "type": "string", "description": "A Splink settings file, as Splink's own JSON. Every non-null comparison level in it must carry both m_probability and u_probability: the step does not train." },
+                    "threshold_match_probability": { "type": "number", "minimum": 0, "exclusiveMaximum": 1, "description": "Keep pairs at or above this match probability. Set at most one of the two thresholds; with neither, every blocked pair is written." },
+                    "threshold_match_weight": { "type": "number", "description": "Keep pairs at or above this match weight. Set at most one of the two thresholds." },
+                    "out": { "type": "string", "description": "The Parquet file Splink's predictions are written to, sorted so two runs on the same inputs are byte-identical." }
+                }),
+                &["inputs", "model", "out"],
+            );
+            schema["x-at-most-one-of"] =
+                json!(["threshold_match_probability", "threshold_match_weight"]);
+            schema
+        }
         "gleif_ra_fetch" => object(
             json!({
                 "ra": { "type": "string", "description": "GLEIF registration-authority id to page (e.g. RA000665)." },
@@ -554,6 +584,7 @@ const IGNORED_KEYWORDS: &[&str] = &[
     "description",
     "default",
     "x-at-most",
+    "x-at-most-one-of",
     "x-kind",
     "x-required-for",
 ];
@@ -969,6 +1000,53 @@ const DESCRIBED: &[Described] = &[
             "out",
             "file",
             "The Parquet file the resolved crosswalk is written to.",
+        )],
+    },
+    Described {
+        name: "splink",
+        summary: "Scores record pairs with a Splink model you supply and writes the predictions to a Parquet file.",
+        wraps: &[
+            Wraps {
+                id: "splink",
+                name: "Splink",
+                url: "https://moj-analytical-services.github.io/splink/",
+                use_: "Scores each blocked pair with the model's Fellegi-Sunter weights, which the step takes as given and never trains.",
+            },
+            Wraps {
+                id: "duckdb",
+                name: "DuckDB",
+                url: "https://duckdb.org",
+                use_: "The backend Splink runs its comparisons on.",
+            },
+        ],
+        example: r#"- name: match
+  op: splink@1
+  with:
+    inputs:
+      - role: left
+        path: build/left.parquet
+      - role: right
+        path: build/right.parquet
+    model: models/match.json
+    threshold_match_probability: 0.9
+    out: build/matches.parquet
+"#,
+        reads: &[
+            role(
+                "inputs.path",
+                "file",
+                "A Parquet file the model scores, one per entry of `inputs`.",
+            ),
+            role(
+                "model",
+                "file",
+                "The Splink settings file, as Splink's own JSON.",
+            ),
+        ],
+        writes: &[role(
+            "out",
+            "file",
+            "The Parquet file Splink's predictions are written to.",
         )],
     },
     Described {
@@ -1601,6 +1679,7 @@ mod with_schema_tests {
             "datapackage_describe" => configuration_fields::<DatapackageDescribeConfig>(),
             "finetype_validate" => configuration_fields::<FinetypeValidateConfig>(),
             "splink_resolve" => configuration_fields::<SplinkResolveConfig>(),
+            "splink" => configuration_fields::<SplinkConfig>(),
             "gleif_ra_fetch" => configuration_fields::<GleifRaFetchConfig>(),
             "umap_project" => configuration_fields::<UmapProjectConfig>(),
             "text_embed" => configuration_fields::<TextEmbedConfig>(),
@@ -1859,16 +1938,47 @@ mod with_schema_tests {
                 json!((low + high) / 2.0)
             }
             Some("boolean") => json!(true),
-            Some("array") => json!([
-                probe(&format!("{key}_0"), &prop["items"]),
-                probe(&format!("{key}_1"), &prop["items"]),
-            ]),
+            Some("array") => {
+                let first = probe(&format!("{key}_0"), &prop["items"]);
+                let mut second = probe(&format!("{key}_1"), &prop["items"]);
+                // Two items built from one object schema would carry equal strings,
+                // which a configuration that keys a list by a field (`inputs`' roles)
+                // refuses as a repeat. The second takes a `_1` suffix wherever its
+                // property's pattern still admits it.
+                if let (Some(props), Some(item)) = (
+                    prop["items"]["properties"].as_object(),
+                    second.as_object_mut(),
+                ) {
+                    for (k, v) in item.iter_mut() {
+                        let Some(s) = v.as_str() else { continue };
+                        let suffixed = format!("{s}_1");
+                        let admitted = props[k].get("enum").is_none()
+                            && props[k]["pattern"].as_str().is_none_or(|p| {
+                                regex::Regex::new(p).is_ok_and(|re| re.is_match(&suffixed))
+                            });
+                        if admitted {
+                            *v = json!(suffixed);
+                        }
+                    }
+                }
+                json!([first, second])
+            }
             Some("object") => match prop.get("properties") {
-                Some(_) => properties(prop)
-                    .into_iter()
-                    .map(|(k, p)| (k.clone(), probe(k, p)))
-                    .collect::<serde_json::Map<_, _>>()
-                    .into(),
+                Some(_) => {
+                    // `x-at-most-one-of` names keys a manifest may not set together;
+                    // the probe sets the first and leaves the rest out, since a
+                    // manifest of every key would be refused.
+                    let excluded: Vec<&str> = prop["x-at-most-one-of"]
+                        .as_array()
+                        .map(|keys| keys.iter().skip(1).filter_map(Json::as_str).collect())
+                        .unwrap_or_default();
+                    properties(prop)
+                        .into_iter()
+                        .filter(|(k, _)| !excluded.contains(&k.as_str()))
+                        .map(|(k, p)| (k.clone(), probe(k, p)))
+                        .collect::<serde_json::Map<_, _>>()
+                        .into()
+                }
                 None => json!({
                     format!("probe_{key}"): probe(&format!("{key}_value"), &prop["additionalProperties"])
                 }),
@@ -2445,6 +2555,11 @@ mod with_schema_tests {
     fn script_invocation(op: &str, with: &Value, dir: &Path) -> Result<Vec<String>> {
         match op {
             "splink_resolve" => splink_resolve_invocation(&SplinkResolveConfig::parse(with)?, dir),
+            "splink" => {
+                let cfg = SplinkConfig::parse(with)?;
+                cfg.validate()?;
+                splink_invocation(&cfg, dir)
+            }
             "gleif_ra_fetch" => gleif_ra_fetch_invocation(&GleifRaFetchConfig::parse(with)?, dir),
             "umap_project" => {
                 let cfg = UmapProjectConfig::parse(with)?;
@@ -3123,6 +3238,7 @@ ap.add_argument("--nowhere", default=NOWHERE)
             "datapackage_describe" => read_as::<DatapackageDescribeConfig>(with),
             "finetype_validate" => read_as::<FinetypeValidateConfig>(with),
             "splink_resolve" => read_as::<SplinkResolveConfig>(with),
+            "splink" => read_as::<SplinkConfig>(with),
             "gleif_ra_fetch" => read_as::<GleifRaFetchConfig>(with),
             "umap_project" => read_as::<UmapProjectConfig>(with),
             "text_embed" => read_as::<TextEmbedConfig>(with),
@@ -6112,6 +6228,177 @@ fn splink_resolve_invocation(cfg: &SplinkResolveConfig, dir: &Path) -> Result<Ve
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// splink (transform) — probabilistic record linkage with a model the Protocol
+// supplies. Where `splink_resolve` holds one dataset's columns and model, this
+// operator holds none: the inputs, the Splink settings JSON and the threshold all
+// come from `with:`, and the frozen script scores the pairs with the model as given
+// (it never trains). `op: splink@1` addresses the exact script bytes embedded below.
+// Same uv-run substrate as `splink_resolve`; runs in OutputMode::Inherit so the
+// script's refusals stream as they happen.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The splink script, pinned into the binary. `@1` == these exact bytes.
+const SPLINK_PY: &str = include_str!("../operators/splink/splink.py");
+
+/// The script cache directory `materialize_frozen_script` builds for this operator.
+/// Test-only, for the same reason [`UMAP_PROJECT_CACHE_DIR`] is.
+#[cfg(test)]
+const SPLINK_CACHE_DIR: &str = "arcform-op-splink-1.0.0";
+
+struct Splink;
+
+/// One input: a Parquet file under the role the model's SQL and the output name it by.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Debug))]
+#[serde(deny_unknown_fields)]
+struct SplinkInput {
+    role: String,
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Debug))]
+#[serde(deny_unknown_fields)]
+struct SplinkConfig {
+    /// The inputs, each a `reads` asset resolved against ctx.dir.
+    inputs: Vec<SplinkInput>,
+    /// The Splink settings JSON (a `reads` asset).
+    model: String,
+    /// The predictions Parquet (the `produces` asset).
+    out: String,
+    /// Keep pairs at or above this probability, in `[0, 1)`. Omitted from the argv
+    /// when unset.
+    #[serde(default)]
+    threshold_match_probability: Option<f64>,
+    /// Keep pairs at or above this weight. Omitted from the argv when unset.
+    #[serde(default)]
+    threshold_match_weight: Option<f64>,
+}
+
+impl SplinkConfig {
+    fn parse(with: &Value) -> Result<Self> {
+        serde_yaml::from_value(with.clone()).map_err(|e| {
+            Error::ManifestValidation(format!("splink: invalid `with:` config: {}", e))
+        })
+    }
+
+    /// Refuse, at manifest load, what is decidable without reading a file. The role
+    /// and probability rules are the script's own, stated here so a manifest is
+    /// refused before `uv` starts.
+    fn validate(&self) -> Result<()> {
+        if self.inputs.is_empty() {
+            return Err(Error::ManifestValidation(
+                "splink: `inputs:` is empty — name at least one Parquet file to score, each \
+                 with a `role` and a `path`"
+                    .to_string(),
+            ));
+        }
+        for (at, input) in self.inputs.iter().enumerate() {
+            let mut chars = input.role.chars();
+            let shaped = chars.next().is_some_and(|c| c.is_ascii_lowercase())
+                && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+            if !shaped {
+                return Err(Error::ManifestValidation(format!(
+                    "splink: `inputs:` role {:?} is not a lowercase letter followed by \
+                     lowercase letters, digits or underscores",
+                    input.role
+                )));
+            }
+            if self.inputs[..at].iter().any(|i| i.role == input.role) {
+                return Err(Error::ManifestValidation(format!(
+                    "splink: `inputs:` gives the role {:?} more than once — each input \
+                     needs a role of its own",
+                    input.role
+                )));
+            }
+        }
+        if self.threshold_match_probability.is_some() && self.threshold_match_weight.is_some() {
+            return Err(Error::ManifestValidation(
+                "splink: `threshold_match_probability` and `threshold_match_weight` are \
+                 both set — set one, or neither to write every blocked pair"
+                    .to_string(),
+            ));
+        }
+        if let Some(p) = self.threshold_match_probability
+            && !(0.0..1.0).contains(&p)
+        {
+            return Err(Error::ManifestValidation(format!(
+                "splink: `threshold_match_probability: {}` is outside [0, 1)",
+                p
+            )));
+        }
+        if let Some(w) = self.threshold_match_weight
+            && !w.is_finite()
+        {
+            return Err(Error::ManifestValidation(format!(
+                "splink: `threshold_match_weight: {}` is not a finite number",
+                w
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Operator for Splink {
+    fn name(&self) -> &'static str {
+        "splink"
+    }
+
+    fn version(&self) -> semver::Version {
+        semver::Version::new(1, 0, 0)
+    }
+
+    fn assets(&self, with: &Value) -> Result<OpAssets> {
+        let cfg = SplinkConfig::parse(with)?;
+        cfg.validate()?;
+        let mut assets = OpAssets::default();
+        for input in &cfg.inputs {
+            assets.record_reads(input.path.clone(), crate::asset_kind::AssetKind::File);
+        }
+        assets.record_reads(cfg.model.clone(), crate::asset_kind::AssetKind::File);
+        assets.record_produces(cfg.out.clone(), crate::asset_kind::AssetKind::File);
+        Ok(assets)
+    }
+
+    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
+        let cfg = SplinkConfig::parse(with)?;
+        cfg.validate()?;
+        let out = ctx.dir.join(&cfg.out);
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let args = splink_invocation(&cfg, ctx.dir)?;
+        run_process("uv", &args, ctx, OutputMode::Inherit, "splink")
+    }
+}
+
+/// The full argv `run` hands `uv`: materialise the frozen script and build its
+/// arguments. One `--input ROLE=PATH` per input in manifest order, then the model and
+/// the output, then the one threshold the manifest set, if any.
+fn splink_invocation(cfg: &SplinkConfig, dir: &Path) -> Result<Vec<String>> {
+    let script = materialize_frozen_script("splink", "1.0.0", SPLINK_PY)?;
+    let at = |p: &str| dir.join(p).display().to_string();
+    let mut extra = Vec::new();
+    for input in &cfg.inputs {
+        extra.push("--input".to_string());
+        extra.push(format!("{}={}", input.role, at(&input.path)));
+    }
+    extra.push("--model".to_string());
+    extra.push(at(&cfg.model));
+    extra.push("--out".to_string());
+    extra.push(at(&cfg.out));
+    if let Some(p) = cfg.threshold_match_probability {
+        extra.push("--threshold-match-probability".to_string());
+        extra.push(p.to_string());
+    }
+    if let Some(w) = cfg.threshold_match_weight {
+        extra.push("--threshold-match-weight".to_string());
+        extra.push(w.to_string());
+    }
+    Ok(uv_run_args(&script.to_string_lossy(), &extra))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // gleif_ra_fetch (ingress) — page the public GLEIF v1 API for every entity
 // registered under one registration authority (RA000665 = the SEC) and emit the
 // `lei,registered_as,category` CSV the `load` step consumes.
@@ -8123,6 +8410,102 @@ mod tests {
     }
 
     #[test]
+    fn splink_declares_every_input_and_the_model_as_reads() {
+        let with: Value = serde_yaml::from_str(
+            "inputs:\n  - {role: left, path: a.parquet}\n  - {role: right, path: b.parquet}\nmodel: m.json\nout: o.parquet",
+        )
+        .unwrap();
+        let a = assets_for("splink", Some(&with)).unwrap();
+        assert_eq!(a.reads, vec!["a.parquet", "b.parquet", "m.json"]);
+        assert_eq!(a.produces, vec!["o.parquet".to_string()]);
+    }
+
+    fn splink_with(extra: &str) -> Value {
+        serde_yaml::from_str(&format!("model: m.json\nout: o.parquet\n{extra}")).unwrap()
+    }
+
+    #[test]
+    fn splink_refuses_a_role_given_twice() {
+        let with = splink_with("inputs: [{role: a, path: x}, {role: a, path: y}]");
+        let err = assets_for("splink", Some(&with)).unwrap_err().to_string();
+        assert!(err.contains("inputs") && err.contains("\"a\""), "{err}");
+    }
+
+    #[test]
+    fn splink_refuses_both_thresholds() {
+        let with = splink_with(
+            "inputs: [{role: a, path: x}]\nthreshold_match_probability: 0.5\nthreshold_match_weight: 2",
+        );
+        let err = assets_for("splink", Some(&with)).unwrap_err().to_string();
+        assert!(err.contains("threshold_match_probability"), "{err}");
+        assert!(err.contains("threshold_match_weight"), "{err}");
+    }
+
+    #[test]
+    fn splink_refuses_no_inputs() {
+        let with = splink_with("inputs: []");
+        let err = assets_for("splink", Some(&with)).unwrap_err().to_string();
+        assert!(err.contains("inputs"), "{err}");
+    }
+
+    #[test]
+    fn splink_refuses_a_role_or_probability_the_script_would() {
+        let bad_role = splink_with("inputs: [{role: Left, path: x}]");
+        assert!(assets_for("splink", Some(&bad_role)).is_err());
+        for p in ["1", "-0.1", "1.5"] {
+            let with = splink_with(&format!(
+                "inputs: [{{role: a, path: x}}]\nthreshold_match_probability: {p}"
+            ));
+            assert!(assets_for("splink", Some(&with)).is_err(), "{p}");
+        }
+        let zero = splink_with("inputs: [{role: a, path: x}]\nthreshold_match_probability: 0");
+        assert!(assets_for("splink", Some(&zero)).is_ok());
+    }
+
+    #[test]
+    fn splink_resolves_by_semver() {
+        assert!(resolve("splink").is_ok());
+        assert!(resolve("splink@1").is_ok());
+        assert!(resolve("splink@2").is_err());
+    }
+
+    #[test]
+    fn splink_argv_carries_each_input_and_one_threshold() {
+        let dir = Path::new("proto");
+        let with = splink_with(
+            "inputs: [{role: left, path: a.parquet}, {role: right, path: b.parquet}]\nthreshold_match_probability: 0.9",
+        );
+        let cfg = SplinkConfig::parse(&with).unwrap();
+        let argv = splink_invocation(&cfg, dir).unwrap();
+        assert_eq!(&argv[..2], ["run", "--script"]);
+        assert_eq!(
+            &argv[3..],
+            [
+                "--input",
+                "left=proto/a.parquet",
+                "--input",
+                "right=proto/b.parquet",
+                "--model",
+                "proto/m.json",
+                "--out",
+                "proto/o.parquet",
+                "--threshold-match-probability",
+                "0.9",
+            ]
+        );
+        let with = splink_with("inputs: [{role: a, path: x}]\nthreshold_match_weight: -2.5");
+        let argv = splink_invocation(&SplinkConfig::parse(&with).unwrap(), dir).unwrap();
+        assert_eq!(
+            &argv[argv.len() - 2..],
+            ["--threshold-match-weight", "-2.5"]
+        );
+        assert!(!argv.iter().any(|a| a == "--threshold-match-probability"));
+        let none = splink_with("inputs: [{role: a, path: x}]");
+        let argv = splink_invocation(&SplinkConfig::parse(&none).unwrap(), dir).unwrap();
+        assert!(!argv.iter().any(|a| a.starts_with("--threshold")));
+    }
+
+    #[test]
     fn splink_resolve_sample_omitted_for_published_run() {
         // Published run: no sample → the full corpus, no `--sample` flag at all
         // (it MUST be omittable — a `--sample 0` would cap GLEIF to zero rows).
@@ -8976,6 +9359,18 @@ mod tests {
                         SPLINK_RESOLVE_CACHE_DIR,
                     )
                 }
+                "splink" => {
+                    let with: Value = serde_yaml::from_str(
+                        "inputs: [{role: left, path: in.parquet}]\nmodel: model.json\nout: out.parquet",
+                    )
+                    .unwrap();
+                    (
+                        Splink
+                            .run(&with, &ctx)
+                            .expect_err("a script cache that cannot be written must stop the step"),
+                        SPLINK_CACHE_DIR,
+                    )
+                }
                 "gleif_ra_fetch" => {
                     let with: Value = serde_yaml::from_str("ra: RA000665\nout: out.csv").unwrap();
                     (
@@ -9016,6 +9411,7 @@ mod tests {
                 SPLINK_RESOLVE_CACHE_DIR,
                 "splink_resolve.py",
             ),
+            ("splink", SPLINK_CACHE_DIR, "splink.py"),
             (
                 "gleif_ra_fetch",
                 GLEIF_RA_FETCH_CACHE_DIR,
