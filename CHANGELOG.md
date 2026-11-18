@@ -9,6 +9,10 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ## [Unreleased]
 
+### Fixed
+
+- **`splink@1` writes its columns in a fixed order: `match_weight`, `match_probability`, the sort columns, then every other column by name.** Splink builds the columns a model retains from a set, so their order changed with each process's hash seed and two runs on the same inputs wrote the same rows in files that differed in bytes, against the operator's promise. A test now runs the script under two hash seeds and compares the files. The crosswalk's published output is unaffected: its SQL selects columns by name.
+
 ### Changed
 
 - **A failed `command:` step, or an `op:` step that runs a process such as `uv`, now ends arc's error with the last 20 lines of that step's standard error, as a failed SQL step's error already holds DuckDB's.** A refusal test of a Python check script could only match `failed (exit code 1)`, so it passed on any crash, a traceback included. Now `arc test`'s `fails_with:` matches the script's own refusal. The step's standard error still streams to the terminal as it runs, now through a pipe, so a tool that colours or animates its output only on a terminal prints it plainly.
