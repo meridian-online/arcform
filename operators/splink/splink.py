@@ -270,12 +270,20 @@ def main(argv=None) -> int:
     )
 
     uid = settings.get("unique_id_column_name", "unique_id")
-    keys = [_quoted(uid + "_l"), _quoted(uid + "_r")]
+    lead = ["match_weight", "match_probability"]
+    keys = [uid + "_l", uid + "_r"]
     if len(inputs) > 1:
         src = settings.get("source_dataset_column_name", "source_dataset")
-        keys = [_quoted(src + "_l"), _quoted(src + "_r")] + keys
+        keys = [src + "_l", src + "_r"] + keys
+    lead += keys
+    # Splink builds its retained columns from a set, whose order changes with the hash
+    # seed; a fixed column order keeps the file the same bytes on every run.
+    available = con.sql(f"SELECT * FROM {predictions.physical_name} LIMIT 0").columns
+    rest = sorted(c for c in available if c not in lead)
+    select = ", ".join(_quoted(c) for c in [c for c in lead if c in available] + rest)
     table = con.sql(
-        f"SELECT * FROM {predictions.physical_name} ORDER BY {', '.join(keys)}"
+        f"SELECT {select} FROM {predictions.physical_name} "
+        f"ORDER BY {', '.join(_quoted(k) for k in keys)}"
     ).to_arrow_table()
     pq.write_table(table, args.out, compression="zstd")
     return 0

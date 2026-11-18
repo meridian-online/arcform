@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -239,6 +240,42 @@ class SplinkE2ETest(unittest.TestCase):
             self.assertEqual(r.returncode, 2, value)
             self.assertIn("threshold_match_weight", r.stderr)
             self.assertIn(value, r.stderr)
+
+    def test_columns_are_in_a_fixed_order_whatever_the_hash_seed(self) -> None:
+        cols = ["unique_id", "name", "postcode", "town", "region", "country", "note"]
+        for path, ids in ((self.a, (1, 2)), (self.b, (10, 20))):
+            con = duckdb.connect()
+            con.execute("CREATE TABLE t (unique_id BIGINT, name VARCHAR, postcode VARCHAR, "
+                        "town VARCHAR, region VARCHAR, country VARCHAR, note VARCHAR)")
+            con.executemany("INSERT INTO t VALUES (?, 'ann', 'x', 't', 'r', 'c', 'n')",
+                            [(i,) for i in ids])
+            con.execute("COPY t TO ? (FORMAT parquet)", [str(path)])
+        model = {
+            **MODEL,
+            "blocking_rules_to_generate_predictions": [
+                "l.postcode = r.postcode", "l.town = r.town",
+                "l.region = r.region AND l.country = r.country",
+            ],
+            "additional_columns_to_retain": ["note"],
+        }
+        self.model.write_text(json.dumps(model))
+        outs = []
+        for seed in ("1", "2"):
+            out = self.dir / f"seed{seed}.parquet"
+            cmd = [sys.executable, str(SCRIPT), "--input", f"a={self.a}", "--input", f"b={self.b}",
+                   "--model", str(self.model), "--out", str(out)]
+            r = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, "PYTHONHASHSEED": seed})
+            self.assertEqual(r.returncode, 0, r.stderr)
+            outs.append(out)
+        self.assertEqual(outs[0].read_bytes(), outs[1].read_bytes())
+        names = [c[0] for c in duckdb.sql(
+            "DESCRIBE SELECT * FROM read_parquet(?)", params=[str(outs[0])]).fetchall()]
+        lead = ["match_weight", "match_probability", "source_dataset_l", "source_dataset_r",
+                "unique_id_l", "unique_id_r"]
+        self.assertEqual(names[:6], lead)
+        self.assertEqual(names[6:], sorted(names[6:]))
+        self.assertIn("note_l", names)
+        self.assertGreaterEqual(len(names), 14)
 
 
 if __name__ == "__main__":
