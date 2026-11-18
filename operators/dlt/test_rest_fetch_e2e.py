@@ -53,6 +53,7 @@ class Api:
         self.with_total = with_total
         self.requests: list[tuple[float, str]] = []
         self.redirects = 0
+        self.truncate_first = 0  # times to cut the first page's body short
         self.redirect_body = b""
         self.lock = threading.Lock()
 
@@ -106,6 +107,16 @@ def serve(api: Api):
                 return
             status, body = api.respond(parts.query)
             payload = json.dumps(body).encode() if body is not None else b'{"error":"boom"}'
+            if api.truncate_first and "cursor%5D=c" not in parts.query:
+                # A 200 whose body stops short of its Content-Length, then the connection
+                # closes (http.server speaks HTTP/1.0): the client sees a broken transfer.
+                api.truncate_first -= 1
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload[: len(payload) // 2])
+                return
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
@@ -251,6 +262,19 @@ class RestFetchE2E(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertNotIn("repeats an earlier request", r.stderr)
         self.assertEqual(api.redirects, 4)
+        self.assertEqual(len(self.out.read_bytes().splitlines()), 5)
+
+    def test_a_page_whose_body_is_cut_off_is_retried_not_refused_as_a_repeat(self) -> None:
+        # A 200 whose body breaks off is retried by dlt (ChunkedEncodingError); the
+        # retried page must not find its own URL already recorded.
+        api = self.three_pages()
+        api.truncate_first = 1
+        r = self.run_op(self.source(api), env={"RUNTIME__REQUEST_MAX_ATTEMPTS": "2",
+                                               "RUNTIME__REQUEST_BACKOFF_FACTOR": "0"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("repeats an earlier request", r.stderr)
+        self.assertEqual(api.truncate_first, 0)
+        self.assertEqual(len(api.requests), 4)
         self.assertEqual(len(self.out.read_bytes().splitlines()), 5)
 
     def test_a_missing_total_path_is_refused(self) -> None:

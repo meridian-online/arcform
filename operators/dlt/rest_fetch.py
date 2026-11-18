@@ -197,23 +197,25 @@ def fetch(source: dict, expect_total_path: str | None, page_delay_seconds: float
         # redirect is left alone too and the page it leads to is judged instead.
         if not response.ok or response.is_redirect:
             return response
-        # Only a final 2xx page reaches here, and dlt never retries one, so each page
-        # is seen once; a GET page whose final URL was already read in this run is a
-        # next link that leads back, which no paginator would stop on.
-        if response.request.method == "GET":
-            if response.url in pages_read:
-                raise PagingLoop(
-                    f"the API's next page repeats an earlier request ({response.url}); "
-                    "refusing to page in a loop"
-                )
-            pages_read.add(response.url)
+        # A GET page whose final URL was already read in this run is a next link that
+        # leads back, which no paginator would stop on. Only a final 2xx reaches here,
+        # but one whose body breaks off is retried by dlt, so the URL is recorded only
+        # at the end, once the body has been read and every check has passed.
+        is_get = response.request.method == "GET"
+        if is_get and response.url in pages_read:
+            raise PagingLoop(
+                f"the API's next page repeats an earlier request ({response.url}); "
+                "refusing to page in a loop"
+            )
         body = response.json()
         if selector and not jsonpath.find_values(selector, body):
             raise ValueError(f"data_selector {selector!r} matches nothing in the response from {response.url}")
         if state["first"]:
-            state["first"] = False
             if expect_total_path:
                 state["total"] = _as_count(dotted_get(body, expect_total_path), expect_total_path)
+            state["first"] = False
+        if is_get:
+            pages_read.add(response.url)
         return response
 
     # An endpoint's response_actions replace the defaults' rather than adding to them.
