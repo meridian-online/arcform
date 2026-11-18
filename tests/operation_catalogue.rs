@@ -44,14 +44,15 @@ const JOIN_TABLES: &str = "join-tables";
 const APPEND_ROWS: &str = "append-rows";
 const READ_FILE: &str = "read-file";
 
-/// The operators the default build holds: the ten every build holds and the three
+/// The operators the default build holds: the eleven every build holds and the three
 /// `http-fetch` adds, which `cli` turns on.
-const OPERATORS: [&str; 13] = [
+const OPERATORS: [&str; 14] = [
     "parquet_export",
     "archive_extract",
     "datapackage_describe",
     "finetype_validate",
     "splink_resolve",
+    "splink",
     "gleif_ra_fetch",
     "umap_project",
     "text_embed",

@@ -67,6 +67,11 @@ jobs:
       # line of that script is invisible to CI.
       - name: umap_project tests
         run: python3 operators/umap_project/test_umap_project.py
+      # splink.py is the same shape: Splink, DuckDB and pyarrow arrive under `uv`, so the
+      # script imports them inside `main()` and its refusals, which run before Splink
+      # starts, are tested here with the standard library alone.
+      - name: splink tests
+        run: python3 operators/splink/test_splink.py
       # The checkers' own regression test runs FIRST, for the same reason the mutation
       # gate's self-test does: a checker is green over working prose and green over
       # broken prose, and the two runs look identical. Both defects it drives were
@@ -333,6 +338,18 @@ jobs:
       # hour spawning each. The step above has already resolved this dependency set.
       - name: umap_project persisted-fit end to end
         run: uv run operators/umap_project/test_umap_project_fit.py
+
+      # `splink@1` end to end: a real Splink scoring run under `uv`, which the
+      # `operators` job has none of. It pins what the stdlib suite cannot reach, that the
+      # predictions come out sorted and byte-identical across two runs.
+      - name: splink end to end
+        run: uv run operators/splink/test_splink_e2e.py
+
+      # The same operator driven through `arc run`: the script is materialised into the
+      # temp directory and run by `uv`, which is where a script named for its package
+      # once imported itself.
+      - name: splink through arc
+        run: cargo test --workspace --test splink -- --include-ignored
 
       # tests/text_embed.rs and tests/text_embed_parity.rs carry #[ignore]d tests that
       # need a built subtoken extension, which this runner does not stage — and,
