@@ -189,8 +189,14 @@ def main(argv=None) -> int:
 
     # This file is named splink.py: drop its own directory from the import path so
     # `import splink` finds the package, not the script.
-    here = os.path.dirname(os.path.abspath(__file__))
-    sys.path[:] = [q for q in sys.path if os.path.abspath(q or ".") != here]
+    # Compare real paths: a temp directory can be spelled /var/... in one place and
+    # /private/var/... in another. A `splink` already imported from this file is
+    # dropped too, so the import below reads the package.
+    here = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
+    sys.path[:] = [q for q in sys.path if os.path.realpath(q or ".") != here]
+    own = sys.modules.get("splink")
+    if own is not None and os.path.realpath(getattr(own, "__file__", "") or "") == os.path.realpath(__file__):
+        del sys.modules["splink"]
 
     import duckdb
     import pyarrow.parquet as pq

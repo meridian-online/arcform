@@ -2533,8 +2533,9 @@ mod with_schema_tests {
     }
 
     /// The operators that run a frozen Python script.
-    const SCRIPT_OPERATORS: [&str; 4] = [
+    const SCRIPT_OPERATORS: [&str; 5] = [
         "splink_resolve",
+        "splink",
         "gleif_ra_fetch",
         "umap_project",
         "text_embed",
@@ -2760,6 +2761,7 @@ mod with_schema_tests {
             Json::Number(n) => vec![n.to_string()],
             Json::Bool(b) => vec![b.to_string()],
             Json::Array(items) => items.iter().flat_map(rendered).collect(),
+            Json::Object(fields) => fields.values().flat_map(rendered).collect(),
             _ => Vec::new(),
         }
     }
@@ -2767,7 +2769,12 @@ mod with_schema_tests {
     /// Whether an argv value carries a probe: as given, or as a path under the
     /// protocol directory.
     fn carries(argument: &str, probe: &str) -> bool {
-        argument == probe || Path::new(argument).ends_with(probe)
+        // `ROLE=PATH` carries the role and the path it joins.
+        let part_carries = |a: &str| a == probe || Path::new(a).ends_with(probe);
+        part_carries(argument)
+            || argument
+                .split_once('=')
+                .is_some_and(|(left, right)| part_carries(left) || part_carries(right))
     }
 
     /// A frozen-script operator's step, built as far as the argv its `run` hands `uv`:
@@ -2806,6 +2813,29 @@ mod with_schema_tests {
         Ok(ScriptCall { source, passed })
     }
 
+    /// The manifests that together carry every key of `schema`. One manifest of every
+    /// key, unless the schema names keys a manifest may not set together
+    /// (`x-at-most-one-of`): then each such key gets a manifest of its own, the others
+    /// left out.
+    fn manifests_covering_every_key(schema: &Json) -> Vec<Json> {
+        let first = probe("", schema);
+        let mut manifests = vec![first.clone()];
+        let exclusive: Vec<&str> = schema["x-at-most-one-of"]
+            .as_array()
+            .map(|keys| keys.iter().filter_map(Json::as_str).collect())
+            .unwrap_or_default();
+        for other in exclusive.iter().skip(1) {
+            let mut manifest = first.clone();
+            manifest
+                .as_object_mut()
+                .unwrap()
+                .remove(*exclusive.first().unwrap());
+            manifest[*other] = probe(other, &schema["properties"][*other]);
+            manifests.push(manifest);
+        }
+        manifests
+    }
+
     /// Which option each schema key reaches in `call`, the step built from `full`, by
     /// option: the one whose values carry the key's probe value. A key is found by the
     /// value it carries, so a flag that carries none would need this extended; no key
@@ -2819,6 +2849,11 @@ mod with_schema_tests {
         let mut faults = Vec::new();
         let mut seen = BTreeSet::new();
         for (key, _) in properties(schema) {
+            // A key the manifest leaves out (one of `x-at-most-one-of`'s others) reaches
+            // nothing in this call; another call carries it.
+            if full.get(key.as_str()).is_none() {
+                continue;
+            }
             let values = rendered(&full[key]);
             if values.is_empty() || !values.iter().all(|v| seen.insert(v.clone())) {
                 faults.push(format!(
@@ -2979,17 +3014,28 @@ ap.add_argument(
             assert!(catalogue.contains(&op), "`{op}` is not in the catalogue");
             let schema = with_schema(op).expect("every catalogue operator has a schema");
             let schema_required = required(&schema);
-            let full = probe("", &schema);
-            let call = match script_call(op, &full) {
-                Ok(call) => call,
-                Err(e) => {
-                    faults.push(format!("{op}, from a manifest of every schema key: {e}"));
-                    continue;
-                }
-            };
-            let ScriptCall { source, passed } = &call;
-            let (key_of, unreached) = options_keys_reach(&schema, &full, &call);
-            faults.extend(unreached.into_iter().map(|f| format!("{op}: {f}")));
+            let manifests = manifests_covering_every_key(&schema);
+            let mut passed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            let mut key_of = BTreeMap::new();
+            let mut source = String::new();
+            for full in &manifests {
+                let call = match script_call(op, full) {
+                    Ok(call) => call,
+                    Err(e) => {
+                        faults.push(format!("{op}, from a manifest of every schema key: {e}"));
+                        continue;
+                    }
+                };
+                let (reached, unreached) = options_keys_reach(&schema, full, &call);
+                faults.extend(unreached.into_iter().map(|f| format!("{op}: {f}")));
+                key_of.extend(reached);
+                passed.extend(call.passed);
+                source = call.source;
+            }
+            if source.is_empty() {
+                continue;
+            }
+            let (source, passed) = (&source, &passed);
 
             let never: BTreeSet<&str> = OPTIONS_ARC_NEVER_PASSES
                 .iter()
@@ -3029,6 +3075,10 @@ ap.add_argument(
                 let schema_type = (prop["type"].as_str(), prop["items"]["type"].as_str());
                 match argparse_schema_type(option) {
                     Ok((t, items)) if (Some(t), items) == schema_type => {}
+                    // An object per item reaches the script folded into one string
+                    // (`inputs`' role and path as `--input ROLE=PATH`).
+                    Ok(("array", Some("string")))
+                        if schema_type == (Some("array"), Some("object")) => {}
                     Ok((t, items)) => faults.push(format!(
                         "{op}: the script reads {flag} as {t}{}, but the schema types `{key}` as {}{}",
                         items.map(|i| format!(" of {i}")).unwrap_or_default(),
@@ -3143,7 +3193,12 @@ ap.add_argument("--nowhere", default=NOWHERE)
                         continue;
                     }
                 };
-            let (key_of, _) = options_keys_reach(&schema, &full, &every_key);
+            let mut key_of = options_keys_reach(&schema, &full, &every_key).0;
+            for other in manifests_covering_every_key(&schema).iter().skip(1) {
+                if let Ok(call) = script_call(op, other) {
+                    key_of.extend(options_keys_reach(&schema, other, &call).0);
+                }
+            }
             let declared = script_options(&left_out.source);
             for (key, prop) in properties(&schema) {
                 let stated = prop.get("default");
@@ -8450,6 +8505,8 @@ mod tests {
 
     #[test]
     fn splink_refuses_a_role_or_probability_the_script_would() {
+        let inf = splink_with("inputs: [{role: a, path: x}]\nthreshold_match_weight: .inf");
+        assert!(assets_for("splink", Some(&inf)).is_err());
         let bad_role = splink_with("inputs: [{role: Left, path: x}]");
         assert!(assets_for("splink", Some(&bad_role)).is_err());
         for p in ["1", "-0.1", "1.5"] {

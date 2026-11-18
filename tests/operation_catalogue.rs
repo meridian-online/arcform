@@ -44,7 +44,7 @@ const JOIN_TABLES: &str = "join-tables";
 const APPEND_ROWS: &str = "append-rows";
 const READ_FILE: &str = "read-file";
 
-/// The operators the default build holds: the ten every build holds and the three
+/// The operators the default build holds: the eleven every build holds and the three
 /// `http-fetch` adds, which `cli` turns on.
 const OPERATORS: [&str; 14] = [
     "parquet_export",

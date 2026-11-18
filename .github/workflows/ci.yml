@@ -345,6 +345,12 @@ jobs:
       - name: splink end to end
         run: uv run operators/splink/test_splink_e2e.py
 
+      # The same operator driven through `arc run`: the script is materialised into the
+      # temp directory and run by `uv`, which is where a script named for its package
+      # once imported itself.
+      - name: splink through arc
+        run: cargo test --test splink
+
       # tests/text_embed.rs and tests/text_embed_parity.rs carry #[ignore]d tests that
       # need a built subtoken extension, which this runner does not stage — and,
       # for the projection half, the several hundred megabytes `uv` resolves for
