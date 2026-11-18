@@ -220,6 +220,20 @@ class RestFetchE2E(unittest.TestCase):
         self.assertEqual(len(api.requests), 4)
         self.assertEqual(len(self.out.read_bytes().splitlines()), 5)
 
+    def test_a_redirect_target_retried_by_the_outer_request_is_not_a_repeat(self) -> None:
+        # The redirect hop is sent from inside the first request's retry loop. Its target
+        # fails for all of the hop's own attempts, so the outer request retries, follows
+        # the redirect again and sends the hop a second time: a retry, not a loop.
+        api = self.three_pages(fail_page=0, fail_times=2)
+        api.redirect_body = b"<html>Moved</html>"
+        r = self.run_op(self.source(api, path="moved/items"),
+                        env={"RUNTIME__REQUEST_MAX_ATTEMPTS": "2",
+                             "RUNTIME__REQUEST_BACKOFF_FACTOR": "0"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("repeats an earlier request", r.stderr)
+        self.assertEqual(api.redirects, 2)
+        self.assertEqual(len(self.out.read_bytes().splitlines()), 5)
+
     def test_a_missing_total_path_is_refused(self) -> None:
         api = self.three_pages(with_total=False)
         r = self.run_op(self.source(api), "--expect-total-path", "meta.pagination.total")

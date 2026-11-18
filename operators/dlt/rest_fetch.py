@@ -215,20 +215,24 @@ def fetch(source: dict, expect_total_path: str | None, page_delay_seconds: float
     seen_gets: set[str] = set()
 
     def paced_send(request, **kwargs):
-        # Each logical request passes here once: dlt's retries sit inside `send`, and a
-        # redirect hop arrives with its own target URL. A GET repeating an earlier one
-        # is a next link that leads back, which no paginator would stop on.
-        if request.method == "GET":
-            if request.url in seen_gets:
-                raise PagingLoop(
-                    f"the API's next page repeats an earlier request ({request.url}); "
-                    "refusing to page in a loop"
-                )
-            seen_gets.add(request.url)
+        # A GET repeating one that already succeeded is a next link that leads back,
+        # which no paginator would stop on. dlt's retries sit inside `send`, but a
+        # redirect hop is sent through here from inside the outer request's retries,
+        # so it can pass more than once; only a URL whose response arrived (ok, or a
+        # redirect) is recorded, and a hop retried after failing is not a repeat.
+        is_get = request.method == "GET"
+        if is_get and request.url in seen_gets:
+            raise PagingLoop(
+                f"the API's next page repeats an earlier request ({request.url}); "
+                "refusing to page in a loop"
+            )
         if sent[0] and page_delay_seconds:
             time.sleep(page_delay_seconds)
         sent[0] += 1
-        return send(request, **kwargs)
+        response = send(request, **kwargs)
+        if is_get and (response.ok or response.is_redirect):
+            seen_gets.add(request.url)
+        return response
 
     session.send = paced_send
     source["client"]["session"] = session
