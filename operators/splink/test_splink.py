@@ -176,6 +176,7 @@ class ModelProblemsTest(unittest.TestCase):
             "blocking": model(blocking_rules_to_generate_predictions=[{"blocking_rule": None}]),
             "retain": model(additional_columns_to_retain=[["x"]]),
             "uid": model(unique_id_column_name=5),
+            "src": model(link_type="link_only", source_dataset_column_name=["x"]),
         }
         for field, m in cases.items():
             out = op.model_problems(m, TWO, "m.json")

@@ -130,6 +130,9 @@ def model_problems(
     elif link_type not in LINK_TYPES:
         problems.append(about_model(f"link_type {link_type!r} is not one of {', '.join(LINK_TYPES)}"))
     src = settings.get("source_dataset_column_name", "source_dataset")
+    if not isinstance(src, str) or not src:
+        problems.append(about_model(f"source_dataset_column_name {src!r} is not a column name"))
+        src = "source_dataset"
     if link_type != "dedupe_only" and src != "source_dataset":
         # Splink only creates a column named `source_dataset`; any other name must exist.
         needed.setdefault(src, "source_dataset_column_name")
