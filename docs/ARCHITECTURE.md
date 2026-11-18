@@ -128,7 +128,7 @@ Each input is registered with Splink under a generated table name, never under i
 
 The script, `operators/splink/splink.py`, is frozen into the binary and run with `uv`, as the other embedded Python operators are. Unlike them, which pin version ranges, it pins `splink==5.0.0`, `duckdb==2.0.0` and `pyarrow==26.0.1` exactly, because its output is published and a parity check against an earlier build of the same crosswalk depends on every dependency staying where it was.
 
-It refuses before Splink starts, exiting 2 with one line per reason. arc refuses some of these at manifest load, before `uv` runs: no inputs; a role that does not match `^[a-z][a-z0-9_]*$` or is given twice; both thresholds set; a match probability outside [0, 1); a `threshold_match_weight` that is not finite. The script refuses the rest, repeats all four of those (it is also run directly) and refuses a `--input` that is not `ROLE=PATH`:
+It refuses before Splink starts, exiting 2 with one line per reason. arc refuses some of these at manifest load, before `uv` runs: no inputs; a role that does not match `^[a-z][a-z0-9_]*$` or is given twice; both thresholds set; a match probability outside [0, 1); a `threshold_match_weight` that is not finite. The script refuses the rest, repeats all of those (it is also run directly) and refuses a `--input` that is not `ROLE=PATH`:
 
 - a level other than the null level that lacks `m_probability` or `u_probability`;
 - a `link_type` that does not fit the input count (`dedupe_only` takes one input, `link_only` and `link_and_dedupe` at least two);
