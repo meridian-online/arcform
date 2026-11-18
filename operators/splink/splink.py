@@ -79,12 +79,21 @@ def model_problems(
 
     needed: dict[str, str] = {}  # column -> where the model names it
     uid = settings.get("unique_id_column_name", "unique_id")
+    if not isinstance(uid, str) or not uid:
+        problems.append(about_model(f"unique_id_column_name {uid!r} is not a column name"))
+        uid = "unique_id"
     needed[uid] = "unique_id_column_name"
 
     for comp in comparisons:
         cname = comp.get("output_column_name", "?")
         for level in comp.get("comparison_levels", []):
-            label = level.get("label_for_charts") or level.get("sql_condition", "?")
+            cond = level.get("sql_condition")
+            if not isinstance(cond, str):
+                problems.append(
+                    about_model(f"comparison {cname!r} has a level whose sql_condition is not text")
+                )
+                continue
+            label = level.get("label_for_charts") or cond
             if not level.get("is_null_level"):
                 missing = [k for k in ("m_probability", "u_probability") if level.get(k) is None]
                 if missing:
@@ -94,14 +103,22 @@ def model_problems(
                             f"{' or '.join(missing)}; the model is not fully specified"
                         )
                     )
-            for col in _level_columns(level.get("sql_condition", "")):
+            for col in _level_columns(cond):
                 needed.setdefault(col, f"comparison {cname!r} level {label!r}")
 
     for rule in settings.get("blocking_rules_to_generate_predictions", []) or []:
-        sql = rule.get("blocking_rule", "") if isinstance(rule, dict) else str(rule)
+        sql = rule.get("blocking_rule") if isinstance(rule, dict) else rule
+        if not isinstance(sql, str):
+            problems.append(
+                about_model(f"blocking_rules_to_generate_predictions has a rule that is not text: {rule!r}")
+            )
+            continue
         for col in _rule_columns(sql):
             needed.setdefault(col, f"blocking rule {sql!r}")
     for col in settings.get("additional_columns_to_retain", []) or []:
+        if not isinstance(col, str):
+            problems.append(about_model(f"additional_columns_to_retain has a non-text entry: {col!r}"))
+            continue
         needed.setdefault(col, "additional_columns_to_retain")
 
     link_type = settings.get("link_type", "dedupe_only")
@@ -116,6 +133,9 @@ def model_problems(
     if link_type != "dedupe_only" and src != "source_dataset":
         # Splink only creates a column named `source_dataset`; any other name must exist.
         needed.setdefault(src, "source_dataset_column_name")
+    if link_type != "dedupe_only" and src == "source_dataset":
+        # Splink adds the default column itself when linking, so inputs need not hold it.
+        needed.pop("source_dataset", None)
 
     names = set().union(*(set(c) for c in columns.values())) if columns else set()
     for role, cols in columns.items():

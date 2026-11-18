@@ -165,6 +165,29 @@ class ModelProblemsTest(unittest.TestCase):
         m = model(blocking_rules_to_generate_predictions=['l."town" = r."town"'])
         self.assertTrue(any("'town'" in p for p in op.model_problems(m, TWO)))
 
+    def test_malformed_fields_are_refused_naming_the_model_path(self) -> None:
+        def level(**kw):
+            m = copy.deepcopy(MODEL)
+            m["comparisons"][0]["comparison_levels"][1].update(kw)
+            return m
+
+        cases = {
+            "sql_condition": level(sql_condition=None),
+            "blocking": model(blocking_rules_to_generate_predictions=[{"blocking_rule": None}]),
+            "retain": model(additional_columns_to_retain=[["x"]]),
+            "uid": model(unique_id_column_name=5),
+        }
+        for field, m in cases.items():
+            out = op.model_problems(m, TWO, "m.json")
+            self.assertTrue(any("model m.json" in p for p in out), (field, out))
+
+    def test_the_default_source_dataset_column_is_not_required_of_inputs(self) -> None:
+        m = model(
+            link_type="link_and_dedupe",
+            blocking_rules_to_generate_predictions=["l.source_dataset <> r.source_dataset"],
+        )
+        self.assertEqual(op.model_problems(m, TWO), [])
+
 
 if __name__ == "__main__":
     unittest.main()
