@@ -50,7 +50,8 @@ CREATE OR REPLACE TABLE gleif AS
          registration_status AS reg_status
   FROM read_parquet('build/gleif.parquet');
 
--- Deterministic authoritative pairs — GLEIF SEC registrations. Type the SEC
+-- Deterministic authoritative pairs — GLEIF SEC registrations, taken from the raw
+-- lei-records the fetch writes one per line (a missing field reads as NULL). Type the SEC
 -- identifier by its scheme (SEC-defined: S…=fund series, C…=share class, digits=CIK);
 -- unpad CIKs to match EDGAR, keep series/class verbatim. `category` is GLEIF's own
 -- authoritative entity type (FUND | GENERAL | BRANCH | …).
@@ -65,7 +66,12 @@ CREATE OR REPLACE TABLE gleif_ra_sec AS
          THEN CAST(registered_as AS BIGINT)::VARCHAR
          ELSE trim(registered_as) END AS key,
     category
-  FROM read_csv('build/gleif_ra_sec.csv', header=true, all_varchar=true)
+  FROM (
+    SELECT json_extract_string(json, '$.attributes.lei') AS lei,
+           json_extract_string(json, '$.attributes.entity.registeredAs') AS registered_as,
+           json_extract_string(json, '$.attributes.entity.category') AS category
+    FROM read_ndjson_objects('build/gleif_ra_sec.jsonl')
+  )
   WHERE lei IS NOT NULL AND registered_as IS NOT NULL AND registered_as <> ''
     -- Keep only the three EDGAR identifier schemes. RA000665 also carries a handful
     -- of SEC investment-adviser file numbers (`805-…`, Form ADV) — a different scheme

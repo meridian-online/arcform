@@ -150,7 +150,6 @@ static ARCHIVE_EXTRACT: ArchiveExtract = ArchiveExtract;
 static DATAPACKAGE_DESCRIBE: DatapackageDescribe = DatapackageDescribe;
 static FINETYPE_VALIDATE: FinetypeValidate = FinetypeValidate;
 static SPLINK: Splink = Splink;
-static GLEIF_RA_FETCH: GleifRaFetch = GleifRaFetch;
 static DLT: Dlt = Dlt;
 static UMAP_PROJECT: UmapProject = UmapProject;
 static TEXT_EMBED: TextEmbed = TextEmbed;
@@ -175,7 +174,6 @@ fn catalog() -> Vec<&'static dyn Operator> {
         &DATAPACKAGE_DESCRIBE,
         &FINETYPE_VALIDATE,
         &SPLINK,
-        &GLEIF_RA_FETCH,
         &DLT,
         &UMAP_PROJECT,
         &TEXT_EMBED,
@@ -381,15 +379,6 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
                 json!(["threshold_match_probability", "threshold_match_weight"]);
             schema
         }
-        "gleif_ra_fetch" => object(
-            json!({
-                "ra": { "type": "string", "description": "GLEIF registration-authority id to page (e.g. RA000665)." },
-                "out": { "type": "string", "description": "Destination CSV path, relative to the protocol directory." },
-                "page_size": { "type": "integer", "minimum": 1, "default": 200, "description": "GLEIF page[size]." },
-                "user_agent": { "type": "string", "default": "Meridian Protocol (open-analytics; research@meridian.online)", "description": "User-Agent request header." }
-            }),
-            &["ra", "out"],
-        ),
         "dlt" => object(
             json!({
                 "source": { "type": "object", "description": "dlt's own `rest_api` source configuration, as dlt's documentation describes it: the client's base URL, headers and paginator, and exactly one resource with its endpoint, query parameters and data selector. Passed to dlt as JSON, so a bracketed query key stays as written and an integer stays an integer. Refused, before any request: no `client.base_url`; other than one resource; a key named `incremental`, `auth` or `processing_steps` anywhere except inside a request's own `params`, `headers`, `json` or `data`, where such a name is the API's business; a parameter of `type: resolve` or `type: incremental`; a `write_disposition` other than `replace`." },
@@ -1014,36 +1003,6 @@ const DESCRIBED: &[Described] = &[
             "out",
             "file",
             "The Parquet file Splink's predictions are written to.",
-        )],
-    },
-    Described {
-        name: "gleif_ra_fetch",
-        summary: "Pages through GLEIF's entities for one registration authority and writes them to a CSV file.",
-        wraps: &[
-            Wraps {
-                id: "gleif-api",
-                name: "GLEIF API",
-                url: "https://www.gleif.org/en/lei-data/gleif-api",
-                use_: "The public API whose `lei-records` the step pages through, filtered to one registration authority.",
-            },
-            Wraps {
-                id: "dlt",
-                name: "dlt",
-                url: "https://dlthub.com",
-                use_: "Pages the API and writes the records.",
-            },
-        ],
-        example: r#"- name: fetch_ra
-  op: gleif_ra_fetch@1
-  with:
-    ra: RA000665
-    out: raw/gleif_ra000665.csv
-"#,
-        reads: &[],
-        writes: &[role(
-            "out",
-            "file",
-            "The CSV file the entities are written to, relative to the protocol directory.",
         )],
     },
     Described {
@@ -1684,7 +1643,6 @@ mod with_schema_tests {
             "datapackage_describe" => configuration_fields::<DatapackageDescribeConfig>(),
             "finetype_validate" => configuration_fields::<FinetypeValidateConfig>(),
             "splink" => configuration_fields::<SplinkConfig>(),
-            "gleif_ra_fetch" => configuration_fields::<GleifRaFetchConfig>(),
             "dlt" => configuration_fields::<DltConfig>(),
             "umap_project" => configuration_fields::<UmapProjectConfig>(),
             "text_embed" => configuration_fields::<TextEmbedConfig>(),
@@ -2538,23 +2496,12 @@ mod with_schema_tests {
     }
 
     /// The operators that run a frozen Python script.
-    const SCRIPT_OPERATORS: [&str; 5] = [
-        "splink",
-        "gleif_ra_fetch",
-        "dlt",
-        "umap_project",
-        "text_embed",
-    ];
+    const SCRIPT_OPERATORS: [&str; 4] = ["splink", "dlt", "umap_project", "text_embed"];
 
     /// Options a frozen script declares that no `with:` key reaches, each with the
     /// reason arc never passes it. Every run through arc takes the script's default for
-    /// these, so none is a value an analyst could set and not see.
-    const OPTIONS_ARC_NEVER_PASSES: &[(&str, &str, &str)] = &[(
-        "gleif_ra_fetch",
-        "--max-pages",
-        "a smoke-test lever only: production always does a full, guarded, unbounded \
-         pull, so every run through arc takes the script's default of no cap",
-    )];
+    /// these, so none is a value an analyst could set and not see. None at present.
+    const OPTIONS_ARC_NEVER_PASSES: &[(&str, &str, &str)] = &[];
 
     /// The argv a frozen-script operator's `run` hands `uv` for `with`, built by the
     /// function `run` calls, without spawning `uv`.
@@ -2565,7 +2512,6 @@ mod with_schema_tests {
                 cfg.validate()?;
                 splink_invocation(&cfg, dir)
             }
-            "gleif_ra_fetch" => gleif_ra_fetch_invocation(&GleifRaFetchConfig::parse(with)?, dir),
             "dlt" => dlt_invocation(&DltConfig::parse(with)?, dir),
             "umap_project" => {
                 let cfg = UmapProjectConfig::parse(with)?;
@@ -3373,7 +3319,6 @@ ap.add_argument("--nowhere", default=NOWHERE)
             "datapackage_describe" => read_as::<DatapackageDescribeConfig>(with),
             "finetype_validate" => read_as::<FinetypeValidateConfig>(with),
             "splink" => read_as::<SplinkConfig>(with),
-            "gleif_ra_fetch" => read_as::<GleifRaFetchConfig>(with),
             "dlt" => read_as::<DltConfig>(with),
             "umap_project" => read_as::<UmapProjectConfig>(with),
             "text_embed" => read_as::<TextEmbedConfig>(with),
@@ -3484,7 +3429,7 @@ ap.add_argument("--nowhere", default=NOWHERE)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Subprocess substrate — the shared spawn/wait/error-map for operators that wrap
-// an external process: a `uv run` Python script (splink, gleif_ra_fetch)
+// an external process: a `uv run` Python script (splink)
 // or a CLI (datapackage_describe → finetype). One place for the retry taxonomy so
 // each op doesn't hand-roll a Command block with divergent error handling.
 // (Wired by those operators in later increments — allow(dead_code) until then.)
@@ -6417,123 +6362,10 @@ fn splink_invocation(cfg: &SplinkConfig, dir: &Path) -> Result<Vec<String>> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// gleif_ra_fetch (ingress) — page the public GLEIF v1 API for every entity
-// registered under one registration authority (RA000665 = the SEC) and emit the
-// `lei,registered_as,category` CSV the `load` step consumes.
-//
-// Retires `edgar_gleif/scripts/fetch_gleif_ra.sh`. That script hand-rolled cursor
-// paging in bash (`page[cursor]=*`, follow `.links.next`, terminate on null/empty,
-// with a loop guard) because GLEIF hard-caps OFFSET paging at 10,000 records and
-// RA000665 has ~27k. The embedded `fetch_gleif_ra.py` does the same with dlt's
-// `RESTClient` + `JSONLinkPaginator(next_url_path="links.next")` — STATELESS
-// full-refresh (no incremental cursor persisted) — then writes a DETERMINISTIC
-// SORTED CSV so the row-set parity gate against the retired script is a clean
-// `EXCEPT`. Same uv-run substrate + frozen-script contract as datapackage_describe
-// and splink: `op@1` addresses these exact script bytes.
-//
-// Ingress, so `reads: []` (the network source is not a graph node) and
-// `produces: [out]` — the CSV sits in the AssetGraph downstream of nothing and
-// upstream of `load`, exactly where the old `command:` step sat but now typed.
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// The GLEIF-fetch script, pinned into the binary. `@1` == these exact bytes.
-const GLEIF_RA_FETCH_PY: &str = include_str!("../operators/gleif_ra_fetch/fetch_gleif_ra.py");
-
-/// The script cache directory `materialize_frozen_script` builds for this operator.
-/// Test-only, for the same reason [`UMAP_PROJECT_CACHE_DIR`] is: production never
-/// spells the path, and a test traps it to drive the cache's two failure paths.
-#[cfg(test)]
-const GLEIF_RA_FETCH_CACHE_DIR: &str = "arcform-op-gleif_ra_fetch-1.0.0";
-
-struct GleifRaFetch;
-
-#[derive(Deserialize)]
-#[cfg_attr(test, derive(Debug))]
-#[serde(deny_unknown_fields)]
-struct GleifRaFetchConfig {
-    /// GLEIF registration-authority id to page (e.g. `RA000665`, the SEC).
-    ra: String,
-    /// Destination CSV path, relative to the manifest directory (the `produces`
-    /// asset). The script writes it atomically (`.part` + rename).
-    out: String,
-    /// GLEIF `page[size]`. Defaults to the script's 200 when omitted.
-    #[serde(default)]
-    page_size: Option<u64>,
-    /// User-Agent request header. Defaults to the script's Meridian UA when omitted.
-    #[serde(default)]
-    user_agent: Option<String>,
-}
-
-impl GleifRaFetchConfig {
-    fn parse(with: &Value) -> Result<Self> {
-        serde_yaml::from_value(with.clone()).map_err(|e| {
-            Error::ManifestValidation(format!("gleif_ra_fetch: invalid `with:` config: {}", e))
-        })
-    }
-}
-
-impl Operator for GleifRaFetch {
-    fn name(&self) -> &'static str {
-        "gleif_ra_fetch"
-    }
-
-    fn ingress(&self) -> bool {
-        true
-    }
-
-    fn version(&self) -> semver::Version {
-        semver::Version::new(1, 0, 0)
-    }
-
-    fn assets(&self, with: &Value) -> Result<OpAssets> {
-        let cfg = GleifRaFetchConfig::parse(with)?;
-        // Ingress: the network source is not a graph node; only the local CSV is.
-        let mut assets = OpAssets::default();
-        assets.record_produces(cfg.out.clone(), crate::asset_kind::AssetKind::File);
-        Ok(assets)
-    }
-
-    fn run(&self, with: &Value, ctx: &OpContext) -> Result<StepOutput> {
-        let cfg = GleifRaFetchConfig::parse(with)?;
-        let out = ctx.dir.join(&cfg.out);
-        if let Some(parent) = out.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        let args = gleif_ra_fetch_invocation(&cfg, ctx.dir)?;
-        run_process("uv", &args, ctx, OutputMode::Capture, "gleif_ra_fetch")
-    }
-}
-
-/// The full argv `run` hands `uv`: materialise the frozen script and build its
-/// arguments. Split out of [`Operator::run`], as [`umap_project_invocation`] is, so a
-/// test reads the argv the script is really given without spawning `uv`.
-fn gleif_ra_fetch_invocation(cfg: &GleifRaFetchConfig, dir: &Path) -> Result<Vec<String>> {
-    let script = materialize_frozen_script("gleif_ra_fetch", "1.0.0", GLEIF_RA_FETCH_PY)?;
-    let mut extra = vec![
-        "--ra".to_string(),
-        cfg.ra.clone(),
-        "--out".to_string(),
-        dir.join(&cfg.out).display().to_string(),
-    ];
-    // `--max-pages` is intentionally NOT surfaced in config — it is a smoke-test
-    // lever only. Production always does a full, guarded, unbounded pull.
-    if let Some(ps) = cfg.page_size {
-        extra.push("--page-size".to_string());
-        extra.push(ps.to_string());
-    }
-    if let Some(ref ua) = cfg.user_agent {
-        extra.push("--user-agent".to_string());
-        extra.push(ua.clone());
-    }
-    Ok(uv_run_args(&script.to_string_lossy(), &extra))
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // dlt (ingress) — page one resource of a REST API through dlt's `rest_api` source
 // and write its records as sorted JSON Lines.
 //
-// It is meant to replace `gleif_ra_fetch`, which serves one API only. Everything
+// It serves any REST API, not one. Everything
 // particular to one API (base URL, headers, paginator, endpoint, query parameters, data
 // selector) is the step's `source`, which is dlt's own `rest_api` configuration
 // passed through as JSON; arc names none of it. The frozen `rest_fetch.py` adds what
@@ -6545,7 +6377,7 @@ fn gleif_ra_fetch_invocation(cfg: &GleifRaFetchConfig, dir: &Path) -> Result<Vec
 // that is not a mapping, a negative or non-finite `page_delay_seconds`, a negative
 // `tolerance`); the script refuses the rest, before any request.
 //
-// Ingress, so `reads: []` and `produces: [out]`, as `gleif_ra_fetch`.
+// Ingress, so `reads: []` and `produces: [out]`.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The dlt fetch script, pinned into the binary. `@1` == these exact bytes.
@@ -7417,7 +7249,7 @@ fn text_embed_invocation(cfg: &TextEmbedConfig, dir: &Path) -> Result<Vec<String
 // uv (activate) — a Protocol's OWN Python step, inside the asset graph.
 //
 // The generic counterpart to the frozen-script operators (`splink`,
-// `gleif_ra_fetch`, `umap_project`, `text_embed`): the same `uv run --script`
+// `umap_project`, `text_embed`): the same `uv run --script`
 // substrate, but the script is the Protocol's rather than one compiled into this
 // binary. Without it, a Python step has to be `command:` — which addresses no exact
 // bytes, declares no assets, and runs under whatever `python3` the machine has.
@@ -8693,51 +8525,6 @@ mod tests {
         assert!(!argv.iter().any(|a| a.starts_with("--threshold")));
     }
 
-    #[test]
-    fn gleif_ra_fetch_is_in_catalog_and_versioned() {
-        assert!(resolve("gleif_ra_fetch").is_ok());
-        assert!(resolve("gleif_ra_fetch@1").is_ok());
-        assert!(resolve("gleif_ra_fetch@^1.0").is_ok());
-        assert!(resolve("gleif_ra_fetch@2").is_err()); // version not satisfied
-    }
-
-    #[test]
-    fn gleif_ra_fetch_declares_only_its_output() {
-        // Ingress: produces the local CSV, reads no graph node (the GLEIF API is not
-        // in the AssetGraph). `out` is lowercased into the produces asset.
-        let with: Value =
-            serde_yaml::from_str("ra: RA000665\nout: build/gleif_ra_sec.csv").unwrap();
-        let a = assets_for("gleif_ra_fetch", Some(&with)).unwrap();
-        assert_eq!(a.produces, vec!["build/gleif_ra_sec.csv".to_string()]);
-        assert!(a.reads.is_empty());
-    }
-
-    #[test]
-    fn gleif_ra_fetch_optional_fields_default() {
-        // page_size / user_agent are optional — a minimal ra+out config validates.
-        let min: Value = serde_yaml::from_str("ra: RA000665\nout: g.csv").unwrap();
-        assert!(assets_for("gleif_ra_fetch", Some(&min)).is_ok());
-        // …and both may be supplied.
-        let full: Value =
-            serde_yaml::from_str("ra: RA000665\nout: g.csv\npage_size: 50\nuser_agent: 'X (y@z)'")
-                .unwrap();
-        assert!(assets_for("gleif_ra_fetch", Some(&full)).is_ok());
-    }
-
-    #[test]
-    fn gleif_ra_fetch_rejects_bad_config() {
-        // missing required `out`
-        let no_out: Value = serde_yaml::from_str("ra: RA000665").unwrap();
-        assert!(assets_for("gleif_ra_fetch", Some(&no_out)).is_err());
-        // missing required `ra`
-        let no_ra: Value = serde_yaml::from_str("out: g.csv").unwrap();
-        assert!(assets_for("gleif_ra_fetch", Some(&no_ra)).is_err());
-        // unknown field rejected (deny_unknown_fields) — e.g. a stray `max_pages`,
-        // which is a smoke-test-only CLI flag and deliberately not a config field.
-        let bogus: Value = serde_yaml::from_str("ra: RA000665\nout: g.csv\nmax_pages: 2").unwrap();
-        assert!(assets_for("gleif_ra_fetch", Some(&bogus)).is_err());
-    }
-
     // ── dlt ──────────────────────────────────────────────────────────────────
 
     /// A step paging a cursor API whose query keys carry brackets and whose page size
@@ -9742,15 +9529,6 @@ out: build/records.jsonl
                         SPLINK_CACHE_DIR,
                     )
                 }
-                "gleif_ra_fetch" => {
-                    let with: Value = serde_yaml::from_str("ra: RA000665\nout: out.csv").unwrap();
-                    (
-                        GleifRaFetch
-                            .run(&with, &ctx)
-                            .expect_err("a script cache that cannot be written must stop the step"),
-                        GLEIF_RA_FETCH_CACHE_DIR,
-                    )
-                }
                 "dlt" => {
                     let with: Value = serde_yaml::from_str(
                         "source: {client: {base_url: 'https://api.example.org/'}, resources: [r]}\nout: out.jsonl",
@@ -9789,11 +9567,6 @@ out: build/records.jsonl
             ("umap_project", UMAP_PROJECT_CACHE_DIR, "umap_project.py"),
             ("text_embed", TEXT_EMBED_CACHE_DIR, "text_embed.py"),
             ("splink", SPLINK_CACHE_DIR, "splink.py"),
-            (
-                "gleif_ra_fetch",
-                GLEIF_RA_FETCH_CACHE_DIR,
-                "gleif_ra_fetch.py",
-            ),
             ("dlt", DLT_CACHE_DIR, DLT_SCRIPT_FILE),
         ] {
             let block_the_directory = tempfile::tempdir().unwrap();

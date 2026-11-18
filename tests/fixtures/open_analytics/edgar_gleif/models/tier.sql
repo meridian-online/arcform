@@ -1,7 +1,8 @@
 -- Build the tiered, multi-grain edge set: one row per link between an EDGAR identifier
 -- and an LEI, keyed by a typed SEC identifier (cik | series | class). Tiers, in precedence order:
 --   authoritative  — deterministic, no guessing (SEC registration; N-CEN next)
---   confirmed      — exact normalised-name Splink match (~95% precision)
+--   confirmed      — exact normalised-name Splink match (98% agree with GLEIF's SEC
+--                    registrations where those name the filer, November 2026)
 --   candidate      — fuzzy name match, surfaced not asserted
 --   ambiguous      — one exact name matched more than one entity
 -- A deterministic edge always wins over a name-match for the same (key_type, key).

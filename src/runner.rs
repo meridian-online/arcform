@@ -2369,8 +2369,8 @@ fn glob_match(p: &[char], n: &[char]) -> bool {
 /// A combined content hash over every asset a step is answerable for that is
 /// actually backed by bytes on disk — `File` and `Directory` kinds, per
 /// `declared_kind`: what it produces, plus what it reads directly that nothing in
-/// the manifest produces (an external input — the shape of `build/gleif_ra_sec.csv`
-/// before `gleif_ra_fetch` existed to own it). `Table` and `Pattern` never
+/// the manifest produces (an external input — the shape of a file a `command:` step
+/// writes before a typed step owns it). `Table` and `Pattern` never
 /// participate — a table is left to the existing config-hash and
 /// downstream-propagation machinery, and a pattern's staleness comes from what
 /// produces the matches, not from the pattern string itself. This only ever adds

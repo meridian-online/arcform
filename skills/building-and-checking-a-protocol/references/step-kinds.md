@@ -48,7 +48,7 @@ Use an operator for work that is not a query over tables already in the database
 
 | Purpose | Operators |
 | --- | --- |
-| Fetching | `http_fetch` (one file at an address), `html_link_discover` (the links on an index page), `archive_extract` (members of a zip), `gleif_ra_fetch` (GLEIF entities for one registration authority), `dlt` (one resource of a paginated REST API, configured by dlt's `rest_api` source in `with: source:`) |
+| Fetching | `http_fetch` (one file at an address), `html_link_discover` (the links on an index page), `archive_extract` (members of a zip), `dlt` (one resource of a paginated REST API, configured by dlt's `rest_api` source in `with: source:`) |
 | Entity resolution | `splink` (scores record pairs with a Splink model the Protocol supplies, for any dataset) |
 | Embedding and projection | `text_embed`, `umap_project` |
 | Export and description | `parquet_export`, `datapackage_describe`, `finetype_validate` |
