@@ -3,18 +3,26 @@
 //! tests in `src/operator.rs` read the argv; this is the test that would have caught a
 //! script that cannot import Splink once arc has put it in the temp directory.
 //!
-//! It needs `uv` (Splink, DuckDB and pyarrow resolve on first use) and skips where `uv`
-//! is not on PATH. CI runs it in the job that installs `uv`.
+//! It needs `uv` (Splink, DuckDB and pyarrow resolve on first use), so the test is
+//! `#[ignore]`d and fails without `uv` when asked for. CI runs it with
+//! `--include-ignored` in the job that installs `uv`.
 
 use std::path::Path;
 use std::process::Command;
 
-fn have_uv() -> bool {
-    Command::new("uv")
+/// `uv` on PATH, or a hard failure. Only called from a test carrying `#[ignore]`:
+/// asking for the ignored tests is a claim that `uv` is here, so a missing one fails.
+fn require_uv() {
+    let found = Command::new("uv")
         .arg("--version")
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    assert!(
+        found,
+        "`uv` must be on PATH: this test is #[ignore]d so an ordinary machine skips it, \
+         and running it with --include-ignored claims `uv` is installed"
+    );
 }
 
 const MANIFEST: &str = "\
@@ -61,11 +69,10 @@ fn write_parquet(path: &Path, values: &str) {
 }
 
 #[test]
+#[ignore = "needs `uv` and resolves Splink from the network: run under ci.yml's uv job, \
+            which passes --include-ignored"]
 fn a_two_input_protocol_writes_the_scored_pairs() {
-    if !have_uv() {
-        eprintln!("skipping a_two_input_protocol_writes_the_scored_pairs: no `uv` on PATH");
-        return;
-    }
+    require_uv();
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     std::fs::create_dir_all(dir.join("build")).unwrap();
