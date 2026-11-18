@@ -1524,6 +1524,10 @@ mod tests {
                         "models/package.sql",
                         include_str!("../tests/fixtures/open_analytics/gleif/models/package.sql"),
                     ),
+                    (
+                        "models/search.sql",
+                        include_str!("../tests/fixtures/open_analytics/gleif/models/search.sql"),
+                    ),
                 ],
             ),
             (
@@ -1628,7 +1632,7 @@ mod tests {
             (
                 "gleif/arcform.yaml",
                 include_str!("../tests/fixtures/open_analytics/gleif/arcform.yaml"),
-                "0ead97a5cd547ea4c59f8137f0decd9ae2b1df4ebb0352b01fe6fd1b08c168fd",
+                "bbc1c8b708fdb016a5977541697a8449271157f72d43eb6d902433bc91eb551c",
             ),
             (
                 "gleif/models/load.sql",
@@ -1641,24 +1645,29 @@ mod tests {
                 "359276a8bb87c39636ae74703815b00b28e7da2be506c9da1526379beabef4f4",
             ),
             (
+                "gleif/models/search.sql",
+                include_str!("../tests/fixtures/open_analytics/gleif/models/search.sql"),
+                "342e3a53dc6c94822786c2dde9cb698b8172d1d5097332120a09b8868adf162e",
+            ),
+            (
                 "naics/arcform.yaml",
                 include_str!("../tests/fixtures/open_analytics/naics/arcform.yaml"),
-                "8e1290e3bb2dbf1c556885de2a700dbe100735f4d4f2bcf6c32083e61193c8c1",
+                "de59d3c664fb68f50d92cb1fac94c7e5748f5919e526cc9e6b7f571080c8511d",
             ),
             (
                 "naics/models/load.sql",
                 include_str!("../tests/fixtures/open_analytics/naics/models/load.sql"),
-                "a1b258a5d58739d609a871b09eae6d341ba71ae8a40fc370e7df6db7805d6019",
+                "d0381b1c7ff893e726b25280f49e563c3306db11a2985874bc803622ca5625b7",
             ),
             (
                 "naics/models/package.sql",
                 include_str!("../tests/fixtures/open_analytics/naics/models/package.sql"),
-                "24181e6342dcd3c571756faad6245953dc3bf47fa644735f981267f480ab987e",
+                "46a70be4ad7ed9ba4f22490aae8c16af7021c68bc3101c9a01b1624b585e9965",
             ),
             (
                 "edgar/arcform.yaml",
                 include_str!("../tests/fixtures/open_analytics/edgar/arcform.yaml"),
-                "767ec8d0d0596098ba7820de349022fbb51dd6c1dc1319223c2486c67e5000a2",
+                "5f936ebf6e9456d12920140b3cbe5f884e7e397472b3de9064ae78040126668a",
             ),
             (
                 "edgar/models/load.sql",
@@ -1673,7 +1682,7 @@ mod tests {
             (
                 "edgar_gleif/arcform.yaml",
                 include_str!("../tests/fixtures/open_analytics/edgar_gleif/arcform.yaml"),
-                "984405ebaf3c2099d86336d9823f4d14ebae1343a8bea10087ff2c7aa7aee924",
+                "125817bf385db9d9b7186d238cd4f51ec9bca9c180bbb3213507a6ab0d8a0cbf",
             ),
             (
                 "edgar_gleif/models/sec_entities.sql",

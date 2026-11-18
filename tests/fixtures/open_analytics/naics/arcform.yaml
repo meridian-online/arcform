@@ -2,25 +2,42 @@
 # industry-classification Dataset is ingested from the official U.S. Census file.
 # `arc run` executes this manifest; one Run → one Dataset version. See ./README.md.
 #
-# MOSTLY-CONFIG. Every step but one is a first-class `sql:` model or a typed `op:`
-# operator (the arcform catalog). The exception is named here rather than left for a
-# reader to discover: `stamp_descriptor` is a `command:` step. This comment used to say
-# there were none, which stopped being true the moment that step landed. The curl fetch
+# ALL-CONFIG. Every step is a first-class `sql:` model or a typed `op:` operator (the
+# arcform catalog); `stamp_descriptor` runs its script through `op: uv@1`. The curl fetch
 # is http_fetch; the terminal COPY is parquet_export; datapackage_describe emits the
 # descriptor from the built Parquet; finetype_validate gates it. (The Census workbook is
 # an .xlsx — load.sql reads it directly via DuckDB's `excel` extension, so no external
 # xlsx→csv tool is needed.) Operator code lives in the arcform repo, not here.
 #
-# BOUNDARY — do NOT fold this into this manifest:
-#   • PUBLISH (content-addressed R2 upload + manifest/catalog pointer flip) stays in
-#     the out-of-repo publish pipeline and READS this Protocol's terminal output,
-#     build/naics.parquet + the emitted datapackage.json. It is not an arcform step.
+# PUBLISH. The last step, `publish` (ducklake_write), writes the table into the shared
+# open lake as one snapshot: the catalog, the data file and the table's readable Parquet
+# copy on R2 (public at https://openlake.meridian.online/). With all three R2 variables
+# set, from .env or the environment, EVERY `arc run` publishes into the live lake;
+# `arc run --publish` only makes a missing credential fail the run instead of publishing
+# into build/lake/. For local work keep .env absent and the variables unset. Keep the
+# credential outside this folder and export it for the publishing command only. Readers
+# need DuckDB 2.0 or later. It reads only what stamp_descriptor wrote, so it runs after it.
+#
+# CODE LIST. The table is a code list under the contract in docs/code-lists.md: five
+# levels, sector to national industry, each row pointing at its parent, and
+# `check_code_list` holds the built file to it. load.sql is also run, by relative path,
+# by the NAICS index (../naics_2022_titles) and concordance (../naics_2017_to_2022), so
+# a change to how this Protocol reads Census's workbook reaches both.
+#
+# TESTS. tests.yaml beside this file holds the Protocol's tests, which `arc test` runs
+# against the cut-down Census workbook in testdata/, with no network and no publish.
+#
+# ONE WRITER PER FILE. The export and describe write to build/stage/; the stamp alone
+# writes the published build/naics.parquet and build/datapackage.json.
 #
 # Produces: build/naics.parquet  →  published as census.naics_2022
 name: naics
 engine: duckdb
-engine_version: ">=1.2"
+# Kept in step with ../soc_2018, which pins the DuckDB that arc links (2.0), the writer of its published Parquet.
+engine_version: ">=2.0"
 db: build/naics.db
+# The R2 write credential, if a .env is present (see .env.example); the process environment also counts.
+dotenv: [.env]
 
 # Transient API/network blips shouldn't sink a run — retry fetches with backoff.
 defaults:
@@ -40,11 +57,13 @@ steps:
       headers:
         User-Agent: "Meridian Protocol (open-analytics; research@meridian.online)"
 
-  # ── Load + normalise: strip the trilateral 'T' marker, derive level, null blanks ─
-  # Reads the .xlsx directly (DuckDB `excel` extension, `read_xlsx`).
+  # ── Load: the ladder, from the workbook ──────────────────────────────────────────
+  # Reads the .xlsx directly (DuckDB `excel` extension, `read_xlsx`): levels, parents,
+  # ancestors, description_full, the trilateral 'T' stripped, blank paragraphs NULL.
   - name: load
     sql: models/load.sql
     depends_on: [build/naics_desc.xlsx]
+    produces: [naics]
 
   # ── Package: materialise the terminal table (adds the search corpus) ─────────────
   - name: package
@@ -59,44 +78,99 @@ steps:
     op: parquet_export@1
     with:
       input: naics_out
-      dest: build/naics.parquet
+      dest: build/stage/naics.parquet
       compression: zstd
       order_by: "code"
 
-  # ── Describe: EMIT datapackage.json from the built Parquet ───────────────────────
+  # ── Describe: EMIT the descriptor from the built Parquet ─────────────────────────
   # finetype types every column nominations.finetype.json does not declare;
   # descriptor.overrides.json overlays the curated half
   # (identity, licenses, sources, per-field prose, primaryKey). Hard-fails on drift.
   - name: describe
     op: datapackage_describe@1
     with:
-      parquet: build/naics.parquet
+      parquet: build/stage/naics.parquet
       overrides: descriptor.overrides.json
       # The columns whose type is declared rather than inferred. finetype takes each one
       # as given, carries its label's bounds, marks it x-finetype-nominated and states no
       # confidence for it; the file says why each was declared.
       nominations: nominations.finetype.json
-      out: datapackage.json
+      out: build/stage/described.json
+
+  # ── Check: the code-list contract ───────────────────────────────────────────────
+  # scripts/check_code_list.py holds the built file to the contract's core columns and
+  # its ladder (docs/code-lists.md). `shasum -a 256 scripts/check_code_list.py` prints
+  # the digest.
+  - name: check_code_list
+    op: uv@1
+    with:
+      script: ../../scripts/check_code_list.py
+      sha256: a6d4fd3c42aca53591f7f94bfef625f9c4f503b2d4331b64bea8103db88f7102
+      deps:
+        - duckdb==2.0.0
+      args:
+        - --parquet
+        - build/stage/naics.parquet
+        - --levels
+        - sector,subsector,industry_group,naics_industry,national_industry
+        - --json
+        - build/code_list_check.json
+      reads:
+        - build/stage/naics.parquet
+      produces:
+        - build/code_list_check.json
 
   # ── Validate: GATE the built Parquet against the self-derived finetype contract ──
   # finetype_validate (CHECK-ONLY) checks the terminal Parquet against schema.finetype.json
   # (self-derived from THIS Parquet — see its $comment). Pass-through today, fail-closed
-  # drift tripwire for future Runs; writes nothing, so build/naics.parquet is untouched.
+  # drift tripwire for future Runs; writes nothing.
   - name: validate
     op: finetype_validate@1
     with:
-      parquet: build/naics.parquet
+      parquet: build/stage/naics.parquet
       schema: schema.finetype.json
+
+  # ── Lake: every published table's descriptor, as the open lake holds it ─────────
+  # The repository commits no descriptor: the lake's meta.descriptors and manifest.json
+  # hold the one stored copy, and emit_descriptor.py joins the two back into each
+  # table's full descriptor and writes them all to one bundle, table name to descriptor.
+  # It runs before the stamp, which keeps the lake's `created` when it writes the object
+  # the lake already serves; the check before publish compares this build against it. It
+  # reads the public catalogue and manifest, with no credential, and declares both as
+  # remote reads, so arc runs it on every run. One file, so `arc test` can fixture this
+  # step by name.
+  # `shasum -a 256 scripts/emit_descriptor.py` prints the digest.
+  - name: emit_descriptors
+    op: uv@1
+    with:
+      script: ../../scripts/emit_descriptor.py
+      sha256: 897e2c94fc2c51187f852f595d8bd61a04308ecac6a35a2f28e57c1183e2aaec
+      deps:
+        - duckdb==2.0.0
+        - pyyaml==6.0.3
+      args:
+        - --all
+        - --bundle
+        - build/lake_descriptors.json
+      # The tables it emits are the ones every Protocol's publish step names.
+      reads:
+        - https://openlake.meridian.online/catalog/open.ducklake
+        - https://openlake.meridian.online/manifest.json
+        - ../../datasets/*/arcform.yaml
+      produces:
+        - build/lake_descriptors.json
+
   # ── Self-describe: put the descriptor INSIDE the Parquet it describes ───────────
   # Someone holding https://openlake.meridian.online/census/naics_2022.parquet
-  # cannot find the datapackage.json that describes it: it is a second file, in a
-  # source repository they have no reason to know exists, and behind an authenticating
-  # edge there is no repository to find. This step writes the finished descriptor into
-  # the file's own Parquet footer, so the object answers for itself from its URL alone:
+  # cannot find the datapackage.json that describes it: it is a second record, in a
+  # catalogue they have no reason to know exists. This step writes the finished
+  # descriptor into the file's own Parquet footer, so the object answers for itself
+  # from its URL alone:
   #   SELECT decode(value) FROM parquet_kv_metadata('<url>')
   #    WHERE decode(key) = 'datapackage.json';
   #
-  # It runs LAST because it embeds the FINISHED descriptor, and it re-measures the
+  # It is the last step that shapes the descriptor, because it embeds the FINISHED
+  # descriptor; only the checks before publish follow it. It re-measures the
   # resource `bytes` and `hash` because stamping lengthens the file past the figures
   # describe took off the unstamped build.
   #
@@ -107,14 +181,127 @@ steps:
   # The embedded copy omits the resource `bytes` and `hash`, and the package's
   # `created`: a file cannot state its own size, because writing the value changes it,
   # and a write time moves on a publish that changed nothing else. Those stay in
-  # datapackage.json, measured against the finished object; check_descriptors.py holds
-  # the two copies to each other.
+  # build/datapackage.json, which publish stores in the lake, measured against the
+  # finished object; check_descriptors.py holds the two copies to each other.
   #
   # Everything before the footer is compared byte for byte, so the order_by above still
   # decides the data bytes and a stamp that moved one is refused with the original left
   # in place. Re-running the step is a no-op to the byte.
+  #
+  # `--carry-created-from` keeps the `created` the lake's copy states when the stamped
+  # file is the object the lake already serves; anything else, a first publish included,
+  # takes the one `describe` wrote.
+  #
+  # `op: uv@1` rather than a bare `python3`: the readback imports duckdb, and a
+  # `python3` without it failed the step. uv resolves the interpreter and the package
+  # itself. It reads the staged Parquet and descriptor and alone writes the published
+  # build/naics.parquet and build/datapackage.json, so each file has one writer.
   - name: stamp_descriptor
-    command: "python3 ../../scripts/stamp_descriptor.py stamp --descriptor datapackage.json --parquet build/naics.parquet"
+    op: uv@1
+    with:
+      script: ../../scripts/stamp_descriptor.py
+      # `shasum -a 256 scripts/stamp_descriptor.py` prints this.
+      sha256: c36284fd200d76a6e5f3da9e3051a9dd8fe057df99603ed80e79043ef6dbb5a1
+      # Pinned to the DuckDB that engine_version names. The stamp
+      # rewrites no data page, so this need not be the DuckDB that wrote the Parquet.
+      deps:
+        - duckdb==2.0.0
+      args:
+        - stamp
+        - --carry-created-from
+        - build/lake_descriptors.json
+        - --table
+        - census.naics_2022
+        - --descriptor
+        - build/stage/described.json
+        - --parquet
+        - build/stage/naics.parquet
+        - --out
+        - build/naics.parquet
+        - --out-descriptor
+        - build/datapackage.json
+      reads:
+        - build/lake_descriptors.json
+        - build/stage/described.json
+        - build/stage/naics.parquet
+      produces:
+        - build/naics.parquet
+        - build/datapackage.json
 
-  # publish: the out-of-repo publish pipeline reads build/naics.parquet + the emitted
-  # datapackage.json (boundary — not an arc step). See README.
+  # ── Check: the built table against the lake, before it is published ─────────────
+  # check_before_publish.py runs four checks on this build. Three read the lake too:
+  # label agreement (strict, on what involves this table) against every other table's
+  # descriptor in the bundle, the frictionless reference implementation over the built
+  # descriptor, and check_descriptors.py's rules read against the local Parquet. The
+  # fourth holds the build to the committed overrides. A failing check fails
+  # the run, so publish never runs. Each built descriptor keeps the path it is published
+  # at; the script reads the bytes from the local Parquet instead. It imports its
+  # sibling checks in-process and the digest pins only its own bytes, so those scripts
+  # are reads too: editing one makes this step stale.
+  # `shasum -a 256 scripts/check_before_publish.py` prints the digest.
+  - name: check_before_publish
+    op: uv@1
+    with:
+      script: ../../scripts/check_before_publish.py
+      sha256: 53bd12b2ba03901deea8a9d559764639557ca5b7539567d10abda6b0a62e99a5
+      deps:
+        - duckdb==2.0.0
+        - pyyaml==6.0.3
+        - frictionless==5.19.0
+      args:
+        - --datasets-dir
+        - ../../datasets
+        - --slug
+        - naics
+        - --lake-bundle
+        - build/lake_descriptors.json
+        - --built
+        - build/datapackage.json=build/naics.parquet
+        - --json
+        - build/check_before_publish.json
+      reads:
+        - build/lake_descriptors.json
+        - build/datapackage.json
+        - build/naics.parquet
+        - ../../datasets/*/arcform.yaml
+        - ../../datasets/label-agreement.json
+        - ../../datasets/frictionless-rejections.json
+        - ../../datasets/licence-notices.json
+        - ../../scripts/check_descriptors.py
+        - ../../scripts/check_constraint_ratchet.py
+        - ../../scripts/check_frictionless.py
+        - ../../scripts/check_label_agreement.py
+        - ../../scripts/emit_descriptor.py
+        - ../../scripts/stamp_descriptor.py
+      produces:
+        - build/check_before_publish.json
+
+  # ── Publish: the table into the open lake, one snapshot ─────────────────────────
+  # Runs on every `arc run`. With R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY and R2_ACCOUNT_ID
+  # all set, every run publishes live; otherwise into build/lake/, and `arc run --publish`
+  # fails instead.
+  - name: publish
+    op: ducklake_write@1
+    with:
+      public_base: https://openlake.meridian.online/
+      catalog: catalog/open.ducklake
+      data_path: lake/
+      runs: runs/
+      manifest: manifest.json
+      local_catalog: build/lake/open.ducklake
+      # on_descriptor_change: fail refuses the publish, writing nothing, when a field's FineType
+      # label moved against the descriptor the lake holds and the field is not nominated;
+      # every other difference is reported.
+      tables:
+        - table: census.naics_2022
+          from: build/naics.parquet
+          descriptor: build/datapackage.json
+          on_descriptor_change: fail
+          readable_copy: census/naics_2022.parquet
+      credential:
+        type: r2
+        bucket: meridian-open
+        env:
+          key_id: R2_ACCESS_KEY_ID
+          secret: R2_SECRET_ACCESS_KEY
+          account_id: R2_ACCOUNT_ID
