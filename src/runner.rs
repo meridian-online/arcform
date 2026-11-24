@@ -722,6 +722,7 @@ pub fn run_with_publish(
                         state: "skipped".to_string(),
                         attempts: 0,
                         skip_reason,
+                        start_sec: None,
                         duration_sec: None,
                         report: None,
                         check: None,
@@ -788,6 +789,7 @@ pub fn run_with_publish(
             // captured into the contract as `duration_sec` (per-step timing, replacing the
             // discarded pipeline-wide retry count).
             let step_start = Instant::now();
+            let start_sec = step_start.duration_since(pipeline_start).as_secs_f64();
 
             for attempt in 1..=max_attempts {
                 if attempt > 1 {
@@ -1021,6 +1023,7 @@ pub fn run_with_publish(
                                 state: "success".to_string(),
                                 attempts: attempt,
                                 skip_reason: None,
+                                start_sec: Some(start_sec),
                                 duration_sec: Some(step_start.elapsed().as_secs_f64()),
                                 report: output.report,
                                 check: check_section.take(),
@@ -1063,6 +1066,7 @@ pub fn run_with_publish(
                                 state: "failed".to_string(),
                                 attempts: attempt,
                                 skip_reason: None,
+                                start_sec: Some(start_sec),
                                 duration_sec: Some(step_start.elapsed().as_secs_f64()),
                                 report: None,
                                 check,
@@ -1086,6 +1090,7 @@ pub fn run_with_publish(
                         state: "failed".to_string(),
                         attempts: max_attempts,
                         skip_reason: None,
+                        start_sec: Some(start_sec),
                         duration_sec: Some(step_start.elapsed().as_secs_f64()),
                         report: None,
                         // A check whose query did not run counts as failed, whatever its
@@ -6832,6 +6837,20 @@ steps:
             load.duration_sec.is_some(),
             "executed step records its duration"
         );
+        // (c4) each executed step records where it started, on the duration's clock,
+        // so a later step starts no earlier than the step before it ended.
+        let tally = contract.steps.iter().find(|s| s.name == "tally").unwrap();
+        let (load_start, load_took) = (load.start_sec.unwrap(), load.duration_sec.unwrap());
+        let tally_start = tally.start_sec.expect("executed step records its start");
+        assert!(
+            load_start >= 0.0,
+            "a step starts after the run: {load_start}"
+        );
+        assert!(
+            tally_start >= load_start + load_took,
+            "tally starts at {tally_start}, before load ended at {}",
+            load_start + load_took
+        );
         assert!(
             load.status.skip_reason.is_none(),
             "an executed step has no skip reason"
@@ -6863,6 +6882,42 @@ steps:
                 .any(|l| l["event"] == "run_complete" && l["outcome"] == "success"),
             "stream has terminal run_complete line"
         );
+    }
+
+    // A step skipped as fresh ran in no time on this run, so its entry carries neither a
+    // start nor a duration, and a record written before `start_sec` existed reads with
+    // none.
+    #[test]
+    fn a_skipped_step_records_no_start_and_an_older_record_reads_without_one() {
+        use crate::contract::{Contract, StepEntry};
+
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: widgets\nsteps:\n  - name: load\n    sql: models/load.sql\n";
+        setup_project(
+            dir.path(),
+            yaml,
+            &[(
+                "models/load.sql",
+                "CREATE TABLE widgets (id INTEGER, name TEXT);\n",
+            )],
+        );
+        let engine = MockEngine::new();
+        let state = MockStateBackend::new();
+        run(dir.path(), &engine, &state, false).unwrap();
+        run(dir.path(), &engine, &state, false).unwrap();
+
+        let contract: Contract = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("build/.arcform/runs/run-2.json")).unwrap(),
+        )
+        .unwrap();
+        let load = &contract.steps[0];
+        assert_eq!(load.status.state, "skipped");
+        assert_eq!((load.start_sec, load.duration_sec), (None, None));
+
+        let mut older = serde_json::to_value(load).unwrap();
+        older.as_object_mut().unwrap().remove("start_sec");
+        let older: StepEntry = serde_json::from_value(older).unwrap();
+        assert_eq!(older.start_sec, None);
     }
 
     // Three runs of one unchanged manifest over a tool that moves between the second
