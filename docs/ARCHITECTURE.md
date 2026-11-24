@@ -206,6 +206,13 @@ The runner image uploads exactly the files this list names (see "The runner imag
 - **The Protocol declares its outputs; arc checks and records them, and the runner reads the record, never `arcform.yaml`.** Two alternatives were rejected. Uploading every file the record says a run produced would ship raw downloads (GLEIF's is about 470 MB) beside the dataset, and only finished outputs should leave a hosted run, since every byte out of AWS is charged and counts against a subscriber's allowance. Uploading what `datapackage.json` lists does not work because the open datasets' descriptors give each resource's published URL as its `path`, not the file in the build, and a Protocol without a descriptor would upload nothing. A fixed `outputs/` folder by convention was dropped because nothing would check it, and the open datasets' publish already reads `build/<name>.parquet` and `datapackage.json` where they are.
 - **A missing declared output fails the run in arc itself, locally too**, so a Protocol that stops writing an output is caught before a hosted run uploads an incomplete set.
 
+### Step timings
+
+Each executed step's entry in the run record carries `start_sec`, seconds from the run's start to the step's start, and `duration_sec`, its wall-clock time across every attempt and backoff, both read from one monotonic clock started just before `on_init`. `start_sec + duration_sec` is where the step ended, so a viewer draws a step's timeline bar from the record alone; the gaps between bars are arc's own bookkeeping between steps and the hooks. A step skipped as fresh, or never reached, has both `null`. The `.jsonl` stream is no substitute: it writes one line per step as it finishes, with no line as it starts, and its timestamps are whole seconds.
+
+- *`start_sec` is an offset, not a timestamp.* An offset and a duration on one clock always line up, where a wall-clock timestamp can jump with the system clock and `run.started_at` is whole seconds.
+- *Adding `start_sec` keeps the tag at `b5/1`.* It defaults to `null` on read, so a record written before it still reads, and readers that match the tag exactly, as open-analytics' publish does, keep reading new records.
+
 ### Checks and measures
 
 A Protocol asks questions of its own data with two step kinds beside `sql:`, `op:` and `command:`. A check is one SQL query that returns the rows that are wrong, and passes when it returns none. A measure is one SQL query that returns one row of named numbers, recorded in every run so later checks, in this run and in later ones, can compare against it. Both are steps in `arcform.yaml`, so a reader of the manifest sees every check and where it runs (`src/check.rs`, and the check and measure arms of the step loop in `src/runner.rs`):

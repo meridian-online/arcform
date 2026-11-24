@@ -14,10 +14,11 @@
 //!     `run_complete` line. Append-only; a tailing reader takes the last complete
 //!     line per step.
 //!
-//! The `contract_version` tag (`"b5/1"`) versions the JSON shape. Fields that a
-//! later phase will populate (bytes, content hashes, file-path lineage, per-step
-//! duration, typed skip reasons, …) are present in the schema but emitted as `null`
-//! now, so the shape is stable across phases.
+//! The `contract_version` tag (`"b5/1"`) versions the JSON shape. A field the run
+//! could not know (a skipped step's timing, a file's bytes it never measured) is
+//! present and `null`, so the shape is stable. A field added later defaults on read,
+//! so a record written before it still reads; such an addition keeps the tag, which
+//! readers match exactly or by family.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
@@ -286,6 +287,12 @@ pub struct StepEntry {
     pub status: StatusInfo,
     /// Actual attempt count (1 on first-try success, more if retried; 0 if skipped/not reached).
     pub attempts: u32,
+    /// Seconds from the run's start to this step's start, on the clock `duration_sec`
+    /// uses, so `start_sec + duration_sec` is where the step ended. Time spent in
+    /// `on_init` comes before the first step's start. `null` when the step was skipped
+    /// or never reached, and in a record written before arc kept it.
+    #[serde(default)]
+    pub start_sec: Option<f64>,
     /// Wall-clock duration of the step (all attempts + backoff). `null` when the step was
     /// skipped or never reached.
     pub duration_sec: Option<f64>,
@@ -497,6 +504,9 @@ pub struct StepOutcome {
     pub attempts: u32,
     /// For a skipped step, why it was fresh; `None` for steps that executed.
     pub skip_reason: Option<crate::state::SkipReason>,
+    /// Seconds from the run's start to the step's start; `None` when skipped or never
+    /// reached.
+    pub start_sec: Option<f64>,
     /// Wall-clock duration of the step; `None` when skipped or never reached.
     pub duration_sec: Option<f64>,
     /// The operator's own report of a successful execution (see
@@ -1093,6 +1103,7 @@ fn build_step(
         state: "skipped".to_string(),
         attempts: 0,
         skip_reason: None,
+        start_sec: None,
         duration_sec: None,
         report: None,
         check: None,
@@ -1127,6 +1138,7 @@ fn build_step(
             skip_reason: outcome.skip_reason,
         },
         attempts: outcome.attempts,
+        start_sec: outcome.start_sec,
         duration_sec: outcome.duration_sec,
         retry,
         timeout_sec: step.timeout_sec,
