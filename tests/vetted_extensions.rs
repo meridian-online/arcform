@@ -582,7 +582,13 @@ fn a_protocol_with_no_install_prints_what_it_printed_before() {
     // The calls the engine received on 68a1fa2, recorded by running that commit's binary on
     // the same fake engine: no call arc makes for a pin. Then the question for the run record,
     // after the last step, which arc asks since the record names the DuckDB the steps ran on.
+    // On macOS the temporary directory is a symlink into `/private`, and arc names the
+    // path it resolved, so mask the resolved root before the one the test created.
     let root = protocol.root.path().display().to_string();
+    let resolved = std::fs::canonicalize(protocol.root.path())
+        .unwrap()
+        .display()
+        .to_string();
     let calls: Vec<String> = run
         .engine_calls
         .iter()
@@ -590,7 +596,7 @@ fn a_protocol_with_no_install_prints_what_it_printed_before() {
             if is_report(call) {
                 "report".to_string()
             } else {
-                call.replace(&root, "ROOT")
+                call.replace(&resolved, "ROOT").replace(&root, "ROOT")
             }
         })
         .collect();
