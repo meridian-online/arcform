@@ -69,6 +69,7 @@ const WORTH_CHASING: &str = "Keep the orders worth chasing";
 /// The model that recording writes, byte for byte.
 const BIG_ORDERS_MODEL: &str = "\
 -- generated: filter-rows on orders
+-- operation: {\"arguments\":{\"where\":\"amount > 100\"},\"on\":\"orders\",\"operation\":\"filter-rows\"}
 CREATE OR REPLACE TABLE \"big_orders\" AS
 SELECT *
 FROM orders
@@ -81,6 +82,7 @@ const APPENDED_SORT_STEP: &str = "  - name: by_amount\n    sql: models/02_by_amo
 /// The model recording `sort-rows` on `orders` as `by_amount` writes, byte for byte.
 const BY_AMOUNT_MODEL: &str = "\
 -- generated: sort-rows on orders
+-- operation: {\"arguments\":{\"order_by\":\"amount desc\"},\"on\":\"orders\",\"operation\":\"sort-rows\"}
 CREATE OR REPLACE TABLE \"by_amount\" AS
 SELECT *
 FROM orders
@@ -750,7 +752,7 @@ fn record_hide_writes_the_model_and_arc_run_drops_the_column() {
     );
     assert_eq!(
         protocol.read("models/02_no_note.sql"),
-        "-- generated: hide-column on orders\nCREATE OR REPLACE TABLE \"no_note\" AS\nSELECT * EXCLUDE (note)\nFROM orders;\n"
+        "-- generated: hide-column on orders\n-- operation: {\"arguments\":{\"column\":\"note\"},\"on\":\"orders\",\"operation\":\"hide-column\"}\nCREATE OR REPLACE TABLE \"no_note\" AS\nSELECT * EXCLUDE (note)\nFROM orders;\n"
     );
     ok(&protocol.arc(&["run"]), "arc run");
     assert_eq!(
@@ -779,7 +781,7 @@ fn a_column_named_with_a_reserved_word_is_hidden_written_in_quotes_and_runs() {
     );
     assert_eq!(
         protocol.read("models/02_no_order.sql"),
-        "-- generated: hide-column on orders\nCREATE OR REPLACE TABLE \"no_order\" AS\nSELECT * EXCLUDE (\"order\")\nFROM orders;\n",
+        "-- generated: hide-column on orders\n-- operation: {\"arguments\":{\"column\":\"order\"},\"on\":\"orders\",\"operation\":\"hide-column\"}\nCREATE OR REPLACE TABLE \"no_order\" AS\nSELECT * EXCLUDE (\"order\")\nFROM orders;\n",
         "the column is written in quotes, as DuckDB reads it"
     );
     ok(&protocol.arc(&["run"]), "arc run");
@@ -821,7 +823,7 @@ fn record_rename_writes_the_model_and_arc_run_renames_the_column_in_place() {
     );
     assert_eq!(
         protocol.read("models/02_relabelled.sql"),
-        "-- generated: rename-column on orders\nBEGIN TRANSACTION;\nCREATE OR REPLACE TABLE \"relabelled\" AS\nSELECT *\nFROM orders;\nALTER TABLE \"relabelled\" RENAME COLUMN note TO label;\nCOMMIT;\n"
+        "-- generated: rename-column on orders\n-- operation: {\"arguments\":{\"column\":\"note\",\"to\":\"label\"},\"on\":\"orders\",\"operation\":\"rename-column\"}\nBEGIN TRANSACTION;\nCREATE OR REPLACE TABLE \"relabelled\" AS\nSELECT *\nFROM orders;\nALTER TABLE \"relabelled\" RENAME COLUMN note TO label;\nCOMMIT;\n"
     );
     ok(&protocol.arc(&["run"]), "arc run");
     assert_eq!(
@@ -922,7 +924,7 @@ fn record_derive_writes_the_model_and_arc_run_adds_the_computed_column() {
     );
     assert_eq!(
         protocol.read("models/02_doubled_orders.sql"),
-        "-- generated: derive-column on orders\nBEGIN TRANSACTION;\nCREATE OR REPLACE TABLE \"doubled_orders\" AS\nSELECT *, amount * 2 AS __arc_derived\nFROM orders;\nALTER TABLE \"doubled_orders\" RENAME COLUMN __arc_derived TO doubled;\nCOMMIT;\n"
+        "-- generated: derive-column on orders\n-- operation: {\"arguments\":{\"column\":\"doubled\",\"expression\":\"amount * 2\"},\"on\":\"orders\",\"operation\":\"derive-column\"}\nBEGIN TRANSACTION;\nCREATE OR REPLACE TABLE \"doubled_orders\" AS\nSELECT *, amount * 2 AS __arc_derived\nFROM orders;\nALTER TABLE \"doubled_orders\" RENAME COLUMN __arc_derived TO doubled;\nCOMMIT;\n"
     );
     ok(&protocol.arc(&["run"]), "arc run");
     assert_eq!(
@@ -1016,7 +1018,7 @@ fn record_cast_writes_the_model_and_arc_run_converts_the_column() {
     );
     assert_eq!(
         protocol.read("models/02_typed_orders.sql"),
-        "-- generated: cast-column on orders\nCREATE OR REPLACE TABLE \"typed_orders\" AS\nSELECT * REPLACE (CAST(amount AS VARCHAR) AS amount)\nFROM orders;\n"
+        "-- generated: cast-column on orders\n-- operation: {\"arguments\":{\"column\":\"amount\",\"type\":\"VARCHAR\"},\"on\":\"orders\",\"operation\":\"cast-column\"}\nCREATE OR REPLACE TABLE \"typed_orders\" AS\nSELECT * REPLACE (CAST(amount AS VARCHAR) AS amount)\nFROM orders;\n"
     );
     ok(&protocol.arc(&["run"]), "arc run");
     assert_eq!(
@@ -1126,7 +1128,7 @@ fn record_summary_writes_the_grouped_model_and_arc_run_gives_one_row_for_each_gr
     );
     assert_eq!(
         protocol.read("models/02_order_counts.sql"),
-        "-- generated: summarise-rows on orders\nCREATE OR REPLACE TABLE \"order_counts\" AS\nSELECT amount > 100 AS big, count(*) AS n\nFROM orders\nGROUP BY 1;\n"
+        "-- generated: summarise-rows on orders\n-- operation: {\"arguments\":{\"aggregates\":\"count(*) AS n\",\"group_by\":\"amount > 100 AS big\"},\"on\":\"orders\",\"operation\":\"summarise-rows\"}\nCREATE OR REPLACE TABLE \"order_counts\" AS\nSELECT amount > 100 AS big, count(*) AS n\nFROM orders\nGROUP BY 1;\n"
     );
     ok(&protocol.arc(&["run"]), "arc run");
     let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
@@ -1149,7 +1151,7 @@ fn record_summary_without_a_group_by_gives_one_row_for_the_whole_table() {
     );
     assert_eq!(
         protocol.read("models/02_order_counts.sql"),
-        "-- generated: summarise-rows on orders\nCREATE OR REPLACE TABLE \"order_counts\" AS\nSELECT count(*) AS n\nFROM orders\nGROUP BY ();\n"
+        "-- generated: summarise-rows on orders\n-- operation: {\"arguments\":{\"aggregates\":\"count(*) AS n\"},\"on\":\"orders\",\"operation\":\"summarise-rows\"}\nCREATE OR REPLACE TABLE \"order_counts\" AS\nSELECT count(*) AS n\nFROM orders\nGROUP BY ();\n"
     );
     ok(&protocol.arc(&["run"]), "arc run");
     let db = duckdb::Connection::open(protocol.dir.join("shop.duckdb")).expect("open shop.duckdb");
@@ -1356,7 +1358,7 @@ fn record_dedupe_without_arguments_keeps_one_of_each_set_of_identical_rows() {
     );
     assert_eq!(
         protocol.read("models/02_unique_orders.sql"),
-        "-- generated: dedupe-rows on orders\nCREATE OR REPLACE TABLE \"unique_orders\" AS\nSELECT DISTINCT *\nFROM orders;\n"
+        "-- generated: dedupe-rows on orders\n-- operation: {\"arguments\":{},\"on\":\"orders\",\"operation\":\"dedupe-rows\"}\nCREATE OR REPLACE TABLE \"unique_orders\" AS\nSELECT DISTINCT *\nFROM orders;\n"
     );
     ok(&protocol.arc(&["run"]), "arc run");
     assert_eq!(
@@ -1374,7 +1376,7 @@ fn record_dedupe_with_a_key_and_an_order_keeps_the_first_row_of_each_key() {
     );
     assert_eq!(
         protocol.read("models/02_unique_orders.sql"),
-        "-- generated: dedupe-rows on orders\nCREATE OR REPLACE TABLE \"unique_orders\" AS\nSELECT *\nFROM orders\nQUALIFY row_number() OVER (PARTITION BY note ORDER BY amount desc\n) = 1;\n"
+        "-- generated: dedupe-rows on orders\n-- operation: {\"arguments\":{\"key\":\"note\",\"order_by\":\"amount desc\"},\"on\":\"orders\",\"operation\":\"dedupe-rows\"}\nCREATE OR REPLACE TABLE \"unique_orders\" AS\nSELECT *\nFROM orders\nQUALIFY row_number() OVER (PARTITION BY note ORDER BY amount desc\n) = 1;\n"
     );
     ok(&protocol.arc(&["run"]), "arc run");
     assert_eq!(
@@ -1438,7 +1440,7 @@ fn record_limit(protocol: &Protocol, args: &[&str]) -> Output {
 }
 
 /// The model `limit-rows` writes for `count=2` and `order_by=amount desc`.
-const TOP_ORDERS_MODEL: &str = "-- generated: limit-rows on orders\nCREATE OR REPLACE TABLE \"top_orders\" AS\nSELECT *\nFROM orders\nORDER BY amount desc\nLIMIT 2;\n";
+const TOP_ORDERS_MODEL: &str = "-- generated: limit-rows on orders\n-- operation: {\"arguments\":{\"count\":2,\"order_by\":\"amount desc\"},\"on\":\"orders\",\"operation\":\"limit-rows\"}\nCREATE OR REPLACE TABLE \"top_orders\" AS\nSELECT *\nFROM orders\nORDER BY amount desc\nLIMIT 2;\n";
 
 #[test]
 fn record_limit_keeps_the_first_rows_in_the_order_given() {
@@ -1519,7 +1521,7 @@ fn record_fill_writes_the_model_and_arc_run_fills_the_missing_values_alone() {
     );
     assert_eq!(
         protocol.read("models/02_filled_orders.sql"),
-        "-- generated: fill-nulls on orders\nCREATE OR REPLACE TABLE \"filled_orders\" AS\nSELECT * REPLACE (coalesce(amount, 0) AS amount)\nFROM orders;\n"
+        "-- generated: fill-nulls on orders\n-- operation: {\"arguments\":{\"column\":\"amount\",\"value\":\"0\"},\"on\":\"orders\",\"operation\":\"fill-nulls\"}\nCREATE OR REPLACE TABLE \"filled_orders\" AS\nSELECT * REPLACE (coalesce(amount, 0) AS amount)\nFROM orders;\n"
     );
     ok(&protocol.arc(&["run"]), "arc run");
     assert_eq!(
@@ -1633,6 +1635,7 @@ fn a_filter_recorded_on_a_table_named_with_a_reserved_word_is_written_with_the_n
         protocol.read("models/02_big_order.sql"),
         "\
 -- generated: filter-rows on order
+-- operation: {\"arguments\":{\"where\":\"amount > 100\"},\"on\":\"order\",\"operation\":\"filter-rows\"}
 CREATE OR REPLACE TABLE \"big_order\" AS
 SELECT *
 FROM \"order\"
@@ -1663,6 +1666,7 @@ fn a_sort_recorded_on_a_table_named_with_a_reserved_word_is_written_with_the_nam
         protocol.read("models/02_by_amount.sql"),
         "\
 -- generated: sort-rows on order
+-- operation: {\"arguments\":{\"order_by\":\"amount DESC\"},\"on\":\"order\",\"operation\":\"sort-rows\"}
 CREATE OR REPLACE TABLE \"by_amount\" AS
 SELECT *
 FROM \"order\"
@@ -1716,6 +1720,7 @@ fn a_filter_recorded_on_a_table_whose_name_is_not_plain_is_written_with_the_name
         protocol.read("models/02_big_orders.sql"),
         "\
 -- generated: filter-rows on café
+-- operation: {\"arguments\":{\"where\":\"amount > 100\"},\"on\":\"café\",\"operation\":\"filter-rows\"}
 CREATE OR REPLACE TABLE \"big_orders\" AS
 SELECT *
 FROM \"café\"
@@ -1745,6 +1750,7 @@ fn a_sort_recorded_on_a_table_whose_name_is_not_plain_is_written_with_the_name_i
         protocol.read("models/02_by_amount.sql"),
         "\
 -- generated: sort-rows on café
+-- operation: {\"arguments\":{\"order_by\":\"amount DESC\"},\"on\":\"café\",\"operation\":\"sort-rows\"}
 CREATE OR REPLACE TABLE \"by_amount\" AS
 SELECT *
 FROM \"café\"
@@ -1773,6 +1779,7 @@ fn a_table_duckdb_reads_bare_is_written_bare() {
         protocol.read("models/02_big_data.sql"),
         "\
 -- generated: filter-rows on data
+-- operation: {\"arguments\":{\"where\":\"amount > 100\"},\"on\":\"data\",\"operation\":\"filter-rows\"}
 CREATE OR REPLACE TABLE \"big_data\" AS
 SELECT *
 FROM data

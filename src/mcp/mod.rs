@@ -69,7 +69,8 @@ const INSTRUCTIONS: &str = "Use arc when you analyse data over DuckDB and the wo
     Work in this order. Discover: table_describe shows what a table in a Protocol's database \
     holds, sql_query runs SELECTs against it, table_profile types its columns with FineType, \
     operation_describe and operator_describe say what arc's operations and operators take, and \
-    sql_recognise says what arc reads a SQL statement as. Record: protocol_create makes a \
+    sql_recognise says what arc reads a SQL statement as, and operation_read what a recorded \
+    step's operation and arguments were. Record: protocol_create makes a \
     Protocol, then sql_record, operation_record and operator_record add a step each, an \
     operator's `with:` checked against its schema; protocol_edit changes one thing in the spec, \
     and protocol_write_file writes a table schema, a panel or the README. Run: protocol_run \
@@ -426,6 +427,7 @@ mod tests {
             "generate",
             "operator_describe",
             "operation_describe",
+            "operation_read",
             "sql_recognise",
             "panel_check",
             "table_describe",
@@ -548,6 +550,7 @@ mod tests {
             "operator_describe",
             "operation_describe",
             "operation_record",
+            "operation_read",
             "operator_record",
             "sql_recognise",
             "protocol_edit",
@@ -568,7 +571,7 @@ mod tests {
                 "missing tool `{expected}` in {names:?}"
             );
         }
-        assert_eq!(names.len(), 23, "unexpected tool set: {names:?}");
+        assert_eq!(names.len(), 24, "unexpected tool set: {names:?}");
         // Every tool advertises an object input schema.
         for tool in listed["tools"].as_array().unwrap() {
             assert!(tool["description"].is_string());
@@ -649,6 +652,7 @@ mod tests {
             "history_list",
             "history_restore",
             "sql_recognise",
+            "operation_read",
             "sql_record",
         ] {
             assert!(instructions.contains(tool), "instructions omit `{tool}`");
