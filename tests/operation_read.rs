@@ -11,11 +11,13 @@
 //!      `north, south` reads back as that operation on that one table with its
 //!      condition, `as_recorded` true, and reading writes no file;
 //!   2. **roles** — a list role and a single role read back by role, a list as a
-//!      list and a single role as a name;
+//!      list and a single role as a name, and an operation that reads no table
+//!      reads back with no `on`;
 //!   3. **the same bytes** — the record's keys are sorted, so arguments sent in
 //!      either order write the same model;
 //!   4. **hand edit** — a model edited under the header still answers its record,
-//!      with `as_recorded` false;
+//!      with `as_recorded` false, and a record line edited to name another step
+//!      or model cannot change which the answer names;
 //!   5. **no record** — a hand-written SQL step, a model whose header has no
 //!      record under it, and an `op:` step answer `operation` null;
 //!   6. **refused** — no step of that name, and a record line that is not a JSON
@@ -232,6 +234,61 @@ fn a_list_role_reads_back_as_a_list_and_a_single_role_as_a_name() {
             "as_recorded": true,
         })
     );
+}
+
+#[test]
+fn an_operation_that_reads_no_table_reads_back_with_no_on() {
+    let protocol = Protocol::new();
+    protocol.ok(&[
+        "operation",
+        "record",
+        "read-file",
+        "--name",
+        "raw",
+        "--arg",
+        "path=data/raw.csv",
+    ]);
+    assert_eq!(
+        protocol.read("raw"),
+        json!({
+            "step": "raw",
+            "model": "models/03_raw.sql",
+            "operation": "read-file",
+            "arguments": { "path": "data/raw.csv" },
+            "as_recorded": true,
+        })
+    );
+}
+
+#[test]
+fn a_record_line_cannot_say_which_step_or_model_it_is() {
+    let protocol = Protocol::new();
+    protocol.ok(&[
+        "operation",
+        "record",
+        "filter-rows",
+        "--on",
+        "orders",
+        "--name",
+        "big",
+        "--arg",
+        "where=amount > 100",
+    ]);
+    let path = protocol.dir().join("models/03_big.sql");
+    let model = protocol.model("models/03_big.sql");
+    std::fs::write(
+        &path,
+        model.replace(
+            "-- operation: {",
+            "-- operation: {\"step\":\"other\",\"model\":\"x.sql\",\"extra\":1,",
+        ),
+    )
+    .unwrap();
+    let answer = protocol.read("big");
+    assert_eq!(answer["step"], "big", "{answer}");
+    assert_eq!(answer["model"], "models/03_big.sql", "{answer}");
+    assert!(answer.get("extra").is_none(), "{answer}");
+    assert_eq!(answer["as_recorded"], false, "{answer}");
 }
 
 #[test]

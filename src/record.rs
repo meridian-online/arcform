@@ -3162,7 +3162,8 @@ pub(crate) const OPERATION_RECORD: &str = "-- operation:";
 /// For a step whose model carries the [`OPERATION_RECORD`] line under the
 /// [`GENERATED_MARKER`], the answer is `step`, `model` (its path as the
 /// manifest cites it), then the record's `operation`, `on`, `reads` and
-/// `arguments` as [`Operation::record_of`] writes them, so it is what
+/// `arguments` as [`Operation::record_of`] writes them, and no other key of
+/// the line, so it is what
 /// `operation_record` takes to record the step again; and `as_recorded`, true
 /// when the model holds, byte for byte, what this arc writes for that record
 /// under the step's name. It is false when the model was edited by hand under
@@ -3243,7 +3244,11 @@ pub(crate) fn read_step(dir: &Path, step_name: &str) -> Result<serde_json::Value
     let mut answer = serde_json::Map::new();
     answer.insert("step".to_string(), step_name.into());
     answer.insert("model".to_string(), sql_rel.into());
-    answer.extend(record.clone());
+    for key in ["operation", "on", "reads", "arguments"] {
+        if let Some(value) = record.get(key) {
+            answer.insert(key.to_string(), value.clone());
+        }
+    }
     answer.insert("as_recorded".to_string(), as_recorded.into());
     Ok(answer.into())
 }
