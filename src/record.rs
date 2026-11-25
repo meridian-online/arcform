@@ -2962,12 +2962,15 @@ pub(crate) struct Recorded {
 /// over what they were given, and an operation added to the catalogue is
 /// recorded through both with no edit to either. The model's first line is the
 /// long name and every table read, in role order, a list's in the order given,
-/// written as [`provenance`] writes it, and nothing else, so the same request
-/// writes the same bytes whoever sends it; a description is the caller's own
-/// words, written on the step as given, so it too is the same whoever sends it.
-/// The step is recorded through
-/// [`record_step_with_history`](crate::history::record_step_with_history), so
-/// each recording is a version of the protocol, and it runs nothing.
+/// written as [`provenance`] writes it, and nothing else; its second line is
+/// the [`OPERATION_RECORD`], the operation, the tables and the arguments as
+/// JSON with its keys sorted, which [`read_step`] reads back. So the same
+/// request writes the same bytes whoever sends it; a description is the
+/// caller's own words, written on the step as given, so it too is the same
+/// whoever sends it. The step is recorded through
+/// [`record_sql_step_with_history`](crate::history::record_sql_step_with_history),
+/// with the model's bytes given, so each recording is a version of the
+/// protocol, and it runs nothing.
 ///
 /// Refused, with the protocol's directory untouched: an operation arc does not
 /// hold; arguments the operation's `parameters` do not admit, whether one is
@@ -3002,8 +3005,9 @@ pub(crate) fn record_operation(
 /// or `long_name` alone for an operation that reads no table. The roles are
 /// left out, and the names are written as given, unquoted, so the line is for a
 /// person reading the model and not a format a program reads back: a name
-/// holding `, ` reads ambiguously in it. [`sql_is_generated`] reads the marker
-/// alone.
+/// holding `, ` reads ambiguously in it. A program reads the
+/// [`OPERATION_RECORD`] line under it instead, through [`read_step`];
+/// [`sql_is_generated`] reads the marker alone.
 fn provenance(long_name: &str, reads: &Reads) -> String {
     let tables: Vec<&str> = reads.tables().collect();
     if tables.is_empty() {
@@ -3032,30 +3036,216 @@ impl Operation {
             arguments,
             description,
         } = *request;
+        let (reads, contents) = self.model(on, reads, name, arguments)?;
+        for table in reads.tables() {
+            made_by_a_step(dir, table)?;
+        }
+
+        let step = SqlStep {
+            name,
+            description,
+            contents: &contents,
+        };
+        let (model, _) = crate::history::record_sql_step_with_history(dir, &step, history)?;
+        let notes = self.notes.map(|notes| notes(arguments)).unwrap_or_default();
+        Ok(Recorded { model, notes })
+    }
+
+    /// The tables a recording of this operation reads, admitted, and the bytes of
+    /// its model: the [`GENERATED_MARKER`] line with the [`provenance`], the
+    /// [`OPERATION_RECORD`] line, then the operation's SQL. Refused as
+    /// [`record_operation`] describes for the arguments and the reads, and for a
+    /// provenance that spans lines; it reads no protocol, so whether a step makes
+    /// each table is the caller's to ask.
+    fn model(
+        &self,
+        on: Option<&str>,
+        reads: &serde_json::Map<String, serde_json::Value>,
+        name: &str,
+        arguments: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(Reads, String)> {
         self.admit(arguments)?;
         let reads = self.admit_reads(on, reads)?;
         if let Some(reads_checks) = self.reads_checks {
             reads_checks(&reads)?;
         }
-        for table in reads.tables() {
-            made_by_a_step(dir, table)?;
+        let provenance = provenance(self.long_name, &reads);
+        one_line(&provenance)?;
+        let sql = (self.sql)(&Recording {
+            name,
+            on: reads.one("table"),
+            reads: &reads,
+            arguments,
+        });
+        let record = self.record_of(&reads, arguments);
+        let mut contents =
+            format!("{GENERATED_MARKER} {provenance}\n{OPERATION_RECORD} {record}\n{sql}");
+        if !contents.ends_with('\n') {
+            contents.push('\n');
         }
-
-        let step = RecordedStep {
-            name: name.to_string(),
-            sql: (self.sql)(&Recording {
-                name,
-                on: reads.one("table"),
-                reads: &reads,
-                arguments,
-            }),
-            provenance: provenance(self.long_name, &reads),
-            description: description.map(str::to_string),
-        };
-        let (model, _) = crate::history::record_step_with_history(dir, &step, history)?;
-        let notes = self.notes.map(|notes| notes(arguments)).unwrap_or_default();
-        Ok(Recorded { model, notes })
+        Ok((reads, contents))
     }
+
+    /// The record of a recording, as its model's [`OPERATION_RECORD`] line holds
+    /// it: one line of JSON, an object of `operation`, the long name; `on`, the
+    /// table in the role `table`, absent for an operation that reads none;
+    /// `reads`, each other role filled, a table name for a single role and a list
+    /// for a list, absent when there is none; and `arguments`, as admitted. These
+    /// are the keys `operation_record` takes and `sql_recognise` answers. Each
+    /// object's keys are sorted, at every depth, so the same request writes the
+    /// same bytes whichever order its keys were sent in.
+    fn record_of(
+        &self,
+        reads: &Reads,
+        arguments: &serde_json::Map<String, serde_json::Value>,
+    ) -> String {
+        let mut record = serde_json::Map::new();
+        record.insert("operation".to_string(), self.long_name.into());
+        let on = reads.one("table");
+        if !on.is_empty() {
+            record.insert("on".to_string(), on.into());
+        }
+        let mut others = serde_json::Map::new();
+        for role in self
+            .reads
+            .iter()
+            .filter(|role| role.kind == "table" && role.name != "table")
+        {
+            let tables = reads.list(role.name);
+            if let Some(first) = tables.first() {
+                let value = if role.list {
+                    serde_json::Value::from(tables.to_vec())
+                } else {
+                    serde_json::Value::from(first.as_str())
+                };
+                others.insert(role.name.to_string(), value);
+            }
+        }
+        if !others.is_empty() {
+            record.insert("reads".to_string(), others.into());
+        }
+        record.insert("arguments".to_string(), arguments.clone().into());
+        sorted(&record.into()).to_string()
+    }
+}
+
+/// `value` with each object's keys in sorted order, at every depth. arc's JSON
+/// keeps the order keys were inserted in, so a record written from it is sorted
+/// here to be the same bytes whatever order a caller gave.
+fn sorted(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut keys: Vec<&String> = object.keys().collect();
+            keys.sort();
+            keys.into_iter()
+                .map(|key| (key.clone(), sorted(&object[key])))
+                .collect::<serde_json::Map<_, _>>()
+                .into()
+        }
+        serde_json::Value::Array(items) => items.iter().map(sorted).collect(),
+        other => other.clone(),
+    }
+}
+
+// ------------------------------------------------ reading a recorded step back
+
+/// The opening of the second line of a model [`record_operation`] writes: the
+/// operation the step was recorded as and what it was recorded with, as one
+/// line of JSON after it, for a program to read back. The [`GENERATED_MARKER`]
+/// line above it is for a person, and names the tables unquoted; this line is
+/// the one a program reads, through [`read_step`].
+pub(crate) const OPERATION_RECORD: &str = "-- operation:";
+
+/// What the step `step_name` of the protocol at `dir` was recorded as: the
+/// object `arc operation read` prints and `arc mcp`'s `operation_read` answers.
+///
+/// For a step whose model carries the [`OPERATION_RECORD`] line under the
+/// [`GENERATED_MARKER`], the answer is `step`, `model` (its path as the
+/// manifest cites it), then the record's `operation`, `on`, `reads` and
+/// `arguments` as [`Operation::record_of`] writes them, so it is what
+/// `operation_record` takes to record the step again; and `as_recorded`, true
+/// when the model holds, byte for byte, what this arc writes for that record
+/// under the step's name. It is false when the model was edited by hand under
+/// the header, when it was written by an arc whose SQL for the operation
+/// differs, or when this arc holds no operation of the record's name or does
+/// not admit its arguments; the record is answered either way, and whether to
+/// show its values for a model that is not as recorded is the caller's call.
+///
+/// Any other step answers `step` and `operation` null: an `op:` or `command:`
+/// step, a SQL step recorded from a statement arc read as no operation, a
+/// hand-written model, a model an older arc recorded before it wrote the
+/// record, and one [`amend_step_sql`] rewrote, which writes no record.
+///
+/// Opens no database and runs nothing. Refused: a protocol arc cannot load, no
+/// step of that name, a model the manifest cites that is not there, and a
+/// record line that is not a JSON object naming its operation.
+pub(crate) fn read_step(dir: &Path, step_name: &str) -> Result<serde_json::Value> {
+    let manifest = Manifest::load(dir)?;
+    let Some(step) = manifest.steps.iter().find(|s| s.name == step_name) else {
+        let names: Vec<&str> = manifest.steps.iter().map(|s| s.name.as_str()).collect();
+        return Err(refused(format!(
+            "no step named `{step_name}`; the protocol's steps are {}",
+            names.join(", ")
+        )));
+    };
+    let none = serde_json::json!({ "step": step_name, "operation": null });
+    let Some(sql_rel) = step.sql.as_deref() else {
+        return Ok(none);
+    };
+    let sql_abs = dir.join(sql_rel);
+    let model = std::fs::read_to_string(&sql_abs).map_err(|_| Error::SqlFileNotFound {
+        step: step_name.to_string(),
+        path: sql_abs.clone(),
+    })?;
+    if !sql_is_generated(&model) {
+        return Ok(none);
+    }
+    let Some(line) = model
+        .lines()
+        .nth(1)
+        .and_then(|line| line.strip_prefix(OPERATION_RECORD))
+    else {
+        return Ok(none);
+    };
+    let unreadable = || {
+        refused(format!(
+            "the `{OPERATION_RECORD}` line of {} is not a JSON object naming its operation, \
+             as arc writes it",
+            sql_abs.display()
+        ))
+    };
+    let Ok(serde_json::Value::Object(record)) = serde_json::from_str(line.trim()) else {
+        return Err(unreadable());
+    };
+    let Some(long_name) = record.get("operation").and_then(|v| v.as_str()) else {
+        return Err(unreadable());
+    };
+    let empty = serde_json::Map::new();
+    let object = |key: &str| match record.get(key) {
+        Some(serde_json::Value::Object(object)) => Some(object),
+        None => Some(&empty),
+        Some(_) => None,
+    };
+    let on = match record.get("on") {
+        None => Some(None),
+        Some(serde_json::Value::String(on)) => Some(Some(on.as_str())),
+        Some(_) => None,
+    };
+    let (Some(on), Some(reads), Some(arguments)) = (on, object("reads"), object("arguments"))
+    else {
+        return Err(unreadable());
+    };
+    let as_recorded = operation(long_name).is_some_and(|op| {
+        op.model(on, reads, step_name, arguments)
+            .is_ok_and(|(_, contents)| contents == model)
+    });
+
+    let mut answer = serde_json::Map::new();
+    answer.insert("step".to_string(), step_name.into());
+    answer.insert("model".to_string(), sql_rel.into());
+    answer.extend(record.clone());
+    answer.insert("as_recorded".to_string(), as_recorded.into());
+    Ok(answer.into())
 }
 
 // ----------------------------------------------- recording an operator step

@@ -18,6 +18,7 @@ Ask arc what it reads your statement as. When the reply names an operation (`fil
 | Step | CLI | MCP |
 | --- | --- | --- |
 | What arc reads a statement as | `arc sql recognise "<statement>"` | `sql_recognise` with `sql` |
+| Say what a recorded step was recorded as: its operation, tables and arguments | `arc operation read <step> --dir <dir>` | `operation_read` with `step`, `dir` |
 | The operations arc holds | `arc operation list --json` | `operation_describe` (no arguments) |
 | What one operation takes | `arc operation describe <long-name>` | `operation_describe` with `operation` |
 | Record it | `arc operation record <long-name> --on <table> --name <step> --arg <key>=<value> --description "<why>" --dir <dir>` | `operation_record` with `operation`, `on`, `name`, `arguments`, `description`, `dir` |

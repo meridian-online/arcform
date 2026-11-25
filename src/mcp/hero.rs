@@ -26,6 +26,8 @@
 //! - `history_list` and `history_restore` list the recorded states of a Protocol's
 //!   spec, or of one file beside it, and roll it back to one, as `arc history list
 //!   --json` and `arc history restore` do.
+//! - `operation_read` answers what a step of a Protocol was recorded as: the
+//!   object `arc operation read` prints, from the record its generated model carries.
 //! - `sql_recognise` answers what arc reads a SQL statement as: the object `arc sql
 //!   recognise` prints, both read through the one reader in `record`.
 //! - `sql_record` records a SQL statement as a new step of a Protocol, through the
@@ -698,6 +700,33 @@ fn history_restore_schema() -> Value {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// operation_read
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What a step of a Protocol was recorded as: the object `arc operation read`
+/// prints, read through the same reader. `dir` defaults to `.`, as `--dir` does.
+/// Writes no file and runs nothing; a refusal is an error result naming what was
+/// wrong.
+fn operation_read(args: &Value) -> ToolResult {
+    let dir = PathBuf::from(optional_string(args, "dir")?.unwrap_or("."));
+    let step = required_string(args, "step")?;
+    crate::record::read_step(&dir, step)
+        .map(ToolOutput::json)
+        .map_err(|e| e.to_string())
+}
+
+fn operation_read_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "step": { "type": "string", "description": "The step's name, as arcform.yaml names it." },
+            "dir": { "type": "string", "description": "Protocol directory (where arcform.yaml lives). Defaults to the current directory." }
+        },
+        "required": ["step"]
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // sql_recognise
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1099,6 +1128,13 @@ pub(super) fn tools() -> Vec<ToolDef> {
             input_schema: operation_record_schema,
             handler: operation_record,
             annotations: Annotations::WRITES,
+        },
+        ToolDef {
+            name: "operation_read",
+            description: "Answer what a step of a Protocol was recorded as: the operation, `on`, `reads` and `arguments` it was recorded with, as operation_record takes them, read from the record its generated model carries, with `as_recorded` saying whether the model is still the SQL arc writes for that record (false after a hand edit under the header). A step not recorded as an operation answers `operation` null. Reads the Protocol's files; writes nothing and runs nothing.",
+            input_schema: operation_read_schema,
+            handler: operation_read,
+            annotations: Annotations::READ_ONLY,
         },
         ToolDef {
             name: "operator_record",

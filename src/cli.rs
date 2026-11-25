@@ -203,6 +203,7 @@ pub enum Commands {
     /// Protocol+Run contract), `operator_describe` (an operator's `with:` schema),
     /// `operation_describe` (the SQL operations arc holds, and what one takes),
     /// `operation_record` (record an operation as a step of a Protocol),
+    /// `operation_read` (what a recorded step's operation and arguments were),
     /// `operator_record` (record an operator step, its `with:` checked against the
     /// operator's schema), `sql_recognise` (what arc reads a SQL statement as),
     /// `sql_record` (record a SQL statement as a step of a Protocol),
@@ -533,6 +534,19 @@ pub enum OperationCmd {
         /// step carries none.
         #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
         description: Option<String>,
+
+        /// Protocol directory (where arcform.yaml lives).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+    /// Print what a step was recorded as, as JSON: the operation, the tables it
+    /// reads and the arguments it was recorded with, read from the record its
+    /// generated model carries, and `as_recorded`, whether the model is still
+    /// what arc writes for that record; or `operation` null for a step not
+    /// recorded as an operation. Reads the protocol's files and runs nothing.
+    Read {
+        /// The step's name, as arcform.yaml names it.
+        step: String,
 
         /// Protocol directory (where arcform.yaml lives).
         #[arg(long, default_value = ".")]
@@ -1688,6 +1702,11 @@ fn dispatch_operation(cmd: OperationCmd, out: &mut impl Write) -> Result<()> {
                 description: description.as_deref(),
             };
             operation_record(&dir, &request, &history, out)
+        }
+        OperationCmd::Read { step, dir } => {
+            let answer = crate::record::read_step(&dir, &step)?;
+            writeln!(out, "{answer:#}")?;
+            Ok(())
         }
     }
 }

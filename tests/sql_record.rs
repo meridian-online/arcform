@@ -66,6 +66,7 @@ const APPENDED_BY_AMOUNT: &str = "  - name: by_amount\n    sql: models/02_by_amo
 /// The model recording [`FILTER`] writes, byte for byte.
 const BIG_ORDERS_MODEL: &str = "\
 -- generated: filter-rows on orders
+-- operation: {\"arguments\":{\"where\":\"amount > 100\"},\"on\":\"orders\",\"operation\":\"filter-rows\"}
 CREATE OR REPLACE TABLE \"big_orders\" AS
 SELECT *
 FROM orders
@@ -384,6 +385,7 @@ fn a_filter_of_a_table_named_with_a_reserved_word_leaves_the_bytes_the_same_filt
         typed.read("models/02_big_order.sql"),
         "\
 -- generated: filter-rows on order
+-- operation: {\"arguments\":{\"where\":\"amount > 100\"},\"on\":\"order\",\"operation\":\"filter-rows\"}
 CREATE OR REPLACE TABLE \"big_order\" AS
 SELECT *
 FROM \"order\"

@@ -11,6 +11,7 @@ In the CLI column, `--dir` defaults to the current directory; for `arc edit-prot
 | Describe a table already in a Protocol's database: row count, column types, null counts, five sample rows | `arc table describe <table> --dir <dir>` | `table_describe` with `table`, `dir` |
 | Run read-only SELECTs and return the rows | `arc sql query "<select>" --limit 100 --dir <dir>` | `sql_query` with `sql`, `limit`, `dir` |
 | Say what arc reads a SQL statement as: an operation it holds, or none | `arc sql recognise "<statement>"` | `sql_recognise` with `sql` |
+| Say what a recorded step was recorded as: its operation, tables and arguments | `arc operation read <step> --dir <dir>` | `operation_read` with `step`, `dir` |
 | List the SQL operations arc holds | `arc operation list --json` | `operation_describe` (no arguments) |
 | Say what one operation takes | `arc operation describe <long-name>` | `operation_describe` with `operation` |
 | List the operators | None: the CLI has no operator listing | `operator_describe` with no arguments |
