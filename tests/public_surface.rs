@@ -27,12 +27,12 @@
 //!    the `cli` feature; `Cargo.toml` gates the feature so `default-features = false`
 //!    leaves `spec` and `words` alone at the root. `words`' own items are frozen.
 //! 3. `arcform::spec` re-exports exactly the documented contract.
-//! 4. Every `impl` block on an exported type lives in that type's own module — so
+//! 4. Every `impl` block on an exported type, `spec`'s or `words`', lives in that type's own module — so
 //!    inherent methods (and trait impls) cannot be bolted on from somewhere this
 //!    file does not freeze.
 //! 5. Those modules' `pub` items are frozen.
 //! 6. No `use … as …` renames an exported type, which would slip an `impl` past (4).
-//! 7. The schema types' derive lists are frozen — a derive on an exported type is
+//! 7. The schema types' and `words`' types' derive lists are frozen — a derive on an exported type is
 //!    public API too.
 //! 8. `Error` stays `#[non_exhaustive]`.
 //!
@@ -112,6 +112,11 @@ const EXPORTED: [(&str, &str); 48] = [
     ("Error", "error.rs"),
     ("Result", "error.rs"),
 ];
+
+/// Every type `arcform::words` publishes, and the module that owns it. Kept apart
+/// from `EXPORTED`, which is compared exactly with `spec`'s re-exports, and joined to
+/// it wherever an impl's location or a rename is checked.
+const WORDS_EXPORTED: [(&str, &str); 2] = [("Alias", "words.rs"), ("OperationWords", "words.rs")];
 
 /// Every module file in the crate. Frozen so a new one cannot be added without
 /// passing under the checks below.
@@ -218,7 +223,17 @@ const MODULE_FILES: [&str; 59] = [
 /// `src/spec.rs`: editing an existing spec goes through the write path, which splices
 /// original bytes and never re-serialises. This freeze keeps any change to that
 /// arrangement a deliberate, version-visible act instead of a silent drift.
-const FROZEN_DERIVES: [(&str, &str, &[&str]); 25] = [
+const FROZEN_DERIVES: [(&str, &str, &[&str]); 27] = [
+    (
+        "words.rs",
+        "Alias",
+        &["Debug", "Clone", "PartialEq", "Eq", "Deserialize"],
+    ),
+    (
+        "words.rs",
+        "OperationWords",
+        &["Debug", "Clone", "PartialEq", "Eq", "Deserialize"],
+    ),
     (
         "manifest.rs",
         "Param",
@@ -1008,7 +1023,8 @@ fn the_spec_module_exports_exactly_the_documented_contract() {
 /// module, which is the only place the item lists below freeze.
 #[test]
 fn impls_on_exported_types_live_only_in_their_own_module() {
-    let owners = std::collections::BTreeMap::from(EXPORTED);
+    let owners: std::collections::BTreeMap<&str, &str> =
+        EXPORTED.into_iter().chain(WORDS_EXPORTED).collect();
     for file in MODULE_FILES {
         for target in impl_self_types(&src(file)) {
             let Some(owner) = owners.get(target.as_str()) else {
@@ -1028,7 +1044,8 @@ fn impls_on_exported_types_live_only_in_their_own_module() {
 /// not recognise. There is no reason to alias the schema types internally.
 #[test]
 fn no_module_renames_an_exported_type() {
-    let exported = exported_names();
+    let mut exported = exported_names();
+    exported.extend(WORDS_EXPORTED.iter().map(|(name, _)| (*name).to_string()));
     for file in MODULE_FILES {
         let code = blank_non_code(&src(file));
         for (lineno, line) in code.lines().enumerate() {
@@ -1272,6 +1289,7 @@ fn the_schema_types_derive_exactly_what_is_recorded() {
         "panel_check.rs",
         "protocol_read.rs",
         "error.rs",
+        "words.rs",
     ] {
         let found = pub_type_derives(&src(owner));
         let expected: Vec<(String, Vec<String>)> = FROZEN_DERIVES
