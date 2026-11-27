@@ -1965,6 +1965,17 @@ steps:
         assert!(nothing.contains("nothing[name=first]"), "{nothing}");
     }
 
+    // A path with no name in it is applied without loading the document, so
+    // text that does not load, such as a hand-edit that left a key twice, can
+    // still be repaired by an edit that does not name an item.
+    #[test]
+    fn a_path_without_a_name_does_not_need_the_text_to_load() {
+        let twice = "a: 1\na: 1\nb: 2\n";
+        assert!(serde_yaml::from_str::<serde_yaml::Value>(twice).is_err());
+        let out = apply_yaml_edits(twice, &[SpecEdit::Delete { path: p(&["a"]) }]).unwrap();
+        assert_eq!(out, "a: 1\nb: 2\n");
+    }
+
     #[test]
     fn delete_refuses_flow_collection_elements() {
         let edit = SpecEdit::Delete {

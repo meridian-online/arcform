@@ -2312,6 +2312,11 @@ mod tests {
             ]
         );
         assert_eq!(parse_path(".").unwrap(), vec![]);
+        // A path may open with an index, for YAML whose root is a sequence.
+        assert_eq!(
+            parse_path("[0].name").unwrap(),
+            vec![Index(0), Key("name".into())]
+        );
         assert_eq!(
             parse_path("steps[name=load.raw].command").unwrap(),
             vec![
