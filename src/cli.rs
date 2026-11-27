@@ -2803,6 +2803,46 @@ mod tests {
     }
 
     #[test]
+    fn operation_describe_carries_title_sentence_and_aliases() {
+        let mut out = Vec::new();
+        operation_describe("fill-nulls", &mut out).expect("describe succeeds");
+        let described: serde_json::Value = serde_json::from_slice(&out).expect("JSON");
+        assert_eq!(described["title"], "Fill in missing values");
+        assert!(
+            described["sentence"]
+                .as_str()
+                .is_some_and(|s| s.ends_with('.')),
+            "{described}"
+        );
+        let aliases = described["aliases"].as_array().expect("aliases is a list");
+        assert!(
+            aliases.contains(&serde_json::json!({ "word": "fill_null", "source": "Polars" })),
+            "{described}"
+        );
+        // A word whose tool goes unnamed has no `source` key at all.
+        assert!(
+            aliases
+                .iter()
+                .all(|a| a.get("source").is_none_or(serde_json::Value::is_string)),
+            "{described}"
+        );
+    }
+
+    #[test]
+    fn operation_list_json_carries_the_title() {
+        let mut out = Vec::new();
+        operation_list(true, &mut out).expect("list succeeds");
+        let listed: serde_json::Value = serde_json::from_slice(&out).expect("JSON");
+        let fill = listed
+            .as_array()
+            .expect("an array")
+            .iter()
+            .find(|e| e["long_name"] == "fill-nulls")
+            .expect("fill-nulls is listed");
+        assert_eq!(fill["title"], "Fill in missing values");
+    }
+
+    #[test]
     fn operation_describe_reports_a_failed_write() {
         let err = operation_describe("filter-rows", &mut FailingWriter).unwrap_err();
         assert!(err.to_string().contains("stdout is closed"), "{err}");

@@ -1296,7 +1296,11 @@ mod tests {
                     .keys()
                     .map(String::as_str)
                     .collect();
-                assert_eq!(keys, ["long_name", "summary"], "entry: {entry}");
+                assert_eq!(
+                    keys,
+                    ["aliases", "long_name", "sentence", "summary", "title"],
+                    "entry: {entry}"
+                );
             }
             let long_names: Vec<&str> = entries
                 .iter()

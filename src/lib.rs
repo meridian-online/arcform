@@ -5,14 +5,16 @@
 //! own copy of the schema. Two schemas drift; one schema cannot. So the spec loader
 //! and its validation are published here, and everything else stays private.
 //!
-//! **The published surface is [`spec`].** Read it for the contract, including what it
-//! guarantees, what it deliberately withholds, and why a consumer should pin an exact
-//! version.
+//! **The published surface is [`spec`] and [`words`].** Read [`spec`] for the contract,
+//! including what it guarantees, what it deliberately withholds, and why a consumer
+//! should pin an exact version. [`words`] is what each operation arc holds is called:
+//! its title, its sentence and the words other tools use for it, so a tool that lets
+//! someone find an operation reads the same words arc does.
 //!
 //! One other item exists at the crate root, and it is not published: [`cli_main`], the
 //! `arc` binary's entry point. It is compiled only under the `cli` feature, which is on
 //! by default so that `cargo build` produces the binary. **Link this crate with
-//! `default-features = false`** and the crate root exports [`spec`] and nothing else —
+//! `default-features = false`** and the crate root exports [`spec`] and [`words`] and nothing else —
 //! which is what a library consumer wants, since [`cli_main`] parses the *caller's*
 //! `argv` and can terminate the caller's process.
 //!
@@ -71,6 +73,7 @@ mod state;
 mod working_db;
 
 pub mod spec;
+pub mod words;
 
 /// The `arc` binary's entry point.
 ///
