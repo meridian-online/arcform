@@ -4432,6 +4432,37 @@ pub(crate) fn refused(message: String) -> Error {
 mod tests {
     use super::*;
 
+    /// A `models` that is a file and not a folder is refused when the folder is
+    /// made, before any model is written, and the manifest and the file are left
+    /// as they were.
+    #[test]
+    fn a_models_that_is_a_file_is_refused_where_the_folder_is_made() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let manifest = "name: p\nsteps: []\n";
+        std::fs::write(dir.join(MANIFEST_FILENAME), manifest).unwrap();
+        std::fs::write(dir.join("models"), "not a folder").unwrap();
+        let step = RecordedStep {
+            name: "kept".to_string(),
+            sql: "SELECT 1".to_string(),
+            provenance: "test".to_string(),
+            description: None,
+        };
+        let error = record_step(dir, &step).expect_err("refused");
+        assert!(
+            matches!(&error, Error::Io(e) if e.kind() == std::io::ErrorKind::AlreadyExists),
+            "not the refusal of making `models`: {error:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(MANIFEST_FILENAME)).unwrap(),
+            manifest
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("models")).unwrap(),
+            "not a folder"
+        );
+    }
+
     #[test]
     fn the_marker_is_read_from_the_first_line_only() {
         assert!(sql_is_generated(
