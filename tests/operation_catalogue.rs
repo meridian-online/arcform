@@ -14,9 +14,9 @@
 //!      `parameters` JSON Schema that requires `where`, admits nothing else, and
 //!      offers the comparisons a condition is written with without holding the
 //!      condition to them;
-//!   3. **describe an operator** — each operator the build holds, in the same
-//!      five keys: what its step reads and writes by role, and its `with:`
-//!      schema less those roles as `parameters`;
+//!   3. **describe an operator** — each operator the build holds, in the five
+//!      keys every description holds: what its step reads and writes by role,
+//!      and its `with:` schema less those roles as `parameters`;
 //!   4. **refuse** — a name arc holds neither as an operation nor as an operator
 //!      exits non-zero with nothing on stdout, and the message points at
 //!      `arc operation list`;
@@ -72,11 +72,21 @@ fn operators() -> Vec<&'static str> {
     operators
 }
 
-/// The keys every description holds, sorted.
-const DESCRIPTION_KEYS: [&str; 5] = ["long_name", "parameters", "reads", "summary", "writes"];
+/// The keys an operation's description holds, sorted: the five every
+/// description holds, and the catalogue's `title`, `sentence` and `aliases`.
+const DESCRIPTION_KEYS: [&str; 8] = [
+    "aliases",
+    "long_name",
+    "parameters",
+    "reads",
+    "sentence",
+    "summary",
+    "title",
+    "writes",
+];
 
-/// The keys an operator's description holds, sorted: an operation's five, and
-/// `wraps` and `example`.
+/// The keys an operator's description holds, sorted: the five every
+/// description holds, and `wraps` and `example`.
 const OPERATOR_DESCRIPTION_KEYS: [&str; 7] = [
     "example",
     "long_name",
@@ -466,7 +476,7 @@ fn describe_reads_the_filters_table_then_a_column_of_it_and_writes_a_table() {
 }
 
 #[test]
-fn describe_prints_each_operator_in_the_five_keys_an_operation_is_described_in_and_two_more() {
+fn describe_prints_each_operator_and_each_operation_in_its_own_keys() {
     let operators = operators();
     for op in operators.iter().copied().chain([
         FILTER_ROWS,

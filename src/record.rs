@@ -2694,24 +2694,42 @@ impl Operation {
         })
     }
 
-    /// The listing entry: the long name and the one line saying what it does.
+    /// The listing entry: the long name, the one line saying what it does, and
+    /// what the operation catalogue calls it — its title, its sentence and the
+    /// words other tools use for it.
     pub(crate) fn listing(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut entry = serde_json::json!({
             "long_name": self.long_name,
             "summary": self.summary,
-        })
+        });
+        self.add_words(&mut entry);
+        entry
     }
 
     /// The full description: the listing entry, what the operation reads and
     /// writes, and a `parameters` JSON Schema of what it takes.
     pub(crate) fn description(&self) -> serde_json::Value {
-        description(
+        let mut entry = description(
             self.long_name,
             self.summary,
             self.reads,
             self.writes,
             (self.parameters)(),
-        )
+        );
+        self.add_words(&mut entry);
+        entry
+    }
+
+    /// Put the catalogue's words for the operation into `entry`. Every
+    /// operation has them: `words`' tests hold the embedded catalogue to one
+    /// entry per operation, so an operation without one fails the build's
+    /// tests, not a user's command.
+    fn add_words(&self, entry: &mut serde_json::Value) {
+        let words = crate::words::of(self.long_name)
+            .unwrap_or_else(|| panic!("operations.json has no entry for {}", self.long_name));
+        for (key, value) in words.fields() {
+            entry[key] = value;
+        }
     }
 }
 
@@ -4767,7 +4785,8 @@ mod tests {
     ];
 
     // Every description, of an operation or of an operator, is read the same way
-    // by a caller: the same five keys (and an operator's `wraps` and `example`), and each role in `reads` and `writes` named
+    // by a caller: the same five keys (and an operation's `title`, `sentence` and
+    // `aliases`, or an operator's `wraps` and `example`), and each role in `reads` and `writes` named
     // once, of a kind arc knows, with a sentence to print, an `of` that points back
     // at an earlier read that holds columns, and `min_items` on a list alone. An
     // operation reads nothing, or reads first one required table called `table`,
@@ -4784,9 +4803,19 @@ mod tests {
                 .map(String::as_str)
                 .collect();
             keys.sort_unstable();
-            // An operator's description adds `wraps` and `example` to the five.
+            // An operation's description adds the catalogue's words to the five,
+            // and an operator's adds `wraps` and `example`.
             let expected: &[&str] = if operation(name).is_some() {
-                &["long_name", "parameters", "reads", "summary", "writes"]
+                &[
+                    "aliases",
+                    "long_name",
+                    "parameters",
+                    "reads",
+                    "sentence",
+                    "summary",
+                    "title",
+                    "writes",
+                ]
             } else {
                 &[
                     "example",

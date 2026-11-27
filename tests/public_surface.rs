@@ -1,6 +1,6 @@
 //! The published surface, enumerated.
 //!
-//! `arcform` exports a spec loader and nothing else. That is a promise, and promises made
+//! `arcform` exports a spec loader and the operations' words, and nothing else. That is a promise, and promises made
 //! only in prose get broken by a stray `pub` in an unrelated commit. This test reads
 //! the source and fails when the surface changes — widening it is then a deliberate
 //! act with a diff to argue about, not a side effect.
@@ -23,16 +23,16 @@
 //! # What is checked
 //!
 //! 1. The set of module files is frozen — a new module is a deliberate act.
-//! 2. The crate root exports `spec`, plus the doc-hidden `cli_main` under the `cli`
-//!    feature; `Cargo.toml` gates the feature so `default-features = false` leaves
-//!    `spec` alone at the root.
+//! 2. The crate root exports `spec` and `words`, plus the doc-hidden `cli_main` under
+//!    the `cli` feature; `Cargo.toml` gates the feature so `default-features = false`
+//!    leaves `spec` and `words` alone at the root. `words`' own items are frozen.
 //! 3. `arcform::spec` re-exports exactly the documented contract.
-//! 4. Every `impl` block on an exported type lives in that type's own module — so
+//! 4. Every `impl` block on an exported type, `spec`'s or `words`', lives in that type's own module — so
 //!    inherent methods (and trait impls) cannot be bolted on from somewhere this
 //!    file does not freeze.
 //! 5. Those modules' `pub` items are frozen.
 //! 6. No `use … as …` renames an exported type, which would slip an `impl` past (4).
-//! 7. The schema types' derive lists are frozen — a derive on an exported type is
+//! 7. The schema types' and `words`' types' derive lists are frozen — a derive on an exported type is
 //!    public API too.
 //! 8. `Error` stays `#[non_exhaustive]`.
 //!
@@ -113,9 +113,14 @@ const EXPORTED: [(&str, &str); 48] = [
     ("Result", "error.rs"),
 ];
 
+/// Every type `arcform::words` publishes, and the module that owns it. Kept apart
+/// from `EXPORTED`, which is compared exactly with `spec`'s re-exports, and joined to
+/// it wherever an impl's location or a rename is checked.
+const WORDS_EXPORTED: [(&str, &str); 2] = [("Alias", "words.rs"), ("OperationWords", "words.rs")];
+
 /// Every module file in the crate. Frozen so a new one cannot be added without
 /// passing under the checks below.
-const MODULE_FILES: [&str; 58] = [
+const MODULE_FILES: [&str; 59] = [
     "asset.rs",
     "asset_kind.rs",
     "bridge.rs",
@@ -196,6 +201,10 @@ const MODULE_FILES: [&str; 58] = [
     "skills.rs",
     "spec.rs",
     "state.rs",
+    // What each operation is called: its title, its sentence and the words other
+    // tools use for it, from Meridian's operation catalogue. Published, and its
+    // items frozen in `the_words_module_declares_only_contracted_items`.
+    "words.rs",
     // Where a Protocol that names no `db:` keeps its working database: arc's data
     // folder, keyed to the Protocol directory. Private to the crate — the folder is a
     // run-time facility, as the fetch cache is, not a schema.
@@ -214,7 +223,17 @@ const MODULE_FILES: [&str; 58] = [
 /// `src/spec.rs`: editing an existing spec goes through the write path, which splices
 /// original bytes and never re-serialises. This freeze keeps any change to that
 /// arrangement a deliberate, version-visible act instead of a silent drift.
-const FROZEN_DERIVES: [(&str, &str, &[&str]); 25] = [
+const FROZEN_DERIVES: [(&str, &str, &[&str]); 27] = [
+    (
+        "words.rs",
+        "Alias",
+        &["Debug", "Clone", "PartialEq", "Eq", "Deserialize"],
+    ),
+    (
+        "words.rs",
+        "OperationWords",
+        &["Debug", "Clone", "PartialEq", "Eq", "Deserialize"],
+    ),
     (
         "manifest.rs",
         "Param",
@@ -880,18 +899,19 @@ fn the_module_list_is_frozen() {
     );
 }
 
-/// The crate root exports one module. Everything else is private, so nothing behind
+/// The crate root exports two modules. Everything else is private, so nothing behind
 /// it — the runner, the engine, introspection, the registry, the operator catalog —
 /// is reachable from outside.
 #[test]
-fn the_crate_root_exports_only_spec_and_the_gated_binary_entry_point() {
+fn the_crate_root_exports_only_spec_words_and_the_gated_binary_entry_point() {
     let lib = src("lib.rs");
 
     assert_eq!(
         pub_items(&lib),
-        frozen(&["spec", "cli_main"]),
-        "the crate root exports `pub mod spec` and, under the `cli` feature, the \
-         doc-hidden binary entry point. Adding to this list widens the contract."
+        frozen(&["spec", "words", "cli_main"]),
+        "the crate root exports `pub mod spec`, `pub mod words` and, under the `cli` \
+         feature, the doc-hidden binary entry point. Adding to this list widens the \
+         contract."
     );
 
     assert!(
@@ -905,7 +925,7 @@ fn the_crate_root_exports_only_spec_and_the_gated_binary_entry_point() {
     assert!(
         lib.contains("#[cfg(feature = \"cli\")]\n#[doc(hidden)]\npub fn cli_main()"),
         "`cli_main` must stay `#[cfg(feature = \"cli\")]` and `#[doc(hidden)]` — with \
-         `default-features = false` the crate root is `spec` and nothing else"
+         `default-features = false` the crate root is `spec` and `words` and nothing else"
     );
     assert!(
         lib.contains("#[cfg(feature = \"cli\")]\nmod cli;"),
@@ -1003,7 +1023,8 @@ fn the_spec_module_exports_exactly_the_documented_contract() {
 /// module, which is the only place the item lists below freeze.
 #[test]
 fn impls_on_exported_types_live_only_in_their_own_module() {
-    let owners = std::collections::BTreeMap::from(EXPORTED);
+    let owners: std::collections::BTreeMap<&str, &str> =
+        EXPORTED.into_iter().chain(WORDS_EXPORTED).collect();
     for file in MODULE_FILES {
         for target in impl_self_types(&src(file)) {
             let Some(owner) = owners.get(target.as_str()) else {
@@ -1023,7 +1044,8 @@ fn impls_on_exported_types_live_only_in_their_own_module() {
 /// not recognise. There is no reason to alias the schema types internally.
 #[test]
 fn no_module_renames_an_exported_type() {
-    let exported = exported_names();
+    let mut exported = exported_names();
+    exported.extend(WORDS_EXPORTED.iter().map(|(name, _)| (*name).to_string()));
     for file in MODULE_FILES {
         let code = blank_non_code(&src(file));
         for (lineno, line) in code.lines().enumerate() {
@@ -1047,6 +1069,24 @@ fn no_module_renames_an_exported_type() {
             }
         }
     }
+}
+
+/// `arcform::words` is published whole, so each of its `pub` items is contract.
+/// It holds the words and the lookups over them, and nothing that runs a step.
+#[test]
+fn the_words_module_declares_only_contracted_items() {
+    assert_eq!(
+        pub_items(&src("words.rs")),
+        frozen(&[
+            "Alias",
+            "OperationWords",
+            "operations",
+            "of",
+            "landscape_commit"
+        ]),
+        "`arcform::words` is published. A new `pub` item there widens the contract: \
+         add it here deliberately, or make it `pub(crate)`"
+    );
 }
 
 /// Inherent `pub fn`s on exported types are exported too. Freeze them, or the surface
@@ -1249,6 +1289,7 @@ fn the_schema_types_derive_exactly_what_is_recorded() {
         "panel_check.rs",
         "protocol_read.rs",
         "error.rs",
+        "words.rs",
     ] {
         let found = pub_type_derives(&src(owner));
         let expected: Vec<(String, Vec<String>)> = FROZEN_DERIVES
