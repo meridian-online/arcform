@@ -272,6 +272,45 @@ fn an_invalid_edit_is_refused_with_the_reason_and_the_file_untouched() {
     );
 }
 
+/// A step named in its path is the step edited, wherever it stands: the name
+/// is looked up in the bytes arc reads for the edit, so a step another writer
+/// put ahead of it in the meantime does not turn the delete onto a neighbour.
+/// A name no step has is refused with the file untouched.
+#[test]
+fn a_step_named_in_the_path_is_the_step_deleted() {
+    let dir = corpus_copy();
+    let spec = dir.path().join(MANIFEST_FILENAME);
+    let names = || -> Vec<String> {
+        Manifest::from_yaml_str(&std::fs::read_to_string(&spec).unwrap())
+            .unwrap()
+            .steps
+            .into_iter()
+            .map(|step| step.name)
+            .collect()
+    };
+    assert_eq!(names()[1], "moon_phases");
+
+    // Another writer moves the steps after the caller read the file.
+    arc_ok(dir.path(), &["edit-protocol", "reorder", "steps", "3", "0"]);
+    assert_ne!(names()[1], "moon_phases");
+
+    arc_ok(
+        dir.path(),
+        &["edit-protocol", "delete", "steps[name=moon_phases]"],
+    );
+    let left = names();
+    assert!(!left.contains(&"moon_phases".to_string()), "{left:?}");
+    assert_eq!(left.len(), 3, "exactly one step went: {left:?}");
+
+    let before = std::fs::read(&spec).unwrap();
+    let stderr = arc_refused(
+        dir.path(),
+        &["edit-protocol", "delete", "steps[name=moon_phases]"],
+    );
+    assert!(stderr.contains("no item of steps"), "{stderr}");
+    assert_eq!(std::fs::read(&spec).unwrap(), before);
+}
+
 /// Creation goes through the same gate and the same refusals: an existing
 /// spec is never overwritten, and an invalid manifest never becomes a file.
 #[test]

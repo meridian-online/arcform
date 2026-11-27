@@ -55,6 +55,18 @@
 //! the loaded original with the entries moved — and text that loads to
 //! anything else is refused.
 //!
+//! # Addressing an item by its name
+//!
+//! An index names a place, and the item at a place changes when another
+//! writer adds, deletes or moves one before it. A caller that read the file,
+//! chose `steps[2]` and asked for the delete could lose a different step. A
+//! path can instead name the item, [`PathPart::Named`] (`steps[name=load]`),
+//! and each edit resolves it to an index against the text that edit is
+//! applied to, so the name and the edit read the same bytes. A name no item
+//! has, or that two items share, is refused. This does not lock the file: a
+//! write by another process between arc's read and arc's rename is still
+//! replaced by arc's, as with every edit here.
+//!
 //! # Creating is not editing
 //!
 //! A spec authored from scratch has no prior authorship to protect, so
@@ -80,8 +92,9 @@ use crate::manifest::{MANIFEST_FILENAME, Manifest};
 
 // ------------------------------------------------------------------ the values
 
-/// One step along a path into the YAML document: a mapping key or a sequence
-/// index. `"steps".into()` and `2.into()` both work, so a path reads
+/// One step along a path into the YAML document: a mapping key, a sequence
+/// index, or the sequence item of a given name. `"steps".into()` and
+/// `2.into()` both work, so a path reads
 /// `vec!["steps".into(), 2.into(), "command".into()]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathPart {
@@ -89,6 +102,13 @@ pub enum PathPart {
     Key(String),
     /// A zero-based index into a sequence.
     Index(usize),
+    /// The one item of a sequence whose `name` key holds this string, spelled
+    /// `steps[name=load]`. It is resolved to that item's index against the
+    /// same text the edit is applied to, so another writer moving the steps
+    /// between a caller reading the file and arc editing it cannot redirect
+    /// the edit to a different step. A name no item has, or that two items
+    /// share, is refused.
+    Named(String),
 }
 
 impl From<&str> for PathPart {
@@ -571,7 +591,7 @@ pub(crate) fn write_merge_rule(dir: &Path) -> Result<MergeRule> {
 fn splice_edits(original: &str, edits: &[SpecEdit]) -> Result<String> {
     let mut text = original.to_string();
     for edit in edits {
-        text = apply_one(&text, edit)?;
+        text = apply_one(&text, &with_names_resolved(&text, edit)?)?;
     }
     if !text.ends_with('\n') {
         text.push('\n');
@@ -727,6 +747,7 @@ fn route_of(path: &[PathPart]) -> yamlpath::Route<'_> {
             .map(|part| match part {
                 PathPart::Key(k) => yamlpath::Component::Key(k.as_str().into()),
                 PathPart::Index(i) => yamlpath::Component::Index(*i),
+                PathPart::Named(_) => unreachable!("a name resolves before its path is routed"),
             })
             .collect::<Vec<_>>(),
     )
@@ -751,9 +772,90 @@ fn path_display(path: &[PathPart]) -> String {
                 out.push_str(&i.to_string());
                 out.push(']');
             }
+            PathPart::Named(name) => {
+                out.push_str("[name=");
+                out.push_str(name);
+                out.push(']');
+            }
         }
     }
     out
+}
+
+/// `edit` with each [`PathPart::Named`] in its path replaced by the index of
+/// the item it names in `text`, the text it is about to be applied to. An edit
+/// with no name in its path comes back as it was.
+fn with_names_resolved(text: &str, edit: &SpecEdit) -> Result<SpecEdit> {
+    let mut edit = edit.clone();
+    let path = match &mut edit {
+        SpecEdit::Replace { path, .. }
+        | SpecEdit::RewriteFragment { path, .. }
+        | SpecEdit::Add { path, .. }
+        | SpecEdit::Append { path, .. }
+        | SpecEdit::Delete { path }
+        | SpecEdit::Reorder { path, .. }
+        | SpecEdit::Nest { path, .. }
+        | SpecEdit::Lift { path, .. } => path,
+    };
+    if path.iter().any(|part| matches!(part, PathPart::Named(_))) {
+        *path = names_resolved(text, path)?;
+    }
+    Ok(edit)
+}
+
+/// `path` with each name replaced by the index of the one item, in the
+/// sequence the path has reached, whose `name` key holds it. Refused when the
+/// path reaches nothing there, when what it reaches is not a sequence, and
+/// when no item or more than one item has the name.
+fn names_resolved(text: &str, path: &[PathPart]) -> Result<Vec<PathPart>> {
+    let document = load_value(path, text)?;
+    let mut here = Some(&document);
+    let mut resolved = Vec::new();
+    for part in path {
+        let part = match part {
+            PathPart::Named(name) => {
+                let at = path_display(&resolved);
+                let items = here
+                    .ok_or_else(|| target_err(path, format!("there is nothing at {at}")))?
+                    .as_sequence()
+                    .ok_or_else(|| target_err(path, format!("{at} is not a sequence")))?;
+                let matching: Vec<usize> = items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| {
+                        item.get("name").and_then(serde_yaml::Value::as_str) == Some(name)
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                match matching[..] {
+                    [index] => PathPart::Index(index),
+                    [] => {
+                        return Err(target_err(
+                            path,
+                            format!("no item of {at} has the name {name:?}"),
+                        ));
+                    }
+                    _ => {
+                        return Err(target_err(
+                            path,
+                            format!(
+                                "{} items of {at} have the name {name:?}; address one by its index",
+                                matching.len()
+                            ),
+                        ));
+                    }
+                }
+            }
+            other => other.clone(),
+        };
+        here = here.and_then(|value| match &part {
+            PathPart::Key(k) => value.get(k.as_str()),
+            PathPart::Index(i) => value.get(*i),
+            PathPart::Named(_) => None,
+        });
+        resolved.push(part);
+    }
+    Ok(resolved)
 }
 
 fn target_err(path: &[PathPart], detail: impl std::fmt::Display) -> Error {
@@ -1425,6 +1527,7 @@ fn described(
         .try_fold(&mut value, |value, part| match part {
             PathPart::Key(k) => value.get_mut(k.as_str()),
             PathPart::Index(i) => value.get_mut(*i),
+            PathPart::Named(_) => unreachable!("a name resolves before an edit is applied"),
         })
         .and_then(serde_yaml::Value::as_mapping_mut)
         .ok_or_else(|| target_err(path, "the loaded document holds no mapping here"))?;
@@ -1441,6 +1544,7 @@ fn mapping_at<'v>(
         .try_fold(value, |value, part| match part {
             PathPart::Key(k) => value.get(k.as_str()),
             PathPart::Index(i) => value.get(*i),
+            PathPart::Named(_) => unreachable!("a name resolves before an edit is applied"),
         })
         .and_then(serde_yaml::Value::as_mapping)
 }
@@ -1786,6 +1890,98 @@ steps:
             out.text()
         );
         assert_eq!(out.manifest().steps.len(), 1);
+    }
+
+    fn named(name: &str) -> PathPart {
+        PathPart::Named(name.to_string())
+    }
+
+    // A step addressed by its name is the step deleted, wherever it stands in
+    // the list: the name resolves against the bytes the edit is applied to.
+    #[test]
+    fn delete_by_name_removes_the_step_of_that_name() {
+        let edit = SpecEdit::Delete {
+            path: vec!["steps".into(), named("first")],
+        };
+        let out = apply_edits(SPEC, &[edit]).unwrap();
+        let names: Vec<_> = out.manifest().steps.iter().map(|s| &s.name).collect();
+        assert_eq!(names, ["second"]);
+
+        // The same address, after a step has been put in front of it, still
+        // finds the step of that name and not the one now at its old index.
+        let moved = SPEC.replacen(
+            "steps:\n",
+            "steps:\n  - name: zeroth\n    command: \"true\"\n\n",
+            1,
+        );
+        let edit = SpecEdit::Delete {
+            path: vec!["steps".into(), named("first")],
+        };
+        let out = apply_edits(&moved, &[edit]).unwrap();
+        let names: Vec<_> = out.manifest().steps.iter().map(|s| &s.name).collect();
+        assert_eq!(names, ["zeroth", "second"]);
+    }
+
+    // A name works anywhere an index does, deeper paths included, and the edit
+    // leaves the same bytes an index would.
+    #[test]
+    fn a_named_item_takes_any_edit_an_indexed_one_takes() {
+        let by_name = SpecEdit::Replace {
+            path: vec!["steps".into(), named("second"), "command".into()],
+            value: "\"cat data.txt\"".to_string(),
+        };
+        let by_index = SpecEdit::Replace {
+            path: p(&["steps", "1", "command"]),
+            value: "\"cat data.txt\"".to_string(),
+        };
+        assert_eq!(
+            apply_edits(SPEC, &[by_name]).unwrap().text(),
+            apply_edits(SPEC, &[by_index]).unwrap().text()
+        );
+    }
+
+    // A name no item has, a name two items share, and a name given where there
+    // is no sequence are refused, each naming the path as written.
+    #[test]
+    fn a_name_that_picks_out_no_single_item_is_refused() {
+        let refusal = |text: &str, path: Vec<PathPart>| -> String {
+            match apply_yaml_edits(text, &[SpecEdit::Delete { path }]) {
+                Err(Error::EditTarget { path, detail }) => format!("{path}: {detail}"),
+                other => panic!("expected EditTarget, got {other:?}"),
+            }
+        };
+        let missing = refusal(SPEC, vec!["steps".into(), named("third")]);
+        assert!(missing.contains("steps[name=third]"), "{missing}");
+        assert!(missing.contains("no item"), "{missing}");
+
+        let twice = "steps:\n  - name: a\n  - name: a\n";
+        let shared = refusal(twice, vec!["steps".into(), named("a")]);
+        assert!(shared.contains("2 items"), "{shared}");
+
+        let not_a_list = refusal(SPEC, vec!["name".into(), named("first")]);
+        assert!(not_a_list.contains("not a sequence"), "{not_a_list}");
+
+        let nothing = refusal(SPEC, vec!["nothing".into(), named("first")]);
+        assert!(nothing.contains("nothing[name=first]"), "{nothing}");
+
+        // Text that does not load is refused with the loader's reason, not
+        // read as an empty document that holds no sequence.
+        let unloadable = refusal(
+            "steps:\n  - name: a\nsteps: []\n",
+            vec!["steps".into(), named("a")],
+        );
+        assert!(unloadable.contains("does not load as YAML"), "{unloadable}");
+    }
+
+    // A path with no name in it is applied without loading the document, so
+    // text that does not load, such as a hand-edit that left a key twice, can
+    // still be repaired by an edit that does not name an item.
+    #[test]
+    fn a_path_without_a_name_does_not_need_the_text_to_load() {
+        let twice = "a: 1\na: 1\nb: 2\n";
+        assert!(serde_yaml::from_str::<serde_yaml::Value>(twice).is_err());
+        let out = apply_yaml_edits(twice, &[SpecEdit::Delete { path: p(&["a"]) }]).unwrap();
+        assert_eq!(out, "a: 1\nb: 2\n");
     }
 
     #[test]

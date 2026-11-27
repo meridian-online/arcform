@@ -673,7 +673,10 @@ pub enum RegistryCmd {
 
 /// One edit to a protocol spec, addressed by PATH: dot-separated mapping keys
 /// with zero-based `[N]` sequence indices — `steps[2].command`,
-/// `params.port.default` — and `.` alone for the manifest root.
+/// `params.port.default` — and `.` alone for the manifest root. `[name=NAME]`
+/// in place of an index is the sequence item whose `name` key is NAME, such as
+/// `steps[name=load].command`: it stays on that step when another writer adds
+/// or moves steps, where an index would not.
 ///
 /// Replacement text is spliced verbatim, exactly as the library's write path
 /// takes it: multi-line values must arrive already indented for the position
@@ -714,6 +717,9 @@ pub enum EditOp {
         item: String,
     },
     /// Delete the element at PATH, along with its flush comment header.
+    /// `steps[name=load]` deletes the step named `load` wherever it stands,
+    /// so a step moved or added by another writer since the file was read
+    /// cannot turn the delete onto a different step.
     Delete { path: String },
     /// Move the item at index FROM of the block sequence at PATH so it ends
     /// up at index TO.
@@ -924,8 +930,10 @@ fn spec_edit_of(op: EditOp) -> Result<SpecEdit> {
 }
 
 /// `steps[2].command` → the write path's address parts; `.` alone is the
-/// manifest root (an empty path — only `add` accepts one). A path whose
-/// syntax does not parse is refused here, before any file is read.
+/// manifest root (an empty path — only `add` accepts one). `steps[name=load]`
+/// is the step named `load`, whatever its index; the name runs to the first
+/// `]`, so it may hold a `.`. A path whose syntax does not parse is refused
+/// here, before any file is read.
 fn parse_path(raw: &str) -> Result<Vec<PathPart>> {
     let syntax = |detail: String| Error::EditTarget {
         path: raw.to_string(),
@@ -940,29 +948,39 @@ fn parse_path(raw: &str) -> Result<Vec<PathPart>> {
         ));
     }
     let mut parts = Vec::new();
-    for segment in raw.split('.') {
-        if segment.is_empty() {
-            return Err(syntax("empty path segment".to_string()));
-        }
-        let (key, mut rest) = match segment.find('[') {
-            Some(0) => (None, segment),
-            Some(at) => (Some(&segment[..at]), &segment[at..]),
-            None => (Some(segment), ""),
-        };
-        if let Some(key) = key {
+    let mut rest = raw;
+    loop {
+        // One segment: a key, then any number of `[...]`, or brackets alone.
+        let key_end = rest.find(['.', '[']).unwrap_or(rest.len());
+        let key = &rest[..key_end];
+        rest = &rest[key_end..];
+        if !key.is_empty() {
             parts.push(PathPart::Key(key.to_string()));
         }
-        while !rest.is_empty() {
-            let (digits, tail) = rest
-                .strip_prefix('[')
-                .and_then(|r| r.split_once(']'))
-                .ok_or_else(|| syntax(format!("malformed index in segment {segment:?}")))?;
-            let index: usize = digits
-                .parse()
-                .map_err(|_| syntax(format!("index {digits:?} is not a number")))?;
-            parts.push(PathPart::Index(index));
+        let mut bracketed = false;
+        while let Some(open) = rest.strip_prefix('[') {
+            let (inside, tail) = open
+                .split_once(']')
+                .ok_or_else(|| syntax(format!("unclosed `[` in {rest:?}")))?;
+            parts.push(match inside.strip_prefix("name=") {
+                Some("") => return Err(syntax("`[name=]` names no item".to_string())),
+                Some(name) => PathPart::Named(name.to_string()),
+                None => PathPart::Index(inside.parse().map_err(|_| {
+                    syntax(format!("index {inside:?} is not a number or `name=<name>`"))
+                })?),
+            });
             rest = tail;
+            bracketed = true;
         }
+        if key.is_empty() && !bracketed {
+            return Err(syntax("empty path segment".to_string()));
+        }
+        if rest.is_empty() {
+            break;
+        }
+        rest = rest
+            .strip_prefix('.')
+            .ok_or_else(|| syntax(format!("unexpected {rest:?} after `]`")))?;
     }
     Ok(parts)
 }
@@ -2295,6 +2313,19 @@ mod tests {
             ]
         );
         assert_eq!(parse_path(".").unwrap(), vec![]);
+        // A path may open with an index, for YAML whose root is a sequence.
+        assert_eq!(
+            parse_path("[0].name").unwrap(),
+            vec![Index(0), Key("name".into())]
+        );
+        assert_eq!(
+            parse_path("steps[name=load.raw].command").unwrap(),
+            vec![
+                Key("steps".into()),
+                PathPart::Named("load.raw".into()),
+                Key("command".into())
+            ]
+        );
 
         for bad in [
             "",
@@ -2304,12 +2335,28 @@ mod tests {
             "steps[0",
             "steps[0]tail",
             "steps[]",
+            "steps[name=]",
+            "steps[name=load",
         ] {
             let err = parse_path(bad).unwrap_err();
             assert!(
                 matches!(err, Error::EditTarget { .. }),
                 "{bad:?} must be refused as an edit-target error, got {err}"
             );
+        }
+
+        // Each refusal gives its own reason, not one a later check happens
+        // to reach.
+        for (bad, reason) in [
+            ("steps[0", "unclosed `[`"),
+            ("steps[name=load", "unclosed `[`"),
+            ("steps[0]tail", "after `]`"),
+            ("steps..command", "empty path segment"),
+            ("steps[name=]", "names no item"),
+            ("steps[x]", "not a number"),
+        ] {
+            let err = parse_path(bad).unwrap_err().to_string();
+            assert!(err.contains(reason), "{bad:?}: {err}");
         }
     }
 

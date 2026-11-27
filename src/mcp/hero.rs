@@ -615,7 +615,7 @@ fn protocol_edit_schema() -> Value {
         "type": "object",
         "properties": {
             "edit": { "type": "string", "enum": ["replace", "rewrite", "add", "append", "delete", "reorder"], "description": "Which edit to make." },
-            "path": { "type": "string", "description": "Where in arcform.yaml: dot-separated mapping keys with zero-based [N] sequence indices, such as `steps[2].command` or `params.port.default`; `.` alone is the manifest root (only `add` takes it)." },
+            "path": { "type": "string", "description": "Where in arcform.yaml: dot-separated mapping keys with zero-based [N] sequence indices, such as `steps[2].command` or `params.port.default`, or [name=<name>] for the sequence item whose `name` key is <name>, such as `steps[name=load].command`, which stays on that step when another writer adds or moves steps; `.` alone is the manifest root (only `add` takes it)." },
             "value": { "type": "string", "description": "replace and add: the new value, spliced verbatim; a multi-line value arrives already indented for where it lands." },
             "from": { "description": "rewrite: the text to change, which must occur exactly once in the value at `path`. reorder: the index the item is at (a whole number)." },
             "to": { "description": "rewrite: the text that replaces it. reorder: the index the item should end up at (a whole number)." },
@@ -1145,7 +1145,7 @@ pub(super) fn tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "protocol_edit",
-            description: "Make one edit to a Protocol's arcform.yaml, as `arc edit-protocol` does: replace a value, rewrite one fragment of it, add a key, append a sequence item, delete an element or reorder a sequence, addressed by a path such as `steps[2].command`. The edit is applied to the file's bytes, so every byte it does not target survives (comments, key order, quoting), and is checked by the loader before anything is written; one that does not apply or does not load is refused with the file untouched. The state replaced is kept in history. Returns the edited Protocol's steps. Runs nothing.",
+            description: "Make one edit to a Protocol's arcform.yaml, as `arc edit-protocol` does: replace a value, rewrite one fragment of it, add a key, append a sequence item, delete an element or reorder a sequence, addressed by a path such as `steps[2].command`, or `steps[name=load].command` for the step named `load` wherever it stands, looked up in the file as it is edited. The edit is applied to the file's bytes, so every byte it does not target survives (comments, key order, quoting), and is checked by the loader before anything is written; one that does not apply or does not load is refused with the file untouched. The state replaced is kept in history. Returns the edited Protocol's steps. Runs nothing.",
             input_schema: protocol_edit_schema,
             handler: protocol_edit,
             annotations: Annotations::EDITS,

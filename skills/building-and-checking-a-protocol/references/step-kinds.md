@@ -38,9 +38,11 @@ Trying a `SELECT` with `sql_query` is how you check it before recording; the ans
 
 No verb rewrites a step's model in place. To change a step, delete it and record it again under the same name; it is recorded at the end of the list, so move it back before the steps that read its table.
 
+Address a step by its name, `steps[name=<step>]`, rather than by its place, `steps[<i>]`, counting from 0. arc looks the name up in the file as it edits it, so a step that another writer added or moved since you read the file does not turn the edit onto its neighbour. A name works anywhere an index does, as in `steps[name=<step>].with.<key>`.
+
 | Step | CLI | MCP |
 | --- | --- | --- |
-| Delete step `<i>` (counting from 0) | `arc edit-protocol --dir <dir> delete 'steps[<i>]'` | `protocol_edit` with `edit`, `path`, `dir` |
+| Delete the step named `<step>` | `arc edit-protocol --dir <dir> delete 'steps[name=<step>]'` | `protocol_edit` with `edit`, `path`, `dir` |
 | Move a step | `arc edit-protocol --dir <dir> reorder steps <from> <to>` | `protocol_edit` with `edit`, `path`, `from`, `to`, `dir` |
 
 ## 3. An operator
@@ -62,7 +64,7 @@ Read the operator's `with:` before recording it, and pass it as JSON. `operator_
 | --- | --- | --- |
 | The operator's `with:` schema | `arc operation describe <operator>` | `operator_describe` with `operator` |
 | Record it | `arc operator record <operator> --name <step> --with '<json>' --description "<why>" --dir <dir>` | `operator_record` with `operator`, `name`, `with`, `description`, `dir` |
-| Change one value of its `with:` | `arc edit-protocol --dir <dir> replace 'steps[<i>].with.<key>' <value>` | `protocol_edit` with `edit`, `path`, `value`, `dir` |
+| Change one value of its `with:` | `arc edit-protocol --dir <dir> replace 'steps[name=<step>].with.<key>' <value>` | `protocol_edit` with `edit`, `path`, `value`, `dir` |
 
 An operator's output file is declared by the operator, so do not add a `produces:` for it: a step that reads the file depends on its path. A fetch that should not re-download on every run takes a precondition, as brewtrend's do:
 
