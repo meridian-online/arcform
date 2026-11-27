@@ -34,7 +34,7 @@ From a shell, `arc run` prints the same graph: each asset with its row count, th
 | Fault in | How to change it |
 | --- | --- |
 | An operation or SQL step | Delete it and record it again under the same name, then move it back above the steps that read its table (see `step-kinds.md`) |
-| An operator's `with:` | `protocol_edit` with `edit` "replace" and `path` "steps[<i>].with.<key>" (`arc edit-protocol --dir <dir> replace 'steps[<i>].with.<key>' <value>`) |
+| An operator's `with:` | `protocol_edit` with `edit` "replace" and `path` "steps[name=<step>].with.<key>" (`arc edit-protocol --dir <dir> replace 'steps[name=<step>].with.<key>' <value>`) |
 | The source itself | Tell the user what the source holds; the fix may be a different source, or a different question |
 
 Then run, and read the result again in order: `run.outcome`, each step's `status.state`, each asset's `row_count`.
@@ -47,7 +47,7 @@ The empty-filter Protocol keeps the sales over 1,000. The run succeeds and `larg
 arc run
 arc table describe sales
 arc sql query "SELECT max(amount) AS largest FROM sales"
-arc edit-protocol delete 'steps[1]'
+arc edit-protocol delete 'steps[name=large_sales]'
 arc sql record "SELECT * FROM sales WHERE amount > 50" --name large_sales --description "Keep the sales over 50, the large ones in this data"
 arc run
 arc table describe large_sales

@@ -54,9 +54,9 @@ Every record verb takes a description: `--description "<why>"` from a shell, `de
 
 | Step | CLI | MCP |
 | --- | --- | --- |
-| Add a description to a step recorded without one | `arc edit-protocol --dir <dir> add 'steps[<i>]' description '"<why>"'` | `protocol_edit` with `edit`, `path`, `key`, `value`, `dir` |
+| Add a description to a step recorded without one | `arc edit-protocol --dir <dir> add 'steps[name=<step>]' description '"<why>"'` | `protocol_edit` with `edit`, `path`, `key`, `value`, `dir` |
 
-Over MCP, `edit` is "add", `path` is "steps[<i>]" (the step's place in the list, from 0) and `key` is "description". `value` is written into the YAML as it stands, so wrap it in double quotes inside the string, and inside them escape any `"` as `\"` and any `\` as `\\`; or wrap it in single quotes and double any `'` inside. A description with a colon in it is otherwise refused as a YAML error.
+Over MCP, `edit` is "add", `path` is "steps[name=<step>]" (the step named `<step>`; "steps[<i>]" names its place in the list, from 0, which another writer can change under you) and `key` is "description". `value` is written into the YAML as it stands, so wrap it in double quotes inside the string, and inside them escape any `"` as `\"` and any `\` as `\\`; or wrap it in single quotes and double any `'` inside. A description with a colon in it is otherwise refused as a YAML error.
 
 ## 5. Run
 
@@ -123,7 +123,7 @@ A restore keeps the state it replaces, so a wrong restore is undone by restoring
 | --- | --- |
 | The run exits 0 and you are about to present | Read `run.outcome`, each step's `status.state` and each asset's `row_count` first |
 | A table has 0 rows | Trace it upstream with `references/tracing-a-wrong-table.md`; do not present from it |
-| `invalid manifest: duplicate step name` | A step of that name exists. To change it, delete it (`protocol_edit` with `edit` set to "delete", or `arc edit-protocol --dir <dir> delete 'steps[<i>]'`) and record it again |
+| `invalid manifest: duplicate step name` | A step of that name exists. To change it, delete it (`protocol_edit` with `edit` set to "delete", or `arc edit-protocol --dir <dir> delete 'steps[name=<step>]'`) and record it again |
 | `dependency order violation: step '<a>' reads asset '<b>' but ... runs after it` | Steps are recorded at the end. Move the reader after the step that makes its table: `arc edit-protocol --dir <dir> reorder steps <from> <to>` (`protocol_edit` with `edit` set to "reorder") |
 | `sql_query` over `read_text` returns no rows | The path was relative, read from the server's working directory. Give the absolute path to the Protocol folder |
 | A replayed step's SELECT fails over MCP with `No files found that match the pattern` | `sql_query` reads relative paths from the server's working directory. Rewrite them as absolute paths under the Protocol folder |
