@@ -1963,6 +1963,14 @@ steps:
 
         let nothing = refusal(SPEC, vec!["nothing".into(), named("first")]);
         assert!(nothing.contains("nothing[name=first]"), "{nothing}");
+
+        // Text that does not load is refused with the loader's reason, not
+        // read as an empty document that holds no sequence.
+        let unloadable = refusal(
+            "steps:\n  - name: a\nsteps: []\n",
+            vec!["steps".into(), named("a")],
+        );
+        assert!(unloadable.contains("does not load as YAML"), "{unloadable}");
     }
 
     // A path with no name in it is applied without loading the document, so
