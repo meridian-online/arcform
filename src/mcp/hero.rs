@@ -615,7 +615,7 @@ fn protocol_edit_schema() -> Value {
         "type": "object",
         "properties": {
             "edit": { "type": "string", "enum": ["replace", "rewrite", "add", "append", "delete", "reorder"], "description": "Which edit to make." },
-            "path": { "type": "string", "description": "Where in arcform.yaml: dot-separated mapping keys with zero-based [N] sequence indices, such as `steps[2].command` or `params.port.default`; `.` alone is the manifest root (only `add` takes it)." },
+            "path": { "type": "string", "description": "Where in arcform.yaml: dot-separated mapping keys with zero-based [N] sequence indices, such as `steps[2].command` or `params.port.default`, or [name=<name>] for the sequence item whose `name` key is <name>, such as `steps[name=load].command`, which stays on that step when another writer adds or moves steps; `.` alone is the manifest root (only `add` takes it)." },
             "value": { "type": "string", "description": "replace and add: the new value, spliced verbatim; a multi-line value arrives already indented for where it lands." },
             "from": { "description": "rewrite: the text to change, which must occur exactly once in the value at `path`. reorder: the index the item is at (a whole number)." },
             "to": { "description": "rewrite: the text that replaces it. reorder: the index the item should end up at (a whole number)." },

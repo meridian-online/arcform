@@ -673,7 +673,10 @@ pub enum RegistryCmd {
 
 /// One edit to a protocol spec, addressed by PATH: dot-separated mapping keys
 /// with zero-based `[N]` sequence indices — `steps[2].command`,
-/// `params.port.default` — and `.` alone for the manifest root.
+/// `params.port.default` — and `.` alone for the manifest root. `[name=NAME]`
+/// in place of an index is the sequence item whose `name` key is NAME, such as
+/// `steps[name=load].command`: it stays on that step when another writer adds
+/// or moves steps, where an index would not.
 ///
 /// Replacement text is spliced verbatim, exactly as the library's write path
 /// takes it: multi-line values must arrive already indented for the position
