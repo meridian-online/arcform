@@ -1453,6 +1453,7 @@ fn hide_column_parameters() -> serde_json::Value {
                     a name, not SQL, so a name that needs quotes is given without them. \
                     A name the table does not have fails the run.",
                 "x-kind": "column",
+                "x-of": ["table"],
             }
         },
         "required": ["column"],
@@ -1491,12 +1492,14 @@ fn rename_column_parameters() -> serde_json::Value {
                     a name, not SQL, so a name that needs quotes is given without them. \
                     A name the table does not have fails the run.",
                 "x-kind": "column",
+                "x-of": ["table"],
             },
             "to": {
                 "type": "string",
                 "description": "The name the column takes; a name, not SQL, \
                     so a name that needs quotes is given without them.",
                 "x-kind": "column",
+                "x-new": true,
             }
         },
         "required": ["column", "to"],
@@ -1551,6 +1554,7 @@ fn derive_column_parameters() -> serde_json::Value {
                     The step adds the column as `__arc_derived` first and then renames it, \
                     so a table that already holds a column of that name is not one this operation can add to.",
                 "x-kind": "column",
+                "x-new": true,
             },
             "expression": {
                 "type": "string",
@@ -1609,6 +1613,7 @@ fn cast_column_parameters() -> serde_json::Value {
                     a name, not SQL, so a name that needs quotes is given without them. \
                     A name the table does not have fails the run.",
                 "x-kind": "column",
+                "x-of": ["table"],
             },
             "type": {
                 "type": "string",
@@ -2036,6 +2041,7 @@ fn fill_nulls_parameters() -> serde_json::Value {
                     a name, not SQL, so a name that needs quotes is given without them. \
                     A name the table does not have fails the run.",
                 "x-kind": "column",
+                "x-of": ["table"],
             },
             "value": {
                 "type": "string",
@@ -2102,7 +2108,7 @@ fn join_tables_parameters() -> serde_json::Value {
             },
             "using": {
                 "type": "array",
-                "items": { "type": "string", "x-kind": "column" },
+                "items": { "type": "string", "x-kind": "column", "x-of": ["table", "other"] },
                 "minItems": 1,
                 "description": "The columns the join is on, which both tables hold under the same name: \
                     names, not SQL, so a name that needs quotes is given without them. \
@@ -5168,6 +5174,65 @@ mod tests {
                 .is_ok(),
             "a column with a name was refused"
         );
+    }
+
+    #[test]
+    fn every_column_argument_says_whether_it_names_a_column_of_a_read_or_a_new_one() {
+        let mut seen = 0;
+        for op in CATALOGUE {
+            let tables: Vec<&str> = op
+                .reads
+                .iter()
+                .filter(|role| role.kind == "table")
+                .map(|role| role.name)
+                .collect();
+            let schema = (op.parameters)();
+            let properties = schema["properties"].as_object().expect("properties");
+            for (key, property) in properties {
+                let shape = if property["type"] == "array" {
+                    &property["items"]
+                } else {
+                    property
+                };
+                if shape["x-kind"] != "column" {
+                    continue;
+                }
+                seen += 1;
+                let at = format!("`{}`'s `{key}`", op.long_name);
+                match (shape.get("x-of"), shape.get("x-new")) {
+                    (Some(of), None) => {
+                        let of = of.as_array().expect("`x-of` is a list");
+                        assert!(!of.is_empty(), "{at} has an empty `x-of`");
+                        for role in of {
+                            assert!(
+                                role.as_str().is_some_and(|r| tables.contains(&r)),
+                                "{at} names {role} in `x-of`, which is no table it reads"
+                            );
+                        }
+                    }
+                    (None, Some(new)) => {
+                        assert_eq!(new, true, "{at} has an `x-new` other than `true`");
+                    }
+                    (of, new) => panic!(
+                        "{at} needs exactly one of `x-of` and `x-new`, and has {of:?} and {new:?}"
+                    ),
+                }
+            }
+        }
+        assert_eq!(seen, 7, "the column arguments the catalogue holds changed");
+        let new_ones = |op: &str| -> Vec<String> {
+            let schema = (operation(op).unwrap().parameters)();
+            schema["properties"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(_, p)| p["x-new"] == true)
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+        assert_eq!(new_ones(RENAME_COLUMN), ["to"]);
+        assert_eq!(new_ones(DERIVE_COLUMN), ["column"]);
+        assert!(new_ones(HIDE_COLUMN).is_empty());
     }
 
     #[test]
