@@ -975,11 +975,12 @@ fn parse_path(raw: &str) -> Result<Vec<PathPart>> {
         if key.is_empty() && !bracketed {
             return Err(syntax("empty path segment".to_string()));
         }
-        match rest.strip_prefix('.') {
-            Some(next) => rest = next,
-            None if rest.is_empty() => break,
-            None => return Err(syntax(format!("unexpected {rest:?} after `]`"))),
+        if rest.is_empty() {
+            break;
         }
+        rest = rest
+            .strip_prefix('.')
+            .ok_or_else(|| syntax(format!("unexpected {rest:?} after `]`")))?;
     }
     Ok(parts)
 }
@@ -2342,6 +2343,20 @@ mod tests {
                 matches!(err, Error::EditTarget { .. }),
                 "{bad:?} must be refused as an edit-target error, got {err}"
             );
+        }
+
+        // Each refusal gives its own reason, not one a later check happens
+        // to reach.
+        for (bad, reason) in [
+            ("steps[0", "unclosed `[`"),
+            ("steps[name=load", "unclosed `[`"),
+            ("steps[0]tail", "after `]`"),
+            ("steps..command", "empty path segment"),
+            ("steps[name=]", "names no item"),
+            ("steps[x]", "not a number"),
+        ] {
+            let err = parse_path(bad).unwrap_err().to_string();
+            assert!(err.contains(reason), "{bad:?}: {err}");
         }
     }
 

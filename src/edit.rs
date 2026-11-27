@@ -810,7 +810,7 @@ fn with_names_resolved(text: &str, edit: &SpecEdit) -> Result<SpecEdit> {
 fn names_resolved(text: &str, path: &[PathPart]) -> Result<Vec<PathPart>> {
     let document = load_value(path, text)?;
     let mut here = Some(&document);
-    let mut resolved = Vec::with_capacity(path.len());
+    let mut resolved = Vec::new();
     for part in path {
         let part = match part {
             PathPart::Named(name) => {
