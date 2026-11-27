@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 
 /// Every type, constant and function `arcform::spec` re-exports, and the module that
 /// owns it. An `impl` on any of these names may only appear in its owning file.
-const EXPORTED: [(&str, &str); 48] = [
+const EXPORTED: [(&str, &str); 51] = [
     ("Manifest", "manifest.rs"),
     ("Step", "manifest.rs"),
     ("Severity", "manifest.rs"),
@@ -79,6 +79,11 @@ const EXPORTED: [(&str, &str); 48] = [
     ("amend_step_sql", "record.rs"),
     ("GENERATED_MARKER", "record.rs"),
     ("sql_is_generated", "record.rs"),
+    // An operation's model, given without a Protocol: what a preview runs is
+    // what the record path writes.
+    ("OperationRequest", "record.rs"),
+    ("OperationModel", "record.rs"),
+    ("operation_model", "record.rs"),
     // Local history: the middle tier between undo and version control, and
     // the checkpointed roads machine edits take through it.
     ("LocalHistory", "history.rs"),
@@ -223,7 +228,7 @@ const MODULE_FILES: [&str; 59] = [
 /// `src/spec.rs`: editing an existing spec goes through the write path, which splices
 /// original bytes and never re-serialises. This freeze keeps any change to that
 /// arrangement a deliberate, version-visible act instead of a silent drift.
-const FROZEN_DERIVES: [(&str, &str, &[&str]); 27] = [
+const FROZEN_DERIVES: [(&str, &str, &[&str]); 29] = [
     (
         "words.rs",
         "Alias",
@@ -330,6 +335,14 @@ const FROZEN_DERIVES: [(&str, &str, &[&str]); 27] = [
     (
         "record.rs",
         "RecordedStep",
+        &["Debug", "Clone", "PartialEq", "Eq"],
+    ),
+    // A request borrows its parts, so it is `Copy`; like a recorded step it is
+    // NOT a serde type, since the JSON it holds is the caller's to send.
+    ("record.rs", "OperationRequest", &["Debug", "Clone", "Copy"]),
+    (
+        "record.rs",
+        "OperationModel",
         &["Debug", "Clone", "PartialEq", "Eq"],
     ),
     // The history values are plain data like the edit values, and NOT serde
@@ -1268,6 +1281,11 @@ fn exported_modules_declare_only_contracted_items() {
             "record_step",
             "amend_step_sql",
             "sql_is_generated",
+            // An operation's model without a Protocol, and the request and the
+            // answer it takes and gives.
+            "OperationRequest",
+            "OperationModel",
+            "operation_model",
         ]),
         "a `pub` item in `record.rs` is public API once its type is re-exported; \
          use `pub(crate)` unless you mean to promise it"

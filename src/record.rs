@@ -184,7 +184,9 @@ fn write_recorded(
         path: manifest_path.clone(),
         source: e,
     })?;
-    let steps_before = Manifest::from_yaml_str(&original)?.steps.len();
+    // A manifest that does not load is refused for that first, before the
+    // model's path is looked at; `spliced` loads it again to count its steps.
+    Manifest::from_yaml_str(&original)?;
 
     // Where the model will land. Create mode: an occupied path is refused,
     // never overwritten — an existing file may carry authorship.
@@ -202,9 +204,36 @@ fn write_recorded(
     }
 
     // The manifest splice, applied and gated in memory FIRST: a refusal here
-    // means nothing has touched the disk. The new item copies the indentation
-    // of the last existing step, so the appended lines match the document's
-    // own convention.
+    // means nothing has touched the disk.
+    let validated = spliced(&original, step, &sql_cited)?;
+
+    // Both writes are now committed to. The checkpoint seam fires before the
+    // first byte changes on disk.
+    checkpoint(dir);
+
+    let models_dir_created = !models_abs.exists();
+    std::fs::create_dir_all(&models_abs)?;
+    if let Err(e) = write_atomic(&sql_abs, contents.as_bytes()) {
+        remove_orphan_model(&sql_abs, &models_abs, models_dir_created);
+        return Err(e);
+    }
+
+    if let Err(e) = validated.write_to(dir) {
+        // Take the model back out: a failed promotion leaves no orphan.
+        remove_orphan_model(&sql_abs, &models_abs, models_dir_created);
+        return Err(e);
+    }
+    Ok((sql_rel, validated))
+}
+
+/// `original`, a manifest's text, with a step named `step.name` citing
+/// `sql_cited` spliced onto the end of its `steps`, `step.description` as its
+/// `description:` when it has one, gated and read back in memory: what
+/// [`write_recorded`] writes, before it writes anything. The new item copies the
+/// indentation of the last existing step, so the appended lines match the
+/// document's own convention. Of `step` it reads the name and the description.
+fn spliced(original: &str, step: &RecordedStep, sql_cited: &str) -> Result<ValidatedSpec> {
+    let steps_before = Manifest::from_yaml_str(original)?.steps.len();
     let steps_path = vec![PathPart::Key("steps".to_string())];
     let item = |indent: &str| {
         let mut item = format!(
@@ -230,32 +259,15 @@ fn write_recorded(
         }
     } else {
         SpecEdit::Append {
-            item: item(&sequence_item_indent(&original, &steps_path)?),
+            item: item(&sequence_item_indent(original, &steps_path)?),
             path: steps_path,
         }
     };
-    let validated = apply_edits(&original, &[edit])?;
+    let validated = apply_edits(original, &[edit])?;
 
     // The reloaded document is the arbiter: see [`reads_back`].
-    reads_back(validated.manifest(), steps_before, step, &sql_cited)?;
-
-    // Both writes are now committed to. The checkpoint seam fires before the
-    // first byte changes on disk.
-    checkpoint(dir);
-
-    let models_dir_created = !models_abs.exists();
-    std::fs::create_dir_all(&models_abs)?;
-    if let Err(e) = write_atomic(&sql_abs, contents.as_bytes()) {
-        remove_orphan_model(&sql_abs, &models_abs, models_dir_created);
-        return Err(e);
-    }
-
-    if let Err(e) = validated.write_to(dir) {
-        // Take the model back out: a failed promotion leaves no orphan.
-        remove_orphan_model(&sql_abs, &models_abs, models_dir_created);
-        return Err(e);
-    }
-    Ok((sql_rel, validated))
+    reads_back(validated.manifest(), steps_before, step, sql_cited)?;
+    Ok(validated)
 }
 
 /// Rewrite the SQL of the recorded step named `step_name` — permitted only
@@ -2937,26 +2949,30 @@ fn unlocated(tree: &serde_json::Value) -> serde_json::Value {
 
 // ------------------------------------------------- recording an operation
 
-/// What a caller asks [`record_operation`] to record. The command line and `arc
-/// mcp` each build one from what they were given and hand it over unchanged.
-#[derive(Clone, Copy)]
-pub(crate) struct OperationRequest<'a> {
+/// An operation asked for as a step: what [`operation_model`] writes the model
+/// of, and what `arc operation record` and `arc mcp`'s `operation_record` record.
+/// The command line and `arc mcp` each build one from what they were given and
+/// hand it over unchanged. Its fields are the keys `operation_record` takes, as
+/// JSON: an argument `arc operation describe` types `integer` is a JSON integer
+/// here, and a list role's tables are a JSON list.
+#[derive(Debug, Clone, Copy)]
+pub struct OperationRequest<'a> {
     /// The operation's long name, as `arc operation list` lists it.
-    pub(crate) long_name: &'a str,
+    pub long_name: &'a str,
     /// The table the operation is applied to: shorthand for the role `table`
     /// in `reads`, so it is given there or here, not both. `None` when `reads`
     /// names it, or the operation reads no table.
-    pub(crate) on: Option<&'a str>,
+    pub on: Option<&'a str>,
     /// Each table the operation reads, by the name of the role it plays, as
     /// `arc operation describe` lists them: a table name for a single role, a
     /// list of names for a list. Empty when `on` names the one table read.
-    pub(crate) reads: &'a serde_json::Map<String, serde_json::Value>,
+    pub reads: &'a serde_json::Map<String, serde_json::Value>,
     /// The new step's name, which is also the name of the table it makes.
-    pub(crate) name: &'a str,
+    pub name: &'a str,
     /// The operation's arguments.
-    pub(crate) arguments: &'a serde_json::Map<String, serde_json::Value>,
+    pub arguments: &'a serde_json::Map<String, serde_json::Value>,
     /// The step's `description:`, or `None` for a step with none.
-    pub(crate) description: Option<&'a str>,
+    pub description: Option<&'a str>,
 }
 
 /// What [`record_operation`] recorded.
@@ -3008,14 +3024,88 @@ pub(crate) fn record_operation(
     history: &crate::history::LocalHistory,
 ) -> Result<Recorded> {
     let Some(op) = operation(request.long_name) else {
-        let held: Vec<&str> = CATALOGUE.iter().map(|op| op.long_name).collect();
-        return Err(refused(format!(
-            "no operation called `{}`; the operations arc holds are {}",
-            request.long_name,
-            held.join(", ")
-        )));
+        return Err(not_held(request.long_name));
     };
     op.record(dir, request, history)
+}
+
+/// The model of an operation's step, as [`operation_model`] gives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationModel {
+    /// The model's bytes, as `arc operation record` writes them under `models/`:
+    /// the [`GENERATED_MARKER`] line, the operation's record line, then the
+    /// operation's SQL.
+    pub model: String,
+    /// What the operation says of the step, a sentence each, as `arc operation
+    /// record` says them: empty for an operation that says nothing.
+    pub notes: Vec<String>,
+}
+
+/// **The model arc would write for `request`, writing nothing**: the bytes
+/// `arc operation record` writes under `models/` for the same request in any
+/// Protocol it records it in, with the notes it says. It reads no file, opens no
+/// Protocol's database and runs none of the step's SQL; a SQL fragment is
+/// parsed and probed on an empty in-memory DuckDB, as the record path does.
+///
+/// A tool that previews an operation while a person fills in its arguments asks
+/// for the model here, runs it on its own connection, and records the step
+/// through `arc operation record` once the person keeps it. The model does not
+/// depend on the Protocol: arc writes the same bytes for a request whichever
+/// folder it is recorded in, so what is previewed is what is recorded.
+///
+/// Refused as `arc operation record` refuses the request, with each message in
+/// its words: an operation arc does not hold; arguments the operation does not
+/// admit; reads it does not admit; a step name or a description the record
+/// path refuses (see [`record_step`]). What depends on a Protocol is not
+/// checked, since there is none: whether a step makes each table read, and
+/// whether a step already has the name. `arc operation record` still refuses
+/// those.
+///
+/// # Errors
+///
+/// The refusals above, each naming what was wrong.
+pub fn operation_model(request: &OperationRequest) -> Result<OperationModel> {
+    let Some(op) = operation(request.long_name) else {
+        return Err(not_held(request.long_name));
+    };
+    let OperationRequest {
+        long_name: _,
+        on,
+        reads,
+        name,
+        arguments,
+        description,
+    } = *request;
+    let (_, model) = op.model(on, reads, name, arguments)?;
+    valid_step_name(name)?;
+    if let Some(description) = description {
+        valid_description(description)?;
+    }
+    // The splice the record path makes, onto a Protocol of no steps, so a name
+    // or a description that would not read back as itself is refused here too.
+    let recorded = RecordedStep {
+        name: name.to_string(),
+        sql: String::new(),
+        provenance: String::new(),
+        description: description.map(str::to_string),
+    };
+    spliced(
+        "name: model\nsteps: []\n",
+        &recorded,
+        &format!("models/01_{}.sql", filename_slug(name)),
+    )?;
+    let notes = op.notes.map(|notes| notes(arguments)).unwrap_or_default();
+    Ok(OperationModel { model, notes })
+}
+
+/// The refusal of a request for an operation arc does not hold, naming those it
+/// does.
+fn not_held(long_name: &str) -> Error {
+    let held: Vec<&str> = CATALOGUE.iter().map(|op| op.long_name).collect();
+    refused(format!(
+        "no operation called `{long_name}`; the operations arc holds are {}",
+        held.join(", ")
+    ))
 }
 
 /// A model's provenance, the text after its [`GENERATED_MARKER`]: `long_name`,
