@@ -2601,11 +2601,12 @@ pub(crate) fn operation(long_name: &str) -> Option<&'static Operation> {
 /// the `maximum` rather than as a string. A value of type `array` whose items
 /// are strings is split on each `,` into that list, each item trimmed, so
 /// `using=a, b` gives `["a", "b"]`; an empty item, `a,,b`, is kept for admit to
-/// refuse. Such a value that opens with `[` is read instead as a JSON list,
-/// each item as written, so `using=["north, south", "region"]` gives an item
-/// holding a comma; one that does not read as a JSON list is refused, naming
-/// the argument, rather than split, since a name opening with `[` is given as
-/// a JSON list too, `using=["[units]"]`. A JSON list's items are not checked
+/// refuse. Such a value that opens with `[`, after any leading whitespace, is
+/// read instead as a JSON list, each item as written, so
+/// `using=["north, south", "region"]` gives an item holding a comma; one that
+/// does not read as a JSON list is refused, naming the argument, rather than
+/// split, since a name opening with `[` is given as a JSON list too,
+/// `using=["[units]"]`. A JSON list's items are not checked
 /// here: an item that is not a string is admit's to refuse. An operation arc
 /// does not hold leaves the arguments as given, for [`record_operation`] to
 /// refuse. `arc mcp` passes JSON, whose integers and lists are already
@@ -2637,11 +2638,11 @@ pub(crate) fn typed_arguments(
 }
 
 /// The command line's `text` for the list argument `key` of `long_name`, as
-/// [`typed_arguments`] reads it: a JSON list when it opens with `[`, refused
-/// when it does not read as one, and otherwise split on each `,`, each item
-/// trimmed.
+/// [`typed_arguments`] reads it: a JSON list when it opens with `[` after any
+/// leading whitespace, as `using= ["a, b"]` does, refused when it does not read
+/// as one, and otherwise split on each `,`, each item trimmed.
 fn list_of_strings(long_name: &str, key: &str, text: &str) -> Result<serde_json::Value> {
-    if !text.starts_with('[') {
+    if !text.trim_start().starts_with('[') {
         return Ok(text.split(',').map(str::trim).collect::<Vec<_>>().into());
     }
     match serde_json::from_str::<serde_json::Value>(text) {
@@ -6916,7 +6917,18 @@ mod tests {
             "a JSON list of names is refused by admit"
         );
 
-        for given in ["[units]", "[\"a\", ", "[a, b]"] {
+        let spaced = typed_arguments(
+            JOIN_TABLES,
+            arguments(serde_json::json!({ "using": r#" ["north, south"]"# })),
+        )
+        .unwrap();
+        assert_eq!(
+            spaced["using"],
+            serde_json::json!(["north, south"]),
+            "a JSON list after a space is split on its commas"
+        );
+
+        for given in ["[units]", "[\"a\", ", "[a, b]", " [a, b]"] {
             let err = typed_arguments(
                 JOIN_TABLES,
                 arguments(serde_json::json!({ "using": given })),
