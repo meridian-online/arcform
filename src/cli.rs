@@ -524,8 +524,8 @@ pub enum OperationCmd {
 
         /// An argument of the operation (repeatable), as `arc operation describe`
         /// lists them. Format: KEY=VALUE. A list argument takes its items
-        /// comma-separated (`using=a,b`), so an item holding a comma can be given
-        /// through `arc mcp` alone.
+        /// comma-separated (`using=a,b`), or as a JSON list of strings
+        /// (`using='["north, south","region"]'`) for an item holding a comma.
         #[arg(long = "arg", value_name = "KEY=VALUE")]
         args: Vec<String>,
 
@@ -1708,7 +1708,8 @@ fn dispatch_operation(cmd: OperationCmd, out: &mut impl Write) -> Result<()> {
             // is turned into one here, as `arc mcp`'s JSON gives it. `--read`
             // gives a role's tables one at a time; a list role's are gathered
             // into a list here, as `arc mcp`'s JSON gives them.
-            let arguments = crate::record::typed_arguments(&long_name, operation_arguments(&args)?);
+            let arguments =
+                crate::record::typed_arguments(&long_name, operation_arguments(&args)?)?;
             let reads = crate::record::typed_reads(&long_name, &operation_reads(&reads)?);
             let history = open_history()?;
             let request = crate::record::OperationRequest {

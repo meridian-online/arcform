@@ -400,3 +400,42 @@ fn a_cross_join_pairs_every_order_with_every_customer() {
         "three orders by three customers"
     );
 }
+
+#[test]
+fn a_using_key_holding_a_comma_is_given_on_the_command_line_as_a_json_list() {
+    let protocol = Protocol::new();
+    std::fs::write(
+        protocol.dir.join("models/01_orders.sql"),
+        ORDERS_SQL.replace("customer_id", "\"customer, id\""),
+    )
+    .unwrap();
+    std::fs::write(
+        protocol.dir.join("models/02_customers.sql"),
+        CUSTOMERS_SQL.replace("customer_id", "\"customer, id\""),
+    )
+    .unwrap();
+    protocol.record_and_run(&[r#"using=["customer, id"]"#]);
+    assert_eq!(
+        protocol.columns(),
+        ["customer, id", "id", "name", "amount", "customers_name"]
+    );
+    assert_eq!(
+        protocol.rows("SELECT id, customers_name FROM joined ORDER BY id"),
+        [
+            (Some(1), Some("Ann".to_string())),
+            (Some(2), Some("Bo".to_string())),
+            (Some(3), None),
+        ]
+    );
+
+    let out = protocol.record_join(&["using=[customer, id]"]);
+    assert!(
+        !out.status.success(),
+        "a bracketed list that is not JSON was recorded"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("opens with `[` but is not a JSON list"),
+        "{stderr}"
+    );
+}

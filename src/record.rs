@@ -2601,17 +2601,21 @@ pub(crate) fn operation(long_name: &str) -> Option<&'static Operation> {
 /// the `maximum` rather than as a string. A value of type `array` whose items
 /// are strings is split on each `,` into that list, each item trimmed, so
 /// `using=a, b` gives `["a", "b"]`; an empty item, `a,,b`, is kept for admit to
-/// refuse, and a string holding a comma cannot be given as one item here, only
-/// through `arc mcp`. An operation arc
+/// refuse. Such a value that opens with `[` is read instead as a JSON list,
+/// each item as written, so `using=["north, south", "region"]` gives an item
+/// holding a comma; one that does not read as a JSON list is refused, naming
+/// the argument, rather than split, since a name opening with `[` is given as
+/// a JSON list too, `using=["[units]"]`. A JSON list's items are not checked
+/// here: an item that is not a string is admit's to refuse. An operation arc
 /// does not hold leaves the arguments as given, for [`record_operation`] to
-/// refuse. `arc mcp` passes JSON, whose integers are already integers, and does
-/// not call this.
+/// refuse. `arc mcp` passes JSON, whose integers and lists are already
+/// integers and lists, and does not call this.
 pub(crate) fn typed_arguments(
     long_name: &str,
     arguments: serde_json::Map<String, serde_json::Value>,
-) -> serde_json::Map<String, serde_json::Value> {
+) -> Result<serde_json::Map<String, serde_json::Value>> {
     let Some(op) = operation(long_name) else {
-        return arguments;
+        return Ok(arguments);
     };
     let schema = (op.parameters)();
     arguments
@@ -2623,13 +2627,31 @@ pub(crate) fn typed_arguments(
                 Some(text)
                     if property["type"] == "array" && property["items"]["type"] == "string" =>
                 {
-                    Some(text.split(',').map(str::trim).collect::<Vec<_>>().into())
+                    Some(list_of_strings(long_name, &key, text)?)
                 }
                 _ => None,
             };
-            (key, typed.unwrap_or(value))
+            Ok((key, typed.unwrap_or(value)))
         })
         .collect()
+}
+
+/// The command line's `text` for the list argument `key` of `long_name`, as
+/// [`typed_arguments`] reads it: a JSON list when it opens with `[`, refused
+/// when it does not read as one, and otherwise split on each `,`, each item
+/// trimmed.
+fn list_of_strings(long_name: &str, key: &str, text: &str) -> Result<serde_json::Value> {
+    if !text.starts_with('[') {
+        return Ok(text.split(',').map(str::trim).collect::<Vec<_>>().into());
+    }
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(list @ serde_json::Value::Array(_)) => Ok(list),
+        _ => Err(refused(format!(
+            "the argument `{key}` of `{long_name}` opens with `[` but is not a JSON list: \
+             give its items comma-separated, or as a JSON list of strings such as \
+             `{key}=[\"a, b\", \"c\"]`, which also gives an item opening with `[`"
+        ))),
+    }
 }
 
 /// The `--read ROLE=TABLE` pairs the command line gives, in the order given, as
@@ -6109,7 +6131,8 @@ mod tests {
         let typed = typed_arguments(
             LIMIT_ROWS,
             arguments(serde_json::json!({ "count": "2", "order_by": "1" })),
-        );
+        )
+        .unwrap();
         assert_eq!(
             serde_json::Value::Object(typed),
             serde_json::json!({ "count": 2, "order_by": "1" })
@@ -6128,7 +6151,8 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                typed_arguments(LIMIT_ROWS, arguments(serde_json::json!({ "count": given })))["count"],
+                typed_arguments(LIMIT_ROWS, arguments(serde_json::json!({ "count": given })))
+                    .unwrap()["count"],
                 typed,
                 "{given:?}"
             );
@@ -6142,7 +6166,7 @@ mod tests {
             (FILTER_ROWS, serde_json::json!({ "where": "2" })),
             ("no-such-operation", serde_json::json!({ "count": "2" })),
         ] {
-            let typed = typed_arguments(operation, arguments(given.clone()));
+            let typed = typed_arguments(operation, arguments(given.clone())).unwrap();
             assert_eq!(serde_json::Value::Object(typed), given, "{operation}");
         }
     }
@@ -6848,7 +6872,7 @@ mod tests {
             "condition": "a, b",
         }));
         assert_eq!(
-            serde_json::Value::Object(typed_arguments(JOIN_TABLES, given)),
+            serde_json::Value::Object(typed_arguments(JOIN_TABLES, given).unwrap()),
             serde_json::json!({
                 "using": ["customer_id", "region"],
                 "kind": "full",
@@ -6858,11 +6882,64 @@ mod tests {
         let empty = typed_arguments(
             JOIN_TABLES,
             arguments(serde_json::json!({ "using": "a,,b" })),
-        );
+        )
+        .unwrap();
         assert_eq!(empty["using"], serde_json::json!(["a", "", "b"]));
         assert!(
             operation(JOIN_TABLES).unwrap().admit(&empty).is_err(),
             "an empty item is admitted"
+        );
+    }
+
+    #[test]
+    fn typed_arguments_read_a_list_opening_with_a_bracket_as_json_so_an_item_can_hold_a_comma() {
+        let typed = typed_arguments(
+            JOIN_TABLES,
+            arguments(serde_json::json!({
+                "using": r#"["north, south", " region ", "[units]"]"#,
+                "condition": "[a] = [b]",
+            })),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::Value::Object(typed.clone()),
+            serde_json::json!({
+                "using": ["north, south", " region ", "[units]"],
+                "condition": "[a] = [b]",
+            }),
+            "a JSON list's items are kept as written, and a string argument is not read as JSON"
+        );
+        let mut one = typed;
+        one.remove("condition");
+        assert!(
+            operation(JOIN_TABLES).unwrap().admit(&one).is_ok(),
+            "a JSON list of names is refused by admit"
+        );
+
+        for given in ["[units]", "[\"a\", ", "[a, b]"] {
+            let err = typed_arguments(
+                JOIN_TABLES,
+                arguments(serde_json::json!({ "using": given })),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains(
+                    "the argument `using` of `join-tables` opens with `[` but is not a JSON list"
+                ) && err.contains(r#"`using=["a, b", "c"]`"#),
+                "{given:?} was refused with another message: {err}"
+            );
+        }
+
+        let numbers = typed_arguments(
+            JOIN_TABLES,
+            arguments(serde_json::json!({ "using": "[1, 2]" })),
+        )
+        .unwrap();
+        assert_eq!(numbers["using"], serde_json::json!([1, 2]));
+        assert!(
+            operation(JOIN_TABLES).unwrap().admit(&numbers).is_err(),
+            "a JSON list of numbers is admitted as column names"
         );
     }
 
