@@ -403,8 +403,8 @@ pub(crate) fn with_schema(op_name: &str) -> Option<serde_json::Value> {
                 "columns": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "The numeric columns to reduce, in order. A numeric scalar contributes one feature; a list/array of numerics — a vector column — contributes one per element. There is no text column and no model: to map text, write a vector column from it first (text_embed, or a SQL step calling the DuckDB embedding extension)." },
                 "out": { "type": "string", "description": "Parquet to write — every input column plus projection_x and projection_y as DOUBLE, and projection_fit_id (VARCHAR, same value on every row) fingerprinting the exact numbers and knobs this fit consumed." },
                 "fit": { "type": "string", "description": "Where the fitted projection is kept between runs, and the field that makes the map hold still when rows are appended. Declared as an asset this step both READS and PRODUCES: the first run writes it, every later run reads it back, and rows the fit already holds come back with the same coordinates while appended rows are placed into that layout instead of starting a new one. Omit it and every run refits the whole input, so appending one row moves every point. Two consequences worth knowing before you set it: deleting the file marks the step stale and refits, which is how you ask for a new layout on purpose; and moving neighbors, min_dist or metric while a fit exists is REFUSED naming the mismatch, because those knobs are part of what the fit is." },
-                "neighbors": { "type": "integer", "minimum": 2, "default": 15, "x-at-most": { "rows_of": "input", "minus": 1, "bounds_default": true }, "description": "UMAP n_neighbors: low reads local structure, high reads global. At most one below the input's row count: arc run counts the rows of the Parquet `input` names when the step runs, and refuses a value above that bound before the script starts, naming the value and the row count. An unset value takes 15 or that bound, whichever is smaller. x-at-most states the bound for a program: rows_of names the with: key whose Parquet is counted, minus what is taken off its row count, and bounds_default that the bound applies to the default as well. The bound is arcform's, not umap-learn's, so umap-learn's documentation for n_neighbors does not describe it." },
-                "min_dist": { "type": "number", "minimum": 0, "exclusiveMaximum": 1, "default": 0.1, "description": "UMAP min_dist: how tightly points may pack." },
+                "neighbors": { "type": "integer", "minimum": 2, "default": 15, "x-at-most": { "rows_of": "input", "minus": 1, "bounds_default": true }, "x-ends": ["local", "global"], "description": "UMAP n_neighbors: low reads local structure, high reads global. At most one below the input's row count: arc run counts the rows of the Parquet `input` names when the step runs, and refuses a value above that bound before the script starts, naming the value and the row count. An unset value takes 15 or that bound, whichever is smaller. x-at-most states the bound for a program: rows_of names the with: key whose Parquet is counted, minus what is taken off its row count, and bounds_default that the bound applies to the default as well. The bound is arcform's, not umap-learn's, so umap-learn's documentation for n_neighbors does not describe it." },
+                "min_dist": { "type": "number", "minimum": 0, "exclusiveMaximum": 1, "default": 0.1, "x-ends": ["packed", "spread"], "description": "UMAP min_dist: how tightly points may pack." },
                 "metric": { "type": "string", "enum": UMAP_METRICS, "default": "euclidean", "description": "How the distance between two rows is measured. The default is the reading an arbitrary feature matrix wants; cosine is the reading an L2-normalised vector column wants. Nothing here scales your columns — under euclidean a wider-spread column dominates the layout, which is a decision for the SQL step that selects them." }
             }),
             &["input", "columns", "out"],
@@ -583,6 +583,7 @@ const IGNORED_KEYWORDS: &[&str] = &[
     "default",
     "x-at-most",
     "x-at-most-one-of",
+    "x-ends",
     "x-kind",
     "x-required-for",
 ];
@@ -2304,6 +2305,45 @@ mod with_schema_tests {
                 "`{role}` is a role and stays in splink's `parameters`: {described}"
             );
         }
+    }
+
+    /// `x-ends` gives a number's range two words, for its low end and its high end,
+    /// so a client can label a bar drawn over the range in arc's words rather than its
+    /// own. The words follow each value's description: few neighbors read local
+    /// structure and many global, and a small `min_dist` packs points where a large one
+    /// spreads them.
+    #[test]
+    fn umap_projects_numbers_say_what_their_ends_mean() {
+        let described = description("umap_project").expect("umap_project is described");
+        let properties = &described["parameters"]["properties"];
+        assert_eq!(
+            properties["neighbors"]["x-ends"],
+            json!(["local", "global"]),
+            "{}",
+            properties["neighbors"]
+        );
+        assert_eq!(
+            properties["min_dist"]["x-ends"],
+            json!(["packed", "spread"]),
+            "{}",
+            properties["min_dist"]
+        );
+    }
+
+    /// `x-ends` is a label and says nothing about the value, so the `with:` check
+    /// passes over it: a block that fits umap_project's schema, `x-ends` and all, has
+    /// no fault.
+    #[test]
+    fn x_ends_is_an_annotation_the_checker_ignores() {
+        assert!(IGNORED_KEYWORDS.contains(&"x-ends"));
+        let schema = with_schema("umap_project").expect("umap_project has a with: schema");
+        assert!(schema["properties"]["neighbors"].get("x-ends").is_some());
+        let faults = check_with(
+            "umap_project",
+            &json!({"input": "i", "columns": ["a"], "out": "o", "neighbors": 5, "min_dist": 0.5}),
+        )
+        .expect("umap_project has a with: schema");
+        assert!(faults.is_empty(), "{faults:?}");
     }
 
     /// Every name `assets()` records comes from a key the description lists in the
