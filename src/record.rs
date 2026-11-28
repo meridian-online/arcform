@@ -2124,8 +2124,9 @@ fn join_tables_parameters() -> serde_json::Value {
                 "minItems": 1,
                 "description": "The columns the join is on, which both tables hold under the same name: \
                     names, not SQL, so a name that needs quotes is given without them. \
-                    On the command line a comma separates them (`using=a,b`), so a name holding a comma \
-                    can be given through `arc mcp` alone. Every kind but `cross` takes this or `condition`.",
+                    On the command line a comma separates them (`using=a,b`); a name holding a comma, or one \
+                    opening with `[`, is given in a JSON list (`using=[\"north, south\",\"region\"]`). \
+                    Every kind but `cross` takes this or `condition`.",
             },
             "condition": {
                 "type": "string",
