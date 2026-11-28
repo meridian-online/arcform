@@ -282,9 +282,11 @@ pub fn rank(query: &str, candidate: &Candidate) -> Option<Rank> {
     }
 
     // Tier 6: a piece of the sentence. An earlier piece scores higher.
-    normalise(candidate.sentence).find(&query).map(|at| Rank {
+    // Count characters, not bytes, as `word_prefix` does.
+    let sentence = normalise(candidate.sentence);
+    sentence.find(&query).map(|at| Rank {
         tier: 6,
-        score: -(at as i32),
+        score: -(sentence[..at].chars().count() as i32),
         matched: Matched::Sentence,
     })
 }
@@ -643,6 +645,20 @@ mod tests {
         assert_eq!(rank("unls", &verb).map(|r| r.tier), Some(5));
         assert_eq!(rank("recorded last", &verb).map(|r| r.tier), Some(6));
         assert_eq!(rank("zzz", &verb), None);
+    }
+
+    #[test]
+    fn a_sentence_match_scores_by_characters_not_bytes() {
+        let verb = |sentence| Candidate {
+            title: None,
+            long_name: "x",
+            aliases: &[],
+            sentence,
+        };
+        let plain = rank("rows", &verb("Ab the rows.")).expect("plain matches");
+        let accented = rank("rows", &verb("\u{e9}b the rows.")).expect("accented matches");
+        assert_eq!((plain.tier, plain.score), (6, -7));
+        assert_eq!(accented.score, plain.score);
     }
 
     #[test]
