@@ -121,7 +121,14 @@ const EXPORTED: [(&str, &str); 51] = [
 /// Every type `arcform::words` publishes, and the module that owns it. Kept apart
 /// from `EXPORTED`, which is compared exactly with `spec`'s re-exports, and joined to
 /// it wherever an impl's location or a rename is checked.
-const WORDS_EXPORTED: [(&str, &str); 2] = [("Alias", "words.rs"), ("OperationWords", "words.rs")];
+const WORDS_EXPORTED: [(&str, &str); 6] = [
+    ("Alias", "words.rs"),
+    ("OperationWords", "words.rs"),
+    ("Matched", "words.rs"),
+    ("Rank", "words.rs"),
+    ("Candidate", "words.rs"),
+    ("Hit", "words.rs"),
+];
 
 /// Every module file in the crate. Frozen so a new one cannot be added without
 /// passing under the checks below.
@@ -228,7 +235,7 @@ const MODULE_FILES: [&str; 59] = [
 /// `src/spec.rs`: editing an existing spec goes through the write path, which splices
 /// original bytes and never re-serialises. This freeze keeps any change to that
 /// arrangement a deliberate, version-visible act instead of a silent drift.
-const FROZEN_DERIVES: [(&str, &str, &[&str]); 29] = [
+const FROZEN_DERIVES: [(&str, &str, &[&str]); 33] = [
     (
         "words.rs",
         "Alias",
@@ -239,6 +246,14 @@ const FROZEN_DERIVES: [(&str, &str, &[&str]); 29] = [
         "OperationWords",
         &["Debug", "Clone", "PartialEq", "Eq", "Deserialize"],
     ),
+    (
+        "words.rs",
+        "Matched",
+        &["Debug", "Clone", "PartialEq", "Eq"],
+    ),
+    ("words.rs", "Rank", &["Debug", "Clone", "PartialEq", "Eq"]),
+    ("words.rs", "Candidate", &["Debug", "Clone", "Copy"]),
+    ("words.rs", "Hit", &["Debug", "Clone", "PartialEq", "Eq"]),
     (
         "manifest.rs",
         "Param",
@@ -1095,7 +1110,16 @@ fn the_words_module_declares_only_contracted_items() {
             "OperationWords",
             "operations",
             "of",
-            "landscape_commit"
+            "landscape_commit",
+            // The matcher: how well a text matches one operation, and every
+            // operation a text finds.
+            "Matched",
+            "Rank",
+            "Candidate",
+            "Hit",
+            "normalise",
+            "rank",
+            "search",
         ]),
         "`arcform::words` is published. A new `pub` item there widens the contract: \
          add it here deliberately, or make it `pub(crate)`"
