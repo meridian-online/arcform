@@ -27,6 +27,7 @@ use serde_yaml::Value;
 use crate::engine::StepOutput;
 use crate::error::{Error, Result};
 
+mod bound;
 mod ducklake_publish;
 #[cfg(feature = "http-fetch")]
 mod ducklake_write;
@@ -6773,39 +6774,26 @@ impl UmapProjectConfig {
         let Some(asked) = self.neighbors else {
             return Ok(());
         };
-        let Some(rows) = parquet_row_count(&dir.join(&self.input)) else {
+        let rule = with_schema("umap_project")
+            .map(|schema| schema["properties"]["neighbors"]["x-at-most"].clone())
+            .unwrap_or_default();
+        let with = serde_json::json!({ "input": self.input });
+        let Some(bound) = bound::work_out(&rule, &with, dir) else {
             return Ok(());
         };
-        let bound = rows.saturating_sub(1);
-        if asked > bound {
-            return Err(Error::ManifestValidation(format!(
-                "umap_project: `neighbors: {}` is above {}, one below the {} rows of {} \
-                 — UMAP cannot place a point against more rows than there are besides \
-                 it. Set `neighbors:` to {} or less, or leave it unset to take 15 or {}, \
-                 whichever is smaller",
-                asked, bound, rows, self.input, bound, bound
+        let Some(at_most) = bound.at_most else {
+            return Ok(());
+        };
+        if asked > at_most {
+            return Err(Error::ManifestValidation(bound::past_bound_sentence(
+                "umap_project",
+                "neighbors",
+                asked,
+                &bound,
             )));
         }
         Ok(())
     }
-}
-
-/// The number of rows in the Parquet at `path`, read in process, or `None` when it
-/// cannot be read. It counts what `umap_project.py` counts: every row `read_parquet`
-/// returns for the same path.
-fn parquet_row_count(path: &Path) -> Option<u64> {
-    let conn = duckdb::Connection::open_in_memory().ok()?;
-    let rows: i64 = conn
-        .query_row(
-            &format!(
-                "SELECT count(*) FROM read_parquet('{}')",
-                sql_lit(&path.display().to_string())
-            ),
-            [],
-            |row| row.get(0),
-        )
-        .ok()?;
-    u64::try_from(rows).ok()
 }
 
 /// Build umap_project.py's argv tail (everything after the script path). One
@@ -9765,20 +9753,6 @@ out: build/records.jsonl
             min_dist: None,
             metric: None,
         }
-    }
-
-    #[test]
-    fn parquet_row_count_counts_every_row_and_reads_none_from_a_missing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(
-            parquet_row_count(&parquet_of_rows(dir.path(), "in.parquet", 48)),
-            Some(48)
-        );
-        assert_eq!(
-            parquet_row_count(&parquet_of_rows(dir.path(), "empty.parquet", 0)),
-            Some(0)
-        );
-        assert_eq!(parquet_row_count(&dir.path().join("absent.parquet")), None);
     }
 
     /// The bound is one below the row count, exactly: on 48 rows 47 runs and 48 is
