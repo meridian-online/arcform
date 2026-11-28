@@ -328,14 +328,19 @@ fn best(matches: impl Iterator<Item = (i32, Matched)>) -> Option<(i32, Matched)>
 }
 
 /// Where `query` starts `text` or a word of it, as a score: 0 at the start of
-/// the text, lower for each character further in. A word starts the text or
-/// follows a character that is neither a letter, a digit nor an apostrophe,
-/// so "kee" starts "Keep Only" but not "Peek".
+/// the text, lower for each character further in. The text's start matches
+/// whatever its first character, so "@order" starts "@ORDER_BY". Further in, a
+/// word is a letter or digit that follows a character that is neither a
+/// letter, a digit nor an apostrophe, so "kee" starts "Keep Only" but "eek"
+/// does not start "Peek".
 fn word_prefix(query: &str, text: &str) -> Option<i32> {
     let mut previous: Option<char> = None;
     for (at, c) in text.char_indices() {
-        let starts_word = previous.is_none_or(|p| !(p.is_alphanumeric() || p == '\''));
-        if starts_word && c.is_alphanumeric() && text[at..].starts_with(query) {
+        let starts_word = match previous {
+            None => true,
+            Some(p) => c.is_alphanumeric() && !(p.is_alphanumeric() || p == '\''),
+        };
+        if starts_word && text[at..].starts_with(query) {
             return Some(-(text[..at].chars().count() as i32));
         }
         previous = Some(c);
@@ -494,6 +499,15 @@ mod tests {
             ("keep only", "filter-rows", 3, alias("Keep Only")),
             ("kee", "filter-rows", 4, alias("Keep")),
             ("keep on", "filter-rows", 4, alias("Keep Only")),
+            (
+                "@order",
+                "sort-rows",
+                4,
+                Matched::Alias {
+                    word: "@ORDER_BY".to_string(),
+                    source: Some("SQLMesh".to_string()),
+                },
+            ),
             ("fltr", "filter-rows", 5, Matched::LongName),
             ("each missing value", "fill-nulls", 6, Matched::Sentence),
         ];
