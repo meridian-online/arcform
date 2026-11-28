@@ -11,6 +11,7 @@ Rationale for each change is recorded in the project's design notes and commit h
 
 ### Fixed
 
+- **`arc run` now prints what a step's process wrote to standard error when the step succeeds, for the operators that hold it back until the process exits: `text_embed`, `umap_project` and `dlt`.** It reached the terminal only when the step failed, so a diagnostic written on success, such as `text_embed`'s count of rows that embedded as zero vectors, was lost. The lines appear after the step finishes rather than as they are written, because these operators read the whole output at once. They include what `uv` itself reports, such as the packages it installed, as a streaming operator such as `splink` already shows live. A `command:` step and a streaming operator are unchanged.
 - **`splink@1` writes its columns in a fixed order: `match_weight`, `match_probability`, the sort columns, then every other column by name.** Splink builds the columns a model retains from a set, so their order changed with each process's hash seed and two runs on the same inputs wrote the same rows in files that differed in bytes, against the operator's promise. A test now runs the script under two hash seeds and compares the files. The crosswalk's published output is unaffected: its SQL selects columns by name.
 
 ### Changed

@@ -196,6 +196,20 @@ fn report_hook_failure(slot: &str, hook: &crate::manifest::Step, e: &Error) {
     }
 }
 
+/// Write what a successful step's child wrote to stderr and arc held back, as written,
+/// ending it with a newline so the next line of the run starts on its own.
+fn write_held_stderr(held: &str) {
+    if held.is_empty() {
+        return;
+    }
+    use std::io::Write;
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(held.as_bytes());
+    if !held.ends_with('\n') {
+        let _ = err.write_all(b"\n");
+    }
+}
+
 /// Drop terminal escape sequences, which arc writes whatever `NO_COLOR` says, so what a
 /// child `arc run` printed reads as plain text. A control sequence (`ESC [` up to its final
 /// byte) is dropped whole, and any other escape with the one character after it.
@@ -930,6 +944,14 @@ pub fn run_with_publish(
                     Ok(output) => {
                         succeeded += 1;
                         executed += 1;
+                        // An operator that captures its child's output (to parse its
+                        // stdout, or to keep its stderr for a failure's error) holds
+                        // back what the child wrote to stderr until it exits. Pass it
+                        // on now: a streaming operator or a `command:` step shows the
+                        // same lines live, and a diagnostic written on success, such
+                        // as a count of rows that embedded as zero vectors, is meant
+                        // to be read.
+                        write_held_stderr(&output.stderr);
                         // Hashed AFTER execution, so it reflects what the step just
                         // wrote — the baseline the *next* run's staleness check
                         // compares against. Recorded for EVERY step kind, `command:`

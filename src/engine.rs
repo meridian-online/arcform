@@ -32,6 +32,10 @@ pub struct EngineInfo {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct StepOutput {
+    /// What the step's process wrote to stderr that has NOT already reached the
+    /// terminal: a capturing operator's, held until its process exited. The runner
+    /// prints it when the step succeeds. Empty where stderr was streamed live, so a
+    /// line is never shown twice.
     pub stderr: String,
     /// Captured stdout from a command step when output capture is active.
     /// None for SQL steps and command steps without output capture.
@@ -778,8 +782,10 @@ impl Engine for DuckDbEngine {
             ));
         }
 
+        // `stderr` is already on the terminal: `stream_stderr` wrote it as it arrived,
+        // so it is not handed back to be printed again.
         Ok(StepOutput {
-            stderr,
+            stderr: String::new(),
             stdout: None,
             report: None,
         })
