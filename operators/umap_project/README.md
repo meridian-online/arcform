@@ -152,6 +152,8 @@ Why a value above the bound is refused rather than clamped: measured end to end 
 
 **The authoring schema states the bound for a program as well as a person.** `neighbors` carries `"minimum": 2`, `"default": 15` and `"x-at-most": {"rows_of": "input", "minus": 1, "bounds_default": true}`: `rows_of` names the `with:` key whose Parquet is counted, `minus` what is taken off its row count, and `bounds_default` that the bound applies to the default as well, so a form can show *47 at most* on a 48-row table without its own copy of the rule. Its description, which an editor and `arc mcp`'s `operator_describe` show and which no edit to this file reaches, says the same. `umap_project_schema_states_the_neighbors_bound_and_the_default_rule` reddens if either loses it.
 
+The schema also says what the two ends of each number's range mean, for a form that draws the range as a bar: `neighbors` carries `"x-ends": ["local", "global"]` and `min_dist` `"x-ends": ["packed", "spread"]`, the low end first. The words follow the descriptions: few neighbors read local structure and many read global, and a small `min_dist` packs points together where a large one spreads them. `x-ends` is a label only; arc's `with:` check ignores it.
+
 ## What counts as a column it can project
 
 `columns:` names columns that are already numbers, in either of two shapes:
