@@ -87,6 +87,10 @@
 //! - [`record_step`] — new numbered model under `models/` + step splice, refusal-first
 //! - [`amend_step_sql`] — rewrite a *generated* model; hand-authored files are refused
 //! - [`GENERATED_MARKER`], [`sql_is_generated`] — the ownership line, readable by anyone
+//! - [`OperationRequest`], [`operation_model`], [`OperationModel`] — the model `arc
+//!   operation record` would write for one of arc's SQL operations, and its notes,
+//!   with the record path's refusals, writing nothing and reading no Protocol: a
+//!   preview runs what will be recorded
 //!
 //! Local history (the `history` module's docs carry the full
 //! discussion — the middle tier between editor undo and version control, its
@@ -136,7 +140,9 @@
 //!
 //! Execution. There is no way through this surface to run a pipeline, open a DuckDB
 //! connection, introspect SQL, evaluate a precondition, build an asset graph, reach
-//! the operator catalog, or touch the registry. Of the database and the run contract
+//! the operator catalog, or touch the registry. [`operation_model`] writes an
+//! operation's SQL and runs none of it: the in-memory DuckDB it parses arguments on
+//! is the record path's, not a connection a caller reaches. Of the database and the run contract
 //! it gives the database's path and the tables a run made with their hashes, and
 //! reads neither further. Those are the engine's business and they move; the spec
 //! does not.
@@ -161,6 +167,10 @@
 //! should pin `version = "=x.y.z"`. The guarantee offered is narrow and real:
 //! within a version, what is listed above is what exists, it behaves as `arc`
 //! itself behaves, and nothing else is reachable.
+//!
+//! [`OperationRequest`] holds its tables and arguments as `serde_json` maps, the JSON
+//! `arc mcp`'s `operation_record` takes, so building one means depending on
+//! `serde_json` 1.
 //!
 //! One wart to know about: [`Step::with`] — the typed config block of an `op:` step —
 //! is a `serde_yaml::Value`, so inspecting it means depending on `serde_yaml` 0.9.
@@ -241,5 +251,6 @@ pub use crate::panel_check::{CheckedPanels, PanelFinding, check_panel, check_pan
 pub use crate::precondition::{FreshConfig, ModifiedAfterConfig, Precondition, ToolConfig};
 pub use crate::protocol_read::{RunTables, protocol_db_path, read_log, report_run, run_tables};
 pub use crate::record::{
-    GENERATED_MARKER, RecordedStep, amend_step_sql, record_step, sql_is_generated,
+    GENERATED_MARKER, OperationModel, OperationRequest, RecordedStep, amend_step_sql,
+    operation_model, record_step, sql_is_generated,
 };

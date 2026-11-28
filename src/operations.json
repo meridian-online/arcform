@@ -1,0 +1,2432 @@
+{
+ "landscape_commit": "e647009",
+ "operations": [
+  {
+   "aliases": [
+    {
+     "source": "KNIME",
+     "word": "DB Row Filter"
+    },
+    {
+     "word": "Delete"
+    },
+    {
+     "source": "VisiData",
+     "word": "dup-search"
+    },
+    {
+     "source": "VisiData",
+     "word": "dup-search-cols"
+    },
+    {
+     "word": "Exclude"
+    },
+    {
+     "source": "KNIME",
+     "word": "Expression Row Filter"
+    },
+    {
+     "source": "Polars",
+     "word": "filter"
+    },
+    {
+     "word": "Filter by condition"
+    },
+    {
+     "word": "Filter by search"
+    },
+    {
+     "word": "Filter contains"
+    },
+    {
+     "word": "Filter custom formula"
+    },
+    {
+     "word": "Filter Documents (by Content)"
+    },
+    {
+     "word": "Filter ends with"
+    },
+    {
+     "word": "Filter exact"
+    },
+    {
+     "word": "Filter Examples"
+    },
+    {
+     "word": "Filter greater than"
+    },
+    {
+     "word": "Filter in"
+    },
+    {
+     "word": "Filter less than"
+    },
+    {
+     "word": "Filter not equals"
+    },
+    {
+     "word": "Filter Rows"
+    },
+    {
+     "word": "Filter starts with"
+    },
+    {
+     "word": "FilterRowKind"
+    },
+    {
+     "word": "Java Filter"
+    },
+    {
+     "source": "KNIME",
+     "word": "Java Snippet Row Filter"
+    },
+    {
+     "word": "Keep"
+    },
+    {
+     "word": "Keep Only"
+    },
+    {
+     "source": "KNIME",
+     "word": "Nominal Value Row Filter"
+    },
+    {
+     "word": "Range of Dates"
+    },
+    {
+     "word": "Range of Values"
+    },
+    {
+     "word": "Relative Date"
+    },
+    {
+     "source": "Polars",
+     "word": "remove"
+    },
+    {
+     "source": "KNIME",
+     "word": "Row Filter"
+    },
+    {
+     "source": "KNIME",
+     "word": "Row Filter (Labs)"
+    },
+    {
+     "word": "Row Filtering"
+    },
+    {
+     "source": "KNIME",
+     "word": "Rule-based Row Filter"
+    },
+    {
+     "source": "KNIME",
+     "word": "Rule-based Row Filter (Dictionary)"
+    },
+    {
+     "source": "Apache NiFi",
+     "word": "ScriptedFilterRecord"
+    },
+    {
+     "word": "Selected Values"
+    },
+    {
+     "word": "Table.FindText"
+    },
+    {
+     "word": "Table.SelectRows"
+    },
+    {
+     "word": "tCombinedSQLFilter"
+    },
+    {
+     "source": "OpenRefine",
+     "word": "Text filter"
+    },
+    {
+     "word": "tFilterRow"
+    },
+    {
+     "word": "tSQLTemplateFilterRows"
+    },
+    {
+     "source": "SQL",
+     "word": "WHERE"
+    },
+    {
+     "word": "Wildcard Match"
+    }
+   ],
+   "long_name": "filter-rows",
+   "sentence": "Keep only the rows that match a condition, a list of chosen values or a piece of text.",
+   "title": "Filter rows"
+  },
+  {
+   "aliases": [
+    {
+     "source": "SQLMesh",
+     "word": "@ORDER_BY"
+    },
+    {
+     "source": "Polars",
+     "word": "arg_sort_by"
+    },
+    {
+     "source": "KNIME",
+     "word": "DB Sorter"
+    },
+    {
+     "source": "SQL",
+     "word": "ORDER BY"
+    },
+    {
+     "word": "ORDERBY"
+    },
+    {
+     "source": "OpenRefine",
+     "word": "Reorder rows permanently"
+    },
+    {
+     "source": "Polars",
+     "word": "sort"
+    },
+    {
+     "word": "Sort (Multiple)"
+    },
+    {
+     "word": "Sort by Pareto Rank"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "Sort Rows"
+    },
+    {
+     "source": "VisiData",
+     "word": "sort-asc"
+    },
+    {
+     "source": "VisiData",
+     "word": "sort-asc-add"
+    },
+    {
+     "source": "VisiData",
+     "word": "sort-asc-change"
+    },
+    {
+     "source": "VisiData",
+     "word": "sort-desc"
+    },
+    {
+     "source": "VisiData",
+     "word": "sort-desc-add"
+    },
+    {
+     "source": "VisiData",
+     "word": "sort-desc-change"
+    },
+    {
+     "source": "VisiData",
+     "word": "sort-keys-asc"
+    },
+    {
+     "source": "VisiData",
+     "word": "sort-keys-asc-add"
+    },
+    {
+     "source": "VisiData",
+     "word": "sort-keys-desc"
+    },
+    {
+     "source": "VisiData",
+     "word": "sort-keys-desc-add"
+    },
+    {
+     "source": "VisiData",
+     "word": "sort-selected-asc"
+    },
+    {
+     "source": "VisiData",
+     "word": "sort-selected-desc"
+    },
+    {
+     "source": "DataFusion",
+     "word": "sort_by"
+    },
+    {
+     "source": "KNIME",
+     "word": "Sorter"
+    },
+    {
+     "source": "DataFusion",
+     "word": "Sorting"
+    },
+    {
+     "source": "Ibis",
+     "word": "SortKey"
+    },
+    {
+     "word": "Table.Sort"
+    },
+    {
+     "word": "tExternalSortOutput"
+    },
+    {
+     "word": "tExternalSortRow"
+    },
+    {
+     "word": "tSortRow"
+    }
+   ],
+   "long_name": "sort-rows",
+   "sentence": "Put the rows in order by the values of one or more columns.",
+   "title": "Sort rows"
+  },
+  {
+   "aliases": [
+    {
+     "source": "SQLMesh",
+     "word": "@STAR"
+    },
+    {
+     "word": "ApplyMapping"
+    },
+    {
+     "word": "ChangeSchema"
+    },
+    {
+     "source": "KNIME",
+     "word": "Column Filter"
+    },
+    {
+     "source": "KNIME",
+     "word": "Column Filter (PMML)"
+    },
+    {
+     "source": "KNIME",
+     "word": "DB Column Filter"
+    },
+    {
+     "word": "Delete columns"
+    },
+    {
+     "source": "Polars",
+     "word": "drop"
+    },
+    {
+     "word": "Drop Columns"
+    },
+    {
+     "source": "DataFusion",
+     "word": "drop_columns"
+    },
+    {
+     "source": "Polars",
+     "word": "drop_in_place"
+    },
+    {
+     "source": "Ibis",
+     "word": "DropColumns"
+    },
+    {
+     "word": "DropFields"
+    },
+    {
+     "source": "Polars",
+     "word": "exclude"
+    },
+    {
+     "word": "FieldMapper"
+    },
+    {
+     "word": "Filter"
+    },
+    {
+     "source": "Apache NiFi",
+     "word": "FilterAttribute"
+    },
+    {
+     "word": "Hide Field"
+    },
+    {
+     "source": "VisiData",
+     "word": "hide-col"
+    },
+    {
+     "source": "VisiData",
+     "word": "hide-selected"
+    },
+    {
+     "word": "Keep Only Field"
+    },
+    {
+     "word": "Keep/remove columns"
+    },
+    {
+     "source": "Ibis",
+     "word": "Project"
+    },
+    {
+     "word": "Project / Select"
+    },
+    {
+     "source": "DataFusion",
+     "word": "Projection"
+    },
+    {
+     "source": "OpenRefine",
+     "word": "Re-order / remove columns"
+    },
+    {
+     "word": "Remove Field"
+    },
+    {
+     "source": "OpenRefine",
+     "word": "Remove this column"
+    },
+    {
+     "source": "Apache NiFi",
+     "word": "RemoveRecordField"
+    },
+    {
+     "source": "DuckDB",
+     "word": "SELECT"
+    },
+    {
+     "word": "Select Attributes"
+    },
+    {
+     "word": "Select by Random"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "Select Values"
+    },
+    {
+     "source": "DataFusion",
+     "word": "select_columns"
+    },
+    {
+     "source": "DataFusion",
+     "word": "select_exprs"
+    },
+    {
+     "source": "Polars",
+     "word": "select_seq"
+    },
+    {
+     "word": "SelectFields"
+    },
+    {
+     "source": "dbt",
+     "word": "star"
+    },
+    {
+     "source": "KNIME",
+     "word": "Table Manipulator"
+    },
+    {
+     "word": "Table.Column"
+    },
+    {
+     "word": "Table.RemoveColumns"
+    },
+    {
+     "word": "Table.SelectColumns"
+    },
+    {
+     "word": "tFilterColumns"
+    },
+    {
+     "word": "tSQLTemplateFilterColumns"
+    },
+    {
+     "source": "VisiData",
+     "word": "unhide-cols"
+    }
+   ],
+   "long_name": "hide-column",
+   "sentence": "Take a column out of the table so it no longer appears.",
+   "title": "Hide a column"
+  },
+  {
+   "aliases": [
+    {
+     "source": "SQLMesh",
+     "word": "@STAR"
+    },
+    {
+     "source": "Polars",
+     "word": "alias"
+    },
+    {
+     "word": "ApplyMapping"
+    },
+    {
+     "source": "SQL",
+     "word": "AS"
+    },
+    {
+     "word": "ChangeSchema"
+    },
+    {
+     "source": "KNIME",
+     "word": "Column Renamer"
+    },
+    {
+     "source": "KNIME",
+     "word": "DB Column Renamer"
+    },
+    {
+     "word": "FieldMapper"
+    },
+    {
+     "source": "Ibis",
+     "word": "Project"
+    },
+    {
+     "source": "DataFusion",
+     "word": "Projection"
+    },
+    {
+     "source": "OpenRefine",
+     "word": "Re-order / remove columns"
+    },
+    {
+     "source": "Polars",
+     "word": "rename"
+    },
+    {
+     "word": "Rename Columns"
+    },
+    {
+     "word": "Rename Field"
+    },
+    {
+     "source": "OpenRefine",
+     "word": "Rename this column"
+    },
+    {
+     "source": "VisiData",
+     "word": "rename-col"
+    },
+    {
+     "word": "RenameField"
+    },
+    {
+     "source": "Apache NiFi",
+     "word": "RenameRecordField"
+    },
+    {
+     "source": "DuckDB",
+     "word": "SELECT"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "Select Values"
+    },
+    {
+     "source": "DataFusion",
+     "word": "select_exprs"
+    },
+    {
+     "source": "Polars",
+     "word": "select_seq"
+    },
+    {
+     "source": "dbt",
+     "word": "star"
+    },
+    {
+     "source": "KNIME",
+     "word": "Table Manipulator"
+    },
+    {
+     "word": "Table.RenameColumns"
+    },
+    {
+     "word": "tFilterColumns"
+    },
+    {
+     "word": "tSQLTemplateFilterColumns"
+    },
+    {
+     "source": "DataFusion",
+     "word": "with_column_renamed"
+    }
+   ],
+   "long_name": "rename-column",
+   "sentence": "Give a column a new name and leave its values alone.",
+   "title": "Rename a column"
+  },
+  {
+   "aliases": [
+    {
+     "word": "Add Column"
+    },
+    {
+     "source": "OpenRefine",
+     "word": "Add column based on this column"
+    },
+    {
+     "source": "OpenRefine",
+     "word": "Add column with URLs of matched entities"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "Add Constants"
+    },
+    {
+     "source": "OpenRefine",
+     "word": "Add entity identifiers column"
+    },
+    {
+     "source": "VisiData",
+     "word": "addcol-bulk"
+    },
+    {
+     "source": "VisiData",
+     "word": "addcol-expr"
+    },
+    {
+     "source": "VisiData",
+     "word": "addcol-iter"
+    },
+    {
+     "source": "VisiData",
+     "word": "addcol-new"
+    },
+    {
+     "source": "VisiData",
+     "word": "addcol-source"
+    },
+    {
+     "word": "Aggregate Token Length"
+    },
+    {
+     "word": "Calculate new column(s)"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "Calculator"
+    },
+    {
+     "word": "Compare Columns"
+    },
+    {
+     "source": "KNIME",
+     "word": "Constant Value Column Appender"
+    },
+    {
+     "word": "Copy"
+    },
+    {
+     "word": "Create Calculated Field"
+    },
+    {
+     "word": "Custom Calculation"
+    },
+    {
+     "word": "Derive"
+    },
+    {
+     "word": "Derived column"
+    },
+    {
+     "word": "Duplicate Field"
+    },
+    {
+     "source": "KNIME",
+     "word": "Expression"
+    },
+    {
+     "source": "DataFusion",
+     "word": "EXTEND"
+    },
+    {
+     "word": "Extract Length"
+    },
+    {
+     "word": "Extract Token Number"
+    },
+    {
+     "word": "Format String"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "Formula"
+    },
+    {
+     "word": "Generate Attributes"
+    },
+    {
+     "word": "Generate Copy"
+    },
+    {
+     "word": "Generate Empty Attribute"
+    },
+    {
+     "word": "Generate Levenshtein Distance"
+    },
+    {
+     "word": "Generate Prompts"
+    },
+    {
+     "source": "Polars",
+     "word": "insert_column"
+    },
+    {
+     "word": "Length"
+    },
+    {
+     "source": "Polars",
+     "word": "lit"
+    },
+    {
+     "source": "Ibis",
+     "word": "Literal"
+    },
+    {
+     "word": "New formula"
+    },
+    {
+     "source": "KNIME",
+     "word": "Renderer to Image"
+    },
+    {
+     "word": "Repeat"
+    },
+    {
+     "word": "Reverse"
+    },
+    {
+     "source": "KNIME",
+     "word": "String Manipulation"
+    },
+    {
+     "word": "Substring"
+    },
+    {
+     "word": "Table.AddColumn"
+    },
+    {
+     "word": "Table.DuplicateColumn"
+    },
+    {
+     "word": "Table.TransformRows"
+    },
+    {
+     "word": "Text Match"
+    },
+    {
+     "word": "tMap"
+    },
+    {
+     "source": "Apache NiFi",
+     "word": "UpdateAttribute"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "User Defined Java Expression"
+    },
+    {
+     "source": "DataFusion",
+     "word": "with_column"
+    },
+    {
+     "source": "Polars",
+     "word": "with_columns"
+    },
+    {
+     "source": "Polars",
+     "word": "with_columns_seq"
+    }
+   ],
+   "long_name": "derive-column",
+   "sentence": "Add a new column worked out from an expression, a fixed value or a copy of another column.",
+   "title": "Add a calculated column"
+  },
+  {
+   "aliases": [
+    {
+     "source": "SQLMesh",
+     "word": "@STAR"
+    },
+    {
+     "source": "VisiData",
+     "word": "addcol-cast"
+    },
+    {
+     "word": "ApplyMapping"
+    },
+    {
+     "source": "SQL",
+     "word": "CAST"
+    },
+    {
+     "word": "Cast / Convert Type"
+    },
+    {
+     "word": "Change column type"
+    },
+    {
+     "word": "Change Data Type"
+    },
+    {
+     "word": "ChangeSchema"
+    },
+    {
+     "word": "Convert data type"
+    },
+    {
+     "word": "Convert Type"
+    },
+    {
+     "source": "KNIME",
+     "word": "Double to Integer"
+    },
+    {
+     "word": "FieldMapper"
+    },
+    {
+     "word": "Format Numbers"
+    },
+    {
+     "source": "KNIME",
+     "word": "Image to Table"
+    },
+    {
+     "word": "IntToIp"
+    },
+    {
+     "word": "IpToInt"
+    },
+    {
+     "word": "Nominal to Text"
+    },
+    {
+     "source": "KNIME",
+     "word": "Number to String"
+    },
+    {
+     "source": "KNIME",
+     "word": "Number to String (PMML)"
+    },
+    {
+     "word": "Numerical to Polynominal"
+    },
+    {
+     "word": "Numerical to Real"
+    },
+    {
+     "word": "Parse Numbers"
+    },
+    {
+     "source": "KNIME",
+     "word": "Path to String"
+    },
+    {
+     "source": "KNIME",
+     "word": "Path to URI"
+    },
+    {
+     "source": "Ibis",
+     "word": "Project"
+    },
+    {
+     "source": "DataFusion",
+     "word": "Projection"
+    },
+    {
+     "source": "OpenRefine",
+     "word": "Re-order / remove columns"
+    },
+    {
+     "word": "Real to Integer"
+    },
+    {
+     "word": "ResolveChoice"
+    },
+    {
+     "source": "DuckDB",
+     "word": "SELECT"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "Select Values"
+    },
+    {
+     "source": "DataFusion",
+     "word": "select_exprs"
+    },
+    {
+     "source": "Polars",
+     "word": "select_seq"
+    },
+    {
+     "word": "Settype"
+    },
+    {
+     "source": "dbt",
+     "word": "star"
+    },
+    {
+     "source": "KNIME",
+     "word": "String to Number"
+    },
+    {
+     "source": "KNIME",
+     "word": "String to Number (PMML)"
+    },
+    {
+     "source": "KNIME",
+     "word": "String to Path"
+    },
+    {
+     "source": "KNIME",
+     "word": "String to SVG"
+    },
+    {
+     "source": "KNIME",
+     "word": "Table Manipulator"
+    },
+    {
+     "source": "KNIME",
+     "word": "Table to Image"
+    },
+    {
+     "word": "Table.TransformColumnTypes"
+    },
+    {
+     "word": "tConvertType"
+    },
+    {
+     "word": "Text to Nominal"
+    },
+    {
+     "word": "tFilterColumns"
+    },
+    {
+     "source": "OpenRefine",
+     "word": "To date"
+    },
+    {
+     "source": "OpenRefine",
+     "word": "To number"
+    },
+    {
+     "source": "OpenRefine",
+     "word": "To text"
+    },
+    {
+     "source": "Ibis",
+     "word": "TryCast"
+    },
+    {
+     "word": "tSQLTemplateFilterColumns"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-any"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-any-selected"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-currency"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-currency-selected"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-date"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-date-selected"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-datedelta"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-datetime"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-float"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-float-selected"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-floatlocale"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-floatlocale-selected"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-floatsi"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-floatsi-selected"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-int"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-int-selected"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-ipaddr"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-ipnet"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-len"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-len-selected"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-soupstr"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-string"
+    },
+    {
+     "source": "VisiData",
+     "word": "type-string-selected"
+    }
+   ],
+   "long_name": "cast-column",
+   "sentence": "Turn a column's values into another type, such as text into numbers or dates.",
+   "title": "Change a column's type"
+  },
+  {
+   "aliases": [
+    {
+     "source": "SQL",
+     "word": "COALESCE"
+    },
+    {
+     "word": "Coalesce / Null Fill"
+    },
+    {
+     "source": "KNIME",
+     "word": "Column Merger"
+    },
+    {
+     "word": "Constant Fill"
+    },
+    {
+     "source": "Polars",
+     "word": "fill_nan"
+    },
+    {
+     "source": "Polars",
+     "word": "fill_null"
+    },
+    {
+     "source": "Ibis",
+     "word": "FillNull"
+    },
+    {
+     "word": "FillWithMode"
+    },
+    {
+     "word": "If field value is null"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "If null"
+    },
+    {
+     "source": "mlpack",
+     "word": "Imputation"
+    },
+    {
+     "word": "Merge Fields"
+    },
+    {
+     "source": "KNIME",
+     "word": "Missing Value"
+    },
+    {
+     "source": "KNIME",
+     "word": "Missing Value (Apply)"
+    },
+    {
+     "word": "Replace All Missings"
+    },
+    {
+     "word": "Replace missing"
+    },
+    {
+     "word": "Replace Missing Values"
+    }
+   ],
+   "long_name": "fill-nulls",
+   "sentence": "Fill each missing value in a column with a value or an expression.",
+   "title": "Fill in missing values"
+  },
+  {
+   "aliases": [
+    {
+     "source": "SQLMesh",
+     "word": "@GROUP_BY"
+    },
+    {
+     "source": "VisiData",
+     "word": "addcol-aggr"
+    },
+    {
+     "source": "Ibis",
+     "word": "Aggregate"
+    },
+    {
+     "source": "VisiData",
+     "word": "aggregate-col"
+    },
+    {
+     "source": "VisiData",
+     "word": "aggregate-cols"
+    },
+    {
+     "source": "Ibis",
+     "word": "All"
+    },
+    {
+     "source": "Ibis",
+     "word": "Any"
+    },
+    {
+     "source": "DuckDB",
+     "word": "any_value"
+    },
+    {
+     "word": "ANYIF"
+    },
+    {
+     "word": "Approx Quantile"
+    },
+    {
+     "source": "DuckDB",
+     "word": "approx_count_distinct"
+    },
+    {
+     "source": "DataFusion",
+     "word": "approx_distinct"
+    },
+    {
+     "source": "DataFusion",
+     "word": "approx_median"
+    },
+    {
+     "source": "DataFusion",
+     "word": "approx_percentile_cont"
+    },
+    {
+     "source": "DataFusion",
+     "word": "approx_percentile_cont_with_weight"
+    },
+    {
+     "source": "Ibis",
+     "word": "ApproxCountDistinct"
+    },
+    {
+     "word": "APPROXIMATEMEDIAN"
+    },
+    {
+     "word": "APPROXIMATEPERCENTILE"
+    },
+    {
+     "word": "APPROXIMATEQUARTILE"
+    },
+    {
+     "source": "Ibis",
+     "word": "ApproxMedian"
+    },
+    {
+     "source": "Ibis",
+     "word": "ApproxMultiQuantile"
+    },
+    {
+     "source": "Ibis",
+     "word": "ApproxQuantile"
+    },
+    {
+     "source": "DuckDB",
+     "word": "arbitrary"
+    },
+    {
+     "source": "DuckDB",
+     "word": "arg_max"
+    },
+    {
+     "source": "DuckDB",
+     "word": "arg_max_null"
+    },
+    {
+     "source": "DuckDB",
+     "word": "arg_max_nulls_last"
+    },
+    {
+     "source": "DuckDB",
+     "word": "arg_min"
+    },
+    {
+     "source": "DuckDB",
+     "word": "arg_min_null"
+    },
+    {
+     "source": "DuckDB",
+     "word": "arg_min_nulls_last"
+    },
+    {
+     "source": "DuckDB",
+     "word": "argmax"
+    },
+    {
+     "source": "DuckDB",
+     "word": "argmin"
+    },
+    {
+     "word": "Array Aggregate"
+    },
+    {
+     "source": "DuckDB",
+     "word": "array_agg"
+    },
+    {
+     "source": "Ibis",
+     "word": "ArrayCollect"
+    },
+    {
+     "word": "AVERAGE"
+    },
+    {
+     "word": "AVERAGEIF"
+    },
+    {
+     "source": "DuckDB",
+     "word": "avg"
+    },
+    {
+     "source": "DuckDB",
+     "word": "bit_and"
+    },
+    {
+     "source": "DuckDB",
+     "word": "bit_or"
+    },
+    {
+     "source": "DuckDB",
+     "word": "bit_xor"
+    },
+    {
+     "source": "Ibis",
+     "word": "BitAnd"
+    },
+    {
+     "source": "Ibis",
+     "word": "BitOr"
+    },
+    {
+     "source": "DuckDB",
+     "word": "bitstring_agg"
+    },
+    {
+     "source": "Ibis",
+     "word": "BitXor"
+    },
+    {
+     "source": "DuckDB",
+     "word": "bool_and"
+    },
+    {
+     "source": "DuckDB",
+     "word": "bool_or"
+    },
+    {
+     "word": "Calgary Cross Count"
+    },
+    {
+     "word": "Collect List"
+    },
+    {
+     "word": "Concatenate text"
+    },
+    {
+     "source": "Polars",
+     "word": "corr"
+    },
+    {
+     "word": "CORREL"
+    },
+    {
+     "source": "Ibis",
+     "word": "Correlation"
+    },
+    {
+     "source": "DuckDB",
+     "word": "count"
+    },
+    {
+     "word": "Count Records"
+    },
+    {
+     "word": "Count Rows"
+    },
+    {
+     "source": "DuckDB",
+     "word": "count_if"
+    },
+    {
+     "source": "DuckDB",
+     "word": "count_star"
+    },
+    {
+     "word": "COUNTA"
+    },
+    {
+     "word": "COUNTAIF"
+    },
+    {
+     "source": "Ibis",
+     "word": "CountDistinct"
+    },
+    {
+     "word": "COUNTDISTINCTIF"
+    },
+    {
+     "source": "Ibis",
+     "word": "CountDistinctStar"
+    },
+    {
+     "source": "DuckDB",
+     "word": "countif"
+    },
+    {
+     "source": "Ibis",
+     "word": "CountStar"
+    },
+    {
+     "source": "Polars",
+     "word": "cov"
+    },
+    {
+     "word": "COVAR"
+    },
+    {
+     "source": "Ibis",
+     "word": "Covariance"
+    },
+    {
+     "word": "COVARSAMP"
+    },
+    {
+     "word": "Create Profile"
+    },
+    {
+     "source": "KNIME",
+     "word": "DB GroupBy"
+    },
+    {
+     "word": "Denormalize"
+    },
+    {
+     "word": "Diff Summary"
+    },
+    {
+     "word": "Extract Aggregates"
+    },
+    {
+     "word": "Extract Mode"
+    },
+    {
+     "source": "DuckDB",
+     "word": "favg"
+    },
+    {
+     "source": "DuckDB",
+     "word": "FILTER"
+    },
+    {
+     "source": "DuckDB",
+     "word": "first"
+    },
+    {
+     "source": "DataFusion",
+     "word": "first_value"
+    },
+    {
+     "source": "VisiData",
+     "word": "freq-summary"
+    },
+    {
+     "source": "DuckDB",
+     "word": "fsum"
+    },
+    {
+     "source": "SQL",
+     "word": "GROUP BY"
+    },
+    {
+     "source": "DataFusion",
+     "word": "GROUP BY ALL"
+    },
+    {
+     "source": "Polars",
+     "word": "group_by"
+    },
+    {
+     "source": "DuckDB",
+     "word": "group_concat"
+    },
+    {
+     "source": "KNIME",
+     "word": "GroupBy"
+    },
+    {
+     "source": "Polars",
+     "word": "GroupBy.agg"
+    },
+    {
+     "source": "Polars",
+     "word": "GroupBy.all"
+    },
+    {
+     "source": "Polars",
+     "word": "GroupBy.count"
+    },
+    {
+     "source": "Polars",
+     "word": "GroupBy.first"
+    },
+    {
+     "source": "Polars",
+     "word": "GroupBy.last"
+    },
+    {
+     "source": "Polars",
+     "word": "GroupBy.len"
+    },
+    {
+     "source": "Polars",
+     "word": "GroupBy.max"
+    },
+    {
+     "source": "Polars",
+     "word": "GroupBy.mean"
+    },
+    {
+     "source": "Polars",
+     "word": "GroupBy.median"
+    },
+    {
+     "source": "Polars",
+     "word": "GroupBy.min"
+    },
+    {
+     "source": "Polars",
+     "word": "GroupBy.n_unique"
+    },
+    {
+     "source": "Polars",
+     "word": "GroupBy.quantile"
+    },
+    {
+     "source": "Polars",
+     "word": "GroupBy.sum"
+    },
+    {
+     "source": "Ibis",
+     "word": "GroupConcat"
+    },
+    {
+     "source": "OpenRefine",
+     "word": "Join multi-valued cells"
+    },
+    {
+     "source": "DuckDB",
+     "word": "kahan_sum"
+    },
+    {
+     "word": "KTHLARGEST"
+    },
+    {
+     "word": "KTHLARGESTIF"
+    },
+    {
+     "word": "KTHLARGESTUNIQUE"
+    },
+    {
+     "word": "KTHLARGESTUNIQUEIF"
+    },
+    {
+     "source": "Ibis",
+     "word": "Kurtosis"
+    },
+    {
+     "source": "DuckDB",
+     "word": "last"
+    },
+    {
+     "source": "DataFusion",
+     "word": "last_value"
+    },
+    {
+     "source": "DuckDB",
+     "word": "list"
+    },
+    {
+     "source": "DuckDB",
+     "word": "listagg"
+    },
+    {
+     "word": "LISTIF"
+    },
+    {
+     "source": "DuckDB",
+     "word": "max"
+    },
+    {
+     "source": "DuckDB",
+     "word": "max_by"
+    },
+    {
+     "word": "MAXIF"
+    },
+    {
+     "source": "DuckDB",
+     "word": "mean"
+    },
+    {
+     "source": "Polars",
+     "word": "median"
+    },
+    {
+     "source": "VisiData",
+     "word": "memo-aggregate"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "Memory Group By"
+    },
+    {
+     "source": "DuckDB",
+     "word": "min"
+    },
+    {
+     "source": "DuckDB",
+     "word": "min_by"
+    },
+    {
+     "word": "MINIF"
+    },
+    {
+     "source": "Ibis",
+     "word": "Mode"
+    },
+    {
+     "word": "MODEIF"
+    },
+    {
+     "source": "Ibis",
+     "word": "MultiQuantile"
+    },
+    {
+     "source": "DataFusion",
+     "word": "nth_value"
+    },
+    {
+     "word": "PERCENTILE"
+    },
+    {
+     "source": "DataFusion",
+     "word": "percentile_cont"
+    },
+    {
+     "source": "DuckDB",
+     "word": "product"
+    },
+    {
+     "source": "Polars",
+     "word": "quantile"
+    },
+    {
+     "word": "QUARTILE"
+    },
+    {
+     "source": "KNIME",
+     "word": "Row Aggregator"
+    },
+    {
+     "source": "DuckDB",
+     "word": "sem"
+    },
+    {
+     "source": "Ibis",
+     "word": "StandardDev"
+    },
+    {
+     "word": "Statistical aggregation"
+    },
+    {
+     "source": "Polars",
+     "word": "std"
+    },
+    {
+     "source": "DuckDB",
+     "word": "stddev"
+    },
+    {
+     "source": "DuckDB",
+     "word": "stddev_pop"
+    },
+    {
+     "source": "DuckDB",
+     "word": "stddev_samp"
+    },
+    {
+     "word": "STDEV"
+    },
+    {
+     "word": "STDEVIF"
+    },
+    {
+     "word": "STDEVSAMP"
+    },
+    {
+     "word": "STDEVSAMPIF"
+    },
+    {
+     "source": "DuckDB",
+     "word": "string_agg"
+    },
+    {
+     "source": "DuckDB",
+     "word": "sum"
+    },
+    {
+     "source": "DuckDB",
+     "word": "sum_no_overflow"
+    },
+    {
+     "word": "SUMIF"
+    },
+    {
+     "source": "DuckDB",
+     "word": "sumkahan"
+    },
+    {
+     "word": "Summarize"
+    },
+    {
+     "word": "Table.AggregateTableColumn"
+    },
+    {
+     "word": "Table.Group"
+    },
+    {
+     "word": "tAggregateRow"
+    },
+    {
+     "word": "tAggregateSortedRow"
+    },
+    {
+     "word": "tCombinedSQLAggregate"
+    },
+    {
+     "word": "tDenormalize"
+    },
+    {
+     "word": "tDenormalizeSortedRow"
+    },
+    {
+     "word": "tSQLTemplateAggregate"
+    },
+    {
+     "word": "tSurviveFields"
+    },
+    {
+     "word": "UNIQUE"
+    },
+    {
+     "source": "Polars",
+     "word": "var"
+    },
+    {
+     "source": "DuckDB",
+     "word": "var_pop"
+    },
+    {
+     "source": "DuckDB",
+     "word": "var_samp"
+    },
+    {
+     "source": "DuckDB",
+     "word": "variance"
+    },
+    {
+     "word": "VARIF"
+    },
+    {
+     "word": "VARSAMP"
+    },
+    {
+     "word": "VARSAMPIF"
+    },
+    {
+     "word": "Weighted Average"
+    },
+    {
+     "source": "DataFusion",
+     "word": "WITHIN GROUP"
+    }
+   ],
+   "long_name": "summarise-rows",
+   "sentence": "Collapse the rows into one row per group, with totals, counts and other summaries.",
+   "title": "Summarise by group"
+  },
+  {
+   "aliases": [
+    {
+     "source": "SQLMesh",
+     "word": "@DEDUPLICATE"
+    },
+    {
+     "source": "VisiData",
+     "word": "dedupe-rows"
+    },
+    {
+     "source": "dbt",
+     "word": "deduplicate"
+    },
+    {
+     "word": "Deduplicate rows"
+    },
+    {
+     "source": "Apache NiFi",
+     "word": "DeduplicateRecord"
+    },
+    {
+     "source": "SQL",
+     "word": "DISTINCT"
+    },
+    {
+     "source": "DataFusion",
+     "word": "DISTINCT ON"
+    },
+    {
+     "source": "DataFusion",
+     "word": "distinct_on"
+    },
+    {
+     "word": "Drop Duplicates"
+    },
+    {
+     "source": "KNIME",
+     "word": "Duplicate Row Filter"
+    },
+    {
+     "source": "OpenRefine",
+     "word": "Remove duplicate rows"
+    },
+    {
+     "word": "Remove Duplicates"
+    },
+    {
+     "word": "RemoveDuplicates"
+    },
+    {
+     "word": "Table.Distinct"
+    },
+    {
+     "source": "Polars",
+     "word": "unique"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "Unique Rows"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "Unique Rows (HashSet)"
+    }
+   ],
+   "long_name": "dedupe-rows",
+   "sentence": "Keep one row from each set of rows that repeat.",
+   "title": "Deduplicate rows"
+  },
+  {
+   "aliases": [
+    {
+     "source": "SQLMesh",
+     "word": "@LIMIT"
+    },
+    {
+     "source": "Polars",
+     "word": "bottom_k"
+    },
+    {
+     "source": "VisiData",
+     "word": "dup-limit"
+    },
+    {
+     "source": "VisiData",
+     "word": "dup-nolimit"
+    },
+    {
+     "source": "SQL",
+     "word": "FETCH FIRST"
+    },
+    {
+     "word": "Filter from top"
+    },
+    {
+     "source": "Polars",
+     "word": "first"
+    },
+    {
+     "source": "Polars",
+     "word": "head"
+    },
+    {
+     "word": "Keep min/max"
+    },
+    {
+     "source": "Polars",
+     "word": "last"
+    },
+    {
+     "source": "Polars",
+     "word": "limit"
+    },
+    {
+     "source": "KNIME",
+     "word": "Table Cropper"
+    },
+    {
+     "word": "Table.FirstN"
+    },
+    {
+     "word": "Table.LastN"
+    },
+    {
+     "word": "Table.Max"
+    },
+    {
+     "word": "Table.MaxN"
+    },
+    {
+     "word": "Table.Min"
+    },
+    {
+     "word": "Table.MinN"
+    },
+    {
+     "source": "Polars",
+     "word": "tail"
+    },
+    {
+     "source": "KNIME",
+     "word": "Top k Row Filter"
+    },
+    {
+     "word": "Top N / Limit"
+    },
+    {
+     "source": "Polars",
+     "word": "top_k"
+    },
+    {
+     "word": "Trim table"
+    },
+    {
+     "word": "tTop"
+    }
+   ],
+   "long_name": "limit-rows",
+   "sentence": "Keep only the first rows, the last rows or the top few by a value.",
+   "title": "Take the first or last rows"
+  },
+  {
+   "aliases": [
+    {
+     "source": "SQLMesh",
+     "word": "@JOIN"
+    },
+    {
+     "word": "Anti Join"
+    },
+    {
+     "word": "Append Fields"
+    },
+    {
+     "word": "Calgary Join"
+    },
+    {
+     "word": "Cartesian Product"
+    },
+    {
+     "source": "SQL",
+     "word": "CROSS JOIN"
+    },
+    {
+     "source": "KNIME",
+     "word": "Cross Joiner"
+    },
+    {
+     "word": "Cross merge"
+    },
+    {
+     "source": "KNIME",
+     "word": "DB Joiner"
+    },
+    {
+     "source": "DataFusion",
+     "word": "EXISTS"
+    },
+    {
+     "source": "Ibis",
+     "word": "ExistsSubquery"
+    },
+    {
+     "word": "Full"
+    },
+    {
+     "source": "SQL",
+     "word": "FULL JOIN"
+    },
+    {
+     "source": "DataFusion",
+     "word": "FULL OUTER JOIN"
+    },
+    {
+     "source": "DataFusion",
+     "word": "IN"
+    },
+    {
+     "word": "Inner"
+    },
+    {
+     "source": "SQL",
+     "word": "INNER JOIN"
+    },
+    {
+     "source": "Ibis",
+     "word": "InSubquery"
+    },
+    {
+     "word": "Intersect"
+    },
+    {
+     "source": "Polars",
+     "word": "join"
+    },
+    {
+     "word": "Join datasets"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "Join Rows"
+    },
+    {
+     "word": "Join Rows (cartesian product)"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-cols-full"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-cols-inner"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-cols-outer"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-selected"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-selected-full"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-selected-inner"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-selected-outer"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-sheets-all-full"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-sheets-all-inner"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-sheets-all-outer"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-sheets-cols"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-sheets-top2"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-sheets-top2-full"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-sheets-top2-inner"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-sheets-top2-outer"
+    },
+    {
+     "source": "DataFusion",
+     "word": "join_on"
+    },
+    {
+     "source": "KNIME",
+     "word": "Joiner"
+    },
+    {
+     "source": "Ibis",
+     "word": "JoinLink"
+    },
+    {
+     "word": "Joins"
+    },
+    {
+     "word": "Keep/remove matching"
+    },
+    {
+     "word": "Left"
+    },
+    {
+     "source": "DataFusion",
+     "word": "LEFT ANTI JOIN"
+    },
+    {
+     "source": "SQL",
+     "word": "LEFT JOIN"
+    },
+    {
+     "source": "DataFusion",
+     "word": "LEFT OUTER JOIN"
+    },
+    {
+     "source": "DataFusion",
+     "word": "LEFT SEMI JOIN"
+    },
+    {
+     "word": "leftOnly"
+    },
+    {
+     "word": "Merge another table"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "Merge Join"
+    },
+    {
+     "source": "KNIME",
+     "word": "Reference Row Filter"
+    },
+    {
+     "word": "Right"
+    },
+    {
+     "source": "DataFusion",
+     "word": "RIGHT ANTI JOIN"
+    },
+    {
+     "source": "SQL",
+     "word": "RIGHT JOIN"
+    },
+    {
+     "source": "DataFusion",
+     "word": "RIGHT OUTER JOIN"
+    },
+    {
+     "source": "DataFusion",
+     "word": "RIGHT SEMI JOIN"
+    },
+    {
+     "word": "rightOnly"
+    },
+    {
+     "word": "Semi Join"
+    },
+    {
+     "word": "Set Minus"
+    },
+    {
+     "word": "Table.Join"
+    },
+    {
+     "word": "Table.RemoveMatchingRows"
+    },
+    {
+     "word": "tJoin"
+    }
+   ],
+   "long_name": "join-tables",
+   "sentence": "Bring two tables together by matching rows on a shared key.",
+   "title": "Join tables on a key"
+  },
+  {
+   "aliases": [
+    {
+     "source": "SQLMesh",
+     "word": "@UNION"
+    },
+    {
+     "word": "Append"
+    },
+    {
+     "word": "Append (Robust)"
+    },
+    {
+     "word": "Append (Superset)"
+    },
+    {
+     "word": "Append another table"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "Append Streams"
+    },
+    {
+     "source": "Polars",
+     "word": "concat"
+    },
+    {
+     "source": "KNIME",
+     "word": "Concatenate"
+    },
+    {
+     "source": "KNIME",
+     "word": "DB Concatenate"
+    },
+    {
+     "source": "Polars",
+     "word": "extend"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-cols-append"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-cols-concat"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-selected-append"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-selected-concat"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-sheets-all-append"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-sheets-all-concat"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-sheets-top2-append"
+    },
+    {
+     "source": "VisiData",
+     "word": "join-sheets-top2-concat"
+    },
+    {
+     "word": "Merge Streams"
+    },
+    {
+     "word": "Prioritize streams"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "Stream schema merge"
+    },
+    {
+     "word": "Table.Combine"
+    },
+    {
+     "word": "tUnite"
+    },
+    {
+     "source": "Polars",
+     "word": "union"
+    },
+    {
+     "source": "SQL",
+     "word": "UNION ALL"
+    },
+    {
+     "source": "DataFusion",
+     "word": "UNION BY NAME"
+    },
+    {
+     "word": "Union datasets"
+    },
+    {
+     "source": "DataFusion",
+     "word": "union_by_name"
+    },
+    {
+     "source": "Polars",
+     "word": "vstack"
+    }
+   ],
+   "long_name": "append-rows",
+   "sentence": "Stack the rows of one table under another that has the same columns.",
+   "title": "Append tables"
+  },
+  {
+   "aliases": [
+    {
+     "source": "mlpack",
+     "word": "ArmaASCII"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "Beam file input"
+    },
+    {
+     "source": "DataFusion",
+     "word": "CSV"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "CSV file input"
+    },
+    {
+     "source": "KNIME",
+     "word": "CSV Reader"
+    },
+    {
+     "word": "Csv.Document"
+    },
+    {
+     "source": "Apache NiFi",
+     "word": "CSVReader"
+    },
+    {
+     "word": "Delimited text format"
+    },
+    {
+     "word": "Dynamic Input"
+    },
+    {
+     "source": "KNIME",
+     "word": "File Reader (Complex Format)"
+    },
+    {
+     "word": "GZIP CSV Input"
+    },
+    {
+     "word": "Hadoop File Input"
+    },
+    {
+     "word": "Import delimited text file"
+    },
+    {
+     "word": "Import from Apache Parquet"
+    },
+    {
+     "word": "Import JSON from file"
+    },
+    {
+     "word": "Input"
+    },
+    {
+     "word": "Input Data"
+    },
+    {
+     "source": "DataFusion",
+     "word": "JSON"
+    },
+    {
+     "word": "JSON format"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "JSON Normalize Input"
+    },
+    {
+     "source": "VisiData",
+     "word": "jsonl"
+    },
+    {
+     "word": "JSONL / NDJSON"
+    },
+    {
+     "source": "VisiData",
+     "word": "jsonla"
+    },
+    {
+     "source": "VisiData",
+     "word": "jsonobj"
+    },
+    {
+     "source": "Apache NiFi",
+     "word": "JsonTreeReader"
+    },
+    {
+     "source": "VisiData",
+     "word": "lsv"
+    },
+    {
+     "source": "DataFusion",
+     "word": "Parquet"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "Parquet file input"
+    },
+    {
+     "word": "Parquet format"
+    },
+    {
+     "word": "Parquet Input"
+    },
+    {
+     "word": "Parquet.Document"
+    },
+    {
+     "source": "DuckDB",
+     "word": "parquet_scan"
+    },
+    {
+     "source": "VisiData",
+     "word": "psv"
+    },
+    {
+     "source": "mlpack",
+     "word": "RawASCII"
+    },
+    {
+     "word": "Read CSV"
+    },
+    {
+     "source": "Polars",
+     "word": "read_clipboard"
+    },
+    {
+     "source": "DuckDB",
+     "word": "read_csv"
+    },
+    {
+     "source": "DuckDB",
+     "word": "read_csv_auto"
+    },
+    {
+     "source": "DuckDB",
+     "word": "read_json"
+    },
+    {
+     "source": "DuckDB",
+     "word": "read_json_auto"
+    },
+    {
+     "source": "DuckDB",
+     "word": "read_ndjson"
+    },
+    {
+     "source": "DuckDB",
+     "word": "read_ndjson_auto"
+    },
+    {
+     "source": "DuckDB",
+     "word": "read_parquet"
+    },
+    {
+     "word": "S3 CSV Input"
+    },
+    {
+     "source": "Polars",
+     "word": "scan_csv"
+    },
+    {
+     "source": "Polars",
+     "word": "scan_ndjson"
+    },
+    {
+     "source": "Polars",
+     "word": "scan_parquet"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "Spark file input"
+    },
+    {
+     "source": "Apache Hop",
+     "word": "Text File Input"
+    },
+    {
+     "word": "tFileInputDelimited"
+    },
+    {
+     "word": "tFileInputJSON"
+    },
+    {
+     "word": "tFileInputParquet"
+    },
+    {
+     "word": "tFileStreamInputParquet"
+    },
+    {
+     "source": "VisiData",
+     "word": "tsv"
+    },
+    {
+     "source": "VisiData",
+     "word": "usv"
+    }
+   ],
+   "long_name": "read-file",
+   "sentence": "Read a delimited, Parquet or JSON file into a table, picking the reader from the file's ending.",
+   "title": "Read a file"
+  }
+ ],
+ "version": 1
+}
